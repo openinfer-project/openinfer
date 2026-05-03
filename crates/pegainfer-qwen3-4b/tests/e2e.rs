@@ -7,15 +7,15 @@ use log::info;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
-use pegainfer::sampler::SamplingParams;
-use pegainfer::scheduler::{self, SchedulerRequest, TokenEvent};
-use pegainfer::server_engine::FinishReason;
+use pegainfer_core::engine::{
+    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent,
+};
+use pegainfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3-4B");
 
 fn get_model_path() -> String {
     let model_path =
@@ -30,7 +30,7 @@ fn get_test_data_path(model_path: &str) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or(model_path);
     let test_data_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_data")
+        .join("../../test_data")
         .join(format!("{model_name}.json"));
     info!("Using test data path: {}", test_data_path.display());
     test_data_path
@@ -61,13 +61,11 @@ fn load_test_cases(test_data_path: &Path) -> Vec<TestCase> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-fn init_logging() {
-    pegainfer::logging::init_stderr("info");
-}
+fn init_logging() {}
 
 /// Submit a request and collect all generated tokens (blocking).
 fn generate_tokens(
-    handle: &scheduler::SchedulerHandle,
+    handle: &EngineHandle,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -76,7 +74,7 @@ fn generate_tokens(
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
     handle
-        .submit(SchedulerRequest {
+        .submit(GenerateRequest {
             prompt_tokens,
             params: SamplingParams::default(), // greedy
             max_tokens,
@@ -109,19 +107,17 @@ fn test_e2e_generation() {
     let test_data_path = get_test_data_path(&model_path);
     let test_cases = load_test_cases(&test_data_path);
 
-    info!("Loading model...");
-    let start = Instant::now();
-    let model = Qwen3Model::from_safetensors_with_runtime(
-        &model_path,
-        ModelRuntimeConfig {
+    info!("Loading engine...");
+    let handle = pegainfer_qwen3_4b::start_engine(
+        Path::new(&model_path),
+        EngineLoadOptions {
             enable_cuda_graph: true,
-            ..Default::default()
+            device_ordinals: vec![0],
+            seed: 42,
         },
     )
-    .expect("Failed to load model");
+    .expect("Failed to start engine");
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = scheduler::start(model, 42).expect("Failed to start scheduler");
-    info!("Engine loaded in {:.2?}", start.elapsed());
 
     // Build expected-output lookup from JSON
     let expected: HashMap<&str, &str> = test_cases
@@ -195,7 +191,7 @@ fn test_e2e_generation() {
         drop(rx); // drop receiver immediately
         // Submit should succeed — scheduler will notice send error and retire the request
         handle
-            .submit(SchedulerRequest {
+            .submit(GenerateRequest {
                 prompt_tokens,
                 params: SamplingParams::default(),
                 max_tokens: 10,

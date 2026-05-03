@@ -1,9 +1,9 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::model_executor::{
-    DecodePlan, DecodeResult, DecodeStepItem, ModelExecutor, PrefillPlan, PrefillResult,
-    PrefillStepItem, Qwen3Executor, UnifiedPlan, UnifiedResult,
+use crate::executor::{
+    DecodePlan, DecodeResult, DecodeStepItem, PrefillPlan, PrefillResult, PrefillStepItem,
+    Qwen3Executor, UnifiedPlan, UnifiedResult,
 };
 
 use super::{ActiveRequestState, PendingRequest};

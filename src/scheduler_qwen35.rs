@@ -106,7 +106,7 @@ pub fn start_with_capacity(
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
-    Ok(SchedulerHandle { submit_tx })
+    Ok(SchedulerHandle::new(submit_tx))
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────

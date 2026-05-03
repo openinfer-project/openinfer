@@ -6,11 +6,16 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/pegainfer-core", "crates/pegainfer-kernels"]
+members = [
+    "crates/pegainfer-core",
+    "crates/pegainfer-kernels",
+    "crates/pegainfer-qwen3-4b",
+]
 
 [dependencies]
 pegainfer-core = { path = "crates/pegainfer-core" }
 pegainfer-kernels = { path = "crates/pegainfer-kernels" }
+pegainfer-qwen3-4b = { path = "crates/pegainfer-qwen3-4b" }
 safetensors = "0.7"
 anyhow = "1.0"
 ndarray = "0.16"

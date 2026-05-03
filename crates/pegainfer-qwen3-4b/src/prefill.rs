@@ -1,10 +1,10 @@
 use anyhow::Result;
 
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::kv_pool::{KvLayout, KvState};
-use crate::ops;
-use crate::ops::PrefillPagedPlan;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::ops;
+use pegainfer_core::ops::PrefillPagedPlan;
+use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 /// Created once per prefill in `process_all_layers_batch`, eliminating
@@ -144,7 +144,7 @@ impl Qwen3Model {
         hidden: &mut HiddenStates,
         start_pos: usize,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
-        layout: &crate::kv_pool::KvLayout,
+        layout: &pegainfer_core::kv_pool::KvLayout,
         plan: &PrefillPagedPlan,
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {

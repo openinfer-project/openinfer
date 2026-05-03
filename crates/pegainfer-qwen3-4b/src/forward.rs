@@ -4,17 +4,17 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 
 use super::weights::Qwen3Model;
-use crate::kv_pool::KvState;
-use crate::model::{GenerationState, ModelForward};
-use crate::ops;
-use crate::sampler::SamplingParams;
-use crate::tensor::{DeviceContext, DeviceVec};
+use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::model::{GenerationState, ModelForward};
+use pegainfer_core::ops;
+use pegainfer_core::sampler::SamplingParams;
+use pegainfer_core::tensor::{DeviceContext, DeviceVec};
 
 /// Per-request mutable state for Qwen3.
 ///
-/// Used by the `ModelForward` trait (tests, bench_serving). The production
-/// scheduler uses `BatchDecodeBuffers` directly and never creates this struct.
-pub struct Qwen3State {
+/// Used by the legacy `ModelForward` compatibility path. The production
+/// scheduler and model benchmarks use the executor phase API instead.
+pub(crate) struct Qwen3State {
     /// Paged KV state — used by the prefill path (FlashInfer).
     pub(super) kv_state: KvState,
     /// Logits from the last forward pass.
@@ -50,7 +50,7 @@ impl Qwen3State {
                 .map_err(|e| anyhow::anyhow!("Alloc sample_top1_value failed: {e}"))?,
             sample_row_states: ctx
                 .stream
-                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+                .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())
                 .map_err(|e| anyhow::anyhow!("Alloc sample_row_states failed: {e}"))?,
             sample_valid: ctx
                 .stream

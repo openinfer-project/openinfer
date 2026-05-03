@@ -4,17 +4,17 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::{Config, TensorParallelConfig};
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use crate::weight_loader::{
+use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use pegainfer_core::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
     load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 
 #[derive(Clone, Copy, Debug)]
-pub struct ModelRuntimeConfig {
-    pub enable_cuda_graph: bool,
-    pub tensor_parallel: Option<TensorParallelConfig>,
-    pub device_ordinal: usize,
+pub(crate) struct ModelRuntimeConfig {
+    pub(crate) enable_cuda_graph: bool,
+    pub(crate) tensor_parallel: Option<TensorParallelConfig>,
+    pub(crate) device_ordinal: usize,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -58,7 +58,7 @@ pub(super) struct TransformerBlock {
 }
 
 /// Qwen3 model — weights and config only. Mutable state lives in `Qwen3State`.
-pub struct Qwen3Model {
+pub(crate) struct Qwen3Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config,
     pub(super) embed_tokens: DeviceMatrix,
@@ -68,7 +68,7 @@ pub struct Qwen3Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
-    pub(super) kv_pool: crate::kv_pool::KvPool,
+    pub(super) kv_pool: pegainfer_core::kv_pool::KvPool,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) tp_comm: Option<Comm>,
 }
@@ -80,7 +80,7 @@ unsafe impl Send for Qwen3Model {}
 unsafe impl Sync for Qwen3Model {}
 
 impl Qwen3Model {
-    pub fn from_safetensors_with_runtime(
+    pub(crate) fn from_safetensors_with_runtime(
         model_path: &str,
         runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
@@ -307,7 +307,7 @@ impl Qwen3Model {
         info!("GPU model loaded successfully");
 
         let page_size = 16;
-        let layout = crate::kv_pool::KvLayout::new(
+        let layout = pegainfer_core::kv_pool::KvLayout::new(
             config.num_hidden_layers,
             config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
@@ -324,7 +324,7 @@ impl Qwen3Model {
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
-        let kv_pool = crate::kv_pool::KvPool::new(
+        let kv_pool = pegainfer_core::kv_pool::KvPool::new(
             &ctx,
             config.num_hidden_layers,
             config.local_num_key_value_heads(tensor_parallel),
@@ -365,7 +365,7 @@ impl Qwen3Model {
         &self.config
     }
 
-    pub(crate) fn device_ctx(&self) -> &crate::tensor::DeviceContext {
+    pub(crate) fn device_ctx(&self) -> &pegainfer_core::tensor::DeviceContext {
         &self.ctx
     }
 
@@ -393,7 +393,10 @@ impl Qwen3Model {
         self.tp_comm = Some(comm);
     }
 
-    pub(crate) fn all_reduce_hidden(&self, hidden: &mut crate::tensor::HiddenStates) -> Result<()> {
+    pub(crate) fn all_reduce_hidden(
+        &self,
+        hidden: &mut pegainfer_core::tensor::HiddenStates,
+    ) -> Result<()> {
         if let Some(comm) = &self.tp_comm {
             comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
                 .map_err(|e| anyhow::anyhow!("nccl all-reduce failed: {e:?}"))?;
@@ -402,11 +405,11 @@ impl Qwen3Model {
     }
 
     /// Allocate a fresh (empty) per-request KV state from the shared pool.
-    pub(crate) fn alloc_kv(&self) -> crate::kv_pool::KvState {
+    pub(crate) fn alloc_kv(&self) -> pegainfer_core::kv_pool::KvState {
         self.kv_pool.alloc()
     }
 
-    pub(crate) fn kv_pool(&self) -> &crate::kv_pool::KvPool {
+    pub(crate) fn kv_pool(&self) -> &pegainfer_core::kv_pool::KvPool {
         &self.kv_pool
     }
 

@@ -6,6 +6,7 @@ use log::info;
 use pegainfer::logging;
 use pegainfer::model::Qwen35Model;
 use pegainfer::server_engine::{ModelType, detect_model_type};
+use pegainfer_core::engine::EngineLoadOptions;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -63,13 +64,15 @@ async fn main() {
             } else {
                 (0..args.tp_size).collect()
             };
-            let handle = pegainfer::scheduler::start_qwen3(
-                model_path,
-                args.cuda_graph,
-                &device_ordinals,
-                42,
+            let handle = pegainfer_qwen3_4b::start_engine(
+                &args.model_path,
+                EngineLoadOptions {
+                    enable_cuda_graph: args.cuda_graph,
+                    device_ordinals,
+                    seed: 42,
+                },
             )
-            .expect("Failed to start Qwen3 scheduler");
+            .expect("Failed to start Qwen3 engine");
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 

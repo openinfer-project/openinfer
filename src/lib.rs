@@ -3,7 +3,6 @@ mod ffi;
 pub(crate) mod kv_pool;
 pub mod logging;
 pub mod model;
-pub(crate) mod model_executor;
 pub mod ops;
 pub mod sampler;
 pub mod scheduler;

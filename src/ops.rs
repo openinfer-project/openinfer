@@ -5,10 +5,7 @@ mod recurrent;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use pegainfer_core::ops::{
-    PrefillPagedPlan, paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    prefill_attention_paged_into,
-};
+pub(crate) use pegainfer_core::ops::{PrefillPagedPlan, paged_attention_batch_decode_hd256_into};
 pub use pegainfer_core::ops::{
     add_batch, add_batch_into, argmax, embedding_batch, embedding_decode_into, extract_vec,
     extract_vec_into, flashinfer_topk_row_states_bytes, fused_add_rms_norm_batch_into,

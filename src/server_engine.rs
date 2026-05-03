@@ -2,23 +2,7 @@ use std::fmt;
 
 use anyhow::Result;
 
-// ── Shared types ────────────────────────────────────────────────────────
-
-/// Per-token log-probability data (token ID + logprob).
-/// Token strings are resolved by the vLLM frontend tokenizer layer.
-#[derive(Clone, Debug)]
-pub struct TokenLogprob {
-    /// Log-probability of the selected token.
-    pub logprob: f32,
-    /// Top-k alternative token IDs and their log-probabilities.
-    pub top_logprobs: Vec<(u32, f32)>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FinishReason {
-    Length,
-    Stop,
-}
+pub use pegainfer_core::engine::{FinishReason, TokenLogprob};
 
 // ── Model type detection ────────────────────────────────────────────────
 

@@ -23,13 +23,12 @@ use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
 use log::{debug, info};
 use pegainfer::logging;
-use pegainfer::model::{
-    GenerationState, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model,
-};
+use pegainfer::model::Qwen35Model;
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
 use pegainfer::scheduler_qwen35;
 use pegainfer::server_engine::{ModelType, detect_model_type};
+use pegainfer_core::engine::EngineLoadOptions;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
@@ -853,38 +852,6 @@ where
     }
 }
 
-struct ModelWithState<M: ModelForward> {
-    model: M,
-    state: M::State,
-}
-
-impl<M: ModelForward> BenchModel for ModelWithState<M> {
-    fn timed_generation(
-        &mut self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        sampling: &SamplingParams,
-        rng: &mut StdRng,
-    ) -> GenTimings {
-        run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
-            self.state.reset()?;
-            self.model.forward(toks, &mut self.state)?;
-            let mut last = self.model.select_token(&mut self.state, sampling, rng)?;
-            if !cb(last) {
-                return Ok(());
-            }
-            for _ in 1..n {
-                self.model.forward(&[last], &mut self.state)?;
-                last = self.model.select_token(&mut self.state, sampling, rng)?;
-                if !cb(last) {
-                    break;
-                }
-            }
-            Ok(())
-        })
-    }
-}
-
 struct SchedulerBenchModel {
     handle: SchedulerHandle,
 }
@@ -966,7 +933,10 @@ fn measure_timings(
     ensure!(output_len > 0, "--output-len must be > 0");
     validate_run_args(run)?;
 
-    let sampling = SamplingParams::default();
+    let sampling = SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::default()
+    };
     let mut rng = StdRng::seed_from_u64(run.seed);
 
     for _ in 0..run.warmup {
@@ -1634,27 +1604,26 @@ fn main() -> Result<()> {
     );
     let model_type = detect_model_type(&cli.model_path)?;
     debug!("Detected model type: {:?}", model_type);
-    let runtime = ModelRuntimeConfig {
-        enable_cuda_graph: cli.cuda_graph,
-        tensor_parallel: None,
-        device_ordinal: 0,
-    };
     let load_start = Instant::now();
 
     match model_type {
         ModelType::Qwen3 => {
-            let model = Qwen3Model::from_safetensors_with_runtime(&cli.model_path, runtime)?;
-            let state = model.create_state()?;
+            let handle = pegainfer_qwen3_4b::start_engine(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: cli.cuda_graph,
+                    device_ordinals: vec![0],
+                    seed: command_seed(&cli),
+                },
+            )?;
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = ModelWithState { model, state };
+            let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
         }
         ModelType::Qwen35 => {
-            let model = Qwen35Model::from_safetensors_with_options(
-                &cli.model_path,
-                runtime.enable_cuda_graph,
-            )?;
+            let model =
+                Qwen35Model::from_safetensors_with_options(&cli.model_path, cli.cuda_graph)?;
             // Bench runs one request at a time — use minimal batch capacity
             // to leave GPU memory for large prefill scratch buffers.
             let handle = scheduler_qwen35::start_with_capacity(model, command_seed(&cli), 4)?;

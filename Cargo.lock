@@ -3019,7 +3019,9 @@ dependencies = [
  "memmap2",
  "ndarray",
  "parking_lot",
+ "pegainfer-core",
  "pegainfer-kernels",
+ "pegainfer-qwen3-4b",
  "rand 0.10.0",
  "rmp-serde",
  "rmpv",
@@ -3036,6 +3038,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "log",
+ "memmap2",
+ "parking_lot",
+ "pegainfer-kernels",
+ "rand 0.10.0",
+ "safetensors",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pegainfer-kernels"
 version = "0.1.0"
 dependencies = [
@@ -3043,6 +3062,26 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+]
+
+[[package]]
+name = "pegainfer-qwen3-4b"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "crossbeam-channel",
+ "cudarc",
+ "fastrace",
+ "half",
+ "log",
+ "pegainfer-core",
+ "pegainfer-kernels",
+ "rand 0.10.0",
+ "serde",
+ "serde_json",
+ "tokio",
+ "vllm-text",
 ]
 
 [[package]]

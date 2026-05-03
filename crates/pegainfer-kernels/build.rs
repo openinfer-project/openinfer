@@ -616,6 +616,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
+    if !cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 
     println!("cargo:rerun-if-changed={}", root.join("csrc").display());
     println!("cargo:rerun-if-changed=build.rs");

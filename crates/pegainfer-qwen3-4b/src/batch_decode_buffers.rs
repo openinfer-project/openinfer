@@ -4,9 +4,9 @@ use anyhow::Result;
 
 use cudarc::driver::CudaSlice;
 
-use crate::kv_pool::KvState;
-use crate::model::cuda_graph::CudaGraphState;
-use crate::tensor::{DeviceContext, HiddenStates};
+use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::tensor::{DeviceContext, HiddenStates};
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];

@@ -4,19 +4,30 @@ use std::thread;
 use anyhow::Result;
 use crossbeam_channel as channel;
 
-use crate::kv_pool::{KvPool, KvState};
-use crate::model::qwen3::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::model::{ModelRuntimeConfig, Qwen3Model, TensorParallelConfig};
-use crate::ops;
-use crate::sampler::SamplingParams;
-use crate::server_engine::TokenLogprob;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
+use crate::config::TensorParallelConfig;
+use crate::weights::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer_core::engine::TokenLogprob;
+use pegainfer_core::kv_pool::{KvPool, KvState};
+use pegainfer_core::ops;
+use pegainfer_core::sampler::SamplingParams;
+use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct RequestId(pub(crate) u64);
+pub struct RequestId(pub(crate) u64);
+
+impl RequestId {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone)]
-pub(crate) struct PrefillStepItem {
+pub struct PrefillStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) params: SamplingParams,
@@ -26,18 +37,54 @@ pub(crate) struct PrefillStepItem {
 }
 
 impl PrefillStepItem {
+    pub fn new(
+        request_id: RequestId,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        logprobs: usize,
+        echo: bool,
+        random_val: f32,
+    ) -> Self {
+        Self {
+            request_id,
+            prompt_tokens,
+            params,
+            logprobs,
+            echo,
+            random_val,
+        }
+    }
+
     fn as_slice(&self) -> &[u32] {
         &self.prompt_tokens
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct DecodeStepItem {
+pub struct DecodeStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_id: u32,
     pub(crate) params: SamplingParams,
     pub(crate) logprobs: usize,
     pub(crate) random_val: f32,
+}
+
+impl DecodeStepItem {
+    pub fn new(
+        request_id: RequestId,
+        token_id: u32,
+        params: SamplingParams,
+        logprobs: usize,
+        random_val: f32,
+    ) -> Self {
+        Self {
+            request_id,
+            token_id,
+            params,
+            logprobs,
+            random_val,
+        }
+    }
 }
 
 type RequestStateBatch = Vec<(RequestId, KvState)>;
@@ -323,7 +370,7 @@ struct CublasThreadGuard;
 impl Drop for CublasThreadGuard {
     fn drop(&mut self) {
         unsafe {
-            crate::ffi::cublas_destroy();
+            pegainfer_core::ffi::cublas_destroy();
         }
     }
 }
@@ -343,7 +390,7 @@ impl SamplingScratch {
             top1_value: ctx.stream.alloc_zeros(1)?,
             row_states: ctx
                 .stream
-                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
+                .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())?,
             valid: ctx.stream.alloc_zeros(1)?,
             out: ctx.stream.alloc_zeros(1)?,
         })
@@ -390,7 +437,7 @@ fn compute_logprobs_from_cpu(
 
 fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
     unsafe {
-        let err = crate::ffi::cuda_set_device(model.device_ctx().device_ordinal as i32);
+        let err = pegainfer_core::ffi::cuda_set_device(model.device_ctx().device_ordinal as i32);
         if err != 0 {
             return Err(anyhow::anyhow!(
                 "Failed to set CUDA device {} on worker thread: cudaError={}",
@@ -405,27 +452,27 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
         .bind_to_thread()
         .map_err(|e| anyhow::anyhow!("Failed to bind CUDA context to thread: {e}"))?;
     unsafe {
-        crate::ffi::cublas_init();
+        pegainfer_core::ffi::cublas_init();
     }
     Ok(())
 }
 
-pub(crate) struct PrefillPlan<'a> {
+pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
     pub echo: bool,
 }
 
-pub(crate) struct DecodePlan<'a> {
+pub struct DecodePlan<'a> {
     pub requests: &'a [DecodeStepItem],
 }
 
-pub(crate) struct UnifiedPlan<'a> {
+pub struct UnifiedPlan<'a> {
     pub prefill_requests: &'a [PrefillStepItem],
     pub decode_requests: &'a [DecodeStepItem],
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PrefillRequestResult {
+pub struct PrefillRequestResult {
     pub request_id: RequestId,
     pub first_token: u32,
     pub first_token_logprob: Option<TokenLogprob>,
@@ -433,21 +480,21 @@ pub(crate) struct PrefillRequestResult {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DecodeRequestResult {
+pub struct DecodeRequestResult {
     pub request_id: RequestId,
     pub token: u32,
     pub logprob: Option<TokenLogprob>,
 }
 
-pub(crate) struct PrefillResult {
+pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
 }
 
-pub(crate) struct DecodeResult {
+pub struct DecodeResult {
     pub requests: Vec<DecodeRequestResult>,
 }
 
-pub(crate) struct UnifiedResult {
+pub struct UnifiedResult {
     pub prefill_requests: Vec<PrefillRequestResult>,
     pub decode_requests: Vec<DecodeRequestResult>,
 }
@@ -468,7 +515,7 @@ struct Qwen3ExecutorMetadata {
     stop_token_ids: Vec<u32>,
 }
 
-pub(crate) struct Qwen3Executor {
+pub struct Qwen3Executor {
     metadata: Qwen3ExecutorMetadata,
     kv_pools: Vec<KvPool>,
     primary: RankWorker,
@@ -490,7 +537,7 @@ impl Qwen3Executor {
         })
     }
 
-    pub(crate) fn from_runtime(
+    pub fn from_runtime(
         model_path: &str,
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
@@ -557,6 +604,34 @@ impl Qwen3Executor {
             primary,
             workers,
         })
+    }
+
+    pub fn page_size(&self) -> usize {
+        <Self as ModelExecutor>::page_size(self)
+    }
+
+    pub fn available_pages(&self) -> usize {
+        <Self as ModelExecutor>::available_pages(self)
+    }
+
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        <Self as ModelExecutor>::is_stop_token(self, token_id)
+    }
+
+    pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
+        <Self as ModelExecutor>::drop_request(self, request_id)
+    }
+
+    pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+        <Self as ModelExecutor>::execute_prefill(self, plan)
+    }
+
+    pub fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+        <Self as ModelExecutor>::execute_decode(self, plan)
+    }
+
+    pub fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+        <Self as ModelExecutor>::execute_unified(self, plan)
     }
 
     fn wait_for_step_ack(
@@ -703,7 +778,7 @@ impl LocalQwen3Lane {
         params: &SamplingParams,
         random_val: f32,
     ) -> Result<u32> {
-        crate::ops::gpu_sample_into(
+        pegainfer_core::ops::gpu_sample_into(
             self.model.device_ctx(),
             logits,
             &mut self.sample_scratch.probs,
@@ -734,7 +809,7 @@ impl LocalQwen3Lane {
         target_token: u32,
         top_k: usize,
     ) -> Option<TokenLogprob> {
-        crate::ops::extract_vec(self.model.device_ctx(), all_logits, prev_pos)
+        pegainfer_core::ops::extract_vec(self.model.device_ctx(), all_logits, prev_pos)
             .ok()
             .and_then(|logits_vec| {
                 let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;

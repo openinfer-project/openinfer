@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
-use crate::model_executor::RequestId;
-use crate::server_engine::{FinishReason, TokenLogprob};
+use crate::executor::RequestId;
+use pegainfer_core::engine::{FinishReason, TokenLogprob};
 
 use super::{ActiveRequestState, TokenEvent};
 
@@ -66,7 +66,7 @@ impl StepEffects {
 }
 
 pub(super) fn apply_effects(
-    executor: &mut impl crate::model_executor::ModelExecutor,
+    executor: &mut impl crate::executor::ModelExecutor,
     active: &mut Vec<ActiveRequestState>,
     effects: StepEffects,
 ) {

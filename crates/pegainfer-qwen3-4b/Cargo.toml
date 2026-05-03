@@ -1,11 +1,14 @@
 [package]
-name = "pegainfer-core"
+name = "pegainfer-qwen3-4b"
 version = "0.1.0"
 edition = "2024"
+autobenches = false
 
 [dependencies]
+pegainfer-core = { path = "../pegainfer-core" }
 pegainfer-kernels = { path = "../pegainfer-kernels" }
 anyhow = "1.0"
+crossbeam-channel = "0.5"
 cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
     "cublas",
@@ -13,14 +16,21 @@ cudarc = { version = "0.19.4", features = [
     "f16",
     "nccl",
 ] }
+fastrace = { version = "0.7.16", features = ["enable"] }
 half = { version = "2.4", features = ["num-traits"] }
 log = "0.4"
-memmap2 = "0.9"
-parking_lot = "0.12.5"
 rand = "0.10"
-safetensors = "0.7"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+vllm-text = { git = "https://github.com/Inferact/vllm-frontend-rs.git", branch = "main" }
+
+[[bench]]
+name = "qwen3_runtime"
+harness = false
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -2 }
@@ -46,7 +56,6 @@ unused_peekable = "warn"
 dbg_macro = "warn"
 exit = "warn"
 get_unwrap = "warn"
-implicit_hasher = "allow"
 print_stdout = "allow"
 print_stderr = "allow"
 rc_buffer = "warn"

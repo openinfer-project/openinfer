@@ -24,8 +24,7 @@ use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use crate::sampler::SamplingParams;
-use crate::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
-use crate::server_engine::FinishReason;
+use pegainfer_core::engine::{EngineHandle, FinishReason, GenerateRequest, TokenEvent};
 
 const ENGINE_INDEX: u32 = 0;
 
@@ -45,7 +44,7 @@ impl ModelLenConfig {
 struct LocalEngineBridge {
     input_address: String,
     output_address: String,
-    handle: SchedulerHandle,
+    handle: EngineHandle,
     max_model_len: u32,
 }
 
@@ -191,7 +190,7 @@ impl LocalEngineBridge {
 
         let (token_tx, token_rx) = mpsc::unbounded_channel();
         self.handle
-            .submit(SchedulerRequest {
+            .submit(GenerateRequest {
                 prompt_tokens,
                 params: convert_sampling(&sampling_params),
                 max_tokens: sampling_params.max_tokens as usize,
@@ -215,7 +214,7 @@ impl LocalEngineBridge {
 }
 
 pub async fn serve(
-    handle: SchedulerHandle,
+    handle: EngineHandle,
     model_path: &Path,
     port: u16,
     shutdown: CancellationToken,

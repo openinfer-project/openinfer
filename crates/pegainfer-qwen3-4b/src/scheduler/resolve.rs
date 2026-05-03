@@ -1,7 +1,5 @@
-use crate::model_executor::{
-    DecodeRequestResult, ModelExecutor, PrefillRequestResult, Qwen3Executor,
-};
-use crate::server_engine::FinishReason;
+use crate::executor::{DecodeRequestResult, PrefillRequestResult, Qwen3Executor};
+use pegainfer_core::engine::FinishReason;
 
 use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, StepEffects};
 use super::plan::ExecutionArtifacts;

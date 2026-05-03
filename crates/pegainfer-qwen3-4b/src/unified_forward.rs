@@ -10,11 +10,11 @@ use half::bf16;
 
 use super::prefill::PrefillBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::ffi;
-use crate::kv_pool::{KvLayout, KvState};
-use crate::ops;
-use crate::ops::PrefillPagedPlan;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_core::ffi;
+use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::ops;
+use pegainfer_core::ops::PrefillPagedPlan;
+use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Decode attention metadata (allocated per unified step, not CUDA-graph safe).
 #[allow(clippy::struct_field_names)]

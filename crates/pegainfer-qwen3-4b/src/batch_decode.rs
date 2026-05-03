@@ -4,8 +4,8 @@ use anyhow::Result;
 
 use super::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers, bucket_for};
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::kv_pool::{KvLayout, KvState};
-use crate::ops;
+use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::ops;
 
 impl Qwen3Model {
     /// Batch decode step: N requests, 1 new token each, one forward pass.
@@ -253,14 +253,14 @@ impl Qwen3Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelForward;
-    use crate::model::qwen3::batch_decode_buffers::BatchDecodeBuffers;
-    use crate::model::qwen3::weights::ModelRuntimeConfig;
-    use crate::sampler::SamplingParams;
+    use crate::batch_decode_buffers::BatchDecodeBuffers;
+    use crate::weights::ModelRuntimeConfig;
+    use pegainfer_core::model::ModelForward;
+    use pegainfer_core::sampler::SamplingParams;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen3-4B");
 
     fn get_model_path() -> String {
         std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
@@ -281,7 +281,7 @@ mod tests {
         let mut scratch_row_states = model
             .ctx
             .stream
-            .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+            .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())
             .unwrap();
         let mut scratch_valid = model.ctx.stream.alloc_zeros(1).unwrap();
         let mut scratch_out = model.ctx.stream.alloc_zeros(1).unwrap();
@@ -470,14 +470,14 @@ mod tests {
                 let mut row_states: cudarc::driver::CudaSlice<u8> = model
                     .ctx
                     .stream
-                    .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())
+                    .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())
                     .unwrap();
                 let mut valid: cudarc::driver::CudaSlice<u8> =
                     model.ctx.stream.alloc_zeros(1).unwrap();
                 let mut out: cudarc::driver::CudaSlice<i32> =
                     model.ctx.stream.alloc_zeros(1).unwrap();
                 let random_val: f32 = rand::RngExt::random(&mut rng);
-                let token = crate::ops::gpu_sample_into(
+                let token = pegainfer_core::ops::gpu_sample_into(
                     &model.ctx,
                     logits,
                     &mut probs,
