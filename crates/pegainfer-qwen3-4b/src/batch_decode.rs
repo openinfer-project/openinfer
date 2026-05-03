@@ -255,8 +255,8 @@ mod tests {
     use super::*;
     use crate::batch_decode_buffers::BatchDecodeBuffers;
     use crate::weights::ModelRuntimeConfig;
-    use pegainfer_core::model::ModelForward;
     use pegainfer_core::sampler::SamplingParams;
+    use pegainfer_core::tensor::DeviceVec;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -305,12 +305,60 @@ mod tests {
             .collect()
     }
 
+    fn sample_logits(
+        model: &Qwen3Model,
+        logits: &DeviceVec,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> u32 {
+        let mut probs: cudarc::driver::CudaSlice<f32> = model
+            .ctx
+            .stream
+            .alloc_zeros(model.config.vocab_size)
+            .unwrap();
+        let mut top1_value: cudarc::driver::CudaSlice<half::bf16> =
+            model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut row_states: cudarc::driver::CudaSlice<u8> = model
+            .ctx
+            .stream
+            .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())
+            .unwrap();
+        let mut valid: cudarc::driver::CudaSlice<u8> = model.ctx.stream.alloc_zeros(1).unwrap();
+        let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
+        let random_val: f32 = rand::RngExt::random(rng);
+        ops::gpu_sample_into(
+            &model.ctx,
+            logits,
+            &mut probs,
+            &mut top1_value,
+            &mut row_states,
+            &mut valid,
+            &mut out,
+            params,
+            random_val,
+        )
+        .unwrap()
+    }
+
+    fn prefill_one(
+        model: &Qwen3Model,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> (KvState, u32) {
+        let mut kv_state = model.kv_pool.alloc();
+        let prompts: Vec<&[u32]> = vec![prompt_tokens];
+        let mut kv_refs: Vec<&mut KvState> = vec![&mut kv_state];
+        let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
+        let first_token = sample_logits(model, &logits_vec[0], params, rng);
+        (kv_state, first_token)
+    }
+
     /// Run single-request decode via batch_decode(bs=1) for a prompt, return generated token IDs.
     ///
-    /// Uses batch_decode with bs=1 (not ModelForward::forward) so the decode path
+    /// Uses batch_prefill and batch_decode with bs=1 so the decode path
     /// is identical to the multi-request batch — same cuBLAS handle, same FlashInfer
-    /// BatchDecode kernel. This avoids FP accumulation differences between BatchPrefill
-    /// (used by forward()) and BatchDecode.
+    /// BatchDecode kernel.
     fn sequential_decode(
         model: &Qwen3Model,
         prompt_tokens: &[u32],
@@ -320,13 +368,7 @@ mod tests {
         let params = SamplingParams::default(); // greedy
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Prefill via ModelForward (produces first token)
-        let mut state = model.create_state().unwrap();
-        model.forward(prompt_tokens, &mut state).unwrap();
-        let first_token = model.select_token(&mut state, &params, &mut rng).unwrap();
-
-        // Decode remaining tokens via batch_decode(bs=1)
-        let mut kv_state = std::mem::replace(&mut state.kv_state, model.kv_pool.alloc());
+        let (mut kv_state, first_token) = prefill_one(model, prompt_tokens, &params, &mut rng);
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
             model.config.hidden_size,
@@ -365,17 +407,13 @@ mod tests {
         let params = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Create per-request states and prefill each independently
         let mut kv_states: Vec<KvState> = (0..bs).map(|_| model.kv_pool.alloc()).collect();
-        let mut first_tokens = Vec::with_capacity(bs);
-
-        for (i, prompt) in prompts.iter().enumerate() {
-            let mut state = model.create_state().unwrap();
-            model.forward(prompt, &mut state).unwrap();
-            let token = model.select_token(&mut state, &params, &mut rng).unwrap();
-            first_tokens.push(token);
-            std::mem::swap(&mut kv_states[i], &mut state.kv_state);
-        }
+        let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
+        let (logits_vec, _) = model.batch_prefill(prompts, &mut kv_refs, false).unwrap();
+        let first_tokens: Vec<u32> = logits_vec
+            .iter()
+            .map(|logits| sample_logits(model, logits, &params, &mut rng))
+            .collect();
 
         let mut all_tokens: Vec<Vec<u32>> = first_tokens.iter().map(|&t| vec![t]).collect();
 
@@ -446,9 +484,7 @@ mod tests {
             let mut seq_first_tokens = Vec::new();
             for prompt in [&prefill_a, &prefill_b, &prefill_c] {
                 let mut rng = StdRng::seed_from_u64(seed);
-                let mut state = model.create_state().unwrap();
-                model.forward(prompt.as_slice(), &mut state).unwrap();
-                let token = model.select_token(&mut state, &params, &mut rng).unwrap();
+                let (_kv_state, token) = prefill_one(&model, prompt.as_slice(), &params, &mut rng);
                 seq_first_tokens.push(token);
             }
 
@@ -460,35 +496,7 @@ mod tests {
             let mut batch_first_tokens = Vec::new();
             for logits in &logits_vec {
                 let mut rng = StdRng::seed_from_u64(seed);
-                let mut probs: cudarc::driver::CudaSlice<f32> = model
-                    .ctx
-                    .stream
-                    .alloc_zeros(model.config.vocab_size)
-                    .unwrap();
-                let mut top1_value: cudarc::driver::CudaSlice<half::bf16> =
-                    model.ctx.stream.alloc_zeros(1).unwrap();
-                let mut row_states: cudarc::driver::CudaSlice<u8> = model
-                    .ctx
-                    .stream
-                    .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())
-                    .unwrap();
-                let mut valid: cudarc::driver::CudaSlice<u8> =
-                    model.ctx.stream.alloc_zeros(1).unwrap();
-                let mut out: cudarc::driver::CudaSlice<i32> =
-                    model.ctx.stream.alloc_zeros(1).unwrap();
-                let random_val: f32 = rand::RngExt::random(&mut rng);
-                let token = pegainfer_core::ops::gpu_sample_into(
-                    &model.ctx,
-                    logits,
-                    &mut probs,
-                    &mut top1_value,
-                    &mut row_states,
-                    &mut valid,
-                    &mut out,
-                    &params,
-                    random_val,
-                )
-                .unwrap();
+                let token = sample_logits(&model, logits, &params, &mut rng);
                 batch_first_tokens.push(token);
             }
 

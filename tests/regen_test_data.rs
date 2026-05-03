@@ -154,7 +154,7 @@ fn write_golden_json(output_path: &Path, model_name: &str, cases_json: &[serde_j
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("Failed to create test data directory");
     }
-    std::fs::write(output_path, &json).expect("Failed to write test data");
+    std::fs::write(output_path, format!("{json}\n")).expect("Failed to write test data");
     eprintln!("Wrote {}", output_path.display());
 }
 

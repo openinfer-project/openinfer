@@ -105,14 +105,18 @@ fn resolve_decode_outputs(
             let completion_tokens = req.generated_count + 1;
             let is_eos = !req.params.ignore_eos && executor.is_stop_token(result.token);
             let at_limit = completion_tokens >= req.max_tokens;
-            if is_eos || at_limit {
+            if is_eos {
                 DecodeEffect::Finish {
                     request_id: result.request_id,
-                    finish_reason: if is_eos {
-                        FinishReason::Stop
-                    } else {
-                        FinishReason::Length
-                    },
+                    finish_reason: FinishReason::Stop,
+                    completion_tokens,
+                }
+            } else if at_limit {
+                DecodeEffect::EmitAndFinish {
+                    request_id: result.request_id,
+                    token: result.token,
+                    logprob: result.logprob.clone(),
+                    finish_reason: FinishReason::Length,
                     completion_tokens,
                 }
             } else {

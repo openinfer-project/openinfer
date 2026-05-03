@@ -1362,7 +1362,8 @@ fn run_snapshot(
     fs::create_dir_all(&dir)?;
     let filename = model_name.to_lowercase();
     let path = dir.join(format!("{filename}.json"));
-    fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+    let snapshot_json = serde_json::to_string_pretty(&report)?;
+    fs::write(&path, format!("{snapshot_json}\n"))?;
 
     println!("{}", render_snapshot_text(&report, &path));
     Ok(())

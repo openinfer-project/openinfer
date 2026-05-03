@@ -2,7 +2,7 @@
 
 **Created**: 2026-05-03
 **Status**: ready for diff review
-**TL;DR**: `crates/pegainfer-qwen3-4b` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. 5090 release build, workspace test-target compile, clippy, Qwen3 crate e2e, and root `bench_serving snapshot` pass. Qwen3 Criterion benches now use the production `runtime::Qwen3Executor` phase API instead of `ModelForward`.
+**TL;DR**: `crates/pegainfer-qwen3-4b` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. 5090 release build, workspace test-target compile, clippy, Qwen3 crate e2e, and root `bench_serving snapshot` pass. Qwen3 Criterion benches use the production `runtime::Qwen3Executor` phase API; the old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`.
 
 ## Preparation
 
@@ -132,12 +132,12 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - `RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path /data/Qwen3-4B snapshot` passes:
     - `prefill_heavy (10000,1)`: TTFT p50 `500.90ms`, p99 `503.30ms`
     - `decode_heavy (1024,256)`: TPOT p50 `7.57ms`, p99 `7.74ms`
-    - The scheduler emits `255` tokens for a `max_tokens=256` cap because its limit path finishes without emitting the final decoded token. This was exposed when `bench_serving` switched from the old direct `ModelForward` path to the real scheduler path; fixing that semantic belongs in a focused scheduler follow-up.
+    - This run exposed a scheduler length-limit bug: `max_tokens=256` emitted only `255` token events because the limit path finished without emitting the final decoded token. It was fixed in Step 7.
 - Snapshot pulled back to `bench_snapshots/rtx-5090/qwen3-4b.json`.
 
 ### Step 6: Bench Boundary Cleanup
 - Removed the duplicate Qwen3 `tests/bench_prefill.rs`; performance timing belongs under Criterion benches, while tests keep correctness/e2e coverage.
-- Rejected a bench-only support API and also rejected using `ModelForward` as the benchmark entry. `ModelForward` remains only as a legacy compatibility path inside the model crate.
+- Rejected a bench-only support API and also rejected using `ModelForward` as the benchmark entry.
 - Added an explicit `runtime` module that re-exports the scheduler's real `Qwen3Executor` phase API: `PrefillPlan`, `DecodePlan`, `UnifiedPlan`, request items, and result types.
 - Removed top-level public `Qwen3Model`, `ModelRuntimeConfig`, and `Qwen3State` re-exports. External low-level tools must opt into `runtime`; root continues to use `start_engine`.
 - Replaced `crates/pegainfer-qwen3-4b/benches/qwen3_prefill.rs` with `benches/qwen3_runtime.rs`. It measures executor prefill TTFT over `128`, `512`, `1024`, `2048`, `4096`, and `10000` token prompts, plus executor decode TPOT for batch sizes `1`, `2`, `4`, `8`, `16`, and `32` at a `1024` token context.
@@ -151,6 +151,20 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - 5090 full Criterion bench passes with `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo bench -p pegainfer-qwen3-4b --bench qwen3_runtime`:
     - Prefill TTFT: `128 -> 11.804ms`, `512 -> 23.200ms`, `1024 -> 44.114ms`, `2048 -> 87.327ms`, `4096 -> 179.60ms`, `10000 -> 505.55ms`.
     - Decode one-step batch time at 1024-token context: `bs1 -> 9.3095ms`, `bs2 -> 9.3207ms`, `bs4 -> 9.4059ms`, `bs8 -> 10.960ms`, `bs16 -> 11.718ms`, `bs32 -> 13.196ms`.
+
+### Step 7: Retire ModelForward and Fix Length Limit
+- Deleted `pegainfer_core::model::{ModelForward, GenerationState}` and removed the root `src/model.rs` re-export.
+- Deleted the Qwen3 `forward.rs` compatibility path. Qwen3 tests that used it now build their baselines from `batch_prefill(bs=1)` plus `batch_decode(bs=1)`, so they exercise the same phase APIs as production.
+- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. EOS behavior is unchanged: EOS finishes without emitting the stop token. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`.
+- Regenerated `test_data/Qwen3-4B.json` because every length-limited golden output now includes the final requested token.
+- Re-ran `bench_serving snapshot` on 5090 and pulled back `bench_snapshots/rtx-5090/qwen3-4b.json`; `decode_heavy (1024,256)` now records `generated_tokens min=max=avg=256`.
+- Performance stayed within noise on RTX 5090:
+  - `prefill_heavy (10000,1)`: TTFT p50 `501.69ms`, p99 `503.16ms`.
+  - `decode_heavy (1024,256)`: TPOT p50 `7.56ms`, p99 `7.73ms`.
+- Final verification after this step:
+  - Local `cargo fmt --all --check`, `cargo metadata --no-deps --format-version 1`, and `git diff --check` pass.
+  - 5090 `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
+  - 5090 `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture` passes.
 
 ## Debrief
 

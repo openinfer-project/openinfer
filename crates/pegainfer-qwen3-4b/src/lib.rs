@@ -4,7 +4,6 @@ mod batch_decode;
 mod batch_decode_buffers;
 mod config;
 mod executor;
-mod forward;
 mod prefill;
 mod scheduler;
 mod unified_forward;

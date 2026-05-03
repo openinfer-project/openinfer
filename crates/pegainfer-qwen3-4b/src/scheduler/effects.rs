@@ -41,6 +41,13 @@ pub(super) enum DecodeEffect {
         finish_reason: FinishReason,
         completion_tokens: usize,
     },
+    EmitAndFinish {
+        request_id: RequestId,
+        token: u32,
+        logprob: Option<TokenLogprob>,
+        finish_reason: FinishReason,
+        completion_tokens: usize,
+    },
     EmitAndContinue {
         request_id: RequestId,
         token: u32,
@@ -94,6 +101,31 @@ pub(super) fn apply_effects(
                     prompt_tokens: req.prompt_len,
                     completion_tokens,
                 });
+                let _ = executor.drop_request(request_id);
+                to_retire.push(index);
+            }
+            DecodeEffect::EmitAndFinish {
+                request_id,
+                token,
+                logprob,
+                finish_reason,
+                completion_tokens,
+            } => {
+                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
+                    continue;
+                };
+                let req = &active[index];
+                if req
+                    .token_tx
+                    .send(TokenEvent::Token { id: token, logprob })
+                    .is_ok()
+                {
+                    let _ = req.token_tx.send(TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens,
+                    });
+                }
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
             }

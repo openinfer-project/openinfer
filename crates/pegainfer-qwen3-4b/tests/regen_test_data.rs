@@ -152,6 +152,6 @@ fn regen_test_data() {
         "cases": cases_json,
     });
     let json = serde_json::to_string_pretty(&data).unwrap();
-    std::fs::write(&output_path, &json).expect("Failed to write test data");
+    std::fs::write(&output_path, format!("{json}\n")).expect("Failed to write test data");
     eprintln!("Wrote {}", output_path.display());
 }

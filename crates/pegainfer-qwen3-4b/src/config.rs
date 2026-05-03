@@ -74,10 +74,6 @@ impl Config {
         }
     }
 
-    pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
-        self.stop_token_ids.contains(&token_id)
-    }
-
     pub(crate) fn local_num_attention_heads(&self, tp: TensorParallelConfig) -> usize {
         self.num_attention_heads / tp.world_size
     }

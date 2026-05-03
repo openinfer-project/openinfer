@@ -9,5 +9,4 @@ pub(crate) mod kv_cache {
 
 pub mod qwen35;
 
-pub use pegainfer_core::model::{GenerationState, ModelForward};
 pub use qwen35::Qwen35Model;

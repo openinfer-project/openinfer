@@ -57,7 +57,7 @@ pub(super) struct TransformerBlock {
     pub(super) mlp: MLP,
 }
 
-/// Qwen3 model — weights and config only. Mutable state lives in `Qwen3State`.
+/// Qwen3 model — weights and config only. Request state is owned by the executor.
 pub(crate) struct Qwen3Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config,

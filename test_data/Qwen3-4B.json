@@ -1,66 +1,66 @@
 {
-  "model_name": "Qwen3-4B",
-  "engine": "pegainfer",
   "cases": [
     {
+      "max_new_tokens": 50,
       "name": "tell_story",
-      "prompt": "Tell me a story",
-      "max_new_tokens": 50,
-      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and imaginative,"
+      "output": " about a young girl named Lila who is a talented painter, but she is not allowed to paint because of her family's rules. She is very frustrated and wants to paint, but she is not allowed. She is very creative and imaginative, and",
+      "prompt": "Tell me a story"
     },
     {
+      "max_new_tokens": 50,
       "name": "my_name",
-      "prompt": "My name is",
-      "max_new_tokens": 50,
-      "output": " Xiaoyu, and I am a student at the University of Science and Technology of China. I am currently working on a research project about the application of AI in the field of education. I am interested in exploring how AI can be used to"
+      "output": " Xiaoyu, and I am a student at the University of Science and Technology of China. I am currently working on a research project about the application of AI in the field of education. I am interested in exploring how AI can be used to improve",
+      "prompt": "My name is"
     },
     {
-      "name": "math",
-      "prompt": "What is 2 + 2?",
       "max_new_tokens": 30,
-      "output": " Also, can you explain how to solve it step by step?\n\n2 + 2 equals 4. To solve this, you start with the"
+      "name": "math",
+      "output": " Also, can you explain how to solve it step by step?\n\n2 + 2 equals 4. To solve this, you start with the number",
+      "prompt": "What is 2 + 2?"
     },
     {
+      "max_new_tokens": 50,
       "name": "chinese_weather",
-      "prompt": "今天天气真好",
-      "max_new_tokens": 50,
-      "output": "，阳光明媚，适合户外活动。我决定去公园散步。公园里有各种各样的花，有玫瑰、郁金香、菊花，还有各种各样的树木，比如松树、梧桐树、银杏树。"
+      "output": "，阳光明媚，适合户外活动。我决定去公园散步。公园里有各种各样的花，有玫瑰、郁金香、菊花，还有各种各样的树木，比如松树、梧桐树、银杏树。我",
+      "prompt": "今天天气真好"
     },
     {
+      "max_new_tokens": 50,
       "name": "chinese_capital",
-      "prompt": "请介绍一下中国的首都",
-      "max_new_tokens": 50,
-      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国北部，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京的地理位置非常优越，地处华北平原的北部边缘，东临渤海，"
+      "output": "北京的地理位置和历史背景。\n\n北京，作为中国的首都，位于中国北部，是中华人民共和国的首都，也是中国的政治、文化和国际交往中心。北京的地理位置非常优越，地处华北平原的北部边缘，东临渤海，西",
+      "prompt": "请介绍一下中国的首都"
     },
     {
+      "max_new_tokens": 50,
       "name": "python_code",
-      "prompt": "Write a Python function to reverse a string",
-      "max_new_tokens": 50,
-      "output": ". But the function should not use any built-in string reversal functions or methods (like [::-1], reversed(), or [::-1] in slicing). Also, the function should not use any loops (for, while, etc.) and must"
+      "output": ". But the function should not use any built-in string reversal functions or methods (like [::-1], reversed(), or [::-1] in slicing). Also, the function should not use any loops (for, while, etc.) and must be",
+      "prompt": "Write a Python function to reverse a string"
     },
     {
+      "max_new_tokens": 50,
       "name": "kanye_album",
-      "prompt": "我最喜欢的 Kanye West 的专辑是",
-      "max_new_tokens": 50,
-      "output": "《Yeezus》，因为它的音乐风格非常独特，融合了多种元素，比如电子、嘻哈、摇滚和实验音乐。此外，专辑中的歌曲如《Power》和《Ultralight Beam》展现了 Kanye 的"
+      "output": "《Yeezus》，因为它的音乐风格非常独特，融合了多种元素，比如电子、嘻哈、摇滚和实验音乐。此外，专辑中的歌曲如《Power》和《Ultralight Beam》展现了 Kanye 的音乐",
+      "prompt": "我最喜欢的 Kanye West 的专辑是"
     },
     {
+      "max_new_tokens": 50,
       "name": "coldplay_ghost",
-      "prompt": "Coldplay 的《Ghost story》专辑真是",
-      "max_new_tokens": 50,
-      "output": "让人难以置信，我听了一次就爱上了。这首歌的旋律和歌词真的太棒了，我感觉它能触动每个人的心弦。不过，我有点担心，如果我听太多次，会不会变得麻木？毕竟"
+      "output": "让人难以置信，我听了一次就爱上了。这首歌的旋律和歌词真的太棒了，我感觉它能触动每个人的心弦。不过，我有点担心，如果我听太多次，会不会变得麻木？毕竟，",
+      "prompt": "Coldplay 的《Ghost story》专辑真是"
     },
     {
+      "max_new_tokens": 50,
       "name": "oyster_riddle",
-      "prompt": "生蚝煮熟了是熟蚝",
-      "max_new_tokens": 50,
-      "output": "，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮"
+      "output": "，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟了是熟蚝，生蚝煮熟",
+      "prompt": "生蚝煮熟了是熟蚝"
     },
     {
-      "name": "monkey_king_lake",
-      "prompt": "孙悟空跳到一个湖里，跳出来变成了六耳猕猴，这个湖的名字是",
       "max_new_tokens": 50,
-      "output": "？（ ）\n\nA.镜湖\n\nB.镜泊湖\n\nC.西湖\n\nD.洞庭湖\n\n这个题目是关于《西游记》中的情节，孙悟空跳到一个湖里，跳出来变成了六耳"
+      "name": "monkey_king_lake",
+      "output": "？（ ）\n\nA.镜湖\n\nB.镜泊湖\n\nC.西湖\n\nD.洞庭湖\n\n这个题目是关于《西游记》中的情节，孙悟空跳到一个湖里，跳出来变成了六耳猕",
+      "prompt": "孙悟空跳到一个湖里，跳出来变成了六耳猕猴，这个湖的名字是"
     }
-  ]
+  ],
+  "engine": "pegainfer",
+  "model_name": "Qwen3-4B"
 }

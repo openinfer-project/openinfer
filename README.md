@@ -203,7 +203,7 @@ src/
 ├── server_engine.rs       # Model detection and compatibility re-exports
 ├── scheduler.rs           # Compatibility re-export of core engine request/event types
 ├── scheduler_qwen35.rs    # Qwen3.5 scheduler
-├── model.rs               # Root-local Qwen3.5 model plus core trait re-exports
+├── model.rs               # Root-local Qwen3.5 model
 ├── model/
 │   └── qwen35/            # Qwen3.5: config, weights, forward, prefill, decode, recurrent_state
 ├── ops.rs                 # Root compatibility dispatch + Qwen3.5 recurrent wrapper
@@ -218,7 +218,6 @@ src/
 
 crates/pegainfer-core/             # Shared runtime API for model crates
 ├── src/engine.rs                  # EngineHandle, GenerateRequest, TokenEvent
-├── src/model.rs                   # ModelForward / GenerationState traits
 ├── src/kv_pool.rs                 # Paged KV pool and request state
 ├── src/ops.rs                     # Shared op wrappers over pegainfer-kernels
 └── src/weight_loader.rs           # Safetensors helpers shared by model crates
