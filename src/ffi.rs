@@ -1,1 +1,1 @@
-pub(crate) use pegainfer_kernels::ffi::*;
+pub(crate) use pegainfer_core::ffi::*;

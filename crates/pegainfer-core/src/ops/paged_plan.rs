@@ -6,12 +6,12 @@ use cudarc::driver::CudaSlice;
 use crate::kv_pool::KvDesc;
 use crate::tensor::DeviceContext;
 
-pub(crate) struct PrefillPagedPlan {
+pub struct PrefillPagedPlan {
     inner: pegainfer_kernels::ops::PrefillPagedPlan,
 }
 
 impl PrefillPagedPlan {
-    pub(crate) fn new(
+    pub fn new(
         ctx: &DeviceContext,
         desc: &KvDesc<'_>,
         start_pos: usize,
@@ -39,7 +39,7 @@ impl PrefillPagedPlan {
         })
     }
 
-    pub(crate) fn new_batch(
+    pub fn new_batch(
         ctx: &DeviceContext,
         descs: &[KvDesc<'_>],
         start_positions: &[usize],
@@ -72,43 +72,43 @@ impl PrefillPagedPlan {
         })
     }
 
-    pub(crate) fn page_indices_d(&self) -> &CudaSlice<i32> {
+    pub fn page_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.page_indices_d()
     }
-    pub(crate) fn page_indptr_d(&self) -> &CudaSlice<i32> {
+    pub fn page_indptr_d(&self) -> &CudaSlice<i32> {
         self.inner.page_indptr_d()
     }
-    pub(crate) fn last_page_len_d(&self) -> &CudaSlice<i32> {
+    pub fn last_page_len_d(&self) -> &CudaSlice<i32> {
         self.inner.last_page_len_d()
     }
-    pub(crate) fn batch_indices_d(&self) -> &CudaSlice<i32> {
+    pub fn batch_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.batch_indices_d()
     }
-    pub(crate) fn positions_d(&self) -> &CudaSlice<i32> {
+    pub fn positions_d(&self) -> &CudaSlice<i32> {
         self.inner.positions_d()
     }
-    pub(crate) fn q_indptr_d(&self) -> &CudaSlice<i32> {
+    pub fn q_indptr_d(&self) -> &CudaSlice<i32> {
         self.inner.q_indptr_d()
     }
-    pub(crate) fn request_indices_d(&self) -> &CudaSlice<i32> {
+    pub fn request_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.request_indices_d()
     }
-    pub(crate) fn qo_tile_indices_d(&self) -> &CudaSlice<i32> {
+    pub fn qo_tile_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.qo_tile_indices_d()
     }
-    pub(crate) fn kv_tile_indices_d(&self) -> &CudaSlice<i32> {
+    pub fn kv_tile_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.kv_tile_indices_d()
     }
-    pub(crate) fn kv_chunk_size_d(&self) -> &CudaSlice<i32> {
+    pub fn kv_chunk_size_d(&self) -> &CudaSlice<i32> {
         self.inner.kv_chunk_size_d()
     }
-    pub(crate) fn total_num_rows_d(&self) -> &CudaSlice<u32> {
+    pub fn total_num_rows_d(&self) -> &CudaSlice<u32> {
         self.inner.total_num_rows_d()
     }
-    pub(crate) fn batch_size(&self) -> i32 {
+    pub fn batch_size(&self) -> i32 {
         self.inner.batch_size()
     }
-    pub(crate) fn num_tiles(&self) -> i32 {
+    pub fn num_tiles(&self) -> i32 {
         self.inner.num_tiles()
     }
 }

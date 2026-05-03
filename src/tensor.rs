@@ -1,1 +1,1 @@
-pub use pegainfer_kernels::tensor::*;
+pub use pegainfer_core::tensor::*;

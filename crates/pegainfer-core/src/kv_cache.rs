@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 /// KV Cache — contiguous buffers for fused attention.
-pub(crate) struct KVCache {
+pub struct KVCache {
     // [layer] -> contiguous buffer (num_kv_heads * max_seq * head_dim)
     k_cache: Vec<DeviceVec>,
     v_cache: Vec<DeviceVec>,
@@ -17,7 +17,7 @@ pub(crate) struct KVCache {
 }
 
 impl KVCache {
-    pub(crate) fn new(num_layers: usize, num_kv_heads: usize) -> Self {
+    pub fn new(num_layers: usize, num_kv_heads: usize) -> Self {
         Self {
             k_cache: Vec::new(),
             v_cache: Vec::new(),
@@ -29,12 +29,16 @@ impl KVCache {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.seq_len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.seq_len == 0
+    }
+
     /// Get mutable references to K/V cache for a layer
-    pub(crate) fn get_cache_mut(
+    pub fn get_cache_mut(
         &mut self,
         ctx: &DeviceContext,
         layer: usize,
@@ -51,7 +55,7 @@ impl KVCache {
         Ok((&mut self.k_cache[layer], &mut self.v_cache[layer]))
     }
 
-    pub(crate) fn init_if_needed(&mut self, ctx: &DeviceContext, head_dim: usize) -> Result<()> {
+    pub fn init_if_needed(&mut self, ctx: &DeviceContext, head_dim: usize) -> Result<()> {
         if self.head_dim == 0 {
             self.head_dim = head_dim;
             for _ in 0..self.num_layers {
@@ -63,7 +67,7 @@ impl KVCache {
         Ok(())
     }
 
-    pub(crate) fn advance_seq_len(&mut self, count: usize) {
+    pub fn advance_seq_len(&mut self, count: usize) {
         self.seq_len += count;
     }
 }

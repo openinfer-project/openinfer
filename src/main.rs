@@ -6,7 +6,6 @@ use log::info;
 use pegainfer::logging;
 use pegainfer::model::Qwen35Model;
 use pegainfer::server_engine::{ModelType, detect_model_type};
-use pegainfer::trace_reporter::FileReporter;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -32,10 +31,6 @@ struct Args {
     /// Tensor-parallel world size for Qwen3
     #[arg(long, default_value_t = 1)]
     tp_size: usize,
-
-    /// Enable request tracing and write trace JSON files to this directory
-    #[arg(long)]
-    trace_output_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -43,15 +38,6 @@ async fn main() {
     logging::init_default();
 
     let args = Args::parse();
-
-    if let Some(ref trace_path) = args.trace_output_path {
-        std::fs::create_dir_all(trace_path).expect("Failed to create trace output directory");
-        fastrace::set_reporter(
-            FileReporter::new(trace_path.clone()),
-            fastrace::collector::Config::default(),
-        );
-        info!("Tracing enabled: output_dir={}", trace_path.display());
-    }
 
     let model_path = args
         .model_path
@@ -110,9 +96,4 @@ async fn main() {
     )
     .await
     .expect("vLLM frontend server failed");
-
-    if args.trace_output_path.is_some() {
-        info!("Flushing pending traces...");
-        fastrace::flush();
-    }
 }

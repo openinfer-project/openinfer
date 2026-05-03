@@ -6,9 +6,10 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/pegainfer-kernels"]
+members = ["crates/pegainfer-core", "crates/pegainfer-kernels"]
 
 [dependencies]
+pegainfer-core = { path = "crates/pegainfer-core" }
 pegainfer-kernels = { path = "crates/pegainfer-kernels" }
 safetensors = "0.7"
 anyhow = "1.0"

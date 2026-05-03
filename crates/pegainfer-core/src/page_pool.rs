@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 
 /// Shared fixed-page allocator with RAII-owned permits.
 #[derive(Clone, Debug)]
-pub(crate) struct PagePool {
+pub struct PagePool {
     inner: Arc<PagePoolInner>,
 }
 
@@ -16,23 +16,23 @@ struct PagePoolInner {
 
 /// A set of pages leased from a [`PagePool`]. Pages return automatically on drop.
 #[derive(Debug)]
-pub(crate) struct OwnedPagePermit {
+pub struct OwnedPagePermit {
     inner: Arc<PagePoolInner>,
     pages: Vec<PageId>,
 }
 
 /// Opaque page identifier within a pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct PageId(usize);
+pub struct PageId(usize);
 
 impl PageId {
-    pub(crate) fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self.0
     }
 }
 
 impl PagePool {
-    pub(crate) fn new(capacity_pages: usize) -> Self {
+    pub fn new(capacity_pages: usize) -> Self {
         let free_list = (0..capacity_pages).rev().map(PageId).collect();
         Self {
             inner: Arc::new(PagePoolInner {
@@ -42,7 +42,7 @@ impl PagePool {
         }
     }
 
-    pub(crate) fn try_acquire_many(&self, n: usize) -> Option<OwnedPagePermit> {
+    pub fn try_acquire_many(&self, n: usize) -> Option<OwnedPagePermit> {
         if n == 0 {
             return Some(OwnedPagePermit {
                 inner: Arc::clone(&self.inner),
@@ -66,31 +66,31 @@ impl PagePool {
         })
     }
 
-    pub(crate) fn capacity_pages(&self) -> usize {
+    pub fn capacity_pages(&self) -> usize {
         self.inner.capacity_pages
     }
 
-    pub(crate) fn available_pages(&self) -> usize {
+    pub fn available_pages(&self) -> usize {
         self.inner.free_list.lock().len()
     }
 }
 
 impl OwnedPagePermit {
-    pub(crate) fn pages(&self) -> &[PageId] {
+    pub fn pages(&self) -> &[PageId] {
         &self.pages
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.pages.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
 
     /// Try to acquire `n` more pages, appending them to this permit.
     /// Returns `true` on success. On failure the permit is unchanged.
-    pub(crate) fn try_grow(&mut self, n: usize) -> bool {
+    pub fn try_grow(&mut self, n: usize) -> bool {
         if n == 0 {
             return true;
         }

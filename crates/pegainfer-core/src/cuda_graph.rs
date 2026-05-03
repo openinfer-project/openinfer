@@ -9,7 +9,7 @@ use crate::tensor::DeviceContext;
 
 /// CUDA Graph state for decode path.
 /// First decode call captures the graph; subsequent calls replay it.
-pub(crate) struct CudaGraphState {
+pub struct CudaGraphState {
     graph: Option<CudaGraph>,
 }
 
@@ -18,14 +18,14 @@ pub(crate) struct CudaGraphState {
 unsafe impl Send for CudaGraphState {}
 
 impl CudaGraphState {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { graph: None }
     }
 
     /// Run kernel closure directly, or capture into a graph and replay.
     ///
     /// `kernels` must be a pure GPU kernel sequence — no CPU-GPU sync, no allocation.
-    pub(crate) fn run_or_capture<F>(&mut self, ctx: &DeviceContext, kernels: F) -> Result<()>
+    pub fn run_or_capture<F>(&mut self, ctx: &DeviceContext, kernels: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,
     {
@@ -54,5 +54,11 @@ impl CudaGraphState {
             }
         }
         Ok(())
+    }
+}
+
+impl Default for CudaGraphState {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -7,7 +7,7 @@ use crate::kv_pool::KvLayout;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prefill_attention_paged_into(
+pub fn prefill_attention_paged_into(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
     k_batch: &mut HiddenStates,
@@ -50,7 +50,7 @@ pub(crate) fn prefill_attention_paged_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paged_attention_batch_decode_into(
+pub fn paged_attention_batch_decode_into(
     ctx: &DeviceContext,
     q: &HiddenStates,
     k: &HiddenStates,
@@ -91,7 +91,7 @@ pub(crate) fn paged_attention_batch_decode_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paged_attention_batch_decode_hd256_into(
+pub fn paged_attention_batch_decode_hd256_into(
     ctx: &DeviceContext,
     q: &HiddenStates,
     k: &HiddenStates,

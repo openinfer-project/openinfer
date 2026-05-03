@@ -87,9 +87,6 @@ cargo run --release -- --model-path models/Qwen3.5-4B
 
 # Disable CUDA Graph (useful for debugging)
 cargo run --release -- --cuda-graph=false
-
-# Performance tracing (Chrome Trace JSON → open with Perfetto UI)
-cargo run --release -- --trace-output-path traces/
 ```
 
 **Environment variables:**
@@ -222,11 +219,16 @@ src/
 ├── ffi.rs                 # Re-export of pegainfer-kernels FFI bindings
 ├── weight_loader.rs       # Safetensors loading + RoPE precomputation
 ├── sampler.rs             # Temperature, top-k, top-p sampling
-└── trace_reporter.rs      # Chrome Trace JSON profiling
+└── trace_reporter.rs      # Archived fastrace JSON reporter, not wired into CLI
+
+crates/pegainfer-core/             # Shared runtime API for model crates
+├── src/model.rs                   # ModelForward / GenerationState traits
+├── src/kv_pool.rs                 # Paged KV pool and request state
+├── src/ops.rs                     # Shared op wrappers over pegainfer-kernels
+└── src/weight_loader.rs           # Safetensors helpers shared by model crates
 
 crates/pegainfer-kernels/          # Shared GPU kernel/runtime crate
 ├── KERNELS.md                     # LLM routing index for model op -> wrapper -> FFI -> source
-├── kernel_manifest/qwen3_4b.toml  # Machine-readable Qwen3-4B kernel index
 ├── src/                           # GPU tensor types, FFI, paged KV layout, Rust ops
 ├── csrc/                          # Hand-written CUDA / FlashInfer C++ wrappers
 └── tools/triton/                  # Triton AOT kernels (build-time compiled)
