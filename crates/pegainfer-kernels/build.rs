@@ -1,6 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Instant;
 
 struct TritonKernelSpec {
     artifact_dir: &'static str,
@@ -13,12 +16,72 @@ struct TritonKernelSpec {
     num_stages: u32,
 }
 
+struct NvccTask {
+    cu_file: PathBuf,
+    obj_file: PathBuf,
+    args: Vec<String>,
+}
+
 fn workspace_root() -> PathBuf {
     crate_root().join("../..")
 }
 
 fn crate_root() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
+}
+
+fn build_timing_enabled() -> bool {
+    std::env::var("PEGAINFER_BUILD_TIMING").is_ok_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !(value.is_empty() || value == "0" || value == "false" || value == "off")
+    })
+}
+
+fn time_phase<T>(label: impl AsRef<str>, f: impl FnOnce() -> T) -> T {
+    if !build_timing_enabled() {
+        return f();
+    }
+
+    let started = Instant::now();
+    let result = f();
+    println!(
+        "cargo:warning=build-timing {} {:.3}s",
+        label.as_ref(),
+        started.elapsed().as_secs_f64()
+    );
+    result
+}
+
+fn parse_job_count_env(name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    match value.trim().parse::<usize>() {
+        Ok(jobs) if jobs > 0 => Some(jobs),
+        _ => {
+            println!("cargo:warning=Ignoring invalid {name}={value}; expected a positive integer.");
+            None
+        }
+    }
+}
+
+fn nvcc_job_count() -> usize {
+    if let Some(jobs) = parse_job_count_env("PEGAINFER_NVCC_JOBS") {
+        return jobs;
+    }
+
+    parse_job_count_env("NUM_JOBS")
+        .or_else(|| thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn nvcc_task_priority(cu_file: &Path) -> usize {
+    match cu_file.file_stem().and_then(|stem| stem.to_str()) {
+        Some("paged_attention") => 0,
+        Some("flashinfer_sampling") => 1,
+        Some("flashinfer_top1") => 2,
+        Some("flashinfer_norm") => 3,
+        _ => 10,
+    }
 }
 
 fn parse_sm_token(raw: &str) -> Option<String> {
@@ -203,33 +266,35 @@ fn generate_triton_artifacts(
     let generator_path = root.join("tools/triton/gen_triton_aot.py");
     let artifact_dir = out_dir.join("triton_aot").join(spec.artifact_dir);
 
-    let output = Command::new(python)
-        .arg(&generator_path)
-        .arg("--kernel-path")
-        .arg(root.join(spec.kernel_path))
-        .arg("--kernel-name")
-        .arg(spec.kernel_name)
-        .arg("--signature")
-        .arg(spec.signature)
-        .arg("--grid")
-        .arg(spec.grid)
-        .arg("--out-name")
-        .arg(spec.out_name)
-        .arg("--out-dir")
-        .arg(&artifact_dir)
-        .arg("--target")
-        .arg(triton_target)
-        .arg("--num-warps")
-        .arg(spec.num_warps.to_string())
-        .arg("--num-stages")
-        .arg(spec.num_stages.to_string())
-        .output()
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to run Triton AOT generator for {}: {err}",
-                spec.kernel_name
-            )
-        });
+    let output = time_phase(format!("triton-gen {}", spec.kernel_name), || {
+        Command::new(python)
+            .arg(&generator_path)
+            .arg("--kernel-path")
+            .arg(root.join(spec.kernel_path))
+            .arg("--kernel-name")
+            .arg(spec.kernel_name)
+            .arg("--signature")
+            .arg(spec.signature)
+            .arg("--grid")
+            .arg(spec.grid)
+            .arg("--out-name")
+            .arg(spec.out_name)
+            .arg("--out-dir")
+            .arg(&artifact_dir)
+            .arg("--target")
+            .arg(triton_target)
+            .arg("--num-warps")
+            .arg(spec.num_warps.to_string())
+            .arg("--num-stages")
+            .arg(spec.num_stages.to_string())
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to run Triton AOT generator for {}: {err}",
+                    spec.kernel_name
+                )
+            })
+    });
 
     assert!(
         output.status.success(),
@@ -475,7 +540,9 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     for source in &generated_sources {
         build.file(source);
     }
-    build.compile("triton_kernels_aot");
+    time_phase("cc triton_kernels_aot", || {
+        build.compile("triton_kernels_aot");
+    });
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
@@ -521,7 +588,7 @@ fn main() {
 
     let root = crate_root();
     let csrc_dir = root.join("csrc");
-    let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
+    let mut cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
         .expect("Failed to read csrc/ directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -536,6 +603,7 @@ fn main() {
             }
         })
         .collect();
+    cu_files.sort();
 
     println!(
         "cargo:warning=Legacy CUDA translation units retired from the runtime build: {}",
@@ -546,7 +614,10 @@ fn main() {
             .join(", ")
     );
 
-    let mut obj_files = Vec::new();
+    let nvcc_jobs = nvcc_job_count();
+    println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
+
+    let mut nvcc_tasks = Vec::new();
     for cu_file in &cu_files {
         let stem = cu_file.file_stem().unwrap().to_str().unwrap();
         let obj_file = out_dir.join(format!("{}_cuda.o", stem));
@@ -576,19 +647,58 @@ fn main() {
             ]);
         }
 
-        let status = Command::new(&nvcc)
-            .args(&nvcc_args)
-            .status()
-            .unwrap_or_else(|_| panic!("Failed to run nvcc for {}", cu_file.display()));
-
-        assert!(
-            status.success(),
-            "nvcc compilation failed for {}",
-            cu_file.display()
-        );
-
-        obj_files.push(obj_file);
+        nvcc_tasks.push(NvccTask {
+            cu_file: cu_file.clone(),
+            obj_file,
+            args: nvcc_args,
+        });
     }
+
+    nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));
+
+    let task_queue = Mutex::new(VecDeque::from(nvcc_tasks));
+    let nvcc_workers = nvcc_jobs.min(task_queue.lock().expect("task queue poisoned").len());
+    let mut obj_files = Vec::new();
+    thread::scope(|scope| {
+        let handles: Vec<_> = (0..nvcc_workers)
+            .map(|_| {
+                let task_queue = &task_queue;
+                let nvcc = nvcc.clone();
+                scope.spawn(move || {
+                    let mut completed = Vec::new();
+                    loop {
+                        let task = task_queue.lock().expect("task queue poisoned").pop_front();
+                        let Some(task) = task else {
+                            break;
+                        };
+
+                        let status = time_phase(format!("nvcc {}", task.cu_file.display()), || {
+                            Command::new(&nvcc)
+                                .args(&task.args)
+                                .status()
+                                .unwrap_or_else(|_| {
+                                    panic!("Failed to run nvcc for {}", task.cu_file.display())
+                                })
+                        });
+                        completed.push((task.cu_file, task.obj_file, status));
+                    }
+                    completed
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            for (cu_file, obj_file, status) in handle.join().expect("nvcc worker panicked") {
+                assert!(
+                    status.success(),
+                    "nvcc compilation failed for {}",
+                    cu_file.display()
+                );
+                obj_files.push(obj_file);
+            }
+        }
+    });
+    obj_files.sort();
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
@@ -598,10 +708,12 @@ fn main() {
             .map(|path| path.to_string_lossy().to_string()),
     );
 
-    let status = Command::new("ar")
-        .args(&ar_args)
-        .status()
-        .expect("Failed to run ar");
+    let status = time_phase("ar libkernels_cuda.a", || {
+        Command::new("ar")
+            .args(&ar_args)
+            .status()
+            .expect("Failed to run ar")
+    });
 
     assert!(status.success(), "ar failed");
 
@@ -626,4 +738,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");
     println!("cargo:rerun-if-env-changed=CUDA_SM");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_BUILD_TIMING");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_JOBS");
 }
