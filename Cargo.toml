@@ -6,6 +6,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
+resolver = "3"
 members = [
     "crates/pegainfer-core",
     "crates/pegainfer-cupti",
@@ -13,19 +14,14 @@ members = [
     "crates/pegainfer-qwen3-4b",
 ]
 
-[dependencies]
-pegainfer-core = { path = "crates/pegainfer-core" }
-pegainfer-kernels = { path = "crates/pegainfer-kernels" }
-pegainfer-qwen3-4b = { path = "crates/pegainfer-qwen3-4b" }
-safetensors = "0.7"
+[workspace.dependencies]
 anyhow = "1.0"
-ndarray = "0.16"
-half = { version = "2.4", features = ["num-traits"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.149"
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
-uuid = { version = "1", features = ["v4"] }
+cc = "1.2"
+clap = { version = "4.6.1", features = ["derive"] }
+colored = "3"
+comfy-table = "7.2"
+criterion = { version = "0.8", features = ["html_reports"] }
+crossbeam-channel = "0.5"
 cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
     "cublas",
@@ -33,33 +29,37 @@ cudarc = { version = "0.19.4", features = [
     "f16",
     "nccl",
 ] }
-memmap2 = "0.9"
+fastrace = { version = "0.7.17", features = ["enable"] }
+half = { version = "2.7", features = ["num-traits"] }
+hex = "0.4"
 log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
-colored = "3"
-fastrace = { version = "0.7.16", features = ["enable"] }
-clap = { version = "4.5.57", features = ["derive"] }
-rand = "0.10"
-comfy-table = "7.2"
+memmap2 = "0.9"
 parking_lot = "0.12.5"
-crossbeam-channel = "0.5"
+pegainfer-core = { path = "crates/pegainfer-core" }
+pegainfer-cupti = { path = "crates/pegainfer-cupti" }
+pegainfer-kernels = { path = "crates/pegainfer-kernels" }
+pegainfer-qwen3-4b = { path = "crates/pegainfer-qwen3-4b" }
+rand = "0.10"
 rmp-serde = "1.3"
 rmpv = "1.3"
-vllm-engine-core-client = { git = "https://github.com/Inferact/vllm-frontend-rs.git", branch = "main" }
-vllm-server = { git = "https://github.com/Inferact/vllm-frontend-rs.git", branch = "main" }
-vllm-text = { git = "https://github.com/Inferact/vllm-frontend-rs.git", branch = "main" }
+safetensors = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11"
+tokio = "1"
+tokio-util = "0.7"
+toml = "1.1"
+uuid = "1"
+vllm-engine-core-client = { git = "https://github.com/Inferact/vllm-frontend-rs.git", rev = "eb2b54b1a0b3ef2904a25538bc0211f058f7e95f" }
+vllm-server = { git = "https://github.com/Inferact/vllm-frontend-rs.git", rev = "eb2b54b1a0b3ef2904a25538bc0211f058f7e95f" }
+vllm-text = { git = "https://github.com/Inferact/vllm-frontend-rs.git", rev = "eb2b54b1a0b3ef2904a25538bc0211f058f7e95f" }
 zeromq = { git = "https://github.com/BugenZhao/zmq.rs", rev = "dde4ee5c48846b0cc22b1f4fad8c7514748180fe", default-features = false, features = [
     "tokio-runtime",
     "all-transport",
 ] }
 
-[features]
-reference = []
-
-[dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
-
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -2 }
 # Allowed pedantic lints (too noisy for this codebase)
 cast_lossless = "allow"
@@ -69,6 +69,8 @@ cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 collapsible_else_if = "allow"
 collapsible_if = "allow"
+doc_markdown = "allow"
+implicit_hasher = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
@@ -78,7 +80,6 @@ too_many_arguments = "allow"
 too_many_lines = "allow"
 uninlined_format_args = "allow"
 upper_case_acronyms = "allow"
-doc_markdown = "allow"
 # Cherry-picked nursery lints
 redundant_clone = "warn"
 unused_peekable = "warn"
@@ -92,9 +93,43 @@ rc_buffer = "warn"
 rc_mutex = "warn"
 rest_pat_in_fully_bound_structs = "warn"
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 unreachable_pub = "warn"
+
+[dependencies]
+pegainfer-core = { workspace = true }
+pegainfer-qwen3-4b = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
+comfy-table = { workspace = true }
+cudarc = { workspace = true }
+fastrace = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
+rand = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+vllm-engine-core-client = { workspace = true }
+vllm-server = { workspace = true }
+vllm-text = { workspace = true }
+zeromq = { workspace = true }
+
+[features]
+reference = []
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
 
 [[bench]]
 name = "ops_bench"

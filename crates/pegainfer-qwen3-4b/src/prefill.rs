@@ -8,7 +8,7 @@ use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
-/// Created once per prefill in `process_all_layers_batch`, eliminating
+/// Created once per prefill pass, eliminating
 /// per-layer `cuMemAllocAsync` overhead (~11k calls / 88ms at seq=2048).
 ///
 /// Buffer reuse across steps (all kernels serialized on a single stream):
@@ -67,75 +67,6 @@ impl Qwen3Model {
         ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
 
         Ok(out)
-    }
-
-    #[fastrace::trace(name = "process_all_layers_batch")]
-    pub(super) fn process_all_layers_batch(
-        &self,
-        mut hidden: HiddenStates,
-        start_pos: usize,
-        kv_state: &mut KvState,
-    ) -> Result<HiddenStates> {
-        let seq_len = hidden.seq_len;
-        let num_heads = self.local_num_attention_heads();
-        let num_kv_heads = self.local_num_key_value_heads();
-        let head_dim = self.config.head_dim;
-        let inter_dim = self.local_intermediate_size();
-        let q_dim = self.local_q_dim();
-        let kv_dim = self.local_kv_dim();
-
-        // Allocate pages and advance before building the plan.
-        kv_state.ensure_capacity(start_pos + seq_len)?;
-        kv_state.advance(seq_len);
-
-        // Build paged prefill plan once — shared across all layers.
-        let desc = kv_state.desc();
-        let plan = PrefillPagedPlan::new_with_cta_tile_q(
-            &self.ctx,
-            &desc,
-            start_pos,
-            seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            PREFILL_ATTENTION_CTA_TILE_Q,
-        )?;
-
-        // Allocate all intermediates once — eliminates ~11k cuMemAllocAsync calls.
-        let mut bufs = PrefillBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            seq_len,
-        )?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.forward_layer_batch_paged(
-                layer_idx,
-                layer,
-                &mut hidden,
-                start_pos,
-                kv_state.buffer(),
-                kv_state.layout(),
-                &plan,
-                &mut bufs,
-            )?;
-        }
-
-        Ok(hidden)
-    }
-
-    pub(super) fn compute_logits_batch(&self, hidden: &HiddenStates) -> Result<DeviceVec> {
-        let last_hidden = ops::extract_vec(&self.ctx, hidden, hidden.seq_len - 1)?;
-        let normed = ops::rms_norm(
-            &self.ctx,
-            &last_hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-        )?;
-        ops::linear(&self.ctx, &normed, self.output_projection())
     }
 
     #[allow(clippy::too_many_arguments)]
