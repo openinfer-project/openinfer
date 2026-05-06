@@ -64,7 +64,7 @@ export PEGAINFER_TRITON_PYTHON=.venv/bin/python
 cargo run --release
 ```
 
-> Workspace layout: the server CLI lives in the root `pegainfer` package. The model crates under `crates/` (e.g. `pegainfer-qwen3-4b`, `pegainfer-kernels`, `pegainfer-core`) own model, runtime, and kernel code plus diagnostic bins only; they are not server entrypoints. `cargo run --release` (or `cargo run --release --bin pegainfer`) is what you want. A natural-looking `cargo run --package pegainfer-qwen3-4b --bin pegainfer-qwen3-4b` does not exist and will fail with `no bin target named ...`.
+> **Note**: The server CLI is in the root `pegainfer` package. Crates under `crates/` (e.g., `pegainfer-qwen3-4b`, `pegainfer-kernels`) contain model logic and diagnostic tools but are not server entrypoints. Use `cargo run --release` (or `cargo run --release --bin pegainfer`) from the root. Running with `--package pegainfer-qwen3-4b` will fail with `no bin target named ...`.
 
 ```bash
 # Try it
