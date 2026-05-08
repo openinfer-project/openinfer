@@ -93,6 +93,8 @@ fn generate_tokens(
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
+            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
+            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
             None => panic!("scheduler channel closed without Finished"),
         }
     }

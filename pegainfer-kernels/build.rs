@@ -22,6 +22,12 @@ struct NvccTask {
     args: Vec<String>,
 }
 
+struct TileLangArtifacts {
+    cu_files: Vec<PathBuf>,
+    template_include: PathBuf,
+    cutlass_include: PathBuf,
+}
+
 fn workspace_root() -> PathBuf {
     crate_root().join("..")
 }
@@ -96,20 +102,38 @@ fn parse_sm_token(raw: &str) -> Option<String> {
         .unwrap_or(token);
 
     if let Some((major, minor)) = token.split_once('.') {
-        if major.chars().all(|c| c.is_ascii_digit()) && minor.chars().all(|c| c.is_ascii_digit()) {
-            return Some(format!("{}{}", major, minor));
+        let digit_count = minor.chars().take_while(|c| c.is_ascii_digit()).count();
+        let (minor_digits, suffix) = minor.split_at(digit_count);
+        if major.chars().all(|c| c.is_ascii_digit())
+            && !minor_digits.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            return Some(format!("{major}{minor_digits}{suffix}"));
         }
         return None;
     }
 
-    if token.chars().all(|c| c.is_ascii_digit()) {
-        if token.len() == 1 {
-            return Some(format!("{}0", token));
+    let digit_count = token.chars().take_while(|c| c.is_ascii_digit()).count();
+    let (digits, suffix) = token.split_at(digit_count);
+    if !digits.is_empty() && suffix.chars().all(|c| c.is_ascii_alphabetic()) {
+        if digits.len() == 1 {
+            return Some(format!("{digits}0{suffix}"));
         }
-        return Some(token.to_string());
+        return Some(format!("{digits}{suffix}"));
     }
 
     None
+}
+
+fn normalize_flashinfer_sm(sm: &str) -> String {
+    match sm {
+        // FlashInfer normalizes RTX 50 / SM120 to the family-specific `f`
+        // target when CUDA >= 12.9. Plain sm_120 builds compile but trip
+        // CUTLASS conditional MMA runtime asserts in SM120 groupwise GEMM.
+        "120" => "120f".to_string(),
+        "121" => "121a".to_string(),
+        _ => sm.to_string(),
+    }
 }
 
 fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
@@ -172,14 +196,21 @@ fn detect_sm_targets() -> Vec<String> {
 fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
     let mut args = Vec::new();
     for sm in sm_targets {
+        let sm = normalize_flashinfer_sm(sm);
         args.push("-gencode".to_string());
         args.push(format!("arch=compute_{sm},code=sm_{sm}"));
     }
 
     if let Some(max_sm) = sm_targets
         .iter()
-        .filter_map(|sm| sm.parse::<u32>().ok())
-        .max()
+        .map(|sm| normalize_flashinfer_sm(sm))
+        .max_by_key(|sm| {
+            sm.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .unwrap_or(0)
+        })
     {
         args.push("-gencode".to_string());
         args.push(format!("arch=compute_{max_sm},code=compute_{max_sm}"));
@@ -238,6 +269,151 @@ fn find_triton_python() -> Result<String, String> {
         "Could not find a Python interpreter with Triton installed. Set PEGAINFER_TRITON_PYTHON, bootstrap .venv, or ensure `python3 -c 'import triton'` works. Probe results: {}.",
         diagnostics.join(" | ")
     ))
+}
+
+fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
+    let output = Command::new(candidate)
+        .args(["-c", "import tilelang"])
+        .output()
+        .map_err(|err| format!("{candidate}: {err}"))?;
+
+    if output.status.success() {
+        Ok(candidate.to_string())
+    } else {
+        Err(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn find_tilelang_python() -> Result<String, String> {
+    if let Ok(candidate) = std::env::var("PEGAINFER_TILELANG_PYTHON") {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            return Err("PEGAINFER_TILELANG_PYTHON is set but empty.".to_string());
+        }
+        return probe_tilelang_python(candidate).map_err(|message| {
+            format!("PEGAINFER_TILELANG_PYTHON=`{candidate}` could not import TileLang: {message}")
+        });
+    }
+
+    let local_venv = workspace_root().join("../.venv/bin/python");
+    let workspace_venv = workspace_root().join(".venv/bin/python");
+    let mut diagnostics = Vec::new();
+    let mut candidates = Vec::new();
+    if local_venv.exists() {
+        candidates.push(local_venv.to_string_lossy().to_string());
+    }
+    if workspace_venv.exists() {
+        candidates.push(workspace_venv.to_string_lossy().to_string());
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+
+    for candidate in candidates {
+        match probe_tilelang_python(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(message) => diagnostics.push(message),
+        }
+    }
+
+    Err(format!(
+        "Could not find a Python interpreter with TileLang installed. Probe results: {}.",
+        diagnostics.join(" | ")
+    ))
+}
+
+fn generate_deepseek_tilelang_artifacts(out_dir: &Path) -> TileLangArtifacts {
+    let python = find_tilelang_python().unwrap_or_else(|message| {
+        panic!("DeepSeek V4 TileLang kernels require TileLang at build time: {message}")
+    });
+
+    let root = crate_root();
+    let generator_path = root.join("tools/tilelang/gen_deepseek_v4_tilelang.py");
+    assert!(
+        generator_path.exists(),
+        "DeepSeek V4 TileLang generator is missing: {}",
+        generator_path.display()
+    );
+
+    let artifact_dir = out_dir.join("tilelang").join("deepseek_v4");
+    let output = time_phase("tilelang-gen deepseek_v4", || {
+        Command::new(&python)
+            .arg(&generator_path)
+            .arg("--out-dir")
+            .arg(&artifact_dir)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run DeepSeek TileLang generator: {err}"))
+    });
+    assert!(
+        output.status.success(),
+        "DeepSeek TileLang generator failed. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut cu_path = None;
+    let mut template_include = None;
+    let mut cutlass_include = None;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("CU_PATH=") {
+            cu_path = Some(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("TILELANG_TEMPLATE_PATH=") {
+            template_include = Some(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("CUTLASS_INCLUDE_DIR=") {
+            cutlass_include = Some(PathBuf::from(value.trim()));
+        }
+    }
+
+    let cu_path = cu_path.expect("DeepSeek TileLang generator did not print CU_PATH");
+    let template_include =
+        template_include.expect("DeepSeek TileLang generator did not print TILELANG_TEMPLATE_PATH");
+    let cutlass_include =
+        cutlass_include.expect("DeepSeek TileLang generator did not print CUTLASS_INCLUDE_DIR");
+
+    println!(
+        "cargo:warning=Using DeepSeek V4 TileLang generated CUDA: {}",
+        cu_path.display()
+    );
+    println!("cargo:rerun-if-changed={}", generator_path.display());
+    println!("cargo:rerun-if-env-changed=PEGAINFER_TILELANG_PYTHON");
+
+    TileLangArtifacts {
+        cu_files: vec![cu_path],
+        template_include,
+        cutlass_include,
+    }
+}
+
+fn flashinfer_include_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("PEGAINFER_FLASHINFER_INCLUDE") {
+        let path = PathBuf::from(path);
+        if path.join("flashinfer/sampling.cuh").exists() {
+            return path;
+        }
+        println!(
+            "cargo:warning=PEGAINFER_FLASHINFER_INCLUDE={} does not contain flashinfer/sampling.cuh; falling back.",
+            path.display()
+        );
+    }
+
+    let root = workspace_root();
+    let candidates = [
+        root.join("third_party/flashinfer/include"),
+        root.join("../.venv/lib/python3.13/site-packages/flashinfer/data/include"),
+        root.join("../.venv/lib/python3.12/site-packages/flashinfer/data/include"),
+        root.join("../.venv/lib/python3.11/site-packages/flashinfer/data/include"),
+        root.join("../.venv/lib/python3.10/site-packages/flashinfer/data/include"),
+    ];
+
+    for candidate in candidates {
+        if candidate.join("flashinfer/sampling.cuh").exists() {
+            return candidate;
+        }
+    }
+
+    root.join("third_party/flashinfer/include")
 }
 
 fn triton_target(sm_targets: &[String]) -> String {
@@ -574,6 +750,12 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
     let arch_args = nvcc_arch_args(&sm_targets);
+    let deepseek_enabled = std::env::var_os("CARGO_FEATURE_DEEPSEEK_V4").is_some();
+    let tilelang_artifacts = if deepseek_enabled {
+        Some(generate_deepseek_tilelang_artifacts(&out_dir))
+    } else {
+        None
+    };
     println!(
         "cargo:warning=Compiling CUDA kernels for targets: {}",
         sm_targets
@@ -588,12 +770,15 @@ fn main() {
 
     let root = crate_root();
     let csrc_dir = root.join("csrc");
-    let mut cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
+    let mut cu_files: Vec<_> = std::fs::read_dir(&csrc_dir)
         .expect("Failed to read csrc/ directory")
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
             let file_name = path.file_name()?.to_str()?;
+            if !deepseek_enabled && file_name.starts_with("deepseek_") {
+                return None;
+            }
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
                 && !replaced_cuda_files.contains(file_name)
             {
@@ -604,6 +789,15 @@ fn main() {
         })
         .collect();
     cu_files.sort();
+    for entry in std::fs::read_dir(&csrc_dir).expect("Failed to read csrc/ directory") {
+        let path = entry.expect("Failed to read csrc/ entry").path();
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if matches!(extension, "cu" | "cuh") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 
     println!(
         "cargo:warning=Legacy CUDA translation units retired from the runtime build: {}",
@@ -616,6 +810,19 @@ fn main() {
 
     let nvcc_jobs = nvcc_job_count();
     println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
+    let flashinfer_include = flashinfer_include_dir();
+    let flashinfer_data = flashinfer_include
+        .parent()
+        .expect("FlashInfer include dir must have a parent")
+        .to_path_buf();
+    let flashinfer_cutlass_include = flashinfer_data.join("cutlass/include");
+    let flashinfer_cutlass_util_include = flashinfer_data.join("cutlass/tools/util/include");
+    let flashinfer_csrc_include = flashinfer_data.join("csrc");
+    let flashinfer_spdlog_include = flashinfer_data.join("spdlog/include");
+    println!(
+        "cargo:warning=Using FlashInfer include dir: {}",
+        flashinfer_include.display()
+    );
 
     let mut nvcc_tasks = Vec::new();
     for cu_file in &cu_files {
@@ -637,13 +844,32 @@ fn main() {
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
+            || stem.starts_with("deepseek_")
         {
             nvcc_args.extend([
                 "--std=c++17".to_string(),
                 "-I".to_string(),
-                root.join("third_party/flashinfer/include")
+                flashinfer_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer_csrc_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer_cutlass_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer_cutlass_util_include
                     .to_string_lossy()
                     .to_string(),
+                "-I".to_string(),
+                flashinfer_spdlog_include.to_string_lossy().to_string(),
+            ]);
+        }
+
+        if stem == "deepseek_quant" {
+            nvcc_args.extend([
+                "--expt-relaxed-constexpr".to_string(),
+                "-static-global-template-stub=false".to_string(),
+                "-DFLASHINFER_ENABLE_FP8_E8M0".to_string(),
+                "-DFLASHINFER_ENABLE_FP4_E2M1".to_string(),
+                "-DCUTLASS_ENABLE_GDC_FOR_SM100=1".to_string(),
             ]);
         }
 
@@ -652,6 +878,50 @@ fn main() {
             obj_file,
             args: nvcc_args,
         });
+    }
+
+    if !deepseek_enabled {
+        println!(
+            "cargo:warning=DeepSeek V4 CUDA/TileLang kernels disabled; enable the pegainfer-kernels `deepseek-v4` feature to build them"
+        );
+    }
+
+    if let Some(tilelang_artifacts) = tilelang_artifacts {
+        for cu_file in tilelang_artifacts.cu_files {
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{stem}_cuda.o"));
+            let mut nvcc_args = vec![
+                "-c".to_string(),
+                cu_file.to_string_lossy().to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+                "-O3".to_string(),
+            ];
+            nvcc_args.extend(arch_args.clone());
+            nvcc_args.extend([
+                "--std=c++20".to_string(),
+                "--compiler-options".to_string(),
+                "-fPIC".to_string(),
+                "-w".to_string(),
+                "-Xcudafe".to_string(),
+                "--diag_suppress=177".to_string(),
+                "-I".to_string(),
+                tilelang_artifacts
+                    .template_include
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                tilelang_artifacts
+                    .cutlass_include
+                    .to_string_lossy()
+                    .to_string(),
+            ]);
+            nvcc_tasks.push(NvccTask {
+                cu_file,
+                obj_file,
+                args: nvcc_args,
+            });
+        }
     }
 
     nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));

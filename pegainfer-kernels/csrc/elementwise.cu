@@ -80,6 +80,37 @@ __global__ void embedding_batched_kernel(
   }
 }
 
+// ============================================================================
+// Tensor-parallel vocab-sharded embedding lookup.
+//
+// Each rank owns [vocab_start, vocab_start + part_vocab_size). Tokens outside
+// the local shard write zeros. An all-reduce over ranks recovers the full
+// embedding result, matching the official ParallelEmbedding implementation.
+// Output layout remains [seq_len, hidden_size].
+// ============================================================================
+
+__global__ void embedding_batched_vocab_shard_kernel(
+    const __nv_bfloat16 *__restrict__ embed,
+    const uint32_t *__restrict__ token_ids,
+    __nv_bfloat16 *__restrict__ out,
+    int hidden_size, int seq_len, uint32_t vocab_start,
+    uint32_t part_vocab_size) {
+  int total = hidden_size * seq_len;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int token_offset = idx / hidden_size;
+    int dim_offset = idx % hidden_size;
+    uint32_t token_id = token_ids[token_offset];
+    if (token_id >= vocab_start && token_id < vocab_start + part_vocab_size) {
+      uint32_t local_token_id = token_id - vocab_start;
+      out[idx] = embed[(size_t)local_token_id * hidden_size + dim_offset];
+    } else {
+      out[idx] = __float2bfloat16(0.0f);
+    }
+  }
+}
+
 extern "C" {
 
 CUresult add_cuda(
@@ -116,6 +147,18 @@ CUresult embedding_batched_cuda(
   int block = 256;
   int grid = (total + block - 1) / block;
   embedding_batched_kernel<<<grid, block, 0, stream>>>(embed, token_ids, out, hidden_size, seq_len);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult embedding_batched_vocab_shard_cuda(
+    const __nv_bfloat16 *embed, const uint32_t *token_ids,
+    __nv_bfloat16 *out, int hidden_size, int seq_len,
+    uint32_t vocab_start, uint32_t part_vocab_size, cudaStream_t stream) {
+  int total = hidden_size * seq_len;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  embedding_batched_vocab_shard_kernel<<<grid, block, 0, stream>>>(
+      embed, token_ids, out, hidden_size, seq_len, vocab_start, part_vocab_size);
   return (CUresult)cudaGetLastError();
 }
 

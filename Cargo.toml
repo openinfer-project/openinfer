@@ -6,6 +6,7 @@ members = [
     "pegainfer-core",
     "pegainfer-cupti",
     "pegainfer-kernels",
+    "pegainfer-deepseek-v4",
     "pegainfer-qwen3-4b",
     "pegainfer-qwen35-4b",
 ]
@@ -30,10 +31,12 @@ half = { version = "2.7", features = ["num-traits"] }
 hex = "0.4"
 log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
+libc = "0.2"
 memmap2 = "0.9"
 parking_lot = "0.12.5"
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
+pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
 pegainfer-kernels = { path = "pegainfer-kernels" }
 pegainfer-qwen3-4b = { path = "pegainfer-qwen3-4b" }
 pegainfer-qwen35-4b = { path = "pegainfer-qwen35-4b" }

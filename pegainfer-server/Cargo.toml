@@ -19,6 +19,7 @@ path = "src/bin/bench_serving.rs"
 
 [dependencies]
 pegainfer-core = { workspace = true }
+pegainfer-deepseek-v4 = { workspace = true, optional = true }
 pegainfer-qwen3-4b = { workspace = true }
 pegainfer-qwen35-4b = { workspace = true }
 anyhow = { workspace = true }
@@ -42,6 +43,10 @@ vllm-engine-core-client = { workspace = true }
 vllm-server = { workspace = true }
 vllm-text = { workspace = true }
 zeromq = { workspace = true }
+
+[features]
+default = []
+deepseek-v4 = ["dep:pegainfer-deepseek-v4", "pegainfer-deepseek-v4/deepseek-v4"]
 
 [dev-dependencies]
 criterion = { workspace = true }

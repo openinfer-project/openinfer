@@ -80,6 +80,8 @@ fn generate_text(
             Some(TokenEvent::Token { id, .. }) => out.push(id),
             Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
+            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
+            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
             None => panic!("scheduler channel closed"),
         }
     }

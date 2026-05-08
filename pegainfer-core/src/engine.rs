@@ -39,6 +39,7 @@ pub struct TokenLogprob {
 pub enum FinishReason {
     Length,
     Stop,
+    Error,
 }
 
 pub struct GenerateRequest {
@@ -61,6 +62,16 @@ pub enum TokenEvent {
     },
     Finished {
         finish_reason: FinishReason,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+    Error {
+        message: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+    Rejected {
+        message: String,
         prompt_tokens: usize,
         completion_tokens: usize,
     },

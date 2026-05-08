@@ -889,6 +889,12 @@ impl BenchModel for SchedulerBenchModel {
                     }
                     Some(TokenEvent::PromptTokens { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
+                    Some(TokenEvent::Error { message, .. }) => {
+                        anyhow::bail!("scheduler request failed: {message}");
+                    }
+                    Some(TokenEvent::Rejected { message, .. }) => {
+                        anyhow::bail!("scheduler request rejected: {message}");
+                    }
                     None => anyhow::bail!("scheduler channel closed"),
                 }
             }
@@ -1606,6 +1612,21 @@ fn main() -> Result<()> {
     let load_start = Instant::now();
 
     match model_type {
+        #[cfg(feature = "deepseek-v4")]
+        ModelType::DeepSeekV4 => {
+            let handle = pegainfer_deepseek_v4::start_engine(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    device_ordinals: (0..8).collect(),
+                    seed: command_seed(&cli),
+                },
+            )?;
+            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
+            let load_ms = dur_ms(load_start.elapsed());
+            let mut bench = SchedulerBenchModel { handle };
+            dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
+        }
         ModelType::Qwen3 => {
             let handle = pegainfer_qwen3_4b::start_engine(
                 Path::new(&cli.model_path),

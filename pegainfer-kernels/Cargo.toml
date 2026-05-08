@@ -11,5 +11,9 @@ half = { workspace = true }
 [build-dependencies]
 cc = { workspace = true }
 
+[features]
+default = []
+deepseek-v4 = []
+
 [lints]
 workspace = true

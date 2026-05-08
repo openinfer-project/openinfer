@@ -34,7 +34,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     logging::init_default();
 
     let args = Args::parse();
@@ -57,6 +57,22 @@ async fn main() {
     );
 
     let handle = match model_type {
+        #[cfg(feature = "deepseek-v4")]
+        ModelType::DeepSeekV4 => {
+            let handle = pegainfer_deepseek_v4::start_engine(
+                &args.model_path,
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    device_ordinals: (0..8).collect(),
+                    seed: 42,
+                },
+            )
+            .expect("Failed to start DeepSeek V4 engine");
+
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+
+            handle
+        }
         ModelType::Qwen3 => {
             let device_ordinals: Vec<usize> = if args.tp_size == 1 {
                 vec![args.device_ordinal]
@@ -102,4 +118,6 @@ async fn main() {
     )
     .await
     .expect("vLLM frontend server failed");
+
+    Ok(())
 }

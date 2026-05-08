@@ -22,6 +22,25 @@
 
 using DType = __nv_bfloat16;
 
+__global__ void rms_norm_batched_serial_kernel(const DType *x, const DType *weight, DType *out,
+                                               int hidden_dim, int seq_len, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_dim * seq_len;
+    if (idx >= total) return;
+
+    int dim = idx % hidden_dim;
+    int row = idx / hidden_dim;
+    const DType *row_x = x + row * hidden_dim;
+    float sum_sq = 0.0f;
+    for (int k = 0; k < hidden_dim; ++k) {
+        float value = __bfloat162float(row_x[k]);
+        sum_sq += value * value;
+    }
+    float inv_rms = rsqrtf(sum_sq / hidden_dim + eps);
+    float value = __bfloat162float(row_x[dim]) * inv_rms * __bfloat162float(weight[dim]);
+    out[row * hidden_dim + dim] = __float2bfloat16(value);
+}
+
 extern "C" {
 
 // ============================================================================
@@ -31,10 +50,7 @@ void rms_norm_cuda(const DType *x, const DType *weight, DType *out,
                    int n, float eps, cudaStream_t stream) {
     flashinfer::norm::RMSNorm<DType>(
         const_cast<DType*>(x), const_cast<DType*>(weight), out,
-        /*batch_size=*/1, /*d=*/static_cast<uint32_t>(n),
-        /*stride_input=*/static_cast<uint32_t>(n),
-        /*stride_output=*/static_cast<uint32_t>(n),
-        eps, /*enable_pdl=*/false, stream);
+        1, n, n, n, eps, false, stream);
 }
 
 // ============================================================================
@@ -45,11 +61,7 @@ void rms_norm_batched_cuda(const DType *x, const DType *weight, DType *out,
                            float eps, cudaStream_t stream) {
     flashinfer::norm::RMSNorm<DType>(
         const_cast<DType*>(x), const_cast<DType*>(weight), out,
-        /*batch_size=*/static_cast<uint32_t>(seq_len),
-        /*d=*/static_cast<uint32_t>(hidden_dim),
-        /*stride_input=*/static_cast<uint32_t>(hidden_dim),
-        /*stride_output=*/static_cast<uint32_t>(hidden_dim),
-        eps, /*enable_pdl=*/false, stream);
+        seq_len, hidden_dim, hidden_dim, hidden_dim, eps, false, stream);
 }
 
 // ============================================================================

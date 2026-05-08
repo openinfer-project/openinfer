@@ -109,6 +109,8 @@ fn generate_text_scheduler(
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
+            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
+            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
             None => panic!("scheduler closed"),
         }
     }

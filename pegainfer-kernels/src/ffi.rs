@@ -5,6 +5,20 @@ pub type Half = u16;
 
 // CUDA kernels - all use half precision
 unsafe extern "C" {
+    pub fn deepseek_bf16_to_f32_cuda(
+        input: *const Half,
+        output: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_f32_to_bf16_cuda(
+        input: *const f32,
+        output: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn rms_norm_cuda(
         x: *const Half,
         weight: *const Half,
@@ -67,6 +81,17 @@ unsafe extern "C" {
         out: *mut Half,
         hidden_size: i32,
         seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn embedding_batched_vocab_shard_cuda(
+        embed: *const Half,
+        token_ids: *const u32,
+        out: *mut Half,
+        hidden_size: i32,
+        seq_len: i32,
+        vocab_start: u32,
+        part_vocab_size: u32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -201,6 +226,459 @@ unsafe extern "C" {
         rms_eps: f32,
         stream: CUstream,
     );
+
+    pub fn deepseek_fp8_linear_cuda(
+        x: *const Half,
+        weight: *const u8,
+        weight_scale: *const u8,
+        out: *mut Half,
+        seq_len: i32,
+        in_dim: i32,
+        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_fp4_linear_cuda(
+        x: *const Half,
+        weight: *const u8,
+        weight_scale: *const u8,
+        out: *mut Half,
+        seq_len: i32,
+        in_dim: i32,
+        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_swiglu_clamp_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        n: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_swiglu_clamp_weighted_cuda(
+        gate: *const Half,
+        up: *const Half,
+        route_weights: *const f32,
+        route_indices: *const i32,
+        out: *mut Half,
+        n: i32,
+        hidden_dim: i32,
+        topk: i32,
+        global_expert: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hash_gate_cuda(
+        x: *const Half,
+        gate_weight: *const Half,
+        tid2eid: *const i64,
+        token_ids: *const u32,
+        route_weights: *mut f32,
+        route_indices: *mut i32,
+        seq_len: i32,
+        hidden_dim: i32,
+        n_experts: i32,
+        topk: i32,
+        route_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_score_gate_cuda(
+        x: *const Half,
+        gate_weight: *const Half,
+        gate_bias: *const f32,
+        route_weights: *mut f32,
+        route_indices: *mut i32,
+        seq_len: i32,
+        hidden_dim: i32,
+        n_experts: i32,
+        topk: i32,
+        route_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_score_gate_debug_cuda(
+        x: *const Half,
+        gate_weight: *const Half,
+        gate_bias: *const f32,
+        raw_scores: *mut f32,
+        original_scores: *mut f32,
+        select_scores: *mut f32,
+        route_weights: *mut f32,
+        route_indices: *mut i32,
+        seq_len: i32,
+        hidden_dim: i32,
+        n_experts: i32,
+        topk: i32,
+        route_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_weighted_expert_accum_cuda(
+        expert_out: *const Half,
+        route_weights: *const f32,
+        route_indices: *const i32,
+        accum: *mut Half,
+        seq_len: i32,
+        hidden_dim: i32,
+        topk: i32,
+        global_expert: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_weighted_expert_accum_f32_cuda(
+        expert_out: *const Half,
+        route_weights: *const f32,
+        route_indices: *const i32,
+        accum: *mut f32,
+        seq_len: i32,
+        hidden_dim: i32,
+        topk: i32,
+        global_expert: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_expert_accum_f32_cuda(
+        expert_out: *const Half,
+        accum: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_add_f32_bf16_to_bf16_cuda(
+        a: *const f32,
+        b: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_head_rms_norm_cuda(
+        x: *const Half,
+        out: *mut Half,
+        seq_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_apply_rope_q_kv_cuda(
+        q: *mut Half,
+        kv: *mut Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        start_pos: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_fill_rope_cache_cuda(
+        inv_freq: *const f32,
+        cos_cache: *mut f32,
+        sin_cache: *mut f32,
+        max_seq_len: i32,
+        pairs: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_indexed_attention_prefill_cuda(
+        q: *const Half,
+        kv: *const Half,
+        attn_sink: *const f32,
+        topk_idxs: *const i32,
+        out: *mut Half,
+        seq_len: i32,
+        kv_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        topk: i32,
+        softmax_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_indexer_scores_prefill_cuda(
+        q: *const Half,
+        kv: *const Half,
+        weights: *const Half,
+        scores: *mut f32,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        compressed_len: i32,
+        score_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_indexer_topk_prefill_cuda(
+        scores: *const f32,
+        topk_idxs: *mut i32,
+        seq_len: i32,
+        compressed_len: i32,
+        topk: i32,
+        ratio: i32,
+        offset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_indexer_scores_decode_cuda(
+        q: *const Half,
+        kv: *const Half,
+        weights: *const Half,
+        scores: *mut f32,
+        local_heads: i32,
+        head_dim: i32,
+        compressed_len: i32,
+        score_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_indexer_topk_decode_cuda(
+        scores: *const f32,
+        topk_idxs: *mut i32,
+        compressed_len: i32,
+        topk: i32,
+        offset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_concat_topk_indices_cuda(
+        a: *const i32,
+        b: *const i32,
+        out: *mut i32,
+        seq_len: i32,
+        a_topk: i32,
+        b_topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hadamard_fp4_quant_bf16_cuda(
+        x: *mut Half,
+        rows: i32,
+        groups: i32,
+        dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_apply_rope_hidden_cuda(
+        x: *mut Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        start_pos: i32,
+        inverse: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_apply_rope_hidden_strided_cuda(
+        x: *mut Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        start_pos: i32,
+        position_stride: i32,
+        inverse: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_bf16_linear_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        seq_len: i32,
+        in_dim: i32,
+        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_fp8_act_quant_nope_bf16_cuda(
+        x: *mut Half,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        block_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_bf16_copy_rows_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        hidden_dim: i32,
+        rows: i32,
+        src_start_row: i32,
+        dst_start_row: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compressor_nonoverlap_prefill_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        weighted: *mut f32,
+        out: *mut Half,
+        seq_len: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        ratio: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compressor_overlap_prefill_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        weighted: *mut f32,
+        out: *mut Half,
+        seq_len: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compressor_nonoverlap_decode_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut Half,
+        start_pos: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        ratio: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compressor_overlap_decode_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut Half,
+        start_pos: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_concat_seq_bf16_cuda(
+        a: *const Half,
+        b: *const Half,
+        out: *mut Half,
+        a_seq_len: i32,
+        b_seq_len: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_expand_cuda(
+        x: *const Half,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_mixes_cuda(
+        x: *const Half,
+        hc_fn: *const f32,
+        mixes: *mut f32,
+        raw_mixes: *mut f32,
+        rms_scales: *mut f32,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        mix_hc: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_split_sinkhorn_cuda(
+        mixes: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        seq_len: i32,
+        hc: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_pre_output_cuda(
+        x: *const Half,
+        pre: *const f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_head_pre_cuda(
+        mixes: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        pre: *mut f32,
+        seq_len: i32,
+        hc: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_post_cuda(
+        x: *const Half,
+        residual: *const Half,
+        post: *const f32,
+        comb: *const f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_last_token_bf16_logits_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut f32,
+        seq_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
 
     // ========================================================================
     // Qwen3.5 kernels

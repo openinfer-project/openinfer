@@ -289,6 +289,24 @@ async fn run_request_stream(
                 );
                 return;
             }
+            TokenEvent::Error { message, .. } => {
+                let _ = send_terminal_output(
+                    &output_tx,
+                    request_id,
+                    EngineCoreFinishReason::Error,
+                    Some(StopReason::Text(message)),
+                );
+                return;
+            }
+            TokenEvent::Rejected { message, .. } => {
+                let _ = send_terminal_output(
+                    &output_tx,
+                    request_id,
+                    EngineCoreFinishReason::Stop,
+                    Some(StopReason::Text(message)),
+                );
+                return;
+            }
         }
     }
 }
@@ -443,6 +461,7 @@ fn convert_finish_reason(reason: FinishReason) -> EngineCoreFinishReason {
     match reason {
         FinishReason::Length => EngineCoreFinishReason::Length,
         FinishReason::Stop => EngineCoreFinishReason::Stop,
+        FinishReason::Error => EngineCoreFinishReason::Error,
     }
 }
 

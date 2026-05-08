@@ -3,4 +3,5 @@
 /models
 /.venv/
 __pycache__/
+*.py[cod]
 /bench_results/
