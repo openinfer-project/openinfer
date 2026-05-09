@@ -22,7 +22,6 @@ pub fn hc_expand_bf16_hidden(
             )
         };
         result.result()?;
-        ctx.sync()?;
     }
     Ok(out)
 }
@@ -792,7 +791,6 @@ pub fn bf16_linear_bf16_hidden(
             )
         };
         result.result()?;
-        ctx.sync()?;
     }
     Ok(out)
 }

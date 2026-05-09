@@ -356,19 +356,20 @@ pub fn window_topk_indices(
     ensure!(seq_len > 0, "seq_len must be positive");
     ensure!(window_size > 0, "window_size must be positive");
     let topk = seq_len.min(window_size);
-    let mut host = vec![-1_i32; seq_len * topk];
-    for token in 0..seq_len {
-        let key_start = token.saturating_sub(window_size - 1);
-        let mut route = 0;
-        for key in key_start..=token {
-            if route < topk {
-                host[token * topk + route] = key as i32;
-                route += 1;
-            }
-        }
+    let mut data = ctx.stream.alloc_zeros(seq_len * topk)?;
+    {
+        let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_window_topk_indices_cuda(
+                out_ptr as *mut i32,
+                seq_len as i32,
+                window_size as i32,
+                topk as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
     }
-    let data = ctx.stream.clone_htod(&host)?;
-    ctx.sync()?;
     Ok((data, topk))
 }
 
@@ -379,25 +380,19 @@ pub fn window_topk_indices_decode(
 ) -> Result<(CudaSlice<i32>, usize)> {
     ctx.set_current()?;
     ensure!(window_size > 0, "window_size must be positive");
-    let mut host = vec![-1_i32; window_size];
-    if start_pos >= window_size - 1 {
-        let pos = start_pos % window_size;
-        let mut route = 0;
-        for key in (pos + 1)..window_size {
-            host[route] = key as i32;
-            route += 1;
-        }
-        for key in 0..=pos {
-            host[route] = key as i32;
-            route += 1;
-        }
-    } else {
-        for (idx, slot) in host.iter_mut().enumerate().take(start_pos + 1) {
-            *slot = idx as i32;
-        }
+    let mut data = ctx.stream.alloc_zeros(window_size)?;
+    {
+        let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_window_topk_indices_decode_cuda(
+                out_ptr as *mut i32,
+                start_pos as i32,
+                window_size as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
     }
-    let data = ctx.stream.clone_htod(&host)?;
-    ctx.sync()?;
     Ok((data, window_size))
 }
 
@@ -415,17 +410,21 @@ pub fn compress_topk_indices(
         compressed > 0,
         "seq_len {seq_len} is smaller than ratio {ratio}"
     );
-    let mut host = vec![-1_i32; seq_len * compressed];
-    for token in 0..seq_len {
-        let valid = (token + 1) / ratio;
-        for block in 0..compressed {
-            if block < valid {
-                host[token * compressed + block] = (offset + block) as i32;
-            }
-        }
+    let mut data = ctx.stream.alloc_zeros(seq_len * compressed)?;
+    {
+        let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_compress_topk_indices_cuda(
+                out_ptr as *mut i32,
+                seq_len as i32,
+                compressed as i32,
+                ratio as i32,
+                offset as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
     }
-    let data = ctx.stream.clone_htod(&host)?;
-    ctx.sync()?;
     Ok((data, compressed))
 }
 
@@ -438,11 +437,19 @@ pub fn compress_topk_indices_decode(
     ctx.set_current()?;
     ensure!(ratio > 0, "compress ratio must be positive");
     let compressed = (start_pos + 1) / ratio;
-    let host = (0..compressed)
-        .map(|block| (offset + block) as i32)
-        .collect::<Vec<_>>();
-    let data = ctx.stream.clone_htod(&host)?;
-    ctx.sync()?;
+    let mut data = ctx.stream.alloc_zeros(compressed)?;
+    {
+        let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_compress_topk_indices_decode_cuda(
+                out_ptr as *mut i32,
+                compressed as i32,
+                offset as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
     Ok((data, compressed))
 }
 
@@ -464,25 +471,24 @@ pub fn window_and_compress_topk_indices(
         "seq_len {seq_len} is smaller than ratio {ratio}"
     );
     let topk = window_topk + compressed;
-    let mut host = vec![-1_i32; seq_len * topk];
-    for token in 0..seq_len {
-        let key_start = token.saturating_sub(window_size - 1);
-        let mut route = 0;
-        for key in key_start..=token {
-            if route < window_topk {
-                host[token * topk + route] = key as i32;
-                route += 1;
-            }
-        }
-        let valid = (token + 1) / ratio;
-        for block in 0..compressed {
-            if block < valid {
-                host[token * topk + window_topk + block] = (compress_offset + block) as i32;
-            }
-        }
+    let mut data = ctx.stream.alloc_zeros(seq_len * topk)?;
+    {
+        let (out_ptr, _out_guard) = data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_window_and_compress_topk_indices_cuda(
+                out_ptr as *mut i32,
+                seq_len as i32,
+                window_size as i32,
+                window_topk as i32,
+                compressed as i32,
+                ratio as i32,
+                compress_offset as i32,
+                topk as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
     }
-    let data = ctx.stream.clone_htod(&host)?;
-    ctx.sync()?;
     Ok((data, topk))
 }
 

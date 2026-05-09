@@ -420,10 +420,6 @@ fn run_direct_decode_logits(
             &mut runtime.caches[layer],
         )
         .with_context(|| format!("block_decode_group_bf16_hidden layer {layer} pos {start_pos}"))?;
-        for ctx in &runtime.contexts {
-            ctx.sync()
-                .with_context(|| format!("sync after layer {layer} pos {start_pos}"))?;
-        }
     }
 
     let logits_inputs = (0..8)

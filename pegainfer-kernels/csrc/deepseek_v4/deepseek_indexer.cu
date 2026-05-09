@@ -298,6 +298,87 @@ __global__ void deepseek_concat_topk_indices_kernel(
   }
 }
 
+__global__ void deepseek_window_topk_indices_kernel(
+    int *__restrict__ out,
+    int seq_len,
+    int window_size,
+    int topk) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * topk;
+  if (idx >= total) return;
+  int token = idx / topk;
+  int route = idx - token * topk;
+  int key_start = token - (window_size - 1);
+  if (key_start < 0) key_start = 0;
+  int key = key_start + route;
+  out[idx] = key <= token ? key : -1;
+}
+
+__global__ void deepseek_window_topk_indices_decode_kernel(
+    int *__restrict__ out,
+    int start_pos,
+    int window_size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= window_size) return;
+  if (start_pos >= window_size - 1) {
+    int pos = start_pos % window_size;
+    int first_count = window_size - 1 - pos;
+    out[idx] = idx < first_count ? pos + 1 + idx : idx - first_count;
+  } else {
+    out[idx] = idx <= start_pos ? idx : -1;
+  }
+}
+
+__global__ void deepseek_compress_topk_indices_kernel(
+    int *__restrict__ out,
+    int seq_len,
+    int compressed,
+    int ratio,
+    int offset) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * compressed;
+  if (idx >= total) return;
+  int token = idx / compressed;
+  int block = idx - token * compressed;
+  int valid = (token + 1) / ratio;
+  out[idx] = block < valid ? offset + block : -1;
+}
+
+__global__ void deepseek_compress_topk_indices_decode_kernel(
+    int *__restrict__ out,
+    int compressed,
+    int offset) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= compressed) return;
+  out[idx] = offset + idx;
+}
+
+__global__ void deepseek_window_and_compress_topk_indices_kernel(
+    int *__restrict__ out,
+    int seq_len,
+    int window_size,
+    int window_topk,
+    int compressed,
+    int ratio,
+    int compress_offset,
+    int topk) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * topk;
+  if (idx >= total) return;
+  int token = idx / topk;
+  int route = idx - token * topk;
+  if (route < window_topk) {
+    int key_start = token - (window_size - 1);
+    if (key_start < 0) key_start = 0;
+    int key = key_start + route;
+    out[idx] = key <= token ? key : -1;
+  } else {
+    int block = route - window_topk;
+    int valid = (token + 1) / ratio;
+    out[idx] = block < compressed && block < valid ? compress_offset + block : -1;
+  }
+}
+
 __global__ void deepseek_hadamard_rotate_bf16_serial_kernel(
     const __nv_bfloat16 *__restrict__ x,
     __nv_bfloat16 *__restrict__ out,
@@ -422,6 +503,86 @@ cudaError_t deepseek_concat_topk_indices_cuda(
   int blocks = (total + threads - 1) / threads;
   deepseek_concat_topk_indices_kernel<<<blocks, threads, 0, stream>>>(
       a, b, out, seq_len, a_topk, b_topk);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_window_topk_indices_cuda(
+    int *out,
+    int seq_len,
+    int window_size,
+    int topk,
+    cudaStream_t stream) {
+  if (seq_len <= 0 || window_size <= 0 || topk <= 0) return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  int total = seq_len * topk;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_window_topk_indices_kernel<<<blocks, threads, 0, stream>>>(
+      out, seq_len, window_size, topk);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_window_topk_indices_decode_cuda(
+    int *out,
+    int start_pos,
+    int window_size,
+    cudaStream_t stream) {
+  if (start_pos < 0 || window_size <= 0) return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  int blocks = (window_size + threads - 1) / threads;
+  deepseek_window_topk_indices_decode_kernel<<<blocks, threads, 0, stream>>>(
+      out, start_pos, window_size);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_compress_topk_indices_cuda(
+    int *out,
+    int seq_len,
+    int compressed,
+    int ratio,
+    int offset,
+    cudaStream_t stream) {
+  if (seq_len <= 0 || compressed <= 0 || ratio <= 0) return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  int total = seq_len * compressed;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_compress_topk_indices_kernel<<<blocks, threads, 0, stream>>>(
+      out, seq_len, compressed, ratio, offset);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_compress_topk_indices_decode_cuda(
+    int *out,
+    int compressed,
+    int offset,
+    cudaStream_t stream) {
+  if (compressed < 0) return cudaErrorInvalidValue;
+  if (compressed == 0) return cudaSuccess;
+  constexpr int threads = 256;
+  int blocks = (compressed + threads - 1) / threads;
+  deepseek_compress_topk_indices_decode_kernel<<<blocks, threads, 0, stream>>>(
+      out, compressed, offset);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_window_and_compress_topk_indices_cuda(
+    int *out,
+    int seq_len,
+    int window_size,
+    int window_topk,
+    int compressed,
+    int ratio,
+    int compress_offset,
+    int topk,
+    cudaStream_t stream) {
+  if (seq_len <= 0 || window_size <= 0 || window_topk <= 0 ||
+      compressed <= 0 || ratio <= 0 || topk <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int total = seq_len * topk;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_window_and_compress_topk_indices_kernel<<<blocks, threads, 0, stream>>>(
+      out, seq_len, window_size, window_topk, compressed, ratio, compress_offset, topk);
   return cudaGetLastError();
 }
 

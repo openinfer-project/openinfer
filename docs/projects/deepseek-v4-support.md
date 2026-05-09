@@ -190,6 +190,8 @@ The major validation bottlenecks were fixed with nsys-guided changes:
 
 The 2026-05-09 prefill RoPE reuse pass changed `prefill_logits_and_decode_cache_group_bf16_hidden` to require caller-provided RoPE caches. The direct engine passes `runtime.ropes`, so cache-seeding prompt prefill no longer calls `precompute_rope_cache` inside the per-layer loop. Local release format/check passed, and exact E2E validation was verified after the change with a low single-digit percent speedup.
 
+The follow-up optimization pass removes two redundant stream synchronizations after pure same-stream kernels (`hc_expand_bf16_hidden` and `bf16_linear_bf16_hidden`), removes the direct decode per-layer host synchronization, reuses thread-local per-device scratch buffers for `all_reduce_hidden_group_fp32`, and generates fixed attention top-k index tensors on GPU instead of building host `Vec<i32>` buffers and synchronizing after H2D copies. Local release format/check passed, and E2E plus speed validation showed a substantial improvement. MoE route-index D2H synchronization remains the next higher-risk target because it changes CPU expert-activation control flow.
+
 Earlier exact-request profiling removed the large synchronous `cudaMalloc/cudaFree` cliff. The current decode-heavy profile shows the remaining allocation issue is many small async allocations and frees inside decode, alongside kernel launch count. The next GPU buckets are NCCL all-reduce and TileLang FP4/FP8 GEMM.
 
 The current synthetic decode-heavy baseline on 5090-dev is:

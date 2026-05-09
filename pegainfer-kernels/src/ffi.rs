@@ -459,6 +459,49 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_window_topk_indices_cuda(
+        out: *mut i32,
+        seq_len: i32,
+        window_size: i32,
+        topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_window_topk_indices_decode_cuda(
+        out: *mut i32,
+        start_pos: i32,
+        window_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compress_topk_indices_cuda(
+        out: *mut i32,
+        seq_len: i32,
+        compressed: i32,
+        ratio: i32,
+        offset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compress_topk_indices_decode_cuda(
+        out: *mut i32,
+        compressed: i32,
+        offset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_window_and_compress_topk_indices_cuda(
+        out: *mut i32,
+        seq_len: i32,
+        window_size: i32,
+        window_topk: i32,
+        compressed: i32,
+        ratio: i32,
+        compress_offset: i32,
+        topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_hadamard_fp4_quant_bf16_cuda(
         x: *mut Half,
         rows: i32,
