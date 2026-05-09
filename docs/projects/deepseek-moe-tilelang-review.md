@@ -1,7 +1,7 @@
 # DeepSeek MoE TileLang Review
 
 **Created**: 2026-05-09
-**Status**: active
+**Status**: complete
 
 ## Current TL;DR
 
@@ -11,7 +11,8 @@
 - A scoped rank-thread decode slice improved 1x32 steady TPOT to `113.54ms/token`. Replacing it with 8 persistent Qwen3-style rank workers improved the same bench to `94.84ms/token`; replacing the decode-only packed MoE path with direct top-k expert execution improved it again to `80.49ms/token`. Full exact E2E passed all 20 cases after each effective optimization.
 - Persistent-worker nsys shows about `107` f32 all-reduce collectives per steady decode token. Post-arrival NCCL tail is only about `0.019ms/collective`, while arrival skew averages about `0.83ms/collective`; per-token skew is therefore the Amdahl-sized bucket. The direct proof is in `dsv4_rank_stage_proof.sqlite`: for `token=12`, `layer=17`, `moe_ar`, rank0's NCCL kernel lasts `1.220ms` only because rank4 reaches the same collective `1.200ms` later after running local MoE and shared-expert work. The root cause is not a single 60ms NCCL transfer, and EP8 routed expert imbalance alone does not explain 100ms TPOT. The stronger explanation is repeated rank phase skew before collectives, amplified by runtime/allocator/host-loop overhead and then serialized across 43 layers.
 - Failed optimizations to avoid repeating: replacing hot zeroed allocations with uninitialized allocation regressed 1x32 TPOT to `107.52ms/token`; sharing W1/W3 FP4 activation quantization regressed it to `119.63ms/token`; CPU-pinning persistent workers regressed to `105.66ms/token`; moving routed all-reduce before shared expert regressed to `85.67ms/token`; rank0-only route broadcast regressed to `86.98ms/token`; moving shared expert before routed expert regressed to `87.58ms/token`; BF16 tensor-op score gate regressed to `85.03ms/token`; BF16 attention all-reduce regressed to `86.51ms/token`. These were reverted.
-- Next optimization should reduce the remaining per-rank MoE decode imbalance, runtime allocation/launch amplification, and/or the number of f32 collectives. Polishing standalone memset or quant-launch details is not enough unless it moves the per-token skew bucket.
+- Current-pass conclusion: `80.49ms/token` is close to the small-patch ceiling for this architecture. The next real drop needs to reduce routed expert imbalance, fuse/group the decode routed expert path, make route/expert scheduling GPU-resident, or reduce the number of f32 collective barriers. Polishing standalone memset, gate, dtype, CPU affinity, or local operation ordering is not enough unless it moves the per-token skew bucket.
+- Defensible TPOT ceiling estimate: `70-80ms/token` is the current structure's near ceiling; `55-65ms/token` likely needs grouped/fused routed expert decode and less runtime/host scheduling; `45-55ms/token` likely needs fewer collective barriers or a different communication/dataflow design; below `45ms/token` is not credible from the present MP8 decode structure.
 - Keep this profile as the decode composition baseline for the next refactor; do not judge future MoE changes only by exact e2e text pass.
 
 ## Preparation
@@ -39,6 +40,7 @@
 ### Step 10: Hard stop for current optimization pass
 - 2026-05-10 01:18 CST: the user set a hard stop at 2026-05-10 04:30 CST. If no additional effective optimization is found by then, stop with the current evidence, a ceiling estimate, clean worktree, and a final conclusion instead of spending more tokens on low-Amdahl experiments.
 - Working rule after the direct top-k MoE commit: only keep changes that move the measured 1x32 steady TPOT below the committed `80.49ms/token` baseline and then pass full exact DeepSeek V4 E2E. Failed experiments should be recorded and reverted.
+- 2026-05-10 01:43 CST conclusion: stopped early because the remaining candidates that fit a small safe patch all failed the Amdahl test. The failing experiments consistently regressed to `85-107ms/token`, while the committed direct top-k MoE path remains the best exact-E2E-validated result at `80.49ms/token`.
 
 ### Step 1: Inspect official DeepSeek TileKernels MoE directory
 - Cloned the official repository for local inspection:
