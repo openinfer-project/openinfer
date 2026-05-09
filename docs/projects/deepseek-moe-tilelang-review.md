@@ -475,9 +475,46 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
     - case 12: `15` tokens, `88.76ms` TPOT
     - case 18: `14` tokens, `88.91ms` TPOT
   - Interpretation: this validates the Amdahl analysis. The win is not from making FP4 GEMMs faster; it removes decode-only packed mapping/expand/reduce work and the host loop over 32 local experts, so ranks reach the MoE all-reduce with less phase skew and less runtime fragmentation. The remaining TPOT still pays 43 MoE all-reduces, 43 attention all-reduces, and 21 indexer all-reduces per token.
+- Reprofiled the direct top-k MoE decode path:
+
+```bash
+nsys profile --stats=false --force-overwrite=true \
+  --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+  --delay=34 --duration=12 \
+  -o target/profiling/dsv4_decode_direct_topk_moe_1x32 \
+  target/release/bench_serving \
+  --model-path /data/DeepSeek-V4-Flash --format json \
+  request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+
+nsys export --type sqlite --force-overwrite=true \
+  -o target/profiling/dsv4_decode_direct_topk_moe_1x32.sqlite \
+  target/profiling/dsv4_decode_direct_topk_moe_1x32.nsys-rep
+```
+
+  - Trace artifacts:
+    - `target/profiling/dsv4_decode_direct_topk_moe_1x32.nsys-rep`
+    - `target/profiling/dsv4_decode_direct_topk_moe_1x32.sqlite`
+  - The nsys run was distorted (`122.89ms/token`) and ended with the known NCCL destructor abort after benchmark JSON. Use it for composition and ordering, not absolute TPOT.
+  - Direct top-k MoE removed the intended packed-layout decode work. In this trace, `deepseek_moe_local_mapping_kernel`, `deepseek_moe_expand_to_fused_kernel`, and `deepseek_moe_reduce_fused_f32_kernel` each have only `416` launches; the new `deepseek_moe_accumulate_weighted_bf16_to_f32_kernel` has `14,560` launches but only `12.25ms` total in the trace.
+  - The remaining f32 all-reduce bucket is still mostly arrival skew, not NCCL transfer:
+    - `32` final logits all-gather groups give token boundaries.
+    - steady tokens `2..30` each have `107` f32 all-reduce collectives.
+    - average f32 collective skew is `0.572ms`; average post-arrival tail is `0.0193ms`.
+    - average per steady token skew is `61.17ms/token`; average post-arrival tail is `2.07ms/token`.
+    - per-token skew increased in the tail of the nsys window (`~74-80ms` on tokens 27-30), so the trace shows profiler/runtime drift in addition to real skew.
+  - Kernel composition after direct top-k MoE:
+    - raw f32 NCCL kernel sum: `17.86s` in trace, still mostly wait time.
+    - routed FP4 expert GEMM totals remain large: W1/W3 `1.97s`, W2 `0.51s`.
+    - packed MoE layout kernels are no longer material (`<1ms` each).
+    - FP4 expert work is still uneven by device; rank/device 6 is highest (`4236` W1/W3 kernels, `279.5ms`) while device 4 is lowest (`3452`, `225.6ms`). This supports route-dependent local expert work as a remaining skew source.
+  - Runtime/API churn remains large on rank workers:
+    - `cudaLaunchKernel_v7000`: `1.22M` calls.
+    - `cuMemAllocAsync`: `836.5K` calls; `cuMemFreeAsync`: `836.1K` calls.
+    - `cuMemcpyDtoHAsync_v2`: `20.3K` calls; `cuStreamSynchronize`: `19.9K` calls.
+    - The direct top-k path still does one route-index D2H sync per rank per layer; removing packed layout lowered work, but did not make routing/expert scheduling GPU-resident.
 - Next action:
   - Stop chasing raw kernel-launch and memset counts until a change shows it reduces per-token skew.
-  - Reprofile the new `80.49ms/token` decode path and recompute logical-collective skew. If the skew bucket is still dominant, focus on reducing MoE rank-local imbalance further, keeping expert routing/execution GPU-resident without host route sync, or reducing/fusing f32 collectives so each rank-local imbalance is paid fewer times.
+  - The next experiment should target route/expert scheduling or allocation churn, not packed MoE layout. Candidate directions: remove the decode MoE route-index D2H/sync, preallocate per-rank MoE scratch for W1/W3/activation/W2 outputs, or reduce/fuse f32 collectives so each remaining rank-local imbalance is paid fewer times.
   - Any BF16/faster all-reduce experiment must be judged by exact E2E plus logical-collective wall analysis. A faster NCCL tail alone cannot move TPOT much while `~80-100ms/token` is arrival skew.
 
 ## Debrief
@@ -493,8 +530,8 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - For DeepSeek V4 MoE, routing indices should become GPU-resident execution metadata. The CPU should not decide active experts from a full D2H route-index copy in the hot path.
   - The next useful kernel import is likely `mask_indices_by_tp` / `group_count` or `get_fused_mapping`, not `topk_gate`, but decode performance ultimately needs grouped/fused routed expert execution or fewer collective barriers.
   - DeepSeek MP8 decode should keep the persistent worker architecture. Worker-owned contexts/comms removed the per-layer thread lifecycle cost and lowered the dispatch skew enough to make smaller GPU buckets visible.
-  - After persistent workers, the next performance question is why ranks reach each collective at different times. Current evidence points to route-dependent MoE expert work count plus runtime/API amplification from allocation/free, launch gaps, D2H synchronization, and host-controlled local-expert loops, not NCCL link bandwidth.
+  - After persistent workers and direct top-k MoE, the next performance question is why ranks still reach each collective at different times. Current evidence points to route-dependent MoE expert work count plus runtime/API amplification from allocation/free, launch gaps, D2H synchronization, and host-controlled route/expert scheduling, not NCCL link bandwidth.
 - **Follow-ups**:
-  - Reprofile the direct top-k MoE decode path, then build the next experiment around reducing remaining MoE rank-local imbalance/runtime churn or reducing the number of f32 collectives.
+  - Build the next experiment around reducing remaining MoE route/expert scheduling sync, rank-local imbalance, runtime allocation churn, or the number of f32 collectives.
   - Add a targeted MoE routing parity test against official `top2_sum_gate` semantics for the current config.
   - Decide whether to keep packed layout only for prefill and add a separate decode-specific routed expert kernel.
