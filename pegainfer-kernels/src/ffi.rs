@@ -344,6 +344,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_moe_accumulate_weighted_bf16_to_f32_cuda(
+        expert_out: *const Half,
+        route_weights: *const f32,
+        route: i32,
+        out: *mut f32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_add_f32_bf16_to_bf16_cuda(
         a: *const f32,
         b: *const Half,

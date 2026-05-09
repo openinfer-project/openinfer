@@ -749,18 +749,8 @@ pub fn block_decode_rank_lane_bf16_hidden(
     } else {
         score_route_bf16_hidden(ctx, config, &ffn_norm, &ffn)?
     };
-    let plan = build_moe_fused_route_plan(ctx, config, weights, routed, ffn_norm.hidden_dim)?;
-    let expanded_input = expand_moe_fused_input(ctx, &ffn_norm, &plan)?;
-    let expanded_out = local_experts_forward_packed_bf16_hidden(
-        ctx,
-        config,
-        weights,
-        layer,
-        &expanded_input,
-        &plan,
-    )?;
     let mut routed_out =
-        reduce_moe_fused_output_f32(ctx, &expanded_out, &plan, ffn_norm.hidden_dim)?;
+        decode_routed_moe_rank_local_f32_hidden(ctx, config, weights, layer, &ffn_norm, &routed)?;
     let shared_out = shared_expert_forward_bf16_hidden(ctx, &ffn_norm, &ffn, config.swiglu_limit)?;
     all_reduce_f32_hidden_in_place(&mut routed_out, comm)
         .with_context(|| format!("moe routed all_reduce layer {layer}"))?;

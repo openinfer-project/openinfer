@@ -350,6 +350,105 @@ pub fn reduce_moe_fused_output_f32(
     Ok(out)
 }
 
+fn accumulate_weighted_bf16_to_f32_hidden(
+    ctx: &RankGpuContext,
+    expert_out: &Bf16HiddenStates,
+    route_weights: &CudaSlice<f32>,
+    route: usize,
+    out: &mut F32HiddenStates,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        expert_out.seq_len == 1,
+        "weighted MoE accumulate expects seq_len=1, got {}",
+        expert_out.seq_len
+    );
+    ensure!(
+        out.seq_len == 1,
+        "weighted MoE accumulate output expects seq_len=1, got {}",
+        out.seq_len
+    );
+    ensure!(
+        expert_out.hidden_dim == out.hidden_dim,
+        "weighted MoE accumulate hidden dim mismatch: expert={}, out={}",
+        expert_out.hidden_dim,
+        out.hidden_dim
+    );
+    {
+        let (expert_ptr, _expert_guard) = expert_out.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = route_weights.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_accumulate_weighted_bf16_to_f32_cuda(
+                expert_ptr as *const ffi::Half,
+                weights_ptr as *const f32,
+                route as i32,
+                out_ptr as *mut f32,
+                out.hidden_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_routed_moe_rank_local_f32_hidden(
+    ctx: &RankGpuContext,
+    config: &Config,
+    weights: &RankWeightView<'_>,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    routed: &RoutedExperts,
+) -> Result<F32HiddenStates> {
+    ctx.set_current()?;
+    ensure!(
+        input.seq_len == 1,
+        "decode routed MoE expects seq_len=1, got {}",
+        input.seq_len
+    );
+    ensure!(
+        routed.seq_len == 1,
+        "decode routed MoE route seq_len mismatch: {}",
+        routed.seq_len
+    );
+    ensure!(
+        routed.topk == config.n_activated_experts,
+        "decode routed MoE topk mismatch: route={}, config={}",
+        routed.topk,
+        config.n_activated_experts
+    );
+    ensure!(
+        config.n_routed_experts.is_multiple_of(weights.world_size()),
+        "n_routed_experts={} must be divisible by world_size={}",
+        config.n_routed_experts,
+        weights.world_size()
+    );
+    let local_experts = config.n_routed_experts / weights.world_size();
+    let global_start = weights.rank() * local_experts;
+    let route_indices = ctx.stream.clone_dtoh(&routed.indices)?;
+    ctx.sync()?;
+
+    let mut out = F32HiddenStates {
+        data: ctx.stream.alloc_zeros(input.hidden_dim)?,
+        hidden_dim: input.hidden_dim,
+        seq_len: 1,
+    };
+    for (route, expert_id) in route_indices.iter().copied().enumerate().take(routed.topk) {
+        if expert_id < global_start as i32
+            || expert_id >= (global_start + local_experts) as i32
+        {
+            continue;
+        }
+        let local_expert = expert_id as usize - global_start;
+        let expert = weights.local_expert(layer, local_expert)?;
+        let expert_out =
+            local_expert_forward_bf16_hidden(ctx, input, &expert, config.swiglu_limit)?;
+        accumulate_weighted_bf16_to_f32_hidden(ctx, &expert_out, &routed.weights, route, &mut out)?;
+    }
+    Ok(out)
+}
+
 pub fn local_experts_forward_packed_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,

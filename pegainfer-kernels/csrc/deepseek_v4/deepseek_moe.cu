@@ -616,6 +616,18 @@ __global__ void deepseek_moe_reduce_fused_f32_kernel(
   out[idx] = acc;
 }
 
+__global__ void deepseek_moe_accumulate_weighted_bf16_to_f32_kernel(
+    const __nv_bfloat16 *__restrict__ expert_out,
+    const float *__restrict__ route_weights,
+    int route,
+    float *__restrict__ out,
+    int hidden_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= hidden_dim) return;
+  float weight = route_weights[route];
+  out[idx] = __fadd_rn(out[idx], __bfloat162float(expert_out[idx]) * weight);
+}
+
 extern "C" {
 
 cudaError_t deepseek_moe_local_mapping_cuda(
@@ -708,6 +720,20 @@ cudaError_t deepseek_moe_reduce_fused_f32_cuda(
   int blocks = (total + threads - 1) / threads;
   deepseek_moe_reduce_fused_f32_kernel<<<blocks, threads, 0, stream>>>(
       expanded, route_weights, token_topk_to_pos, out, seq_len, hidden_dim, topk);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_moe_accumulate_weighted_bf16_to_f32_cuda(
+    const __nv_bfloat16 *expert_out,
+    const float *route_weights,
+    int route,
+    float *out,
+    int hidden_dim,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  int blocks = (hidden_dim + threads - 1) / threads;
+  deepseek_moe_accumulate_weighted_bf16_to_f32_kernel<<<blocks, threads, 0, stream>>>(
+      expert_out, route_weights, route, out, hidden_dim);
   return cudaGetLastError();
 }
 
