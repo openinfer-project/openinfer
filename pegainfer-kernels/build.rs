@@ -28,6 +28,14 @@ struct TileLangArtifacts {
     cutlass_include: PathBuf,
 }
 
+struct FlashInferIncludes {
+    include: PathBuf,
+    csrc: PathBuf,
+    cutlass: PathBuf,
+    cutlass_util: PathBuf,
+    spdlog: PathBuf,
+}
+
 fn workspace_root() -> PathBuf {
     crate_root().join("..")
 }
@@ -386,11 +394,22 @@ fn generate_deepseek_tilelang_artifacts(out_dir: &Path) -> TileLangArtifacts {
     }
 }
 
-fn flashinfer_include_dir() -> PathBuf {
+fn first_existing_dir(candidates: &[PathBuf], fallback: PathBuf) -> PathBuf {
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .cloned()
+        .unwrap_or(fallback)
+}
+
+fn flashinfer_includes() -> FlashInferIncludes {
+    let crate_root = crate_root();
+    let root = workspace_root();
+
     if let Ok(path) = std::env::var("PEGAINFER_FLASHINFER_INCLUDE") {
         let path = PathBuf::from(path);
         if path.join("flashinfer/sampling.cuh").exists() {
-            return path;
+            return flashinfer_includes_from_include(path);
         }
         println!(
             "cargo:warning=PEGAINFER_FLASHINFER_INCLUDE={} does not contain flashinfer/sampling.cuh; falling back.",
@@ -398,9 +417,13 @@ fn flashinfer_include_dir() -> PathBuf {
         );
     }
 
-    let root = workspace_root();
     let candidates = [
+        crate_root.join("third_party/flashinfer/include"),
         root.join("third_party/flashinfer/include"),
+        root.join(".venv/lib/python3.13/site-packages/flashinfer/data/include"),
+        root.join(".venv/lib/python3.12/site-packages/flashinfer/data/include"),
+        root.join(".venv/lib/python3.11/site-packages/flashinfer/data/include"),
+        root.join(".venv/lib/python3.10/site-packages/flashinfer/data/include"),
         root.join("../.venv/lib/python3.13/site-packages/flashinfer/data/include"),
         root.join("../.venv/lib/python3.12/site-packages/flashinfer/data/include"),
         root.join("../.venv/lib/python3.11/site-packages/flashinfer/data/include"),
@@ -409,11 +432,49 @@ fn flashinfer_include_dir() -> PathBuf {
 
     for candidate in candidates {
         if candidate.join("flashinfer/sampling.cuh").exists() {
-            return candidate;
+            return flashinfer_includes_from_include(candidate);
         }
     }
 
-    root.join("third_party/flashinfer/include")
+    flashinfer_includes_from_include(crate_root.join("third_party/flashinfer/include"))
+}
+
+fn flashinfer_includes_from_include(include: PathBuf) -> FlashInferIncludes {
+    let flashinfer_root = include
+        .parent()
+        .expect("FlashInfer include dir must have a parent")
+        .to_path_buf();
+
+    let csrc = flashinfer_root.join("csrc");
+    let cutlass = first_existing_dir(
+        &[
+            flashinfer_root.join("3rdparty/cutlass/include"),
+            flashinfer_root.join("cutlass/include"),
+        ],
+        flashinfer_root.join("cutlass/include"),
+    );
+    let cutlass_util = first_existing_dir(
+        &[
+            flashinfer_root.join("3rdparty/cutlass/tools/util/include"),
+            flashinfer_root.join("cutlass/tools/util/include"),
+        ],
+        flashinfer_root.join("cutlass/tools/util/include"),
+    );
+    let spdlog = first_existing_dir(
+        &[
+            flashinfer_root.join("3rdparty/spdlog/include"),
+            flashinfer_root.join("spdlog/include"),
+        ],
+        flashinfer_root.join("spdlog/include"),
+    );
+
+    FlashInferIncludes {
+        include,
+        csrc,
+        cutlass,
+        cutlass_util,
+        spdlog,
+    }
 }
 
 fn triton_target(sm_targets: &[String]) -> String {
@@ -810,18 +871,10 @@ fn main() {
 
     let nvcc_jobs = nvcc_job_count();
     println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
-    let flashinfer_include = flashinfer_include_dir();
-    let flashinfer_data = flashinfer_include
-        .parent()
-        .expect("FlashInfer include dir must have a parent")
-        .to_path_buf();
-    let flashinfer_cutlass_include = flashinfer_data.join("cutlass/include");
-    let flashinfer_cutlass_util_include = flashinfer_data.join("cutlass/tools/util/include");
-    let flashinfer_csrc_include = flashinfer_data.join("csrc");
-    let flashinfer_spdlog_include = flashinfer_data.join("spdlog/include");
+    let flashinfer = flashinfer_includes();
     println!(
         "cargo:warning=Using FlashInfer include dir: {}",
-        flashinfer_include.display()
+        flashinfer.include.display()
     );
 
     let mut nvcc_tasks = Vec::new();
@@ -849,17 +902,15 @@ fn main() {
             nvcc_args.extend([
                 "--std=c++17".to_string(),
                 "-I".to_string(),
-                flashinfer_include.to_string_lossy().to_string(),
+                flashinfer.include.to_string_lossy().to_string(),
                 "-I".to_string(),
-                flashinfer_csrc_include.to_string_lossy().to_string(),
+                flashinfer.csrc.to_string_lossy().to_string(),
                 "-I".to_string(),
-                flashinfer_cutlass_include.to_string_lossy().to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
                 "-I".to_string(),
-                flashinfer_cutlass_util_include
-                    .to_string_lossy()
-                    .to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
                 "-I".to_string(),
-                flashinfer_spdlog_include.to_string_lossy().to_string(),
+                flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
         }
 
@@ -1008,6 +1059,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");
     println!("cargo:rerun-if-env-changed=CUDA_SM");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_FLASHINFER_INCLUDE");
     println!("cargo:rerun-if-env-changed=PEGAINFER_BUILD_TIMING");
     println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_JOBS");
 }
