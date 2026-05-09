@@ -96,6 +96,7 @@ pub struct TensorRef<'a> {
     pub tensor: &'a GpuRawTensor,
 }
 
+#[derive(Clone)]
 pub struct RankWeightView<'a> {
     config: &'a Config,
     weights: &'a RankWeights,

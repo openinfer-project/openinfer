@@ -44,6 +44,7 @@ pub struct RankWeights {
     pub total_bytes: usize,
 }
 
+#[derive(Clone)]
 pub struct RankGpuContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,

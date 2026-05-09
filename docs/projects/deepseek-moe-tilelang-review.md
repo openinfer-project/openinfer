@@ -7,9 +7,9 @@
 
 - Official DeepSeek `tile_kernels/moe` is routing/layout infrastructure, not a drop-in fused FP4 expert MLP. The useful pieces are `top2_sum_gate`, TP masking, group/count helpers, `get_fused_mapping`, `expand_to_fused`, and `reduce_fused`.
 - The first local packed-layout experiment preserved exact DeepSeek V4 output, but it did not fix decode TPOT. Non-nsys `prompt-len=1`, `output-len=32` measured `171.11ms/token`; nsys measured `268.51ms/token` with profiler overhead.
-- The NCCL bucket was over-interpreted: grouped by 8-rank logical collective, the trace shows most apparent NCCL duration is rank arrival skew/waiting, not pure communication. The bigger immediate issue was CPU serial rank dispatch.
-- A rank-thread decode slice now runs each layer's 8 rank-local block lanes concurrently and enters NCCL from the rank lane. The same `prompt-len=1`, `output-len=32` bench improved steady TPOT to `113.54ms/token` while exact case 0 still passed.
-- Next optimization should turn the scoped rank-thread slice into persistent rank workers like Qwen3 TP, then continue with decode-specific grouped/fused routed expert execution. Polishing standalone MoE expand/reduce kernels is not enough for single-token decode.
+- The NCCL bucket was over-interpreted: grouped by 8-rank logical collective, the trace shows most apparent NCCL duration is rank arrival skew/waiting, not pure communication. The bigger immediate issue was CPU rank dispatch.
+- A scoped rank-thread decode slice improved 1x32 steady TPOT to `113.54ms/token`. Replacing it with 8 persistent Qwen3-style rank workers improved the same bench to `94.84ms/token`; full exact E2E passed all 20 cases.
+- Next optimization should continue with decode-specific grouped/fused routed expert execution and scratch/allocator cleanup. Polishing standalone MoE expand/reduce kernels is not enough for single-token decode.
 - Keep this profile as the decode composition baseline for the next refactor; do not judge future MoE changes only by exact e2e text pass.
 
 ## Preparation
@@ -260,9 +260,78 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - The CPU rank-dispatch hypothesis was correct: a minimal rank-thread decode slice cut steady TPOT from the prior `171ms/token` range to `113.54ms/token`.
   - This slice is not the final architecture because it creates scoped threads every decode layer. The next implementation should mirror Qwen3 TP more closely with 8 persistent rank workers that own `RankGpuContext`, `RankWeightView`, `Comm`, caches, and RoPE state.
 
+### Step 8: Persistent rank workers for direct decode
+- Captured a follow-up nsys trace for the scoped rank-thread path:
+
+```bash
+nsys profile --stats=false --force-overwrite=true \
+  --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
+  --delay=34 --duration=12 \
+  -o target/profiling/dsv4_rank_thread_decode_1x32_direct \
+  target/release/bench_serving \
+  --model-path /data/DeepSeek-V4-Flash --format json \
+  request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+```
+
+  - Trace artifacts:
+    - `target/profiling/dsv4_rank_thread_decode_1x32_direct.nsys-rep`
+    - `target/profiling/dsv4_rank_thread_decode_1x32_direct.sqlite`
+  - The nsys run was heavily distorted (`138.86ms/token`) and ended with the existing NCCL abort-on-exit panic after benchmark JSON had been emitted.
+  - Logical NCCL recomputation for f32 all-reduce kernels:
+    - `6527` f32 NCCL kernels, `815` complete 8-rank groups in the trace window.
+    - Raw per-kernel duration sum: `42165.87ms`.
+    - Logical wall sum: `10448.35ms`.
+    - Arrival skew sum: `10432.51ms`.
+    - Tail after final rank arrival: `15.84ms`.
+    - Interpretation: under nsys, raw NCCL time is almost entirely rank arrival skew / profiling distortion. The post-arrival communication tail averages about `19us` per collective.
+- Implemented persistent direct-decode rank workers:
+  - `load_full_direct_runtime` now starts `deepseek-v4-rank-{0..7}` workers during model load.
+  - Each worker owns a cloned rank CUDA context handle, `RankWeightView`, a decode NCCL communicator, and per-rank RoPE cache. The worker thread binds the CUDA context and initializes thread-local cuBLAS once at startup.
+  - Decode dispatch sends one command per rank per token. Each worker runs embedding, embedding all-reduce, HC expand, all layers, and rank-local final logits inside the persistent lane.
+  - The main direct thread now only moves per-rank decode cache ownership to/from workers and performs the final logits all-gather/argmax.
+  - Prefill remains on the existing group path with its own NCCL communicator. CUDA graph remains unsupported for DeepSeek V4 direct decode.
+- Validation:
+
+```bash
+cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
+```
+
+  - Passed with the existing unreachable-pub warnings in `runtime/core.rs` and `runtime/state.rs`.
+
+```bash
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
+  --model-path /data/DeepSeek-V4-Flash --format json \
+  request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+```
+
+  - load: `35.54s`
+  - TTFT: `175.18ms`
+  - first decode step: `92.94ms`
+  - steady TPOT avg: `94.84ms/token`
+  - p50: `94.23ms`
+  - p95: `98.23ms`
+  - e2e: `3.11s`
+
+```bash
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
+  --model-path /data/DeepSeek-V4-Flash \
+  --ground-truth test_data/deepseek-v4-ground-truth.json \
+  --max-new-tokens 64
+```
+
+  - Passed all 20 DeepSeek V4 exact cases.
+  - Representative long-output cases after persistent workers:
+    - case 4: `21` tokens, `100.89ms` TPOT
+    - case 9: `21` tokens, `102.41ms` TPOT
+    - case 12: `15` tokens, `103.56ms` TPOT
+    - case 18: `14` tokens, `113.72ms` TPOT
+- Interpretation:
+  - Persistent rank workers are an effective CPU-dispatch optimization: scoped rank-thread steady TPOT `113.54ms/token` moved to `94.84ms/token`.
+  - The remaining decode floor is more likely the many tiny FP4/FP8 GEMMs, activation quantization, allocator/memset churn, and model-specific compressor/indexer work than raw NCCL link time.
+
 ## Debrief
 
-- **Outcome**: Official DeepSeek TileKernels MoE source was inspected at commit `36d9e45d38e204ebb87e6f6e833821eee0482fe5`. The main finding is that official MoE support centers on GPU-resident routing selection, TP/EP masking/remapping, expert-major fused mapping, input expansion, and output reduction. A first packed-layout experiment preserved exact output but did not improve decode. A later rank-thread decode slice showed the largest immediate issue was CPU serial rank dispatch/rank arrival skew, improving the 1x32 steady TPOT to `113.54ms/token`.
+- **Outcome**: Official DeepSeek TileKernels MoE source was inspected at commit `36d9e45d38e204ebb87e6f6e833821eee0482fe5`. The main finding is that official MoE support centers on GPU-resident routing selection, TP/EP masking/remapping, expert-major fused mapping, input expansion, and output reduction. A first packed-layout experiment preserved exact output but did not improve decode. Rank-thread decode showed the largest immediate issue was CPU rank dispatch/rank arrival skew, improving 1x32 steady TPOT to `113.54ms/token`; persistent rank workers pushed it further to `94.84ms/token` with all 20 exact cases passing.
 - **Pitfalls encountered**:
   - The name `moe` is easy to misread as a fused expert MLP implementation. In this repository it is mostly layout and routing infrastructure.
   - Local exact text passing does not prove the execution path matches official routing topology; it can still be correct enough for text while doing too much full-batch expert work and synchronizing through host route indices.
@@ -271,9 +340,8 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - **Lessons learned**:
   - For DeepSeek V4 MoE, routing indices should become GPU-resident execution metadata. The CPU should not decide active experts from a full D2H route-index copy in the hot path.
   - The next useful kernel import is likely `mask_indices_by_tp` / `group_count` or `get_fused_mapping`, not `topk_gate`, but decode performance ultimately needs grouped/fused routed expert execution.
-  - DeepSeek MP8 should use persistent rank workers like Qwen3 TP. Scoped rank-thread decode is a useful proof, but worker-owned contexts/comms are the cleaner architecture.
+  - DeepSeek MP8 decode should keep the persistent worker architecture. Worker-owned contexts/comms removed the per-layer thread lifecycle cost and lowered the dispatch skew enough to make smaller GPU buckets visible.
 - **Follow-ups**:
-  - Replace scoped per-layer rank threads with 8 persistent rank workers that own contexts, comms, caches, and RoPE state.
-  - Re-profile the rank-thread decode path and recompute NCCL as logical collectives, not raw per-rank kernel-duration sums.
+  - Re-profile the persistent-worker decode path and recompute NCCL as logical collectives, not raw per-rank kernel-duration sums.
   - Add a targeted MoE routing parity test against official `top2_sum_gate` semantics for the current config.
   - Decide whether to keep packed layout only for prefill and add a separate decode-specific routed expert kernel.

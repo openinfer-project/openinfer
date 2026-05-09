@@ -655,81 +655,10 @@ pub fn block_decode_group_rank_threads_bf16_hidden(
             let comm = RankComm::new(comm);
             handles.push(scope.spawn(move || -> Result<(usize, HcHiddenStates)> {
                 let comm = comm.get();
-                ensure!(
-                    input.seq_len == 1,
-                    "rank-thread block decode expects HC seq_len=1, got {}",
-                    input.seq_len
-                );
-                let block = weights.block(layer)?;
-
-                let (attn_input, attn_hc) = hc_pre_bf16_hidden(
-                    ctx,
-                    config,
-                    input,
-                    &block.hc_attn_fn,
-                    &block.hc_attn_scale,
-                    &block.hc_attn_base,
+                let hidden = block_decode_rank_lane_bf16_hidden(
+                    ctx, weights, comm, config, layer, input, token_ids, rope, start_pos, cache,
                 )
-                .with_context(|| format!("hc_pre attention layer {layer} rank {rank}"))?;
-                let attn_norm =
-                    rms_norm_bf16_hidden(ctx, &attn_input, &block.attn_norm, config.rms_norm_eps)
-                        .with_context(|| format!("attention rms_norm layer {layer} rank {rank}"))?;
-                let mut attn_out = attention_decode_rank_local_collective_bf16_hidden(
-                    ctx,
-                    config,
-                    layer,
-                    &attn_norm,
-                    &block.attn,
-                    rope,
-                    start_pos,
-                    cache,
-                    comm,
-                )
-                .with_context(|| format!("attention decode layer {layer} rank {rank}"))?;
-                all_reduce_hidden_fp32_in_place(ctx, &mut attn_out, comm)
-                    .with_context(|| format!("attention all_reduce layer {layer} rank {rank}"))?;
-                let after_attn = hc_post_bf16_hidden(ctx, &attn_out, input, &attn_hc)
-                    .with_context(|| format!("hc_post attention layer {layer} rank {rank}"))?;
-
-                let (ffn_input, ffn_hc) = hc_pre_bf16_hidden(
-                    ctx,
-                    config,
-                    &after_attn,
-                    &block.hc_ffn_fn,
-                    &block.hc_ffn_scale,
-                    &block.hc_ffn_base,
-                )
-                .with_context(|| format!("hc_pre ffn layer {layer} rank {rank}"))?;
-                let ffn_norm =
-                    rms_norm_bf16_hidden(ctx, &ffn_input, &block.ffn_norm, config.rms_norm_eps)
-                        .with_context(|| format!("ffn rms_norm layer {layer} rank {rank}"))?;
-
-                let ffn = weights.ffn(layer)?;
-                let routed = if layer < config.n_hash_layers {
-                    hash_route_bf16_hidden(ctx, config, &ffn_norm, &ffn, token_ids)?
-                } else {
-                    score_route_bf16_hidden(ctx, config, &ffn_norm, &ffn)?
-                };
-                let plan =
-                    build_moe_fused_route_plan(ctx, config, weights, routed, ffn_norm.hidden_dim)?;
-                let expanded_input = expand_moe_fused_input(ctx, &ffn_norm, &plan)?;
-                let expanded_out = local_experts_forward_packed_bf16_hidden(
-                    ctx,
-                    config,
-                    weights,
-                    layer,
-                    &expanded_input,
-                    &plan,
-                )?;
-                let mut routed_out =
-                    reduce_moe_fused_output_f32(ctx, &expanded_out, &plan, ffn_norm.hidden_dim)?;
-                let shared_out =
-                    shared_expert_forward_bf16_hidden(ctx, &ffn_norm, &ffn, config.swiglu_limit)?;
-                all_reduce_f32_hidden_in_place(&mut routed_out, comm)
-                    .with_context(|| format!("moe routed all_reduce layer {layer} rank {rank}"))?;
-                let ffn_out = add_f32_bf16_to_bf16_hidden(ctx, &routed_out, &shared_out)?;
-                let hidden = hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
-                    .with_context(|| format!("hc_post ffn layer {layer} rank {rank}"))?;
+                .with_context(|| format!("rank-thread block decode layer {layer} rank {rank}"))?;
                 Ok((rank, hidden))
             }));
         }
@@ -749,6 +678,95 @@ pub fn block_decode_group_rank_threads_bf16_hidden(
         Ok(())
     })?;
     Ok(out)
+}
+
+pub fn block_decode_rank_lane_bf16_hidden(
+    ctx: &RankGpuContext,
+    weights: &RankWeightView<'_>,
+    comm: &Comm,
+    config: &Config,
+    layer: usize,
+    input: &HcHiddenStates,
+    token_ids: &CudaSlice<u32>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    cache: &mut LayerDecodeCache,
+) -> Result<HcHiddenStates> {
+    ensure!(
+        input.seq_len == 1,
+        "rank lane block decode expects HC seq_len=1, got {}",
+        input.seq_len
+    );
+    ensure!(
+        layer < config.n_layers,
+        "rank lane block decode layer {layer} out of range"
+    );
+    let block = weights.block(layer)?;
+
+    let (attn_input, attn_hc) = hc_pre_bf16_hidden(
+        ctx,
+        config,
+        input,
+        &block.hc_attn_fn,
+        &block.hc_attn_scale,
+        &block.hc_attn_base,
+    )
+    .with_context(|| format!("hc_pre attention layer {layer}"))?;
+    let attn_norm = rms_norm_bf16_hidden(ctx, &attn_input, &block.attn_norm, config.rms_norm_eps)
+        .with_context(|| format!("attention rms_norm layer {layer}"))?;
+    let mut attn_out = attention_decode_rank_local_collective_bf16_hidden(
+        ctx,
+        config,
+        layer,
+        &attn_norm,
+        &block.attn,
+        rope,
+        start_pos,
+        cache,
+        comm,
+    )
+    .with_context(|| format!("attention decode layer {layer}"))?;
+    all_reduce_hidden_fp32_in_place(ctx, &mut attn_out, comm)
+        .with_context(|| format!("attention all_reduce layer {layer}"))?;
+    let after_attn = hc_post_bf16_hidden(ctx, &attn_out, input, &attn_hc)
+        .with_context(|| format!("hc_post attention layer {layer}"))?;
+
+    let (ffn_input, ffn_hc) = hc_pre_bf16_hidden(
+        ctx,
+        config,
+        &after_attn,
+        &block.hc_ffn_fn,
+        &block.hc_ffn_scale,
+        &block.hc_ffn_base,
+    )
+    .with_context(|| format!("hc_pre ffn layer {layer}"))?;
+    let ffn_norm = rms_norm_bf16_hidden(ctx, &ffn_input, &block.ffn_norm, config.rms_norm_eps)
+        .with_context(|| format!("ffn rms_norm layer {layer}"))?;
+
+    let ffn = weights.ffn(layer)?;
+    let routed = if layer < config.n_hash_layers {
+        hash_route_bf16_hidden(ctx, config, &ffn_norm, &ffn, token_ids)?
+    } else {
+        score_route_bf16_hidden(ctx, config, &ffn_norm, &ffn)?
+    };
+    let plan = build_moe_fused_route_plan(ctx, config, weights, routed, ffn_norm.hidden_dim)?;
+    let expanded_input = expand_moe_fused_input(ctx, &ffn_norm, &plan)?;
+    let expanded_out = local_experts_forward_packed_bf16_hidden(
+        ctx,
+        config,
+        weights,
+        layer,
+        &expanded_input,
+        &plan,
+    )?;
+    let mut routed_out =
+        reduce_moe_fused_output_f32(ctx, &expanded_out, &plan, ffn_norm.hidden_dim)?;
+    let shared_out = shared_expert_forward_bf16_hidden(ctx, &ffn_norm, &ffn, config.swiglu_limit)?;
+    all_reduce_f32_hidden_in_place(&mut routed_out, comm)
+        .with_context(|| format!("moe routed all_reduce layer {layer}"))?;
+    let ffn_out = add_f32_bf16_to_bf16_hidden(ctx, &routed_out, &shared_out)?;
+    hc_post_bf16_hidden(ctx, &ffn_out, &after_attn, &ffn_hc)
+        .with_context(|| format!("hc_post ffn layer {layer}"))
 }
 
 fn attention_decode_rank_local_collective_bf16_hidden(

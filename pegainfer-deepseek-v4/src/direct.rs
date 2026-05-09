@@ -1,6 +1,7 @@
 use std::{path::Path, sync::mpsc as std_mpsc, thread};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use crossbeam_channel as channel;
 use cudarc::driver::{CudaSlice, DevicePtrMut, result as cuda_result};
 use log::{info, warn};
 use pegainfer_core::engine::{
@@ -10,10 +11,13 @@ use tokio::sync::mpsc;
 
 use crate::{
     Config, DeepSeekRopeCache, F32Logits, LayerDecodeCache, RankGpuContext, RankWeightView,
-    TensorParallelConfig, block_decode_group_rank_threads_bf16_hidden,
-    embedding_vocab_parallel_group, final_logits_group_bf16_hidden, hc_expand_bf16_hidden,
-    load_rank_to_gpu, precompute_rope_cache, prefill_logits_and_decode_cache_group_bf16_hidden,
+    TensorParallelConfig, all_gather_logits_group, all_reduce_hidden_in_place,
+    block_decode_rank_lane_bf16_hidden, embedding_rank_local, final_logits_rank_local_bf16_hidden,
+    hc_expand_bf16_hidden, load_rank_to_gpu, precompute_rope_cache,
+    prefill_logits_and_decode_cache_group_bf16_hidden,
 };
+
+type RankResult = (usize, F32Logits, Vec<LayerDecodeCache>);
 
 struct FullDirectRuntime<'a> {
     contexts: Vec<RankGpuContext>,
@@ -21,7 +25,153 @@ struct FullDirectRuntime<'a> {
     comms: Vec<cudarc::nccl::safe::Comm>,
     caches: Vec<Vec<LayerDecodeCache>>,
     ropes: Vec<Vec<DeepSeekRopeCache>>,
+    workers: Vec<RankWorker>,
     max_cache_seq_len: usize,
+}
+
+enum RankCommand {
+    SetRopes {
+        ropes: Vec<DeepSeekRopeCache>,
+        resp: channel::Sender<Result<()>>,
+    },
+    Decode {
+        token_id: u32,
+        start_pos: usize,
+        caches: Vec<LayerDecodeCache>,
+        resp: channel::Sender<Result<RankResult>>,
+    },
+    Shutdown,
+}
+
+struct RankWorker {
+    tx: channel::Sender<RankCommand>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct OwnedRankComm(cudarc::nccl::safe::Comm);
+
+// SAFETY: The communicator is moved into exactly one persistent rank worker and
+// is only used by that worker thread for its owning CUDA stream/device.
+unsafe impl Send for OwnedRankComm {}
+
+impl OwnedRankComm {
+    fn get(&self) -> &cudarc::nccl::safe::Comm {
+        &self.0
+    }
+}
+
+impl RankWorker {
+    fn spawn(
+        rank: usize,
+        ctx: RankGpuContext,
+        weights: RankWeightView<'static>,
+        comm: cudarc::nccl::safe::Comm,
+        config: &'static Config,
+    ) -> Result<Self> {
+        let (tx, rx) = channel::unbounded();
+        let (startup_tx, startup_rx) = channel::bounded(1);
+        let comm = OwnedRankComm(comm);
+        let handle = thread::Builder::new()
+            .name(format!("deepseek-v4-rank-{rank}"))
+            .spawn(move || {
+                let mut ropes = Vec::new();
+                let startup = bind_rank_thread(&ctx);
+                match startup {
+                    Ok(()) => {
+                        let _ = startup_tx.send(Ok(()));
+                        while let Ok(cmd) = rx.recv() {
+                            match cmd {
+                                RankCommand::SetRopes {
+                                    ropes: next_ropes,
+                                    resp,
+                                } => {
+                                    ropes = next_ropes;
+                                    let _ = resp.send(Ok(()));
+                                }
+                                RankCommand::Decode {
+                                    token_id,
+                                    start_pos,
+                                    mut caches,
+                                    resp,
+                                } => {
+                                    let result = run_decode_on_rank_lane(
+                                        rank,
+                                        &ctx,
+                                        &weights,
+                                        comm.get(),
+                                        &ropes,
+                                        config,
+                                        token_id,
+                                        start_pos,
+                                        &mut caches,
+                                    )
+                                    .map(|logits| (rank, logits, caches));
+                                    let _ = resp.send(result);
+                                }
+                                RankCommand::Shutdown => break,
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = startup_tx.send(Err(err));
+                    }
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("failed to spawn DeepSeek rank worker {rank}: {err}"))?;
+        startup_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker {rank} exited during startup"))??;
+        Ok(Self {
+            tx,
+            handle: Some(handle),
+        })
+    }
+
+    fn decode(
+        &self,
+        token_id: u32,
+        start_pos: usize,
+        caches: Vec<LayerDecodeCache>,
+    ) -> Result<channel::Receiver<Result<RankResult>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(RankCommand::Decode {
+                token_id,
+                start_pos,
+                caches,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    fn set_ropes(&self, ropes: Vec<DeepSeekRopeCache>) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(RankCommand::SetRopes {
+                ropes,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed on SetRopes"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped SetRopes response"))?
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(RankCommand::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for FullDirectRuntime<'_> {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            worker.shutdown();
+        }
+    }
 }
 
 pub struct DirectGeneration {
@@ -225,6 +375,14 @@ fn reject_request(req: &GenerateRequest, prompt_len: usize, reason: String) {
     });
 }
 
+fn bind_rank_thread(ctx: &RankGpuContext) -> Result<()> {
+    ctx.set_current()?;
+    unsafe {
+        pegainfer_kernels::ffi::cublas_init();
+    }
+    Ok(())
+}
+
 fn load_full_direct_runtime(
     model_path: &Path,
     config: &'static Config,
@@ -245,18 +403,35 @@ fn load_full_direct_runtime(
         .iter()
         .map(|weights| weights.view(config))
         .collect::<Result<Vec<_>>>()?;
-    let streams = contexts
+    let prefill_streams = contexts
         .iter()
         .map(|ctx| ctx.stream.clone())
         .collect::<Vec<_>>();
-    let comms = cudarc::nccl::safe::Comm::from_devices(streams)
+    let comms = cudarc::nccl::safe::Comm::from_devices(prefill_streams)
         .map_err(|err| anyhow::anyhow!("NCCL comm creation failed: {err:?}"))?;
+    let decode_streams = contexts
+        .iter()
+        .map(|ctx| ctx.stream.clone())
+        .collect::<Vec<_>>();
+    let worker_comms = cudarc::nccl::safe::Comm::from_devices(decode_streams)
+        .map_err(|err| anyhow::anyhow!("decode NCCL comm creation failed: {err:?}"))?;
+    let mut workers = Vec::with_capacity(8);
+    for (((rank, ctx), view), comm) in contexts
+        .iter()
+        .cloned()
+        .enumerate()
+        .zip(views.iter().cloned())
+        .zip(worker_comms.into_iter())
+    {
+        workers.push(RankWorker::spawn(rank, ctx, view, comm, config)?);
+    }
     Ok(FullDirectRuntime {
         contexts,
         views,
         comms,
         caches: Vec::new(),
         ropes: Vec::new(),
+        workers,
         max_cache_seq_len: 0,
     })
 }
@@ -306,11 +481,33 @@ fn ensure_direct_decode_caches(
     if runtime.caches.len() != config.n_layers || runtime.max_cache_seq_len < max_seq_len {
         runtime.caches = allocate_direct_decode_caches(&runtime.contexts, config, max_seq_len)?;
         runtime.ropes = allocate_direct_rope_caches(&runtime.contexts, config, max_seq_len)?;
+        let worker_ropes = allocate_worker_rope_caches(&runtime.contexts, config, max_seq_len)?;
+        for (rank, (worker, ropes)) in runtime.workers.iter().zip(worker_ropes).enumerate() {
+            worker
+                .set_ropes(ropes)
+                .with_context(|| format!("set worker rope cache rank {rank}"))?;
+        }
         runtime.max_cache_seq_len = max_seq_len;
     } else {
         reset_direct_decode_caches(runtime)?;
     }
     Ok(())
+}
+
+fn allocate_worker_rope_caches(
+    contexts: &[RankGpuContext],
+    config: &Config,
+    max_seq_len: usize,
+) -> Result<Vec<Vec<DeepSeekRopeCache>>> {
+    let mut rank_ropes = Vec::with_capacity(contexts.len());
+    for ctx in contexts {
+        let mut ropes = Vec::with_capacity(config.n_layers);
+        for layer in 0..config.n_layers {
+            ropes.push(precompute_rope_cache(ctx, config, layer, max_seq_len)?);
+        }
+        rank_ropes.push(ropes);
+    }
+    Ok(rank_ropes)
 }
 
 fn reset_direct_decode_caches(runtime: &mut FullDirectRuntime<'_>) -> Result<()> {
@@ -353,6 +550,131 @@ fn fill_f32_cuda_slice(ctx: &RankGpuContext, slice: &mut CudaSlice<f32>, value: 
     Ok(())
 }
 
+fn take_rank_caches(
+    runtime: &mut FullDirectRuntime<'_>,
+    rank_count: usize,
+) -> Result<Vec<Vec<LayerDecodeCache>>> {
+    ensure_cache_shape(runtime, rank_count)?;
+    let mut by_rank = (0..rank_count)
+        .map(|_| Vec::with_capacity(runtime.caches.len()))
+        .collect::<Vec<_>>();
+    for layer_caches in runtime.caches.drain(..) {
+        ensure!(
+            layer_caches.len() == rank_count,
+            "decode cache rank count mismatch: have {}, need {}",
+            layer_caches.len(),
+            rank_count
+        );
+        for (rank, cache) in layer_caches.into_iter().enumerate() {
+            by_rank[rank].push(cache);
+        }
+    }
+    Ok(by_rank)
+}
+
+fn restore_rank_caches(
+    runtime: &mut FullDirectRuntime<'_>,
+    mut by_rank: Vec<Vec<LayerDecodeCache>>,
+    layer_count: usize,
+) -> Result<()> {
+    ensure!(
+        !by_rank.is_empty(),
+        "cannot restore decode caches without rank caches"
+    );
+    let rank_count = by_rank.len();
+    for (rank, caches) in by_rank.iter().enumerate() {
+        ensure!(
+            caches.len() == layer_count,
+            "rank {rank} returned {} layer caches, expected {layer_count}",
+            caches.len()
+        );
+    }
+
+    let mut by_layer = Vec::with_capacity(layer_count);
+    for _ in 0..layer_count {
+        by_layer.push(Vec::with_capacity(rank_count));
+    }
+    for mut rank_caches in by_rank.drain(..) {
+        for (layer, cache) in rank_caches.drain(..).enumerate() {
+            by_layer[layer].push(cache);
+        }
+    }
+    runtime.caches = by_layer;
+    Ok(())
+}
+
+fn ensure_cache_shape(runtime: &FullDirectRuntime<'_>, rank_count: usize) -> Result<()> {
+    ensure!(
+        !runtime.caches.is_empty(),
+        "direct decode caches are not initialized"
+    );
+    for (layer, layer_caches) in runtime.caches.iter().enumerate() {
+        ensure!(
+            layer_caches.len() == rank_count,
+            "decode cache rank count mismatch at layer {layer}: have {}, need {}",
+            layer_caches.len(),
+            rank_count
+        );
+    }
+    Ok(())
+}
+
+fn run_decode_on_rank_lane(
+    rank: usize,
+    ctx: &RankGpuContext,
+    weights: &RankWeightView<'_>,
+    comm: &cudarc::nccl::safe::Comm,
+    ropes: &[DeepSeekRopeCache],
+    config: &Config,
+    token_id: u32,
+    start_pos: usize,
+    caches: &mut [LayerDecodeCache],
+) -> Result<F32Logits> {
+    ensure!(
+        ropes.len() == config.n_layers,
+        "rank {rank} rope cache layer mismatch: have {}, need {}",
+        ropes.len(),
+        config.n_layers
+    );
+    ensure!(
+        caches.len() == config.n_layers,
+        "rank {rank} decode cache layer mismatch: have {}, need {}",
+        caches.len(),
+        config.n_layers
+    );
+
+    ctx.set_current()?;
+    let token_ids = ctx
+        .stream
+        .clone_htod(&[token_id])
+        .with_context(|| format!("copy token_id to rank {rank}"))?;
+    let mut hidden = embedding_rank_local(ctx, config, weights, &token_ids, 1)
+        .with_context(|| format!("embedding rank {rank}"))?;
+    all_reduce_hidden_in_place(&mut hidden, comm)
+        .with_context(|| format!("embedding all_reduce rank {rank}"))?;
+    let mut hc = hc_expand_bf16_hidden(ctx, &hidden, config.hc_mult)
+        .with_context(|| format!("hc_expand rank {rank}"))?;
+
+    for layer in 0..config.n_layers {
+        hc = block_decode_rank_lane_bf16_hidden(
+            ctx,
+            weights,
+            comm,
+            config,
+            layer,
+            &hc,
+            &token_ids,
+            &ropes[layer],
+            start_pos,
+            &mut caches[layer],
+        )
+        .with_context(|| format!("decode layer {layer} rank {rank}"))?;
+    }
+
+    final_logits_rank_local_bf16_hidden(ctx, config, weights, &hc)
+        .with_context(|| format!("final logits rank {rank}"))
+}
+
 fn run_direct_decode_logits(
     runtime: &mut FullDirectRuntime<'_>,
     config: &Config,
@@ -366,75 +688,49 @@ fn run_direct_decode_logits(
             config.n_layers
         );
     }
-    let token_ids = runtime
-        .contexts
+    let rank_count = runtime.workers.len();
+    ensure!(
+        rank_count == 8,
+        "DeepSeek V4 direct decode expects 8 workers"
+    );
+    let rank_caches = take_rank_caches(runtime, rank_count)?;
+    let pending = runtime
+        .workers
         .iter()
+        .zip(rank_caches.into_iter())
         .enumerate()
-        .map(|(rank, ctx)| {
-            ctx.stream
-                .clone_htod(&[token_id])
-                .with_context(|| format!("copy token_id to rank {rank}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for ctx in &runtime.contexts {
-        ctx.sync().context("sync after token_id copy")?;
-    }
-    let embedding_inputs = (0..8)
-        .map(|rank| {
-            (
-                &runtime.contexts[rank],
-                &runtime.views[rank],
-                &runtime.comms[rank],
-                &token_ids[rank],
-            )
-        })
-        .collect::<Vec<_>>();
-    let hidden = embedding_vocab_parallel_group(&embedding_inputs, config, 1)
-        .context("embedding_vocab_parallel_group")?;
-    let mut hcs = (0..8)
-        .map(|rank| {
-            hc_expand_bf16_hidden(&runtime.contexts[rank], &hidden[rank], config.hc_mult)
-                .with_context(|| format!("hc_expand rank {rank}"))
+        .map(|(rank, (worker, caches))| {
+            worker
+                .decode(token_id, start_pos, caches)
+                .with_context(|| format!("dispatch decode rank {rank}"))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for layer in 0..config.n_layers {
-        let rope_refs = runtime.ropes[layer].iter().collect::<Vec<_>>();
-        let block_inputs = (0..8)
-            .map(|rank| {
-                (
-                    &runtime.contexts[rank],
-                    &runtime.views[rank],
-                    &runtime.comms[rank],
-                    &hcs[rank],
-                    &token_ids[rank],
-                )
-            })
-            .collect::<Vec<_>>();
-        hcs = block_decode_group_rank_threads_bf16_hidden(
-            &block_inputs,
-            config,
-            layer,
-            &rope_refs,
-            start_pos,
-            &mut runtime.caches[layer],
-        )
-        .with_context(|| {
-            format!("block_decode_group_rank_threads_bf16_hidden layer {layer} pos {start_pos}")
-        })?;
+    let mut results = Vec::with_capacity(rank_count);
+    for recv in pending {
+        results.push(
+            recv.recv()
+                .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped decode response"))??,
+        );
     }
+    results.sort_by_key(|(rank, _, _)| *rank);
 
-    let logits_inputs = (0..8)
-        .map(|rank| {
-            (
-                &runtime.contexts[rank],
-                &runtime.views[rank],
-                &runtime.comms[rank],
-                &hcs[rank],
-            )
-        })
+    let mut logits_inputs = Vec::with_capacity(rank_count);
+    let mut returned_caches = Vec::with_capacity(rank_count);
+    for (rank, logits, caches) in results {
+        logits_inputs.push((&runtime.contexts[rank], &runtime.comms[rank], logits));
+        returned_caches.push(caches);
+    }
+    let gather_inputs = logits_inputs
+        .iter()
+        .map(|(ctx, comm, logits)| (*ctx, *comm, logits))
         .collect::<Vec<_>>();
-    final_logits_group_bf16_hidden(&logits_inputs, config).context("final_logits_group_bf16_hidden")
+    let gathered =
+        all_gather_logits_group(&gather_inputs).context("decode final logits all_gather")?;
+    drop(gather_inputs);
+    drop(logits_inputs);
+    restore_rank_caches(runtime, returned_caches, config.n_layers)?;
+    Ok(gathered)
 }
 
 fn run_prefill_logits_and_seed_decode_cache(
