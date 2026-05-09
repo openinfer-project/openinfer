@@ -1,5 +1,6 @@
 mod config;
 mod direct;
+pub mod e2e_runner;
 mod model;
 mod runtime;
 mod weights;

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -853,6 +854,7 @@ fn main() {
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
 
     let nvcc = format!("{}/bin/nvcc", cuda_path);
+    let cuda_include = Path::new(&cuda_path).join("include");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
     let arch_args = nvcc_arch_args(&sm_targets);
@@ -932,6 +934,8 @@ fn main() {
             "-o".to_string(),
             obj_file.to_string_lossy().to_string(),
             "-O3".to_string(),
+            "-I".to_string(),
+            cuda_include.to_string_lossy().to_string(),
         ];
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
@@ -991,6 +995,8 @@ fn main() {
                 "-o".to_string(),
                 obj_file.to_string_lossy().to_string(),
                 "-O3".to_string(),
+                "-I".to_string(),
+                cuda_include.to_string_lossy().to_string(),
             ];
             nvcc_args.extend(arch_args.clone());
             nvcc_args.extend([
@@ -1066,6 +1072,7 @@ fn main() {
     obj_files.sort();
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
+    let _ = fs::remove_file(&cuda_lib);
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
     ar_args.extend(
         obj_files

@@ -3040,9 +3040,11 @@ name = "pegainfer-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "colored",
  "cudarc",
  "half",
  "log",
+ "logforth",
  "memmap2",
  "parking_lot",
  "pegainfer-kernels",
@@ -3063,6 +3065,7 @@ name = "pegainfer-deepseek-v4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "cudarc",
  "half",
  "libc",

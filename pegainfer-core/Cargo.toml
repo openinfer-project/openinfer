@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 pegainfer-kernels = { workspace = true }
 anyhow = { workspace = true }
+colored = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
+logforth = { workspace = true }
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 safetensors = { workspace = true }

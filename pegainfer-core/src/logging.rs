@@ -1,20 +1,16 @@
-//! Unified logging configuration for Rust LLM.
-//!
-//! Provides consistent log initialization across server and tests.
+//! Unified logging configuration.
+
+use std::sync::Once;
 
 use colored::Color::{Green, Red, Yellow};
 use logforth::diagnostic::ThreadLocalDiagnostic;
 use logforth::layout::TextLayout;
-use std::sync::Once;
 
 static INIT: Once = Once::new();
 
 #[derive(Debug, Clone)]
 struct LoggingConfig {
-    /// Log level filter (e.g., "info", "debug", "info,pegainfer=debug").
-    /// Falls back to RUST_LOG environment variable if set.
     level: String,
-    /// Enable colored output (info=green, warn=yellow, error=red).
     colored: bool,
 }
 
@@ -27,7 +23,6 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Default noisy modules to reduce log spam.
 const DEFAULT_NOISY_MODULE_LEVELS: [(&str, &str); 5] = [
     ("h2", "warn"),
     ("hyper", "warn"),
@@ -51,26 +46,16 @@ fn apply_default_module_levels(mut filter: String) -> String {
     filter
 }
 
-/// Initialize logging with the given configuration.
-///
-/// This function is idempotent - subsequent calls after the first are no-ops.
-/// The RUST_LOG environment variable takes precedence over the configured level.
-/// When RUST_LOG is not set, noisy dependency modules default to warn to
-/// keep debug output focused on application components.
 fn init(config: LoggingConfig) {
     INIT.call_once(|| {
         let LoggingConfig { level, colored } = config;
-
         let filter_str =
             std::env::var("RUST_LOG").unwrap_or_else(|_| apply_default_module_levels(level));
-
-        let mut builder = logforth::starter_log::builder();
-
-        // Parse filter from string using EnvFilterBuilder
         let filter =
             logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str)
                 .build();
 
+        let mut builder = logforth::starter_log::builder();
         if colored {
             let layout = TextLayout::default()
                 .info_color(Green)
@@ -93,9 +78,6 @@ fn init(config: LoggingConfig) {
     });
 }
 
-/// Initialize logging to stderr without colors.
-///
-/// Convenience function for tests use case.
 pub fn init_stderr(level: &str) {
     init(LoggingConfig {
         level: level.to_string(),
@@ -103,7 +85,6 @@ pub fn init_stderr(level: &str) {
     });
 }
 
-/// Initialize logging with default settings (stderr, colored, "info" level).
 pub fn init_default() {
     init(LoggingConfig::default());
 }

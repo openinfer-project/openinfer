@@ -22,7 +22,7 @@ crossbeam-channel = "0.5"
 cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
     "cublas",
-    "cuda-12080",
+    "cuda-13010",
     "f16",
     "nccl",
 ] }

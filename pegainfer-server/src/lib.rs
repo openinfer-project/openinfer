@@ -1,4 +1,4 @@
-pub mod logging;
+pub use pegainfer_core::logging;
 pub mod ops;
 pub mod sampler;
 pub mod scheduler;

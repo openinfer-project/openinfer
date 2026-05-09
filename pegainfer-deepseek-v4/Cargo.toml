@@ -12,6 +12,7 @@ deepseek-v4 = ["pegainfer-kernels/deepseek-v4"]
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
 log = { workspace = true }
@@ -40,9 +41,9 @@ name = "deepseek_mp8_check"
 path = "src/bin/deepseek_mp8_check.rs"
 required-features = ["deepseek-v4"]
 
-[[test]]
-name = "e2e"
-path = "tests/e2e.rs"
+[[bin]]
+name = "deepseek_v4_e2e"
+path = "src/bin/deepseek_v4_e2e.rs"
 required-features = ["deepseek-v4"]
 
 [[test]]
