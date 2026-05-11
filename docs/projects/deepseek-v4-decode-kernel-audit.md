@@ -1,11 +1,11 @@
 # DeepSeek V4 Decode Kernel Audit
 
 **Created**: 2026-05-11
-**Status**: active
+**Status**: complete
 
 ## TL;DR
 
-Decode is being audited at launch granularity instead of wrapper granularity. Final logits now preserves the FP32 SGEMV math path while caching the converted rank-local head weight in per-device scratch, so steady decode no longer converts the full BF16 head weight or creates/destroys cuBLAS resources every token. Exact DeepSeek V4 E2E remains `20/20`; the comparable 1x32 clean bench improved from `98.80ms` to `93.14ms`.
+Decode launch audit is complete for the current non-MoE slice. Kept changes cache the final logits F32 head-weight scratch and fuse the attention FP32 all-reduce tail into HC post while preserving the old BF16 rounding boundary. Exact DeepSeek V4 E2E remains `20/20`; the best comparable 1x32 clean bench improved from `98.80ms` to `91.84ms` with token hash `5f6c64b667f2abf5`. Several plausible launch-reduction experiments were rejected because exact parity alone did not produce stable TPOT wins.
 
 ## Preparation
 
@@ -287,3 +287,9 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - Result: reverted the code before remote testing. Local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` failed during TileLang generation: `M must be divisible by 16, but got 8`. The current TileLang GEMM lowering used by sparse attention requires the head dimension of the GEMM tile to be a multiple of 16, so a direct h8 sparse attention shape is not viable without a different kernel formulation.
 
 ## Debrief
+
+- **Outcome**: Kept the changes that survived exact E2E and decode bench review: final logits scratch reuse, generated-token trace reporting, and attention all-reduce tail fusion into HC post.
+- **Rejected experiments**: final HC head plus RMSNorm fusion, shared decode window top-k indices, KV RoPE plus no-PE quant fusion, HC RMS-scale folding into BF16->F32 conversion, parallel indexer decode scoring, shared FP8 quantization for attention `wq_a/wkv`, and direct h8 TileLang sparse attention.
+- **Benchmark discipline**: token hash equality is required before comparing TPOT because token ids affect hash routing, EPLB/expert balance, and rank skew. Single 1x32 runs on 5090 became too noisy late in the audit; promising candidates need repeated runs and the longer `1x160 warmup=2 iters=3` shape.
+- **Profiling discipline**: NCCL kernel wall time is synchronization-window evidence, not pure transport time. Non-NCCL repeated clusters after the kept changes are mostly MoE/grouped GEMM, HC pre/mixes, compressor decode, sparse attention, and indexer scoring.
+- **Follow-ups**: Further meaningful gains likely need a more structural MoE route/tile scheduling change, a different sparse-attention kernel formulation that naturally supports h8, or rank-skew analysis around collective arrival timing. Small local fusion attempts are now documented and should not be retried without a new profile or a materially different kernel design.
