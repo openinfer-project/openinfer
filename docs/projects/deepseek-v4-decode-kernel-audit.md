@@ -270,4 +270,14 @@ nsys stats --report cuda_gpu_kern_sum --format csv --output /tmp/dsv4_current_de
   - 1x32 with `--seed 42`: `steady_tpot_ms.avg = 101.90ms`, token hash `5f6c64b667f2abf5`.
 - Result: reverted the code. Sharing the activation quantization across attention `wq_a` and `wkv` reduced one small quant launch per layer, but changed the GEMM scheduling/quant scratch lock window enough that the short decode bench regressed versus `91.84ms`.
 
+### Step 13: Post-revert bench sanity
+- After reverting the Step 12 code and syncing source back to 5090, rebuilt through `cargo run --release` and reran the short bench:
+
+```bash
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1 --seed 42
+```
+
+- Result: `steady_tpot_ms.avg = 107.25ms`, token hash `5f6c64b667f2abf5`.
+- Takeaway: single 1x32 runs are currently too noisy to use as the only decision gate. Keep using token hash equality, repeated runs, and the longer `1x160 warmup=2 iters=3` shape when a candidate looks promising.
+
 ## Debrief
