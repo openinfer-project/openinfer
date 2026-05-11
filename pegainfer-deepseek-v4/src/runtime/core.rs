@@ -314,9 +314,6 @@ pub fn hc_pre_bf16_hidden(
     );
 
     let mut mixes: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * mix_hc)?;
-    let mut raw_mixes: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * mix_hc)?;
-    let mut rms_scales: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len)?;
-    let mut pre: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * input.hc)?;
     let mut post: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * input.hc)?;
     let mut comb: CudaSlice<f32> = ctx
         .stream
@@ -327,15 +324,13 @@ pub fn hc_pre_bf16_hidden(
         let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
         let (fn_ptr, _fn_guard) = hc_fn.tensor.data.device_ptr(&ctx.stream);
         let (mixes_ptr, _mixes_guard) = mixes.device_ptr_mut(&ctx.stream);
-        let (raw_mixes_ptr, _raw_mixes_guard) = raw_mixes.device_ptr_mut(&ctx.stream);
-        let (rms_scales_ptr, _rms_scales_guard) = rms_scales.device_ptr_mut(&ctx.stream);
         let result = unsafe {
             ffi::deepseek_hc_mixes_cuda(
                 x_ptr as *const ffi::Half,
                 fn_ptr as *const f32,
                 mixes_ptr as *mut f32,
-                raw_mixes_ptr as *mut f32,
-                rms_scales_ptr as *mut f32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
                 input.seq_len as i32,
                 input.hc as i32,
                 input.hidden_dim as i32,
@@ -347,56 +342,86 @@ pub fn hc_pre_bf16_hidden(
         result.result()?;
     }
 
-    {
+    let use_fused_pre = input.seq_len == 1
+        && input.hc == 4
+        && config.hc_sinkhorn_iters == 20
+        && (config.hc_eps - 1.0e-6).abs() <= 1.0e-12;
+
+    if use_fused_pre {
         let (mixes_ptr, _mixes_guard) = mixes.device_ptr(&ctx.stream);
         let (scale_ptr, _scale_guard) = hc_scale.tensor.data.device_ptr(&ctx.stream);
         let (base_ptr, _base_guard) = hc_base.tensor.data.device_ptr(&ctx.stream);
-        let (pre_ptr, _pre_guard) = pre.device_ptr_mut(&ctx.stream);
         let (post_ptr, _post_guard) = post.device_ptr_mut(&ctx.stream);
         let (comb_ptr, _comb_guard) = comb.device_ptr_mut(&ctx.stream);
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
         let result = unsafe {
-            ffi::deepseek_hc_split_sinkhorn_cuda(
+            ffi::deepseek_hc_pre_from_mixes_cuda(
+                x_ptr as *const ffi::Half,
                 mixes_ptr as *const f32,
                 scale_ptr as *const f32,
                 base_ptr as *const f32,
-                pre_ptr as *mut f32,
                 post_ptr as *mut f32,
                 comb_ptr as *mut f32,
+                out_ptr as *mut ffi::Half,
                 input.seq_len as i32,
                 input.hc as i32,
+                input.hidden_dim as i32,
                 config.hc_sinkhorn_iters as i32,
                 config.hc_eps,
                 ctx.stream.cu_stream(),
             )
         };
         result.result()?;
-    }
+    } else {
+        let mut pre: CudaSlice<f32> = ctx.stream.alloc_zeros(input.seq_len * input.hc)?;
+        {
+            let (mixes_ptr, _mixes_guard) = mixes.device_ptr(&ctx.stream);
+            let (scale_ptr, _scale_guard) = hc_scale.tensor.data.device_ptr(&ctx.stream);
+            let (base_ptr, _base_guard) = hc_base.tensor.data.device_ptr(&ctx.stream);
+            let (pre_ptr, _pre_guard) = pre.device_ptr_mut(&ctx.stream);
+            let (post_ptr, _post_guard) = post.device_ptr_mut(&ctx.stream);
+            let (comb_ptr, _comb_guard) = comb.device_ptr_mut(&ctx.stream);
+            let result = unsafe {
+                ffi::deepseek_hc_split_sinkhorn_cuda(
+                    mixes_ptr as *const f32,
+                    scale_ptr as *const f32,
+                    base_ptr as *const f32,
+                    pre_ptr as *mut f32,
+                    post_ptr as *mut f32,
+                    comb_ptr as *mut f32,
+                    input.seq_len as i32,
+                    input.hc as i32,
+                    config.hc_sinkhorn_iters as i32,
+                    config.hc_eps,
+                    ctx.stream.cu_stream(),
+                )
+            };
+            result.result()?;
+        }
 
-    {
-        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
-        let (pre_ptr, _pre_guard) = pre.device_ptr(&ctx.stream);
-        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-        let result = unsafe {
-            ffi::deepseek_hc_pre_output_cuda(
-                x_ptr as *const ffi::Half,
-                pre_ptr as *const f32,
-                out_ptr as *mut ffi::Half,
-                input.seq_len as i32,
-                input.hc as i32,
-                input.hidden_dim as i32,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
+        {
+            let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+            let (pre_ptr, _pre_guard) = pre.device_ptr(&ctx.stream);
+            let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+            let result = unsafe {
+                ffi::deepseek_hc_pre_output_cuda(
+                    x_ptr as *const ffi::Half,
+                    pre_ptr as *const f32,
+                    out_ptr as *mut ffi::Half,
+                    input.seq_len as i32,
+                    input.hc as i32,
+                    input.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+            };
+            result.result()?;
+        }
     }
 
     Ok((
         out,
         HcPreState {
-            raw_mixes,
-            mixes,
-            rms_scales,
-            pre,
             post,
             comb,
             seq_len: input.seq_len,

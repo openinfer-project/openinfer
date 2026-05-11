@@ -33,10 +33,6 @@ pub struct HcHiddenStates {
 }
 
 pub struct HcPreState {
-    pub raw_mixes: CudaSlice<f32>,
-    pub mixes: CudaSlice<f32>,
-    pub rms_scales: CudaSlice<f32>,
-    pub pre: CudaSlice<f32>,
     pub post: CudaSlice<f32>,
     pub comb: CudaSlice<f32>,
     pub seq_len: usize,

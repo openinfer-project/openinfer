@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter flow. Route/expert metadata stays on device, the old row-routed scalar local expert kernel is gone, and local experts use grouped TileLang FP4 GEMM over expert-major packed rows. Direct runtime no longer owns rank contexts/caches centrally: rank workers own their context, communicator, RoPE, and decode cache, and the old single-thread group prefill/debug entry points are removed. The request loop is split into a scheduler facade and rank-worker implementation, with the scheduler thread named `deepseek-v4-scheduler`. Current 1x32 serving bench after cleanup: `steady_tpot_ms.avg = 105.54ms`; exact DeepSeek V4 E2E after cleanup: `20/20`.
+Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter flow. Route/expert metadata stays on device, the old row-routed scalar local expert kernel is gone, and local experts use grouped TileLang FP4 GEMM over expert-major packed rows. Direct runtime no longer owns rank contexts/caches centrally: rank workers own their context, communicator, RoPE, and decode cache, and the old single-thread group prefill/debug entry points are removed. The request loop is split into a scheduler facade and rank-worker implementation, with the scheduler thread named `deepseek-v4-scheduler`. Current follow-up fuses decode HC split-sinkhorn plus pre-output before the following RMSNorm for `seq_len=1`; exact DeepSeek V4 E2E remains `20/20`. Current 1x32 serving bench after cleanup before HC fuse: `steady_tpot_ms.avg = 105.54ms`.
 
 ## Preparation
 
@@ -122,6 +122,25 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Verification:
   - `cargo fmt` passed
   - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+
+### Step 10: Decode HC pre fuse before RMSNorm
+- Added a decode-shape HC pre fused CUDA entry:
+  - `deepseek_hc_pre_from_mixes_cuda`
+  - It consumes already scaled `mixes`, computes `pre/post/comb`, runs the `hc=4`, `sinkhorn_iters=20` sinkhorn loop, writes `post/comb` for `hc_post`, and directly emits the BF16 branch input consumed by the following RMSNorm.
+- Kept `deepseek_hc_mixes_cuda` as the producer for now, so this first cut preserves the cuBLAS SGEMV dot-product path and only fuses the split-sinkhorn plus pre-output side.
+- Removed unused HC pre state fields from runtime ownership:
+  - `raw_mixes`
+  - `mixes`
+  - `rms_scales`
+  - `pre`
+- Restricted the fused path to `seq_len == 1`; an initial attempt that also covered prefill long sequences caused the full E2E run to take far longer than normal, likely because generation drifted into long max-token completions. Decode-only gating restored exact behavior.
+- Updated `pegainfer-kernels/KERNELS.md` with the new HC FFI symbol.
+- Verification:
+  - local `cargo fmt --check` passed
+  - local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - 5090 `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash --offset 0 --limit 1` passed
+  - 5090 full `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash` passed: `All 20 DeepSeek V4 exact cases passed`
 
 ### Step 3: Expand scope to decode backend replacement
 - User goal changed from adding standalone AG/RS collectives to completing the MoE all-to-all backend replacement and passing DeepSeek V4 E2E.
