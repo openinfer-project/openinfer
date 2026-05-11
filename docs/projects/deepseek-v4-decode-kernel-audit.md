@@ -226,4 +226,18 @@ nsys stats --report cuda_gpu_kern_sum --format csv --output /tmp/dsv4_current_de
   - `deepseek_indexer_scores_decode_serial_kernel`: `33.73ms`, `2180` instances, `15.47us` avg.
 - Takeaway: after excluding MoE and treating NCCL as synchronization evidence, the next non-MoE candidates are HC pre/mixes structure, compressor decode project, sparse attention, and indexer scoring. Tiny KV-prep kernels are not promising by themselves; the failed Step 7 confirms launch-count reduction alone is not enough.
 
+### Step 10: Try computing HC RMS scale during BF16->F32 conversion
+- Changed `deepseek_hc_mixes_cuda` experimentally so the BF16->F32 conversion kernel also computes the RMS scale for each token using the same reduction shape as `deepseek_hc_scale_mixes_block_kernel`.
+- After cuBLAS computes raw mixes, a tiny `deepseek_hc_apply_mix_scales_kernel` multiplies the `seq_len * mix_hc` mixes by the precomputed scale.
+- Goal: avoid rereading the full `hc_dim = hc * dim` BF16 input in `deepseek_hc_scale_mixes_block_kernel`.
+- Local verification:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed.
+- Verification:
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`.
+- Bench result:
+  - 1x32 with `--seed 42`: `steady_tpot_ms.avg = 110.71ms`, `p50 = 109.78ms`, `p95 = 115.26ms`, token hash `5f6c64b667f2abf5`.
+- Result: reverted the code. The token hash matched the baseline, but TPOT regressed heavily versus `91.84ms`. Avoid folding the RMS-scale reduction into the conversion kernel; the extra reduction work and altered kernel shape cost more than rereading the HC input in the existing scale kernel.
+
 ## Debrief
