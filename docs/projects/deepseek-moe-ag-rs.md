@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter flow. Route/expert metadata stays on device, the old row-routed scalar local expert kernel is gone, and local experts use grouped TileLang FP4 GEMM over expert-major packed rows. Direct runtime no longer owns rank contexts/caches centrally: rank workers own their context, communicator, RoPE, and decode cache, and the old single-thread group prefill/debug entry points are removed. The request loop is split into a scheduler facade and rank-worker implementation, with the scheduler thread named `deepseek-v4-scheduler`. Current follow-up fuses decode HC split-sinkhorn plus pre-output before the following RMSNorm for `seq_len=1`; exact DeepSeek V4 E2E remains `20/20`. Current 1x32 serving bench after cleanup before HC fuse: `steady_tpot_ms.avg = 105.54ms`.
+Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter flow. Route/expert metadata stays on device, the old row-routed scalar local expert kernel is gone, and local experts use grouped TileLang FP4 GEMM over expert-major packed rows. Direct runtime no longer owns rank contexts/caches centrally: rank workers own their context, communicator, RoPE, and decode cache, and the old single-thread group prefill/debug entry points are removed. The request loop is split into a scheduler facade and rank-worker implementation, with the scheduler thread named `deepseek-v4-scheduler`. Current follow-up fuses decode HC split-sinkhorn plus pre-output plus following RMSNorm for `seq_len=1`; exact DeepSeek V4 E2E remains `20/20`. Current clean 1x32 serving bench after HC prenorm fuse: `steady_tpot_ms.avg = 98.80ms`.
 
 ## Preparation
 
@@ -154,6 +154,17 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - profiling benchmark with hard-coded sync markers showed attention path sums of `35.019ms`, `31.378ms`, and `36.826ms` for the three measured decode steps, down from `37.287ms`, `33.595ms`, and `40.627ms` after Step 10.
   - The same profiling run reported `steady_tpot_ms.avg = 93.04ms`, `first_decode_step_ms = 104.01ms`; these numbers include forced sync/log overhead and are for comparison only.
   - clean serving benchmark after removing profiling markers reported `steady_tpot_ms.avg = 98.80ms`, `p50 = 97.89ms`, `p95 = 102.62ms`, and `first_decode_step_ms = 92.46ms` for `prompt_len=1`, `output_len=32`, `warmup=1`, `iters=1`.
+
+### Step 12: Reject hand-written decode HC mixes kernel
+- Tried exposing the existing `deepseek_hc_mixes_kernel` as a decode-only FFI entry so decode HC mixes would avoid the current BF16-to-F32 conversion plus cuBLAS SGEMV wrapper.
+- An initial wiring mistake routed prefill through the decode-only entry and failed immediately with `CUDA_ERROR_INVALID_VALUE`; prefill must continue to use `deepseek_hc_mixes_cuda` because it handles `seq_len > 1`.
+- After restricting the hand-written entry to the decode prenorm path:
+  - local `cargo fmt --check` passed
+  - local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - 5090 `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash --offset 0 --limit 1` passed
+  - 5090 full `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash` passed: `All 20 DeepSeek V4 exact cases passed`
+  - 5090 clean serving bench regressed to `steady_tpot_ms.avg = 115.10ms`, `p50 = 114.17ms`, `p95 = 119.36ms`, and `first_decode_step_ms = 109.01ms`
+- Result: reverted the decode mixes entry and kept `deepseek_hc_mixes_cuda`. The hand-written reduction order is exact-safe for the current golden cases, but slower than cuBLAS on the decode shape.
 
 ### Step 3: Expand scope to decode backend replacement
 - User goal changed from adding standalone AG/RS collectives to completing the MoE all-to-all backend replacement and passing DeepSeek V4 E2E.
