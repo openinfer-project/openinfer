@@ -153,6 +153,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - full `deepseek_v4_e2e --model-path /data/DeepSeek-V4-Flash` passed: `All 20 DeepSeek V4 exact cases passed`
   - profiling benchmark with hard-coded sync markers showed attention path sums of `35.019ms`, `31.378ms`, and `36.826ms` for the three measured decode steps, down from `37.287ms`, `33.595ms`, and `40.627ms` after Step 10.
   - The same profiling run reported `steady_tpot_ms.avg = 93.04ms`, `first_decode_step_ms = 104.01ms`; these numbers include forced sync/log overhead and are for comparison only.
+  - clean serving benchmark after removing profiling markers reported `steady_tpot_ms.avg = 98.80ms`, `p50 = 97.89ms`, `p95 = 102.62ms`, and `first_decode_step_ms = 92.46ms` for `prompt_len=1`, `output_len=32`, `warmup=1`, `iters=1`.
 
 ### Step 3: Expand scope to decode backend replacement
 - User goal changed from adding standalone AG/RS collectives to completing the MoE all-to-all backend replacement and passing DeepSeek V4 E2E.
