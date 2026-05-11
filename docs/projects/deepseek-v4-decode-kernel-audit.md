@@ -116,4 +116,17 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - Observation: average TPOT differs by about `3.1%` across two clean runs and p99 varies more than the mean. This bench shape is useful for stability tracking, but more runs are needed before treating a single measurement as reproducible.
 - Both long bench runs printed a rank-7 `NcclError` panic while aborting the communicator after scheduler exit. The process returned success and metrics were emitted, but shutdown cleanup should be investigated separately.
 
+### Step 3: Fuse decode final HC head plus RMSNorm
+- Tried a decode-only final-head fused kernel for `seq_len=1`.
+- The experiment kept `deepseek_hc_mixes_cuda` unchanged so final head dot products still used the existing FP32 cuBLAS path, then fused `deepseek_hc_head_pre_cuda`, `deepseek_hc_pre_output_cuda`, and the following RMSNorm into one kernel.
+- The fused kernel preserved the old BF16 rounding boundary between HC head output and RMSNorm, and non-`seq_len=1` shapes stayed on the old path.
+- Verification:
+  - local `cargo fmt --check` passed
+  - local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`
+- Bench result:
+  - 1x32 run 1: `steady_tpot_ms.avg = 100.69ms`
+  - 1x32 run 2: `steady_tpot_ms.avg = 107.65ms`
+- Result: reverted the code. Reducing two small launches did not offset replacing FlashInfer RMSNorm with the custom fused reduction kernel.
+
 ## Debrief
