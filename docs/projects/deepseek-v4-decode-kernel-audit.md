@@ -256,4 +256,18 @@ nsys stats --report cuda_gpu_kern_sum --format csv --output /tmp/dsv4_current_de
   - 1x160 run 2 with `--seed 42`: `steady_tpot_ms.avg = 112.10ms`, token hash `6346f03343d75a65`.
 - Result: reverted the code. The token hashes matched within each shape, but TPOT was not reproducible. The average of the two short runs was worse than the current `91.84ms` short baseline, and the two long runs bracketed the existing noisy range rather than proving a stable improvement.
 
+### Step 12: Share FP8 activation quantization for attention `wq_a` and `wkv`
+- Added `deepseek_fp8_two_linear_cuda`, a TileLang-only wrapper that quantizes one BF16 input once and runs two FP8 GEMMs with separate weights/scales/outputs.
+- Replaced attention projection's independent `wq_a(input)` and `wkv(input)` calls with one two-linear call. `wq_b(q_norm)` remains separate because it consumes a different input.
+- Reason: the nsys snapshot shows many `deepseek_tilelang_act_quant_k4096_kernel` launches, and attention projection was quantizing the same layer input twice.
+- Local verification:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed.
+- Verification:
+  - 5090 full exact E2E passed: `All 20 DeepSeek V4 exact cases passed`.
+- Bench result:
+  - 1x32 with `--seed 42`: `steady_tpot_ms.avg = 101.90ms`, token hash `5f6c64b667f2abf5`.
+- Result: reverted the code. Sharing the activation quantization across attention `wq_a` and `wkv` reduced one small quant launch per layer, but changed the GEMM scheduling/quant scratch lock window enough that the short decode bench regressed versus `91.84ms`.
+
 ## Debrief
