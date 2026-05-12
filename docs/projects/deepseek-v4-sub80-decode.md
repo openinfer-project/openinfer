@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-After the grouped MoE pointer-cache commit, DeepSeek V4 fixed-token long bench is now `83.37-89.65ms/token`. This follow-up targets the remaining gap toward a stable sub-80ms decode by first identifying which post-cache collective windows still carry rank-arrival skew. No new `bs=1` or `seq_len=1` specialization is allowed.
+After the grouped MoE pointer-cache commit, DeepSeek V4 fixed-token long bench was `83.37-89.65ms/token`. Linux rank-worker CPU affinity moved the fixed-token long bench to `72.88-73.60ms/token` while preserving the fixed hash and exact E2E. The remaining work is pushing below 70ms without adding `bs=1` or `seq_len=1` specialization.
 
 ## Preparation
 
@@ -74,5 +74,41 @@ After the grouped MoE pointer-cache commit, DeepSeek V4 fixed-token long bench i
 - Decision:
   - Do not keep the top-k cache code. It is correct, but it does not move the fixed-token long bench below the existing `83.37-89.65ms` post-pointer-cache range.
   - The result suggests deterministic top-k index generation is not a dominant contributor to the remaining hidden all-reduce arrival skew.
+
+### Step 3: separate host launch skew from GPU arrival skew
+- Joined f32 NCCL kernels to CUDA runtime launch records through `correlationId`.
+- Corrected aligned hidden all-reduce groups show:
+
+| Class | Kernel wall avg | Kernel start-skew avg | Runtime launch start-skew avg | Enqueue-to-kernel max avg |
+| --- | ---: | ---: | ---: | ---: |
+| attention hidden `1x4096` | `1.023ms` | `1.006ms` | `4.324ms` | `3.327ms` |
+| ratio-4 indexer score | `0.409ms` | `0.388ms` | `4.437ms` | `4.056ms` |
+
+- Interpretation:
+  - Rank worker host launch timing is more scattered than the final GPU NCCL start timing.
+  - Stream backlog hides part of the host scatter, but the remaining hidden all-reduce arrival skew is still about `1ms` per hidden collective.
+  - This makes rank worker CPU scheduling a plausible contributor, so the next reversible attempt pins rank worker threads to distinct CPUs from the current Linux cpuset.
+- Code attempt:
+  - Added Linux-only rank worker CPU affinity at thread startup.
+  - Affinity failure logs a warning and does not fail model startup.
+  - This is not a `bs=1` or `seq_len=1` specialization.
+- Local validation:
+  - `cargo fmt --check` passed.
+  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed.
+- 5090 validation:
+  - Exact E2E passed: `All 20 DeepSeek V4 exact cases passed`.
+  - Rank workers pinned successfully to CPUs `0..7`.
+  - Fixed-token bench round 1: `steady_tpot_ms.avg = 72.879603`, p50 `72.159356`, p95 `76.381629`, p99 `77.569638`, hash `6346f03343d75a65`.
+  - Fixed-token bench round 2: `steady_tpot_ms.avg = 73.601627`, p50 `72.909497`, p95 `76.869231`, p99 `78.121858`, hash `6346f03343d75a65`.
+- Post-change profile:
+
+| Class | Kernel wall avg before | Kernel wall avg after | Start-skew avg before | Start-skew avg after |
+| --- | ---: | ---: | ---: | ---: |
+| attention hidden `1x4096` | `1.023ms` | `0.861ms` | `1.006ms` | `0.843ms` |
+| ratio-4 indexer score | `0.409ms` | `0.366ms` | `0.388ms` | `0.346ms` |
+
+- Decision:
+  - Keep rank-worker CPU affinity. It directly reduces corrected f32 all-reduce arrival skew and moves the fixed-token long bench below 80ms with stable hashes.
+  - This does not reach the stricter sub-70 target yet; continue with the next largest remaining rank-arrival source.
 
 ## Debrief

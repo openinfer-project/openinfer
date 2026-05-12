@@ -72,6 +72,7 @@ impl RankWorker {
         let handle = thread::Builder::new()
             .name(format!("deepseek-v4-rank-{rank}"))
             .spawn(move || {
+                pin_rank_worker_thread(rank);
                 let mut ropes = Vec::new();
                 let mut caches = Vec::new();
                 let mut max_cache_seq_len = 0usize;
@@ -211,6 +212,45 @@ impl RankWorker {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn pin_rank_worker_thread(rank: usize) {
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        let set_size = std::mem::size_of::<libc::cpu_set_t>();
+        if libc::sched_getaffinity(0, set_size, &mut allowed) != 0 {
+            log::warn!("failed to read CPU affinity mask for DeepSeek rank worker {rank}");
+            return;
+        }
+
+        let mut cpus = Vec::new();
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            if libc::CPU_ISSET(cpu, &allowed) {
+                cpus.push(cpu);
+            }
+        }
+        if cpus.is_empty() {
+            log::warn!("empty CPU affinity mask for DeepSeek rank worker {rank}");
+            return;
+        }
+
+        let cpu = cpus[rank % cpus.len()];
+        let mut target: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut target);
+        libc::CPU_SET(cpu, &mut target);
+        let rc = libc::pthread_setaffinity_np(libc::pthread_self(), set_size, &target);
+        if rc != 0 {
+            log::warn!(
+                "failed to pin DeepSeek rank worker {rank} to CPU {cpu}: pthread_setaffinity_np rc={rc}"
+            );
+        } else {
+            log::info!("pinned DeepSeek rank worker {rank} to CPU {cpu}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_rank_worker_thread(_rank: usize) {}
 
 impl Drop for FullDirectRuntime {
     fn drop(&mut self) {
