@@ -10,7 +10,7 @@
 
 ## Scope
 
-This note records what we learned from "ZeRO-Prefill: Efficient Long-Context LLM Inference with Asynchronous Expert Parallelism" ([arXiv:2605.02960](https://arxiv.org/abs/2605.02960)) and how it should shape future PegaFlow/PegaInfer planning for large MoE serving.
+This note records what we learned from "ZeRO-Prefill: Zero Redundancy Overheads in MoE Prefill Serving" ([arXiv:2605.02960](https://arxiv.org/abs/2605.02960)) and how it should shape future PegaFlow/PegaInfer planning for large MoE serving.
 
 The assumed product shape is P/D separation with an external router. The router is responsible for deciding whether work belongs to long prefill, delta prefill, or decode. This document only describes what pegainfer should care about after the router has already handed it a long-prefill batch.
 
@@ -25,8 +25,6 @@ The paper identifies three main waste sources in conventional MoE expert paralle
 - Sub-saturated per-device compute and expert-routing stragglers.
 - HBM pressure from expert weights, activations, and KV cache.
 - Synchronous activation AllToAll communication on every MoE layer.
-
-These waste sources matter most when a long-prefill batch has enough work to make compute the dominant resource. Short delta-prefill and decode do not automatically satisfy the same condition.
 
 ## Paper-Fact: AsyncEP Boundary
 
@@ -47,9 +45,9 @@ The paper also treats CPU-DRAM expert offload as a first-class option. In D2D-on
 
 ZeRO-Prefill includes a KV-cache-free mode for prefill-only workloads that directly produce logits, embeddings, classification results, or verification scores. That mode is only valid when the request does not need to continue into decode.
 
-For P/D-separated serving, a long-P cluster that hands work to a decode cluster must preserve the KV state or an equivalent handoff artifact. KV-cache-free execution is therefore a separate service shape, not a drop-in optimization for P-to-D handoff.
-
 ## Derivation: Compute-Bound Batch
+
+The paper's waste sources matter most when a long-prefill batch has enough work to make compute the dominant resource. In our P/D-separated roadmap, short delta-prefill and decode should not be assumed to satisfy the same condition.
 
 For pegainfer, the first long-P goal is to keep selected long-prefill work compute-bound. Once the router has already selected a long-prefill batch, the engine should avoid fragmenting it into chunks that lose MFU or make expert transfer visible again.
 
@@ -70,6 +68,8 @@ The second long-P goal is to move expert-weight transfer out of the critical pat
 **Defer:** whether the eventual backend uses AsyncEP-style D2D gather, hybrid CPU offload, or a different MoE execution strategy.
 
 ## Derivation: HBM And KV
+
+For P/D-separated serving, a long-P cluster that hands work to a decode cluster must preserve the KV state or an equivalent handoff artifact. KV-cache-free execution is therefore a separate service shape, not a drop-in optimization for P-to-D handoff.
 
 The third long-P goal is to control HBM pressure without breaking P-to-D handoff. Long prefill can stress HBM through expert weights, activations, and KV state at the same time.
 
