@@ -19,6 +19,7 @@ pub struct DirectGeneration {
 }
 
 pub struct DeepSeekV4RequestState {
+    request_epoch: u64,
     prompt_len: usize,
     max_new_tokens: usize,
     ignore_eos: bool,
@@ -29,6 +30,7 @@ pub struct DeepSeekV4RequestState {
 
 #[derive(Clone, Debug)]
 pub struct DirectDecodeStep {
+    request_epoch: u64,
     generated_len_before: usize,
     prompt_len: usize,
     token: Option<u32>,
@@ -78,6 +80,7 @@ impl DeepSeekV4RequestState {
 pub struct DeepSeekV4DirectGenerator {
     config: &'static Config,
     runtime: FullDirectRuntime,
+    next_request_epoch: u64,
 }
 
 impl DeepSeekV4DirectGenerator {
@@ -91,7 +94,11 @@ impl DeepSeekV4DirectGenerator {
             },
         )?));
         let runtime = load_full_direct_runtime(model_path, config)?;
-        Ok(Self { config, runtime })
+        Ok(Self {
+            config,
+            runtime,
+            next_request_epoch: 0,
+        })
     }
 
     pub fn eos_token_id(&self) -> usize {
@@ -107,8 +114,15 @@ impl DeepSeekV4DirectGenerator {
         if prompt_tokens.is_empty() {
             bail!("DeepSeek V4 request produced an empty prompt");
         }
+        let request_epoch = self.next_request_epoch;
+        self.next_request_epoch = self
+            .next_request_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request epoch exhausted"))?;
+
         if max_new_tokens == 0 {
             return Ok(DeepSeekV4RequestState {
+                request_epoch,
                 prompt_len: prompt_tokens.len(),
                 max_new_tokens,
                 ignore_eos,
@@ -131,6 +145,7 @@ impl DeepSeekV4DirectGenerator {
         )?;
 
         Ok(DeepSeekV4RequestState {
+            request_epoch,
             prompt_len: prompt_tokens.len(),
             max_new_tokens,
             ignore_eos,
@@ -143,6 +158,7 @@ impl DeepSeekV4DirectGenerator {
     pub fn sample_greedy_step(&self, state: &DeepSeekV4RequestState) -> Result<DirectDecodeStep> {
         if let Some(finish_reason) = state.finish_reason {
             return Ok(DirectDecodeStep {
+                request_epoch: state.request_epoch,
                 generated_len_before: state.generated.len(),
                 prompt_len: state.prompt_len,
                 token: None,
@@ -157,6 +173,7 @@ impl DeepSeekV4DirectGenerator {
         let token = argmax_f32(&next_logits) as u32;
         if !state.ignore_eos && token as usize == self.config.eos_token_id {
             return Ok(DirectDecodeStep {
+                request_epoch: state.request_epoch,
                 generated_len_before: state.generated.len(),
                 prompt_len: state.prompt_len,
                 token: None,
@@ -167,6 +184,7 @@ impl DeepSeekV4DirectGenerator {
         let finish_reason =
             (state.generated.len() + 1 == state.max_new_tokens).then_some(FinishReason::Length);
         Ok(DirectDecodeStep {
+            request_epoch: state.request_epoch,
             generated_len_before: state.generated.len(),
             prompt_len: state.prompt_len,
             token: Some(token),
@@ -355,6 +373,13 @@ fn ensure_step_matches_state(
     state: &DeepSeekV4RequestState,
     step: &DirectDecodeStep,
 ) -> Result<()> {
+    if step.request_epoch != state.request_epoch {
+        bail!(
+            "DeepSeek V4 decode step request epoch mismatch: step={}, state={}",
+            step.request_epoch,
+            state.request_epoch
+        );
+    }
     if step.prompt_len != state.prompt_len {
         bail!(
             "DeepSeek V4 decode step prompt length mismatch: step={}, state={}",
