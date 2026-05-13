@@ -2,6 +2,8 @@ use std::{path::Path, thread};
 
 use anyhow::{Context, Result, ensure};
 use crossbeam_channel as channel;
+#[cfg(test)]
+use cudarc::driver::DeviceRepr;
 use cudarc::driver::{CudaSlice, DevicePtrMut, result as cuda_result};
 
 use crate::{
@@ -11,15 +13,27 @@ use crate::{
     load_rank_to_gpu, precompute_rope_cache,
     runtime::{
         AttentionAuxScratch, AttentionIndexScratch, AttentionOutputScratch,
-        AttentionProjectionScratch, DecodeEntryScratch, FinalLogitsScratch, HcPostScratch,
-        HcPreNormScratch, MoeAgRsScratch, SharedExpertScratch, all_gather_logits,
-        all_gather_logits_into, block_decode_rank_lane_bf16_hidden_with_scratch,
+        AttentionProjectionScratch, DecodeBatchMeta, DecodeEntryScratch, F32BatchLogits,
+        FinalLogitsScratch, HcPostScratch, HcPreNormScratch, MoeAgRsScratch, SharedExpertScratch,
+        all_gather_logits, all_gather_logits_into,
+        block_decode_rank_lane_bf16_hidden_batch_with_scratch,
+        block_decode_rank_lane_bf16_hidden_with_scratch,
         block_prefill_rank_lane_bf16_hidden_with_decode_cache, embedding_rank_local_into,
-        final_logits_rank_local_bf16_hidden_into, hc_expand_bf16_hidden_into,
+        final_logits_rank_local_bf16_hidden_into, hc_expand_bf16_hidden_into, hc_head_bf16_hidden,
+        rank_local_logits_from_hidden_all, rms_norm_bf16_hidden,
     },
 };
 
 type RankResult = (usize, Option<Vec<f32>>);
+type RankBatchResult = (usize, Option<Vec<Vec<f32>>>);
+const DIRECT_BATCH_DECODE_CAPACITY: usize = 2;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DirectBatchDecodeEntry {
+    pub(super) token_id: u32,
+    pub(super) start_pos: usize,
+    pub(super) slot_id: usize,
+}
 
 pub(super) struct FullDirectRuntime {
     workers: Vec<RankWorker>,
@@ -31,6 +45,7 @@ enum RankCommand {
     // a temporary bridge while DeepSeek V4 still uses its direct generator.
     EnsureCaches {
         max_seq_len: usize,
+        request_slots: usize,
         resp: channel::Sender<Result<()>>,
     },
     ResetCaches {
@@ -44,6 +59,22 @@ enum RankCommand {
         token_id: u32,
         start_pos: usize,
         resp: channel::Sender<Result<RankResult>>,
+    },
+    #[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
+    DecodeBatch {
+        entries: Vec<DirectBatchDecodeEntry>,
+        resp: channel::Sender<Result<RankBatchResult>>,
+    },
+    #[cfg(test)]
+    CloneCacheSlot {
+        src_slot: usize,
+        dst_slot: usize,
+        resp: channel::Sender<Result<()>>,
+    },
+    #[cfg(test)]
+    ResetCacheSlot {
+        slot_id: usize,
+        resp: channel::Sender<Result<()>>,
     },
     Shutdown,
 }
@@ -67,6 +98,15 @@ impl OwnedRankComm {
 
 struct RankDecodeScratch {
     token_ids: CudaSlice<u32>,
+    batch_token_ids: CudaSlice<u32>,
+    start_pos: CudaSlice<i32>,
+    src_rows: CudaSlice<i32>,
+    window_dst_rows: CudaSlice<i32>,
+    window_base: CudaSlice<i32>,
+    compressed_base: CudaSlice<i32>,
+    compressed_len: CudaSlice<i32>,
+    start_pos_host: Vec<usize>,
+    slot_ids_host: Vec<usize>,
     entry: DecodeEntryScratch,
     hc_post: HcPostScratch,
     final_logits: FinalLogitsScratch,
@@ -82,19 +122,37 @@ struct RankDecodeScratch {
 impl RankDecodeScratch {
     fn new(ctx: &RankGpuContext, config: &Config, world_size: usize) -> Result<Self> {
         ctx.set_current()?;
+        let seq_capacity = DIRECT_BATCH_DECODE_CAPACITY;
         let token_ids = unsafe { ctx.stream.alloc(1)? };
-        let entry = DecodeEntryScratch::new(ctx, config, 1)?;
-        let hc_post = HcPostScratch::new(ctx, config, 1)?;
-        let final_logits = FinalLogitsScratch::new(ctx, config, world_size, 1)?;
-        let hc_pre_norm = HcPreNormScratch::new(ctx, config, 1)?;
-        let shared_expert = SharedExpertScratch::new(ctx, config, 1)?;
-        let moe_ag_rs = MoeAgRsScratch::new(ctx, config, world_size, 1)?;
-        let attention_projection = AttentionProjectionScratch::new(ctx, config, world_size, 1)?;
-        let attention_output = AttentionOutputScratch::new(ctx, config, world_size, 1)?;
-        let attention_index = AttentionIndexScratch::new(ctx, config)?;
-        let attention_aux = AttentionAuxScratch::new(ctx, config, world_size)?;
+        let batch_token_ids = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let start_pos = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let src_rows = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let window_dst_rows = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let window_base = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let compressed_base = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let compressed_len = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let entry = DecodeEntryScratch::new(ctx, config, seq_capacity)?;
+        let hc_post = HcPostScratch::new(ctx, config, seq_capacity)?;
+        let final_logits = FinalLogitsScratch::new(ctx, config, world_size, seq_capacity)?;
+        let hc_pre_norm = HcPreNormScratch::new(ctx, config, seq_capacity)?;
+        let shared_expert = SharedExpertScratch::new(ctx, config, seq_capacity)?;
+        let moe_ag_rs = MoeAgRsScratch::new(ctx, config, world_size, seq_capacity)?;
+        let attention_projection =
+            AttentionProjectionScratch::new(ctx, config, world_size, seq_capacity)?;
+        let attention_output = AttentionOutputScratch::new(ctx, config, world_size, seq_capacity)?;
+        let attention_index = AttentionIndexScratch::new(ctx, config, seq_capacity)?;
+        let attention_aux = AttentionAuxScratch::new(ctx, config, world_size, seq_capacity)?;
         Ok(Self {
             token_ids,
+            batch_token_ids,
+            start_pos,
+            src_rows,
+            window_dst_rows,
+            window_base,
+            compressed_base,
+            compressed_len,
+            start_pos_host: Vec::with_capacity(seq_capacity),
+            slot_ids_host: Vec::with_capacity(seq_capacity),
             entry,
             hc_post,
             final_logits,
@@ -113,6 +171,112 @@ impl RankDecodeScratch {
         ctx.stream.memcpy_htod(&[token_id], &mut self.token_ids)?;
         Ok(&self.token_ids)
     }
+}
+
+fn fill_decode_batch_metadata(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    slot_stride: usize,
+    compressed_slots: usize,
+    entries: &[DirectBatchDecodeEntry],
+    token_ids: &mut CudaSlice<u32>,
+    start_pos_slice: &mut CudaSlice<i32>,
+    src_rows_slice: &mut CudaSlice<i32>,
+    window_dst_rows_slice: &mut CudaSlice<i32>,
+    window_base_slice: &mut CudaSlice<i32>,
+    compressed_base_slice: &mut CudaSlice<i32>,
+    compressed_len_slice: &mut CudaSlice<i32>,
+    start_pos_host: &mut Vec<usize>,
+    slot_ids_host: &mut Vec<usize>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        !entries.is_empty(),
+        "direct batch decode entries must not be empty"
+    );
+    ensure!(
+        entries.len() <= DIRECT_BATCH_DECODE_CAPACITY,
+        "direct batch decode capacity exceeded: entries={}, capacity={DIRECT_BATCH_DECODE_CAPACITY}",
+        entries.len()
+    );
+    ensure!(
+        layer < config.compress_ratios.len(),
+        "batch meta layer {layer} out of range"
+    );
+    let ratio = config.compress_ratios[layer];
+    ensure!(
+        slot_stride >= config.sliding_window,
+        "batch decode slot stride {} smaller than sliding window {}",
+        slot_stride,
+        config.sliding_window
+    );
+    ensure!(
+        ratio == 0 || compressed_slots > 0,
+        "batch decode compressed layer {layer} has no compressed cache slots"
+    );
+    ensure!(
+        ratio > 0 || compressed_slots == 0,
+        "batch decode non-compressed layer {layer} unexpectedly has {compressed_slots} compressed slots"
+    );
+    ensure!(
+        slot_stride == config.sliding_window + compressed_slots,
+        "batch decode slot stride mismatch: stride={}, window={}, compressed={}",
+        slot_stride,
+        config.sliding_window,
+        compressed_slots
+    );
+    let mut token_ids_host = Vec::with_capacity(entries.len());
+    let mut start_pos = Vec::with_capacity(entries.len());
+    let mut src_rows = Vec::with_capacity(entries.len());
+    let mut window_dst_rows = Vec::with_capacity(entries.len());
+    let mut window_base = Vec::with_capacity(entries.len());
+    let mut compressed_base = Vec::with_capacity(entries.len());
+    let mut compressed_len = Vec::with_capacity(entries.len());
+    start_pos_host.clear();
+    slot_ids_host.clear();
+    for (row, entry) in entries.iter().enumerate() {
+        ensure!(
+            entry.slot_id < DIRECT_BATCH_DECODE_CAPACITY,
+            "batch decode slot {} exceeds capacity {DIRECT_BATCH_DECODE_CAPACITY}",
+            entry.slot_id
+        );
+        token_ids_host.push(entry.token_id);
+        start_pos.push(entry.start_pos as i32);
+        src_rows.push(row as i32);
+        let base = entry.slot_id * slot_stride;
+        window_base.push(base as i32);
+        window_dst_rows.push((base + entry.start_pos % config.sliding_window) as i32);
+        let c_base = base + config.sliding_window;
+        compressed_base.push(c_base as i32);
+        if ratio > 0 {
+            ensure!(
+                entry.start_pos / ratio < compressed_slots,
+                "batch decode compressed dst out of range: start_pos={}, ratio={}, compressed_slots={}",
+                entry.start_pos,
+                ratio,
+                compressed_slots
+            );
+        }
+        compressed_len.push(if ratio > 0 {
+            ((entry.start_pos + 1) / ratio) as i32
+        } else {
+            0
+        });
+        start_pos_host.push(entry.start_pos);
+        slot_ids_host.push(entry.slot_id);
+    }
+    ctx.stream.memcpy_htod(&token_ids_host, token_ids)?;
+    ctx.stream.memcpy_htod(&start_pos, start_pos_slice)?;
+    ctx.stream.memcpy_htod(&src_rows, src_rows_slice)?;
+    ctx.stream
+        .memcpy_htod(&window_dst_rows, window_dst_rows_slice)?;
+    ctx.stream.memcpy_htod(&window_base, window_base_slice)?;
+    ctx.stream
+        .memcpy_htod(&compressed_base, compressed_base_slice)?;
+    ctx.stream
+        .memcpy_htod(&compressed_len, compressed_len_slice)?;
+    Ok(())
 }
 
 impl RankWorker {
@@ -135,6 +299,7 @@ impl RankWorker {
                 let mut ropes = Vec::new();
                 let mut caches = Vec::new();
                 let mut max_cache_seq_len = 0usize;
+                let mut cache_request_slots = 0usize;
                 let startup = bind_rank_thread(&ctx).and_then(|()| {
                     let ptr_cache = build_moe_expert_ptr_cache(&ctx, config, &weights)?;
                     let decode_scratch =
@@ -146,14 +311,20 @@ impl RankWorker {
                         let _ = startup_tx.send(Ok(()));
                         while let Ok(cmd) = rx.recv() {
                             match cmd {
-                                RankCommand::EnsureCaches { max_seq_len, resp } => {
+                                RankCommand::EnsureCaches {
+                                    max_seq_len,
+                                    request_slots,
+                                    resp,
+                                } => {
                                     let result = ensure_rank_worker_caches(
                                         &ctx,
                                         config,
                                         max_seq_len,
+                                        request_slots,
                                         &mut caches,
                                         &mut ropes,
                                         &mut max_cache_seq_len,
+                                        &mut cache_request_slots,
                                     );
                                     let _ = resp.send(result);
                                 }
@@ -201,6 +372,47 @@ impl RankWorker {
                                     .map(|logits| (rank, logits));
                                     let _ = resp.send(result);
                                 }
+                                RankCommand::DecodeBatch { entries, resp } => {
+                                    let result = run_decode_batch_on_rank_lane(
+                                        rank,
+                                        &ctx,
+                                        &weights,
+                                        &ptr_cache,
+                                        comm.get(),
+                                        moe_comm.get(),
+                                        &ropes,
+                                        config,
+                                        &entries,
+                                        &mut caches,
+                                        &mut decode_scratch,
+                                    )
+                                    .map(|logits| (rank, logits));
+                                    let _ = resp.send(result);
+                                }
+                                #[cfg(test)]
+                                RankCommand::CloneCacheSlot {
+                                    src_slot,
+                                    dst_slot,
+                                    resp,
+                                } => {
+                                    let result = clone_rank_decode_cache_slot_for_test(
+                                        &ctx,
+                                        config,
+                                        &mut caches,
+                                        src_slot,
+                                        dst_slot,
+                                    );
+                                    let _ = resp.send(result);
+                                }
+                                #[cfg(test)]
+                                RankCommand::ResetCacheSlot { slot_id, resp } => {
+                                    let result = reset_rank_decode_cache_slot_for_test(
+                                        &ctx,
+                                        &mut caches,
+                                        slot_id,
+                                    );
+                                    let _ = resp.send(result);
+                                }
                                 RankCommand::Shutdown => break,
                             }
                         }
@@ -236,11 +448,27 @@ impl RankWorker {
         Ok(resp_rx)
     }
 
-    fn ensure_caches(&self, max_seq_len: usize) -> Result<()> {
+    #[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
+    fn decode_batch(
+        &self,
+        entries: Vec<DirectBatchDecodeEntry>,
+    ) -> Result<channel::Receiver<Result<RankBatchResult>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(RankCommand::DecodeBatch {
+                entries,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    fn ensure_caches(&self, max_seq_len: usize, request_slots: usize) -> Result<()> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(RankCommand::EnsureCaches {
                 max_seq_len,
+                request_slots,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed on EnsureCaches"))?;
@@ -257,6 +485,39 @@ impl RankWorker {
         resp_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped ResetCaches response"))?
+    }
+
+    #[cfg(test)]
+    fn clone_cache_slot_for_test(&self, src_slot: usize, dst_slot: usize) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(RankCommand::CloneCacheSlot {
+                src_slot,
+                dst_slot,
+                resp: resp_tx,
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("DeepSeek rank worker channel closed on CloneCacheSlot")
+            })?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped CloneCacheSlot response"))?
+    }
+
+    #[cfg(test)]
+    fn reset_cache_slot_for_test(&self, slot_id: usize) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(RankCommand::ResetCacheSlot {
+                slot_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("DeepSeek rank worker channel closed on ResetCacheSlot")
+            })?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped ResetCacheSlot response"))?
     }
 
     fn prefill(&self, prompt_tokens: Vec<u32>) -> Result<channel::Receiver<Result<RankResult>>> {
@@ -348,14 +609,16 @@ fn allocate_rank_decode_caches(
     ctx: &RankGpuContext,
     config: &Config,
     max_seq_len: usize,
+    request_slots: usize,
 ) -> Result<Vec<LayerDecodeCache>> {
     let mut caches = Vec::with_capacity(config.n_layers);
     for layer in 0..config.n_layers {
-        caches.push(LayerDecodeCache::zeros_with_max_seq(
+        caches.push(LayerDecodeCache::zeros_with_max_seq_and_slots(
             ctx,
             config,
             layer,
             max_seq_len,
+            request_slots,
         )?);
     }
     Ok(caches)
@@ -378,13 +641,40 @@ pub(super) fn ensure_direct_decode_caches(
     config: &Config,
     max_seq_len: usize,
 ) -> Result<()> {
+    ensure_direct_decode_caches_with_slots(runtime, config, max_seq_len, 1)
+}
+
+#[cfg(test)]
+pub(super) fn ensure_direct_decode_batch_caches_for_test(
+    runtime: &mut FullDirectRuntime,
+    config: &Config,
+    max_seq_len: usize,
+) -> Result<()> {
+    ensure_direct_decode_caches_with_slots(
+        runtime,
+        config,
+        max_seq_len,
+        DIRECT_BATCH_DECODE_CAPACITY,
+    )
+}
+
+fn ensure_direct_decode_caches_with_slots(
+    runtime: &mut FullDirectRuntime,
+    config: &Config,
+    max_seq_len: usize,
+    request_slots: usize,
+) -> Result<()> {
     ensure!(
         runtime.workers.len() == 8,
         "DeepSeek V4 direct runtime expects 8 rank workers"
     );
+    ensure!(
+        request_slots > 0,
+        "DeepSeek V4 direct runtime cache request slots must be positive"
+    );
     for (rank, worker) in runtime.workers.iter().enumerate() {
         worker
-            .ensure_caches(max_seq_len)
+            .ensure_caches(max_seq_len, request_slots)
             .with_context(|| format!("ensure rank worker caches rank {rank}"))?;
         worker
             .reset_caches()
@@ -398,14 +688,20 @@ fn ensure_rank_worker_caches(
     ctx: &RankGpuContext,
     config: &Config,
     max_seq_len: usize,
+    request_slots: usize,
     caches: &mut Vec<LayerDecodeCache>,
     ropes: &mut Vec<DeepSeekRopeCache>,
     max_cache_seq_len: &mut usize,
+    cache_request_slots: &mut usize,
 ) -> Result<()> {
-    if caches.len() != config.n_layers || *max_cache_seq_len < max_seq_len {
-        *caches = allocate_rank_decode_caches(ctx, config, max_seq_len)?;
+    if caches.len() != config.n_layers
+        || *max_cache_seq_len < max_seq_len
+        || *cache_request_slots != request_slots
+    {
+        *caches = allocate_rank_decode_caches(ctx, config, max_seq_len, request_slots)?;
         *ropes = allocate_rank_rope_caches(ctx, config, max_seq_len)?;
         *max_cache_seq_len = max_seq_len;
+        *cache_request_slots = request_slots;
     }
     Ok(())
 }
@@ -425,6 +721,239 @@ fn reset_rank_decode_caches(ctx: &RankGpuContext, caches: &mut [LayerDecodeCache
             fill_f32_cuda_slice(ctx, &mut indexer_compressor.score, f32::NEG_INFINITY)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn reset_rank_decode_cache_slot_for_test(
+    ctx: &RankGpuContext,
+    caches: &mut [LayerDecodeCache],
+    slot_id: usize,
+) -> Result<()> {
+    ensure!(
+        slot_id < DIRECT_BATCH_DECODE_CAPACITY,
+        "reset cache slot out of range: slot={slot_id}, capacity={DIRECT_BATCH_DECODE_CAPACITY}",
+    );
+    for (layer, cache) in caches.iter_mut().enumerate() {
+        reset_slot_rows(
+            ctx,
+            &mut cache.kv.data,
+            cache.kv.hidden_dim,
+            cache.kv.slots / DIRECT_BATCH_DECODE_CAPACITY,
+            slot_id,
+            half::bf16::ZERO,
+        )
+        .with_context(|| format!("reset layer {layer} KV cache slot"))?;
+        if let Some(compressor) = cache.compressor.as_mut() {
+            let rows_per_slot = compressor.slots / DIRECT_BATCH_DECODE_CAPACITY;
+            reset_slot_rows(
+                ctx,
+                &mut compressor.kv,
+                compressor.hidden_dim,
+                rows_per_slot,
+                slot_id,
+                0.0,
+            )
+            .with_context(|| format!("reset layer {layer} compressor KV slot"))?;
+            reset_slot_rows(
+                ctx,
+                &mut compressor.score,
+                compressor.hidden_dim,
+                rows_per_slot,
+                slot_id,
+                f32::NEG_INFINITY,
+            )
+            .with_context(|| format!("reset layer {layer} compressor score slot"))?;
+        }
+        if let Some(indexer_kv) = cache.indexer_kv.as_mut() {
+            reset_slot_rows(
+                ctx,
+                &mut indexer_kv.data,
+                indexer_kv.hidden_dim,
+                indexer_kv.slots / DIRECT_BATCH_DECODE_CAPACITY,
+                slot_id,
+                half::bf16::ZERO,
+            )
+            .with_context(|| format!("reset layer {layer} indexer KV slot"))?;
+        }
+        if let Some(indexer_compressor) = cache.indexer_compressor.as_mut() {
+            let rows_per_slot = indexer_compressor.slots / DIRECT_BATCH_DECODE_CAPACITY;
+            reset_slot_rows(
+                ctx,
+                &mut indexer_compressor.kv,
+                indexer_compressor.hidden_dim,
+                rows_per_slot,
+                slot_id,
+                0.0,
+            )
+            .with_context(|| format!("reset layer {layer} indexer compressor KV slot"))?;
+            reset_slot_rows(
+                ctx,
+                &mut indexer_compressor.score,
+                indexer_compressor.hidden_dim,
+                rows_per_slot,
+                slot_id,
+                f32::NEG_INFINITY,
+            )
+            .with_context(|| format!("reset layer {layer} indexer compressor score slot"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn clone_rank_decode_cache_slot_for_test(
+    ctx: &RankGpuContext,
+    config: &Config,
+    caches: &mut [LayerDecodeCache],
+    src_slot: usize,
+    dst_slot: usize,
+) -> Result<()> {
+    ensure!(
+        src_slot < DIRECT_BATCH_DECODE_CAPACITY && dst_slot < DIRECT_BATCH_DECODE_CAPACITY,
+        "clone cache slot out of range: src={src_slot}, dst={dst_slot}, capacity={DIRECT_BATCH_DECODE_CAPACITY}",
+    );
+    ensure!(
+        caches.len() == config.n_layers,
+        "clone cache slot layer mismatch: have {}, need {}",
+        caches.len(),
+        config.n_layers
+    );
+    if src_slot == dst_slot {
+        return Ok(());
+    }
+    for (layer, cache) in caches.iter_mut().enumerate() {
+        clone_slot_rows(
+            ctx,
+            &mut cache.kv.data,
+            cache.kv.hidden_dim,
+            cache.kv.slots / DIRECT_BATCH_DECODE_CAPACITY,
+            src_slot,
+            dst_slot,
+        )
+        .with_context(|| format!("clone layer {layer} KV cache slot"))?;
+        if let Some(compressor) = cache.compressor.as_mut() {
+            let rows_per_slot = compressor.slots / DIRECT_BATCH_DECODE_CAPACITY;
+            clone_slot_rows(
+                ctx,
+                &mut compressor.kv,
+                compressor.hidden_dim,
+                rows_per_slot,
+                src_slot,
+                dst_slot,
+            )
+            .with_context(|| format!("clone layer {layer} compressor KV slot"))?;
+            clone_slot_rows(
+                ctx,
+                &mut compressor.score,
+                compressor.hidden_dim,
+                rows_per_slot,
+                src_slot,
+                dst_slot,
+            )
+            .with_context(|| format!("clone layer {layer} compressor score slot"))?;
+        }
+        if let Some(indexer_kv) = cache.indexer_kv.as_mut() {
+            clone_slot_rows(
+                ctx,
+                &mut indexer_kv.data,
+                indexer_kv.hidden_dim,
+                indexer_kv.slots / DIRECT_BATCH_DECODE_CAPACITY,
+                src_slot,
+                dst_slot,
+            )
+            .with_context(|| format!("clone layer {layer} indexer KV slot"))?;
+        }
+        if let Some(indexer_compressor) = cache.indexer_compressor.as_mut() {
+            let rows_per_slot = indexer_compressor.slots / DIRECT_BATCH_DECODE_CAPACITY;
+            clone_slot_rows(
+                ctx,
+                &mut indexer_compressor.kv,
+                indexer_compressor.hidden_dim,
+                rows_per_slot,
+                src_slot,
+                dst_slot,
+            )
+            .with_context(|| format!("clone layer {layer} indexer compressor KV slot"))?;
+            clone_slot_rows(
+                ctx,
+                &mut indexer_compressor.score,
+                indexer_compressor.hidden_dim,
+                rows_per_slot,
+                src_slot,
+                dst_slot,
+            )
+            .with_context(|| format!("clone layer {layer} indexer compressor score slot"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn clone_slot_rows<T>(
+    ctx: &RankGpuContext,
+    data: &mut CudaSlice<T>,
+    row_width: usize,
+    rows_per_slot: usize,
+    src_slot: usize,
+    dst_slot: usize,
+) -> Result<()>
+where
+    T: Copy + DeviceRepr,
+{
+    ctx.set_current()?;
+    ensure!(row_width > 0, "clone cache row width must be positive");
+    ensure!(
+        rows_per_slot > 0,
+        "clone cache rows_per_slot must be positive"
+    );
+    let slot_len = row_width * rows_per_slot;
+    let src_start = src_slot * slot_len;
+    let dst_start = dst_slot * slot_len;
+    ensure!(
+        src_start + slot_len <= data.len() && dst_start + slot_len <= data.len(),
+        "clone cache slot copy out of range: len={}, slot_len={}, src={}, dst={}",
+        data.len(),
+        slot_len,
+        src_slot,
+        dst_slot
+    );
+    let mut host = ctx.stream.clone_dtoh(data)?;
+    host.copy_within(src_start..src_start + slot_len, dst_start);
+    ctx.stream.memcpy_htod(&host, data)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn reset_slot_rows<T>(
+    ctx: &RankGpuContext,
+    data: &mut CudaSlice<T>,
+    row_width: usize,
+    rows_per_slot: usize,
+    slot_id: usize,
+    fill: T,
+) -> Result<()>
+where
+    T: Copy + DeviceRepr,
+{
+    ctx.set_current()?;
+    ensure!(row_width > 0, "reset cache row width must be positive");
+    ensure!(
+        rows_per_slot > 0,
+        "reset cache rows_per_slot must be positive"
+    );
+    let slot_len = row_width * rows_per_slot;
+    let start = slot_id * slot_len;
+    ensure!(
+        start + slot_len <= data.len(),
+        "reset cache slot out of range: len={}, slot_len={}, slot={}",
+        data.len(),
+        slot_len,
+        slot_id
+    );
+    let mut host = ctx.stream.clone_dtoh(data)?;
+    host[start..start + slot_len].fill(fill);
+    ctx.stream.memcpy_htod(&host, data)?;
     Ok(())
 }
 
@@ -585,6 +1114,187 @@ fn run_decode_on_rank_lane(
         .with_context(|| format!("final logits all_gather rank {rank}"))
 }
 
+fn run_decode_batch_on_rank_lane(
+    rank: usize,
+    ctx: &RankGpuContext,
+    weights: &RankWeightView<'_>,
+    ptr_cache: &crate::MoeGroupedPtrCache,
+    comm: &cudarc::nccl::safe::Comm,
+    moe_comm: &cudarc::nccl::safe::Comm,
+    ropes: &[DeepSeekRopeCache],
+    config: &Config,
+    entries: &[DirectBatchDecodeEntry],
+    caches: &mut [LayerDecodeCache],
+    scratch: &mut RankDecodeScratch,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    ensure!(
+        !entries.is_empty(),
+        "rank {rank} batch decode must have at least one entry"
+    );
+    ensure!(
+        entries.len() <= DIRECT_BATCH_DECODE_CAPACITY,
+        "rank {rank} batch decode entries={} exceeds capacity {DIRECT_BATCH_DECODE_CAPACITY}",
+        entries.len()
+    );
+    ensure!(
+        ropes.len() == config.n_layers,
+        "rank {rank} rope cache layer mismatch: have {}, need {}",
+        ropes.len(),
+        config.n_layers
+    );
+    ensure!(
+        caches.len() == config.n_layers,
+        "rank {rank} decode cache layer mismatch: have {}, need {}",
+        caches.len(),
+        config.n_layers
+    );
+
+    ctx.set_current()?;
+    let token_ids_host = entries
+        .iter()
+        .map(|entry| entry.token_id)
+        .collect::<Vec<_>>();
+    ctx.stream
+        .memcpy_htod(&token_ids_host, &mut scratch.batch_token_ids)?;
+    embedding_rank_local_into(
+        ctx,
+        config,
+        weights,
+        &scratch.batch_token_ids,
+        entries.len(),
+        &mut scratch.entry.embedding,
+    )
+    .with_context(|| format!("batch embedding rank {rank}"))?;
+    all_reduce_hidden_in_place(&mut scratch.entry.embedding, comm)
+        .with_context(|| format!("batch embedding all_reduce rank {rank}"))?;
+    hc_expand_bf16_hidden_into(
+        ctx,
+        &scratch.entry.embedding,
+        config.hc_mult,
+        &mut scratch.entry.hc_expand,
+    )
+    .with_context(|| format!("batch hc_expand rank {rank}"))?;
+
+    let mut current_hc_slot = None;
+    for layer in 0..config.n_layers {
+        let output_slot = current_hc_slot.map_or(0, |slot| 1 - slot);
+        let slot_stride = caches[layer].kv.slots / DIRECT_BATCH_DECODE_CAPACITY;
+        let compressed_slots = slot_stride
+            .checked_sub(config.sliding_window)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "batch decode layer {layer} cache slots per request {} smaller than sliding window {}",
+                    slot_stride,
+                    config.sliding_window
+                )
+            })?;
+        fill_decode_batch_metadata(
+            ctx,
+            config,
+            layer,
+            slot_stride,
+            compressed_slots,
+            entries,
+            &mut scratch.batch_token_ids,
+            &mut scratch.start_pos,
+            &mut scratch.src_rows,
+            &mut scratch.window_dst_rows,
+            &mut scratch.window_base,
+            &mut scratch.compressed_base,
+            &mut scratch.compressed_len,
+            &mut scratch.start_pos_host,
+            &mut scratch.slot_ids_host,
+        )?;
+        let token_ids = &scratch.batch_token_ids;
+        let batch_meta = DecodeBatchMeta {
+            batch: entries.len(),
+            compressed_slots,
+            start_pos: &scratch.start_pos,
+            src_rows: &scratch.src_rows,
+            window_dst_rows: &scratch.window_dst_rows,
+            window_base: &scratch.window_base,
+            compressed_base: &scratch.compressed_base,
+            compressed_len: &scratch.compressed_len,
+            start_pos_host: &scratch.start_pos_host,
+            slot_ids_host: &scratch.slot_ids_host,
+        };
+        if let Some(input_slot) = current_hc_slot {
+            let (attention_reduce_temp, attention_hc_out, layer_outputs) = (
+                &mut scratch.hc_post.attention_reduce_temp,
+                &mut scratch.hc_post.attention_out,
+                &mut scratch.hc_post.layer_outputs,
+            );
+            let (hc_input, layer_out) =
+                split_hc_input_output(layer_outputs, input_slot, output_slot)?;
+            block_decode_rank_lane_bf16_hidden_batch_with_scratch(
+                ctx,
+                weights,
+                ptr_cache,
+                comm,
+                moe_comm,
+                config,
+                layer,
+                hc_input,
+                token_ids,
+                &ropes[layer],
+                &batch_meta,
+                &mut caches[layer],
+                &mut scratch.hc_pre_norm,
+                &mut scratch.shared_expert,
+                &mut scratch.moe_ag_rs,
+                &mut scratch.attention_projection,
+                &mut scratch.attention_output,
+                &mut scratch.attention_index,
+                &mut scratch.attention_aux,
+                attention_reduce_temp,
+                attention_hc_out,
+                layer_out,
+            )
+            .with_context(|| format!("batch decode layer {layer} rank {rank}"))?;
+        } else {
+            let layer_out = scratch
+                .hc_post
+                .layer_outputs
+                .get_mut(output_slot)
+                .ok_or_else(|| anyhow::anyhow!("missing HC post output slot {output_slot}"))?;
+            block_decode_rank_lane_bf16_hidden_batch_with_scratch(
+                ctx,
+                weights,
+                ptr_cache,
+                comm,
+                moe_comm,
+                config,
+                layer,
+                &scratch.entry.hc_expand,
+                token_ids,
+                &ropes[layer],
+                &batch_meta,
+                &mut caches[layer],
+                &mut scratch.hc_pre_norm,
+                &mut scratch.shared_expert,
+                &mut scratch.moe_ag_rs,
+                &mut scratch.attention_projection,
+                &mut scratch.attention_output,
+                &mut scratch.attention_index,
+                &mut scratch.attention_aux,
+                &mut scratch.hc_post.attention_reduce_temp,
+                &mut scratch.hc_post.attention_out,
+                layer_out,
+            )
+            .with_context(|| format!("batch decode layer {layer} rank {rank}"))?;
+        }
+        current_hc_slot = Some(output_slot);
+    }
+
+    let final_hc = current_hc_slot
+        .and_then(|slot| scratch.hc_post.layer_outputs.get(slot))
+        .unwrap_or(&scratch.entry.hc_expand);
+    let local_logits = final_batch_logits_rank_local_bf16_hidden(ctx, config, weights, final_hc)
+        .with_context(|| format!("batch final logits rank {rank}"))?;
+    gather_batch_logits_for_sampling(rank, ctx, comm, weights, &local_logits)
+        .with_context(|| format!("batch final logits all_gather rank {rank}"))
+}
+
 fn split_hc_input_output(
     layer_outputs: &mut [crate::HcHiddenStates],
     input_slot: usize,
@@ -672,6 +1382,58 @@ fn run_prefill_on_rank_lane(
         .with_context(|| format!("prefill final logits all_gather rank {rank}"))
 }
 
+fn final_batch_logits_rank_local_bf16_hidden(
+    ctx: &RankGpuContext,
+    config: &Config,
+    weights: &RankWeightView<'_>,
+    input: &crate::HcHiddenStates,
+) -> Result<F32BatchLogits> {
+    ctx.set_current()?;
+    let hidden = hc_head_bf16_hidden(
+        ctx,
+        config,
+        input,
+        &weights.hc_head_fn()?,
+        &weights.hc_head_scale()?,
+        &weights.hc_head_base()?,
+    )?;
+    let normed = rms_norm_bf16_hidden(ctx, &hidden, &weights.norm()?, config.rms_norm_eps)?;
+    rank_local_logits_from_hidden_all(ctx, &normed, &weights.head()?)
+}
+
+fn gather_batch_logits_for_sampling(
+    rank: usize,
+    ctx: &RankGpuContext,
+    comm: &cudarc::nccl::safe::Comm,
+    weights: &RankWeightView<'_>,
+    local_logits: &F32BatchLogits,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    ctx.set_current()?;
+    let world_size = weights.world_size();
+    ensure!(world_size > 0, "batch logits world size must be positive");
+    let gathered_len = local_logits.data.len() * world_size;
+    let mut gathered = unsafe { ctx.stream.alloc(gathered_len)? };
+    comm.all_gather(&local_logits.data, &mut gathered)
+        .map_err(|err| anyhow::anyhow!("NCCL batch logits all-gather failed: {err:?}"))?;
+    if rank != 0 {
+        return Ok(None);
+    }
+    let host = ctx.stream.clone_dtoh(&gathered)?;
+    ctx.sync()?;
+    let local_vocab = local_logits.vocab_size;
+    let seq_len = local_logits.seq_len;
+    let mut rows = (0..seq_len)
+        .map(|_| Vec::with_capacity(local_vocab * world_size))
+        .collect::<Vec<_>>();
+    for row in 0..seq_len {
+        for rank in 0..world_size {
+            let start = rank * seq_len * local_vocab + row * local_vocab;
+            rows[row].extend_from_slice(&host[start..start + local_vocab]);
+        }
+    }
+    Ok(Some(rows))
+}
+
 fn gather_logits_for_sampling(
     rank: usize,
     ctx: &RankGpuContext,
@@ -741,6 +1503,81 @@ pub(super) fn run_direct_decode_logits(
     rank0_logits(results)
 }
 
+#[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
+pub(super) fn run_direct_decode_batch_logits(
+    runtime: &mut FullDirectRuntime,
+    entries: &[DirectBatchDecodeEntry],
+) -> Result<Vec<Vec<f32>>> {
+    ensure!(
+        runtime.workers.len() == 8,
+        "DeepSeek V4 direct batch decode expects 8 workers"
+    );
+    ensure!(
+        !entries.is_empty(),
+        "DeepSeek V4 direct batch decode entries must not be empty"
+    );
+    ensure!(
+        entries.len() <= DIRECT_BATCH_DECODE_CAPACITY,
+        "DeepSeek V4 direct batch decode capacity exceeded: entries={}, capacity={DIRECT_BATCH_DECODE_CAPACITY}",
+        entries.len()
+    );
+    let rank_count = runtime.workers.len();
+    let pending = runtime
+        .workers
+        .iter()
+        .enumerate()
+        .map(|(rank, worker)| {
+            worker
+                .decode_batch(entries.to_vec())
+                .with_context(|| format!("dispatch batch decode rank {rank}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut results = Vec::with_capacity(rank_count);
+    for recv in pending {
+        results.push(recv.recv().map_err(|_| {
+            anyhow::anyhow!("DeepSeek rank worker dropped batch decode response")
+        })??);
+    }
+    results.sort_by_key(|(rank, _)| *rank);
+    rank0_batch_logits(results)
+}
+
+#[cfg(test)]
+pub(super) fn clone_direct_decode_cache_slot_for_test(
+    runtime: &mut FullDirectRuntime,
+    src_slot: usize,
+    dst_slot: usize,
+) -> Result<()> {
+    ensure!(
+        runtime.workers.len() == 8,
+        "DeepSeek V4 direct cache clone expects 8 workers"
+    );
+    for (rank, worker) in runtime.workers.iter().enumerate() {
+        worker
+            .clone_cache_slot_for_test(src_slot, dst_slot)
+            .with_context(|| format!("clone rank worker cache slot rank {rank}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn reset_direct_decode_cache_slot_for_test(
+    runtime: &mut FullDirectRuntime,
+    slot_id: usize,
+) -> Result<()> {
+    ensure!(
+        runtime.workers.len() == 8,
+        "DeepSeek V4 direct cache slot reset expects 8 workers"
+    );
+    for (rank, worker) in runtime.workers.iter().enumerate() {
+        worker
+            .reset_cache_slot_for_test(slot_id)
+            .with_context(|| format!("reset rank worker cache slot rank {rank}"))?;
+    }
+    Ok(())
+}
+
 pub(super) fn run_prefill_logits_and_seed_decode_cache(
     runtime: &mut FullDirectRuntime,
     config: &Config,
@@ -784,4 +1621,13 @@ fn rank0_logits(results: Vec<RankResult>) -> Result<Vec<f32>> {
         .find_map(|(rank, logits)| (rank == 0).then_some(logits))
         .flatten()
         .ok_or_else(|| anyhow::anyhow!("rank 0 did not return gathered logits"))
+}
+
+#[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
+fn rank0_batch_logits(results: Vec<RankBatchResult>) -> Result<Vec<Vec<f32>>> {
+    results
+        .into_iter()
+        .find_map(|(rank, logits)| (rank == 0).then_some(logits))
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("rank 0 did not return gathered batch logits"))
 }

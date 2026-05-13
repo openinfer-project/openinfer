@@ -433,6 +433,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_apply_rope_q_kv_batch_cuda(
+        q: *mut Half,
+        kv: *mut Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        start_pos: *const i32,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_fill_rope_cache_cuda(
         inv_freq: *const f32,
         cos_cache: *mut f32,
@@ -493,12 +506,38 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_indexer_scores_decode_batch_cuda(
+        q: *const Half,
+        kv: *const Half,
+        weights: *const Half,
+        compressed_len: *const i32,
+        cache_base: *const i32,
+        scores: *mut f32,
+        batch: i32,
+        local_heads: i32,
+        head_dim: i32,
+        max_compressed_len: i32,
+        score_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_indexer_topk_decode_cuda(
         scores: *const f32,
         topk_idxs: *mut i32,
         compressed_len: i32,
         topk: i32,
         offset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_indexer_topk_decode_batch_cuda(
+        scores: *const f32,
+        topk_idxs: *mut i32,
+        compressed_len: *const i32,
+        cache_base: *const i32,
+        batch: i32,
+        max_compressed_len: i32,
+        topk: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -527,6 +566,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_window_topk_indices_decode_batch_cuda(
+        out: *mut i32,
+        start_pos: *const i32,
+        cache_base: *const i32,
+        batch: i32,
+        window_size: i32,
+        topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_compress_topk_indices_cuda(
         out: *mut i32,
         seq_len: i32,
@@ -540,6 +589,15 @@ unsafe extern "C" {
         out: *mut i32,
         compressed: i32,
         offset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compress_topk_indices_decode_batch_cuda(
+        out: *mut i32,
+        compressed_len: *const i32,
+        cache_base: *const i32,
+        batch: i32,
+        topk: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -572,6 +630,19 @@ unsafe extern "C" {
         head_dim: i32,
         rotary_dim: i32,
         start_pos: i32,
+        inverse: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_apply_rope_hidden_batch_cuda(
+        x: *mut Half,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        start_pos: *const i32,
+        seq_len: i32,
+        local_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
         inverse: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -617,6 +688,16 @@ unsafe extern "C" {
         rows: i32,
         src_start_row: i32,
         dst_start_row: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_bf16_copy_rows_indexed_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        src_rows: *const i32,
+        dst_rows: *const i32,
+        hidden_dim: i32,
+        rows: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -669,6 +750,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_compressor_nonoverlap_decode_at_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut Half,
+        start_pos: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        ratio: i32,
+        state_offset: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_compressor_overlap_decode_cuda(
         x: *const Half,
         wkv: *const Half,
@@ -682,6 +782,24 @@ unsafe extern "C" {
         start_pos: i32,
         hidden_dim: i32,
         head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_compressor_overlap_decode_at_cuda(
+        x: *const Half,
+        wkv: *const Half,
+        wgate: *const Half,
+        ape: *const f32,
+        norm: *const Half,
+        kv_state: *mut f32,
+        score_state: *mut f32,
+        weighted: *mut f32,
+        out: *mut Half,
+        start_pos: i32,
+        hidden_dim: i32,
+        head_dim: i32,
+        state_offset: i32,
         eps: f32,
         stream: CUstream,
     ) -> CUresult;
@@ -813,6 +931,16 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn deepseek_last_token_bf16_logits_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut f32,
+        seq_len: i32,
+        dim: i32,
+        vocab_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_bf16_logits_cuda(
         x: *const Half,
         weight: *const Half,
         out: *mut f32,

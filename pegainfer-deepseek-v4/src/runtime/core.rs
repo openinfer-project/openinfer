@@ -452,6 +452,58 @@ pub(crate) fn rank_local_logits_from_hidden_into(
     Ok(())
 }
 
+pub(crate) fn rank_local_logits_from_hidden_all(
+    ctx: &RankGpuContext,
+    input: &Bf16HiddenStates,
+    head: &TensorRef<'_>,
+) -> Result<F32BatchLogits> {
+    ctx.set_current()?;
+    ensure!(
+        head.tensor.dtype == safetensors::Dtype::BF16,
+        "head weight {} must be BF16, got {:?}",
+        head.name,
+        head.tensor.dtype
+    );
+    ensure!(
+        head.tensor.shape.len() == 2,
+        "head weight {} must be rank-2, got {:?}",
+        head.name,
+        head.tensor.shape
+    );
+    let vocab_size = head.tensor.shape[0];
+    let hidden_dim = head.tensor.shape[1];
+    ensure!(
+        hidden_dim == input.hidden_dim,
+        "head input dim mismatch: head expects {}, got {}",
+        hidden_dim,
+        input.hidden_dim
+    );
+    ensure!(input.seq_len > 0, "logits input seq_len must be positive");
+    let mut out = unsafe { ctx.stream.alloc(input.seq_len * vocab_size)? };
+    {
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (head_ptr, _head_guard) = head.tensor.data.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_bf16_logits_cuda(
+                x_ptr as *const ffi::Half,
+                head_ptr as *const ffi::Half,
+                out_ptr as *mut f32,
+                input.seq_len as i32,
+                input.hidden_dim as i32,
+                vocab_size as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(F32BatchLogits {
+        data: out,
+        vocab_size,
+        seq_len: input.seq_len,
+    })
+}
+
 pub fn final_logits_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,

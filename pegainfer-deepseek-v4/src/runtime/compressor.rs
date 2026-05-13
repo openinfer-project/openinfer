@@ -280,6 +280,22 @@ pub fn compressor_nonoverlap_decode_bf16_hidden(
     start_pos: usize,
     state: &mut CompressorDecodeState,
 ) -> Result<Option<Bf16HiddenStates>> {
+    compressor_nonoverlap_decode_bf16_hidden_at(
+        ctx, config, input, compressor, ratio, rope, start_pos, state, 0,
+    )
+}
+
+pub(crate) fn compressor_nonoverlap_decode_bf16_hidden_at(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    compressor: &CompressorWeights<'_>,
+    ratio: usize,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    state: &mut CompressorDecodeState,
+    state_offset: usize,
+) -> Result<Option<Bf16HiddenStates>> {
     ctx.set_current()?;
     ensure!(ratio > 1, "compress ratio must be > 1");
     ensure!(ratio != 4, "ratio=4 uses the overlap compressor path");
@@ -295,11 +311,11 @@ pub fn compressor_nonoverlap_decode_bf16_hidden(
         input.seq_len
     );
     ensure!(
-        state.hidden_dim == config.head_dim && state.slots == ratio,
-        "decode compressor state mismatch: hidden_dim={}, slots={}, expected {}x{}",
+        state.hidden_dim == config.head_dim && state_offset + ratio <= state.slots,
+        "decode compressor state mismatch: hidden_dim={}, slots={}, offset={}, need {} rows",
         state.hidden_dim,
         state.slots,
-        config.head_dim,
+        state_offset,
         ratio
     );
 
@@ -335,7 +351,7 @@ pub fn compressor_nonoverlap_decode_bf16_hidden(
             (ptr::null_mut(), None)
         };
         let result = unsafe {
-            ffi::deepseek_compressor_nonoverlap_decode_cuda(
+            ffi::deepseek_compressor_nonoverlap_decode_at_cuda(
                 x_ptr as *const ffi::Half,
                 wkv_ptr as *const ffi::Half,
                 wgate_ptr as *const ffi::Half,
@@ -349,6 +365,7 @@ pub fn compressor_nonoverlap_decode_bf16_hidden(
                 input.hidden_dim as i32,
                 config.head_dim as i32,
                 ratio as i32,
+                state_offset as i32,
                 config.rms_norm_eps,
                 ctx.stream.cu_stream(),
             )
@@ -393,6 +410,23 @@ pub fn compressor_overlap_decode_bf16_hidden_with_dim(
     state: &mut CompressorDecodeState,
     rotate_fp4: bool,
 ) -> Result<Option<Bf16HiddenStates>> {
+    compressor_overlap_decode_bf16_hidden_with_dim_at(
+        ctx, config, input, compressor, rope, start_pos, head_dim, state, 0, rotate_fp4,
+    )
+}
+
+pub(crate) fn compressor_overlap_decode_bf16_hidden_with_dim_at(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: &Bf16HiddenStates,
+    compressor: &CompressorWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: usize,
+    head_dim: usize,
+    state: &mut CompressorDecodeState,
+    state_offset: usize,
+    rotate_fp4: bool,
+) -> Result<Option<Bf16HiddenStates>> {
     ctx.set_current()?;
     ensure!(
         input.hidden_dim == config.dim,
@@ -406,11 +440,11 @@ pub fn compressor_overlap_decode_bf16_hidden_with_dim(
         input.seq_len
     );
     ensure!(
-        state.hidden_dim == 2 * head_dim && state.slots == 8,
-        "overlap decode compressor state mismatch: hidden_dim={}, slots={}, expected {}x8",
+        state.hidden_dim == 2 * head_dim && state_offset + 8 <= state.slots,
+        "overlap decode compressor state mismatch: hidden_dim={}, slots={}, offset={}, need 8 rows",
         state.hidden_dim,
         state.slots,
-        2 * head_dim
+        state_offset
     );
 
     let should_compress = (start_pos + 1).is_multiple_of(4);
@@ -445,7 +479,7 @@ pub fn compressor_overlap_decode_bf16_hidden_with_dim(
             (ptr::null_mut(), None)
         };
         let result = unsafe {
-            ffi::deepseek_compressor_overlap_decode_cuda(
+            ffi::deepseek_compressor_overlap_decode_at_cuda(
                 x_ptr as *const ffi::Half,
                 wkv_ptr as *const ffi::Half,
                 wgate_ptr as *const ffi::Half,
@@ -458,6 +492,7 @@ pub fn compressor_overlap_decode_bf16_hidden_with_dim(
                 start_pos as i32,
                 input.hidden_dim as i32,
                 head_dim as i32,
+                state_offset as i32,
                 config.rms_norm_eps,
                 ctx.stream.cu_stream(),
             )
@@ -511,8 +546,8 @@ pub(crate) fn compressor_overlap_decode_bf16_hidden_with_dim_scratch<'a>(
         input.seq_len
     );
     ensure!(
-        state.hidden_dim == 2 * head_dim && state.slots == 8,
-        "overlap decode compressor state mismatch: hidden_dim={}, slots={}, expected {}x8",
+        state.hidden_dim == 2 * head_dim && state.slots >= 8,
+        "overlap decode compressor state mismatch: hidden_dim={}, slots={}, expected at least {}x8",
         state.hidden_dim,
         state.slots,
         2 * head_dim

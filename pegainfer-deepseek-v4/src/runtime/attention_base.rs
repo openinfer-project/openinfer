@@ -338,6 +338,72 @@ pub(crate) fn apply_rope_q_kv_in_place(
     Ok(())
 }
 
+pub(crate) fn apply_rope_q_kv_batch_in_place(
+    ctx: &RankGpuContext,
+    q: &mut Bf16HiddenStates,
+    kv: &mut Bf16HiddenStates,
+    rope: &DeepSeekRopeCache,
+    local_heads: usize,
+    head_dim: usize,
+    start_pos: &CudaSlice<i32>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        q.hidden_dim == local_heads * head_dim,
+        "batch RoPE q hidden dim mismatch: expected {}, got {}",
+        local_heads * head_dim,
+        q.hidden_dim
+    );
+    ensure!(
+        kv.hidden_dim == head_dim,
+        "batch RoPE kv hidden dim mismatch: expected {}, got {}",
+        head_dim,
+        kv.hidden_dim
+    );
+    ensure!(
+        q.seq_len == kv.seq_len,
+        "batch RoPE q/kv seq_len mismatch: q={}, kv={}",
+        q.seq_len,
+        kv.seq_len
+    );
+    ensure!(
+        start_pos.len() >= q.seq_len,
+        "batch RoPE start_pos capacity too small: need {}, have {}",
+        q.seq_len,
+        start_pos.len()
+    );
+    ensure!(
+        rope.rotary_dim <= head_dim,
+        "rotary_dim {} exceeds head_dim {}",
+        rope.rotary_dim,
+        head_dim
+    );
+
+    {
+        let (q_ptr, _q_guard) = q.data.device_ptr_mut(&ctx.stream);
+        let (kv_ptr, _kv_guard) = kv.data.device_ptr_mut(&ctx.stream);
+        let (cos_ptr, _cos_guard) = rope.cos.device_ptr(&ctx.stream);
+        let (sin_ptr, _sin_guard) = rope.sin.device_ptr(&ctx.stream);
+        let (start_ptr, _start_guard) = start_pos.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_apply_rope_q_kv_batch_cuda(
+                q_ptr as *mut ffi::Half,
+                kv_ptr as *mut ffi::Half,
+                cos_ptr as *const f32,
+                sin_ptr as *const f32,
+                start_ptr as *const i32,
+                q.seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rope.rotary_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
 pub fn fp8_act_quant_nope_bf16_hidden_in_place(
     ctx: &RankGpuContext,
     hidden: &mut Bf16HiddenStates,
@@ -429,6 +495,59 @@ pub fn apply_rope_hidden_in_place(
                 head_dim as i32,
                 rope.rotary_dim as i32,
                 start_pos as i32,
+                if inverse { 1 } else { 0 },
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_rope_hidden_batch_in_place(
+    ctx: &RankGpuContext,
+    hidden: &mut Bf16HiddenStates,
+    rope: &DeepSeekRopeCache,
+    local_heads: usize,
+    head_dim: usize,
+    start_pos: &CudaSlice<i32>,
+    inverse: bool,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        hidden.hidden_dim == local_heads * head_dim,
+        "batch RoPE hidden dim mismatch: expected {}, got {}",
+        local_heads * head_dim,
+        hidden.hidden_dim
+    );
+    ensure!(
+        start_pos.len() >= hidden.seq_len,
+        "batch RoPE hidden start_pos capacity too small: need {}, have {}",
+        hidden.seq_len,
+        start_pos.len()
+    );
+    ensure!(
+        rope.rotary_dim <= head_dim,
+        "rotary_dim {} exceeds head_dim {}",
+        rope.rotary_dim,
+        head_dim
+    );
+
+    {
+        let (x_ptr, _x_guard) = hidden.data.device_ptr_mut(&ctx.stream);
+        let (cos_ptr, _cos_guard) = rope.cos.device_ptr(&ctx.stream);
+        let (sin_ptr, _sin_guard) = rope.sin.device_ptr(&ctx.stream);
+        let (start_ptr, _start_guard) = start_pos.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_apply_rope_hidden_batch_cuda(
+                x_ptr as *mut ffi::Half,
+                cos_ptr as *const f32,
+                sin_ptr as *const f32,
+                start_ptr as *const i32,
+                hidden.seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rope.rotary_dim as i32,
                 if inverse { 1 } else { 0 },
                 ctx.stream.cu_stream(),
             )
@@ -572,6 +691,55 @@ pub(crate) fn window_topk_indices_decode_into(
     Ok(window_size)
 }
 
+pub(crate) fn window_topk_indices_decode_batch_into(
+    ctx: &RankGpuContext,
+    start_pos: &CudaSlice<i32>,
+    cache_base: &CudaSlice<i32>,
+    batch: usize,
+    window_size: usize,
+    out: &mut CudaSlice<i32>,
+) -> Result<usize> {
+    ctx.set_current()?;
+    ensure!(batch > 0, "window top-k decode batch must be positive");
+    ensure!(window_size > 0, "window_size must be positive");
+    ensure!(
+        start_pos.len() >= batch,
+        "window top-k batch start_pos capacity too small: need {}, have {}",
+        batch,
+        start_pos.len()
+    );
+    ensure!(
+        cache_base.len() >= batch,
+        "window top-k batch cache_base capacity too small: need {}, have {}",
+        batch,
+        cache_base.len()
+    );
+    ensure!(
+        out.len() >= batch * window_size,
+        "window top-k batch output capacity too small: need {}, have {}",
+        batch * window_size,
+        out.len()
+    );
+    {
+        let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+        let (start_ptr, _start_guard) = start_pos.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = cache_base.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_window_topk_indices_decode_batch_cuda(
+                out_ptr as *mut i32,
+                start_ptr as *const i32,
+                base_ptr as *const i32,
+                batch as i32,
+                window_size as i32,
+                window_size as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(window_size)
+}
+
 pub fn compress_topk_indices(
     ctx: &RankGpuContext,
     seq_len: usize,
@@ -627,6 +795,53 @@ pub fn compress_topk_indices_decode(
         result.result()?;
     }
     Ok((data, compressed))
+}
+
+pub(crate) fn compress_topk_indices_decode_batch_into(
+    ctx: &RankGpuContext,
+    compressed_len: &CudaSlice<i32>,
+    cache_base: &CudaSlice<i32>,
+    batch: usize,
+    topk: usize,
+    out: &mut CudaSlice<i32>,
+) -> Result<usize> {
+    ctx.set_current()?;
+    ensure!(batch > 0, "compress top-k decode batch must be positive");
+    ensure!(
+        compressed_len.len() >= batch,
+        "compress top-k batch compressed_len capacity too small: need {}, have {}",
+        batch,
+        compressed_len.len()
+    );
+    ensure!(
+        cache_base.len() >= batch,
+        "compress top-k batch cache_base capacity too small: need {}, have {}",
+        batch,
+        cache_base.len()
+    );
+    ensure!(
+        out.len() >= batch * topk,
+        "compress top-k batch output capacity too small: need {}, have {}",
+        batch * topk,
+        out.len()
+    );
+    {
+        let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+        let (compressed_ptr, _compressed_guard) = compressed_len.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = cache_base.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_compress_topk_indices_decode_batch_cuda(
+                out_ptr as *mut i32,
+                compressed_ptr as *const i32,
+                base_ptr as *const i32,
+                batch as i32,
+                topk as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(topk)
 }
 
 pub fn window_and_compress_topk_indices(

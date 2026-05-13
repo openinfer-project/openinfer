@@ -8,8 +8,14 @@ use pegainfer_core::engine::{
 use tokio::sync::mpsc;
 
 use super::worker::{
-    FullDirectRuntime, ensure_direct_decode_caches, load_full_direct_runtime,
-    run_direct_decode_logits, run_prefill_logits_and_seed_decode_cache,
+    DirectBatchDecodeEntry, FullDirectRuntime, ensure_direct_decode_caches,
+    load_full_direct_runtime, run_direct_decode_batch_logits, run_direct_decode_logits,
+    run_prefill_logits_and_seed_decode_cache,
+};
+#[cfg(test)]
+use super::worker::{
+    clone_direct_decode_cache_slot_for_test, ensure_direct_decode_batch_caches_for_test,
+    reset_direct_decode_cache_slot_for_test,
 };
 use crate::Config;
 
@@ -411,6 +417,45 @@ impl DeepSeekV4DirectGenerator {
         let step = self.sample_greedy_step(state)?;
         self.advance_greedy_step(state, &step)?;
         Ok(step)
+    }
+
+    #[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
+    pub(crate) fn decode_batch_logits_for_test(
+        &mut self,
+        entries: &[(u32, usize, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        let entries = entries
+            .iter()
+            .map(|(token_id, start_pos, slot_id)| DirectBatchDecodeEntry {
+                token_id: *token_id,
+                start_pos: *start_pos,
+                slot_id: *slot_id,
+            })
+            .collect::<Vec<_>>();
+        run_direct_decode_batch_logits(&mut self.runtime, &entries)
+    }
+
+    #[cfg(test)]
+    fn prepare_batch_decode_slots_for_test(&mut self, max_seq_len: usize) -> Result<()> {
+        ensure_direct_decode_batch_caches_for_test(&mut self.runtime, self.config, max_seq_len)
+    }
+
+    #[cfg(test)]
+    fn seed_decode_slot_for_test(
+        &mut self,
+        prompt_tokens: &[u32],
+        slot_id: usize,
+    ) -> Result<Vec<f32>> {
+        reset_direct_decode_cache_slot_for_test(&mut self.runtime, 0)?;
+        let logits = run_prefill_logits_and_seed_decode_cache(
+            &mut self.runtime,
+            self.config,
+            prompt_tokens,
+        )?;
+        if slot_id != 0 {
+            clone_direct_decode_cache_slot_for_test(&mut self.runtime, 0, slot_id)?;
+        }
+        Ok(logits)
     }
 
     pub fn generate_greedy<F>(
@@ -875,6 +920,7 @@ fn argmax_f32(values: &[f32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, path::PathBuf};
 
     #[test]
     fn kv_cache_manager_rejects_active_request_until_release() {
@@ -974,5 +1020,76 @@ mod tests {
         let next = manager.reserve(2, 2, 2).unwrap();
         manager.attach_prepared(&next).unwrap();
         assert!(manager.snapshot().active().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires 8 GPUs and DeepSeek-V4-Flash weights"]
+    fn batch_decode_logits_match_two_single_decode_rows() -> Result<()> {
+        let model_path = env::var_os("PEGAINFER_TEST_MODEL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("models/DeepSeek-V4-Flash"));
+        let mut generator = DeepSeekV4DirectGenerator::from_model_dir(&model_path)?;
+        let prompt_a = (1000..1128).collect::<Vec<u32>>();
+        let prompt_b = (2000..2128).collect::<Vec<u32>>();
+
+        generator.prepare_batch_decode_slots_for_test(prompt_a.len() + 2)?;
+        let prefill_a = generator.seed_decode_slot_for_test(&prompt_a, 1)?;
+        let prefill_b = generator.seed_decode_slot_for_test(&prompt_b, 0)?;
+        let token_a = argmax_f32(&prefill_a) as u32;
+        let token_b = argmax_f32(&prefill_b) as u32;
+
+        let batch = generator.decode_batch_logits_for_test(&[
+            (token_a, prompt_a.len(), 1),
+            (token_b, prompt_b.len(), 0),
+        ])?;
+        assert_eq!(batch.len(), 2);
+
+        let single_a = decode_logits_for_token(&mut generator, &prompt_a, token_a)?;
+        let single_b = decode_logits_for_token(&mut generator, &prompt_b, token_b)?;
+        assert_logits_close("row0 prompt A", &single_a, &batch[0]);
+        assert_logits_close("row1 prompt B", &single_b, &batch[1]);
+        Ok(())
+    }
+
+    fn decode_logits_for_token(
+        generator: &mut DeepSeekV4DirectGenerator,
+        prompt_tokens: &[u32],
+        token: u32,
+    ) -> Result<Vec<f32>> {
+        let mut state = generator.start_greedy_request(prompt_tokens, 2, true)?;
+        let step = generator.sample_greedy_step(&state)?;
+        assert_eq!(step.start_pos(), prompt_tokens.len());
+        let logits = run_direct_decode_logits(&mut generator.runtime, token, prompt_tokens.len())?;
+        generator.release_greedy_request(&mut state)?;
+        Ok(logits)
+    }
+
+    fn assert_logits_close(label: &str, expected: &[f32], actual: &[f32]) {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "{label} vocab length mismatch"
+        );
+        assert_eq!(
+            argmax_f32(expected),
+            argmax_f32(actual),
+            "{label} top token mismatch"
+        );
+        let max_abs = expected
+            .iter()
+            .zip(actual)
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        let mean_abs = expected
+            .iter()
+            .zip(actual)
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .sum::<f32>()
+            / expected.len() as f32;
+        assert!(max_abs <= 1.5, "{label} max_abs diff too large: {max_abs}");
+        assert!(
+            mean_abs <= 0.2,
+            "{label} mean_abs diff too large: {mean_abs}"
+        );
     }
 }

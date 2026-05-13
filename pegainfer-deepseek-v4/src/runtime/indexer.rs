@@ -430,6 +430,103 @@ pub(crate) fn indexer_scores_decode_bf16_hidden_scratch(
     Ok(Some(compressed_len))
 }
 
+pub(crate) struct IndexerDecodeBatchInputs<'a> {
+    pub(crate) q: &'a Bf16HiddenStates,
+    pub(crate) kv_cache: &'a Bf16Cache,
+    pub(crate) weights: &'a Bf16HiddenStates,
+    pub(crate) compressed_len: &'a CudaSlice<i32>,
+    pub(crate) cache_base: &'a CudaSlice<i32>,
+    pub(crate) batch: usize,
+    pub(crate) max_compressed_len: usize,
+}
+
+pub(crate) fn indexer_scores_decode_batch_into(
+    ctx: &RankGpuContext,
+    config: &Config,
+    input: IndexerDecodeBatchInputs<'_>,
+    scores: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(input.batch > 0, "indexer decode batch must be positive");
+    ensure!(
+        input.q.seq_len == input.batch,
+        "indexer batch q seq_len mismatch: expected {}, got {}",
+        input.batch,
+        input.q.seq_len
+    );
+    ensure!(
+        input.weights.seq_len == input.batch,
+        "indexer batch weights seq_len mismatch: expected {}, got {}",
+        input.batch,
+        input.weights.seq_len
+    );
+    ensure!(
+        input.kv_cache.hidden_dim == config.index_head_dim,
+        "indexer batch kv cache dim mismatch: expected {}, got {}",
+        config.index_head_dim,
+        input.kv_cache.hidden_dim
+    );
+    ensure!(
+        input.compressed_len.len() >= input.batch,
+        "indexer batch compressed_len capacity too small: need {}, have {}",
+        input.batch,
+        input.compressed_len.len()
+    );
+    ensure!(
+        input.cache_base.len() >= input.batch,
+        "indexer batch cache_base capacity too small: need {}, have {}",
+        input.batch,
+        input.cache_base.len()
+    );
+    ensure!(
+        scores.len() >= input.batch * input.max_compressed_len,
+        "indexer batch scores capacity too small: need {}, have {}",
+        input.batch * input.max_compressed_len,
+        scores.len()
+    );
+    let local_heads = config.index_n_heads / 8;
+    ensure!(
+        input.q.hidden_dim == local_heads * config.index_head_dim,
+        "indexer batch q hidden mismatch: expected {}, got {}",
+        local_heads * config.index_head_dim,
+        input.q.hidden_dim
+    );
+    ensure!(
+        input.weights.hidden_dim == local_heads,
+        "indexer batch weights hidden mismatch: expected {}, got {}",
+        local_heads,
+        input.weights.hidden_dim
+    );
+    {
+        let (q_ptr, _q_guard) = input.q.data.device_ptr(&ctx.stream);
+        let (kv_ptr, _kv_guard) = input.kv_cache.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = input.weights.data.device_ptr(&ctx.stream);
+        let (compressed_ptr, _compressed_guard) = input.compressed_len.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = input.cache_base.device_ptr(&ctx.stream);
+        let (scores_ptr, _scores_guard) = scores.device_ptr_mut(&ctx.stream);
+        let score_scale =
+            1.0f32 / (config.index_head_dim as f32).sqrt() / (config.index_n_heads as f32).sqrt();
+        let result = unsafe {
+            ffi::deepseek_indexer_scores_decode_batch_cuda(
+                q_ptr as *const ffi::Half,
+                kv_ptr as *const ffi::Half,
+                weights_ptr as *const ffi::Half,
+                compressed_ptr as *const i32,
+                base_ptr as *const i32,
+                scores_ptr as *mut f32,
+                input.batch as i32,
+                local_heads as i32,
+                config.index_head_dim as i32,
+                input.max_compressed_len as i32,
+                score_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
 pub fn indexer_topk_indices_decode(
     ctx: &RankGpuContext,
     config: &Config,
@@ -487,6 +584,69 @@ where
                 compressed_len as i32,
                 topk as i32,
                 offset as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(topk)
+}
+
+pub(crate) fn indexer_topk_indices_decode_batch_into(
+    ctx: &RankGpuContext,
+    config: &Config,
+    scores: &CudaSlice<f32>,
+    compressed_len: &CudaSlice<i32>,
+    cache_base: &CudaSlice<i32>,
+    batch: usize,
+    max_compressed_len: usize,
+    topk_idxs: &mut CudaSlice<i32>,
+) -> Result<usize> {
+    ctx.set_current()?;
+    ensure!(batch > 0, "indexer top-k decode batch must be positive");
+    ensure!(
+        max_compressed_len > 0,
+        "indexer top-k max_compressed_len must be positive"
+    );
+    ensure!(
+        scores.len() >= batch * max_compressed_len,
+        "indexer top-k batch scores capacity too small: need {}, have {}",
+        batch * max_compressed_len,
+        scores.len()
+    );
+    ensure!(
+        compressed_len.len() >= batch,
+        "indexer top-k compressed_len capacity too small: need {}, have {}",
+        batch,
+        compressed_len.len()
+    );
+    ensure!(
+        cache_base.len() >= batch,
+        "indexer top-k cache_base capacity too small: need {}, have {}",
+        batch,
+        cache_base.len()
+    );
+    let topk = config.index_topk.min(max_compressed_len);
+    ensure!(
+        topk_idxs.len() >= batch * topk,
+        "indexer top-k output capacity too small: need {}, have {}",
+        batch * topk,
+        topk_idxs.len()
+    );
+    {
+        let (scores_ptr, _scores_guard) = scores.device_ptr(&ctx.stream);
+        let (topk_ptr, _topk_guard) = topk_idxs.device_ptr_mut(&ctx.stream);
+        let (compressed_ptr, _compressed_guard) = compressed_len.device_ptr(&ctx.stream);
+        let (base_ptr, _base_guard) = cache_base.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_indexer_topk_decode_batch_cuda(
+                scores_ptr as *const f32,
+                topk_ptr as *mut i32,
+                compressed_ptr as *const i32,
+                base_ptr as *const i32,
+                batch as i32,
+                max_compressed_len as i32,
+                topk as i32,
                 ctx.stream.cu_stream(),
             )
         };

@@ -145,6 +145,47 @@ __global__ void deepseek_apply_rope_q_kv_kernel(
   }
 }
 
+__global__ void deepseek_apply_rope_q_kv_batch_kernel(
+    __nv_bfloat16 *__restrict__ q,
+    __nv_bfloat16 *__restrict__ kv,
+    const float *__restrict__ cos_cache,
+    const float *__restrict__ sin_cache,
+    const int *__restrict__ start_pos,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim) {
+  int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_q_pairs = seq_len * local_heads * (rotary_dim / 2);
+  int nope_dim = head_dim - rotary_dim;
+
+  if (pair < total_q_pairs) {
+    int rotary_pair = pair % (rotary_dim / 2);
+    int tmp = pair / (rotary_dim / 2);
+    int head = tmp % local_heads;
+    int token = tmp / local_heads;
+    int pos = start_pos[token];
+    if (pos < 0) return;
+    int q_offset = token * local_heads * head_dim + head * head_dim + nope_dim + 2 * rotary_pair;
+    deepseek_apply_rope_pair(
+        q, q_offset, cos_cache[pos * (rotary_dim / 2) + rotary_pair],
+        sin_cache[pos * (rotary_dim / 2) + rotary_pair], false);
+  }
+
+  int kv_pair = pair - total_q_pairs;
+  int total_kv_pairs = seq_len * (rotary_dim / 2);
+  if (kv_pair >= 0 && kv_pair < total_kv_pairs) {
+    int rotary_pair = kv_pair % (rotary_dim / 2);
+    int token = kv_pair / (rotary_dim / 2);
+    int pos = start_pos[token];
+    if (pos < 0) return;
+    int kv_offset = token * head_dim + nope_dim + 2 * rotary_pair;
+    deepseek_apply_rope_pair(
+        kv, kv_offset, cos_cache[pos * (rotary_dim / 2) + rotary_pair],
+        sin_cache[pos * (rotary_dim / 2) + rotary_pair], false);
+  }
+}
+
 __global__ void deepseek_fill_rope_cache_kernel(
     const float *__restrict__ inv_freq,
     float *__restrict__ cos_cache,
@@ -276,6 +317,30 @@ cudaError_t deepseek_apply_rope_q_kv_cuda(
   int blocks = (total_pairs + threads - 1) / threads;
   deepseek_apply_rope_q_kv_kernel<<<blocks, threads, 0, stream>>>(
       q, kv, cos_cache, sin_cache, seq_len, local_heads, head_dim, rotary_dim, start_pos);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_apply_rope_q_kv_batch_cuda(
+    __nv_bfloat16 *q,
+    __nv_bfloat16 *kv,
+    const float *cos_cache,
+    const float *sin_cache,
+    const int *start_pos,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    cudaStream_t stream) {
+  if (q == nullptr || kv == nullptr || cos_cache == nullptr || sin_cache == nullptr ||
+      start_pos == nullptr || seq_len <= 0 || local_heads <= 0 || head_dim <= 0 ||
+      rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int total_pairs = seq_len * (local_heads + 1) * (rotary_dim / 2);
+  int blocks = (total_pairs + threads - 1) / threads;
+  deepseek_apply_rope_q_kv_batch_kernel<<<blocks, threads, 0, stream>>>(
+      q, kv, cos_cache, sin_cache, start_pos, seq_len, local_heads, head_dim, rotary_dim);
   return cudaGetLastError();
 }
 

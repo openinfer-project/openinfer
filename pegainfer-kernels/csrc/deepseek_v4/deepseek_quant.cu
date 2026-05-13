@@ -349,6 +349,24 @@ __global__ void deepseek_bf16_copy_rows_kernel(
       src[(src_start_row + row) * hidden_dim + col];
 }
 
+__global__ void deepseek_bf16_copy_rows_indexed_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    __nv_bfloat16 *__restrict__ dst,
+    const int *__restrict__ src_rows,
+    const int *__restrict__ dst_rows,
+    int hidden_dim,
+    int rows) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = hidden_dim * rows;
+  if (idx >= total) return;
+  int row = idx / hidden_dim;
+  int col = idx - row * hidden_dim;
+  int src_row = src_rows[row];
+  int dst_row = dst_rows[row];
+  if (src_row < 0 || dst_row < 0) return;
+  dst[dst_row * hidden_dim + col] = src[src_row * hidden_dim + col];
+}
+
 extern "C" int deepseek_tilelang_act_quant_k4096(
     const void* x,
     void* y,
@@ -1009,6 +1027,26 @@ cudaError_t deepseek_bf16_copy_rows_cuda(
   int blocks = (total + threads - 1) / threads;
   deepseek_bf16_copy_rows_kernel<<<blocks, threads, 0, stream>>>(
       src, dst, hidden_dim, rows, src_start_row, dst_start_row);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_bf16_copy_rows_indexed_cuda(
+    const __nv_bfloat16 *src,
+    __nv_bfloat16 *dst,
+    const int *src_rows,
+    const int *dst_rows,
+    int hidden_dim,
+    int rows,
+    cudaStream_t stream) {
+  if (hidden_dim <= 0 || rows < 0 || src_rows == nullptr || dst_rows == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (rows == 0) return cudaSuccess;
+  constexpr int threads = 256;
+  int total = hidden_dim * rows;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_bf16_copy_rows_indexed_kernel<<<blocks, threads, 0, stream>>>(
+      src, dst, src_rows, dst_rows, hidden_dim, rows);
   return cudaGetLastError();
 }
 

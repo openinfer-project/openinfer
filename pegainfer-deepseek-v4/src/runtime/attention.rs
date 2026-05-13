@@ -500,20 +500,15 @@ pub fn indexed_attention_cache_bf16_hidden(
     ctx.set_current()?;
     ensure!(topk > 0, "indexed cache attention topk must be positive");
     ensure!(
-        projections.q.seq_len == 1,
-        "indexed cache attention currently expects decode seq_len=1, got {}",
-        projections.q.seq_len
-    );
-    ensure!(
         kv_cache.hidden_dim == projections.head_dim,
         "kv cache hidden dim mismatch: expected {}, got {}",
         projections.head_dim,
         kv_cache.hidden_dim
     );
     ensure!(
-        topk_idxs.len() >= topk,
+        topk_idxs.len() >= projections.q.seq_len * topk,
         "indexed cache attention topk capacity too small: need {}, have {}",
-        topk,
+        projections.q.seq_len * topk,
         topk_idxs.len()
     );
     ensure!(
@@ -557,20 +552,15 @@ pub(crate) fn indexed_attention_cache_bf16_hidden_into(
     ctx.set_current()?;
     ensure!(topk > 0, "indexed cache attention topk must be positive");
     ensure!(
-        projections.q.seq_len == 1,
-        "indexed cache attention currently expects decode seq_len=1, got {}",
-        projections.q.seq_len
-    );
-    ensure!(
         kv_cache.hidden_dim == projections.head_dim,
         "kv cache hidden dim mismatch: expected {}, got {}",
         projections.head_dim,
         kv_cache.hidden_dim
     );
     ensure!(
-        topk_idxs.len() >= topk,
+        topk_idxs.len() >= projections.q.seq_len * topk,
         "indexed cache attention topk capacity too small: need {}, have {}",
-        topk,
+        projections.q.seq_len * topk,
         topk_idxs.len()
     );
     ensure!(
@@ -639,20 +629,15 @@ pub(crate) fn indexed_attention_cache_bf16_hidden_view_into(
     ctx.set_current()?;
     ensure!(topk > 0, "indexed cache attention topk must be positive");
     ensure!(
-        projections.q.seq_len == 1,
-        "indexed cache attention currently expects decode seq_len=1, got {}",
-        projections.q.seq_len
-    );
-    ensure!(
         kv_cache.hidden_dim == projections.head_dim,
         "kv cache hidden dim mismatch: expected {}, got {}",
         projections.head_dim,
         kv_cache.hidden_dim
     );
     ensure!(
-        topk_idxs.len() >= topk,
+        topk_idxs.len() >= topk * projections.q.seq_len,
         "indexed cache attention topk capacity too small: need {}, have {}",
-        topk,
+        topk * projections.q.seq_len,
         topk_idxs.len()
     );
     ensure!(
@@ -738,6 +723,47 @@ pub(crate) fn attention_output_project_bf16_hidden_scratch<'a>(
         scratch.seq_capacity
     );
     apply_rope_hidden_in_place(
+        ctx,
+        &mut scratch.attn_out,
+        rope,
+        scratch.local_heads,
+        scratch.head_dim,
+        start_pos,
+        true,
+    )?;
+    bf16_linear_bf16_hidden_into(ctx, &scratch.attn_out, &attn.wo_a, &mut scratch.low_rank)?;
+    fp8_linear_bf16_hidden_into(ctx, &scratch.low_rank, &attn.wo_b, &mut scratch.out)?;
+    Ok(&scratch.out)
+}
+
+pub(crate) fn attention_output_project_bf16_hidden_batch_scratch<'a>(
+    ctx: &RankGpuContext,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    start_pos: &CudaSlice<i32>,
+    batch: usize,
+    scratch: &'a mut AttentionOutputScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    ctx.set_current()?;
+    ensure!(batch > 0, "attention output batch must be positive");
+    ensure!(
+        scratch.attn_out.seq_len == batch,
+        "attention output batch mismatch: attn_out seq_len={}, batch={batch}",
+        scratch.attn_out.seq_len
+    );
+    ensure!(
+        start_pos.len() >= batch,
+        "attention output start_pos capacity too small: need {}, have {}",
+        batch,
+        start_pos.len()
+    );
+    ensure!(
+        batch <= scratch.seq_capacity,
+        "attention output scratch capacity too small: need {}, have {}",
+        batch,
+        scratch.seq_capacity
+    );
+    apply_rope_hidden_batch_in_place(
         ctx,
         &mut scratch.attn_out,
         rope,
@@ -974,6 +1000,96 @@ pub(crate) fn attention_decode_rank_local_bf16_hidden_with_scratch<'a>(
     .with_context(|| format!("attention_output_project layer {layer}"))
 }
 
+pub(crate) fn attention_decode_rank_local_bf16_hidden_batch_with_scratch<'a>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    batch_meta: &DecodeBatchMeta<'_>,
+    kv_cache: &mut Bf16Cache,
+    attention_projection_scratch: &mut AttentionProjectionScratch,
+    attention_output_scratch: &'a mut AttentionOutputScratch,
+    attention_index_scratch: &mut AttentionIndexScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    ctx.set_current()?;
+    ensure!(
+        config.compress_ratios[layer] == 0,
+        "rank-local batch decode only supports non-compressed layers, layer {layer} has compress_ratio={}",
+        config.compress_ratios[layer]
+    );
+    ensure!(
+        input.seq_len == batch_meta.batch,
+        "rank-local batch decode input seq_len mismatch: input={}, batch={}",
+        input.seq_len,
+        batch_meta.batch
+    );
+    ensure!(
+        kv_cache.hidden_dim == config.head_dim,
+        "batch decode kv cache hidden dim mismatch: expected {}, got {}",
+        config.head_dim,
+        kv_cache.hidden_dim
+    );
+
+    let projections = attention_project_bf16_hidden_scratch(
+        ctx,
+        config,
+        input,
+        attn,
+        attention_projection_scratch,
+    )
+    .with_context(|| format!("attention_project batch layer {layer}"))?;
+    apply_rope_q_kv_batch_in_place(
+        ctx,
+        projections.q,
+        projections.kv,
+        rope,
+        projections.local_heads,
+        projections.head_dim,
+        batch_meta.start_pos,
+    )
+    .with_context(|| format!("apply_rope_attention_projections batch layer {layer}"))?;
+    copy_bf16_rows_to_cache_indexed(
+        ctx,
+        projections.kv,
+        kv_cache,
+        batch_meta.src_rows,
+        batch_meta.window_dst_rows,
+        batch_meta.batch,
+    )
+    .with_context(|| format!("copy batch kv to cache layer {layer}"))?;
+    let topk = window_topk_indices_decode_batch_into(
+        ctx,
+        batch_meta.start_pos,
+        batch_meta.window_base,
+        batch_meta.batch,
+        config.sliding_window,
+        &mut attention_index_scratch.window_idxs,
+    )
+    .with_context(|| format!("window_topk_indices_decode batch layer {layer}"))?;
+    indexed_attention_cache_bf16_hidden_view_into(
+        ctx,
+        config,
+        &projections,
+        kv_cache,
+        attn,
+        &attention_index_scratch.window_idxs,
+        topk,
+        &mut attention_output_scratch.attn_out,
+    )
+    .with_context(|| format!("indexed_attention_cache batch layer {layer} topk {topk}"))?;
+    attention_output_project_bf16_hidden_batch_scratch(
+        ctx,
+        attn,
+        rope,
+        batch_meta.start_pos,
+        batch_meta.batch,
+        attention_output_scratch,
+    )
+    .with_context(|| format!("attention_output_project batch layer {layer}"))
+}
+
 pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
     ctx: &RankGpuContext,
     config: &Config,
@@ -1076,5 +1192,149 @@ pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden(
         projections.local_heads,
         projections.head_dim,
         start_pos,
+    )
+}
+
+pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_batch_with_scratch<
+    'a,
+>(
+    ctx: &RankGpuContext,
+    config: &Config,
+    layer: usize,
+    input: &Bf16HiddenStates,
+    attn: &AttentionWeights<'_>,
+    rope: &DeepSeekRopeCache,
+    batch_meta: &DecodeBatchMeta<'_>,
+    cache: &mut LayerDecodeCache,
+    attention_projection_scratch: &mut AttentionProjectionScratch,
+    attention_output_scratch: &'a mut AttentionOutputScratch,
+    attention_index_scratch: &mut AttentionIndexScratch,
+) -> Result<&'a Bf16HiddenStates> {
+    ensure!(
+        input.seq_len == batch_meta.batch,
+        "compressed non-overlap batch decode seq_len mismatch: input={}, batch={}",
+        input.seq_len,
+        batch_meta.batch
+    );
+    ensure!(
+        layer < config.compress_ratios.len(),
+        "compressed batch decode layer {layer} out of range"
+    );
+    let ratio = config.compress_ratios[layer];
+    ensure!(
+        ratio > 0 && ratio != 4,
+        "non-overlap batch decode called for ratio {ratio}"
+    );
+    let compressor = attn
+        .compressor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing compressor weights"))?;
+    let compressor_state = cache
+        .compressor
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("layer {layer} missing compressor decode state"))?;
+
+    let projections = attention_project_bf16_hidden_scratch(
+        ctx,
+        config,
+        input,
+        attn,
+        attention_projection_scratch,
+    )?;
+    apply_rope_q_kv_batch_in_place(
+        ctx,
+        projections.q,
+        projections.kv,
+        rope,
+        projections.local_heads,
+        projections.head_dim,
+        batch_meta.start_pos,
+    )?;
+    copy_bf16_rows_to_cache_indexed(
+        ctx,
+        projections.kv,
+        &mut cache.kv,
+        batch_meta.src_rows,
+        batch_meta.window_dst_rows,
+        batch_meta.batch,
+    )?;
+    let compressed_slots = batch_meta.compressed_slots;
+    for row in 0..batch_meta.batch {
+        let row_input = copy_bf16_row_to_hidden(ctx, input, row)?;
+        let state_offset = batch_meta.slot_ids_host[row] * ratio;
+        if let Some(compressed_kv) = compressor_nonoverlap_decode_bf16_hidden_at(
+            ctx,
+            config,
+            &row_input,
+            compressor,
+            ratio,
+            rope,
+            batch_meta.start_pos_host[row],
+            compressor_state,
+            state_offset,
+        )? {
+            let dst = config.sliding_window
+                + batch_meta.slot_ids_host[row] * compressed_slots
+                + batch_meta.start_pos_host[row] / ratio;
+            copy_bf16_rows_to_cache(ctx, &compressed_kv, &mut cache.kv, 0, dst, 1)?;
+        }
+    }
+
+    let window_topk = window_topk_indices_decode_batch_into(
+        ctx,
+        batch_meta.start_pos,
+        batch_meta.window_base,
+        batch_meta.batch,
+        config.sliding_window,
+        &mut attention_index_scratch.window_idxs,
+    )?;
+    let max_compressed_len = batch_meta
+        .start_pos_host
+        .iter()
+        .map(|pos| (pos + 1) / ratio)
+        .max()
+        .unwrap_or(0);
+    let (topk_idxs, topk) = if max_compressed_len > 0 {
+        let compress_topk = compress_topk_indices_decode_batch_into(
+            ctx,
+            batch_meta.compressed_len,
+            batch_meta.compressed_base,
+            batch_meta.batch,
+            max_compressed_len,
+            &mut attention_index_scratch.compress_idxs,
+        )?;
+        concat_topk_indices_into(
+            ctx,
+            &attention_index_scratch.window_idxs,
+            window_topk,
+            &attention_index_scratch.compress_idxs,
+            compress_topk,
+            batch_meta.batch,
+            &mut attention_index_scratch.topk_idxs,
+        )?;
+        (
+            &attention_index_scratch.topk_idxs,
+            window_topk + compress_topk,
+        )
+    } else {
+        (&attention_index_scratch.window_idxs, window_topk)
+    };
+    indexed_attention_cache_bf16_hidden_view_into(
+        ctx,
+        config,
+        &projections,
+        &cache.kv,
+        attn,
+        topk_idxs,
+        topk,
+        &mut attention_output_scratch.attn_out,
+    )?;
+    attention_output_project_bf16_hidden_batch_scratch(
+        ctx,
+        attn,
+        rope,
+        batch_meta.start_pos,
+        batch_meta.batch,
+        attention_output_scratch,
     )
 }

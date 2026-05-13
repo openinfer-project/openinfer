@@ -90,6 +90,33 @@ __global__ void deepseek_apply_rope_hidden_kernel(
       sin_cache[pos * (rotary_dim / 2) + rotary_pair], inverse != 0);
 }
 
+__global__ void deepseek_apply_rope_hidden_batch_kernel(
+    __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ cos_cache,
+    const float *__restrict__ sin_cache,
+    const int *__restrict__ start_pos,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    int inverse) {
+  int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_pairs = seq_len * local_heads * (rotary_dim / 2);
+  if (pair >= total_pairs) return;
+
+  int rotary_pair = pair % (rotary_dim / 2);
+  int tmp = pair / (rotary_dim / 2);
+  int head = tmp % local_heads;
+  int token = tmp / local_heads;
+  int nope_dim = head_dim - rotary_dim;
+  int pos = start_pos[token];
+  if (pos < 0) return;
+  int offset = token * local_heads * head_dim + head * head_dim + nope_dim + 2 * rotary_pair;
+  deepseek_apply_rope_pair(
+      x, offset, cos_cache[pos * (rotary_dim / 2) + rotary_pair],
+      sin_cache[pos * (rotary_dim / 2) + rotary_pair], inverse != 0);
+}
+
 __global__ void deepseek_apply_rope_hidden_strided_kernel(
     __nv_bfloat16 *__restrict__ x,
     const float *__restrict__ cos_cache,
@@ -680,6 +707,30 @@ cudaError_t deepseek_apply_rope_hidden_cuda(
   return cudaGetLastError();
 }
 
+cudaError_t deepseek_apply_rope_hidden_batch_cuda(
+    __nv_bfloat16 *x,
+    const float *cos_cache,
+    const float *sin_cache,
+    const int *start_pos,
+    int seq_len,
+    int local_heads,
+    int head_dim,
+    int rotary_dim,
+    int inverse,
+    cudaStream_t stream) {
+  if (x == nullptr || cos_cache == nullptr || sin_cache == nullptr || start_pos == nullptr ||
+      seq_len <= 0 || local_heads <= 0 || head_dim <= 0 || rotary_dim <= 0 ||
+      rotary_dim > head_dim || (rotary_dim % 2) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int total_pairs = seq_len * local_heads * (rotary_dim / 2);
+  int blocks = (total_pairs + threads - 1) / threads;
+  deepseek_apply_rope_hidden_batch_kernel<<<blocks, threads, 0, stream>>>(
+      x, cos_cache, sin_cache, start_pos, seq_len, local_heads, head_dim, rotary_dim, inverse);
+  return cudaGetLastError();
+}
+
 cudaError_t deepseek_apply_rope_hidden_strided_cuda(
     __nv_bfloat16 *x,
     const float *cos_cache,
@@ -851,6 +902,53 @@ cudaError_t deepseek_compressor_nonoverlap_decode_cuda(
   return cudaGetLastError();
 }
 
+cudaError_t deepseek_compressor_nonoverlap_decode_at_cuda(
+    const __nv_bfloat16 *x,
+    const __nv_bfloat16 *wkv,
+    const __nv_bfloat16 *wgate,
+    const float *ape,
+    const __nv_bfloat16 *norm,
+    float *kv_state,
+    float *score_state,
+    float *weighted,
+    __nv_bfloat16 *out,
+    int start_pos,
+    int hidden_dim,
+    int head_dim,
+    int ratio,
+    int state_offset,
+    float eps,
+    cudaStream_t stream) {
+  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0 || ratio <= 1 || ratio > 128 ||
+      state_offset < 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  size_t project_shared = 2 * threads * sizeof(float);
+  deepseek_compressor_decode_project_kernel<<<head_dim, threads, project_shared, stream>>>(
+      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, head_dim, ratio,
+      state_offset);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  bool should_compress = ((start_pos + 1) % ratio) == 0;
+  if (!should_compress) return cudaSuccess;
+  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
+
+  int blocks = (head_dim + threads - 1) / threads;
+  float *kv_slot = kv_state + state_offset * head_dim;
+  float *score_slot = score_state + state_offset * head_dim;
+  deepseek_compressor_nonoverlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
+      kv_slot, score_slot, weighted, head_dim, ratio);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  int norm_blocks = (head_dim + threads - 1) / threads;
+  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
+      weighted, norm, out, 1, head_dim, eps);
+  return cudaGetLastError();
+}
+
 cudaError_t deepseek_compressor_overlap_decode_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
@@ -898,6 +996,60 @@ cudaError_t deepseek_compressor_overlap_decode_cuda(
   int shift_blocks = (shift_total + threads - 1) / threads;
   deepseek_compressor_overlap_shift_kernel<<<shift_blocks, threads, 0, stream>>>(
       kv_state, score_state, state_dim);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_compressor_overlap_decode_at_cuda(
+    const __nv_bfloat16 *x,
+    const __nv_bfloat16 *wkv,
+    const __nv_bfloat16 *wgate,
+    const float *ape,
+    const __nv_bfloat16 *norm,
+    float *kv_state,
+    float *score_state,
+    float *weighted,
+    __nv_bfloat16 *out,
+    int start_pos,
+    int hidden_dim,
+    int head_dim,
+    int state_offset,
+    float eps,
+    cudaStream_t stream) {
+  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0 || state_offset < 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int ratio = 4;
+  constexpr int threads = 256;
+  int state_dim = 2 * head_dim;
+  size_t project_shared = 2 * threads * sizeof(float);
+  deepseek_compressor_decode_project_kernel<<<state_dim, threads, project_shared, stream>>>(
+      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, state_dim, ratio,
+      state_offset + ratio);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  bool should_compress = ((start_pos + 1) % ratio) == 0;
+  if (!should_compress) return cudaSuccess;
+  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
+
+  int blocks = (head_dim + threads - 1) / threads;
+  float *kv_slot = kv_state + state_offset * state_dim;
+  float *score_slot = score_state + state_offset * state_dim;
+  deepseek_compressor_overlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
+      kv_slot, score_slot, weighted, head_dim);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  int norm_blocks = (head_dim + threads - 1) / threads;
+  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
+      weighted, norm, out, 1, head_dim, eps);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+
+  int shift_total = ratio * state_dim;
+  int shift_blocks = (shift_total + threads - 1) / threads;
+  deepseek_compressor_overlap_shift_kernel<<<shift_blocks, threads, 0, stream>>>(
+      kv_slot, score_slot, state_dim);
   return cudaGetLastError();
 }
 

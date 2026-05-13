@@ -81,6 +81,19 @@ pub(crate) struct DecodeEntryScratch {
     pub(crate) hc_expand: HcHiddenStates,
 }
 
+pub(crate) struct DecodeBatchMeta<'a> {
+    pub(crate) batch: usize,
+    pub(crate) compressed_slots: usize,
+    pub(crate) start_pos: &'a CudaSlice<i32>,
+    pub(crate) src_rows: &'a CudaSlice<i32>,
+    pub(crate) window_dst_rows: &'a CudaSlice<i32>,
+    pub(crate) window_base: &'a CudaSlice<i32>,
+    pub(crate) compressed_base: &'a CudaSlice<i32>,
+    pub(crate) compressed_len: &'a CudaSlice<i32>,
+    pub(crate) start_pos_host: &'a [usize],
+    pub(crate) slot_ids_host: &'a [usize],
+}
+
 pub(crate) struct HcPostScratch {
     pub(crate) attention_reduce_temp: CudaSlice<f32>,
     pub(crate) attention_out: HcHiddenStates,
@@ -156,6 +169,12 @@ pub(crate) struct AttentionAuxScratch {
 pub struct F32Logits {
     pub data: CudaSlice<f32>,
     pub vocab_size: usize,
+}
+
+pub(crate) struct F32BatchLogits {
+    pub(crate) data: CudaSlice<f32>,
+    pub(crate) vocab_size: usize,
+    pub(crate) seq_len: usize,
 }
 
 pub struct RoutedExperts {
@@ -557,14 +576,19 @@ impl AttentionOutputScratch {
 }
 
 impl AttentionIndexScratch {
-    pub(crate) fn new(ctx: &RankGpuContext, config: &Config) -> Result<Self> {
+    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, seq_capacity: usize) -> Result<Self> {
         ctx.set_current()?;
         ensure!(
             config.sliding_window > 0,
             "attention index scratch sliding_window must be positive"
         );
-        let window_capacity = config.sliding_window;
-        let compress_capacity = config.index_topk;
+        ensure!(
+            seq_capacity > 0,
+            "attention index scratch seq_capacity must be positive"
+        );
+        let window_capacity = seq_capacity * config.sliding_window;
+        let max_compressed_len = config.max_position_embeddings.div_ceil(4).max(1);
+        let compress_capacity = seq_capacity * max_compressed_len;
         let compress_alloc = compress_capacity.max(1);
         let window_idxs = unsafe { ctx.stream.alloc(window_capacity)? };
         let compress_idxs = unsafe { ctx.stream.alloc(compress_alloc)? };
@@ -578,11 +602,20 @@ impl AttentionIndexScratch {
 }
 
 impl AttentionAuxScratch {
-    pub(crate) fn new(ctx: &RankGpuContext, config: &Config, world_size: usize) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &RankGpuContext,
+        config: &Config,
+        world_size: usize,
+        seq_capacity: usize,
+    ) -> Result<Self> {
         ctx.set_current()?;
         ensure!(
             world_size > 0,
             "attention aux scratch world size must be positive"
+        );
+        ensure!(
+            seq_capacity > 0,
+            "attention aux scratch seq_capacity must be positive"
         );
         ensure!(
             config.index_n_heads.is_multiple_of(world_size),
@@ -596,9 +629,9 @@ impl AttentionAuxScratch {
         let compressor_weighted = unsafe { ctx.stream.alloc(max_head_dim)? };
         let compressor_out = Bf16HiddenStates::uninit(ctx, max_head_dim, 1)?;
         let indexer_q =
-            Bf16HiddenStates::uninit(ctx, local_index_heads * config.index_head_dim, 1)?;
-        let indexer_weights = Bf16HiddenStates::uninit(ctx, local_index_heads, 1)?;
-        let indexer_scores = unsafe { ctx.stream.alloc(max_compressed_len)? };
+            Bf16HiddenStates::uninit(ctx, local_index_heads * config.index_head_dim, seq_capacity)?;
+        let indexer_weights = Bf16HiddenStates::uninit(ctx, local_index_heads, seq_capacity)?;
+        let indexer_scores = unsafe { ctx.stream.alloc(seq_capacity * max_compressed_len)? };
         Ok(Self {
             compressor_weighted,
             compressor_out,
@@ -701,12 +734,26 @@ impl LayerDecodeCache {
         layer: usize,
         max_seq_len: usize,
     ) -> Result<Self> {
+        Self::zeros_with_max_seq_and_slots(ctx, config, layer, max_seq_len, 1)
+    }
+
+    pub(crate) fn zeros_with_max_seq_and_slots(
+        ctx: &RankGpuContext,
+        config: &Config,
+        layer: usize,
+        max_seq_len: usize,
+        request_slots: usize,
+    ) -> Result<Self> {
         ctx.set_current()?;
         ensure!(
             layer < config.compress_ratios.len(),
             "decode cache layer {layer} out of range"
         );
         ensure!(max_seq_len > 0, "decode cache max_seq_len must be positive");
+        ensure!(
+            request_slots > 0,
+            "decode cache request slots must be positive"
+        );
         let ratio = config.compress_ratios[layer];
         let compressed_slots = if ratio > 0 {
             max_seq_len.div_ceil(ratio)
@@ -716,7 +763,7 @@ impl LayerDecodeCache {
         let kv = Bf16Cache::zeros(
             ctx,
             config.head_dim,
-            config.sliding_window + compressed_slots,
+            request_slots * (config.sliding_window + compressed_slots),
         )?;
         let compressor = if ratio == 0 {
             None
@@ -724,14 +771,14 @@ impl LayerDecodeCache {
             Some(CompressorDecodeState::zeros(
                 ctx,
                 2 * config.head_dim,
-                2 * ratio,
+                request_slots * 2 * ratio,
                 f32::NEG_INFINITY,
             )?)
         } else {
             Some(CompressorDecodeState::zeros(
                 ctx,
                 config.head_dim,
-                ratio,
+                request_slots * ratio,
                 f32::NEG_INFINITY,
             )?)
         };
@@ -739,7 +786,7 @@ impl LayerDecodeCache {
             Some(Bf16Cache::zeros(
                 ctx,
                 config.index_head_dim,
-                max_seq_len.div_ceil(ratio),
+                request_slots * max_seq_len.div_ceil(ratio),
             )?)
         } else {
             None
@@ -748,7 +795,7 @@ impl LayerDecodeCache {
             Some(CompressorDecodeState::zeros(
                 ctx,
                 2 * config.index_head_dim,
-                2 * ratio,
+                request_slots * 2 * ratio,
                 f32::NEG_INFINITY,
             )?)
         } else {
@@ -803,6 +850,54 @@ pub fn copy_bf16_rows_to_cache(
                 rows as i32,
                 src_start_row as i32,
                 dst_start_row as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn copy_bf16_rows_to_cache_indexed(
+    ctx: &RankGpuContext,
+    src: &Bf16HiddenStates,
+    cache: &mut Bf16Cache,
+    src_rows: &CudaSlice<i32>,
+    dst_rows: &CudaSlice<i32>,
+    rows: usize,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        src.hidden_dim == cache.hidden_dim,
+        "indexed copy rows hidden mismatch: src={}, cache={}",
+        src.hidden_dim,
+        cache.hidden_dim
+    );
+    ensure!(
+        src_rows.len() >= rows,
+        "indexed copy source rows capacity too small: need {}, have {}",
+        rows,
+        src_rows.len()
+    );
+    ensure!(
+        dst_rows.len() >= rows,
+        "indexed copy destination rows capacity too small: need {}, have {}",
+        rows,
+        dst_rows.len()
+    );
+    {
+        let (src_ptr, _src_guard) = src.data.device_ptr(&ctx.stream);
+        let (dst_ptr, _dst_guard) = cache.data.device_ptr_mut(&ctx.stream);
+        let (src_rows_ptr, _src_rows_guard) = src_rows.device_ptr(&ctx.stream);
+        let (dst_rows_ptr, _dst_rows_guard) = dst_rows.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_bf16_copy_rows_indexed_cuda(
+                src_ptr as *const ffi::Half,
+                dst_ptr as *mut ffi::Half,
+                src_rows_ptr as *const i32,
+                dst_rows_ptr as *const i32,
+                cache.hidden_dim as i32,
+                rows as i32,
                 ctx.stream.cu_stream(),
             )
         };

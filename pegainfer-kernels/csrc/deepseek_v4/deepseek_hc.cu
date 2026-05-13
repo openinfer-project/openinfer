@@ -689,6 +689,40 @@ __global__ void deepseek_last_token_bf16_logits_kernel(
   }
 }
 
+__global__ void deepseek_bf16_logits_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ weight,
+    float *__restrict__ out,
+    int seq_len,
+    int dim,
+    int vocab_size) {
+  int vocab = blockIdx.x;
+  int token = blockIdx.y;
+  int tid = threadIdx.x;
+  if (vocab >= vocab_size || token >= seq_len) return;
+
+  extern __shared__ float scratch[];
+  int token_base = token * dim;
+  float partial = 0.0f;
+  for (int k = tid; k < dim; k += blockDim.x) {
+    partial += __bfloat162float(x[token_base + k]) *
+               __bfloat162float(weight[vocab * dim + k]);
+  }
+  scratch[tid] = partial;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      scratch[tid] += scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    out[token * vocab_size + vocab] = scratch[0];
+  }
+}
+
 extern "C" {
 
 cudaError_t deepseek_hc_expand_cuda(
@@ -1008,6 +1042,25 @@ cudaError_t deepseek_last_token_bf16_logits_cuda(
       1);
   if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
   return cudaSuccess;
+}
+
+cudaError_t deepseek_bf16_logits_cuda(
+    const __nv_bfloat16 *x,
+    const __nv_bfloat16 *weight,
+    float *out,
+    int seq_len,
+    int dim,
+    int vocab_size,
+    cudaStream_t stream) {
+  if (seq_len <= 0 || dim <= 0 || vocab_size <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  dim3 grid(vocab_size, seq_len);
+  size_t shared_bytes = threads * sizeof(float);
+  deepseek_bf16_logits_kernel<<<grid, threads, shared_bytes, stream>>>(
+      x, weight, out, seq_len, dim, vocab_size);
+  return cudaGetLastError();
 }
 
 }  // extern "C"
