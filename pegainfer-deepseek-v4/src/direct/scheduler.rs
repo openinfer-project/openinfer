@@ -349,11 +349,7 @@ impl DeepSeekV4DirectGenerator {
     }
 
     pub fn release_greedy_request(&mut self, state: &mut DeepSeekV4RequestState) -> Result<()> {
-        if let Some(kv_cache) = state.kv_cache.take() {
-            self.kv_cache.release(&kv_cache)?;
-        }
-        state.next_logits = None;
-        Ok(())
+        release_greedy_request_from(&mut self.kv_cache, state)
     }
 
     pub fn sample_greedy_step(&self, state: &DeepSeekV4RequestState) -> Result<DirectDecodeStep> {
@@ -402,40 +398,10 @@ impl DeepSeekV4DirectGenerator {
         state: &mut DeepSeekV4RequestState,
         step: &DirectDecodeStep,
     ) -> Result<()> {
-        ensure_step_matches_state(state, step)?;
-        if state.is_finished() {
-            return Ok(());
-        }
-
-        if let Some(finish_reason) = step.finish_reason()
-            && step.token().is_none()
-        {
-            state.next_logits = None;
-            state.finish_reason = Some(finish_reason);
-            self.release_greedy_request(state)?;
-            return Ok(());
-        }
-
-        let Some(token) = step.token() else {
-            bail!("DeepSeek V4 decode step without token or finish reason");
-        };
-        state
-            .next_logits
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request state missing consumed logits"))?;
-        state.generated.push(token);
-        if let Some(finish_reason) = step.finish_reason() {
-            state.finish_reason = Some(finish_reason);
-            self.release_greedy_request(state)?;
-            return Ok(());
-        }
-        state.next_logits = Some(run_direct_decode_logits(
-            &mut self.runtime,
-            token,
-            step.start_pos(),
-        )?);
-
-        Ok(())
+        let runtime = &mut self.runtime;
+        advance_greedy_step_with_decode(&mut self.kv_cache, state, step, |token, start_pos| {
+            run_direct_decode_logits(runtime, token, start_pos)
+        })
     }
 
     pub fn decode_greedy_step(
@@ -663,6 +629,66 @@ impl DirectKvCacheManager {
             message: message.to_string(),
         }
         .into())
+    }
+}
+
+fn release_greedy_request_from(
+    kv_cache: &mut DirectKvCacheManager,
+    state: &mut DeepSeekV4RequestState,
+) -> Result<()> {
+    if let Some(lease) = state.kv_cache.take() {
+        kv_cache.release(&lease)?;
+    }
+    state.next_logits = None;
+    Ok(())
+}
+
+fn advance_greedy_step_with_decode<F>(
+    kv_cache: &mut DirectKvCacheManager,
+    state: &mut DeepSeekV4RequestState,
+    step: &DirectDecodeStep,
+    decode_next_logits: F,
+) -> Result<()>
+where
+    F: FnOnce(u32, usize) -> Result<Vec<f32>>,
+{
+    ensure_step_matches_state(state, step)?;
+    if state.is_finished() {
+        return Ok(());
+    }
+
+    if let Some(finish_reason) = step.finish_reason()
+        && step.token().is_none()
+    {
+        state.next_logits = None;
+        state.finish_reason = Some(finish_reason);
+        release_greedy_request_from(kv_cache, state)?;
+        return Ok(());
+    }
+
+    let Some(token) = step.token() else {
+        bail!("DeepSeek V4 decode step without token or finish reason");
+    };
+    state
+        .next_logits
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request state missing consumed logits"))?;
+    state.generated.push(token);
+    if let Some(finish_reason) = step.finish_reason() {
+        state.finish_reason = Some(finish_reason);
+        release_greedy_request_from(kv_cache, state)?;
+        return Ok(());
+    }
+
+    match decode_next_logits(token, step.start_pos()) {
+        Ok(next_logits) => {
+            state.next_logits = Some(next_logits);
+            Ok(())
+        }
+        Err(err) => {
+            release_greedy_request_from(kv_cache, state)?;
+            Err(err)
+        }
     }
 }
 
@@ -906,5 +932,47 @@ mod tests {
         assert_eq!(snapshot.total_allocations(), 1);
         assert_eq!(snapshot.total_resets(), 2);
         assert_eq!(snapshot.total_reuses(), 1);
+    }
+
+    #[test]
+    fn decode_runtime_error_releases_active_kv_lease() {
+        let mut manager = DirectKvCacheManager::new(16);
+        let lease = manager.reserve(1, 4, 4).unwrap();
+        manager.attach_prepared(&lease).unwrap();
+        let mut state = DeepSeekV4RequestState {
+            request_epoch: 1,
+            kv_cache: Some(lease),
+            prompt_len: 4,
+            max_new_tokens: 4,
+            ignore_eos: true,
+            generated: Vec::new(),
+            next_logits: Some(vec![0.0, 1.0]),
+            finish_reason: None,
+        };
+        let step = DirectDecodeStep {
+            request_epoch: 1,
+            generated_len_before: 0,
+            prompt_len: 4,
+            token: Some(1),
+            finish_reason: None,
+        };
+
+        let err = advance_greedy_step_with_decode(&mut manager, &mut state, &step, |_, _| {
+            Err(anyhow::anyhow!("synthetic decode failure"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("synthetic decode failure"));
+        assert!(state.kv_cache_lease().is_none());
+        assert!(state.next_logits.is_none());
+        assert_eq!(state.generated(), &[1]);
+        let snapshot = manager.snapshot();
+        assert!(snapshot.active().is_none());
+        assert_eq!(snapshot.total_releases(), 1);
+
+        let next = manager.reserve(2, 2, 2).unwrap();
+        manager.attach_prepared(&next).unwrap();
+        assert!(manager.snapshot().active().is_some());
     }
 }
