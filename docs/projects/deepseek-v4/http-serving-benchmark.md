@@ -307,6 +307,76 @@ feature, the dominant captured prefill families are overlap compressor and
 indexer top-k, while indexed attention is comparatively small in this 10k
 profile.
 
+### P4 Indexer Top-K Attribution And Equivalence Gate
+
+The next indexer-side gate focuses only on the prefill top-k step under the
+explicit `deepseek-v4-cutedsl-indexer-score` runtime feature. It does not touch
+the default `deepseek-v4` feature, overlap compressor, cache reuse, scheduler,
+or HTTP behavior.
+
+The current code path is:
+
+- `indexer_topk_indices_prefill` calls `deepseek_indexer_topk_prefill_cuda`;
+- the launch is one CUDA block per token:
+  `<<<seq_len, 256, compressed_len * sizeof(float)>>>`;
+- each block copies that token's score row into shared memory, masks invalid
+  compressed positions with `valid = (token + 1) / 4`, and thread 0 performs
+  the current serial top-k selection;
+- ties are kept in candidate order because the selector only replaces on
+  strict `score > best_score`;
+- output indices are `offset + compressed_idx`, where the ratio-4 prefill path
+  uses the raw window length as `offset`.
+
+For the 10k prefill workload from the P3 observation, this gives the concrete
+shape:
+
+| Field | Value |
+| --- | --- |
+| `seq_len` | `10580` |
+| `compressed_len` | `2645` |
+| `topk` | `32` |
+| `ratio` | `4` |
+| `offset` | `10580` |
+| shared memory per block | `10580` bytes |
+
+P3 `nsys` attribution, still under the explicit CuTeDSL score feature, showed
+top-k as the largest remaining indexer-side bucket:
+
+| Kernel family | Total ms / calls | Average ms / call | Note |
+| --- | ---: | ---: | --- |
+| indexer top-k | `12975.70 / 168` | `77.236` | unchanged after indexer-score replacement |
+| indexer score | `1815.79 / 168` | `10.808` | no longer the indexer-side bottleneck |
+| indexed attention | `731.38 / 344` | `2.126` | comparatively small |
+
+The equivalence gate is a GPU test against the current selector semantics:
+
+```bash
+cargo test --release -p pegainfer-kernels \
+  --features deepseek-v4-cutedsl-indexer-score \
+  --test deepseek_indexer_topk -- --ignored --nocapture
+```
+
+It covers two cases:
+
+- odd compressed length with pseudo-random scores:
+  `seq_len=257`, `compressed_len=129`, `topk=32`, `ratio=4`, `offset=777`;
+- the 10k profile shape:
+  `seq_len=10580`, `compressed_len=2645`, `topk=32`, `ratio=4`,
+  `offset=10580`.
+
+The first case checks exact output indices against a CPU reference. The second
+case uses monotonic scores so the expected top-k sequence is fully derivable
+while still exercising the real 10k launch shape, valid-position mask, top-k
+width, and offset behavior.
+
+Hash evidence remains the P3 gate because this PR does not change production
+runtime code: direct 10k generated-token hash `39a863e299d2b187`, 10k HTTP
+output hash `eea187c414579fd7`, and c1/c2/c4/c8 repeated HTTP hash
+`22706877075acde0` under the explicit feature.
+
+This gate decides where a future top-k kernel rewrite or launch adjustment
+starts. It is not itself a serving throughput claim.
+
 ## Boundary
 
 This PR establishes a benchmark gate and one real HTTP run. It does not claim
