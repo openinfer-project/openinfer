@@ -13,8 +13,8 @@ use crate::{
     runtime::{
         AttentionAuxScratch, AttentionIndexScratch, AttentionOutputScratch,
         AttentionProjectionScratch, DecodeBatchMeta, DecodeEntryScratch, F32BatchLogits,
-        FinalLogitsScratch, HcPostScratch, HcPreNormScratch, MoeAgRsScratch, SharedExpertScratch,
-        all_gather_logits, all_gather_logits_into,
+        FinalLogitsScratch, HcPostScratch, HcPreNormScratch, MoeAgRsScratch, PrefillWindowTopk,
+        SharedExpertScratch, all_gather_logits, all_gather_logits_into,
         block_decode_rank_lane_bf16_hidden_batch_with_scratch,
         block_decode_rank_lane_bf16_hidden_with_scratch,
         block_prefill_rank_lane_bf16_hidden_with_decode_cache, embedding_rank_local_into,
@@ -1356,6 +1356,8 @@ fn run_prefill_on_rank_lane(
     ctx.set_current()?;
     let seq_len = prompt_tokens.len();
     let mut profile_phases = Vec::new();
+    let prefill_window_topk = PrefillWindowTopk::new(ctx, seq_len, config.sliding_window)
+        .with_context(|| format!("prefill window topk rank {rank}"))?;
 
     let phase_start = Instant::now();
     let token_ids = ctx
@@ -1429,6 +1431,7 @@ fn run_prefill_on_rank_lane(
             &ropes[layer],
             0,
             &mut caches[layer],
+            &prefill_window_topk,
         )
         .with_context(|| format!("prefill layer {layer} rank {rank}"))?;
         record_prefill_profile_phase(

@@ -289,6 +289,7 @@ pub(crate) fn attention_prefill_compressed_overlap_rank_local_collective_bf16_hi
     start_pos: usize,
     cache: &mut LayerDecodeCache,
     comm: &Comm,
+    prefill_window_topk: &PrefillWindowTopk,
 ) -> Result<Bf16HiddenStates> {
     ensure!(
         config.compress_ratios[layer] == 4,
@@ -346,7 +347,16 @@ pub(crate) fn attention_prefill_compressed_overlap_rank_local_collective_bf16_hi
     .with_context(|| format!("ratio-4 rank-lane indexer tail layer {layer}"))?;
 
     if input.seq_len < 4 {
-        let mut attn_out = sparse_attention_prefill_bf16_hidden(ctx, config, &projections, attn)?;
+        let (topk_idxs, topk) =
+            prefill_window_topk.parts(projections.q.seq_len, config.sliding_window)?;
+        let mut attn_out = sparse_attention_prefill_bf16_hidden_with_topk(
+            ctx,
+            config,
+            &projections,
+            attn,
+            topk_idxs,
+            topk,
+        )?;
         return attention_output_project_bf16_hidden(
             ctx,
             &mut attn_out,
@@ -400,7 +410,7 @@ pub(crate) fn attention_prefill_compressed_overlap_rank_local_collective_bf16_hi
         .map_err(|err| anyhow::anyhow!("NCCL indexer score all-reduce failed: {err:?}"))?;
 
     let (window_idxs, window_topk) =
-        window_topk_indices(ctx, input.seq_len, config.sliding_window)?;
+        prefill_window_topk.parts(input.seq_len, config.sliding_window)?;
     let (compress_idxs, compress_topk) = indexer_topk_indices_prefill(
         ctx,
         config,
@@ -819,6 +829,7 @@ pub(crate) fn attention_prefill_rank_local_bf16_hidden_with_cache(
     rope: &DeepSeekRopeCache,
     start_pos: usize,
     kv_cache: &mut Bf16Cache,
+    prefill_window_topk: &PrefillWindowTopk,
 ) -> Result<Bf16HiddenStates> {
     ctx.set_current()?;
     ensure!(
@@ -833,7 +844,16 @@ pub(crate) fn attention_prefill_rank_local_bf16_hidden_with_cache(
     let mut projections = attention_project_bf16_hidden(ctx, config, input, attn)?;
     apply_rope_attention_projections(ctx, &mut projections, rope, start_pos)?;
     copy_window_prefill_to_ring_cache(ctx, &projections.kv, kv_cache, config.sliding_window)?;
-    let mut attn_out = sparse_attention_prefill_bf16_hidden(ctx, config, &projections, attn)?;
+    let (topk_idxs, topk) =
+        prefill_window_topk.parts(projections.q.seq_len, config.sliding_window)?;
+    let mut attn_out = sparse_attention_prefill_bf16_hidden_with_topk(
+        ctx,
+        config,
+        &projections,
+        attn,
+        topk_idxs,
+        topk,
+    )?;
     attention_output_project_bf16_hidden(
         ctx,
         &mut attn_out,

@@ -621,7 +621,53 @@ pub fn sparse_attention_prefill_bf16_hidden(
     attn: &AttentionWeights<'_>,
 ) -> Result<Bf16HiddenStates> {
     let (topk_idxs, topk) = window_topk_indices(ctx, projections.q.seq_len, config.sliding_window)?;
-    indexed_attention_prefill_bf16_hidden(ctx, config, projections, attn, &topk_idxs, topk)
+    sparse_attention_prefill_bf16_hidden_with_topk(ctx, config, projections, attn, &topk_idxs, topk)
+}
+
+pub(crate) fn sparse_attention_prefill_bf16_hidden_with_topk(
+    ctx: &RankGpuContext,
+    config: &Config,
+    projections: &AttentionProjections,
+    attn: &AttentionWeights<'_>,
+    topk_idxs: &CudaSlice<i32>,
+    topk: usize,
+) -> Result<Bf16HiddenStates> {
+    indexed_attention_prefill_bf16_hidden(ctx, config, projections, attn, topk_idxs, topk)
+}
+
+pub(crate) struct PrefillWindowTopk {
+    indices: CudaSlice<i32>,
+    topk: usize,
+    seq_len: usize,
+    window_size: usize,
+}
+
+impl PrefillWindowTopk {
+    pub(crate) fn new(ctx: &RankGpuContext, seq_len: usize, window_size: usize) -> Result<Self> {
+        let (indices, topk) = window_topk_indices(ctx, seq_len, window_size)?;
+        Ok(Self {
+            indices,
+            topk,
+            seq_len,
+            window_size,
+        })
+    }
+
+    pub(crate) fn parts(
+        &self,
+        seq_len: usize,
+        window_size: usize,
+    ) -> Result<(&CudaSlice<i32>, usize)> {
+        ensure!(
+            self.seq_len == seq_len && self.window_size == window_size,
+            "prefill window topk mismatch: cached seq_len={}, window_size={}, requested seq_len={}, window_size={}",
+            self.seq_len,
+            self.window_size,
+            seq_len,
+            window_size
+        );
+        Ok((&self.indices, self.topk))
+    }
 }
 
 pub fn window_topk_indices(

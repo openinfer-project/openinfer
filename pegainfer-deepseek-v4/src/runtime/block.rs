@@ -60,6 +60,7 @@ pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
     rope: &DeepSeekRopeCache,
     start_pos: usize,
     cache: &mut LayerDecodeCache,
+    prefill_window_topk: &PrefillWindowTopk,
 ) -> Result<HcHiddenStates> {
     ensure!(
         layer < config.n_layers,
@@ -88,6 +89,7 @@ pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
             rope,
             start_pos,
             &mut cache.kv,
+            prefill_window_topk,
         )?,
         4 => attention_prefill_compressed_overlap_rank_local_collective_bf16_hidden_with_cache(
             ctx,
@@ -99,6 +101,7 @@ pub(crate) fn block_prefill_rank_lane_bf16_hidden_with_decode_cache(
             start_pos,
             cache,
             comm,
+            prefill_window_topk,
         )?,
         _ => attention_prefill_compressed_nonoverlap_rank_local_bf16_hidden_with_cache(
             ctx,

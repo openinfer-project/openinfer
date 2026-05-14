@@ -209,6 +209,36 @@ the compressed attention / indexer / compressor path. A candidate reuse of the
 ratio-4 indexer compressed KV was evaluated and rejected because it changed the
 HTTP output hash gate; it is not included in this PR.
 
+### P2 Ratio-4 Block-Prefill Optimization
+
+The first accepted optimization removes repeated generation of the same prefill
+window top-k index table from the layer loop. The table depends only on
+`seq_len` and `sliding_window`, not on the layer. The direct prefill path now
+builds it once per request and reuses it for non-compressed sparse attention and
+ratio-4 compressed attention layers.
+
+HTTP correctness remains the gate. The same c1/c2/c4/c8 sweep still passes with
+`failed=0`, `timeout=0`, and combined hash `22706877075acde0` across all three
+repeats:
+
+| Concurrency | QPS (3 runs) | TTFT avg ms (3 runs) | TPOT avg ms (3 runs) |
+| --- | --- | --- | --- |
+| `1` | `1.737`, `1.730`, `1.744` | `156.5`, `154.6`, `153.2` | `27.92`, `28.20`, `28.00` |
+| `2` | `1.746`, `1.748`, `1.747` | `653.3`, `652.9`, `653.9` | `28.01`, `27.98`, `27.97` |
+| `4` | `1.746`, `1.746`, `1.748` | `1441.7`, `1442.6`, `1441.2` | `27.97`, `28.00`, `27.98` |
+| `8` | `1.745`, `1.746`, `1.747` | `2162.5`, `2159.2`, `2157.3` | `28.01`, `27.97`, `27.99` |
+
+Rank-0 profile shows the clearest long-prompt improvement in the ratio-4 bucket:
+
+| Prompt tokens | P1 ratio-4 `block_prefill` ms | P2 ratio-4 `block_prefill` ms | Delta |
+| ---: | ---: | ---: | ---: |
+| `661` | `200.7` | `207.3` | noisy / no win |
+| `2645` | `818.6` | `815.4` | `-3.2ms` |
+| `10580` | `6902.4` | `6729.9` | `-172.5ms` |
+
+Profile-mode TTFT is still a synchronized diagnostic measurement, not a serving
+number. The serving-number evidence remains the non-profile HTTP sweep above.
+
 ## Boundary
 
 This PR establishes a benchmark gate and one real HTTP run. It does not claim
