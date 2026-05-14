@@ -296,6 +296,7 @@ def main() -> None:
     rows = cute.SymInt(divisibility=8)
     seq_len = cute.SymInt(divisibility=1)
     compressed_len = cute.SymInt(divisibility=8)
+    scores_compressed_len = cute.SymInt(divisibility=1)
     q = make_fake_compact_tensor(
         cutlass.BFloat16,
         (rows, 128, 1),
@@ -327,7 +328,7 @@ def main() -> None:
     )
     kv_scores = make_fake_compact_tensor(
         cutlass.BFloat16,
-        (compressed_len, HEAD_DIM),
+        (scores_compressed_len, HEAD_DIM),
         stride_order=(1, 0),
     )
     weights_scores = make_fake_compact_tensor(
@@ -337,7 +338,7 @@ def main() -> None:
     )
     scores = make_fake_compact_tensor(
         cutlass.Float32,
-        (seq_len, compressed_len),
+        (seq_len, scores_compressed_len),
         stride_order=(1, 0),
     )
     score_scale = cutlass.Float32(0.125)

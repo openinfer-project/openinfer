@@ -342,7 +342,7 @@ fn indexer_scores_prefill_cutedsl_aot_matches_reference() -> Result<()> {
 fn indexer_scores_prefill_cutedsl_exact_matches_serial_topk_shape() -> Result<()> {
     let seq_len = 512usize;
     let local_heads = 8usize;
-    let compressed_len = 128usize;
+    let compressed_len = 129usize;
     let topk = 32usize;
     let ratio = 4usize;
     let score_scale = 0.125f32;
