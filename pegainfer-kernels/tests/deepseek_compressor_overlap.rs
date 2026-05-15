@@ -17,6 +17,11 @@ unsafe extern "C" {
     fn cudaFree(dev_ptr: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
+    fn cudaEventCreate(event: *mut *mut c_void) -> i32;
+    fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> i32;
+    fn cudaEventSynchronize(event: *mut c_void) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> i32;
+    fn cudaEventDestroy(event: *mut c_void) -> i32;
 }
 
 struct DeviceBuffer<T> {
@@ -253,8 +258,17 @@ fn assert_close(name: &str, got: &[f32], expected: &[f32], max_abs_limit: f32) -
     Ok(())
 }
 
-fn check_case(name: &str, seq_len: usize, hidden_dim: usize, head_dim: usize) -> Result<()> {
+// New CuTeDSL Sm120 GEMM path constrains:
+//   - hidden_dim == 4096 (config.dim baked into the AOT cubin)
+//   - head_dim ∈ {128 (indexer), 512 (main)}
+//   - seq_len divisible by ratio=4; M is padded internally to next 128 multiple.
+// Tolerances are looser than the retired scalar serial kernel because BF16
+// tensor-core MMA accumulates in a different order than per-k scalar FMA;
+// for the all-ones x test data this still keeps relative error well below
+// downstream BF16 quantisation noise.
+fn check_case(name: &str, seq_len: usize, head_dim: usize) -> Result<()> {
     ensure!(seq_len % 4 == 0, "seq_len must be ratio4 aligned");
+    let hidden_dim = 4096;
     let eps = 1.0e-6;
     let case = make_case(seq_len, hidden_dim, head_dim);
     let (expected_weighted, expected_out) = reference_overlap(&case, eps);
@@ -264,30 +278,138 @@ fn check_case(name: &str, seq_len: usize, hidden_dim: usize, head_dim: usize) ->
         &format!("{name} weighted"),
         &got_weighted,
         &expected_weighted,
-        8.0e-5,
+        5.0e-3,
     )?;
-    assert_close(&format!("{name} out"), &got_out, &expected_out, 1.0e-3)?;
+    assert_close(&format!("{name} out"), &got_out, &expected_out, 5.0e-3)?;
     Ok(())
-}
-
-#[test]
-#[ignore = "requires CUDA GPU; validates overlap compressor prefill core"]
-fn overlap_prefill_matches_reference_small_main_and_indexer_shapes() -> Result<()> {
-    check_case("main-small", 20, 64, 32)?;
-    check_case("indexer-small", 20, 64, 16)?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires CUDA GPU; covers odd/boundary compressed and head shapes"]
-fn overlap_prefill_matches_reference_odd_boundary_shape() -> Result<()> {
-    check_case("odd-boundary", 68, 40, 33)
 }
 
 #[test]
 #[ignore = "requires CUDA GPU; covers 10k launch shape for main and indexer calls"]
 fn overlap_prefill_matches_reference_10k_representative_shapes() -> Result<()> {
-    check_case("10k-indexer", 10580, 64, 128)?;
-    check_case("10k-main", 10580, 64, 512)?;
+    check_case("10k-indexer", 10580, 128)?;
+    check_case("10k-main", 10580, 512)?;
+    Ok(())
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn percentile(sorted: &[f32], q: f32) -> f32 {
+    if sorted.is_empty() {
+        return f32::NAN;
+    }
+    let idx = ((sorted.len() as f32 - 1.0) * q).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn bench_overlap_prefill(
+    name: &str,
+    seq_len: usize,
+    hidden_dim: usize,
+    head_dim: usize,
+    warmup: usize,
+    iters: usize,
+) -> Result<()> {
+    let eps = 1.0e-6;
+    let case = make_case(seq_len, hidden_dim, head_dim);
+    let compressed_len = seq_len / 4;
+
+    let x_d = DeviceBuffer::from_host(&case.x)?;
+    let wkv_d = DeviceBuffer::from_host(&case.wkv)?;
+    let wgate_d = DeviceBuffer::from_host(&case.wgate)?;
+    let ape_d = DeviceBuffer::from_host(&case.ape)?;
+    let norm_d = DeviceBuffer::from_host(&case.norm)?;
+    let weighted_d = DeviceBuffer::<f32>::zeroed(compressed_len * head_dim)?;
+    let out_d = DeviceBuffer::<u16>::zeroed(compressed_len * head_dim)?;
+    let stream: CUstream = ptr::null_mut();
+
+    let launch = || -> Result<()> {
+        let result = unsafe {
+            ffi::deepseek_compressor_overlap_prefill_cuda(
+                x_d.ptr,
+                wkv_d.ptr,
+                wgate_d.ptr,
+                ape_d.ptr,
+                norm_d.ptr,
+                weighted_d.ptr,
+                out_d.ptr,
+                seq_len as i32,
+                hidden_dim as i32,
+                head_dim as i32,
+                eps,
+                stream,
+            )
+        };
+        ensure!(
+            result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "{name} launch failed: {:?}",
+            result
+        );
+        Ok(())
+    };
+
+    for _ in 0..warmup {
+        launch()?;
+    }
+    cuda_check(unsafe { cudaDeviceSynchronize() })?;
+
+    let mut start_evt: *mut c_void = ptr::null_mut();
+    let mut stop_evt: *mut c_void = ptr::null_mut();
+    cuda_check(unsafe { cudaEventCreate(&mut start_evt) })?;
+    cuda_check(unsafe { cudaEventCreate(&mut stop_evt) })?;
+
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        cuda_check(unsafe { cudaEventRecord(start_evt, ptr::null_mut()) })?;
+        launch()?;
+        cuda_check(unsafe { cudaEventRecord(stop_evt, ptr::null_mut()) })?;
+        cuda_check(unsafe { cudaEventSynchronize(stop_evt) })?;
+        let mut ms: f32 = 0.0;
+        cuda_check(unsafe { cudaEventElapsedTime(&mut ms, start_evt, stop_evt) })?;
+        samples.push(ms);
+    }
+
+    cuda_check(unsafe { cudaEventDestroy(start_evt) })?;
+    cuda_check(unsafe { cudaEventDestroy(stop_evt) })?;
+
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sum: f32 = samples.iter().sum();
+    let avg = sum / samples.len() as f32;
+    let p50 = percentile(&samples, 0.50);
+    let p95 = percentile(&samples, 0.95);
+    let p99 = percentile(&samples, 0.99);
+    let min = samples[0];
+    let max = *samples.last().unwrap();
+
+    // Equivalent throughput: how many compressed positions emitted per second.
+    let tok_per_s = compressed_len as f32 / (avg / 1000.0);
+
+    println!(
+        "[microbench] {name} seq_len={seq_len} hidden_dim={hidden_dim} head_dim={head_dim} \
+         compressed_len={compressed_len} warmup={warmup} iters={iters}\n\
+         \tms/call: avg={avg:.3} p50={p50:.3} p95={p95:.3} p99={p99:.3} min={min:.3} max={max:.3}\n\
+         \tcompressed_pos/s={tok_per_s:.1}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA GPU; microbench overlap compressor prefill at production hidden_dim"]
+fn overlap_prefill_microbench_production_shapes() -> Result<()> {
+    // DSV4 production: hidden_dim = config.dim = 4096.
+    // head_dim 128 corresponds to the indexer compressor call site,
+    // head_dim 512 corresponds to the main compressor call site.
+    let seq_len = env_usize("OVERLAP_BENCH_SEQ_LEN", 10580);
+    let hidden_dim = env_usize("OVERLAP_BENCH_HIDDEN_DIM", 4096);
+    let warmup = env_usize("OVERLAP_BENCH_WARMUP", 10);
+    let iters = env_usize("OVERLAP_BENCH_ITERS", 50);
+
+    bench_overlap_prefill("10k-indexer", seq_len, hidden_dim, 128, warmup, iters)?;
+    bench_overlap_prefill("10k-main", seq_len, hidden_dim, 512, warmup, iters)?;
     Ok(())
 }

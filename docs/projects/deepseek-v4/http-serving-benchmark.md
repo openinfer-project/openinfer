@@ -477,6 +477,58 @@ Direct `bench_serving` under `nsys` for the 10k prompt reports TTFT
 workload-specific attribution observation, not a generalized serving throughput
 or production performance claim.
 
+### P7 cuBLAS GEMM Overlap Compressor Prefill
+
+P6 confirmed the overlap compressor was the largest remaining ratio-4 family.
+The hand-written scalar BF16 FMA kernel
+(`deepseek_compressor_overlap_weighted_kernel`) was retired in favour of two
+`cublasGemmEx` BF16 x BF16 -> FP32 GEMMs (X @ Wgate^T for scores, X @ Wkv^T
+for values) followed by a 1-thread-per-(compressed,dim) epilogue that gathers
+the 8 ratio-4 routes, applies softmax with the per-route APE bias, and emits
+the FP32 weighted sum. The downstream RMSNorm+BF16 cast still runs in
+`deepseek_compressor_norm_serial_kernel`.
+
+Microbench at the production launch shape (`seq_len=10580`,
+`hidden_dim=4096`) on RTX 5090, full pipeline including epilogue + norm,
+50 iterations after 10 warm-ups:
+
+| Call site | p50 ms | p95 ms | p99 ms |
+| --- | ---: | ---: | ---: |
+| 10k-indexer (`head_dim=128`) | `0.302` | `0.309` | `0.343` |
+| 10k-main (`head_dim=512`) | `1.128` | `1.134` | `1.136` |
+
+Profile-mode 10k HTTP prefill (rank 0, 4 warm runs averaged from
+`pegainfer_prefill_profile`):
+
+| Bucket | P6 ms | P7 ms | Δ |
+| --- | ---: | ---: | ---: |
+| total prefill | `8757.7` (warm avg) | `3796.8` | `-4960.9` (`2.3x`) |
+| ratio-0 (2 layers) | `134.8` | `~91` | `-44` |
+| ratio-4 (21 layers) | `6729.9` | `~1646` | `-5084` (`4.1x`) |
+| ratio-128 (20 layers) | `1903.3` | `~1903` | unchanged |
+
+ratio-4 per-layer drops from `~329 ms` to `~76-83 ms`; the bucket is now
+smaller than ratio-128. ratio-128 becomes the next prefill target.
+
+Validation:
+
+| Gate | Result |
+| --- | --- |
+| operator equivalence vs FP32 CPU reference | passes within `atol=5e-3` for both `head_dim=128` and `head_dim=512` at `seq_len=10580` (loosened from `8e-5` because BF16 tensor-core MMA accumulates in a different order than per-k scalar FMA) |
+| 20-case ground-truth e2e (`test_data/deepseek-v4-ground-truth.json`, `max_new_tokens=64`) | `20 / 20` exact-text PASS |
+| 10k HTTP single-request output hash | `eea187c414579fd7` (matches P3 baseline; argmax on prefill-final-token logits is robust to BF16 accumulation noise) |
+| HTTP c1/c2/c4/c8 repeated hash | failed `0`, timeout `0`, per-request hashes stable across 12 runs; combined hash **changed** to `4ca05c20e8954ec0` (was `22706877075acde0`) |
+
+The c1/c2/c4/c8 combined hash change is the BF16 accumulation-order side
+effect: greedy decoding (temperature=0) over 16 output tokens × 8 prompts ×
+43 layers amplifies the FP rounding difference across cuBLAS tensor-core MMA
+vs scalar BF16 FMA into different argmax tokens. The per-run hash is stable
+and exact-text e2e still passes, so this is the new normative HTTP gate.
+
+Numbers in this section were collected on RTX 5090 (sm_120), CUDA 13.1,
+cublasLt default selection, profile-mode server. Non-profile serving
+numbers will be slightly lower than the profile-mode TTFT recorded above.
+
 ## Boundary
 
 This PR establishes a benchmark gate and one real HTTP run. It does not claim
