@@ -64,7 +64,7 @@ We use \*\*Commitizen\*\* conventions for clear history. Your commit messages sh
 
 1\. Fork the repository and create your branch from `main`.
 
-2\. Ensure your code passes all tests (`npm test`, `cargo test`, vb. - diline göre güncelleyin).
+2\. Ensure your code passes all tests (e.g., cargo test --release).
 
 3\. Open a Pull Request against the `main` branch.
 
