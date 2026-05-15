@@ -181,20 +181,23 @@ pub fn build_intra_node_backends(
         // Page-aligned, zero-initialized.
         let num_routed_host = vec![0u32; num_routed_len];
 
-        let send_handle = CUMemAllocHandle::new(send_buffer_bytes, dev_id, CUMemHandleKind::Local)
-            .with_context(|| format!("CUMem alloc send buffer for cuda:{dev_ord}"))?;
+        let send_handle =
+            CUMemAllocHandle::new(send_buffer_bytes, dev_id, CUMemHandleKind::FileDescriptor)
+                .with_context(|| format!("CUMem alloc send buffer for cuda:{dev_ord}"))?;
         let send_mapping = send_handle
             .map(device)
             .with_context(|| format!("CUMem map send buffer on cuda:{dev_ord}"))?;
 
-        let recv_handle = CUMemAllocHandle::new(recv_buffer_bytes, dev_id, CUMemHandleKind::Local)
-            .with_context(|| format!("CUMem alloc recv buffer for cuda:{dev_ord}"))?;
+        let recv_handle =
+            CUMemAllocHandle::new(recv_buffer_bytes, dev_id, CUMemHandleKind::FileDescriptor)
+                .with_context(|| format!("CUMem alloc recv buffer for cuda:{dev_ord}"))?;
         let recv_mapping = recv_handle
             .map(device)
             .with_context(|| format!("CUMem map recv buffer on cuda:{dev_ord}"))?;
 
-        let sync_handle = CUMemAllocHandle::new(sync_buffer_bytes, dev_id, CUMemHandleKind::Local)
-            .with_context(|| format!("CUMem alloc sync buffer for cuda:{dev_ord}"))?;
+        let sync_handle =
+            CUMemAllocHandle::new(sync_buffer_bytes, dev_id, CUMemHandleKind::FileDescriptor)
+                .with_context(|| format!("CUMem alloc sync buffer for cuda:{dev_ord}"))?;
         let sync_mapping = sync_handle
             .map(device)
             .with_context(|| format!("CUMem map sync buffer on cuda:{dev_ord}"))?;
