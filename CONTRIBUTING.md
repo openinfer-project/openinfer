@@ -18,10 +18,7 @@ To get you started quickly, here is everything you need to know to get your firs
 
 If you have questions, need help, or want to discuss a feature, please reach out via:
 
-\* \*\*GitHub Discussions:\*\* \[Link buraya]
-
-\* \*\*Discord/Slack:\*\* \[Link buraya]
-
+* **GitHub Issues & Discussions:** Please use this repository's official Issues and Discussions tabs to ask questions or report problems.
 
 
 \## 🛠️ Setup \& Development
