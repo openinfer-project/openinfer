@@ -1085,15 +1085,36 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
                 &model_path,
                 options.enable_prefill_profile,
             ) {
-                Ok(generator) => {
-                    let _ = init_tx.send(Ok(()));
-                    generator
-                }
+                Ok(generator) => generator,
                 Err(err) => {
                     let _ = init_tx.send(Err(err));
                     return;
                 }
             };
+            #[cfg(feature = "pplx-ep")]
+            if std::env::var("PEGAINFER_DSV4_PPLX").is_ok_and(|v| v != "0" && !v.is_empty()) {
+                info!("PEGAINFER_DSV4_PPLX set; building pplx EP backends");
+                match crate::direct::pplx_bootstrap::build_intra_node_backends(
+                    generator.config,
+                    &(0..8).collect::<Vec<_>>(),
+                    crate::direct::pplx_bootstrap::PplxBootstrapParams::default(),
+                ) {
+                    Ok((backends, resources, _te)) => {
+                        // Leak resources for process lifetime — bootstrap is one-shot.
+                        std::mem::forget(resources);
+                        if let Err(err) = generator.enable_pplx(backends) {
+                            let _ = init_tx.send(Err(err));
+                            return;
+                        }
+                        info!("pplx EP backends installed on all 8 ranks");
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+            let _ = init_tx.send(Ok(()));
             info!("DeepSeek V4 scheduler ready");
             while let Some(req) = submit_rx.blocking_recv() {
                 let mut wave = vec![req];
