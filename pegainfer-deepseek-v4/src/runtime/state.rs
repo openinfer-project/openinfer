@@ -597,10 +597,34 @@ impl MoePplxScratch {
         );
         let topk = config.n_activated_experts;
         let local_experts = config.n_routed_experts / world_size;
-        // Worst case: every peer's tokens all route to this rank's experts.
-        // Upstream caps the receive buffer at this product; matches the
-        // `max_recv_tokens` we pass to `EpBackend::new`.
-        let max_recv_tokens = local_seq_capacity * world_size * topk;
+        // Match the upstream pplx-garden formula (p2p_all_to_all.py:105).
+        // The packed expert buffer is addressed via padded indices, so
+        // capacity must include `expert_padding` slop. Keep these
+        // parameters in sync with `PplxBootstrapParams`.
+        const EXPERT_PADDING: usize = 16;
+        // Match PplxBootstrapParams::default().max_num_tokens — EpBackend
+        // is initialized with this capacity, so the scratch buffer must
+        // match.
+        let max_num_tokens = std::cmp::max(local_seq_capacity, 8);
+        let num_dp_groups = world_size;
+        let num_tokens_total = max_num_tokens * num_dp_groups;
+        let avg_tokens_per_expert = {
+            let raw = (max_num_tokens * topk).div_ceil(config.n_routed_experts);
+            raw + raw / 5 + 1
+        };
+        let max_private_tokens = avg_tokens_per_expert * local_experts;
+        let round_up = |v: usize, m: usize| if m == 0 { v } else { v.div_ceil(m) * m };
+        let max_recv_tokens = max_private_tokens * num_dp_groups
+            + round_up(
+                std::cmp::max(
+                    std::cmp::min(
+                        num_tokens_total * topk + local_experts * (EXPERT_PADDING - 1),
+                        num_tokens_total * local_experts,
+                    ),
+                    local_experts * EXPERT_PADDING,
+                ),
+                EXPERT_PADDING,
+            );
 
         let route_capacity = local_seq_capacity * topk;
         let route_weights = unsafe { ctx.stream.alloc(route_capacity)? };
@@ -617,7 +641,10 @@ impl MoePplxScratch {
             unsafe { ctx.stream.alloc(max_recv_tokens * max_fp4_scale_cols)? };
 
         let expert_indptr = unsafe { ctx.stream.alloc(local_experts + 1)? };
-        let num_recv_tokens = unsafe { ctx.stream.alloc(1)? };
+        // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
+        // expert (matches upstream Python `(num_local_experts,)` shape),
+        // not a single scalar.
+        let num_recv_tokens = unsafe { ctx.stream.alloc(local_experts)? };
         let tokens_per_expert_host = vec![0u32; local_experts];
 
         let out = Bf16HiddenStates::uninit(ctx, config.dim, local_seq_capacity)?;

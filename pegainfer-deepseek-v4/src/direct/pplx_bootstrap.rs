@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use pegainfer_comm::raw::cuda_lib::cumem::{
     CUAllocHandle, CUMemAllocHandle, CUMemHandleKind, CUMemMapping,
 };
-use pegainfer_comm::raw::cuda_lib::{CudaDeviceId, Device};
+use pegainfer_comm::raw::cuda_lib::{CudaDeviceId, CudaHostMemory, Device};
 use pegainfer_comm::raw::fabric_lib::api::{MemoryRegionDescriptor, MemoryRegionHandle};
 use pegainfer_comm::raw::fabric_lib::{
     RdmaEngine, TransferEngine, TransferEngineBuilder, detect_topology,
@@ -66,7 +66,7 @@ impl Default for PplxBootstrapParams {
 /// as the matching [`EpBackend`] is alive.
 #[allow(dead_code)]
 pub struct PplxRankResources {
-    pub num_routed_host: Vec<u32>, // pinned host buffer (Vec is page-aligned + locked downstream)
+    pub num_routed_host: CudaHostMemory, // cuda-pinned host buffer (page-aligned, locked)
     pub send_handle: CUMemAllocHandle,
     pub send_mapping: CUMemMapping,
     pub recv_handle: CUMemAllocHandle,
@@ -105,7 +105,11 @@ pub fn build_intra_node_backends(
 
     let max_num_tokens = params.max_num_tokens;
     let num_experts_per_token = config.n_activated_experts;
-    let num_dp_groups = 1usize; // pure EP, no DP
+    // pplx terminology: dp_size = how many ranks share each DP shard,
+    // num_dp_groups = world_size / dp_size. For pure EP (no DP), every
+    // rank is its own DP shard, so dp_size=1 and num_dp_groups=world_size.
+    let dp_size = 1usize;
+    let num_dp_groups = world_size / dp_size;
 
     let avg_tokens_per_expert = {
         let raw = (max_num_tokens * num_experts_per_token).div_ceil(config.n_routed_experts);
@@ -185,10 +189,23 @@ pub fn build_intra_node_backends(
         let dev_id = CudaDeviceId(dev_ord as u8);
         let device = Device::Cuda(dev_id);
 
+        // Bind the rank's device for all subsequent CUDA calls in this
+        // loop iteration (CUMem alloc + cudaHostAlloc go to this device's
+        // context).
+        pegainfer_comm::raw::cuda_lib::rt::cudaSetDevice(dev_ord as i32)
+            .with_context(|| format!("cudaSetDevice({dev_ord})"))?;
+
         let te = build_te_for(dev_ord)?;
 
         let num_routed_len = num_dp_groups * config.n_routed_experts;
-        let num_routed_host = vec![0u32; num_routed_len];
+        // Upstream Python uses torch.empty(..., pin_memory=True). Plain
+        // Vec<u32> won't satisfy the verbs MR registration on a tightly
+        // page-locked host buffer required for RDMA. Use cudaHostAlloc
+        // to get a page-aligned, registered host buffer, and round up
+        // to PAGE_SIZE.
+        let num_routed_bytes = round_up(num_routed_len * std::mem::size_of::<u32>(), PAGE_SIZE);
+        let num_routed_host = CudaHostMemory::alloc(num_routed_bytes)
+            .with_context(|| format!("alloc pinned num_routed host buffer for cuda:{dev_ord}"))?;
 
         let send_handle =
             CUMemAllocHandle::new(send_buffer_bytes, dev_id, CUMemHandleKind::FileDescriptor)
@@ -212,12 +229,7 @@ pub fn build_intra_node_backends(
             .with_context(|| format!("CUMem map sync buffer on cuda:{dev_ord}"))?;
 
         let (num_routed_mr, num_routed_desc) = te
-            .register_memory_allow_remote(
-                NonNull::new(num_routed_host.as_ptr() as *mut c_void)
-                    .expect("num_routed buffer non-null"),
-                num_routed_len * std::mem::size_of::<u32>(),
-                Device::Host,
-            )
+            .register_memory_allow_remote(num_routed_host.ptr, num_routed_bytes, Device::Host)
             .with_context(|| format!("register num_routed MR for cuda:{dev_ord}"))?;
         let (send_buffer_mr, _send_desc) = te
             .register_memory_allow_remote(send_mapping.data_ptr(), send_buffer_bytes, device)
@@ -326,7 +338,7 @@ pub fn build_intra_node_backends(
             world_size,
             rank,
             node_size: world_size,
-            dp_size: num_dp_groups,
+            dp_size,
             num_experts: config.n_routed_experts,
             num_experts_per_token,
             hidden_dim,
@@ -343,7 +355,7 @@ pub fn build_intra_node_backends(
             scale_elemsize,
         };
         let buffers = EpRankBuffers {
-            num_routed_ptr: resources[rank].num_routed_host.as_ptr() as *mut u32,
+            num_routed_ptr: resources[rank].num_routed_host.ptr.as_ptr() as *mut u32,
             num_routed_mr: resources[rank].num_routed_mr,
             send_buffer_ptr: resources[rank].send_mapping.data_ptr().as_ptr(),
             send_buffer_mr: resources[rank].send_buffer_mr,

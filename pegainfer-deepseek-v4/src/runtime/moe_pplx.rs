@@ -115,17 +115,19 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         let (x_ptr, _x_guard) = input.data.device_ptr(moe_stream);
         let (idx_ptr, _idx_guard) = moe_scratch.route_indices.device_ptr(moe_stream);
         let (w_ptr, _w_guard) = moe_scratch.route_weights.device_ptr(moe_stream);
+        // Upstream a2a_dispatch_send.cu uses `(uint4*)(x_ptr + token * x_stride)`,
+        // so x_stride is in BYTES (sizeof(bf16) * hidden_dim).
         ep.dispatch_send(
             num_tokens,
             x_ptr as *const c_void,
-            input.hidden_dim, // x_stride: BF16 elems between token rows
+            input.hidden_dim * std::mem::size_of::<u16>(), // x_stride: BF16 BYTES per row
             ptr::null(),
             0,
             0,
             idx_ptr as *const i32,
-            topk, // indices_stride
+            topk, // indices_stride: ELEMENTS
             w_ptr as *const f32,
-            topk,        // weights_stride
+            topk,        // weights_stride: ELEMENTS
             ptr::null(), // num_tokens known on host
             stream_raw,
         )
@@ -167,54 +169,29 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         .with_context(|| format!("pplx dispatch_recv layer {layer}"))?;
     }
 
-    // ---- 5. D2H num_recv_tokens + tokens_per_expert, prefix-sum on host ----
-    // dispatch_recv writes num_recv_tokens and tokens_per_expert on
-    // moe_stream; sync once so the host readback is safe.
+    // ---- 5. D2H per-expert recv counts, prefix-sum on host ----
+    // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
+    // expert on moe_stream; sync once so the host readback is safe.
     moe_stream.synchronize()?;
-    let mut num_recv_host = vec![0i32; 1];
+    let mut per_expert_recv = vec![0i32; local_experts];
     ctx.stream
-        .memcpy_dtoh(&moe_scratch.num_recv_tokens, &mut num_recv_host)?;
-
-    // tokens_per_expert lives inside the pplx worker. Pull through the
-    // EpBackend accessor; cudarc has no helper for foreign raw pointers,
-    // so use cuMemcpyAsync directly.
-    {
-        let host = &mut moe_scratch.tokens_per_expert_host[..local_experts];
-        let result = unsafe {
-            cudarc::driver::sys::cuMemcpyAsync(
-                host.as_mut_ptr() as cudarc::driver::sys::CUdeviceptr,
-                ep.tokens_per_expert_ptr() as cudarc::driver::sys::CUdeviceptr,
-                local_experts * std::mem::size_of::<u32>(),
-                ctx.stream.cu_stream(),
-            )
-        };
-        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(anyhow::anyhow!(
-                "pplx tokens_per_expert D2H failed: {result:?}"
-            ));
-        }
-    }
+        .memcpy_dtoh(&moe_scratch.num_recv_tokens, &mut per_expert_recv)?;
     ctx.sync()?;
-    let num_recv_tokens = num_recv_host[0] as usize;
-    ensure!(
-        num_recv_tokens <= moe_scratch.expanded_input.seq_capacity(),
-        "pplx num_recv_tokens={num_recv_tokens} exceeds expanded_input capacity {}",
-        moe_scratch.expanded_input.seq_capacity()
-    );
-
     // Exclusive prefix sum on host -> expert_indptr.
     let mut indptr_host = vec![0i32; local_experts + 1];
     let mut acc: i32 = 0;
     for i in 0..local_experts {
         indptr_host[i] = acc;
         acc = acc
-            .checked_add(moe_scratch.tokens_per_expert_host[i] as i32)
+            .checked_add(per_expert_recv[i])
             .ok_or_else(|| anyhow::anyhow!("pplx expert_indptr overflow"))?;
     }
     indptr_host[local_experts] = acc;
+    let num_recv_tokens = acc as usize;
     ensure!(
-        acc as usize == num_recv_tokens,
-        "pplx tokens_per_expert sum {acc} != num_recv_tokens {num_recv_tokens}",
+        num_recv_tokens <= moe_scratch.expanded_input.seq_capacity(),
+        "pplx num_recv_tokens={num_recv_tokens} exceeds expanded_input capacity {}",
+        moe_scratch.expanded_input.seq_capacity()
     );
     ctx.stream
         .memcpy_htod(&indptr_host, &mut moe_scratch.expert_indptr)?;
@@ -267,7 +244,7 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         let (exp_ptr, _g) = moe_scratch.expert_out.data.device_ptr(moe_stream);
         ep.combine_send(
             exp_ptr as *const c_void,
-            moe_scratch.expert_out.hidden_dim, // expert_x_stride
+            moe_scratch.expert_out.hidden_dim * std::mem::size_of::<u16>(), // expert_x_stride: BF16 BYTES
             stream_raw,
         )
         .with_context(|| format!("pplx combine_send layer {layer}"))?;
@@ -283,7 +260,7 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             num_recv_tokens,
             ScalarType::BF16,
             out_ptr as *mut c_void,
-            moe_scratch.out.hidden_dim, // out_tokens_stride
+            moe_scratch.out.hidden_dim * std::mem::size_of::<u16>(), // out_tokens_stride: BF16 BYTES
             idx_ptr as *const i32,
             topk, // indices_stride
             w_ptr as *const f32,
