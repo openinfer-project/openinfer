@@ -1099,7 +1099,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
                     &(0..8).collect::<Vec<_>>(),
                     crate::direct::pplx_bootstrap::PplxBootstrapParams::default(),
                 ) {
-                    Ok((backends, resources, _te)) => {
+                    Ok((backends, resources)) => {
                         // Leak resources for process lifetime — bootstrap is one-shot.
                         std::mem::forget(resources);
                         if let Err(err) = generator.enable_pplx(backends) {

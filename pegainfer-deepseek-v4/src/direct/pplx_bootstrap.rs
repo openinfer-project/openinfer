@@ -78,6 +78,7 @@ pub struct PplxRankResources {
     pub send_buffer_mr: MemoryRegionHandle,
     pub recv_buffer_mr: MemoryRegionHandle,
     pub recv_buffer_desc: MemoryRegionDescriptor,
+    pub transfer_engine: Arc<TransferEngine>,
 }
 
 /// Build EP backends for all `world_size` ranks living in this process.
@@ -88,7 +89,7 @@ pub fn build_intra_node_backends(
     config: &Config,
     devices: &[usize],
     params: PplxBootstrapParams,
-) -> Result<(Vec<EpBackend>, Vec<PplxRankResources>, Arc<TransferEngine>)> {
+) -> Result<(Vec<EpBackend>, Vec<PplxRankResources>)> {
     let world_size = devices.len();
     if world_size == 0 {
         bail!("pplx bootstrap: device list empty");
@@ -143,10 +144,15 @@ pub fn build_intra_node_backends(
     let recv_buffer_bytes = round_up(max_recv_tokens * token_dim, PAGE_SIZE);
     let sync_buffer_bytes = std::mem::size_of::<u32>() * world_size * 2;
 
-    // Build the single shared TransferEngine across all 8 GPUs.
+    // Build one TransferEngine *per rank*, each binding to its own GPU+NIC.
+    // pplx-garden's AllToAllRankHandle carries a single `address` (the
+    // peer's main NIC). With a single shared TE, `te.main_address()` only
+    // returns worker[0]'s NIC, so all 8 RankHandles end up pointing at the
+    // same NIC and RDMA writes target the wrong domain (local protection
+    // error). One TE per GPU gives each rank its own NIC main address.
     let system_topo = detect_topology().context("pplx bootstrap: detect_topology failed")?;
-    let mut builder = TransferEngineBuilder::default();
-    for &dev in devices {
+
+    let build_te_for = |dev: usize| -> Result<Arc<TransferEngine>> {
         let group = system_topo
             .iter()
             .find(|g| g.cuda_device as usize == dev)
@@ -166,19 +172,22 @@ pub fn build_intra_node_backends(
             .take(n_doms)
             .cloned()
             .collect::<Vec<_>>();
+        let mut builder = TransferEngineBuilder::default();
         builder.add_gpu_domains(dev as u8, doms, worker_cpu, uvm_cpu);
-    }
-    let te = Arc::new(builder.build().context("pplx bootstrap: TE build failed")?);
+        Ok(Arc::new(builder.build().with_context(|| {
+            format!("pplx bootstrap: TE build for cuda:{dev}")
+        })?))
+    };
 
-    // Phase 1: per-rank allocation + MR registration. Allocations made here
-    // are kept alive in `resources[]`.
+    // Phase 1: per-rank allocation + MR registration in this rank's own TE.
     let mut resources: Vec<PplxRankResources> = Vec::with_capacity(world_size);
     for &dev_ord in devices {
         let dev_id = CudaDeviceId(dev_ord as u8);
         let device = Device::Cuda(dev_id);
 
+        let te = build_te_for(dev_ord)?;
+
         let num_routed_len = num_dp_groups * config.n_routed_experts;
-        // Page-aligned, zero-initialized.
         let num_routed_host = vec![0u32; num_routed_len];
 
         let send_handle =
@@ -202,7 +211,6 @@ pub fn build_intra_node_backends(
             .map(device)
             .with_context(|| format!("CUMem map sync buffer on cuda:{dev_ord}"))?;
 
-        // Register MRs. num_routed is on the host; send/recv on device.
         let (num_routed_mr, num_routed_desc) = te
             .register_memory_allow_remote(
                 NonNull::new(num_routed_host.as_ptr() as *mut c_void)
@@ -231,13 +239,15 @@ pub fn build_intra_node_backends(
             send_buffer_mr,
             recv_buffer_mr,
             recv_buffer_desc,
+            transfer_engine: te,
         });
     }
 
-    // Phase 2: capture per-rank handle descriptors. The fresh
-    // `Vec<AllToAllRankHandle>` is rebuilt per-backend below (the upstream
-    // struct is not `Clone`).
-    let main_address = te.main_address();
+    // Phase 2: capture per-rank handle descriptors + peer NIC addresses.
+    let rank_addresses: Vec<_> = resources
+        .iter()
+        .map(|r| r.transfer_engine.main_address())
+        .collect();
     let rank_handle_parts: Vec<(MemoryRegionDescriptor, MemoryRegionDescriptor)> = (0..world_size)
         .map(|r| {
             (
@@ -346,7 +356,10 @@ pub fn build_intra_node_backends(
 
         let rank_handles: Vec<AllToAllRankHandle> = rank_handle_parts
             .iter()
-            .map(|(nr, rb)| AllToAllRankHandle::new(main_address.clone(), nr.clone(), rb.clone()))
+            .enumerate()
+            .map(|(peer, (nr, rb))| {
+                AllToAllRankHandle::new(rank_addresses[peer].clone(), nr.clone(), rb.clone())
+            })
             .collect();
 
         let backend = EpBackend::new(EpBackendParams {
@@ -354,7 +367,7 @@ pub fn build_intra_node_backends(
             dtypes,
             buffers,
             rank_handles,
-            transfer_engine: te.clone(),
+            transfer_engine: resources[rank].transfer_engine.clone(),
             device: dev_ord as u8,
             imm_base: params.imm_base,
             worker_cpu,
@@ -377,7 +390,7 @@ pub fn build_intra_node_backends(
         let _ = rank;
     }
 
-    Ok((backends, resources, te))
+    Ok((backends, resources))
 }
 
 fn round_up(value: usize, multiple: usize) -> usize {

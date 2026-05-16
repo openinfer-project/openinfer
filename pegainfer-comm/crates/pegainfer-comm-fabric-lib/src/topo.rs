@@ -496,9 +496,18 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
                 domains.push(domain);
             }
         }
-        // Single-node NVLink-only deployments have no co-located NICs.
-        // Emit the GPU with empty domains so the bootstrap can still find
-        // its CPU pinning data.
+
+        tracing::info!(
+            "topo: cuda:{} pci={} numa={} → {} domains: {:?}",
+            cuda_device,
+            group.gpu.pci_addr,
+            group.gpu.numa_node,
+            domains.len(),
+            domains
+                .iter()
+                .map(|d| crate::provider::RdmaDomainInfo::name(d).into_owned())
+                .collect::<Vec<_>>()
+        );
 
         topo_groups.push(TopologyGroup {
             cuda_device: cuda_device as u8,
@@ -508,12 +517,20 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
         });
     }
 
+    tracing::info!(
+        "topo: leftover visible_nics: {:?}",
+        visible_nics.keys().collect::<Vec<_>>()
+    );
+
     // Fallback: when no NICs co-locate with any GPU switch group (intra-node
     // NVLink-only), distribute the leftover visible NICs across GPUs so the
     // upstream Worker init (which insists on 1 or 2 Verbs domains per GPU)
     // still has something to bind. The data plane for single-node EP runs
     // over NVLink, so the bound NIC is essentially a placeholder.
     if !topo_groups.is_empty() && topo_groups.iter().all(|g| g.domains.is_empty()) {
+        tracing::warn!(
+            "topo: all GPUs have empty domains — applying single-NIC fallback"
+        );
         let fallback: Vec<_> = visible_nics.values().cloned().collect();
         if let Some(first_nic) = fallback.into_iter().next() {
             for g in &mut topo_groups {
