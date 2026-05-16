@@ -1,8 +1,8 @@
 # pplx-garden EP 后端接入 dsv4-flash
 
 **创建时间**：2026-05-15
-**状态**：active（kernel-side illegal-address debug）
-**当前 blocker**：LOC_PROT 已解除；本地补齐 CUDA device binding、stride 单位、padded expert layout 后，`cargo check --release -p pegainfer-deepseek-v4 --features pplx-ep` 通过，等待 H200/8-rank 现场验证 `CUDA_ERROR_ILLEGAL_ADDRESS` 是否消失。Codex 默认 PATH 未包含 CUDA toolkit，需要临时带上 `/usr/local/cuda-13.1/bin` 才能让 cc-rs 找到 `nvcc`。
+**状态**：active（functional baseline 已落地，进入 perf 优化）
+**当前 blocker**：H200/8-rank decode 端到端跑通，`CUDA_ERROR_ILLEGAL_ADDRESS` 消失；steady TPOT **6.9 s/tok**（vs NCCL baseline 63.77 ms/tok），慢 ~108×。优化第一抓手是 `moe_pplx.rs` per-layer 的 host-blocking sync（`moe_stream.synchronize()` + D2H `recv_tokens_per_expert` + `ctx.sync()` + H2D `expert_indptr`），43 层全量串成同步链。
 
 ## TL;DR
 
@@ -193,18 +193,26 @@ RankWorker::spawn
 - `block_decode_rank_lane_bf16_hidden_with_scratch`（含 batch 变体）签名改成 `moe: &mut MoeRunContext<'_>`，内部 `dispatch_decode_moe_step` 按 `moe.pplx.is_some()` 分发到两条路径。
 - `RankWorker` 新增 `RankCommand::EnablePplx { ep_backend }`；`DeepSeekV4DirectGenerator::enable_pplx(Vec<EpBackend>)` 把 per-rank 后端塞进对应 worker。
 - `cargo check -p pegainfer-comm` 通过。dsv4 因为 pegainfer-kernels 在本机 CUDA/flashinfer SDK 缺失编译不了（pre-existing），结构性 review 看 diff。
-- LOC_PROT 后续非法地址修复：
-  - `build_intra_node_backends` Phase 3 在每个 `EpBackend::new` 前重新 `cudaSetDevice(dev_ord)`，避免 `AllToAllContext` 的 CUDA workspace / GDR buffer 分配到上一轮 current device。
-  - CUMem sync buffer 本地映射后 `cudaMemset(0)`，避免同步 flag 读取脏初值。
-  - `dispatch_recv` 的 `out_x_stride` 改为 BF16 byte stride，匹配 kernel 对 `std::byte*` 的寻址。
-  - `combine_recv` 的 `out_tokens_stride` 改为 BF16 element stride，匹配 kernel cast 成 `U*` 后的寻址。
-  - `expert_indptr` 改为 pplx `padded_index` 对应的 padded prefix sum，grouped FP4 GEMM 和 `combine_send` 读取同一套 expert-major row layout。
-  - 本地验证：`PATH=/usr/local/cuda-13.1/bin:$PATH cargo check --release -p pegainfer-deepseek-v4 --features pplx-ep` 通过。
+- 修通 H200 decode 全链路的几次硬伤：
+  - **per-rank TransferEngine**：每张卡绑自己的 CX-7 NIC，`AllToAllRankHandle` 才能带上 peer 自己的 NIC `main_address`。早期共享 TE 时所有 RankHandle 都指向 worker[0]，触发 RDMA `LOC_PROT_ERR`。
+  - **`num_dp_groups = world_size / dp_size`**（纯 EP 下 = world_size）：之前硬编码 1 让 `num_routed[N*num_experts]` 越界写。
+  - **`num_routed_host`** 改用 `CudaHostMemory::alloc`（`cudaHostAllocPortable | cudaHostAllocMapped`），满足 Verbs MR + UVA。
+  - dispatch / combine 的 `x_stride`、`out_x_stride` 全部按 BF16 **byte** stride 传；`combine_recv` 的 `out_tokens_stride` 按 BF16 **element** stride 传（kernel 内 cast 后再算偏移）。
+  - `dispatch_recv` 的 `out_num_tokens_ptr` 是 `(num_local_experts,)`，不是单个 scalar；prefix sum 出 `expert_indptr` 时按 pplx 的 padded layout（`ceil(count / expert_padding) * expert_padding`）写。
+  - CUMem sync buffer 在本地映射后 `cudaMemset(0)`，避免 sync flag 读到脏初值。
+  - **bootstrap 改成 per-rank thread**：`std::thread::scope` 两段——Phase 1 每个 rank 自己 `cudaSetDevice` 一次后做 TE/CUMem/MR；Phase 2 同样每个 rank 自己映射 peer CUMem handle 并 `EpBackend::new`。彻底去掉了之前主线程 N 次循环里 ambient CUDA context 漂移导致的指针注册错卡问题（`dispatch_recv` `CUDA_ERROR_ILLEGAL_ADDRESS` 的最终根因）。
+  - `PplxRankResources.peer_mappings` 接管 peer CUMem `CUMemMapping` 的生命周期，不再 `Box::leak`。
 
-**剩下的全是机器侧的事**
-1. **Bootstrap**：用户在自己的 entry binary 里造 `Vec<EpBackend>`——`fabric_lib::TransferEngine` 初始化、跨 rank 交换 `AllToAllRankHandle`、用 `cuda-lib::CudaDeviceMemory` 分配 send/recv buffer、`fabric_lib::MemoryRegionHandle` 注册 MR，然后 `EpBackend::new(EpBackendParams { ... })`。这套 rendezvous 跟 pplx-garden 的 Python 前端做的是一回事；可以复用 NCCL bootstrap 通道交换 rank-handle 字节。
-2. 调 `generator.enable_pplx(backends)` 一次（在 prefill 之前），后续 decode 自动走 pplx 分发。
-3. 跑 dsv4 e2e 20 例做一致性对照（注意 combine_recv 的 BF16 accumulate 与 AG/RS 路径的 F32 累加在数值上有差，可能需要放宽 atol）。
-4. nsys profile，看 dispatch_send → shared expert → dispatch_recv 之间的 host 间隙是否被填满；用此调 expert_indptr 上 host prefix-sum 的 sync 开销是否需要换 GPU kernel。
+**Functional baseline（commit `0abe8fa`）**
+- 命令：`PEGAINFER_DSV4_PPLX=1 NCCL_NVLS_ENABLE=0 ./target/release/bench_serving --model-path /data/models/DeepSeek-V4-Flash-mp8 request --prompt-len 1 --output-len 4 --warmup 0 --iters 1`
+- 结果：prefill 521 ms，first decode step 7331 ms，steady TPOT **6900 ms / tok**（0.14 tok/s）。
+- NCCL 对照（同机 H200）：steady TPOT **63.77 ms / tok**（15.69 tok/s）。
+- 退出时 a2a_context worker shutdown 路径有 segfault，不影响前向；后续清理。
 
-CUDA Graph：dsv4 decode 当前**没有**开 graph capture（`start_engine` 里 `enable_cuda_graph=true` 只是一行 warn），所以这次接入不需要额外关闭逻辑。
+**下一步：性能优化**
+1. **去掉 per-layer host sync**：当前 `moe_pplx.rs` 每层都做 `moe_stream.synchronize()` + D2H `recv_tokens_per_expert` + `ctx.sync()` + host prefix sum + H2D `expert_indptr`。43 层串成同步链，是 6900 ms TPOT 的最大嫌疑。方向：
+   - per-expert 计数走 pinned host 异步 DMA，prefix sum 移到 GPU kernel（`scan`）。
+   - 或用 upstream 的 `bound_m_ptr` 让 grouped GEMM 直接从 device 端读 expert bounds，不再 host readback。
+2. **CUDA Graph**：pplx 路径目前禁了 graph capture（host worker bookkeeping + sync flag 跟 capture 冲突）。把 per-step host sync 拆掉之后再评估能否把 routed 这段重新 capture。
+3. **nsys profile**：看 dispatch_send → shared expert → dispatch_recv 的 overlap 实际有没有发生；shared expert kernel 在 ctx.stream 上，需要确认它不被 `moe_stream.synchronize` 顺带 stall。
+4. 退出 path 的 a2a worker teardown segfault 顺手清掉。
