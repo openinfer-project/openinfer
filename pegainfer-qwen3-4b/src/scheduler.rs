@@ -189,6 +189,10 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
+// Prefill samples the first output token but does not append it to KV. A
+// generated token occupies KV only when it is fed as the next decode input.
+// Therefore N returned completion tokens occupy at most N - 1 generated-token
+// KV slots.
 fn max_request_tokens(req: &PendingRequest) -> usize {
     req.prompt_tokens
         .len()
@@ -489,6 +493,64 @@ mod tests {
                     .collect(),
             })
         }
+    }
+
+    #[test]
+    fn kv_budget_counts_only_tokens_written_to_cache() {
+        let (pending_req, _pending_rx) = request(16, 1);
+        let pending = PendingRequest::from_scheduler_request(RequestId(7), pending_req);
+        assert_eq!(max_request_tokens(&pending), 16);
+        assert_eq!(pages_needed(max_request_tokens(&pending), 16), 1);
+
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let after_prefill = ActiveRequestState {
+            request_id: RequestId(8),
+            token_tx,
+            last_token: 100,
+            generated_count: 1,
+            max_tokens: 3,
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        };
+        assert_eq!(current_active_tokens(&after_prefill), 16);
+        assert_eq!(max_active_tokens(&after_prefill), 18);
+
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let after_one_decode = ActiveRequestState {
+            request_id: RequestId(9),
+            token_tx,
+            last_token: 200,
+            generated_count: 2,
+            max_tokens: 3,
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        };
+        assert_eq!(current_active_tokens(&after_one_decode), 17);
+        assert_eq!(max_active_tokens(&after_one_decode), 18);
+    }
+
+    #[test]
+    fn one_token_completion_on_page_boundary_fits_one_page() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(1, Arc::clone(&dropped));
+        let handle = start_with_executor(executor, 42);
+
+        let (fits_exactly, mut rx) = request(16, 1);
+        handle.submit(fits_exactly).expect("submit fits_exactly");
+        assert!(
+            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
+            "prefill should emit the sampled token"
+        );
+        assert!(
+            matches!(rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            "one-token completion should finish without a decode KV page"
+        );
+        assert!(
+            dropped.lock().unwrap().contains(&0),
+            "finished request should release its one prompt page"
+        );
     }
 
     #[test]

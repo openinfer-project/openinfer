@@ -103,6 +103,13 @@
 - Remote RTX 5090 command:
   - `cargo test --release -p pegainfer-server rejected_request_is_reported_as_error --lib` — passed, `1 passed`.
 
+### Step 8: PR review comment follow-up
+- Read PR #131 review comments from `gemini-code-assist`. The comments claimed the KV budget formulas should use `prompt_len + max_tokens` and `prompt_len + generated_count`.
+- Source check showed that Qwen3 prefill writes only prompt tokens to KV; the sampled first output token is not appended until it is fed as a later decode input. Therefore a request returning `N` completion tokens occupies at most `prompt_len + N - 1` KV tokens.
+- Kept the scheduler formula unchanged and added explicit boundary coverage for this contract:
+  - helper-level assertions for current/max KV token counts;
+  - a scheduler regression proving `prompt_len=page_size, max_tokens=1` fits in one prompt page and finishes without a decode KV page.
+
 ### Unexpected
 - The exact Qwen3-4B e2e initially failed because the checked-in golden text did not match the current HF revision/runtime output. This matches prior project history around Qwen3 greedy near-tie/golden drift. After regenerating the golden data for the current model snapshot, exact e2e passed.
 - DeepSeek diff-review was attempted twice and timed out (`180s`, then `300s`), so no external advisor result is counted.
@@ -117,6 +124,7 @@
   - CUDA feature selection mattered on the remote 5090: `cuda-13010` expects CUDA 13.1 driver API symbols, so validation hosts using CUDA 13.0 need a CUDA 13.1/compat runtime rather than a source-level downgrade.
 - **Lessons learned**:
   - The scheduler should treat KV as a lifetime reservation until preemption exists. That is simpler and safer than relying on decode-time allocation errors.
+  - KV budget math must count tokens actually written to KV, not sampled tokens already returned to the client. For Qwen3, the first sampled token does not occupy KV until the next decode step.
   - Requests larger than a single model instance's usable KV capacity need explicit rejection; otherwise they would wait forever and block the queue.
   - Serving regression evidence should include both the pressure client result and a post-pressure completion, because the original failure mode kept `/v1/models` alive while completions hung.
 - **Follow-ups**:
