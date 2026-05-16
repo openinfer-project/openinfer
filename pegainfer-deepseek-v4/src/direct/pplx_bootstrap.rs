@@ -378,7 +378,17 @@ fn run_phase2(
         .iter()
         .find(|g| g.cuda_device as usize == dev_ord)
         .with_context(|| format!("topology lookup for cuda:{dev_ord}"))?;
-    let worker_cpu = group.cpus.first().copied();
+    // Pin the a2a worker to a CPU distinct from this rank's TE worker
+    // (`cpus[0]`) and UVM watcher (`cpus[2]` / fallback `cpus[1]`); see
+    // build_te_for. Without this they all single-CPU-pin to the same
+    // core and the kernel-side `tx_ready` spin waits ~50 ms behind the
+    // queued worker progress.
+    let worker_cpu = group
+        .cpus
+        .get(3)
+        .copied()
+        .or_else(|| group.cpus.get(1).copied())
+        .or_else(|| group.cpus.first().copied());
 
     let topology = EpTopology {
         world_size,
