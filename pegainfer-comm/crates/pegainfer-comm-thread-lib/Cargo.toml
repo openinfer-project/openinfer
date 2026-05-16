@@ -6,3 +6,4 @@ publish = false
 [dependencies]
 libc = { workspace = true }
 syscalls = { workspace = true }
+tracing = { workspace = true }

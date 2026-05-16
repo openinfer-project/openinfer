@@ -36,6 +36,23 @@ use std::ptr;
 use cudarc::driver::CudaStream;
 use pegainfer_comm::{EpBackend, ScalarType};
 
+#[inline]
+fn _now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+#[inline]
+fn _caller_tid_cpu() -> (i64, i32) {
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as i64;
+        let cpu = libc::sched_getcpu();
+        (tid, cpu)
+    }
+}
+
 use super::core::shared_expert_forward_bf16_hidden_scratch;
 use super::moe::{
     hash_route_bf16_hidden_into, local_experts_forward_packed_bf16_hidden_scratch,
@@ -113,6 +130,15 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         let (x_ptr, _x_guard) = input.data.device_ptr(moe_stream);
         let (idx_ptr, _idx_guard) = moe_scratch.route_indices.device_ptr(moe_stream);
         let (w_ptr, _w_guard) = moe_scratch.route_weights.device_ptr(moe_stream);
+        let (tid, cpu) = _caller_tid_cpu();
+        tracing::info!(
+            "[ep.dispatch_send ENTER] layer={} t_ns={} caller_tid={} caller_cpu={}",
+            layer,
+            _now_ns(),
+            tid,
+            cpu
+        );
+        let _t0 = std::time::Instant::now();
         // Upstream a2a_dispatch_send.cu uses `(uint4*)(x_ptr + token * x_stride)`,
         // so x_stride is in BYTES (sizeof(bf16) * hidden_dim).
         ep.dispatch_send(
@@ -130,6 +156,11 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             stream_raw,
         )
         .with_context(|| format!("pplx dispatch_send layer {layer}"))?;
+        tracing::info!(
+            "[ep.dispatch_send LEAVE] layer={} dur_us={}",
+            layer,
+            _t0.elapsed().as_micros()
+        );
     }
 
     // ---- 3. Shared expert on ctx.stream (overlaps with dispatch_send) ----
@@ -157,6 +188,12 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             .recv_tokens_per_expert
             .device_ptr_mut(moe_stream);
         let (out_x_ptr, _g1) = moe_scratch.expanded_input.data.device_ptr_mut(moe_stream);
+        tracing::info!(
+            "[ep.dispatch_recv ENTER] layer={} t_ns={}",
+            layer,
+            _now_ns()
+        );
+        let _t1 = std::time::Instant::now();
         ep.dispatch_recv(
             out_num_ptr as *mut i32,
             out_x_ptr as *mut c_void,
@@ -167,12 +204,24 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             stream_raw,
         )
         .with_context(|| format!("pplx dispatch_recv layer {layer}"))?;
+        tracing::info!(
+            "[ep.dispatch_recv LEAVE] layer={} dur_us={}",
+            layer,
+            _t1.elapsed().as_micros()
+        );
     }
 
     // ---- 5. D2H per-expert recv counts, prefix-sum on host ----
     // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
     // expert on moe_stream; sync once so the host readback is safe.
+    tracing::info!("[moe_stream.sync ENTER] layer={} t_ns={}", layer, _now_ns());
+    let _t_sync = std::time::Instant::now();
     moe_stream.synchronize()?;
+    tracing::info!(
+        "[moe_stream.sync LEAVE] layer={} dur_us={}",
+        layer,
+        _t_sync.elapsed().as_micros()
+    );
     ctx.stream.memcpy_dtoh(
         &moe_scratch.recv_tokens_per_expert,
         &mut moe_scratch.recv_tokens_per_expert_host,
@@ -263,12 +312,19 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
     moe_stream.wait(&experts_done)?;
     {
         let (exp_ptr, _g) = moe_scratch.expert_out.data.device_ptr(moe_stream);
+        tracing::info!("[ep.combine_send ENTER] layer={} t_ns={}", layer, _now_ns());
+        let _t2 = std::time::Instant::now();
         ep.combine_send(
             exp_ptr as *const c_void,
             moe_scratch.expert_out.hidden_dim * std::mem::size_of::<u16>(), // expert_x_stride: BF16 BYTES
             stream_raw,
         )
         .with_context(|| format!("pplx combine_send layer {layer}"))?;
+        tracing::info!(
+            "[ep.combine_send LEAVE] layer={} dur_us={}",
+            layer,
+            _t2.elapsed().as_micros()
+        );
     }
 
     // ---- 8. combine_recv: routed += into `out` (already holds shared) ----
@@ -276,6 +332,8 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
         let (out_ptr, _g0) = moe_scratch.out.data.device_ptr_mut(moe_stream);
         let (idx_ptr, _g1) = moe_scratch.route_indices.device_ptr(moe_stream);
         let (w_ptr, _g2) = moe_scratch.route_weights.device_ptr(moe_stream);
+        tracing::info!("[ep.combine_recv ENTER] layer={} t_ns={}", layer, _now_ns());
+        let _t3 = std::time::Instant::now();
         ep.combine_recv(
             num_tokens,
             num_recv_tokens,
@@ -291,6 +349,11 @@ pub(crate) fn decode_moe_pplx_bf16_hidden_with_scratch<'a>(
             stream_raw,
         )
         .with_context(|| format!("pplx combine_recv layer {layer}"))?;
+        tracing::info!(
+            "[ep.combine_recv LEAVE] layer={} dur_us={}",
+            layer,
+            _t3.elapsed().as_micros()
+        );
     }
     let combine_done = moe_stream.record_event(Some(
         cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,

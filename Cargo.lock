@@ -3524,6 +3524,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "syscalls",
+ "tracing",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@ use fabric_lib::{
     },
 };
 use nvtx::{range_end, range_start};
+use thread_lib;
 
 use crate::a2a_handles::AllToAllRankHandle;
 
@@ -325,11 +326,39 @@ impl WorkerState {
     }
 
     pub fn main_loop(&self) {
+        let (tid, sched_cpu) = thread_lib::current_tid_and_cpu();
+        tracing::info!(
+            "[a2a worker main_loop] device={} tid={} sched_cpu={}",
+            self.device,
+            tid,
+            sched_cpu
+        );
         // Worker thread main loop.
+        let mut step_idx: u64 = 0;
         while self.is_running() {
+            let (_, cpu_now) = thread_lib::current_tid_and_cpu();
+            let t_enter_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            tracing::info!(
+                "[a2a worker step ENTER] device={} step_idx={} t_ns={} sched_cpu={}",
+                self.device,
+                step_idx,
+                t_enter_ns,
+                cpu_now
+            );
+            let t0 = std::time::Instant::now();
             let step_dispatch_range = range_start!("p2p_all_to_all");
             self.step();
             range_end!(step_dispatch_range);
+            tracing::info!(
+                "[a2a worker step LEAVE] device={} step_idx={} dur_us={}",
+                self.device,
+                step_idx,
+                t0.elapsed().as_micros()
+            );
+            step_idx += 1;
         }
     }
 
