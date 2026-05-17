@@ -29,14 +29,14 @@ The timing model is intentionally simple: TTFT is `base_ttft_ms + prompt_len / p
 
 The frontend still needs tokenizer/model metadata, but the simulator never loads model weights.
 
-## Evidence
+## Implementation Details
 
-- Format/metadata gates pass: `git diff --check`, `cargo fmt --check`, and `cargo metadata --no-deps --format-version 1`.
-- Dependency gate passes: `cargo tree -p pegainfer-sim --edges normal | rg "pegainfer-(core|kernels|qwen|deepseek)|cudarc|cuda"` has no matches.
-- Rust gates pass: `cargo test --release -p pegainfer-engine`, `cargo test --release -p pegainfer-vllm-frontend`, `cargo test --release -p pegainfer-sim`, and focused clippy for the frontend and sim crates.
-- Local HTTP smoke passes for `/v1/models`, non-streaming `/v1/completions`, and streaming `/v1/completions`.
-- Remote `vllm bench serve` gate: 50 successful requests, 0 failed requests, concurrency 4, mean TTFT 22.01 ms, mean TPOT 13.12 ms, output throughput 291.66 tok/s.
+- `pegainfer-engine` owns the shared engine contract, while `pegainfer-core` only re-exports it for existing model crates.
+- `pegainfer-vllm-frontend` owns the bridge logic; `pegainfer-server/src/vllm_frontend.rs` stays as a compatibility re-export.
+- `pegainfer-sim` is kept as a separate model crate so future simulation changes do not have to live inside the real model crates.
 
-## Follow-Ups
+## Future Plans
+
+Frontend e2e and CPU profiling are the next useful follow-ups for this crate boundary.
 
 If reviewers want richer simulation, add jitter, tail distributions, and batching behavior in follow-up PRs after this crate boundary lands.
