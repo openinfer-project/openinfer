@@ -349,7 +349,17 @@ async fn run_request_stream(
                 );
                 return;
             }
-            TokenEvent::Error { message, .. } | TokenEvent::Rejected { message, .. } => {
+            TokenEvent::Error { message, .. } => {
+                let _ = send_terminal_output(
+                    &output_tx,
+                    request_id,
+                    EngineCoreFinishReason::Error,
+                    Some(StopReason::Text(message)),
+                );
+                return;
+            }
+            TokenEvent::Rejected { message, .. } => {
+                // Rejected means the request could not be admitted, not that it completed cleanly.
                 let _ = send_terminal_output(
                     &output_tx,
                     request_id,
