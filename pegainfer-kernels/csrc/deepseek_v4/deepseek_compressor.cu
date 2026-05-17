@@ -312,157 +312,124 @@ __global__ void deepseek_compressor_norm_serial_kernel(
   out[compressed * head_dim + dim] = __float2bfloat16(value);
 }
 
-__global__ void deepseek_compressor_overlap_weighted_kernel(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ wkv,
-    const __nv_bfloat16 *__restrict__ wgate,
+// Fused overlap-compressor prefill epilogue. Consumes per-token (score, value)
+// FP32 tensors produced by two upstream X @ W^T BF16->FP32 cuBLAS GEMMs (gate
+// scores, kv values), and for each compressed row:
+//   1) gathers the 8 ratio-4 overlap routes per (compressed, dim) cell,
+//   2) adds the per-route APE bias and runs numerically-stable softmax,
+//   3) writes the FP32 weighted output,
+//   4) reduces the row's sum-of-squares to inv_rms and emits the BF16 RMSNormed
+//      output -- all in one launch, without round-tripping `weighted` through
+//      HBM between softmax and RMSNorm.
+//
+// scores_in / values_in are row-major (seq_len, 2*head_dim) FP32 tensors emitted
+// by cuBLAS via the swap-and-transpose trick used in deepseek_bf16_linear_cuda:
+// cuBLAS sees A=W with OP_T and B=X with OP_N, so its column-major (n, seq_len)
+// result is bit-equal to the row-major (seq_len, n) buffer we read here.
+// sv_n_stride is the M-row stride, equal to 2 * head_dim.
+//
+// Launch: 1 block per compressed position, blockDim.x covers head_dim with a
+// strided loop. Block must be a multiple of warpSize and at most 1024 threads.
+__global__ void deepseek_compressor_overlap_fused_epilogue_kernel(
+    const float *__restrict__ scores_in,
+    const float *__restrict__ values_in,
     const float *__restrict__ ape,
+    const __nv_bfloat16 *__restrict__ norm,
     float *__restrict__ weighted,
+    __nv_bfloat16 *__restrict__ out,
     int compressed_len,
-    int hidden_dim,
-    int head_dim) {
-  int dim = blockIdx.x;
-  int compressed = blockIdx.y;
+    int head_dim,
+    int sv_n_stride,
+    float eps) {
+  int c = blockIdx.x;
+  if (c >= compressed_len) return;
   int tid = threadIdx.x;
-  if (dim >= head_dim || compressed >= compressed_len) return;
+  int n_block = blockDim.x;
 
   constexpr int ratio = 4;
   constexpr int routes = 8;
-  extern __shared__ float scratch[];
-  float *score_scratch = scratch;
-  float *kv_scratch = scratch + blockDim.x;
-  float *scores = scratch + 2 * blockDim.x;
-  float *values = scores + routes;
+  constexpr float neg_inf = -3.4028234663852886e38f;
 
+  float sum_sq_local = 0.0f;
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float scores[routes];
+    float values[routes];
 #pragma unroll
-  for (int route = 0; route < routes; ++route) {
-    bool valid = true;
-    int token = 0;
-    int out_dim = 0;
-    int ape_dim = 0;
-    if (route < ratio) {
-      valid = compressed > 0;
-      token = (compressed - 1) * ratio + route;
-      out_dim = dim;
-      ape_dim = route * (2 * head_dim) + dim;
-    } else {
-      int local_route = route - ratio;
-      token = compressed * ratio + local_route;
-      out_dim = head_dim + dim;
-      ape_dim = local_route * (2 * head_dim) + head_dim + dim;
-    }
-
-    float score_partial = 0.0f;
-    float kv_partial = 0.0f;
-    if (valid) {
-      for (int k = tid; k < hidden_dim; k += blockDim.x) {
-        float x_value = __bfloat162float(x[token * hidden_dim + k]);
-        score_partial += x_value * __bfloat162float(wgate[out_dim * hidden_dim + k]);
-        kv_partial += x_value * __bfloat162float(wkv[out_dim * hidden_dim + k]);
+    for (int r = 0; r < routes; ++r) {
+      bool valid;
+      int token;
+      int out_dim;
+      int ape_dim;
+      if (r < ratio) {
+        valid = c > 0;
+        token = (c - 1) * ratio + r;
+        out_dim = d;
+        ape_dim = r * (2 * head_dim) + d;
+      } else {
+        int lr = r - ratio;
+        valid = true;
+        token = c * ratio + lr;
+        out_dim = head_dim + d;
+        ape_dim = lr * (2 * head_dim) + head_dim + d;
+      }
+      if (valid) {
+        int offset = token * sv_n_stride + out_dim;
+        scores[r] = scores_in[offset] + ape[ape_dim];
+        values[r] = values_in[offset];
+      } else {
+        scores[r] = neg_inf;
+        values[r] = 0.0f;
       }
     }
-    score_scratch[tid] = score_partial;
-    kv_scratch[tid] = kv_partial;
-    __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        score_scratch[tid] += score_scratch[tid + stride];
-        kv_scratch[tid] += kv_scratch[tid + stride];
-      }
-      __syncthreads();
-    }
-
-    if (tid == 0) {
-      scores[route] = valid ? score_scratch[0] + ape[ape_dim] : -3.4028234663852886e38f;
-      values[route] = valid ? kv_scratch[0] : 0.0f;
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    float max_score = -3.4028234663852886e38f;
+    float m = scores[0];
 #pragma unroll
-    for (int route = 0; route < routes; ++route) {
-      max_score = fmaxf(max_score, scores[route]);
-    }
+    for (int r = 1; r < routes; ++r) m = fmaxf(m, scores[r]);
+
     float denom = 0.0f;
     float acc = 0.0f;
 #pragma unroll
-    for (int route = 0; route < routes; ++route) {
-      float prob = expf(scores[route] - max_score);
-      denom += prob;
-      acc += prob * values[route];
+    for (int r = 0; r < routes; ++r) {
+      float p = __expf(scores[r] - m);
+      denom += p;
+      acc += p * values[r];
     }
-    weighted[compressed * head_dim + dim] = acc / denom;
+    float w = acc / denom;
+    weighted[c * head_dim + d] = w;
+    sum_sq_local += w * w;
   }
-}
 
-__global__ void deepseek_compressor_overlap_weighted_serial_kernel(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ wkv,
-    const __nv_bfloat16 *__restrict__ wgate,
-    const float *__restrict__ ape,
-    float *__restrict__ weighted,
-    int compressed_len,
-    int hidden_dim,
-    int head_dim) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = compressed_len * head_dim;
-  if (idx >= total) return;
+  // Block-wide reduction of sum_sq via warp-shfl + smem.
+  __shared__ float warp_sums[32];
+  int lane = tid & 31;
+  int warp = tid >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    sum_sq_local += __shfl_down_sync(0xffffffffu, sum_sq_local, off);
+  }
+  if (lane == 0) warp_sums[warp] = sum_sq_local;
+  __syncthreads();
 
-  int dim = idx % head_dim;
-  int compressed = idx / head_dim;
-  constexpr int ratio = 4;
-  constexpr int routes = 8;
-  float scores[routes];
-  float values[routes];
-
-  for (int route = 0; route < routes; ++route) {
-    bool valid = true;
-    int token = 0;
-    int out_dim = 0;
-    int ape_dim = 0;
-    if (route < ratio) {
-      valid = compressed > 0;
-      token = (compressed - 1) * ratio + route;
-      out_dim = dim;
-      ape_dim = route * (2 * head_dim) + dim;
-    } else {
-      int local_route = route - ratio;
-      token = compressed * ratio + local_route;
-      out_dim = head_dim + dim;
-      ape_dim = local_route * (2 * head_dim) + head_dim + dim;
-    }
-
-    if (valid) {
-      float score_sum = 0.0f;
-      float kv_sum = 0.0f;
-      for (int k = 0; k < hidden_dim; ++k) {
-        float x_value = __bfloat162float(x[token * hidden_dim + k]);
-        score_sum += x_value * __bfloat162float(wgate[out_dim * hidden_dim + k]);
-        kv_sum += x_value * __bfloat162float(wkv[out_dim * hidden_dim + k]);
-      }
-      scores[route] = score_sum + ape[ape_dim];
-      values[route] = kv_sum;
-    } else {
-      scores[route] = -3.4028234663852886e38f;
-      values[route] = 0.0f;
+  int n_warps = (n_block + 31) >> 5;
+  float total = (tid < n_warps) ? warp_sums[tid] : 0.0f;
+  if (warp == 0) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      total += __shfl_down_sync(0xffffffffu, total, off);
     }
   }
+  __shared__ float total_sum;
+  if (tid == 0) total_sum = total;
+  __syncthreads();
 
-  float max_score = -3.4028234663852886e38f;
-  for (int route = 0; route < routes; ++route) {
-    max_score = fmaxf(max_score, scores[route]);
+  float inv_rms = rsqrtf(total_sum / static_cast<float>(head_dim) + eps);
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float w = weighted[c * head_dim + d];
+    float ns = __bfloat162float(norm[d]);
+    out[c * head_dim + d] = __float2bfloat16(w * inv_rms * ns);
   }
-  float denom = 0.0f;
-  float acc = 0.0f;
-  for (int route = 0; route < routes; ++route) {
-    float prob = expf(scores[route] - max_score);
-    denom += prob;
-    acc += prob * values[route];
-  }
-  weighted[compressed * head_dim + dim] = acc / denom;
 }
 
 __global__ void deepseek_compressor_decode_project_kernel(
@@ -832,6 +799,11 @@ cudaError_t deepseek_compressor_nonoverlap_prefill_cuda(
   return cudaGetLastError();
 }
 
+// Two BF16 x BF16 -> FP32 cuBLAS GEMMs (X @ Wgate^T for scores, X @ Wkv^T for
+// values) into a shared FP32 scratch, then one fused epilogue kernel that
+// gathers the 8 overlap routes, softmaxes, writes `weighted`, and RMSNorms in
+// place to BF16 `out`. The single scratch alloc (covering both score + value
+// buffers) avoids paying cudaMallocAsync overhead twice.
 cudaError_t deepseek_compressor_overlap_prefill_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
@@ -845,22 +817,84 @@ cudaError_t deepseek_compressor_overlap_prefill_cuda(
     int head_dim,
     float eps,
     cudaStream_t stream) {
-  if (seq_len < 4) return cudaErrorInvalidValue;
-  int compressed_len = seq_len / 4;
-  constexpr int threads = 256;
-  dim3 weighted_grid(head_dim, compressed_len);
-  constexpr int routes = 8;
-  size_t weighted_shared = (2 * threads + 2 * routes) * sizeof(float);
-  deepseek_compressor_overlap_weighted_kernel<<<weighted_grid, threads, weighted_shared, stream>>>(
-      x, wkv, wgate, ape, weighted, compressed_len, hidden_dim, head_dim);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
+  if (x == nullptr || wkv == nullptr || wgate == nullptr || ape == nullptr ||
+      norm == nullptr || weighted == nullptr || out == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len < 4 || (seq_len & 3) != 0 || hidden_dim <= 0 || head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int compressed_len = seq_len / 4;
+  const int n = 2 * head_dim;
 
-  int norm_total = compressed_len * head_dim;
-  int norm_blocks = (norm_total + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, compressed_len, head_dim, eps);
-  return cudaGetLastError();
+  DeepseekCompressorScratch *scratch_ptr = nullptr;
+  cudaError_t cuda_status = deepseek_compressor_scratch_for_device(&scratch_ptr);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  DeepseekCompressorScratch &scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  cuda_status = deepseek_ensure_compressor_bf16_linear_handle(scratch);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  cublasStatus_t status = cublasSetStream(scratch.bf16_linear_handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
+
+  const size_t sv_elems = static_cast<size_t>(seq_len) * n;
+  float *sv_buf = nullptr;
+  cuda_status = cudaMallocAsync(
+      reinterpret_cast<void **>(&sv_buf), 2 * sv_elems * sizeof(float), stream);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  float *scores_buf = sv_buf;
+  float *values_buf = sv_buf + sv_elems;
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  // C = X @ W^T at row-major (seq_len, 2*head_dim) via cuBLAS column-major
+  // swap-and-transpose: A=W with OP_T and B=X with OP_N, then C in cuBLAS
+  // column-major (n, seq_len) is bit-for-bit the row-major (seq_len, n)
+  // buffer the epilogue reads. Output dtype is CUDA_R_32F to preserve the
+  // FP32 tensor-core accumulator -- a BF16 output here loses ~3 orders of
+  // magnitude of precision in the per-route scores before softmax.
+  status = cublasGemmEx(
+      scratch.bf16_linear_handle,
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      n, seq_len, hidden_dim,
+      &alpha,
+      wgate, CUDA_R_16BF, hidden_dim,
+      x, CUDA_R_16BF, hidden_dim,
+      &beta,
+      scores_buf, CUDA_R_32F, n,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cudaFreeAsync(sv_buf, stream);
+    return cudaErrorUnknown;
+  }
+  status = cublasGemmEx(
+      scratch.bf16_linear_handle,
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      n, seq_len, hidden_dim,
+      &alpha,
+      wkv, CUDA_R_16BF, hidden_dim,
+      x, CUDA_R_16BF, hidden_dim,
+      &beta,
+      values_buf, CUDA_R_32F, n,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cudaFreeAsync(sv_buf, stream);
+    return cudaErrorUnknown;
+  }
+
+  // Block size: round head_dim up to a multiple of warpSize, capped at 1024.
+  int epilogue_threads = head_dim;
+  if (epilogue_threads < 32) epilogue_threads = 32;
+  if (epilogue_threads > 1024) epilogue_threads = 1024;
+  epilogue_threads = (epilogue_threads + 31) & ~31;
+  deepseek_compressor_overlap_fused_epilogue_kernel<<<compressed_len, epilogue_threads, 0, stream>>>(
+      scores_buf, values_buf, ape, norm, weighted, out,
+      compressed_len, head_dim, n, eps);
+  cuda_status = cudaGetLastError();
+  cudaFreeAsync(sv_buf, stream);
+  return cuda_status;
 }
 
 cudaError_t deepseek_compressor_nonoverlap_decode_cuda(

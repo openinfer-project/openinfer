@@ -253,6 +253,11 @@ fn assert_close(name: &str, got: &[f32], expected: &[f32], max_abs_limit: f32) -
     Ok(())
 }
 
+// Tolerances are looser than what a scalar BF16 FMA kernel produces because
+// the new path routes both dot products through cuBLAS BF16 tensor-core MMA,
+// which accumulates in a different order than the per-k scalar FMA the
+// reference uses; the 3x bf16-noise FlashAttention-style envelope is well
+// inside what the downstream RMSNorm BF16 store quantises away anyway.
 fn check_case(name: &str, seq_len: usize, hidden_dim: usize, head_dim: usize) -> Result<()> {
     ensure!(seq_len % 4 == 0, "seq_len must be ratio4 aligned");
     let eps = 1.0e-6;
@@ -264,9 +269,9 @@ fn check_case(name: &str, seq_len: usize, hidden_dim: usize, head_dim: usize) ->
         &format!("{name} weighted"),
         &got_weighted,
         &expected_weighted,
-        8.0e-5,
+        5.0e-3,
     )?;
-    assert_close(&format!("{name} out"), &got_out, &expected_out, 1.0e-3)?;
+    assert_close(&format!("{name} out"), &got_out, &expected_out, 5.0e-3)?;
     Ok(())
 }
 
@@ -287,7 +292,7 @@ fn overlap_prefill_matches_reference_odd_boundary_shape() -> Result<()> {
 #[test]
 #[ignore = "requires CUDA GPU; covers 10k launch shape for main and indexer calls"]
 fn overlap_prefill_matches_reference_10k_representative_shapes() -> Result<()> {
-    check_case("10k-indexer", 10580, 64, 128)?;
-    check_case("10k-main", 10580, 64, 512)?;
+    check_case("10k-indexer", 10580, 4096, 128)?;
+    check_case("10k-main", 10580, 4096, 512)?;
     Ok(())
 }
