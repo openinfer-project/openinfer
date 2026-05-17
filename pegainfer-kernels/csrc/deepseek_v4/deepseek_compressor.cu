@@ -656,6 +656,216 @@ __global__ void deepseek_bf16_linear_serial_kernel(
   out[token * out_dim + out_col] = __float2bfloat16(sum);
 }
 
+// =============================================================================
+// Batched decode compressor kernels (task #46, mask option B locked).
+//
+// Layout invariants matching the existing single-row variants:
+//   * Projection writes one state row per call site, always (unconditional).
+//   * Weighted + norm fire only on rows where (start_pos + 1) % ratio == 0.
+//   * Overlap shift fires only when weighted fires; shifts the per-slot state
+//     window down by `ratio` rows.
+//   * For batched callers we add a batch dim (blockIdx.y) and read per-row
+//     `start_pos_d[row]` / `slot_ids_d[row]`. State offsets are computed
+//     in-kernel as `slot_ids_d[row] * state_offset_mul`.
+//   * Per Review msg 027a1df4, false-mask rows early-exit before touching
+//     `weighted` or `out`; those rows of `weighted` / `out` are undefined
+//     output and callers must not read them.
+//
+// Output buffers are dense [batch, head_dim]; row stride = head_dim.
+// =============================================================================
+
+__global__ void deepseek_compressor_decode_project_batch_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ wkv,
+    const __nv_bfloat16 *__restrict__ wgate,
+    const float *__restrict__ ape,
+    float *__restrict__ kv_state,
+    float *__restrict__ score_state,
+    const int *__restrict__ start_pos_d,
+    const int *__restrict__ slot_ids_d,
+    int state_offset_mul,
+    int state_offset_bias,
+    int batch,
+    int hidden_dim,
+    int out_dim,
+    int ratio) {
+  int dim = blockIdx.x;
+  int row = blockIdx.y;
+  int tid = threadIdx.x;
+  if (dim >= out_dim || row >= batch) return;
+
+  int start_pos = start_pos_d[row];
+  int state_offset = slot_ids_d[row] * state_offset_mul + state_offset_bias;
+  const __nv_bfloat16 *x_row = x + row * hidden_dim;
+
+  extern __shared__ float scratch[];
+  float *kv_scratch = scratch;
+  float *score_scratch = scratch + blockDim.x;
+  float kv_partial = 0.0f;
+  float score_partial = 0.0f;
+  for (int k = tid; k < hidden_dim; k += blockDim.x) {
+    float xv = __bfloat162float(x_row[k]);
+    kv_partial += xv * __bfloat162float(wkv[dim * hidden_dim + k]);
+    score_partial += xv * __bfloat162float(wgate[dim * hidden_dim + k]);
+  }
+  kv_scratch[tid] = kv_partial;
+  score_scratch[tid] = score_partial;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      kv_scratch[tid] += kv_scratch[tid + stride];
+      score_scratch[tid] += score_scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    int local_pos = start_pos % ratio;
+    int state_row = state_offset + local_pos;
+    kv_state[state_row * out_dim + dim] = kv_scratch[0];
+    score_state[state_row * out_dim + dim] =
+        score_scratch[0] + ape[local_pos * out_dim + dim];
+  }
+}
+
+__global__ void deepseek_compressor_nonoverlap_decode_weighted_batch_kernel(
+    const float *__restrict__ kv_state,
+    const float *__restrict__ score_state,
+    float *__restrict__ weighted,
+    const int *__restrict__ start_pos_d,
+    const int *__restrict__ slot_ids_d,
+    int state_offset_mul,
+    int batch,
+    int head_dim,
+    int ratio) {
+  int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y;
+  if (dim >= head_dim || row >= batch) return;
+
+  int start_pos = start_pos_d[row];
+  if (((start_pos + 1) % ratio) != 0) return;  // mask option B early-exit
+
+  int state_offset = slot_ids_d[row] * state_offset_mul;
+  const float *kv_slot = kv_state + state_offset * head_dim;
+  const float *score_slot = score_state + state_offset * head_dim;
+
+  float max_score = -3.4028234663852886e38f;
+  for (int route = 0; route < ratio; ++route) {
+    max_score = fmaxf(max_score, score_slot[route * head_dim + dim]);
+  }
+  float denom = 0.0f;
+  float acc = 0.0f;
+  for (int route = 0; route < ratio; ++route) {
+    float prob = expf(score_slot[route * head_dim + dim] - max_score);
+    denom += prob;
+    acc += prob * kv_slot[route * head_dim + dim];
+  }
+  weighted[row * head_dim + dim] = acc / denom;
+}
+
+__global__ void deepseek_compressor_norm_serial_batch_kernel(
+    const float *__restrict__ weighted,
+    const __nv_bfloat16 *__restrict__ norm,
+    __nv_bfloat16 *__restrict__ out,
+    const int *__restrict__ start_pos_d,
+    int batch,
+    int head_dim,
+    int ratio,
+    float eps) {
+  int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y;
+  if (dim >= head_dim || row >= batch) return;
+
+  int start_pos = start_pos_d[row];
+  if (((start_pos + 1) % ratio) != 0) return;  // mask option B early-exit
+
+  const float *w_row = weighted + row * head_dim;
+  float sum_sq = 0.0f;
+  for (int k = 0; k < head_dim; ++k) {
+    float v = w_row[k];
+    sum_sq += v * v;
+  }
+  float inv_rms = rsqrtf(sum_sq / static_cast<float>(head_dim) + eps);
+  float value = w_row[dim] * inv_rms * __bfloat162float(norm[dim]);
+  out[row * head_dim + dim] = __float2bfloat16(value);
+}
+
+__global__ void deepseek_compressor_overlap_decode_weighted_batch_kernel(
+    const float *__restrict__ kv_state,
+    const float *__restrict__ score_state,
+    float *__restrict__ weighted,
+    const int *__restrict__ start_pos_d,
+    const int *__restrict__ slot_ids_d,
+    int state_offset_mul,
+    int batch,
+    int head_dim) {
+  int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y;
+  if (dim >= head_dim || row >= batch) return;
+
+  constexpr int ratio = 4;
+  constexpr int routes = 8;
+  int state_dim = 2 * head_dim;
+
+  int start_pos = start_pos_d[row];
+  if (((start_pos + 1) % ratio) != 0) return;  // mask option B early-exit
+
+  int state_offset = slot_ids_d[row] * state_offset_mul;
+  const float *kv_slot = kv_state + state_offset * state_dim;
+  const float *score_slot = score_state + state_offset * state_dim;
+
+  float route_scores[routes];
+  float route_values[routes];
+  for (int route = 0; route < routes; ++route) {
+    if (route < ratio) {
+      route_scores[route] = score_slot[route * state_dim + dim];
+      route_values[route] = kv_slot[route * state_dim + dim];
+    } else {
+      int local = route - ratio;
+      route_scores[route] = score_slot[(ratio + local) * state_dim + head_dim + dim];
+      route_values[route] = kv_slot[(ratio + local) * state_dim + head_dim + dim];
+    }
+  }
+
+  float max_score = -3.4028234663852886e38f;
+  for (int route = 0; route < routes; ++route) {
+    max_score = fmaxf(max_score, route_scores[route]);
+  }
+  float denom = 0.0f;
+  float acc = 0.0f;
+  for (int route = 0; route < routes; ++route) {
+    float prob = expf(route_scores[route] - max_score);
+    denom += prob;
+    acc += prob * route_values[route];
+  }
+  weighted[row * head_dim + dim] = acc / denom;
+}
+
+__global__ void deepseek_compressor_overlap_shift_batch_kernel(
+    float *__restrict__ kv_state,
+    float *__restrict__ score_state,
+    const int *__restrict__ start_pos_d,
+    const int *__restrict__ slot_ids_d,
+    int state_offset_mul,
+    int batch,
+    int state_dim,
+    int ratio) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y;
+  int total = ratio * state_dim;
+  if (idx >= total || row >= batch) return;
+
+  int start_pos = start_pos_d[row];
+  if (((start_pos + 1) % ratio) != 0) return;  // mask option B early-exit
+
+  int state_offset = slot_ids_d[row] * state_offset_mul;
+  float *kv_slot = kv_state + state_offset * state_dim;
+  float *score_slot = score_state + state_offset * state_dim;
+  kv_slot[idx] = kv_slot[total + idx];
+  score_slot[idx] = score_slot[total + idx];
+}
+
 extern "C" {
 
 cudaError_t deepseek_apply_rope_hidden_cuda(
@@ -897,7 +1107,14 @@ cudaError_t deepseek_compressor_overlap_prefill_cuda(
   return cuda_status;
 }
 
-cudaError_t deepseek_compressor_nonoverlap_decode_cuda(
+
+// task #46: batched decode compressor host wrappers.
+// Per Review msg 027a1df4 mask option B: kernel-internal mask via
+// `start_pos_d[row]`; false rows early-exit before touching weighted/out;
+// callers must not read weighted/out for masked rows. Per-row metadata
+// (`start_pos_d`, `slot_ids_d`) is consumed as device arrays prepared once
+// per batch in `fill_decode_batch_metadata`; no per-step host->device sync.
+cudaError_t deepseek_compressor_nonoverlap_decode_batch_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
     const __nv_bfloat16 *wgate,
@@ -907,39 +1124,52 @@ cudaError_t deepseek_compressor_nonoverlap_decode_cuda(
     float *score_state,
     float *weighted,
     __nv_bfloat16 *out,
-    int start_pos,
+    const int *start_pos_d,
+    const int *slot_ids_d,
+    int batch,
     int hidden_dim,
     int head_dim,
     int ratio,
     float eps,
     cudaStream_t stream) {
-  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0 || ratio <= 1 || ratio > 128) {
+  if (batch <= 0 || hidden_dim <= 0 || head_dim <= 0 || ratio <= 1 || ratio > 128) {
     return cudaErrorInvalidValue;
   }
+  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
   constexpr int threads = 256;
+
+  // Phase 1: projection + per-row state update. Always runs; no mask.
+  // state_offset = slot_ids[row] * ratio; state_offset_bias = 0 for
+  // non-overlap (the per-slot state window has `ratio` rows starting at
+  // base = slot_id * ratio).
   size_t project_shared = 2 * threads * sizeof(float);
-  deepseek_compressor_decode_project_kernel<<<head_dim, threads, project_shared, stream>>>(
-      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, head_dim, ratio, 0);
+  dim3 project_grid(head_dim, batch, 1);
+  deepseek_compressor_decode_project_batch_kernel<<<project_grid, threads,
+                                                    project_shared, stream>>>(
+      x, wkv, wgate, ape, kv_state, score_state, start_pos_d, slot_ids_d,
+      /*state_offset_mul=*/ratio,
+      /*state_offset_bias=*/0,
+      batch, hidden_dim, head_dim, ratio);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
-  bool should_compress = ((start_pos + 1) % ratio) == 0;
-  if (!should_compress) return cudaSuccess;
-  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
-
-  int blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_nonoverlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
-      kv_state, score_state, weighted, head_dim, ratio);
+  // Phase 2: weighted softmax + RMS norm. Mask gates per row inside kernel.
+  int dim_blocks = (head_dim + threads - 1) / threads;
+  dim3 weighted_grid(dim_blocks, batch, 1);
+  deepseek_compressor_nonoverlap_decode_weighted_batch_kernel<<<
+      weighted_grid, threads, 0, stream>>>(
+      kv_state, score_state, weighted, start_pos_d, slot_ids_d,
+      /*state_offset_mul=*/ratio, batch, head_dim, ratio);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
-  int norm_blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, 1, head_dim, eps);
+  deepseek_compressor_norm_serial_batch_kernel<<<weighted_grid, threads, 0,
+                                                 stream>>>(
+      weighted, norm, out, start_pos_d, batch, head_dim, ratio, eps);
   return cudaGetLastError();
 }
 
-cudaError_t deepseek_compressor_nonoverlap_decode_at_cuda(
+cudaError_t deepseek_compressor_overlap_decode_batch_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
     const __nv_bfloat16 *wgate,
@@ -949,144 +1179,59 @@ cudaError_t deepseek_compressor_nonoverlap_decode_at_cuda(
     float *score_state,
     float *weighted,
     __nv_bfloat16 *out,
-    int start_pos,
+    const int *start_pos_d,
+    const int *slot_ids_d,
+    int batch,
     int hidden_dim,
     int head_dim,
-    int ratio,
-    int state_offset,
     float eps,
     cudaStream_t stream) {
-  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0 || ratio <= 1 || ratio > 128 ||
-      state_offset < 0) {
+  if (batch <= 0 || hidden_dim <= 0 || head_dim <= 0) {
     return cudaErrorInvalidValue;
   }
-  constexpr int threads = 256;
-  size_t project_shared = 2 * threads * sizeof(float);
-  deepseek_compressor_decode_project_kernel<<<head_dim, threads, project_shared, stream>>>(
-      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, head_dim, ratio,
-      state_offset);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  bool should_compress = ((start_pos + 1) % ratio) == 0;
-  if (!should_compress) return cudaSuccess;
   if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
-
-  int blocks = (head_dim + threads - 1) / threads;
-  float *kv_slot = kv_state + state_offset * head_dim;
-  float *score_slot = score_state + state_offset * head_dim;
-  deepseek_compressor_nonoverlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
-      kv_slot, score_slot, weighted, head_dim, ratio);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  int norm_blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, 1, head_dim, eps);
-  return cudaGetLastError();
-}
-
-cudaError_t deepseek_compressor_overlap_decode_cuda(
-    const __nv_bfloat16 *x,
-    const __nv_bfloat16 *wkv,
-    const __nv_bfloat16 *wgate,
-    const float *ape,
-    const __nv_bfloat16 *norm,
-    float *kv_state,
-    float *score_state,
-    float *weighted,
-    __nv_bfloat16 *out,
-    int start_pos,
-    int hidden_dim,
-    int head_dim,
-    float eps,
-    cudaStream_t stream) {
-  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0) {
-    return cudaErrorInvalidValue;
-  }
   constexpr int ratio = 4;
   constexpr int threads = 256;
   int state_dim = 2 * head_dim;
+
+  // Overlap per-slot state window has 8 rows of [2*head_dim].
+  // Projection writes into the upper half (rows [ratio..2*ratio]); shift
+  // moves it into the lower half (rows [0..ratio]) when should_compress.
+  // state_offset_mul = 8 (rows per slot); state_offset_bias = ratio.
   size_t project_shared = 2 * threads * sizeof(float);
-  deepseek_compressor_decode_project_kernel<<<state_dim, threads, project_shared, stream>>>(
-      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, state_dim, ratio, ratio);
+  dim3 project_grid(state_dim, batch, 1);
+  deepseek_compressor_decode_project_batch_kernel<<<project_grid, threads,
+                                                    project_shared, stream>>>(
+      x, wkv, wgate, ape, kv_state, score_state, start_pos_d, slot_ids_d,
+      /*state_offset_mul=*/8,
+      /*state_offset_bias=*/ratio,
+      batch, hidden_dim, state_dim, ratio);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
-  bool should_compress = ((start_pos + 1) % ratio) == 0;
-  if (!should_compress) return cudaSuccess;
-  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
-
-  int blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_overlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
-      kv_state, score_state, weighted, head_dim);
+  int dim_blocks = (head_dim + threads - 1) / threads;
+  dim3 weighted_grid(dim_blocks, batch, 1);
+  deepseek_compressor_overlap_decode_weighted_batch_kernel<<<
+      weighted_grid, threads, 0, stream>>>(
+      kv_state, score_state, weighted, start_pos_d, slot_ids_d,
+      /*state_offset_mul=*/8, batch, head_dim);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
-  int norm_blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, 1, head_dim, eps);
+  deepseek_compressor_norm_serial_batch_kernel<<<weighted_grid, threads, 0,
+                                                 stream>>>(
+      weighted, norm, out, start_pos_d, batch, head_dim, ratio, eps);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
+  // Phase 3: shift per-slot state window (only masked rows execute).
   int shift_total = ratio * state_dim;
   int shift_blocks = (shift_total + threads - 1) / threads;
-  deepseek_compressor_overlap_shift_kernel<<<shift_blocks, threads, 0, stream>>>(
-      kv_state, score_state, state_dim);
-  return cudaGetLastError();
-}
-
-cudaError_t deepseek_compressor_overlap_decode_at_cuda(
-    const __nv_bfloat16 *x,
-    const __nv_bfloat16 *wkv,
-    const __nv_bfloat16 *wgate,
-    const float *ape,
-    const __nv_bfloat16 *norm,
-    float *kv_state,
-    float *score_state,
-    float *weighted,
-    __nv_bfloat16 *out,
-    int start_pos,
-    int hidden_dim,
-    int head_dim,
-    int state_offset,
-    float eps,
-    cudaStream_t stream) {
-  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0 || state_offset < 0) {
-    return cudaErrorInvalidValue;
-  }
-  constexpr int ratio = 4;
-  constexpr int threads = 256;
-  int state_dim = 2 * head_dim;
-  size_t project_shared = 2 * threads * sizeof(float);
-  deepseek_compressor_decode_project_kernel<<<state_dim, threads, project_shared, stream>>>(
-      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, state_dim, ratio,
-      state_offset + ratio);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  bool should_compress = ((start_pos + 1) % ratio) == 0;
-  if (!should_compress) return cudaSuccess;
-  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
-
-  int blocks = (head_dim + threads - 1) / threads;
-  float *kv_slot = kv_state + state_offset * state_dim;
-  float *score_slot = score_state + state_offset * state_dim;
-  deepseek_compressor_overlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
-      kv_slot, score_slot, weighted, head_dim);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  int norm_blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, 1, head_dim, eps);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  int shift_total = ratio * state_dim;
-  int shift_blocks = (shift_total + threads - 1) / threads;
-  deepseek_compressor_overlap_shift_kernel<<<shift_blocks, threads, 0, stream>>>(
-      kv_slot, score_slot, state_dim);
+  dim3 shift_grid(shift_blocks, batch, 1);
+  deepseek_compressor_overlap_shift_batch_kernel<<<shift_grid, threads, 0,
+                                                   stream>>>(
+      kv_state, score_state, start_pos_d, slot_ids_d,
+      /*state_offset_mul=*/8, batch, state_dim, ratio);
   return cudaGetLastError();
 }
 

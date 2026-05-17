@@ -372,7 +372,7 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
     attention_projection_scratch: &mut AttentionProjectionScratch,
     attention_output_scratch: &mut AttentionOutputScratch,
     attention_index_scratch: &mut AttentionIndexScratch,
-    _attention_aux_scratch: &mut AttentionAuxScratch,
+    attention_aux_scratch: &mut AttentionAuxScratch,
     attention_hc_post_scratch: &mut CudaSlice<f32>,
     attention_hc_out: &mut HcHiddenStates,
     layer_out: &mut HcHiddenStates,
@@ -447,7 +447,7 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
                     attention_projection_scratch,
                     attention_output_scratch,
                     attention_index_scratch,
-                    _attention_aux_scratch,
+                    attention_aux_scratch,
                 )
                 .with_context(|| format!("attention overlap batch decode layer {layer}"))?;
             all_reduce_hidden_fp32_hc_post_view_into(
@@ -474,6 +474,7 @@ pub(crate) fn block_decode_rank_lane_bf16_hidden_batch_with_scratch(
                     attention_projection_scratch,
                     attention_output_scratch,
                     attention_index_scratch,
+                    attention_aux_scratch,
                 )
                 .with_context(|| format!("attention compressed batch decode layer {layer}"))?;
             all_reduce_hidden_fp32_hc_post_view_into(
@@ -752,44 +753,103 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_batch_w
         batch_meta.batch,
     )?;
     let compressed_slots = batch_meta.compressed_slots;
-    for row in 0..batch_meta.batch {
-        let row_input = copy_bf16_row_to_hidden(ctx, input, row)?;
-        let state_offset = batch_meta.slot_ids_host[row] * 8;
-        if let Some(compressed_kv) = compressor_overlap_decode_bf16_hidden_with_dim_at(
+    // task #46: batched main + indexer compressors via 4 batched kernels
+    // each (project/weighted/norm/shift). Mask option B per Review msg
+    // 027a1df4. Phases run sequentially because both reuse the same
+    // `attention_aux_scratch.compressor_out_batch` buffer.
+    let max_slot_id = batch_meta
+        .slot_ids_host
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    {
+        let main_batch = compressor_overlap_decode_bf16_hidden_batch_scratch(
             ctx,
             config,
-            &row_input,
+            input,
             compressor,
-            rope,
-            batch_meta.start_pos_host[row],
             config.head_dim,
+            batch_meta.start_pos,
+            batch_meta.slot_ids,
+            batch_meta.batch,
+            max_slot_id,
             compressor_state,
-            state_offset,
-            false,
-        )? {
+            attention_aux_scratch,
+        )?;
+        for row in 0..batch_meta.batch {
+            let sp = batch_meta.start_pos_host[row];
+            if !(sp + 1).is_multiple_of(4) {
+                continue;
+            }
+            let mut row_compressed = copy_bf16_row_to_hidden(ctx, main_batch, row)?;
+            let rope_start = sp + 1 - 4;
+            apply_rope_hidden_strided_in_place(
+                ctx,
+                &mut row_compressed,
+                rope,
+                1,
+                config.head_dim,
+                rope_start,
+                4,
+                false,
+            )?;
+            fp8_act_quant_nope_bf16_hidden_in_place(
+                ctx,
+                &mut row_compressed,
+                1,
+                config.head_dim,
+                rope.rotary_dim,
+                64,
+            )?;
             let dst = decode_cache_compressed_row(
                 config.sliding_window,
                 compressed_slots,
                 batch_meta.slot_ids_host[row],
-                batch_meta.start_pos_host[row] / 4,
+                sp / 4,
             );
-            copy_bf16_rows_to_cache(ctx, &compressed_kv, &mut cache.kv, 0, dst, 1)?;
+            copy_bf16_rows_to_cache(ctx, &row_compressed, &mut cache.kv, 0, dst, 1)?;
         }
-        if let Some(indexer_compressed_kv) = compressor_overlap_decode_bf16_hidden_with_dim_at(
+    }
+    {
+        let indexer_batch = compressor_overlap_decode_bf16_hidden_batch_scratch(
             ctx,
             config,
-            &row_input,
+            input,
             &indexer.compressor,
-            rope,
-            batch_meta.start_pos_host[row],
             config.index_head_dim,
+            batch_meta.start_pos,
+            batch_meta.slot_ids,
+            batch_meta.batch,
+            max_slot_id,
             indexer_state,
-            state_offset,
-            true,
-        )? {
-            let dst = batch_meta.slot_ids_host[row] * compressed_slots
-                + batch_meta.start_pos_host[row] / 4;
-            copy_bf16_rows_to_cache(ctx, &indexer_compressed_kv, indexer_kv, 0, dst, 1)?;
+            attention_aux_scratch,
+        )?;
+        for row in 0..batch_meta.batch {
+            let sp = batch_meta.start_pos_host[row];
+            if !(sp + 1).is_multiple_of(4) {
+                continue;
+            }
+            let mut row_compressed = copy_bf16_row_to_hidden(ctx, indexer_batch, row)?;
+            let rope_start = sp + 1 - 4;
+            apply_rope_hidden_strided_in_place(
+                ctx,
+                &mut row_compressed,
+                rope,
+                1,
+                config.index_head_dim,
+                rope_start,
+                4,
+                false,
+            )?;
+            hadamard_fp4_quant_bf16_hidden_in_place(
+                ctx,
+                &mut row_compressed,
+                1,
+                config.index_head_dim,
+            )?;
+            let dst = batch_meta.slot_ids_host[row] * compressed_slots + sp / 4;
+            copy_bf16_rows_to_cache(ctx, &row_compressed, indexer_kv, 0, dst, 1)?;
         }
     }
 

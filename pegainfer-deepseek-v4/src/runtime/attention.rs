@@ -1124,6 +1124,7 @@ pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_batc
     attention_projection_scratch: &mut AttentionProjectionScratch,
     attention_output_scratch: &'a mut AttentionOutputScratch,
     attention_index_scratch: &mut AttentionIndexScratch,
+    attention_aux_scratch: &mut AttentionAuxScratch,
 ) -> Result<&'a Bf16HiddenStates> {
     ensure!(
         input.seq_len == batch_meta.batch,
@@ -1174,28 +1175,63 @@ pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_batc
         batch_meta.batch,
     )?;
     let compressed_slots = batch_meta.compressed_slots;
+    // task #46: batched projection + weighted softmax + RMS norm in 3 batched
+    // kernels (mask option B per Review msg 027a1df4 — false-mask rows produce
+    // undefined output and must be skipped by host-side mask below). Per-row
+    // RoPE + FP8 quant + cache copy remain in this loop because existing
+    // strided RoPE API takes a uniform start_pos — per-row variable RoPE
+    // kernel is deferred to a follow-up PR.
+    let max_slot_id = batch_meta
+        .slot_ids_host
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let compressed_batch = compressor_nonoverlap_decode_bf16_hidden_batch_scratch(
+        ctx,
+        config,
+        input,
+        compressor,
+        ratio,
+        batch_meta.start_pos,
+        batch_meta.slot_ids,
+        batch_meta.batch,
+        max_slot_id,
+        compressor_state,
+        attention_aux_scratch,
+    )?;
     for row in 0..batch_meta.batch {
-        let row_input = copy_bf16_row_to_hidden(ctx, input, row)?;
-        let state_offset = batch_meta.slot_ids_host[row] * ratio;
-        if let Some(compressed_kv) = compressor_nonoverlap_decode_bf16_hidden_at(
-            ctx,
-            config,
-            &row_input,
-            compressor,
-            ratio,
-            rope,
-            batch_meta.start_pos_host[row],
-            compressor_state,
-            state_offset,
-        )? {
-            let dst = decode_cache_compressed_row(
-                config.sliding_window,
-                compressed_slots,
-                batch_meta.slot_ids_host[row],
-                batch_meta.start_pos_host[row] / ratio,
-            );
-            copy_bf16_rows_to_cache(ctx, &compressed_kv, &mut cache.kv, 0, dst, 1)?;
+        let sp = batch_meta.start_pos_host[row];
+        if !(sp + 1).is_multiple_of(ratio) {
+            continue;
         }
+        let mut row_compressed = copy_bf16_row_to_hidden(ctx, compressed_batch, row)?;
+        let rope_start = sp + 1 - ratio;
+        apply_rope_hidden_strided_in_place(
+            ctx,
+            &mut row_compressed,
+            rope,
+            1,
+            config.head_dim,
+            rope_start,
+            ratio,
+            false,
+        )?;
+        fp8_act_quant_nope_bf16_hidden_in_place(
+            ctx,
+            &mut row_compressed,
+            1,
+            config.head_dim,
+            rope.rotary_dim,
+            64,
+        )?;
+        let dst = decode_cache_compressed_row(
+            config.sliding_window,
+            compressed_slots,
+            batch_meta.slot_ids_host[row],
+            sp / ratio,
+        );
+        copy_bf16_rows_to_cache(ctx, &row_compressed, &mut cache.kv, 0, dst, 1)?;
     }
 
     let window_topk = window_topk_indices_decode_batch_into(

@@ -112,6 +112,10 @@ struct RankDecodeScratch {
     token_ids: CudaSlice<u32>,
     batch_token_ids: CudaSlice<u32>,
     start_pos: CudaSlice<i32>,
+    /// Per-row slot ids on device. Consumed by the batched decode compressor
+    /// kernels (task #46) to compute per-row state offsets as
+    /// `slot_ids[row] * state_offset_mul` without per-step host->device sync.
+    slot_ids: CudaSlice<i32>,
     src_rows: CudaSlice<i32>,
     window_dst_rows: CudaSlice<i32>,
     window_base: CudaSlice<i32>,
@@ -146,6 +150,7 @@ impl RankDecodeScratch {
         let token_ids = unsafe { ctx.stream.alloc(1)? };
         let batch_token_ids = unsafe { ctx.stream.alloc(seq_capacity)? };
         let start_pos = unsafe { ctx.stream.alloc(seq_capacity)? };
+        let slot_ids = unsafe { ctx.stream.alloc(seq_capacity)? };
         let src_rows = unsafe { ctx.stream.alloc(seq_capacity)? };
         let window_dst_rows = unsafe { ctx.stream.alloc(seq_capacity)? };
         let window_base = unsafe { ctx.stream.alloc(seq_capacity)? };
@@ -172,6 +177,7 @@ impl RankDecodeScratch {
             compressed_base,
             compressed_len,
             start_pos_host: Vec::with_capacity(seq_capacity),
+            slot_ids,
             slot_ids_host: Vec::with_capacity(seq_capacity),
             entry,
             hc_post,
@@ -230,6 +236,7 @@ fn fill_decode_batch_metadata(
     entries: &[DirectBatchDecodeEntry],
     token_ids: &mut CudaSlice<u32>,
     start_pos_slice: &mut CudaSlice<i32>,
+    slot_ids_slice: &mut CudaSlice<i32>,
     src_rows_slice: &mut CudaSlice<i32>,
     window_dst_rows_slice: &mut CudaSlice<i32>,
     window_base_slice: &mut CudaSlice<i32>,
@@ -276,6 +283,7 @@ fn fill_decode_batch_metadata(
     );
     let mut token_ids_host = Vec::with_capacity(entries.len());
     let mut start_pos = Vec::with_capacity(entries.len());
+    let mut slot_ids = Vec::with_capacity(entries.len());
     let mut src_rows = Vec::with_capacity(entries.len());
     let mut window_dst_rows = Vec::with_capacity(entries.len());
     let mut window_base = Vec::with_capacity(entries.len());
@@ -291,6 +299,7 @@ fn fill_decode_batch_metadata(
         );
         token_ids_host.push(entry.token_id);
         start_pos.push(entry.start_pos as i32);
+        slot_ids.push(entry.slot_id as i32);
         src_rows.push(row as i32);
         let base = entry.slot_id * slot_stride;
         window_base.push(base as i32);
@@ -316,6 +325,7 @@ fn fill_decode_batch_metadata(
     }
     ctx.stream.memcpy_htod(&token_ids_host, token_ids)?;
     ctx.stream.memcpy_htod(&start_pos, start_pos_slice)?;
+    ctx.stream.memcpy_htod(&slot_ids, slot_ids_slice)?;
     ctx.stream.memcpy_htod(&src_rows, src_rows_slice)?;
     ctx.stream
         .memcpy_htod(&window_dst_rows, window_dst_rows_slice)?;
@@ -1340,6 +1350,7 @@ fn run_decode_batch_on_rank_lane(
             entries,
             &mut scratch.batch_token_ids,
             &mut scratch.start_pos,
+            &mut scratch.slot_ids,
             &mut scratch.src_rows,
             &mut scratch.window_dst_rows,
             &mut scratch.window_base,
@@ -1353,6 +1364,7 @@ fn run_decode_batch_on_rank_lane(
             batch: entries.len(),
             compressed_slots,
             start_pos: &scratch.start_pos,
+            slot_ids: &scratch.slot_ids,
             src_rows: &scratch.src_rows,
             window_dst_rows: &scratch.window_dst_rows,
             window_base: &scratch.window_base,

@@ -86,6 +86,10 @@ pub(crate) struct DecodeBatchMeta<'a> {
     pub(crate) batch: usize,
     pub(crate) compressed_slots: usize,
     pub(crate) start_pos: &'a CudaSlice<i32>,
+    /// Per-row slot ids on device. Used by the batched decode compressor
+    /// kernels (task #46) to compute per-row state offsets without per-step
+    /// host->device sync.
+    pub(crate) slot_ids: &'a CudaSlice<i32>,
     pub(crate) src_rows: &'a CudaSlice<i32>,
     pub(crate) window_dst_rows: &'a CudaSlice<i32>,
     pub(crate) window_base: &'a CudaSlice<i32>,
@@ -224,8 +228,15 @@ pub(crate) struct AttentionIndexScratch {
 }
 
 pub(crate) struct AttentionAuxScratch {
-    pub(crate) compressor_weighted: CudaSlice<f32>,
-    pub(crate) compressor_out: Bf16HiddenStates,
+    /// Dense `[seq_capacity, max_head_dim]` device buffer for the batched
+    /// decode compressor weighted intermediate. Per Review msg 027a1df4
+    /// (task #46), false-mask rows are undefined and must not be read.
+    /// Single-row callers use `seq_capacity = 1` semantics on the same buffer.
+    pub(crate) compressor_weighted_batch: CudaSlice<f32>,
+    /// Dense `[seq_capacity, max_head_dim]` bf16 output of the batched
+    /// decode compressor. Layout: `seq_len = seq_capacity`,
+    /// `hidden_dim = max_head_dim`. Caller scatters masked rows to cache.
+    pub(crate) compressor_out_batch: Bf16HiddenStates,
     pub(crate) indexer_q: Bf16HiddenStates,
     pub(crate) indexer_weights: Bf16HiddenStates,
     pub(crate) indexer_scores: CudaSlice<f32>,
@@ -786,15 +797,16 @@ impl AttentionAuxScratch {
         let max_head_dim = config.head_dim.max(config.index_head_dim);
         let local_index_heads = config.index_n_heads / world_size;
         let max_compressed_len = config.max_position_embeddings.div_ceil(4).max(1);
-        let compressor_weighted = unsafe { ctx.stream.alloc(max_head_dim)? };
-        let compressor_out = Bf16HiddenStates::uninit(ctx, max_head_dim, 1)?;
+        let compressor_weighted_batch =
+            unsafe { ctx.stream.alloc(seq_capacity * max_head_dim)? };
+        let compressor_out_batch = Bf16HiddenStates::uninit(ctx, max_head_dim, seq_capacity)?;
         let indexer_q =
             Bf16HiddenStates::uninit(ctx, local_index_heads * config.index_head_dim, seq_capacity)?;
         let indexer_weights = Bf16HiddenStates::uninit(ctx, local_index_heads, seq_capacity)?;
         let indexer_scores = unsafe { ctx.stream.alloc(seq_capacity * max_compressed_len)? };
         Ok(Self {
-            compressor_weighted,
-            compressor_out,
+            compressor_weighted_batch,
+            compressor_out_batch,
             indexer_q,
             indexer_weights,
             indexer_scores,

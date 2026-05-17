@@ -755,7 +755,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_compressor_nonoverlap_decode_cuda(
+    // task #46: batched decode compressor entry points. Per-row metadata
+    // (`start_pos_d`, `slot_ids_d`) is consumed from device arrays prepared
+    // once per batch in the rank scheduler; no per-step host->device sync.
+    // Per Review msg 027a1df4 mask option B, false-mask rows early-exit
+    // inside the kernel and do not write `weighted[row]` / `out[row]`;
+    // callers must not read those rows.
+    pub fn deepseek_compressor_nonoverlap_decode_batch_cuda(
         x: *const Half,
         wkv: *const Half,
         wgate: *const Half,
@@ -765,7 +771,9 @@ unsafe extern "C" {
         score_state: *mut f32,
         weighted: *mut f32,
         out: *mut Half,
-        start_pos: i32,
+        start_pos_d: *const i32,
+        slot_ids_d: *const i32,
+        batch: i32,
         hidden_dim: i32,
         head_dim: i32,
         ratio: i32,
@@ -773,7 +781,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_compressor_nonoverlap_decode_at_cuda(
+    pub fn deepseek_compressor_overlap_decode_batch_cuda(
         x: *const Half,
         wkv: *const Half,
         wgate: *const Half,
@@ -783,46 +791,11 @@ unsafe extern "C" {
         score_state: *mut f32,
         weighted: *mut f32,
         out: *mut Half,
-        start_pos: i32,
+        start_pos_d: *const i32,
+        slot_ids_d: *const i32,
+        batch: i32,
         hidden_dim: i32,
         head_dim: i32,
-        ratio: i32,
-        state_offset: i32,
-        eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_compressor_overlap_decode_cuda(
-        x: *const Half,
-        wkv: *const Half,
-        wgate: *const Half,
-        ape: *const f32,
-        norm: *const Half,
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        weighted: *mut f32,
-        out: *mut Half,
-        start_pos: i32,
-        hidden_dim: i32,
-        head_dim: i32,
-        eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_compressor_overlap_decode_at_cuda(
-        x: *const Half,
-        wkv: *const Half,
-        wgate: *const Half,
-        ape: *const f32,
-        norm: *const Half,
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        weighted: *mut f32,
-        out: *mut Half,
-        start_pos: i32,
-        hidden_dim: i32,
-        head_dim: i32,
-        state_offset: i32,
         eps: f32,
         stream: CUstream,
     ) -> CUresult;
