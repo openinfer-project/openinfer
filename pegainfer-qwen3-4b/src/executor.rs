@@ -501,6 +501,7 @@ pub struct UnifiedResult {
 
 pub(crate) trait ModelExecutor: Send {
     fn page_size(&self) -> usize;
+    fn max_request_pages(&self) -> usize;
     fn available_pages(&self) -> usize;
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
@@ -610,6 +611,10 @@ impl Qwen3Executor {
         <Self as ModelExecutor>::page_size(self)
     }
 
+    pub fn max_request_pages(&self) -> usize {
+        <Self as ModelExecutor>::max_request_pages(self)
+    }
+
     pub fn available_pages(&self) -> usize {
         <Self as ModelExecutor>::available_pages(self)
     }
@@ -672,6 +677,14 @@ impl Qwen3Executor {
 impl ModelExecutor for Qwen3Executor {
     fn page_size(&self) -> usize {
         self.metadata.page_size
+    }
+
+    fn max_request_pages(&self) -> usize {
+        self.kv_pools
+            .iter()
+            .map(|pool| pool.capacity_pages().saturating_sub(1))
+            .min()
+            .unwrap_or(0)
     }
 
     fn available_pages(&self) -> usize {

@@ -20,7 +20,7 @@
 //! contribution is added in-place. This trades the AG/RS path's F32
 //! intermediate accumulation for BF16 accumulation — numerics will
 //! drift slightly vs NCCL AG/RS and need a tolerance bump in the
-//! exact-E2E gate (see `docs/projects/pplx-ep-integration.md`).
+//! exact-E2E gate (see `docs/models/deepseek-v4/pplx-ep-integration.md`).
 //!
 //! # expert_indptr build
 //!

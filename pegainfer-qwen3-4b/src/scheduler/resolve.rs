@@ -1,4 +1,4 @@
-use crate::executor::{DecodeRequestResult, PrefillRequestResult, Qwen3Executor};
+use crate::executor::{DecodeRequestResult, ModelExecutor, PrefillRequestResult};
 use pegainfer_core::engine::FinishReason;
 
 use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, StepEffects};
@@ -6,7 +6,7 @@ use super::plan::ExecutionArtifacts;
 use super::{ActiveRequestState, PendingRequest};
 
 pub(super) fn resolve_step(
-    executor: &Qwen3Executor,
+    executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
     artifacts: ExecutionArtifacts,
 ) -> StepEffects {
@@ -28,7 +28,7 @@ pub(super) fn resolve_step(
 }
 
 fn resolve_prefill_outputs(
-    executor: &Qwen3Executor,
+    executor: &impl ModelExecutor,
     pending: Vec<PendingRequest>,
     request_results: Vec<PrefillRequestResult>,
 ) -> StepEffects {
@@ -91,7 +91,7 @@ fn resolve_prefill_outputs(
 }
 
 fn resolve_decode_outputs(
-    executor: &Qwen3Executor,
+    executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
     request_results: &[DecodeRequestResult],
 ) -> Vec<DecodeEffect> {

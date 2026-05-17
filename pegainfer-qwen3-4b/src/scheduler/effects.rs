@@ -144,6 +144,7 @@ pub(super) fn apply_effects(
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_err()
                 {
+                    let _ = executor.drop_request(request_id);
                     to_retire.push(index);
                 } else {
                     req.last_token = token;

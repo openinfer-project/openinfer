@@ -22,6 +22,7 @@ pegainfer-core = { workspace = true }
 pegainfer-deepseek-v4 = { workspace = true, optional = true }
 pegainfer-qwen3-4b = { workspace = true }
 pegainfer-qwen35-4b = { workspace = true }
+pegainfer-vllm-frontend = { workspace = true }
 pegainfer-vllm-support = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -33,17 +34,10 @@ half = { workspace = true }
 log = { workspace = true }
 logforth = { workspace = true }
 rand = { workspace = true }
-rmp-serde = { workspace = true }
-rmpv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-util = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
-vllm-engine-core-client = { workspace = true }
-vllm-server = { workspace = true }
 vllm-text = { workspace = true }
-zeromq = { workspace = true }
 
 [features]
 default = []

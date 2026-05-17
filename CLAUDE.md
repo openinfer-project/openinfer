@@ -69,23 +69,46 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 Collaboration centered on the `docs/` directory.
 
-## Knowledge Architecture (PARA)
+## Knowledge Architecture (domain-axis)
 
-Based on the PARA methodology. Classify information at the point of capture — no staging area.
+Docs are organized by what they're *about*, not by lifecycle stage. A doc's freshness lives in its TL;DR (and `Last touched:` for active areas) — not by which directory it sits in. Completed work stays co-located with its domain. There is no `archives/` directory — if a doc no longer earns its keep, delete it; if a lasting lesson hides inside it, lift that lesson into `lessons/` first, then delete.
 
 ```
 docs/
-├── index.md           # Document index
-├── projects/          # Time-bound efforts with clear deliverables
-├── areas/             # Ongoing responsibilities requiring maintained standards
-├── resources/         # Topics and references with potential future value
-└── archives/          # Completed, abandoned, or shelved inactive items
+├── index.md           # Routing table — every doc must be listed here
+├── roadmap/           # Strategic plans, quarterly direction, milestones
+├── models/<line>/     # Per-model living docs (qwen3, qwen35, deepseek-v4, ...)
+│                      # — design, accuracy, perf, refactor records, gotchas
+├── subsystems/<area>/ # Cross-cutting components (runtime, scheduler, frontend, kernels)
+├── playbooks/         # Reusable how-to: benching, profiling, accuracy, onboarding
+├── lessons/           # Tribal knowledge from research / other projects
+├── benchmarks/        # Standalone benchmark snapshots and eval reports
+├── conventions/       # Ongoing standards (bench regression, coding style)
+└── private/           # Local-only notes (gitignored)
 ```
+
+Classification rule at capture time:
+- Is it tied to a specific model? → `models/<line>/`
+- A specific subsystem? → `subsystems/<area>/`
+- Reusable how-to applicable across models? → `playbooks/`
+- Lasting lesson from elsewhere (other repo, research, postmortem)? → `lessons/`
+- Snapshot of measurement, not a doc that evolves? → `benchmarks/`
+- Strategic / cross-cutting plan? → `roadmap/`
+
+If you can't pick one, the doc probably needs splitting.
 
 ## Documentation Style
 
 - Docs cover what `--help` and code can't: pitfalls, diagnostic paths, decision context. Don't restate CLI reference.
 - Every command in a doc must be run and verified before committing. Unverified commands are technical debt.
+- The only required header is a one-line **TL;DR**. Keep it true; that's the contract.
+- For `models/<line>/` and `subsystems/<area>/` docs, add `Last touched: YYYY-MM` and bump it when you do meaningful work on the doc (not for typo fixes). The date is a fact, not a judgement — readers infer freshness themselves.
+- `playbooks/`, `lessons/`, `conventions/`, `roadmap/`, `benchmarks/`, `archives/` don't need a freshness stamp. They're either timeless until disproven, or self-dated, or explicitly inert.
+- No `Status:` enum. Enum fields go stale exactly when you need them most.
+
+## index.md Drift Policy
+
+`index.md` is a routing table with a scanning-friendly TL;DR column. It is *allowed to drift* from the TL;DR inside each doc — the doc body is authoritative. Update `index.md` when you create or delete a doc, or when the existing TL;DR is so wrong it actively misleads. Don't churn it on every doc edit.
 
 ## Core Principles (CODE)
 
@@ -103,21 +126,14 @@ Documentation exists to advance work, not to hoard information. Four steps when 
 At the start of each session, you must read `index.md` and load the documents needed for the task at hand.
 
 **Execute**
-- Update relevant documents as you go. When a new problem or idea arises, create a document in the appropriate PARA directory.
+- Update relevant documents as you go. When a new problem or idea arises, create a document in the appropriate domain directory (see classification rule above).
 - Record *why* a decision was made, not just *what* was done.
 
 **Commit**
 
 When a session wraps up:
-- Update the TL;DR and status at the top of each modified document.
-- Update `index.md` to keep the global routing table current.
-
-## index.md Specification
-
-The document index — nothing more:
-
-| Path | TL;DR |
-| --- | --- |
+- Update the TL;DR (and `Last touched`, where applicable) at the top of each modified document.
+- Update `index.md` only when you created or deleted a doc, or when its TL;DR row is now misleading (see Drift Policy above).
 
 ---
 

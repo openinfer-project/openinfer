@@ -2,6 +2,9 @@
 resolver = "3"
 default-members = ["pegainfer-server"]
 members = [
+    "pegainfer-engine",
+    "pegainfer-vllm-frontend",
+    "pegainfer-sim",
     "pegainfer-vllm-support",
     "pegainfer-server",
     "pegainfer-core",
@@ -65,9 +68,11 @@ parking_lot = "0.12.5"
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
+pegainfer-engine = { path = "pegainfer-engine" }
 pegainfer-kernels = { path = "pegainfer-kernels" }
 pegainfer-qwen3-4b = { path = "pegainfer-qwen3-4b" }
 pegainfer-qwen35-4b = { path = "pegainfer-qwen35-4b" }
+pegainfer-vllm-frontend = { path = "pegainfer-vllm-frontend" }
 pegainfer-vllm-support = { path = "pegainfer-vllm-support" }
 pegainfer-comm = { path = "pegainfer-comm" }
 pkg-config = "0.3.32"

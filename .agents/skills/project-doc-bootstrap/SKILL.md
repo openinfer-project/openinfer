@@ -1,12 +1,13 @@
 ---
 name: project-doc
 description: >
-  Track any non-trivial task through a project doc in docs/projects/.
+  Track any non-trivial task through a doc placed in the right domain directory
+  under docs/ (models/<line>/, subsystems/<area>/, playbooks/, lessons/, etc.).
   Covers the full lifecycle: read docs first, write a plan, wait for approval,
   log execution, and capture lessons learned.
   Use this skill whenever the user gives a concrete task — not just Q&A or
   casual discussion. Even if the task seems straightforward, if it involves
-  doing something (not just answering something), open or reuse a project doc.
+  doing something (not just answering something), open or reuse a domain doc.
   Bias toward using this skill. When in doubt, use it.
 ---
 
@@ -61,19 +62,27 @@ other documents are relevant to this task.
 Based on the index, read the minimal set of documents that could inform
 this task. Think about:
 
-- Is there a doc about the system/area being touched?
-- Are there past project docs for similar work? Check `docs/projects/`.
+- Is there a doc about the model line or subsystem being touched
+  (`docs/models/<line>/`, `docs/subsystems/<area>/`)?
+- Is there a relevant playbook or lesson (`docs/playbooks/`, `docs/lessons/`)?
+- Is there a past task doc on similar work in the same domain directory?
 - If writing code or scripts, are there existing implementations to learn from?
 
 Be honest about what you read. Only list files you actually opened.
 
-### 1.3 Find or create the project doc
+### 1.3 Find or create the task doc
 
-Search `docs/projects/` for an existing doc that matches this task.
+Decide where the doc belongs using the classification rule in `CLAUDE.md`
+(model line / subsystem / playbook / lesson / benchmark / roadmap). If a doc
+in that directory already covers this task, reuse it.
 
 - Exists and active → reuse it, update the Preparation section.
-- Nothing matches → create a new file with a descriptive slug.
-  Examples: `fix-auth-timeout.md`, `add-retry-tests.md`, `refactor-config-loader.md`
+- Nothing matches → create a new file with a descriptive slug in the
+  appropriate directory.
+  Examples:
+    - `docs/models/qwen35/fix-decode-state-leak.md`
+    - `docs/subsystems/scheduler/chunked-prefill.md`
+    - `docs/playbooks/nsys-trace-collection.md`
 
 ### 1.4 Write the Preparation section
 
@@ -84,8 +93,8 @@ Search `docs/projects/` for an existing doc that matches this task.
   - `path/to/doc` — what it told us
   - `path/to/doc` — what it told us
 - **Relevant history**:
-  - `docs/projects/past-task.md` — learned that X causes Y
-  - (or: no relevant past project docs found)
+  - `docs/<domain>/past-task.md` — learned that X causes Y
+  - (or: no relevant past docs found)
 - **Plan**:
   1. Concrete step with specifics (files, commands, resources)
   2. Concrete step
@@ -112,7 +121,7 @@ you do anything.
 Format:
 
 ```
-📋 Project doc: `docs/projects/<name>.md`
+📋 Task doc: `docs/<domain>/<name>.md`
 
 Read:
 - `docs/index.md`
@@ -192,13 +201,15 @@ Present the debrief to the user as a summary when the task is done.
 
 ## File Template
 
-When creating a new project doc, use this structure:
+When creating a new task doc, use this structure:
 
 ```markdown
 # <Task Title>
 
-**Created**: <date>
-**Status**: active | complete | blocked
+> **TL;DR:** One-line summary. Keep it true as the task progresses — that's
+> the only thing readers can rely on.
+>
+> **Last touched:** YYYY-MM   <!-- only for docs/models/ and docs/subsystems/ -->
 
 ## Preparation
 
@@ -213,7 +224,10 @@ When creating a new project doc, use this structure:
 (filled in Phase 3)
 ```
 
-Update **Status** as the task progresses.
+Update the **TL;DR** whenever the headline state of the work changes. Bump
+**Last touched** when you do real work on the doc (skip it for typo fixes).
+Add a new row to `docs/index.md` when creating the doc; only update an
+existing row if its TL;DR has become actively misleading.
 
 ---
 

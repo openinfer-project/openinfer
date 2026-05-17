@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-checks:
+    name: CPU checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check locked Cargo metadata
+        run: cargo metadata --locked --no-deps --format-version 1
+
+      - name: Check pegainfer-comm
+        run: cargo check --release -p pegainfer-comm --all-targets
+
+      - name: Clippy pegainfer-comm
+        run: cargo clippy --release -p pegainfer-comm --all-targets -- -D warnings
+
+      - name: Test pegainfer-comm
+        run: cargo test --release -p pegainfer-comm

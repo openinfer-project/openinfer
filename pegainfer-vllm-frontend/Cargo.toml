@@ -1,0 +1,22 @@
+[package]
+name = "pegainfer-vllm-frontend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pegainfer-engine = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+vllm-engine-core-client = { workspace = true }
+vllm-server = { workspace = true }
+zeromq = { workspace = true }
+
+[lints]
+workspace = true

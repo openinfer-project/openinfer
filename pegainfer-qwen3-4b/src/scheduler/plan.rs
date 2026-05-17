@@ -2,8 +2,8 @@ use anyhow::Result;
 use rand::rngs::StdRng;
 
 use crate::executor::{
-    DecodePlan, DecodeResult, DecodeStepItem, PrefillPlan, PrefillResult, PrefillStepItem,
-    Qwen3Executor, UnifiedPlan, UnifiedResult,
+    DecodePlan, DecodeResult, DecodeStepItem, ModelExecutor, PrefillPlan, PrefillResult,
+    PrefillStepItem, UnifiedPlan, UnifiedResult,
 };
 
 use super::{ActiveRequestState, PendingRequest};
@@ -44,7 +44,7 @@ pub(super) fn build_next_plan(
 }
 
 pub(super) fn execute_plan(
-    executor: &mut Qwen3Executor,
+    executor: &mut impl ModelExecutor,
     active: &mut [ActiveRequestState],
     plan: ExecutionPlan,
     rng: &mut StdRng,

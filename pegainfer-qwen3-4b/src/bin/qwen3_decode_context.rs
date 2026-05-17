@@ -14,6 +14,14 @@ const DEFAULT_CONTEXTS: &[usize] = &[128, 512, 1024, 2048, 4096, 8192, 10_000];
 const DEFAULT_MEASURE_ITERS: usize = 5;
 const DEFAULT_PROFILE_STEPS: usize = 32;
 
+#[link(name = "cudart")]
+unsafe extern "C" {
+    #[link_name = "cudaProfilerStart"]
+    fn cuda_profiler_start() -> i32;
+    #[link_name = "cudaProfilerStop"]
+    fn cuda_profiler_stop() -> i32;
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
     Measure,
@@ -288,13 +296,13 @@ fn measure_contexts(args: &Args) -> Result<()> {
 }
 
 fn profiler_start() -> Result<()> {
-    let err = unsafe { pegainfer_core::ffi::cudaProfilerStart() };
+    let err = unsafe { cuda_profiler_start() };
     anyhow::ensure!(err == 0, "cudaProfilerStart failed with cudaError={err}");
     Ok(())
 }
 
 fn profiler_stop() -> Result<()> {
-    let err = unsafe { pegainfer_core::ffi::cudaProfilerStop() };
+    let err = unsafe { cuda_profiler_stop() };
     anyhow::ensure!(err == 0, "cudaProfilerStop failed with cudaError={err}");
     Ok(())
 }

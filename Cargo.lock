@@ -3551,6 +3551,7 @@ dependencies = [
  "logforth",
  "memmap2",
  "parking_lot",
+ "pegainfer-engine",
  "pegainfer-kernels",
  "safetensors",
  "serde_json",
@@ -3584,6 +3585,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-engine"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -3660,8 +3668,33 @@ dependencies = [
  "pegainfer-deepseek-v4",
  "pegainfer-qwen3-4b",
  "pegainfer-qwen35-4b",
+ "pegainfer-vllm-frontend",
  "pegainfer-vllm-support",
  "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
+name = "pegainfer-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pegainfer-engine",
+ "pegainfer-vllm-frontend",
+ "tokio",
+]
+
+[[package]]
+name = "pegainfer-vllm-frontend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "pegainfer-engine",
  "rmp-serde",
  "rmpv",
  "serde",
@@ -3671,7 +3704,6 @@ dependencies = [
  "uuid",
  "vllm-engine-core-client",
  "vllm-server",
- "vllm-text",
  "zeromq",
 ]
 
