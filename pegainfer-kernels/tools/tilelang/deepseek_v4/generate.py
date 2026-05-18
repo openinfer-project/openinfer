@@ -299,7 +299,13 @@ def fp4_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FE8M0):
             T.clear(C_local_accum)
 
             K_iters = T.ceildiv(K, block_K)
-            for k in T.Pipelined(K_iters, num_stages=2):
+            # task #54 schedule retune: pipeline depth 2 -> 4 so the FP4 ->
+            # FP8 cast and shared-memory loads overlap an extra pair of K-tiles.
+            # Per-stage SMEM footprint (A_shared 1 KB FP8 + B_fp4_shared ~0.5 KB
+            # FP4 + B_shared 4 KB FP8) keeps four stages comfortably under
+            # Blackwell SM120's per-block budget; the K-loop body is otherwise
+            # unchanged and FP4 scale / quant block layout is untouched.
+            for k in T.Pipelined(K_iters, num_stages=4):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[bx * block_N, k * block_K], B_fp4_shared)
                 for i, j in T.Parallel(block_N, block_K):
