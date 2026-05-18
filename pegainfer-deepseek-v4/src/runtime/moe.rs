@@ -915,9 +915,16 @@ pub fn local_experts_forward_packed_bf16_hidden(
         ctx.stream
             .alloc::<u8>(expanded_input.seq_len * expanded_input.hidden_dim)?
     };
+    // task #57: match `MoeAgRsScratch::fp4_act_scale_workspace` sizing -- the
+    // CUTLASS mixed-MX grouped GEMM host wrapper carves the buffer into a
+    // 128-block input region and a 32-block expanded output region, so the
+    // non-scratch one-off allocation here mirrors the scratch capacity
+    // (128-block + 32-block) instead of only 128-block.
     let mut fp4_act_scale_workspace = unsafe {
+        let scale_cols_128 = expanded_input.hidden_dim.div_ceil(128);
+        let scale_cols_32 = expanded_input.hidden_dim.div_ceil(32);
         ctx.stream
-            .alloc::<u8>(expanded_input.seq_len * expanded_input.hidden_dim.div_ceil(128))?
+            .alloc::<u8>(expanded_input.seq_len * (scale_cols_128 + scale_cols_32))?
     };
     let plan_view = MoeFusedRoutePlanView {
         routed: RoutedExpertsView {

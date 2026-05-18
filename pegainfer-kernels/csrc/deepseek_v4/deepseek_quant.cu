@@ -4,6 +4,23 @@
 
 #include <mutex>
 
+// task #57: pull in the CUTLASS 3.x device-side grouped GEMM machinery used by
+// `deepseek_moe_mxfp4_grouped_mixed_gemm_cuda` below. Everything else in this
+// file is hand-written CUDA / FlashInfer / TileLang glue, so the includes are
+// scoped here rather than at top-of-file.
+#include "cutlass/cutlass.h"
+#include "cute/tensor.hpp"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/util/packed_stride.hpp"
+
 namespace {
 
 constexpr size_t kFlashInferFp8WorkspaceBytes = 32ull * 1024ull * 1024ull;
@@ -567,6 +584,307 @@ static bool deepseek_tilelang_grouped_fp4_linear_fns(
   return *act_fn != nullptr && *gemm_fn != nullptr;
 }
 
+// task #57: Expand a per-128-element UE8M0 activation scale tensor to its
+// per-32-element form by replicating each input byte 4 times in place along
+// the scale-column axis. Required because the existing `act_fn` (TileLang
+// AOT) emits 128-block scales while the CUTLASS mixed MX FP8 x FP4 grouped
+// GEMM consumes 32-block scales. The transform is mathematically lossless:
+// applying the same scalar `s` to each 32-element subblock recovers the
+// original 128-block dequant. Input and output buffers must not alias.
+__global__ void deepseek_mxfp4_scale_reformat_128_to_32_kernel(
+    const unsigned char* __restrict__ scale_in,    // [rows, k_div_128]
+    unsigned char* __restrict__ scale_out,         // [rows, 4 * k_div_128]
+    int rows,
+    int k_div_128) {
+  int col_in = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y;
+  if (col_in >= k_div_128 || row >= rows) return;
+  unsigned char s = scale_in[row * k_div_128 + col_in];
+  int k_div_32 = k_div_128 * 4;
+  int col_out_base = col_in * 4;
+  unsigned char* row_out = scale_out + row * k_div_32 + col_out_base;
+  row_out[0] = s;
+  row_out[1] = s;
+  row_out[2] = s;
+  row_out[3] = s;
+}
+
+static cudaError_t deepseek_mxfp4_scale_reformat_128_to_32(
+    const unsigned char* scale_in,
+    unsigned char* scale_out,
+    int rows,
+    int in_dim,
+    cudaStream_t stream) {
+  if (rows <= 0 || in_dim <= 0 || (in_dim % 128) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (scale_in == nullptr || scale_out == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+  int k_div_128 = in_dim / 128;
+  constexpr int threads = 128;
+  dim3 grid((k_div_128 + threads - 1) / threads, rows);
+  deepseek_mxfp4_scale_reformat_128_to_32_kernel<<<grid, threads, 0, stream>>>(
+      scale_in, scale_out, rows, k_div_128);
+  return cudaGetLastError();
+}
+
+// task #57: CUTLASS SM120 grouped mixed-MX GEMM specialization.
+// A is MX-FP8 (E4M3 elements + UE8M0 scale per 32-element block),
+// B is MX-FP4 (E2M1 elements + UE8M0 scale per 32-element block),
+// D is bf16 (no block-scale output).
+// All experts share in_dim/out_dim; only rows-per-expert vary, so the GEMM
+// runs in `kGrouped` mode with a single launcher.
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+namespace deepseek_mxfp4_grouped_mixed {
+
+using namespace cute;
+
+using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+
+using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+using LayoutATag = cutlass::layout::RowMajor;
+constexpr int AlignmentA = 16;
+
+using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+using LayoutBTag = cutlass::layout::ColumnMajor;
+constexpr int AlignmentB = 32;
+
+using ElementD = cutlass::bfloat16_t;
+using ElementC = cutlass::bfloat16_t;
+using LayoutCTag = cutlass::layout::RowMajor;
+using LayoutDTag = cutlass::layout::RowMajor;
+constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm120;
+using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+using ThreadBlockShape = Shape<_128, _128, _128>;
+using ClusterShape = Shape<_1, _1, _1>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ThreadBlockShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, LayoutCTag*, AlignmentC,
+    ElementD, LayoutDTag*, AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementA, LayoutATag*, AlignmentA,
+    ElementB, LayoutBTag*, AlignmentB,
+    ElementAccumulator,
+    ThreadBlockShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    ProblemShape,
+    CollectiveMainloop,
+    CollectiveEpilogue>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+using ElementAData = typename ElementA::DataType;          // float_e4m3_t
+using ElementBData = typename ElementB::DataType;          // float_e2m1_t
+using ElementSF    = typename ElementA::ScaleFactorType;   // float_ue8m0_t (shared by A & B)
+
+using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+
+// Tiny launcher kernel that materializes per-group problem shapes, A/SFA
+// pointer arrays, strides, and SF layouts from the device-side `expert_indptr`
+// CSR. Output dim and input dim are uniform across groups; only the M extent
+// changes per group.
+__global__ void deepseek_mxfp4_grouped_mixed_setup_kernel(
+    const int* __restrict__ expert_indptr,
+    int local_experts,
+    int in_dim,
+    int out_dim,
+    const ElementAData* __restrict__ a_base,           // FP8 act, [rows, in_dim] row-major
+    const ElementSF* __restrict__ sfa_base,            // SFA, [rows, in_dim/32]
+    const ElementBData* const* __restrict__ b_ptrs,    // per-expert B (FP4 weight) pointers
+    const ElementSF* const* __restrict__ sfb_ptrs,    // per-expert SFB pointers
+    ElementD* __restrict__ d_base,                     // bf16 out, [rows, out_dim]
+    UnderlyingProblemShape* __restrict__ problems,
+    const ElementAData** __restrict__ ptr_a,
+    const ElementBData** __restrict__ ptr_b,
+    const ElementSF** __restrict__ ptr_sfa,
+    const ElementSF** __restrict__ ptr_sfb,
+    ElementD** __restrict__ ptr_d,
+    StrideA* __restrict__ stride_a,
+    StrideB* __restrict__ stride_b,
+    StrideD* __restrict__ stride_d,
+    LayoutSFA* __restrict__ layout_sfa,
+    LayoutSFB* __restrict__ layout_sfb) {
+  int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= local_experts) return;
+  int row_start = expert_indptr[g];
+  int row_end = expert_indptr[g + 1];
+  int m = row_end - row_start;
+  int n = out_dim;
+  int k = in_dim;
+  problems[g] = cute::make_shape(m, n, k);
+
+  ptr_a[g] = a_base + static_cast<long long>(row_start) * in_dim;
+  // SFA layout assumes row-major scale tensor with `in_dim/32` columns.
+  ptr_sfa[g] = sfa_base + static_cast<long long>(row_start) * (in_dim / 32);
+  ptr_b[g] = b_ptrs[g];
+  ptr_sfb[g] = sfb_ptrs[g];
+  ptr_d[g] = d_base + static_cast<long long>(row_start) * out_dim;
+
+  stride_a[g] = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  stride_b[g] = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  stride_d[g] = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
+  layout_sfa[g] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  layout_sfb[g] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, 1));
+}
+
+}  // namespace deepseek_mxfp4_grouped_mixed
+
+static cudaError_t deepseek_moe_mxfp4_grouped_mixed_gemm_cuda(
+    const uint8_t* x_fp8,                  // [rows, in_dim] row-major FP8 E4M3
+    const uint8_t* x_scale_32,             // [rows, in_dim/32] row-major UE8M0
+    const uint8_t* const* w_e2m1,          // per-expert col-major FP4 weights (nibble-packed)
+    const uint8_t* const* w_scale_32,      // per-expert UE8M0 weight scales
+    const int* expert_indptr,              // device [local_experts+1] CSR
+    __nv_bfloat16* d_bf16,                 // [rows, out_dim] row-major
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    cudaStream_t stream) {
+  using namespace deepseek_mxfp4_grouped_mixed;
+
+  if (rows < 0 || in_dim <= 0 || out_dim <= 0 || local_experts <= 0)
+    return cudaErrorInvalidValue;
+  if (rows == 0) return cudaSuccess;
+  if ((in_dim % 32) != 0) return cudaErrorInvalidValue;
+  if (x_fp8 == nullptr || x_scale_32 == nullptr || w_e2m1 == nullptr ||
+      w_scale_32 == nullptr || expert_indptr == nullptr || d_bf16 == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+
+  // One contiguous device scratch for all per-group arrays.
+  size_t bytes_problems   = sizeof(UnderlyingProblemShape) * local_experts;
+  size_t bytes_ptr_a      = sizeof(const ElementAData*) * local_experts;
+  size_t bytes_ptr_b      = sizeof(const ElementBData*) * local_experts;
+  size_t bytes_ptr_sfa    = sizeof(const ElementSF*)    * local_experts;
+  size_t bytes_ptr_sfb    = sizeof(const ElementSF*)    * local_experts;
+  size_t bytes_ptr_d      = sizeof(ElementD*)           * local_experts;
+  size_t bytes_stride_a   = sizeof(StrideA)   * local_experts;
+  size_t bytes_stride_b   = sizeof(StrideB)   * local_experts;
+  size_t bytes_stride_d   = sizeof(StrideD)   * local_experts;
+  size_t bytes_layout_sfa = sizeof(LayoutSFA) * local_experts;
+  size_t bytes_layout_sfb = sizeof(LayoutSFB) * local_experts;
+
+  auto align = [](size_t s) -> size_t { return (s + 15ull) & ~15ull; };
+  size_t total_bytes =
+      align(bytes_problems) + align(bytes_ptr_a) + align(bytes_ptr_b) +
+      align(bytes_ptr_sfa) + align(bytes_ptr_sfb) + align(bytes_ptr_d) +
+      align(bytes_stride_a) + align(bytes_stride_b) + align(bytes_stride_d) +
+      align(bytes_layout_sfa) + align(bytes_layout_sfb);
+
+  uint8_t* scratch = nullptr;
+  cudaError_t err = cudaMallocAsync(&scratch, total_bytes, stream);
+  if (err != cudaSuccess) return err;
+
+  uint8_t* cursor = scratch;
+  auto carve = [&](size_t s) -> uint8_t* {
+    uint8_t* p = cursor;
+    cursor += align(s);
+    return p;
+  };
+
+  auto* problems   = reinterpret_cast<UnderlyingProblemShape*>(carve(bytes_problems));
+  auto* ptr_a      = reinterpret_cast<const ElementAData**>(carve(bytes_ptr_a));
+  auto* ptr_b      = reinterpret_cast<const ElementBData**>(carve(bytes_ptr_b));
+  auto* ptr_sfa    = reinterpret_cast<const ElementSF**>(carve(bytes_ptr_sfa));
+  auto* ptr_sfb    = reinterpret_cast<const ElementSF**>(carve(bytes_ptr_sfb));
+  auto* ptr_d      = reinterpret_cast<ElementD**>(carve(bytes_ptr_d));
+  auto* stride_a   = reinterpret_cast<StrideA*>(carve(bytes_stride_a));
+  auto* stride_b   = reinterpret_cast<StrideB*>(carve(bytes_stride_b));
+  auto* stride_d   = reinterpret_cast<StrideD*>(carve(bytes_stride_d));
+  auto* layout_sfa = reinterpret_cast<LayoutSFA*>(carve(bytes_layout_sfa));
+  auto* layout_sfb = reinterpret_cast<LayoutSFB*>(carve(bytes_layout_sfb));
+
+  {
+    constexpr int threads = 32;
+    int blocks = (local_experts + threads - 1) / threads;
+    deepseek_mxfp4_grouped_mixed_setup_kernel<<<blocks, threads, 0, stream>>>(
+        expert_indptr,
+        local_experts,
+        in_dim,
+        out_dim,
+        reinterpret_cast<const ElementAData*>(x_fp8),
+        reinterpret_cast<const ElementSF*>(x_scale_32),
+        reinterpret_cast<const ElementBData* const*>(w_e2m1),
+        reinterpret_cast<const ElementSF* const*>(w_scale_32),
+        reinterpret_cast<ElementD*>(d_bf16),
+        problems,
+        ptr_a, ptr_b, ptr_sfa, ptr_sfb, ptr_d,
+        stride_a, stride_b, stride_d,
+        layout_sfa, layout_sfb);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      cudaFreeAsync(scratch, stream);
+      return err;
+    }
+  }
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {local_experts, problems, /*host_problem_shapes=*/nullptr},
+      {ptr_a, stride_a, ptr_b, stride_b, ptr_sfa, layout_sfa, ptr_sfb, layout_sfb},
+      {{/*alpha=*/1.0f, /*beta=*/0.0f},
+       /*ptr_C=*/nullptr, /*stride_C=*/nullptr,
+       /*ptr_D=*/ptr_d,  /*stride_D=*/stride_d}};
+
+  Gemm gemm;
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  uint8_t* gemm_workspace = nullptr;
+  if (workspace_size > 0) {
+    err = cudaMallocAsync(&gemm_workspace, workspace_size, stream);
+    if (err != cudaSuccess) {
+      cudaFreeAsync(scratch, stream);
+      return err;
+    }
+  }
+
+  cutlass::Status status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) {
+    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
+    cudaFreeAsync(scratch, stream);
+    return cudaErrorNotSupported;
+  }
+
+  status = gemm.initialize(arguments, gemm_workspace, stream);
+  if (status != cutlass::Status::kSuccess) {
+    if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
+    cudaFreeAsync(scratch, stream);
+    return cudaErrorUnknown;
+  }
+
+  status = gemm.run(stream);
+  if (gemm_workspace) cudaFreeAsync(gemm_workspace, stream);
+  cudaFreeAsync(scratch, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+  return cudaGetLastError();
+}
+#endif  // CUTLASS_ARCH_MMA_SM120_SUPPORTED || CUTLASS_ARCH_MMA_SM121_SUPPORTED
+
 static cudaError_t deepseek_moe_fp4_grouped_w1_w3_workspace_cuda(
     const __nv_bfloat16 *x,
     const unsigned char *const *w1_weights,
@@ -604,30 +922,45 @@ static cudaError_t deepseek_moe_fp4_grouped_w1_w3_workspace_cuda(
     return cudaErrorNotSupported;
   }
 
-  const int scale_cols = (in_dim + 127) / 128;
+  // task #57: scratch holds two co-resident scale tensors:
+  //   [0 .. rows*scale_cols_128)              -> per-128-block UE8M0 (act_fn output)
+  //   [rows*scale_cols_128 .. rows*(128+32))  -> per-32-block UE8M0 (CUTLASS input)
+  const int scale_cols_128 = (in_dim + 127) / 128;
+  const int scale_cols_32  = (in_dim + 31) / 32;
   const size_t required_act_bytes = (size_t)rows * (size_t)in_dim;
-  const size_t required_act_scale_bytes = (size_t)rows * (size_t)scale_cols;
+  const size_t required_act_scale_bytes =
+      (size_t)rows * (size_t)(scale_cols_128 + scale_cols_32);
   if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
     return cudaErrorInvalidValue;
   }
+  unsigned char* act_scale_128 = act_scale;
+  unsigned char* act_scale_32  = act_scale + (size_t)rows * (size_t)scale_cols_128;
 
   cudaError_t err = static_cast<cudaError_t>(
-      act_fn(x, act, act_scale, rows, stream));
+      act_fn(x, act, act_scale_128, rows, stream));
   if (err != cudaSuccess) return err;
 
-  err = static_cast<cudaError_t>(deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
-      act,
-      reinterpret_cast<const void* const*>(w1_weights),
-      reinterpret_cast<const void* const*>(w3_weights),
-      gate_out,
-      up_out,
-      act_scale,
-      reinterpret_cast<const void* const*>(w1_scales),
-      reinterpret_cast<const void* const*>(w3_scales),
+  err = deepseek_mxfp4_scale_reformat_128_to_32(
+      act_scale_128, act_scale_32, rows, in_dim, stream);
+  if (err != cudaSuccess) return err;
+
+  // W13 is two grouped GEMMs sharing the FP8 activation tensor; the TileLang
+  // path fused them, but for the CUTLASS mixed E4M3 x E2M1 + UE8M0 GroupedGemm
+  // it is cleaner (and within budget) to run them as two back-to-back launches.
+  err = deepseek_moe_mxfp4_grouped_mixed_gemm_cuda(
+      act, act_scale_32,
+      w1_weights, w1_scales,
       expert_indptr,
-      rows,
-      local_experts,
-      stream));
+      gate_out,
+      rows, in_dim, out_dim, local_experts, stream);
+  if (err != cudaSuccess) return err;
+
+  err = deepseek_moe_mxfp4_grouped_mixed_gemm_cuda(
+      act, act_scale_32,
+      w3_weights, w3_scales,
+      expert_indptr,
+      up_out,
+      rows, in_dim, out_dim, local_experts, stream);
   return err == cudaSuccess ? cudaGetLastError() : err;
 }
 
@@ -665,28 +998,35 @@ static cudaError_t deepseek_moe_fp4_grouped_w2_swiglu_workspace_cuda(
   if (!deepseek_tilelang_grouped_fp4_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
     return cudaErrorNotSupported;
   }
+  (void)act_fn;
+  (void)gemm_fn;
 
-  const int scale_cols = (in_dim + 127) / 128;
+  // task #57: see W13 wrapper for the dual-scale workspace layout.
+  const int scale_cols_128 = (in_dim + 127) / 128;
+  const int scale_cols_32  = (in_dim + 31) / 32;
   const size_t required_act_bytes = (size_t)rows * (size_t)in_dim;
-  const size_t required_act_scale_bytes = (size_t)rows * (size_t)scale_cols;
+  const size_t required_act_scale_bytes =
+      (size_t)rows * (size_t)(scale_cols_128 + scale_cols_32);
   if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
     return cudaErrorInvalidValue;
   }
+  unsigned char* act_scale_128 = act_scale;
+  unsigned char* act_scale_32  = act_scale + (size_t)rows * (size_t)scale_cols_128;
 
   cudaError_t err = deepseek_swiglu_clamp_act_quant_k2048_cuda(
-      gate, up, act, act_scale, rows, limit, stream);
+      gate, up, act, act_scale_128, rows, limit, stream);
   if (err != cudaSuccess) return err;
 
-  err = static_cast<cudaError_t>(gemm_fn(
-      act,
-      reinterpret_cast<const void* const*>(weights),
-      out,
-      act_scale,
-      reinterpret_cast<const void* const*>(scales),
+  err = deepseek_mxfp4_scale_reformat_128_to_32(
+      act_scale_128, act_scale_32, rows, in_dim, stream);
+  if (err != cudaSuccess) return err;
+
+  err = deepseek_moe_mxfp4_grouped_mixed_gemm_cuda(
+      act, act_scale_32,
+      weights, scales,
       expert_indptr,
-      rows,
-      local_experts,
-      stream));
+      out,
+      rows, in_dim, out_dim, local_experts, stream);
   return err == cudaSuccess ? cudaGetLastError() : err;
 }
 

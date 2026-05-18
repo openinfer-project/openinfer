@@ -533,9 +533,19 @@ impl MoeAgRsScratch {
         let expert_out = Bf16HiddenStates::uninit(ctx, config.dim, route_capacity)?;
         let max_fp4_input_dim = config.dim.max(config.moe_inter_dim);
         let max_fp4_scale_cols = max_fp4_input_dim.div_ceil(128);
+        // task #57: the CUTLASS mixed-MX grouped GEMM expects per-32-element
+        // scale blocks while `act_fn` still emits per-128-element blocks. The
+        // host wrapper carves this scratch into a leading 128-block region
+        // (sized `route_capacity * max_fp4_scale_cols` bytes) and a trailing
+        // 32-block region (`route_capacity * max_fp4_scale_cols_32` bytes,
+        // 4x larger) so the reformat kernel can read the input and write the
+        // expanded output without aliasing. FFI semantics (`act_scale_bytes`)
+        // are unchanged; only the Rust scratch capacity grows.
+        let max_fp4_scale_cols_32 = max_fp4_input_dim.div_ceil(32);
+        let fp4_act_scale_combined_cols = max_fp4_scale_cols + max_fp4_scale_cols_32;
         let fp4_act_workspace = unsafe { ctx.stream.alloc(route_capacity * max_fp4_input_dim)? };
         let fp4_act_scale_workspace =
-            unsafe { ctx.stream.alloc(route_capacity * max_fp4_scale_cols)? };
+            unsafe { ctx.stream.alloc(route_capacity * fp4_act_scale_combined_cols)? };
         let partial_routed = F32HiddenStates {
             data: unsafe { ctx.stream.alloc(config.dim * global_seq_capacity)? },
             hidden_dim: config.dim,
@@ -634,9 +644,17 @@ impl MoePplxScratch {
         let expert_out = Bf16HiddenStates::uninit(ctx, config.dim, max_recv_tokens)?;
         let max_fp4_input_dim = config.dim.max(config.moe_inter_dim);
         let max_fp4_scale_cols = max_fp4_input_dim.div_ceil(128);
+        // task #57 PPLX-side: mechanical capacity expansion to keep parity
+        // with `MoeAgRsScratch` after the CUTLASS mixed-MX grouped GEMM is
+        // installed. The host wrapper carves this scratch into 128-block
+        // input + 32-block expanded output regions; no PPLX-path behavior
+        // change is intended here -- PPLX is verified separately, not under
+        // task #57.
+        let max_fp4_scale_cols_32 = max_fp4_input_dim.div_ceil(32);
+        let fp4_act_scale_combined_cols = max_fp4_scale_cols + max_fp4_scale_cols_32;
         let fp4_act_workspace = unsafe { ctx.stream.alloc(max_recv_tokens * max_fp4_input_dim)? };
         let fp4_act_scale_workspace =
-            unsafe { ctx.stream.alloc(max_recv_tokens * max_fp4_scale_cols)? };
+            unsafe { ctx.stream.alloc(max_recv_tokens * fp4_act_scale_combined_cols)? };
 
         let expert_indptr = unsafe { ctx.stream.alloc(local_experts + 1)? };
         // dispatch_recv writes `out_num_tokens_ptr[expert]` for each local
