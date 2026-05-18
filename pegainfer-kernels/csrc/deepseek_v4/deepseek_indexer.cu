@@ -252,6 +252,77 @@ __global__ void deepseek_indexer_topk_prefill_kernel(
   }
 }
 
+__device__ __forceinline__ bool deepseek_indexer_topk_better(float lhs_score, int lhs_idx,
+                                                            float rhs_score, int rhs_idx) {
+  return lhs_score > rhs_score ||
+         (lhs_score == rhs_score && lhs_idx >= 0 && (rhs_idx < 0 || lhs_idx < rhs_idx));
+}
+
+__global__ void deepseek_indexer_topk_prefill_bitonic_kernel(
+    const float *__restrict__ scores,
+    int *__restrict__ topk_idxs,
+    int seq_len,
+    int compressed_len,
+    int topk,
+    int ratio,
+    int offset) {
+  constexpr int sort_n = 4096;
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+
+  extern __shared__ unsigned char smem[];
+  float *sort_scores = reinterpret_cast<float *>(smem);
+  int *sort_indices = reinterpret_cast<int *>(sort_scores + sort_n);
+
+  int valid = (token + 1) / ratio;
+  for (int idx = threadIdx.x; idx < sort_n; idx += blockDim.x) {
+    if (idx < compressed_len && idx < valid) {
+      sort_scores[idx] = scores[token * compressed_len + idx];
+      sort_indices[idx] = idx;
+    } else {
+      sort_scores[idx] = -3.4028234663852886e38f;
+      sort_indices[idx] = -1;
+    }
+  }
+  __syncthreads();
+
+  // Static 4096-slot bitonic sort covers the real DSV4 10k prefill shape
+  // (`compressed_len=2645`, `topk=512`). Sort descending by score and then
+  // ascending by candidate index to preserve the current strict `>` tie order.
+  for (int k = 2; k <= sort_n; k <<= 1) {
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int idx = threadIdx.x; idx < sort_n; idx += blockDim.x) {
+        int other = idx ^ j;
+        if (other > idx) {
+          bool ascending = (idx & k) != 0;
+          float lhs_score = sort_scores[idx];
+          int lhs_idx = sort_indices[idx];
+          float rhs_score = sort_scores[other];
+          int rhs_idx = sort_indices[other];
+          bool rhs_better =
+              deepseek_indexer_topk_better(rhs_score, rhs_idx, lhs_score, lhs_idx);
+          bool lhs_better =
+              deepseek_indexer_topk_better(lhs_score, lhs_idx, rhs_score, rhs_idx);
+          if ((!ascending && rhs_better) || (ascending && lhs_better)) {
+            sort_scores[idx] = rhs_score;
+            sort_indices[idx] = rhs_idx;
+            sort_scores[other] = lhs_score;
+            sort_indices[other] = lhs_idx;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  for (int route = threadIdx.x; route < topk; route += blockDim.x) {
+    int best_idx = sort_indices[route];
+    float best_score = sort_scores[route];
+    topk_idxs[token * topk + route] =
+        best_idx >= 0 && best_score > -3.0e38f ? best_idx + offset : -1;
+  }
+}
+
 __global__ void deepseek_indexer_scores_decode_kernel(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ kv,
@@ -671,6 +742,19 @@ cudaError_t deepseek_indexer_topk_prefill_cuda(
     int ratio,
     int offset,
     cudaStream_t stream) {
+  if (scores == nullptr || topk_idxs == nullptr || seq_len <= 0 || compressed_len <= 0 ||
+      topk <= 0 || ratio <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (compressed_len <= 4096 && topk <= 512) {
+    constexpr int threads = 256;
+    constexpr int sort_n = 4096;
+    size_t shared_bytes = sort_n * (sizeof(float) + sizeof(int));
+    deepseek_indexer_topk_prefill_bitonic_kernel<<<seq_len, threads, shared_bytes, stream>>>(
+        scores, topk_idxs, seq_len, compressed_len, topk, ratio, offset);
+    return cudaGetLastError();
+  }
+
   constexpr int threads = 256;
   size_t shared_bytes = (compressed_len + threads) * sizeof(float) + threads * sizeof(int);
   deepseek_indexer_topk_prefill_kernel<<<seq_len, threads, shared_bytes, stream>>>(
