@@ -1,13 +1,13 @@
 #include "deepseek_common.cuh"
 
-#include <flashinfer/gemm/gemm_groupwise_sm120.cuh>
-
-#include <mutex>
-
-// task #57: pull in the CUTLASS 3.x device-side grouped GEMM machinery used by
-// `deepseek_moe_mxfp4_grouped_mixed_gemm_cuda` below. Everything else in this
-// file is hand-written CUDA / FlashInfer / TileLang glue, so the includes are
-// scoped here rather than at top-of-file.
+// task #57 (#58 root-cause): the CUTLASS 3.x grouped block-scaled GEMM
+// machinery used by `deepseek_moe_mxfp4_grouped_mixed_gemm_cuda` below MUST
+// be included before `<flashinfer/gemm/gemm_groupwise_sm120.cuh>`. The
+// FlashInfer groupwise SM120 header transitively pulls a CUTLASS state that
+// makes the grouped mainloop instantiate `fp4_shift_B` with a const Tensor
+// where the lambda needs `RegisterTypeB&` (instantiation tail
+// `SM120_16x8x32_TN_VS<e4m3, e2m1, f32, ue8m0, VS=32>`). Reversing the order
+// is a pure build-compat fix; no runtime / type / API change.
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 #include "cutlass/tensor_ref.h"
@@ -20,6 +20,10 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
+
+#include <flashinfer/gemm/gemm_groupwise_sm120.cuh>
+
+#include <mutex>
 
 namespace {
 
