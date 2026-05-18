@@ -187,6 +187,27 @@ __global__ void deepseek_indexer_scores_decode_epilogue_kernel(
   scores[compressed] = acc * score_scale;
 }
 
+// One-block-per-token warp-shuffle top-K selector. Each lane keeps a
+// register-resident sorted (score desc, candidate-index asc) list of size
+// `DEEPSEEK_INDEXER_TOPK_MAX` entries (unused slots stay at the -INF
+// sentinel). A single streaming pass over `scores` does sorted-insertion
+// (strict `>`); a `topk`-round emit-merge then drains the winning lane each
+// round via warp shuffles. No shared memory, no __syncthreads.
+//
+// All per-lane array indices are compile-time constants so the lists stay
+// register-resident on sm_120. The runtime `topk` only bounds the emit
+// loop; the streaming and bubble-up are always over the full size-32
+// list. For `topk` < 32 this does strictly more insertion work than
+// minimally required, but the final top-`topk` emit is bit-exact since
+// top-K ⊂ top-32 under the same total order.
+//
+// Tie-break preserved bit-exact against the previous 256-thread shared-mem
+// kernel: score desc, candidate-index asc (lower compressed index wins on
+// equal score). Within a single lane the streamed `cand` is monotonically
+// increasing so per-lane ties resolve naturally; the cross-lane comparator
+// reasserts the (score desc, idx asc) order during the warp reduction.
+constexpr int DEEPSEEK_INDEXER_TOPK_MAX = 32;
+
 __global__ void deepseek_indexer_topk_prefill_kernel(
     const float *__restrict__ scores,
     int *__restrict__ topk_idxs,
@@ -198,57 +219,78 @@ __global__ void deepseek_indexer_topk_prefill_kernel(
   int token = blockIdx.x;
   if (token >= seq_len) return;
 
-  extern __shared__ float scratch[];
-  float *select_scores = scratch;
-  float *thread_scores = select_scores + compressed_len;
-  int *thread_indices = reinterpret_cast<int *>(thread_scores + blockDim.x);
-  int valid = (token + 1) / ratio;
-  for (int idx = threadIdx.x; idx < compressed_len; idx += blockDim.x) {
-    select_scores[idx] =
-        idx < valid ? scores[token * compressed_len + idx] : -3.4028234663852886e38f;
-  }
-  __syncthreads();
+  constexpr float kNegInf = -3.4028234663852886e38f;
+  constexpr float kNegInfThreshold = -3.0e38f;
+  constexpr int K = DEEPSEEK_INDEXER_TOPK_MAX;
 
-  for (int route = 0; route < topk; ++route) {
-    int best_idx = -1;
-    float best_score = -3.4028234663852886e38f;
-    for (int candidate = threadIdx.x; candidate < compressed_len; candidate += blockDim.x) {
-      float score = select_scores[candidate];
-      if (score > best_score) {
-        best_score = score;
-        best_idx = candidate;
+  float ls[K];
+  int li[K];
+  #pragma unroll
+  for (int i = 0; i < K; ++i) {
+    ls[i] = kNegInf;
+    li[i] = -1;
+  }
+
+  int valid = (token + 1) / ratio;
+  const float *row = scores + (size_t)token * compressed_len;
+
+  // Streaming pass: bubble-up insertion (strict `>`). The candidate at
+  // slot `K-1` is the smallest currently kept; only candidates that
+  // strictly beat it are admitted.
+  for (int cand = threadIdx.x; cand < compressed_len; cand += 32) {
+    float s = (cand < valid) ? row[cand] : kNegInf;
+    if (s <= ls[K - 1]) continue;
+    ls[K - 1] = s;
+    li[K - 1] = cand;
+    #pragma unroll
+    for (int i = K - 1; i > 0; --i) {
+      if (ls[i] > ls[i - 1]) {
+        float ts = ls[i];
+        int ti = li[i];
+        ls[i] = ls[i - 1];
+        li[i] = li[i - 1];
+        ls[i - 1] = ts;
+        li[i - 1] = ti;
       }
     }
-    thread_scores[threadIdx.x] = best_score;
-    thread_indices[threadIdx.x] = best_idx;
-    __syncthreads();
+  }
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) {
-        float other_score = thread_scores[threadIdx.x + stride];
-        int other_idx = thread_indices[threadIdx.x + stride];
-        float current_score = thread_scores[threadIdx.x];
-        int current_idx = thread_indices[threadIdx.x];
-        if (other_score > current_score ||
-            (other_score == current_score && other_idx >= 0 &&
-             (current_idx < 0 || other_idx < current_idx))) {
-          thread_scores[threadIdx.x] = other_score;
-          thread_indices[threadIdx.x] = other_idx;
-        }
+  // Emit-merge: each round, every lane emits ls[0]; warp shuffles compute
+  // the global winner; the winning lane shifts its list left and inserts
+  // a sentinel at the tail.
+  for (int route = 0; route < topk; ++route) {
+    float best_s = ls[0];
+    int best_i = li[0];
+    int best_l = threadIdx.x;
+
+    #pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+      float o_s = __shfl_xor_sync(0xffffffff, best_s, stride);
+      int o_i = __shfl_xor_sync(0xffffffff, best_i, stride);
+      int o_l = __shfl_xor_sync(0xffffffff, best_l, stride);
+      bool take = (o_s > best_s) ||
+                  (o_s == best_s && o_i >= 0 && (best_i < 0 || o_i < best_i));
+      if (take) {
+        best_s = o_s;
+        best_i = o_i;
+        best_l = o_l;
       }
-      __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-      int best_idx = thread_indices[0];
-      float best_score = thread_scores[0];
-      topk_idxs[token * topk + route] =
-          best_idx >= 0 && best_score > -3.0e38f ? best_idx + offset : -1;
-      if (best_idx >= 0) {
-        select_scores[best_idx] = -3.4028234663852886e38f;
-      }
+      topk_idxs[(size_t)token * topk + route] =
+          (best_i >= 0 && best_s > kNegInfThreshold) ? best_i + offset : -1;
     }
-    __syncthreads();
+
+    if (threadIdx.x == best_l) {
+      #pragma unroll
+      for (int i = 0; i < K - 1; ++i) {
+        ls[i] = ls[i + 1];
+        li[i] = li[i + 1];
+      }
+      ls[K - 1] = kNegInf;
+      li[K - 1] = -1;
+    }
   }
 }
 
@@ -671,9 +713,10 @@ cudaError_t deepseek_indexer_topk_prefill_cuda(
     int ratio,
     int offset,
     cudaStream_t stream) {
-  constexpr int threads = 256;
-  size_t shared_bytes = (compressed_len + threads) * sizeof(float) + threads * sizeof(int);
-  deepseek_indexer_topk_prefill_kernel<<<seq_len, threads, shared_bytes, stream>>>(
+  if (topk <= 0 || topk > DEEPSEEK_INDEXER_TOPK_MAX) {
+    return cudaErrorInvalidValue;
+  }
+  deepseek_indexer_topk_prefill_kernel<<<seq_len, 32, 0, stream>>>(
       scores, topk_idxs, seq_len, compressed_len, topk, ratio, offset);
   return cudaGetLastError();
 }
