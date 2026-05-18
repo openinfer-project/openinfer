@@ -190,11 +190,11 @@ fn indexer_topk_prefill_matches_reference_odd_shape() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires CUDA GPU; covers the 10k prefill launch/shape from task #27"]
-fn indexer_topk_prefill_matches_reference_10k_profile_shape() -> Result<()> {
+#[ignore = "requires CUDA GPU; covers the real DSV4 10k prefill index_topk shape"]
+fn indexer_topk_prefill_matches_reference_10k_real_index_topk_shape() -> Result<()> {
     let seq_len = 10580;
     let compressed_len = 2645;
-    let topk = 32;
+    let topk = 512;
     let ratio = 4;
     let offset = seq_len;
     let mut scores = vec![0.0f32; seq_len * compressed_len];
