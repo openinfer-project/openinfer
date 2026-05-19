@@ -3573,6 +3573,7 @@ dependencies = [
  "cudarc",
  "half",
  "hex",
+ "libloading 0.9.0",
  "memmap2",
  "pegainfer-core",
  "pegainfer-engine",

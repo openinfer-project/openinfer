@@ -102,13 +102,40 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         EXPECTED_OUTPUT_TOKEN_SHA256
     );
     ensure!(
-        result.stats.host_dispatch_remote_routes > 0,
-        "real EP gate did not exercise any remote routed expert"
+        result.stats.ep_backend == current_backend(),
+        "DeepSeek-V2-Lite E2E backend mismatch: got {}, expected {}",
+        result.stats.ep_backend,
+        current_backend()
     );
-    ensure!(
-        result.stats.host_dispatch_local_routes > 0,
-        "real EP gate did not exercise any local routed expert"
-    );
+    match result.stats.ep_backend.as_str() {
+        "host-staged" => {
+            ensure!(
+                result.stats.host_dispatch_remote_routes > 0,
+                "host-staged EP gate did not exercise any remote routed expert"
+            );
+            ensure!(
+                result.stats.host_dispatch_local_routes > 0,
+                "host-staged EP gate did not exercise any local routed expert"
+            );
+        }
+        "nccl" => {
+            ensure!(
+                result.stats.nccl_dispatch_remote_routes > 0,
+                "NCCL EP gate did not exercise any remote routed expert"
+            );
+            ensure!(
+                result.stats.nccl_dispatch_local_routes > 0,
+                "NCCL EP gate did not exercise any local routed expert"
+            );
+            ensure!(
+                result.stats.nccl_combine_routes
+                    == result.stats.nccl_dispatch_local_routes
+                        + result.stats.nccl_dispatch_remote_routes,
+                "NCCL combine route accounting drift"
+            );
+        }
+        other => anyhow::bail!("unexpected DeepSeek-V2-Lite EP backend in E2E: {other}"),
+    }
 
     let output_text = tokenizer
         .decode(&result.tokens, false)
@@ -126,6 +153,7 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         "model_path": model_path,
         "gpu_count": 2,
         "ep_size": result.stats.ep_size,
+        "ep_backend": result.stats.ep_backend,
         "devices": result.stats.device_ordinals,
         "prompt": prompt,
         "prompt_tokens": result.stats.prompt_tokens,
@@ -134,8 +162,15 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         "output_text_sha256": output_text_sha256,
         "host_dispatch_local_routes": result.stats.host_dispatch_local_routes,
         "host_dispatch_remote_routes": result.stats.host_dispatch_remote_routes,
+        "nccl_dispatch_local_routes": result.stats.nccl_dispatch_local_routes,
+        "nccl_dispatch_remote_routes": result.stats.nccl_dispatch_remote_routes,
+        "nccl_combine_routes": result.stats.nccl_combine_routes,
         "output_text": output_text,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn current_backend() -> String {
+    env::var("PEGAINFER_DSV2_LITE_EP_BACKEND").unwrap_or_else(|_| "host-staged".to_string())
 }

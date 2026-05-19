@@ -4,6 +4,7 @@ mod engine;
 mod ep;
 mod host_ops;
 mod model;
+mod nccl_backend;
 mod runtime;
 mod weights;
 

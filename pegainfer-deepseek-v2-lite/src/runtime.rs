@@ -19,23 +19,30 @@ use crate::{
         normalize_compressed_kv, topk_softmax_routes,
     },
     model::{
-        AttentionWeights, DriverRankModel, ExpertRankModel, MlpWeights, MoeMlp, dense_mlp_forward,
+        AttentionWeights, DriverRankModel, ExpertMlp, ExpertRankModel, MlpWeights, MoeMlp,
+        dense_mlp_forward,
     },
+    nccl_backend::NaiveNcclEp2Backend,
     weights::{ModelManifest, RankLoadPlan},
 };
 
 const EP_BACKEND_ENV: &str = "PEGAINFER_DSV2_LITE_EP_BACKEND";
 const HOST_STAGED_BACKEND: &str = "host-staged";
+const NCCL_BACKEND: &str = "nccl";
 
 #[derive(Clone, Debug, Default)]
 pub struct GenerationStats {
     pub model_path: PathBuf,
     pub device_ordinals: Vec<usize>,
+    pub ep_backend: String,
     pub ep_size: usize,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub host_dispatch_local_routes: usize,
     pub host_dispatch_remote_routes: usize,
+    pub nccl_dispatch_local_routes: usize,
+    pub nccl_dispatch_remote_routes: usize,
+    pub nccl_combine_routes: usize,
     pub output_token_sha256: String,
 }
 
@@ -52,12 +59,84 @@ pub struct DeepSeekV2LiteEp2Generator {
     config: Config,
     rank0: DriverRankModel,
     rank1: ExpertRankModel,
+    backend: EpBackendRuntime,
 }
 
 // SAFETY: The generator is driven by exactly one worker thread after load. It
 // switches CUDA devices explicitly before every rank-local op and recreates the
 // thread-local cuBLAS handle when the active device changes.
 unsafe impl Send for DeepSeekV2LiteEp2Generator {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EpBackendKind {
+    HostStaged,
+    Nccl,
+}
+
+impl EpBackendKind {
+    fn from_env() -> Result<Self> {
+        let raw = env::var(EP_BACKEND_ENV).ok();
+        parse_backend(raw.as_deref())
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HostStaged => HOST_STAGED_BACKEND,
+            Self::Nccl => NCCL_BACKEND,
+        }
+    }
+}
+
+enum EpBackendRuntime {
+    HostStaged,
+    Nccl(NaiveNcclEp2Backend),
+}
+
+impl EpBackendRuntime {
+    fn new(
+        kind: EpBackendKind,
+        rank0: &pegainfer_core::tensor::DeviceContext,
+        rank1: &pegainfer_core::tensor::DeviceContext,
+    ) -> Result<Self> {
+        match kind {
+            EpBackendKind::HostStaged => Ok(Self::HostStaged),
+            EpBackendKind::Nccl => Ok(Self::Nccl(NaiveNcclEp2Backend::new(rank0, rank1)?)),
+        }
+    }
+
+    fn kind(&self) -> EpBackendKind {
+        match self {
+            Self::HostStaged => EpBackendKind::HostStaged,
+            Self::Nccl(_) => EpBackendKind::Nccl,
+        }
+    }
+}
+
+fn parse_backend(raw: Option<&str>) -> Result<EpBackendKind> {
+    match raw.unwrap_or(HOST_STAGED_BACKEND) {
+        HOST_STAGED_BACKEND => Ok(EpBackendKind::HostStaged),
+        NCCL_BACKEND => Ok(EpBackendKind::Nccl),
+        other => bail!(
+            "DeepSeek-V2-Lite EP=2 backend '{other}' is not supported; supported backends: {HOST_STAGED_BACKEND}, {NCCL_BACKEND}"
+        ),
+    }
+}
+
+impl GenerationStats {
+    fn record_routes(&mut self, backend: EpBackendKind, local_routes: usize, remote_routes: usize) {
+        match backend {
+            EpBackendKind::HostStaged => {
+                self.host_dispatch_local_routes += local_routes;
+                self.host_dispatch_remote_routes += remote_routes;
+            }
+            EpBackendKind::Nccl => {
+                self.nccl_dispatch_local_routes += local_routes;
+                self.nccl_dispatch_remote_routes += remote_routes;
+                self.nccl_combine_routes += local_routes + remote_routes;
+            }
+        }
+    }
+}
 
 impl DeepSeekV2LiteEp2Generator {
     pub fn load(model_path: &Path, options: EngineLoadOptions) -> Result<Self> {
@@ -66,7 +145,7 @@ impl DeepSeekV2LiteEp2Generator {
             !options.enable_cuda_graph,
             "DeepSeek-V2-Lite EP=2 first gate requires cuda_graph disabled"
         );
-        validate_backend_and_devices(&options.device_ordinals)?;
+        let backend_kind = validate_backend_and_devices(&options.device_ordinals)?;
 
         let rank0_layout = ExpertParallelConfig::ep2(0).validate_for(&config)?;
         let rank1_layout = ExpertParallelConfig::ep2(1).validate_for(&config)?;
@@ -88,6 +167,7 @@ impl DeepSeekV2LiteEp2Generator {
             options.device_ordinals[1],
         )
         .context("load DeepSeek-V2-Lite EP rank 1")?;
+        let backend = EpBackendRuntime::new(backend_kind, &rank0.ctx, &rank1.ctx)?;
 
         Ok(Self {
             model_path: model_path.to_path_buf(),
@@ -95,6 +175,7 @@ impl DeepSeekV2LiteEp2Generator {
             config,
             rank0,
             rank1,
+            backend,
         })
     }
 
@@ -118,6 +199,7 @@ impl DeepSeekV2LiteEp2Generator {
         let mut stats = GenerationStats {
             model_path: self.model_path.clone(),
             device_ordinals: self.device_ordinals.clone(),
+            ep_backend: self.backend.kind().as_str().to_string(),
             ep_size: 2,
             prompt_tokens: prompt_tokens.len(),
             ..GenerationStats::default()
@@ -255,8 +337,7 @@ impl DeepSeekV2LiteEp2Generator {
             }
             MlpWeights::Moe(moe) => self.moe_forward(layer_idx, &ffn_norm, moe)?,
         };
-        stats.host_dispatch_local_routes += local_routes;
-        stats.host_dispatch_remote_routes += remote_routes;
+        stats.record_routes(self.backend.kind(), local_routes, remote_routes);
         ops::add_batch(&self.rank0.ctx, &after_attn, &ffn_out)
     }
 
@@ -327,6 +408,18 @@ impl DeepSeekV2LiteEp2Generator {
         input: &HiddenStates,
         moe: &MoeMlp,
     ) -> Result<(HiddenStates, usize, usize)> {
+        match &self.backend {
+            EpBackendRuntime::HostStaged => self.moe_forward_host_staged(layer_idx, input, moe),
+            EpBackendRuntime::Nccl(nccl) => self.moe_forward_nccl(nccl, layer_idx, input, moe),
+        }
+    }
+
+    fn moe_forward_host_staged(
+        &self,
+        layer_idx: usize,
+        input: &HiddenStates,
+        moe: &MoeMlp,
+    ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
         let route_logits = ops::gemm(&self.rank0.ctx, &moe.gate, input)?;
         let route_logits_host = hidden_to_f32(&self.rank0.ctx, &route_logits)?;
@@ -362,6 +455,75 @@ impl DeepSeekV2LiteEp2Generator {
         let hidden = hidden_from_f32_host(
             &self.rank0.ctx,
             &accum,
+            self.config.hidden_size,
+            input.seq_len,
+        )?;
+        Ok((hidden, local_routes, remote_routes))
+    }
+
+    fn moe_forward_nccl(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        moe: &MoeMlp,
+    ) -> Result<(HiddenStates, usize, usize)> {
+        activate(&self.rank0.ctx)?;
+        let route_logits = ops::gemm(&self.rank0.ctx, &moe.gate, input)?;
+        let route_logits_host = hidden_to_f32(&self.rank0.ctx, &route_logits)?;
+        let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+
+        let shared = dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)?;
+        let mut rank0_contrib = hidden_to_f32(&self.rank0.ctx, &shared)?;
+        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
+        let rank1_input =
+            nccl.dispatch_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input)?;
+        let mut local_routes = 0usize;
+        let mut remote_routes = 0usize;
+
+        for (token, token_routes) in routes.iter().enumerate() {
+            for &(global_expert, weight) in token_routes {
+                let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
+                let (out, dst) = match owner_rank {
+                    0 => {
+                        local_routes += 1;
+                        let expert = self.rank0.routed_expert(layer_idx, global_expert)?;
+                        (
+                            expert_forward_device(&self.rank0.ctx, expert, input, token)?,
+                            &mut rank0_contrib,
+                        )
+                    }
+                    1 => {
+                        remote_routes += 1;
+                        let expert = self.rank1.routed_expert(layer_idx, global_expert)?;
+                        (
+                            expert_forward_device(&self.rank1.ctx, expert, &rank1_input, token)?,
+                            &mut rank1_contrib,
+                        )
+                    }
+                    other => {
+                        bail!("routed expert {global_expert} maps to unsupported EP rank {other}")
+                    }
+                };
+                let offset = token * self.config.hidden_size;
+                for (dst, value) in dst[offset..offset + self.config.hidden_size]
+                    .iter_mut()
+                    .zip(out)
+                {
+                    *dst += weight * value;
+                }
+            }
+        }
+
+        let combined = nccl.combine_f32_contributions_to_rank0(
+            &self.rank0.ctx,
+            &self.rank1.ctx,
+            &rank0_contrib,
+            &rank1_contrib,
+        )?;
+        let hidden = hidden_from_f32_host(
+            &self.rank0.ctx,
+            &combined,
             self.config.hidden_size,
             input.seq_len,
         )?;
@@ -406,7 +568,24 @@ impl DeepSeekV2LiteEp2Generator {
     }
 }
 
-fn validate_backend_and_devices(device_ordinals: &[usize]) -> Result<()> {
+fn expert_forward_device(
+    ctx: &pegainfer_core::tensor::DeviceContext,
+    expert: &ExpertMlp,
+    input: &HiddenStates,
+    token_idx: usize,
+) -> Result<Vec<f32>> {
+    activate(ctx)?;
+    let token = ops::extract_vec(ctx, input, token_idx)?;
+    let token_hidden = HiddenStates {
+        hidden_dim: token.len,
+        seq_len: 1,
+        data: token.data,
+    };
+    let out = dense_mlp_forward(ctx, &expert.dense, &token_hidden)?;
+    hidden_to_f32(ctx, &out)
+}
+
+fn validate_backend_and_devices(device_ordinals: &[usize]) -> Result<EpBackendKind> {
     ensure!(
         device_ordinals.len() == 2,
         "DeepSeek-V2-Lite first EP gate supports exactly 2 CUDA devices for ep_size=2, got {}",
@@ -417,12 +596,7 @@ fn validate_backend_and_devices(device_ordinals: &[usize]) -> Result<()> {
         "DeepSeek-V2-Lite EP=2 requires two distinct CUDA device ordinals, got {:?}",
         device_ordinals
     );
-    let backend = env::var(EP_BACKEND_ENV).unwrap_or_else(|_| HOST_STAGED_BACKEND.to_string());
-    ensure!(
-        backend == HOST_STAGED_BACKEND,
-        "DeepSeek-V2-Lite EP=2 backend '{backend}' is not supported by the first gate; supported backend: {HOST_STAGED_BACKEND}"
-    );
-    Ok(())
+    EpBackendKind::from_env()
 }
 
 fn token_sha256(tokens: &[u32]) -> String {
@@ -477,6 +651,27 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("two distinct CUDA device ordinals"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn ep_backend_defaults_to_host_staged() {
+        assert_eq!(parse_backend(None).unwrap(), EpBackendKind::HostStaged);
+    }
+
+    #[test]
+    fn ep_backend_accepts_nccl() {
+        assert_eq!(parse_backend(Some("nccl")).unwrap(), EpBackendKind::Nccl);
+    }
+
+    #[test]
+    fn ep_backend_rejects_unknown_backend() {
+        let err = parse_backend(Some("pplx")).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("supported backends: host-staged, nccl"),
             "unexpected error: {err:#}"
         );
     }
