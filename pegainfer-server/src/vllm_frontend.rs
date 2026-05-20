@@ -216,6 +216,7 @@ impl LocalEngineBridge {
 pub async fn serve(
     handle: EngineHandle,
     model_path: &Path,
+    served_model_name: Option<&str>,
     port: u16,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -246,6 +247,9 @@ pub async fn serve(
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_path.to_string_lossy().into_owned(),
+        served_model_name: served_model_name
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default(),
         listener_mode: HttpListenerMode::BindTcp {
             host: "0.0.0.0".to_string(),
             port,

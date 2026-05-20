@@ -16,6 +16,11 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
     model_path: PathBuf,
 
+    /// Public model ID returned by the OpenAI API (/v1/models, completion `model`).
+    /// Defaults to the model path when omitted.
+    #[arg(long)]
+    served_model_name: Option<String>,
+
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
     port: u16,
@@ -113,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     pegainfer::vllm_frontend::serve(
         handle,
         &args.model_path,
+        args.served_model_name.as_deref(),
         args.port,
         pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
     )

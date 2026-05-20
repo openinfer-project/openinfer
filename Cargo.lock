@@ -5784,7 +5784,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=eb2b54b1a0b3ef2904a25538bc0211f058f7e95f#eb2b54b1a0b3ef2904a25538bc0211f058f7e95f"
+source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9#b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -5814,7 +5814,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=eb2b54b1a0b3ef2904a25538bc0211f058f7e95f#eb2b54b1a0b3ef2904a25538bc0211f058f7e95f"
+source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9#b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9"
 dependencies = [
  "arc-swap",
  "byteorder",
@@ -5845,7 +5845,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=eb2b54b1a0b3ef2904a25538bc0211f058f7e95f#eb2b54b1a0b3ef2904a25538bc0211f058f7e95f"
+source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9#b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -5864,7 +5864,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=eb2b54b1a0b3ef2904a25538bc0211f058f7e95f#eb2b54b1a0b3ef2904a25538bc0211f058f7e95f"
+source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9#b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9"
 dependencies = [
  "prometheus-client",
 ]
@@ -5872,7 +5872,7 @@ dependencies = [
 [[package]]
 name = "vllm-server"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=eb2b54b1a0b3ef2904a25538bc0211f058f7e95f#eb2b54b1a0b3ef2904a25538bc0211f058f7e95f"
+source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9#b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -5911,7 +5911,7 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=eb2b54b1a0b3ef2904a25538bc0211f058f7e95f#eb2b54b1a0b3ef2904a25538bc0211f058f7e95f"
+source = "git+https://github.com/Inferact/vllm-frontend-rs.git?rev=b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9#b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
