@@ -3622,6 +3622,7 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+ "serde",
 ]
 
 [[package]]
@@ -3630,6 +3631,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "comfy-table",
  "crossbeam-channel",
  "cudarc",
  "fastrace",

@@ -2,6 +2,8 @@ pub mod kernel_plan;
 
 mod batch_decode;
 mod batch_decode_buffers;
+mod batch_decode_dag;
+pub mod batch_decode_trace;
 mod config;
 mod executor;
 pub mod kernel_bench;

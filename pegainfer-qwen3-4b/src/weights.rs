@@ -397,6 +397,24 @@ impl Qwen3Model {
         &self,
         hidden: &mut pegainfer_core::tensor::HiddenStates,
     ) -> Result<()> {
+        #[cfg(feature = "kernel-call-trace")]
+        if pegainfer_core::ops::call_trace::is_enabled() {
+            let label = pegainfer_core::ops::call_trace::current_label("all_reduce_hidden");
+            pegainfer_core::ops::call_trace::record_call(
+                pegainfer_core::ops::call_spec::all_reduce_hidden_call(
+                    label,
+                    hidden.hidden_dim,
+                    hidden.seq_len,
+                ),
+            );
+        }
+        self.all_reduce_hidden_untraced(hidden)
+    }
+
+    pub(crate) fn all_reduce_hidden_untraced(
+        &self,
+        hidden: &mut pegainfer_core::tensor::HiddenStates,
+    ) -> Result<()> {
         if let Some(comm) = &self.tp_comm {
             comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
                 .map_err(|e| anyhow::anyhow!("nccl all-reduce failed: {e:?}"))?;

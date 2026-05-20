@@ -3,9 +3,211 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::bf16;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::ffi;
+
+/// Marker trait for tensor metadata tags.
+pub trait NamedTag {
+    const NAME: &'static str;
+}
+
+/// Marker trait for tensor element type vocabulary.
+pub trait DTypeTag: NamedTag {}
+
+/// Marker trait for tensor layout vocabulary.
+pub trait LayoutTag: NamedTag {}
+
+/// Marker trait for tensor axis vocabulary.
+pub trait AxisTag: NamedTag {}
+
+macro_rules! named_tag {
+    ($name:ident, $value:literal, $trait_name:ident) => {
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct $name;
+
+        impl NamedTag for $name {
+            const NAME: &'static str = $value;
+        }
+
+        impl $trait_name for $name {}
+    };
+}
+
+named_tag!(Bf16, "bf16", DTypeTag);
+named_tag!(F32, "f32", DTypeTag);
+named_tag!(I32, "i32", DTypeTag);
+named_tag!(U32, "u32", DTypeTag);
+named_tag!(U8, "u8", DTypeTag);
+
+named_tag!(Contiguous1D, "contiguous_1d", LayoutTag);
+named_tag!(RowMajor2D, "row_major_2d", LayoutTag);
+named_tag!(HiddenStatesLayout, "hidden_states", LayoutTag);
+named_tag!(PagedKvPageFirst, "paged_kv_page_first", LayoutTag);
+
+named_tag!(Batch, "batch", AxisTag);
+named_tag!(BatchPlusOne, "batch_plus_1", AxisTag);
+named_tag!(HeadDim, "head_dim", AxisTag);
+named_tag!(Hidden, "hidden", AxisTag);
+named_tag!(InDim, "in", AxisTag);
+named_tag!(Intermediate, "intermediate", AxisTag);
+named_tag!(Inter2, "inter2", AxisTag);
+named_tag!(Kv, "kv", AxisTag);
+named_tag!(KvDim, "kv_dim", AxisTag);
+named_tag!(KvHead, "kv_head", AxisTag);
+named_tag!(Layer, "layer", AxisTag);
+named_tag!(OutDim, "out", AxisTag);
+named_tag!(OutTotal, "out_total", AxisTag);
+named_tag!(Page, "page", AxisTag);
+named_tag!(PageSlot, "page_slot", AxisTag);
+named_tag!(PosInPage, "pos_in_page", AxisTag);
+named_tag!(QDim, "q_dim", AxisTag);
+named_tag!(RopeDim, "rope_dim", AxisTag);
+named_tag!(Seq, "seq", AxisTag);
+named_tag!(Tile, "tile", AxisTag);
+named_tag!(Token, "token", AxisTag);
+named_tag!(Vocab, "vocab", AxisTag);
+
+/// One named axis in an erased tensor metadata description.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct AxisSpec {
+    pub name: String,
+    pub size: usize,
+}
+
+impl AxisSpec {
+    pub fn new<A: AxisTag>(size: usize) -> Self {
+        Self {
+            name: A::NAME.to_string(),
+            size,
+        }
+    }
+
+    pub fn named(name: impl Into<String>, size: usize) -> Self {
+        Self {
+            name: name.into(),
+            size,
+        }
+    }
+}
+
+/// Erased tensor metadata for schedules, reports, and future instrumentation.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TensorSpec {
+    pub dtype: String,
+    pub layout: String,
+    pub axes: Vec<AxisSpec>,
+}
+
+impl TensorSpec {
+    pub fn new<D: DTypeTag, L: LayoutTag>(axes: impl IntoIterator<Item = AxisSpec>) -> Self {
+        Self {
+            dtype: D::NAME.to_string(),
+            layout: L::NAME.to_string(),
+            axes: axes.into_iter().collect(),
+        }
+    }
+
+    pub fn named(
+        dtype: impl Into<String>,
+        layout: impl Into<String>,
+        axes: impl IntoIterator<Item = AxisSpec>,
+    ) -> Self {
+        Self {
+            dtype: dtype.into(),
+            layout: layout.into(),
+            axes: axes.into_iter().collect(),
+        }
+    }
+
+    pub fn compact(&self) -> String {
+        let axes = self
+            .axes
+            .iter()
+            .map(|axis| format!("{}={}", axis.name, axis.size))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}[{}] layout={}", self.dtype, axes, self.layout)
+    }
+}
+
+/// A named kernel argument carrying an erased tensor description.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TensorArg {
+    pub name: String,
+    pub spec: TensorSpec,
+}
+
+impl TensorArg {
+    pub fn new(name: impl Into<String>, spec: TensorSpec) -> Self {
+        Self {
+            name: name.into(),
+            spec,
+        }
+    }
+
+    pub fn compact(&self) -> String {
+        format!("{}: {}", self.name, self.spec.compact())
+    }
+}
+
+/// String-valued non-tensor kernel metadata.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct AttrSpec {
+    pub name: String,
+    pub value: String,
+}
+
+impl AttrSpec {
+    pub fn new(name: impl Into<String>, value: String) -> Self {
+        Self {
+            name: name.into(),
+            value,
+        }
+    }
+}
+
+/// Erased logical kernel call IR shared by static schedules and future traces.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCall {
+    pub op: String,
+    pub label: String,
+    pub inputs: Vec<TensorArg>,
+    pub outputs: Vec<TensorArg>,
+    pub attrs: Vec<AttrSpec>,
+}
+
+impl KernelCall {
+    #[must_use]
+    pub fn new(op: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            op: op.into(),
+            label: label.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            attrs: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn input(mut self, name: impl Into<String>, spec: TensorSpec) -> Self {
+        self.inputs.push(TensorArg::new(name, spec));
+        self
+    }
+
+    #[must_use]
+    pub fn output(mut self, name: impl Into<String>, spec: TensorSpec) -> Self {
+        self.outputs.push(TensorArg::new(name, spec));
+        self
+    }
+
+    #[must_use]
+    pub fn attr(mut self, name: impl Into<String>, value: String) -> Self {
+        self.attrs.push(AttrSpec::new(name, value));
+        self
+    }
+}
 
 /// CUDA device context holding context and stream.
 #[derive(Clone)]

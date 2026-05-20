@@ -5,9 +5,38 @@ use anyhow::Result;
 use super::batch_decode_buffers::{
     BATCH_BUCKETS, BatchDecodeBuffers, DecodeAttentionPath, bucket_for,
 };
+use super::batch_decode_dag::BatchDecodeDag;
 use super::weights::{Qwen3Model, TransformerBlock};
 use pegainfer_core::kv_pool::{KvLayout, KvState};
+#[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops;
+use pegainfer_kernels::tensor::{KvDim, QDim};
+
+#[cfg(feature = "kernel-call-trace")]
+macro_rules! dag_label {
+    ($label:expr) => {
+        $label.to_string()
+    };
+}
+
+#[cfg(not(feature = "kernel-call-trace"))]
+macro_rules! dag_label {
+    ($label:expr) => {
+        ()
+    };
+}
+
+#[cfg(feature = "kernel-call-trace")]
+macro_rules! trace_decode_kv_len {
+    ($kv_len:expr, $body:block) => {
+        ops::call_trace::with_decode_kv_len($kv_len, || $body)
+    };
+}
+
+#[cfg(not(feature = "kernel-call-trace"))]
+macro_rules! trace_decode_kv_len {
+    ($kv_len:expr, $body:block) => {{ $body }};
+}
 
 impl Qwen3Model {
     /// Batch decode step: N requests, 1 new token each, one forward pass.
@@ -58,6 +87,8 @@ impl Qwen3Model {
         let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
         let attention_path = bufs.attention_path(padded_bs);
+        #[cfg(feature = "kernel-call-trace")]
+        let trace_kv_len = kv_refs.iter().map(|kv| kv.seq_len()).max().unwrap_or(0);
 
         // Forward pass — with or without CUDA Graph
         let kv_buffer = kv_states[0].buffer();
@@ -68,12 +99,16 @@ impl Qwen3Model {
             // Take graphs out of bufs to avoid split-borrow conflict with closure
             let mut graphs = std::mem::take(&mut bufs.graphs);
             let result = graphs[graph_idx].run_or_capture(&self.ctx, || {
-                self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)
+                trace_decode_kv_len!(trace_kv_len, {
+                    self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)
+                })
             });
             bufs.graphs = graphs;
             result?;
         } else {
-            self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)?;
+            trace_decode_kv_len!(trace_kv_len, {
+                self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)
+            })?;
         }
 
         Ok(())
@@ -87,55 +122,44 @@ impl Qwen3Model {
         attention_path: DecodeAttentionPath,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
-        let eps = self.config.rms_norm_eps;
         let num_layers = self.layers.len();
+        let dag = BatchDecodeDag::new(self, kv_buffer, layout, bs, attention_path);
 
         // Embedding: N token_ids → hidden [hidden_dim, bs]
-        ops::embedding_batch(
-            &self.ctx,
-            &self.embed_tokens,
-            &bufs.token_ids_d,
-            &mut bufs.hidden,
-        )?;
+        dag.embedding(dag_label!("embedding"), &bufs.token_ids_d, &mut bufs.hidden)?;
 
         // First layer norm
-        ops::rms_norm_batch_into(
-            &self.ctx,
+        dag.rms_norm(
+            dag_label!("input.rms_norm"),
             &bufs.hidden,
             &self.layers[0].input_layernorm,
-            eps,
             &mut bufs.normed,
         );
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.batch_decode_layer(
-                layer_idx,
-                layer,
-                kv_buffer,
-                layout,
-                bs,
-                attention_path,
-                bufs,
-            )?;
+            Self::batch_decode_layer(layer_idx, layer, &dag, bufs)?;
 
             let next_weight = if layer_idx + 1 < num_layers {
                 &self.layers[layer_idx + 1].input_layernorm
             } else {
                 &self.norm
             };
-            ops::fused_add_rms_norm_batch_into(
-                &self.ctx,
+            dag.fused_add_rms_norm(
+                if layer_idx + 1 < num_layers {
+                    dag_label!(format!("L{layer_idx}.mlp.fused_add_rms_norm"))
+                } else {
+                    dag_label!("final.rms_norm")
+                },
                 &mut bufs.hidden,
                 &bufs.mlp_out,
                 next_weight,
-                eps,
                 &mut bufs.normed,
             );
         }
 
         // Output projection: logits [vocab_size, bs]
-        ops::gemm_into(
-            &self.ctx,
+        dag.lm_head(
+            dag_label!("lm_head"),
             self.output_projection(),
             &bufs.normed,
             &mut bufs.logits,
@@ -146,41 +170,35 @@ impl Qwen3Model {
 
     #[allow(clippy::too_many_arguments)]
     fn batch_decode_layer(
-        &self,
         layer_idx: usize,
         layer: &TransformerBlock,
-        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
-        layout: &KvLayout,
-        bs: usize,
-        attention_path: DecodeAttentionPath,
+        dag: &BatchDecodeDag<'_>,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
-        let eps = self.config.rms_norm_eps;
-
         // Match prefill numerics: compute Q/K/V via row-sliced GEMMs instead of
         // fused qkv GEMM + deinterleave. The fused path is mathematically
         // equivalent but diverges enough under shard-local TP to flip greedy
         // decode in parity tests.
         let q_dim = layer.attention.q_dim;
         let kv_dim = layer.attention.kv_dim;
-        ops::gemm_rows_into(
-            &self.ctx,
+        dag.gemm_rows::<QDim>(
+            dag_label!(format!("L{layer_idx}.attn.q_proj")),
             &layer.attention.qkv_proj,
             0,
             q_dim,
             &bufs.normed,
             &mut bufs.q,
         );
-        ops::gemm_rows_into(
-            &self.ctx,
+        dag.gemm_rows::<KvDim>(
+            dag_label!(format!("L{layer_idx}.attn.k_proj")),
             &layer.attention.qkv_proj,
             q_dim,
             kv_dim,
             &bufs.normed,
             &mut bufs.k,
         );
-        ops::gemm_rows_into(
-            &self.ctx,
+        dag.gemm_rows::<KvDim>(
+            dag_label!(format!("L{layer_idx}.attn.v_proj")),
             &layer.attention.qkv_proj,
             q_dim + kv_dim,
             kv_dim,
@@ -189,107 +207,65 @@ impl Qwen3Model {
         );
 
         // QK norm + RoPE (batched, per-request positions)
-        ops::qk_norm_rope_batch_decode_into(
-            &self.ctx,
+        dag.qk_norm_rope(
+            dag_label!(format!("L{layer_idx}.attn.qk_norm_rope")),
             &mut bufs.q,
             &mut bufs.k,
             &layer.attention.q_norm,
             &layer.attention.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
             &bufs.positions_d,
-            self.local_num_attention_heads(),
-            self.local_num_key_value_heads(),
-            self.config.head_dim,
-            eps,
         );
 
         // KV append + paged attention decode (FlashInfer, batched)
-        match attention_path {
-            DecodeAttentionPath::NonPartition => {
-                ops::paged_attention_batch_decode_into(
-                    &self.ctx,
-                    &bufs.q,
-                    &bufs.k,
-                    &bufs.v,
-                    kv_buffer,
-                    layout,
-                    layer_idx,
-                    &bufs.page_indices_d,
-                    &bufs.page_indptr_d,
-                    &bufs.last_page_len_d,
-                    &bufs.positions_d,
-                    &bufs.request_indices_d,
-                    &bufs.kv_tile_indices_d,
-                    &bufs.kv_chunk_size_d,
-                    &mut bufs.attn_out,
-                    self.local_num_attention_heads(),
-                    bs,
-                )?;
-            }
-            DecodeAttentionPath::SplitKv => {
-                ops::paged_attention_batch_decode_split_kv_into(
-                    &self.ctx,
-                    &bufs.q,
-                    &bufs.k,
-                    &bufs.v,
-                    kv_buffer,
-                    layout,
-                    layer_idx,
-                    &bufs.page_indices_d,
-                    &bufs.page_indptr_d,
-                    &bufs.last_page_len_d,
-                    &bufs.positions_d,
-                    &bufs.request_indices_d,
-                    &bufs.split_request_indices_d,
-                    &bufs.split_kv_tile_indices_d,
-                    &bufs.split_kv_chunk_size_d,
-                    &bufs.split_o_indptr_d,
-                    &bufs.split_block_valid_mask_d,
-                    &mut bufs.split_tmp_v,
-                    &mut bufs.split_tmp_s,
-                    bufs.split_padded_slots,
-                    &mut bufs.attn_out,
-                    self.local_num_attention_heads(),
-                    bs,
-                )?;
-            }
-        }
+        dag.paged_decode_attention(
+            dag_label!(format!("L{layer_idx}.attn.paged_decode")),
+            layer_idx,
+            bufs,
+        )?;
 
         // O projection (GEMM)
-        ops::gemm_into(
-            &self.ctx,
+        dag.o_proj(
+            dag_label!(format!("L{layer_idx}.attn.o_proj")),
             &layer.attention.o_proj,
             &bufs.attn_out,
             &mut bufs.attn_proj,
         );
-        self.all_reduce_hidden(&mut bufs.attn_proj)?;
+        dag.all_reduce_hidden(
+            dag_label!(format!("L{layer_idx}.attn.all_reduce")),
+            &mut bufs.attn_proj,
+        )?;
 
         // Residual + LayerNorm
-        ops::fused_add_rms_norm_batch_into(
-            &self.ctx,
+        dag.fused_add_rms_norm(
+            dag_label!(format!("L{layer_idx}.attn.fused_add_rms_norm")),
             &mut bufs.hidden,
             &bufs.attn_proj,
             &layer.post_attention_layernorm,
-            eps,
             &mut bufs.normed,
         );
 
         // MLP: fused gate+up GEMM → silu_mul_fused → down GEMM
-        ops::gemm_into(
-            &self.ctx,
+        dag.gate_up_proj(
+            dag_label!(format!("L{layer_idx}.mlp.gate_up_proj")),
             &layer.mlp.gate_up_proj,
             &bufs.normed,
             &mut bufs.gate_up_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.mlp_act);
-        ops::gemm_into(
-            &self.ctx,
+        dag.silu_mul(
+            dag_label!(format!("L{layer_idx}.mlp.silu_mul")),
+            &bufs.gate_up_out,
+            &mut bufs.mlp_act,
+        );
+        dag.down_proj(
+            dag_label!(format!("L{layer_idx}.mlp.down_proj")),
             &layer.mlp.down_proj,
             &bufs.mlp_act,
             &mut bufs.mlp_out,
         );
-        self.all_reduce_hidden(&mut bufs.mlp_out)?;
+        dag.all_reduce_hidden(
+            dag_label!(format!("L{layer_idx}.mlp.all_reduce")),
+            &mut bufs.mlp_out,
+        )?;
 
         Ok(())
     }
@@ -300,6 +276,7 @@ mod tests {
     use super::*;
     use crate::batch_decode_buffers::BatchDecodeBuffers;
     use crate::weights::ModelRuntimeConfig;
+    use pegainfer_core::ops;
     use pegainfer_core::sampler::SamplingParams;
     use pegainfer_core::tensor::DeviceVec;
     use rand::SeedableRng;

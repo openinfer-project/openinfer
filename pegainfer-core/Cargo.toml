@@ -19,5 +19,9 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
+[features]
+default = []
+kernel-call-trace = []
+
 [lints]
 workspace = true

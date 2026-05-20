@@ -112,7 +112,7 @@ pub fn current_allowed_cpus() -> Result<Vec<CpuId>> {
     unsafe {
         let mut allowed: libc::cpu_set_t = std::mem::zeroed();
         let set_size = std::mem::size_of::<libc::cpu_set_t>();
-        let ret = libc::sched_getaffinity(0, set_size, &mut allowed);
+        let ret = libc::sched_getaffinity(0, set_size, std::ptr::addr_of_mut!(allowed));
         ensure!(ret == 0, "sched_getaffinity failed with errno {}", errno());
 
         let mut cpus = Vec::new();
@@ -132,7 +132,11 @@ pub fn pin_current_thread_to_cpu(cpu: CpuId) -> Result<()> {
         libc::CPU_ZERO(&mut target);
         libc::CPU_SET(cpu.as_usize(), &mut target);
         let set_size = std::mem::size_of::<libc::cpu_set_t>();
-        let ret = libc::pthread_setaffinity_np(libc::pthread_self(), set_size, &target);
+        let ret = libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            set_size,
+            std::ptr::addr_of!(target),
+        );
         ensure!(
             ret == 0,
             "pthread_setaffinity_np failed for CPU {cpu} with errno {ret}"
@@ -152,7 +156,7 @@ pub fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
             .map_err(|err| anyhow::anyhow!("{err:?}"))?;
         CStr::from_ptr(buf.as_ptr())
             .to_str()
-            .map(|bus_id| bus_id.to_ascii_lowercase())
+            .map(str::to_ascii_lowercase)
             .map_err(anyhow::Error::msg)
     }
 }

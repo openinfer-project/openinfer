@@ -167,9 +167,7 @@ fn normalize_nvcc_sm(sm: &str, supported_arches: Option<&BTreeSet<String>>) -> S
         if supported_arches.is_some_and(|arches| arches.contains(&format!("compute_{preferred}"))) {
             return preferred.to_string();
         }
-        let raw = sm_numeric_prefix(sm)
-            .map(|sm| sm.to_string())
-            .unwrap_or_else(|| sm.to_string());
+        let raw = sm_numeric_prefix(sm).map_or_else(|| sm.to_string(), |sm| sm.to_string());
         println!(
             "cargo:warning=nvcc does not list compute_{preferred}; compiling CUDA kernels for raw sm_{raw}"
         );

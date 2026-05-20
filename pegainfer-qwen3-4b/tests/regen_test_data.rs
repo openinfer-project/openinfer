@@ -109,8 +109,7 @@ fn generate_text_scheduler(
     loop {
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::Scheduled { .. }) => {}
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),

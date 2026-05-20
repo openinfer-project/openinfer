@@ -76,7 +76,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/kernels/pegainfer-kernels-boundary.md` | Architecture decision: pegainfer should use reusable frontend/runtime/data-plane layers plus per-model engines; kernels become first-class assets through a ledger, simulator, and request tracing. |
-| `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel report moved to a feature-gated bin; full raw-CUPTI decode/prefill reports, split prefill stages, 10k attention-core comparisons, BF16-HMMA tensor metrics, FlashInfer FMHA v2/package measurements, and measured FA2 `CTA_TILE_Q=64` prefill default in place. |
+| `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel/report tooling is feature-gated: `qwen3_kernel_report` covers per-op kernel reports, and `qwen3_model_report` emits runtime-traced eager-DAG decode operator rollups with TensorSpec `KernelCall`s, latency stats, tables, and Graphviz DOT; measured FA2 `CTA_TILE_Q=64` prefill default in place. |
 
 ## playbooks
 

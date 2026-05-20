@@ -1,8 +1,9 @@
 # Kernel Op Reports
 
 **Created**: 2026-05-04
+**Last touched**: 2026-05
 **Status**: active; prefill/report commit ready, decode tuning deferred
-**TL;DR**: `qwen3_kernel_snapshot` is no longer a Cargo bench. Qwen3 now has a feature-gated `qwen3_kernel_report` bin that reads `kernel_manifests/qwen3-4b.toml`, emits cold-L2 per-op reports for paged decode and paged prefill attention, stores raw CUPTI metric maps without runner-owned diagnosis labels, compares reports, and composes measured decode op reports into phase contribution reports. Prefill is split into QK+RoPE, KV scatter, and attention-core stage reports; at `seq_len=10000`, the attention core dominates and contiguous single-request FlashInfer is only `1.008x` faster than the paged path. FlashInfer FMHA v2 was measured and is slower on RTX 5090 for this shape, while the measured FA2 `CTA_TILE_Q=64` path wins the single-request prefill grid and is now the Qwen3 production prefill default.
+**TL;DR**: `qwen3_kernel_snapshot` is no longer a Cargo bench. Qwen3 has feature-gated `qwen3_kernel_report` per-op kernel tooling and `qwen3_model_report` model-level decode operator reporting. Decode now routes through an eager `BatchDecodeDag`, so the executable forward sequence is also the `KernelCall` contract source for runtime tracing; `qwen3_model_report` disables CUDA Graph, traces that DAG, then joins traced TensorSpecs against measured microbench results to emit by-op, by-call-site, coverage, schedule-preview, latency-stat, and Graphviz DOT reports. Prefill remains covered by `qwen3_kernel_report` stage reports; measured FA2 `CTA_TILE_Q=64` is the Qwen3 production prefill default on the RTX 5090 grid.
 
 ## Preparation
 
@@ -365,9 +366,83 @@
   - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-qwen3-4b --features kernel-report --all-targets -- -D warnings`
   - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer --bin pegainfer -- -D warnings`
 
+### Step 21: Add runtime-traced Qwen3 model operator report
+- Added non-enum tensor metadata vocabulary under `pegainfer-kernels/src/tensor.rs`:
+  - marker traits for dtype, layout, and axis tags;
+  - erased `TensorSpec`, `TensorArg`, `AttrSpec`, and `KernelCall` for schedules, reports, and future instrumentation.
+- Added `pegainfer-core::ops::call_spec` builders so op TensorSpec construction lives next to op wrappers, not in the model-report CLI.
+- Added `pegainfer-core::ops::call_trace` and traced op wrappers behind the `kernel-call-trace` feature. Normal Qwen3 builds re-export the direct kernel ops and compile out trace labels/recording. The `pegainfer-qwen3-4b` `kernel-report` feature enables `kernel-call-trace`.
+- Wired Qwen3 batch decode labels into the actual `batch_decode` path through feature-gated macros, so label formatting and trace collection disappear when the feature is off. The trace path forces CUDA Graph off before recording.
+- Added `qwen3_model_report`, a feature-gated per-model CLI:
+  - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
+  - The CLI loads `models/Qwen3-4B` by default, creates KV state for the requested decode context, runs one real `batch_decode` trace, microbenches the traced KernelCalls, and emits JSON under `target/model_reports/qwen3-4b/`.
+  - Missing bench providers fail loudly with the missing `op`, `label`, and TensorSpec; no estimated or nearest-neighbor rows are used.
+- Validation:
+  - `cargo fmt --all --check` passed.
+  - `git diff --check` passed.
+  - `cargo check --release -p pegainfer-qwen3-4b --lib` passed, confirming trace wrappers are not required for the normal library path.
+  - `cargo check --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report` passed.
+  - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote `target/model_reports/qwen3-4b/decode-bs16-kv2048.json`.
+  - JSON audit confirmed `model/phase/config/schedule/by_op/by_call_site/coverage` are present, `schedule_source` is `runtime trace: Qwen3Model::batch_decode with CUDA Graph disabled`, and paged KV is represented as `bf16[page, layer, kv, pos_in_page, kv_head, head_dim] layout=paged_kv_page_first`.
+  - `cargo test --release -p pegainfer-qwen3-4b --lib` passed: `7 passed`.
+
+### Step 22: Add latency stats, readable tables, and DOT output
+- `qwen3_model_report` now records latency samples per unique traced `KernelCall` instead of a single mean. JSON schema `2` includes `mean_us`, sample `stddev_us`, `min_us`, `p50_us`, `p95_us`, `p99_us`, and `max_us`.
+- Default report iterations increased from `8` to `32` so p99 has enough samples to be useful for quick operator diagnostics.
+- Text output now uses `comfy-table` for by-op, by-call-site, coverage, and compact schedule-preview sections. The detailed TensorSpec schedule stays in JSON.
+- Each run writes a sibling Graphviz DOT file next to the JSON, for example:
+  - `target/model_reports/qwen3-4b/decode-bs16-kv2048.json`
+  - `target/model_reports/qwen3-4b/decode-bs16-kv2048.dot`
+- Validation:
+  - `cargo check --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report` passed.
+  - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote JSON plus DOT.
+  - `dot -Tsvg target/model_reports/qwen3-4b/decode-bs16-kv2048.dot -o /tmp/qwen3-model-report.svg` passed.
+  - JSON audit confirmed schema `2`, default `iters=32`, and `stddev_us` / `p99_us` fields in by-op rows.
+  - `cargo fmt --all --check`, `git diff --check`, and `cargo check --release -p pegainfer-qwen3-4b --lib` passed.
+
+### Step 23: Make decode tracing come from an eager DAG builder
+- Added `pegainfer-qwen3-4b/src/batch_decode_dag.rs`.
+- `BatchDecodeDag` is eager: each method records the op's `KernelCall` contract when `kernel-call-trace` is active and immediately launches the production kernel. The batch decode forward path now calls DAG methods instead of wrapping free-form op calls with ad hoc trace labels.
+- Normal builds still compile out label construction through `dag_label!`; the `kernel-report` feature enables labels and `KernelCall` recording.
+- `all_reduce_hidden` now has an untraced internal path so the DAG builder owns decode all-reduce trace records without double-counting.
+- Validation:
+  - `cargo check --release -p pegainfer-qwen3-4b --lib` passed.
+  - `cargo check --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report` passed.
+  - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed; by-op counts remained `gemm=109`, `gemm_rows=108`, `paged_decode_attention=36`, `all_reduce_hidden=72`.
+
+### Step 24: Check eager-DAG decode runtime impact
+- Ran current worktree decode-heavy request benchmark:
+  - `cargo run --release --bin bench_serving -- --model-path models/Qwen3-4B request --prompt-len 1024 --output-len 256 --warmup 5 --iters 20`
+  - Result: `steady_tpot_ms p50=11.33`, `p95=11.35`, `p99=11.45`, samples `5080`.
+- Ran current worktree fixed-context decode probe:
+  - `target/release/qwen3_decode_context --model-path models/Qwen3-4B --contexts 1024 --iters 20`
+  - Result: `p50=11.3781ms`, `avg=11.6660ms`.
+- Built a detached baseline worktree at `HEAD=3ffe745` and ran the same fixed-context decode probe on the same GPU/model:
+  - `PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python cargo run --release -p pegainfer-qwen3-4b --bin qwen3_decode_context --manifest-path /tmp/pegainfer-bench-baseline/Cargo.toml -- --model-path /data/code/workspace-rustllm/pegainfer/models/Qwen3-4B --contexts 1024 --iters 20`
+  - Result: `p50=11.3610ms`, `avg=11.6449ms`.
+- Interpretation: eager DAG is not measurable as a decode overhead in this probe. Current worktree vs same-machine `HEAD` baseline is `+0.0171ms` p50 (`+0.15%`), well under the benchmark-regression `2%` TPOT threshold.
+- The standard `bench_serving snapshot --warmup 5 --iters 20` could not complete because `prefill-heavy (10000,1)` hit CUDA OOM on this run. The existing tracked `bench_snapshots/rtx-5090/qwen3-4b.json` was restored from backup after the failed snapshot attempt.
+- Existing snapshot data at `bench_snapshots/rtx-5090/qwen3-4b.json` still has `steady_tpot_ms p50=7.559606ms`, which is much faster than both current worktree and detached `HEAD` measurements on this machine. Since detached `HEAD` reproduces the same `~11.36ms` fixed-context number as the eager-DAG worktree, that older snapshot delta is not attributable to the eager DAG change.
+
+### Step 25: PR readiness cleanup
+- Cleaned release clippy findings surfaced by the model-report work:
+  - `pegainfer-kernels::tensor::KernelCall` builder methods are now `#[must_use]`, and attrs are explicitly string-valued at the erased report boundary.
+  - `pegainfer-kernels/build.rs` and `pegainfer-core/src/cpu_topology.rs` no longer trip release clippy on `map(...).unwrap_or_else(...)`, raw pointer borrows, or redundant closures.
+  - Qwen3 e2e/regen tests and `qwen3_model_report` text/DOT rendering now pass the all-targets clippy style gates.
+- Local checks passed:
+  - `cargo fmt --all --check`
+  - `git diff --check`
+  - `cargo clippy --release -p pegainfer-qwen3-4b --features kernel-report --all-targets -- -D warnings`
+  - `cargo test --release -p pegainfer-qwen3-4b --lib`
+  - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
+- Qwen3-4B e2e was run with an absolute model path:
+  - `PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture`
+  - Current worktree produced greedy-output mismatches on repeated runs.
+  - A detached baseline worktree at `HEAD=3ffe745` reproduced the same Kanye prompt mismatch, so this e2e failure is not introduced by the eager-DAG/model-report changes.
+
 ## Debrief
 
-- **Outcome**: Replaced the Qwen3 kernel snapshot bench with a normal, feature-gated `qwen3_kernel_report` binary. The runner now covers paged decode attention, paged prefill attention, split prefill stages, and contiguous single-request prefill attention core with cold-L2 latency only. GPU manifest runs passed for decode/prefill, targeted 10k stage comparisons passed for paged `bs=1`, single contiguous `bs=1`, and paged `bs=2`, FlashInfer Python/package alternatives were measured for the same Qwen3 10k BF16 prefill attention-core shape, and Qwen3 production prefill now uses measured FA2 `CTA_TILE_Q=64`.
+- **Outcome**: Replaced the Qwen3 kernel snapshot bench with a normal, feature-gated `qwen3_kernel_report` binary and added `qwen3_model_report` for runtime-traced decode operator reports. The runner now covers paged decode attention, paged prefill attention, split prefill stages, and contiguous single-request prefill attention core with cold-L2 latency only. GPU manifest runs passed for decode/prefill, targeted 10k stage comparisons passed for paged `bs=1`, single contiguous `bs=1`, and paged `bs=2`, FlashInfer Python/package alternatives were measured for the same Qwen3 10k BF16 prefill attention-core shape, Qwen3 production prefill now uses measured FA2 `CTA_TILE_Q=64`, model-level decode reports now emit latency stats, readable tables, and Graphviz DOT, and decode tracing now comes from the same eager DAG builder that launches the kernels.
 - **Pitfalls encountered**:
   - `cargo bench` appends a trailing `--bench` argument to `harness=false` binaries. That made the new `clap` parser fail and confirmed this should be a real bin, not a bench target.
   - A normal `src/bin` target cannot use dev-dependencies. Making report-only dependencies ordinary non-optional dependencies would pull CUPTI into default Qwen3/server builds, so the bin now uses `required-features = ["kernel-report"]`.
@@ -376,6 +451,7 @@
   - FlashInfer's JIT environment treats `FLASHINFER_JIT_VERBOSE=1` as a debug build switch for backward compatibility. The first FMHA v2 cache contained `-O0 -G`; those results were discarded, and the release measurement used a separate cache directory with explicit debug flags disabled.
   - The official `flashinfer-python 0.6.6` package did not expose `trtllm_fmha_v2_prefill`. Its public `trtllm-gen` wrapper also has a plan-argument bug with explicit max lengths and then reports unsupported architecture on RTX 5090 once that is worked around.
   - The temporary validation worktree does not have model weights under the default model path, so model-loading tests fail with `No such file or directory`. For kernel-report work, keep using report binaries and release builds unless a model path is explicitly staged.
+  - The local Qwen3-4B e2e greedy baseline can fail on `HEAD=3ffe745` with the same Kanye prompt mismatch seen in this worktree. Treat that as a separate baseline/test-data issue, not as evidence against the eager-DAG/model-report PR.
 - **Lessons learned**:
   - Kernel reporting should be treated as tooling, not benchmarking harness plumbing. Cargo bench's hidden behavior is a poor fit for a manifest-driven CLI.
   - Report tooling that needs profiler libraries should be feature-gated from the production model crate dependency graph.
