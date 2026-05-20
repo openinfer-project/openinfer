@@ -18,7 +18,6 @@ use crate::device::activate;
 type NcclCommInitAll = unsafe extern "C" fn(*mut ncclComm_t, c_int, *const c_int) -> ncclResult_t;
 type NcclCommCount = unsafe extern "C" fn(ncclComm_t, *mut c_int) -> ncclResult_t;
 type NcclCommCuDevice = unsafe extern "C" fn(ncclComm_t, *mut c_int) -> ncclResult_t;
-type NcclCommDestroy = unsafe extern "C" fn(ncclComm_t) -> ncclResult_t;
 type NcclCommAbort = unsafe extern "C" fn(ncclComm_t) -> ncclResult_t;
 type NcclGroupStart = unsafe extern "C" fn() -> ncclResult_t;
 type NcclGroupEnd = unsafe extern "C" fn() -> ncclResult_t;
@@ -43,7 +42,6 @@ struct RawNcclLib {
     comm_init_all: NcclCommInitAll,
     comm_count: NcclCommCount,
     comm_cu_device: NcclCommCuDevice,
-    comm_destroy: NcclCommDestroy,
     comm_abort: NcclCommAbort,
     group_start: NcclGroupStart,
     group_end: NcclGroupEnd,
@@ -353,18 +351,11 @@ impl Drop for NaiveNcclEp2Backend {
     fn drop(&mut self) {
         for comm in &mut self.comms {
             if !comm.is_null() {
-                let destroy_status = unsafe {
-                    // SAFETY: Best-effort clean teardown for communicator
-                    // handles returned by `ncclCommInitAll`.
-                    (self.lib.comm_destroy)(*comm)
+                let _ = unsafe {
+                    // SAFETY: Abort is non-collective and safe for
+                    // best-effort teardown in Drop.
+                    (self.lib.comm_abort)(*comm)
                 };
-                if destroy_status != ncclResult_t::ncclSuccess {
-                    let _ = unsafe {
-                        // SAFETY: Abort is the fallback when clean destroy
-                        // reports an error during best-effort Drop.
-                        (self.lib.comm_abort)(*comm)
-                    };
-                }
                 *comm = ptr::null_mut();
             }
         }
@@ -402,7 +393,6 @@ impl RawNcclLib {
             comm_init_all: unsafe { load_symbol(&library, b"ncclCommInitAll\0")? },
             comm_count: unsafe { load_symbol(&library, b"ncclCommCount\0")? },
             comm_cu_device: unsafe { load_symbol(&library, b"ncclCommCuDevice\0")? },
-            comm_destroy: unsafe { load_symbol(&library, b"ncclCommDestroy\0")? },
             comm_abort: unsafe { load_symbol(&library, b"ncclCommAbort\0")? },
             group_start: unsafe { load_symbol(&library, b"ncclGroupStart\0")? },
             group_end: unsafe { load_symbol(&library, b"ncclGroupEnd\0")? },
