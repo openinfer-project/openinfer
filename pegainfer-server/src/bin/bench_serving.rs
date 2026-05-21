@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -20,6 +21,8 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
+use cudarc::driver::Profiler;
+use cudarc::runtime::result::device as cuda_device;
 use log::{debug, info};
 use pegainfer::logging;
 use pegainfer::sampler::SamplingParams;
@@ -135,6 +138,10 @@ struct Cli {
     #[arg(long)]
     out: Option<String>,
 
+    /// Capture only measured iterations for nsys `-c cudaProfilerApi`
+    #[arg(long, default_value_t = false)]
+    cuda_profiler_capture: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -177,6 +184,10 @@ struct RequestArgs {
     /// Max generated tokens
     #[arg(long, default_value_t = 64)]
     output_len: usize,
+
+    /// Number of concurrent requests per measured iteration
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
 
     #[command(flatten)]
     run: RunArgs,
@@ -275,6 +286,7 @@ struct GeneratedTokenTrace {
 struct RequestWorkload {
     prompt: PromptDescriptor,
     output_len: usize,
+    concurrency: usize,
     warmup: usize,
     iters: usize,
     seed: u64,
@@ -851,6 +863,19 @@ trait BenchModel {
         sampling: &SamplingParams,
         rng: &mut StdRng,
     ) -> GenTimings;
+
+    fn timed_generation_batch(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        rng: &mut StdRng,
+        concurrency: usize,
+    ) -> Vec<GenTimings> {
+        (0..concurrency)
+            .map(|_| self.timed_generation(prompt_tokens, max_new_tokens, sampling, rng))
+            .collect()
+    }
 }
 
 fn run_timed<F>(prompt_tokens: &[u32], max_new_tokens: usize, mut generate: F) -> GenTimings
@@ -943,6 +968,72 @@ impl BenchModel for SchedulerBenchModel {
             Ok(())
         })
     }
+
+    fn timed_generation_batch(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        _rng: &mut StdRng,
+        concurrency: usize,
+    ) -> Vec<GenTimings> {
+        let mut workers = Vec::with_capacity(concurrency);
+        for idx in 0..concurrency {
+            let handle = self.handle.clone();
+            let prompt_tokens = prompt_tokens.to_vec();
+            let sampling = sampling.clone();
+            workers.push(thread::spawn(move || {
+                run_timed(&prompt_tokens, max_new_tokens, |toks, n, cb| {
+                    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+                    handle
+                        .submit(SchedulerRequest {
+                            request_id: Some(format!("bench-serving-{idx}")),
+                            queued_at_unix_s: None,
+                            prompt_tokens: toks.to_vec(),
+                            params: SamplingParams {
+                                temperature: sampling.temperature,
+                                top_k: sampling.top_k,
+                                top_p: sampling.top_p,
+                                ignore_eos: sampling.ignore_eos,
+                            },
+                            max_tokens: n,
+                            token_tx,
+                            logprobs: 0,
+                            echo: false,
+                        })
+                        .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
+
+                    loop {
+                        match token_rx.blocking_recv() {
+                            Some(TokenEvent::Token { id, .. }) => {
+                                if !cb(id) {
+                                    break;
+                                }
+                            }
+                            Some(
+                                TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. },
+                            ) => {}
+                            Some(TokenEvent::Finished { .. }) => break,
+                            Some(TokenEvent::Error { message, .. }) => {
+                                anyhow::bail!("scheduler request failed: {message}");
+                            }
+                            Some(TokenEvent::Rejected { message, .. }) => {
+                                anyhow::bail!("scheduler request rejected: {message}");
+                            }
+                            None => anyhow::bail!("scheduler channel closed"),
+                        }
+                    }
+
+                    Ok(())
+                })
+            }));
+        }
+
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("bench request worker panicked"))
+            .collect()
+    }
 }
 
 fn command_seed(cli: &Cli) -> u64 {
@@ -974,8 +1065,11 @@ fn measure_timings(
     prompt_tokens: &[u32],
     output_len: usize,
     run: &RunArgs,
+    cuda_profiler_capture: bool,
+    concurrency: usize,
 ) -> Result<Vec<GenTimings>> {
     ensure!(output_len > 0, "--output-len must be > 0");
+    ensure!(concurrency > 0, "--concurrency must be > 0");
     validate_run_args(run)?;
 
     let sampling = SamplingParams {
@@ -985,13 +1079,37 @@ fn measure_timings(
     let mut rng = StdRng::seed_from_u64(run.seed);
 
     for _ in 0..run.warmup {
-        model.timed_generation(prompt_tokens, output_len, &sampling, &mut rng);
+        let _ = model.timed_generation_batch(
+            prompt_tokens,
+            output_len,
+            &sampling,
+            &mut rng,
+            concurrency,
+        );
     }
 
-    let mut timings = Vec::with_capacity(run.iters);
+    let profiler = if cuda_profiler_capture {
+        info!(
+            "Starting CUDA profiler capture around {} measured iterations",
+            run.iters
+        );
+        cuda_device::set(0).context("failed to set CUDA device before profiler capture")?;
+        Some(Profiler::new().context("failed to start CUDA profiler capture")?)
+    } else {
+        None
+    };
+
+    let mut timings = Vec::with_capacity(run.iters * concurrency);
     for _ in 0..run.iters {
-        timings.push(model.timed_generation(prompt_tokens, output_len, &sampling, &mut rng));
+        timings.extend(model.timed_generation_batch(
+            prompt_tokens,
+            output_len,
+            &sampling,
+            &mut rng,
+            concurrency,
+        ));
     }
+    drop(profiler);
     Ok(timings)
 }
 
@@ -1084,19 +1202,28 @@ fn bench_request(
         None,
     )?;
     info!(
-        "Starting request benchmark: prompt_tokens={} output_len={} warmup={} iters={} seed={}",
+        "Starting request benchmark: prompt_tokens={} output_len={} concurrency={} warmup={} iters={} seed={}",
         prompt.descriptor.prompt_tokens,
         args.output_len,
+        args.concurrency,
         args.run.warmup,
         args.run.iters,
         args.run.seed
     );
-    let timings = measure_timings(model, &prompt.tokens, args.output_len, &args.run)?;
+    let timings = measure_timings(
+        model,
+        &prompt.tokens,
+        args.output_len,
+        &args.run,
+        cli.cuda_profiler_capture,
+        args.concurrency,
+    )?;
     Ok(BenchReport::Request(Box::new(RequestReport {
         run: run_info(cli, "request", model_type, load_ms, cuda_graph),
         workload: RequestWorkload {
             prompt: prompt.descriptor,
             output_len: args.output_len,
+            concurrency: args.concurrency,
             warmup: args.run.warmup,
             iters: args.run.iters,
             seed: args.run.seed,
@@ -1130,7 +1257,14 @@ fn bench_matrix(
                 "Running matrix cell: prompt_len={} output_len={}",
                 prompt_len, output_len
             );
-            let timings = measure_timings(model, &prompt_tokens, output_len, &args.run)?;
+            let timings = measure_timings(
+                model,
+                &prompt_tokens,
+                output_len,
+                &args.run,
+                cli.cuda_profiler_capture,
+                1,
+            )?;
             let metrics = build_request_metrics(&timings);
             cells.push(MatrixCell {
                 prompt_len,
@@ -1187,7 +1321,14 @@ fn bench_curve(
         args.run.iters,
         args.run.seed
     );
-    let timings = measure_timings(model, &prompt.tokens, args.output_len, &args.run)?;
+    let timings = measure_timings(
+        model,
+        &prompt.tokens,
+        args.output_len,
+        &args.run,
+        cli.cuda_profiler_capture,
+        1,
+    )?;
 
     let mut tbt_by_pos: Vec<Vec<Duration>> = Vec::new();
     for timing in &timings {
@@ -1414,13 +1555,21 @@ fn run_snapshot(
         &prefill_tokens,
         SNAPSHOT_PREFILL_OUTPUT_LEN,
         &args.run,
+        cli.cuda_profiler_capture,
+        1,
     )?;
     let prefill_metrics = build_request_metrics(&prefill_timings);
 
     info!("Running decode-heavy ({SNAPSHOT_DECODE_PROMPT_LEN},{SNAPSHOT_DECODE_OUTPUT_LEN})");
     let decode_tokens = synthetic_prompt_tokens(SNAPSHOT_DECODE_PROMPT_LEN);
-    let decode_timings =
-        measure_timings(model, &decode_tokens, SNAPSHOT_DECODE_OUTPUT_LEN, &args.run)?;
+    let decode_timings = measure_timings(
+        model,
+        &decode_tokens,
+        SNAPSHOT_DECODE_OUTPUT_LEN,
+        &args.run,
+        cli.cuda_profiler_capture,
+        1,
+    )?;
     let decode_metrics = build_request_metrics(&decode_timings);
 
     let model_name = model_display_name(&cli.model_path);
@@ -1729,7 +1878,7 @@ fn main() -> Result<()> {
             let handle = pegainfer_kimi_k2::start_engine(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
-                    enable_cuda_graph: false,
+                    enable_cuda_graph: cli.cuda_graph,
                     enable_prefill_profile: false,
                     device_ordinals: (0..8).collect(),
                     seed: command_seed(&cli),
@@ -1738,7 +1887,14 @@ fn main() -> Result<()> {
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };
-            dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
+            dispatch(
+                &cli,
+                model_type,
+                load_ms,
+                cli.cuda_graph,
+                &mut bench,
+                &tokenizer,
+            )
         }
         ModelType::Qwen3 => {
             let handle = pegainfer_qwen3_4b::start_engine(
