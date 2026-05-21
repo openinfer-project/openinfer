@@ -35,7 +35,7 @@ use pegainfer_kernels::{
         kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
         kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
         repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
-        silu_mul_batch_into,
+        silu_mul_batch_into, silu_mul_fused_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
 };
@@ -453,8 +453,7 @@ struct KimiDenseForwardCache {
 
 struct KimiMoeForwardCache {
     router: KimiRouterDeviceWeights,
-    shared_gate_proj: DeviceMatrix,
-    shared_up_proj: DeviceMatrix,
+    shared_gate_up_proj: DeviceMatrix,
     shared_down_proj: DeviceMatrix,
 }
 
@@ -492,8 +491,7 @@ struct KimiWorkerDecodeScratch {
     dense_gate: HiddenStates,
     dense_up: HiddenStates,
     dense_activated: HiddenStates,
-    shared_gate: HiddenStates,
-    shared_up: HiddenStates,
+    shared_gate_up: HiddenStates,
     shared_activated: HiddenStates,
     qkv_a: HiddenStates,
     q_a: HiddenStates,
@@ -1711,8 +1709,7 @@ impl KimiWorkerDecodeScratch {
             dense_gate: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 8, batch_size)?,
             dense_up: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 8, batch_size)?,
             dense_activated: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 8, batch_size)?,
-            shared_gate: HiddenStates::zeros(ctx, KIMI_K2_EXPERT_INTERMEDIATE / 8, batch_size)?,
-            shared_up: HiddenStates::zeros(ctx, KIMI_K2_EXPERT_INTERMEDIATE / 8, batch_size)?,
+            shared_gate_up: HiddenStates::zeros(ctx, KIMI_K2_EXPERT_INTERMEDIATE / 4, batch_size)?,
             shared_activated: HiddenStates::zeros(
                 ctx,
                 KIMI_K2_EXPERT_INTERMEDIATE / 8,
@@ -2090,13 +2087,11 @@ fn forward_moe_layer_batch_into(
         normed,
     );
 
-    let mut shared_gate = HiddenStates::zeros(ctx, moe.shared_gate_proj.rows, seq_len)?;
-    let mut shared_up = HiddenStates::zeros(ctx, moe.shared_up_proj.rows, seq_len)?;
-    let mut shared_activated = HiddenStates::zeros(ctx, moe.shared_gate_proj.rows, seq_len)?;
+    let mut shared_gate_up = HiddenStates::zeros(ctx, moe.shared_gate_up_proj.rows, seq_len)?;
+    let mut shared_activated = HiddenStates::zeros(ctx, moe.shared_gate_up_proj.rows / 2, seq_len)?;
     let mut shared_out = HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, seq_len)?;
-    gemm_into_checked(ctx, &moe.shared_gate_proj, normed, &mut shared_gate)?;
-    gemm_into_checked(ctx, &moe.shared_up_proj, normed, &mut shared_up)?;
-    silu_mul_batch_into(ctx, &shared_gate, &shared_up, &mut shared_activated)?;
+    gemm_into_checked(ctx, &moe.shared_gate_up_proj, normed, &mut shared_gate_up)?;
+    silu_mul_fused_batch_into(ctx, &shared_gate_up, &mut shared_activated);
     gemm_into_checked(
         ctx,
         &moe.shared_down_proj,
@@ -2238,22 +2233,11 @@ fn forward_moe_layer_decode_into(
 
     gemm_graphsafe_into_checked(
         ctx,
-        &moe.shared_gate_proj,
+        &moe.shared_gate_up_proj,
         &scratch.normed,
-        &mut scratch.shared_gate,
+        &mut scratch.shared_gate_up,
     )?;
-    gemm_graphsafe_into_checked(
-        ctx,
-        &moe.shared_up_proj,
-        &scratch.normed,
-        &mut scratch.shared_up,
-    )?;
-    silu_mul_batch_into(
-        ctx,
-        &scratch.shared_gate,
-        &scratch.shared_up,
-        &mut scratch.shared_activated,
-    )?;
+    silu_mul_fused_batch_into(ctx, &scratch.shared_gate_up, &mut scratch.shared_activated);
     gemm_graphsafe_into_checked(
         ctx,
         &moe.shared_down_proj,
@@ -2584,10 +2568,11 @@ fn load_layer_forward_cache(
                 &shared_up_proj,
                 &shared_down_proj,
             )?;
+            let shared_gate_up_proj =
+                DeviceMatrix::vstack(&device_ctx, &[&shared_gate_proj, &shared_up_proj])?;
             KimiLayerForwardKindCache::Moe(KimiMoeForwardCache {
                 router,
-                shared_gate_proj,
-                shared_up_proj,
+                shared_gate_up_proj,
                 shared_down_proj,
             })
         }

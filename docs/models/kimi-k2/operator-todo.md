@@ -1,6 +1,6 @@
 # Kimi-K2.6 文本算子 TODO
 
-> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap 已通过 H20 gate，真实 fixture output16 steady TPOT `14.23ms`，synthetic output64 steady TPOT `14.61ms`。
+> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM 已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.50ms`，synthetic output64 steady TPOT avg `14.66ms` / p99 `15.11ms`。
 >
 > **Last touched:** 2026-05
 
@@ -120,6 +120,10 @@
   - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.234ms`、p50 `14.214ms`、p95 `14.408ms`，四路 token prefix 全部匹配 vLLM fixture `[1008,2742,2531,414,19180,6082,1379,387,261,5216,63853,13,374,1765,11983,306]`。
   - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.615ms`、p50 `14.588ms`、p95 `15.119ms`、p99 `16.950ms`，四路 hash 一致。
   - 对比 fused-qkv 后的 output64 avg `16.43ms`，本轮 worker overlap 降低约 `1.82ms/token`；目标 `15ms` 已在 avg/p50 上达成，p95 接近目标，p99/max 仍需 tail profile。
+- shared gate/up fused GEMM gate：MoE shared expert 的 `shared_gate_proj` 和 `shared_up_proj` 在 load-time `vstack` 为 `shared_gate_up_proj`，decode/prompt 使用一次 GEMM 加已有 `silu_mul_fused_batch_into`，不新增 kernel、不做 split copy。H20 gate：
+  - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.354ms`、p50 `14.365ms`、p95 `14.495ms`、p99 `14.495ms`，四路 token prefix 仍完全匹配 vLLM fixture。
+  - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.658ms`、p50 `14.714ms`、p95 `15.051ms`、p99 `15.111ms`、max `15.115ms`，四路 hash 一致。
+  - 这刀 avg 比上一档 output64 `14.615ms` 略慢，但 p99/max 从 `16.95ms` 收到约 `15.11ms`，符合“稳定 15ms 左右”的目标，因此保留；下一步如果继续优化，优先找回 avg 而不放大 tail。
 
 ## Rejected: decode TP hidden BF16 bulk collective
 

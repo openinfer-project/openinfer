@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。H20 static/runtime trace 均为 `1886` calls，`gemm_graphsafe` 从 `428` 降到 `367`；MoE shared/main 与 routed compute/aux stream overlap 已通过 H20 correctness/perf gate，真实 fixture output16 steady TPOT `14.23ms`，synthetic output64 steady TPOT `14.61ms`。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM 已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.50ms`，synthetic output64 steady TPOT avg `14.66ms` / p99 `15.11ms`。
 >
 > **Last touched:** 2026-05
 
@@ -68,7 +68,7 @@ This list follows the current worker implementation. The static trace is now sou
 | MLA v up | `kimi_mla_v_up(kv_b_proj, latent)`; this is the PegaInfer equivalent of vLLM `_v_up_proj`. | `worker.rs:1907-1912` |
 | MLA output projection | `gemm_graphsafe(o_proj)` then TP all-reduce through BF16-via-F32 bridge, then residual add. | `worker.rs:1913-1934`, `batch_decode_trace.rs:279-291` |
 | Dense layer 0 MLP | post-attn RMSNorm, separate gate/up GEMMs, `silu_mul_batch`, down GEMM, BF16-via-F32 TP all-reduce, residual add. | `batch_decode_trace.rs:294-327` |
-| MoE shared expert | post-attn RMSNorm; shared gate/up GEMMs, `silu_mul_batch`, shared down GEMM, BF16-via-F32 TP all-reduce. | `worker.rs:2201-2238` |
+| MoE shared expert | post-attn RMSNorm; load-time fused shared gate/up GEMM, `silu_mul_fused_batch_into`, shared down GEMM, BF16-via-F32 TP all-reduce. | `worker.rs:2201-2238` |
 | MoE router | `kimi_router_noaux_tc_launch` with Kimi config, producing `router_topk_weight` and `router_topk_idx`. | `worker.rs:2262-2285` |
 | MoE route align | `kimi_moe_marlin_align_block_size` builds local EP route metadata. | `worker.rs:2118-2127`, `batch_decode_trace.rs:360-377` |
 | MoE W13 | `kimi_marlin_wna16_w13_gemm` using vLLM Marlin WNA16 package. | `worker.rs:2143-2153` |
@@ -80,11 +80,11 @@ This list follows the current worker implementation. The static trace is now sou
 
 ## Count Snapshot
 
-Current H20 static trace after the fused `qkv_a` update:
+Current H20 static trace after fused `qkv_a` and shared gate/up:
 
 ```text
-calls 1886
-367 gemm_graphsafe
+calls 1826
+307 gemm_graphsafe
 245 rms_norm_batch
 123 all_reduce
 122 add_batch
@@ -178,7 +178,7 @@ H20 graph serving gates after fused-qkv:
 
 ## Next Actions
 
-1. Profile the new p99/max tail under compute-overlap: output64 avg/p50 are under `15ms`, but p99 is still `16.95ms`.
+1. Profile any remaining p99/max tail under shared gate/up fused GEMM: output64 avg/p50/p95 are under or near `15ms`, and p99 is now about `15.11ms`.
 2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
-3. Next graph-safe local wins: shared expert gate/up load-time fusion, `scale_f32 + routed residual add` equivalent fusion, Marlin clear fusion, and `kimi_mla_paged_kv_append` provider coverage.
+3. Next graph-safe local wins: `scale_f32 + routed residual add` equivalent fusion, Marlin clear fusion, and `kimi_mla_paged_kv_append` provider coverage.
 4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

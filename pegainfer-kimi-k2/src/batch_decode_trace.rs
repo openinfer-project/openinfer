@@ -346,14 +346,8 @@ fn push_moe_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
     let prefix = format!("L{layer_idx}.moe");
     calls.push(rms(&format!("{prefix}.post_attention_norm"), batch));
     calls.push(gemm(
-        &format!("{prefix}.shared_gate"),
-        LOCAL_SHARED_INTERMEDIATE,
-        KIMI_K2_HIDDEN,
-        batch,
-    ));
-    calls.push(gemm(
-        &format!("{prefix}.shared_up"),
-        LOCAL_SHARED_INTERMEDIATE,
+        &format!("{prefix}.shared_gate_up"),
+        2 * LOCAL_SHARED_INTERMEDIATE,
         KIMI_K2_HIDDEN,
         batch,
     ));
