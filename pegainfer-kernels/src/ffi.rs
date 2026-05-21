@@ -300,8 +300,9 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_mla_split_compressed_kv_cuda(
-        kv_a: *const Half,
+    pub fn kimi_mla_split_qkv_a_cuda(
+        qkv_a: *const Half,
+        q_a: *mut Half,
         compressed: *mut Half,
         k_rope: *mut Half,
         seq_len: i32,

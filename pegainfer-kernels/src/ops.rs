@@ -44,11 +44,11 @@ pub use kimi_mla::{
     KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
     KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_LOCAL_HEADS_TP8, KIMI_K2_MLA_NOPE_DIM,
     KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-    KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_MLA_V_HEAD_DIM,
-    KimiMlaPagedKvLayout, kimi_flashinfer_batch_decode_mla, kimi_flashinfer_single_prefill_mla,
-    kimi_mla_absorb_q_nope, kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe,
-    kimi_mla_rope_assemble_prefill, kimi_mla_rope_split_decode, kimi_mla_split_compressed_kv,
-    kimi_mla_v_up,
+    KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+    KIMI_K2_MLA_V_HEAD_DIM, KimiMlaPagedKvLayout, kimi_flashinfer_batch_decode_mla,
+    kimi_flashinfer_single_prefill_mla, kimi_mla_absorb_q_nope, kimi_mla_paged_kv_append,
+    kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill, kimi_mla_rope_split_decode,
+    kimi_mla_split_qkv_a, kimi_mla_v_up,
 };
 pub use kimi_router::{
     KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN, KIMI_K2_ROUTER_N_GROUP, KIMI_K2_ROUTER_SCALE,

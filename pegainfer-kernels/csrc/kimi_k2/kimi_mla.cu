@@ -32,6 +32,8 @@ constexpr int kQHeadDim = 192;
 constexpr int kVHeadDim = 128;
 constexpr int kKvBHeadDim = kNopeDim + kVHeadDim;
 constexpr int kLocalHeads = 8;
+constexpr int kQLoraRank = 1536;
+constexpr int kQkvAOut = kQLoraRank + kKvLoraRank + kRopeDim;
 
 flashinfer::paged_kv_mla_t<DType, IdType> make_paged_kv_mla(void* ckv_cache,
                                                              void* kpe_cache,
@@ -61,21 +63,24 @@ flashinfer::paged_kv_mla_t<DType, IdType> make_paged_kv_mla(void* ckv_cache,
       /*rope_pos_offset=*/nullptr);
 }
 
-__global__ void split_compressed_kv_kernel(const DType* __restrict__ kv_a,
-                                           DType* __restrict__ compressed,
-                                           DType* __restrict__ k_rope,
-                                           int seq_len) {
+__global__ void split_qkv_a_kernel(const DType* __restrict__ qkv_a,
+                                   DType* __restrict__ q_a,
+                                   DType* __restrict__ compressed,
+                                   DType* __restrict__ k_rope,
+                                   int seq_len) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = seq_len * (kKvLoraRank + kRopeDim);
+  int total = seq_len * kQkvAOut;
   if (idx >= total) {
     return;
   }
-  int token = idx / (kKvLoraRank + kRopeDim);
-  int dim = idx - token * (kKvLoraRank + kRopeDim);
-  if (dim < kKvLoraRank) {
-    compressed[token * kKvLoraRank + dim] = kv_a[idx];
+  int token = idx / kQkvAOut;
+  int dim = idx - token * kQkvAOut;
+  if (dim < kQLoraRank) {
+    q_a[token * kQLoraRank + dim] = qkv_a[idx];
+  } else if (dim < kQLoraRank + kKvLoraRank) {
+    compressed[token * kKvLoraRank + (dim - kQLoraRank)] = qkv_a[idx];
   } else {
-    k_rope[token * kRopeDim + (dim - kKvLoraRank)] = kv_a[idx];
+    k_rope[token * kRopeDim + (dim - kQLoraRank - kKvLoraRank)] = qkv_a[idx];
   }
 }
 
@@ -235,18 +240,19 @@ __global__ void rope_apply_kpe_kernel(const DType* __restrict__ k_rope,
 
 extern "C" {
 
-cudaError_t kimi_mla_split_compressed_kv_cuda(const DType* kv_a,
-                                             DType* compressed,
-                                             DType* k_rope,
-                                             int seq_len,
-                                             cudaStream_t stream) {
+cudaError_t kimi_mla_split_qkv_a_cuda(const DType* qkv_a,
+                                      DType* q_a,
+                                      DType* compressed,
+                                      DType* k_rope,
+                                      int seq_len,
+                                      cudaStream_t stream) {
   if (seq_len <= 0) {
     return cudaErrorInvalidValue;
   }
-  int total = seq_len * (kKvLoraRank + kRopeDim);
+  int total = seq_len * kQkvAOut;
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
-  split_compressed_kv_kernel<<<blocks, threads, 0, stream>>>(kv_a, compressed, k_rope, seq_len);
+  split_qkv_a_kernel<<<blocks, threads, 0, stream>>>(qkv_a, q_a, compressed, k_rope, seq_len);
   return cudaGetLastError();
 }
 

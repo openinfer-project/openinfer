@@ -13,13 +13,13 @@ use pegainfer_kernels::tensor::{
 use tokio::sync::mpsc;
 
 use crate::config::{
-    KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_KV_A_OUT, KIMI_K2_LAYERS,
-    KIMI_K2_MOE_LAYERS, KIMI_K2_Q_LORA_RANK, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_VOCAB,
+    KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS,
+    KIMI_K2_Q_LORA_RANK, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_VOCAB,
 };
 use pegainfer_kernels::ops::{
     KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
     KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-    KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_ROPE_DIM,
+    KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
 };
 
 pub const MODEL: &str = "kimi-k2";
@@ -192,11 +192,18 @@ fn push_attention_layer(
     let prefix = format!("L{layer_idx}.attn");
     calls.push(rms(&format!("{prefix}.input_norm"), batch));
     calls.push(gemm(
-        &format!("{prefix}.q_a"),
-        KIMI_K2_Q_LORA_RANK,
+        &format!("{prefix}.fused_qkv_a"),
+        KIMI_K2_MLA_QKV_A_OUT,
         KIMI_K2_HIDDEN,
         batch,
     ));
+    calls.push(
+        KernelCall::new("kimi_mla_split_qkv_a", format!("{prefix}.split_qkv_a"))
+            .input("qkv_a", hidden(KIMI_K2_MLA_QKV_A_OUT, batch))
+            .output("q_a", hidden(KIMI_K2_Q_LORA_RANK, batch))
+            .output("compressed_kv", hidden(KIMI_K2_MLA_KV_LORA_RANK, batch))
+            .output("k_rope", hidden(KIMI_K2_MLA_ROPE_DIM, batch)),
+    );
     calls.push(rms_dim(
         &format!("{prefix}.q_a_norm"),
         KIMI_K2_Q_LORA_RANK,
@@ -208,21 +215,6 @@ fn push_attention_layer(
         KIMI_K2_Q_LORA_RANK,
         batch,
     ));
-    calls.push(gemm(
-        &format!("{prefix}.kv_a"),
-        KIMI_K2_KV_A_OUT,
-        KIMI_K2_HIDDEN,
-        batch,
-    ));
-    calls.push(
-        KernelCall::new(
-            "kimi_mla_split_compressed_kv",
-            format!("{prefix}.split_compressed_kv"),
-        )
-        .input("kv_a", hidden(KIMI_K2_KV_A_OUT, batch))
-        .output("compressed_kv", hidden(KIMI_K2_MLA_KV_LORA_RANK, batch))
-        .output("k_rope", hidden(KIMI_K2_MLA_ROPE_DIM, batch)),
-    );
     calls.push(rms_dim(
         &format!("{prefix}.kv_a_norm"),
         KIMI_K2_MLA_KV_LORA_RANK,

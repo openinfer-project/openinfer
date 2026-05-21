@@ -6,17 +6,18 @@ use pegainfer_kernels::{
         KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_INT4_GROUP_SIZE,
         KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
         KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_TOPK, KimiInt4ExpertRole,
-        KimiInt4NibbleOrder, KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight,
-        KimiMarlinInt4Weight, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
-        KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig, KimiRouterOutput,
-        KimiRouterScratch, add_batch_into, embedding_batch_vocab_shard, flashinfer_top1_batch_into,
-        flashinfer_topk_row_states_bytes, gemm_graphsafe_into_checked, kimi_add_f32_bf16_to_bf16,
-        kimi_flashinfer_batch_decode_mla, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
-        kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope,
-        kimi_mla_rope_split_decode, kimi_mla_v_up, kimi_moe_marlin_align_block_size,
-        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
-        scale_f32_in_place, silu_mul_batch_into,
+        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_TOPK,
+        KimiInt4ExpertRole, KimiInt4NibbleOrder, KimiInt4WeightManifest,
+        KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight, KimiMarlinRouteWorkspace,
+        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
+        KimiRouterOutput, KimiRouterScratch, add_batch_into, embedding_batch_vocab_shard,
+        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes, gemm_graphsafe_into_checked,
+        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla, kimi_marlin_sum_topk_rows_f32,
+        kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
+        kimi_mla_absorb_q_nope, kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
+        kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
+        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
+        silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, KernelCall, TensorSpec},
 };
@@ -51,6 +52,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "kimi_add_f32_bf16_to_bf16" => Some(measure_add_f32_bf16(call, iters)?),
         "embedding_batch_vocab_shard" => Some(measure_embedding(call, iters)?),
         "top1_batch" => Some(measure_top1(call, iters)?),
+        "kimi_mla_split_qkv_a" => Some(measure_mla_split_qkv_a(call, iters)?),
         "kimi_mla_rope_split_decode" => Some(measure_mla_rope_split(call, iters)?),
         "kimi_mla_absorb_q_nope" => Some(measure_mla_absorb_q(call, iters)?),
         "kimi_mla_v_up" => Some(measure_mla_v_up(call, iters)?),
@@ -281,6 +283,19 @@ fn measure_top1(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
     measure_loop(&ctx, iters, || {
         flashinfer_top1_batch_into(&ctx, &logits, &mut top1_values, &mut row_states, &mut out)
+    })
+}
+
+fn measure_mla_split_qkv_a(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let qkv_a_spec = input(call, "qkv_a")?;
+    let batch = axis(qkv_a_spec, "batch")?;
+    let ctx = DeviceContext::new()?;
+    let qkv_a = HiddenStates::zeros(&ctx, KIMI_K2_MLA_QKV_A_OUT, batch)?;
+    let mut q_a = HiddenStates::zeros(&ctx, crate::config::KIMI_K2_Q_LORA_RANK, batch)?;
+    let mut compressed = HiddenStates::zeros(&ctx, KIMI_K2_MLA_KV_LORA_RANK, batch)?;
+    let mut k_rope = HiddenStates::zeros(&ctx, KIMI_K2_MLA_ROPE_DIM, batch)?;
+    measure_loop(&ctx, iters, || {
+        kimi_mla_split_qkv_a(&ctx, &qkv_a, &mut q_a, &mut compressed, &mut k_rope)
     })
 }
 

@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer 当前 decode 的最大结构差异在 MLA attention：vLLM 用 `fused_qkv_a_proj` 合并 `q_a + kv_a`，并用 `concat_and_cache_mla + FlashMLA + W_UK/W_UV bmm` 的 data-movement-friendly decode；PegaInfer 目前把 `q_a`、`kv_a` 拆成两个 GEMM。本文档创建时发现 `batch_decode_trace.rs` 漏记 `split_compressed_kv`、`kv_a_norm`、`paged_kv_append` 且多记一个 decode 不存在的 `kv_b` GEMM；该 trace 漂移已修正，修正后 bs4/kv1024 静态 trace 为 `1947` calls。下一步按差异表评估 fused qkv_a、MLA metadata/cache append、F32 bridge collective 三类优化。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。H20 static/runtime trace 均为 `1886` calls，`gemm_graphsafe` 从 `428` 降到 `367`，旧 `kimi_mla_split_compressed_kv` 已从主路径删除；真实 fixture output16 四路 token 对齐 vLLM，synthetic output64 steady TPOT 从 `16.70ms` 到 `16.43ms`。
 >
 > **Last touched:** 2026-05
 
@@ -60,8 +60,7 @@ This list follows the current worker implementation. The static trace is now sou
 | --- | --- | --- |
 | Embedding | `embedding_batch_vocab_shard` then TP all-reduce through BF16-via-F32 bridge. | `batch_decode_trace.rs:49-63` |
 | Attention input | `rms_norm_batch_into(hidden, input_norm)`. | `worker.rs:1777-1783` |
-| MLA q down | `gemm_graphsafe(q_a_proj)` then `rms_norm_batch(q_a_norm)` then `gemm_graphsafe(q_b_proj)`. | `worker.rs:1784-1808` |
-| MLA kv down | `gemm_graphsafe(kv_a_proj_with_mqa)` then `kimi_mla_split_compressed_kv` then `rms_norm_batch(kv_a_norm)`. | `worker.rs:1809-1827` |
+| MLA q/kv down projection | `gemm_graphsafe(fused_qkv_a_proj)` then `kimi_mla_split_qkv_a` produces `q_a`, `compressed_kv`, and `k_rope`; q branch then runs `rms_norm_batch(q_a_norm)` and `gemm_graphsafe(q_b_proj)`, kv branch runs `rms_norm_batch(kv_a_norm)`. | `worker.rs:1784-1827` |
 | MLA RoPE split | `kimi_mla_rope_split_decode(q_proj, k_rope, cos, sin, positions)` produces `q_nope`, `q_pe`, and `append_kpe`. | `worker.rs:1839-1849` |
 | MLA q absorb | `kimi_mla_absorb_q_nope(kv_b_proj, q_nope)` uses preloaded `kv_b_proj` weight; this is the PegaInfer equivalent of vLLM `q_nope @ W_UK_T`. | `worker.rs:1850-1855` |
 | MLA cache append | `kimi_mla_paged_kv_append(compressed_normed, append_kpe, page tables, positions)` writes worker-owned paged MLA KV. | `worker.rs:1856-1868` |
@@ -81,16 +80,16 @@ This list follows the current worker implementation. The static trace is now sou
 
 ## Count Snapshot
 
-Current static trace regenerated locally after fixing MLA trace drift:
+Current H20 static trace after the fused `qkv_a` update:
 
 ```text
-calls 1947
-428 gemm_graphsafe
+calls 1886
+367 gemm_graphsafe
 245 rms_norm_batch
 123 all_reduce
 122 add_batch
 120 kimi_marlin_wna16_gemm
-61  kimi_mla_split_compressed_kv
+61  kimi_mla_split_qkv_a
 61  kimi_mla_rope_split_decode
 61  kimi_mla_absorb_q_nope
 61  kimi_mla_paged_kv_append
@@ -109,7 +108,7 @@ calls 1947
 1   top1_batch
 ```
 
-This count is now source-aligned for the high-level worker operators. It still folds BF16-via-F32 collectives into one logical `all_reduce` and does not count CUDA memset/memcpy nodes.
+This count is source-aligned for the high-level worker operators. It still folds BF16-via-F32 collectives into one logical `all_reduce` and does not count CUDA memset/memcpy nodes.
 
 ## Trace Drift Fixed In This Session
 
@@ -117,15 +116,15 @@ This count is now source-aligned for the high-level worker operators. It still f
 
 | Trace item | Current trace | Actual worker path | Effect |
 | --- | --- | --- | --- |
-| q/kv down projection | records `q_a` GEMM and `kv_a` GEMM separately | same | Real structural difference from vLLM; vLLM fuses these into `fused_qkv_a_proj`. Kept. |
-| compressed KV split | missing | `kimi_mla_split_compressed_kv` | Fixed: now counted once per layer. |
+| q/kv down projection | now records one `fused_qkv_a` GEMM plus `kimi_mla_split_qkv_a` | worker uses load-time `DeviceMatrix::vstack(q_a_proj, kv_a_proj_with_mqa)` and one graph-safe GEMM | Fixed in the fused-qkv patch; removes one GEMM per layer and the old separate KV split path. |
+| fused qkv split | now counted as `kimi_mla_split_qkv_a` | `kimi_mla_split_qkv_a` writes `q_a`, `compressed_kv`, `k_rope` directly | Provider added in `kernel_report.rs`; no second split kernel remains. |
 | `kv_a_norm` | missing | `rms_norm_batch_into(compressed_kv, kv_a_norm)` | Fixed: RMSNorm count increased by 61. |
 | decode `kv_b` GEMM | records `L*.attn.kv_b` as `gemm_graphsafe` | no full `kv_b` GEMM in decode; worker uses `kv_b_proj` weight in `absorb_q` and `v_up` custom kernels | Fixed: fake GEMM removed, GEMM count decreased by 61. |
 | MLA cache append | missing | `kimi_mla_paged_kv_append` | Fixed: now counted once per layer. |
 | all-reduce bridge | folded into one `all_reduce(dtype=bf16_via_f32)` | actual path is BF16-to-F32 kernel, NCCL F32 collective, F32-to-BF16 kernel | Fine for high-level op count, wrong for kernel launch count and CUDA graph node count. |
 | top1 | `top1_batch` | kernel is `argmax_batch_bf16_cuda`; `ctx.sync()` + D2H id/value readback happen after graph body | The GPU op is counted, but graph-external host boundary is hidden. |
 
-Patch range: `push_attention_layer` in `batch_decode_trace.rs` removed the fake `kv_b` GEMM and added `kimi_mla_split_compressed_kv`, `rms_norm_batch` for `kv_a_norm`, and `kimi_mla_paged_kv_append`.
+Patch range: `push_attention_layer` in `batch_decode_trace.rs` first removed the fake `kv_b` GEMM and added the missing MLA operators; the fused-qkv patch then replaced `q_a GEMM + kv_a GEMM + split_compressed_kv` with `fused_qkv_a GEMM + split_qkv_a`.
 
 Validation:
 
@@ -136,13 +135,38 @@ PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel
   trace --source static --batch-size 4 --kv-len 1024 --out /tmp/kimi_decode_trace_fixed_bs4_kv1024.json
 ```
 
-H20 validation used the same `cargo check` and static trace command under `/root/develop/xingming/pegainfer-kimi-k2-main` with `PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python`; output was `calls=1947` with the same op counts as above. `nvidia-smi --query-compute-apps` printed no active process after the trace parse.
+H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `/root/develop/xingming/pegainfer-kimi-k2-main` with `PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
+
+Runtime model-report validation on H20:
+
+```bash
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
+  decode --source runtime --batch-size 4 --kv-len 28 --iters 1 --format text \
+  --out /tmp/kimi_runtime_model_report_bs4_kv28_fixed_trace_v2.json
+```
+
+The fused-qkv runtime report produced `total_schedule_calls=1886`, `measured_schedule_calls=1642`, `missing_schedule_calls=244`, and measured subset `136.549ms`. Missing providers are explicit:
+
+- `all_reduce`: `123` calls, multi-rank H20 provider needed.
+- `reduce_scatter`: `60` calls, multi-rank H20 provider needed.
+- `kimi_mla_paged_kv_append`: `61` calls.
+
+Measured subset top rows with `iters=1`: `kimi_marlin_wna16_gemm` `120` calls / `118.06ms`, `gemm_graphsafe` `367` calls / `5.73ms`, `kimi_router_noaux_tc` `60` calls / `2.61ms`, `rms_norm_batch` `245` calls / `2.03ms`, and `kimi_mla_split_qkv_a` `61` calls / `0.44ms`. This report is a corrected ledger gate, not a final TPOT number; it still lacks NCCL and `kimi_mla_paged_kv_append`.
+
+H20 graph serving gates after fused-qkv:
+
+- Synthetic `prompt-len=27`, `output-len=64`, `concurrency=4`, `--cuda-graph true`: steady TPOT avg `16.43ms`, p50 `16.48ms`, p95 `16.77ms`, p99 `16.82ms`; generated token hashes matched across all four rows.
+- Real Kimi fixture rendered prompt, `output-len=16`, `concurrency=4`, `--cuda-graph true`: steady TPOT avg `16.15ms`, p50 `16.15ms`, p95 `16.29ms`, p99 `16.30ms`; all four rows matched the vLLM fixture prefix `[1008,2742,2531,414,19180,6082,1379,387,261,5216,63853,13,374,1765,11983,306]`.
+- H20 GPU was released after the gates; `nvidia-smi --query-compute-apps` printed no active process.
 
 ## Path Differences That Matter
 
 | Difference | vLLM | PegaInfer | Why it matters |
 | --- | --- | --- | --- |
-| MLA first projection | One `MergedReplicatedLinear` for `[q_lora_rank, kv_lora_rank + rope_dim]`. | Two GEMMs: `q_a_proj` and `kv_a_proj_with_mqa`. | PegaInfer pays one extra GEMM launch per layer and rereads hidden twice. This is the cleanest operator-list delta. |
+| MLA first projection | One `MergedReplicatedLinear` for `[q_lora_rank, kv_lora_rank + rope_dim]`. | Now one load-time fused `DeviceMatrix` plus one graph-safe GEMM and one split kernel. | This structural delta is closed in code. The keep/revert gate is H20 correctness plus TPOT/model-report improvement. |
 | Dense gate/up | V1 can use fused `gate_up_proj`; V0 module-level path still exposes gate/up. | Separate gate and up GEMMs for dense layer and shared expert. | One dense layer only matters little; shared expert repeats 60 times and is a real candidate after trace is fixed. |
 | Router GEMM | V1 has small-batch `dsv3_router_gemm` / `router_gemm_bf16_fp32` path before grouped top-k. | `kimi_router_noaux_tc_launch` is a single custom router/top-k kernel path. | Need compare microbench, not assume; router was ~3.7ms/step in old strong-sync profile. |
 | MLA cache append and metadata | vLLM uses `concat_and_cache_mla`; FlashMLA prepares tile scheduler metadata and graph buffers. | PegaInfer uses `kimi_mla_paged_kv_append` and precomputed decode arena arrays. | Need compare metadata/cache append cost before changing attention kernels; trace currently hides this. |
@@ -154,7 +178,6 @@ H20 validation used the same `cargo check` and static trace command under `/root
 
 ## Next Actions
 
-1. Run corrected `kimi_model_report decode --source runtime` on H20 so the measured perf ledger uses the fixed trace shape, not the old `1825`-call shape.
-2. Evaluate `fused_qkv_a_proj` as the first structural MLA optimization candidate: it is bs1..4-general, preserves graph-readiness, and removes one per-layer GEMM launch plus one hidden read.
-3. After corrected H20 model report exists, evaluate shared expert `gate/up` fusion and router microbench against vLLM-style small-batch kernels.
-4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.
+1. Add timing coverage for `kimi_mla_paged_kv_append` or a full-rank collective harness so the model report no longer hides the remaining MLA/cache and NCCL portions.
+2. Evaluate shared expert gate/up fusion and router microbench against vLLM-style small-batch kernels.
+3. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

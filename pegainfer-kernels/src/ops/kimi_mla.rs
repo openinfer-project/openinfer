@@ -11,11 +11,13 @@ pub const KIMI_K2_MLA_Q_HEAD_DIM: usize = 192;
 pub const KIMI_K2_MLA_V_HEAD_DIM: usize = 128;
 pub const KIMI_K2_MLA_ROPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM;
 pub const KIMI_K2_MLA_NOPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_ROPE_DIM;
+const KIMI_K2_MLA_Q_LORA_RANK: usize = 1536;
 pub const KIMI_K2_MLA_KV_LORA_RANK: usize = 512;
 pub const KIMI_K2_MLA_KV_A_OUT: usize = 576;
 pub const KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8: usize = 2048;
 pub const KIMI_K2_MLA_Q_LOCAL_OUT_TP8: usize = KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_Q_HEAD_DIM;
 pub const KIMI_K2_MLA_O_LOCAL_IN_TP8: usize = KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_V_HEAD_DIM;
+pub const KIMI_K2_MLA_QKV_A_OUT: usize = KIMI_K2_MLA_Q_LORA_RANK + KIMI_K2_MLA_KV_A_OUT;
 pub const KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8: usize =
     KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_KV_LORA_RANK;
 pub const KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8: usize =
@@ -131,45 +133,55 @@ fn validate_paged_layout(
     Ok(())
 }
 
-pub fn kimi_mla_split_compressed_kv(
+pub fn kimi_mla_split_qkv_a(
     ctx: &DeviceContext,
-    kv_a: &HiddenStates,
+    qkv_a: &HiddenStates,
+    q_a: &mut HiddenStates,
     compressed: &mut HiddenStates,
     k_rope: &mut HiddenStates,
 ) -> Result<()> {
     ensure!(
-        kv_a.hidden_dim == KIMI_K2_MLA_KV_A_OUT,
-        "Kimi MLA kv_a hidden dim must be {}, got {}",
-        KIMI_K2_MLA_KV_A_OUT,
-        kv_a.hidden_dim
+        qkv_a.hidden_dim == KIMI_K2_MLA_QKV_A_OUT,
+        "Kimi MLA qkv_a hidden dim must be {}, got {}",
+        KIMI_K2_MLA_QKV_A_OUT,
+        qkv_a.hidden_dim
     );
     ensure!(
-        compressed.hidden_dim == KIMI_K2_MLA_KV_LORA_RANK && compressed.seq_len == kv_a.seq_len,
-        "Kimi MLA compressed shape mismatch: got [{}, {}], expected [{}, {}]",
+        q_a.hidden_dim == KIMI_K2_MLA_Q_LORA_RANK && q_a.seq_len == qkv_a.seq_len,
+        "Kimi MLA q_a split shape mismatch: got [{}, {}], expected [{}, {}]",
+        q_a.hidden_dim,
+        q_a.seq_len,
+        KIMI_K2_MLA_Q_LORA_RANK,
+        qkv_a.seq_len
+    );
+    ensure!(
+        compressed.hidden_dim == KIMI_K2_MLA_KV_LORA_RANK && compressed.seq_len == qkv_a.seq_len,
+        "Kimi MLA compressed split shape mismatch: got [{}, {}], expected [{}, {}]",
         compressed.hidden_dim,
         compressed.seq_len,
         KIMI_K2_MLA_KV_LORA_RANK,
-        kv_a.seq_len
+        qkv_a.seq_len
     );
     ensure!(
-        k_rope.hidden_dim == KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM
-            && k_rope.seq_len == kv_a.seq_len,
-        "Kimi MLA k_rope shape mismatch: got [{}, {}], expected [{}, {}]",
+        k_rope.hidden_dim == KIMI_K2_MLA_ROPE_DIM && k_rope.seq_len == qkv_a.seq_len,
+        "Kimi MLA k_rope split shape mismatch: got [{}, {}], expected [{}, {}]",
         k_rope.hidden_dim,
         k_rope.seq_len,
-        KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM,
-        kv_a.seq_len
+        KIMI_K2_MLA_ROPE_DIM,
+        qkv_a.seq_len
     );
 
-    let (kv_a_ptr, _kv_a_guard) = kv_a.data.device_ptr(&ctx.stream);
+    let (qkv_a_ptr, _qkv_a_guard) = qkv_a.data.device_ptr(&ctx.stream);
+    let (q_a_ptr, _q_a_guard) = q_a.data.device_ptr_mut(&ctx.stream);
     let (compressed_ptr, _compressed_guard) = compressed.data.device_ptr_mut(&ctx.stream);
     let (k_rope_ptr, _k_rope_guard) = k_rope.data.device_ptr_mut(&ctx.stream);
     let result = unsafe {
-        ffi::kimi_mla_split_compressed_kv_cuda(
-            kv_a_ptr as *const ffi::Half,
+        ffi::kimi_mla_split_qkv_a_cuda(
+            qkv_a_ptr as *const ffi::Half,
+            q_a_ptr as *mut ffi::Half,
             compressed_ptr as *mut ffi::Half,
             k_rope_ptr as *mut ffi::Half,
-            kv_a.seq_len as i32,
+            qkv_a.seq_len as i32,
             ctx.stream.cu_stream(),
         )
     };

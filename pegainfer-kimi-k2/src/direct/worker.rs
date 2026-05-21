@@ -23,18 +23,19 @@ use pegainfer_kernels::{
         KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
         KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_LOCAL_HEADS_TP8, KIMI_K2_MLA_NOPE_DIM,
         KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_MLA_V_HEAD_DIM,
-        KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
-        KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig, KimiRouterOutput,
-        KimiRouterScratch, add_batch_into, bf16_hidden_to_f32_into, embedding_batch_vocab_shard,
-        f32_to_bf16_hidden_into, flashinfer_topk_row_states_bytes, gemm_graphsafe_into_checked,
-        gemm_into_checked, kimi_flashinfer_batch_decode_mla, kimi_flashinfer_single_prefill_mla,
-        kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm,
-        kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope, kimi_mla_paged_kv_append,
-        kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill, kimi_mla_rope_split_decode,
-        kimi_mla_split_compressed_kv, kimi_mla_v_up, kimi_moe_marlin_align_block_size,
-        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
-        scale_f32_in_place, silu_mul_batch_into,
+        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
+        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
+        KimiRouterOutput, KimiRouterScratch, add_batch_into, bf16_hidden_to_f32_into,
+        embedding_batch_vocab_shard, f32_to_bf16_hidden_into, flashinfer_topk_row_states_bytes,
+        gemm_graphsafe_into_checked, gemm_into_checked, kimi_flashinfer_batch_decode_mla,
+        kimi_flashinfer_single_prefill_mla, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
+        kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope,
+        kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill,
+        kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
+        kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
+        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
+        silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
 };
@@ -429,10 +430,9 @@ struct KimiLayerForwardCache {
 
 struct KimiAttentionForwardCache {
     input_norm: DeviceVec,
-    q_a_proj: DeviceMatrix,
+    fused_qkv_a_proj: DeviceMatrix,
     q_a_norm: DeviceVec,
     q_b_proj: DeviceMatrix,
-    kv_a_proj_with_mqa: DeviceMatrix,
     kv_a_norm: DeviceVec,
     kv_b_proj: DeviceMatrix,
     o_proj: DeviceMatrix,
@@ -494,10 +494,10 @@ struct KimiWorkerDecodeScratch {
     shared_gate: HiddenStates,
     shared_up: HiddenStates,
     shared_activated: HiddenStates,
+    qkv_a: HiddenStates,
     q_a: HiddenStates,
     q_a_normed: HiddenStates,
     q_proj: HiddenStates,
-    kv_a: HiddenStates,
     compressed_kv: HiddenStates,
     k_rope: HiddenStates,
     compressed_normed: HiddenStates,
@@ -996,10 +996,14 @@ impl KimiRankThreadState {
             KIMI_K2_RMS_NORM_EPS,
             normed,
         );
+        let mut qkv_a = HiddenStates::zeros(ctx, KIMI_K2_MLA_QKV_A_OUT, seq_len)?;
         let mut q_a = HiddenStates::zeros(ctx, KIMI_K2_Q_LORA_RANK, seq_len)?;
         let mut q_a_normed = HiddenStates::zeros(ctx, KIMI_K2_Q_LORA_RANK, seq_len)?;
         let mut q_proj = HiddenStates::zeros(ctx, KIMI_K2_MLA_Q_LOCAL_OUT_TP8, seq_len)?;
-        gemm_into_checked(ctx, &attention.q_a_proj, normed, &mut q_a)?;
+        let mut compressed_kv = HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_LORA_RANK, seq_len)?;
+        let mut k_rope = HiddenStates::zeros(ctx, KIMI_K2_QK_ROPE_HEAD_DIM, seq_len)?;
+        gemm_into_checked(ctx, &attention.fused_qkv_a_proj, normed, &mut qkv_a)?;
+        kimi_mla_split_qkv_a(ctx, &qkv_a, &mut q_a, &mut compressed_kv, &mut k_rope)?;
         rms_norm_batch_into(
             ctx,
             &q_a,
@@ -1009,13 +1013,8 @@ impl KimiRankThreadState {
         );
         gemm_into_checked(ctx, &attention.q_b_proj, &q_a_normed, &mut q_proj)?;
 
-        let mut kv_a = HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_A_OUT, seq_len)?;
-        let mut compressed_kv = HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_LORA_RANK, seq_len)?;
-        let mut k_rope = HiddenStates::zeros(ctx, KIMI_K2_QK_ROPE_HEAD_DIM, seq_len)?;
         let mut compressed_normed = HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_LORA_RANK, seq_len)?;
         let mut kv_b = HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8, seq_len)?;
-        gemm_into_checked(ctx, &attention.kv_a_proj_with_mqa, normed, &mut kv_a)?;
-        kimi_mla_split_compressed_kv(ctx, &kv_a, &mut compressed_kv, &mut k_rope)?;
         rms_norm_batch_into(
             ctx,
             &compressed_kv,
@@ -1697,10 +1696,10 @@ impl KimiWorkerDecodeScratch {
                 KIMI_K2_EXPERT_INTERMEDIATE / 8,
                 batch_size,
             )?,
+            qkv_a: HiddenStates::zeros(ctx, KIMI_K2_MLA_QKV_A_OUT, batch_size)?,
             q_a: HiddenStates::zeros(ctx, KIMI_K2_Q_LORA_RANK, batch_size)?,
             q_a_normed: HiddenStates::zeros(ctx, KIMI_K2_Q_LORA_RANK, batch_size)?,
             q_proj: HiddenStates::zeros(ctx, KIMI_K2_MLA_Q_LOCAL_OUT_TP8, batch_size)?,
-            kv_a: HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_A_OUT, batch_size)?,
             compressed_kv: HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_LORA_RANK, batch_size)?,
             k_rope: HiddenStates::zeros(ctx, KIMI_K2_MLA_ROPE_DIM, batch_size)?,
             compressed_normed: HiddenStates::zeros(ctx, KIMI_K2_MLA_KV_LORA_RANK, batch_size)?,
@@ -1781,7 +1780,19 @@ fn forward_mla_decode_layer_into(
         KIMI_K2_RMS_NORM_EPS,
         &mut scratch.normed,
     );
-    gemm_graphsafe_into_checked(ctx, &attention.q_a_proj, &scratch.normed, &mut scratch.q_a)?;
+    gemm_graphsafe_into_checked(
+        ctx,
+        &attention.fused_qkv_a_proj,
+        &scratch.normed,
+        &mut scratch.qkv_a,
+    )?;
+    kimi_mla_split_qkv_a(
+        ctx,
+        &scratch.qkv_a,
+        &mut scratch.q_a,
+        &mut scratch.compressed_kv,
+        &mut scratch.k_rope,
+    )?;
     debug_identical_decode_rows_bf16(
         ctx,
         rank,
@@ -1805,18 +1816,6 @@ fn forward_mla_decode_layer_into(
         &attention.q_b_proj,
         &scratch.q_a_normed,
         &mut scratch.q_proj,
-    )?;
-    gemm_graphsafe_into_checked(
-        ctx,
-        &attention.kv_a_proj_with_mqa,
-        &scratch.normed,
-        &mut scratch.kv_a,
-    )?;
-    kimi_mla_split_compressed_kv(
-        ctx,
-        &scratch.kv_a,
-        &mut scratch.compressed_kv,
-        &mut scratch.k_rope,
     )?;
     rms_norm_batch_into(
         ctx,
@@ -2446,14 +2445,38 @@ fn load_layer_forward_cache(
     weights: &KimiRankGpuWeights,
     layer: &KimiLayerWeightNames,
 ) -> Result<KimiLayerForwardCache> {
+    let q_a_proj = raw_tensor(weights, &layer.attention.q_a_proj)?
+        .copy_bf16_matrix_from_shape(ctx, "attention_q_a_proj")?;
+    ensure!(
+        q_a_proj.rows == KIMI_K2_Q_LORA_RANK && q_a_proj.cols == KIMI_K2_HIDDEN,
+        "layer {} q_a_proj shape must be [{}, {}], got [{}, {}]",
+        layer.layer_idx,
+        KIMI_K2_Q_LORA_RANK,
+        KIMI_K2_HIDDEN,
+        q_a_proj.rows,
+        q_a_proj.cols
+    );
+    let kv_a_proj_with_mqa = raw_tensor(weights, &layer.attention.kv_a_proj_with_mqa)?
+        .copy_bf16_matrix_from_shape(ctx, "attention_kv_a_proj_with_mqa")?;
+    ensure!(
+        kv_a_proj_with_mqa.rows == KIMI_K2_MLA_KV_A_OUT
+            && kv_a_proj_with_mqa.cols == KIMI_K2_HIDDEN,
+        "layer {} kv_a_proj_with_mqa shape must be [{}, {}], got [{}, {}]",
+        layer.layer_idx,
+        KIMI_K2_MLA_KV_A_OUT,
+        KIMI_K2_HIDDEN,
+        kv_a_proj_with_mqa.rows,
+        kv_a_proj_with_mqa.cols
+    );
+    let device_ctx = ctx.as_device_context();
+    let fused_qkv_a_proj = DeviceMatrix::vstack(&device_ctx, &[&q_a_proj, &kv_a_proj_with_mqa])?;
     let attention = KimiAttentionForwardCache {
         input_norm: raw_tensor(weights, &layer.attention.input_layernorm)?.copy_bf16_vec(
             ctx,
             KIMI_K2_HIDDEN,
             "attention_input_norm",
         )?,
-        q_a_proj: raw_tensor(weights, &layer.attention.q_a_proj)?
-            .copy_bf16_matrix_from_shape(ctx, "attention_q_a_proj")?,
+        fused_qkv_a_proj,
         q_a_norm: raw_tensor(weights, &layer.attention.q_a_layernorm)?.copy_bf16_vec(
             ctx,
             KIMI_K2_Q_LORA_RANK,
@@ -2461,8 +2484,6 @@ fn load_layer_forward_cache(
         )?,
         q_b_proj: raw_tensor(weights, &layer.attention.q_b_proj)?
             .copy_bf16_matrix_from_shape(ctx, "attention_q_b_proj")?,
-        kv_a_proj_with_mqa: raw_tensor(weights, &layer.attention.kv_a_proj_with_mqa)?
-            .copy_bf16_matrix_from_shape(ctx, "attention_kv_a_proj_with_mqa")?,
         kv_a_norm: raw_tensor(weights, &layer.attention.kv_a_layernorm)?.copy_bf16_vec(
             ctx,
             KIMI_K2_MLA_KV_LORA_RANK,
@@ -2572,12 +2593,13 @@ fn ensure_dense_mlp_shapes(
 
 fn ensure_attention_shapes(layer_idx: usize, attention: &KimiAttentionForwardCache) -> Result<()> {
     ensure!(
-        attention.q_a_proj.rows == KIMI_K2_Q_LORA_RANK && attention.q_a_proj.cols == KIMI_K2_HIDDEN,
-        "layer {layer_idx} q_a_proj shape must be [{}, {}], got [{}, {}]",
-        KIMI_K2_Q_LORA_RANK,
+        attention.fused_qkv_a_proj.rows == KIMI_K2_MLA_QKV_A_OUT
+            && attention.fused_qkv_a_proj.cols == KIMI_K2_HIDDEN,
+        "layer {layer_idx} fused_qkv_a_proj shape must be [{}, {}], got [{}, {}]",
+        KIMI_K2_MLA_QKV_A_OUT,
         KIMI_K2_HIDDEN,
-        attention.q_a_proj.rows,
-        attention.q_a_proj.cols
+        attention.fused_qkv_a_proj.rows,
+        attention.fused_qkv_a_proj.cols
     );
     ensure!(
         attention.q_b_proj.rows == KIMI_K2_MLA_Q_LOCAL_OUT_TP8
@@ -2587,15 +2609,6 @@ fn ensure_attention_shapes(layer_idx: usize, attention: &KimiAttentionForwardCac
         KIMI_K2_Q_LORA_RANK,
         attention.q_b_proj.rows,
         attention.q_b_proj.cols
-    );
-    ensure!(
-        attention.kv_a_proj_with_mqa.rows == KIMI_K2_MLA_KV_A_OUT
-            && attention.kv_a_proj_with_mqa.cols == KIMI_K2_HIDDEN,
-        "layer {layer_idx} kv_a_proj_with_mqa shape must be [{}, {}], got [{}, {}]",
-        KIMI_K2_MLA_KV_A_OUT,
-        KIMI_K2_HIDDEN,
-        attention.kv_a_proj_with_mqa.rows,
-        attention.kv_a_proj_with_mqa.cols
     );
     ensure!(
         attention.kv_b_proj.rows == KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8
