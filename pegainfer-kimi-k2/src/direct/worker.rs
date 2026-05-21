@@ -14,6 +14,9 @@ use cudarc::nccl::{
     ReduceOp,
     safe::{Comm, Id},
 };
+use pegainfer_core::cuda_graph::CudaGraphState;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_core::ops::call_trace;
 use pegainfer_kernels::{
     ffi,
     ops::{
@@ -30,20 +33,22 @@ use pegainfer_kernels::{
         kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope, kimi_mla_paged_kv_append,
         kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill, kimi_mla_rope_split_decode,
         kimi_mla_split_compressed_kv, kimi_mla_v_up, kimi_moe_marlin_align_block_size,
-        kimi_router_noaux_tc_launch, rms_norm_batch_into, scale_f32_in_place, silu_mul_batch_into,
+        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
+        scale_f32_in_place, silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
 };
 
 use crate::{
     config::{
-        KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_LAYERS,
-        KIMI_K2_Q_LORA_RANK, KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROPE_THETA,
-        KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW,
-        KIMI_K2_YARN_FACTOR, KIMI_K2_YARN_ORIGINAL_MAX_POS,
+        KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_DENSE_LAYERS, KIMI_K2_EXPERT_INTERMEDIATE,
+        KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_Q_LORA_RANK,
+        KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROPE_THETA, KIMI_K2_ROUTED_EXPERTS,
+        KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR,
+        KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
     direct::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
-    experts::KIMI_K2_EP8_LOCAL_EXPERTS,
+    experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
         KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights, KimiRankShardPlan,
@@ -53,7 +58,6 @@ use crate::{
 };
 
 const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
-const KIMI_DECODE_SINGLE_BATCH: usize = 1;
 const KIMI_DECODE_MAX_BATCH: usize = 4;
 const KIMI_DECODE_PAGE_SIZE: usize = 16;
 const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
@@ -156,6 +160,7 @@ impl KimiRankWorker {
         thread_placement: KimiRankThreadPlacement,
         ctx: KimiRankGpuContext,
         collective_barrier: Arc<Barrier>,
+        enable_cuda_graph: bool,
     ) -> Result<Self> {
         ensure!(
             placement.rank == weight_plan.rank,
@@ -203,6 +208,7 @@ impl KimiRankWorker {
                     worker_weight_names,
                     worker_sliced_load_plan,
                     worker_collective_barrier,
+                    enable_cuda_graph,
                 ) {
                     Ok(state) => {
                         let _ = startup_tx.send(Ok(()));
@@ -351,6 +357,7 @@ struct KimiRankThreadState {
     weight_names: KimiRankWeightNames,
     sliced_load_plan: KimiRankSlicedLoadPlan,
     collective_barrier: Arc<Barrier>,
+    enable_cuda_graph: bool,
     weight_report: Option<KimiRankWeightLoadReport>,
     loaded: Option<KimiRankLoadedWeights>,
 }
@@ -375,19 +382,33 @@ struct KimiRankLoadedWeights {
 }
 
 struct KimiWorkerDecodeArenas {
-    single: KimiWorkerDecodeArena,
-    batch: KimiWorkerDecodeArena,
+    arenas: Vec<KimiWorkerDecodeArena>,
 }
 
 impl KimiWorkerDecodeArenas {
-    fn get_mut(&mut self, decode_batch_size: usize) -> Result<&mut KimiWorkerDecodeArena> {
-        match decode_batch_size {
-            KIMI_DECODE_SINGLE_BATCH => Ok(&mut self.single),
-            KIMI_DECODE_MAX_BATCH => Ok(&mut self.batch),
-            _ => bail!(
-                "Kimi decode batch size {decode_batch_size} must be {KIMI_DECODE_SINGLE_BATCH} or {KIMI_DECODE_MAX_BATCH}"
-            ),
+    fn new(ctx: &DeviceContext, vocab_rows: usize) -> Result<Self> {
+        let mut arenas = Vec::with_capacity(KIMI_DECODE_MAX_BATCH);
+        for batch_size in 1..=KIMI_DECODE_MAX_BATCH {
+            arenas.push(
+                KimiWorkerDecodeArena::new(
+                    ctx,
+                    KIMI_K2_LAYERS,
+                    batch_size,
+                    KIMI_DECODE_PAGE_SIZE,
+                    vocab_rows,
+                )
+                .with_context(|| format!("failed to allocate Kimi bs{batch_size} decode arena"))?,
+            );
         }
+        Ok(Self { arenas })
+    }
+
+    fn get_mut(&mut self, decode_batch_size: usize) -> Result<&mut KimiWorkerDecodeArena> {
+        ensure!(
+            (1..=KIMI_DECODE_MAX_BATCH).contains(&decode_batch_size),
+            "Kimi decode batch size {decode_batch_size} must be in 1..={KIMI_DECODE_MAX_BATCH}"
+        );
+        Ok(&mut self.arenas[decode_batch_size - 1])
     }
 }
 
@@ -456,6 +477,7 @@ struct KimiWorkerDecodeArena {
     layer_caches: Vec<KimiWorkerMlaLayerCache>,
     scratch: KimiWorkerDecodeScratch,
     logits: HiddenStates,
+    graph: CudaGraphState,
 }
 
 struct KimiWorkerMlaLayerCache {
@@ -497,6 +519,7 @@ struct KimiWorkerDecodeScratch {
     marlin_activated: HiddenStates,
     marlin_expert_output: HiddenStates,
     routed_out_f32: CudaSlice<f32>,
+    routed_reduce_scatter_send_f32: CudaSlice<f32>,
     top1_value_scratch: CudaSlice<half::bf16>,
     top1_out: CudaSlice<i32>,
     hidden_allreduce_f32: CudaSlice<f32>,
@@ -517,6 +540,7 @@ fn bind_rank_thread(
     weight_names: KimiRankWeightNames,
     sliced_load_plan: KimiRankSlicedLoadPlan,
     collective_barrier: Arc<Barrier>,
+    enable_cuda_graph: bool,
 ) -> Result<KimiRankThreadState> {
     ctx.set_current()?;
     unsafe {
@@ -529,6 +553,7 @@ fn bind_rank_thread(
         weight_names,
         sliced_load_plan,
         collective_barrier,
+        enable_cuda_graph,
         weight_report: None,
         loaded: None,
     })
@@ -626,32 +651,14 @@ impl KimiRankThreadState {
                         self.sliced_load_plan.rank
                     )
                 })?;
-        let decode_arena = KimiWorkerDecodeArena::new(
-            &self.ctx.as_device_context(),
-            KIMI_K2_LAYERS,
-            KIMI_DECODE_SINGLE_BATCH,
-            KIMI_DECODE_PAGE_SIZE,
-            one_token_cache.vocab_rows,
-        )
-        .with_context(|| {
-            format!(
-                "failed to allocate Kimi rank {} bs1 decode arena",
-                self.sliced_load_plan.rank
-            )
-        })?;
-        let batch_decode_arena = KimiWorkerDecodeArena::new(
-            &self.ctx.as_device_context(),
-            KIMI_K2_LAYERS,
-            KIMI_DECODE_MAX_BATCH,
-            KIMI_DECODE_PAGE_SIZE,
-            one_token_cache.vocab_rows,
-        )
-        .with_context(|| {
-            format!(
-                "failed to allocate Kimi rank {} batch decode arena",
-                self.sliced_load_plan.rank
-            )
-        })?;
+        let decode_arenas =
+            KimiWorkerDecodeArenas::new(&self.ctx.as_device_context(), one_token_cache.vocab_rows)
+                .with_context(|| {
+                    format!(
+                        "failed to allocate Kimi rank {} decode arenas",
+                        self.sliced_load_plan.rank
+                    )
+                })?;
         let report = KimiRankWeightLoadReport::from_loaded_weights(
             tensor_count,
             total_bytes,
@@ -661,10 +668,7 @@ impl KimiRankThreadState {
             gpu: weights,
             expert_kernels: expert_kernel_weights,
             one_token_cache,
-            decode_arenas: KimiWorkerDecodeArenas {
-                single: decode_arena,
-                batch: batch_decode_arena,
-            },
+            decode_arenas,
         };
         debug_assert_eq!(loaded.gpu.rank, report.rank);
         debug_assert_eq!(
@@ -720,10 +724,23 @@ impl KimiRankThreadState {
         let rank = gpu.rank;
         let active_len = token_ids.len();
         let debug_same_rows = false;
+        #[cfg(feature = "kernel-call-trace")]
+        if rank == 0 && call_trace::is_enabled() {
+            let kv_len = append_positions
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            for call in
+                crate::batch_decode_trace::trace_decode_kernel_calls("", decode_batch_size, kv_len)?
+            {
+                call_trace::record_call(call);
+            }
+        }
         ensure!(
-            decode_batch_size == KIMI_DECODE_SINGLE_BATCH
-                || decode_batch_size == KIMI_DECODE_MAX_BATCH,
-            "Kimi decode batch size {decode_batch_size} must be {KIMI_DECODE_SINGLE_BATCH} or {KIMI_DECODE_MAX_BATCH}"
+            (1..=KIMI_DECODE_MAX_BATCH).contains(&decode_batch_size),
+            "Kimi decode batch size {decode_batch_size} must be in 1..={KIMI_DECODE_MAX_BATCH}"
         );
         ensure!(
             active_len <= decode_batch_size,
@@ -737,167 +754,47 @@ impl KimiRankThreadState {
             .upload_batch_tokens(&device_ctx, token_ids)
             .with_context(|| format!("Kimi rank {rank} upload batch decode tokens"))?;
 
-        embedding_batch_vocab_shard(
-            &device_ctx,
-            &cache.token_embedding,
-            &decode_arena.token_ids_d,
-            &mut decode_arena.scratch.hidden,
-            cache.vocab_start as u32,
-            cache.vocab_rows as u32,
-        )?;
-        all_reduce_hidden_via_f32_in_place_with_barrier(
-            &device_ctx,
-            &self.collective_barrier,
-            &mut decode_arena.scratch.hidden,
-            &mut decode_arena.scratch.hidden_allreduce_f32,
-            tp_comm.get(),
-        )?;
-        debug_identical_decode_rows_bf16(
-            &device_ctx,
-            rank,
-            "embedding_allreduce",
-            None,
-            active_len,
-            token_ids,
-            append_positions,
-            &decode_arena.scratch.hidden,
-            debug_same_rows,
-        );
-
-        let mut dense_layers_executed = 0usize;
-        let mut moe_layers_executed = 0usize;
-        for layer in &cache.layers {
-            forward_mla_decode_layer_into(
+        if self.enable_cuda_graph {
+            let mut graph = std::mem::take(&mut decode_arena.graph);
+            let graph_barrier = Arc::clone(&self.collective_barrier);
+            let result = graph.run_or_capture_synchronized(
                 &device_ctx,
-                &layer.attention,
-                decode_arena,
-                layer.layer_idx,
-                active_len,
-                rank,
-                token_ids,
-                append_positions,
-                debug_same_rows,
-            )
-            .with_context(|| format!("Kimi MLA batch decode layer {}", layer.layer_idx))?;
-            all_reduce_hidden_via_f32_in_place_with_barrier(
-                &device_ctx,
-                &self.collective_barrier,
-                &mut decode_arena.scratch.projected,
-                &mut decode_arena.scratch.hidden_allreduce_f32,
-                tp_comm.get(),
-            )?;
-            debug_identical_decode_rows_bf16(
-                &device_ctx,
-                rank,
-                "mla_projected_allreduce",
-                Some(layer.layer_idx),
-                active_len,
-                token_ids,
-                append_positions,
-                &decode_arena.scratch.projected,
-                debug_same_rows,
-            );
-            add_batch_into(
-                &device_ctx,
-                &decode_arena.scratch.hidden,
-                &decode_arena.scratch.projected,
-                &mut decode_arena.scratch.normed,
-            )?;
-            debug_identical_decode_rows_bf16(
-                &device_ctx,
-                rank,
-                "mla_residual_add",
-                Some(layer.layer_idx),
-                active_len,
-                token_ids,
-                append_positions,
-                &decode_arena.scratch.normed,
-                debug_same_rows,
-            );
-            std::mem::swap(
-                &mut decode_arena.scratch.hidden,
-                &mut decode_arena.scratch.normed,
-            );
-            debug_identical_decode_rows_bf16(
-                &device_ctx,
-                rank,
-                "mla_residual",
-                Some(layer.layer_idx),
-                active_len,
-                token_ids,
-                append_positions,
-                &decode_arena.scratch.hidden,
-                debug_same_rows,
-            );
-            match &layer.kind {
-                KimiLayerForwardKindCache::Dense(dense) => {
-                    forward_dense_mlp_decode_into(
+                |_| {
+                    graph_barrier.wait();
+                },
+                || {
+                    forward_decode_batch_next_token_kernels(
                         &device_ctx,
                         tp_comm.get(),
-                        dense,
-                        &layer.attention.post_attention_norm,
-                        &self.collective_barrier,
-                        &mut decode_arena.scratch,
-                        active_len,
-                        rank,
-                        token_ids,
-                        append_positions,
-                        layer.layer_idx,
-                        debug_same_rows,
-                    )
-                    .with_context(|| {
-                        format!("Kimi dense batch decode MLP layer {}", layer.layer_idx)
-                    })?;
-                    dense_layers_executed += 1;
-                }
-                KimiLayerForwardKindCache::Moe(moe) => {
-                    forward_moe_layer_decode_into(
-                        &device_ctx,
-                        tp_comm.get(),
-                        layer.layer_idx,
-                        moe,
-                        &layer.attention.post_attention_norm,
+                        cache,
                         expert_kernels,
-                        &self.collective_barrier,
-                        &mut decode_arena.scratch,
+                        decode_arena,
                         active_len,
                         rank,
                         token_ids,
                         append_positions,
                         debug_same_rows,
                     )
-                    .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
-                    moe_layers_executed += 1;
-                }
-            }
-            debug_identical_decode_rows_bf16(
+                },
+            );
+            decode_arena.graph = graph;
+            result?;
+        } else {
+            forward_decode_batch_next_token_kernels(
                 &device_ctx,
-                rank,
-                "layer_output",
-                Some(layer.layer_idx),
+                tp_comm.get(),
+                cache,
+                expert_kernels,
+                decode_arena,
                 active_len,
+                rank,
                 token_ids,
                 append_positions,
-                &decode_arena.scratch.hidden,
                 debug_same_rows,
-            );
+            )?;
         }
 
-        rms_norm_batch_into(
-            &device_ctx,
-            &decode_arena.scratch.hidden,
-            &cache.final_norm,
-            KIMI_K2_RMS_NORM_EPS,
-            &mut decode_arena.scratch.normed,
-        );
-        gemm_graphsafe_into_checked(
-            &device_ctx,
-            &cache.lm_head,
-            &decode_arena.scratch.normed,
-            &mut decode_arena.logits,
-        )?;
-
-        let local_top1 = sample_local_top1_batch_with_values(
+        let local_top1 = read_local_top1_batch_values(
             &device_ctx,
             &decode_arena.logits,
             active_len,
@@ -916,8 +813,8 @@ impl KimiRankThreadState {
                 vocab_start: cache.vocab_start,
                 vocab_rows: cache.vocab_rows,
                 vocab_shards_considered: 1,
-                dense_layers_executed,
-                moe_layers_executed,
+                dense_layers_executed: KIMI_K2_DENSE_LAYERS,
+                moe_layers_executed: KIMI_K2_MOE_LAYERS,
                 attention_layers_stubbed: 0,
                 remaining_layers_stubbed: 0,
                 sampled_from_rank_local_logits: true,
@@ -1219,6 +1116,179 @@ impl KimiRankThreadState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn forward_decode_batch_next_token_kernels(
+    device_ctx: &DeviceContext,
+    comm: &Comm,
+    cache: &KimiOneTokenForwardCache,
+    expert_kernels: &KimiRankExpertMarlinWeights,
+    decode_arena: &mut KimiWorkerDecodeArena,
+    active_len: usize,
+    rank: usize,
+    token_ids: &[u32],
+    append_positions: &[usize],
+    debug_same_rows: bool,
+) -> Result<()> {
+    embedding_batch_vocab_shard(
+        device_ctx,
+        &cache.token_embedding,
+        &decode_arena.token_ids_d,
+        &mut decode_arena.scratch.hidden,
+        cache.vocab_start as u32,
+        cache.vocab_rows as u32,
+    )?;
+    all_reduce_hidden_via_f32_in_place(
+        device_ctx,
+        &mut decode_arena.scratch.hidden,
+        &mut decode_arena.scratch.hidden_allreduce_f32,
+        comm,
+    )?;
+    debug_identical_decode_rows_bf16(
+        device_ctx,
+        rank,
+        "embedding_allreduce",
+        None,
+        active_len,
+        token_ids,
+        append_positions,
+        &decode_arena.scratch.hidden,
+        debug_same_rows,
+    );
+
+    for layer in &cache.layers {
+        forward_mla_decode_layer_into(
+            device_ctx,
+            &layer.attention,
+            decode_arena,
+            layer.layer_idx,
+            active_len,
+            rank,
+            token_ids,
+            append_positions,
+            debug_same_rows,
+        )
+        .with_context(|| format!("Kimi MLA batch decode layer {}", layer.layer_idx))?;
+        all_reduce_hidden_via_f32_in_place(
+            device_ctx,
+            &mut decode_arena.scratch.projected,
+            &mut decode_arena.scratch.hidden_allreduce_f32,
+            comm,
+        )?;
+        debug_identical_decode_rows_bf16(
+            device_ctx,
+            rank,
+            "mla_projected_allreduce",
+            Some(layer.layer_idx),
+            active_len,
+            token_ids,
+            append_positions,
+            &decode_arena.scratch.projected,
+            debug_same_rows,
+        );
+        add_batch_into(
+            device_ctx,
+            &decode_arena.scratch.hidden,
+            &decode_arena.scratch.projected,
+            &mut decode_arena.scratch.normed,
+        )?;
+        debug_identical_decode_rows_bf16(
+            device_ctx,
+            rank,
+            "mla_residual_add",
+            Some(layer.layer_idx),
+            active_len,
+            token_ids,
+            append_positions,
+            &decode_arena.scratch.normed,
+            debug_same_rows,
+        );
+        std::mem::swap(
+            &mut decode_arena.scratch.hidden,
+            &mut decode_arena.scratch.normed,
+        );
+        debug_identical_decode_rows_bf16(
+            device_ctx,
+            rank,
+            "mla_residual",
+            Some(layer.layer_idx),
+            active_len,
+            token_ids,
+            append_positions,
+            &decode_arena.scratch.hidden,
+            debug_same_rows,
+        );
+        match &layer.kind {
+            KimiLayerForwardKindCache::Dense(dense) => {
+                forward_dense_mlp_decode_into(
+                    device_ctx,
+                    comm,
+                    dense,
+                    &layer.attention.post_attention_norm,
+                    &mut decode_arena.scratch,
+                    active_len,
+                    rank,
+                    token_ids,
+                    append_positions,
+                    layer.layer_idx,
+                    debug_same_rows,
+                )
+                .with_context(|| {
+                    format!("Kimi dense batch decode MLP layer {}", layer.layer_idx)
+                })?;
+            }
+            KimiLayerForwardKindCache::Moe(moe) => {
+                forward_moe_layer_decode_into(
+                    device_ctx,
+                    comm,
+                    layer.layer_idx,
+                    moe,
+                    &layer.attention.post_attention_norm,
+                    expert_kernels,
+                    &mut decode_arena.scratch,
+                    active_len,
+                    rank,
+                    token_ids,
+                    append_positions,
+                    debug_same_rows,
+                )
+                .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
+            }
+        }
+        debug_identical_decode_rows_bf16(
+            device_ctx,
+            rank,
+            "layer_output",
+            Some(layer.layer_idx),
+            active_len,
+            token_ids,
+            append_positions,
+            &decode_arena.scratch.hidden,
+            debug_same_rows,
+        );
+    }
+
+    rms_norm_batch_into(
+        device_ctx,
+        &decode_arena.scratch.hidden,
+        &cache.final_norm,
+        KIMI_K2_RMS_NORM_EPS,
+        &mut decode_arena.scratch.normed,
+    );
+    gemm_graphsafe_into_checked(
+        device_ctx,
+        &cache.lm_head,
+        &decode_arena.scratch.normed,
+        &mut decode_arena.logits,
+    )?;
+    launch_local_top1_batch(
+        device_ctx,
+        &decode_arena.logits,
+        active_len,
+        &mut decode_arena.scratch.top1_value_scratch,
+        &mut decode_arena.scratch.top1_out,
+    )
+}
+
 impl KimiOneTokenForwardCache {
     fn from_gpu_weights(
         ctx: &KimiRankGpuContext,
@@ -1351,6 +1421,7 @@ impl KimiWorkerDecodeArena {
             layer_caches,
             scratch: KimiWorkerDecodeScratch::new(ctx, batch_size)?,
             logits: HiddenStates::zeros(ctx, vocab_rows, batch_size)?,
+            graph: CudaGraphState::new(),
         })
     }
 
@@ -1612,6 +1683,7 @@ impl KimiWorkerDecodeScratch {
             marlin_block_size,
         )?;
         let route_elems = batch_size * KIMI_K2_TOPK;
+        let reduce_scatter_send_rows = batch_size * KIMI_K2_EP_WORLD;
         Ok(Self {
             hidden: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, batch_size)?,
             normed: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, batch_size)?,
@@ -1660,6 +1732,9 @@ impl KimiWorkerDecodeScratch {
             marlin_activated: HiddenStates::zeros(ctx, KIMI_K2_EXPERT_INTERMEDIATE, route_elems)?,
             marlin_expert_output: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, route_elems)?,
             routed_out_f32: ctx.stream.alloc_zeros(batch_size * KIMI_K2_HIDDEN)?,
+            routed_reduce_scatter_send_f32: ctx
+                .stream
+                .alloc_zeros(reduce_scatter_send_rows * KIMI_K2_HIDDEN)?,
             top1_value_scratch: ctx.stream.alloc_zeros(batch_size)?,
             top1_out: ctx.stream.alloc_zeros(batch_size)?,
             hidden_allreduce_f32: ctx.stream.alloc_zeros(batch_size * KIMI_K2_HIDDEN)?,
@@ -1895,7 +1970,6 @@ fn forward_dense_mlp_decode_into(
     comm: &Comm,
     dense: &KimiDenseForwardCache,
     post_attention_norm: &DeviceVec,
-    collective_barrier: &Barrier,
     scratch: &mut KimiWorkerDecodeScratch,
     active_len: usize,
     rank: usize,
@@ -1905,10 +1979,9 @@ fn forward_dense_mlp_decode_into(
     debug_same_rows: bool,
 ) -> Result<()> {
     ensure!(
-        (KIMI_DECODE_SINGLE_BATCH..=KIMI_DECODE_MAX_BATCH).contains(&scratch.hidden.seq_len),
-        "Kimi dense decode scratch seq_len {} outside supported range {}..={}",
+        (1..=KIMI_DECODE_MAX_BATCH).contains(&scratch.hidden.seq_len),
+        "Kimi dense decode scratch seq_len {} outside supported range 1..={}",
         scratch.hidden.seq_len,
-        KIMI_DECODE_SINGLE_BATCH,
         KIMI_DECODE_MAX_BATCH
     );
     rms_norm_batch_into(
@@ -1937,9 +2010,8 @@ fn forward_dense_mlp_decode_into(
         &scratch.dense_activated,
         &mut scratch.projected,
     )?;
-    all_reduce_hidden_via_f32_in_place_with_barrier(
+    all_reduce_hidden_via_f32_in_place(
         ctx,
-        collective_barrier,
         &mut scratch.projected,
         &mut scratch.hidden_allreduce_f32,
         comm,
@@ -2114,7 +2186,6 @@ fn forward_moe_layer_decode_into(
     moe: &KimiMoeForwardCache,
     post_attention_norm: &DeviceVec,
     expert_kernels: &KimiRankExpertMarlinWeights,
-    collective_barrier: &Barrier,
     scratch: &mut KimiWorkerDecodeScratch,
     active_len: usize,
     rank: usize,
@@ -2124,8 +2195,8 @@ fn forward_moe_layer_decode_into(
 ) -> Result<()> {
     let seq_len = scratch.hidden.seq_len;
     ensure!(
-        (KIMI_DECODE_SINGLE_BATCH..=KIMI_DECODE_MAX_BATCH).contains(&seq_len),
-        "Kimi MoE decode scratch seq_len {seq_len} outside supported range {KIMI_DECODE_SINGLE_BATCH}..={KIMI_DECODE_MAX_BATCH}"
+        (1..=KIMI_DECODE_MAX_BATCH).contains(&seq_len),
+        "Kimi MoE decode scratch seq_len {seq_len} outside supported range 1..={KIMI_DECODE_MAX_BATCH}"
     );
     rms_norm_batch_into(
         ctx,
@@ -2159,9 +2230,8 @@ fn forward_moe_layer_decode_into(
         &scratch.shared_activated,
         &mut scratch.projected,
     )?;
-    all_reduce_hidden_via_f32_in_place_with_barrier(
+    all_reduce_hidden_via_f32_in_place(
         ctx,
-        collective_barrier,
         &mut scratch.projected,
         &mut scratch.hidden_allreduce_f32,
         comm,
@@ -2322,11 +2392,20 @@ fn forward_moe_layer_decode_into(
         KIMI_K2_HIDDEN,
         debug_same_rows,
     );
-    all_reduce_f32_in_place_with_barrier(
-        collective_barrier,
+    repeat_f32_for_reduce_scatter_into(
+        ctx,
+        &scratch.routed_out_f32,
+        &mut scratch.routed_reduce_scatter_send_f32,
+        seq_len * KIMI_K2_HIDDEN,
+        KIMI_K2_EP_WORLD,
+    )?;
+    reduce_scatter_f32_hidden_into(
+        &scratch.routed_reduce_scatter_send_f32,
+        seq_len * KIMI_K2_EP_WORLD,
+        KIMI_K2_HIDDEN,
         &mut scratch.routed_out_f32,
         seq_len,
-        KIMI_K2_HIDDEN,
+        KIMI_K2_EP_WORLD,
         comm,
     )?;
     scale_f32_in_place(
@@ -2545,9 +2624,8 @@ fn all_reduce_hidden_in_place(hidden: &mut HiddenStates, comm: &Comm) -> Result<
         .map_err(|err| anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0))
 }
 
-fn all_reduce_hidden_via_f32_in_place_with_barrier(
+fn all_reduce_hidden_via_f32_in_place(
     ctx: &DeviceContext,
-    collective_barrier: &Barrier,
     hidden: &mut HiddenStates,
     f32_scratch: &mut CudaSlice<f32>,
     comm: &Comm,
@@ -2558,7 +2636,6 @@ fn all_reduce_hidden_via_f32_in_place_with_barrier(
         f32_scratch.len(),
         hidden.data.len()
     );
-    let _ = collective_barrier;
     bf16_hidden_to_f32_into(ctx, hidden, f32_scratch)?;
     all_reduce_f32_bulk_in_place(f32_scratch, hidden.seq_len, hidden.hidden_dim, comm)?;
     f32_to_bf16_hidden_into(ctx, f32_scratch, hidden)
@@ -2589,17 +2666,37 @@ fn all_reduce_f32_bulk_in_place(
         .map_err(|err| anyhow::anyhow!("Kimi bulk f32 all-reduce failed: status={:?}", err.0))
 }
 
-fn all_reduce_f32_in_place_with_barrier(
-    collective_barrier: &Barrier,
-    values: &mut CudaSlice<f32>,
-    rows: usize,
+fn reduce_scatter_f32_hidden_into(
+    global: &CudaSlice<f32>,
+    global_rows: usize,
     row_len: usize,
+    local: &mut CudaSlice<f32>,
+    local_rows: usize,
+    world_size: usize,
     comm: &Comm,
 ) -> Result<()> {
-    let _ = collective_barrier;
-    // Routed expert combine bridge: sum local F32 routed contributions across
-    // ranks with NCCL until the real PPLX sparse dispatch/combine path exists.
-    all_reduce_f32_bulk_in_place(values, rows, row_len, comm)
+    ensure!(world_size > 0, "Kimi RS world size must be positive");
+    ensure!(
+        global_rows == local_rows * world_size,
+        "Kimi RS rows mismatch: global_rows={global_rows}, local_rows={local_rows}, world_size={world_size}"
+    );
+    ensure!(
+        global.len() >= global_rows * row_len,
+        "Kimi RS global buffer too small: have {}, need {}",
+        global.len(),
+        global_rows * row_len
+    );
+    ensure!(
+        local.len() >= local_rows * row_len,
+        "Kimi RS local buffer too small: have {}, need {}",
+        local.len(),
+        local_rows * row_len
+    );
+    let global_view = global.slice(0..global_rows * row_len);
+    let mut local_view = local.slice_mut(0..local_rows * row_len);
+    comm.reduce_scatter(&global_view, &mut local_view, &ReduceOp::Sum)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("Kimi routed RS f32 hidden failed: status={:?}", err.0))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3262,13 +3359,13 @@ fn sample_local_top1_with_value_reuse(
     Ok((top_id as u32, top_value))
 }
 
-fn sample_local_top1_batch_with_values(
+fn launch_local_top1_batch(
     ctx: &DeviceContext,
     logits: &HiddenStates,
     active_rows: usize,
     top1_values: &mut CudaSlice<half::bf16>,
     out: &mut CudaSlice<i32>,
-) -> Result<Vec<(u32, f32)>> {
+) -> Result<()> {
     ensure!(
         active_rows > 0 && active_rows <= logits.seq_len,
         "Kimi batched top1 active_rows {active_rows} must be in 1..={}",
@@ -3297,7 +3394,16 @@ fn sample_local_top1_batch_with_values(
             );
         }
     }
+    Ok(())
+}
 
+fn read_local_top1_batch_values(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    active_rows: usize,
+    top1_values: &mut CudaSlice<half::bf16>,
+    out: &mut CudaSlice<i32>,
+) -> Result<Vec<(u32, f32)>> {
     ctx.sync()?;
     let top_ids = ctx
         .stream

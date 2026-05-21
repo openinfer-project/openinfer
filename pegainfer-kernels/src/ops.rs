@@ -17,8 +17,8 @@ pub use attention::{
 };
 pub use elementwise::{
     add_batch, add_batch_into, bf16_hidden_to_f32_into, extract_vec, extract_vec_into,
-    f32_to_bf16_hidden_into, scale_f32_in_place, silu_mul_batch, silu_mul_batch_into,
-    silu_mul_fused_batch_into, write_vec_into,
+    f32_to_bf16_hidden_into, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
+    silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
 };
 pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
 pub use kimi_experts::{
@@ -29,16 +29,16 @@ pub use kimi_experts::{
     KimiInt4ExpertRole, KimiInt4ExpertWeights, KimiInt4LogicalShape, KimiInt4NibbleOrder,
     KimiInt4TensorShape, KimiInt4Weight, KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight,
     KimiMarlinInt4ExpertWeights, KimiMarlinInt4Weight, KimiMarlinRouteWorkspace, KimiMarlinRouting,
-    KimiMarlinWna16Workspace, KimiSwiGluPlan, kimi_cutlass_int4_grouped_launch,
-    kimi_cutlass_int4_grouped_prepare, kimi_cutlass_int4_grouped_workspace_sizes,
-    kimi_cutlass_int4_reorder_scale, kimi_cutlass_int4_reorder_weight,
-    kimi_cutlass_int4_sm90a_support, kimi_cutlass_int4_sm90a_support_probe,
-    kimi_int4_grouped_w1_w3, kimi_int4_grouped_w2_swiglu, kimi_int4_metadata_probe,
-    kimi_marlin_int4_fuse_w13, kimi_marlin_int4_reorder_scale, kimi_marlin_int4_reorder_weight,
-    kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm,
-    kimi_marlin_wna16_w13_gemm, kimi_moe_build_expert_major_route, kimi_moe_expand_to_expert_major,
-    kimi_moe_marlin_align_block_size, kimi_moe_reduce_expert_major_f32, kimi_swiglu_silu_mul,
-    packed_int4_cols, validate_ep_rank,
+    KimiMarlinWna16Workspace, KimiSwiGluPlan, kimi_add_f32_bf16_to_bf16,
+    kimi_cutlass_int4_grouped_launch, kimi_cutlass_int4_grouped_prepare,
+    kimi_cutlass_int4_grouped_workspace_sizes, kimi_cutlass_int4_reorder_scale,
+    kimi_cutlass_int4_reorder_weight, kimi_cutlass_int4_sm90a_support,
+    kimi_cutlass_int4_sm90a_support_probe, kimi_int4_grouped_w1_w3, kimi_int4_grouped_w2_swiglu,
+    kimi_int4_metadata_probe, kimi_marlin_int4_fuse_w13, kimi_marlin_int4_reorder_scale,
+    kimi_marlin_int4_reorder_weight, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
+    kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_moe_build_expert_major_route,
+    kimi_moe_expand_to_expert_major, kimi_moe_marlin_align_block_size,
+    kimi_moe_reduce_expert_major_f32, kimi_swiglu_silu_mul, packed_int4_cols, validate_ep_rank,
 };
 pub use kimi_mla::{
     KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
@@ -63,4 +63,7 @@ pub use norm::{
     fused_add_rms_norm_batch_into, fused_add_rms_norm_into, rms_norm, rms_norm_batch_into,
     rms_norm_batch_offset_into, rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into,
 };
-pub use sampling::{argmax, flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into};
+pub use sampling::{
+    argmax, flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes, gpu_sample,
+    gpu_sample_into,
+};

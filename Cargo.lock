@@ -3625,12 +3625,15 @@ name = "pegainfer-kimi-k2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "cudarc",
  "half",
  "memmap2",
  "pegainfer-core",
+ "pegainfer-cupti",
  "pegainfer-kernels",
  "safetensors",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

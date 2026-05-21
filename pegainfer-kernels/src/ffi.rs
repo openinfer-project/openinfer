@@ -93,6 +93,14 @@ unsafe extern "C" {
 
     pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
 
+    pub fn repeat_f32_for_reduce_scatter_cuda(
+        local: *const f32,
+        repeated: *mut f32,
+        local_elems: i32,
+        world_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn fused_add_rms_norm_cuda(
         hidden: *mut Half,
         residual: *const Half,

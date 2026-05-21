@@ -118,6 +118,41 @@ pub fn scale_f32_in_place(
     Ok(())
 }
 
+pub fn repeat_f32_for_reduce_scatter_into(
+    ctx: &DeviceContext,
+    local: &CudaSlice<f32>,
+    repeated: &mut CudaSlice<f32>,
+    local_elems: usize,
+    world_size: usize,
+) -> Result<()> {
+    assert!(
+        local_elems <= local.len(),
+        "repeat_f32 local_elems {} exceeds local len {}",
+        local_elems,
+        local.len()
+    );
+    assert!(
+        repeated.len() >= local_elems * world_size,
+        "repeat_f32 repeated len {} < local_elems {} * world_size {}",
+        repeated.len(),
+        local_elems,
+        world_size
+    );
+    let (local_ptr, _local_guard) = local.device_ptr(&ctx.stream);
+    let (repeated_ptr, _repeated_guard) = repeated.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::repeat_f32_for_reduce_scatter_cuda(
+            local_ptr as *const f32,
+            repeated_ptr as *mut f32,
+            local_elems as i32,
+            world_size as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Batched SiLU+mul: out[i] = silu(gate[i]) * up[i]
 pub fn silu_mul_batch(
     ctx: &DeviceContext,

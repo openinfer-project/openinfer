@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         ModelType::DeepSeekV2Lite => false,
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => false,
-        ModelType::KimiK2 => false,
+        ModelType::KimiK2 => args.cuda_graph,
         ModelType::Qwen3 | ModelType::Qwen35 => args.cuda_graph,
     };
 
@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
             let handle = pegainfer_kimi_k2::start_engine(
                 &args.model_path,
                 EngineLoadOptions {
-                    enable_cuda_graph: false,
+                    enable_cuda_graph: args.cuda_graph,
                     enable_prefill_profile: false,
                     device_ordinals: (0..8).collect(),
                     seed: 42,

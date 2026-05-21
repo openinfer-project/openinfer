@@ -8,15 +8,41 @@ autotests = false
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true, optional = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
 memmap2 = { workspace = true }
+pegainfer-cupti = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }
 pegainfer-kernels = { workspace = true }
 safetensors = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
+kernel-report = [
+    "dep:clap",
+    "dep:pegainfer-cupti",
+    "kernel-call-trace",
+]
+
+[[bin]]
+name = "kimi_kernel_report"
+path = "src/bin/kimi_kernel_report.rs"
+required-features = ["kernel-report"]
+
+[[bin]]
+name = "kimi_model_report"
+path = "src/bin/kimi_model_report.rs"
+required-features = ["kernel-report"]
+
+[[bin]]
+name = "kimi_graph_probe"
+path = "src/bin/kimi_graph_probe.rs"
+required-features = ["kernel-report"]
 
 [lints]
 workspace = true

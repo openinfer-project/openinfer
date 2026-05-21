@@ -47,10 +47,10 @@ pub struct KimiK2DirectRuntimeConfig {
     ///
     /// Current Kimi decode does *not* install pplx-garden EP. TP embedding /
     /// projection and MoE shared/routed combines go through NCCL reductions
-    /// over the 8 rank streams, with a CPU rank barrier before decode
-    /// collectives to avoid rank-phase divergence. Rename this field before
-    /// wiring real PPLX dispatch/combine so the two paths cannot be confused.
+    /// over the 8 rank streams. Rename this field before wiring real PPLX
+    /// dispatch/combine so the two paths cannot be confused.
     pub use_nccl_ep_bridge: bool,
+    pub enable_cuda_graph: bool,
 }
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
@@ -60,12 +60,6 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
             options.device_ordinals
         );
     }
-    if options.enable_cuda_graph {
-        bail!(
-            "Kimi-K2 direct scheduler does not support CUDA Graph while using the temporary NCCL EP bridge"
-        );
-    }
-
     let text_config = load_text_config(model_path)?;
     let weight_manifest = ensure_text_only_model_index(model_path)?;
     let placements = build_tp8_ep8_placements(&options.device_ordinals)?;
@@ -93,11 +87,12 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         placements,
         thread_placement,
         use_nccl_ep_bridge: true,
+        enable_cuda_graph: options.enable_cuda_graph,
     };
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
-    thread::Builder::new()
+    let scheduler_handle = thread::Builder::new()
         .name("kimi-k2-scheduler".into())
         .spawn(move || {
             pin_scheduler_thread(&runtime_config.thread_placement);
@@ -115,7 +110,10 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     init_rx
         .recv()
         .map_err(|err| anyhow::anyhow!("Kimi-K2 scheduler init channel closed: {err}"))??;
-    Ok(EngineHandle::new(submit_tx))
+    Ok(EngineHandle::new_with_join_handle(
+        submit_tx,
+        scheduler_handle,
+    ))
 }
 
 fn load_text_config(model_path: &Path) -> Result<KimiK2TextConfig> {
@@ -182,11 +180,7 @@ impl KimiK2DirectScheduler {
     }
 
     fn handle_request_batch(&mut self, reqs: Vec<GenerateRequest>) {
-        let decode_batch_size = if reqs.len() == 1 {
-            1
-        } else {
-            KIMI_DIRECT_MAX_BATCH
-        };
+        let decode_batch_size = reqs.len();
         let mut active = Vec::with_capacity(reqs.len());
         for (slot, req) in reqs.into_iter().enumerate() {
             if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
@@ -431,6 +425,7 @@ impl KimiK2DirectRuntime {
                 thread_placement,
                 ctx,
                 Arc::clone(&collective_barrier),
+                config.enable_cuda_graph,
             )?;
             debug_assert_eq!(worker.placement(), placement);
             debug_assert_eq!(worker.weight_plan().rank, placement.rank);

@@ -15,6 +15,44 @@ pub const KIMI_K2_LOCAL_EXPERTS: usize = KIMI_K2_ROUTED_EXPERTS / KIMI_K2_EP_WOR
 pub const KIMI_K2_TOPK: usize = 8;
 pub const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
 
+pub fn kimi_add_f32_bf16_to_bf16(
+    ctx: &DeviceContext,
+    a: &CudaSlice<f32>,
+    b: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let elems = b.hidden_dim * b.seq_len;
+    ensure!(
+        a.len() >= elems,
+        "Kimi f32 add input too small: have {}, need {}",
+        a.len(),
+        elems
+    );
+    ensure!(
+        out.hidden_dim == b.hidden_dim && out.seq_len == b.seq_len,
+        "Kimi f32 add output shape mismatch: out=[{}, {}], b=[{}, {}]",
+        out.hidden_dim,
+        out.seq_len,
+        b.hidden_dim,
+        b.seq_len
+    );
+
+    let (a_ptr, _a_guard) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _b_guard) = b.data.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::kimi_add_f32_bf16_to_bf16_cuda(
+            a_ptr as *const f32,
+            b_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            elems as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiCutlassSm90aSupport {
     pub supported: bool,

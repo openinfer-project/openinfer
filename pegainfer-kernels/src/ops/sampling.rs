@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 const FLASHINFER_TOPK_ROW_STATES_BYTES: usize = 1024 * 1024;
 
@@ -170,4 +170,54 @@ fn gpu_sample_core(
 
 pub fn flashinfer_topk_row_states_bytes() -> usize {
     FLASHINFER_TOPK_ROW_STATES_BYTES
+}
+
+pub fn flashinfer_top1_batch_into(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    top1_values: &mut CudaSlice<half::bf16>,
+    row_states_scratch: &mut CudaSlice<u8>,
+    out: &mut CudaSlice<i32>,
+) -> Result<()> {
+    let rows = logits.seq_len;
+    if top1_values.len() < rows {
+        return Err(anyhow!(
+            "top1 values scratch too small: have {}, need {}",
+            top1_values.len(),
+            rows
+        ));
+    }
+    if out.len() < rows {
+        return Err(anyhow!(
+            "top1 output too small: have {}, need {}",
+            out.len(),
+            rows
+        ));
+    }
+    if row_states_scratch.len() < FLASHINFER_TOPK_ROW_STATES_BYTES {
+        return Err(anyhow!(
+            "top1 row states scratch too small: have {}, need {}",
+            row_states_scratch.len(),
+            FLASHINFER_TOPK_ROW_STATES_BYTES
+        ));
+    }
+
+    let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = top1_values.device_ptr_mut(&ctx.stream);
+    let (r_ptr, _gr) = row_states_scratch.device_ptr_mut(&ctx.stream);
+    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::flashinfer_top1_batch_cuda(
+            l_ptr as *const ffi::Half,
+            v_ptr as *mut ffi::Half,
+            r_ptr as *mut u8,
+            o_ptr as *mut i32,
+            rows as i32,
+            logits.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
 }

@@ -9,11 +9,14 @@ use anyhow::Result;
 use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 pub mod attention;
+pub mod batch_decode_trace;
 pub mod collectives;
 pub mod config;
 pub mod dense;
 mod direct;
 pub mod experts;
+#[cfg(feature = "kernel-report")]
+pub mod kernel_report;
 pub mod router;
 pub mod runtime;
 pub mod tensor;

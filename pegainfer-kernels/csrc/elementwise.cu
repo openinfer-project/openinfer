@@ -53,6 +53,19 @@ __global__ void scale_f32_kernel(float *__restrict__ values, float scale, int n)
   }
 }
 
+__global__ void repeat_f32_rows_for_reduce_scatter_kernel(
+    const float *__restrict__ local,
+    float *__restrict__ repeated,
+    int local_elems,
+    int world_size) {
+  int total = local_elems * world_size;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    repeated[idx] = local[idx % local_elems];
+  }
+}
+
 // ============================================================================
 // SiLU-mul from separate gate/up buffers: out = silu(gate) * up
 // Matches Triton silu_mul_kernel rounding: silu computed in f32,
@@ -176,6 +189,17 @@ CUresult scale_f32_cuda(float *values, float scale, int n, cudaStream_t stream) 
   int block = 256;
   int grid = (n + block - 1) / block;
   scale_f32_kernel<<<grid, block, 0, stream>>>(values, scale, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult repeat_f32_for_reduce_scatter_cuda(
+    const float *local, float *repeated, int local_elems, int world_size,
+    cudaStream_t stream) {
+  int total = local_elems * world_size;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  repeat_f32_rows_for_reduce_scatter_kernel<<<grid, block, 0, stream>>>(
+      local, repeated, local_elems, world_size);
   return (CUresult)cudaGetLastError();
 }
 

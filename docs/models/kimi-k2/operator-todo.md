@@ -1,6 +1,6 @@
 # Kimi-K2.6 文本算子 TODO
 
-> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。direct worker/scheduler 的 H20 smoke/candidate/debug 测试入口已清理出主线；decode arena 已拆成 active-batch arena，避免单请求按 4 行 scratch/router/Marlin/reduce 执行，但后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode：4 并发 fixture prompt `max_tokens=2` 返回 `[1008,2742]`；decode row-state 曾收缩到 layer1 W13 Marlin，根因是 PegaInfer 误走 `use_atomic_add=true` 的 BF16 atomic split-K 路径。现已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。性能主线已开始撤掉诊断负担：同 token row-diff D2H 主路径硬关，decode F32 collectives 从 row-wise 诊断桥恢复为单次 contiguous all-reduce，decode collective CPU barrier 不再执行；下一步 H20 复测 bs4 TPOT。
+> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。direct worker/scheduler 的 H20 smoke/candidate/debug 测试入口已清理出主线；decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，避免 2/3 并发按 4 行 scratch/router/Marlin/reduce 执行；后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode：4 并发 fixture prompt `max_tokens=2` 返回 `[1008,2742]`；decode row-state 曾收缩到 layer1 W13 Marlin，根因是 PegaInfer 误走 `use_atomic_add=true` 的 BF16 atomic split-K 路径。现已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。性能主线已开始撤掉诊断负担：同 token row-diff D2H 主路径硬关，decode collective CPU barrier 不再执行；routed MoE decode combine 已从 dense F32 all-reduce bridge 改为 NCCL reduce-scatter bridge：local router/Marlin 仍按本 rank 实际 batch 行数执行，再用 device repeat 构造 RS 输入，H20 gate 待补。
 >
 > **Last touched:** 2026-05
 
@@ -14,8 +14,8 @@
 
 1. H20 端到端优先：停止继续新增内部 smoke 作为主线。`pegainfer-server` + OpenAI-compatible `/v1/completions` 已在 H20 跑通 K2.5 `max_tokens=1/2/8`；vLLM fixture 27-token prompt 的 `max_tokens=1` 返回 token id `1008`，`max_tokens=2` 返回 `[1008, 2742]`，4 并发 `max_tokens=8` 四路一致返回 `[1008,2742,2531,414,19180,6082,1379,387]`。
 2. Decode(bs4) 生产化：worker-owned MLA KV/cache owner 已落地，prompt prefill 已把每层 compressed KV/KPE 写入 arena，direct crate 的旧 H20 smoke/candidate/perf 测试入口已移除；scheduler 现在按最多 4 个请求组成 wave，第 2 个 token 起调用真实 bs4 decode body。当前 HTTP 端到端 4 并发 output8 曾为 `57.4 tok/s`；强同步 profile 下稳态 decode step 约 `35.0ms`，纯 decode bs4 总吞吐约 `114 tok/s`。W13 atomic row-state bug 修复后，固定 4 并发 output16 gate 的 row diff 已清零；性能主线重新回到 NCCL bridge 下的 MoE collective/route 固定开销、continuous batching、collective/sampling D2H 清理和 graph-ready collectives，PPLX EP 作为后续替换项保留。
-3. EP 生产化：当前 runtime 明确是 NCCL-sum correctness bridge，代码字段为 `use_nccl_ep_bridge=true`；PPLX dispatch/combine 尚未接入，后续再按 DSV4 结构替换 MoE combine 路径。
-4. Decode batch policy：旧代码把单请求也塞进固定 bs4 scratch，导致 router/Marlin route elems/routed reduce/logits 都按 4 行执行。active-batch arena 清理可以保留，但禁止基于 `bs==1` 做假设优化；所有性能改动必须服务 `bs>1` 和 `decode(bs4)>300 tok/s`。bs1 no-barrier 实验已回退，目标下一步是解释并消除 CPU barrier 背后的 rank/stream/状态问题，再减少 collective cadence。
+3. EP 生产化：decode routed MoE combine 正从 dense all-reduce bridge 迁到 NCCL reduce-scatter bridge。当前实现目标是 `local router/Marlin -> device repeat f32 -> reduce_scatter_f32_hidden`，不做 BF16 all-gather，也不把 local expert compute 按 EP world 放大。这还不是真 PPLX dispatch/combine；PPLX EP 需要后续替换 MoE-side dispatch/combine call sites。
+4. Decode batch policy：旧代码把单请求也塞进固定 bs4 scratch，导致 router/Marlin route elems/routed reduce/logits 都按 4 行执行；上一版只拆成 bs1/bs4 两档，2/3 并发仍会落到 bs4。当前改为预分配 `1..=4` 四个 arena，scheduler 用真实 wave size 选择 arena。禁止基于 `bs==1` 做假设优化；所有性能改动必须服务 `bs>1` 和 `decode(bs4)>300 tok/s`。
 5. Prefill perf hardening：当前 correctness path 在 128+ synthetic prompt 已过 1k tok/s，但仍有 per-layer allocation、首个 collective stream drain、host-visible final top1；后续要把 scratch/RoPE/cache 预分配，形成稳定 perf gate。
 6. vLLM parity hardening：当前 H20 多 prompt gate 4/4 greedy argmax match，top-20 id overlap 最低 `19/20`；后续在 PPLX/perf path 上继续扩 prompt，出现 mismatch 再做 first-diff 定位。
 7. 子模块 H20 gate：只证明真实权重能 load/package/route/launch/reduce；数值 gate 只对 Torch/vLLM 外部 fixture，不再用本仓库自写 dequant+cuBLAS 当 correctness reference。
@@ -76,7 +76,7 @@
 
 - atomic 修复后，原来用于定位 row-state 的 `debug_identical_decode_*` 已经不适合留在性能主路径：4 并发同 prompt 会满足同 token / 同 position 条件，导致每层多个切点执行 `sync + D2H + sync`。
 - 代码决策：decode worker 里 `debug_same_rows` 硬关为 `false`。诊断 helper 暂留作下一次 first-diff 工具，但默认请求不再触发 D2H。
-- 代码决策：`all_reduce_hidden_via_f32_in_place_with_barrier` 继续保留 BF16->F32->BF16 桥，避免 BF16 NCCL row-offset rounding；但 F32 NCCL 从 per-row loop 改回单次 contiguous all-reduce。row-wise F32 collective 是 atomic bug 未修前的诊断桥，bs4 下会把每个 collective 放大成 4 次。
+- 代码决策：`all_reduce_hidden_via_f32_in_place` 继续保留 BF16->F32->BF16 桥，避免 BF16 NCCL row-offset rounding；但 F32 NCCL 从 per-row loop 改回单次 contiguous all-reduce。row-wise F32 collective 是 atomic bug 未修前的诊断桥，bs4 下会把每个 collective 放大成 4 次。
 - 代码决策：decode F32 TP/routed collective helper 不再执行 CPU `Barrier`。prompt load 后第一发 vocab-shard embedding TP collective 的 barrier + stream drain 先保留，因为那是 H20 首个 NCCL call 的独立稳定性问题，不混进 decode steady TPOT 的这一刀。
 - 本地验证：`cargo fmt --all --check`、`PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
 - H20 验证：
@@ -86,6 +86,31 @@
   - warm `max_tokens=64` wall `1774.731ms`、HTTP 端到端输出吞吐 `144.247 tok/s`，四路前 16 token 匹配，64 token 长度一致，tail 一致；
   - `ROUTER_COUNT=0`、`ROUTE_ROW_COUNT=0`、`ROW_COUNT=0`。验证后已停止 tmux/port `18080`，H20 `nvidia-smi --query-compute-apps` 无进程。
 - 结论：撤掉 row-diff D2H、row-wise F32 collective 和 decode CPU barrier 后，warm output64 从旧口径约 `114 tok/s` 提升到 `144 tok/s` 量级，但仍低于 `decode(bs4)>300 tok/s`。下一刀评估 decode TP hidden 是否能从 BF16->F32->BF16 bridge 恢复为 BF16 bulk collective，或者直接转向 PPLX/collective cadence。
+
+## Execution Log: routed MoE decode reduce-scatter bridge
+
+- 设计对照：原 routed F32 dense all-reduce bridge 改成 NCCL reduce-scatter bridge，但不引入 BF16 all-gather。local router、Marlin W13/W2、SwiGLU、top-k sum 仍按本 rank 实际 batch 行数执行。
+- 代码改动：
+  - `KimiWorkerDecodeScratch` 增加 `routed_reduce_scatter_send_f32`，容量为 `batch_size * EP8 * hidden`；
+  - 新增 `repeat_f32_for_reduce_scatter_cuda` / Rust wrapper，在 device 上把 local `[B,H]` partial 重复成 reduce-scatter 输入 `[EP8*B,H]`；
+  - `forward_moe_layer_decode_into` 在 `kimi_marlin_sum_topk_rows_f32` 后执行 device repeat，再用 `reduce_scatter_f32_hidden_into` 写回本地 `[B,H]`，随后沿用 router scale 与 residual add；
+  - `batch_decode_trace.rs` 的每层 MoE trace 从 `routed_allreduce` 改成 `repeat_f32_for_reduce_scatter` + `routed_reduce_scatter`。该路径避免 `B*EP8` expert compute，仍是 NCCL bridge，不是最终 PPLX EP。
+- graph 约束：这条 bridge 使用预分配 buffer、同 stream device kernel 和 NCCL reduce-scatter，不需要 D2H、不做 step 内分配。H20 graph probe 已证明 NCCL all-reduce / reduce-scatter 本身可以 capture；整段 decode graph 需要跨 rank begin/enqueue/end/launch 对齐。
+- 验证状态：本地 `cargo fmt --all --check` 与 `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins` 已过；H20 短 greedy gate 待同步后补。
+
+## Execution Log: CUDA Graph gate
+
+- baseline：H20 当前稳定 correctness 版本在 4 并发 fixture 上，warm `max_tokens=64` 为 `27.76ms/token`、`144.1 tok/s`，更长 warm `max_tokens=128` 为 `24.92ms/token`、`160.5 tok/s`；四路前 16 token 与 vLLM fixture 一致。
+- rejected fusion：尝试把 `allreduce_f32 -> f32_to_bf16 -> add_batch` 改成已有 `add_f32_bf16_to_bf16`，`max_tokens=128` 到 `24.09ms/token`，但 token 从第 3 个开始变成 `[1008,2742,924,6454,...]`。根因是旧语义有 `F32 contribution -> BF16` 的 rounding boundary，新 kernel 变成 `F32 contribution + BF16 residual -> BF16`，数值边界不等价。该语义改动已回退；后续若做 fusion，必须写“先 round contribution 到 BF16，再执行 BF16 residual add”的专用 kernel。
+- CUDA Graph gate：按 Qwen 路径把 Kimi decode GPU body 拆成 graph 内 launch 和 graph 外 top1 D2H，server 侧临时把 Kimi `enable_cuda_graph` 打开，H20 `max_tokens=2` 四并发卡在第一轮 decode capture，日志只有 completions request，没有 completion/error；kill server 后客户端断连。结论：当前“整段 decode + NCCL all-reduce/reduce-scatter bridge”不能直接 CUDA Graph capture，表现为 capture-time hang。
+- graph root cause 复查：新增 `kimi_graph_probe`，H20 分别验证 local kernel、cuBLAS GEMM、NCCL all-reduce、NCCL reduce-scatter 的 capture/replay 均通过。此前 hang 不是 collective 不能进图，而是 Kimi worker 每个 rank 独立 begin/end/launch，NCCL graph capture 没有跨 rank 阶段对齐。
+- 修复：`CudaGraphState` 增加同步 phase hook；Kimi worker 在 graph capture/replay 的 begin、enqueue 后、end、launch 前后使用 rank barrier 对齐。`pegainfer-server` 侧 Kimi 开始尊重 `--cuda-graph true`，用于显式 gate。
+- H20 graph gate：`target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 18080 --cuda-graph true` 启动，4 并发 fixture prompt：
+  - `max_tokens=2`：wall `4511.0ms`，四路 token ids `[1008,2742]`，证明原 capture hang 已修；
+  - warm `max_tokens=16`：wall `714.4ms`，`89.6 tok/s`，四路 16 token 全对；
+  - warm `max_tokens=64`：wall `1523.1ms`，`168.1 tok/s`，`23.80ms/token/wave`，四路 prefix/tail 一致；
+  - warm `max_tokens=128`：wall `2641.9ms`，`193.8 tok/s`，`20.64ms/token/wave`，四路 prefix/tail 一致。
+- 决策：Kimi graph 主线继续推进；当前 graph 能进整段 decode，但距离 `15ms/token/wave` 仍有约 `5.6ms` 差距。下一步不做 residual fusion，优先看 graph replay 下剩余 kernel/NCCL 时间组成，尤其是 TP hidden bridge、shared expert GEMM+collective、routed RS bridge 和 FlashInfer MLA。
 
 ## Rejected: decode TP hidden BF16 bulk collective
 
@@ -131,16 +156,108 @@
 - 结论：top1 不是当前 decode(bs4) 主瓶颈；Marlin GEMM 平均占比也不是最大头，但它的 p99/max 说明 routed expert 负载和 rank arrival skew 必须进入 profile 口径。下一步应按 DSV4 Flash 的经验先压 MoE/collective cadence：减少每层 shared/routed all-reduce、route/align 固定开销、allocator churn 和 rank phase skew，再考虑更大粒度 graph/static decode block。
 - 以后 Kimi 性能 profile 必须同时报告 `count/total/avg/std/p50/p95/p99/max/p99-p50/max-p50`；只给 p50 或 avg 的数据不能支持 keep/revert 决策。
 
+## Qwen3 exporter/report 经验迁移
+
+- 2026-05-21 复盘 Qwen3-4B 的测量链路后，Kimi 性能口径改为先补 model-local exporter/report，再用 HTTP/nsys 做端到端佐证。
+- Qwen3 当前不是靠端到端 trace 直接解释单 op，而是三层结构：
+  - `batch_decode_trace.rs` 通过 `kernel-call-trace` 导出真实 decode DAG 的 `KernelCall`，包含 op、shape、call-site 和 repeat count；
+  - `qwen3_kernel_report.rs` 用 manifest 驱动单 op snapshot，CUDA event/CUPTI 只测目标 op，记录硬件、cache state、iters、CUPTI 指标和变体；
+  - `qwen3_model_report.rs` 重新按 runtime trace 的 call count 组合出 model-level decode report。
+- Kimi 后续不能再用“HTTP 4 并发 + nsys 整个请求窗口”的 trace 计算纯 decode kernel 时间；该口径混入 prompt prefill、frontend、scheduler、首轮 lazy init 和 response 开销。之前把 `magma_sgemmEx_kernel` 的 `240` 次总耗时按 `16` 个 output token 平摊，是错误口径；`240 = 4 请求 * 60 MoE 层`，主要对应 4 个 prompt prefill 中的 shared expert GEMM，不是 TP8 decode steady shared GEMM。
+- Kimi 下一步测量入口：
+  1. 增加 `kimi_decode_trace`：导出 bs1/bs4 decode DAG，先覆盖 `embedding`、MLA projections/rope/FlashInfer MLA/o_proj、dense/shared GEMM、router、Marlin W13/W2、SwiGLU、topk reduce、BF16/F32 all-reduce、logits/top1。
+  2. 增加 `kimi_kernel_report`：先给 attention-only、shared BF16 GEMM、Marlin WNA16、router/align/reduce、NCCL BF16/F32 bridge 建独立 provider；每个 provider 用 CUDA event/CUPTI，不读 HTTP trace。
+  3. 增加 `kimi_model_report decode --batch-size {1,4} --kv-len <n>`：按真实 61 层 schedule 汇总 mean/std/p50/p95/p99/max，并显式区分 prompt/prefill 和 decode steady。
+  4. H20 perf keep/revert 只接受：外部 vLLM greedy gate 不回退，加 model report 显示目标 decode stage 下降。端到端 HTTP throughput 作为最终 serving 佐证，不再作为 first-principles kernel 时间来源。
+- 本轮已落地第一版 Kimi tooling：
+  - `pegainfer-kimi-k2/src/batch_decode_trace.rs` 生成 rank0-local decode `KernelCall` DAG；bs4/kv1024 trace 展开 `1765` 个 call，覆盖 `61` 层 MLA、`60` 层 MoE、`183` 次 all-reduce、final logits/top1。
+  - `pegainfer-kimi-k2/src/kernel_report.rs` 提供单 op CUDA event provider；已覆盖 BF16 GEMM、RMSNorm、SiLU、BF16 add、F32 scale、embedding、top1、MLA rope/absorb/v_up/FlashInfer decode、router、route align、W13 SwiGLU、W13/W2 Marlin WNA16 synthetic provider、topk sum、Kimi F32+BF16 add。`kimi_add_f32_bf16_to_bf16` 已提升到 `pegainfer-kernels::ops`，不再用 BF16 add 冒充。
+  - `pegainfer-kimi-k2/src/bin/kimi_kernel_report.rs` 支持 `trace` / `run`；`pegainfer-kimi-k2/src/bin/kimi_model_report.rs` 按 trace call count 汇总 `by_op` / `by_call_site` / coverage。
+  - 当前缺口必须在 report 里保持显式 missing：`all_reduce` 需要 8-rank H20 harness；`kimi_marlin_wna16_gemm` 已有 synthetic package provider，但缺真实 per-rank route histogram。
+- 本轮把 live runtime hook 的基础补上：
+  - `pegainfer-core::ops::call_trace` 从纯 thread-local collector 扩展为 TLS + global collector；父线程 `collect_result` 现在可以收集 worker 子线程记录的 `KernelCall`。
+  - 新增 CPU-only 单测 `collect_result_captures_calls_from_child_thread` 覆盖跨线程收集，避免 Kimi 的 persistent rank worker trace 永远留在 worker TLS 里。
+  - Kimi `kernel-report` feature 现在包含 `kernel-call-trace`。`forward_decode_batch_next_tokens` 的真实 rank worker decode command 在 rank0、collector enabled 时，会按实际 `decode_batch_size` 和 `append_positions` 记录同一份 rank0-local decode DAG。
+  - non-HTTP runtime trace CLI 已完成：`kimi_kernel_report trace --source runtime` 和 `kimi_model_report decode --source runtime` 会启动 direct runtime，并用 `call_trace::collect_result` 收集 rank0 worker 发出的 calls；`--source static` 只保留为离线 DAG 对照。
+- Rank scope 决策：Kimi 是 8 卡 TP8/EP8。第一版 report 只采 rank0 local compute + collective placeholder，足够解释 dense/shared/attention 的单 rank kernel count；但会丢 MoE EP 真实 route 分布、rank imbalance 和 NCCL tail。后续补 full-rank extension 时要记录每 rank route histogram、local routed rows、collective p99/max，不能用 rank0 代表 EP 全局。
+- 已验证命令：
+
+```bash
+cargo fmt --all --check
+PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
+PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-qwen3-4b --features kernel-report --bins
+PEGAINFER_CUDA_SM=90a cargo test --release -p pegainfer-core --features kernel-call-trace collect_result_captures_calls_from_child_thread
+PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- trace --batch-size 4 --kv-len 1024 --out /tmp/kimi_decode_trace_bs4_kv1024.json
+```
+
+- trace 摘要：`calls=1765`、`unique_ops=18`，top ops 为 `gemm_graphsafe=489`、`rms_norm_batch=184`、`all_reduce=183`、`add_batch=122`、`kimi_marlin_wna16_gemm=120`。
+- H20 验证：
+  - 先 probe `h20-100`：仓库路径 `/root/develop/xingming/pegainfer-kimi-k2-main`，模型权重仍在 `/data/models/Kimi-K2.5`；本轮只做 build/trace，没有启动 server。
+  - dry-run rsync 后同步本轮精确文件列表；不传模型、日志或 build artifact。
+  - 远端首次 `cargo check` 失败于缺少 Triton Python：`Could not find a Python interpreter with Triton installed`。改用现有 `/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python` 作为 `PEGAINFER_TRITON_PYTHON` 后通过。
+  - 远端通过：
+
+```bash
+PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+  cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
+PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+  cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
+  trace --batch-size 4 --kv-len 1024 --out /tmp/kimi_decode_trace_bs4_kv1024.json
+```
+
+  - 远端 trace 摘要同本地：`calls=1765`、`unique_ops=18`、JSON `1921890` bytes。运行结束后没有 Kimi server 进程；当时 H20 上另有无关 `scripts/pd_rdma_e2e.py --cuda-device 2` 占用约 `1520MiB`。
+  - 跨线程 trace 补丁同步后，H20 复跑 `cargo test --release -p pegainfer-core --features kernel-call-trace collect_result_captures_calls_from_child_thread`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins` 和同一条 trace 命令均通过；trace 仍为 `1765` calls。
+- Runtime trace gate：
+  - `kimi_kernel_report trace` 默认 `--source runtime`，通过 `EngineHandle` 直接启动 Kimi direct runtime、提交 `GenerateRequest`，不经过 HTTP/server。`--source static` 只作为离线 DAG 对照。
+  - 真实 runtime trace 最小 H20 命令：
+
+```bash
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
+  trace --source runtime --batch-size 1 --kv-len 2 --out /tmp/kimi_runtime_trace_bs1_kv2.json
+```
+
+  - 第一轮忘记 `LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib`，scheduler 初始化阶段找不到 NCCL；修正环境后 trace 写出 JSON，但退出时 segfault。根因是 Kimi `start_engine` 丢弃 scheduler `JoinHandle`，进程退出时没有等待 CUDA/NCCL worker teardown。
+  - 修复：`start_engine` 改为 `EngineHandle::new_with_join_handle(submit_tx, scheduler_handle)`；H20 重跑 runtime trace 退出码 `0`。
+  - 成功产物：`/tmp/kimi_runtime_trace_bs1_kv2.json`，`calls=1765`，first `decode.embedding / embedding_batch_vocab_shard`，last `decode.top1 / top1_batch`，top call counts 同静态 DAG。此证据来自真实 direct runtime decode worker，不经过 HTTP。
+- Runtime model report gate：
+  - H20 最小命令：
+
+```bash
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
+  decode --source runtime --batch-size 1 --kv-len 2 --iters 1 --format text \
+  --out /tmp/kimi_runtime_model_report_bs1_kv2.json
+```
+
+  - 结果退出码 `0`，`schedule=1765`，`schedule_source="Kimi direct runtime decode trace via EngineHandle/worker; no HTTP"`，`coverage_missing=7`，`total_measured_us=17094.496`。这是账本结构 gate，不是性能结论；`iters=1` 只证明 model report 能消费真实 runtime call count。
+- 当前 provider 边界：`all_reduce` 需要独立 8-rank/NCCL harness；`kimi_marlin_wna16_gemm` 已有 synthetic packed INT4 provider，但还没有真实 per-rank route histogram。CUPTI raw metric 本轮不接入，当前是 CUDA event-only。
+- CUPTI 决策更新：先不接 CUPTI，目标收敛到 decode 性能组成解释。`kimi_model_report` schema `2` 已把 total call coverage 拆开：
+  - `total_schedule_calls`
+  - `measured_schedule_calls`
+  - `missing_schedule_calls`
+  - `missing_by_op`
+- H20 runtime model report schema2 gate：`decode --source runtime --batch-size 1 --kv-len 2 --iters 1` 退出码 `0`。接入 Marlin provider 前输出 `total_schedule_calls=1765`、`measured_schedule_calls=1462`、`missing_schedule_calls=303`；接入 Marlin provider 后输出 `measured_schedule_calls=1582`、`missing_schedule_calls=183`，missing 只剩：
+  - `all_reduce`: `183` calls / `5` normalized call-sites，reason 带 `rank participation hint=8`，说明它是 8 rank NCCL collective placeholder，不是单卡 kernel。
+- H20 report 产物：
+  - runtime bs1/kv2: `/tmp/kimi_runtime_model_report_bs1_kv2_marlin.json`，measured subset `51.796ms`，Marlin WNA16 `34.554ms`，coverage `1582/1765`。
+  - static bs4/kv1024: `/tmp/kimi_static_model_report_bs4_kv1024_marlin.json`，measured subset `149.904ms`，Marlin WNA16 `118.476ms`，coverage `1582/1765`。
+- 解读规则：`total_measured_us` 只代表 event provider 已覆盖的 rank0-local call subset，不是完整 TPOT；报告里的性能组成要同时读 `by_op` 和 `missing_by_op`。Marlin provider 当前用 synthetic all-local route，缺少真实 EP8 route histogram，所以 bs4 Marlin 占比不能直接当作线上 8 卡全局平均；它用于说明 report 已能把 W13/W2 大块计入账本，并暴露下一步需要 full-rank route histogram。
+
 ## H20 active-batch 清理与 bs1 假设禁令
 
-- 2026-05-21 清理固定 bs4 decode scratch：`KimiRankLoadedWeights` 现在持有两个 arena，bs1 请求使用 `KIMI_DECODE_SINGLE_BATCH=1` arena，多请求使用 `KIMI_DECODE_MAX_BATCH=4` arena。prefill 时按当前 wave 的 decode batch size 写入对应 paged KV，避免单请求 decode 读空 cache。
-- 删除 decode dense/MoE 中 `scratch.hidden.seq_len == 4` 的硬断言，改为 `1..=4`；bs1 不再按 4 行执行 embedding、MLA projection、router、Marlin W13/W2、routed F32 reduce 和 logits。
+- 2026-05-21 清理固定 bs4 decode scratch：第一轮把 `KimiRankLoadedWeights` 拆成 bs1/bs4 两个 arena，解决单请求按 4 行执行的问题；本轮继续改成 `1..=4` 四个 arena，scheduler 用真实 `reqs.len()` 作为 decode batch size，2/3 并发也不再按 4 行执行。
+- 删除 decode dense/MoE 中 `scratch.hidden.seq_len == 4` 的硬断言，改为 `1..=KIMI_DECODE_MAX_BATCH`；bs1/bs2/bs3 不再按 4 行执行 embedding、MLA projection、router、Marlin W13/W2、routed F32 reduce 和 logits。
 - H20 验证：
   - 本地 `cargo fmt --all --check`、`PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
   - H20 同步后 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server --bin pegainfer --bin bench_serving` 通过。
   - barrier 版本单请求 fixture prompt：`max_tokens=16` wall `462.832ms`，`max_tokens=32` wall `832.748ms`，`max_tokens=64` wall `1598.763ms`；`16->32` 差分 TPOT `23.12ms`，`32->64` 差分 TPOT `23.94ms`。
-  - rejected no-barrier 实验：bs1 跳过 CPU barrier 曾让暖态 `32->64` 差分 TPOT 到 `18.01ms`，但这是 `bs==1` 假设优化，不服务 `decode(bs4)>300 tok/s`，并且掩盖了 CPU barrier 背后的真实 bug；代码已回退到所有 decode collective 统一走 barrier。
-- 决策：禁止新增 `bs==1` 专用性能分支。后续优化必须按 active batch / bs4 / continuous batching 设计，且要解释为什么 NCCL all-reduce 之前需要 CPU barrier。下一处大头仍是 NCCL bridge 每 token的 collective cadence：embedding all-reduce、61 个 attention o_proj all-reduce、1 个 dense MLP all-reduce、60 个 shared BF16 all-reduce、60 个 routed F32 all-reduce，合计约 183 次 collective。
+  - rejected no-barrier 实验：bs1 跳过 CPU barrier 曾让暖态 `32->64` 差分 TPOT 到 `18.01ms`，但这是 `bs==1` 假设优化，不服务 `decode(bs4)>300 tok/s`，并且掩盖了当时的 rank/stream 状态问题；该路径已回退，当前生产 decode collective 不再使用 CPU barrier。
+- 决策：禁止新增 `bs==1` 专用性能分支。后续优化必须按 active batch / bs4 / continuous batching 设计。下一处大头仍是 NCCL bridge 每 token 的 collective cadence：embedding all-reduce、61 个 attention o_proj all-reduce、1 个 dense MLP all-reduce、60 个 shared BF16 all-reduce、60 个 routed F32 all-reduce，合计约 183 次 collective；CUDA Graph capture/replay 的 rank phase 对齐只用于 graph begin/end/launch，不是每个 collective 前的 CPU barrier。
 
 ## NCCL barrier 排查：先收紧错误边界
 
