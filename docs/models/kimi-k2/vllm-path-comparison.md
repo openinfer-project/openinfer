@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。H20 static/runtime trace 均为 `1886` calls，`gemm_graphsafe` 从 `428` 降到 `367`，旧 `kimi_mla_split_compressed_kv` 已从主路径删除；真实 fixture output16 四路 token 对齐 vLLM，synthetic output64 steady TPOT 从 `16.70ms` 到 `16.43ms`。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。H20 static/runtime trace 均为 `1886` calls，`gemm_graphsafe` 从 `428` 降到 `367`；MoE shared/main 与 routed compute/aux stream overlap 已通过 H20 correctness/perf gate，真实 fixture output16 steady TPOT `14.23ms`，synthetic output64 steady TPOT `14.61ms`。
 >
 > **Last touched:** 2026-05
 
@@ -178,6 +178,7 @@ H20 graph serving gates after fused-qkv:
 
 ## Next Actions
 
-1. Add timing coverage for `kimi_mla_paged_kv_append` or a full-rank collective harness so the model report no longer hides the remaining MLA/cache and NCCL portions.
-2. Evaluate shared expert gate/up fusion and router microbench against vLLM-style small-batch kernels.
-3. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.
+1. Profile the new p99/max tail under compute-overlap: output64 avg/p50 are under `15ms`, but p99 is still `16.95ms`.
+2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
+3. Next graph-safe local wins: shared expert gate/up load-time fusion, `scale_f32 + routed residual add` equivalent fusion, Marlin clear fusion, and `kimi_mla_paged_kv_append` provider coverage.
+4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

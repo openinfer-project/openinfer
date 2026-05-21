@@ -353,6 +353,7 @@ impl Drop for KimiRankWorker {
 
 struct KimiRankThreadState {
     ctx: KimiRankGpuContext,
+    decode_aux_ctx: DeviceContext,
     _cublas: KimiCublasThreadGuard,
     tp_comm: Option<OwnedRankComm>,
     weight_names: KimiRankWeightNames,
@@ -543,11 +544,23 @@ fn bind_rank_thread(
     enable_cuda_graph: bool,
 ) -> Result<KimiRankThreadState> {
     ctx.set_current()?;
+    let decode_aux_stream = ctx.ctx.new_stream().with_context(|| {
+        format!(
+            "failed to create Kimi decode aux stream for device {}",
+            ctx.device_ordinal
+        )
+    })?;
+    let decode_aux_ctx = DeviceContext {
+        ctx: Arc::clone(&ctx.ctx),
+        stream: decode_aux_stream,
+        device_ordinal: ctx.device_ordinal,
+    };
     unsafe {
         pegainfer_kernels::ffi::cublas_init();
     }
     Ok(KimiRankThreadState {
         ctx,
+        decode_aux_ctx,
         _cublas: KimiCublasThreadGuard,
         tp_comm: None,
         weight_names,
@@ -715,6 +728,11 @@ impl KimiRankThreadState {
             )
         })?;
         let device_ctx = self.ctx.as_device_context();
+        let decode_aux_ctx = DeviceContext {
+            ctx: Arc::clone(&self.decode_aux_ctx.ctx),
+            stream: Arc::clone(&self.decode_aux_ctx.stream),
+            device_ordinal: self.decode_aux_ctx.device_ordinal,
+        };
         let KimiRankLoadedWeights {
             gpu,
             expert_kernels,
@@ -765,6 +783,7 @@ impl KimiRankThreadState {
                 || {
                     forward_decode_batch_next_token_kernels(
                         &device_ctx,
+                        &decode_aux_ctx,
                         tp_comm.get(),
                         cache,
                         expert_kernels,
@@ -782,6 +801,7 @@ impl KimiRankThreadState {
         } else {
             forward_decode_batch_next_token_kernels(
                 &device_ctx,
+                &decode_aux_ctx,
                 tp_comm.get(),
                 cache,
                 expert_kernels,
@@ -1118,6 +1138,7 @@ impl KimiRankThreadState {
 #[allow(clippy::too_many_arguments)]
 fn forward_decode_batch_next_token_kernels(
     device_ctx: &DeviceContext,
+    decode_aux_ctx: &DeviceContext,
     comm: &Comm,
     cache: &KimiOneTokenForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
@@ -1238,6 +1259,7 @@ fn forward_decode_batch_next_token_kernels(
             KimiLayerForwardKindCache::Moe(moe) => {
                 forward_moe_layer_decode_into(
                     device_ctx,
+                    decode_aux_ctx,
                     comm,
                     layer.layer_idx,
                     moe,
@@ -2180,6 +2202,7 @@ fn forward_moe_layer_batch_into(
 
 fn forward_moe_layer_decode_into(
     ctx: &DeviceContext,
+    aux_ctx: &DeviceContext,
     comm: &Comm,
     layer_idx: usize,
     moe: &KimiMoeForwardCache,
@@ -2204,6 +2227,14 @@ fn forward_moe_layer_decode_into(
         KIMI_K2_RMS_NORM_EPS,
         &mut scratch.normed,
     );
+    let norm_ready = ctx
+        .stream
+        .record_event(None)
+        .with_context(|| format!("Kimi MoE layer {layer_idx} record norm_ready"))?;
+    aux_ctx
+        .stream
+        .wait(&norm_ready)
+        .with_context(|| format!("Kimi MoE layer {layer_idx} aux wait norm_ready"))?;
 
     gemm_graphsafe_into_checked(
         ctx,
@@ -2269,7 +2300,7 @@ fn forward_moe_layer_decode_into(
             topk_idx: &mut scratch.router_topk_idx,
         };
         kimi_router_noaux_tc_launch(
-            ctx,
+            aux_ctx,
             KimiRouterConfig::kimi_k2(),
             KimiRouterBatch {
                 batch_size: seq_len,
@@ -2297,7 +2328,7 @@ fn forward_moe_layer_decode_into(
     );
 
     let routing = kimi_moe_marlin_align_block_size(
-        ctx,
+        aux_ctx,
         &mut scratch.marlin_route_workspace,
         &scratch.router_topk_idx,
         seq_len,
@@ -2313,11 +2344,14 @@ fn forward_moe_layer_decode_into(
         })?
         .as_marlin_weights();
 
-    ctx.stream.memset_zeros(&mut scratch.marlin_w13_out.data)?;
-    ctx.stream
+    aux_ctx
+        .stream
+        .memset_zeros(&mut scratch.marlin_w13_out.data)?;
+    aux_ctx
+        .stream
         .memset_zeros(&mut scratch.marlin_workspace.locks)?;
     kimi_marlin_wna16_w13_gemm(
-        ctx,
+        aux_ctx,
         &mut scratch.marlin_workspace,
         &routing,
         &scratch.normed,
@@ -2336,7 +2370,11 @@ fn forward_moe_layer_decode_into(
         &scratch.marlin_w13_out,
         debug_same_rows,
     );
-    kimi_marlin_w13_swiglu(ctx, &scratch.marlin_w13_out, &mut scratch.marlin_activated)?;
+    kimi_marlin_w13_swiglu(
+        aux_ctx,
+        &scratch.marlin_w13_out,
+        &mut scratch.marlin_activated,
+    )?;
     debug_identical_decode_route_rows_bf16(
         ctx,
         rank,
@@ -2348,12 +2386,14 @@ fn forward_moe_layer_decode_into(
         &scratch.marlin_activated,
         debug_same_rows,
     );
-    ctx.stream
+    aux_ctx
+        .stream
         .memset_zeros(&mut scratch.marlin_expert_output.data)?;
-    ctx.stream
+    aux_ctx
+        .stream
         .memset_zeros(&mut scratch.marlin_workspace.locks)?;
     kimi_marlin_wna16_w2_gemm(
-        ctx,
+        aux_ctx,
         &mut scratch.marlin_workspace,
         &routing,
         &scratch.marlin_activated,
@@ -2372,9 +2412,9 @@ fn forward_moe_layer_decode_into(
         &scratch.marlin_expert_output,
         debug_same_rows,
     );
-    ctx.stream.memset_zeros(&mut scratch.routed_out_f32)?;
+    aux_ctx.stream.memset_zeros(&mut scratch.routed_out_f32)?;
     kimi_marlin_sum_topk_rows_f32(
-        ctx,
+        aux_ctx,
         &scratch.marlin_expert_output,
         seq_len,
         &mut scratch.routed_out_f32,
@@ -2392,12 +2432,19 @@ fn forward_moe_layer_decode_into(
         debug_same_rows,
     );
     repeat_f32_for_reduce_scatter_into(
-        ctx,
+        aux_ctx,
         &scratch.routed_out_f32,
         &mut scratch.routed_reduce_scatter_send_f32,
         seq_len * KIMI_K2_HIDDEN,
         KIMI_K2_EP_WORLD,
     )?;
+    let routed_local_done = aux_ctx
+        .stream
+        .record_event(None)
+        .with_context(|| format!("Kimi MoE layer {layer_idx} record routed_local_done"))?;
+    ctx.stream
+        .wait(&routed_local_done)
+        .with_context(|| format!("Kimi MoE layer {layer_idx} main wait routed_local_done"))?;
     reduce_scatter_f32_hidden_into(
         &scratch.routed_reduce_scatter_send_f32,
         seq_len * KIMI_K2_EP_WORLD,
