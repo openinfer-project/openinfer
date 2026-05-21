@@ -21,6 +21,7 @@ path = "src/bin/bench_serving.rs"
 pegainfer-core = { workspace = true }
 pegainfer-deepseek-v2-lite = { workspace = true, optional = true }
 pegainfer-deepseek-v4 = { workspace = true, optional = true }
+pegainfer-kimi-k2 = { workspace = true }
 pegainfer-qwen3-4b = { workspace = true }
 pegainfer-qwen35-4b = { workspace = true }
 pegainfer-vllm-frontend = { workspace = true }

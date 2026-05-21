@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         ModelType::DeepSeekV2Lite => false,
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => false,
+        ModelType::KimiK2 => false,
         ModelType::Qwen3 | ModelType::Qwen35 => args.cuda_graph,
     };
 
@@ -104,6 +105,22 @@ async fn main() -> anyhow::Result<()> {
                     seed: 42,
                 },
             )?;
+
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+
+            handle
+        }
+        ModelType::KimiK2 => {
+            let handle = pegainfer_kimi_k2::start_engine(
+                &args.model_path,
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    enable_prefill_profile: false,
+                    device_ordinals: (0..8).collect(),
+                    seed: 42,
+                },
+            )
+            .context("failed to start Kimi-K2.6 text engine")?;
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 

@@ -59,6 +59,13 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150: HF incremental greedy, host-staged EP2, and NCCL EP2 are token/text exact for `Hello`, output_len=16. |
 
+## models / kimi-k2
+
+| Path | TL;DR |
+| --- | --- |
+| `models/kimi-k2/support-analysis.md` | Kimi-K2 text-only bring-up：Marlin WNA16 routed expert、MLA prompt、全 61 层 prompt forward、多 prompt vLLM top-20 gate 已过；bs4 wave decode 已接入，Marlin atomic split-K row-state bug 修复后 output16 row diff 清零，正在撤掉 decode 诊断负担并回到 bs4 性能主线。 |
+| `models/kimi-k2/operator-todo.md` | Kimi-K2 算子清单：signed/unsigned nibble、Marlin WNA16 package/compute/worker backend 已过 H20；decode/prefill KV 主链已接端到端，W13/W2 已匹配 vLLM `c_tmp` global-reduce 路径，row-wise F32 bridge 已改回 bulk collective。 |
+
 ## subsystems / runtime
 
 | Path | TL;DR |

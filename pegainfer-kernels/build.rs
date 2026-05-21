@@ -1153,6 +1153,11 @@ fn main() {
                 flashinfer.cutlass_util.to_string_lossy().to_string(),
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
+                "-I".to_string(),
+                csrc_dir
+                    .join("kimi_k2/vllm_marlin")
+                    .to_string_lossy()
+                    .to_string(),
             ]);
         }
 
@@ -1163,6 +1168,36 @@ fn main() {
                 "-DFLASHINFER_ENABLE_FP8_E8M0".to_string(),
                 "-DFLASHINFER_ENABLE_FP4_E2M1".to_string(),
                 "-DCUTLASS_ENABLE_GDC_FOR_SM100=1".to_string(),
+            ]);
+        }
+
+        if stem.starts_with("kimi_") {
+            nvcc_args.extend([
+                "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "-I".to_string(),
+                flashinfer.include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.csrc.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.spdlog.to_string_lossy().to_string(),
+                "-I".to_string(),
+                csrc_dir
+                    .join("kimi_k2/vllm_marlin")
+                    .to_string_lossy()
+                    .to_string(),
+            ]);
+        }
+
+        if stem == "kimi_cutlass_int4_sm90a" {
+            nvcc_args.extend([
+                "-static-global-template-stub=false".to_string(),
+                "-Xcudafe".to_string(),
+                "--diag_suppress=177".to_string(),
             ]);
         }
 

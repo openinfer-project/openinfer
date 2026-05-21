@@ -1,7 +1,38 @@
 use cudarc::driver::sys::{CUresult, CUstream};
+use std::ffi::c_void;
 
 // Half type (16-bit float) - same layout as CUDA half
 pub type Half = u16;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KimiCutlassInt4GroupedWorkspaceSizes {
+    pub problem_sizes_bytes: usize,
+    pub ptr_arrays_bytes: usize,
+    pub stride_arrays_bytes: usize,
+    pub layout_arrays_bytes: usize,
+    pub cutlass_workspace_bytes: usize,
+    pub total_bytes: usize,
+    pub alignment: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct KimiCutlassInt4GroupedLaunchParams {
+    pub input: *const Half,
+    pub weight_packed_reordered: *const u8,
+    pub weight_scale: *const Half,
+    pub expert_indptr: *const u32,
+    pub output: *mut Half,
+    pub workspace: *mut c_void,
+    pub workspace_bytes: usize,
+    pub routed_tokens: i32,
+    pub in_dim: i32,
+    pub out_dim: i32,
+    pub local_experts: i32,
+    pub group_size: i32,
+    pub sm_count: i32,
+}
 
 // CUDA kernels - all use half precision
 unsafe extern "C" {
@@ -45,6 +76,22 @@ unsafe extern "C" {
         n: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn bf16_to_f32_cuda(
+        input: *const Half,
+        output: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn f32_to_bf16_cuda(
+        input: *const f32,
+        output: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
 
     pub fn fused_add_rms_norm_cuda(
         hidden: *mut Half,
@@ -97,11 +144,30 @@ unsafe extern "C" {
 
     pub fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
 
+    pub fn argmax_batch_bf16_cuda(
+        x: *const Half,
+        values: *mut Half,
+        indices: *mut i32,
+        rows: i32,
+        n: i32,
+        stream: CUstream,
+    );
+
     pub fn flashinfer_top1_cuda(
         logits: *const Half,
         top1_value_scratch: *mut Half,
         row_states_scratch: *mut u8,
         output: *mut i32,
+        vocab_size: i32,
+        stream: CUstream,
+    );
+
+    pub fn flashinfer_top1_batch_cuda(
+        logits: *const Half,
+        top1_values: *mut Half,
+        row_states_scratch: *mut u8,
+        output: *mut i32,
+        num_rows: i32,
         vocab_size: i32,
         stream: CUstream,
     );
@@ -127,7 +193,7 @@ unsafe extern "C" {
         N: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     pub fn gemm_graphsafe_cuda(
         W: *const Half,
@@ -137,7 +203,381 @@ unsafe extern "C" {
         N: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> i32;
+
+    pub fn kimi_int4_expert_metadata_probe_cuda(
+        weight_shape: *const i32,
+        weight_shape_entries: usize,
+        local_experts: i32,
+        in_dim: i32,
+        out_dim: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_int4_grouped_w1_w3_cuda(
+        expert_major_hidden: *const Half,
+        w1_packed: *const u8,
+        w1_scale: *const Half,
+        w1_shape: *const i32,
+        w3_packed: *const u8,
+        w3_scale: *const Half,
+        w3_shape: *const i32,
+        expert_indptr: *const u32,
+        gate_out: *mut Half,
+        up_out: *mut Half,
+        routed_tokens: i32,
+        hidden_dim: i32,
+        intermediate_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_int4_grouped_w2_swiglu_cuda(
+        gate: *const Half,
+        up: *const Half,
+        w2_packed: *const u8,
+        w2_scale: *const Half,
+        w2_shape: *const i32,
+        expert_indptr: *const u32,
+        expert_output: *mut Half,
+        routed_tokens: i32,
+        intermediate_dim: i32,
+        hidden_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_moe_expert_major_route_cuda(
+        topk_idx: *const i32,
+        pos_to_token: *mut i32,
+        token_topk_to_pos: *mut i32,
+        expert_indptr: *mut u32,
+        expert_cursor: *mut u32,
+        local_count: *mut u32,
+        active_tokens: i32,
+        topk: i32,
+        global_start: i32,
+        local_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_moe_expand_to_expert_major_cuda(
+        hidden: *const Half,
+        pos_to_token: *const i32,
+        expert_major_hidden: *mut Half,
+        hidden_dim: i32,
+        routed_capacity: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_moe_reduce_expert_major_f32_cuda(
+        expert_major_output: *const Half,
+        topk_weight: *const f32,
+        token_topk_to_pos: *const i32,
+        out: *mut f32,
+        active_tokens: i32,
+        hidden_dim: i32,
+        topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_add_f32_bf16_to_bf16_cuda(
+        a: *const f32,
+        b: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_split_compressed_kv_cuda(
+        kv_a: *const Half,
+        compressed: *mut Half,
+        k_rope: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_rope_assemble_prefill_cuda(
+        q_proj: *const Half,
+        k_rope: *const Half,
+        kv_b: *const Half,
+        cos: *const Half,
+        sin: *const Half,
+        q_attn: *mut Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        seq_len: i32,
+        local_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_rope_split_decode_cuda(
+        q_proj: *const Half,
+        k_rope: *const Half,
+        cos: *const Half,
+        sin: *const Half,
+        positions: *const i32,
+        q_nope: *mut Half,
+        q_pe: *mut Half,
+        append_kpe: *mut Half,
+        batch_size: i32,
+        local_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_rope_apply_kpe_cuda(
+        k_rope: *const Half,
+        cos: *const Half,
+        sin: *const Half,
+        positions: *const i32,
+        append_kpe: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_flashinfer_single_prefill_mla_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        local_heads: i32,
+        seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn kimi_mla_absorb_q_nope_cuda(
+        kv_b_proj: *const Half,
+        q_nope: *const Half,
+        q_abs_nope: *mut Half,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn kimi_mla_v_up_cuda(
+        kv_b_proj: *const Half,
+        latent: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn kimi_mla_paged_kv_append_cuda(
+        ckv_cache: *mut Half,
+        kpe_cache: *mut Half,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len: *const i32,
+        append_ckv: *const Half,
+        append_kpe: *const Half,
+        batch_indices: *const i32,
+        positions: *const i32,
+        nnz: i32,
+        ckv_stride_page: i64,
+        ckv_stride_n: i64,
+        kpe_stride_page: i64,
+        kpe_stride_n: i64,
+        page_size: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn kimi_flashinfer_batch_decode_mla_cuda(
+        q_nope: *const Half,
+        q_pe: *const Half,
+        output: *mut Half,
+        ckv_cache: *const Half,
+        kpe_cache: *const Half,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        ckv_stride_page: i64,
+        ckv_stride_n: i64,
+        kpe_stride_page: i64,
+        kpe_stride_n: i64,
+        page_size: i32,
+        batch_size: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn kimi_cutlass_int4_sm90a_support_cuda() -> CUresult;
+
+    pub fn kimi_cutlass_int4_sm90a_support_probe_cuda(
+        supported: *mut i32,
+        sm_major: *mut i32,
+        sm_minor: *mut i32,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_grouped_workspace_sizes_sm90a_cuda(
+        max_routed_tokens: i32,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        sizes: *mut KimiCutlassInt4GroupedWorkspaceSizes,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_grouped_prepare_sm90a_cuda(
+        params: KimiCutlassInt4GroupedLaunchParams,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_grouped_launch_sm90a_cuda(
+        params: KimiCutlassInt4GroupedLaunchParams,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_reorder_weight_sm90a_cuda(
+        weight_packed_offset_binary: *const u8,
+        weight_packed_reordered: *mut u8,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_reorder_scale_sm90a_cuda(
+        weight_scale_checkpoint: *const Half,
+        weight_scale_reordered: *mut Half,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_marlin_int4_reorder_scale_cuda(
+        weight_scale_checkpoint: *const Half,
+        weight_scale_marlin: *mut Half,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_marlin_int4_reorder_weight_cuda(
+        weight_packed_checkpoint_offset_binary: *const u8,
+        weight_packed_marlin: *mut u8,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_marlin_int4_fuse_w13_cuda(
+        gate_weight_packed_marlin: *const u8,
+        up_weight_packed_marlin: *const u8,
+        w13_weight_packed_marlin: *mut u8,
+        gate_scale_marlin: *const Half,
+        up_scale_marlin: *const Half,
+        w13_scale_marlin: *mut Half,
+        in_dim: i32,
+        intermediate_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_marlin_wna16_gemm_cuda(
+        input: *const Half,
+        output: *mut Half,
+        c_tmp: *mut f32,
+        b_qweight: *const u8,
+        b_scales: *const Half,
+        workspace: *mut i32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_post_padded: *const i32,
+        topk_weights: *const f32,
+        workspace_len: i32,
+        sorted_token_ids_len: i32,
+        moe_block_size: i32,
+        top_k: i32,
+        mul_topk_weights: bool,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        local_experts: i32,
+        group_size: i32,
+        sm_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_marlin_w13_swiglu_cuda(
+        w13: *const Half,
+        out: *mut Half,
+        rows: i32,
+        intermediate_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_marlin_sum_topk_rows_f32_cuda(
+        route_output: *const Half,
+        out: *mut f32,
+        active_tokens: i32,
+        topk: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_moe_marlin_align_block_size_cuda(
+        topk_idx: *const i32,
+        sorted_token_ids: *mut i32,
+        expert_ids: *mut i32,
+        num_tokens_post_padded: *mut i32,
+        expert_offsets: *mut u32,
+        expert_cursor: *mut u32,
+        active_tokens: i32,
+        topk: i32,
+        global_start: i32,
+        local_experts: i32,
+        block_size: i32,
+        max_padded_tokens: i32,
+        max_m_blocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_grouped_w1_w3_sm90a_cuda(
+        expert_major_hidden: *const Half,
+        w1_packed: *const u8,
+        w1_scale: *const Half,
+        w3_packed: *const u8,
+        w3_scale: *const Half,
+        expert_indptr: *const u32,
+        gate_out: *mut Half,
+        up_out: *mut Half,
+        routed_tokens: i32,
+        hidden_dim: i32,
+        intermediate_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_cutlass_int4_grouped_w2_sm90a_cuda(
+        activated: *const Half,
+        w2_packed: *const u8,
+        w2_scale: *const Half,
+        expert_indptr: *const u32,
+        expert_output: *mut Half,
+        routed_tokens: i32,
+        intermediate_dim: i32,
+        hidden_dim: i32,
+        local_experts: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
 
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(
@@ -368,6 +808,24 @@ unsafe extern "C" {
         route_weights: *mut f32,
         route_indices: *mut i32,
         seq_len: i32,
+        hidden_dim: i32,
+        n_experts: i32,
+        topk: i32,
+        route_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_k2_router_noaux_tc_cuda(
+        hidden: *const Half,
+        gate_weight: *const Half,
+        e_score_correction_bias: *const f32,
+        logits: *mut f32,
+        scores: *mut f32,
+        choice_scores: *mut f32,
+        topk_weight: *mut f32,
+        topk_idx: *mut i32,
+        active_tokens: i32,
+        padded_tokens: i32,
         hidden_dim: i32,
         n_experts: i32,
         topk: i32,

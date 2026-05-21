@@ -12,6 +12,7 @@ pub enum ModelType {
     DeepSeekV2Lite,
     #[cfg(feature = "deepseek-v4")]
     DeepSeekV4,
+    KimiK2,
     Qwen3,
     Qwen35,
 }
@@ -23,6 +24,7 @@ impl fmt::Display for ModelType {
             Self::DeepSeekV2Lite => write!(f, "DeepSeek-V2-Lite"),
             #[cfg(feature = "deepseek-v4")]
             Self::DeepSeekV4 => write!(f, "DeepSeek V4"),
+            Self::KimiK2 => write!(f, "Kimi-K2.6"),
             Self::Qwen3 => write!(f, "Qwen3"),
             Self::Qwen35 => write!(f, "Qwen3.5"),
         }
@@ -66,6 +68,20 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
         anyhow::bail!(
             "DeepSeek V4 support is feature-gated; rebuild pegainfer-server with --features deepseek-v4"
         );
+    }
+
+    if json
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model_type| model_type == "kimi_k25" || model_type == "kimi_k2")
+        || json
+            .get("text_config")
+            .and_then(|text| text.get("model_type"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|model_type| model_type == "kimi_k2")
+    {
+        pegainfer_kimi_k2::probe_config_json(&json)?;
+        return Ok(ModelType::KimiK2);
     }
 
     if json.get("text_config").is_some() {

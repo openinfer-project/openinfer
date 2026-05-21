@@ -12,6 +12,7 @@ members = [
     "pegainfer-kernels",
     "pegainfer-deepseek-v4",
     "pegainfer-deepseek-v2-lite",
+    "pegainfer-kimi-k2",
     "pegainfer-qwen3-4b",
     "pegainfer-qwen35-4b",
     # ---- pegainfer-comm (EP all-to-all skeleton, hardware-free default) ----
@@ -71,6 +72,7 @@ pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
 pegainfer-engine = { path = "pegainfer-engine" }
 pegainfer-kernels = { path = "pegainfer-kernels" }
+pegainfer-kimi-k2 = { path = "pegainfer-kimi-k2" }
 pegainfer-qwen3-4b = { path = "pegainfer-qwen3-4b" }
 pegainfer-qwen35-4b = { path = "pegainfer-qwen35-4b" }
 pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }

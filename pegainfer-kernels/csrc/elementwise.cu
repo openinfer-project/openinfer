@@ -20,6 +20,40 @@ __global__ void add_kernel(
 }
 
 // ============================================================================
+// Type conversion helpers for deterministic decode collectives.
+// ============================================================================
+
+__global__ void bf16_to_f32_kernel(
+    const __nv_bfloat16 *__restrict__ input,
+    float *__restrict__ output,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    output[idx] = __bfloat162float(input[idx]);
+  }
+}
+
+__global__ void f32_to_bf16_kernel(
+    const float *__restrict__ input,
+    __nv_bfloat16 *__restrict__ output,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    output[idx] = __float2bfloat16(input[idx]);
+  }
+}
+
+__global__ void scale_f32_kernel(float *__restrict__ values, float scale, int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    values[idx] *= scale;
+  }
+}
+
+// ============================================================================
 // SiLU-mul from separate gate/up buffers: out = silu(gate) * up
 // Matches Triton silu_mul_kernel rounding: silu computed in f32,
 // cast to bf16, then multiplied with up in bf16→f32.
@@ -119,6 +153,29 @@ CUresult add_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   add_kernel<<<grid, block, 0, stream>>>(a, b, out, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult bf16_to_f32_cuda(
+    const __nv_bfloat16 *input, float *output, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  bf16_to_f32_kernel<<<grid, block, 0, stream>>>(input, output, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult f32_to_bf16_cuda(
+    const float *input, __nv_bfloat16 *output, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  f32_to_bf16_kernel<<<grid, block, 0, stream>>>(input, output, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult scale_f32_cuda(float *values, float scale, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  scale_f32_kernel<<<grid, block, 0, stream>>>(values, scale, n);
   return (CUresult)cudaGetLastError();
 }
 

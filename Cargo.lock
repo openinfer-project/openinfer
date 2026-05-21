@@ -3621,6 +3621,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-kimi-k2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "memmap2",
+ "pegainfer-core",
+ "pegainfer-kernels",
+ "safetensors",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "pegainfer-qwen3-4b"
 version = "0.1.0"
 dependencies = [
@@ -3684,6 +3700,7 @@ dependencies = [
  "pegainfer-core",
  "pegainfer-deepseek-v2-lite",
  "pegainfer-deepseek-v4",
+ "pegainfer-kimi-k2",
  "pegainfer-qwen3-4b",
  "pegainfer-qwen35-4b",
  "pegainfer-vllm-frontend",

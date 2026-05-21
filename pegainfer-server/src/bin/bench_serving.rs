@@ -1725,6 +1725,21 @@ fn main() -> Result<()> {
             let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
         }
+        ModelType::KimiK2 => {
+            let handle = pegainfer_kimi_k2::start_engine(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    enable_prefill_profile: false,
+                    device_ordinals: (0..8).collect(),
+                    seed: command_seed(&cli),
+                },
+            )?;
+            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
+            let load_ms = dur_ms(load_start.elapsed());
+            let mut bench = SchedulerBenchModel { handle };
+            dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
+        }
         ModelType::Qwen3 => {
             let handle = pegainfer_qwen3_4b::start_engine(
                 Path::new(&cli.model_path),

@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -39,6 +39,82 @@ pub fn add_batch_into(
     };
     result.result()?;
 
+    Ok(())
+}
+
+pub fn bf16_hidden_to_f32_into(
+    ctx: &DeviceContext,
+    input: &HiddenStates,
+    output: &mut CudaSlice<f32>,
+) -> Result<()> {
+    assert!(
+        output.len() >= input.data.len(),
+        "f32 output len {} < bf16 input len {}",
+        output.len(),
+        input.data.len()
+    );
+    let (input_ptr, _gi) = input.data.device_ptr(&ctx.stream);
+    let (output_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::bf16_to_f32_cuda(
+            input_ptr as *const ffi::Half,
+            output_ptr as *mut f32,
+            input.data.len() as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+pub fn f32_to_bf16_hidden_into(
+    ctx: &DeviceContext,
+    input: &CudaSlice<f32>,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    assert!(
+        input.len() >= output.data.len(),
+        "f32 input len {} < bf16 output len {}",
+        input.len(),
+        output.data.len()
+    );
+    let n = output.data.len();
+    let (input_ptr, _gi) = input.device_ptr(&ctx.stream);
+    let (output_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::f32_to_bf16_cuda(
+            input_ptr as *const f32,
+            output_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+pub fn scale_f32_in_place(
+    ctx: &DeviceContext,
+    values: &mut CudaSlice<f32>,
+    len: usize,
+    scale: f32,
+) -> Result<()> {
+    assert!(
+        len <= values.len(),
+        "scale_f32_in_place len {} exceeds values len {}",
+        len,
+        values.len()
+    );
+    let (values_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::scale_f32_cuda(
+            values_ptr as *mut f32,
+            scale,
+            len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
     Ok(())
 }
 

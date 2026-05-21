@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "id": "hello",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ]
+    },
+    {
+      "id": "math_short",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 * 23? Answer with just the number."
+        }
+      ]
+    },
+    {
+      "id": "self_intro_zh",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，请用两句话介绍一下你自己。"
+        }
+      ]
+    },
+    {
+      "id": "code_rust",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Rust function that adds two i32 values."
+        }
+      ]
+    }
+  ]
+}

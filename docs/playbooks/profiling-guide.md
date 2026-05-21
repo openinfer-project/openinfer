@@ -1,6 +1,6 @@
 # GPU Profiling Guide
 
-> **TL;DR:** For benchmarking, use `bench_serving --help`. For profiling, capture a trace with `nsys` and analyze with `nsys stats`. This document covers pitfalls and diagnostic paths, not CLI reference.
+> **TL;DR:** For benchmarking, use `bench_serving --help`. For profiling, capture a trace with `nsys`, analyze totals with `nsys stats`, and always inspect `std/p95/p99/max` tails before making optimization decisions. This document covers pitfalls and diagnostic paths, not CLI reference.
 >
 > **Status:** Active.
 
@@ -76,6 +76,16 @@ Normal pattern: MLP (intermediate + output) + GEMV account for >90%. Attention s
 ```
 
 Normal pattern: `cuMemcpyHtoDAsync` is dominated by model loading (one-time). During inference, watch `cuStreamSynchronize` — if it far exceeds kernel launch + graph launch, the host is waiting for the GPU unnecessarily.
+
+## Tail-Aware Kernel Stats
+
+`nsys stats` is good for total time and average duration, but it can hide the most important decode regressions. For serving work, do not judge a kernel by p50 alone: collect `count`, `total`, `avg`, `std`, `p50`, `p95`, `p99`, and `max`.
+
+The common failure mode is a kernel with a healthy p50 but a large p99/max. That usually points to route imbalance, rank arrival skew, allocator churn, stream drains, or rare launch/runtime stalls. In MoE decode, NCCL all-reduce and routed expert kernels are especially likely to look cheap at p50 while dominating p99.
+
+Use the checked-in helper `tools/nsys_tail_stats.py` on exported sqlite traces when tail behavior matters. It emits separate kernel and CUDA API tables sorted by total time and by tail score, so a trace review can call out both steady-state cost and rare stalls.
+
+For keep/revert decisions, a profile that only reports p50 or avg is incomplete. The minimum acceptable evidence is the tail table plus a clear statement of whether the profile includes prompt, steady decode, HTTP/frontend, or profiler overhead.
 
 ## Standard Optimization Profiles
 
