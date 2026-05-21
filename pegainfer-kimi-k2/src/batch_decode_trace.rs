@@ -215,6 +215,20 @@ fn push_attention_layer(
         batch,
     ));
     calls.push(
+        KernelCall::new(
+            "kimi_mla_split_compressed_kv",
+            format!("{prefix}.split_compressed_kv"),
+        )
+        .input("kv_a", hidden(KIMI_K2_KV_A_OUT, batch))
+        .output("compressed_kv", hidden(KIMI_K2_MLA_KV_LORA_RANK, batch))
+        .output("k_rope", hidden(KIMI_K2_MLA_ROPE_DIM, batch)),
+    );
+    calls.push(rms_dim(
+        &format!("{prefix}.kv_a_norm"),
+        KIMI_K2_MLA_KV_LORA_RANK,
+        batch,
+    ));
+    calls.push(
         KernelCall::new("kimi_mla_rope_split_decode", format!("{prefix}.rope_split"))
             .input("q_proj", hidden(KIMI_K2_MLA_Q_LOCAL_OUT_TP8, batch))
             .input("k_rope", hidden(KIMI_K2_MLA_ROPE_DIM, batch))
@@ -228,12 +242,6 @@ fn push_attention_layer(
             .output("q_pe", hidden(KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, batch))
             .output("append_kpe", hidden(KIMI_K2_MLA_ROPE_DIM, batch)),
     );
-    calls.push(gemm(
-        &format!("{prefix}.kv_b"),
-        KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_KV_LORA_RANK,
-        batch,
-    ));
     calls.push(
         KernelCall::new("kimi_mla_absorb_q_nope", format!("{prefix}.absorb_q"))
             .input(
@@ -248,6 +256,22 @@ fn push_attention_layer(
                 weight(KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_LORA_RANK),
             )
             .output("q_abs_nope", hidden(KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, batch)),
+    );
+    calls.push(
+        KernelCall::new(
+            "kimi_mla_paged_kv_append",
+            format!("{prefix}.paged_kv_append"),
+        )
+        .input("compressed_normed", hidden(KIMI_K2_MLA_KV_LORA_RANK, batch))
+        .input("append_kpe", hidden(KIMI_K2_MLA_ROPE_DIM, batch))
+        .output(
+            "ckv_cache",
+            paged_cache("ckv", kv_len, batch, KIMI_K2_MLA_KV_LORA_RANK),
+        )
+        .output(
+            "kpe_cache",
+            paged_cache("kpe", kv_len, batch, KIMI_K2_MLA_ROPE_DIM),
+        ),
     );
     calls.push(
         KernelCall::new(
