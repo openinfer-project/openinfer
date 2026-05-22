@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum 前冗余 memset 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.36ms`，synthetic output64 steady TPOT avg `14.56ms` / p99 `15.06ms`。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.31ms`，synthetic output64 steady TPOT avg `14.47ms` / p99 `14.92ms`。
 >
 > **Last touched:** 2026-05
 
@@ -181,7 +181,7 @@ H20 graph serving gates after fused-qkv:
 
 ## Next Actions
 
-1. Profile any remaining p99/max tail under shared gate/up fused GEMM plus routed scaled-add fusion: output64 avg/p50/p95 are under or near `15ms`, and p99 is now about `15.06ms`.
+1. Profile any remaining p99/max tail under shared gate/up fused GEMM plus routed scaled-add fusion and Marlin locks clear removal: output64 avg/p50/p95/p99 are now all under `15ms`, with p99 about `14.92ms`.
 2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
-3. Next graph-safe local wins: Marlin output/locks clear fusion where semantics allow it, `kimi_mla_paged_kv_append` provider coverage, and a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
+3. Next graph-safe local wins: keep Marlin output clears unless route metadata proves every consumed row is written, add `kimi_mla_paged_kv_append` provider coverage, and design a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
 4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

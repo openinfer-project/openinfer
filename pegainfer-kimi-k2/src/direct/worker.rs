@@ -2331,9 +2331,6 @@ fn forward_moe_layer_decode_into(
     aux_ctx
         .stream
         .memset_zeros(&mut scratch.marlin_w13_out.data)?;
-    aux_ctx
-        .stream
-        .memset_zeros(&mut scratch.marlin_workspace.locks)?;
     kimi_marlin_wna16_w13_gemm(
         aux_ctx,
         &mut scratch.marlin_workspace,
@@ -2373,9 +2370,6 @@ fn forward_moe_layer_decode_into(
     aux_ctx
         .stream
         .memset_zeros(&mut scratch.marlin_expert_output.data)?;
-    aux_ctx
-        .stream
-        .memset_zeros(&mut scratch.marlin_workspace.locks)?;
     kimi_marlin_wna16_w2_gemm(
         aux_ctx,
         &mut scratch.marlin_workspace,

@@ -1,6 +1,6 @@
 # Kimi-K2.6 文本算子 TODO
 
-> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum 前冗余 memset 清理均已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.36ms`，synthetic output64 steady TPOT avg `14.56ms` / p99 `15.06ms`。
+> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理均已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.31ms`，synthetic output64 steady TPOT avg `14.47ms` / p99 `14.92ms`。
 >
 > **Last touched:** 2026-05
 
@@ -135,6 +135,12 @@
   - H20 build gate：远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins`、`cargo build --release -p pegainfer-server --bin bench_serving` 通过。
   - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.225ms`、p50 `14.241ms`、p95 `14.354ms`、p99 `14.355ms`，四路 token prefix 完全匹配 vLLM fixture。
   - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.563ms`、p50 `14.613ms`、p95 `14.953ms`、p99 `15.056ms`、max `15.057ms`，四路 hash 一致。
+- Marlin locks clear cleanup：vendored Marlin WNA16 在每个用到的 lock 上通过 `barrier_release(..., last)` 把最后一个 split-K slice 的 lock 重置为 0；workspace 初始为 zero buffer，因此 decode 每层 W13/W2 launch 前重复清 `marlin_workspace.locks` 没有语义作用。本轮删掉这 120 次 graph 内 locks memset。
+  - 语义边界：W13/W2 output memset 仍保留。route align 会产生本 rank 不负责的 route row 与 padding row；这些行不会被 Marlin 写出，后续 `kimi_marlin_w13_swiglu` / `kimi_marlin_sum_topk_rows_f32` 依赖它们保持 0，不能把 output clear 和 locks clear 混为一类。
+  - H20 build gate：远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins`、`cargo build --release -p pegainfer-server --bin bench_serving` 通过。
+  - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.145ms`、p50 `14.157ms`、p95 `14.308ms`、p99 `14.309ms`，四路 token prefix 完全匹配 vLLM fixture。
+  - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.470ms`、p50 `14.529ms`、p95 `14.852ms`、p99 `14.917ms`、max `14.930ms`，四路 hash 一致。
+  - bench exit caveat：两组 `bench_serving` 都已写出 JSON 和指标，但进程退出时有 worker 残留占卡；验证后按具体 `bench_serving --model-path /data/models/Kimi-K2.5` 命令清理，H20 `nvidia-smi --query-compute-apps` 为空。后续要单独修 benchmark teardown，不把它记作 TPOT 回退。
 
 ## Rejected: decode TP hidden BF16 bulk collective
 
