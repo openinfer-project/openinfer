@@ -41,6 +41,9 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 vllm-text = { workspace = true }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [features]
 default = []
 deepseek-v4 = ["dep:pegainfer-deepseek-v4", "pegainfer-deepseek-v4/deepseek-v4"]

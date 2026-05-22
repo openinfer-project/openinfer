@@ -8,6 +8,10 @@ use pegainfer::logging;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer_core::engine::EngineLoadOptions;
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
 #[derive(Parser)]
