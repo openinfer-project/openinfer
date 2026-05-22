@@ -13,7 +13,7 @@ use crate::config::{
     KIMI_K2_YARN_ORIGINAL_MAX_POS, KimiK2ParallelShape,
 };
 use crate::tensor::{
-    Bf16, DType, F32, HeaderError, HeaderResult, Layout, Shape2, Shape3, StreamHandle, TensorMut,
+    Bf16, DType, F32, HeaderError, HeaderResult, Shape2, Shape3, StreamHandle, TensorMut,
     TensorRef, TokenBatch, U32,
 };
 
@@ -1144,6 +1144,3 @@ fn unsupported<T>(message: impl Into<String>) -> HeaderResult<T> {
         message: message.into(),
     })
 }
-
-#[allow(dead_code)]
-fn _layout_marker(_layout: Layout) {}

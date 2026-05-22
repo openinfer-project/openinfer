@@ -19,17 +19,6 @@ pub(super) struct KimiRankThreadPlacement {
 }
 
 impl KimiRankThreadPlacement {
-    #[allow(dead_code)]
-    pub(super) fn role_cpu(&self, offset: usize, role: &str) -> Result<CpuId> {
-        self.cpu_slice.get(offset).copied().with_context(|| {
-            format!(
-                "Kimi rank {} CPU slice {} is too small for {role} at offset {offset}",
-                self.rank,
-                format_cpu_list(&self.cpu_slice)
-            )
-        })
-    }
-
     pub(super) fn cpu_slice_display(&self) -> String {
         format_cpu_list(&self.cpu_slice)
     }

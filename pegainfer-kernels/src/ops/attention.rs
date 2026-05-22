@@ -510,7 +510,6 @@ pub fn qk_norm_rope_batch_decode_into(
     }
 }
 
-#[allow(dead_code)]
 /// Batched QK RMSNorm + partial RoPE for Qwen3.5 HD256 decode.
 ///
 /// Reads Q from interleaved `q_full` ([q, gate] per head), writes prepared Q into `q`,
@@ -795,7 +794,6 @@ pub fn paged_attention_batch_decode_split_kv_into(
     Ok(())
 }
 
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_batch_decode_hd256_into(
     ctx: &DeviceContext,

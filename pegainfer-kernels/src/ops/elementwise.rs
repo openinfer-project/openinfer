@@ -256,7 +256,6 @@ pub fn extract_vec_into(
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Copy `src` into one column of `batch`.
 pub fn write_vec_into(
     ctx: &DeviceContext,
