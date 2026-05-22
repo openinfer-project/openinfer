@@ -18,7 +18,6 @@ pub mod experts;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
 pub mod router;
-pub mod runtime;
 pub mod tensor;
 pub mod tokenizer;
 pub mod weights;
