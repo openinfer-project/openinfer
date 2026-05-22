@@ -39,10 +39,5 @@ name = "kimi_model_report"
 path = "src/bin/kimi_model_report.rs"
 required-features = ["kernel-report"]
 
-[[bin]]
-name = "kimi_graph_probe"
-path = "src/bin/kimi_graph_probe.rs"
-required-features = ["kernel-report"]
-
 [lints]
 workspace = true

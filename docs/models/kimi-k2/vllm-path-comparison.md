@@ -177,7 +177,7 @@ H20 graph serving gates after fused-qkv:
 
 ## Routed Bridge Probe
 
-`kimi_graph_probe --probe routed-bridge-compare` compares the current NCCL bridge against a direct F32 all-reduce in the same CUDA Graph replay setup. H20 `world=8,batch=4,hidden=7168,replay_iters=500` measured direct all-reduce at max-rank `33.46us` and current `repeat_f32_for_reduce_scatter + reduce_scatter` at max-rank `32.90us` (`0.983x`). This says the current bridge should not be reverted to direct all-reduce for speed; the real next communication change needs token ownership with true AG/RS or a PPLX dispatch/combine path.
+Historical `kimi_graph_probe --probe routed-bridge-compare` (since retired, see changelog) compared the current NCCL bridge against a direct F32 all-reduce in the same CUDA Graph replay setup. H20 `world=8,batch=4,hidden=7168,replay_iters=500` measured direct all-reduce at max-rank `33.46us` and current `repeat_f32_for_reduce_scatter + reduce_scatter` at max-rank `32.90us` (`0.983x`). This says the current bridge should not be reverted to direct all-reduce for speed; the real next communication change needs token ownership with true AG/RS or a PPLX dispatch/combine path.
 
 ## TP-Only MoE Cadence Probe
 
