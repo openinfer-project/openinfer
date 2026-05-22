@@ -63,6 +63,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/kimi-k2/optimization.md` | Kimi-K2 model card + optimization log：61 层 MLA + Marlin WNA16 MoE，H20 ×8 当前 TP8/EP8。重点是 decode：bs4 graph TPOT `14.39ms`（≈`278 tok/s`），目标 `> 300 tok/s`；下一阶段迁到 TP1+DP8+EP8（PPLX）。Prefill 优先级低。 |
 | `models/kimi-k2/support-analysis.md` | Kimi-K2 text-only bring-up：Marlin WNA16 routed expert、MLA prompt、全 61 层 prompt forward、多 prompt vLLM top-20 gate 已过；bs4 wave decode 已接入，Marlin atomic split-K row-state bug 修复后 output16 row diff 清零，正在撤掉 decode 诊断负担并回到 bs4 性能主线。 |
 | `models/kimi-k2/operator-todo.md` | Kimi-K2 算子清单：MLA + Marlin WNA16 routed expert + NCCL RS bridge 主链；CUDA Graph 覆盖整段 decode，synthetic output64 avg `14.39ms` / p99 `14.83ms`；CUTLASS INT4 后端与 decode row-diff 诊断已下线，详见 changelog。 |
 | `models/kimi-k2/changelog.md` | Kimi-K2 算子工作日志：Execution Log / Rejected / Debrief / 经验迁移 全部归档，按原始顺序保留；当前状态见 operator-todo。 |
