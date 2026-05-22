@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, VecDeque},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Barrier, mpsc as std_mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -14,43 +14,16 @@ use pegainfer_core::engine::{
 use tokio::sync::mpsc;
 
 use crate::{
-    KimiK2TextConfig,
     config::{KIMI_K2_DENSE_LAYERS, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_VOCAB},
     direct::{
-        affinity::{KimiRankThreadPlacementPlan, pin_scheduler_thread},
-        worker::{
-            KimiK2RankPlacement, KimiRankWeightLoadReport, KimiRankWorker, build_tp8_ep8_placements,
-        },
+        affinity::pin_scheduler_thread,
+        config::KimiK2DirectRuntimeConfig,
+        worker::{KimiRankWeightLoadReport, KimiRankWorker, build_tp8_ep8_placements},
     },
-    probe_config_json,
-    weights::{
-        KimiK2WeightManifest, KimiRankGpuContext, KimiRankShardPlan, KimiRankSlicedLoadPlan,
-        KimiRankWeightNames, KimiRankWeightPlan, ensure_text_only_model_index,
-    },
+    weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
 };
 
 const KIMI_DIRECT_MAX_BATCH: usize = 4;
-
-#[derive(Clone, Debug)]
-pub struct KimiK2DirectRuntimeConfig {
-    pub model_path: PathBuf,
-    pub text_config: KimiK2TextConfig,
-    pub weight_manifest: KimiK2WeightManifest,
-    pub rank_weight_plans: Vec<KimiRankWeightPlan>,
-    pub rank_weight_names: Vec<KimiRankWeightNames>,
-    pub rank_shard_plans: Vec<KimiRankShardPlan>,
-    pub rank_sliced_load_plans: Vec<KimiRankSlicedLoadPlan>,
-    pub placements: Vec<KimiK2RankPlacement>,
-    pub(crate) thread_placement: KimiRankThreadPlacementPlan,
-    /// Temporary H20 correctness/perf bridge.
-    ///
-    /// Current Kimi decode does *not* install pplx-garden EP. TP embedding /
-    /// projection and MoE shared/routed combines go through NCCL reductions
-    /// over the 8 rank streams. Rename this field before wiring real PPLX
-    /// dispatch/combine so the two paths cannot be confused.
-    pub use_nccl_ep_bridge: bool,
-    pub enable_cuda_graph: bool,
-}
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     if options.device_ordinals != (0..8).collect::<Vec<_>>() {
@@ -59,10 +32,11 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
             options.device_ordinals
         );
     }
-    let text_config = load_text_config(model_path)?;
     let weight_manifest = ensure_text_only_model_index(model_path)?;
     let placements = build_tp8_ep8_placements(&options.device_ordinals)?;
-    let thread_placement = KimiRankThreadPlacementPlan::for_devices(&options.device_ordinals)?;
+    let thread_placement = crate::direct::affinity::KimiRankThreadPlacementPlan::for_devices(
+        &options.device_ordinals,
+    )?;
     let rank_weight_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_plan(rank))
         .collect::<Result<Vec<_>>>()?;
@@ -77,7 +51,6 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         .collect::<Result<Vec<_>>>()?;
     let runtime_config = KimiK2DirectRuntimeConfig {
         model_path: model_path.to_path_buf(),
-        text_config,
         weight_manifest,
         rank_weight_plans,
         rank_weight_names,
@@ -85,7 +58,6 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         rank_sliced_load_plans,
         placements,
         thread_placement,
-        use_nccl_ep_bridge: true,
         enable_cuda_graph: options.enable_cuda_graph,
     };
 
@@ -113,15 +85,6 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         submit_tx,
         scheduler_handle,
     ))
-}
-
-fn load_text_config(model_path: &Path) -> Result<KimiK2TextConfig> {
-    let config_path = model_path.join("config.json");
-    let content = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
-    probe_config_json(&json)
 }
 
 struct KimiK2DirectScheduler {
@@ -358,11 +321,6 @@ struct KimiK2DirectRuntime {
 
 impl KimiK2DirectRuntime {
     fn spawn(config: KimiK2DirectRuntimeConfig) -> Result<Self> {
-        if !config.use_nccl_ep_bridge {
-            bail!(
-                "Kimi-K2 currently requires the temporary NCCL EP bridge; real PPLX EP is not wired yet"
-            );
-        }
         if config.rank_weight_plans.len() != config.placements.len() {
             bail!(
                 "Kimi-K2 rank weight plan count {} must match placements {}",

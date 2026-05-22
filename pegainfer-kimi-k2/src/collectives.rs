@@ -3,8 +3,9 @@
 //! This module defines the tensor-parallel and expert-parallel contracts used
 //! by the eventual CUDA/PPLX implementation. The production EP target is still
 //! pplx-garden dispatch/combine. The current direct runtime is separate from
-//! this header draft and explicitly uses a temporary NCCL-sum bridge; see
-//! `direct::scheduler::KimiK2DirectRuntimeConfig::use_nccl_ep_bridge`.
+//! this header draft and uses a temporary NCCL-sum bridge over the 8 rank
+//! streams for TP embedding/projection and MoE shared/routed combines; see
+//! `direct::KimiK2DirectRuntime` for the actual call sites.
 //! The functions intentionally stop at validation and return `Unsupported`:
 //! no collective transport body lives in this header crate.
 
