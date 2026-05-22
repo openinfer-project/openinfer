@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
-use crate::direct::affinity::KimiRankThreadPlacementPlan;
-use crate::direct::worker::KimiK2RankPlacement;
+use crate::runner::affinity::KimiRankThreadPlacementPlan;
+use crate::runner::worker::KimiK2RankPlacement;
 use crate::weights::{
     KimiK2WeightManifest, KimiRankShardPlan, KimiRankSlicedLoadPlan, KimiRankWeightNames,
     KimiRankWeightPlan,
 };
 
 #[derive(Clone, Debug)]
-pub struct KimiK2DirectRuntimeConfig {
+pub struct KimiK2RunnerConfig {
     pub model_path: PathBuf,
     pub weight_manifest: KimiK2WeightManifest,
     pub rank_weight_plans: Vec<KimiRankWeightPlan>,

@@ -291,10 +291,10 @@ fn compose_report(
         },
         schedule_source: match source {
             TraceSource::Runtime => {
-                "Kimi direct runtime decode trace via EngineHandle/worker; no HTTP".to_string()
+                "Kimi runner decode trace via EngineHandle/worker; no HTTP".to_string()
             }
             TraceSource::Static => {
-                "Kimi direct worker decode DAG mirror; no HTTP, no prompt/prefill window"
+                "Kimi runner worker decode DAG mirror; no HTTP, no prompt/prefill window"
                     .to_string()
             }
         },

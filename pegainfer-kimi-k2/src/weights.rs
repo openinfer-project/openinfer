@@ -529,8 +529,8 @@ pub struct KimiRankGpuContext {
     pub device_ordinal: usize,
 }
 
-// SAFETY: each Kimi rank owns one CUDA context/stream pair and the direct
-// runtime drives that pair from the rank worker thread.
+// SAFETY: each Kimi rank owns one CUDA context/stream pair and the runner
+// drives that pair from the rank worker thread.
 unsafe impl Send for KimiRankGpuContext {}
 unsafe impl Sync for KimiRankGpuContext {}
 

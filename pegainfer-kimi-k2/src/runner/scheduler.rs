@@ -15,15 +15,15 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::{KIMI_K2_DENSE_LAYERS, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_VOCAB},
-    direct::{
+    runner::{
         affinity::pin_scheduler_thread,
-        config::KimiK2DirectRuntimeConfig,
+        config::KimiK2RunnerConfig,
         worker::{KimiRankWeightLoadReport, KimiRankWorker, build_tp8_ep8_placements},
     },
     weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
 };
 
-const KIMI_DIRECT_MAX_BATCH: usize = 4;
+const KIMI_RUNNER_MAX_BATCH: usize = 4;
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     if options.device_ordinals != (0..8).collect::<Vec<_>>() {
@@ -34,7 +34,7 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     }
     let weight_manifest = ensure_text_only_model_index(model_path)?;
     let placements = build_tp8_ep8_placements(&options.device_ordinals)?;
-    let thread_placement = crate::direct::affinity::KimiRankThreadPlacementPlan::for_devices(
+    let thread_placement = crate::runner::affinity::KimiRankThreadPlacementPlan::for_devices(
         &options.device_ordinals,
     )?;
     let rank_weight_plans = (0..placements.len())
@@ -49,7 +49,7 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     let rank_sliced_load_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_sliced_load_plan(rank))
         .collect::<Result<Vec<_>>>()?;
-    let runtime_config = KimiK2DirectRuntimeConfig {
+    let runtime_config = KimiK2RunnerConfig {
         model_path: model_path.to_path_buf(),
         weight_manifest,
         rank_weight_plans,
@@ -67,7 +67,7 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         .name("kimi-k2-scheduler".into())
         .spawn(move || {
             pin_scheduler_thread(&runtime_config.thread_placement);
-            let mut scheduler = match KimiK2DirectScheduler::new(runtime_config) {
+            let mut scheduler = match KimiK2Scheduler::new(runtime_config) {
                 Ok(scheduler) => scheduler,
                 Err(err) => {
                     let _ = init_tx.send(Err(err));
@@ -87,8 +87,8 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     ))
 }
 
-struct KimiK2DirectScheduler {
-    runtime: KimiK2DirectRuntime,
+struct KimiK2Scheduler {
+    runtime: KimiK2Runtime,
 }
 
 struct ActiveKimiRequest {
@@ -101,10 +101,10 @@ struct ActiveKimiRequest {
     decode_batch_size: usize,
 }
 
-impl KimiK2DirectScheduler {
-    fn new(config: KimiK2DirectRuntimeConfig) -> Result<Self> {
+impl KimiK2Scheduler {
+    fn new(config: KimiK2RunnerConfig) -> Result<Self> {
         Ok(Self {
-            runtime: KimiK2DirectRuntime::spawn(config)?,
+            runtime: KimiK2Runtime::spawn(config)?,
         })
     }
 
@@ -122,8 +122,8 @@ impl KimiK2DirectScheduler {
                 pending.push_back(req);
             }
 
-            let mut batch = Vec::with_capacity(KIMI_DIRECT_MAX_BATCH);
-            while batch.len() < KIMI_DIRECT_MAX_BATCH {
+            let mut batch = Vec::with_capacity(KIMI_RUNNER_MAX_BATCH);
+            while batch.len() < KIMI_RUNNER_MAX_BATCH {
                 let Some(req) = pending.pop_front() else {
                     break;
                 };
@@ -313,14 +313,14 @@ impl KimiK2DirectScheduler {
     }
 }
 
-struct KimiK2DirectRuntime {
-    config: KimiK2DirectRuntimeConfig,
+struct KimiK2Runtime {
+    config: KimiK2RunnerConfig,
     workers: Vec<KimiRankWorker>,
     rank_weight_reports: Vec<KimiRankWeightLoadReport>,
 }
 
-impl KimiK2DirectRuntime {
-    fn spawn(config: KimiK2DirectRuntimeConfig) -> Result<Self> {
+impl KimiK2Runtime {
+    fn spawn(config: KimiK2RunnerConfig) -> Result<Self> {
         if config.rank_weight_plans.len() != config.placements.len() {
             bail!(
                 "Kimi-K2 rank weight plan count {} must match placements {}",
@@ -435,7 +435,7 @@ impl KimiK2DirectRuntime {
         input_ids: Vec<u32>,
         slot: usize,
         decode_batch_size: usize,
-    ) -> Result<crate::direct::worker::KimiOneTokenForwardReport> {
+    ) -> Result<crate::runner::worker::KimiOneTokenForwardReport> {
         if self.workers.is_empty() {
             bail!("Kimi runtime has no rank workers");
         }
@@ -477,7 +477,7 @@ impl KimiK2DirectRuntime {
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-    ) -> Result<Vec<crate::direct::worker::KimiOneTokenForwardReport>> {
+    ) -> Result<Vec<crate::runner::worker::KimiOneTokenForwardReport>> {
         if self.workers.is_empty() {
             bail!("Kimi runtime has no rank workers");
         }
@@ -546,7 +546,7 @@ impl KimiK2DirectRuntime {
 }
 
 fn validate_one_token_report(
-    report: &crate::direct::worker::KimiOneTokenForwardReport,
+    report: &crate::runner::worker::KimiOneTokenForwardReport,
     phase: &str,
     expected_slot: usize,
     expected_input_token: u32,
@@ -619,7 +619,7 @@ fn validate_one_token_report(
     Ok(())
 }
 
-impl Drop for KimiK2DirectRuntime {
+impl Drop for KimiK2Runtime {
     fn drop(&mut self) {
         for worker in &mut self.workers {
             let _ = worker.shutdown();

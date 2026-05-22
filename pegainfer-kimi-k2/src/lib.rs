@@ -11,16 +11,16 @@ use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
 pub mod batch_decode_trace;
 pub mod collectives;
 pub mod config;
-mod direct;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
 pub mod layers;
+mod runner;
 pub mod tensor;
 pub mod tokenizer;
 pub mod weights;
 
 pub use config::{KimiK2TextConfig, KimiModelKind, probe_config_json, probe_model};
-pub use direct::{KimiK2DirectRuntimeConfig, KimiK2RankPlacement};
+pub use runner::{KimiK2RankPlacement, KimiK2RunnerConfig};
 pub use weights::{
     KIMI_K2_WEIGHT_INDEX, KimiAttentionGpuWeights, KimiDenseMlpGpuWeights,
     KimiInt4ProjectionGpuWeights, KimiK2WeightManifest, KimiLayerGpuWeights,
@@ -33,7 +33,7 @@ pub use weights::{
 };
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    direct::start_engine(model_path, options)
+    runner::start_engine(model_path, options)
 }
 
 #[cfg(test)]

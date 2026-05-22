@@ -47,8 +47,8 @@ use crate::{
         KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR,
         KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
-    direct::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
     layers::experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
+    runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
         KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights, KimiRankShardPlan,
