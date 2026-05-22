@@ -64,7 +64,8 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `models/kimi-k2/support-analysis.md` | Kimi-K2 text-only bring-up：Marlin WNA16 routed expert、MLA prompt、全 61 层 prompt forward、多 prompt vLLM top-20 gate 已过；bs4 wave decode 已接入，Marlin atomic split-K row-state bug 修复后 output16 row diff 清零，正在撤掉 decode 诊断负担并回到 bs4 性能主线。 |
-| `models/kimi-k2/operator-todo.md` | Kimi-K2 算子清单：Marlin WNA16 与 MLA decode 主链已接端到端；CUDA Graph + fused qkv_a + MoE overlap + shared/dense gate-up fusion + routed scaled-add + clear cleanup 后，H20 fixture output16 p99 `14.26ms`，synthetic output64 avg `14.39ms` / p99 `14.83ms`；vLLM TP-only MoE final all-reduce probe 已回退。 |
+| `models/kimi-k2/operator-todo.md` | Kimi-K2 算子清单：MLA + Marlin WNA16 routed expert + NCCL RS bridge 主链；CUDA Graph 覆盖整段 decode，synthetic output64 avg `14.39ms` / p99 `14.83ms`；CUTLASS INT4 后端与 decode row-diff 诊断已下线，详见 changelog。 |
+| `models/kimi-k2/changelog.md` | Kimi-K2 算子工作日志：Execution Log / Rejected / Debrief / 经验迁移 全部归档，按原始顺序保留；当前状态见 operator-todo。 |
 | `models/kimi-k2/vllm-path-comparison.md` | Kimi-K2 decode 路径对照：vLLM-style fused qkv_a、MoE shared/routed compute overlap、shared/dense gate-up fusion、routed scaled-add 和 bridge microbench 已过 H20 gate；output64 avg/p50/p99 均在 `15ms` 内，vLLM TP-only MoE final all-reduce BF16/F32 两版均慢于当前 RS bridge。 |
 
 ## subsystems / runtime

@@ -2,7 +2,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Barrier,
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
@@ -63,9 +62,6 @@ const KIMI_DECODE_MAX_BATCH: usize = 4;
 const KIMI_DECODE_PAGE_SIZE: usize = 16;
 const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
 const KIMI_DECODE_ROPE_CACHE_TOKENS: usize = KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST;
-const KIMI_DECODE_ROW_DEBUG_MAX_LAYER: usize = KIMI_K2_LAYERS - 1;
-const KIMI_DECODE_ROW_DEBUG_MAX_REPORTS: usize = 256;
-static KIMI_DECODE_ROW_DIFF_REPORTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiK2RankPlacement {
@@ -737,7 +733,6 @@ impl KimiRankThreadState {
         } = loaded;
         let rank = gpu.rank;
         let active_len = token_ids.len();
-        let debug_same_rows = false;
         #[cfg(feature = "kernel-call-trace")]
         if rank == 0 && call_trace::is_enabled() {
             let kv_len = append_positions
@@ -784,11 +779,6 @@ impl KimiRankThreadState {
                         cache,
                         expert_kernels,
                         decode_arena,
-                        active_len,
-                        rank,
-                        token_ids,
-                        append_positions,
-                        debug_same_rows,
                     )
                 },
             );
@@ -802,11 +792,6 @@ impl KimiRankThreadState {
                 cache,
                 expert_kernels,
                 decode_arena,
-                active_len,
-                rank,
-                token_ids,
-                append_positions,
-                debug_same_rows,
             )?;
         }
 
@@ -1131,7 +1116,6 @@ impl KimiRankThreadState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_decode_batch_next_token_kernels(
     device_ctx: &DeviceContext,
     decode_aux_ctx: &DeviceContext,
@@ -1139,11 +1123,6 @@ fn forward_decode_batch_next_token_kernels(
     cache: &KimiOneTokenForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
     decode_arena: &mut KimiWorkerDecodeArena,
-    active_len: usize,
-    rank: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    debug_same_rows: bool,
 ) -> Result<()> {
     embedding_batch_vocab_shard(
         device_ctx,
@@ -1159,79 +1138,25 @@ fn forward_decode_batch_next_token_kernels(
         &mut decode_arena.scratch.hidden_allreduce_f32,
         comm,
     )?;
-    debug_identical_decode_rows_bf16(
-        device_ctx,
-        rank,
-        "embedding_allreduce",
-        None,
-        active_len,
-        token_ids,
-        append_positions,
-        &decode_arena.scratch.hidden,
-        debug_same_rows,
-    );
 
     for layer in &cache.layers {
-        forward_mla_decode_layer_into(
-            device_ctx,
-            &layer.attention,
-            decode_arena,
-            layer.layer_idx,
-            active_len,
-            rank,
-            token_ids,
-            append_positions,
-            debug_same_rows,
-        )
-        .with_context(|| format!("Kimi MLA batch decode layer {}", layer.layer_idx))?;
+        forward_mla_decode_layer_into(device_ctx, &layer.attention, decode_arena, layer.layer_idx)
+            .with_context(|| format!("Kimi MLA batch decode layer {}", layer.layer_idx))?;
         all_reduce_hidden_via_f32_in_place(
             device_ctx,
             &mut decode_arena.scratch.projected,
             &mut decode_arena.scratch.hidden_allreduce_f32,
             comm,
         )?;
-        debug_identical_decode_rows_bf16(
-            device_ctx,
-            rank,
-            "mla_projected_allreduce",
-            Some(layer.layer_idx),
-            active_len,
-            token_ids,
-            append_positions,
-            &decode_arena.scratch.projected,
-            debug_same_rows,
-        );
         add_batch_into(
             device_ctx,
             &decode_arena.scratch.hidden,
             &decode_arena.scratch.projected,
             &mut decode_arena.scratch.normed,
         )?;
-        debug_identical_decode_rows_bf16(
-            device_ctx,
-            rank,
-            "mla_residual_add",
-            Some(layer.layer_idx),
-            active_len,
-            token_ids,
-            append_positions,
-            &decode_arena.scratch.normed,
-            debug_same_rows,
-        );
         std::mem::swap(
             &mut decode_arena.scratch.hidden,
             &mut decode_arena.scratch.normed,
-        );
-        debug_identical_decode_rows_bf16(
-            device_ctx,
-            rank,
-            "mla_residual",
-            Some(layer.layer_idx),
-            active_len,
-            token_ids,
-            append_positions,
-            &decode_arena.scratch.hidden,
-            debug_same_rows,
         );
         match &layer.kind {
             KimiLayerForwardKindCache::Dense(dense) => {
@@ -1241,12 +1166,6 @@ fn forward_decode_batch_next_token_kernels(
                     dense,
                     &layer.attention.post_attention_norm,
                     &mut decode_arena.scratch,
-                    active_len,
-                    rank,
-                    token_ids,
-                    append_positions,
-                    layer.layer_idx,
-                    debug_same_rows,
                 )
                 .with_context(|| {
                     format!("Kimi dense batch decode MLP layer {}", layer.layer_idx)
@@ -1262,28 +1181,13 @@ fn forward_decode_batch_next_token_kernels(
                     &layer.attention.post_attention_norm,
                     expert_kernels,
                     &mut decode_arena.scratch,
-                    active_len,
-                    rank,
-                    token_ids,
-                    append_positions,
-                    debug_same_rows,
                 )
                 .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
             }
         }
-        debug_identical_decode_rows_bf16(
-            device_ctx,
-            rank,
-            "layer_output",
-            Some(layer.layer_idx),
-            active_len,
-            token_ids,
-            append_positions,
-            &decode_arena.scratch.hidden,
-            debug_same_rows,
-        );
     }
 
+    let active_len = decode_arena.scratch.hidden.seq_len;
     rms_norm_batch_into(
         device_ctx,
         &decode_arena.scratch.hidden,
@@ -1762,11 +1666,6 @@ fn forward_mla_decode_layer_into(
     attention: &KimiAttentionForwardCache,
     arena: &mut KimiWorkerDecodeArena,
     layer_idx: usize,
-    active_len: usize,
-    rank: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    debug_same_rows: bool,
 ) -> Result<()> {
     let KimiWorkerDecodeArena {
         batch_size,
@@ -1809,17 +1708,6 @@ fn forward_mla_decode_layer_into(
         &mut scratch.compressed_kv,
         &mut scratch.k_rope,
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "mla_q_a",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.q_a,
-        debug_same_rows,
-    );
     rms_norm_batch_into(
         ctx,
         &scratch.q_a,
@@ -1839,17 +1727,6 @@ fn forward_mla_decode_layer_into(
         &attention.kv_a_norm,
         KIMI_K2_RMS_NORM_EPS,
         &mut scratch.compressed_normed,
-    );
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "mla_compressed_normed",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.compressed_normed,
-        debug_same_rows,
     );
     kimi_mla_rope_split_decode(
         ctx,
@@ -1881,17 +1758,6 @@ fn forward_mla_decode_layer_into(
         batch_indices_d,
         positions_d,
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "mla_append_ckv",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.compressed_normed,
-        debug_same_rows,
-    );
     kimi_flashinfer_batch_decode_mla(
         ctx,
         &scratch.q_abs_nope,
@@ -1908,17 +1774,6 @@ fn forward_mla_decode_layer_into(
         kv_chunk_size_d,
         kimi_mla_softmax_scale(),
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "mla_latent",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.latent,
-        debug_same_rows,
-    );
     kimi_mla_v_up(
         ctx,
         &attention.kv_b_proj,
@@ -1931,17 +1786,6 @@ fn forward_mla_decode_layer_into(
         &scratch.attn_out,
         &mut scratch.projected,
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "mla_projected",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.projected,
-        debug_same_rows,
-    );
     ensure!(
         scratch.projected.seq_len == *batch_size,
         "Kimi decode projected batch mismatch"
@@ -1984,12 +1828,6 @@ fn forward_dense_mlp_decode_into(
     dense: &KimiDenseForwardCache,
     post_attention_norm: &DeviceVec,
     scratch: &mut KimiWorkerDecodeScratch,
-    active_len: usize,
-    rank: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    layer_idx: usize,
-    debug_same_rows: bool,
 ) -> Result<()> {
     ensure!(
         (1..=KIMI_DECODE_MAX_BATCH).contains(&scratch.hidden.seq_len),
@@ -2023,34 +1861,12 @@ fn forward_dense_mlp_decode_into(
         &mut scratch.hidden_allreduce_f32,
         comm,
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "dense_projected",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.projected,
-        debug_same_rows,
-    );
     add_batch_into(
         ctx,
         &scratch.hidden,
         &scratch.projected,
         &mut scratch.normed,
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "dense_residual_add",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.normed,
-        debug_same_rows,
-    );
     std::mem::swap(&mut scratch.hidden, &mut scratch.normed);
     Ok(())
 }
@@ -2193,11 +2009,6 @@ fn forward_moe_layer_decode_into(
     post_attention_norm: &DeviceVec,
     expert_kernels: &KimiRankExpertMarlinWeights,
     scratch: &mut KimiWorkerDecodeScratch,
-    active_len: usize,
-    rank: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    debug_same_rows: bool,
 ) -> Result<()> {
     let seq_len = scratch.hidden.seq_len;
     ensure!(
@@ -2239,28 +2050,6 @@ fn forward_moe_layer_decode_into(
         &mut scratch.hidden_allreduce_f32,
         comm,
     )?;
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "moe_shared_projected",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.projected,
-        debug_same_rows,
-    );
-    debug_identical_decode_rows_bf16(
-        ctx,
-        rank,
-        "moe_normed_input",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.normed,
-        debug_same_rows,
-    );
 
     {
         let mut router_scratch = KimiRouterScratch {
@@ -2287,18 +2076,6 @@ fn forward_moe_layer_decode_into(
             &mut router_output,
         )?;
     }
-    debug_identical_decode_router_topk(
-        ctx,
-        rank,
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.router_topk_idx,
-        &scratch.router_topk_weight,
-        seq_len,
-        debug_same_rows,
-    );
 
     let routing = kimi_moe_marlin_align_block_size(
         aux_ctx,
@@ -2329,33 +2106,11 @@ fn forward_moe_layer_decode_into(
         &scratch.router_topk_weight,
         &mut scratch.marlin_w13_out,
     )?;
-    debug_identical_decode_route_rows_bf16(
-        ctx,
-        rank,
-        "moe_w13_out",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.marlin_w13_out,
-        debug_same_rows,
-    );
     kimi_marlin_w13_swiglu(
         aux_ctx,
         &scratch.marlin_w13_out,
         &mut scratch.marlin_activated,
     )?;
-    debug_identical_decode_route_rows_bf16(
-        ctx,
-        rank,
-        "moe_w13_swiglu",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.marlin_activated,
-        debug_same_rows,
-    );
     aux_ctx
         .stream
         .memset_zeros(&mut scratch.marlin_expert_output.data)?;
@@ -2368,35 +2123,12 @@ fn forward_moe_layer_decode_into(
         &scratch.router_topk_weight,
         &mut scratch.marlin_expert_output,
     )?;
-    debug_identical_decode_route_rows_bf16(
-        ctx,
-        rank,
-        "moe_w2_route_output",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.marlin_expert_output,
-        debug_same_rows,
-    );
     kimi_marlin_sum_topk_rows_f32(
         aux_ctx,
         &scratch.marlin_expert_output,
         seq_len,
         &mut scratch.routed_out_f32,
     )?;
-    debug_identical_decode_rows_f32(
-        ctx,
-        rank,
-        "moe_routed_local",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.routed_out_f32,
-        KIMI_K2_HIDDEN,
-        debug_same_rows,
-    );
     repeat_f32_for_reduce_scatter_into(
         aux_ctx,
         &scratch.routed_out_f32,
@@ -2420,18 +2152,6 @@ fn forward_moe_layer_decode_into(
         KIMI_K2_EP_WORLD,
         comm,
     )?;
-    debug_identical_decode_rows_f32(
-        ctx,
-        rank,
-        "moe_routed_reduce",
-        Some(layer_idx),
-        active_len,
-        token_ids,
-        append_positions,
-        &scratch.routed_out_f32,
-        KIMI_K2_HIDDEN,
-        debug_same_rows,
-    );
     add_batch_into(
         ctx,
         &scratch.hidden,
@@ -2719,457 +2439,6 @@ fn reduce_scatter_f32_hidden_into(
     comm.reduce_scatter(&global_view, &mut local_view, &ReduceOp::Sum)
         .map(|_| ())
         .map_err(|err| anyhow::anyhow!("Kimi routed RS f32 hidden failed: status={:?}", err.0))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_identical_decode_rows_bf16(
-    ctx: &DeviceContext,
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    values: &HiddenStates,
-    enabled: bool,
-) {
-    if !debug_decode_rows_enabled(enabled, active_len, values.seq_len, phase, layer_idx)
-        || debug_row_diff_report_budget_exhausted()
-    {
-        return;
-    }
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    let host = match ctx.stream.clone_dtoh(&values.data) {
-        Ok(host) => host,
-        Err(err) => {
-            eprintln!("KIMI_DECODE_ROW_DEBUG D2H failed rank={rank} phase={phase}: {err}");
-            return;
-        }
-    };
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG post-D2H sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    debug_report_bf16_row_diff(
-        rank,
-        phase,
-        layer_idx,
-        active_len,
-        token_ids,
-        append_positions,
-        values.hidden_dim,
-        &host,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_identical_decode_route_rows_bf16(
-    ctx: &DeviceContext,
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    values: &HiddenStates,
-    enabled: bool,
-) {
-    let route_rows = active_len * KIMI_K2_TOPK;
-    if !debug_decode_rows_enabled(enabled, active_len, values.seq_len, phase, layer_idx)
-        || values.seq_len < route_rows
-        || debug_row_diff_report_budget_exhausted()
-    {
-        return;
-    }
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    let host = match ctx.stream.clone_dtoh(&values.data) {
-        Ok(host) => host,
-        Err(err) => {
-            eprintln!("KIMI_DECODE_ROW_DEBUG D2H failed rank={rank} phase={phase}: {err}");
-            return;
-        }
-    };
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG post-D2H sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    debug_report_bf16_route_row_diff(
-        rank,
-        phase,
-        layer_idx,
-        active_len,
-        token_ids,
-        append_positions,
-        values.hidden_dim,
-        &host,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_identical_decode_rows_f32(
-    ctx: &DeviceContext,
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    values: &CudaSlice<f32>,
-    hidden_dim: usize,
-    enabled: bool,
-) {
-    if !debug_decode_rows_enabled(
-        enabled,
-        active_len,
-        values.len() / hidden_dim,
-        phase,
-        layer_idx,
-    ) || debug_row_diff_report_budget_exhausted()
-    {
-        return;
-    }
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    let host = match ctx.stream.clone_dtoh(values) {
-        Ok(host) => host,
-        Err(err) => {
-            eprintln!("KIMI_DECODE_ROW_DEBUG D2H failed rank={rank} phase={phase}: {err}");
-            return;
-        }
-    };
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG post-D2H sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    debug_report_f32_row_diff(
-        rank,
-        phase,
-        layer_idx,
-        active_len,
-        token_ids,
-        append_positions,
-        hidden_dim,
-        &host,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_report_bf16_row_diff(
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    hidden_dim: usize,
-    host: &[half::bf16],
-) {
-    let mut first = None;
-    let mut max_abs = 0.0f32;
-    for row in 1..active_len {
-        for dim in 0..hidden_dim {
-            let base = host[dim].to_f32();
-            let value = host[row * hidden_dim + dim].to_f32();
-            let diff = (base - value).abs();
-            if diff > max_abs {
-                max_abs = diff;
-            }
-            if diff != 0.0 && first.is_none() {
-                first = Some((row, dim, base, value, diff));
-            }
-        }
-    }
-    if let Some((row, dim, base, value, diff)) = first {
-        debug_print_row_diff(
-            rank,
-            phase,
-            layer_idx,
-            active_len,
-            token_ids,
-            append_positions,
-            row,
-            dim,
-            base,
-            value,
-            diff,
-            max_abs,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_report_bf16_route_row_diff(
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    hidden_dim: usize,
-    host: &[half::bf16],
-) {
-    let mut first = None;
-    let mut max_abs = 0.0f32;
-    for row in 1..active_len {
-        for route in 0..KIMI_K2_TOPK {
-            let base_offset = route * hidden_dim;
-            let row_offset = (row * KIMI_K2_TOPK + route) * hidden_dim;
-            for dim in 0..hidden_dim {
-                let base = host[base_offset + dim].to_f32();
-                let value = host[row_offset + dim].to_f32();
-                let diff = (base - value).abs();
-                if diff > max_abs {
-                    max_abs = diff;
-                }
-                if diff != 0.0 && first.is_none() {
-                    first = Some((row, route, dim, base, value, diff));
-                }
-            }
-        }
-    }
-    if let Some((row, route, dim, base, value, diff)) = first {
-        debug_print_route_row_diff(
-            rank,
-            phase,
-            layer_idx,
-            active_len,
-            token_ids,
-            append_positions,
-            row,
-            route,
-            dim,
-            base,
-            value,
-            diff,
-            max_abs,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_report_f32_row_diff(
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    hidden_dim: usize,
-    host: &[f32],
-) {
-    let mut first = None;
-    let mut max_abs = 0.0f32;
-    for row in 1..active_len {
-        for dim in 0..hidden_dim {
-            let base = host[dim];
-            let value = host[row * hidden_dim + dim];
-            let diff = (base - value).abs();
-            if diff > max_abs {
-                max_abs = diff;
-            }
-            if diff != 0.0 && first.is_none() {
-                first = Some((row, dim, base, value, diff));
-            }
-        }
-    }
-    if let Some((row, dim, base, value, diff)) = first {
-        debug_print_row_diff(
-            rank,
-            phase,
-            layer_idx,
-            active_len,
-            token_ids,
-            append_positions,
-            row,
-            dim,
-            base,
-            value,
-            diff,
-            max_abs,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_print_route_row_diff(
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    row: usize,
-    route: usize,
-    dim: usize,
-    base: f32,
-    value: f32,
-    diff: f32,
-    max_abs: f32,
-) {
-    if !debug_try_consume_row_diff_report() {
-        return;
-    }
-    eprintln!(
-        "KIMI_DECODE_ROUTE_ROW_DIFF rank={rank} phase={phase} layer={:?} active_len={} tokens={:?} positions={:?} row={} route={} dim={} row0={} row{}={} first_abs_diff={} max_abs_diff={}",
-        layer_idx,
-        active_len,
-        token_ids,
-        append_positions,
-        row,
-        route,
-        dim,
-        base,
-        row,
-        value,
-        diff,
-        max_abs
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_print_row_diff(
-    rank: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    row: usize,
-    dim: usize,
-    base: f32,
-    value: f32,
-    diff: f32,
-    max_abs: f32,
-) {
-    if !debug_try_consume_row_diff_report() {
-        return;
-    }
-    eprintln!(
-        "KIMI_DECODE_ROW_DIFF rank={rank} phase={phase} layer={:?} active_len={} tokens={:?} positions={:?} row={} dim={} row0={} row{}={} first_abs_diff={} max_abs_diff={}",
-        layer_idx,
-        active_len,
-        token_ids,
-        append_positions,
-        row,
-        dim,
-        base,
-        row,
-        value,
-        diff,
-        max_abs
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn debug_identical_decode_router_topk(
-    ctx: &DeviceContext,
-    rank: usize,
-    layer_idx: Option<usize>,
-    active_len: usize,
-    token_ids: &[u32],
-    append_positions: &[usize],
-    topk_idx: &CudaSlice<i32>,
-    topk_weight: &CudaSlice<f32>,
-    rows: usize,
-    enabled: bool,
-) {
-    let phase = "moe_router_topk";
-    if !debug_decode_rows_enabled(enabled, active_len, rows, phase, layer_idx)
-        || debug_row_diff_report_budget_exhausted()
-    {
-        return;
-    }
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    let idx_host = match ctx.stream.clone_dtoh(topk_idx) {
-        Ok(host) => host,
-        Err(err) => {
-            eprintln!("KIMI_DECODE_ROW_DEBUG D2H idx failed rank={rank} phase={phase}: {err}");
-            return;
-        }
-    };
-    let weight_host = match ctx.stream.clone_dtoh(topk_weight) {
-        Ok(host) => host,
-        Err(err) => {
-            eprintln!("KIMI_DECODE_ROW_DEBUG D2H weight failed rank={rank} phase={phase}: {err}");
-            return;
-        }
-    };
-    if let Err(err) = ctx.sync() {
-        eprintln!("KIMI_DECODE_ROW_DEBUG post-D2H sync failed rank={rank} phase={phase}: {err:#}");
-        return;
-    }
-    for row in 1..active_len {
-        for k in 0..KIMI_K2_TOPK {
-            let base_offset = k;
-            let row_offset = row * KIMI_K2_TOPK + k;
-            let base_idx = idx_host[base_offset];
-            let row_idx = idx_host[row_offset];
-            let base_weight = weight_host[base_offset];
-            let row_weight = weight_host[row_offset];
-            if base_idx != row_idx || base_weight.to_bits() != row_weight.to_bits() {
-                if debug_try_consume_row_diff_report() {
-                    eprintln!(
-                        "KIMI_DECODE_ROUTER_DIFF rank={rank} phase={phase} layer={:?} active_len={} tokens={:?} positions={:?} row={} k={} row0_idx={} row{}_idx={} row0_weight={} row{}_weight={} weight_abs_diff={}",
-                        layer_idx,
-                        active_len,
-                        token_ids,
-                        append_positions,
-                        row,
-                        k,
-                        base_idx,
-                        row,
-                        row_idx,
-                        base_weight,
-                        row,
-                        row_weight,
-                        (base_weight - row_weight).abs()
-                    );
-                }
-                return;
-            }
-        }
-    }
-}
-
-fn debug_decode_rows_enabled(
-    enabled: bool,
-    active_len: usize,
-    available_rows: usize,
-    phase: &str,
-    layer_idx: Option<usize>,
-) -> bool {
-    enabled
-        && active_len > 1
-        && active_len <= available_rows
-        && layer_idx
-            .map(|idx| idx <= KIMI_DECODE_ROW_DEBUG_MAX_LAYER)
-            .unwrap_or(true)
-        && layer_idx
-            .map(|idx| idx <= 1 || phase == "layer_output")
-            .unwrap_or(true)
-}
-
-fn debug_row_diff_report_budget_exhausted() -> bool {
-    KIMI_DECODE_ROW_DIFF_REPORTS.load(AtomicOrdering::Relaxed) >= KIMI_DECODE_ROW_DEBUG_MAX_REPORTS
-}
-
-fn debug_try_consume_row_diff_report() -> bool {
-    KIMI_DECODE_ROW_DIFF_REPORTS
-        .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::Relaxed, |count| {
-            (count < KIMI_DECODE_ROW_DEBUG_MAX_REPORTS).then_some(count + 1)
-        })
-        .is_ok()
 }
 
 fn kimi_mla_softmax_scale() -> f32 {

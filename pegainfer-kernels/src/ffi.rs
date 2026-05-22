@@ -1,38 +1,7 @@
 use cudarc::driver::sys::{CUresult, CUstream};
-use std::ffi::c_void;
 
 // Half type (16-bit float) - same layout as CUDA half
 pub type Half = u16;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KimiCutlassInt4GroupedWorkspaceSizes {
-    pub problem_sizes_bytes: usize,
-    pub ptr_arrays_bytes: usize,
-    pub stride_arrays_bytes: usize,
-    pub layout_arrays_bytes: usize,
-    pub cutlass_workspace_bytes: usize,
-    pub total_bytes: usize,
-    pub alignment: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct KimiCutlassInt4GroupedLaunchParams {
-    pub input: *const Half,
-    pub weight_packed_reordered: *const u8,
-    pub weight_scale: *const Half,
-    pub expert_indptr: *const u32,
-    pub output: *mut Half,
-    pub workspace: *mut c_void,
-    pub workspace_bytes: usize,
-    pub routed_tokens: i32,
-    pub in_dim: i32,
-    pub out_dim: i32,
-    pub local_experts: i32,
-    pub group_size: i32,
-    pub sm_count: i32,
-}
 
 // CUDA kernels - all use half precision
 unsafe extern "C" {
@@ -223,41 +192,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_int4_grouped_w1_w3_cuda(
-        expert_major_hidden: *const Half,
-        w1_packed: *const u8,
-        w1_scale: *const Half,
-        w1_shape: *const i32,
-        w3_packed: *const u8,
-        w3_scale: *const Half,
-        w3_shape: *const i32,
-        expert_indptr: *const u32,
-        gate_out: *mut Half,
-        up_out: *mut Half,
-        routed_tokens: i32,
-        hidden_dim: i32,
-        intermediate_dim: i32,
-        local_experts: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_int4_grouped_w2_swiglu_cuda(
-        gate: *const Half,
-        up: *const Half,
-        w2_packed: *const u8,
-        w2_scale: *const Half,
-        w2_shape: *const i32,
-        expert_indptr: *const u32,
-        expert_output: *mut Half,
-        routed_tokens: i32,
-        intermediate_dim: i32,
-        hidden_dim: i32,
-        local_experts: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn kimi_moe_expert_major_route_cuda(
         topk_idx: *const i32,
         pos_to_token: *mut i32,
@@ -426,53 +360,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub fn kimi_cutlass_int4_sm90a_support_cuda() -> CUresult;
-
-    pub fn kimi_cutlass_int4_sm90a_support_probe_cuda(
-        supported: *mut i32,
-        sm_major: *mut i32,
-        sm_minor: *mut i32,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_grouped_workspace_sizes_sm90a_cuda(
-        max_routed_tokens: i32,
-        in_dim: i32,
-        out_dim: i32,
-        local_experts: i32,
-        group_size: i32,
-        sizes: *mut KimiCutlassInt4GroupedWorkspaceSizes,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_grouped_prepare_sm90a_cuda(
-        params: KimiCutlassInt4GroupedLaunchParams,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_grouped_launch_sm90a_cuda(
-        params: KimiCutlassInt4GroupedLaunchParams,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_reorder_weight_sm90a_cuda(
-        weight_packed_offset_binary: *const u8,
-        weight_packed_reordered: *mut u8,
-        in_dim: i32,
-        out_dim: i32,
-        local_experts: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_reorder_scale_sm90a_cuda(
-        weight_scale_checkpoint: *const Half,
-        weight_scale_reordered: *mut Half,
-        in_dim: i32,
-        out_dim: i32,
-        local_experts: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn kimi_marlin_int4_reorder_scale_cuda(
         weight_scale_checkpoint: *const Half,
         weight_scale_marlin: *mut Half,
@@ -563,37 +450,6 @@ unsafe extern "C" {
         block_size: i32,
         max_padded_tokens: i32,
         max_m_blocks: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_grouped_w1_w3_sm90a_cuda(
-        expert_major_hidden: *const Half,
-        w1_packed: *const u8,
-        w1_scale: *const Half,
-        w3_packed: *const u8,
-        w3_scale: *const Half,
-        expert_indptr: *const u32,
-        gate_out: *mut Half,
-        up_out: *mut Half,
-        routed_tokens: i32,
-        hidden_dim: i32,
-        intermediate_dim: i32,
-        local_experts: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_cutlass_int4_grouped_w2_sm90a_cuda(
-        activated: *const Half,
-        w2_packed: *const u8,
-        w2_scale: *const Half,
-        expert_indptr: *const u32,
-        expert_output: *mut Half,
-        routed_tokens: i32,
-        intermediate_dim: i32,
-        hidden_dim: i32,
-        local_experts: i32,
-        group_size: i32,
         stream: CUstream,
     ) -> CUresult;
 

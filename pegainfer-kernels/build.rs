@@ -1193,14 +1193,6 @@ fn main() {
             ]);
         }
 
-        if stem == "kimi_cutlass_int4_sm90a" {
-            nvcc_args.extend([
-                "-static-global-template-stub=false".to_string(),
-                "-Xcudafe".to_string(),
-                "--diag_suppress=177".to_string(),
-            ]);
-        }
-
         nvcc_tasks.push(NvccTask {
             cu_file: cu_file.clone(),
             obj_file,

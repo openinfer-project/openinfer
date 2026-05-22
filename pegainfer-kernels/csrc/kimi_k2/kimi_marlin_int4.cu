@@ -116,6 +116,31 @@ __global__ void kimi_marlin_fuse_w13_weight_kernel(
   }
 }
 
+__device__ __forceinline__ int kimi_marlin_scale_perm_64(int offset) {
+  return (offset / 8) + 8 * (offset % 8);
+}
+
+__global__ void kimi_marlin_reorder_scale_kernel(
+    const __nv_bfloat16* scale_checkpoint,
+    __nv_bfloat16* scale_marlin,
+    int out_dim,
+    int scale_k,
+    size_t total_elements) {
+  size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  size_t elements_per_expert = static_cast<size_t>(out_dim) * scale_k;
+  for (; idx < total_elements; idx += stride) {
+    size_t in_expert = idx % elements_per_expert;
+    size_t expert_base = idx - in_expert;
+    size_t block = in_expert / 64;
+    int offset = static_cast<int>(in_expert % 64);
+    size_t transposed = block * 64 + static_cast<size_t>(kimi_marlin_scale_perm_64(offset));
+    int group = static_cast<int>(transposed / out_dim);
+    int row = static_cast<int>(transposed - static_cast<size_t>(group) * out_dim);
+    scale_marlin[idx] = scale_checkpoint[expert_base + static_cast<size_t>(row) * scale_k + group];
+  }
+}
+
 __global__ void kimi_marlin_fuse_w13_scale_kernel(
     const __nv_bfloat16* __restrict__ gate_scale,
     const __nv_bfloat16* __restrict__ up_scale,
@@ -161,6 +186,36 @@ CUresult kimi_marlin_int4_reorder_weight_cuda(
   kimi_marlin_repack_uint4b8_noact_kernel<<<grid, kMarlinThreads, 0, stream>>>(
       reinterpret_cast<const uint32_t*>(weight_packed_checkpoint_offset_binary),
       reinterpret_cast<uint32_t*>(weight_packed_marlin), in_dim, out_dim);
+  cudaError_t err = cudaPeekAtLastError();
+  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult kimi_marlin_int4_reorder_scale_cuda(
+    const __nv_bfloat16* weight_scale_checkpoint,
+    __nv_bfloat16* weight_scale_marlin,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    int group_size,
+    cudaStream_t stream) {
+  if (weight_scale_checkpoint == nullptr || weight_scale_marlin == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (in_dim <= 0 || out_dim <= 0 || local_experts != kKimiLocalExperts ||
+      group_size != kKimiInt4GroupSize || (in_dim % group_size) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  int scale_k = in_dim / group_size;
+  size_t elements_per_expert = static_cast<size_t>(out_dim) * scale_k;
+  if ((elements_per_expert % 64) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  size_t total_elements = static_cast<size_t>(local_experts) * elements_per_expert;
+  dim3 block(256);
+  dim3 grid(static_cast<unsigned>((total_elements + block.x - 1) / block.x));
+  kimi_marlin_reorder_scale_kernel<<<grid, block, 0, stream>>>(
+      weight_scale_checkpoint, weight_scale_marlin, out_dim, scale_k, total_elements);
   cudaError_t err = cudaPeekAtLastError();
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
