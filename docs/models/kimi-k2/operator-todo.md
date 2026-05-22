@@ -1,6 +1,6 @@
 # Kimi-K2.6 文本算子 TODO
 
-> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理均已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.31ms`，synthetic output64 steady TPOT avg `14.47ms` / p99 `14.92ms`。
+> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、dense layer0 gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理均已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.26ms`，synthetic output64 steady TPOT avg `14.39ms` / p99 `14.83ms`。vLLM TP-only MoE final all-reduce cadence 已对照验证，但 BF16/F32 两版均慢于当前 RS bridge，暂不保留。
 >
 > **Last touched:** 2026-05
 
@@ -141,12 +141,25 @@
   - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.145ms`、p50 `14.157ms`、p95 `14.308ms`、p99 `14.309ms`，四路 token prefix 完全匹配 vLLM fixture。
   - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.470ms`、p50 `14.529ms`、p95 `14.852ms`、p99 `14.917ms`、max `14.930ms`，四路 hash 一致。
   - bench exit caveat：两组 `bench_serving` 都已写出 JSON 和指标，但进程退出时有 worker 残留占卡；验证后按具体 `bench_serving --model-path /data/models/Kimi-K2.5` 命令清理，H20 `nvidia-smi --query-compute-apps` 为空。后续要单独修 benchmark teardown，不把它记作 TPOT 回退。
+- dense layer0 gate/up fused GEMM gate：dense layer0 的 `gate_proj` 和 `up_proj` 在 load-time `vstack` 为 `gate_up_proj`，prompt/decode 复用 `silu_mul_fused_batch_into`。这不是 bs1 分支，scratch 按实际 `1..=4` batch arena 分配。
+  - 本地 gate：`cargo fmt --all --check`、`PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins` 通过。
+  - H20 build gate：远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins`、`cargo build --release -p pegainfer-server --bin bench_serving` 通过。
+  - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.126ms`、p50 `14.13ms` 量级、p99 `14.258ms`，四路 token prefix 完全匹配 vLLM fixture。
+  - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.388ms`、p99 `14.834ms`，四路 hash 一致。
 
 ## Rejected: decode TP hidden BF16 bulk collective
 
 - 试验内容：把 decode TP hidden reductions 从 BF16->F32->BF16 bridge 改回 BF16 bulk NCCL all-reduce，覆盖 embedding、attention `o_proj`、dense/shared down-proj 的 active-batch 通用路径；routed expert combine 仍保留 F32。
 - H20 结果：远端 `fmt/check/build` 通过；固定 4 并发 fixture 中 `max_tokens=16` wall `4693.312ms`、`13.636 tok/s`，但 row1 输出变成 `[1008,2742,924,6454,2531,...]`；`max_tokens=64` wall `1788.999ms`、`143.097 tok/s`，row2 同样发散。
 - 结论：BF16 NCCL row-offset rounding 仍会影响 greedy，不只是诊断日志噪声；这条没有性能收益，且破坏 output16/64 correctness，已回退到 F32 bulk bridge。下一步不再在 BF16 hidden collective 上试探，转向减少 collective 次数/launch 次数和 PPLX EP。
+
+## Rejected: vLLM TP-only MoE final all-reduce cadence
+
+- vLLM TP-only Kimi/DeepSeekV3 decode 源码对照结论：embedding `1` 次 BF16 all-reduce、61 层 attention `o_proj` 各 `1` 次 BF16 all-reduce、dense layer0 `down_proj` `1` 次 BF16 all-reduce、60 个 MoE 层在 shared+routed 本地合并后各 `1` 次 BF16 all-reduce。合计 `123` 次 BF16 all-reduce，`0` 次 reduce-scatter。
+- PegaInfer 当前 decode cadence 是 `123` 次 logical hidden all-reduce，加上 60 个 MoE routed `repeat_f32_for_reduce_scatter + reduce_scatter` bridge。结构上比 vLLM TP-only 多 60 次 RS，但 bridge microbench 之前显示 `repeat+RS` 与 direct F32 all-reduce 相近。
+- 试验 A：把 decode MoE 改成 shared local + routed local scale 后本地合并，执行一次 BF16 final all-reduce，再加 residual。H20 correctness 通过：fixture output16 四路 prefix 全对，synthetic output64 四路 hash 一致；性能回退，output16 steady avg `14.925ms` / p99 `18.285ms`，output64 steady avg `15.048ms` / p99 `16.129ms`。
+- 试验 B：保持同样 final all-reduce cadence，但 final reduction 用 BF16->F32->NCCL F32->BF16 bridge。H20 correctness 通过；性能仍回退，output16 steady avg `14.730ms` / p99 `15.705ms`，output64 steady avg `14.818ms` / p99 `15.227ms`。
+- 决策：这条路径已回退到当前 RS bridge。下一次 collective 改动不再做“只对齐 vLLM TP-only cadence”的单点替换；需要带 nsys/graph 账本证明减少了 tail 或总 TPOT，再进入 worker。PPLX/真 AG-RS token ownership 仍是独立方向。
 
 ## H20 decode profile 结论
 

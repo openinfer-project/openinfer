@@ -6,10 +6,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kimi_k2::batch_decode_trace::{
-    EP_WORLD_SIZE, MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site,
-    trace_decode_kernel_calls, trace_runtime_decode_kernel_calls,
+    MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site, trace_decode_kernel_calls,
+    trace_runtime_decode_kernel_calls,
 };
 use pegainfer_kimi_k2::config::KIMI_K2_LAYERS;
+use pegainfer_kimi_k2::experts::KIMI_K2_EP_WORLD;
 use pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key, measure_call};
 use serde::Serialize;
 
@@ -285,7 +286,7 @@ fn compose_report(
             kv_len,
             layers: KIMI_K2_LAYERS,
             tp_world_size: TP_WORLD_SIZE,
-            ep_world_size: EP_WORLD_SIZE,
+            ep_world_size: KIMI_K2_EP_WORLD,
             iters,
         },
         schedule_source: match source {

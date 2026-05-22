@@ -35,7 +35,7 @@ use pegainfer_kernels::{
         kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
         kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
         kimi_scaled_add_f32_bf16_to_bf16, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
-        scale_f32_in_place, silu_mul_batch_into, silu_mul_fused_batch_into,
+        scale_f32_in_place, silu_mul_fused_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
 };
@@ -446,8 +446,7 @@ enum KimiLayerForwardKindCache {
 }
 
 struct KimiDenseForwardCache {
-    gate_proj: DeviceMatrix,
-    up_proj: DeviceMatrix,
+    gate_up_proj: DeviceMatrix,
     down_proj: DeviceMatrix,
 }
 
@@ -488,8 +487,7 @@ struct KimiWorkerMlaLayerCache {
 struct KimiWorkerDecodeScratch {
     hidden: HiddenStates,
     normed: HiddenStates,
-    dense_gate: HiddenStates,
-    dense_up: HiddenStates,
+    dense_gate_up: HiddenStates,
     dense_activated: HiddenStates,
     shared_gate_up: HiddenStates,
     shared_activated: HiddenStates,
@@ -1706,8 +1704,7 @@ impl KimiWorkerDecodeScratch {
         Ok(Self {
             hidden: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, batch_size)?,
             normed: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, batch_size)?,
-            dense_gate: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 8, batch_size)?,
-            dense_up: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 8, batch_size)?,
+            dense_gate_up: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 4, batch_size)?,
             dense_activated: HiddenStates::zeros(ctx, KIMI_K2_DENSE_INTERMEDIATE / 8, batch_size)?,
             shared_gate_up: HiddenStates::zeros(ctx, KIMI_K2_EXPERT_INTERMEDIATE / 4, batch_size)?,
             shared_activated: HiddenStates::zeros(
@@ -1968,14 +1965,12 @@ fn forward_dense_mlp_batch_into(
         KIMI_K2_RMS_NORM_EPS,
         normed,
     );
-    let local_intermediate = dense.gate_proj.rows;
-    let mut gate = HiddenStates::zeros(ctx, local_intermediate, hidden.seq_len)?;
-    let mut up = HiddenStates::zeros(ctx, local_intermediate, hidden.seq_len)?;
+    let local_intermediate = dense.gate_up_proj.rows / 2;
+    let mut gate_up = HiddenStates::zeros(ctx, dense.gate_up_proj.rows, hidden.seq_len)?;
     let mut activated = HiddenStates::zeros(ctx, local_intermediate, hidden.seq_len)?;
     let mut mlp_out = HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, hidden.seq_len)?;
-    gemm_into_checked(ctx, &dense.gate_proj, normed, &mut gate)?;
-    gemm_into_checked(ctx, &dense.up_proj, normed, &mut up)?;
-    silu_mul_batch_into(ctx, &gate, &up, &mut activated)?;
+    gemm_into_checked(ctx, &dense.gate_up_proj, normed, &mut gate_up)?;
+    silu_mul_fused_batch_into(ctx, &gate_up, &mut activated);
     gemm_into_checked(ctx, &dense.down_proj, &activated, &mut mlp_out)?;
     all_reduce_hidden_in_place(&mut mlp_out, comm)?;
     add_batch_into(ctx, hidden, &mlp_out, next_hidden)?;
@@ -2011,17 +2006,11 @@ fn forward_dense_mlp_decode_into(
     );
     gemm_graphsafe_into_checked(
         ctx,
-        &dense.gate_proj,
+        &dense.gate_up_proj,
         &scratch.normed,
-        &mut scratch.dense_gate,
+        &mut scratch.dense_gate_up,
     )?;
-    gemm_graphsafe_into_checked(ctx, &dense.up_proj, &scratch.normed, &mut scratch.dense_up)?;
-    silu_mul_batch_into(
-        ctx,
-        &scratch.dense_gate,
-        &scratch.dense_up,
-        &mut scratch.dense_activated,
-    )?;
+    silu_mul_fused_batch_into(ctx, &scratch.dense_gate_up, &mut scratch.dense_activated);
     gemm_graphsafe_into_checked(
         ctx,
         &dense.down_proj,
@@ -2532,9 +2521,9 @@ fn load_layer_forward_cache(
                 KIMI_K2_DENSE_INTERMEDIATE / 8,
                 gate_proj.rows
             );
+            let gate_up_proj = DeviceMatrix::vstack(&device_ctx, &[&gate_proj, &up_proj])?;
             KimiLayerForwardKindCache::Dense(KimiDenseForwardCache {
-                gate_proj,
-                up_proj,
+                gate_up_proj,
                 down_proj,
             })
         }

@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.31ms`，synthetic output64 steady TPOT avg `14.47ms` / p99 `14.92ms`。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、dense layer0 gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.26ms`，synthetic output64 steady TPOT avg `14.39ms` / p99 `14.83ms`。vLLM TP-only MoE final all-reduce cadence 已实测 BF16/F32 两版均慢于当前 RS bridge，因此保留 RS bridge。
 >
 > **Last touched:** 2026-05
 
@@ -179,9 +179,23 @@ H20 graph serving gates after fused-qkv:
 
 `kimi_graph_probe --probe routed-bridge-compare` compares the current NCCL bridge against a direct F32 all-reduce in the same CUDA Graph replay setup. H20 `world=8,batch=4,hidden=7168,replay_iters=500` measured direct all-reduce at max-rank `33.46us` and current `repeat_f32_for_reduce_scatter + reduce_scatter` at max-rank `32.90us` (`0.983x`). This says the current bridge should not be reverted to direct all-reduce for speed; the real next communication change needs token ownership with true AG/RS or a PPLX dispatch/combine path.
 
+## TP-Only MoE Cadence Probe
+
+Hypatia 对 `/data/code/pega-ci/vllm` 的 Kimi/DeepSeekV3 TP-only path 做了源码对照：vLLM decode 是 embedding `1` 次、attention `61` 次、dense layer0 `1` 次、MoE final `60` 次 BF16 all-reduce，总计 `123` 次 BF16 all-reduce，MoE TP-only path 不使用 reduce-scatter。PegaInfer 当前是同样 `123` 次 logical hidden all-reduce，再额外加 `60` 次 routed `repeat+RS` bridge。
+
+把 PegaInfer decode MoE 临时改成 vLLM TP-only final all-reduce 后，H20 correctness 通过但性能回退：
+
+| Variant | output16 steady | output64 steady | Decision |
+| --- | --- | --- | --- |
+| BF16 final all-reduce | avg `14.925ms`, p99 `18.285ms` | avg `15.048ms`, p99 `16.129ms` | Reverted |
+| BF16-via-F32 final all-reduce | avg `14.730ms`, p99 `15.705ms` | avg `14.818ms`, p99 `15.227ms` | Reverted |
+| Current RS bridge + dense gate/up fused | p99 `14.258ms` | avg `14.388ms`, p99 `14.834ms` | Kept |
+
+Conclusion: source-level cadence parity alone is not a keep criterion. The next communication change must either implement real token ownership/AG-RS/PPLX semantics or show a measured graph/nsys win before touching the worker path.
+
 ## Next Actions
 
-1. Profile any remaining p99/max tail under shared gate/up fused GEMM plus routed scaled-add fusion and Marlin locks clear removal: output64 avg/p50/p95/p99 are now all under `15ms`, with p99 about `14.92ms`.
+1. Profile any remaining p99/max tail under dense/shared gate-up fusion plus routed scaled-add fusion and Marlin locks clear removal: output64 avg/p50/p95/p99 are now around `14.4/14.5/14.9/14.8ms`, with p99 under `15ms` in the latest kept gate.
 2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
 3. Next graph-safe local wins: keep Marlin output clears unless route metadata proves every consumed row is written, add `kimi_mla_paged_kv_append` provider coverage, and design a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
 4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

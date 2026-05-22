@@ -312,14 +312,8 @@ fn push_dense_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize)
     let prefix = format!("L{layer_idx}.dense");
     calls.push(rms(&format!("{prefix}.post_attention_norm"), batch));
     calls.push(gemm(
-        &format!("{prefix}.gate"),
-        LOCAL_DENSE_INTERMEDIATE,
-        KIMI_K2_HIDDEN,
-        batch,
-    ));
-    calls.push(gemm(
-        &format!("{prefix}.up"),
-        LOCAL_DENSE_INTERMEDIATE,
+        &format!("{prefix}.gate_up"),
+        2 * LOCAL_DENSE_INTERMEDIATE,
         KIMI_K2_HIDDEN,
         batch,
     ));
