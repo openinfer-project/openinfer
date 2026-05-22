@@ -703,14 +703,26 @@ fn maybe_load_rank_weights(
     workers: &[KimiRankWorker],
 ) -> Result<Vec<KimiRankWeightLoadReport>> {
     ensure_weight_payload_available(model_path, load_plans)?;
+    let receivers = workers
+        .iter()
+        .map(|worker| worker.load_sliced_weights_async(model_path))
+        .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(workers.len());
-    for worker in workers {
-        let report = worker.load_sliced_weights(model_path).with_context(|| {
-            format!(
-                "Kimi-K2 rank {} sliced weight load failed",
-                worker.placement().rank
-            )
-        })?;
+    for (worker, receiver) in workers.iter().zip(receivers) {
+        let report = receiver
+            .recv()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Kimi-K2 rank {} dropped weight load response",
+                    worker.placement().rank
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "Kimi-K2 rank {} sliced weight load failed",
+                    worker.placement().rank
+                )
+            })?;
         reports.push(report);
     }
     Ok(reports)

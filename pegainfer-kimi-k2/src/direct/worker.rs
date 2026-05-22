@@ -256,10 +256,10 @@ impl KimiRankWorker {
         &self.thread_placement
     }
 
-    pub(super) fn load_sliced_weights(
+    pub(super) fn load_sliced_weights_async(
         &self,
         model_path: &Path,
-    ) -> Result<KimiRankWeightLoadReport> {
+    ) -> Result<Receiver<Result<KimiRankWeightLoadReport>>> {
         let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.tx
             .send(KimiRankCommand::LoadSlicedWeights {
@@ -267,9 +267,7 @@ impl KimiRankWorker {
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
-        resp_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker dropped weight load response"))?
+        Ok(resp_rx)
     }
 
     pub(super) fn init_tp_comm_async(
