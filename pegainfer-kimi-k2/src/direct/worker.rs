@@ -101,13 +101,8 @@ pub(super) struct KimiOneTokenForwardReport {
     pub local_top_logit_f32: f32,
     pub vocab_start: usize,
     pub vocab_rows: usize,
-    pub vocab_shards_considered: usize,
     pub dense_layers_executed: usize,
     pub moe_layers_executed: usize,
-    pub attention_layers_stubbed: usize,
-    pub remaining_layers_stubbed: usize,
-    pub sampled_from_rank_local_logits: bool,
-    pub selected_from_global_vocab_shards: bool,
 }
 
 enum KimiRankCommand {
@@ -811,13 +806,8 @@ impl KimiRankThreadState {
                 local_top_logit_f32,
                 vocab_start: cache.vocab_start,
                 vocab_rows: cache.vocab_rows,
-                vocab_shards_considered: 1,
                 dense_layers_executed: KIMI_K2_DENSE_LAYERS,
                 moe_layers_executed: KIMI_K2_MOE_LAYERS,
-                attention_layers_stubbed: 0,
-                remaining_layers_stubbed: 0,
-                sampled_from_rank_local_logits: true,
-                selected_from_global_vocab_shards: false,
             });
         }
         Ok(reports)
@@ -965,13 +955,8 @@ impl KimiRankThreadState {
             local_top_logit_f32,
             vocab_start: cache.vocab_start,
             vocab_rows: cache.vocab_rows,
-            vocab_shards_considered: 1,
             dense_layers_executed,
             moe_layers_executed,
-            attention_layers_stubbed: 0,
-            remaining_layers_stubbed: 0,
-            sampled_from_rank_local_logits: true,
-            selected_from_global_vocab_shards: false,
         })
     }
 

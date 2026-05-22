@@ -454,7 +454,6 @@ impl KimiK2DirectRuntime {
                 })??,
             );
         }
-        let shard_count = reports.len();
         let expected_input = input_ids
             .last()
             .copied()
@@ -462,18 +461,14 @@ impl KimiK2DirectRuntime {
         for report in &reports {
             validate_one_token_report(report, "prompt", slot, expected_input)?;
         }
-        let mut best = reports
+        reports
             .into_iter()
             .max_by(|left, right| {
                 left.local_top_logit_f32
                     .partial_cmp(&right.local_top_logit_f32)
                     .unwrap_or(Ordering::Equal)
             })
-            .ok_or_else(|| anyhow::anyhow!("Kimi runtime produced no rank forward reports"))?;
-        best.vocab_shards_considered = shard_count;
-        best.sampled_from_rank_local_logits = false;
-        best.selected_from_global_vocab_shards = shard_count > 1;
-        Ok(best)
+            .ok_or_else(|| anyhow::anyhow!("Kimi runtime produced no rank forward reports"))
     }
 
     fn forward_decode_batch_next_tokens(
@@ -535,7 +530,7 @@ impl KimiK2DirectRuntime {
         }
         let mut selected = Vec::with_capacity(token_ids.len());
         for row in 0..token_ids.len() {
-            let mut best = rank_reports
+            let best = rank_reports
                 .iter()
                 .map(|reports| reports[row].clone())
                 .max_by(|left, right| {
@@ -544,9 +539,6 @@ impl KimiK2DirectRuntime {
                         .unwrap_or(Ordering::Equal)
                 })
                 .ok_or_else(|| anyhow::anyhow!("Kimi runtime produced no report for row {row}"))?;
-            best.vocab_shards_considered = shard_count;
-            best.sampled_from_rank_local_logits = false;
-            best.selected_from_global_vocab_shards = shard_count > 1;
             selected.push(best);
         }
         Ok(selected)
@@ -623,13 +615,6 @@ fn validate_one_token_report(
         report.dense_layers_executed,
         report.moe_layers_executed,
         KIMI_K2_LAYERS
-    );
-    ensure!(
-        report.attention_layers_stubbed == 0 && report.remaining_layers_stubbed == 0,
-        "Kimi {phase} rank {} report still has stubs: attention={}, remaining={}",
-        report.rank,
-        report.attention_layers_stubbed,
-        report.remaining_layers_stubbed
     );
     Ok(())
 }
