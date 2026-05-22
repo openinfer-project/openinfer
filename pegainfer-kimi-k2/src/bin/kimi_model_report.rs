@@ -10,8 +10,8 @@ use pegainfer_kimi_k2::batch_decode_trace::{
     trace_runtime_decode_kernel_calls,
 };
 use pegainfer_kimi_k2::config::KIMI_K2_LAYERS;
-use pegainfer_kimi_k2::experts::KIMI_K2_EP_WORLD;
 use pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key, measure_call};
+use pegainfer_kimi_k2::layers::experts::KIMI_K2_EP_WORLD;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 16;

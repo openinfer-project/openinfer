@@ -48,7 +48,7 @@ use crate::{
         KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
     direct::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
-    experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
+    layers::experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
         KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights, KimiRankShardPlan,
