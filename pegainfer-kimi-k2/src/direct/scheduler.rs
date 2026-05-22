@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Barrier, mpsc as std_mpsc},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -30,7 +30,6 @@ use crate::{
 };
 
 const KIMI_DIRECT_MAX_BATCH: usize = 4;
-const KIMI_BATCH_ADMIT_WAIT: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Debug)]
 pub struct KimiK2DirectRuntimeConfig {
@@ -158,12 +157,6 @@ impl KimiK2DirectScheduler {
 
             while let Ok(req) = submit_rx.try_recv() {
                 pending.push_back(req);
-            }
-            if pending.len() < KIMI_DIRECT_MAX_BATCH {
-                thread::sleep(KIMI_BATCH_ADMIT_WAIT);
-                while let Ok(req) = submit_rx.try_recv() {
-                    pending.push_back(req);
-                }
             }
 
             let mut batch = Vec::with_capacity(KIMI_DIRECT_MAX_BATCH);
