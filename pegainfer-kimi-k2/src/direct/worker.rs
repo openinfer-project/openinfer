@@ -2396,7 +2396,6 @@ fn forward_moe_layer_decode_into(
         &scratch.marlin_expert_output,
         debug_same_rows,
     );
-    aux_ctx.stream.memset_zeros(&mut scratch.routed_out_f32)?;
     kimi_marlin_sum_topk_rows_f32(
         aux_ctx,
         &scratch.marlin_expert_output,

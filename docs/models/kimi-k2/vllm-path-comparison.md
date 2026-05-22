@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel 已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.45ms`，synthetic output64 steady TPOT avg `14.63ms` / p99 `15.06ms`。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel、routed sum 前冗余 memset 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.36ms`，synthetic output64 steady TPOT avg `14.56ms` / p99 `15.06ms`。
 >
 > **Last touched:** 2026-05
 
@@ -175,9 +175,13 @@ H20 graph serving gates after fused-qkv:
 | TP collectives | vLLM parallel layers hide TP reductions; BF16 path does not visibly use our BF16-via-F32 bridge. | PegaInfer uses BF16-via-F32 bridge for hidden all-reduces because BF16 collective changed greedy output. | This is correctness-driven overhead; replacing it needs external vLLM greedy/top-k gate. |
 | Sampling/top1 | vLLM sampling/logprobs is integrated with its sampler path. | PegaInfer graph body ends at local top1; worker D2H reads local top1 and scheduler CPU-selects across ranks. | This graph-external boundary is real, but prior profile says it is not the largest item; fix after trace/accounting is accurate. |
 
+## Routed Bridge Probe
+
+`kimi_graph_probe --probe routed-bridge-compare` compares the current NCCL bridge against a direct F32 all-reduce in the same CUDA Graph replay setup. H20 `world=8,batch=4,hidden=7168,replay_iters=500` measured direct all-reduce at max-rank `33.46us` and current `repeat_f32_for_reduce_scatter + reduce_scatter` at max-rank `32.90us` (`0.983x`). This says the current bridge should not be reverted to direct all-reduce for speed; the real next communication change needs token ownership with true AG/RS or a PPLX dispatch/combine path.
+
 ## Next Actions
 
 1. Profile any remaining p99/max tail under shared gate/up fused GEMM plus routed scaled-add fusion: output64 avg/p50/p95 are under or near `15ms`, and p99 is now about `15.06ms`.
 2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
-3. Next graph-safe local wins: Marlin clear fusion, `kimi_mla_paged_kv_append` provider coverage, and a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
+3. Next graph-safe local wins: Marlin output/locks clear fusion where semantics allow it, `kimi_mla_paged_kv_append` provider coverage, and a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
 4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

@@ -14,7 +14,7 @@ use cudarc::nccl::{
 };
 use half::bf16;
 use pegainfer_kernels::{
-    ops::{gemm_graphsafe_into_checked, scale_f32_in_place},
+    ops::{gemm_graphsafe_into_checked, repeat_f32_for_reduce_scatter_into, scale_f32_in_place},
     tensor::{DeviceContext, DeviceMatrix, HiddenStates},
 };
 use serde::Serialize;
@@ -43,6 +43,7 @@ enum Probe {
     NcclAllReduce,
     NcclReduceScatter,
     NcclTwoStreamOverlap,
+    RoutedBridgeCompare,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +58,8 @@ struct ProbeReport {
     elapsed_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     overlap: Option<OverlapReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge: Option<BridgeReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,15 +72,238 @@ struct OverlapReport {
     overlap_avg_us_by_rank: Vec<f32>,
 }
 
+#[derive(Debug, Serialize)]
+struct BridgeReport {
+    replay_iters: usize,
+    all_reduce_avg_us_max_rank: f32,
+    repeat_reduce_scatter_avg_us_max_rank: f32,
+    repeat_reduce_scatter_over_all_reduce: f32,
+    all_reduce_avg_us_by_rank: Vec<f32>,
+    repeat_reduce_scatter_avg_us_by_rank: Vec<f32>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RankOverlapTiming {
     sequential_avg_us: f32,
     overlap_avg_us: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RankBridgeTiming {
+    all_reduce_avg_us: f32,
+    repeat_reduce_scatter_avg_us: f32,
+}
+
+fn run_routed_bridge_compare_probe(
+    world_size: usize,
+    batch_size: usize,
+    hidden: usize,
+    replay_iters: usize,
+) -> Result<BridgeReport> {
+    if world_size == 0 {
+        bail!("world_size must be positive");
+    }
+    if replay_iters == 0 {
+        bail!("replay_iters must be positive");
+    }
+    let id = Id::new().map_err(|err| anyhow!("NCCL unique id creation failed: {err:?}"))?;
+    let begin = Arc::new(Barrier::new(world_size));
+    let enqueued = Arc::new(Barrier::new(world_size));
+    let captured = Arc::new(Barrier::new(world_size));
+    let launched = Arc::new(Barrier::new(world_size));
+    let (tx, rx) = mpsc::channel();
+
+    for rank in 0..world_size {
+        let tx = tx.clone();
+        let begin = Arc::clone(&begin);
+        let enqueued = Arc::clone(&enqueued);
+        let captured = Arc::clone(&captured);
+        let launched = Arc::clone(&launched);
+        thread::Builder::new()
+            .name(format!("kimi-graph-probe-bridge-rank-{rank}"))
+            .spawn(move || {
+                let result = run_routed_bridge_compare_rank(
+                    rank,
+                    world_size,
+                    batch_size,
+                    hidden,
+                    id,
+                    begin,
+                    enqueued,
+                    captured,
+                    launched,
+                    replay_iters,
+                );
+                let _ = tx.send((rank, result));
+            })
+            .with_context(|| format!("spawn routed bridge graph probe rank {rank}"))?;
+    }
+    drop(tx);
+
+    let mut failures = Vec::new();
+    let mut rank_timings = Vec::with_capacity(world_size);
+    for (rank, result) in rx {
+        match result {
+            Ok(timing) => rank_timings.push((rank, timing)),
+            Err(err) => failures.push(format!("rank {rank}: {err:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        bail!("routed bridge graph probe failed:\n{}", failures.join("\n"));
+    }
+    rank_timings.sort_by_key(|(rank, _)| *rank);
+    let all_reduce_avg_us_by_rank: Vec<f32> = rank_timings
+        .iter()
+        .map(|(_, timing)| timing.all_reduce_avg_us)
+        .collect();
+    let repeat_reduce_scatter_avg_us_by_rank: Vec<f32> = rank_timings
+        .iter()
+        .map(|(_, timing)| timing.repeat_reduce_scatter_avg_us)
+        .collect();
+    let all_reduce_avg_us_max_rank = all_reduce_avg_us_by_rank
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max);
+    let repeat_reduce_scatter_avg_us_max_rank = repeat_reduce_scatter_avg_us_by_rank
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max);
+    Ok(BridgeReport {
+        replay_iters,
+        all_reduce_avg_us_max_rank,
+        repeat_reduce_scatter_avg_us_max_rank,
+        repeat_reduce_scatter_over_all_reduce: repeat_reduce_scatter_avg_us_max_rank
+            / all_reduce_avg_us_max_rank.max(f32::EPSILON),
+        all_reduce_avg_us_by_rank,
+        repeat_reduce_scatter_avg_us_by_rank,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_routed_bridge_compare_rank(
+    rank: usize,
+    world_size: usize,
+    batch_size: usize,
+    hidden: usize,
+    id: Id,
+    begin: Arc<Barrier>,
+    enqueued: Arc<Barrier>,
+    captured: Arc<Barrier>,
+    launched: Arc<Barrier>,
+    replay_iters: usize,
+) -> Result<RankBridgeTiming> {
+    let ctx = DeviceContext::new_with_device(rank)?;
+    let comm = Comm::from_rank(ctx.stream.clone(), rank, world_size, id)
+        .map_err(|err| anyhow!("NCCL comm init failed: {err:?}"))?;
+    let elems = batch_size * hidden;
+    let mut all_reduce_values: CudaSlice<f32> = ctx.stream.alloc_zeros(elems)?;
+    let local: CudaSlice<f32> = ctx.stream.alloc_zeros(elems)?;
+    let mut repeated: CudaSlice<f32> = ctx.stream.alloc_zeros(elems * world_size)?;
+    let mut reduce_scatter_recv: CudaSlice<f32> = ctx.stream.alloc_zeros(elems)?;
+
+    comm.all_reduce_in_place(&mut all_reduce_values, &ReduceOp::Sum)
+        .map_err(|err| anyhow!("warmup all_reduce failed: {:?}", err.0))?;
+    repeat_f32_for_reduce_scatter_into(&ctx, &local, &mut repeated, elems, world_size)?;
+    comm.reduce_scatter(&repeated, &mut reduce_scatter_recv, &ReduceOp::Sum)
+        .map_err(|err| anyhow!("warmup repeat+reduce_scatter failed: {:?}", err.0))?;
+    ctx.sync()?;
+
+    let all_reduce_graph = capture_routed_bridge_graph(
+        rank,
+        &ctx,
+        &comm,
+        &mut all_reduce_values,
+        &local,
+        &mut repeated,
+        &mut reduce_scatter_recv,
+        elems,
+        world_size,
+        false,
+        &begin,
+        &enqueued,
+        &captured,
+    )?;
+    let all_reduce_avg_us = replay_graph_timed(
+        rank,
+        &ctx,
+        &all_reduce_graph,
+        replay_iters,
+        &launched,
+        "routed-all-reduce",
+    )?;
+
+    let repeat_reduce_scatter_graph = capture_routed_bridge_graph(
+        rank,
+        &ctx,
+        &comm,
+        &mut all_reduce_values,
+        &local,
+        &mut repeated,
+        &mut reduce_scatter_recv,
+        elems,
+        world_size,
+        true,
+        &begin,
+        &enqueued,
+        &captured,
+    )?;
+    let repeat_reduce_scatter_avg_us = replay_graph_timed(
+        rank,
+        &ctx,
+        &repeat_reduce_scatter_graph,
+        replay_iters,
+        &launched,
+        "routed-repeat-reduce-scatter",
+    )?;
+
+    Ok(RankBridgeTiming {
+        all_reduce_avg_us,
+        repeat_reduce_scatter_avg_us,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_routed_bridge_graph(
+    rank: usize,
+    ctx: &DeviceContext,
+    comm: &Comm,
+    all_reduce_values: &mut CudaSlice<f32>,
+    local: &CudaSlice<f32>,
+    repeated: &mut CudaSlice<f32>,
+    reduce_scatter_recv: &mut CudaSlice<f32>,
+    elems: usize,
+    world_size: usize,
+    repeat_reduce_scatter: bool,
+    begin: &Barrier,
+    enqueued: &Barrier,
+    captured: &Barrier,
+) -> Result<CudaGraph> {
+    begin.wait();
+    ctx.stream
+        .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        .map_err(|err| anyhow!("rank {rank} begin_capture failed: {err}"))?;
+    if repeat_reduce_scatter {
+        repeat_f32_for_reduce_scatter_into(ctx, local, repeated, elems, world_size)?;
+        comm.reduce_scatter(repeated, reduce_scatter_recv, &ReduceOp::Sum)
+            .map_err(|err| anyhow!("capture repeat+reduce_scatter failed: {:?}", err.0))?;
+    } else {
+        comm.all_reduce_in_place(all_reduce_values, &ReduceOp::Sum)
+            .map_err(|err| anyhow!("capture all_reduce failed: {:?}", err.0))?;
+    }
+    enqueued.wait();
+    let graph = ctx
+        .stream
+        .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+        .map_err(|err| anyhow!("rank {rank} end_capture failed: {err}"))?
+        .ok_or_else(|| anyhow!("rank {rank} end_capture returned empty graph"))?;
+    captured.wait();
+    Ok(graph)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let started = Instant::now();
+    let mut bridge = None;
     let overlap = match cli.probe {
         Probe::LocalKernel => {
             run_local_kernel(cli.batch_size, cli.hidden)?;
@@ -101,6 +327,15 @@ fn main() -> Result<()> {
             cli.hidden,
             cli.replay_iters,
         )?),
+        Probe::RoutedBridgeCompare => {
+            bridge = Some(run_routed_bridge_compare_probe(
+                cli.world_size,
+                cli.batch_size,
+                cli.hidden,
+                cli.replay_iters,
+            )?);
+            None
+        }
     };
     let report = ProbeReport {
         probe: cli.probe,
@@ -112,6 +347,7 @@ fn main() -> Result<()> {
         replay_ok: true,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         overlap,
+        bridge,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
