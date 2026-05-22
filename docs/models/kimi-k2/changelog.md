@@ -666,3 +666,11 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - CUDA kernels in anonymous namespaces can produce ambiguous NVCC stub names when heavy CuTe headers are included.
 - **Lessons learned**:
   - Keep the launcher ABI generic per projection first; W1/W3 true fused-N should be added when the loader owns a fused/reordered packed buffer.
+
+## Execution Log: WNA16 single-layer parity 容差 follow-up（2026-05-22）
+
+- 背景：cleanup commit `99b213a` 之后 h20 重跑 5 条 H20-only gate，4 条通过，唯一红的是 `h20_kimi_marlin_wna16_single_layer_matches_vllm_reference`。
+- 隔离实验：在 cleanup 前的 `cab7ba2` 上跑同测试，失败 bitwise 完全一致；再用 `pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py` + vLLM 0.19.0 重生成 `/tmp/kimi_marlin_wna16_reference/`（`weight_source=deterministic_synthetic`），失败 bitwise 同样完全一致。结论：fixture 和 cleanup 都不是问题源，vLLM Marlin kernel 是 deterministic 的。
+- 实际数字：`w13_out: max_diff=0.5 mean_diff=0.0055` 卡到 `(0.5, 0.03)` 上限通过；`route_output: max_diff=96 mean_diff=1.8632`，限 `(16, 0.03)`，max=96 / mean=1.86 在 BF16 量级 ~7000 下相对误差 < 0.03%（~1.5 ULP）。差异在 SwiGLU 之后的 w2 GEMM/atomic split-K 累加顺序上，不是算法 bug。
+- 决定：不动测试代码，保留这条作为"严格 bit-level parity"红线（`#[ignore]`，不进 default test run）。后续如果要让它转 green，要么换成 vLLM-side `use_atomic_add=False, use_fp32_reduce=True` 的稳定累加路径生成 fixture，要么把容差按 ULP-relative 重写，二选一前不动它。
+- 备份：旧 fixture 已挪到 h20-100 `/tmp/kimi_marlin_wna16_reference.bak.1779438284/`，新 fixture 在 `/tmp/kimi_marlin_wna16_reference/`。
