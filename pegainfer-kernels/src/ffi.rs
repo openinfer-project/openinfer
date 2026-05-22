@@ -300,6 +300,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn kimi_scaled_add_f32_bf16_to_bf16_cuda(
+        a: *const f32,
+        scale: f32,
+        b: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn kimi_mla_split_qkv_a_cuda(
         qkv_a: *const Half,
         q_a: *mut Half,

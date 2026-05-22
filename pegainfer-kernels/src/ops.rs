@@ -38,7 +38,8 @@ pub use kimi_experts::{
     kimi_marlin_int4_reorder_weight, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
     kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_moe_build_expert_major_route,
     kimi_moe_expand_to_expert_major, kimi_moe_marlin_align_block_size,
-    kimi_moe_reduce_expert_major_f32, kimi_swiglu_silu_mul, packed_int4_cols, validate_ep_rank,
+    kimi_moe_reduce_expert_major_f32, kimi_scaled_add_f32_bf16_to_bf16, kimi_swiglu_silu_mul,
+    packed_int4_cols, validate_ep_rank,
 };
 pub use kimi_mla::{
     KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,

@@ -221,6 +221,19 @@ __global__ void kimi_add_f32_bf16_to_bf16_kernel(
   out[idx] = __float2bfloat16(a[idx] + __bfloat162float(b[idx]));
 }
 
+__global__ void kimi_scaled_add_f32_bf16_to_bf16_kernel(
+    const float* __restrict__ a,
+    float scale,
+    const __nv_bfloat16* __restrict__ b,
+    __nv_bfloat16* __restrict__ out,
+    int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  float scaled = __fmul_rn(a[idx], scale);
+  float sum = __fadd_rn(scaled, __bfloat162float(b[idx]));
+  out[idx] = __float2bfloat16(sum);
+}
+
 __global__ void kimi_moe_marlin_align_small_kernel(
     const int* __restrict__ topk_idx,
     int* __restrict__ sorted_token_ids,
@@ -653,6 +666,25 @@ CUresult kimi_add_f32_bf16_to_bf16_cuda(
   constexpr int threads = 256;
   int blocks = (n + threads - 1) / threads;
   kimi_add_f32_bf16_to_bf16_kernel<<<blocks, threads, 0, stream>>>(a, b, out, n);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
+CUresult kimi_scaled_add_f32_bf16_to_bf16_cuda(
+    const float* a,
+    float scale,
+    const __nv_bfloat16* b,
+    __nv_bfloat16* out,
+    int n,
+    cudaStream_t stream) {
+  if (a == nullptr || b == nullptr || out == nullptr || n < 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (n == 0) return CUDA_SUCCESS;
+  constexpr int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  kimi_scaled_add_f32_bf16_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      a, scale, b, out, n);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }

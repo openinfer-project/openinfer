@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM 已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.50ms`，synthetic output64 steady TPOT avg `14.66ms` / p99 `15.11ms`。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel 已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.45ms`，synthetic output64 steady TPOT avg `14.63ms` / p99 `15.06ms`。
 >
 > **Last touched:** 2026-05
 
@@ -83,7 +83,7 @@ This list follows the current worker implementation. The static trace is now sou
 Current H20 static trace after fused `qkv_a` and shared gate/up:
 
 ```text
-calls 1826
+calls 1766
 307 gemm_graphsafe
 245 rms_norm_batch
 123 all_reduce
@@ -102,8 +102,7 @@ calls 1826
 60  kimi_marlin_sum_topk_rows_f32
 60  repeat_f32_for_reduce_scatter
 60  reduce_scatter
-60  scale_f32_in_place
-60  kimi_add_f32_bf16_to_bf16
+60  kimi_scaled_add_f32_bf16_to_bf16
 1   embedding_batch_vocab_shard
 1   top1_batch
 ```
@@ -167,18 +166,18 @@ H20 graph serving gates after fused-qkv:
 | Difference | vLLM | PegaInfer | Why it matters |
 | --- | --- | --- | --- |
 | MLA first projection | One `MergedReplicatedLinear` for `[q_lora_rank, kv_lora_rank + rope_dim]`. | Now one load-time fused `DeviceMatrix` plus one graph-safe GEMM and one split kernel. | This structural delta is closed in code. The keep/revert gate is H20 correctness plus TPOT/model-report improvement. |
-| Dense gate/up | V1 can use fused `gate_up_proj`; V0 module-level path still exposes gate/up. | Separate gate and up GEMMs for dense layer and shared expert. | One dense layer only matters little; shared expert repeats 60 times and is a real candidate after trace is fixed. |
+| Dense gate/up | V1 can use fused `gate_up_proj`; V0 module-level path still exposes gate/up. | Dense layer still uses separate gate/up; MoE shared expert now uses load-time fused gate/up GEMM. | One dense layer only matters little; shared expert repeat cost is now closed at the high-level GEMM count. |
 | Router GEMM | V1 has small-batch `dsv3_router_gemm` / `router_gemm_bf16_fp32` path before grouped top-k. | `kimi_router_noaux_tc_launch` is a single custom router/top-k kernel path. | Need compare microbench, not assume; router was ~3.7ms/step in old strong-sync profile. |
 | MLA cache append and metadata | vLLM uses `concat_and_cache_mla`; FlashMLA prepares tile scheduler metadata and graph buffers. | PegaInfer uses `kimi_mla_paged_kv_append` and precomputed decode arena arrays. | Need compare metadata/cache append cost before changing attention kernels; trace currently hides this. |
 | MLA q absorb/v up | vLLM uses `torch.bmm` with preprocessed `W_UK_T/W_UV`. | PegaInfer custom kernels `kimi_mla_absorb_q_nope` and `kimi_mla_v_up` over `kv_b_proj`. | Semantically aligned, but microbench should decide whether custom kernels or cuBLAS batched GEMM wins for bs1..4. |
 | MoE WNA16 | Both use Marlin WNA16 route align, W13, SiLU, W2, sum. | PegaInfer has persistent workspace and explicit local EP route metadata. | Main MoE kernel choice is already aligned; next work is route histogram/tail and combine, not replacing WNA16. |
-| Routed combine | vLLM EP path maps local experts via `expert_map`; final tensor-parallel reduce happens through vLLM distributed path. | PegaInfer currently uses NCCL bridge: local sum -> repeat -> reduce-scatter -> scale -> residual. | This is not PPLX EP; it is graph-capturable but likely still extra data movement. |
+| Routed combine | vLLM EP path maps local experts via `expert_map`; final tensor-parallel reduce happens through vLLM distributed path. | PegaInfer currently uses NCCL bridge: local sum -> repeat -> reduce-scatter -> fused scale+residual add. | This is not PPLX EP; it is graph-capturable but likely still extra data movement. |
 | TP collectives | vLLM parallel layers hide TP reductions; BF16 path does not visibly use our BF16-via-F32 bridge. | PegaInfer uses BF16-via-F32 bridge for hidden all-reduces because BF16 collective changed greedy output. | This is correctness-driven overhead; replacing it needs external vLLM greedy/top-k gate. |
 | Sampling/top1 | vLLM sampling/logprobs is integrated with its sampler path. | PegaInfer graph body ends at local top1; worker D2H reads local top1 and scheduler CPU-selects across ranks. | This graph-external boundary is real, but prior profile says it is not the largest item; fix after trace/accounting is accurate. |
 
 ## Next Actions
 
-1. Profile any remaining p99/max tail under shared gate/up fused GEMM: output64 avg/p50/p95 are under or near `15ms`, and p99 is now about `15.11ms`.
+1. Profile any remaining p99/max tail under shared gate/up fused GEMM plus routed scaled-add fusion: output64 avg/p50/p95 are under or near `15ms`, and p99 is now about `15.06ms`.
 2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
-3. Next graph-safe local wins: `scale_f32 + routed residual add` equivalent fusion, Marlin clear fusion, and `kimi_mla_paged_kv_append` provider coverage.
+3. Next graph-safe local wins: Marlin clear fusion, `kimi_mla_paged_kv_append` provider coverage, and a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
 4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

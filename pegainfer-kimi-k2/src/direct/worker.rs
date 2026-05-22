@@ -34,8 +34,8 @@ use pegainfer_kernels::{
         kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill,
         kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
         kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
-        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
-        silu_mul_batch_into, silu_mul_fused_batch_into,
+        kimi_scaled_add_f32_bf16_to_bf16, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
+        scale_f32_in_place, silu_mul_batch_into, silu_mul_fused_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
 };
@@ -2438,12 +2438,6 @@ fn forward_moe_layer_decode_into(
         KIMI_K2_EP_WORLD,
         comm,
     )?;
-    scale_f32_in_place(
-        ctx,
-        &mut scratch.routed_out_f32,
-        seq_len * KIMI_K2_HIDDEN,
-        KIMI_K2_ROUTER_SCALE,
-    )?;
     debug_identical_decode_rows_f32(
         ctx,
         rank,
@@ -2462,9 +2456,10 @@ fn forward_moe_layer_decode_into(
         &scratch.projected,
         &mut scratch.normed,
     )?;
-    add_f32_bf16_to_bf16_hidden_into(
+    scaled_add_f32_bf16_to_bf16_hidden_into(
         ctx,
         &scratch.routed_out_f32,
+        KIMI_K2_ROUTER_SCALE,
         &scratch.normed,
         &mut scratch.hidden,
     )?;
@@ -3328,6 +3323,16 @@ fn add_f32_bf16_to_bf16_hidden_into(
     };
     result.result()?;
     Ok(())
+}
+
+fn scaled_add_f32_bf16_to_bf16_hidden_into(
+    ctx: &DeviceContext,
+    a: &CudaSlice<f32>,
+    scale: f32,
+    b: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    kimi_scaled_add_f32_bf16_to_bf16(ctx, a, scale, b, out)
 }
 
 fn sample_local_top1_with_value(ctx: &DeviceContext, logits: &DeviceVec) -> Result<(u32, f32)> {

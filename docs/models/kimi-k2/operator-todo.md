@@ -1,6 +1,6 @@
 # Kimi-K2.6 文本算子 TODO
 
-> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM 已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.50ms`，synthetic output64 steady TPOT avg `14.66ms` / p99 `15.11ms`。
+> **TL;DR:** Kimi-K2.6 首阶段只做 text-only。当前 routed expert INT4 package/compute/worker 主链已转向 vLLM Marlin WNA16：signed/unsigned nibble、checkpoint/CUTLASS/Marlin scale layout、fused W13(`gate_then_up`) + W2 runtime package 均已明确；真实 K2.5 rank0 layer1 W13 + SwiGLU + W2 + top-k reduce 对 vLLM fixture 0-diff，H20 全 61 层 prompt forward 多 prompt gate 4/4 greedy argmax match。decode arena 已从 bs1/bs4 两档改为 `1..=4` 按实际 wave size 选 arena，后续优化禁止假设 `bs==1`。scheduler 已接入 bs4 wave decode；Marlin W13/W2 已匹配 vLLM `use_atomic_add=false,use_fp32_reduce=true` 并预分配 `c_tmp`；H20 固定 4 并发 `max_tokens=16` gate 四路 token 全对，`ROUTER/ROUTE_ROW/ROW` diff 全为 0。CUDA Graph 已覆盖整段 decode；MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、routed scale+residual add fused kernel 已通过 H20 gate，真实 fixture output16 steady TPOT p99 `14.45ms`，synthetic output64 steady TPOT avg `14.63ms` / p99 `15.06ms`。
 >
 > **Last touched:** 2026-05
 
@@ -124,6 +124,12 @@
   - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.354ms`、p50 `14.365ms`、p95 `14.495ms`、p99 `14.495ms`，四路 token prefix 仍完全匹配 vLLM fixture。
   - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.658ms`、p50 `14.714ms`、p95 `15.051ms`、p99 `15.111ms`、max `15.115ms`，四路 hash 一致。
   - 这刀 avg 比上一档 output64 `14.615ms` 略慢，但 p99/max 从 `16.95ms` 收到约 `15.11ms`，符合“稳定 15ms 左右”的目标，因此保留；下一步如果继续优化，优先找回 avg 而不放大 tail。
+- routed scale+residual fused add gate：decode MoE combine 原来每层执行 `scale_f32_in_place(routed_out_f32, 2.827)` 再执行 `kimi_add_f32_bf16_to_bf16(routed_out_f32, shared_residual)`。本轮新增 `kimi_scaled_add_f32_bf16_to_bf16`，把 scale 和 F32+BF16 residual add 合成一个 batch-general kernel；prompt path 暂不变，decode path 移除每 MoE 层一次 scale launch。
+  - 语义约束：kernel 用 `__fmul_rn` + `__fadd_rn`，保持当前 decode path 的 F32 scale 后再与 BF16 residual 相加并落 BF16；这不是 bs1 专用分支，输入长度为 `batch * hidden`。
+  - H20 build gate：rsync dry-run 只同步 7 个小文件；远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins`、`cargo build --release -p pegainfer-server --bin bench_serving` 通过。
+  - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.293ms`、p50 `14.293ms`、p95 `14.445ms`、p99 `14.445ms`，四路 token prefix 完全匹配 vLLM fixture。
+  - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.629ms`、p50 `14.702ms`、p95 `15.050ms`、p99 `15.062ms`、max `15.063ms`，四路 hash 一致。
+  - trace gate：重新 build `kimi_kernel_report` 后，static bs4/kv1024 trace 从 `1826` calls 降到 `1766` calls；`scale_f32_in_place=0`、`kimi_scaled_add_f32_bf16_to_bf16=60`、旧 `kimi_add_f32_bf16_to_bf16=0`。
 
 ## Rejected: decode TP hidden BF16 bulk collective
 

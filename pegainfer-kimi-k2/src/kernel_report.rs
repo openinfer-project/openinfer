@@ -16,8 +16,8 @@ use pegainfer_kernels::{
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
         kimi_mla_absorb_q_nope, kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
         kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
-        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
-        silu_mul_batch_into,
+        kimi_scaled_add_f32_bf16_to_bf16, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
+        scale_f32_in_place, silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, KernelCall, TensorSpec},
 };
@@ -50,6 +50,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "add_batch" => Some(measure_add(call, iters)?),
         "scale_f32_in_place" => Some(measure_scale_f32(call, iters)?),
         "kimi_add_f32_bf16_to_bf16" => Some(measure_add_f32_bf16(call, iters)?),
+        "kimi_scaled_add_f32_bf16_to_bf16" => Some(measure_scaled_add_f32_bf16(call, iters)?),
         "embedding_batch_vocab_shard" => Some(measure_embedding(call, iters)?),
         "top1_batch" => Some(measure_top1(call, iters)?),
         "kimi_mla_split_qkv_a" => Some(measure_mla_split_qkv_a(call, iters)?),
@@ -253,6 +254,25 @@ fn measure_add_f32_bf16(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let mut out = HiddenStates::zeros(&ctx, hidden, batch)?;
     measure_loop(&ctx, iters, || {
         kimi_add_f32_bf16_to_bf16(&ctx, &a, &b, &mut out)
+    })
+}
+
+fn measure_scaled_add_f32_bf16(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let b = input(call, "b")?;
+    let hidden = axis(b, "hidden")?;
+    let batch = axis(b, "batch")?;
+    let scale = call
+        .attrs
+        .iter()
+        .find(|attr| attr.name == "scale")
+        .and_then(|attr| attr.value.parse::<f32>().ok())
+        .unwrap_or(2.827);
+    let ctx = DeviceContext::new()?;
+    let a: CudaSlice<f32> = ctx.stream.alloc_zeros(hidden * batch)?;
+    let b = HiddenStates::zeros(&ctx, hidden, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, hidden, batch)?;
+    measure_loop(&ctx, iters, || {
+        kimi_scaled_add_f32_bf16_to_bf16(&ctx, &a, scale, &b, &mut out)
     })
 }
 

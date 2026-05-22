@@ -20,6 +20,7 @@ use pegainfer_kernels::ops::{
     KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
     KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
     KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+    KIMI_K2_ROUTER_SCALE,
 };
 
 pub const MODEL: &str = "kimi-k2";
@@ -469,27 +470,10 @@ fn push_moe_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
         EP_WORLD_SIZE,
         "f32",
     ));
-    calls.push(
-        KernelCall::new("scale_f32_in_place", format!("{prefix}.routed_scale"))
-            .input(
-                "values",
-                TensorSpec::new::<F32, Contiguous1D>([AxisSpec::named(
-                    "elem",
-                    batch * KIMI_K2_HIDDEN,
-                )]),
-            )
-            .output(
-                "values",
-                TensorSpec::new::<F32, Contiguous1D>([AxisSpec::named(
-                    "elem",
-                    batch * KIMI_K2_HIDDEN,
-                )]),
-            ),
-    );
     calls.push(add(&format!("{prefix}.shared_residual"), batch));
     calls.push(
         KernelCall::new(
-            "kimi_add_f32_bf16_to_bf16",
+            "kimi_scaled_add_f32_bf16_to_bf16",
             format!("{prefix}.routed_residual"),
         )
         .input(
@@ -497,7 +481,8 @@ fn push_moe_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
             TensorSpec::new::<F32, Contiguous1D>([AxisSpec::named("elem", batch * KIMI_K2_HIDDEN)]),
         )
         .input("b", hidden(KIMI_K2_HIDDEN, batch))
-        .output("out", hidden(KIMI_K2_HIDDEN, batch)),
+        .output("out", hidden(KIMI_K2_HIDDEN, batch))
+        .attr("scale", KIMI_K2_ROUTER_SCALE.to_string()),
     );
 }
 
