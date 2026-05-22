@@ -7,6 +7,7 @@ edition = "2024"
 once_cell = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "time"] }
 vllm-text = { workspace = true }
+vllm-tokenizer = { workspace = true }
 
 [lints]
 workspace = true

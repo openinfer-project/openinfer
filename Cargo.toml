@@ -98,10 +98,11 @@ tokio = "1"
 tokio-util = "0.7"
 toml = "1.1"
 uuid = "1"
-vllm-engine-core-client = { git = "https://github.com/Inferact/vllm-frontend-rs.git", rev = "b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9" }
-vllm-server = { git = "https://github.com/Inferact/vllm-frontend-rs.git", rev = "b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9" }
-vllm-text = { git = "https://github.com/Inferact/vllm-frontend-rs.git", rev = "b7bc63d7e2a7a1cb3ca0e9dc02394756aedaa2f9" }
-zeromq = { git = "https://github.com/BugenZhao/zmq.rs", rev = "dde4ee5c48846b0cc22b1f4fad8c7514748180fe", default-features = false, features = [
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
+zeromq = { version = "0.6.0", default-features = false, features = [
     "tokio-runtime",
     "all-transport",
 ] }

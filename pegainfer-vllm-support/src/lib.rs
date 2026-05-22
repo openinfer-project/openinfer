@@ -3,10 +3,8 @@ use std::sync::{Arc, Mutex};
 use once_cell::sync::OnceCell;
 use tokio::runtime::{Builder, Runtime};
 use vllm_text::backend::hf::{ResolvedModelFiles, TokenizerSource};
-use vllm_text::tokenizer::{
-    DynTokenizer, HuggingFaceTokenizer, TekkenTokenizer, TiktokenTokenizer,
-};
 use vllm_text::{Error, Result};
+use vllm_tokenizer::{DynTokenizer, HuggingFaceTokenizer, TekkenTokenizer, TiktokenTokenizer};
 
 static TOKENIZER_RESOLVER_RUNTIME: OnceCell<Mutex<Runtime>> = OnceCell::new();
 

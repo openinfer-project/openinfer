@@ -9,11 +9,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
+use vllm_engine_core_client::protocol::logprobs::{
+    Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob as WireTokenLogprob,
+};
 use vllm_engine_core_client::protocol::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
     EngineCoreOutputs, EngineCoreRequest, EngineCoreRequestType, EngineCoreSamplingParams,
-    Logprobs, MaybeWireLogprobs, PositionLogprobs, StopReason, TokenLogprob as WireTokenLogprob,
-    UtilityOutput, UtilityResultEnvelope, encode_msgpack, stats::PrefillStats,
+    StopReason, UtilityOutput, UtilityResultEnvelope, encode_msgpack, stats::PrefillStats,
 };
 use vllm_engine_core_client::{EngineId, TransportMode};
 use vllm_server::{
@@ -72,6 +74,7 @@ impl LocalEngineBridge {
             max_model_len: self.max_model_len as u64,
             num_gpu_blocks: 0,
             dp_stats_address: None,
+            dtype: None,
         };
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))
