@@ -183,24 +183,65 @@ pub(crate) fn typed_shared_expert_decode(
     Ok(())
 }
 
-// ── What the compiler catches now ────────────────────────────────────
-//
-// The following mistakes are compile errors with the typed API:
-//
-// 1. Swapping q_a and compressed_kv in a GEMM call:
-//    typed_ops::gemm_graphsafe_into(ctx, &w.q_b_proj, compressed_kv, q_proj)?;
-//    // ERROR: expected GpuTensor<1536>, got GpuTensor<512>
-//
-// 2. Using wrong norm weight:
-//    typed_ops::rms_norm_into(ctx, q_a, &w.kv_a_norm, eps, q_a_normed);
-//    // ERROR: expected NormWeight<1536>, got NormWeight<512>
-//
-// 3. Writing GEMM output to wrong buffer:
-//    typed_ops::gemm_graphsafe_into(ctx, &w.o_proj, attn_out, normed)?;
-//    // ERROR: expected GpuTensor<7168> (w.o_proj OUT), got GpuTensor<7168> — OK!
-//    // But if normed were GpuTensor<2048>:
-//    // ERROR: expected GpuTensor<7168>, got GpuTensor<2048>
-//
-// 4. Passing gate_up to silu_mul with wrong intermediate:
-//    typed_ops::silu_mul_fused_into::<SHARED_ACTIVATED>(ctx, gate_up, activated);
-//    // ERROR: gate_up is GpuTensor<DENSE_GATE_UP> (4608) but 2*SHARED_ACTIVATED = 512
+// ── DSL versions using typed_forward_pass! ───────────────────────────
+
+/// Dense MLP decode via `typed_forward_pass!` DSL.
+///
+/// Compare with `typed_dense_mlp_decode` above (9 lines of ops) and the
+/// original `forward_dense_mlp_decode_into` in worker.rs (48 lines).
+#[allow(dead_code)]
+pub(crate) fn dsl_dense_mlp_decode(
+    ctx: &DeviceContext,
+    w: &TypedDenseWeights,
+    hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
+    normed: &mut GpuTensor<KIMI_K2_HIDDEN>,
+    gate_up: &mut GpuTensor<DENSE_GATE_UP>,
+    activated: &mut GpuTensor<DENSE_ACTIVATED>,
+    projected: &mut GpuTensor<KIMI_K2_HIDDEN>,
+) -> Result<()> {
+    pegainfer_kernels::typed_forward_pass! {
+        ctx, KIMI_K2_RMS_NORM_EPS;
+
+        rms_norm         (hidden    => normed,    w.post_attn_norm);
+        gemm             (normed    => gate_up,   w.gate_up_proj);
+        silu_mul<DENSE_ACTIVATED> (gate_up => activated);
+        gemm             (activated => projected, w.down_proj);
+        // all_reduce omitted (comm not in scope)
+        add              (hidden, projected => normed);
+        swap             (hidden, normed);
+    }
+    Ok(())
+}
+
+/// MLA decode layer (GEMM + norm steps only) via DSL.
+///
+/// The MLA-specific kernels (split_qkv_a, rope_split, absorb_q, kv_append,
+/// decode_attn, v_up) are omitted — they need custom DSL ops or stay inline.
+#[allow(dead_code)]
+pub(crate) fn dsl_mla_decode_gemm_norms(
+    ctx: &DeviceContext,
+    w: &TypedMlaWeights,
+    hidden: &GpuTensor<KIMI_K2_HIDDEN>,
+    normed: &mut GpuTensor<KIMI_K2_HIDDEN>,
+    qkv_a: &mut GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
+    q_a: &mut GpuTensor<KIMI_K2_Q_LORA_RANK>,
+    q_a_normed: &mut GpuTensor<KIMI_K2_Q_LORA_RANK>,
+    q_proj: &mut GpuTensor<KIMI_K2_MLA_Q_LOCAL_OUT_TP8>,
+    compressed_kv: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    compressed_normed: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    attn_out: &mut GpuTensor<KIMI_K2_MLA_O_LOCAL_IN_TP8>,
+    projected: &mut GpuTensor<KIMI_K2_HIDDEN>,
+) -> Result<()> {
+    pegainfer_kernels::typed_forward_pass! {
+        ctx, KIMI_K2_RMS_NORM_EPS;
+
+        rms_norm  (hidden         => normed,           w.input_norm);
+        gemm      (normed         => qkv_a,            w.fused_qkv_a_proj);
+        // split_qkv_a, rope, absorb_q, kv_append, decode_attn, v_up — inline
+        rms_norm  (q_a            => q_a_normed,       w.q_a_norm);
+        gemm      (q_a_normed     => q_proj,           w.q_b_proj);
+        rms_norm  (compressed_kv  => compressed_normed, w.kv_a_norm);
+        gemm      (attn_out       => projected,        w.o_proj);
+    }
+    Ok(())
+}
