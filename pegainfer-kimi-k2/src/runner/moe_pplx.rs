@@ -308,7 +308,7 @@ pub(super) fn forward_moe_layer_decode_pplx(
             0,
             ScalarType::BF16,
             out_ptr as *mut c_void,
-            KIMI_K2_HIDDEN,
+            KIMI_K2_HIDDEN * std::mem::size_of::<u16>(),
             idx_ptr as *const i32,
             KIMI_K2_TOPK,
             w_ptr as *const f32,
