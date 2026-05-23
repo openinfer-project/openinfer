@@ -46,7 +46,7 @@ use crate::{
 
 use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch};
 
-pub(super) const PPLX_EXPERT_PADDING: usize = 64;
+pub(super) const PPLX_EXPERT_PADDING: usize = 16;
 
 pub(super) struct KimiMoePplxScratch {
     pub(super) expert_padding: usize,
@@ -73,7 +73,7 @@ impl KimiMoePplxScratch {
             max_recv_per_expert.div_ceil(PPLX_EXPERT_PADDING) * PPLX_EXPERT_PADDING;
         let pplx_recv_capacity = max_recv_padded * KIMI_K2_EP8_LOCAL_EXPERTS;
 
-        let marlin_block_size = super::worker::kimi_marlin_block_size(pplx_recv_capacity);
+        let marlin_block_size = 8;
         let route_workspace =
             KimiMarlinRouteWorkspace::new(ctx, pplx_recv_capacity, marlin_block_size)?;
         let marlin_workspace = KimiMarlinWna16Workspace::new(
