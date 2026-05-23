@@ -200,10 +200,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} main wait route_ready"))?;
 
     // ---- 4. dispatch_send ----
-    if layer_idx <= 2 {
-        ctx.sync()?;
-        eprintln!("pplx-diag: layer {layer_idx} pre-dispatch_send");
-    }
     {
         let (x_ptr, _x_guard) = scratch.normed.data.device_ptr(&ctx.stream);
         let (idx_ptr, _idx_guard) = scratch.router_topk_idx.device_ptr(&ctx.stream);
@@ -243,10 +239,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
     }
 
     // ---- 6. Build Marlin routing from PPLX recv counts ----
-    if layer_idx <= 2 {
-        ctx.sync()?;
-        eprintln!("pplx-diag: layer {layer_idx} dispatch_recv done, building routing");
-    }
     let routing = kimi_pplx_build_marlin_routing(
         ctx,
         &mut pplx.pplx_route_workspace,
@@ -254,6 +246,12 @@ pub(super) fn forward_moe_layer_decode_pplx(
         pplx.expert_padding,
     )
     .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
+    if layer_idx <= 2 {
+        eprintln!(
+            "pplx-diag: layer {layer_idx} routing route_elems={}",
+            routing.route_elems
+        );
+    }
 
     let layer_weights = expert_kernels
         .layers
@@ -277,6 +275,11 @@ pub(super) fn forward_moe_layer_decode_pplx(
         &pplx.pplx_dummy_topk_weight,
         &mut pplx.pplx_w13_out,
     )?;
+    if layer_idx <= 2 {
+        ctx.sync()
+            .with_context(|| format!("CUDA error after W13 GEMM layer {layer_idx}"))?;
+        eprintln!("pplx-diag: layer {layer_idx} W13 ok");
+    }
 
     // ---- 8. SwiGLU activation ----
     pplx.pplx_activated.seq_len = routing.route_elems;
@@ -294,12 +297,13 @@ pub(super) fn forward_moe_layer_decode_pplx(
         &pplx.pplx_dummy_topk_weight,
         &mut pplx.pplx_expert_output,
     )?;
+    if layer_idx <= 2 {
+        ctx.sync()
+            .with_context(|| format!("CUDA error after W2 GEMM layer {layer_idx}"))?;
+        eprintln!("pplx-diag: layer {layer_idx} W2 ok");
+    }
 
     // ---- 10. combine_send ----
-    if layer_idx <= 2 {
-        ctx.sync()?;
-        eprintln!("pplx-diag: layer {layer_idx} expert GEMMs done, combine_send");
-    }
     {
         let (exp_ptr, _g) = pplx.pplx_expert_output.data.device_ptr(&ctx.stream);
         ep.combine_send(
