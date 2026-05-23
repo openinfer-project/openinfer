@@ -1538,30 +1538,29 @@ pub fn kimi_marlin_sum_topk_rows_f32(
     Ok(())
 }
 
-/// Build Marlin routing metadata from PPLX `recv_tokens_per_expert` counts.
-///
-/// PPLX `dispatch_recv` writes tokens in expert-major padded layout: each
-/// expert occupies `ceil(count, expert_padding) * expert_padding` rows.
-/// This function constructs `sorted_token_ids` as identity mapping into
-/// that layout so the Marlin GEMM reads/writes PPLX buffers directly.
-///
-/// Requires `expert_padding % block_size == 0`.
 /// Build Marlin routing metadata on-stream from PPLX recv counts.
 ///
-/// Launches a single-thread CUDA kernel that reads `recv_tokens_per_expert`,
+/// Launches a <<<1,1>>> CUDA kernel that reads `recv_tokens_per_expert`,
 /// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
-/// and `num_tokens_post_padded` directly on the GPU — no D2H sync needed.
+/// and `num_tokens_post_padded` directly on the GPU — zero D2H.
 ///
-/// Returns routing with `route_elems = pplx_recv_capacity`. The actual total
-/// padded tokens is written to `num_tokens_post_padded[0]` on-device; Marlin
-/// reads it to limit GEMM work, and `swiglu_w13_pplx` reads it to limit
-/// activation work.
+/// `seq_len` is the actual batch size for this decode step.  A tight upper
+/// bound on the total padded tokens is computed on the host:
+///
+///     tight = min(seq_len × topk, local_experts) × expert_padding
+///
+/// This replaces `pplx_recv_capacity` as `route_elems` / `max_padded_tokens`,
+/// shrinking Marlin lock clearing, SwiGLU grid, and routing-kernel fill from
+/// 3072 → 512 at bs=1.  The CUDA kernel writes the *actual* total to
+/// `num_tokens_post_padded[0]`; Marlin and `swiglu_w13_pplx` read it
+/// on-device to skip the remaining padding within `tight`.
 pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     ctx: &DeviceContext,
     workspace: &'a mut KimiMarlinRouteWorkspace,
     recv_tokens_per_expert: &CudaSlice<i32>,
     expert_padding: usize,
     pplx_recv_capacity: usize,
+    seq_len: usize,
 ) -> Result<KimiMarlinRouting<'a>> {
     ensure!(expert_padding > 0, "pplx expert_padding must be positive");
     ensure!(
@@ -1584,8 +1583,12 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     );
 
     let block_size = workspace.block_size;
-    let capacity_padded = pplx_recv_capacity;
-    let capacity_blocks = pplx_recv_capacity.div_ceil(block_size);
+
+    // Host-side tight upper bound: at most min(seq_len*topk, local_experts)
+    // distinct experts receive tokens, each padded to expert_padding.
+    let max_nonzero_experts = (seq_len * KIMI_K2_TOPK).min(KIMI_K2_LOCAL_EXPERTS);
+    let tight_max = (max_nonzero_experts * expert_padding).min(pplx_recv_capacity);
+    let tight_m_blocks = tight_max.div_ceil(block_size);
 
     {
         let (counts_ptr, _g0) = recv_tokens_per_expert.device_ptr(&ctx.stream);
@@ -1602,8 +1605,8 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
                 KIMI_K2_LOCAL_EXPERTS as i32,
                 expert_padding as i32,
                 block_size as i32,
-                capacity_padded as i32,
-                capacity_blocks as i32,
+                tight_max as i32,
+                tight_m_blocks as i32,
                 ctx.stream.cu_stream(),
             )
         };
@@ -1613,13 +1616,13 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     }
 
     Ok(KimiMarlinRouting {
-        batch_size: capacity_padded,
-        active_tokens: capacity_padded,
-        route_elems: capacity_padded,
+        batch_size: tight_max,
+        active_tokens: tight_max,
+        route_elems: tight_max,
         global_expert_start: 0,
         block_size,
-        max_padded_tokens: capacity_padded,
-        max_m_blocks: capacity_blocks,
+        max_padded_tokens: tight_max,
+        max_m_blocks: tight_m_blocks,
         sorted_token_ids: &workspace.sorted_token_ids,
         expert_ids: &workspace.expert_ids,
         num_tokens_post_padded: &workspace.num_tokens_post_padded,

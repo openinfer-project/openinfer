@@ -238,13 +238,14 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx dispatch_recv layer {layer_idx}"))?;
     }
 
-    // ---- 6. Build Marlin routing (D2H of actual total for tight work sizing) ----
+    // ---- 6. Build Marlin routing (tight host-side bound, zero D2H) ----
     let routing = kimi_pplx_build_marlin_routing_on_stream(
         ctx,
         &mut pplx.pplx_route_workspace,
         &pplx.recv_tokens_per_expert,
         pplx.expert_padding,
         pplx.pplx_recv_capacity,
+        seq_len,
     )
     .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
 
