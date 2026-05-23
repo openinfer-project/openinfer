@@ -258,6 +258,107 @@ fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
+const SYSTEM_RESERVED_CPU: usize = 0;
+const SCHEDULER_CPU: usize = 1;
+
+#[derive(Clone, Debug)]
+pub struct RankThreadPlacement {
+    pub rank: usize,
+    pub device_ordinal: usize,
+    pub numa_node: usize,
+    pub cpu_slice: Vec<CpuId>,
+    pub rank_worker_cpu: CpuId,
+}
+
+impl RankThreadPlacement {
+    pub fn role_cpu(&self, offset: usize, role: &str) -> Result<CpuId> {
+        self.cpu_slice.get(offset).copied().with_context(|| {
+            format!(
+                "rank {} CPU slice {} is too small for {role} at offset {offset}",
+                self.rank,
+                format_cpu_list(&self.cpu_slice)
+            )
+        })
+    }
+
+    pub fn cpu_slice_display(&self) -> String {
+        format_cpu_list(&self.cpu_slice)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RankThreadPlacementPlan {
+    scheduler_cpu: Option<CpuId>,
+    ranks: Vec<RankThreadPlacement>,
+}
+
+impl RankThreadPlacementPlan {
+    pub fn for_devices(devices: &[usize]) -> Result<Self> {
+        let scheduler_cpu = {
+            let cpu = CpuId::new(SCHEDULER_CPU)?;
+            let allowed = current_allowed_cpus()?;
+            allowed.contains(&cpu).then_some(cpu)
+        };
+        let allowed_cpus = current_allowed_cpus()?;
+        let reserved_cpus = [CpuId::new(SYSTEM_RESERVED_CPU)?, CpuId::new(SCHEDULER_CPU)?];
+
+        let mut rank_nodes = Vec::with_capacity(devices.len());
+        let mut numa_nodes = BTreeMap::new();
+        for (rank, &device_ordinal) in devices.iter().enumerate() {
+            let numa_node = cuda_device_numa_node(device_ordinal)
+                .with_context(|| format!("read NUMA node for rank {rank} cuda:{device_ordinal}"))?;
+            rank_nodes.push(RankNumaNode { rank, numa_node });
+            numa_nodes.insert(numa_node, ());
+        }
+
+        let pools = numa_nodes
+            .keys()
+            .map(|&node| read_numa_cpu_pool(node))
+            .collect::<Result<Vec<_>>>()?;
+        let slices = split_rank_cpu_slices(&pools, &rank_nodes, &allowed_cpus, &reserved_cpus)?;
+        ensure!(
+            slices.len() == devices.len(),
+            "built {} CPU slices for {} devices",
+            slices.len(),
+            devices.len()
+        );
+
+        let mut ranks = Vec::with_capacity(devices.len());
+        for (rank, &device_ordinal) in devices.iter().enumerate() {
+            let slice = slices
+                .iter()
+                .find(|slice| slice.rank == rank)
+                .with_context(|| format!("missing CPU slice for rank {rank}"))?;
+            let rank_worker_cpu = *slice
+                .cpus
+                .first()
+                .with_context(|| format!("rank {rank} has empty CPU slice"))?;
+            ranks.push(RankThreadPlacement {
+                rank: slice.rank,
+                device_ordinal,
+                numa_node: slice.numa_node,
+                cpu_slice: slice.cpus.clone(),
+                rank_worker_cpu,
+            });
+        }
+        Ok(Self {
+            scheduler_cpu,
+            ranks,
+        })
+    }
+
+    pub fn scheduler_cpu(&self) -> Option<CpuId> {
+        self.scheduler_cpu
+    }
+
+    pub fn rank(&self, rank: usize) -> Result<RankThreadPlacement> {
+        self.ranks
+            .get(rank)
+            .cloned()
+            .with_context(|| format!("missing thread placement for rank {rank}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

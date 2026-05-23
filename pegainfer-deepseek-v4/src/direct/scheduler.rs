@@ -1097,11 +1097,16 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
             #[cfg(feature = "pplx-ep")]
             if std::env::var("PEGAINFER_DSV4_PPLX").is_ok_and(|v| v != "0" && !v.is_empty()) {
                 info!("PEGAINFER_DSV4_PPLX set; building pplx EP backends");
-                match crate::direct::pplx_bootstrap::build_intra_node_backends(
-                    generator.config,
+                let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
+                    n_routed_experts: generator.config.n_routed_experts,
+                    n_activated_experts: generator.config.n_activated_experts,
+                    hidden_dim: generator.config.dim,
+                };
+                match pegainfer_comm::bootstrap::build_intra_node_backends(
+                    ep_shape,
                     &(0..8).collect::<Vec<_>>(),
                     generator.runtime.thread_placement(),
-                    crate::direct::pplx_bootstrap::PplxBootstrapParams::default(),
+                    pegainfer_comm::bootstrap::PplxBootstrapParams::default(),
                 ) {
                     Ok((backends, resources)) => {
                         // Leak resources for process lifetime — bootstrap is one-shot.

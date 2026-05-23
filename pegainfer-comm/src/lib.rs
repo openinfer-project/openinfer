@@ -16,6 +16,9 @@ pub use ep_backend::{
     EpBackend, EpBackendParams, EpDtypes, EpRankBuffers, EpTopology, ScalarType,
 };
 
+/// Single-process intra-node bootstrap for the pplx-garden EP backend.
+pub mod bootstrap;
+
 /// Re-exports of the underlying `pplx-garden` building blocks. Available
 /// so PegaInfer-side bootstrap code can build `EpBackendParams` without
 /// taking direct dependencies on the vendored crates.

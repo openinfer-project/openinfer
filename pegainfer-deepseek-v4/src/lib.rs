@@ -17,9 +17,6 @@ pub use direct::{
     DirectKvCacheActiveSnapshot, DirectKvCacheLease, DirectKvCacheReject,
     DirectKvCacheRejectReason, DirectKvCacheSnapshot, start_engine,
 };
-#[cfg(feature = "pplx-ep")]
-#[doc(hidden)]
-pub use direct::{PplxBootstrapParams, build_intra_node_backends_for_devices};
 #[cfg(feature = "deepseek-v4")]
 pub use model::{
     AttentionWeightNames, AttentionWeights, BlockWeightNames, BlockWeights, CompressorWeightNames,

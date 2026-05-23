@@ -3354,9 +3354,14 @@ name = "pegainfer-comm"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "cudarc",
+ "half",
+ "log",
  "pegainfer-comm-cuda-lib",
  "pegainfer-comm-fabric-lib",
  "pegainfer-comm-p2p-all-to-all",
+ "pegainfer-core",
  "thiserror 2.0.18",
 ]
 

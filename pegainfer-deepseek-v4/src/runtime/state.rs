@@ -598,7 +598,7 @@ impl MoePplxScratch {
         // Match the upstream pplx-garden formula (p2p_all_to_all.py:105).
         // The packed expert buffer is addressed via padded indices, so
         // capacity must include `expert_padding` slop. Keep these
-        // parameters in sync with `PplxBootstrapParams`.
+        // parameters in sync with `pegainfer_comm::bootstrap::PplxBootstrapParams`.
         const EXPERT_PADDING: usize = 16;
         // Match PplxBootstrapParams::default().max_num_tokens — EpBackend
         // is initialized with this capacity, so the scratch buffer must

@@ -5,17 +5,21 @@ use std::thread;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use pegainfer_comm::ScalarType;
-use pegainfer_deepseek_v4::{
-    Config, PplxBootstrapParams, RankGpuContext, build_intra_node_backends_for_devices,
+use pegainfer_comm::bootstrap::{
+    EpModelShape, PplxBootstrapParams, build_intra_node_backends_for_devices,
 };
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long)]
-    model_path: String,
+    #[arg(long, default_value_t = 256)]
+    n_experts: usize,
+    #[arg(long, default_value_t = 6)]
+    topk: usize,
+    #[arg(long, default_value_t = 4096)]
+    hidden_dim: usize,
     #[arg(long, default_value_t = 8)]
     world_size: usize,
     #[arg(long, default_value_t = 1)]
@@ -42,7 +46,10 @@ struct IterTimes {
 
 impl IterTimes {
     fn split_sum_us(self) -> f64 {
-        self.dispatch_send_us + self.dispatch_recv_us + self.combine_send_us + self.combine_recv_us
+        self.dispatch_send_us
+            + self.dispatch_recv_us
+            + self.combine_send_us
+            + self.combine_recv_us
     }
 }
 
@@ -56,25 +63,38 @@ struct Stats {
     max: f64,
 }
 
+struct GpuContext {
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+}
+
+impl GpuContext {
+    fn new(device: usize) -> Result<Self> {
+        let ctx = CudaContext::new(device).with_context(|| {
+            format!("failed to create CUDA context for device {device}")
+        })?;
+        let stream = ctx.new_stream().with_context(|| {
+            format!("failed to create CUDA stream for device {device}")
+        })?;
+        Ok(Self { ctx, stream })
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.stream.synchronize().context("failed to synchronize stream")
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.world_size > 0, "world_size must be positive");
     ensure!(args.repeats > 0, "repeats must be positive");
-    ensure!(
-        args.nets_per_gpu > 0,
-        "nets_per_gpu must be positive for pplx bootstrap"
-    );
+    ensure!(args.nets_per_gpu > 0, "nets_per_gpu must be positive for pplx bootstrap");
 
-    let config = Config::from_model_dir(&args.model_path)
-        .with_context(|| format!("load config from {}", args.model_path))?;
-    ensure!(
-        config.n_routed_experts == 256 && config.n_activated_experts == 6 && config.dim == 4096,
-        "bench expects dsv4 payload: experts={}, topk={}, hidden={}",
-        config.n_routed_experts,
-        config.n_activated_experts,
-        config.dim
-    );
-
+    let shape = EpModelShape {
+        n_routed_experts: args.n_experts,
+        n_activated_experts: args.topk,
+        hidden_dim: args.hidden_dim,
+    };
     let devices: Vec<usize> = (0..args.world_size).collect();
     let params = PplxBootstrapParams {
         max_num_tokens: args.max_num_tokens,
@@ -85,15 +105,18 @@ fn main() -> Result<()> {
     };
 
     eprintln!(
-        "building pplx EP backends: world={} max_tokens={} max_private={} padding={} hidden={} topk={}",
+        "building pplx EP backends: world={} max_tokens={} max_private={} padding={} \
+         hidden={} topk={} n_experts={}",
         args.world_size,
         args.max_num_tokens,
         args.max_private_tokens,
         args.expert_padding,
-        config.dim,
-        config.n_activated_experts
+        args.hidden_dim,
+        args.topk,
+        args.n_experts,
     );
-    let (backends, _resources) = build_intra_node_backends_for_devices(&config, &devices, params)?;
+    let (backends, _resources) =
+        build_intra_node_backends_for_devices(shape, &devices, params)?;
 
     let barrier = Arc::new(Barrier::new(args.world_size));
     let mut rank_results: Vec<Vec<IterTimes>> = Vec::with_capacity(args.world_size);
@@ -101,10 +124,9 @@ fn main() -> Result<()> {
         let mut handles = Vec::with_capacity(args.world_size);
         for (rank, backend) in backends.into_iter().enumerate() {
             let barrier = Arc::clone(&barrier);
-            let config = config.clone();
             let args = &args;
             handles.push(scope.spawn(move || {
-                run_rank(rank, backend, &config, args, barrier)
+                run_rank(rank, backend, args, barrier)
                     .with_context(|| format!("rank {rank}"))
             }));
         }
@@ -121,16 +143,14 @@ fn main() -> Result<()> {
 fn run_rank(
     rank: usize,
     mut backend: pegainfer_comm::EpBackend,
-    config: &Config,
     args: &Args,
     barrier: Arc<Barrier>,
 ) -> Result<Vec<IterTimes>> {
-    let ctx = RankGpuContext::new(rank)?;
-    ctx.set_current()?;
+    let gpu = GpuContext::new(rank)?;
 
-    let hidden = config.dim;
-    let topk = config.n_activated_experts;
-    let local_experts = config.n_routed_experts / args.world_size;
+    let hidden = args.hidden_dim;
+    let topk = args.topk;
+    let local_experts = args.n_experts / args.world_size;
     let max_recv_tokens = compute_max_recv_tokens(
         args.max_num_tokens,
         topk,
@@ -141,25 +161,19 @@ fn run_rank(
     );
 
     let x_host = vec![bf16::from_f32((rank + 1) as f32); args.max_num_tokens * hidden];
-    let indices_host = route_indices(
-        rank,
-        args.world_size,
-        args.max_num_tokens,
-        topk,
-        local_experts,
-    );
+    let indices_host =
+        route_indices(rank, args.world_size, args.max_num_tokens, topk, local_experts);
     let weights_host = vec![1.0f32 / topk as f32; args.max_num_tokens * topk];
 
-    let x = ctx.stream.clone_htod(&x_host)?;
-    let indices = ctx.stream.clone_htod(&indices_host)?;
-    let weights = ctx.stream.clone_htod(&weights_host)?;
-    let mut recv_tokens_per_expert = ctx.stream.alloc_zeros::<i32>(local_experts)?;
-    let mut out_x = ctx.stream.alloc_zeros::<bf16>(max_recv_tokens * hidden)?;
-    let expert_y = ctx.stream.alloc_zeros::<bf16>(max_recv_tokens * hidden)?;
-    let mut out_tokens = ctx
-        .stream
-        .alloc_zeros::<bf16>(args.max_num_tokens * hidden)?;
-    ctx.sync()?;
+    let x = gpu.stream.clone_htod(&x_host)?;
+    let indices = gpu.stream.clone_htod(&indices_host)?;
+    let weights = gpu.stream.clone_htod(&weights_host)?;
+    let mut recv_tokens_per_expert = gpu.stream.alloc_zeros::<i32>(local_experts)?;
+    let mut out_x = gpu.stream.alloc_zeros::<bf16>(max_recv_tokens * hidden)?;
+    let expert_y = gpu.stream.alloc_zeros::<bf16>(max_recv_tokens * hidden)?;
+    let mut out_tokens =
+        gpu.stream.alloc_zeros::<bf16>(args.max_num_tokens * hidden)?;
+    gpu.sync()?;
 
     let total_iters = args.warmup + args.repeats;
     let mut measured = Vec::with_capacity(args.repeats);
@@ -168,7 +182,7 @@ fn run_rank(
         let record = iter >= args.warmup;
         let mut times = IterTimes::default();
 
-        times.dispatch_send_us = time_stage(&ctx, record, || {
+        times.dispatch_send_us = time_stage(&gpu, record, || {
             dispatch_send(
                 &mut backend,
                 args.max_num_tokens,
@@ -177,22 +191,22 @@ fn run_rank(
                 &x,
                 &indices,
                 &weights,
-                &ctx,
+                &gpu,
             )
         })?;
-        times.dispatch_recv_us = time_stage(&ctx, record, || {
+        times.dispatch_recv_us = time_stage(&gpu, record, || {
             dispatch_recv(
                 &mut backend,
                 hidden,
                 &mut recv_tokens_per_expert,
                 &mut out_x,
-                &ctx,
+                &gpu,
             )
         })?;
-        times.combine_send_us = time_stage(&ctx, record, || {
-            combine_send(&mut backend, hidden, &expert_y, &ctx)
+        times.combine_send_us = time_stage(&gpu, record, || {
+            combine_send(&mut backend, hidden, &expert_y, &gpu)
         })?;
-        times.combine_recv_us = time_stage(&ctx, record, || {
+        times.combine_recv_us = time_stage(&gpu, record, || {
             combine_recv(
                 &mut backend,
                 args.max_num_tokens,
@@ -201,7 +215,7 @@ fn run_rank(
                 &mut out_tokens,
                 &indices,
                 &weights,
-                &ctx,
+                &gpu,
             )
         })?;
 
@@ -209,7 +223,7 @@ fn run_rank(
             measured.push(times);
         }
     }
-    ctx.sync()?;
+    gpu.sync()?;
     barrier.wait();
     Ok(measured)
 }
@@ -222,12 +236,12 @@ fn dispatch_send(
     x: &CudaSlice<bf16>,
     indices: &CudaSlice<i32>,
     weights: &CudaSlice<f32>,
-    ctx: &RankGpuContext,
+    gpu: &GpuContext,
 ) -> Result<()> {
-    let stream = ctx.stream.cu_stream() as u64;
-    let (x_ptr, _x_guard) = x.device_ptr(&ctx.stream);
-    let (idx_ptr, _idx_guard) = indices.device_ptr(&ctx.stream);
-    let (w_ptr, _w_guard) = weights.device_ptr(&ctx.stream);
+    let stream = gpu.stream.cu_stream() as u64;
+    let (x_ptr, _x_guard) = x.device_ptr(&gpu.stream);
+    let (idx_ptr, _idx_guard) = indices.device_ptr(&gpu.stream);
+    let (w_ptr, _w_guard) = weights.device_ptr(&gpu.stream);
     backend
         .dispatch_send(
             num_tokens,
@@ -251,11 +265,11 @@ fn dispatch_recv(
     hidden: usize,
     recv_tokens_per_expert: &mut CudaSlice<i32>,
     out_x: &mut CudaSlice<bf16>,
-    ctx: &RankGpuContext,
+    gpu: &GpuContext,
 ) -> Result<()> {
-    let stream = ctx.stream.cu_stream() as u64;
-    let (out_num_ptr, _g0) = recv_tokens_per_expert.device_ptr_mut(&ctx.stream);
-    let (out_x_ptr, _g1) = out_x.device_ptr_mut(&ctx.stream);
+    let stream = gpu.stream.cu_stream() as u64;
+    let (out_num_ptr, _g0) = recv_tokens_per_expert.device_ptr_mut(&gpu.stream);
+    let (out_x_ptr, _g1) = out_x.device_ptr_mut(&gpu.stream);
     backend
         .dispatch_recv(
             out_num_ptr as *mut i32,
@@ -273,10 +287,10 @@ fn combine_send(
     backend: &mut pegainfer_comm::EpBackend,
     hidden: usize,
     expert_y: &CudaSlice<bf16>,
-    ctx: &RankGpuContext,
+    gpu: &GpuContext,
 ) -> Result<()> {
-    let stream = ctx.stream.cu_stream() as u64;
-    let (expert_ptr, _g) = expert_y.device_ptr(&ctx.stream);
+    let stream = gpu.stream.cu_stream() as u64;
+    let (expert_ptr, _g) = expert_y.device_ptr(&gpu.stream);
     backend
         .combine_send(
             expert_ptr as *const c_void,
@@ -294,12 +308,12 @@ fn combine_recv(
     out_tokens: &mut CudaSlice<bf16>,
     indices: &CudaSlice<i32>,
     weights: &CudaSlice<f32>,
-    ctx: &RankGpuContext,
+    gpu: &GpuContext,
 ) -> Result<()> {
-    let stream = ctx.stream.cu_stream() as u64;
-    let (out_ptr, _g0) = out_tokens.device_ptr_mut(&ctx.stream);
-    let (idx_ptr, _g1) = indices.device_ptr(&ctx.stream);
-    let (w_ptr, _g2) = weights.device_ptr(&ctx.stream);
+    let stream = gpu.stream.cu_stream() as u64;
+    let (out_ptr, _g0) = out_tokens.device_ptr_mut(&gpu.stream);
+    let (idx_ptr, _g1) = indices.device_ptr(&gpu.stream);
+    let (w_ptr, _g2) = weights.device_ptr(&gpu.stream);
     backend
         .combine_recv(
             num_tokens,
@@ -318,7 +332,7 @@ fn combine_recv(
         .map_err(anyhow::Error::from)
 }
 
-fn time_stage<F>(ctx: &RankGpuContext, record: bool, f: F) -> Result<f64>
+fn time_stage<F>(gpu: &GpuContext, record: bool, f: F) -> Result<f64>
 where
     F: FnOnce() -> Result<()>,
 {
@@ -326,15 +340,15 @@ where
         f()?;
         return Ok(0.0);
     }
-    let start = ctx
+    let start = gpu
         .ctx
         .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-    let end = ctx
+    let end = gpu
         .ctx
         .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-    start.record(&ctx.stream)?;
+    start.record(&gpu.stream)?;
     f()?;
-    end.record(&ctx.stream)?;
+    end.record(&gpu.stream)?;
     Ok(start.elapsed_ms(&end)? as f64 * 1000.0)
 }
 
