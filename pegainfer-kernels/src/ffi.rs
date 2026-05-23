@@ -443,6 +443,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn kimi_marlin_w13_swiglu_pplx_cuda(
+        w13: *const Half,
+        out: *mut Half,
+        num_tokens_post_padded: *const i32,
+        max_rows: i32,
+        intermediate_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn kimi_marlin_sum_topk_rows_f32_cuda(
         route_output: *const Half,
         out: *mut f32,

@@ -30,7 +30,7 @@ use pegainfer_kernels::{
     ops::{
         KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch,
         KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, add_batch_into,
-        bf16_hidden_to_f32_into, gemm_graphsafe_into_checked, kimi_marlin_w13_swiglu,
+        bf16_hidden_to_f32_into, gemm_graphsafe_into_checked, kimi_marlin_w13_swiglu_pplx,
         kimi_marlin_wna16_pplx_w2_gemm, kimi_marlin_wna16_pplx_w13_gemm,
         kimi_pplx_build_marlin_routing_on_stream, kimi_router_noaux_tc_launch, rms_norm_batch_into,
         silu_mul_fused_batch_into,
@@ -270,9 +270,14 @@ pub(super) fn forward_moe_layer_decode_pplx(
         &mut pplx.pplx_w13_out,
     )?;
 
-    // ---- 8. SwiGLU activation ----
+    // ---- 8. SwiGLU activation (GPU reads actual row count, no D2H) ----
     pplx.pplx_activated.seq_len = routing.route_elems;
-    kimi_marlin_w13_swiglu(ctx, &pplx.pplx_w13_out, &mut pplx.pplx_activated)?;
+    kimi_marlin_w13_swiglu_pplx(
+        ctx,
+        &pplx.pplx_w13_out,
+        routing.num_tokens_post_padded,
+        &mut pplx.pplx_activated,
+    )?;
 
     // ---- 9. Marlin W2 (down) GEMM ----
     pplx.pplx_expert_output.seq_len = routing.route_elems;

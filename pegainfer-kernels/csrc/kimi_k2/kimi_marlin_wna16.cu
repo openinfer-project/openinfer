@@ -360,6 +360,26 @@ __global__ void swiglu_w13_kernel(
   out[idx] = __float2bfloat16(silu_bf16 * up);
 }
 
+__global__ void swiglu_w13_pplx_kernel(
+    const __nv_bfloat16* __restrict__ w13,
+    __nv_bfloat16* __restrict__ out,
+    const int32_t* __restrict__ num_tokens_post_padded,
+    int intermediate_dim) {
+  int actual_rows = num_tokens_post_padded[0];
+  if (actual_rows <= 0) return;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = actual_rows * intermediate_dim;
+  if (idx >= total) return;
+  int row = idx / intermediate_dim;
+  int col = idx - row * intermediate_dim;
+  const __nv_bfloat16* row_ptr = w13 + row * (2 * intermediate_dim);
+  float gate = __bfloat162float(row_ptr[col]);
+  float up = __bfloat162float(row_ptr[intermediate_dim + col]);
+  float silu = gate / (1.0f + expf(-gate));
+  float silu_bf16 = __bfloat162float(__float2bfloat16(silu));
+  out[idx] = __float2bfloat16(silu_bf16 * up);
+}
+
 __global__ void sum_topk_rows_kernel(
     const __nv_bfloat16* __restrict__ route_output,
     float* __restrict__ out,
@@ -427,6 +447,26 @@ CUresult kimi_marlin_w13_swiglu_cuda(
   int blocks = (total + threads - 1) / threads;
   pegainfer_kimi_marlin_moe_wna16::swiglu_w13_kernel<<<blocks, threads, 0, stream>>>(
       w13, out, rows, intermediate_dim);
+  return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
+}
+
+CUresult kimi_marlin_w13_swiglu_pplx_cuda(
+    const __nv_bfloat16* w13,
+    __nv_bfloat16* out,
+    const int32_t* num_tokens_post_padded,
+    int max_rows,
+    int intermediate_dim,
+    cudaStream_t stream) {
+  if (w13 == nullptr || out == nullptr || num_tokens_post_padded == nullptr ||
+      max_rows < 0 || intermediate_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (max_rows == 0) return CUDA_SUCCESS;
+  constexpr int threads = 256;
+  int total = max_rows * intermediate_dim;
+  int blocks = (total + threads - 1) / threads;
+  pegainfer_kimi_marlin_moe_wna16::swiglu_w13_pplx_kernel<<<blocks, threads, 0, stream>>>(
+      w13, out, num_tokens_post_padded, intermediate_dim);
   return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
 }
 

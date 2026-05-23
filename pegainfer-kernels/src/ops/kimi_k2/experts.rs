@@ -1463,6 +1463,47 @@ pub fn kimi_marlin_w13_swiglu(
     Ok(())
 }
 
+/// SwiGLU for PPLX path: grid launched at `max_rows` but actual work
+/// limited by `num_tokens_post_padded[0]` read on-device — no D2H needed.
+pub fn kimi_marlin_w13_swiglu_pplx(
+    ctx: &DeviceContext,
+    w13: &HiddenStates,
+    num_tokens_post_padded: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    validate_hidden_states(
+        "pplx_marlin_w13_swiglu.input",
+        w13,
+        2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        output.seq_len,
+    )?;
+    validate_hidden_states(
+        "pplx_marlin_w13_swiglu.output",
+        output,
+        KIMI_K2_EXPERT_INTERMEDIATE,
+        w13.seq_len,
+    )?;
+    ensure!(
+        num_tokens_post_padded.len() >= 1,
+        "num_tokens_post_padded must have at least 1 element"
+    );
+    let (w13_ptr, _w13_guard) = w13.data.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = output.data.device_ptr_mut(&ctx.stream);
+    let (ntp_ptr, _ntp_guard) = num_tokens_post_padded.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::kimi_marlin_w13_swiglu_pplx_cuda(
+            w13_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            ntp_ptr as *const i32,
+            w13.seq_len as i32,
+            KIMI_K2_EXPERT_INTERMEDIATE as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 pub fn kimi_marlin_sum_topk_rows_f32(
     ctx: &DeviceContext,
     route_output: &HiddenStates,
@@ -1509,12 +1550,12 @@ pub fn kimi_marlin_sum_topk_rows_f32(
 ///
 /// Launches a single-thread CUDA kernel that reads `recv_tokens_per_expert`,
 /// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
-/// and `num_tokens_post_padded` directly on the GPU.
+/// and `num_tokens_post_padded` directly on the GPU — no D2H sync needed.
 ///
-/// After the kernel, a single 4-byte D2H reads `num_tokens_post_padded[0]`
-/// so that `route_elems` reflects the actual total padded tokens rather than
-/// the pre-allocated capacity. This lets SwiGLU, memset, and Marlin operate
-/// on the real work size instead of the worst-case allocation.
+/// Returns routing with `route_elems = pplx_recv_capacity`. The actual total
+/// padded tokens is written to `num_tokens_post_padded[0]` on-device; Marlin
+/// reads it to limit GEMM work, and `swiglu_w13_pplx` reads it to limit
+/// activation work.
 pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     ctx: &DeviceContext,
     workspace: &'a mut KimiMarlinRouteWorkspace,
@@ -1571,18 +1612,14 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
         }
     }
 
-    let total_buf = ctx.stream.clone_dtoh(&workspace.num_tokens_post_padded)?;
-    let actual_total = total_buf[0].max(0) as usize;
-    let actual_m_blocks = actual_total.div_ceil(block_size);
-
     Ok(KimiMarlinRouting {
-        batch_size: actual_total,
-        active_tokens: actual_total,
-        route_elems: actual_total,
+        batch_size: capacity_padded,
+        active_tokens: capacity_padded,
+        route_elems: capacity_padded,
         global_expert_start: 0,
         block_size,
-        max_padded_tokens: actual_total,
-        max_m_blocks: actual_m_blocks,
+        max_padded_tokens: capacity_padded,
+        max_m_blocks: capacity_blocks,
         sorted_token_ids: &workspace.sorted_token_ids,
         expert_ids: &workspace.expert_ids,
         num_tokens_post_padded: &workspace.num_tokens_post_padded,
