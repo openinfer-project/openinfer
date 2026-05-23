@@ -23,7 +23,7 @@ use crate::raw::fabric_lib::api::{
     DomainAddress, MemoryRegionDescriptor, MemoryRegionHandle,
 };
 use crate::raw::fabric_lib::{
-    TopologyGroup, TransferEngine, TransferEngineBuilder, detect_topology,
+    RdmaEngine, TopologyGroup, TransferEngine, TransferEngineBuilder, detect_topology,
 };
 use crate::raw::p2p_all_to_all::{AllToAllRankHandle, ScalarType};
 use crate::{EpBackend, EpBackendParams, EpDtypes, EpRankBuffers, EpTopology};
