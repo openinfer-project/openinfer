@@ -11,7 +11,7 @@ use std::ptr;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
 use half::bf16;
 use pegainfer_comm::ScalarType;
 use pegainfer_comm::bootstrap::{
