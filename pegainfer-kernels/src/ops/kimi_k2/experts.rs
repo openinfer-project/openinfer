@@ -1519,6 +1519,7 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     workspace: &'a mut KimiMarlinRouteWorkspace,
     recv_tokens_per_expert: &CudaSlice<i32>,
     expert_padding: usize,
+    pplx_recv_capacity: usize,
 ) -> Result<KimiMarlinRouting<'a>> {
     ensure!(expert_padding > 0, "pplx expert_padding must be positive");
     ensure!(
@@ -1533,10 +1534,16 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
         KIMI_K2_LOCAL_EXPERTS,
         recv_tokens_per_expert.len()
     );
+    ensure!(
+        pplx_recv_capacity <= workspace.max_padded_tokens,
+        "pplx_recv_capacity {} exceeds workspace max_padded_tokens {}",
+        pplx_recv_capacity,
+        workspace.max_padded_tokens
+    );
 
     let block_size = workspace.block_size;
-    let max_padded = workspace.max_padded_tokens;
-    let max_blocks = workspace.max_m_blocks;
+    let max_padded = pplx_recv_capacity;
+    let max_blocks = pplx_recv_capacity.div_ceil(block_size);
 
     {
         let (counts_ptr, _g0) = recv_tokens_per_expert.device_ptr(&ctx.stream);

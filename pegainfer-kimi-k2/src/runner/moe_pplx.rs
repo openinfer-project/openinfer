@@ -244,6 +244,7 @@ pub(super) fn forward_moe_layer_decode_pplx(
         &mut pplx.pplx_route_workspace,
         &pplx.recv_tokens_per_expert,
         pplx.expert_padding,
+        pplx.pplx_recv_capacity,
     )
     .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
 
