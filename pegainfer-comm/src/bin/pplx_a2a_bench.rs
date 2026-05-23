@@ -1,4 +1,6 @@
 use std::ffi::c_void;
+use std::io::{BufRead, BufReader};
+use std::process::Command;
 use std::ptr;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -104,7 +106,7 @@ impl GpuContext {
 
 struct SweepRow {
     label: String,
-    max_rank_split: Stats,
+    summary_line: String,
 }
 
 const DSV4_SHAPE: EpModelShape =
@@ -135,6 +137,66 @@ fn sweep_configs(args: &Args) -> Vec<BenchConfig> {
     configs
 }
 
+fn run_sweep(args: &Args) -> Result<()> {
+    let configs = sweep_configs(args);
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    let mut rows = Vec::with_capacity(configs.len());
+
+    for config in &configs {
+        eprintln!("[sweep] running {}", config.label);
+        let mut child = Command::new(&exe)
+            .args([
+                "--n-experts",
+                &config.shape.n_routed_experts.to_string(),
+                "--topk",
+                &config.shape.n_activated_experts.to_string(),
+                "--hidden-dim",
+                &config.shape.hidden_dim.to_string(),
+                "--world-size",
+                &config.world_size.to_string(),
+                "--max-num-tokens",
+                &config.max_num_tokens.to_string(),
+                "--expert-padding",
+                &config.expert_padding.to_string(),
+                "--nets-per-gpu",
+                &config.nets_per_gpu.to_string(),
+                "--warmup",
+                &config.warmup.to_string(),
+                "--repeats",
+                &config.repeats.to_string(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("spawn subprocess for {}", config.label))?;
+
+        let stdout = child.stdout.take().unwrap();
+        let mut max_rank_line = None;
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line?;
+            println!("{}", line);
+            if line.starts_with("max_rank_split_us:") {
+                max_rank_line = Some(line);
+            }
+        }
+
+        let status = child.wait()?;
+        ensure!(status.success(), "{} exited with {status}", config.label);
+
+        if let Some(line) = max_rank_line {
+            rows.push(SweepRow { label: config.label.clone(), summary_line: line });
+        }
+        println!();
+    }
+
+    println!("=== sweep summary (max_rank_split_sum_us) ===");
+    for row in &rows {
+        println!("{:<20} {}", row.label, row.summary_line);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.world_size > 0, "world_size must be positive");
@@ -142,19 +204,7 @@ fn main() -> Result<()> {
     ensure!(args.nets_per_gpu > 0, "nets_per_gpu must be positive for pplx bootstrap");
 
     if args.sweep {
-        let configs = sweep_configs(&args);
-        let mut rows = Vec::with_capacity(configs.len());
-        for config in &configs {
-            let rank_results = run_config(config)?;
-            print_report_header(&config.label);
-            print_report(&rank_results);
-            rows.push(SweepRow {
-                label: config.label.clone(),
-                max_rank_split: max_rank_split_stats(&rank_results),
-            });
-            println!();
-        }
-        print_sweep_summary(&rows);
+        run_sweep(&args)?;
     } else {
         let config = BenchConfig {
             label: format!(
@@ -534,25 +584,6 @@ fn print_report(rank_results: &[Vec<IterTimes>]) {
         "max_rank_split_us: mean={:.1} p50={:.1} p95={:.1} p99={:.1} max={:.1}",
         s.mean, s.p50, s.p95, s.p99, s.max
     );
-}
-
-fn print_sweep_summary(rows: &[SweepRow]) {
-    println!("=== sweep summary (max_rank_split_sum_us) ===");
-    println!(
-        "{:<20} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "config", "mean", "p50", "p95", "p99", "max"
-    );
-    for row in rows {
-        println!(
-            "{:<20} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
-            row.label,
-            row.max_rank_split.mean,
-            row.max_rank_split.p50,
-            row.max_rank_split.p95,
-            row.max_rank_split.p99,
-            row.max_rank_split.max,
-        );
-    }
 }
 
 fn print_stats(name: &str, values: &[f64]) {
