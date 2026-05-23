@@ -407,6 +407,46 @@ impl KimiK2Runtime {
                 .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped TP comm init response"))?
                 .with_context(|| format!("Kimi rank {rank} TP comm init"))?;
         }
+
+        #[cfg(feature = "pplx-ep")]
+        {
+            let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
+                n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
+                n_activated_experts: crate::config::KIMI_K2_TOPK,
+                hidden_dim: crate::config::KIMI_K2_HIDDEN,
+            };
+            let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
+            match pegainfer_comm::bootstrap::build_intra_node_backends_for_devices(
+                ep_shape,
+                &devices,
+                pegainfer_comm::bootstrap::PplxBootstrapParams::default(),
+            ) {
+                Ok((backends, resources)) => {
+                    std::mem::forget(resources);
+                    let pplx_receivers = workers
+                        .iter()
+                        .zip(backends)
+                        .map(|(worker, backend)| worker.enable_pplx_async(backend))
+                        .collect::<Result<Vec<_>>>()?;
+                    for (rank, receiver) in pplx_receivers.into_iter().enumerate() {
+                        receiver
+                            .recv()
+                            .map_err(|_| {
+                                anyhow::anyhow!("Kimi rank {rank} dropped PPLX enable response")
+                            })?
+                            .with_context(|| format!("Kimi rank {rank} PPLX EP backend enable"))?;
+                    }
+                    eprintln!(
+                        "kimi-k2: pplx EP backends installed on all {} ranks",
+                        workers.len()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("kimi-k2: pplx EP bootstrap failed, falling back to NCCL: {err:#}");
+                }
+            }
+        }
+
         Ok(Self {
             config,
             workers,

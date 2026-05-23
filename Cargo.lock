@@ -3634,6 +3634,7 @@ dependencies = [
  "cudarc",
  "half",
  "memmap2",
+ "pegainfer-comm",
  "pegainfer-core",
  "pegainfer-cupti",
  "pegainfer-kernels",

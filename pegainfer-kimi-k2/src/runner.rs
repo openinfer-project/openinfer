@@ -1,5 +1,7 @@
 mod affinity;
 mod config;
+#[cfg(feature = "pplx-ep")]
+mod moe_pplx;
 mod scheduler;
 mod worker;
 

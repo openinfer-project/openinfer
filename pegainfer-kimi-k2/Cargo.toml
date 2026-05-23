@@ -13,6 +13,7 @@ cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-cupti = { workspace = true, optional = true }
+pegainfer-comm = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }
 pegainfer-kernels = { workspace = true }
 safetensors = { workspace = true }
@@ -24,6 +25,7 @@ tokio = { workspace = true }
 [features]
 default = []
 kimi-k2 = ["pegainfer-kernels/kimi-k2"]
+pplx-ep = ["kimi-k2", "dep:pegainfer-comm"]
 kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
 kernel-report = [
     "dep:clap",

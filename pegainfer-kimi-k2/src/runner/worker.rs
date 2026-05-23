@@ -128,6 +128,11 @@ enum KimiRankCommand {
         decode_batch_size: usize,
         resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
+    #[cfg(feature = "pplx-ep")]
+    EnablePplx {
+        ep_backend: pegainfer_comm::EpBackend,
+        resp: SyncSender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -319,6 +324,21 @@ impl KimiRankWorker {
         Ok(resp_rx)
     }
 
+    #[cfg(feature = "pplx-ep")]
+    pub(super) fn enable_pplx_async(
+        &self,
+        ep_backend: pegainfer_comm::EpBackend,
+    ) -> Result<Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(KimiRankCommand::EnablePplx {
+                ep_backend,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
     pub(super) fn shutdown(&mut self) -> Result<()> {
         if self.handle.is_none() {
             return Ok(());
@@ -351,6 +371,10 @@ struct KimiRankThreadState {
     enable_cuda_graph: bool,
     weight_report: Option<KimiRankWeightLoadReport>,
     loaded: Option<KimiRankLoadedWeights>,
+    #[cfg(feature = "pplx-ep")]
+    ep_backend: Option<pegainfer_comm::EpBackend>,
+    #[cfg(feature = "pplx-ep")]
+    moe_pplx_scratch: Option<super::moe_pplx::KimiMoePplxScratch>,
 }
 
 struct OwnedRankComm(Comm);
@@ -439,10 +463,10 @@ struct KimiDenseForwardCache {
     down_proj: DeviceMatrix,
 }
 
-struct KimiMoeForwardCache {
-    router: KimiRouterDeviceWeights,
-    shared_gate_up_proj: DeviceMatrix,
-    shared_down_proj: DeviceMatrix,
+pub(super) struct KimiMoeForwardCache {
+    pub(super) router: KimiRouterDeviceWeights,
+    pub(super) shared_gate_up_proj: DeviceMatrix,
+    pub(super) shared_down_proj: DeviceMatrix,
 }
 
 struct KimiWorkerDecodeArena {
@@ -473,42 +497,42 @@ struct KimiWorkerMlaLayerCache {
     kpe_cache: CudaSlice<half::bf16>,
 }
 
-struct KimiWorkerDecodeScratch {
-    hidden: HiddenStates,
-    normed: HiddenStates,
-    dense_gate_up: HiddenStates,
-    dense_activated: HiddenStates,
-    shared_gate_up: HiddenStates,
-    shared_activated: HiddenStates,
-    qkv_a: HiddenStates,
-    q_a: HiddenStates,
-    q_a_normed: HiddenStates,
-    q_proj: HiddenStates,
-    compressed_kv: HiddenStates,
-    k_rope: HiddenStates,
-    compressed_normed: HiddenStates,
-    q_nope: HiddenStates,
-    q_pe: HiddenStates,
-    append_kpe: HiddenStates,
-    q_abs_nope: HiddenStates,
-    latent: HiddenStates,
-    attn_out: HiddenStates,
-    projected: HiddenStates,
-    router_logits: CudaSlice<f32>,
-    router_scores: CudaSlice<f32>,
-    router_choice_scores: CudaSlice<f32>,
-    router_topk_weight: CudaSlice<f32>,
-    router_topk_idx: CudaSlice<i32>,
-    marlin_route_workspace: KimiMarlinRouteWorkspace,
-    marlin_workspace: KimiMarlinWna16Workspace,
-    marlin_w13_out: HiddenStates,
-    marlin_activated: HiddenStates,
-    marlin_expert_output: HiddenStates,
-    routed_out_f32: CudaSlice<f32>,
-    routed_reduce_scatter_send_f32: CudaSlice<f32>,
-    top1_value_scratch: CudaSlice<half::bf16>,
-    top1_out: CudaSlice<i32>,
-    hidden_allreduce_f32: CudaSlice<f32>,
+pub(super) struct KimiWorkerDecodeScratch {
+    pub(super) hidden: HiddenStates,
+    pub(super) normed: HiddenStates,
+    pub(super) dense_gate_up: HiddenStates,
+    pub(super) dense_activated: HiddenStates,
+    pub(super) shared_gate_up: HiddenStates,
+    pub(super) shared_activated: HiddenStates,
+    pub(super) qkv_a: HiddenStates,
+    pub(super) q_a: HiddenStates,
+    pub(super) q_a_normed: HiddenStates,
+    pub(super) q_proj: HiddenStates,
+    pub(super) compressed_kv: HiddenStates,
+    pub(super) k_rope: HiddenStates,
+    pub(super) compressed_normed: HiddenStates,
+    pub(super) q_nope: HiddenStates,
+    pub(super) q_pe: HiddenStates,
+    pub(super) append_kpe: HiddenStates,
+    pub(super) q_abs_nope: HiddenStates,
+    pub(super) latent: HiddenStates,
+    pub(super) attn_out: HiddenStates,
+    pub(super) projected: HiddenStates,
+    pub(super) router_logits: CudaSlice<f32>,
+    pub(super) router_scores: CudaSlice<f32>,
+    pub(super) router_choice_scores: CudaSlice<f32>,
+    pub(super) router_topk_weight: CudaSlice<f32>,
+    pub(super) router_topk_idx: CudaSlice<i32>,
+    pub(super) marlin_route_workspace: KimiMarlinRouteWorkspace,
+    pub(super) marlin_workspace: KimiMarlinWna16Workspace,
+    pub(super) marlin_w13_out: HiddenStates,
+    pub(super) marlin_activated: HiddenStates,
+    pub(super) marlin_expert_output: HiddenStates,
+    pub(super) routed_out_f32: CudaSlice<f32>,
+    pub(super) routed_reduce_scatter_send_f32: CudaSlice<f32>,
+    pub(super) top1_value_scratch: CudaSlice<half::bf16>,
+    pub(super) top1_out: CudaSlice<i32>,
+    pub(super) hidden_allreduce_f32: CudaSlice<f32>,
 }
 
 struct KimiCublasThreadGuard;
@@ -554,6 +578,10 @@ fn bind_rank_thread(
         enable_cuda_graph,
         weight_report: None,
         loaded: None,
+        #[cfg(feature = "pplx-ep")]
+        ep_backend: None,
+        #[cfg(feature = "pplx-ep")]
+        moe_pplx_scratch: None,
     })
 }
 
@@ -596,12 +624,39 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 );
                 let _ = resp.send(result);
             }
+            #[cfg(feature = "pplx-ep")]
+            KimiRankCommand::EnablePplx { ep_backend, resp } => {
+                let result = state.enable_pplx(ep_backend);
+                let _ = resp.send(result);
+            }
             KimiRankCommand::Shutdown => break,
         }
     }
 }
 
 impl KimiRankThreadState {
+    #[cfg(feature = "pplx-ep")]
+    fn enable_pplx(&mut self, ep_backend: pegainfer_comm::EpBackend) -> Result<()> {
+        self.ctx.set_current()?;
+        if self.moe_pplx_scratch.is_none() {
+            self.moe_pplx_scratch = Some(
+                super::moe_pplx::KimiMoePplxScratch::new(
+                    &self.ctx.as_device_context(),
+                    KIMI_DECODE_MAX_BATCH,
+                )
+                .with_context(|| {
+                    format!(
+                        "Kimi rank {} PPLX scratch allocation",
+                        self.sliced_load_plan.rank
+                    )
+                })?,
+            );
+        }
+        self.ep_backend = Some(ep_backend);
+        self.enable_cuda_graph = false;
+        Ok(())
+    }
+
     fn init_tp_comm(&mut self, id: Id, world_size: usize) -> Result<()> {
         ensure!(
             self.tp_comm.is_none(),
@@ -772,12 +827,20 @@ impl KimiRankThreadState {
                         cache,
                         expert_kernels,
                         decode_arena,
+                        #[cfg(feature = "pplx-ep")]
+                        None,
                     )
                 },
             );
             decode_arena.graph = graph;
             result?;
         } else {
+            #[cfg(feature = "pplx-ep")]
+            let mut pplx_ctx = self
+                .ep_backend
+                .as_mut()
+                .zip(self.moe_pplx_scratch.as_mut())
+                .map(|(ep, scratch)| PplxDecodeContext { ep, scratch });
             forward_decode_batch_next_token_kernels(
                 &device_ctx,
                 &decode_aux_ctx,
@@ -785,6 +848,8 @@ impl KimiRankThreadState {
                 cache,
                 expert_kernels,
                 decode_arena,
+                #[cfg(feature = "pplx-ep")]
+                pplx_ctx.as_mut(),
             )?;
         }
 
@@ -1099,6 +1164,12 @@ impl KimiRankThreadState {
     }
 }
 
+#[cfg(feature = "pplx-ep")]
+struct PplxDecodeContext<'a> {
+    ep: &'a mut pegainfer_comm::EpBackend,
+    scratch: &'a mut super::moe_pplx::KimiMoePplxScratch,
+}
+
 fn forward_decode_batch_next_token_kernels(
     device_ctx: &DeviceContext,
     decode_aux_ctx: &DeviceContext,
@@ -1106,6 +1177,7 @@ fn forward_decode_batch_next_token_kernels(
     cache: &KimiOneTokenForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
     decode_arena: &mut KimiWorkerDecodeArena,
+    #[cfg(feature = "pplx-ep")] mut pplx: Option<&mut PplxDecodeContext<'_>>,
 ) -> Result<()> {
     embedding_batch_vocab_shard(
         device_ctx,
@@ -1155,17 +1227,50 @@ fn forward_decode_batch_next_token_kernels(
                 })?;
             }
             KimiLayerForwardKindCache::Moe(moe) => {
-                forward_moe_layer_decode_into(
-                    device_ctx,
-                    decode_aux_ctx,
-                    comm,
-                    layer.layer_idx,
-                    moe,
-                    &layer.attention.post_attention_norm,
-                    expert_kernels,
-                    &mut decode_arena.scratch,
-                )
-                .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
+                #[cfg(feature = "pplx-ep")]
+                if let Some(pplx_ctx) = pplx.as_mut() {
+                    super::moe_pplx::forward_moe_layer_decode_pplx(
+                        device_ctx,
+                        decode_aux_ctx,
+                        comm,
+                        pplx_ctx.ep,
+                        layer.layer_idx,
+                        moe,
+                        &layer.attention.post_attention_norm,
+                        expert_kernels,
+                        &mut decode_arena.scratch,
+                        pplx_ctx.scratch,
+                    )
+                    .with_context(|| {
+                        format!("Kimi MoE PPLX batch decode layer {}", layer.layer_idx)
+                    })?;
+                } else {
+                    forward_moe_layer_decode_into(
+                        device_ctx,
+                        decode_aux_ctx,
+                        comm,
+                        layer.layer_idx,
+                        moe,
+                        &layer.attention.post_attention_norm,
+                        expert_kernels,
+                        &mut decode_arena.scratch,
+                    )
+                    .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
+                }
+                #[cfg(not(feature = "pplx-ep"))]
+                {
+                    forward_moe_layer_decode_into(
+                        device_ctx,
+                        decode_aux_ctx,
+                        comm,
+                        layer.layer_idx,
+                        moe,
+                        &layer.attention.post_attention_norm,
+                        expert_kernels,
+                        &mut decode_arena.scratch,
+                    )
+                    .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
+                }
             }
         }
     }
@@ -2349,7 +2454,7 @@ fn all_reduce_hidden_in_place(hidden: &mut HiddenStates, comm: &Comm) -> Result<
         .map_err(|err| anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0))
 }
 
-fn all_reduce_hidden_via_f32_in_place(
+pub(super) fn all_reduce_hidden_via_f32_in_place(
     ctx: &DeviceContext,
     hidden: &mut HiddenStates,
     f32_scratch: &mut CudaSlice<f32>,
@@ -2430,7 +2535,7 @@ fn kimi_mla_softmax_scale() -> f32 {
     base * mscale * mscale
 }
 
-fn kimi_marlin_block_size(active_tokens: usize) -> usize {
+pub(super) fn kimi_marlin_block_size(active_tokens: usize) -> usize {
     for block_size in [8usize, 16, 32, 48, KIMI_MARLIN_MAX_BLOCK_SIZE] {
         let routes_per_expert_block = active_tokens as f32 * KIMI_K2_TOPK as f32
             / KIMI_K2_EP8_LOCAL_EXPERTS as f32
@@ -2559,7 +2664,7 @@ fn add_f32_bf16_to_bf16_hidden_into(
     Ok(())
 }
 
-fn scaled_add_f32_bf16_to_bf16_hidden_into(
+pub(super) fn scaled_add_f32_bf16_to_bf16_hidden_into(
     ctx: &DeviceContext,
     a: &CudaSlice<f32>,
     scale: f32,

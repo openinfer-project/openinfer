@@ -1497,6 +1497,205 @@ pub fn kimi_marlin_sum_topk_rows_f32(
     Ok(())
 }
 
+/// Build Marlin routing metadata from PPLX `recv_tokens_per_expert` counts.
+///
+/// PPLX `dispatch_recv` writes tokens in expert-major padded layout: each
+/// expert occupies `ceil(count, expert_padding) * expert_padding` rows.
+/// This function constructs `sorted_token_ids` as identity mapping into
+/// that layout so the Marlin GEMM reads/writes PPLX buffers directly.
+///
+/// Requires `expert_padding % block_size == 0`.
+pub fn kimi_pplx_build_marlin_routing<'a>(
+    ctx: &DeviceContext,
+    workspace: &'a mut KimiMarlinRouteWorkspace,
+    recv_tokens_per_expert: &CudaSlice<i32>,
+    expert_padding: usize,
+) -> Result<KimiMarlinRouting<'a>> {
+    ensure!(expert_padding > 0, "pplx expert_padding must be positive");
+    ensure!(
+        expert_padding % workspace.block_size == 0,
+        "pplx expert_padding {} must be a multiple of Marlin block_size {}",
+        expert_padding,
+        workspace.block_size
+    );
+    ensure!(
+        recv_tokens_per_expert.len() >= KIMI_K2_LOCAL_EXPERTS,
+        "recv_tokens_per_expert len must be >= {}, got {}",
+        KIMI_K2_LOCAL_EXPERTS,
+        recv_tokens_per_expert.len()
+    );
+
+    ctx.sync()?;
+    let counts_host: Vec<i32> = ctx
+        .stream
+        .clone_dtoh(recv_tokens_per_expert)
+        .map_err(|e| anyhow::anyhow!("D2H recv_tokens_per_expert: {e}"))?;
+
+    let block_size = workspace.block_size;
+    let mut total_pplx_capacity: usize = 0;
+    for &count in &counts_host[..KIMI_K2_LOCAL_EXPERTS] {
+        let c = count.max(0) as usize;
+        total_pplx_capacity += c.div_ceil(expert_padding) * expert_padding;
+    }
+    ensure!(
+        total_pplx_capacity <= workspace.max_padded_tokens,
+        "pplx total capacity {} exceeds Marlin workspace {}",
+        total_pplx_capacity,
+        workspace.max_padded_tokens
+    );
+
+    let sentinel = total_pplx_capacity as i32;
+    let max_m_blocks = total_pplx_capacity.div_ceil(block_size);
+    ensure!(
+        max_m_blocks <= workspace.max_m_blocks,
+        "pplx m_blocks {} exceeds Marlin workspace {}",
+        max_m_blocks,
+        workspace.max_m_blocks
+    );
+
+    let mut sorted_ids = vec![sentinel; workspace.max_padded_tokens];
+    let mut expert_ids = vec![0i32; workspace.max_m_blocks];
+
+    let mut pplx_cursor: usize = 0;
+    for (e, &count) in counts_host[..KIMI_K2_LOCAL_EXPERTS].iter().enumerate() {
+        let c = count.max(0) as usize;
+        let padded = c.div_ceil(expert_padding) * expert_padding;
+        for j in 0..padded {
+            let idx = pplx_cursor + j;
+            if idx < sorted_ids.len() {
+                sorted_ids[idx] = if j < c { idx as i32 } else { sentinel };
+            }
+        }
+        let block_start = pplx_cursor / block_size;
+        let block_end = (pplx_cursor + padded) / block_size;
+        for b in block_start..block_end.min(expert_ids.len()) {
+            expert_ids[b] = e as i32;
+        }
+        pplx_cursor += padded;
+    }
+
+    ctx.stream
+        .memcpy_htod(&sorted_ids, &mut workspace.sorted_token_ids)?;
+    ctx.stream
+        .memcpy_htod(&expert_ids, &mut workspace.expert_ids)?;
+    let num_tokens = [total_pplx_capacity as i32];
+    ctx.stream
+        .memcpy_htod(&num_tokens, &mut workspace.num_tokens_post_padded)?;
+
+    Ok(KimiMarlinRouting {
+        batch_size: total_pplx_capacity,
+        active_tokens: total_pplx_capacity,
+        route_elems: total_pplx_capacity,
+        global_expert_start: 0,
+        block_size,
+        max_padded_tokens: total_pplx_capacity,
+        max_m_blocks,
+        sorted_token_ids: &workspace.sorted_token_ids,
+        expert_ids: &workspace.expert_ids,
+        num_tokens_post_padded: &workspace.num_tokens_post_padded,
+    })
+}
+
+/// W13 (gate+up) GEMM for PPLX path: top_k=1, no weight scaling.
+pub fn kimi_marlin_wna16_pplx_w13_gemm(
+    ctx: &DeviceContext,
+    workspace: &mut KimiMarlinWna16Workspace,
+    routing: &KimiMarlinRouting<'_>,
+    input: &HiddenStates,
+    weight: &KimiMarlinFusedW13Int4Weight<'_>,
+    topk_weight: &CudaSlice<f32>,
+    output_w13: &mut HiddenStates,
+) -> Result<()> {
+    weight.validate()?;
+    workspace.validate_for(routing, 2 * KIMI_K2_EXPERT_INTERMEDIATE)?;
+    validate_hidden_states(
+        "pplx_marlin_w13.input",
+        input,
+        KIMI_K2_HIDDEN,
+        routing.active_tokens,
+    )?;
+    validate_hidden_states(
+        "pplx_marlin_w13.output",
+        output_w13,
+        2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        routing.route_elems,
+    )?;
+    ensure!(
+        topk_weight.len() >= routing.route_elems,
+        "topk_weight len must cover {}, got {}",
+        routing.route_elems,
+        topk_weight.len()
+    );
+    launch_marlin_wna16_gemm(
+        ctx,
+        workspace,
+        routing,
+        input,
+        weight.weight_packed_uint4b8,
+        weight.weight_scale_permuted,
+        topk_weight,
+        output_w13,
+        1,
+        false,
+        routing.active_tokens,
+        2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        KIMI_K2_HIDDEN,
+    )
+}
+
+/// W2 (down) GEMM for PPLX path: top_k=1, no weight scaling.
+/// combine_recv handles the topk weight reduction.
+pub fn kimi_marlin_wna16_pplx_w2_gemm(
+    ctx: &DeviceContext,
+    workspace: &mut KimiMarlinWna16Workspace,
+    routing: &KimiMarlinRouting<'_>,
+    input: &HiddenStates,
+    weight: &KimiMarlinInt4Weight<'_>,
+    topk_weight: &CudaSlice<f32>,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    weight.validate()?;
+    ensure!(
+        weight.manifest.role == KimiInt4ExpertRole::W2Down,
+        "Marlin W2 role mismatch: got {:?}",
+        weight.manifest.role
+    );
+    workspace.validate_for(routing, KIMI_K2_HIDDEN)?;
+    validate_hidden_states(
+        "pplx_marlin_w2.input",
+        input,
+        KIMI_K2_EXPERT_INTERMEDIATE,
+        routing.route_elems,
+    )?;
+    validate_hidden_states(
+        "pplx_marlin_w2.output",
+        output,
+        KIMI_K2_HIDDEN,
+        routing.route_elems,
+    )?;
+    ensure!(
+        topk_weight.len() >= routing.route_elems,
+        "topk_weight len must cover {}, got {}",
+        routing.route_elems,
+        topk_weight.len()
+    );
+    launch_marlin_wna16_gemm(
+        ctx,
+        workspace,
+        routing,
+        input,
+        weight.weight_packed_uint4b8,
+        weight.weight_scale_permuted,
+        topk_weight,
+        output,
+        1,
+        false,
+        routing.route_elems,
+        KIMI_K2_HIDDEN,
+        KIMI_K2_EXPERT_INTERMEDIATE,
+    )
+}
+
 fn launch_marlin_wna16_gemm(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
