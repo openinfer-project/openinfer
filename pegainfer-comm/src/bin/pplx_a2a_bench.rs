@@ -47,7 +47,7 @@ struct BenchConfig {
     shape: EpModelShape,
     world_size: usize,
     max_num_tokens: usize,
-    max_private_tokens: usize,
+    max_private_tokens: Option<usize>,
     expert_padding: usize,
     nets_per_gpu: u8,
     warmup: usize,
@@ -124,7 +124,7 @@ fn sweep_configs(args: &Args) -> Vec<BenchConfig> {
                 shape,
                 world_size: args.world_size,
                 max_num_tokens: tokens,
-                max_private_tokens: args.max_private_tokens,
+                max_private_tokens: None,
                 expert_padding: args.expert_padding,
                 nets_per_gpu: args.nets_per_gpu,
                 warmup: args.warmup,
@@ -168,7 +168,7 @@ fn main() -> Result<()> {
             },
             world_size: args.world_size,
             max_num_tokens: args.max_num_tokens,
-            max_private_tokens: args.max_private_tokens,
+            max_private_tokens: Some(args.max_private_tokens),
             expert_padding: args.expert_padding,
             nets_per_gpu: args.nets_per_gpu,
             warmup: args.warmup,
@@ -185,7 +185,7 @@ fn run_config(config: &BenchConfig) -> Result<Vec<Vec<IterTimes>>> {
     let params = PplxBootstrapParams {
         max_num_tokens: config.max_num_tokens,
         expert_padding: config.expert_padding,
-        max_private_tokens: Some(config.max_private_tokens),
+        max_private_tokens: config.max_private_tokens,
         nets_per_gpu: config.nets_per_gpu,
         imm_base: 0x8a2a_0000,
     };
@@ -234,12 +234,17 @@ fn run_rank(
     let hidden = config.shape.hidden_dim;
     let topk = config.shape.n_activated_experts;
     let local_experts = config.shape.n_routed_experts / config.world_size;
+    let max_private_tokens = config.max_private_tokens.unwrap_or_else(|| {
+        let avg =
+            (config.max_num_tokens * topk).div_ceil(config.shape.n_routed_experts);
+        (avg + avg / 5 + 1) * local_experts
+    });
     let max_recv_tokens = compute_max_recv_tokens(
         config.max_num_tokens,
         topk,
         local_experts,
         config.world_size,
-        config.max_private_tokens,
+        max_private_tokens,
         config.expert_padding,
     );
 
