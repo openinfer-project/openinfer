@@ -1509,11 +1509,12 @@ pub fn kimi_marlin_sum_topk_rows_f32(
 ///
 /// Launches a single-thread CUDA kernel that reads `recv_tokens_per_expert`,
 /// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
-/// and `num_tokens_post_padded` directly on the GPU — no D2H sync needed.
+/// and `num_tokens_post_padded` directly on the GPU.
 ///
-/// Returns routing with `route_elems = max_padded_tokens` so that the Marlin
-/// GEMM launches with the maximum grid. The sentinel mechanism inside the
-/// kernel ensures only real tokens contribute to the output.
+/// After the kernel, a single 4-byte D2H reads `num_tokens_post_padded[0]`
+/// so that `route_elems` reflects the actual total padded tokens rather than
+/// the pre-allocated capacity. This lets SwiGLU, memset, and Marlin operate
+/// on the real work size instead of the worst-case allocation.
 pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     ctx: &DeviceContext,
     workspace: &'a mut KimiMarlinRouteWorkspace,
@@ -1542,8 +1543,8 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     );
 
     let block_size = workspace.block_size;
-    let max_padded = pplx_recv_capacity;
-    let max_blocks = pplx_recv_capacity.div_ceil(block_size);
+    let capacity_padded = pplx_recv_capacity;
+    let capacity_blocks = pplx_recv_capacity.div_ceil(block_size);
 
     {
         let (counts_ptr, _g0) = recv_tokens_per_expert.device_ptr(&ctx.stream);
@@ -1560,8 +1561,8 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
                 KIMI_K2_LOCAL_EXPERTS as i32,
                 expert_padding as i32,
                 block_size as i32,
-                max_padded as i32,
-                max_blocks as i32,
+                capacity_padded as i32,
+                capacity_blocks as i32,
                 ctx.stream.cu_stream(),
             )
         };
@@ -1570,14 +1571,18 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
         }
     }
 
+    let total_buf = ctx.stream.clone_dtoh(&workspace.num_tokens_post_padded)?;
+    let actual_total = total_buf[0].max(0) as usize;
+    let actual_m_blocks = actual_total.div_ceil(block_size);
+
     Ok(KimiMarlinRouting {
-        batch_size: max_padded,
-        active_tokens: max_padded,
-        route_elems: max_padded,
+        batch_size: actual_total,
+        active_tokens: actual_total,
+        route_elems: actual_total,
         global_expert_start: 0,
         block_size,
-        max_padded_tokens: max_padded,
-        max_m_blocks: max_blocks,
+        max_padded_tokens: actual_total,
+        max_m_blocks: actual_m_blocks,
         sorted_token_ids: &workspace.sorted_token_ids,
         expert_ids: &workspace.expert_ids,
         num_tokens_post_padded: &workspace.num_tokens_post_padded,

@@ -238,7 +238,7 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx dispatch_recv layer {layer_idx}"))?;
     }
 
-    // ---- 6. Build Marlin routing on-stream (no D2H sync) ----
+    // ---- 6. Build Marlin routing (D2H of actual total for tight work sizing) ----
     let routing = kimi_pplx_build_marlin_routing_on_stream(
         ctx,
         &mut pplx.pplx_route_workspace,
@@ -260,7 +260,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
     // ---- 7. Marlin W13 (gate+up) GEMM ----
     pplx.pplx_recv_hidden.seq_len = routing.route_elems;
     pplx.pplx_w13_out.seq_len = routing.route_elems;
-    ctx.stream.memset_zeros(&mut pplx.pplx_w13_out.data)?;
     kimi_marlin_wna16_pplx_w13_gemm(
         ctx,
         &mut pplx.pplx_marlin_workspace,
@@ -277,7 +276,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
 
     // ---- 9. Marlin W2 (down) GEMM ----
     pplx.pplx_expert_output.seq_len = routing.route_elems;
-    ctx.stream.memset_zeros(&mut pplx.pplx_expert_output.data)?;
     kimi_marlin_wna16_pplx_w2_gemm(
         ctx,
         &mut pplx.pplx_marlin_workspace,
