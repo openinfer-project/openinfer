@@ -424,11 +424,15 @@ impl KimiK2Runtime {
                 hidden_dim: crate::config::KIMI_K2_HIDDEN,
             };
             let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
+            let pplx_params = pegainfer_comm::bootstrap::PplxBootstrapParams {
+                expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
+                ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
+            };
             match pegainfer_comm::bootstrap::build_intra_node_backends(
                 ep_shape,
                 &devices,
                 &config.pplx_thread_placement,
-                pegainfer_comm::bootstrap::PplxBootstrapParams::default(),
+                pplx_params,
             ) {
                 Ok((backends, resources)) => {
                     std::mem::forget(resources);

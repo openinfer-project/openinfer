@@ -46,7 +46,7 @@ use crate::{
 
 use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch};
 
-pub(super) const PPLX_EXPERT_PADDING: usize = 16;
+pub(super) const PPLX_EXPERT_PADDING: usize = 64;
 
 pub(super) struct KimiMoePplxScratch {
     pub(super) expert_padding: usize,
