@@ -422,6 +422,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn kimi_pplx_build_marlin_routing_on_stream(
+        recv_tokens_per_expert: *const i32,
+        sorted_token_ids: *mut i32,
+        expert_ids: *mut i32,
+        num_tokens_post_padded: *mut i32,
+        num_local_experts: i32,
+        expert_padding: i32,
+        block_size: i32,
+        max_padded_tokens: i32,
+        max_m_blocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn kimi_marlin_w13_swiglu_cuda(
         w13: *const Half,
         out: *mut Half,

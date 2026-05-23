@@ -1505,7 +1505,16 @@ pub fn kimi_marlin_sum_topk_rows_f32(
 /// that layout so the Marlin GEMM reads/writes PPLX buffers directly.
 ///
 /// Requires `expert_padding % block_size == 0`.
-pub fn kimi_pplx_build_marlin_routing<'a>(
+/// Build Marlin routing metadata on-stream from PPLX recv counts.
+///
+/// Launches a single-thread CUDA kernel that reads `recv_tokens_per_expert`,
+/// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
+/// and `num_tokens_post_padded` directly on the GPU — no D2H sync needed.
+///
+/// Returns routing with `route_elems = max_padded_tokens` so that the Marlin
+/// GEMM launches with the maximum grid. The sentinel mechanism inside the
+/// kernel ensures only real tokens contribute to the output.
+pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     ctx: &DeviceContext,
     workspace: &'a mut KimiMarlinRouteWorkspace,
     recv_tokens_per_expert: &CudaSlice<i32>,
@@ -1525,71 +1534,43 @@ pub fn kimi_pplx_build_marlin_routing<'a>(
         recv_tokens_per_expert.len()
     );
 
-    ctx.sync()?;
-    let counts_host: Vec<i32> = ctx
-        .stream
-        .clone_dtoh(recv_tokens_per_expert)
-        .map_err(|e| anyhow::anyhow!("D2H recv_tokens_per_expert: {e}"))?;
-
     let block_size = workspace.block_size;
-    let mut total_pplx_capacity: usize = 0;
-    for &count in &counts_host[..KIMI_K2_LOCAL_EXPERTS] {
-        let c = count.max(0) as usize;
-        total_pplx_capacity += c.div_ceil(expert_padding) * expert_padding;
-    }
-    ensure!(
-        total_pplx_capacity <= workspace.max_padded_tokens,
-        "pplx total capacity {} exceeds Marlin workspace {}",
-        total_pplx_capacity,
-        workspace.max_padded_tokens
-    );
+    let max_padded = workspace.max_padded_tokens;
+    let max_blocks = workspace.max_m_blocks;
 
-    let sentinel = total_pplx_capacity as i32;
-    let max_m_blocks = total_pplx_capacity.div_ceil(block_size);
-    ensure!(
-        max_m_blocks <= workspace.max_m_blocks,
-        "pplx m_blocks {} exceeds Marlin workspace {}",
-        max_m_blocks,
-        workspace.max_m_blocks
-    );
+    {
+        let (counts_ptr, _g0) = recv_tokens_per_expert.device_ptr(&ctx.stream);
+        let (sorted_ptr, _g1) = workspace.sorted_token_ids.device_ptr_mut(&ctx.stream);
+        let (expert_ptr, _g2) = workspace.expert_ids.device_ptr_mut(&ctx.stream);
+        let (ntp_ptr, _g3) = workspace.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
 
-    let mut sorted_ids = vec![sentinel; workspace.max_padded_tokens];
-    let mut expert_ids = vec![0i32; workspace.max_m_blocks];
-
-    let mut pplx_cursor: usize = 0;
-    for (e, &count) in counts_host[..KIMI_K2_LOCAL_EXPERTS].iter().enumerate() {
-        let c = count.max(0) as usize;
-        let padded = c.div_ceil(expert_padding) * expert_padding;
-        for j in 0..padded {
-            let idx = pplx_cursor + j;
-            if idx < sorted_ids.len() {
-                sorted_ids[idx] = if j < c { idx as i32 } else { sentinel };
-            }
+        let result = unsafe {
+            ffi::kimi_pplx_build_marlin_routing_on_stream(
+                counts_ptr as *const i32,
+                sorted_ptr as *mut i32,
+                expert_ptr as *mut i32,
+                ntp_ptr as *mut i32,
+                KIMI_K2_LOCAL_EXPERTS as i32,
+                expert_padding as i32,
+                block_size as i32,
+                max_padded as i32,
+                max_blocks as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            anyhow::bail!("kimi_pplx_build_marlin_routing_on_stream failed: {result:?}");
         }
-        let block_start = pplx_cursor / block_size;
-        let block_end = (pplx_cursor + padded) / block_size;
-        for b in block_start..block_end.min(expert_ids.len()) {
-            expert_ids[b] = e as i32;
-        }
-        pplx_cursor += padded;
     }
-
-    ctx.stream
-        .memcpy_htod(&sorted_ids, &mut workspace.sorted_token_ids)?;
-    ctx.stream
-        .memcpy_htod(&expert_ids, &mut workspace.expert_ids)?;
-    let num_tokens = [total_pplx_capacity as i32];
-    ctx.stream
-        .memcpy_htod(&num_tokens, &mut workspace.num_tokens_post_padded)?;
 
     Ok(KimiMarlinRouting {
-        batch_size: total_pplx_capacity,
-        active_tokens: total_pplx_capacity,
-        route_elems: total_pplx_capacity,
+        batch_size: max_padded,
+        active_tokens: max_padded,
+        route_elems: max_padded,
         global_expert_start: 0,
         block_size,
-        max_padded_tokens: total_pplx_capacity,
-        max_m_blocks,
+        max_padded_tokens: max_padded,
+        max_m_blocks: max_blocks,
         sorted_token_ids: &workspace.sorted_token_ids,
         expert_ids: &workspace.expert_ids,
         num_tokens_post_padded: &workspace.num_tokens_post_padded,

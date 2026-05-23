@@ -32,7 +32,7 @@ use pegainfer_kernels::{
         KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, add_batch_into,
         bf16_hidden_to_f32_into, gemm_graphsafe_into_checked, kimi_marlin_w13_swiglu,
         kimi_marlin_wna16_pplx_w2_gemm, kimi_marlin_wna16_pplx_w13_gemm,
-        kimi_pplx_build_marlin_routing, kimi_router_noaux_tc_launch, rms_norm_batch_into,
+        kimi_pplx_build_marlin_routing_on_stream, kimi_router_noaux_tc_launch, rms_norm_batch_into,
         silu_mul_fused_batch_into,
     },
     tensor::{DeviceContext, DeviceVec, HiddenStates},
@@ -238,55 +238,54 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx dispatch_recv layer {layer_idx}"))?;
     }
 
-    // ---- 6. Build Marlin routing from PPLX recv counts ----
-    let routing = kimi_pplx_build_marlin_routing(
+    // ---- 6. Build Marlin routing on-stream (no D2H sync) ----
+    let routing = kimi_pplx_build_marlin_routing_on_stream(
         ctx,
         &mut pplx.pplx_route_workspace,
         &pplx.recv_tokens_per_expert,
         pplx.expert_padding,
     )
     .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
-    if routing.route_elems > 0 {
-        let layer_weights = expert_kernels
-            .layers
-            .iter()
-            .find(|layer| layer.layer_idx == layer_idx)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Kimi rank expert Marlin package missing layer {layer_idx}")
-            })?
-            .as_marlin_weights();
 
-        // ---- 7. Marlin W13 (gate+up) GEMM ----
-        pplx.pplx_recv_hidden.seq_len = routing.route_elems;
-        pplx.pplx_w13_out.seq_len = routing.route_elems;
-        ctx.stream.memset_zeros(&mut pplx.pplx_w13_out.data)?;
-        kimi_marlin_wna16_pplx_w13_gemm(
-            ctx,
-            &mut pplx.pplx_marlin_workspace,
-            &routing,
-            &pplx.pplx_recv_hidden,
-            &layer_weights.w13,
-            &pplx.pplx_dummy_topk_weight,
-            &mut pplx.pplx_w13_out,
-        )?;
+    let layer_weights = expert_kernels
+        .layers
+        .iter()
+        .find(|layer| layer.layer_idx == layer_idx)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Kimi rank expert Marlin package missing layer {layer_idx}")
+        })?
+        .as_marlin_weights();
 
-        // ---- 8. SwiGLU activation ----
-        pplx.pplx_activated.seq_len = routing.route_elems;
-        kimi_marlin_w13_swiglu(ctx, &pplx.pplx_w13_out, &mut pplx.pplx_activated)?;
+    // ---- 7. Marlin W13 (gate+up) GEMM ----
+    pplx.pplx_recv_hidden.seq_len = routing.route_elems;
+    pplx.pplx_w13_out.seq_len = routing.route_elems;
+    ctx.stream.memset_zeros(&mut pplx.pplx_w13_out.data)?;
+    kimi_marlin_wna16_pplx_w13_gemm(
+        ctx,
+        &mut pplx.pplx_marlin_workspace,
+        &routing,
+        &pplx.pplx_recv_hidden,
+        &layer_weights.w13,
+        &pplx.pplx_dummy_topk_weight,
+        &mut pplx.pplx_w13_out,
+    )?;
 
-        // ---- 9. Marlin W2 (down) GEMM ----
-        pplx.pplx_expert_output.seq_len = routing.route_elems;
-        ctx.stream.memset_zeros(&mut pplx.pplx_expert_output.data)?;
-        kimi_marlin_wna16_pplx_w2_gemm(
-            ctx,
-            &mut pplx.pplx_marlin_workspace,
-            &routing,
-            &pplx.pplx_activated,
-            &layer_weights.w2_down,
-            &pplx.pplx_dummy_topk_weight,
-            &mut pplx.pplx_expert_output,
-        )?;
-    }
+    // ---- 8. SwiGLU activation ----
+    pplx.pplx_activated.seq_len = routing.route_elems;
+    kimi_marlin_w13_swiglu(ctx, &pplx.pplx_w13_out, &mut pplx.pplx_activated)?;
+
+    // ---- 9. Marlin W2 (down) GEMM ----
+    pplx.pplx_expert_output.seq_len = routing.route_elems;
+    ctx.stream.memset_zeros(&mut pplx.pplx_expert_output.data)?;
+    kimi_marlin_wna16_pplx_w2_gemm(
+        ctx,
+        &mut pplx.pplx_marlin_workspace,
+        &routing,
+        &pplx.pplx_activated,
+        &layer_weights.w2_down,
+        &pplx.pplx_dummy_topk_weight,
+        &mut pplx.pplx_expert_output,
+    )?;
 
     // ---- 10. combine_send ----
     {

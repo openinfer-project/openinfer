@@ -624,4 +624,71 @@ CUresult kimi_scaled_add_f32_bf16_to_bf16_cuda(
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
+__global__ void kimi_pplx_build_marlin_routing_kernel(
+    const int32_t* __restrict__ recv_tokens_per_expert,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ num_tokens_post_padded,
+    int num_local_experts,
+    int expert_padding,
+    int block_size,
+    int max_padded_tokens,
+    int max_m_blocks) {
+  int total = 0;
+  for (int e = 0; e < num_local_experts; e++) {
+    int c = recv_tokens_per_expert[e];
+    if (c < 0) c = 0;
+    int padded = ((c + expert_padding - 1) / expert_padding) * expert_padding;
+    total += padded;
+  }
+  int sentinel = total;
+  int cursor = 0;
+  for (int e = 0; e < num_local_experts; e++) {
+    int c = recv_tokens_per_expert[e];
+    if (c < 0) c = 0;
+    int padded = ((c + expert_padding - 1) / expert_padding) * expert_padding;
+    for (int j = 0; j < padded; j++) {
+      int idx = cursor + j;
+      if (idx < max_padded_tokens) {
+        sorted_token_ids[idx] = (j < c) ? idx : sentinel;
+      }
+    }
+    int block_start = cursor / block_size;
+    int block_end = (cursor + padded) / block_size;
+    for (int b = block_start; b < block_end && b < max_m_blocks; b++) {
+      expert_ids[b] = e;
+    }
+    cursor += padded;
+  }
+  for (int j = cursor; j < max_padded_tokens; j++) {
+    sorted_token_ids[j] = sentinel;
+  }
+  num_tokens_post_padded[0] = total;
+}
+
+CUresult kimi_pplx_build_marlin_routing_on_stream(
+    const int32_t* recv_tokens_per_expert,
+    int32_t* sorted_token_ids,
+    int32_t* expert_ids,
+    int32_t* num_tokens_post_padded,
+    int num_local_experts,
+    int expert_padding,
+    int block_size,
+    int max_padded_tokens,
+    int max_m_blocks,
+    cudaStream_t stream) {
+  kimi_pplx_build_marlin_routing_kernel<<<1, 1, 0, stream>>>(
+      recv_tokens_per_expert,
+      sorted_token_ids,
+      expert_ids,
+      num_tokens_post_padded,
+      num_local_experts,
+      expert_padding,
+      block_size,
+      max_padded_tokens,
+      max_m_blocks);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
 }  // extern "C"
