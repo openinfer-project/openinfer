@@ -257,6 +257,7 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .as_marlin_weights();
 
     // ---- 7. Marlin W13 (gate+up) GEMM ----
+    pplx.pplx_recv_hidden.seq_len = routing.route_elems;
     pplx.pplx_w13_out.seq_len = routing.route_elems;
     ctx.stream.memset_zeros(&mut pplx.pplx_w13_out.data)?;
     kimi_marlin_wna16_pplx_w13_gemm(
