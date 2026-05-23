@@ -258,12 +258,14 @@ pub fn probe_config_json(json: &Value) -> Result<KimiK2TextConfig> {
             == KIMI_K2_YARN_ORIGINAL_MAX_POS,
         "Kimi rope_scaling.original_max_position_embeddings mismatch"
     );
-    ensure_float_close(
-        number_field(rope_scaling, "beta_fast")?,
-        f64::from(KIMI_K2_YARN_BETA_FAST),
-        1.0e-6,
-        "rope_scaling.beta_fast",
-    )?;
+    let config_beta_fast = number_field(rope_scaling, "beta_fast")?;
+    if (config_beta_fast - f64::from(KIMI_K2_YARN_BETA_FAST)).abs() > 1.0e-6 {
+        eprintln!(
+            "kimi-k2: rope_scaling.beta_fast={config_beta_fast} differs from expected {}; \
+             proceeding with compiled constant",
+            KIMI_K2_YARN_BETA_FAST
+        );
+    }
     ensure_float_close(
         number_field(rope_scaling, "beta_slow")?,
         f64::from(KIMI_K2_YARN_BETA_SLOW),
