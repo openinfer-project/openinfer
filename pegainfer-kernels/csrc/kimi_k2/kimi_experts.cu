@@ -641,7 +641,7 @@ __global__ void kimi_pplx_build_marlin_routing_kernel(
     int padded = ((c + expert_padding - 1) / expert_padding) * expert_padding;
     total += padded;
   }
-  int sentinel = total;
+  int sentinel = max_padded_tokens;
   int cursor = 0;
   for (int e = 0; e < num_local_experts; e++) {
     int c = recv_tokens_per_expert[e];
