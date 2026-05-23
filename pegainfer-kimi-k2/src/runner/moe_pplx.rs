@@ -246,61 +246,46 @@ pub(super) fn forward_moe_layer_decode_pplx(
         pplx.expert_padding,
     )
     .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
-    if layer_idx <= 2 {
-        eprintln!(
-            "pplx-diag: layer {layer_idx} routing route_elems={}",
-            routing.route_elems
-        );
-    }
+    if routing.route_elems > 0 {
+        let layer_weights = expert_kernels
+            .layers
+            .iter()
+            .find(|layer| layer.layer_idx == layer_idx)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Kimi rank expert Marlin package missing layer {layer_idx}")
+            })?
+            .as_marlin_weights();
 
-    let layer_weights = expert_kernels
-        .layers
-        .iter()
-        .find(|layer| layer.layer_idx == layer_idx)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Kimi rank expert Marlin package missing layer {layer_idx}")
-        })?
-        .as_marlin_weights();
+        // ---- 7. Marlin W13 (gate+up) GEMM ----
+        pplx.pplx_recv_hidden.seq_len = routing.route_elems;
+        pplx.pplx_w13_out.seq_len = routing.route_elems;
+        ctx.stream.memset_zeros(&mut pplx.pplx_w13_out.data)?;
+        kimi_marlin_wna16_pplx_w13_gemm(
+            ctx,
+            &mut pplx.pplx_marlin_workspace,
+            &routing,
+            &pplx.pplx_recv_hidden,
+            &layer_weights.w13,
+            &pplx.pplx_dummy_topk_weight,
+            &mut pplx.pplx_w13_out,
+        )?;
 
-    // ---- 7. Marlin W13 (gate+up) GEMM ----
-    pplx.pplx_recv_hidden.seq_len = routing.route_elems;
-    pplx.pplx_w13_out.seq_len = routing.route_elems;
-    ctx.stream.memset_zeros(&mut pplx.pplx_w13_out.data)?;
-    kimi_marlin_wna16_pplx_w13_gemm(
-        ctx,
-        &mut pplx.pplx_marlin_workspace,
-        &routing,
-        &pplx.pplx_recv_hidden,
-        &layer_weights.w13,
-        &pplx.pplx_dummy_topk_weight,
-        &mut pplx.pplx_w13_out,
-    )?;
-    if layer_idx <= 2 {
-        ctx.sync()
-            .with_context(|| format!("CUDA error after W13 GEMM layer {layer_idx}"))?;
-        eprintln!("pplx-diag: layer {layer_idx} W13 ok");
-    }
+        // ---- 8. SwiGLU activation ----
+        pplx.pplx_activated.seq_len = routing.route_elems;
+        kimi_marlin_w13_swiglu(ctx, &pplx.pplx_w13_out, &mut pplx.pplx_activated)?;
 
-    // ---- 8. SwiGLU activation ----
-    pplx.pplx_activated.seq_len = routing.route_elems;
-    kimi_marlin_w13_swiglu(ctx, &pplx.pplx_w13_out, &mut pplx.pplx_activated)?;
-
-    // ---- 9. Marlin W2 (down) GEMM ----
-    pplx.pplx_expert_output.seq_len = routing.route_elems;
-    ctx.stream.memset_zeros(&mut pplx.pplx_expert_output.data)?;
-    kimi_marlin_wna16_pplx_w2_gemm(
-        ctx,
-        &mut pplx.pplx_marlin_workspace,
-        &routing,
-        &pplx.pplx_activated,
-        &layer_weights.w2_down,
-        &pplx.pplx_dummy_topk_weight,
-        &mut pplx.pplx_expert_output,
-    )?;
-    if layer_idx <= 2 {
-        ctx.sync()
-            .with_context(|| format!("CUDA error after W2 GEMM layer {layer_idx}"))?;
-        eprintln!("pplx-diag: layer {layer_idx} W2 ok");
+        // ---- 9. Marlin W2 (down) GEMM ----
+        pplx.pplx_expert_output.seq_len = routing.route_elems;
+        ctx.stream.memset_zeros(&mut pplx.pplx_expert_output.data)?;
+        kimi_marlin_wna16_pplx_w2_gemm(
+            ctx,
+            &mut pplx.pplx_marlin_workspace,
+            &routing,
+            &pplx.pplx_activated,
+            &layer_weights.w2_down,
+            &pplx.pplx_dummy_topk_weight,
+            &mut pplx.pplx_expert_output,
+        )?;
     }
 
     // ---- 10. combine_send ----
@@ -337,10 +322,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx combine_recv layer {layer_idx}"))?;
     }
 
-    if layer_idx <= 2 {
-        ctx.sync()?;
-        eprintln!("pplx-diag: layer {layer_idx} combine_recv done");
-    }
     // ---- 12. Combine: hidden = hidden + shared + routed * scale ----
     // Step A: normed = hidden + shared (BF16)
     add_batch_into(
