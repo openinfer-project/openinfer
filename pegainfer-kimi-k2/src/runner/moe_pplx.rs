@@ -200,6 +200,10 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} main wait route_ready"))?;
 
     // ---- 4. dispatch_send ----
+    if layer_idx <= 2 {
+        ctx.sync()?;
+        eprintln!("pplx-diag: layer {layer_idx} pre-dispatch_send");
+    }
     {
         let (x_ptr, _x_guard) = scratch.normed.data.device_ptr(&ctx.stream);
         let (idx_ptr, _idx_guard) = scratch.router_topk_idx.device_ptr(&ctx.stream);
@@ -239,6 +243,10 @@ pub(super) fn forward_moe_layer_decode_pplx(
     }
 
     // ---- 6. Build Marlin routing from PPLX recv counts ----
+    if layer_idx <= 2 {
+        ctx.sync()?;
+        eprintln!("pplx-diag: layer {layer_idx} dispatch_recv done, building routing");
+    }
     let routing = kimi_pplx_build_marlin_routing(
         ctx,
         &mut pplx.pplx_route_workspace,
@@ -288,6 +296,10 @@ pub(super) fn forward_moe_layer_decode_pplx(
     )?;
 
     // ---- 10. combine_send ----
+    if layer_idx <= 2 {
+        ctx.sync()?;
+        eprintln!("pplx-diag: layer {layer_idx} expert GEMMs done, combine_send");
+    }
     {
         let (exp_ptr, _g) = pplx.pplx_expert_output.data.device_ptr(&ctx.stream);
         ep.combine_send(
@@ -321,6 +333,10 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx combine_recv layer {layer_idx}"))?;
     }
 
+    if layer_idx <= 2 {
+        ctx.sync()?;
+        eprintln!("pplx-diag: layer {layer_idx} combine_recv done");
+    }
     // ---- 12. Combine: hidden = hidden + shared + routed * scale ----
     // Step A: normed = hidden + shared (BF16)
     add_batch_into(
