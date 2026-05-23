@@ -22,6 +22,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [features]
+default = []
+kimi-k2 = ["pegainfer-kernels/kimi-k2"]
 kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
 kernel-report = [
     "dep:clap",

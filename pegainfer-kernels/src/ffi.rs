@@ -181,7 +181,10 @@ unsafe extern "C" {
         K: i32,
         stream: CUstream,
     ) -> i32;
+}
 
+#[cfg(feature = "kimi-k2")]
+unsafe extern "C" {
     pub fn kimi_int4_expert_metadata_probe_cuda(
         weight_shape: *const i32,
         weight_shape_entries: usize,
@@ -452,7 +455,9 @@ unsafe extern "C" {
         max_m_blocks: i32,
         stream: CUstream,
     ) -> CUresult;
+}
 
+unsafe extern "C" {
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(
         embed: *const Half,
@@ -688,7 +693,10 @@ unsafe extern "C" {
         route_scale: f32,
         stream: CUstream,
     ) -> CUresult;
+}
 
+#[cfg(feature = "kimi-k2")]
+unsafe extern "C" {
     pub fn kimi_k2_router_noaux_tc_cuda(
         hidden: *const Half,
         gate_weight: *const Half,
@@ -706,7 +714,9 @@ unsafe extern "C" {
         route_scale: f32,
         stream: CUstream,
     ) -> CUresult;
+}
 
+unsafe extern "C" {
     pub fn deepseek_moe_local_mapping_cuda(
         route_indices: *const i32,
         pos_to_token: *mut i32,
@@ -1083,24 +1093,6 @@ unsafe extern "C" {
         seq_len: i32,
         hidden_dim: i32,
         head_dim: i32,
-        eps: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_compressor_nonoverlap_decode_cuda(
-        x: *const Half,
-        wkv: *const Half,
-        wgate: *const Half,
-        ape: *const f32,
-        norm: *const Half,
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        weighted: *mut f32,
-        out: *mut Half,
-        start_pos: i32,
-        hidden_dim: i32,
-        head_dim: i32,
-        ratio: i32,
         eps: f32,
         stream: CUstream,
     ) -> CUresult;

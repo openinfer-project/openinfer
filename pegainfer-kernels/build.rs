@@ -286,6 +286,14 @@ fn is_deepseek_v4_source(csrc_dir: &Path, path: &Path) -> bool {
     })
 }
 
+fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
+    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
+        relative
+            .components()
+            .any(|part| part.as_os_str() == "kimi_k2")
+    })
+}
+
 fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
     let Some(relative) = cu_file.strip_prefix(csrc_dir).ok() else {
         return format!("{}_cuda.o", cu_file.file_stem().unwrap().to_string_lossy());
@@ -1039,6 +1047,7 @@ fn main() {
     let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
+    let kimi_k2_enabled = cfg!(feature = "kimi-k2");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
         Some(generate_deepseek_tilelang_artifacts(&out_dir))
@@ -1079,6 +1088,9 @@ fn main() {
         .filter_map(|path| {
             let file_name = path.file_name()?.to_str()?;
             if !deepseek_enabled && is_deepseek_v4_source(&csrc_dir, path) {
+                return None;
+            }
+            if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
                 return None;
             }
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
@@ -1203,6 +1215,11 @@ fn main() {
     if !deepseek_enabled {
         println!(
             "cargo:warning=DeepSeek V4 CUDA/TileLang kernels disabled; enable the pegainfer-kernels `deepseek-v4` feature to build them"
+        );
+    }
+    if !kimi_k2_enabled {
+        println!(
+            "cargo:warning=Kimi-K2 CUDA kernels disabled; enable the pegainfer-kernels `kimi-k2` feature to build them"
         );
     }
 

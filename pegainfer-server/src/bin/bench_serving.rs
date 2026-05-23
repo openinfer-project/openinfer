@@ -1874,6 +1874,7 @@ fn main() -> Result<()> {
             let mut bench = SchedulerBenchModel { handle };
             dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
         }
+        #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {
             let handle = pegainfer_kimi_k2::start_engine(
                 Path::new(&cli.model_path),

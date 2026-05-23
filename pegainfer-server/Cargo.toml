@@ -21,7 +21,7 @@ path = "src/bin/bench_serving.rs"
 pegainfer-core = { workspace = true }
 pegainfer-deepseek-v2-lite = { workspace = true, optional = true }
 pegainfer-deepseek-v4 = { workspace = true, optional = true }
-pegainfer-kimi-k2 = { workspace = true }
+pegainfer-kimi-k2 = { workspace = true, optional = true }
 pegainfer-qwen3-4b = { workspace = true }
 pegainfer-qwen35-4b = { workspace = true }
 pegainfer-vllm-frontend = { workspace = true }
@@ -48,6 +48,7 @@ tikv-jemallocator = "0.6"
 default = []
 deepseek-v4 = ["dep:pegainfer-deepseek-v4", "pegainfer-deepseek-v4/deepseek-v4"]
 deepseek-v2-lite = ["dep:pegainfer-deepseek-v2-lite", "pegainfer-deepseek-v2-lite/deepseek-v2-lite"]
+kimi-k2 = ["dep:pegainfer-kimi-k2", "pegainfer-kimi-k2/kimi-k2"]
 pplx-ep = ["deepseek-v4", "pegainfer-deepseek-v4/pplx-ep"]
 deepseek-v4-cutedsl-diagnostic = [
     "deepseek-v4",

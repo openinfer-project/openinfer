@@ -920,48 +920,6 @@ cudaError_t deepseek_compressor_overlap_prefill_cuda(
   return cuda_status;
 }
 
-cudaError_t deepseek_compressor_nonoverlap_decode_cuda(
-    const __nv_bfloat16 *x,
-    const __nv_bfloat16 *wkv,
-    const __nv_bfloat16 *wgate,
-    const float *ape,
-    const __nv_bfloat16 *norm,
-    float *kv_state,
-    float *score_state,
-    float *weighted,
-    __nv_bfloat16 *out,
-    int start_pos,
-    int hidden_dim,
-    int head_dim,
-    int ratio,
-    float eps,
-    cudaStream_t stream) {
-  if (start_pos < 0 || hidden_dim <= 0 || head_dim <= 0 || ratio <= 1 || ratio > 128) {
-    return cudaErrorInvalidValue;
-  }
-  constexpr int threads = 256;
-  size_t project_shared = 2 * threads * sizeof(float);
-  deepseek_compressor_decode_project_kernel<<<head_dim, threads, project_shared, stream>>>(
-      x, wkv, wgate, ape, kv_state, score_state, start_pos, hidden_dim, head_dim, ratio, 0);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  bool should_compress = ((start_pos + 1) % ratio) == 0;
-  if (!should_compress) return cudaSuccess;
-  if (weighted == nullptr || out == nullptr) return cudaErrorInvalidValue;
-
-  int blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_nonoverlap_decode_weighted_kernel<<<blocks, threads, 0, stream>>>(
-      kv_state, score_state, weighted, head_dim, ratio);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-
-  int norm_blocks = (head_dim + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, 1, head_dim, eps);
-  return cudaGetLastError();
-}
-
 cudaError_t deepseek_compressor_nonoverlap_decode_at_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,

@@ -16,6 +16,7 @@ cc = { workspace = true }
 default = []
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
+kimi-k2 = []
 
 [lints]
 workspace = true
