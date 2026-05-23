@@ -433,6 +433,155 @@ impl HiddenStates {
     }
 }
 
+// ── Typed tensor layer ───────────────────────────────────────────────
+//
+// `GpuTensor<DIM>` encodes the hidden dimension in the type. The seq_len
+// (batch) axis stays runtime because it changes per step. Weight matrices
+// carry both dimensions: `GpuWeight<OUT, IN>`.
+//
+// These are additive — existing `HiddenStates`/`DeviceMatrix` stay untouched.
+// Model crates migrate one at a time.
+
+/// Batched bf16 activation tensor with compile-time hidden dimension.
+///
+/// Memory layout: `[DIM * seq_len]` contiguous bf16, token `i` at `i * DIM`.
+/// cuBLAS sees `[DIM, seq_len]` column-major.
+pub struct GpuTensor<const DIM: usize> {
+    pub data: CudaSlice<bf16>,
+    pub seq_len: usize,
+}
+
+impl<const DIM: usize> GpuTensor<DIM> {
+    pub fn zeros(ctx: &DeviceContext, seq_len: usize) -> Result<Self> {
+        let data: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros(DIM * seq_len)
+            .map_err(|e| anyhow!("GpuTensor<{}>::zeros alloc failed: {}", DIM, e))?;
+        Ok(Self { data, seq_len })
+    }
+
+    pub const fn dim() -> usize {
+        DIM
+    }
+
+    pub fn num_elements(&self) -> usize {
+        DIM * self.seq_len
+    }
+
+    pub fn as_untyped(&self) -> HiddenStatesRef<'_> {
+        HiddenStatesRef {
+            data: &self.data,
+            hidden_dim: DIM,
+            seq_len: self.seq_len,
+        }
+    }
+
+    pub fn as_untyped_mut(&mut self) -> HiddenStatesMut<'_> {
+        HiddenStatesMut {
+            data: &mut self.data,
+            hidden_dim: DIM,
+            seq_len: self.seq_len,
+        }
+    }
+}
+
+/// bf16 weight matrix with compile-time dimensions: `[OUT, IN]` row-major.
+pub struct GpuWeight<const OUT: usize, const IN: usize> {
+    pub data: CudaSlice<bf16>,
+}
+
+impl<const OUT: usize, const IN: usize> GpuWeight<OUT, IN> {
+    pub fn from_device_matrix(m: DeviceMatrix) -> Result<Self> {
+        anyhow::ensure!(
+            m.rows == OUT && m.cols == IN,
+            "GpuWeight<{}, {}>::from_device_matrix shape mismatch: got [{}, {}]",
+            OUT,
+            IN,
+            m.rows,
+            m.cols,
+        );
+        Ok(Self { data: m.data })
+    }
+
+    pub fn as_untyped_ref(&self) -> DeviceMatrixRef<'_> {
+        DeviceMatrixRef {
+            data: &self.data,
+            rows: OUT,
+            cols: IN,
+        }
+    }
+}
+
+/// bf16 RMSNorm weight vector with compile-time dimension.
+pub struct NormWeight<const DIM: usize> {
+    pub data: CudaSlice<bf16>,
+}
+
+impl<const DIM: usize> NormWeight<DIM> {
+    pub fn from_device_vec(v: DeviceVec) -> Result<Self> {
+        anyhow::ensure!(
+            v.len == DIM,
+            "NormWeight<{}>::from_device_vec len mismatch: got {}",
+            DIM,
+            v.len,
+        );
+        Ok(Self { data: v.data })
+    }
+}
+
+/// f32 raw buffer with compile-time element count per batch entry.
+pub struct GpuRawSlice<const ELEMS: usize> {
+    pub data: CudaSlice<f32>,
+    pub batch_size: usize,
+}
+
+impl<const ELEMS: usize> GpuRawSlice<ELEMS> {
+    pub fn zeros(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
+        let data: CudaSlice<f32> = ctx
+            .stream
+            .alloc_zeros(ELEMS * batch_size)
+            .map_err(|e| anyhow!("GpuRawSlice<{}>::zeros alloc failed: {}", ELEMS, e))?;
+        Ok(Self { data, batch_size })
+    }
+}
+
+/// i32 raw buffer with compile-time element count per batch entry.
+pub struct GpuRawSliceI32<const ELEMS: usize> {
+    pub data: CudaSlice<i32>,
+    pub batch_size: usize,
+}
+
+impl<const ELEMS: usize> GpuRawSliceI32<ELEMS> {
+    pub fn zeros(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
+        let data: CudaSlice<i32> = ctx
+            .stream
+            .alloc_zeros(ELEMS * batch_size)
+            .map_err(|e| anyhow!("GpuRawSliceI32<{}>::zeros alloc failed: {}", ELEMS, e))?;
+        Ok(Self { data, batch_size })
+    }
+}
+
+/// Non-owning reference to `HiddenStates`-shaped data (bridge to untyped ops).
+pub struct HiddenStatesRef<'a> {
+    pub data: &'a CudaSlice<bf16>,
+    pub hidden_dim: usize,
+    pub seq_len: usize,
+}
+
+/// Non-owning mutable reference to `HiddenStates`-shaped data.
+pub struct HiddenStatesMut<'a> {
+    pub data: &'a mut CudaSlice<bf16>,
+    pub hidden_dim: usize,
+    pub seq_len: usize,
+}
+
+/// Non-owning reference to `DeviceMatrix`-shaped data.
+pub struct DeviceMatrixRef<'a> {
+    pub data: &'a CudaSlice<bf16>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

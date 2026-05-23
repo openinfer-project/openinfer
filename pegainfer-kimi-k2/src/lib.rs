@@ -3,6 +3,9 @@
 //! The current crate stage owns the compile-checked operator API surface and
 //! text-only config probing. CUDA/runtime bodies land behind these headers.
 
+#![allow(incomplete_features)]
+#![feature(generic_const_exprs)]
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -17,6 +20,10 @@ pub mod layers;
 mod runner;
 pub mod tensor;
 pub mod tokenizer;
+#[cfg(feature = "kimi-k2")]
+pub mod typed_forward;
+#[cfg(feature = "kimi-k2")]
+pub mod typed_scratch;
 pub mod weights;
 
 pub use config::{KimiK2TextConfig, KimiModelKind, probe_config_json, probe_model};
