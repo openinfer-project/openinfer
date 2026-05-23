@@ -1,6 +1,6 @@
 # Kimi-K2 Optimization
 
-> **TL;DR:** Kimi-K2.5/2.6 text-only on H20 ×8（当前 TP8 + EP8）。**重点是 decode 性能**：bs4 synthetic output64 steady TPOT avg `14.39ms` / p99 `14.83ms`（≈`278 tok/s`），目标 `decode(bs4) > 300 tok/s`；下一阶段迁到 TP1 + DP8 + EP8（PPLX dispatch/combine）。Decode 路径已经 CUDA Graph 覆盖整段 + Marlin WNA16 routed expert + NCCL RS bridge，真实 vLLM fixture prompt output16 四路 greedy 完全匹配。Prefill 优先级低，短 prompt streaming TTFT `1995.5ms` 待优化但不影响 decode 主线。vLLM 0.19.0 TP1+DP8+EP8 H20 baseline 已采（[vllm-h20-baseline.md](vllm-h20-baseline.md)）：同 client bs=4 TPOT med `24.97ms`，pegainfer 比 vLLM 低 23%；但 pegainfer HTTP 口径 `19.13ms` 比 in-process `14.39ms` 高 33%，frontend overhead 偏大需排查。
+> **TL;DR:** Kimi-K2.5/2.6 text-only on H20 ×8。**两条并行路径**：(1) TP8+EP8 NCCL（CUDA Graph）bs4 TPOT `14.39ms`（≈278 tok/s）；(2) **TP1+DP8+EP8 PPLX EP**（no CUDA Graph）bs1 TPOT `17.94ms`，已超过 NCCL no-graph baseline `18.52ms`（详见 [pplx-ep-decode.md](pplx-ep-decode.md)）。PPLX 路径从 37ms 优化到 17.94ms（−52%），根因是 expert_padding=64 导致 Marlin 98% 计算浪费。下一步：PPLX + CUDA Graph 兼容、bs>1 throughput、DP8 scheduler。
 >
 > **Last touched:** 2026-05
 
@@ -300,7 +300,7 @@ Marlin 数字是 synthetic all-local route 假设，不是真实 EP8 全局 rout
    - 需要 scheduler / weights / KV cache 全部按 DP rank-local 切，PPLX EP backend 替换当前 NCCL RS bridge，并重新过 greedy parity gate。结构改动，独立 milestone。
 3. **vLLM baseline 完整采集**：✓ 已完成。H20 ×8 vLLM 0.19.0 TP1+DP8+EP8 bs 1..256 扫描见 [vllm-h20-baseline.md](vllm-h20-baseline.md)；bs=8 是 vLLM 拐点（aggregate `308 tok/s`，TPOT med `26.4ms`），bs=256 峰值 `1131 tok/s`。Dashboard 的 vLLM 列已填，留作 TP1+DP8+EP8 milestone 的硬上限。
 4. **HTTP / frontend overhead 排查**：同硬件、同 bs=4，pegainfer HTTP 口径 TPOT `19.13ms` vs in-process `14.39ms`，差 `4.74ms / token` (~33%)。streaming JSON / `vllm-frontend` bridge / scheduler dispatch 三选一是主导，需要拆解。pegainfer 单请求 TPOT 比 vLLM 低 23% 的窗口正在被这块 overhead 吃掉一部分，影响真实业务感知。优先级介于 #1 和 #5 之间。
-5. **PPLX EP dispatch/combine**：作为 TP1 DP8 EP8 的前置组件，独立先把 PPLX backend 在 Kimi worker 里接通；当前 NCCL `repeat_f32 + reduce_scatter` bridge 是临时桥，最终被 PPLX 替换。
+5. **PPLX EP dispatch/combine**：✓ 已完成 decode 路径接入和性能优化。bs=1 TPOT `17.94ms`，超过 NCCL no-graph `18.52ms`。详见 [pplx-ep-decode.md](pplx-ep-decode.md)。剩余：CUDA Graph 兼容性、bs>1 throughput 验证、DP8 scheduler 集成。
 6. **Prefill 性能优化（优先级低）**：short-prompt streaming TTFT `1995.5ms` 偏高，HTTP bench p99 TTFT 飙到 `4240ms` 也是这里的体现（first NCCL collective stream drain + scheduler warmup）。先量 short-prompt prefill 拆解（embedding / MLA prefill / MoE prefill / sampling），再决定是 scratch allocator 还是首个 collective stream drain 主导。Long prompt（128+ synthetic）已经过 1k tok/s，主要痛点是 short prompt + first-call 路径。不影响 decode 主线。
 
 详细推进点参见 [operator-todo.md](operator-todo.md)。历史实验和 reject 路径参见 [changelog.md](changelog.md)。Decode 路径与 vLLM 算子的逐项对照参见 [vllm-path-comparison.md](vllm-path-comparison.md)。
