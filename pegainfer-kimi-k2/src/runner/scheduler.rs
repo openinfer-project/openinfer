@@ -176,6 +176,7 @@ impl KimiK2Scheduler {
                         self.runtime.gpu_weight_ready_rank_count(),
                         self.runtime.rank_count()
                     );
+                    eprintln!("kimi-k2: {message}");
                     for req in active.drain(..) {
                         let _ = req.token_tx.send(TokenEvent::Error {
                             message: message.clone(),
