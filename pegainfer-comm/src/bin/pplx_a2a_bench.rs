@@ -34,6 +34,24 @@ struct Args {
     warmup: usize,
     #[arg(long, default_value_t = 100)]
     repeats: usize,
+
+    /// Sweep preset model shapes (dsv4, kimi-k2) x token counts.
+    /// Overrides --n-experts/--topk/--hidden-dim/--max-num-tokens.
+    #[arg(long)]
+    sweep: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BenchConfig {
+    label: String,
+    shape: EpModelShape,
+    world_size: usize,
+    max_num_tokens: usize,
+    max_private_tokens: usize,
+    expert_padding: usize,
+    nets_per_gpu: u8,
+    warmup: usize,
+    repeats: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -84,49 +102,115 @@ impl GpuContext {
     }
 }
 
+struct SweepRow {
+    label: String,
+    max_rank_split: Stats,
+}
+
+const DSV4_SHAPE: EpModelShape =
+    EpModelShape { n_routed_experts: 256, n_activated_experts: 6, hidden_dim: 4096 };
+
+const KIMI_K2_SHAPE: EpModelShape =
+    EpModelShape { n_routed_experts: 384, n_activated_experts: 8, hidden_dim: 7168 };
+
+fn sweep_configs(args: &Args) -> Vec<BenchConfig> {
+    let shapes = [("dsv4", DSV4_SHAPE), ("kimi-k2", KIMI_K2_SHAPE)];
+    let token_counts = [1, 4, 8, 32, 128, 256];
+    let mut configs = Vec::new();
+    for &(name, shape) in &shapes {
+        for &tokens in &token_counts {
+            configs.push(BenchConfig {
+                label: format!("{name}/tok={tokens}"),
+                shape,
+                world_size: args.world_size,
+                max_num_tokens: tokens,
+                max_private_tokens: args.max_private_tokens,
+                expert_padding: args.expert_padding,
+                nets_per_gpu: args.nets_per_gpu,
+                warmup: args.warmup,
+                repeats: args.repeats,
+            });
+        }
+    }
+    configs
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.world_size > 0, "world_size must be positive");
     ensure!(args.repeats > 0, "repeats must be positive");
     ensure!(args.nets_per_gpu > 0, "nets_per_gpu must be positive for pplx bootstrap");
 
-    let shape = EpModelShape {
-        n_routed_experts: args.n_experts,
-        n_activated_experts: args.topk,
-        hidden_dim: args.hidden_dim,
-    };
-    let devices: Vec<usize> = (0..args.world_size).collect();
+    if args.sweep {
+        let configs = sweep_configs(&args);
+        let mut rows = Vec::with_capacity(configs.len());
+        for config in &configs {
+            let rank_results = run_config(config)?;
+            print_report_header(&config.label);
+            print_report(&rank_results);
+            rows.push(SweepRow {
+                label: config.label.clone(),
+                max_rank_split: max_rank_split_stats(&rank_results),
+            });
+            println!();
+        }
+        print_sweep_summary(&rows);
+    } else {
+        let config = BenchConfig {
+            label: format!(
+                "e={}/k={}/h={}",
+                args.n_experts, args.topk, args.hidden_dim
+            ),
+            shape: EpModelShape {
+                n_routed_experts: args.n_experts,
+                n_activated_experts: args.topk,
+                hidden_dim: args.hidden_dim,
+            },
+            world_size: args.world_size,
+            max_num_tokens: args.max_num_tokens,
+            max_private_tokens: args.max_private_tokens,
+            expert_padding: args.expert_padding,
+            nets_per_gpu: args.nets_per_gpu,
+            warmup: args.warmup,
+            repeats: args.repeats,
+        };
+        let rank_results = run_config(&config)?;
+        print_report(&rank_results);
+    }
+    Ok(())
+}
+
+fn run_config(config: &BenchConfig) -> Result<Vec<Vec<IterTimes>>> {
+    let devices: Vec<usize> = (0..config.world_size).collect();
     let params = PplxBootstrapParams {
-        max_num_tokens: args.max_num_tokens,
-        expert_padding: args.expert_padding,
-        max_private_tokens: Some(args.max_private_tokens),
-        nets_per_gpu: args.nets_per_gpu,
+        max_num_tokens: config.max_num_tokens,
+        expert_padding: config.expert_padding,
+        max_private_tokens: Some(config.max_private_tokens),
+        nets_per_gpu: config.nets_per_gpu,
         imm_base: 0x8a2a_0000,
     };
 
     eprintln!(
-        "building pplx EP backends: world={} max_tokens={} max_private={} padding={} \
-         hidden={} topk={} n_experts={}",
-        args.world_size,
-        args.max_num_tokens,
-        args.max_private_tokens,
-        args.expert_padding,
-        args.hidden_dim,
-        args.topk,
-        args.n_experts,
+        "[{}] bootstrap: world={} max_tokens={} experts={} topk={} hidden={}",
+        config.label,
+        config.world_size,
+        config.max_num_tokens,
+        config.shape.n_routed_experts,
+        config.shape.n_activated_experts,
+        config.shape.hidden_dim,
     );
     let (backends, _resources) =
-        build_intra_node_backends_for_devices(shape, &devices, params)?;
+        build_intra_node_backends_for_devices(config.shape, &devices, params)?;
 
-    let barrier = Arc::new(Barrier::new(args.world_size));
-    let mut rank_results: Vec<Vec<IterTimes>> = Vec::with_capacity(args.world_size);
+    let barrier = Arc::new(Barrier::new(config.world_size));
+    let mut rank_results: Vec<Vec<IterTimes>> = Vec::with_capacity(config.world_size);
     thread::scope(|scope| -> Result<()> {
-        let mut handles = Vec::with_capacity(args.world_size);
+        let mut handles = Vec::with_capacity(config.world_size);
         for (rank, backend) in backends.into_iter().enumerate() {
             let barrier = Arc::clone(&barrier);
-            let args = &args;
+            let config = config;
             handles.push(scope.spawn(move || {
-                run_rank(rank, backend, args, barrier)
+                run_rank(rank, backend, config, barrier)
                     .with_context(|| format!("rank {rank}"))
             }));
         }
@@ -136,34 +220,39 @@ fn main() -> Result<()> {
         Ok(())
     })?;
 
-    print_report(&rank_results);
-    Ok(())
+    Ok(rank_results)
 }
 
 fn run_rank(
     rank: usize,
     mut backend: pegainfer_comm::EpBackend,
-    args: &Args,
+    config: &BenchConfig,
     barrier: Arc<Barrier>,
 ) -> Result<Vec<IterTimes>> {
     let gpu = GpuContext::new(rank)?;
 
-    let hidden = args.hidden_dim;
-    let topk = args.topk;
-    let local_experts = args.n_experts / args.world_size;
+    let hidden = config.shape.hidden_dim;
+    let topk = config.shape.n_activated_experts;
+    let local_experts = config.shape.n_routed_experts / config.world_size;
     let max_recv_tokens = compute_max_recv_tokens(
-        args.max_num_tokens,
+        config.max_num_tokens,
         topk,
         local_experts,
-        args.world_size,
-        args.max_private_tokens,
-        args.expert_padding,
+        config.world_size,
+        config.max_private_tokens,
+        config.expert_padding,
     );
 
-    let x_host = vec![bf16::from_f32((rank + 1) as f32); args.max_num_tokens * hidden];
-    let indices_host =
-        route_indices(rank, args.world_size, args.max_num_tokens, topk, local_experts);
-    let weights_host = vec![1.0f32 / topk as f32; args.max_num_tokens * topk];
+    let x_host =
+        vec![bf16::from_f32((rank + 1) as f32); config.max_num_tokens * hidden];
+    let indices_host = route_indices(
+        rank,
+        config.world_size,
+        config.max_num_tokens,
+        topk,
+        local_experts,
+    );
+    let weights_host = vec![1.0f32 / topk as f32; config.max_num_tokens * topk];
 
     let x = gpu.stream.clone_htod(&x_host)?;
     let indices = gpu.stream.clone_htod(&indices_host)?;
@@ -172,20 +261,20 @@ fn run_rank(
     let mut out_x = gpu.stream.alloc_zeros::<bf16>(max_recv_tokens * hidden)?;
     let expert_y = gpu.stream.alloc_zeros::<bf16>(max_recv_tokens * hidden)?;
     let mut out_tokens =
-        gpu.stream.alloc_zeros::<bf16>(args.max_num_tokens * hidden)?;
+        gpu.stream.alloc_zeros::<bf16>(config.max_num_tokens * hidden)?;
     gpu.sync()?;
 
-    let total_iters = args.warmup + args.repeats;
-    let mut measured = Vec::with_capacity(args.repeats);
+    let total_iters = config.warmup + config.repeats;
+    let mut measured = Vec::with_capacity(config.repeats);
     barrier.wait();
     for iter in 0..total_iters {
-        let record = iter >= args.warmup;
+        let record = iter >= config.warmup;
         let mut times = IterTimes::default();
 
         times.dispatch_send_us = time_stage(&gpu, record, || {
             dispatch_send(
                 &mut backend,
-                args.max_num_tokens,
+                config.max_num_tokens,
                 hidden,
                 topk,
                 &x,
@@ -209,7 +298,7 @@ fn run_rank(
         times.combine_recv_us = time_stage(&gpu, record, || {
             combine_recv(
                 &mut backend,
-                args.max_num_tokens,
+                config.max_num_tokens,
                 hidden,
                 topk,
                 &mut out_tokens,
@@ -396,6 +485,23 @@ fn round_up(value: usize, multiple: usize) -> usize {
     value.div_ceil(multiple) * multiple
 }
 
+fn max_rank_split_stats(rank_results: &[Vec<IterTimes>]) -> Stats {
+    let repeats = rank_results.first().map_or(0, Vec::len);
+    let mut max_split_by_iter = Vec::with_capacity(repeats);
+    for iter in 0..repeats {
+        let max_us = rank_results
+            .iter()
+            .map(|rank| rank[iter].split_sum_us())
+            .fold(0.0, f64::max);
+        max_split_by_iter.push(max_us);
+    }
+    stats(&max_split_by_iter)
+}
+
+fn print_report_header(label: &str) {
+    println!("--- {label} ---");
+}
+
 fn print_report(rank_results: &[Vec<IterTimes>]) {
     let mut dispatch_send = Vec::new();
     let mut dispatch_recv = Vec::new();
@@ -412,24 +518,36 @@ fn print_report(rank_results: &[Vec<IterTimes>]) {
         }
     }
 
-    println!("flattened rank-iteration distribution:");
     print_stats("dispatch_send_us", &dispatch_send);
     print_stats("dispatch_recv_us", &dispatch_recv);
     print_stats("combine_send_us", &combine_send);
     print_stats("combine_recv_us", &combine_recv);
     print_stats("split_sum_us", &split_sum);
 
-    let repeats = rank_results.first().map_or(0, Vec::len);
-    let mut max_split_by_iter = Vec::with_capacity(repeats);
-    for iter in 0..repeats {
-        let max_us = rank_results
-            .iter()
-            .map(|rank| rank[iter].split_sum_us())
-            .fold(0.0, f64::max);
-        max_split_by_iter.push(max_us);
+    let s = max_rank_split_stats(rank_results);
+    println!(
+        "max_rank_split_us: mean={:.1} p50={:.1} p95={:.1} p99={:.1} max={:.1}",
+        s.mean, s.p50, s.p95, s.p99, s.max
+    );
+}
+
+fn print_sweep_summary(rows: &[SweepRow]) {
+    println!("=== sweep summary (max_rank_split_sum_us) ===");
+    println!(
+        "{:<20} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "config", "mean", "p50", "p95", "p99", "max"
+    );
+    for row in rows {
+        println!(
+            "{:<20} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+            row.label,
+            row.max_rank_split.mean,
+            row.max_rank_split.p50,
+            row.max_rank_split.p95,
+            row.max_rank_split.p99,
+            row.max_rank_split.max,
+        );
     }
-    println!("per-iteration max across ranks:");
-    print_stats("max_rank_split_sum_us", &max_split_by_iter);
 }
 
 fn print_stats(name: &str, values: &[f64]) {
