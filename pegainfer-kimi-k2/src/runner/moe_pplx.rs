@@ -9,8 +9,8 @@
 //!
 //! PPLX `dispatch_recv` writes tokens in expert-major padded layout, where
 //! each expert occupies `ceil(count, expert_padding)` rows.  Because
-//! `expert_padding` (16) is a multiple of the Marlin `block_size` (8), the
-//! Marlin GEMM kernel can read/write the PPLX buffer directly using identity
+//! `expert_padding` (8) equals the Marlin `block_size` (8), the Marlin GEMM
+//! kernel can read/write the PPLX buffer directly using identity
 //! `sorted_token_ids`.  No gather/scatter copies are needed.
 //!
 //! # Router scale
@@ -46,7 +46,7 @@ use crate::{
 
 use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch};
 
-pub(super) const PPLX_EXPERT_PADDING: usize = 16;
+pub(super) const PPLX_EXPERT_PADDING: usize = 8;
 
 pub(super) struct KimiMoePplxScratch {
     pub(super) expert_padding: usize,

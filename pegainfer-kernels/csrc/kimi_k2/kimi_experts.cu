@@ -634,36 +634,49 @@ __global__ void kimi_pplx_build_marlin_routing_kernel(
     int block_size,
     int max_padded_tokens,
     int max_m_blocks) {
-  int total = 0;
-  for (int e = 0; e < num_local_experts; e++) {
-    int c = recv_tokens_per_expert[e];
-    if (c < 0) c = 0;
-    int padded = ((c + expert_padding - 1) / expert_padding) * expert_padding;
-    total += padded;
+  __shared__ int offsets[65];
+
+  int tid = threadIdx.x;
+
+  int padded = 0;
+  int count = 0;
+  if (tid < num_local_experts) {
+    count = recv_tokens_per_expert[tid];
+    if (count < 0) count = 0;
+    padded = ((count + expert_padding - 1) / expert_padding) * expert_padding;
   }
+  offsets[tid + 1] = padded;
+  if (tid == 0) offsets[0] = 0;
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int i = 1; i <= num_local_experts; i++)
+      offsets[i] += offsets[i - 1];
+  }
+  __syncthreads();
+
+  int total = offsets[num_local_experts];
   int sentinel = max_padded_tokens;
-  int cursor = 0;
-  for (int e = 0; e < num_local_experts; e++) {
-    int c = recv_tokens_per_expert[e];
-    if (c < 0) c = 0;
-    int padded = ((c + expert_padding - 1) / expert_padding) * expert_padding;
+
+  if (tid < num_local_experts) {
+    int cursor = offsets[tid];
     for (int j = 0; j < padded; j++) {
       int idx = cursor + j;
-      if (idx < max_padded_tokens) {
-        sorted_token_ids[idx] = (j < c) ? idx : sentinel;
-      }
+      if (idx < max_padded_tokens)
+        sorted_token_ids[idx] = (j < count) ? idx : sentinel;
     }
     int block_start = cursor / block_size;
     int block_end = (cursor + padded) / block_size;
-    for (int b = block_start; b < block_end && b < max_m_blocks; b++) {
-      expert_ids[b] = e;
-    }
-    cursor += padded;
+    for (int b = block_start; b < block_end && b < max_m_blocks; b++)
+      expert_ids[b] = tid;
   }
-  for (int j = cursor; j < max_padded_tokens; j++) {
-    sorted_token_ids[j] = sentinel;
+
+  __syncthreads();
+  if (tid == 0) {
+    for (int j = total; j < max_padded_tokens; j++)
+      sorted_token_ids[j] = sentinel;
+    num_tokens_post_padded[0] = total;
   }
-  num_tokens_post_padded[0] = total;
 }
 
 CUresult kimi_pplx_build_marlin_routing_on_stream(
@@ -677,7 +690,7 @@ CUresult kimi_pplx_build_marlin_routing_on_stream(
     int max_padded_tokens,
     int max_m_blocks,
     cudaStream_t stream) {
-  kimi_pplx_build_marlin_routing_kernel<<<1, 1, 0, stream>>>(
+  kimi_pplx_build_marlin_routing_kernel<<<1, 64, 0, stream>>>(
       recv_tokens_per_expert,
       sorted_token_ids,
       expert_ids,
