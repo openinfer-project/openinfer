@@ -15,7 +15,7 @@ members = [
     "pegainfer-kimi-k2",
     "pegainfer-qwen3-4b",
     "pegainfer-qwen35-4b",
-    # ---- pegainfer-comm (EP all-to-all skeleton, hardware-free default) ----
+    # ---- pegainfer-comm (EP all-to-all) ----
     "pegainfer-comm",
     "pegainfer-comm/crates/pegainfer-comm-build-utils",
     "pegainfer-comm/crates/pegainfer-comm-cuda-sys",

@@ -1,4 +1,4 @@
-//! NVLink + RDMA EP all-to-all backend (only under the `hw-rdma` feature).
+//! NVLink + RDMA EP all-to-all backend.
 //!
 //! Thin wrapper around `p2p_all_to_all::AllToAllContext`. The four hot-path
 //! methods mirror the upstream four-step pipeline so callers can run

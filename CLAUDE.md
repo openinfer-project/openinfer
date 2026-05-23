@@ -78,7 +78,7 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 - **Per-model crates** — each model owns config, weights, prefill/decode execution, scheduler, tests, and benches.
 - **`pegainfer-core::ops`** — shared GPU operator wrappers used by model crates.
 - **`pegainfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `deepseek_v4`).
-- **`pegainfer-comm`** — EP all-to-all communication (GDR, NCCL, IB verbs). Hardware-free by default; the only crate tested in CI.
+- **`pegainfer-comm`** — EP all-to-all communication (GDR, NCCL, IB verbs). Requires CUDA + RDMA hardware to compile.
 - **CUDA Graph** — decode path captured inside model executors with pre-allocated buffers to preserve pointer stability.
 - **KV state** — model schedulers own request state; shared paged-KV primitives live in `pegainfer-core`.
 

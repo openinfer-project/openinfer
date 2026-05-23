@@ -2,30 +2,11 @@
 name = "pegainfer-comm"
 edition = "2024"
 publish = false
-description = "PegaInfer comm-backend public surface (EP all-to-all first; future data-movement surfaces later). Default-feature surface is hardware-free; hardware backends live behind feature gates."
-
-[features]
-# Default-feature surface is pure Rust: error type + diagnostic marker. NO
-# dependency on any wrapper crate type, no CUDA / Verbs / GDRCopy probing.
-default = []
-# Hardware backend activator. Pulls in the upstream-derived EP all-to-all
-# implementation (which itself transitively activates CUDA subsystems and
-# fabric-lib). Compiling with this feature requires the matching CUDA,
-# RDMA Verbs, and GDRCopy development / runtime components on the host.
-hw-rdma = [
-    "dep:p2p-all-to-all",
-    "dep:fabric-lib",
-    "dep:cuda-lib",
-    "dep:anyhow",
-    "p2p-all-to-all/hw-rdma",
-    "fabric-lib/hw-rdma",
-    "cuda-lib/hw-cuda",
-]
+description = "PegaInfer comm-backend public surface (EP all-to-all first; future data-movement surfaces later). Requires CUDA, RDMA Verbs, and GDRCopy on the host."
 
 [dependencies]
 thiserror = { workspace = true }
-# Hardware-only dependencies. Default-feature builds MUST NOT link these.
-p2p-all-to-all = { path = "crates/pegainfer-comm-p2p-all-to-all", package = "pegainfer-comm-p2p-all-to-all", optional = true }
-fabric-lib = { path = "crates/pegainfer-comm-fabric-lib", package = "pegainfer-comm-fabric-lib", optional = true }
-cuda-lib = { path = "crates/pegainfer-comm-cuda-lib", package = "pegainfer-comm-cuda-lib", optional = true }
-anyhow = { workspace = true, optional = true }
+anyhow = { workspace = true }
+p2p-all-to-all = { path = "crates/pegainfer-comm-p2p-all-to-all", package = "pegainfer-comm-p2p-all-to-all", features = ["hw-rdma"] }
+fabric-lib = { path = "crates/pegainfer-comm-fabric-lib", package = "pegainfer-comm-fabric-lib", features = ["hw-rdma"] }
+cuda-lib = { path = "crates/pegainfer-comm-cuda-lib", package = "pegainfer-comm-cuda-lib", features = ["hw-cuda"] }

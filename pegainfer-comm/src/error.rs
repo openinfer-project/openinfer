@@ -30,7 +30,6 @@ pub enum Error {
 impl Error {
     /// Wrap an `anyhow::Error` (the wrapper crates' error type) as
     /// [`Error::Backend`].
-    #[cfg(feature = "hw-rdma")]
     pub(crate) fn from_anyhow(err: anyhow::Error) -> Self {
         Self::Backend { source: err.into() }
     }

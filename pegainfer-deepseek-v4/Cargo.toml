@@ -14,14 +14,12 @@ deepseek-v4-cutedsl-diagnostic = [
     "pegainfer-kernels/deepseek-v4-cutedsl-diagnostic",
 ]
 # Activate the pplx-garden NVLink + RDMA all-to-all backend for decode MoE.
-# Pulls in `pegainfer-comm` with its hardware features and exposes
-# `runtime::moe_pplx` for the rank-worker MoE call site. Compiling with this
-# feature requires CUDA, RDMA Verbs, and GDRCopy on the host; default builds
-# are unaffected.
+# Pulls in `pegainfer-comm` and exposes `runtime::moe_pplx` for the
+# rank-worker MoE call site. Compiling with this feature requires CUDA,
+# RDMA Verbs, and GDRCopy on the host.
 pplx-ep = [
     "deepseek-v4",
     "dep:pegainfer-comm",
-    "pegainfer-comm/hw-rdma",
 ]
 pplx-ep-bench = ["pplx-ep"]
 
