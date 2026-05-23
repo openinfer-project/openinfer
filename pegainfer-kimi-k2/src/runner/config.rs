@@ -17,5 +17,7 @@ pub struct KimiK2RunnerConfig {
     pub rank_sliced_load_plans: Vec<KimiRankSlicedLoadPlan>,
     pub placements: Vec<KimiK2RankPlacement>,
     pub(crate) thread_placement: KimiRankThreadPlacementPlan,
+    #[cfg(feature = "pplx-ep")]
+    pub(crate) pplx_thread_placement: pegainfer_core::cpu_topology::RankThreadPlacementPlan,
     pub enable_cuda_graph: bool,
 }

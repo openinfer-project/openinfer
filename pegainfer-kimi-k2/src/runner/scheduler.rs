@@ -49,6 +49,10 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     let rank_sliced_load_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_sliced_load_plan(rank))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(feature = "pplx-ep")]
+    let pplx_thread_placement = pegainfer_core::cpu_topology::RankThreadPlacementPlan::for_devices(
+        &options.device_ordinals,
+    )?;
     let runtime_config = KimiK2RunnerConfig {
         model_path: model_path.to_path_buf(),
         weight_manifest,
@@ -58,6 +62,8 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         rank_sliced_load_plans,
         placements,
         thread_placement,
+        #[cfg(feature = "pplx-ep")]
+        pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
     };
 
@@ -416,9 +422,10 @@ impl KimiK2Runtime {
                 hidden_dim: crate::config::KIMI_K2_HIDDEN,
             };
             let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
-            match pegainfer_comm::bootstrap::build_intra_node_backends_for_devices(
+            match pegainfer_comm::bootstrap::build_intra_node_backends(
                 ep_shape,
                 &devices,
+                &config.pplx_thread_placement,
                 pegainfer_comm::bootstrap::PplxBootstrapParams::default(),
             ) {
                 Ok((backends, resources)) => {
