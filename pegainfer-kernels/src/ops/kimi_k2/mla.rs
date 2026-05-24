@@ -3,7 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::{
     ffi,
-    tensor::{DeviceContext, DeviceMatrix, HiddenStates},
+    tensor::{DeviceContext, GpuTensor, GpuWeight},
 };
 
 pub const KIMI_K2_MLA_LOCAL_HEADS_TP8: usize = 8;
@@ -135,42 +135,21 @@ fn validate_paged_layout(
 
 pub fn kimi_mla_split_qkv_a(
     ctx: &DeviceContext,
-    qkv_a: &HiddenStates,
-    q_a: &mut HiddenStates,
-    compressed: &mut HiddenStates,
-    k_rope: &mut HiddenStates,
+    qkv_a: &GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
+    q_a: &mut GpuTensor<KIMI_K2_MLA_Q_LORA_RANK>,
+    compressed: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    k_rope: &mut GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
 ) -> Result<()> {
     ensure!(
-        qkv_a.hidden_dim == KIMI_K2_MLA_QKV_A_OUT,
-        "Kimi MLA qkv_a hidden dim must be {}, got {}",
-        KIMI_K2_MLA_QKV_A_OUT,
-        qkv_a.hidden_dim
-    );
-    ensure!(
-        q_a.hidden_dim == KIMI_K2_MLA_Q_LORA_RANK && q_a.seq_len == qkv_a.seq_len,
-        "Kimi MLA q_a split shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_a.hidden_dim,
+        q_a.seq_len == qkv_a.seq_len
+            && compressed.seq_len == qkv_a.seq_len
+            && k_rope.seq_len == qkv_a.seq_len,
+        "Kimi MLA split seq_len mismatch: qkv_a={}, q_a={}, compressed={}, k_rope={}",
+        qkv_a.seq_len,
         q_a.seq_len,
-        KIMI_K2_MLA_Q_LORA_RANK,
-        qkv_a.seq_len
-    );
-    ensure!(
-        compressed.hidden_dim == KIMI_K2_MLA_KV_LORA_RANK && compressed.seq_len == qkv_a.seq_len,
-        "Kimi MLA compressed split shape mismatch: got [{}, {}], expected [{}, {}]",
-        compressed.hidden_dim,
         compressed.seq_len,
-        KIMI_K2_MLA_KV_LORA_RANK,
-        qkv_a.seq_len
+        k_rope.seq_len
     );
-    ensure!(
-        k_rope.hidden_dim == KIMI_K2_MLA_ROPE_DIM && k_rope.seq_len == qkv_a.seq_len,
-        "Kimi MLA k_rope split shape mismatch: got [{}, {}], expected [{}, {}]",
-        k_rope.hidden_dim,
-        k_rope.seq_len,
-        KIMI_K2_MLA_ROPE_DIM,
-        qkv_a.seq_len
-    );
-
     let (qkv_a_ptr, _qkv_a_guard) = qkv_a.data.device_ptr(&ctx.stream);
     let (q_a_ptr, _q_a_guard) = q_a.data.device_ptr_mut(&ctx.stream);
     let (compressed_ptr, _compressed_guard) = compressed.data.device_ptr_mut(&ctx.stream);
@@ -191,45 +170,26 @@ pub fn kimi_mla_split_qkv_a(
 
 pub fn kimi_mla_rope_assemble_prefill(
     ctx: &DeviceContext,
-    q_proj: &HiddenStates,
-    k_rope: &HiddenStates,
-    kv_b: &HiddenStates,
+    q_proj: &GpuTensor<KIMI_K2_MLA_Q_LOCAL_OUT_TP8>,
+    k_rope: &GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
+    kv_b: &GpuTensor<KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8>,
     cos: &CudaSlice<half::bf16>,
     sin: &CudaSlice<half::bf16>,
-    q_attn: &mut HiddenStates,
+    q_attn: &mut GpuTensor<KIMI_K2_MLA_Q_LOCAL_OUT_TP8>,
     k_cache: &mut CudaSlice<half::bf16>,
     v_cache: &mut CudaSlice<half::bf16>,
 ) -> Result<()> {
     let seq_len = q_proj.seq_len;
     ensure!(seq_len > 0, "Kimi MLA seq_len must be positive");
     ensure!(
-        q_proj.hidden_dim == KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        "Kimi MLA q local hidden dim must be {}, got {}",
-        KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        q_proj.hidden_dim
-    );
-    ensure!(
-        q_attn.hidden_dim == q_proj.hidden_dim && q_attn.seq_len == seq_len,
-        "Kimi MLA q_attn shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_attn.hidden_dim,
-        q_attn.seq_len,
-        q_proj.hidden_dim,
-        seq_len
-    );
-    ensure!(
-        k_rope.hidden_dim == KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM
-            && k_rope.seq_len == seq_len,
-        "Kimi MLA k_rope shape mismatch"
-    );
-    ensure!(
-        kv_b.hidden_dim == KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8 && kv_b.seq_len == seq_len,
-        "Kimi MLA kv_b shape mismatch: got [{}, {}], expected [{}, {}]",
-        kv_b.hidden_dim,
+        k_rope.seq_len == seq_len && kv_b.seq_len == seq_len && q_attn.seq_len == seq_len,
+        "Kimi MLA prefill assemble seq_len mismatch: q_proj={}, k_rope={}, kv_b={}, q_attn={}",
+        q_proj.seq_len,
+        k_rope.seq_len,
         kv_b.seq_len,
-        KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
-        seq_len
+        q_attn.seq_len
     );
-    let rope_elems = seq_len * (KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM);
+    let rope_elems = seq_len * KIMI_K2_MLA_ROPE_DIM;
     ensure!(
         cos.len() >= rope_elems && sin.len() >= rope_elems,
         "Kimi MLA RoPE cache too small: cos={}, sin={}, need {}",
@@ -273,68 +233,46 @@ pub fn kimi_mla_rope_assemble_prefill(
     Ok(())
 }
 
+pub const KIMI_K2_MLA_Q_NOPE_LOCAL_OUT_TP8: usize =
+    KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_NOPE_DIM;
+
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_mla_rope_split_decode(
     ctx: &DeviceContext,
-    q_proj: &HiddenStates,
-    k_rope: &HiddenStates,
+    q_proj: &GpuTensor<KIMI_K2_MLA_Q_LOCAL_OUT_TP8>,
+    k_rope: &GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
     cos: &CudaSlice<half::bf16>,
     sin: &CudaSlice<half::bf16>,
     positions_d: &CudaSlice<i32>,
-    q_nope: &mut HiddenStates,
-    q_pe: &mut HiddenStates,
-    append_kpe: &mut HiddenStates,
+    q_nope: &mut GpuTensor<KIMI_K2_MLA_Q_NOPE_LOCAL_OUT_TP8>,
+    q_pe: &mut GpuTensor<KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8>,
+    append_kpe: &mut GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
 ) -> Result<()> {
     let batch_size = q_proj.seq_len;
-    ensure!(batch_size > 0, "Kimi MLA decode batch must be positive");
     ensure!(
-        q_proj.hidden_dim == KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        "Kimi MLA q_proj hidden dim must be {}, got {}",
-        KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        q_proj.hidden_dim
-    );
-    ensure!(
-        k_rope.hidden_dim == KIMI_K2_MLA_ROPE_DIM && k_rope.seq_len == batch_size,
-        "Kimi MLA decode k_rope shape mismatch: got [{}, {}], expected [{}, {}]",
-        k_rope.hidden_dim,
+        k_rope.seq_len == batch_size
+            && q_nope.seq_len == batch_size
+            && q_pe.seq_len == batch_size
+            && append_kpe.seq_len == batch_size,
+        "Kimi MLA decode RoPE split seq_len mismatch: q_proj={}, k_rope={}, q_nope={}, q_pe={}, append_kpe={}",
+        q_proj.seq_len,
         k_rope.seq_len,
-        KIMI_K2_MLA_ROPE_DIM,
-        batch_size
-    );
-    ensure!(
-        q_nope.hidden_dim == KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_NOPE_DIM
-            && q_nope.seq_len == batch_size,
-        "Kimi MLA q_nope shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_nope.hidden_dim,
         q_nope.seq_len,
-        KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_NOPE_DIM,
-        batch_size
-    );
-    ensure!(
-        q_pe.hidden_dim == KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8 && q_pe.seq_len == batch_size,
-        "Kimi MLA q_pe shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_pe.hidden_dim,
         q_pe.seq_len,
-        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8,
-        batch_size
+        append_kpe.seq_len
     );
     ensure!(
-        append_kpe.hidden_dim == KIMI_K2_MLA_ROPE_DIM && append_kpe.seq_len == batch_size,
-        "Kimi MLA append_kpe shape mismatch: got [{}, {}], expected [{}, {}]",
-        append_kpe.hidden_dim,
-        append_kpe.seq_len,
-        KIMI_K2_MLA_ROPE_DIM,
-        batch_size
+        cos.len() >= KIMI_K2_MLA_ROPE_DIM && sin.len() >= KIMI_K2_MLA_ROPE_DIM,
+        "Kimi MLA decode RoPE cache too small: cos={}, sin={}, need at least {}",
+        cos.len(),
+        sin.len(),
+        KIMI_K2_MLA_ROPE_DIM
     );
     ensure!(
         positions_d.len() >= batch_size,
-        "Kimi MLA positions too small: got {}, need {}",
+        "Kimi MLA decode positions too small: got {}, need {}",
         positions_d.len(),
         batch_size
-    );
-    ensure!(
-        cos.len() > 0 && cos.len() == sin.len(),
-        "Kimi MLA RoPE cos/sin cache must be non-empty and same length"
     );
 
     let (q_proj_ptr, _q_proj_guard) = q_proj.data.device_ptr(&ctx.stream);
@@ -367,40 +305,31 @@ pub fn kimi_mla_rope_split_decode(
 
 pub fn kimi_mla_rope_apply_kpe(
     ctx: &DeviceContext,
-    k_rope: &HiddenStates,
+    k_rope: &GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
     cos: &CudaSlice<half::bf16>,
     sin: &CudaSlice<half::bf16>,
     positions_d: &CudaSlice<i32>,
-    append_kpe: &mut HiddenStates,
+    append_kpe: &mut GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
 ) -> Result<()> {
     let seq_len = k_rope.seq_len;
-    ensure!(seq_len > 0, "Kimi MLA prefill KPE seq_len must be positive");
     ensure!(
-        k_rope.hidden_dim == KIMI_K2_MLA_ROPE_DIM,
-        "Kimi MLA prefill k_rope hidden dim must be {}, got {}",
-        KIMI_K2_MLA_ROPE_DIM,
-        k_rope.hidden_dim
+        append_kpe.seq_len == seq_len,
+        "Kimi MLA apply KPE seq_len mismatch: k_rope={}, append_kpe={}",
+        k_rope.seq_len,
+        append_kpe.seq_len
     );
     ensure!(
-        append_kpe.hidden_dim == KIMI_K2_MLA_ROPE_DIM && append_kpe.seq_len == seq_len,
-        "Kimi MLA prefill append_kpe shape mismatch: got [{}, {}], expected [{}, {}]",
-        append_kpe.hidden_dim,
-        append_kpe.seq_len,
-        KIMI_K2_MLA_ROPE_DIM,
-        seq_len
-    );
-    ensure!(
-        positions_d.len() >= seq_len,
-        "Kimi MLA prefill positions too small: got {}, need {}",
-        positions_d.len(),
-        seq_len
-    );
-    ensure!(
-        cos.len() >= seq_len * KIMI_K2_MLA_ROPE_DIM && cos.len() == sin.len(),
-        "Kimi MLA prefill RoPE cache too small: cos={}, sin={}, need {}",
+        cos.len() >= seq_len * KIMI_K2_MLA_ROPE_DIM && sin.len() >= seq_len * KIMI_K2_MLA_ROPE_DIM,
+        "Kimi MLA apply KPE RoPE cache too small: cos={}, sin={}, need {}",
         cos.len(),
         sin.len(),
         seq_len * KIMI_K2_MLA_ROPE_DIM
+    );
+    ensure!(
+        positions_d.len() >= seq_len,
+        "Kimi MLA apply KPE positions too small: got {}, need {}",
+        positions_d.len(),
+        seq_len
     );
 
     let (k_rope_ptr, _k_rope_guard) = k_rope.data.device_ptr(&ctx.stream);
@@ -426,34 +355,26 @@ pub fn kimi_mla_rope_apply_kpe(
 
 pub fn kimi_flashinfer_single_prefill_mla(
     ctx: &DeviceContext,
-    q_attn: &HiddenStates,
+    q_attn: &GpuTensor<KIMI_K2_MLA_Q_LOCAL_OUT_TP8>,
     k_cache: &CudaSlice<half::bf16>,
     v_cache: &CudaSlice<half::bf16>,
-    output: &mut HiddenStates,
+    output: &mut GpuTensor<KIMI_K2_MLA_O_LOCAL_IN_TP8>,
     sm_scale: f32,
 ) -> Result<()> {
     let seq_len = q_attn.seq_len;
     ensure!(
-        q_attn.hidden_dim == KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        "Kimi MLA q_attn hidden dim must be {}, got {}",
-        KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        q_attn.hidden_dim
-    );
-    ensure!(
-        output.hidden_dim == KIMI_K2_MLA_O_LOCAL_IN_TP8 && output.seq_len == seq_len,
-        "Kimi MLA output shape mismatch: got [{}, {}], expected [{}, {}]",
-        output.hidden_dim,
-        output.seq_len,
-        KIMI_K2_MLA_O_LOCAL_IN_TP8,
-        seq_len
+        output.seq_len == seq_len,
+        "Kimi MLA single prefill output seq_len mismatch: q_attn={}, output={}",
+        q_attn.seq_len,
+        output.seq_len
     );
     ensure!(
         k_cache.len() >= seq_len * KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_Q_HEAD_DIM,
-        "Kimi MLA k_cache too small"
+        "Kimi MLA single prefill k_cache too small"
     );
     ensure!(
         v_cache.len() >= seq_len * KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_V_HEAD_DIM,
-        "Kimi MLA v_cache too small"
+        "Kimi MLA single prefill v_cache too small"
     );
 
     let (q_ptr, _q_guard) = q_attn.data.device_ptr(&ctx.stream);
@@ -480,36 +401,16 @@ pub fn kimi_flashinfer_single_prefill_mla(
 
 pub fn kimi_mla_absorb_q_nope(
     ctx: &DeviceContext,
-    kv_b_proj: &DeviceMatrix,
-    q_nope: &HiddenStates,
-    q_abs_nope: &mut HiddenStates,
+    kv_b_proj: &GpuWeight<KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_LORA_RANK>,
+    q_nope: &GpuTensor<KIMI_K2_MLA_Q_NOPE_LOCAL_OUT_TP8>,
+    q_abs_nope: &mut GpuTensor<KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8>,
 ) -> Result<()> {
     ensure!(
-        kv_b_proj.rows == KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8
-            && kv_b_proj.cols == KIMI_K2_MLA_KV_LORA_RANK,
-        "Kimi MLA kv_b_proj shape mismatch: got [{}, {}], expected [{}, {}]",
-        kv_b_proj.rows,
-        kv_b_proj.cols,
-        KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_KV_LORA_RANK
+        q_abs_nope.seq_len == q_nope.seq_len,
+        "Kimi MLA absorb q seq_len mismatch: q_nope={}, q_abs_nope={}",
+        q_nope.seq_len,
+        q_abs_nope.seq_len
     );
-    ensure!(q_nope.seq_len > 0, "Kimi MLA q_nope batch must be positive");
-    ensure!(
-        q_nope.hidden_dim == KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_NOPE_DIM,
-        "Kimi MLA q_nope hidden dim must be {}, got {}",
-        KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_NOPE_DIM,
-        q_nope.hidden_dim
-    );
-    ensure!(
-        q_abs_nope.hidden_dim == KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8
-            && q_abs_nope.seq_len == q_nope.seq_len,
-        "Kimi MLA q_abs_nope shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_abs_nope.hidden_dim,
-        q_abs_nope.seq_len,
-        KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8,
-        q_nope.seq_len
-    );
-
     let (weight_ptr, _weight_guard) = kv_b_proj.data.device_ptr(&ctx.stream);
     let (q_ptr, _q_guard) = q_nope.data.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = q_abs_nope.data.device_ptr_mut(&ctx.stream);
@@ -530,35 +431,16 @@ pub fn kimi_mla_absorb_q_nope(
 
 pub fn kimi_mla_v_up(
     ctx: &DeviceContext,
-    kv_b_proj: &DeviceMatrix,
-    latent: &HiddenStates,
-    output: &mut HiddenStates,
+    kv_b_proj: &GpuWeight<KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_LORA_RANK>,
+    latent: &GpuTensor<KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8>,
+    output: &mut GpuTensor<KIMI_K2_MLA_O_LOCAL_IN_TP8>,
 ) -> Result<()> {
     ensure!(
-        kv_b_proj.rows == KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8
-            && kv_b_proj.cols == KIMI_K2_MLA_KV_LORA_RANK,
-        "Kimi MLA kv_b_proj shape mismatch: got [{}, {}], expected [{}, {}]",
-        kv_b_proj.rows,
-        kv_b_proj.cols,
-        KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_KV_LORA_RANK
+        output.seq_len == latent.seq_len,
+        "Kimi MLA v_up seq_len mismatch: latent={}, output={}",
+        latent.seq_len,
+        output.seq_len
     );
-    ensure!(latent.seq_len > 0, "Kimi MLA latent batch must be positive");
-    ensure!(
-        latent.hidden_dim == KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8,
-        "Kimi MLA latent hidden dim must be {}, got {}",
-        KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8,
-        latent.hidden_dim
-    );
-    ensure!(
-        output.hidden_dim == KIMI_K2_MLA_O_LOCAL_IN_TP8 && output.seq_len == latent.seq_len,
-        "Kimi MLA v-up output shape mismatch: got [{}, {}], expected [{}, {}]",
-        output.hidden_dim,
-        output.seq_len,
-        KIMI_K2_MLA_O_LOCAL_IN_TP8,
-        latent.seq_len
-    );
-
     let (weight_ptr, _weight_guard) = kv_b_proj.data.device_ptr(&ctx.stream);
     let (latent_ptr, _latent_guard) = latent.data.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = output.data.device_ptr_mut(&ctx.stream);
@@ -586,8 +468,8 @@ pub fn kimi_mla_paged_kv_append(
     page_indices_d: &CudaSlice<i32>,
     page_indptr_d: &CudaSlice<i32>,
     last_page_len_d: &CudaSlice<i32>,
-    append_ckv: &HiddenStates,
-    append_kpe: &HiddenStates,
+    append_ckv: &GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    append_kpe: &GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
     batch_indices_d: &CudaSlice<i32>,
     positions_d: &CudaSlice<i32>,
 ) -> Result<()> {
@@ -605,23 +487,15 @@ pub fn kimi_mla_paged_kv_append(
         layout.required_kpe_len()?
     );
     ensure!(
-        append_ckv.hidden_dim == KIMI_K2_MLA_KV_LORA_RANK,
-        "Kimi MLA append_ckv hidden dim must be {}, got {}",
-        KIMI_K2_MLA_KV_LORA_RANK,
-        append_ckv.hidden_dim
-    );
-    ensure!(
-        append_kpe.hidden_dim == KIMI_K2_MLA_ROPE_DIM && append_kpe.seq_len == append_ckv.seq_len,
-        "Kimi MLA append_kpe shape mismatch: got [{}, {}], expected [{}, {}]",
-        append_kpe.hidden_dim,
-        append_kpe.seq_len,
-        KIMI_K2_MLA_ROPE_DIM,
-        append_ckv.seq_len
-    );
-    ensure!(
         batch_indices_d.len() >= append_ckv.seq_len && positions_d.len() >= append_ckv.seq_len,
         "Kimi MLA append metadata too small for nnz={}",
         append_ckv.seq_len
+    );
+    ensure!(
+        append_kpe.seq_len == append_ckv.seq_len,
+        "Kimi MLA append seq_len mismatch: append_ckv={}, append_kpe={}",
+        append_ckv.seq_len,
+        append_kpe.seq_len
     );
 
     let (ckv_cache_ptr, _ckv_cache_guard) = ckv_cache.device_ptr_mut(&ctx.stream);
@@ -664,9 +538,9 @@ pub fn kimi_mla_paged_kv_append(
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_flashinfer_batch_decode_mla(
     ctx: &DeviceContext,
-    q_abs_nope: &HiddenStates,
-    q_pe: &HiddenStates,
-    output: &mut HiddenStates,
+    q_abs_nope: &GpuTensor<KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8>,
+    q_pe: &GpuTensor<KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8>,
+    output: &mut GpuTensor<KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8>,
     ckv_cache: &CudaSlice<half::bf16>,
     kpe_cache: &CudaSlice<half::bf16>,
     layout: KimiMlaPagedKvLayout,
@@ -692,36 +566,21 @@ pub fn kimi_flashinfer_batch_decode_mla(
         layout.required_kpe_len()?
     );
     ensure!(
-        q_abs_nope.hidden_dim == KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8
-            && q_abs_nope.seq_len == layout.batch_size,
-        "Kimi MLA q_abs_nope shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_abs_nope.hidden_dim,
-        q_abs_nope.seq_len,
-        KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8,
-        layout.batch_size
-    );
-    ensure!(
-        q_pe.hidden_dim == KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8 && q_pe.seq_len == layout.batch_size,
-        "Kimi MLA q_pe shape mismatch: got [{}, {}], expected [{}, {}]",
-        q_pe.hidden_dim,
-        q_pe.seq_len,
-        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8,
-        layout.batch_size
-    );
-    ensure!(
-        output.hidden_dim == KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8 && output.seq_len == layout.batch_size,
-        "Kimi MLA output shape mismatch: got [{}, {}], expected [{}, {}]",
-        output.hidden_dim,
-        output.seq_len,
-        KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8,
-        layout.batch_size
-    );
-    ensure!(
         request_indices_d.len() >= layout.batch_size
             && kv_tile_indices_d.len() >= layout.batch_size
             && kv_chunk_size_d.len() >= layout.batch_size,
         "Kimi MLA decode plan metadata too small for batch_size={}",
         layout.batch_size
+    );
+    ensure!(
+        q_abs_nope.seq_len == layout.batch_size
+            && q_pe.seq_len == layout.batch_size
+            && output.seq_len == layout.batch_size,
+        "Kimi MLA batch decode seq_len must match layout batch_size {}: q_abs_nope={}, q_pe={}, output={}",
+        layout.batch_size,
+        q_abs_nope.seq_len,
+        q_pe.seq_len,
+        output.seq_len
     );
 
     let (q_abs_nope_ptr, _q_abs_nope_guard) = q_abs_nope.data.device_ptr(&ctx.stream);
@@ -828,7 +687,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut append_ckv =
-            HiddenStates::zeros(&ctx, KIMI_K2_MLA_KV_LORA_RANK, nnz).expect("append ckv");
+            GpuTensor::<KIMI_K2_MLA_KV_LORA_RANK>::zeros(&ctx, nnz).expect("append ckv");
         ctx.stream
             .memcpy_htod(&append_ckv_host, &mut append_ckv.data)
             .expect("append ckv H2D");
@@ -839,13 +698,14 @@ mod tests {
                 half::bf16::from_f32(value)
             })
             .collect::<Vec<_>>();
-        let kv_b_proj = DeviceMatrix::from_host(
+        let kv_b_proj = crate::tensor::DeviceMatrix::from_host(
             &ctx,
             &kv_b_proj_host,
             KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
             KIMI_K2_MLA_KV_LORA_RANK,
         )
         .expect("kv_b_proj");
+        let kv_b_proj = GpuWeight::from_device_matrix(kv_b_proj).expect("typed kv_b_proj");
 
         let q_proj_host = (0..batch_size * KIMI_K2_MLA_Q_LOCAL_OUT_TP8)
             .map(|idx| {
@@ -863,9 +723,9 @@ mod tests {
         let cos_host = vec![half::bf16::from_f32(1.0); rope_elems];
         let sin_host = vec![half::bf16::from_f32(0.0); rope_elems];
         let mut q_proj =
-            HiddenStates::zeros(&ctx, KIMI_K2_MLA_Q_LOCAL_OUT_TP8, batch_size).expect("q_proj");
+            GpuTensor::<KIMI_K2_MLA_Q_LOCAL_OUT_TP8>::zeros(&ctx, batch_size).expect("q_proj");
         let mut k_rope =
-            HiddenStates::zeros(&ctx, KIMI_K2_MLA_ROPE_DIM, batch_size).expect("k_rope");
+            GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch_size).expect("k_rope");
         ctx.stream
             .memcpy_htod(&q_proj_host, &mut q_proj.data)
             .expect("q_proj H2D");
@@ -874,10 +734,12 @@ mod tests {
             .expect("k_rope H2D");
         let cos_d = ctx.stream.clone_htod(&cos_host).expect("cos H2D");
         let sin_d = ctx.stream.clone_htod(&sin_host).expect("sin H2D");
-        let mut q_nope = HiddenStates::zeros(&ctx, q_nope_hidden, batch_size).expect("q_nope");
-        let mut q_pe = HiddenStates::zeros(&ctx, q_pe_hidden, batch_size).expect("q_pe");
+        let mut q_nope =
+            GpuTensor::<KIMI_K2_MLA_Q_NOPE_LOCAL_OUT_TP8>::zeros(&ctx, batch_size).expect("q_nope");
+        let mut q_pe =
+            GpuTensor::<KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8>::zeros(&ctx, batch_size).expect("q_pe");
         let mut append_kpe =
-            HiddenStates::zeros(&ctx, KIMI_K2_MLA_ROPE_DIM, batch_size).expect("append kpe");
+            GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch_size).expect("append kpe");
         kimi_mla_rope_split_decode(
             &ctx,
             &q_proj,
@@ -906,7 +768,8 @@ mod tests {
         )
         .expect("MLA paged append");
 
-        let mut q_abs_nope = HiddenStates::zeros(&ctx, q_abs_hidden, batch_size).expect("q_abs");
+        let mut q_abs_nope =
+            GpuTensor::<KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8>::zeros(&ctx, batch_size).expect("q_abs");
         kimi_mla_absorb_q_nope(&ctx, &kv_b_proj, &q_nope, &mut q_abs_nope).expect("q absorption");
 
         let request_indices_d = ctx
@@ -921,7 +784,8 @@ mod tests {
             .stream
             .clone_htod(&[1i32, 2, 3, page_size as i32])
             .expect("kv chunk size");
-        let mut latent = HiddenStates::zeros(&ctx, q_abs_hidden, batch_size).expect("latent");
+        let mut latent =
+            GpuTensor::<KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8>::zeros(&ctx, batch_size).expect("latent");
         let sm_scale = 1.0f32 / ((KIMI_K2_MLA_KV_LORA_RANK + KIMI_K2_MLA_ROPE_DIM) as f32).sqrt();
 
         kimi_flashinfer_batch_decode_mla(
@@ -943,7 +807,7 @@ mod tests {
         .expect("MLA decode");
 
         let mut attn_out =
-            HiddenStates::zeros(&ctx, attn_out_hidden, batch_size).expect("v_up out");
+            GpuTensor::<KIMI_K2_MLA_O_LOCAL_IN_TP8>::zeros(&ctx, batch_size).expect("v_up out");
         kimi_mla_v_up(&ctx, &kv_b_proj, &latent, &mut attn_out).expect("v-up");
 
         let latent_host = ctx.stream.clone_dtoh(&latent.data).expect("latent D2H");

@@ -5,7 +5,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{AxisSpec, DeviceContext, HiddenStates, KernelCall, TensorSpec};
+use crate::tensor::{AxisSpec, DeviceContext, GpuTensor, HiddenStates, KernelCall, TensorSpec};
 
 pub const KIMI_K2_HIDDEN: usize = 7168;
 pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
@@ -15,26 +15,24 @@ pub const KIMI_K2_LOCAL_EXPERTS: usize = KIMI_K2_ROUTED_EXPERTS / KIMI_K2_EP_WOR
 pub const KIMI_K2_TOPK: usize = 8;
 pub const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
 
-pub fn kimi_add_f32_bf16_to_bf16(
+pub fn kimi_add_f32_bf16_to_bf16<const DIM: usize>(
     ctx: &DeviceContext,
     a: &CudaSlice<f32>,
-    b: &HiddenStates,
-    out: &mut HiddenStates,
+    b: &GpuTensor<DIM>,
+    out: &mut GpuTensor<DIM>,
 ) -> Result<()> {
-    let elems = b.hidden_dim * b.seq_len;
+    let elems = DIM * b.seq_len;
+    ensure!(
+        out.seq_len == b.seq_len,
+        "Kimi f32 add seq_len mismatch: b={}, output={}",
+        b.seq_len,
+        out.seq_len
+    );
     ensure!(
         a.len() >= elems,
         "Kimi f32 add input too small: have {}, need {}",
         a.len(),
         elems
-    );
-    ensure!(
-        out.hidden_dim == b.hidden_dim && out.seq_len == b.seq_len,
-        "Kimi f32 add output shape mismatch: out=[{}, {}], b=[{}, {}]",
-        out.hidden_dim,
-        out.seq_len,
-        b.hidden_dim,
-        b.seq_len
     );
 
     let (a_ptr, _a_guard) = a.device_ptr(&ctx.stream);
@@ -53,27 +51,25 @@ pub fn kimi_add_f32_bf16_to_bf16(
     Ok(())
 }
 
-pub fn kimi_scaled_add_f32_bf16_to_bf16(
+pub fn kimi_scaled_add_f32_bf16_to_bf16<const DIM: usize>(
     ctx: &DeviceContext,
     a: &CudaSlice<f32>,
     scale: f32,
-    b: &HiddenStates,
-    out: &mut HiddenStates,
+    b: &GpuTensor<DIM>,
+    out: &mut GpuTensor<DIM>,
 ) -> Result<()> {
-    let elems = b.hidden_dim * b.seq_len;
+    let elems = DIM * b.seq_len;
+    ensure!(
+        out.seq_len == b.seq_len,
+        "Kimi scaled f32 add seq_len mismatch: b={}, output={}",
+        b.seq_len,
+        out.seq_len
+    );
     ensure!(
         a.len() >= elems,
         "Kimi scaled f32 add input too small: have {}, need {}",
         a.len(),
         elems
-    );
-    ensure!(
-        out.hidden_dim == b.hidden_dim && out.seq_len == b.seq_len,
-        "Kimi scaled f32 add output shape mismatch: out=[{}, {}], b=[{}, {}]",
-        out.hidden_dim,
-        out.seq_len,
-        b.hidden_dim,
-        b.seq_len
     );
 
     let (a_ptr, _a_guard) = a.device_ptr(&ctx.stream);
@@ -1334,29 +1330,41 @@ pub fn kimi_marlin_int4_fuse_w13(
     Ok(())
 }
 
-pub fn kimi_marlin_wna16_w13_gemm(
+pub fn kimi_marlin_wna16_w13_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,
-    input: &HiddenStates,
+    input: &GpuTensor<IN>,
     weight: &KimiMarlinFusedW13Int4Weight<'_>,
     topk_weight: &CudaSlice<f32>,
-    output_w13: &mut HiddenStates,
+    output_w13: &mut GpuTensor<OUT>,
 ) -> Result<()> {
     weight.validate()?;
-    workspace.validate_for(routing, 2 * KIMI_K2_EXPERT_INTERMEDIATE)?;
-    validate_hidden_states(
-        "marlin_w13.input",
-        input,
+    workspace.validate_for(routing, OUT)?;
+    ensure!(
+        IN == KIMI_K2_HIDDEN,
+        "marlin_w13 input dim must be {}, got {}",
         KIMI_K2_HIDDEN,
-        routing.active_tokens,
-    )?;
-    validate_hidden_states(
-        "marlin_w13.output",
-        output_w13,
+        IN
+    );
+    ensure!(
+        OUT == 2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        "marlin_w13 output dim must be {}, got {}",
         2 * KIMI_K2_EXPERT_INTERMEDIATE,
+        OUT
+    );
+    ensure!(
+        input.seq_len == routing.active_tokens,
+        "marlin_w13 input seq_len must be {}, got {}",
+        routing.active_tokens,
+        input.seq_len
+    );
+    ensure!(
+        output_w13.seq_len == routing.route_elems,
+        "marlin_w13 output seq_len must be {}, got {}",
         routing.route_elems,
-    )?;
+        output_w13.seq_len
+    );
     ensure!(
         topk_weight.len() >= routing.route_elems,
         "topk_weight len must cover {}, got {}",
@@ -1367,27 +1375,27 @@ pub fn kimi_marlin_wna16_w13_gemm(
         ctx,
         workspace,
         routing,
-        input,
+        &input.data,
         weight.weight_packed_uint4b8,
         weight.weight_scale_permuted,
         topk_weight,
-        output_w13,
+        &mut output_w13.data,
         KIMI_K2_TOPK,
         false,
         routing.active_tokens,
-        2 * KIMI_K2_EXPERT_INTERMEDIATE,
-        KIMI_K2_HIDDEN,
+        OUT,
+        IN,
     )
 }
 
-pub fn kimi_marlin_wna16_w2_gemm(
+pub fn kimi_marlin_wna16_w2_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,
-    input: &HiddenStates,
+    input: &GpuTensor<IN>,
     weight: &KimiMarlinInt4Weight<'_>,
     topk_weight: &CudaSlice<f32>,
-    output: &mut HiddenStates,
+    output: &mut GpuTensor<OUT>,
 ) -> Result<()> {
     weight.validate()?;
     ensure!(
@@ -1395,19 +1403,19 @@ pub fn kimi_marlin_wna16_w2_gemm(
         "Marlin W2 role mismatch: got {:?}",
         weight.manifest.role
     );
-    workspace.validate_for(routing, KIMI_K2_HIDDEN)?;
-    validate_hidden_states(
-        "marlin_w2.input",
-        input,
+    workspace.validate_for(routing, OUT)?;
+    ensure!(
+        IN == KIMI_K2_EXPERT_INTERMEDIATE,
+        "marlin_w2 input dim must be {}, got {}",
         KIMI_K2_EXPERT_INTERMEDIATE,
-        routing.route_elems,
-    )?;
-    validate_hidden_states(
-        "marlin_w2.output",
-        output,
+        IN
+    );
+    ensure!(
+        OUT == KIMI_K2_HIDDEN,
+        "marlin_w2 output dim must be {}, got {}",
         KIMI_K2_HIDDEN,
-        routing.route_elems,
-    )?;
+        OUT
+    );
     ensure!(
         topk_weight.len() >= routing.route_elems,
         "topk_weight len must cover {}, got {}",
@@ -1418,36 +1426,36 @@ pub fn kimi_marlin_wna16_w2_gemm(
         ctx,
         workspace,
         routing,
-        input,
+        &input.data,
         weight.weight_packed_uint4b8,
         weight.weight_scale_permuted,
         topk_weight,
-        output,
+        &mut output.data,
         1,
         true,
         routing.route_elems,
-        KIMI_K2_HIDDEN,
-        KIMI_K2_EXPERT_INTERMEDIATE,
+        OUT,
+        IN,
     )
 }
 
-pub fn kimi_marlin_w13_swiglu(
+pub fn kimi_marlin_w13_swiglu<const INTER2: usize, const INTER: usize>(
     ctx: &DeviceContext,
-    w13: &HiddenStates,
-    output: &mut HiddenStates,
+    w13: &GpuTensor<INTER2>,
+    output: &mut GpuTensor<INTER>,
 ) -> Result<()> {
-    validate_hidden_states(
-        "marlin_w13_swiglu.input",
-        w13,
-        2 * KIMI_K2_EXPERT_INTERMEDIATE,
-        output.seq_len,
-    )?;
-    validate_hidden_states(
-        "marlin_w13_swiglu.output",
-        output,
-        KIMI_K2_EXPERT_INTERMEDIATE,
+    ensure!(
+        INTER2 == 2 * INTER,
+        "Kimi Marlin SwiGLU dim mismatch: input={}, output={}",
+        INTER2,
+        INTER
+    );
+    ensure!(
+        w13.seq_len == output.seq_len,
+        "Kimi Marlin SwiGLU seq_len mismatch: input={}, output={}",
         w13.seq_len,
-    )?;
+        output.seq_len
+    );
     let (w13_ptr, _w13_guard) = w13.data.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = output.data.device_ptr_mut(&ctx.stream);
     let result = unsafe {
@@ -1455,7 +1463,7 @@ pub fn kimi_marlin_w13_swiglu(
             w13_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             w13.seq_len as i32,
-            KIMI_K2_EXPERT_INTERMEDIATE as i32,
+            INTER as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -1465,24 +1473,24 @@ pub fn kimi_marlin_w13_swiglu(
 
 /// SwiGLU for PPLX path: grid launched at `max_rows` but actual work
 /// limited by `num_tokens_post_padded[0]` read on-device — no D2H needed.
-pub fn kimi_marlin_w13_swiglu_pplx(
+pub fn kimi_marlin_w13_swiglu_pplx<const INTER2: usize, const INTER: usize>(
     ctx: &DeviceContext,
-    w13: &HiddenStates,
+    w13: &GpuTensor<INTER2>,
     num_tokens_post_padded: &CudaSlice<i32>,
-    output: &mut HiddenStates,
+    output: &mut GpuTensor<INTER>,
 ) -> Result<()> {
-    validate_hidden_states(
-        "pplx_marlin_w13_swiglu.input",
-        w13,
-        2 * KIMI_K2_EXPERT_INTERMEDIATE,
-        output.seq_len,
-    )?;
-    validate_hidden_states(
-        "pplx_marlin_w13_swiglu.output",
-        output,
-        KIMI_K2_EXPERT_INTERMEDIATE,
+    ensure!(
+        INTER2 == 2 * INTER,
+        "Kimi PPLX Marlin SwiGLU dim mismatch: input={}, output={}",
+        INTER2,
+        INTER
+    );
+    ensure!(
+        w13.seq_len == output.seq_len,
+        "Kimi PPLX Marlin SwiGLU seq_len mismatch: input={}, output={}",
         w13.seq_len,
-    )?;
+        output.seq_len
+    );
     ensure!(
         num_tokens_post_padded.len() >= 1,
         "num_tokens_post_padded must have at least 1 element"
@@ -1496,7 +1504,7 @@ pub fn kimi_marlin_w13_swiglu_pplx(
             out_ptr as *mut ffi::Half,
             ntp_ptr as *const i32,
             w13.seq_len as i32,
-            KIMI_K2_EXPERT_INTERMEDIATE as i32,
+            INTER as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -1504,23 +1512,23 @@ pub fn kimi_marlin_w13_swiglu_pplx(
     Ok(())
 }
 
-pub fn kimi_marlin_sum_topk_rows_f32(
+pub fn kimi_marlin_sum_topk_rows_f32<const DIM: usize>(
     ctx: &DeviceContext,
-    route_output: &HiddenStates,
+    route_output: &GpuTensor<DIM>,
     active_tokens: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<()> {
-    validate_hidden_states(
-        "marlin_sum_topk.route_output",
-        route_output,
-        KIMI_K2_HIDDEN,
-        active_tokens * KIMI_K2_TOPK,
-    )?;
     ensure!(
-        out.len() >= active_tokens * KIMI_K2_HIDDEN,
+        route_output.seq_len == active_tokens * KIMI_K2_TOPK,
+        "marlin_sum_topk route_output seq_len must be {}, got {}",
+        active_tokens * KIMI_K2_TOPK,
+        route_output.seq_len
+    );
+    ensure!(
+        out.len() >= active_tokens * DIM,
         "marlin_sum_topk output too small: have {}, need {}",
         out.len(),
-        active_tokens * KIMI_K2_HIDDEN
+        active_tokens * DIM
     );
     let (route_ptr, _route_guard) = route_output.data.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
@@ -1530,7 +1538,7 @@ pub fn kimi_marlin_sum_topk_rows_f32(
             out_ptr as *mut f32,
             active_tokens as i32,
             KIMI_K2_TOPK as i32,
-            KIMI_K2_HIDDEN as i32,
+            DIM as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -1630,29 +1638,17 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
 }
 
 /// W13 (gate+up) GEMM for PPLX path: top_k=1, no weight scaling.
-pub fn kimi_marlin_wna16_pplx_w13_gemm(
+pub fn kimi_marlin_wna16_pplx_w13_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,
-    input: &HiddenStates,
+    input: &GpuTensor<IN>,
     weight: &KimiMarlinFusedW13Int4Weight<'_>,
     topk_weight: &CudaSlice<f32>,
-    output_w13: &mut HiddenStates,
+    output_w13: &mut GpuTensor<OUT>,
 ) -> Result<()> {
     weight.validate()?;
-    workspace.validate_for(routing, 2 * KIMI_K2_EXPERT_INTERMEDIATE)?;
-    validate_hidden_states(
-        "pplx_marlin_w13.input",
-        input,
-        KIMI_K2_HIDDEN,
-        routing.active_tokens,
-    )?;
-    validate_hidden_states(
-        "pplx_marlin_w13.output",
-        output_w13,
-        2 * KIMI_K2_EXPERT_INTERMEDIATE,
-        routing.route_elems,
-    )?;
+    workspace.validate_for(routing, OUT)?;
     ensure!(
         topk_weight.len() >= routing.route_elems,
         "topk_weight len must cover {}, got {}",
@@ -1663,29 +1659,29 @@ pub fn kimi_marlin_wna16_pplx_w13_gemm(
         ctx,
         workspace,
         routing,
-        input,
+        &input.data,
         weight.weight_packed_uint4b8,
         weight.weight_scale_permuted,
         topk_weight,
-        output_w13,
+        &mut output_w13.data,
         1,
         false,
         routing.active_tokens,
-        2 * KIMI_K2_EXPERT_INTERMEDIATE,
-        KIMI_K2_HIDDEN,
+        OUT,
+        IN,
     )
 }
 
 /// W2 (down) GEMM for PPLX path: top_k=1, no weight scaling.
 /// combine_recv handles the topk weight reduction.
-pub fn kimi_marlin_wna16_pplx_w2_gemm(
+pub fn kimi_marlin_wna16_pplx_w2_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,
-    input: &HiddenStates,
+    input: &GpuTensor<IN>,
     weight: &KimiMarlinInt4Weight<'_>,
     topk_weight: &CudaSlice<f32>,
-    output: &mut HiddenStates,
+    output: &mut GpuTensor<OUT>,
 ) -> Result<()> {
     weight.validate()?;
     ensure!(
@@ -1693,19 +1689,7 @@ pub fn kimi_marlin_wna16_pplx_w2_gemm(
         "Marlin W2 role mismatch: got {:?}",
         weight.manifest.role
     );
-    workspace.validate_for(routing, KIMI_K2_HIDDEN)?;
-    validate_hidden_states(
-        "pplx_marlin_w2.input",
-        input,
-        KIMI_K2_EXPERT_INTERMEDIATE,
-        routing.route_elems,
-    )?;
-    validate_hidden_states(
-        "pplx_marlin_w2.output",
-        output,
-        KIMI_K2_HIDDEN,
-        routing.route_elems,
-    )?;
+    workspace.validate_for(routing, OUT)?;
     ensure!(
         topk_weight.len() >= routing.route_elems,
         "topk_weight len must cover {}, got {}",
@@ -1716,16 +1700,16 @@ pub fn kimi_marlin_wna16_pplx_w2_gemm(
         ctx,
         workspace,
         routing,
-        input,
+        &input.data,
         weight.weight_packed_uint4b8,
         weight.weight_scale_permuted,
         topk_weight,
-        output,
+        &mut output.data,
         1,
         false,
         routing.route_elems,
-        KIMI_K2_HIDDEN,
-        KIMI_K2_EXPERT_INTERMEDIATE,
+        OUT,
+        IN,
     )
 }
 
@@ -1733,11 +1717,11 @@ fn launch_marlin_wna16_gemm(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,
-    input: &HiddenStates,
+    input: &CudaSlice<bf16>,
     weight_packed_uint4b8: &CudaSlice<u8>,
     weight_scale_permuted: &CudaSlice<bf16>,
     topk_weight: &CudaSlice<f32>,
-    output: &mut HiddenStates,
+    output: &mut CudaSlice<bf16>,
     top_k: usize,
     mul_topk_weights: bool,
     size_m: usize,
@@ -1758,8 +1742,8 @@ fn launch_marlin_wna16_gemm(
         "Kimi Marlin WNA16 weight package must be non-empty"
     );
     let lock_len = workspace.locks.len();
-    let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
-    let (output_ptr, _output_guard) = output.data.device_ptr_mut(&ctx.stream);
+    let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
     let (c_tmp_ptr, _c_tmp_guard) = workspace.c_tmp.device_ptr_mut(&ctx.stream);
     let (weight_ptr, _weight_guard) = weight_packed_uint4b8.device_ptr(&ctx.stream);
     let (scale_ptr, _scale_guard) = weight_scale_permuted.device_ptr(&ctx.stream);

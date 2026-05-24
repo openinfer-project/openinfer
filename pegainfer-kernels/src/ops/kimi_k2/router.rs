@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
+use crate::tensor::{DeviceContext, GpuTensor, GpuWeight};
 
 pub const KIMI_K2_ROUTER_HIDDEN: usize = 7168;
 pub const KIMI_K2_ROUTER_EXPERTS: usize = 384;
@@ -105,11 +105,11 @@ pub struct KimiRouterOutput<'a> {
     pub topk_idx: &'a mut CudaSlice<i32>,
 }
 
-pub fn validate_kimi_router_shapes(
+pub fn validate_kimi_router_shapes<const DIM: usize>(
     config: KimiRouterConfig,
     batch: KimiRouterBatch,
-    hidden: &HiddenStates,
-    gate_weight: &DeviceMatrix,
+    hidden: &GpuTensor<DIM>,
+    _gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
     e_score_correction_bias: &CudaSlice<f32>,
     scratch: &KimiRouterScratch<'_>,
     output: &KimiRouterOutput<'_>,
@@ -117,9 +117,9 @@ pub fn validate_kimi_router_shapes(
     config.validate()?;
     batch.validate()?;
     ensure!(
-        hidden.hidden_dim == config.hidden_dim,
+        DIM == config.hidden_dim,
         "Kimi router hidden dim mismatch: got {}, expected {}",
-        hidden.hidden_dim,
+        DIM,
         config.hidden_dim
     );
     ensure!(
@@ -129,10 +129,10 @@ pub fn validate_kimi_router_shapes(
         batch.padded_tokens
     );
     ensure!(
-        gate_weight.rows == config.n_experts && gate_weight.cols == config.hidden_dim,
-        "Kimi router gate_weight shape mismatch: got [{}, {}], expected [{}, {}]",
-        gate_weight.rows,
-        gate_weight.cols,
+        config.n_experts == KIMI_K2_ROUTER_EXPERTS && config.hidden_dim == KIMI_K2_ROUTER_HIDDEN,
+        "Kimi router config must match typed gate weight [{}, {}], got [{}, {}]",
+        KIMI_K2_ROUTER_EXPERTS,
+        KIMI_K2_ROUTER_HIDDEN,
         config.n_experts,
         config.hidden_dim
     );
@@ -191,12 +191,12 @@ pub fn validate_kimi_router_shapes(
 ///   over `scores + e_score_correction_bias`, then gathers unbiased `scores`,
 ///   normalizes them per active token. Kimi's routed output scale is applied
 ///   after the routed expert sum to match vLLM's rounding boundary.
-pub fn kimi_router_noaux_tc_launch(
+pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
     ctx: &DeviceContext,
     config: KimiRouterConfig,
     batch: KimiRouterBatch,
-    hidden: &HiddenStates,
-    gate_weight: &DeviceMatrix,
+    hidden: &GpuTensor<DIM>,
+    gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
     e_score_correction_bias: &CudaSlice<f32>,
     scratch: &mut KimiRouterScratch<'_>,
     output: &mut KimiRouterOutput<'_>,

@@ -474,11 +474,11 @@ impl KimiRouterGpuWeights<'_> {
         let e_score_correction_bias =
             copy_raw_tensor_to_typed::<f32>(ctx, self.e_score_correction_bias)?;
         Ok(KimiRouterDeviceWeights {
-            gate_weight: DeviceMatrix {
+            gate_weight: GpuWeight::from_device_matrix(DeviceMatrix {
                 data: gate_data,
                 rows: KIMI_K2_ROUTED_EXPERTS,
                 cols: KIMI_K2_HIDDEN,
-            },
+            })?,
             e_score_correction_bias,
         })
     }

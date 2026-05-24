@@ -30,6 +30,7 @@ kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
 kernel-report = [
     "dep:clap",
     "dep:pegainfer-cupti",
+    "kimi-k2",
     "kernel-call-trace",
 ]
 

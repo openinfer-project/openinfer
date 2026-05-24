@@ -12,88 +12,17 @@ use crate::config::{
     KIMI_K2_V_HEAD_DIM, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR,
     KIMI_K2_YARN_ORIGINAL_MAX_POS, KimiK2ParallelShape,
 };
-use crate::tensor::{
-    Bf16, DType, F32, HeaderError, HeaderResult, Shape2, Shape3, StreamHandle, TensorMut,
-    TensorRef, TokenBatch, U32,
+use crate::tensor::{Bf16, DType, F32, HeaderResult, StreamHandle, TensorRef, TokenBatch, U32};
+
+mod tensors;
+mod validation;
+
+pub use tensors::{Tensor1Mut, Tensor1Ref, Tensor2Mut, Tensor2Ref, Tensor3Mut, Tensor3Ref};
+
+use validation::{
+    expect_1d_ref, expect_2d_mut, expect_2d_ref, expect_3d_mut, expect_3d_ref, expect_dtype,
+    shape_err, unsupported, validate_decode_batch, validate_token_batch,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tensor1Ref<T> {
-    pub tensor: TensorRef<T>,
-    pub len: usize,
-}
-
-impl<T> Tensor1Ref<T> {
-    #[must_use]
-    pub const fn new(tensor: TensorRef<T>, len: usize) -> Self {
-        Self { tensor, len }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tensor1Mut<T> {
-    pub tensor: TensorMut<T>,
-    pub len: usize,
-}
-
-impl<T> Tensor1Mut<T> {
-    #[must_use]
-    pub const fn new(tensor: TensorMut<T>, len: usize) -> Self {
-        Self { tensor, len }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tensor2Ref<T> {
-    pub tensor: TensorRef<T>,
-    pub shape: Shape2,
-}
-
-impl<T> Tensor2Ref<T> {
-    #[must_use]
-    pub const fn new(tensor: TensorRef<T>, shape: Shape2) -> Self {
-        Self { tensor, shape }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tensor2Mut<T> {
-    pub tensor: TensorMut<T>,
-    pub shape: Shape2,
-}
-
-impl<T> Tensor2Mut<T> {
-    #[must_use]
-    pub const fn new(tensor: TensorMut<T>, shape: Shape2) -> Self {
-        Self { tensor, shape }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tensor3Ref<T> {
-    pub tensor: TensorRef<T>,
-    pub shape: Shape3,
-}
-
-impl<T> Tensor3Ref<T> {
-    #[must_use]
-    pub const fn new(tensor: TensorRef<T>, shape: Shape3) -> Self {
-        Self { tensor, shape }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Tensor3Mut<T> {
-    pub tensor: TensorMut<T>,
-    pub shape: Shape3,
-}
-
-impl<T> Tensor3Mut<T> {
-    #[must_use]
-    pub const fn new(tensor: TensorMut<T>, shape: Shape3) -> Self {
-        Self { tensor, shape }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MlaRuntimeShape {
@@ -1018,129 +947,4 @@ pub const fn attention_api_summary() -> AttentionApiSummary {
         qk_dim: KIMI_K2_Q_HEAD_DIM,
         v_dim: KIMI_K2_V_HEAD_DIM,
     }
-}
-
-fn validate_token_batch(batch: TokenBatch) -> HeaderResult<()> {
-    if batch.batch_size == 0 {
-        return shape_err("batch_size must be non-zero");
-    }
-    if batch.active_tokens == 0 {
-        return shape_err("active_tokens must be non-zero");
-    }
-    if batch.padded_tokens < batch.active_tokens {
-        return shape_err("padded_tokens must be >= active_tokens");
-    }
-    Ok(())
-}
-
-fn validate_decode_batch(batch: TokenBatch) -> HeaderResult<()> {
-    validate_token_batch(batch)?;
-    if batch.active_tokens != batch.batch_size {
-        return shape_err("decode batch must have one active token per request");
-    }
-    if batch.padded_tokens < batch.batch_size {
-        return shape_err("decode padded_tokens must be >= batch_size");
-    }
-    Ok(())
-}
-
-fn expect_1d_ref<T>(name: &str, tensor: Tensor1Ref<T>, len: usize) -> HeaderResult<()> {
-    if tensor.len != len {
-        return shape_err(format!("{name} expected len {len}, got {}", tensor.len));
-    }
-    expect_dtype(name, tensor.tensor.dtype, dtype_for::<T>())
-}
-
-fn expect_2d_ref<T>(
-    name: &str,
-    tensor: Tensor2Ref<T>,
-    rows: usize,
-    cols: usize,
-) -> HeaderResult<()> {
-    if tensor.shape.rows != rows || tensor.shape.cols != cols {
-        return shape_err(format!(
-            "{name} expected shape [{rows}, {cols}], got [{}, {}]",
-            tensor.shape.rows, tensor.shape.cols
-        ));
-    }
-    expect_dtype(name, tensor.tensor.dtype, dtype_for::<T>())
-}
-
-fn expect_2d_mut<T>(
-    name: &str,
-    tensor: Tensor2Mut<T>,
-    rows: usize,
-    cols: usize,
-) -> HeaderResult<()> {
-    if tensor.shape.rows != rows || tensor.shape.cols != cols {
-        return shape_err(format!(
-            "{name} expected shape [{rows}, {cols}], got [{}, {}]",
-            tensor.shape.rows, tensor.shape.cols
-        ));
-    }
-    expect_dtype(name, tensor.tensor.dtype, dtype_for::<T>())
-}
-
-fn expect_3d_ref<T>(
-    name: &str,
-    tensor: Tensor3Ref<T>,
-    outer: usize,
-    middle: usize,
-    inner: usize,
-) -> HeaderResult<()> {
-    if tensor.shape.outer != outer || tensor.shape.middle != middle || tensor.shape.inner != inner {
-        return shape_err(format!(
-            "{name} expected shape [{outer}, {middle}, {inner}], got [{}, {}, {}]",
-            tensor.shape.outer, tensor.shape.middle, tensor.shape.inner
-        ));
-    }
-    expect_dtype(name, tensor.tensor.dtype, dtype_for::<T>())
-}
-
-fn expect_3d_mut<T>(
-    name: &str,
-    tensor: Tensor3Mut<T>,
-    outer: usize,
-    middle: usize,
-    inner: usize,
-) -> HeaderResult<()> {
-    if tensor.shape.outer != outer || tensor.shape.middle != middle || tensor.shape.inner != inner {
-        return shape_err(format!(
-            "{name} expected shape [{outer}, {middle}, {inner}], got [{}, {}, {}]",
-            tensor.shape.outer, tensor.shape.middle, tensor.shape.inner
-        ));
-    }
-    expect_dtype(name, tensor.tensor.dtype, dtype_for::<T>())
-}
-
-fn dtype_for<T>() -> DType {
-    let name = std::any::type_name::<T>();
-    if name == std::any::type_name::<Bf16>() {
-        DType::Bf16
-    } else if name == std::any::type_name::<F32>() {
-        DType::F32
-    } else if name == std::any::type_name::<U32>() {
-        DType::U32
-    } else {
-        DType::U8
-    }
-}
-
-fn expect_dtype(name: &str, got: DType, expected: DType) -> HeaderResult<()> {
-    if got != expected {
-        return shape_err(format!("{name} expected dtype {expected:?}, got {got:?}"));
-    }
-    Ok(())
-}
-
-fn shape_err<T>(message: impl Into<String>) -> HeaderResult<T> {
-    Err(HeaderError::Shape {
-        message: message.into(),
-    })
-}
-
-fn unsupported<T>(message: impl Into<String>) -> HeaderResult<T> {
-    Err(HeaderError::Unsupported {
-        message: message.into(),
-    })
 }

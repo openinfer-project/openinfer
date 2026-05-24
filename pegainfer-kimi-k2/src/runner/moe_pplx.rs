@@ -29,13 +29,13 @@ use pegainfer_comm::{EpBackend, ScalarType};
 use pegainfer_kernels::{
     ops::{
         KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, add_batch_into,
-        bf16_hidden_to_f32_into, gemm_graphsafe_into_checked, kimi_marlin_w13_swiglu_pplx,
+        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, kimi_marlin_w13_swiglu_pplx,
         kimi_marlin_wna16_pplx_w2_gemm, kimi_marlin_wna16_pplx_w13_gemm,
-        kimi_pplx_build_marlin_routing_on_stream, kimi_router_noaux_tc_launch, rms_norm_batch_into,
-        silu_mul_fused_batch_into,
+        kimi_pplx_build_marlin_routing_on_stream, kimi_router_noaux_tc_launch,
+        kimi_scaled_add_f32_bf16_to_bf16,
     },
-    tensor::{DeviceContext, DeviceVec, HiddenStates},
+    tensor::{DeviceContext, GpuTensor, NormWeight},
+    typed_ops,
 };
 
 use crate::{
@@ -44,7 +44,10 @@ use crate::{
     weights::KimiRankExpertMarlinWeights,
 };
 
-use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch};
+use super::worker::{
+    KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM, SHARED_ACTIVATED_DIM,
+    SHARED_GATE_UP_DIM,
+};
 
 pub(super) const PPLX_EXPERT_PADDING: usize = 8;
 
@@ -52,16 +55,14 @@ pub(super) struct KimiMoePplxScratch {
     pub(super) expert_padding: usize,
     pub(super) pplx_recv_capacity: usize,
     pub(super) recv_tokens_per_expert: CudaSlice<i32>,
-    pub(super) pplx_recv_hidden: HiddenStates,
-    pub(super) pplx_expert_output: HiddenStates,
-    pub(super) pplx_w13_out: HiddenStates,
-    pub(super) pplx_activated: HiddenStates,
+    pub(super) pplx_recv_hidden: GpuTensor<KIMI_K2_HIDDEN>,
+    pub(super) pplx_expert_output: GpuTensor<KIMI_K2_HIDDEN>,
+    pub(super) pplx_w13_out: GpuTensor<MARLIN_W13_OUT_DIM>,
+    pub(super) pplx_activated: GpuTensor<KIMI_K2_EXPERT_INTERMEDIATE>,
     pub(super) pplx_route_workspace: KimiMarlinRouteWorkspace,
     pub(super) pplx_marlin_workspace: KimiMarlinWna16Workspace,
     pub(super) pplx_dummy_topk_weight: CudaSlice<f32>,
-    /// Receives the weighted routed output from combine_recv (BF16).
-    pub(super) pplx_routed_out: HiddenStates,
-    /// F32 scratch for converting routed BF16 before scale+add.
+    pub(super) pplx_routed_out: GpuTensor<KIMI_K2_HIDDEN>,
     pub(super) pplx_routed_f32: CudaSlice<f32>,
 }
 
@@ -90,22 +91,14 @@ impl KimiMoePplxScratch {
             expert_padding: PPLX_EXPERT_PADDING,
             pplx_recv_capacity,
             recv_tokens_per_expert: ctx.stream.alloc_zeros(KIMI_K2_EP8_LOCAL_EXPERTS)?,
-            pplx_recv_hidden: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, pplx_recv_capacity)?,
-            pplx_expert_output: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, pplx_recv_capacity)?,
-            pplx_w13_out: HiddenStates::zeros(
-                ctx,
-                2 * KIMI_K2_EXPERT_INTERMEDIATE,
-                pplx_recv_capacity,
-            )?,
-            pplx_activated: HiddenStates::zeros(
-                ctx,
-                KIMI_K2_EXPERT_INTERMEDIATE,
-                pplx_recv_capacity,
-            )?,
+            pplx_recv_hidden: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
+            pplx_expert_output: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
+            pplx_w13_out: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
+            pplx_activated: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
             pplx_route_workspace: route_workspace,
             pplx_marlin_workspace: marlin_workspace,
             pplx_dummy_topk_weight,
-            pplx_routed_out: HiddenStates::zeros(ctx, KIMI_K2_HIDDEN, max_batch_size)?,
+            pplx_routed_out: GpuTensor::zeros(ctx, max_batch_size)?,
             pplx_routed_f32: ctx.stream.alloc_zeros(max_batch_size * KIMI_K2_HIDDEN)?,
         })
     }
@@ -119,41 +112,33 @@ pub(super) fn forward_moe_layer_decode_pplx(
     ep: &mut EpBackend,
     layer_idx: usize,
     moe: &KimiMoeForwardCache,
-    post_attention_norm: &DeviceVec,
+    post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
     expert_kernels: &KimiRankExpertMarlinWeights,
     scratch: &mut KimiWorkerDecodeScratch,
     pplx: &mut KimiMoePplxScratch,
 ) -> Result<()> {
-    let seq_len = scratch.hidden.seq_len;
+    let seq_len = scratch.mla.hidden.seq_len;
     let stream_raw = ctx.stream.cu_stream() as u64;
 
-    // ---- 1. RMS norm ----
-    rms_norm_batch_into(
+    // Shared expert (main stream) + RMS norm
+    typed_ops::rms_norm_into(
         ctx,
-        &scratch.hidden,
+        &scratch.mla.hidden,
         post_attention_norm,
         KIMI_K2_RMS_NORM_EPS,
-        &mut scratch.normed,
-    );
+        &mut scratch.mla.normed,
+    )?;
 
-    // ---- 2. Shared expert on main stream ----
-    gemm_graphsafe_into_checked(
-        ctx,
-        &moe.shared_gate_up_proj,
-        &scratch.normed,
-        &mut scratch.shared_gate_up,
-    )?;
-    silu_mul_fused_batch_into(ctx, &scratch.shared_gate_up, &mut scratch.shared_activated);
-    gemm_graphsafe_into_checked(
-        ctx,
-        &moe.shared_down_proj,
-        &scratch.shared_activated,
-        &mut scratch.projected,
-    )?;
+    pegainfer_kernels::typed_pipeline! {
+        ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS;
+        gemm     (&scratch.mla.normed           => &mut scratch.shared_expert.gate_up,  moe.shared_gate_up_proj);
+        silu_mul<SHARED_ACTIVATED_DIM> (&scratch.shared_expert.gate_up => &mut scratch.shared_expert.activated);
+        gemm     (&scratch.shared_expert.activated => &mut scratch.mla.projected,       moe.shared_down_proj);
+    }
     super::worker::all_reduce_hidden_via_f32_in_place(
         ctx,
-        &mut scratch.projected,
-        &mut scratch.hidden_allreduce_f32,
+        &mut scratch.mla.projected,
+        &mut scratch.comm.hidden_allreduce_f32,
         comm,
     )?;
 
@@ -168,13 +153,13 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} aux wait norm_ready"))?;
     {
         let mut router_scratch = KimiRouterScratch {
-            logits: &mut scratch.router_logits,
-            scores: &mut scratch.router_scores,
-            choice_scores: &mut scratch.router_choice_scores,
+            logits: &mut scratch.router.router_logits.data,
+            scores: &mut scratch.router.router_scores.data,
+            choice_scores: &mut scratch.router.router_choice_scores.data,
         };
         let mut router_output = KimiRouterOutput {
-            topk_weight: &mut scratch.router_topk_weight,
-            topk_idx: &mut scratch.router_topk_idx,
+            topk_weight: &mut scratch.router.router_topk_weight.data,
+            topk_idx: &mut scratch.router.router_topk_idx.data,
         };
         kimi_router_noaux_tc_launch(
             aux_ctx,
@@ -184,7 +169,7 @@ pub(super) fn forward_moe_layer_decode_pplx(
                 active_tokens: seq_len,
                 padded_tokens: seq_len,
             },
-            &scratch.normed,
+            &scratch.mla.normed,
             &moe.router.gate_weight,
             &moe.router.e_score_correction_bias,
             &mut router_scratch,
@@ -201,9 +186,13 @@ pub(super) fn forward_moe_layer_decode_pplx(
 
     // ---- 4. dispatch_send ----
     {
-        let (x_ptr, _x_guard) = scratch.normed.data.device_ptr(&ctx.stream);
-        let (idx_ptr, _idx_guard) = scratch.router_topk_idx.device_ptr(&ctx.stream);
-        let (w_ptr, _w_guard) = scratch.router_topk_weight.device_ptr(&ctx.stream);
+        let (x_ptr, _x_guard) = scratch.mla.normed.data.device_ptr(&ctx.stream);
+        let (idx_ptr, _idx_guard) = scratch.router.router_topk_idx.data.device_ptr(&ctx.stream);
+        let (w_ptr, _w_guard) = scratch
+            .router
+            .router_topk_weight
+            .data
+            .device_ptr(&ctx.stream);
         let x_stride = KIMI_K2_HIDDEN * std::mem::size_of::<u16>();
         ep.dispatch_send(
             seq_len,
@@ -307,8 +296,12 @@ pub(super) fn forward_moe_layer_decode_pplx(
     pplx.pplx_routed_out.seq_len = seq_len;
     {
         let (out_ptr, _g0) = pplx.pplx_routed_out.data.device_ptr_mut(&ctx.stream);
-        let (idx_ptr, _g1) = scratch.router_topk_idx.device_ptr(&ctx.stream);
-        let (w_ptr, _g2) = scratch.router_topk_weight.device_ptr(&ctx.stream);
+        let (idx_ptr, _g1) = scratch.router.router_topk_idx.data.device_ptr(&ctx.stream);
+        let (w_ptr, _g2) = scratch
+            .router
+            .router_topk_weight
+            .data
+            .device_ptr(&ctx.stream);
         ep.combine_recv(
             seq_len,
             0,
@@ -326,23 +319,20 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx combine_recv layer {layer_idx}"))?;
     }
 
-    // ---- 12. Combine: hidden = hidden + shared + routed * scale ----
-    // Step A: normed = hidden + shared (BF16)
-    add_batch_into(
+    // Combine: hidden = hidden + shared + routed * scale
+    typed_ops::add_into(
         ctx,
-        &scratch.hidden,
-        &scratch.projected,
-        &mut scratch.normed,
+        &scratch.mla.hidden,
+        &scratch.mla.projected,
+        &mut scratch.mla.normed,
     )?;
-    // Step B: convert routed BF16 → F32
-    bf16_hidden_to_f32_into(ctx, &pplx.pplx_routed_out, &mut pplx.pplx_routed_f32)?;
-    // Step C: hidden = normed + routed_f32 * KIMI_K2_ROUTER_SCALE
-    super::worker::scaled_add_f32_bf16_to_bf16_hidden_into(
+    typed_ops::bf16_to_f32_into(ctx, &pplx.pplx_routed_out, &mut pplx.pplx_routed_f32)?;
+    kimi_scaled_add_f32_bf16_to_bf16(
         ctx,
         &pplx.pplx_routed_f32,
         KIMI_K2_ROUTER_SCALE,
-        &scratch.normed,
-        &mut scratch.hidden,
+        &scratch.mla.normed,
+        &mut scratch.mla.hidden,
     )?;
 
     Ok(())

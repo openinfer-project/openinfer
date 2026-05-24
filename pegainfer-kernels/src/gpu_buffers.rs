@@ -1,30 +1,6 @@
-//! `gpu_buffers!` — declarative macro that generates buffer structs + allocation.
-//!
-//! Given a list of typed fields, the macro generates:
-//! 1. The struct definition
-//! 2. `fn new(ctx, batch_size) -> Result<Self>` — allocates every field
-//! 3. `fn set_batch_size(&mut self, bs)` — updates `seq_len` on all `GpuTensor` fields
-//!
-//! Dimension expressions must be wrapped in `{ }` braces:
-//!
-//! ```ignore
-//! gpu_buffers! {
-//!     pub(crate) struct MlaScratch {
-//!         hidden:    GpuTensor<{ KIMI_K2_HIDDEN }>,
-//!         normed:    GpuTensor<{ KIMI_K2_HIDDEN }>,
-//!         qkv_a:     GpuTensor<{ KIMI_K2_MLA_QKV_A_OUT }>,
-//!         router_logits: GpuRawSlice<{ KIMI_K2_ROUTED_EXPERTS }>,
-//!         router_idx:    GpuRawSliceI32<{ KIMI_K2_TOPK }>,
-//!     }
-//! }
-//! ```
+//! Declarative typed GPU buffer structs.
 
-/// Declares a GPU buffer struct with auto-generated `new()` and `set_batch_size()`.
-///
-/// Supports three field kinds:
-/// - `GpuTensor<{ EXPR }>` — bf16 activation buffer
-/// - `GpuRawSlice<{ EXPR }>` — f32 raw buffer
-/// - `GpuRawSliceI32<{ EXPR }>` — i32 raw buffer
+/// Declares a GPU buffer struct with generated `new()` and `set_batch_size()`.
 #[macro_export]
 macro_rules! gpu_buffers {
     (
@@ -64,7 +40,6 @@ macro_rules! gpu_buffers {
         }
     };
 
-    // ── internal: allocation dispatch ──
     (@alloc $ctx:ident, $bs:ident, GpuTensor, $dim:expr) => {
         $crate::tensor::GpuTensor::<{ $dim }>::zeros($ctx, $bs)?
     };
@@ -75,7 +50,6 @@ macro_rules! gpu_buffers {
         $crate::tensor::GpuRawSliceI32::<{ $dim }>::zeros($ctx, $bs)?
     };
 
-    // ── internal: set_batch_size dispatch ──
     (@set_bs $self:ident, $bs:ident, $field:ident, GpuTensor) => {
         $self.$field.seq_len = $bs;
     };

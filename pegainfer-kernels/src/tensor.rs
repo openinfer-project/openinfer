@@ -468,6 +468,19 @@ impl<const DIM: usize> GpuTensor<DIM> {
         DIM * self.seq_len
     }
 
+    pub fn from_device_matrix_rows(m: DeviceMatrix) -> Result<Self> {
+        anyhow::ensure!(
+            m.cols == DIM,
+            "GpuTensor<{}>::from_device_matrix_rows col mismatch: got {}",
+            DIM,
+            m.cols,
+        );
+        Ok(Self {
+            data: m.data,
+            seq_len: m.rows,
+        })
+    }
+
     pub fn as_untyped(&self) -> HiddenStatesRef<'_> {
         HiddenStatesRef {
             data: &self.data,

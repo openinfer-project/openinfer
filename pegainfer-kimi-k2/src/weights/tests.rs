@@ -10,7 +10,7 @@ use pegainfer_kernels::{
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
         kimi_moe_marlin_align_block_size,
     },
-    tensor::HiddenStates,
+    tensor::GpuTensor,
 };
 use safetensors::tensor::{TensorView, serialize};
 use serde_json::json;
@@ -248,15 +248,14 @@ fn h20_kimi_k25_rank0_layer1_marlin_wna16_matches_vllm_reference() {
         BLOCK_SIZE,
     )
     .unwrap();
-    let hidden = HiddenStates {
+    let hidden = GpuTensor::<KIMI_K2_HIDDEN> {
         data: hidden_data,
-        hidden_dim: KIMI_K2_HIDDEN,
         seq_len: TOKENS,
     };
     let layer1_weights = layer1.as_marlin_weights();
 
     let mut w13_out =
-        HiddenStates::zeros(&device_ctx, 2 * KIMI_K2_EXPERT_INTERMEDIATE, route_elems).unwrap();
+        GpuTensor::<{ 2 * KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(&device_ctx, route_elems).unwrap();
     kimi_marlin_wna16_w13_gemm(
         &device_ctx,
         &mut gemm_workspace,
@@ -275,9 +274,9 @@ fn h20_kimi_k25_rank0_layer1_marlin_wna16_matches_vllm_reference() {
     assert_bf16_close("k25_layer1_w13_out", &w13_got, &w13_ref, 0.5, 0.03);
 
     let mut activated =
-        HiddenStates::zeros(&device_ctx, KIMI_K2_EXPERT_INTERMEDIATE, route_elems).unwrap();
+        GpuTensor::<KIMI_K2_EXPERT_INTERMEDIATE>::zeros(&device_ctx, route_elems).unwrap();
     kimi_marlin_w13_swiglu(&device_ctx, &w13_out, &mut activated).unwrap();
-    let mut route_output = HiddenStates::zeros(&device_ctx, KIMI_K2_HIDDEN, route_elems).unwrap();
+    let mut route_output = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&device_ctx, route_elems).unwrap();
     kimi_marlin_wna16_w2_gemm(
         &device_ctx,
         &mut gemm_workspace,

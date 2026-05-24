@@ -25,7 +25,7 @@ use pegainfer_kernels::ops::{
     KimiMarlinInt4ExpertWeights, KimiMarlinInt4Weight, kimi_marlin_int4_fuse_w13,
     kimi_marlin_int4_reorder_scale, kimi_marlin_int4_reorder_weight,
 };
-use pegainfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use pegainfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, GpuWeight};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 
@@ -342,7 +342,7 @@ pub struct KimiRouterGpuWeights<'a> {
 }
 
 pub struct KimiRouterDeviceWeights {
-    pub gate_weight: DeviceMatrix,
+    pub gate_weight: GpuWeight<KIMI_K2_ROUTED_EXPERTS, KIMI_K2_HIDDEN>,
     pub e_score_correction_bias: CudaSlice<f32>,
 }
 
