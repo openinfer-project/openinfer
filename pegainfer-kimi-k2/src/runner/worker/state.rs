@@ -6,7 +6,7 @@ impl KimiRankThreadState {
         self.ctx.set_current()?;
         if self.moe_pplx_scratch.is_none() {
             self.moe_pplx_scratch = Some(
-                super::moe_pplx::KimiMoePplxScratch::new(
+                crate::runner::moe_pplx::KimiMoePplxScratch::new(
                     &self.ctx.as_device_context(),
                     KIMI_DECODE_MAX_BATCH,
                 )

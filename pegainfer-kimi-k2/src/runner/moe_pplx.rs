@@ -46,7 +46,6 @@ use crate::{
 
 use super::worker::{
     KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM, SHARED_ACTIVATED_DIM,
-    SHARED_GATE_UP_DIM,
 };
 
 pub(super) const PPLX_EXPERT_PADDING: usize = 8;

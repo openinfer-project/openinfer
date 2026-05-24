@@ -58,7 +58,7 @@ pub(super) fn forward_decode_batch_next_token_kernels(
             KimiLayerForwardKindCache::Moe(moe) => {
                 #[cfg(feature = "pplx-ep")]
                 if let Some(pplx_ctx) = pplx.as_mut() {
-                    super::moe_pplx::forward_moe_layer_decode_pplx(
+                    crate::runner::moe_pplx::forward_moe_layer_decode_pplx(
                         device_ctx,
                         decode_aux_ctx,
                         comm,
