@@ -155,6 +155,39 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_s
 | ID | Date | Commit | Area | Change | Correctness gate | bs64 result | Decision |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | B0 | 2026-05-25 | `72c770b` | correctness | TP8 PPLX baseline fixed; no performance claim | TP8 NCCL/PPLX 64-token hash `4920f088c2338236` | Not measured | Keep as ground truth |
+| B1 | 2026-05-25 | `d639e55` code, `df1cd18` command doc | scheduler / service profile | Canonical bs64 pressure baseline before performance work | No code change after B0; PPLX correctness baseline remains `4920f088c2338236` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json`: output `137.51 tok/s`, TPOT p50/p95/p99 `26.40/28.13/28.46ms`, TTFT p50/p99 `54.76/58.68s`, 256/256 success | Keep as profile baseline; first optimization should address 4-row scheduling/admission before kernel work |
+
+### B1 Profile Notes
+
+Profile:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json
+```
+
+Observed:
+
+- bs64 output throughput is `137.51 tok/s`, far below vLLM bs64 `583.9 tok/s`.
+- TPOT p50 is `26.40ms`, much lower than vLLM bs64 TPOT p50 `109.00ms`.
+- TTFT p50 is `54.76s`, showing requests are queued in long waves.
+- Current TP8 scheduler cap is still `KIMI_RUNNER_MAX_BATCH = 4`, so bs64 service
+  pressure effectively runs as repeated 4-row decode waves.
+
+Motivation / expected gain:
+
+Raising the DP1 TP8 admission/arena path beyond 4 rows should attack the main
+service-throughput gap directly. If per-token TPOT stayed near the B1 value,
+bs64 throughput would have roughly 4x headroom before kernel scaling becomes the
+dominant limit. The actual gain must be measured because MLA/MoE kernels,
+collectives, scratch size, and graph capture may scale nonlinearly with batch.
+
+Microbench:
+
+B1 is a service profile, not an optimization. The next optimization must add a
+lower-level probe for the changed layer, for example an in-process bs sweep or a
+decode arena/scheduler trace that confirms active rows > 4 before rerunning the
+canonical bs64 pressure command.
 
 ## Candidate Queue
 
