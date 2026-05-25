@@ -4,7 +4,7 @@
 //! Attention splits: prefill tokens use FlashInfer BatchPrefill, decode tokens
 //! use FlashInfer BatchDecode, outputs are concatenated.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
@@ -12,7 +12,7 @@ use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
 use pegainfer_core::ffi;
-use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::kv_pool::{KvExecView, KvLayout};
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -32,17 +32,17 @@ struct DecodeAttentionMeta {
 impl DecodeAttentionMeta {
     fn build(
         ctx: &DeviceContext,
-        kv_states: &[&mut KvState],
+        kv_views: &[KvExecView],
         decode_positions: &[usize],
     ) -> Result<Self> {
-        let num_decode = kv_states.len();
+        let num_decode = kv_views.len();
 
         let mut all_page_indices = Vec::new();
         let mut indptr = vec![0i32];
         let mut last_page_lens = Vec::with_capacity(num_decode);
         let mut chunk_sizes = Vec::with_capacity(num_decode);
 
-        for kv in kv_states {
+        for kv in kv_views {
             let pages = kv.page_indices_i32();
             all_page_indices.extend_from_slice(&pages);
             indptr.push(all_page_indices.len() as i32);
@@ -78,14 +78,14 @@ impl Qwen3Model {
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
-        prefill_kv_states: &mut [&mut KvState],
+        prefill_kv_views: &[KvExecView],
         decode_tokens: &[u32],
-        decode_kv_states: &mut [&mut KvState],
+        decode_kv_views: &[KvExecView],
     ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
         let num_prefill_reqs = prefill_prompts.len();
         let num_decode_reqs = decode_tokens.len();
-        assert_eq!(num_prefill_reqs, prefill_kv_states.len());
-        assert_eq!(num_decode_reqs, decode_kv_states.len());
+        assert_eq!(num_prefill_reqs, prefill_kv_views.len());
+        assert_eq!(num_decode_reqs, decode_kv_views.len());
         assert!(num_prefill_reqs > 0 && num_decode_reqs > 0);
 
         let prefill_seq_lens: Vec<usize> = prefill_prompts.iter().map(|p| p.len()).collect();
@@ -98,22 +98,25 @@ impl Qwen3Model {
             all_tokens.extend_from_slice(prompt);
         }
         all_tokens.extend_from_slice(decode_tokens);
-        let hidden = self.get_embeddings_batch(&all_tokens)?;
+        let hidden = self.get_embeddings_batch(&all_tokens).with_context(|| {
+            format!(
+                "unified embedding failed: prefill_requests={}, decode_requests={}, total_prefill_tokens={}, total_tokens={}",
+                num_prefill_reqs,
+                num_decode_reqs,
+                total_prefill,
+                total_tokens
+            )
+        })?;
 
         // ── 2. Prepare KV states ──────────────────────────────────────
-        let prefill_start_positions: Vec<usize> =
-            prefill_kv_states.iter().map(|kv| kv.seq_len()).collect();
-        for (i, kv) in prefill_kv_states.iter_mut().enumerate() {
-            kv.ensure_capacity(prefill_start_positions[i] + prefill_seq_lens[i])?;
-            kv.advance(prefill_seq_lens[i]);
-        }
+        let prefill_start_positions: Vec<usize> = prefill_kv_views
+            .iter()
+            .map(KvExecView::committed_len)
+            .collect();
 
         let mut decode_positions = Vec::with_capacity(num_decode_reqs);
-        for kv in decode_kv_states.iter_mut() {
-            let pos = kv.seq_len();
-            kv.ensure_capacity(pos + 1)?;
-            kv.advance(1);
-            decode_positions.push(pos);
+        for kv in decode_kv_views {
+            decode_positions.push(kv.committed_len());
         }
 
         // ── 3. Build metadata ─────────────────────────────────────────
@@ -130,7 +133,7 @@ impl Qwen3Model {
         let positions_d = self.ctx.stream.clone_htod(&positions)?;
 
         // Prefill plan (for prefill attention + KV scatter)
-        let prefill_descs: Vec<_> = prefill_kv_states.iter().map(|kv| kv.desc()).collect();
+        let prefill_descs: Vec<_> = prefill_kv_views.iter().map(KvExecView::desc).collect();
         let prefill_plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
             &self.ctx,
             &prefill_descs,
@@ -142,13 +145,12 @@ impl Qwen3Model {
             PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
 
-        // Decode attention metadata (built AFTER advance so seq_lens reflect new state)
         let decode_meta =
-            DecodeAttentionMeta::build(&self.ctx, decode_kv_states, &decode_positions)?;
+            DecodeAttentionMeta::build(&self.ctx, decode_kv_views, &decode_positions)?;
 
         // ── 4. Process layers ─────────────────────────────────────────
-        let kv_buffer = prefill_kv_states[0].buffer();
-        let layout = *prefill_kv_states[0].layout();
+        let kv_buffer = prefill_kv_views[0].buffer();
+        let layout = *prefill_kv_views[0].layout();
 
         let hidden = self.unified_layers(
             hidden,
@@ -220,7 +222,13 @@ impl Qwen3Model {
             kv_dim,
             inter_dim,
             total_tokens,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "unified scratch allocation failed: total_tokens={}, total_prefill={}, decode_tokens={}",
+                total_tokens, total_prefill, num_decode
+            )
+        })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.unified_forward_layer(

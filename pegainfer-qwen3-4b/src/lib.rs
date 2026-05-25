@@ -7,7 +7,9 @@ pub mod batch_decode_trace;
 mod config;
 mod executor;
 pub mod kernel_bench;
+mod kv_cache;
 mod prefill;
+mod request;
 mod scheduler;
 mod unified_forward;
 mod weights;
@@ -26,9 +28,10 @@ pub use kernel_plan::kernel_plan;
 pub mod runtime {
     pub use crate::executor::{
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
-        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,
-        UnifiedPlan, UnifiedResult,
+        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, UnifiedPlan,
+        UnifiedResult,
     };
+    pub use crate::request::RequestId;
 }
 
 pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {

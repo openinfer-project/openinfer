@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rand::rngs::StdRng;
 
 use crate::executor::{
@@ -26,6 +26,24 @@ pub(super) enum ExecutionArtifacts {
         pending: Vec<PendingRequest>,
         result: UnifiedResult,
     },
+}
+
+fn len_summary(values: impl Iterator<Item = usize>) -> (usize, usize, usize) {
+    let mut count = 0;
+    let mut total = 0;
+    let mut min = usize::MAX;
+    let mut max = 0;
+    for value in values {
+        count += 1;
+        total += value;
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if count == 0 {
+        (0, 0, 0)
+    } else {
+        (total, min, max)
+    }
 }
 
 pub(super) fn build_next_plan(
@@ -63,10 +81,22 @@ pub(super) fn execute_plan(
                 })
                 .collect();
             let any_echo = pending.iter().any(|r| r.echo);
-            let result = executor.execute_prefill(PrefillPlan {
-                requests: &requests,
-                echo: any_echo,
-            })?;
+            let (prompt_total, prompt_min, prompt_max) =
+                len_summary(requests.iter().map(|r| r.prompt_tokens.len()));
+            let result = executor
+                .execute_prefill(PrefillPlan {
+                    requests: &requests,
+                    echo: any_echo,
+                })
+                .with_context(|| {
+                    format!(
+                        "prefill plan failed: requests={}, prompt_tokens_total={}, prompt_tokens_min={}, prompt_tokens_max={}, echo={any_echo}",
+                        requests.len(),
+                        prompt_total,
+                        prompt_min,
+                        prompt_max
+                    )
+                })?;
             Ok(ExecutionArtifacts::Prefill { pending, result })
         }
         ExecutionPlan::Decode => {
@@ -80,9 +110,11 @@ pub(super) fn execute_plan(
                     random_val: rand::RngExt::random(rng),
                 })
                 .collect();
-            let result = executor.execute_decode(DecodePlan {
-                requests: &requests,
-            })?;
+            let result = executor
+                .execute_decode(DecodePlan {
+                    requests: &requests,
+                })
+                .with_context(|| format!("decode plan failed: requests={}", requests.len()))?;
             Ok(ExecutionArtifacts::Decode { result })
         }
         ExecutionPlan::Unified { pending } => {
@@ -107,10 +139,23 @@ pub(super) fn execute_plan(
                     random_val: rand::RngExt::random(rng),
                 })
                 .collect();
-            let result = executor.execute_unified(UnifiedPlan {
-                prefill_requests: &prefill_requests,
-                decode_requests: &decode_requests,
-            })?;
+            let (prompt_total, prompt_min, prompt_max) =
+                len_summary(prefill_requests.iter().map(|r| r.prompt_tokens.len()));
+            let result = executor
+                .execute_unified(UnifiedPlan {
+                    prefill_requests: &prefill_requests,
+                    decode_requests: &decode_requests,
+                })
+                .with_context(|| {
+                    format!(
+                        "unified plan failed: prefill_requests={}, decode_requests={}, prefill_tokens_total={}, prefill_tokens_min={}, prefill_tokens_max={}",
+                        prefill_requests.len(),
+                        decode_requests.len(),
+                        prompt_total,
+                        prompt_min,
+                        prompt_max
+                    )
+                })?;
             Ok(ExecutionArtifacts::Unified { pending, result })
         }
     }

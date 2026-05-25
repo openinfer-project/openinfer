@@ -17,7 +17,9 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
-use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
+use crate::executor::{ModelExecutor, Qwen3Executor};
+use crate::kv_cache::{KvAdmission, KvBudgetRequest, KvBudgetState};
+use crate::request::RequestId;
 use pegainfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent};
 use pegainfer_core::sampler::SamplingParams;
 
@@ -141,13 +143,22 @@ fn scheduler_loop<E>(
             }
         }
 
-        let admission = admit_deferred_requests(
-            deferred,
-            &active,
-            executor.page_size(),
-            executor.available_pages(),
-            executor.max_request_pages(),
-        );
+        let admission = match admit_deferred_requests(deferred, &active, &executor) {
+            Ok(admission) => admission,
+            Err((still_deferred, error)) => {
+                let message = format!("KV admission failed: {error:#}");
+                warn!("{message}");
+                for req in still_deferred {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                deferred = Vec::new();
+                continue;
+            }
+        };
         for rejected in &admission.rejected {
             send_rejection(rejected);
         }
@@ -161,8 +172,9 @@ fn scheduler_loop<E>(
         let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
             Ok(v) => v,
             Err(e) => {
-                warn!("Execution step failed: {e}");
-                fail_touched_requests(&mut executor, &mut active, failure_targets, &e.to_string());
+                let message = format!("{e:#}");
+                warn!("Execution step failed: {message}");
+                fail_touched_requests(&mut executor, &mut active, failure_targets, &message);
                 continue;
             }
         };
@@ -185,10 +197,6 @@ struct AdmissionOutcome {
     rejected: Vec<PendingRequest>,
 }
 
-fn pages_needed(token_count: usize, page_size: usize) -> usize {
-    token_count.div_ceil(page_size)
-}
-
 // Prefill samples the first output token but does not append it to KV. A
 // generated token occupies KV only when it is fed as the next decode input.
 // Therefore N returned completion tokens occupy at most N - 1 generated-token
@@ -209,55 +217,62 @@ fn current_active_tokens(req: &ActiveRequestState) -> usize {
         .saturating_add(req.generated_count.saturating_sub(1))
 }
 
-fn active_future_pages(active: &[ActiveRequestState], page_size: usize) -> usize {
-    active
-        .iter()
-        .map(|req| {
-            pages_needed(max_active_tokens(req), page_size)
-                .saturating_sub(pages_needed(current_active_tokens(req), page_size))
-        })
-        .sum()
-}
-
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
-    page_size: usize,
-    available_pages: usize,
-    max_request_pages: usize,
-) -> AdmissionOutcome {
-    let mut budget = available_pages.saturating_sub(active_future_pages(active, page_size));
+    executor: &impl ModelExecutor,
+) -> std::result::Result<AdmissionOutcome, (Vec<PendingRequest>, anyhow::Error)> {
+    let active_budget: Vec<KvBudgetState> = active
+        .iter()
+        .map(|req| KvBudgetState {
+            current_tokens: current_active_tokens(req),
+            max_tokens: max_active_tokens(req),
+        })
+        .collect();
+    let pending_budget: Vec<KvBudgetRequest> = deferred
+        .iter()
+        .map(|req| KvBudgetRequest {
+            prompt_tokens: req.prompt_tokens.len(),
+            max_tokens: max_request_tokens(req),
+        })
+        .collect();
+    let decisions = match executor.admit_requests(&active_budget, &pending_budget) {
+        Ok(decisions) => decisions,
+        Err(error) => return Err((deferred, error)),
+    };
+    if decisions.len() != deferred.len() {
+        let error = anyhow::anyhow!(
+            "KV admission returned {} decisions for {} pending requests",
+            decisions.len(),
+            deferred.len()
+        );
+        return Err((deferred, error));
+    }
+
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
 
-    for req in deferred {
-        let max_needed = pages_needed(max_request_tokens(&req), page_size);
-        if max_needed > max_request_pages {
-            rejected.push(req);
-            continue;
-        }
-
-        if max_needed <= budget {
-            budget -= max_needed;
-            pending.push(req);
-        } else {
-            still_deferred.push(req);
+    for (req, decision) in deferred.into_iter().zip(decisions) {
+        match decision {
+            KvAdmission::Admit => pending.push(req),
+            KvAdmission::Defer => still_deferred.push(req),
+            KvAdmission::Reject => rejected.push(req),
         }
     }
 
-    AdmissionOutcome {
+    Ok(AdmissionOutcome {
         pending,
         deferred: still_deferred,
         rejected,
-    }
+    })
 }
 
 fn send_rejection(req: &PendingRequest) {
     let max_tokens = max_request_tokens(req);
     let _ = req.token_tx.send(TokenEvent::Rejected {
         message: format!(
-            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
+            "request requires more KV cache than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
             req.prompt_tokens.len(),
             max_tokens
         ),
@@ -341,22 +356,22 @@ mod tests {
     };
 
     struct FakeExecutor {
-        page_size: usize,
-        max_request_pages: usize,
-        available_pages: usize,
+        max_request_tokens: usize,
+        available_tokens: usize,
         held_tokens: HashMap<RequestId, usize>,
         fail_decode_once: bool,
+        truncate_admission: bool,
         dropped: Arc<Mutex<Vec<u64>>>,
     }
 
     impl FakeExecutor {
-        fn new(max_request_pages: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
+        fn new(max_request_tokens: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
             Self {
-                page_size: 16,
-                max_request_pages,
-                available_pages: max_request_pages,
+                max_request_tokens,
+                available_tokens: max_request_tokens,
                 held_tokens: HashMap::new(),
                 fail_decode_once: false,
+                truncate_admission: false,
                 dropped,
             }
         }
@@ -366,35 +381,57 @@ mod tests {
             self
         }
 
+        fn with_truncated_admission(mut self) -> Self {
+            self.truncate_admission = true;
+            self
+        }
+
         fn ensure_request_tokens(
             &mut self,
             request_id: RequestId,
             token_count: usize,
         ) -> Result<()> {
             let current_tokens = self.held_tokens.get(&request_id).copied().unwrap_or(0);
-            let current_pages = pages_needed(current_tokens, self.page_size);
-            let needed_pages = pages_needed(token_count, self.page_size);
-            let grow = needed_pages.saturating_sub(current_pages);
-            if grow > self.available_pages {
+            let grow_tokens = token_count.saturating_sub(current_tokens);
+            if grow_tokens > self.available_tokens {
                 anyhow::bail!("fake KV capacity exhausted");
             }
-            self.available_pages -= grow;
+            self.available_tokens -= grow_tokens;
             self.held_tokens.insert(request_id, token_count);
             Ok(())
         }
     }
 
     impl ModelExecutor for FakeExecutor {
-        fn page_size(&self) -> usize {
-            self.page_size
-        }
+        fn admit_requests(
+            &self,
+            active: &[KvBudgetState],
+            pending: &[KvBudgetRequest],
+        ) -> Result<Vec<KvAdmission>> {
+            let active_future_tokens: usize = active
+                .iter()
+                .map(|req| req.max_tokens.saturating_sub(req.current_tokens))
+                .sum();
+            let mut budget = self.available_tokens.saturating_sub(active_future_tokens);
 
-        fn max_request_pages(&self) -> usize {
-            self.max_request_pages
-        }
-
-        fn available_pages(&self) -> usize {
-            self.available_pages
+            let mut decisions: Vec<_> = pending
+                .iter()
+                .map(|req| {
+                    debug_assert!(req.prompt_tokens <= req.max_tokens);
+                    if req.max_tokens > self.max_request_tokens {
+                        KvAdmission::Reject
+                    } else if req.max_tokens <= budget {
+                        budget -= req.max_tokens;
+                        KvAdmission::Admit
+                    } else {
+                        KvAdmission::Defer
+                    }
+                })
+                .collect();
+            if self.truncate_admission {
+                decisions.pop();
+            }
+            Ok(decisions)
         }
 
         fn is_stop_token(&self, _token_id: u32) -> bool {
@@ -403,7 +440,7 @@ mod tests {
 
         fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
             if let Some(tokens) = self.held_tokens.remove(&request_id) {
-                self.available_pages += pages_needed(tokens, self.page_size);
+                self.available_tokens += tokens;
             }
             self.dropped.lock().unwrap().push(request_id.get());
             Ok(())
@@ -500,7 +537,6 @@ mod tests {
         let (pending_req, _pending_rx) = request(16, 1);
         let pending = PendingRequest::from_scheduler_request(RequestId(7), pending_req);
         assert_eq!(max_request_tokens(&pending), 16);
-        assert_eq!(pages_needed(max_request_tokens(&pending), 16), 1);
 
         let (token_tx, _token_rx) = mpsc::unbounded_channel();
         let after_prefill = ActiveRequestState {
@@ -532,9 +568,9 @@ mod tests {
     }
 
     #[test]
-    fn one_token_completion_on_page_boundary_fits_one_page() {
+    fn one_token_completion_needs_only_prompt_tokens() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(1, Arc::clone(&dropped));
+        let executor = FakeExecutor::new(16, Arc::clone(&dropped));
         let handle = start_with_executor(executor, 42);
 
         let (fits_exactly, mut rx) = request(16, 1);
@@ -549,14 +585,14 @@ mod tests {
         );
         assert!(
             dropped.lock().unwrap().contains(&0),
-            "finished request should release its one prompt page"
+            "finished request should release its prompt KV allocation"
         );
     }
 
     #[test]
     fn request_waits_for_full_kv_budget_before_prefill() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
+        let executor = FakeExecutor::new(34, Arc::clone(&dropped));
         let handle = start_with_executor(executor, 42);
 
         let (long_running, mut long_rx) = request(16, 18);
@@ -623,7 +659,7 @@ mod tests {
     #[test]
     fn impossible_request_is_rejected_without_blocking_later_work() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(2, Arc::clone(&dropped));
+        let executor = FakeExecutor::new(32, Arc::clone(&dropped));
         let handle = start_with_executor(executor, 42);
 
         let (too_large, mut too_large_rx) = request(16, 34);
@@ -636,7 +672,7 @@ mod tests {
             }) => {
                 assert_eq!(prompt_tokens, 16);
                 assert_eq!(completion_tokens, 0);
-                assert!(message.contains("requires more KV pages"));
+                assert!(message.contains("requires more KV cache"));
             }
             _ => panic!("oversized request should be rejected"),
         }
@@ -654,9 +690,37 @@ mod tests {
     }
 
     #[test]
+    fn malformed_admission_batch_errors_pending_requests() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(64, Arc::clone(&dropped)).with_truncated_admission();
+        let handle = start_with_executor(executor, 42);
+
+        let (first, mut first_rx) = request(16, 1);
+        let (second, mut second_rx) = request(16, 1);
+        handle.submit(first).expect("submit first");
+        handle.submit(second).expect("submit second");
+
+        for rx in [&mut first_rx, &mut second_rx] {
+            match rx.blocking_recv() {
+                Some(TokenEvent::Error { message, .. }) => {
+                    assert!(
+                        message
+                            .contains("KV admission returned 1 decisions for 2 pending requests")
+                    );
+                }
+                _ => panic!("malformed admission should error pending request"),
+            }
+        }
+        assert!(
+            dropped.lock().unwrap().is_empty(),
+            "admission failed before request KV state was allocated"
+        );
+    }
+
+    #[test]
     fn decode_error_drops_request_state_and_scheduler_recovers() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_failure();
+        let executor = FakeExecutor::new(64, Arc::clone(&dropped)).with_decode_failure();
         let handle = start_with_executor(executor, 42);
 
         let (will_fail, mut fail_rx) = request(16, 2);
@@ -706,7 +770,7 @@ mod tests {
     #[test]
     fn active_receiver_drop_releases_request_state() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
+        let executor = FakeExecutor::new(64, Arc::clone(&dropped));
         let handle = start_with_executor(executor, 42);
 
         let (will_disconnect, mut token_rx) = request(16, 3);

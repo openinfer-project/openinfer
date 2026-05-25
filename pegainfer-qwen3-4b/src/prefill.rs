@@ -1,8 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::{Qwen3Model, TransformerBlock};
-use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::kv_pool::{KvExecView, KvLayout};
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -37,15 +37,36 @@ impl PrefillBuffers {
         seq_len: usize,
     ) -> Result<Self> {
         Ok(Self {
-            hidden_out: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            normed: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            q_batch: HiddenStates::zeros(ctx, q_dim, seq_len)?,
-            k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
-            v_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
-            o_buf: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * inter_dim, seq_len)?,
-            act_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
-            attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
+            hidden_out: HiddenStates::zeros(ctx, hidden_dim, seq_len).with_context(|| {
+                format!("alloc prefill hidden_out failed: dims={hidden_dim}x{seq_len}")
+            })?,
+            normed: HiddenStates::zeros(ctx, hidden_dim, seq_len).with_context(|| {
+                format!("alloc prefill normed failed: dims={hidden_dim}x{seq_len}")
+            })?,
+            q_batch: HiddenStates::zeros(ctx, q_dim, seq_len)
+                .with_context(|| format!("alloc prefill q_batch failed: dims={q_dim}x{seq_len}"))?,
+            k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len).with_context(|| {
+                format!("alloc prefill k_batch failed: dims={kv_dim}x{seq_len}")
+            })?,
+            v_batch: HiddenStates::zeros(ctx, kv_dim, seq_len).with_context(|| {
+                format!("alloc prefill v_batch failed: dims={kv_dim}x{seq_len}")
+            })?,
+            o_buf: HiddenStates::zeros(ctx, hidden_dim, seq_len).with_context(|| {
+                format!("alloc prefill o_buf failed: dims={hidden_dim}x{seq_len}")
+            })?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * inter_dim, seq_len).with_context(|| {
+                format!(
+                    "alloc prefill gate_up_out failed: dims={}x{}",
+                    2 * inter_dim,
+                    seq_len
+                )
+            })?,
+            act_out: HiddenStates::zeros(ctx, inter_dim, seq_len).with_context(|| {
+                format!("alloc prefill act_out failed: dims={inter_dim}x{seq_len}")
+            })?,
+            attn_output: HiddenStates::zeros(ctx, q_dim, seq_len).with_context(|| {
+                format!("alloc prefill attn_output failed: dims={q_dim}x{seq_len}")
+            })?,
         })
     }
 }
@@ -220,27 +241,26 @@ impl Qwen3Model {
     pub(crate) fn batch_prefill(
         &self,
         prompts: &[&[u32]],
-        kv_states: &mut [&mut KvState],
+        kv_views: &[KvExecView],
         echo: bool,
     ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
-        assert_eq!(batch_size, kv_states.len());
+        assert_eq!(batch_size, kv_views.len());
 
         let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
-        let start_positions: Vec<usize> = kv_states.iter().map(|kv| kv.seq_len()).collect();
+        let start_positions: Vec<usize> = kv_views.iter().map(KvExecView::committed_len).collect();
 
         // Concatenate all tokens
         let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
-        let hidden = self.get_embeddings_batch(&all_tokens)?;
+        let hidden = self.get_embeddings_batch(&all_tokens).with_context(|| {
+            format!(
+                "batch prefill embedding failed: requests={}, total_tokens={}",
+                batch_size,
+                all_tokens.len()
+            )
+        })?;
 
-        // Allocate pages and advance for each request
-        for (i, kv) in kv_states.iter_mut().enumerate() {
-            kv.ensure_capacity(start_positions[i] + seq_lens[i])?;
-            kv.advance(seq_lens[i]);
-        }
-
-        // Build batch plan (all descs must reflect post-advance state)
-        let descs: Vec<_> = kv_states.iter().map(|kv| kv.desc()).collect();
+        let descs: Vec<_> = kv_views.iter().map(KvExecView::desc).collect();
         let plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
             &self.ctx,
             &descs,
@@ -253,8 +273,8 @@ impl Qwen3Model {
         )?;
 
         // Forward through all layers
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
+        let kv_buffer = kv_views[0].buffer();
+        let layout = *kv_views[0].layout();
         let hidden = self.process_all_layers_batch_multi(hidden, &layout, kv_buffer, &plan)?;
 
         // All-position logits for echo (before we extract last-token logits)
@@ -303,7 +323,10 @@ impl Qwen3Model {
             kv_dim,
             inter_dim,
             total_tokens,
-        )?;
+        )
+        .with_context(|| {
+            format!("batch prefill scratch allocation failed: total_tokens={total_tokens}")
+        })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_layer_batch_paged(

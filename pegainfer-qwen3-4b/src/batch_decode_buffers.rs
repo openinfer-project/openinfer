@@ -5,7 +5,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use pegainfer_core::cuda_graph::CudaGraphState;
-use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::kv_pool::KvExecView;
 use pegainfer_core::tensor::{DeviceContext, HiddenStates};
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
@@ -170,17 +170,17 @@ impl BatchDecodeBuffers {
         self.logits.seq_len = bs;
     }
 
-    /// Sync paged attention metadata from multiple KvStates to GPU buffers.
+    /// Sync paged attention metadata from multiple prepared KV views to GPU buffers.
     ///
-    /// `padded_bs` >= `kv_states.len()`: padding slots (if any) point to the
+    /// `padded_bs` >= `kv_views.len()`: padding slots (if any) point to the
     /// reserved padding page with seq_len=1 so FlashInfer accesses valid memory.
     pub(crate) fn sync_paged_meta(
         &mut self,
         ctx: &DeviceContext,
-        kv_states: &[&KvState],
+        kv_views: &[KvExecView],
         padded_bs: usize,
     ) -> Result<()> {
-        let real_bs = kv_states.len();
+        let real_bs = kv_views.len();
         debug_assert!(padded_bs >= real_bs);
 
         // Build concatenated page_indices and CSR indptr
@@ -190,7 +190,7 @@ impl BatchDecodeBuffers {
         let mut chunk_sizes = Vec::with_capacity(padded_bs);
         self.max_seq_len = 0;
 
-        for kv in kv_states {
+        for kv in kv_views {
             let pages = kv.page_indices_i32();
             all_page_indices.extend_from_slice(&pages);
             indptr.push(all_page_indices.len() as i32);
@@ -221,7 +221,7 @@ impl BatchDecodeBuffers {
             .memcpy_htod(&request_indices, &mut self.request_indices_d)?;
         ctx.stream
             .memcpy_htod(&kv_tile_indices, &mut self.kv_tile_indices_d)?;
-        self.sync_split_kv_meta(ctx, kv_states, padded_bs)?;
+        self.sync_split_kv_meta(ctx, kv_views, padded_bs)?;
 
         Ok(())
     }
@@ -229,7 +229,7 @@ impl BatchDecodeBuffers {
     fn sync_split_kv_meta(
         &mut self,
         ctx: &DeviceContext,
-        kv_states: &[&KvState],
+        kv_views: &[KvExecView],
         padded_bs: usize,
     ) -> Result<()> {
         let split_chunk_size =
@@ -241,8 +241,9 @@ impl BatchDecodeBuffers {
         let mut split_block_valid_mask = Vec::with_capacity(split_padded_slots);
         split_o_indptr.push(0);
 
-        for (request_idx, kv) in kv_states.iter().enumerate() {
-            let chunks = kv.seq_len().div_ceil(split_chunk_size).max(1);
+        for (request_idx, kv) in kv_views.iter().enumerate() {
+            let seq_len = kv.seq_len();
+            let chunks = seq_len.div_ceil(split_chunk_size).max(1);
             debug_assert!(chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST);
             for chunk_idx in 0..chunks {
                 split_request_indices.push(request_idx as i32);
@@ -252,7 +253,7 @@ impl BatchDecodeBuffers {
             split_o_indptr.push(split_request_indices.len() as i32);
         }
 
-        for _ in kv_states.len()..padded_bs {
+        for _ in kv_views.len()..padded_bs {
             split_o_indptr.push(split_request_indices.len() as i32);
         }
 

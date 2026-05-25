@@ -7,7 +7,7 @@ use super::batch_decode_buffers::{
 };
 use super::batch_decode_dag::BatchDecodeDag;
 use super::weights::{Qwen3Model, TransformerBlock};
-use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::kv_pool::{KvExecView, KvLayout};
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops;
 use pegainfer_kernels::tensor::{KvDim, QDim};
@@ -46,19 +46,16 @@ impl Qwen3Model {
     pub(crate) fn batch_decode(
         &self,
         token_ids: &[u32],
-        kv_states: &mut [&mut KvState],
+        kv_views: &[KvExecView],
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         let bs = token_ids.len();
-        assert_eq!(bs, kv_states.len());
+        assert_eq!(bs, kv_views.len());
         assert!(bs > 0);
 
-        // Grow pages and advance seq_len for each request
         let mut positions = Vec::with_capacity(bs);
-        for kv in kv_states.iter_mut() {
-            let pos = kv.seq_len();
-            kv.ensure_capacity(pos + 1)?;
-            kv.advance(1);
+        for kv in kv_views {
+            let pos = kv.committed_len();
             positions.push(pos as i32);
         }
 
@@ -84,15 +81,14 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&positions, &mut bufs.positions_d)?;
 
-        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
-        bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
+        bufs.sync_paged_meta(&self.ctx, kv_views, padded_bs)?;
         let attention_path = bufs.attention_path(padded_bs);
         #[cfg(feature = "kernel-call-trace")]
-        let trace_kv_len = kv_refs.iter().map(|kv| kv.seq_len()).max().unwrap_or(0);
+        let trace_kv_len = kv_views.iter().map(KvExecView::seq_len).max().unwrap_or(0);
 
         // Forward pass — with or without CUDA Graph
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
+        let kv_buffer = kv_views[0].buffer();
+        let layout = *kv_views[0].layout();
         if self.enable_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
@@ -275,6 +271,8 @@ impl Qwen3Model {
 mod tests {
     use super::*;
     use crate::batch_decode_buffers::BatchDecodeBuffers;
+    use crate::kv_cache::{KvAppend, Qwen3KvCache};
+    use crate::request::RequestId;
     use crate::weights::ModelRuntimeConfig;
     use pegainfer_core::ops;
     use pegainfer_core::sampler::SamplingParams;
@@ -379,13 +377,18 @@ mod tests {
         prompt_tokens: &[u32],
         params: &SamplingParams,
         rng: &mut StdRng,
-    ) -> (KvState, u32) {
-        let mut kv_state = model.kv_pool.alloc();
+    ) -> (Qwen3KvCache, RequestId, u32) {
+        let mut kv_cache = Qwen3KvCache::new(vec![model.kv_pool().clone()]);
+        let request_id = RequestId::new(0);
+        let appends = vec![KvAppend::prefill(request_id, prompt_tokens.len())];
         let prompts: Vec<&[u32]> = vec![prompt_tokens];
-        let mut kv_refs: Vec<&mut KvState> = vec![&mut kv_state];
-        let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
+        let rank_views = kv_cache.prepare_prefill(&appends).unwrap();
+        let (logits_vec, _) = model
+            .batch_prefill(&prompts, rank_views[0].views(), false)
+            .unwrap();
+        kv_cache.commit_prefill(&appends).unwrap();
         let first_token = sample_logits(model, &logits_vec[0], params, rng);
-        (kv_state, first_token)
+        (kv_cache, request_id, first_token)
     }
 
     /// Run single-request decode via batch_decode(bs=1) for a prompt, return generated token IDs.
@@ -402,7 +405,8 @@ mod tests {
         let params = SamplingParams::default(); // greedy
         let mut rng = StdRng::seed_from_u64(seed);
 
-        let (mut kv_state, first_token) = prefill_one(model, prompt_tokens, &params, &mut rng);
+        let (mut kv_cache, request_id, first_token) =
+            prefill_one(model, prompt_tokens, &params, &mut rng);
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
             model.config.hidden_size,
@@ -420,10 +424,12 @@ mod tests {
         let mut tokens = vec![first_token];
         for _ in 1..num_decode_steps {
             let token_ids = [*tokens.last().unwrap()];
-            let mut kv_refs: Vec<&mut KvState> = vec![&mut kv_state];
+            let appends = vec![KvAppend::decode(request_id)];
+            let rank_views = kv_cache.prepare_decode(&appends).unwrap();
             model
-                .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
+                .batch_decode(&token_ids, rank_views[0].views(), &mut bufs)
                 .unwrap();
+            kv_cache.commit_decode(&appends).unwrap();
             let params_refs: Vec<&SamplingParams> = vec![&params];
             let batch_tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             tokens.push(batch_tokens[0]);
@@ -442,9 +448,18 @@ mod tests {
         let params = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(seed);
 
-        let mut kv_states: Vec<KvState> = (0..bs).map(|_| model.kv_pool.alloc()).collect();
-        let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
-        let (logits_vec, _) = model.batch_prefill(prompts, &mut kv_refs, false).unwrap();
+        let mut kv_cache = Qwen3KvCache::new(vec![model.kv_pool().clone()]);
+        let request_ids: Vec<RequestId> = (0..bs as u64).map(RequestId::new).collect();
+        let prefill_appends: Vec<KvAppend> = request_ids
+            .iter()
+            .zip(prompts)
+            .map(|(&request_id, prompt)| KvAppend::prefill(request_id, prompt.len()))
+            .collect();
+        let rank_views = kv_cache.prepare_prefill(&prefill_appends).unwrap();
+        let (logits_vec, _) = model
+            .batch_prefill(prompts, rank_views[0].views(), false)
+            .unwrap();
+        kv_cache.commit_prefill(&prefill_appends).unwrap();
         let first_tokens: Vec<u32> = logits_vec
             .iter()
             .map(|logits| sample_logits(model, logits, &params, &mut rng))
@@ -474,10 +489,13 @@ mod tests {
 
         for _ in 1..num_decode_steps {
             let token_ids: Vec<u32> = all_tokens.iter().map(|t| *t.last().unwrap()).collect();
-            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
+            let decode_appends: Vec<KvAppend> =
+                request_ids.iter().copied().map(KvAppend::decode).collect();
+            let rank_views = kv_cache.prepare_decode(&decode_appends).unwrap();
             model
-                .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
+                .batch_decode(&token_ids, rank_views[0].views(), &mut bufs)
                 .unwrap();
+            kv_cache.commit_decode(&decode_appends).unwrap();
             let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
             let tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             for (i, &tok) in tokens.iter().enumerate() {
@@ -522,14 +540,24 @@ mod tests {
             let mut seq_first_tokens = Vec::new();
             for prompt in [&prefill_a, &prefill_b, &prefill_c] {
                 let mut rng = StdRng::seed_from_u64(seed);
-                let (_kv_state, token) = prefill_one(&model, prompt.as_slice(), &params, &mut rng);
+                let (_kv_cache, _request_id, token) =
+                    prefill_one(&model, prompt.as_slice(), &params, &mut rng);
                 seq_first_tokens.push(token);
             }
 
             let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
-            let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
-            let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
+            let mut kv_cache = Qwen3KvCache::new(vec![model.kv_pool().clone()]);
+            let request_ids: Vec<RequestId> = (0..3).map(RequestId::new).collect();
+            let appends: Vec<KvAppend> = request_ids
+                .iter()
+                .zip(&prompts)
+                .map(|(&request_id, prompt)| KvAppend::prefill(request_id, prompt.len()))
+                .collect();
+            let rank_views = kv_cache.prepare_prefill(&appends).unwrap();
+            let (logits_vec, _) = model
+                .batch_prefill(&prompts, rank_views[0].views(), false)
+                .unwrap();
+            kv_cache.commit_prefill(&appends).unwrap();
 
             let mut batch_first_tokens = Vec::new();
             for logits in &logits_vec {

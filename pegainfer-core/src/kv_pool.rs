@@ -161,11 +161,19 @@ impl KvState {
         self.permit.pages().len()
     }
 
+    pub fn capacity_tokens(&self) -> usize {
+        self.permit.len() * self.pool.inner.layout.page_size
+    }
+
     pub fn last_page_len(&self) -> usize {
-        if self.seq_len == 0 {
+        self.last_page_len_for(self.seq_len)
+    }
+
+    fn last_page_len_for(&self, seq_len: usize) -> usize {
+        if seq_len == 0 {
             0
         } else {
-            let rem = self.seq_len % self.pool.inner.layout.page_size;
+            let rem = seq_len % self.pool.inner.layout.page_size;
             if rem == 0 {
                 self.pool.inner.layout.page_size
             } else {
@@ -208,6 +216,18 @@ impl KvState {
         Ok(())
     }
 
+    /// Validate that an owner outside the forward path already prepared enough
+    /// physical KV capacity for `token_count` tokens.
+    pub fn ensure_prepared_capacity(&self, token_count: usize) -> Result<()> {
+        if token_count > self.capacity_tokens() {
+            bail!(
+                "KvState: capacity was not prepared (need {token_count} tokens, have {})",
+                self.capacity_tokens()
+            );
+        }
+        Ok(())
+    }
+
     /// Advance sequence length after writing tokens.
     pub fn advance(&mut self, count: usize) {
         self.seq_len += count;
@@ -215,13 +235,29 @@ impl KvState {
 
     /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
+        self.desc_with_seq_len(self.seq_len)
+    }
+
+    fn desc_with_seq_len(&self, seq_len: usize) -> KvDesc<'_> {
         KvDesc {
             layout: self.pool.inner.layout,
             buffer: &self.pool.inner.buffer,
             pages: self.permit.pages(),
-            seq_len: self.seq_len,
-            last_page_len: self.last_page_len(),
+            seq_len,
+            last_page_len: self.last_page_len_for(seq_len),
         }
+    }
+
+    pub fn exec_view(&self, append_tokens: usize) -> Result<KvExecView> {
+        let seq_len = self.seq_len + append_tokens;
+        self.ensure_prepared_capacity(seq_len)?;
+        Ok(KvExecView {
+            pool: self.pool.clone(),
+            pages: self.permit.pages().to_vec(),
+            committed_len: self.seq_len,
+            seq_len,
+            last_page_len: self.last_page_len_for(seq_len),
+        })
     }
 
     /// Reset for a new request: return all pages, zero seq_len.
@@ -233,6 +269,58 @@ impl KvState {
             .try_acquire_many(0)
             .expect("zero acquire");
         self.seq_len = 0;
+    }
+}
+
+/// Value-type execution descriptor for one prepared KV request.
+///
+/// It carries only kernel-facing metadata and cloned access to the backing
+/// buffer. Page ownership stays with the `KvState` that produced the view.
+pub struct KvExecView {
+    pool: KvPool,
+    pages: Vec<PageId>,
+    committed_len: usize,
+    seq_len: usize,
+    last_page_len: usize,
+}
+
+impl KvExecView {
+    pub fn committed_len(&self) -> usize {
+        self.committed_len
+    }
+
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    pub fn last_page_len(&self) -> usize {
+        self.last_page_len
+    }
+
+    pub fn num_pages(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn page_indices_i32(&self) -> Vec<i32> {
+        self.pages.iter().map(|p| p.index() as i32).collect()
+    }
+
+    pub fn buffer(&self) -> &CudaSlice<bf16> {
+        &self.pool.inner.buffer
+    }
+
+    pub fn layout(&self) -> &KvLayout {
+        &self.pool.inner.layout
+    }
+
+    pub fn desc(&self) -> KvDesc<'_> {
+        KvDesc {
+            layout: self.pool.inner.layout,
+            buffer: &self.pool.inner.buffer,
+            pages: &self.pages,
+            seq_len: self.seq_len,
+            last_page_len: self.last_page_len,
+        }
     }
 }
 

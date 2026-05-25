@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::executor::RequestId;
+use crate::request::RequestId;
 use pegainfer_core::engine::{FinishReason, TokenLogprob};
 
 use super::{ActiveRequestState, TokenEvent};

@@ -8,6 +8,10 @@ use pegainfer_kernels::tensor::KernelCall;
 #[cfg(feature = "kernel-call-trace")]
 use crate::batch_decode_buffers::BatchDecodeBuffers;
 #[cfg(feature = "kernel-call-trace")]
+use crate::kv_cache::{KvAppend, Qwen3KvCache};
+#[cfg(feature = "kernel-call-trace")]
+use crate::request::RequestId;
+#[cfg(feature = "kernel-call-trace")]
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
 
 pub const MODEL: &str = "qwen3-4b";
@@ -38,16 +42,20 @@ pub fn trace_decode_kernel_calls(
             device_ordinal: 0,
         },
     )?;
-    let mut kv_states = (0..batch_size)
-        .map(|_| {
-            let mut kv = model.alloc_kv();
-            if kv_len > 1 {
-                kv.ensure_capacity(kv_len - 1)?;
-                kv.advance(kv_len - 1);
-            }
-            Ok(kv)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut kv_cache = Qwen3KvCache::new(vec![model.kv_pool().clone()]);
+    let request_ids: Vec<_> = (0..batch_size)
+        .map(|index| RequestId::new(index as u64))
+        .collect();
+    let prefill_appends: Vec<_> = request_ids
+        .iter()
+        .map(|&request_id| KvAppend::prefill(request_id, kv_len.saturating_sub(1)))
+        .collect();
+    let decode_appends: Vec<_> = request_ids
+        .iter()
+        .map(|&request_id| KvAppend::decode(request_id))
+        .collect();
+    kv_cache.prepare_prefill(&prefill_appends)?;
+    kv_cache.commit_prefill(&prefill_appends)?;
 
     let mut bufs = BatchDecodeBuffers::new(
         model.device_ctx(),
@@ -63,8 +71,8 @@ pub fn trace_decode_kernel_calls(
     )?;
     let token_ids = vec![0_u32; batch_size];
     let ((), calls) = call_trace::collect_result(|| {
-        let mut kv_refs = kv_states.iter_mut().collect::<Vec<_>>();
-        model.batch_decode(&token_ids, &mut kv_refs, &mut bufs)
+        let rank_views = kv_cache.prepare_decode(&decode_appends)?;
+        model.batch_decode(&token_ids, rank_views[0].views(), &mut bufs)
     })?;
     Ok(calls)
 }

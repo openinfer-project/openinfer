@@ -103,6 +103,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel/report tooling is feature-gated: `qwen3_kernel_report` covers per-op kernel reports, and `qwen3_model_report` emits runtime-traced eager-DAG decode operator rollups with TensorSpec `KernelCall`s, latency stats, tables, and Graphviz DOT; measured FA2 `CTA_TILE_Q=64` prefill default in place. |
 | `subsystems/kernels/typed-forward-pipeline.md` | Reusable typed tensor pipeline macro in `pegainfer-kernels` so model crates can express common `typed_ops` chains without model-specific wrapper macros. |
 
+## subsystems / kv-cache
+
+| Path | TL;DR |
+| --- | --- |
+| `subsystems/kv-cache/redesign.md` | Qwen3 KV boundary: scheduler speaks token lifecycle, executor-side `Qwen3KvCache` translates to TP physical KV and `KvExecView`, workers only execute, and commit happens after worker success. Release and serving smoke pass; c16 random is a forward workspace admission issue. |
+
 ## playbooks
 
 | Path | TL;DR |
