@@ -238,12 +238,11 @@ impl Qwen3KvCache {
         &self,
         active: &[KvBudgetState],
         pending: &[KvBudgetRequest],
-    ) -> Vec<KvAdmission> {
-        let page_size = self
-            .pools
-            .first()
-            .map(|pool| pool.layout().page_size)
-            .unwrap_or(1);
+    ) -> Result<Vec<KvAdmission>> {
+        let Some(first_pool) = self.pools.first() else {
+            anyhow::bail!("Qwen3KvCache has no physical KV pools");
+        };
+        let page_size = first_pool.layout().page_size;
         let active_future_physical_pages: usize = active
             .iter()
             .map(|req| {
@@ -256,7 +255,7 @@ impl Qwen3KvCache {
             .saturating_sub(active_future_physical_pages);
         let max_request_physical_pages = self.max_request_physical_pages();
 
-        pending
+        Ok(pending
             .iter()
             .map(|req| {
                 debug_assert!(req.prompt_tokens <= req.max_tokens);
@@ -270,7 +269,7 @@ impl Qwen3KvCache {
                     KvAdmission::Defer
                 }
             })
-            .collect()
+            .collect())
     }
 
     pub(crate) fn drop_request(&mut self, request_id: RequestId) {
@@ -409,6 +408,25 @@ mod tests {
 
     fn test_pool(ctx: &DeviceContext, available_request_pages: usize) -> KvPool {
         KvPool::new(ctx, 1, 1, 1, 16, available_request_pages + 1).expect("test KvPool allocation")
+    }
+
+    #[test]
+    fn admit_requests_errors_without_physical_pools() {
+        let cache = Qwen3KvCache::new(Vec::new());
+        let err = cache
+            .admit_requests(
+                &[],
+                &[KvBudgetRequest {
+                    prompt_tokens: 1,
+                    max_tokens: 1,
+                }],
+            )
+            .expect_err("empty physical KV pool set must be explicit");
+
+        assert!(
+            err.to_string().contains("no physical KV pools"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

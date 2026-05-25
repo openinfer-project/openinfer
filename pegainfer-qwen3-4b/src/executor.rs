@@ -548,16 +548,19 @@ impl Qwen3Executor {
         let primary = self
             .primary
             .run_step(steps.next().expect("primary step checked above"), true)?;
-        let mut send_error = None;
+        let mut errors = Vec::new();
         let mut pending = Vec::with_capacity(self.workers.len());
         for (rank, (worker, step)) in self.workers.iter().zip(steps).enumerate() {
             match worker.run_step(step, false) {
                 Ok(recv) => pending.push((rank + 1, recv)),
                 Err(error) => {
-                    send_error = Some(error.context(format!(
-                        "tensor-parallel {op_name} worker rank {} send failed",
-                        rank + 1
-                    )));
+                    errors.push(format!(
+                        "{:#}",
+                        error.context(format!(
+                            "tensor-parallel {op_name} worker rank {} send failed",
+                            rank + 1
+                        ))
+                    ));
                     break;
                 }
             }
@@ -568,7 +571,6 @@ impl Qwen3Executor {
             Err(_) => Err(anyhow::anyhow!("primary worker dropped step response")),
         };
 
-        let mut ack_result = Ok(());
         for (rank, recv) in pending {
             let result = match recv.recv() {
                 Ok(response) => response.result,
@@ -579,26 +581,41 @@ impl Qwen3Executor {
             match result {
                 Ok(WorkerStepOutcome::Ack) => {}
                 Ok(other) => {
-                    ack_result = Err(anyhow::anyhow!(
-                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
+                    errors.push(format!(
+                        "tensor-parallel {op_name} worker rank {rank} returned unexpected payload: {}",
                         other.kind()
                     ));
                 }
                 Err(error) => {
-                    ack_result = Err(error.context(format!(
-                        "tensor-parallel {op_name} worker rank {rank} failed",
-                    )));
+                    errors.push(format!(
+                        "{:#}",
+                        error.context(format!(
+                            "tensor-parallel {op_name} worker rank {rank} failed",
+                        ))
+                    ));
                 }
             }
         }
 
-        if let Some(error) = send_error {
-            return Err(error);
+        let primary_result = match primary_result {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                errors.push(format!(
+                    "{:#}",
+                    error.context(format!("primary {op_name} worker rank 0 failed"))
+                ));
+                None
+            }
+        };
+
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "tensor-parallel {op_name} step failed with {} error(s):\n{}",
+                errors.len(),
+                errors.join("\n")
+            );
         }
-        let primary_result =
-            primary_result.with_context(|| format!("primary {op_name} worker rank 0 failed"))?;
-        ack_result?;
-        Ok(primary_result)
+        Ok(primary_result.expect("primary result exists when no rank errors were collected"))
     }
 }
 
@@ -608,7 +625,7 @@ impl ModelExecutor for Qwen3Executor {
         active: &[KvBudgetState],
         pending: &[KvBudgetRequest],
     ) -> Result<Vec<KvAdmission>> {
-        Ok(self.kv_cache.admit_requests(active, pending))
+        self.kv_cache.admit_requests(active, pending)
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
