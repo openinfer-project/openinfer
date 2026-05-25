@@ -1,3 +1,4 @@
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -545,13 +546,16 @@ impl Qwen3Executor {
         );
         let op_name = steps[0].kind();
         let mut steps = steps.into_iter();
-        let primary = self
-            .primary
-            .run_step(steps.next().expect("primary step checked above"), true)?;
+        let start_gate = Arc::new(StepStartGate::new());
+        let primary = self.primary.run_step(
+            steps.next().expect("primary step checked above"),
+            true,
+            Arc::clone(&start_gate),
+        )?;
         let mut errors = Vec::new();
         let mut pending = Vec::with_capacity(self.workers.len());
         for (rank, (worker, step)) in self.workers.iter().zip(steps).enumerate() {
-            match worker.run_step(step, false) {
+            match worker.run_step(step, false, Arc::clone(&start_gate)) {
                 Ok(recv) => pending.push((rank + 1, recv)),
                 Err(error) => {
                     errors.push(format!(
@@ -565,6 +569,18 @@ impl Qwen3Executor {
                 }
             }
         }
+
+        if !errors.is_empty() {
+            start_gate.cancel()?;
+            drain_cancelled_rank_steps(primary, pending);
+            anyhow::bail!(
+                "tensor-parallel {op_name} step failed before start with {} error(s):\n{}",
+                errors.len(),
+                errors.join("\n")
+            );
+        }
+
+        start_gate.start()?;
 
         let primary_result = match primary.recv() {
             Ok(response) => response.result,
@@ -616,6 +632,16 @@ impl Qwen3Executor {
             );
         }
         Ok(primary_result.expect("primary result exists when no rank errors were collected"))
+    }
+}
+
+fn drain_cancelled_rank_steps(
+    primary: channel::Receiver<WorkerStepResponse>,
+    pending: Vec<(usize, channel::Receiver<WorkerStepResponse>)>,
+) {
+    let _ = primary.recv();
+    for (_, recv) in pending {
+        let _ = recv.recv();
     }
 }
 
@@ -879,9 +905,68 @@ enum WorkerCommand {
     RunStep {
         step: StepCommand,
         collect_result: bool,
+        start_gate: Arc<StepStartGate>,
         resp: channel::Sender<WorkerStepResponse>,
     },
     Shutdown,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StepStartState {
+    Waiting,
+    Start,
+    Cancel,
+}
+
+struct StepStartGate {
+    state: Mutex<StepStartState>,
+    ready: Condvar,
+}
+
+impl StepStartGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StepStartState::Waiting),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn start(&self) -> Result<()> {
+        self.set_state(StepStartState::Start)
+    }
+
+    fn cancel(&self) -> Result<()> {
+        self.set_state(StepStartState::Cancel)
+    }
+
+    fn set_state(&self, next: StepStartState) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("step start gate poisoned"))?;
+        *state = next;
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    fn wait(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("step start gate poisoned"))?;
+        loop {
+            match *state {
+                StepStartState::Waiting => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .map_err(|_| anyhow::anyhow!("step start gate poisoned"))?;
+                }
+                StepStartState::Start => return Ok(()),
+                StepStartState::Cancel => anyhow::bail!("rank step cancelled before start"),
+            }
+        }
+    }
 }
 
 enum WorkerStepOutcome {
@@ -923,10 +1008,15 @@ impl RankWorker {
                                 WorkerCommand::RunStep {
                                     step,
                                     collect_result,
+                                    start_gate,
                                     resp,
                                 } => {
-                                    let result =
-                                        execute_step_on_lane(&mut lane, step, collect_result);
+                                    let result = match start_gate.wait() {
+                                        Ok(()) => {
+                                            execute_step_on_lane(&mut lane, step, collect_result)
+                                        }
+                                        Err(error) => WorkerStepResponse { result: Err(error) },
+                                    };
                                     let _ = resp.send(result);
                                 }
                                 WorkerCommand::Shutdown => break,
@@ -952,12 +1042,14 @@ impl RankWorker {
         &self,
         step: StepCommand,
         collect_result: bool,
+        start_gate: Arc<StepStartGate>,
     ) -> Result<channel::Receiver<WorkerStepResponse>> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::RunStep {
                 step,
                 collect_result,
+                start_gate,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
@@ -969,5 +1061,28 @@ impl RankWorker {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_start_gate_cancel_wakes_waiter() {
+        let gate = Arc::new(StepStartGate::new());
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = thread::spawn(move || waiter_gate.wait());
+
+        gate.cancel().expect("cancel start gate");
+        let err = waiter
+            .join()
+            .expect("waiter thread must not panic")
+            .expect_err("cancelled gate must not start worker execution");
+
+        assert!(
+            err.to_string().contains("cancelled before start"),
+            "unexpected error: {err:#}"
+        );
     }
 }
