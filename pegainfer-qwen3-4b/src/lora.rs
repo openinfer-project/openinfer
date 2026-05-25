@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+use half::{bf16, f16};
+use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
@@ -27,6 +29,30 @@ pub(crate) struct LoraAdapterManifest {
     pub(crate) alpha: usize,
     pub(crate) target_modules: Vec<String>,
     pub(crate) tensor_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoraAdapter {
+    pub(crate) manifest: LoraAdapterManifest,
+    pub(crate) layers: Vec<LoraLayer>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoraLayer {
+    pub(crate) projections: BTreeMap<String, LoraProjection>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoraProjection {
+    pub(crate) a: LoraMatrix,
+    pub(crate) b: LoraMatrix,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoraMatrix {
+    pub(crate) data: Vec<bf16>,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,7 +91,34 @@ impl TargetModules {
     }
 }
 
-pub(crate) fn validate_lora_adapter(path: &Path, config: &Config) -> Result<LoraAdapterManifest> {
+pub(crate) fn load_lora_adapter(path: &Path, config: &Config) -> Result<LoraAdapter> {
+    let (manifest, raw_weights) = inspect_lora_adapter(path, config)?;
+    let tensors = SafeTensors::deserialize(&raw_weights).with_context(|| {
+        format!(
+            "failed to parse {}",
+            path.join(ADAPTER_WEIGHTS_FILE).display()
+        )
+    })?;
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for layer_idx in 0..config.num_hidden_layers {
+        let mut layer = LoraLayer::default();
+        for target in &manifest.target_modules {
+            let spec = projection_spec(config, target)?;
+            let a_name = tensor_name(layer_idx, spec.path_segment, "lora_A");
+            let b_name = tensor_name(layer_idx, spec.path_segment, "lora_B");
+            let a = load_matrix(&tensors, &a_name)?;
+            let b = load_matrix(&tensors, &b_name)?;
+            layer
+                .projections
+                .insert(target.clone(), LoraProjection { a, b });
+        }
+        layers.push(layer);
+    }
+
+    Ok(LoraAdapter { manifest, layers })
+}
+
+fn inspect_lora_adapter(path: &Path, config: &Config) -> Result<(LoraAdapterManifest, Vec<u8>)> {
     let adapter_config = load_adapter_config(path)?;
     let rank = adapter_config.lora_rank;
     let alpha = adapter_config.alpha;
@@ -95,13 +148,15 @@ pub(crate) fn validate_lora_adapter(path: &Path, config: &Config) -> Result<Lora
 
     validate_tensor_catalog(&tensors, config, rank, &target_modules)?;
 
-    Ok(LoraAdapterManifest {
+    let manifest = LoraAdapterManifest {
         path: path.to_path_buf(),
         rank,
         alpha,
         target_modules,
         tensor_count: tensors.len(),
-    })
+    };
+
+    Ok((manifest, raw_weights))
 }
 
 fn load_adapter_config(path: &Path) -> Result<PeftAdapterConfig> {
@@ -233,6 +288,68 @@ fn ensure_lora_dtype(name: &str, dtype: Dtype) -> Result<()> {
     Ok(())
 }
 
+fn load_matrix(tensors: &SafeTensors<'_>, name: &str) -> Result<LoraMatrix> {
+    let tensor = tensors
+        .tensor(name)
+        .with_context(|| format!("missing LoRA tensor {name}"))?;
+    ensure!(
+        tensor.shape().len() == 2,
+        "LoRA tensor {name} expected 2D, got {:?}",
+        tensor.shape()
+    );
+    Ok(LoraMatrix {
+        data: tensor_to_bf16(&tensor, name)?,
+        rows: tensor.shape()[0],
+        cols: tensor.shape()[1],
+    })
+}
+
+fn tensor_to_bf16(tensor: &TensorView<'_>, name: &str) -> Result<Vec<bf16>> {
+    ensure_lora_dtype(name, tensor.dtype())?;
+    let elems = tensor.shape().iter().product::<usize>();
+    match tensor.dtype() {
+        Dtype::BF16 => {
+            ensure!(
+                tensor.data().len() == elems * 2,
+                "LoRA tensor {name} BF16 byte length mismatch"
+            );
+            Ok(tensor
+                .data()
+                .chunks_exact(2)
+                .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+                .collect())
+        }
+        Dtype::F16 => {
+            ensure!(
+                tensor.data().len() == elems * 2,
+                "LoRA tensor {name} F16 byte length mismatch"
+            );
+            Ok(tensor
+                .data()
+                .chunks_exact(2)
+                .map(|bytes| {
+                    let value = f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
+                    bf16::from_f32(value.to_f32())
+                })
+                .collect())
+        }
+        Dtype::F32 => {
+            ensure!(
+                tensor.data().len() == elems * 4,
+                "LoRA tensor {name} F32 byte length mismatch"
+            );
+            Ok(tensor
+                .data()
+                .chunks_exact(4)
+                .map(|bytes| {
+                    bf16::from_f32(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                })
+                .collect())
+        }
+        dtype => bail!("LoRA tensor {name} has unsupported dtype {dtype:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -341,15 +458,24 @@ mod tests {
     }
 
     fn push_tensor(tensors: &mut BTreeMap<String, TestTensor>, name: String, shape: Vec<usize>) {
-        let bytes = vec![0_u8; shape.iter().product::<usize>() * 2];
-        tensors.insert(
-            name,
-            TestTensor {
-                dtype: Dtype::BF16,
-                shape,
-                data: bytes,
-            },
-        );
+        push_tensor_with_dtype(tensors, name, shape, Dtype::BF16, 0.0);
+    }
+
+    fn push_tensor_with_dtype(
+        tensors: &mut BTreeMap<String, TestTensor>,
+        name: String,
+        shape: Vec<usize>,
+        dtype: Dtype,
+        value: f32,
+    ) {
+        let elems = shape.iter().product::<usize>();
+        let data = match dtype {
+            Dtype::BF16 => bf16::from_f32(value).to_bits().to_le_bytes().repeat(elems),
+            Dtype::F16 => f16::from_f32(value).to_bits().to_le_bytes().repeat(elems),
+            Dtype::F32 => value.to_le_bytes().repeat(elems),
+            _ => panic!("unsupported test dtype {dtype:?}"),
+        };
+        tensors.insert(name, TestTensor { dtype, shape, data });
     }
 
     #[test]
@@ -360,7 +486,9 @@ mod tests {
         write_adapter_config(&path, targets, 2);
         write_adapter_weights(&path, &config, targets, 2);
 
-        let manifest = validate_lora_adapter(&path, &config).expect("validate adapter");
+        let manifest = load_lora_adapter(&path, &config)
+            .expect("load adapter")
+            .manifest;
 
         assert_eq!(manifest.rank, 2);
         assert_eq!(manifest.alpha, 16);
@@ -372,13 +500,75 @@ mod tests {
     }
 
     #[test]
+    fn loads_lora_tensors_grouped_by_layer_and_target() {
+        let config = tiny_config();
+        let path = temp_adapter_dir("load");
+        write_adapter_config(&path, &["q_proj", "down_proj"], 2);
+        write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
+
+        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+
+        assert_eq!(adapter.manifest.rank, 2);
+        assert_eq!(adapter.layers.len(), config.num_hidden_layers);
+        let layer0 = &adapter.layers[0];
+        let q_proj = layer0.projections.get("q_proj").expect("q_proj");
+        assert_eq!((q_proj.a.rows, q_proj.a.cols), (2, config.hidden_size));
+        assert_eq!(
+            (q_proj.b.rows, q_proj.b.cols),
+            (config.num_attention_heads * config.head_dim, 2)
+        );
+        let down_proj = layer0.projections.get("down_proj").expect("down_proj");
+        assert_eq!(
+            (down_proj.a.rows, down_proj.a.cols),
+            (2, config.intermediate_size)
+        );
+        assert_eq!(
+            (down_proj.b.rows, down_proj.b.cols),
+            (config.hidden_size, 2)
+        );
+    }
+
+    #[test]
+    fn loads_supported_lora_tensor_dtypes_as_bf16() {
+        let config = tiny_config();
+        let path = temp_adapter_dir("dtype-load");
+        write_adapter_config(&path, &["q_proj"], 2);
+
+        let mut tensors = BTreeMap::new();
+        for layer_idx in 0..config.num_hidden_layers {
+            push_tensor_with_dtype(
+                &mut tensors,
+                tensor_name(layer_idx, "self_attn.q_proj", "lora_A"),
+                vec![2, config.hidden_size],
+                Dtype::F16,
+                1.5,
+            );
+            push_tensor_with_dtype(
+                &mut tensors,
+                tensor_name(layer_idx, "self_attn.q_proj", "lora_B"),
+                vec![config.hidden_size, 2],
+                Dtype::F32,
+                2.25,
+            );
+        }
+        safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
+            .expect("write safetensors");
+
+        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let q_proj = adapter.layers[0].projections.get("q_proj").expect("q_proj");
+
+        assert_eq!(q_proj.a.data[0].to_f32(), bf16::from_f32(1.5).to_f32());
+        assert_eq!(q_proj.b.data[0].to_f32(), bf16::from_f32(2.25).to_f32());
+    }
+
+    #[test]
     fn rejects_unsupported_target_module() {
         let config = tiny_config();
         let path = temp_adapter_dir("unsupported-target");
         write_adapter_config(&path, &["q_proj", "embed_tokens"], 2);
         write_adapter_weights(&path, &config, &["q_proj"], 2);
 
-        let error = validate_lora_adapter(&path, &config).expect_err("unsupported target");
+        let error = load_lora_adapter(&path, &config).expect_err("unsupported target");
 
         assert!(error.to_string().contains("unsupported Qwen3 LoRA target"));
     }
@@ -409,7 +599,7 @@ mod tests {
         safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
             .expect("write safetensors");
 
-        let error = validate_lora_adapter(&path, &config).expect_err("bad tensor shape");
+        let error = load_lora_adapter(&path, &config).expect_err("bad tensor shape");
 
         assert!(error.to_string().contains("shape mismatch"));
     }

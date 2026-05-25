@@ -760,14 +760,35 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
-        let manifest =
-            crate::lora::validate_lora_adapter(&request.lora_path, &self.metadata.config)?;
+        let adapter = crate::lora::load_lora_adapter(&request.lora_path, &self.metadata.config)?;
+        let projection_count: usize = adapter
+            .layers
+            .iter()
+            .map(|layer| layer.projections.len())
+            .sum();
+        let element_count: usize = adapter
+            .layers
+            .iter()
+            .flat_map(|layer| layer.projections.values())
+            .map(|projection| projection.a.data.len() + projection.b.data.len())
+            .sum();
+        let shape_elems: usize = adapter
+            .layers
+            .iter()
+            .flat_map(|layer| layer.projections.values())
+            .map(|projection| {
+                projection.a.rows * projection.a.cols + projection.b.rows * projection.b.cols
+            })
+            .sum();
+        debug_assert_eq!(element_count, shape_elems);
         anyhow::bail!(
-            "Qwen3 LoRA adapter {} validated from {} (rank={}, targets={}) but LoRA math is not implemented yet",
+            "Qwen3 LoRA adapter {} loaded from {} (rank={}, targets={}, projections={}, bf16_elements={}) but LoRA math is not implemented yet",
             request.lora_name,
-            manifest.path.display(),
-            manifest.rank,
-            manifest.target_modules.join(", ")
+            adapter.manifest.path.display(),
+            adapter.manifest.rank,
+            adapter.manifest.target_modules.join(", "),
+            projection_count,
+            element_count
         )
     }
 }
