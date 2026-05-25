@@ -220,6 +220,121 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 | O8 | 2026-05-25 | this commit | compute / RMSNorm fusion | Fuse attention residual add with post-attention RMSNorm using a Kimi-specific kernel that first materializes the BF16-rounded residual sum | `/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json` vs `/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`: 0 output128 mismatches; hash counter `32x 82a791616c737442`, `16x 4ae8834e96c7d195`, `16x 24b2b3856ac0ea3a` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json`: output `516.44 tok/s`, TPOT p50/p95/p99 `114.92/118.95/119.57ms`, TTFT p50/p95/p99 `0.66/3.81/3.97s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.57ms` | Keep. This recovers the add+rms launch/memory win that R4 attempted, without changing token traces. |
 | O9 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Let prompt_len=1 first-token prefill run in microbatch `2`, using row-wise `per_token` GEMM/router/all-reduce boundaries that preserve the decode math order | `/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; `/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json` vs O8/O7 output128: 0 mismatches | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json`: output `523.88 tok/s`, TPOT p50/p95/p99 `113.88/117.51/118.37ms`, TTFT p50/p95/p99 `0.50/3.75/3.86s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.68ms` | Keep. This is a small service win that preserves token traces; larger microbatches remain rejected until layer parity is proven. |
 | O10 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Allocate bs64 decode arena and warm prompt_len=1 before the service is ready, then run prompt_len=1 at microbatch `64` under the recorded large-batch drift gate | Final candidate records drift: o5 `48/64` mismatches vs TP8 NCCL; o128 `64/64` mismatches vs O8/O7. Exact reference point: mb8 was `0/64` on o5 and o128 but slower. | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json`: output `557.71 tok/s`, TPOT p50/p95/p99 `110.95/115.30/115.34ms`, TTFT p50/p95/p99 `473.94/504.25/506.18ms`, 256/256 success; in-process bs64/o128 first decode p50 `104.61ms` | Keep as a drift-recorded performance baseline, not an exact-token baseline; still below vLLM output `583.9 tok/s`, so the next work must target steady TPOT/ITL. |
+| O11 | 2026-05-25 | this commit | PPLX / dispatch send | Add TP route-only `dispatch_send` for the PPLX counts-only TP8 decode path, preserving route metadata and worker sync while skipping the unused hidden payload copy | No extra drift over O10: pending-guard route-only o5 vs O10 `0/64`; route-only o128 vs O10 `0/64`. Drift remains recorded as o5 `48/64` vs TP8 NCCL and o128 `64/64` vs O8. | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.json`: output `564.49 tok/s`, TPOT p50/p95/p99 `110.54/111.60/111.60ms`, TTFT p50/p95/p99 `472.88/500.05/501.35ms`, 256/256 success; A2A split p50 `158.6us -> 135.1us` | Keep as a measured PPLX decode improvement; still below vLLM output `583.9 tok/s`, so continue with the remaining combine/scatter/GEMM profile items. |
+
+### O11 PPLX Route-Only Dispatch Send
+
+Profile:
+
+```text
+/tmp/kimi-profile/o10-steady/bs64_o64_graph_nodes.nsys-rep
+/tmp/kimi-profile/o10-steady/bs64_o64_graph_nodes_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv
+```
+
+The O10 steady profile shows `a2a_dispatch_send_kernel` as a visible PPLX
+decode cost: `60,480` instances, total `4.40s`, avg `72.72us`, median
+`71.07us`. The surrounding PPLX costs were `a2a_combine_recv_kernel` avg
+`128.37us`, Marlin routed expert avg `59.47us`, `a2a_combine_send_kernel` avg
+`32.68us`, compact scatter avg `30.89us`, and `dispatch_recv_counts` avg
+`21.69us`.
+
+Motivation / expected gain:
+
+After O7, TP8/DP1 decode uses `dispatch_recv_counts` and then computes local
+experts from the post-collective hidden state on each rank. The dispatched
+hidden payload is no longer consumed on this TP path; only route metadata and
+the PPLX worker protocol are required. A route-only send should remove the BF16
+hidden payload copies while preserving route counters, `dispatch_send_done`,
+and the node sync flags. Expected gain is one small but direct PPLX split
+reduction, with no token-trace change relative to O10.
+
+Safety constraints are part of the optimization, not a caller convention:
+`dispatch_send_route_only` is intra-node only, rejects a following full
+`dispatch_recv`, and route-only pending state allows only
+`dispatch_recv_counts` before the next stage. The bench CLI also rejects
+`--dispatch-send-route-only` unless `--dispatch-recv-counts-only` is present.
+The Kimi caller gates the route-only path on TP8/DP1 duplicate-source
+canonicalization.
+
+Microbench:
+
+```bash
+target/release/pplx_a2a_bench \
+  --n-experts 384 --topk 8 --hidden-dim 7168 --world-size 8 \
+  --max-num-tokens 64 --max-private-tokens 64 --expert-padding 8 \
+  --nets-per-gpu 1 --warmup 20 --repeats 100 \
+  --dispatch-recv-counts-only --canonicalize-duplicate-sources
+
+target/release/pplx_a2a_bench \
+  --n-experts 384 --topk 8 --hidden-dim 7168 --world-size 8 \
+  --max-num-tokens 64 --max-private-tokens 64 --expert-padding 8 \
+  --nets-per-gpu 1 --warmup 20 --repeats 100 \
+  --dispatch-recv-counts-only --dispatch-send-route-only \
+  --canonicalize-duplicate-sources
+```
+
+Results:
+
+- Full send: `/tmp/kimi-route-only/pplx_a2a_kimi_bs64_full_send_counts_recv.txt`;
+  `dispatch_send` p50/p95/p99 `73.25/78.30/82.21us`, max-rank split
+  p50/p95/p99 `158.6/173.2/179.7us`.
+- Route-only send:
+  `/tmp/kimi-route-only/pplx_a2a_kimi_bs64_route_send_counts_recv.txt`;
+  `dispatch_send` p50/p95/p99 `46.11/49.38/52.58us`, max-rank split
+  p50/p95/p99 `136.3/154.0/171.8us`.
+- Guarded repeat:
+  `/tmp/kimi-route-only/pplx_a2a_kimi_bs64_route_send_counts_recv_guarded.txt`;
+  `dispatch_send` p50/p95/p99 `45.60/49.09/51.42us`, max-rank split
+  p50/p95/p99 `135.1/149.1/159.3us`.
+
+Correctness gate:
+
+```text
+/tmp/kimi-route-only/kimi_pplx_tp8_route_send_mb64_bs64_o5_probe.json
+/tmp/kimi-route-only/kimi_pplx_tp8_route_send_mb64_bs64_o128_probe.json
+/tmp/kimi-route-only/kimi_pplx_tp8_route_send_guarded_mb64_bs64_o5_probe.json
+/tmp/kimi-route-only/kimi_pplx_tp8_route_send_pending_guard_mb64_bs64_o5_probe.json
+```
+
+Recorded comparison counts:
+
+- o5 vs O10: `0/64` mismatches.
+- guarded o5 vs O10: `0/64` mismatches.
+- pending-guard o5 vs O10: `0/64` mismatches.
+- o5 vs TP8 NCCL: `48/64` mismatches.
+- guarded o5 vs TP8 NCCL: `48/64` mismatches.
+- pending-guard o5 vs TP8 NCCL: `48/64` mismatches.
+- o128 vs O10: `0/64` mismatches.
+- o128 vs O8: `64/64` mismatches.
+
+The mismatch counts match O10's drift envelope, so route-only send adds no new
+token drift.
+
+Performance gate:
+
+Canonical bs64 service result:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.json
+```
+
+Observed:
+
+- Successful requests: `256/256`.
+- Output throughput: `564.49 tok/s` vs O10 `557.71 tok/s`.
+- TTFT p50/p95/p99: `472.88/500.05/501.35ms`.
+- TPOT p50/p95/p99: `110.54/111.60/111.60ms`.
+- ITL p50/p95/p99: `110.15/112.81/115.35ms`.
+
+Decision:
+
+Keep. The gain is modest but the subsystem microbench confirms the skipped work,
+service throughput moves in the expected direction, token drift is unchanged
+from the O10 drift-recorded baseline, and the API now rejects the unsafe
+route-only/full-recv pairing. Revert if this path causes any non-O10 token
+mismatch or if repeat canonical bs64 service drops below O10 throughput with
+the same test shape.
 
 ### B1 Profile Notes
 

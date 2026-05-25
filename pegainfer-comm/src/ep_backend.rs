@@ -246,6 +246,37 @@ impl EpBackend {
             .map_err(Error::from_anyhow)
     }
 
+    /// Step 1 metadata-only variant for TP-style callers that only need the
+    /// PPLX route metadata and never consume dispatched hidden payloads.
+    ///
+    /// The worker protocol and route counters are preserved; only the token
+    /// payload copy into peer staging buffers is skipped. A caller that uses
+    /// this variant must pair it with [`Self::dispatch_recv_counts`], not
+    /// [`Self::dispatch_recv`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_send_route_only(
+        &mut self,
+        num_tokens: usize,
+        indices: *const i32,
+        indices_stride: usize,
+        weights: *const f32,
+        weights_stride: usize,
+        bound_m_ptr: *const i32,
+        stream: u64,
+    ) -> Result<()> {
+        self.inner
+            .dispatch_send_route_only(
+                num_tokens,
+                indices,
+                indices_stride,
+                weights,
+                weights_stride,
+                bound_m_ptr,
+                stream,
+            )
+            .map_err(Error::from_anyhow)
+    }
+
     /// Step 2 of dispatch: pull token payloads in from peers.
     ///
     /// Writes `out_x_ptr` / `out_x_scale_ptr` and reports the local
@@ -306,6 +337,27 @@ impl EpBackend {
     /// a downstream local grouped-expert GEMM.
     pub fn tokens_per_expert_ptr(&self) -> *const u32 {
         self.inner.tokens_per_expert_ptr()
+    }
+
+    /// Number of ranks in one data-parallel group according to the PPLX
+    /// topology.
+    pub fn dp_size(&self) -> usize {
+        self.inner.dp_size()
+    }
+
+    /// Number of PPLX ranks in the local NVLink domain.
+    pub fn node_size(&self) -> usize {
+        self.inner.node_size()
+    }
+
+    /// Total number of ranks participating in this EP all-to-all.
+    pub fn world_size(&self) -> usize {
+        self.inner.world_size()
+    }
+
+    /// Whether duplicate source rows are canonicalized for TP-style decode.
+    pub fn canonicalize_duplicate_sources(&self) -> bool {
+        self.inner.canonicalize_duplicate_sources()
     }
 
     /// Step 4 (combine): reduce remote contributions into the per-token

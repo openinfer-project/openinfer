@@ -154,6 +154,18 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
 ) -> Result<()> {
     let seq_len = scratch.mla.hidden.seq_len;
     let stream_raw = ctx.stream.cu_stream() as u64;
+    let use_tp8_dp1_duplicate_routes = comm.is_some()
+        && ep.world_size() == KIMI_K2_EP_WORLD
+        && ep.dp_size() == 1
+        && ep.node_size() == ep.world_size()
+        && ep.canonicalize_duplicate_sources()
+        && KIMI_K2_EP8_LOCAL_EXPERTS * KIMI_K2_EP_WORLD == KIMI_K2_ROUTED_EXPERTS;
+    if comm.is_some() {
+        anyhow::ensure!(
+            use_tp8_dp1_duplicate_routes,
+            "Kimi PPLX route-only decode requires TP8/DP1 intra-node duplicate-source canonicalization"
+        );
+    }
 
     // Shared expert (main stream) + router (aux stream) both consume the
     // post-attention normed hidden state, so start router as soon as norm is
@@ -224,7 +236,24 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         .wait(&route_ready)
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} main wait route_ready"))?;
     // ---- 4. dispatch_send ----
-    {
+    if use_tp8_dp1_duplicate_routes {
+        let (idx_ptr, _idx_guard) = scratch.router.router_topk_idx.data.device_ptr(&ctx.stream);
+        let (w_ptr, _w_guard) = scratch
+            .router
+            .router_topk_weight
+            .data
+            .device_ptr(&ctx.stream);
+        ep.dispatch_send_route_only(
+            seq_len,
+            idx_ptr as *const i32,
+            KIMI_K2_TOPK,
+            w_ptr as *const f32,
+            KIMI_K2_TOPK,
+            ptr::null(),
+            stream_raw,
+        )
+        .with_context(|| format!("pplx dispatch_send_route_only layer {layer_idx}"))?;
+    } else {
         let (x_ptr, _x_guard) = scratch.mla.normed.data.device_ptr(&ctx.stream);
         let (idx_ptr, _idx_guard) = scratch.router.router_topk_idx.data.device_ptr(&ctx.stream);
         let (w_ptr, _w_guard) = scratch
@@ -259,7 +288,7 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         })?
         .as_marlin_weights();
 
-    if comm.is_some() {
+    if use_tp8_dp1_duplicate_routes {
         // TP8/DP1 keeps the post-collective hidden state identical on every
         // rank, so compute local experts with the NCCL Marlin routing and use
         // PPLX only for the combine transfer. This preserves NCCL's route-slot

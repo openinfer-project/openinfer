@@ -113,6 +113,7 @@ pub struct AllToAllContext {
     node_size: usize,
     world_size: usize,
     canonicalize_duplicate_sources: bool,
+    route_only_dispatch_pending: bool,
     device: u8,
     workspace: DeviceWorkspace,
     worker: Arc<WorkerState>,
@@ -256,6 +257,7 @@ impl AllToAllContext {
             node_size,
             world_size,
             canonicalize_duplicate_sources,
+            route_only_dispatch_pending: false,
             device,
             workspace,
             worker,
@@ -277,6 +279,15 @@ impl AllToAllContext {
         Ok(())
     }
 
+    fn ensure_no_route_only_dispatch_pending(&self, next_stage: &str) -> Result<()> {
+        if self.route_only_dispatch_pending {
+            return Err(anyhow!(
+                "{next_stage} cannot run before dispatch_recv_counts after route-only dispatch_send"
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_send(
         &mut self,
@@ -293,6 +304,7 @@ impl AllToAllContext {
         bound_m_ptr: *const i32,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_no_route_only_dispatch_pending("dispatch_send")?;
         if num_tokens > self.max_num_tokens {
             return Err(anyhow!("Number of tokens exceeds maximum allowed"));
         }
@@ -338,6 +350,64 @@ impl AllToAllContext {
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
+        self.route_only_dispatch_pending = false;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+    pub fn dispatch_send_route_only(
+        &mut self,
+        num_tokens: usize,
+        indices: *const i32,
+        indices_stride: usize,
+        weights: *const f32,
+        weights_stride: usize,
+        bound_m_ptr: *const i32,
+        stream: u64,
+    ) -> Result<()> {
+        self.ensure_no_route_only_dispatch_pending("dispatch_send_route_only")?;
+        if num_tokens > self.max_num_tokens {
+            return Err(anyhow!("Number of tokens exceeds maximum allowed"));
+        }
+        if self.node_size != self.world_size {
+            return Err(anyhow!(
+                "route-only dispatch_send is only valid for intra-node all-to-all; node_size={} world_size={}",
+                self.node_size,
+                self.world_size
+            ));
+        }
+
+        cuda_check!(a2a_kernels::a2a_dispatch_send_route_only(
+            self.num_blocks,
+            self.num_experts,
+            self.num_experts_per_token,
+            self.max_private_tokens,
+            self.rank,
+            self.dp_size,
+            self.node_size,
+            self.world_size,
+            num_tokens,
+            bound_m_ptr,
+            indices,
+            indices_stride,
+            weights,
+            weights_stride,
+            self.workspace.token_offset.get_mut_ptr(),
+            self.worker.buffers.num_routed_ptr,
+            self.workspace.expert_offsets.get_mut_ptr(),
+            self.worker.dispatch_route_done.get_device_ptr(),
+            self.worker.dispatch_send_done.get_device_ptr(),
+            self.worker.tx_ready.get_device_ptr(),
+            self.workspace.grid_counter.get_mut_ptr(),
+            self.workspace.sync_counter.get_mut_ptr(),
+            self.workspace.get_sync_ptr(),
+            stream,
+        ))?;
+
+        if self.worker.failed() {
+            return Err(anyhow!("fabric-lib transfer error"));
+        }
+        self.route_only_dispatch_pending = true;
         Ok(())
     }
 
@@ -352,6 +422,8 @@ impl AllToAllContext {
         out_x_scale_stride_token: usize,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_no_route_only_dispatch_pending("dispatch_recv")?;
+
         cuda_check!(a2a_kernels::a2a_dispatch_recv(
             self.num_blocks,
             self.hidden_dim,
@@ -389,6 +461,7 @@ impl AllToAllContext {
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
+        self.route_only_dispatch_pending = false;
 
         Ok(())
     }
@@ -418,6 +491,7 @@ impl AllToAllContext {
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
+        self.route_only_dispatch_pending = false;
 
         Ok(())
     }
@@ -433,6 +507,8 @@ impl AllToAllContext {
         expert_x_stride: usize,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_no_route_only_dispatch_pending("combine_send")?;
+
         cuda_check!(a2a_kernels::a2a_combine_send(
             self.num_blocks,
             self.hidden_dim,
@@ -484,6 +560,8 @@ impl AllToAllContext {
         accumulate: bool,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_no_route_only_dispatch_pending("combine_recv")?;
+
         cuda_check!(a2a_kernels::a2a_combine_recv(
             self.num_blocks,
             self.hidden_dim,
@@ -527,6 +605,22 @@ impl AllToAllContext {
     /// grouped-expert GEMM. Caller must not mutate the buffer.
     pub fn tokens_per_expert_ptr(&self) -> *const u32 {
         self.worker.tokens_per_expert.get_device_ptr()
+    }
+
+    pub fn dp_size(&self) -> usize {
+        self.dp_size
+    }
+
+    pub fn node_size(&self) -> usize {
+        self.node_size
+    }
+
+    pub fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    pub fn canonicalize_duplicate_sources(&self) -> bool {
+        self.canonicalize_duplicate_sources
     }
 }
 

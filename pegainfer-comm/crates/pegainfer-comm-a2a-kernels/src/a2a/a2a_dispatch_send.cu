@@ -109,7 +109,7 @@ private:
     uint32_t positions_[N];
 };
 
-template<bool QUICK, size_t NUM_WARPS, size_t NODE_SIZE, typename TokenDimTy, typename HiddenDimScaleTy, typename NumExpertsPerTokenTy>
+template<bool QUICK, bool ROUTE_ONLY, size_t NUM_WARPS, size_t NODE_SIZE, typename TokenDimTy, typename HiddenDimScaleTy, typename NumExpertsPerTokenTy>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_kernel(
     const size_t token_dim,
     const size_t token_scale_dim,
@@ -293,6 +293,25 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     grid.sync();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         *sync_counter = counter + 1;
+    }
+
+    if constexpr (ROUTE_ONLY) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            fence_release_system();
+            st_mmio_b8(dispatch_send_done, 1);
+        }
+        if (NODE_SIZE > 1) {
+            grid.sync();
+
+            if (blockIdx.x == 0) {
+                auto local_rank = rank % NODE_SIZE;
+                if (threadIdx.x < NODE_SIZE) {
+                    auto *flag = &sync_ptrs[threadIdx.x][local_rank + NODE_SIZE];
+                    st_release_u32(flag, counter + 1);
+                }
+            }
+        }
+        return;
     }
 
     if constexpr (QUICK) {
@@ -692,6 +711,7 @@ int a2a_kernels::a2a_dispatch_send(
                         status = cudaLaunchCooperativeKernel(
                             (void *)&a2a_dispatch_send_kernel<
                                 true,
+                                false,
                                 NUM_WARPS,
                                 NODE_SIZE,
                                 TokenDim,
@@ -708,6 +728,7 @@ int a2a_kernels::a2a_dispatch_send(
                         status = cudaLaunchCooperativeKernel(
                             (void *)&a2a_dispatch_send_kernel<
                                 false,
+                                false,
                                 NUM_WARPS,
                                 NODE_SIZE,
                                 TokenDim,
@@ -723,6 +744,123 @@ int a2a_kernels::a2a_dispatch_send(
                     }
                 });
             });
+        });
+    });
+    nvtxRangePop();
+    return status;
+}
+
+int a2a_kernels::a2a_dispatch_send_route_only(
+    size_t num_blocks,
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t max_private_tokens,
+    size_t rank,
+    size_t dp_size,
+    size_t node_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t *bound_m_ptr,
+    const int32_t *indices,
+    size_t indices_stride,
+    const float *weights,
+    size_t weights_stride,
+    uint32_t *token_offset,
+    uint32_t *num_routed,
+    uint32_t *expert_offsets,
+    uint8_t *dispatch_route_done,
+    uint8_t *dispatch_send_done,
+    uint8_t *tx_ready,
+    uint32_t *grid_counter,
+    uint32_t *sync_counter,
+    uint32_t **sync_ptrs,
+    uint64_t stream
+) {
+    constexpr size_t NUM_WARPS = 16;
+    constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
+
+    dim3 dimGrid(num_blocks, 1, 1);
+    dim3 dimBlock(NUM_THREADS, 1, 1);
+
+    assert(world_size <= NUM_THREADS);
+    assert(num_experts <= NUM_THREADS);
+
+    const size_t token_dim = 0;
+    const size_t token_scale_dim = 0;
+    const size_t token_stride = 16;
+    size_t hidden_dim = 0;
+    size_t hidden_dim_scale = 0;
+    const uint8_t *x_ptr = nullptr;
+    const uint8_t *x_scale_ptr = nullptr;
+    size_t x_elemsize = 0;
+    size_t x_stride = 0;
+    size_t x_scale_elemsize = 0;
+    size_t x_scale_stride_elem = 0;
+    size_t x_scale_stride_token = 0;
+    uint8_t *send_buffer = nullptr;
+    uint8_t **recv_ptrs = nullptr;
+
+    void *args[] = {
+        const_cast<size_t *>(&token_dim),
+        const_cast<size_t *>(&token_scale_dim),
+        const_cast<size_t *>(&token_stride),
+        &hidden_dim,
+        &hidden_dim_scale,
+        &num_experts,
+        &num_experts_per_token,
+        &max_private_tokens,
+        &rank,
+        &dp_size,
+        &node_size,
+        &world_size,
+        &num_tokens,
+        &bound_m_ptr,
+        &x_ptr,
+        &x_elemsize,
+        &x_stride,
+        &x_scale_ptr,
+        &x_scale_elemsize,
+        &x_scale_stride_elem,
+        &x_scale_stride_token,
+        &indices,
+        &indices_stride,
+        &weights,
+        &weights_stride,
+        &token_offset,
+        &num_routed,
+        &expert_offsets,
+        &dispatch_route_done,
+        &dispatch_send_done,
+        &tx_ready,
+        &send_buffer,
+        &grid_counter,
+        &sync_counter,
+        &sync_ptrs,
+        &recv_ptrs,
+    };
+
+    const size_t shared_memory_send = std::max(num_experts, NUM_WARPS) * sizeof(uint32_t);
+
+    nvtxRangePush("dispatch_send_route_only");
+    cudaError_t status;
+    LAUNCH_NUM_EXPERTS_PER_TOKEN(num_experts_per_token, NumExpertsPerToken, {
+        LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
+            status = cudaLaunchCooperativeKernel(
+                (void *)&a2a_dispatch_send_kernel<
+                    true,
+                    true,
+                    NUM_WARPS,
+                    NODE_SIZE,
+                    NotFixed,
+                    NotFixed,
+                    NumExpertsPerToken
+                >,
+                dimGrid,
+                dimBlock,
+                args,
+                shared_memory_send,
+                (cudaStream_t)stream
+            );
         });
     });
     nvtxRangePop();

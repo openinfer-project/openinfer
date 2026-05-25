@@ -47,6 +47,11 @@ struct Args {
     #[arg(long)]
     dispatch_recv_counts_only: bool,
 
+    /// Use route-only dispatch send; useful for TP paths that only need PPLX
+    /// routing metadata before running local expert compute.
+    #[arg(long)]
+    dispatch_send_route_only: bool,
+
     /// Canonicalize duplicate source routes, matching Kimi TP8 production EP.
     #[arg(long)]
     canonicalize_duplicate_sources: bool,
@@ -64,6 +69,7 @@ struct BenchConfig {
     warmup: usize,
     repeats: usize,
     dispatch_recv_counts_only: bool,
+    dispatch_send_route_only: bool,
     canonicalize_duplicate_sources: bool,
 }
 
@@ -143,6 +149,7 @@ fn sweep_configs(args: &Args) -> Vec<BenchConfig> {
                 warmup: args.warmup,
                 repeats: args.repeats,
                 dispatch_recv_counts_only: args.dispatch_recv_counts_only,
+                dispatch_send_route_only: args.dispatch_send_route_only,
                 canonicalize_duplicate_sources: args.canonicalize_duplicate_sources,
             });
         }
@@ -182,6 +189,9 @@ fn run_sweep(args: &Args) -> Result<()> {
                 config
                     .dispatch_recv_counts_only
                     .then_some("--dispatch-recv-counts-only"),
+            )
+            .args(
+                config.dispatch_send_route_only.then_some("--dispatch-send-route-only"),
             )
             .args(
                 config
@@ -225,6 +235,10 @@ fn main() -> Result<()> {
     ensure!(args.world_size > 0, "world_size must be positive");
     ensure!(args.repeats > 0, "repeats must be positive");
     ensure!(args.nets_per_gpu > 0, "nets_per_gpu must be positive for pplx bootstrap");
+    ensure!(
+        !args.dispatch_send_route_only || args.dispatch_recv_counts_only,
+        "--dispatch-send-route-only requires --dispatch-recv-counts-only"
+    );
 
     if args.sweep {
         run_sweep(&args)?;
@@ -247,6 +261,7 @@ fn main() -> Result<()> {
             warmup: args.warmup,
             repeats: args.repeats,
             dispatch_recv_counts_only: args.dispatch_recv_counts_only,
+            dispatch_send_route_only: args.dispatch_send_route_only,
             canonicalize_duplicate_sources: args.canonicalize_duplicate_sources,
         };
         let rank_results = run_config(&config)?;
@@ -355,16 +370,27 @@ fn run_rank(
         let mut times = IterTimes::default();
 
         times.dispatch_send_us = time_stage(&gpu, record, || {
-            dispatch_send(
-                &mut backend,
-                config.max_num_tokens,
-                hidden,
-                topk,
-                &x,
-                &indices,
-                &weights,
-                &gpu,
-            )
+            if config.dispatch_send_route_only {
+                dispatch_send_route_only(
+                    &mut backend,
+                    config.max_num_tokens,
+                    topk,
+                    &indices,
+                    &weights,
+                    &gpu,
+                )
+            } else {
+                dispatch_send(
+                    &mut backend,
+                    config.max_num_tokens,
+                    hidden,
+                    topk,
+                    &x,
+                    &indices,
+                    &weights,
+                    &gpu,
+                )
+            }
         })?;
         times.dispatch_recv_us = time_stage(&gpu, record, || {
             if config.dispatch_recv_counts_only {
@@ -430,6 +456,30 @@ fn dispatch_send(
             ptr::null(),
             0,
             0,
+            idx_ptr as *const i32,
+            topk,
+            w_ptr as *const f32,
+            topk,
+            ptr::null(),
+            stream,
+        )
+        .map_err(anyhow::Error::from)
+}
+
+fn dispatch_send_route_only(
+    backend: &mut pegainfer_comm::EpBackend,
+    num_tokens: usize,
+    topk: usize,
+    indices: &CudaSlice<i32>,
+    weights: &CudaSlice<f32>,
+    gpu: &GpuContext,
+) -> Result<()> {
+    let stream = gpu.stream.cu_stream() as u64;
+    let (idx_ptr, _idx_guard) = indices.device_ptr(&gpu.stream);
+    let (w_ptr, _w_guard) = weights.device_ptr(&gpu.stream);
+    backend
+        .dispatch_send_route_only(
+            num_tokens,
             idx_ptr as *const i32,
             topk,
             w_ptr as *const f32,

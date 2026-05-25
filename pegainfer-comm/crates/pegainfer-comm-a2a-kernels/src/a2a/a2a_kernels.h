@@ -49,6 +49,33 @@ int a2a_dispatch_send(
     uint64_t stream
 );
 
+int a2a_dispatch_send_route_only(
+    size_t num_blocks,
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t max_private_tokens,
+    size_t rank,
+    size_t dp_size,
+    size_t node_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t *bound_m_ptr,
+    const int32_t *indices,
+    size_t indices_stride,
+    const float *weights,
+    size_t weights_stride,
+    uint32_t *token_offset,
+    uint32_t *num_routed,
+    uint32_t *expert_offsets,
+    uint8_t *dispatch_route_done,
+    uint8_t *dispatch_send_done,
+    uint8_t *tx_ready,
+    uint32_t *grid_counter,
+    uint32_t *sync_counter,
+    uint32_t **sync_ptrs,
+    uint64_t stream
+);
+
 int a2a_dispatch_recv(
     size_t num_blocks,
     size_t hidden_dim,

@@ -69,6 +69,33 @@ mod ffi {
             stream: u64,
         ) -> i32;
 
+        unsafe fn a2a_dispatch_send_route_only(
+            num_blocks: usize,
+            num_experts: usize,
+            num_experts_per_token: usize,
+            max_private_tokens: usize,
+            rank: usize,
+            dp_size: usize,
+            node_size: usize,
+            world_size: usize,
+            num_tokens: usize,
+            bound_m_ptr: *const i32,
+            indices: *const i32,
+            indices_stride: usize,
+            weights: *const f32,
+            weights_stride: usize,
+            token_offset: *mut u32,
+            num_routed: *mut u32,
+            expert_offsets: *mut u32,
+            dispatch_route_done: *mut u8,
+            dispatch_send_done: *mut u8,
+            tx_ready: *mut u8,
+            grid_counter: *mut u32,
+            sync_counter: *mut u32,
+            sync_ptrs: *mut *mut u32,
+            stream: u64,
+        ) -> i32;
+
         unsafe fn a2a_dispatch_recv(
             num_blocks: usize,
             hidden_dim: usize,
@@ -177,5 +204,5 @@ mod ffi {
 
 pub use ffi::{
     ScalarType, a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv,
-    a2a_dispatch_recv_counts, a2a_dispatch_send,
+    a2a_dispatch_recv_counts, a2a_dispatch_send, a2a_dispatch_send_route_only,
 };
