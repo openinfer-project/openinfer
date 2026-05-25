@@ -19,6 +19,27 @@ __global__ void add_kernel(
   }
 }
 
+__global__ void scaled_add_rows_kernel(
+    const __nv_bfloat16 *__restrict__ delta,
+    float scale,
+    __nv_bfloat16 *__restrict__ out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int seq_len) {
+  int total = rows * seq_len;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int token = idx / rows;
+    int row = idx - token * rows;
+    int out_idx = token * out_hidden_dim + row_offset + row;
+    float base = __bfloat162float(out[out_idx]);
+    float add = __bfloat162float(delta[idx]) * scale;
+    out[out_idx] = __float2bfloat16(base + add);
+  }
+}
+
 // ============================================================================
 // Type conversion helpers for deterministic decode collectives.
 // ============================================================================
@@ -166,6 +187,28 @@ CUresult add_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   add_kernel<<<grid, block, 0, stream>>>(a, b, out, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult scaled_add_rows_cuda(
+    const __nv_bfloat16 *delta,
+    float scale,
+    __nv_bfloat16 *out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int seq_len,
+    cudaStream_t stream) {
+  if (delta == nullptr || out == nullptr || out_hidden_dim <= 0 ||
+      row_offset < 0 || rows <= 0 || seq_len <= 0 ||
+      row_offset + rows > out_hidden_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = rows * seq_len;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  scaled_add_rows_kernel<<<grid, block, 0, stream>>>(
+      delta, scale, out, out_hidden_dim, row_offset, rows, seq_len);
   return (CUresult)cudaGetLastError();
 }
 

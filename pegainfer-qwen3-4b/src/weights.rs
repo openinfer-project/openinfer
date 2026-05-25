@@ -4,6 +4,7 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::{Config, TensorParallelConfig};
+use crate::lora::{DeviceLoraAdapter, DeviceLoraLayer};
 use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use pegainfer_core::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
@@ -71,6 +72,7 @@ pub(crate) struct Qwen3Model {
     pub(super) kv_pool: pegainfer_core::kv_pool::KvPool,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) tp_comm: Option<Comm>,
+    pub(super) lora_adapter: Option<DeviceLoraAdapter>,
 }
 
 // SAFETY: Each model instance is pinned to a single CUDA device and is only
@@ -346,6 +348,7 @@ impl Qwen3Model {
             kv_pool,
             tensor_parallel,
             tp_comm: None,
+            lora_adapter: None,
         };
 
         if model.enable_cuda_graph {
@@ -391,6 +394,24 @@ impl Qwen3Model {
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
         self.tp_comm = Some(comm);
+    }
+
+    pub(crate) fn set_lora_adapter(&mut self, adapter: DeviceLoraAdapter) {
+        debug!(
+            "Activating Qwen3 LoRA adapter {} from {}",
+            adapter.name,
+            adapter.manifest.path.display()
+        );
+        self.lora_adapter = Some(adapter);
+    }
+
+    pub(crate) fn lora_layer(&self, layer_idx: usize) -> Option<(&DeviceLoraLayer, f32)> {
+        self.lora_adapter.as_ref().and_then(|adapter| {
+            adapter
+                .layers
+                .get(layer_idx)
+                .map(|layer| (layer, adapter.scale))
+        })
     }
 
     pub(crate) fn all_reduce_hidden(

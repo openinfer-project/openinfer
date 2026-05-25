@@ -46,6 +46,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn scaled_add_rows_cuda(
+        delta: *const Half,
+        scale: f32,
+        out: *mut Half,
+        out_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn bf16_to_f32_cuda(
         input: *const Half,
         output: *mut f32,

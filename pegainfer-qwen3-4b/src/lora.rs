@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use half::{bf16, f16};
+use pegainfer_core::ops;
+use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
 use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
@@ -53,6 +55,29 @@ pub(crate) struct LoraMatrix {
     pub(crate) data: Vec<bf16>,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+}
+
+pub(crate) struct DeviceLoraAdapter {
+    pub(crate) name: String,
+    pub(crate) manifest: LoraAdapterManifest,
+    pub(crate) scale: f32,
+    pub(crate) layers: Vec<DeviceLoraLayer>,
+}
+
+#[derive(Default)]
+pub(crate) struct DeviceLoraLayer {
+    pub(crate) q_proj: Option<DeviceLoraProjection>,
+    pub(crate) k_proj: Option<DeviceLoraProjection>,
+    pub(crate) v_proj: Option<DeviceLoraProjection>,
+    pub(crate) o_proj: Option<DeviceLoraProjection>,
+    pub(crate) gate_proj: Option<DeviceLoraProjection>,
+    pub(crate) up_proj: Option<DeviceLoraProjection>,
+    pub(crate) down_proj: Option<DeviceLoraProjection>,
+}
+
+pub(crate) struct DeviceLoraProjection {
+    pub(crate) a: DeviceMatrix,
+    pub(crate) b: DeviceMatrix,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +141,57 @@ pub(crate) fn load_lora_adapter(path: &Path, config: &Config) -> Result<LoraAdap
     }
 
     Ok(LoraAdapter { manifest, layers })
+}
+
+pub(crate) fn load_device_lora_adapter(
+    ctx: &DeviceContext,
+    name: String,
+    adapter: LoraAdapter,
+) -> Result<DeviceLoraAdapter> {
+    let scale = adapter.manifest.alpha as f32 / adapter.manifest.rank as f32;
+    let mut layers = Vec::with_capacity(adapter.layers.len());
+    for layer in adapter.layers {
+        let mut device_layer = DeviceLoraLayer::default();
+        for (target, projection) in layer.projections {
+            let device_projection = DeviceLoraProjection {
+                a: projection.a.to_device(ctx)?,
+                b: projection.b.to_device(ctx)?,
+            };
+            match target.as_str() {
+                "q_proj" => device_layer.q_proj = Some(device_projection),
+                "k_proj" => device_layer.k_proj = Some(device_projection),
+                "v_proj" => device_layer.v_proj = Some(device_projection),
+                "o_proj" => device_layer.o_proj = Some(device_projection),
+                "gate_proj" => device_layer.gate_proj = Some(device_projection),
+                "up_proj" => device_layer.up_proj = Some(device_projection),
+                "down_proj" => device_layer.down_proj = Some(device_projection),
+                _ => bail!("unsupported Qwen3 LoRA target module {target}"),
+            }
+        }
+        layers.push(device_layer);
+    }
+
+    Ok(DeviceLoraAdapter {
+        name,
+        manifest: adapter.manifest,
+        scale,
+        layers,
+    })
+}
+
+pub(crate) fn apply_lora_projection_delta(
+    ctx: &DeviceContext,
+    projection: &DeviceLoraProjection,
+    input: &HiddenStates,
+    out: &mut HiddenStates,
+    row_offset: usize,
+    scale: f32,
+) -> Result<()> {
+    let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, input.seq_len)?;
+    ops::gemm_into(ctx, &projection.a, input, &mut rank_out);
+    let mut delta = HiddenStates::zeros(ctx, projection.b.rows, input.seq_len)?;
+    ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
+    ops::scaled_add_rows_into(ctx, &delta, scale, out, row_offset)
 }
 
 fn inspect_lora_adapter(path: &Path, config: &Config) -> Result<(LoraAdapterManifest, Vec<u8>)> {
@@ -347,6 +423,12 @@ fn tensor_to_bf16(tensor: &TensorView<'_>, name: &str) -> Result<Vec<bf16>> {
                 .collect())
         }
         dtype => bail!("LoRA tensor {name} has unsupported dtype {dtype:?}"),
+    }
+}
+
+impl LoraMatrix {
+    fn to_device(&self, ctx: &DeviceContext) -> Result<DeviceMatrix> {
+        DeviceMatrix::from_host(ctx, &self.data, self.rows, self.cols)
     }
 }
 

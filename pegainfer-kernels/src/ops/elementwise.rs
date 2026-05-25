@@ -42,6 +42,61 @@ pub fn add_batch_into(
     Ok(())
 }
 
+/// In-place scaled add into a row range of `out`: out[row_offset..] += scale * delta.
+pub fn scaled_add_rows_into(
+    ctx: &DeviceContext,
+    delta: &HiddenStates,
+    scale: f32,
+    out: &mut HiddenStates,
+    row_offset: usize,
+) -> Result<()> {
+    assert!(
+        scale.is_finite(),
+        "scaled_add_rows_into scale must be finite"
+    );
+    assert_eq!(
+        delta.seq_len, out.seq_len,
+        "delta seq_len {} != out seq_len {}",
+        delta.seq_len, out.seq_len
+    );
+    assert!(
+        row_offset + delta.hidden_dim <= out.hidden_dim,
+        "row range [{}..{}) exceeds out hidden_dim {}",
+        row_offset,
+        row_offset + delta.hidden_dim,
+        out.hidden_dim
+    );
+
+    let (delta_ptr, _gd) = delta.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::scaled_add_rows_cuda(
+            delta_ptr as *const ffi::Half,
+            scale,
+            out_ptr as *mut ffi::Half,
+            out.hidden_dim as i32,
+            row_offset as i32,
+            delta.hidden_dim as i32,
+            delta.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
+/// In-place scaled add for tensors with identical shape.
+pub fn scaled_add_batch_into(
+    ctx: &DeviceContext,
+    delta: &HiddenStates,
+    scale: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(delta.hidden_dim, out.hidden_dim);
+    scaled_add_rows_into(ctx, delta, scale, out, 0)
+}
+
 pub fn bf16_hidden_to_f32_into(
     ctx: &DeviceContext,
     input: &HiddenStates,
