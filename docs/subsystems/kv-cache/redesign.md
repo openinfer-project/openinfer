@@ -129,13 +129,12 @@ The code keeps `KvState` as the owner of page permits inside `Qwen3KvCache`, but
 
 - Ran a sub-agent review focused on KV ownership, error paths, rank consistency, and commit semantics.
 - Fixed the high-severity finding by moving logical `seq_len` advance out of worker forward paths and into `Qwen3KvCache` commit after rank success.
-- Removed the ownership lease from the worker protocol; worker responses now contain only execution results.
 - Removed the ownership lease from the worker protocol and kept TP physical allocation inside `Qwen3KvCache`; rank remains an implementation detail of KV storage, not a scheduling decision point.
 - Result: success.
 
 ### Step 6: Serve benchmark smoke
 
-- Started the OpenAI-compatible server with `uv run --with triton cargo run --release --bin pegainfer -- --model-path /data/models/Qwen3-4B --served-model-name Qwen3-4B --port 8000`.
+- Started the OpenAI-compatible server with `uv run --with triton cargo run --release --bin pegainfer -- --model-path <Qwen3-4B> --served-model-name Qwen3-4B --port 8000`.
 - Verified `/v1/completions` with `max_tokens=4` before load.
 - Ran `vllm bench serve` against the local server with random prompts across short decode, long decode, and long prefill shapes.
 - Saved raw result JSON under `target/profiling/kv-cache-redesign/`.
