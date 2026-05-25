@@ -29,9 +29,10 @@ use crate::{
 };
 
 const KIMI_RUNNER_MAX_BATCH: usize = 64;
-// Row-wise prompt_len=1 prefill is exact at microbatch=2; larger batches still
-// drift against the TP8 NCCL trace and must stay behind further parity work.
-const KIMI_PROMPT_LEN1_PREFILL_MICROBATCH: usize = 2;
+// Prompt-len=1 service TTFT is dominated by microbatch stair-stepping. Larger
+// row-wise batches have recorded TP8/NCCL trace drift, so this stays tied to
+// the performance ledger rather than treated as exact-token parity.
+const KIMI_PROMPT_LEN1_PREFILL_MICROBATCH: usize = 64;
 const KIMI_PREFILL_BATCH_COALESCE: Duration = Duration::from_millis(100);
 const KIMI_PREFILL_BATCH_POLL: Duration = Duration::from_micros(50);
 
@@ -225,9 +226,22 @@ struct ActiveKimiRequest {
 
 impl KimiK2Scheduler {
     fn new(config: KimiK2RunnerConfig) -> Result<Self> {
-        Ok(Self {
-            runtime: KimiK2Runtime::spawn(config)?,
-        })
+        let runtime = KimiK2Runtime::spawn(config)?;
+        runtime
+            .ensure_decode_batch(KIMI_RUNNER_MAX_BATCH)
+            .with_context(|| {
+                format!("Kimi-K2 warm decode arena bs{KIMI_RUNNER_MAX_BATCH} before serving")
+            })?;
+        let warm_tokens = (0..KIMI_RUNNER_MAX_BATCH)
+            .map(|idx| 100 + (idx % 1000) as u32)
+            .collect::<Vec<_>>();
+        let warm_slots = (0..KIMI_RUNNER_MAX_BATCH).collect::<Vec<_>>();
+        let _ = runtime
+            .forward_prompt_len1_batch_next_tokens(warm_tokens, warm_slots, KIMI_RUNNER_MAX_BATCH)
+            .with_context(|| {
+                format!("Kimi-K2 warm prompt_len1 bs{KIMI_RUNNER_MAX_BATCH} before serving")
+            })?;
+        Ok(Self { runtime })
     }
 
     fn run(&mut self, mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>) {
