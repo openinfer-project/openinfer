@@ -7,6 +7,7 @@ pub mod batch_decode_trace;
 mod config;
 mod executor;
 pub mod kernel_bench;
+mod lora;
 mod prefill;
 mod scheduler;
 mod unified_forward;

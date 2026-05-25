@@ -232,7 +232,7 @@ fn scheduler_loop_with_lora_control<E>(
         // 2. Once idle, apply pending control commands before admitting newer
         // generation requests that arrived behind them.
         if active.is_empty() && deferred.is_empty() {
-            drain_idle_control(&mut pending_control);
+            drain_idle_control(&mut executor, &mut pending_control);
             if pending_control.is_empty() && !post_control_deferred.is_empty() {
                 deferred.append(&mut post_control_deferred);
             }
@@ -263,7 +263,7 @@ fn scheduler_loop_with_lora_control<E>(
                 );
             }
             if active.is_empty() && deferred.is_empty() {
-                drain_idle_control(&mut pending_control);
+                drain_idle_control(&mut executor, &mut pending_control);
                 if pending_control.is_empty() && !post_control_deferred.is_empty() {
                     deferred.append(&mut post_control_deferred);
                 }
@@ -321,13 +321,16 @@ fn enqueue_engine_command(
     }
 }
 
-fn drain_idle_control(pending_control: &mut VecDeque<EngineControlRequest>) {
+fn drain_idle_control(
+    executor: &mut impl ModelExecutor,
+    pending_control: &mut VecDeque<EngineControlRequest>,
+) {
     while let Some(control) = pending_control.pop_front() {
-        handle_control_request(control);
+        handle_control_request(executor, control);
     }
 }
 
-fn handle_control_request(control: EngineControlRequest) {
+fn handle_control_request(executor: &mut impl ModelExecutor, control: EngineControlRequest) {
     match control {
         EngineControlRequest::LoadLoraAdapter {
             request,
@@ -338,11 +341,11 @@ fn handle_control_request(control: EngineControlRequest) {
                 request.lora_name,
                 request.lora_path.display()
             );
-            let _ = response_tx.send(Err(format!(
-                "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
-                request.lora_name,
-                request.lora_path.display()
-            )));
+            let _ = response_tx.send(
+                executor
+                    .load_lora_adapter(&request)
+                    .map_err(|error| error.to_string()),
+            );
         }
     }
 }

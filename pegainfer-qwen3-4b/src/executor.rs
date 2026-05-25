@@ -5,9 +5,9 @@ use anyhow::Result;
 use crossbeam_channel as channel;
 
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::config::TensorParallelConfig;
+use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
-use pegainfer_core::engine::TokenLogprob;
+use pegainfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob};
 use pegainfer_core::kv_pool::{KvPool, KvState};
 use pegainfer_core::ops;
 use pegainfer_core::sampler::SamplingParams;
@@ -509,11 +509,20 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
+
+    fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
+        anyhow::bail!(
+            "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
+            request.lora_name,
+            request.lora_path.display()
+        )
+    }
 }
 
 struct Qwen3ExecutorMetadata {
     page_size: usize,
     stop_token_ids: Vec<u32>,
+    config: Config,
 }
 
 pub struct Qwen3Executor {
@@ -528,6 +537,7 @@ impl Qwen3Executor {
         let metadata = Qwen3ExecutorMetadata {
             page_size: model.kv_pool().layout().page_size,
             stop_token_ids: model.config().stop_token_ids.clone(),
+            config: model.config().clone(),
         };
         let kv_pool = model.kv_pool().clone();
         Ok(Self {
@@ -575,6 +585,7 @@ impl Qwen3Executor {
         let metadata = Qwen3ExecutorMetadata {
             page_size: models[0].kv_pool().layout().page_size,
             stop_token_ids: models[0].config().stop_token_ids.clone(),
+            config: models[0].config().clone(),
         };
 
         let streams = models
@@ -746,6 +757,18 @@ impl ModelExecutor for Qwen3Executor {
                 other.kind()
             )),
         }
+    }
+
+    fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
+        let manifest =
+            crate::lora::validate_lora_adapter(&request.lora_path, &self.metadata.config)?;
+        anyhow::bail!(
+            "Qwen3 LoRA adapter {} validated from {} (rank={}, targets={}) but LoRA math is not implemented yet",
+            request.lora_name,
+            manifest.path.display(),
+            manifest.rank,
+            manifest.target_modules.join(", ")
+        )
     }
 }
 

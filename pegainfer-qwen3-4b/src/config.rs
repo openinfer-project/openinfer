@@ -19,7 +19,7 @@ impl Default for TensorParallelConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Config {
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
