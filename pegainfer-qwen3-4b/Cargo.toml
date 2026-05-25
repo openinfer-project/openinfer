@@ -38,6 +38,7 @@ kernel-report = [
 
 [dev-dependencies]
 pegainfer-vllm-support = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 vllm-text = { workspace = true }
 
 [[bin]]

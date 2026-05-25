@@ -9,6 +9,7 @@ mod effects;
 mod plan;
 mod resolve;
 
+use std::collections::VecDeque;
 use std::thread;
 
 use anyhow::Result;
@@ -18,7 +19,9 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
-use pegainfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent};
+use pegainfer_core::engine::{
+    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, TokenEvent,
+};
 use pegainfer_core::sampler::SamplingParams;
 
 use self::effects::apply_effects;
@@ -76,6 +79,16 @@ pub(crate) fn start_qwen3(
     Ok(start_with_executor(executor, seed))
 }
 
+pub(crate) fn start_qwen3_with_lora_control(
+    model_path: &str,
+    enable_cuda_graph: bool,
+    device_ordinals: &[usize],
+    seed: u64,
+) -> Result<EngineHandle> {
+    let executor = Qwen3Executor::from_runtime(model_path, enable_cuda_graph, device_ordinals)?;
+    Ok(start_with_executor_with_lora_control(executor, seed))
+}
+
 pub(crate) fn start_with_executor<E>(executor: E, seed: u64) -> EngineHandle
 where
     E: ModelExecutor + 'static,
@@ -90,6 +103,22 @@ where
         .expect("failed to spawn scheduler thread");
 
     EngineHandle::new(submit_tx)
+}
+
+pub(crate) fn start_with_executor_with_lora_control<E>(executor: E, seed: u64) -> EngineHandle
+where
+    E: ModelExecutor + 'static,
+{
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+    thread::Builder::new()
+        .name("scheduler".into())
+        .spawn(move || {
+            scheduler_loop_with_lora_control(executor, command_rx, seed);
+        })
+        .expect("failed to spawn scheduler thread");
+
+    EngineHandle::new_with_command_channel(command_tx)
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────
@@ -168,6 +197,153 @@ fn scheduler_loop<E>(
         };
         let effects = resolve_step(&executor, &active, artifacts);
         apply_effects(&mut executor, &mut active, effects);
+    }
+}
+
+fn scheduler_loop_with_lora_control<E>(
+    mut executor: E,
+    mut command_rx: mpsc::UnboundedReceiver<EngineCommand>,
+    seed: u64,
+) where
+    E: ModelExecutor,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut active: Vec<ActiveRequestState> = Vec::new();
+    let mut next_request_id = 0u64;
+    let mut deferred: Vec<PendingRequest> = Vec::new();
+    let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
+    let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
+
+    info!("Scheduler ready with LoRA control");
+
+    loop {
+        // 1. Drain incoming commands. Generation submitted after a pending
+        // control command waits until that control command is handled at idle.
+        while let Ok(command) = command_rx.try_recv() {
+            enqueue_engine_command(
+                command,
+                &mut deferred,
+                &mut pending_control,
+                &mut post_control_deferred,
+                &mut next_request_id,
+            );
+        }
+
+        // 2. Once idle, apply pending control commands before admitting newer
+        // generation requests that arrived behind them.
+        if active.is_empty() && deferred.is_empty() {
+            drain_idle_control(&mut pending_control);
+            if pending_control.is_empty() && !post_control_deferred.is_empty() {
+                deferred.append(&mut post_control_deferred);
+            }
+        }
+
+        // 3. Nothing active and no deferred generation → block until any
+        // command arrives.
+        if active.is_empty() && deferred.is_empty() {
+            if let Some(command) = command_rx.blocking_recv() {
+                enqueue_engine_command(
+                    command,
+                    &mut deferred,
+                    &mut pending_control,
+                    &mut post_control_deferred,
+                    &mut next_request_id,
+                );
+            } else {
+                info!("Scheduler: all handles dropped, exiting");
+                return;
+            }
+            while let Ok(command) = command_rx.try_recv() {
+                enqueue_engine_command(
+                    command,
+                    &mut deferred,
+                    &mut pending_control,
+                    &mut post_control_deferred,
+                    &mut next_request_id,
+                );
+            }
+            if active.is_empty() && deferred.is_empty() {
+                drain_idle_control(&mut pending_control);
+                if pending_control.is_empty() && !post_control_deferred.is_empty() {
+                    deferred.append(&mut post_control_deferred);
+                }
+            }
+        }
+
+        let admission = admit_deferred_requests(
+            deferred,
+            &active,
+            executor.page_size(),
+            executor.available_pages(),
+            executor.max_request_pages(),
+        );
+        for rejected in &admission.rejected {
+            send_rejection(rejected);
+        }
+        let pending = admission.pending;
+        deferred = admission.deferred;
+
+        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
+            continue;
+        };
+        let failure_targets = failure_targets_for(&active, &plan);
+        let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Execution step failed: {e}");
+                fail_touched_requests(&mut executor, &mut active, failure_targets, &e.to_string());
+                continue;
+            }
+        };
+        let effects = resolve_step(&executor, &active, artifacts);
+        apply_effects(&mut executor, &mut active, effects);
+    }
+}
+
+fn enqueue_engine_command(
+    command: EngineCommand,
+    deferred: &mut Vec<PendingRequest>,
+    pending_control: &mut VecDeque<EngineControlRequest>,
+    post_control_deferred: &mut Vec<PendingRequest>,
+    next_request_id: &mut u64,
+) {
+    match command {
+        EngineCommand::Generate(req) => {
+            let pending = PendingRequest::from_scheduler_request(RequestId(*next_request_id), req);
+            *next_request_id += 1;
+            if pending_control.is_empty() {
+                deferred.push(pending);
+            } else {
+                post_control_deferred.push(pending);
+            }
+        }
+        EngineCommand::Control(control) => pending_control.push_back(control),
+    }
+}
+
+fn drain_idle_control(pending_control: &mut VecDeque<EngineControlRequest>) {
+    while let Some(control) = pending_control.pop_front() {
+        handle_control_request(control);
+    }
+}
+
+fn handle_control_request(control: EngineControlRequest) {
+    match control {
+        EngineControlRequest::LoadLoraAdapter {
+            request,
+            response_tx,
+        } => {
+            info!(
+                "LoRA adapter load requested while scheduler is idle: name={}, path={}",
+                request.lora_name,
+                request.lora_path.display()
+            );
+            let _ = response_tx.send(Err(format!(
+                "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
+                request.lora_name,
+                request.lora_path.display()
+            )));
+        }
     }
 }
 
@@ -333,6 +509,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
+    use pegainfer_core::engine::{EngineControlError, LoadLoraAdapterRequest};
 
     use super::*;
     use crate::executor::{
@@ -346,6 +523,7 @@ mod tests {
         available_pages: usize,
         held_tokens: HashMap<RequestId, usize>,
         fail_decode_once: bool,
+        decode_delay: Duration,
         dropped: Arc<Mutex<Vec<u64>>>,
     }
 
@@ -357,12 +535,18 @@ mod tests {
                 available_pages: max_request_pages,
                 held_tokens: HashMap::new(),
                 fail_decode_once: false,
+                decode_delay: Duration::ZERO,
                 dropped,
             }
         }
 
         fn with_decode_failure(mut self) -> Self {
             self.fail_decode_once = true;
+            self
+        }
+
+        fn with_decode_delay(mut self, delay: Duration) -> Self {
+            self.decode_delay = delay;
             self
         }
 
@@ -431,6 +615,9 @@ mod tests {
             &mut self,
             plan: DecodePlan<'_>,
         ) -> Result<crate::executor::DecodeResult> {
+            if !self.decode_delay.is_zero() {
+                std::thread::sleep(self.decode_delay);
+            }
             if self.fail_decode_once {
                 self.fail_decode_once = false;
                 anyhow::bail!("fake decode KV capacity exhausted");
@@ -729,5 +916,76 @@ mod tests {
                 .contains(&0)),
             "dropping an active receiver should release request state"
         );
+    }
+
+    #[test]
+    fn lora_control_reports_unimplemented_when_idle() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
+        let handle = start_with_executor_with_lora_control(executor, 42);
+
+        let error = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build runtime")
+            .block_on(handle.load_lora_adapter(LoadLoraAdapterRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_path: "/tmp/adapter-a".into(),
+            }))
+            .expect_err("adapter load should be a stub error");
+
+        match error {
+            EngineControlError::OperationFailed(message) => {
+                assert!(message.contains("not implemented yet"));
+                assert!(message.contains("adapter-a"));
+            }
+            other => panic!("unexpected control error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lora_control_waits_until_scheduler_idle() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor =
+            FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_delay(Duration::from_millis(80));
+        let handle = start_with_executor_with_lora_control(executor, 42);
+
+        let (long_running, mut token_rx) = request(16, 3);
+        handle.submit(long_running).expect("submit long_running");
+        assert!(
+            matches!(
+                token_rx.blocking_recv(),
+                Some(TokenEvent::Token { id: 100, .. })
+            ),
+            "first token should be emitted before decode"
+        );
+
+        let load_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load_done_thread = Arc::clone(&load_done);
+        let load_handle = handle.clone();
+        let load_thread = thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build runtime")
+                .block_on(load_handle.load_lora_adapter(LoadLoraAdapterRequest {
+                    lora_name: "adapter-a".to_string(),
+                    lora_path: "/tmp/adapter-a".into(),
+                }));
+            load_done_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            result
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !load_done.load(std::sync::atomic::Ordering::SeqCst),
+            "load_lora_adapter should wait while generation is active"
+        );
+
+        while !matches!(token_rx.blocking_recv(), Some(TokenEvent::Finished { .. })) {}
+
+        let error = load_thread
+            .join()
+            .expect("join load thread")
+            .expect_err("adapter load should be a stub error");
+        assert!(matches!(error, EngineControlError::OperationFailed(_)));
     }
 }

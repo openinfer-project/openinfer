@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::Parser;
 use log::info;
 use pegainfer::logging;
@@ -34,6 +34,10 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     cuda_graph: bool,
 
+    /// Enable Qwen3 LoRA serving mode.
+    #[arg(long, default_value_t = false)]
+    enable_lora: bool,
+
     /// CUDA device ordinal for single-GPU Qwen3 loads
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
@@ -59,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
             args.model_path.display()
         )
     })?;
+    if args.enable_lora && !matches!(model_type, ModelType::Qwen3) {
+        bail!("--enable-lora is currently supported only for Qwen3");
+    }
     let effective_cuda_graph = match model_type {
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => false,
@@ -66,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         ModelType::DeepSeekV4 => false,
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => args.cuda_graph,
+        ModelType::Qwen3 if args.enable_lora => false,
         ModelType::Qwen3 | ModelType::Qwen35 => args.cuda_graph,
     };
 
@@ -73,10 +81,11 @@ async fn main() -> anyhow::Result<()> {
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, device_ordinal={}, tp_size={}",
+        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, device_ordinal={}, tp_size={}",
         args.model_path.display(),
         args.cuda_graph,
         effective_cuda_graph,
+        args.enable_lora,
         args.device_ordinal,
         args.tp_size
     );
@@ -133,20 +142,26 @@ async fn main() -> anyhow::Result<()> {
             handle
         }
         ModelType::Qwen3 => {
+            if args.enable_lora && args.tp_size != 1 {
+                bail!("Qwen3 LoRA PR1 supports --tp-size=1 only");
+            }
             let device_ordinals: Vec<usize> = if args.tp_size == 1 {
                 vec![args.device_ordinal]
             } else {
                 (0..args.tp_size).collect()
             };
-            let handle = pegainfer_qwen3_4b::start_engine(
-                &args.model_path,
-                EngineLoadOptions {
-                    enable_cuda_graph: args.cuda_graph,
-                    enable_prefill_profile: false,
-                    device_ordinals,
-                    seed: 42,
-                },
-            )
+            let options = EngineLoadOptions {
+                enable_cuda_graph: effective_cuda_graph,
+                enable_prefill_profile: false,
+                device_ordinals,
+                seed: 42,
+            };
+            let handle = if args.enable_lora {
+                info!("Starting Qwen3 engine with LoRA control; CUDA Graph is disabled");
+                pegainfer_qwen3_4b::start_engine_with_lora_control(&args.model_path, options)
+            } else {
+                pegainfer_qwen3_4b::start_engine(&args.model_path, options)
+            }
             .context("failed to start Qwen3 engine")?;
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
