@@ -6,5 +6,8 @@ edition = "2024"
 [dependencies]
 tokio = { workspace = true, features = ["sync"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [lints]
 workspace = true

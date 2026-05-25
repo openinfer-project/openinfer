@@ -3,8 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use axum::Json;
+use axum::Router;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use log::{info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,11 +32,99 @@ use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use pegainfer_engine::engine::{
-    EngineHandle, FinishReason, GenerateRequest, TokenEvent, TokenLogprob,
+    EngineControlError, EngineHandle, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
+    TokenEvent, TokenLogprob,
 };
 use pegainfer_engine::sampler::SamplingParams;
 
 const ENGINE_INDEX: u32 = 0;
+
+#[derive(Clone)]
+struct LoraRouteState {
+    handle: EngineHandle,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadLoraAdapterHttpRequest {
+    lora_name: String,
+    lora_path: PathBuf,
+    #[serde(default)]
+    load_inplace: bool,
+    #[serde(default)]
+    is_3d_lora_weight: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+pub fn lora_routes(handle: EngineHandle) -> Router {
+    Router::new()
+        .route("/v1/load_lora_adapter", post(load_lora_adapter))
+        .with_state(LoraRouteState { handle })
+}
+
+async fn load_lora_adapter(
+    axum::extract::State(state): axum::extract::State<LoraRouteState>,
+    Json(request): Json<LoadLoraAdapterHttpRequest>,
+) -> Response {
+    if request.lora_name.is_empty() {
+        return bad_request("lora_name must not be empty");
+    }
+    if request.lora_path.as_os_str().is_empty() {
+        return bad_request("lora_path must not be empty");
+    }
+    if request.load_inplace {
+        return bad_request("load_inplace=true is not supported by Qwen3 LoRA PR1");
+    }
+    if request.is_3d_lora_weight {
+        return bad_request("is_3d_lora_weight=true is not supported by Qwen3 LoRA PR1");
+    }
+
+    let lora_name = request.lora_name.clone();
+    match state
+        .handle
+        .load_lora_adapter(LoadLoraAdapterRequest {
+            lora_name: request.lora_name,
+            lora_path: request.lora_path,
+        })
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            format!("Success: LoRA adapter '{lora_name}' added successfully."),
+        )
+            .into_response(),
+        Err(EngineControlError::Unsupported(message)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: message.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(EngineControlError::ChannelClosed) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: EngineControlError::ChannelClosed.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(EngineControlError::OperationFailed(message)) => {
+            (StatusCode::BAD_REQUEST, Json(ErrorBody { error: message })).into_response()
+        }
+    }
+}
+
+fn bad_request(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: message.into(),
+        }),
+    )
+        .into_response()
+}
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {
@@ -634,6 +727,46 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn load_lora_adapter_route_reports_unsupported_engine() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let state = LoraRouteState {
+            handle: EngineHandle::new(submit_tx),
+        };
+        let response = load_lora_adapter(
+            axum::extract::State(state),
+            Json(LoadLoraAdapterHttpRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_path: PathBuf::from("/tmp/adapter-a"),
+                load_inplace: false,
+                is_3d_lora_weight: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let state = LoraRouteState {
+            handle: EngineHandle::new(submit_tx),
+        };
+        let response = load_lora_adapter(
+            axum::extract::State(state),
+            Json(LoadLoraAdapterHttpRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_path: PathBuf::from("/tmp/adapter-a"),
+                load_inplace: true,
+                is_3d_lora_weight: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn rejected_request_is_reported_as_error() {

@@ -1,10 +1,12 @@
 use std::{
+    error::Error,
+    fmt,
     path::PathBuf,
     sync::Arc,
     thread::{self, JoinHandle},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::sampler::SamplingParams;
 
@@ -59,6 +61,47 @@ pub struct GenerateRequest {
     pub echo: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadLoraAdapterRequest {
+    pub lora_name: String,
+    pub lora_path: PathBuf,
+}
+
+pub enum EngineControlRequest {
+    LoadLoraAdapter {
+        request: LoadLoraAdapterRequest,
+        response_tx: oneshot::Sender<std::result::Result<(), String>>,
+    },
+}
+
+pub enum EngineCommand {
+    Generate(GenerateRequest),
+    Control(EngineControlRequest),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum EngineControlError {
+    Unsupported(&'static str),
+    ChannelClosed,
+    OperationFailed(String),
+}
+
+impl fmt::Display for EngineControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(message) => f.write_str(message),
+            Self::ChannelClosed => f.write_str("engine control channel closed"),
+            Self::OperationFailed(message) => {
+                write!(f, "engine control operation failed: {message}")
+            }
+        }
+    }
+}
+
+impl Error for EngineControlError {}
+
+pub type EngineControlResult<T> = std::result::Result<T, EngineControlError>;
+
 pub enum TokenEvent {
     Scheduled {
         queued_at_unix_s: f64,
@@ -97,12 +140,24 @@ pub struct EngineHandle {
 
 struct EngineInner {
     submit_tx: Option<mpsc::UnboundedSender<GenerateRequest>>,
+    command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
 impl EngineHandle {
     pub fn new(submit_tx: mpsc::UnboundedSender<GenerateRequest>) -> Self {
-        Self::from_parts(submit_tx, None)
+        Self::from_parts(Some(submit_tx), None, None)
+    }
+
+    pub fn new_with_command_channel(command_tx: mpsc::UnboundedSender<EngineCommand>) -> Self {
+        Self::from_parts(None, Some(command_tx), None)
+    }
+
+    pub fn new_with_command_channel_and_join_handle(
+        command_tx: mpsc::UnboundedSender<EngineCommand>,
+        join_handle: JoinHandle<()>,
+    ) -> Self {
+        Self::from_parts(None, Some(command_tx), Some(join_handle))
     }
 
     /// Construct a handle that owns the engine thread shutdown.
@@ -114,16 +169,18 @@ impl EngineHandle {
         submit_tx: mpsc::UnboundedSender<GenerateRequest>,
         join_handle: JoinHandle<()>,
     ) -> Self {
-        Self::from_parts(submit_tx, Some(join_handle))
+        Self::from_parts(Some(submit_tx), None, Some(join_handle))
     }
 
     fn from_parts(
-        submit_tx: mpsc::UnboundedSender<GenerateRequest>,
+        submit_tx: Option<mpsc::UnboundedSender<GenerateRequest>>,
+        command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
         join_handle: Option<JoinHandle<()>>,
     ) -> Self {
         Self {
             inner: Arc::new(EngineInner {
-                submit_tx: Some(submit_tx),
+                submit_tx,
+                command_tx,
                 join_handle,
             }),
         }
@@ -135,7 +192,46 @@ impl EngineHandle {
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
         match self.inner.submit_tx.as_ref() {
             Some(submit_tx) => submit_tx.send(req),
-            None => Err(mpsc::error::SendError(req)),
+            None => match self.inner.command_tx.as_ref() {
+                Some(command_tx) => command_tx
+                    .send(EngineCommand::Generate(req))
+                    .map_err(|err| match err.0 {
+                        EngineCommand::Generate(req) => mpsc::error::SendError(req),
+                        EngineCommand::Control(_) => unreachable!("submitted generate command"),
+                    }),
+                None => Err(mpsc::error::SendError(req)),
+            },
+        }
+    }
+
+    pub fn supports_lora_control(&self) -> bool {
+        self.inner.command_tx.is_some()
+    }
+
+    pub async fn load_lora_adapter(
+        &self,
+        request: LoadLoraAdapterRequest,
+    ) -> EngineControlResult<()> {
+        match self.inner.command_tx.as_ref() {
+            Some(command_tx) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                command_tx
+                    .send(EngineCommand::Control(
+                        EngineControlRequest::LoadLoraAdapter {
+                            request,
+                            response_tx,
+                        },
+                    ))
+                    .map_err(|_| EngineControlError::ChannelClosed)?;
+
+                response_rx
+                    .await
+                    .map_err(|_| EngineControlError::ChannelClosed)?
+                    .map_err(EngineControlError::OperationFailed)
+            }
+            None => Err(EngineControlError::Unsupported(
+                "engine does not support dynamic LoRA adapter loading",
+            )),
         }
     }
 }
@@ -143,6 +239,7 @@ impl EngineHandle {
 impl Drop for EngineInner {
     fn drop(&mut self) {
         let _ = self.submit_tx.take();
+        let _ = self.command_tx.take();
         if let Some(join_handle) = self.join_handle.take() {
             if join_handle.thread().id() != thread::current().id() {
                 let _ = join_handle.join();
@@ -177,5 +274,63 @@ mod tests {
 
         drop(clone);
         assert!(exited.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lora_control_support_is_opt_in() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let handle = EngineHandle::new(submit_tx);
+        assert!(!handle.supports_lora_control());
+
+        let (command_tx, _command_rx) = mpsc::unbounded_channel::<EngineCommand>();
+        let handle = EngineHandle::new_with_command_channel(command_tx);
+        assert!(handle.supports_lora_control());
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_sends_control_command() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
+        let handle = EngineHandle::new_with_command_channel(command_tx);
+
+        let request = LoadLoraAdapterRequest {
+            lora_name: "adapter-a".to_string(),
+            lora_path: PathBuf::from("/tmp/adapter-a"),
+        };
+        let load = tokio::spawn({
+            let handle = handle.clone();
+            let request = request.clone();
+            async move { handle.load_lora_adapter(request).await }
+        });
+
+        let command = command_rx.recv().await.expect("control command");
+        match command {
+            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter {
+                request: actual,
+                response_tx,
+            }) => {
+                assert_eq!(actual, request);
+                response_tx.send(Ok(())).expect("send load result");
+            }
+            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
+        }
+
+        load.await.expect("join load task").expect("load succeeded");
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_reports_unsupported_without_control() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let handle = EngineHandle::new(submit_tx);
+        let error = handle
+            .load_lora_adapter(LoadLoraAdapterRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_path: PathBuf::from("/tmp/adapter-a"),
+            })
+            .await
+            .expect_err("control should be unsupported");
+        assert_eq!(
+            error,
+            EngineControlError::Unsupported("engine does not support dynamic LoRA adapter loading")
+        );
     }
 }

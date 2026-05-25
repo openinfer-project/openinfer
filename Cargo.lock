@@ -3740,6 +3740,7 @@ name = "pegainfer-vllm-frontend"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "log",
  "pegainfer-engine",
  "rmp-serde",
