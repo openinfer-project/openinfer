@@ -127,6 +127,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `benchmarks/bs1-4k64-vllm-pegainfer.md` | RTX 5090 single-concurrency probe: `input_len=4096`, `output_len=64`, no vLLM prefix cache. PegaInfer TTFT median `177ms` vs vLLM `198ms`; TPOT median `6.47ms` vs `6.36ms`; corrected output throughput `+6%` for PegaInfer. |
 | `benchmarks/accuracy-eval-results.md` | Phase 1 GSM8K: Qwen3-4B PASS (pegainfer 85.37% vs HF 85.82%, delta -0.45%). Qwen3.5-4B FAIL — long-prompt prefill quality divergence on 8-shot. |
 | `benchmarks/pplx-ep-a2a-h20-nvlink.md` | pplx EP all-to-all latency on 8× H20 NV18 NVLink: DSV4 & Kimi-K2 shapes, tok=1..256. tok=1 p50 ~82μs, tok=256 p50 ~204/303μs. |
+| `benchmarks/deepep-v2-vs-pplx-moe-backend.md` | H20 x8 DeepEP V2 vs current PegaInfer PPLX EP backend comparison: ElasticBuffer/NCCL Gin shows a directional 2.5x-5.3x paired-run ratio on tested DSV4 and Kimi-K2 MoE exchange shapes, with dtype, correctness, harness, and PPLX baseline-drift caveats recorded. |
 
 ## conventions
 
