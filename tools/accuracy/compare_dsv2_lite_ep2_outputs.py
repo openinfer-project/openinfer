@@ -232,10 +232,15 @@ def context_warnings(hf: Output, host: Output, nccl: Output) -> list[str]:
     if len(output_lens) > 1:
         warnings.append(f"output length labels differ across outputs: {sorted(output_lens)!r}")
 
-    if hf.raw.get("generation_mode") not in (None, "incremental_past_key_values"):
+    hf_generation_mode = hf.raw.get("generation_mode")
+    if hf_generation_mode not in (
+        None,
+        "incremental_past_key_values",
+        "transformers_generate_use_cache",
+    ):
         warnings.append(
-            "HF output generation_mode is not incremental_past_key_values: "
-            f"{hf.raw.get('generation_mode')}"
+            "HF output generation_mode is not a recognized HF generation mode: "
+            f"{hf_generation_mode}"
         )
     if host.backend not in (None, "host-staged"):
         warnings.append(f"host-staged file reports backend {host.backend!r}")
