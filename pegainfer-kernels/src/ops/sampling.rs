@@ -110,8 +110,8 @@ fn gpu_sample_core(
     ctx: &DeviceContext,
     logits: &DeviceVec,
     probs_scratch: &mut CudaSlice<f32>,
-    top1_value_scratch: &mut CudaSlice<half::bf16>,
-    row_states_scratch: &mut CudaSlice<u8>,
+    _top1_value_scratch: &mut CudaSlice<half::bf16>,
+    _row_states_scratch: &mut CudaSlice<u8>,
     valid_scratch: &mut CudaSlice<u8>,
     out: &mut CudaSlice<i32>,
     temperature: f32,
@@ -121,15 +121,11 @@ fn gpu_sample_core(
 ) -> Result<u32> {
     if (temperature <= 0.0 || top_k == 1) && top_p >= 1.0 {
         let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (v_ptr, _gv) = top1_value_scratch.device_ptr_mut(&ctx.stream);
-        let (r_ptr, _gr) = row_states_scratch.device_ptr_mut(&ctx.stream);
         let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
 
         unsafe {
-            ffi::flashinfer_top1_cuda(
+            ffi::argmax_cuda(
                 l_ptr as *const ffi::Half,
-                v_ptr as *mut ffi::Half,
-                r_ptr as *mut u8,
                 o_ptr as *mut i32,
                 logits.len as i32,
                 ctx.stream.cu_stream(),

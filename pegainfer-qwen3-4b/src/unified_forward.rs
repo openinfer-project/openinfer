@@ -535,22 +535,32 @@ impl Qwen3Model {
         self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // ── 7+8. Residual add + MLP RMSNorm (fused) ─────────────────
-        ops::fused_add_rms_norm_batch_into(
+        pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             &self.ctx,
             hidden,
             &bufs.o_buf,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        );
+        )?;
 
-        ops::gemm_into(
+        ops::gemm_rows_into(
             &self.ctx,
             &layer.mlp.gate_up_proj,
+            0,
+            self.local_intermediate_size(),
             &bufs.normed,
-            &mut bufs.gate_up_out,
+            &mut bufs.gate_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out);
+        ops::gemm_rows_into(
+            &self.ctx,
+            &layer.mlp.gate_up_proj,
+            self.local_intermediate_size(),
+            self.local_intermediate_size(),
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

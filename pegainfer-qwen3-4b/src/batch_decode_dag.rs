@@ -16,7 +16,7 @@ use pegainfer_core::ops::call_spec::{
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
 use pegainfer_core::tensor::{DeviceMatrix, DeviceVec, HiddenStates};
-use pegainfer_kernels::tensor::{AxisTag, Hidden, InDim, Inter2, Intermediate, QDim, Vocab};
+use pegainfer_kernels::tensor::{AxisTag, Hidden, InDim, Intermediate, QDim, Vocab};
 
 use crate::batch_decode_buffers::{BatchDecodeBuffers, DecodeAttentionPath};
 use crate::weights::Qwen3Model;
@@ -103,7 +103,7 @@ impl<'a> BatchDecodeDag<'a> {
         residual: &HiddenStates,
         weight: &DeviceVec,
         out: &mut HiddenStates,
-    ) {
+    ) -> Result<()> {
         #[cfg(feature = "kernel-call-trace")]
         Self::record(fused_add_rms_norm_batch_call::<Hidden>(
             label,
@@ -111,14 +111,14 @@ impl<'a> BatchDecodeDag<'a> {
             hidden.seq_len,
             self.model.config.rms_norm_eps,
         ));
-        pegainfer_kernels::ops::fused_add_rms_norm_batch_into(
+        pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             &self.model.ctx,
             hidden,
             residual,
             weight,
             self.model.config.rms_norm_eps,
             out,
-        );
+        )
     }
 
     pub(crate) fn gemm_rows<Out: AxisTag>(
@@ -275,16 +275,6 @@ impl<'a> BatchDecodeDag<'a> {
         }
     }
 
-    pub(crate) fn silu_mul(&self, label: DagLabel, gate_up: &HiddenStates, out: &mut HiddenStates) {
-        #[cfg(feature = "kernel-call-trace")]
-        Self::record(silu_mul_fused_batch_call(
-            label,
-            out.hidden_dim,
-            gate_up.seq_len,
-        ));
-        pegainfer_kernels::ops::silu_mul_fused_batch_into(&self.model.ctx, gate_up, out);
-    }
-
     pub(crate) fn all_reduce_hidden(
         &self,
         label: DagLabel,
@@ -309,14 +299,40 @@ impl<'a> BatchDecodeDag<'a> {
         self.gemm::<Hidden, QDim>(label, weight, x, out);
     }
 
-    pub(crate) fn gate_up_proj(
+    pub(crate) fn mlp_gate_proj(
         &self,
         label: DagLabel,
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
     ) {
-        self.gemm::<Inter2, Hidden>(label, weight, x, out);
+        self.gemm_rows::<Intermediate>(label, weight, 0, out.hidden_dim, x, out);
+    }
+
+    pub(crate) fn mlp_up_proj(
+        &self,
+        label: DagLabel,
+        weight: &DeviceMatrix,
+        x: &HiddenStates,
+        out: &mut HiddenStates,
+    ) {
+        self.gemm_rows::<Intermediate>(label, weight, out.hidden_dim, out.hidden_dim, x, out);
+    }
+
+    pub(crate) fn silu_mul_split(
+        &self,
+        label: DagLabel,
+        gate: &HiddenStates,
+        up: &HiddenStates,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        #[cfg(feature = "kernel-call-trace")]
+        Self::record(silu_mul_fused_batch_call(
+            label,
+            gate.hidden_dim,
+            gate.seq_len,
+        ));
+        pegainfer_kernels::ops::silu_mul_batch_into(&self.model.ctx, gate, up, out)
     }
 
     pub(crate) fn down_proj(

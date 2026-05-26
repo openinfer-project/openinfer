@@ -74,14 +74,18 @@ __global__ void prefill_qk_norm_rope_kernel(
         float hi = __bfloat162float(smem[d + half]);
         float c = __bfloat162float(cos_cache[pos * head_dim + d]);
         float s = __bfloat162float(sin_cache[pos * head_dim + d]);
-        result = __float2bfloat16(lo * c - hi * s);
+        float lo_cos = __bfloat162float(__float2bfloat16(lo * c));
+        float hi_sin = __bfloat162float(__float2bfloat16(hi * s));
+        result = __float2bfloat16(lo_cos - hi_sin);
     } else {
         int pair_d = d - half;
         float lo = __bfloat162float(smem[pair_d]);
         float hi = __bfloat162float(smem[d]);
         float c = __bfloat162float(cos_cache[pos * head_dim + pair_d]);
         float s = __bfloat162float(sin_cache[pos * head_dim + pair_d]);
-        result = __float2bfloat16(lo * s + hi * c);
+        float lo_sin = __bfloat162float(__float2bfloat16(lo * s));
+        float hi_cos = __bfloat162float(__float2bfloat16(hi * c));
+        result = __float2bfloat16(lo_sin + hi_cos);
     }
 
     data[offset] = result;

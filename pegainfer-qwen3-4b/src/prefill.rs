@@ -22,7 +22,8 @@ pub(super) struct PrefillBuffers {
     pub(super) k_batch: HiddenStates, // kv_dim × seq_len
     pub(super) v_batch: HiddenStates, // kv_dim × seq_len
     pub(super) o_buf: HiddenStates,  // hidden_dim × seq_len (reused for mlp_out)
-    pub(super) gate_up_out: HiddenStates, // 2*inter_dim × seq_len
+    pub(super) gate_out: HiddenStates, // inter_dim × seq_len
+    pub(super) up_out: HiddenStates, // inter_dim × seq_len
     pub(super) act_out: HiddenStates, // inter_dim × seq_len
     pub(super) attn_output: HiddenStates, // q_dim × seq_len
 }
@@ -43,7 +44,8 @@ impl PrefillBuffers {
             k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * inter_dim, seq_len)?,
+            gate_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
+            up_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
         })
@@ -154,23 +156,34 @@ impl Qwen3Model {
         self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 5+6. Residual add + MLP RMSNorm (fused): hidden += o_buf; normed = rms_norm(hidden)
-        ops::fused_add_rms_norm_batch_into(
+        pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             &self.ctx,
             hidden,
             &bufs.o_buf,
             &layer.post_attention_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        );
+        )?;
 
-        // 7. MLP: fused gate+up GEMM → silu_mul → down → bufs.o_buf
-        ops::gemm_into(
+        // 7. MLP: split gate/up GEMMs → silu_mul → down → bufs.o_buf
+        let inter_dim = self.local_intermediate_size();
+        ops::gemm_rows_into(
             &self.ctx,
             &layer.mlp.gate_up_proj,
+            0,
+            inter_dim,
             &bufs.normed,
-            &mut bufs.gate_up_out,
+            &mut bufs.gate_out,
         );
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out);
+        ops::gemm_rows_into(
+            &self.ctx,
+            &layer.mlp.gate_up_proj,
+            inter_dim,
+            inter_dim,
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

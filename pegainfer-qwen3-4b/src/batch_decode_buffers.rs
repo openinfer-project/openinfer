@@ -60,8 +60,10 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) attn_proj: HiddenStates,
     /// Fused QKV projection output [q_dim + 2*kv_dim, bs]
     pub(crate) qkv_out: HiddenStates,
-    /// Fused gate+up projection output [2*intermediate_size, bs]
-    pub(crate) gate_up_out: HiddenStates,
+    /// Split MLP gate projection output [intermediate_size, bs].
+    pub(crate) gate_out: HiddenStates,
+    /// Split MLP up projection output [intermediate_size, bs].
+    pub(crate) up_out: HiddenStates,
     pub(crate) mlp_act: HiddenStates,
     pub(crate) mlp_out: HiddenStates,
     pub(crate) hidden: HiddenStates,
@@ -122,7 +124,8 @@ impl BatchDecodeBuffers {
             attn_out: HiddenStates::zeros(ctx, q_dim, bs)?,
             attn_proj: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             qkv_out: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, bs)?,
-            gate_up_out: HiddenStates::zeros(ctx, 2 * intermediate_size, bs)?,
+            gate_out: HiddenStates::zeros(ctx, intermediate_size, bs)?,
+            up_out: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             mlp_act: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             hidden: HiddenStates::zeros(ctx, hidden_dim, bs)?,
@@ -163,7 +166,8 @@ impl BatchDecodeBuffers {
         self.attn_out.seq_len = bs;
         self.attn_proj.seq_len = bs;
         self.qkv_out.seq_len = bs;
-        self.gate_up_out.seq_len = bs;
+        self.gate_out.seq_len = bs;
+        self.up_out.seq_len = bs;
         self.mlp_act.seq_len = bs;
         self.mlp_out.seq_len = bs;
         self.hidden.seq_len = bs;

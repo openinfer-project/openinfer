@@ -154,7 +154,7 @@ impl Qwen3Model {
                 &bufs.mlp_out,
                 next_weight,
                 &mut bufs.normed,
-            );
+            )?;
         }
 
         // Output projection: logits [vocab_size, bs]
@@ -242,20 +242,27 @@ impl Qwen3Model {
             &bufs.attn_proj,
             &layer.post_attention_layernorm,
             &mut bufs.normed,
-        );
+        )?;
 
-        // MLP: fused gate+up GEMM → silu_mul_fused → down GEMM
-        dag.gate_up_proj(
-            dag_label!(format!("L{layer_idx}.mlp.gate_up_proj")),
+        // MLP: split gate/up GEMMs → silu_mul → down GEMM
+        dag.mlp_gate_proj(
+            dag_label!(format!("L{layer_idx}.mlp.gate_proj")),
             &layer.mlp.gate_up_proj,
             &bufs.normed,
-            &mut bufs.gate_up_out,
+            &mut bufs.gate_out,
         );
-        dag.silu_mul(
+        dag.mlp_up_proj(
+            dag_label!(format!("L{layer_idx}.mlp.up_proj")),
+            &layer.mlp.gate_up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        dag.silu_mul_split(
             dag_label!(format!("L{layer_idx}.mlp.silu_mul")),
-            &bufs.gate_up_out,
+            &bufs.gate_out,
+            &bufs.up_out,
             &mut bufs.mlp_act,
-        );
+        )?;
         dag.down_proj(
             dag_label!(format!("L{layer_idx}.mlp.down_proj")),
             &layer.mlp.down_proj,

@@ -22,7 +22,7 @@ Qwen3-4B uses bf16 dense full attention with `hidden_size=2560`, `num_attention_
 | `qwen3_4b.norm.fused_add_rms` | residual | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | residual add plus RMSNorm over batch |
 | `qwen3_4b.mlp.silu_mul_fused` | MLP | `ops::silu_mul_fused_batch_into` | `silu_mul_fused_cuda` | `csrc/fused_proj.cu` | CUDA | input `[2 * intermediate, batch]`, output `[intermediate, batch]` |
 | `qwen3_4b.elementwise.add` | residual/unified | `ops::add_batch_into` | `add_cuda` | `csrc/elementwise.cu` | CUDA | same-shape `HiddenStates` |
-| `qwen3_4b.sampling.greedy` | decode output | `ops::gpu_sample_into` | `flashinfer_top1_cuda` | `csrc/flashinfer_top1.cu` | FlashInfer CUDA | top-1 path, uses row-state scratch |
+| `qwen3_4b.sampling.greedy` | decode output | `ops::gpu_sample_into` | `argmax_cuda` | `csrc/argmax.cu` | CUDA | greedy top-1 path, preserves lower-token-id tie-break |
 | `qwen3_4b.sampling.random` | decode output | `ops::gpu_sample_into` | `gpu_sample_flashinfer_cuda` | `csrc/flashinfer_sampling.cu` | FlashInfer CUDA | temperature/top-k/top-p path |
 
 ## DeepSeek V4 MP8 Path
