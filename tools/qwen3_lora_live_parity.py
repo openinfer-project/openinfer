@@ -26,12 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--adapter-path")
-    parser.add_argument("--prompt", default="Hello")
+    parser.add_argument("--prompt", default="Tell me a story")
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--server-url")
     parser.add_argument("--lora-name", default="parity")
-    parser.add_argument("--scale", type=float, default=0.02)
+    parser.add_argument("--scale", type=float, default=0.001)
     parser.add_argument("--startup-timeout-s", type=float, default=180.0)
     return parser.parse_args()
 
@@ -106,7 +106,7 @@ def hf_peft_reference(model_path: Path, adapter_path: Path, prompt: str, max_tok
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     base = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     ).to("cuda")
