@@ -110,7 +110,12 @@ def hf_peft_reference(model_path: Path, adapter_path: Path, prompt: str, max_tok
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     ).to("cuda")
-    model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False).eval()
+    model = PeftModel.from_pretrained(
+        base,
+        adapter_path,
+        is_trainable=False,
+        autocast_adapter_dtype=False,
+    ).eval()
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
 
     with torch.no_grad():
