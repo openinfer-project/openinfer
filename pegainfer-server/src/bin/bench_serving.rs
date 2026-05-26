@@ -856,6 +856,11 @@ struct GenTimings {
 }
 
 trait BenchModel {
+    fn validate_concurrency(&self, concurrency: usize) -> Result<()> {
+        ensure!(concurrency > 0, "--concurrency must be > 0");
+        Ok(())
+    }
+
     fn timed_generation(
         &mut self,
         prompt_tokens: &[u32],
@@ -1036,6 +1041,112 @@ impl BenchModel for SchedulerBenchModel {
     }
 }
 
+#[cfg(feature = "deepseek-v2-lite")]
+struct DeepSeekV2LiteBenchModel {
+    generator: pegainfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator,
+}
+
+#[cfg(feature = "deepseek-v2-lite")]
+impl BenchModel for DeepSeekV2LiteBenchModel {
+    fn validate_concurrency(&self, concurrency: usize) -> Result<()> {
+        ensure!(
+            concurrency == 1,
+            "DeepSeek-V2-Lite direct attribution benchmark supports --concurrency 1 only; \
+             the current EP2 first gate does not expose a true batched serving path"
+        );
+        Ok(())
+    }
+
+    fn timed_generation(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        _rng: &mut StdRng,
+    ) -> GenTimings {
+        assert_dsv2_lite_sampling_contract(sampling);
+        let (result, attribution) = self
+            .generator
+            .generate_greedy_with_attribution(prompt_tokens, max_new_tokens, sampling.ignore_eos)
+            .expect("DeepSeek-V2-Lite generation failed");
+        timings_from_dsv2_lite_attribution(
+            result.tokens,
+            max_new_tokens,
+            attribution.total_generation_us(),
+            attribution.prefill_next_token_us(),
+            attribution.per_token_decode_us(),
+        )
+    }
+}
+
+#[cfg(feature = "deepseek-v2-lite")]
+fn assert_dsv2_lite_sampling_contract(sampling: &SamplingParams) {
+    assert!(
+        sampling.ignore_eos,
+        "DeepSeek-V2-Lite direct attribution benchmark requires ignore_eos=true so output_len maps to an exact generated-token count"
+    );
+    assert!(
+        (sampling.temperature <= 0.0 || sampling.top_k == 1) && sampling.top_p >= 1.0,
+        "DeepSeek-V2-Lite direct attribution benchmark supports greedy decoding only; requested temperature={}, top_k={}, top_p={}",
+        sampling.temperature,
+        sampling.top_k,
+        sampling.top_p
+    );
+}
+
+#[cfg(feature = "deepseek-v2-lite")]
+fn timings_from_dsv2_lite_attribution(
+    generated_token_ids: Vec<u32>,
+    expected_generated_tokens: usize,
+    total_generation_us: u64,
+    prefill_next_token_us: Option<u64>,
+    per_token_decode_us: &[u64],
+) -> GenTimings {
+    // This bench helper intentionally panics on corrupted attribution data rather
+    // than synthesizing a result. The surrounding trait does not carry errors,
+    // and emitting bogus TPOT would be worse than aborting the benchmark.
+    let emitted_tokens = generated_token_ids.len();
+    assert_eq!(
+        emitted_tokens, expected_generated_tokens,
+        "DeepSeek-V2-Lite generated token count mismatch: got {} tokens for requested output_len={}",
+        emitted_tokens, expected_generated_tokens
+    );
+    let expected_decode_steps = expected_generated_tokens.saturating_sub(1);
+    assert_eq!(
+        per_token_decode_us.len(),
+        expected_decode_steps,
+        "DeepSeek-V2-Lite timing count mismatch: got {} decode samples for {} generated tokens",
+        per_token_decode_us.len(),
+        emitted_tokens
+    );
+    assert!(
+        total_generation_us > 0,
+        "DeepSeek-V2-Lite total generation timing is zero; refusing to report TPOT"
+    );
+    if emitted_tokens > 0 {
+        assert!(
+            prefill_next_token_us.is_some_and(|us| us > 0),
+            "DeepSeek-V2-Lite TTFT timing is missing or zero; refusing to report TPOT"
+        );
+    }
+    if expected_decode_steps > 0 {
+        assert!(
+            per_token_decode_us.iter().all(|us| *us > 0),
+            "DeepSeek-V2-Lite decode timing contains a zero-duration sample; refusing to report TPOT"
+        );
+    }
+    GenTimings {
+        ttft: Duration::from_micros(prefill_next_token_us.unwrap_or(total_generation_us)),
+        tbt: per_token_decode_us
+            .iter()
+            .map(|us| Duration::from_micros(*us))
+            .collect(),
+        total: Duration::from_micros(total_generation_us),
+        emitted_tokens,
+        generated_tokens: generated_token_ids,
+    }
+}
+
 fn command_seed(cli: &Cli) -> u64 {
     match &cli.command {
         Command::Request(args) => args.run.seed,
@@ -1069,7 +1180,7 @@ fn measure_timings(
     concurrency: usize,
 ) -> Result<Vec<GenTimings>> {
     ensure!(output_len > 0, "--output-len must be > 0");
-    ensure!(concurrency > 0, "--concurrency must be > 0");
+    model.validate_concurrency(concurrency)?;
     validate_run_args(run)?;
 
     let sampling = SamplingParams {
@@ -1844,7 +1955,7 @@ fn main() -> Result<()> {
     match model_type {
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => {
-            let handle = pegainfer_deepseek_v2_lite::start_engine(
+            let generator = pegainfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator::load(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: false,
@@ -1855,7 +1966,7 @@ fn main() -> Result<()> {
             )?;
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = SchedulerBenchModel { handle };
+            let mut bench = DeepSeekV2LiteBenchModel { generator };
             dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
         }
         #[cfg(feature = "deepseek-v4")]
@@ -1942,5 +2053,107 @@ fn main() -> Result<()> {
                 &tokenizer,
             )
         }
+    }
+}
+
+#[cfg(all(test, feature = "deepseek-v2-lite"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsv2_lite_sampling_contract_accepts_bench_params() {
+        let sampling = SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+
+        assert_dsv2_lite_sampling_contract(&sampling);
+    }
+
+    #[test]
+    #[should_panic(expected = "supports greedy decoding only")]
+    fn dsv2_lite_sampling_contract_rejects_non_greedy_params() {
+        let sampling = SamplingParams {
+            temperature: 0.8,
+            top_k: -1,
+            top_p: 0.95,
+            ignore_eos: true,
+        };
+
+        assert_dsv2_lite_sampling_contract(&sampling);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires ignore_eos=true")]
+    fn dsv2_lite_sampling_contract_rejects_eos_enabled_params() {
+        let sampling = SamplingParams {
+            ignore_eos: false,
+            ..SamplingParams::default()
+        };
+
+        assert_dsv2_lite_sampling_contract(&sampling);
+    }
+
+    #[test]
+    fn dsv2_lite_attribution_timings_preserve_decode_steps() {
+        let timings = timings_from_dsv2_lite_attribution(
+            vec![11, 304, 608],
+            3,
+            60_000,
+            Some(20_000),
+            &[19_000, 18_000],
+        );
+
+        assert_eq!(timings.ttft, Duration::from_micros(20_000));
+        assert_eq!(
+            timings.tbt,
+            vec![Duration::from_micros(19_000), Duration::from_micros(18_000)]
+        );
+        assert_eq!(timings.total, Duration::from_micros(60_000));
+        assert_eq!(timings.emitted_tokens, 3);
+        assert_eq!(timings.generated_tokens, vec![11, 304, 608]);
+    }
+
+    #[test]
+    #[should_panic(expected = "timing count mismatch")]
+    fn dsv2_lite_attribution_timings_fail_on_missing_decode_samples() {
+        let _ = timings_from_dsv2_lite_attribution(
+            vec![11, 304, 608],
+            3,
+            60_000,
+            Some(20_000),
+            &[19_000],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "generated token count mismatch")]
+    fn dsv2_lite_attribution_timings_fail_on_short_generation() {
+        let _ =
+            timings_from_dsv2_lite_attribution(vec![11, 304], 3, 60_000, Some(20_000), &[19_000]);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero-duration")]
+    fn dsv2_lite_attribution_timings_fail_on_zero_decode_samples() {
+        let _ = timings_from_dsv2_lite_attribution(vec![11, 304], 2, 60_000, Some(20_000), &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "total generation timing is zero")]
+    fn dsv2_lite_attribution_timings_fail_on_zero_total_generation() {
+        let _ = timings_from_dsv2_lite_attribution(vec![11, 304], 2, 0, Some(20_000), &[19_000]);
+    }
+
+    #[test]
+    #[should_panic(expected = "TTFT timing is missing or zero")]
+    fn dsv2_lite_attribution_timings_fail_on_missing_ttft() {
+        let _ = timings_from_dsv2_lite_attribution(vec![11, 304], 2, 60_000, None, &[19_000]);
+    }
+
+    #[test]
+    #[should_panic(expected = "TTFT timing is missing or zero")]
+    fn dsv2_lite_attribution_timings_fail_on_zero_ttft() {
+        let _ = timings_from_dsv2_lite_attribution(vec![11, 304], 2, 60_000, Some(0), &[19_000]);
     }
 }
