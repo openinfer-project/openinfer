@@ -141,6 +141,54 @@ def hf_peft_reference(model_path: Path, adapter_path: Path, prompt: str, max_tok
     }
 
 
+def encode_generated_text(model_path: Path, text: str) -> list[int]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+
+def first_token_mismatch(
+    hf_token_ids: list[int],
+    pegainfer_token_ids: list[int],
+    model_path: Path,
+) -> dict | None:
+    if hf_token_ids == pegainfer_token_ids:
+        return None
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    for index, (hf_token_id, pegainfer_token_id) in enumerate(
+        zip(hf_token_ids, pegainfer_token_ids),
+        start=1,
+    ):
+        if hf_token_id != pegainfer_token_id:
+            return {
+                "index_1based": index,
+                "hf_token_id": hf_token_id,
+                "pegainfer_token_id": pegainfer_token_id,
+                "hf_piece": tokenizer.decode([hf_token_id]),
+                "pegainfer_piece": tokenizer.decode([pegainfer_token_id]),
+            }
+
+    return {
+        "index_1based": min(len(hf_token_ids), len(pegainfer_token_ids)) + 1,
+        "hf_token_id": hf_token_ids[len(pegainfer_token_ids)]
+        if len(hf_token_ids) > len(pegainfer_token_ids)
+        else None,
+        "pegainfer_token_id": pegainfer_token_ids[len(hf_token_ids)]
+        if len(pegainfer_token_ids) > len(hf_token_ids)
+        else None,
+        "hf_piece": tokenizer.decode([hf_token_ids[len(pegainfer_token_ids)]])
+        if len(hf_token_ids) > len(pegainfer_token_ids)
+        else None,
+        "pegainfer_piece": tokenizer.decode([pegainfer_token_ids[len(hf_token_ids)]])
+        if len(pegainfer_token_ids) > len(hf_token_ids)
+        else None,
+    }
+
+
 def post_json(url: str, payload: dict, timeout: float = 120.0) -> dict | str:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -301,6 +349,8 @@ def main() -> int:
     if not choices:
         raise RuntimeError(f"completion response has no choices: {completion}")
     pegainfer_text = choices[0].get("text", "")
+    pegainfer_token_ids = encode_generated_text(model_path, pegainfer_text)
+    mismatch = first_token_mismatch(hf["token_ids"], pegainfer_token_ids, model_path)
     summary = {
         "adapter_path": str(adapter_path),
         "hf_text": hf["text"],
@@ -308,6 +358,8 @@ def main() -> int:
         "hf_logit_max_abs_diff_vs_base": hf["logit_max_abs_diff_vs_base"],
         "load_response": load_response,
         "pegainfer_text": pegainfer_text,
+        "pegainfer_token_ids": pegainfer_token_ids,
+        "first_token_mismatch": mismatch,
         "match": pegainfer_text == hf["text"],
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
