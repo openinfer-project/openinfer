@@ -3744,6 +3744,7 @@ dependencies = [
  "axum",
  "log",
  "pegainfer-engine",
+ "reqwest",
  "rmp-serde",
  "rmpv",
  "serde",

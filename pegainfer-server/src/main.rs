@@ -186,14 +186,28 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    pegainfer::vllm_frontend::serve(
-        handle,
-        &args.model_path,
-        args.served_model_name.as_deref(),
-        args.port,
-        pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
-    )
-    .await
+    if args.enable_lora {
+        let max_model_len =
+            pegainfer::vllm_frontend::load_max_model_len(&args.model_path).unwrap_or(4096);
+        pegainfer::vllm_frontend::serve_model_with_lora_routes(
+            handle,
+            args.model_path.to_string_lossy().into_owned(),
+            args.served_model_name.into_iter().collect(),
+            args.port,
+            max_model_len,
+            pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
+        )
+        .await
+    } else {
+        pegainfer::vllm_frontend::serve(
+            handle,
+            &args.model_path,
+            args.served_model_name.as_deref(),
+            args.port,
+            pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
+        )
+        .await
+    }
     .context("vLLM frontend server failed")?;
 
     Ok(())
