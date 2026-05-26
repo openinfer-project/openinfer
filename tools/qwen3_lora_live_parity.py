@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-name", default="parity")
     parser.add_argument("--scale", type=float, default=0.001)
     parser.add_argument("--startup-timeout-s", type=float, default=180.0)
+    parser.add_argument(
+        "--disable-peft-adapter-autocast",
+        action="store_true",
+        help="Disable PEFT's default adapter dtype autocast for diagnostics.",
+    )
     return parser.parse_args()
 
 
@@ -98,7 +103,13 @@ def write_adapter(model_path: Path, adapter_path: Path, scale: float) -> None:
     save_file(tensors, str(adapter_path / "adapter_model.safetensors"))
 
 
-def hf_peft_reference(model_path: Path, adapter_path: Path, prompt: str, max_tokens: int) -> dict:
+def hf_peft_reference(
+    model_path: Path,
+    adapter_path: Path,
+    prompt: str,
+    max_tokens: int,
+    autocast_adapter_dtype: bool,
+) -> dict:
     import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -114,7 +125,7 @@ def hf_peft_reference(model_path: Path, adapter_path: Path, prompt: str, max_tok
         base,
         adapter_path,
         is_trainable=False,
-        autocast_adapter_dtype=False,
+        autocast_adapter_dtype=autocast_adapter_dtype,
     ).eval()
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
 
@@ -327,7 +338,14 @@ def main() -> int:
     with cleanup as adapter_dir:
         adapter_path = Path(adapter_dir)
         write_adapter(model_path, adapter_path, args.scale)
-        hf = hf_peft_reference(model_path, adapter_path, args.prompt, args.max_tokens)
+        peft_autocast_adapter_dtype = not args.disable_peft_adapter_autocast
+        hf = hf_peft_reference(
+            model_path,
+            adapter_path,
+            args.prompt,
+            args.max_tokens,
+            peft_autocast_adapter_dtype,
+        )
 
         server_url = args.server_url or f"http://127.0.0.1:{args.port}"
         if args.server_url is None:
@@ -361,6 +379,7 @@ def main() -> int:
         "hf_text": hf["text"],
         "hf_token_ids": hf["token_ids"],
         "hf_logit_max_abs_diff_vs_base": hf["logit_max_abs_diff_vs_base"],
+        "peft_autocast_adapter_dtype": peft_autocast_adapter_dtype,
         "load_response": load_response,
         "pegainfer_text": pegainfer_text,
         "pegainfer_token_ids": pegainfer_token_ids,
