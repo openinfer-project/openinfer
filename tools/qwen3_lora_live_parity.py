@@ -212,6 +212,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         start_new_session=True,
     )
     process.pegainfer_log_path = log.name  # type: ignore[attr-defined]
+    print(f"server_log={log.name}", file=sys.stderr)
     log.close()
     return process
 
@@ -290,6 +291,9 @@ def main() -> int:
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
             )
+        except Exception:  # noqa: BLE001
+            print(tail_server_output(process), file=sys.stderr)
+            raise
         finally:
             stop_server(process)
 
