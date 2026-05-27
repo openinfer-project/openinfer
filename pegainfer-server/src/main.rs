@@ -142,9 +142,6 @@ async fn main() -> anyhow::Result<()> {
             handle
         }
         ModelType::Qwen3 => {
-            if args.enable_lora && args.tp_size != 1 {
-                bail!("Qwen3 LoRA PR1 supports --tp-size=1 only");
-            }
             let device_ordinals: Vec<usize> = if args.tp_size == 1 {
                 vec![args.device_ordinal]
             } else {

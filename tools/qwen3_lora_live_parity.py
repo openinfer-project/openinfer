@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--server-url")
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--lora-name", default="parity")
     parser.add_argument("--scale", type=float, default=0.001)
     parser.add_argument("--startup-timeout-s", type=float, default=180.0)
@@ -257,6 +258,8 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         "--model-path",
         args.model_path,
         "--enable-lora",
+        "--tp-size",
+        str(args.tp_size),
         "--port",
         str(args.port),
     ]

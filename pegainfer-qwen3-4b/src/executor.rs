@@ -819,11 +819,8 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
-        anyhow::ensure!(
-            self.workers.is_empty(),
-            "Qwen3 LoRA adapter loading currently supports single-GPU execution only"
-        );
         let adapter = crate::lora::load_lora_adapter(&request.lora_path, &self.metadata.config)?;
+        let world_size = self.workers.len() + 1;
         let projection_count: usize = adapter
             .layers
             .iter()
@@ -847,18 +844,63 @@ impl ModelExecutor for Qwen3Executor {
         let rank = adapter.manifest.rank;
         let targets = adapter.manifest.target_modules.join(", ");
         let path = adapter.manifest.path.display().to_string();
-        self.primary
-            .load_lora_adapter(request.lora_name.clone(), adapter)?
-            .recv()
-            .map_err(|_| anyhow::anyhow!("primary worker dropped LoRA load response"))??;
+        let mut sharded_adapters = Vec::with_capacity(world_size);
+        for rank in 0..world_size {
+            sharded_adapters.push(adapter.shard_for_tensor_parallel(
+                &self.metadata.config,
+                TensorParallelConfig { rank, world_size },
+            )?);
+        }
+
+        let mut sharded_adapters = sharded_adapters.into_iter();
+        let primary_adapter = sharded_adapters
+            .next()
+            .expect("rank 0 adapter must exist for nonzero world_size");
+        let primary_response = self
+            .primary
+            .load_lora_adapter(request.lora_name.clone(), primary_adapter)?;
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for (index, worker) in self.workers.iter().enumerate() {
+            let rank = index + 1;
+            let rank_adapter = sharded_adapters
+                .next()
+                .expect("worker adapter must exist for every tensor-parallel rank");
+            pending.push((
+                rank,
+                worker.load_lora_adapter(request.lora_name.clone(), rank_adapter)?,
+            ));
+        }
+
+        let mut errors = Vec::new();
+        match primary_response.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => errors.push(format!("rank 0: {err:#}")),
+            Err(_) => errors.push("rank 0: dropped LoRA load response".to_string()),
+        }
+        for (rank, response) in pending {
+            match response.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => errors.push(format!("rank {rank}: {err:#}")),
+                Err(_) => errors.push(format!("rank {rank}: dropped LoRA load response")),
+            }
+        }
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "failed to load Qwen3 LoRA adapter {} on tensor-parallel ranks: {}",
+                request.lora_name,
+                errors.join("; ")
+            );
+        }
+
         log::info!(
-            "Loaded Qwen3 LoRA adapter {} from {} (rank={}, targets={}, projections={}, bf16_elements={})",
+            "Loaded Qwen3 LoRA adapter {} from {} (rank={}, targets={}, projections={}, bf16_elements={}, tp_world_size={})",
             request.lora_name,
             path,
             rank,
             targets,
             projection_count,
-            element_count
+            element_count,
+            world_size
         );
         Ok(())
     }

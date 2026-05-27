@@ -10,7 +10,7 @@ use safetensors::tensor::TensorView;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{Config, TensorParallelConfig};
 
 const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
 const ADAPTER_WEIGHTS_FILE: &str = "adapter_model.safetensors";
@@ -113,6 +113,41 @@ impl TargetModules {
             Self::One(target) => vec![target],
             Self::Many(targets) => targets,
         }
+    }
+}
+
+impl LoraAdapter {
+    pub(crate) fn shard_for_tensor_parallel(
+        &self,
+        config: &Config,
+        tensor_parallel: TensorParallelConfig,
+    ) -> Result<Self> {
+        tensor_parallel.validate_for(config)?;
+        if !tensor_parallel.is_sharded() {
+            return Ok(self.clone());
+        }
+
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let mut sharded_layer = LoraLayer::default();
+            for (target, projection) in &layer.projections {
+                sharded_layer.projections.insert(
+                    target.clone(),
+                    shard_projection_for_tensor_parallel(
+                        config,
+                        tensor_parallel,
+                        target,
+                        projection,
+                    )?,
+                );
+            }
+            layers.push(sharded_layer);
+        }
+
+        Ok(Self {
+            manifest: self.manifest.clone(),
+            layers,
+        })
     }
 }
 
@@ -430,6 +465,92 @@ impl LoraMatrix {
     fn to_device(&self, ctx: &DeviceContext) -> Result<DeviceMatrix> {
         DeviceMatrix::from_host(ctx, &self.data, self.rows, self.cols)
     }
+
+    fn row_shard(&self, row_offset: usize, rows: usize) -> Result<Self> {
+        ensure!(
+            row_offset + rows <= self.rows,
+            "LoRA row shard out of bounds: row_offset={} rows={} total_rows={}",
+            row_offset,
+            rows,
+            self.rows
+        );
+        let start = row_offset * self.cols;
+        let end = (row_offset + rows) * self.cols;
+        Ok(Self {
+            data: self.data[start..end].to_vec(),
+            rows,
+            cols: self.cols,
+        })
+    }
+
+    fn col_shard(&self, col_offset: usize, cols: usize) -> Result<Self> {
+        ensure!(
+            col_offset + cols <= self.cols,
+            "LoRA col shard out of bounds: col_offset={} cols={} total_cols={}",
+            col_offset,
+            cols,
+            self.cols
+        );
+        let mut data = Vec::with_capacity(self.rows * cols);
+        for row in 0..self.rows {
+            let start = row * self.cols + col_offset;
+            data.extend_from_slice(&self.data[start..start + cols]);
+        }
+        Ok(Self {
+            data,
+            rows: self.rows,
+            cols,
+        })
+    }
+}
+
+fn shard_projection_for_tensor_parallel(
+    config: &Config,
+    tensor_parallel: TensorParallelConfig,
+    target: &str,
+    projection: &LoraProjection,
+) -> Result<LoraProjection> {
+    match target {
+        "q_proj" => {
+            let (row_offset, rows) =
+                tensor_parallel.shard_range(config.num_attention_heads * config.head_dim);
+            Ok(LoraProjection {
+                a: projection.a.clone(),
+                b: projection.b.row_shard(row_offset, rows)?,
+            })
+        }
+        "k_proj" | "v_proj" => {
+            let (row_offset, rows) =
+                tensor_parallel.shard_range(config.num_key_value_heads * config.head_dim);
+            Ok(LoraProjection {
+                a: projection.a.clone(),
+                b: projection.b.row_shard(row_offset, rows)?,
+            })
+        }
+        "gate_proj" | "up_proj" => {
+            let (row_offset, rows) = tensor_parallel.shard_range(config.intermediate_size);
+            Ok(LoraProjection {
+                a: projection.a.clone(),
+                b: projection.b.row_shard(row_offset, rows)?,
+            })
+        }
+        "o_proj" => {
+            let (col_offset, cols) =
+                tensor_parallel.shard_range(config.num_attention_heads * config.head_dim);
+            Ok(LoraProjection {
+                a: projection.a.col_shard(col_offset, cols)?,
+                b: projection.b.clone(),
+            })
+        }
+        "down_proj" => {
+            let (col_offset, cols) = tensor_parallel.shard_range(config.intermediate_size);
+            Ok(LoraProjection {
+                a: projection.a.col_shard(col_offset, cols)?,
+                b: projection.b.clone(),
+            })
+        }
+        _ => bail!("unsupported Qwen3 LoRA target module {target}"),
+    }
 }
 
 #[cfg(test)]
@@ -451,7 +572,7 @@ mod tests {
             intermediate_size: 6,
             num_hidden_layers: 2,
             num_attention_heads: 2,
-            num_key_value_heads: 1,
+            num_key_value_heads: 2,
             head_dim: 2,
             vocab_size: 16,
             rms_norm_eps: 1e-6,
@@ -558,6 +679,17 @@ mod tests {
             _ => panic!("unsupported test dtype {dtype:?}"),
         };
         tensors.insert(name, TestTensor { dtype, shape, data });
+    }
+
+    fn matrix(rows: usize, cols: usize) -> LoraMatrix {
+        let data = (0..rows * cols)
+            .map(|idx| bf16::from_f32(idx as f32))
+            .collect();
+        LoraMatrix { data, rows, cols }
+    }
+
+    fn values(matrix: &LoraMatrix) -> Vec<f32> {
+        matrix.data.iter().map(|value| value.to_f32()).collect()
     }
 
     #[test]
@@ -684,5 +816,80 @@ mod tests {
         let error = load_lora_adapter(&path, &config).expect_err("bad tensor shape");
 
         assert!(error.to_string().contains("shape mismatch"));
+    }
+
+    #[test]
+    fn shards_column_parallel_lora_b_rows_for_tp_rank() {
+        let config = tiny_config();
+        let tp = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
+        let projection = LoraProjection {
+            a: matrix(2, config.hidden_size),
+            b: matrix(config.intermediate_size, 2),
+        };
+
+        let sharded = shard_projection_for_tensor_parallel(&config, tp, "gate_proj", &projection)
+            .expect("shard gate_proj");
+
+        assert_eq!((sharded.a.rows, sharded.a.cols), (2, config.hidden_size));
+        assert_eq!(values(&sharded.a), values(&projection.a));
+        assert_eq!((sharded.b.rows, sharded.b.cols), (3, 2));
+        assert_eq!(values(&sharded.b), vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn shards_row_parallel_lora_a_cols_for_tp_rank() {
+        let config = tiny_config();
+        let tp = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
+        let projection = LoraProjection {
+            a: matrix(2, config.intermediate_size),
+            b: matrix(config.hidden_size, 2),
+        };
+
+        let sharded = shard_projection_for_tensor_parallel(&config, tp, "down_proj", &projection)
+            .expect("shard down_proj");
+
+        assert_eq!((sharded.a.rows, sharded.a.cols), (2, 3));
+        assert_eq!(values(&sharded.a), vec![3.0, 4.0, 5.0, 9.0, 10.0, 11.0]);
+        assert_eq!((sharded.b.rows, sharded.b.cols), (config.hidden_size, 2));
+        assert_eq!(values(&sharded.b), values(&projection.b));
+    }
+
+    #[test]
+    fn shards_full_adapter_for_tensor_parallel() {
+        let config = tiny_config();
+        let path = temp_adapter_dir("tp-shard");
+        write_adapter_config(&path, &["q_proj", "down_proj"], 2);
+        write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
+        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+
+        let sharded = adapter
+            .shard_for_tensor_parallel(
+                &config,
+                TensorParallelConfig {
+                    rank: 1,
+                    world_size: 2,
+                },
+            )
+            .expect("shard adapter");
+
+        let q_proj = sharded.layers[0].projections.get("q_proj").expect("q_proj");
+        assert_eq!((q_proj.a.rows, q_proj.a.cols), (2, config.hidden_size));
+        assert_eq!((q_proj.b.rows, q_proj.b.cols), (2, 2));
+
+        let down_proj = sharded.layers[0]
+            .projections
+            .get("down_proj")
+            .expect("down_proj");
+        assert_eq!((down_proj.a.rows, down_proj.a.cols), (2, 3));
+        assert_eq!(
+            (down_proj.b.rows, down_proj.b.cols),
+            (config.hidden_size, 2)
+        );
     }
 }
