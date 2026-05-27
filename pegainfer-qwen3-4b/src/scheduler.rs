@@ -283,6 +283,22 @@ fn scheduler_loop_with_lora_control<E>(
         let pending = admission.pending;
         deferred = admission.deferred;
 
+        if active.is_empty() && pending.is_empty() {
+            if let Some(command) = command_rx.blocking_recv() {
+                enqueue_engine_command(
+                    command,
+                    &mut deferred,
+                    &mut pending_control,
+                    &mut post_control_deferred,
+                    &mut next_request_id,
+                );
+            } else {
+                info!("Scheduler: all handles dropped, exiting");
+                return;
+            }
+            continue;
+        }
+
         let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
             continue;
         };

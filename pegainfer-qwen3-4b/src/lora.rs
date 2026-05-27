@@ -286,7 +286,7 @@ fn validate_tensor_catalog(
         }
     }
 
-    let actual: BTreeSet<&str> = tensors.names().into_iter().collect();
+    let actual: BTreeSet<String> = tensors.names().into_iter().map(str::to_owned).collect();
     for (name, shape) in &expected {
         let tensor = tensors
             .tensor(name)
@@ -301,7 +301,7 @@ fn validate_tensor_catalog(
     }
 
     for name in actual {
-        if !expected.contains_key(name) {
+        if !expected.contains_key(&name) {
             bail!("unexpected LoRA tensor {name}");
         }
     }

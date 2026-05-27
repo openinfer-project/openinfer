@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -378,33 +378,65 @@ pub async fn serve_model_with_lora_routes(
 ) -> Result<()> {
     let model_id = model_id.into();
     let lora_router = lora_routes(handle.clone());
-    let internal_port = reserve_loopback_port()?;
-    let upstream_base_url: Arc<str> = format!("http://127.0.0.1:{internal_port}").into();
-    let internal_shutdown = shutdown.child_token();
-    let internal_task = tokio::spawn(serve_model_on_host(
-        handle,
-        model_id,
-        served_model_name,
-        "127.0.0.1".to_string(),
-        internal_port,
-        max_model_len,
-        internal_shutdown.clone(),
-    ));
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        let internal_port = reserve_loopback_port()?;
+        let upstream_base_url: Arc<str> = format!("http://127.0.0.1:{internal_port}").into();
+        let internal_shutdown = shutdown.child_token();
+        let mut internal_task = tokio::spawn(serve_model_on_host(
+            handle.clone(),
+            model_id.clone(),
+            served_model_name.clone(),
+            "127.0.0.1".to_string(),
+            internal_port,
+            max_model_len,
+            internal_shutdown.clone(),
+        ));
 
-    wait_for_http_health(&upstream_base_url, &shutdown).await?;
+        let mut internal_task_finished = false;
+        let health_result = tokio::select! {
+            result = wait_for_http_health(&upstream_base_url, &shutdown) => result,
+            result = &mut internal_task => {
+                internal_task_finished = true;
+                match result {
+                    Ok(Ok(())) => Err(anyhow!("internal vLLM server exited before becoming healthy")),
+                    Ok(Err(error)) => Err(error).context("internal vLLM server exited before becoming healthy"),
+                    Err(error) => Err(error).context("LoRA internal server task panicked"),
+                }
+            }
+        };
 
-    info!(
-        "serving LoRA route proxy: public_port={}, upstream={}",
-        port, upstream_base_url
-    );
-    let proxy_result =
-        serve_lora_proxy(port, upstream_base_url, lora_router, shutdown.child_token()).await;
+        if let Err(error) = health_result {
+            internal_shutdown.cancel();
+            if !internal_task_finished {
+                let _ = internal_task.await;
+            }
+            if attempt == 5 {
+                return Err(error).context("failed to start internal vLLM server for LoRA routes");
+            }
+            warn!(
+                "retrying LoRA internal vLLM server startup after attempt {} failed: {error:#}",
+                attempt
+            );
+            last_error = Some(error);
+            continue;
+        }
 
-    internal_shutdown.cancel();
-    let internal_result = internal_task
-        .await
-        .context("LoRA internal server task panicked")?;
-    proxy_result.and(internal_result)
+        info!(
+            "serving LoRA route proxy: public_port={}, upstream={}",
+            port, upstream_base_url
+        );
+        let proxy_result =
+            serve_lora_proxy(port, upstream_base_url, lora_router, shutdown.child_token()).await;
+
+        internal_shutdown.cancel();
+        let internal_result = internal_task
+            .await
+            .context("LoRA internal server task panicked")?;
+        return proxy_result.and(internal_result);
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("internal vLLM server startup was not attempted")))
 }
 
 async fn serve_model_on_host(
@@ -480,7 +512,12 @@ async fn wait_for_http_health(upstream_base_url: &str, shutdown: &CancellationTo
         if tokio::time::Instant::now() >= deadline {
             bail!("timed out waiting for internal vLLM server health at {health_url}");
         }
-        match client.get(&health_url).send().await {
+        match client
+            .get(&health_url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => return Ok(()),
             Ok(_) | Err(_) => {}
         }
