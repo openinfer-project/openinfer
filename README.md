@@ -130,9 +130,9 @@ cargo run --release --bin pegainfer -- --model-path models/Qwen3-4B
 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | Greedy + sampling |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling |
-| DeepSeek-V2-Lite | MoE + EP | feature-gated | `--features deepseek-v2-lite`, 2-GPU path |
+| [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU path |
 | [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention, MP8 checkpoint | 671B total / 37B active | Initial greedy, feature-gated, 8-GPU MP8 |
-| Kimi-K2 | MLA + MoE + Marlin INT4 | feature-gated | `--features kimi-k2`, 8-GPU EP path |
+| [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
 
 Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Feature-gated model lines require rebuilding `pegainfer-server` with the matching `--features ...` flag before launch.
 
