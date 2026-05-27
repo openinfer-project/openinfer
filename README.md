@@ -118,7 +118,7 @@ uv pip install "triton-windows<3.7"
 $env:PEGAINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
 
 cargo build --release
-cargo run --release --bin pegainfer -- --model-path models/Qwen3-4B
+cargo run --release -p pegainfer-server -- --model-path models/Qwen3-4B
 ```
 
 </details>
