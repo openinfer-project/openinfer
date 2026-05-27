@@ -7,6 +7,7 @@ pub mod batch_decode_trace;
 mod config;
 mod executor;
 pub mod kernel_bench;
+mod lora;
 mod prefill;
 mod scheduler;
 mod unified_forward;
@@ -65,4 +66,20 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
     scheduler::start_qwen3(model_path, enable_cuda_graph, &device_ordinals, seed)
+}
+
+pub fn start_engine_with_lora_control(
+    model_path: &Path,
+    options: EngineLoadOptions,
+) -> Result<EngineHandle> {
+    let EngineLoadOptions {
+        enable_cuda_graph,
+        device_ordinals,
+        seed,
+        ..
+    } = options;
+    let model_path = model_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
+    scheduler::start_qwen3_with_lora_control(model_path, enable_cuda_graph, &device_ordinals, seed)
 }

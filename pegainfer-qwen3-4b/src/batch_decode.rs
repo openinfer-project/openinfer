@@ -7,6 +7,7 @@ use super::batch_decode_buffers::{
 };
 use super::batch_decode_dag::BatchDecodeDag;
 use super::weights::{Qwen3Model, TransformerBlock};
+use crate::lora::apply_lora_projection_delta;
 use pegainfer_core::kv_pool::{KvLayout, KvState};
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops;
@@ -137,7 +138,7 @@ impl Qwen3Model {
         );
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            Self::batch_decode_layer(layer_idx, layer, &dag, bufs)?;
+            self.batch_decode_layer(layer_idx, layer, &dag, bufs)?;
 
             let next_weight = if layer_idx + 1 < num_layers {
                 &self.layers[layer_idx + 1].input_layernorm
@@ -170,6 +171,7 @@ impl Qwen3Model {
 
     #[allow(clippy::too_many_arguments)]
     fn batch_decode_layer(
+        &self,
         layer_idx: usize,
         layer: &TransformerBlock,
         dag: &BatchDecodeDag<'_>,
@@ -189,6 +191,18 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.q,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.q_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.normed,
+                &mut bufs.q,
+                0,
+                scale,
+            )?;
+        }
         dag.gemm_rows::<KvDim>(
             dag_label!(format!("L{layer_idx}.attn.k_proj")),
             &layer.attention.qkv_proj,
@@ -197,6 +211,18 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.k,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.k_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.normed,
+                &mut bufs.k,
+                0,
+                scale,
+            )?;
+        }
         dag.gemm_rows::<KvDim>(
             dag_label!(format!("L{layer_idx}.attn.v_proj")),
             &layer.attention.qkv_proj,
@@ -205,6 +231,18 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.v_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.normed,
+                &mut bufs.v,
+                0,
+                scale,
+            )?;
+        }
 
         // QK norm + RoPE (batched, per-request positions)
         dag.qk_norm_rope(
@@ -230,6 +268,18 @@ impl Qwen3Model {
             &bufs.attn_out,
             &mut bufs.attn_proj,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.o_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.attn_out,
+                &mut bufs.attn_proj,
+                0,
+                scale,
+            )?;
+        }
         dag.all_reduce_hidden(
             dag_label!(format!("L{layer_idx}.attn.all_reduce")),
             &mut bufs.attn_proj,
@@ -257,6 +307,28 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.up_out,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx) {
+            if let Some(projection) = &lora_layer.gate_proj {
+                apply_lora_projection_delta(
+                    &self.ctx,
+                    projection,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                    0,
+                    scale,
+                )?;
+            }
+            if let Some(projection) = &lora_layer.up_proj {
+                apply_lora_projection_delta(
+                    &self.ctx,
+                    projection,
+                    &bufs.normed,
+                    &mut bufs.up_out,
+                    0,
+                    scale,
+                )?;
+            }
+        }
         dag.silu_mul_split(
             dag_label!(format!("L{layer_idx}.mlp.silu_mul")),
             &bufs.gate_out,
@@ -269,6 +341,18 @@ impl Qwen3Model {
             &bufs.mlp_act,
             &mut bufs.mlp_out,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.down_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.mlp_act,
+                &mut bufs.mlp_out,
+                0,
+                scale,
+            )?;
+        }
         dag.all_reduce_hidden(
             dag_label!(format!("L{layer_idx}.mlp.all_reduce")),
             &mut bufs.mlp_out,

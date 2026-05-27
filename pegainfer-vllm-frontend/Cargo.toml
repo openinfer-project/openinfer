@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 pegainfer-engine = { workspace = true }
 anyhow = { workspace = true }
+axum = { workspace = true }
 log = { workspace = true }
+reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }

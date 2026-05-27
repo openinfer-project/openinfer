@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::{Qwen3Model, TransformerBlock};
+use crate::lora::apply_lora_projection_delta;
 use pegainfer_core::kv_pool::{KvLayout, KvState};
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
@@ -107,6 +108,18 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.q_batch,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.q_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.normed,
+                &mut bufs.q_batch,
+                0,
+                scale,
+            )?;
+        }
         ops::gemm_rows_into(
             &self.ctx,
             &layer.attention.qkv_proj,
@@ -115,6 +128,18 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.k_batch,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.k_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.normed,
+                &mut bufs.k_batch,
+                0,
+                scale,
+            )?;
+        }
         ops::gemm_rows_into(
             &self.ctx,
             &layer.attention.qkv_proj,
@@ -123,6 +148,18 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v_batch,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.v_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.normed,
+                &mut bufs.v_batch,
+                0,
+                scale,
+            )?;
+        }
 
         // 3. Paged prefill: norm+RoPE → append K/V to paged → batch attention
         ops::prefill_attention_paged_into(
@@ -153,6 +190,18 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.o_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.attn_output,
+                &mut bufs.o_buf,
+                0,
+                scale,
+            )?;
+        }
         self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 5+6. Residual add + MLP RMSNorm (fused): hidden += o_buf; normed = rms_norm(hidden)
@@ -183,6 +232,28 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.up_out,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx) {
+            if let Some(projection) = &lora_layer.gate_proj {
+                apply_lora_projection_delta(
+                    &self.ctx,
+                    projection,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                    0,
+                    scale,
+                )?;
+            }
+            if let Some(projection) = &lora_layer.up_proj {
+                apply_lora_projection_delta(
+                    &self.ctx,
+                    projection,
+                    &bufs.normed,
+                    &mut bufs.up_out,
+                    0,
+                    scale,
+                )?;
+            }
+        }
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
@@ -190,6 +261,18 @@ impl Qwen3Model {
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
+            && let Some(projection) = &lora_layer.down_proj
+        {
+            apply_lora_projection_delta(
+                &self.ctx,
+                projection,
+                &bufs.act_out,
+                &mut bufs.o_buf,
+                0,
+                scale,
+            )?;
+        }
         self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 8. Residual add: attn_residual + mlp_out → bufs.hidden_out (old hidden_in, free to overwrite)

@@ -5,9 +5,9 @@ use anyhow::Result;
 use crossbeam_channel as channel;
 
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::config::TensorParallelConfig;
+use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
-use pegainfer_core::engine::TokenLogprob;
+use pegainfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob};
 use pegainfer_core::kv_pool::{KvPool, KvState};
 use pegainfer_core::ops;
 use pegainfer_core::sampler::SamplingParams;
@@ -509,11 +509,20 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
+
+    fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
+        anyhow::bail!(
+            "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
+            request.lora_name,
+            request.lora_path.display()
+        )
+    }
 }
 
 struct Qwen3ExecutorMetadata {
     page_size: usize,
     stop_token_ids: Vec<u32>,
+    config: Config,
 }
 
 pub struct Qwen3Executor {
@@ -528,6 +537,7 @@ impl Qwen3Executor {
         let metadata = Qwen3ExecutorMetadata {
             page_size: model.kv_pool().layout().page_size,
             stop_token_ids: model.config().stop_token_ids.clone(),
+            config: model.config().clone(),
         };
         let kv_pool = model.kv_pool().clone();
         Ok(Self {
@@ -575,6 +585,7 @@ impl Qwen3Executor {
         let metadata = Qwen3ExecutorMetadata {
             page_size: models[0].kv_pool().layout().page_size,
             stop_token_ids: models[0].config().stop_token_ids.clone(),
+            config: models[0].config().clone(),
         };
 
         let streams = models
@@ -747,6 +758,51 @@ impl ModelExecutor for Qwen3Executor {
             )),
         }
     }
+
+    fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
+        anyhow::ensure!(
+            self.workers.is_empty(),
+            "Qwen3 LoRA adapter loading currently supports single-GPU execution only"
+        );
+        let adapter = crate::lora::load_lora_adapter(&request.lora_path, &self.metadata.config)?;
+        let projection_count: usize = adapter
+            .layers
+            .iter()
+            .map(|layer| layer.projections.len())
+            .sum();
+        let element_count: usize = adapter
+            .layers
+            .iter()
+            .flat_map(|layer| layer.projections.values())
+            .map(|projection| projection.a.data.len() + projection.b.data.len())
+            .sum();
+        let shape_elems: usize = adapter
+            .layers
+            .iter()
+            .flat_map(|layer| layer.projections.values())
+            .map(|projection| {
+                projection.a.rows * projection.a.cols + projection.b.rows * projection.b.cols
+            })
+            .sum();
+        debug_assert_eq!(element_count, shape_elems);
+        let rank = adapter.manifest.rank;
+        let targets = adapter.manifest.target_modules.join(", ");
+        let path = adapter.manifest.path.display().to_string();
+        self.primary
+            .load_lora_adapter(request.lora_name.clone(), adapter)?
+            .recv()
+            .map_err(|_| anyhow::anyhow!("primary worker dropped LoRA load response"))??;
+        log::info!(
+            "Loaded Qwen3 LoRA adapter {} from {} (rank={}, targets={}, projections={}, bf16_elements={})",
+            request.lora_name,
+            path,
+            rank,
+            targets,
+            projection_count,
+            element_count
+        );
+        Ok(())
+    }
 }
 
 impl Drop for Qwen3Executor {
@@ -858,6 +914,13 @@ impl LocalQwen3Lane {
             decode_kv_states,
         )
     }
+
+    fn load_lora_adapter(&mut self, name: String, adapter: crate::lora::LoraAdapter) -> Result<()> {
+        let device_adapter =
+            crate::lora::load_device_lora_adapter(self.model.device_ctx(), name, adapter)?;
+        self.model.set_lora_adapter(device_adapter);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -893,6 +956,11 @@ enum WorkerCommand {
     },
     DropRequest {
         request_id: RequestId,
+        resp: channel::Sender<Result<()>>,
+    },
+    LoadLoraAdapter {
+        name: String,
+        adapter: crate::lora::LoraAdapter,
         resp: channel::Sender<Result<()>>,
     },
     Shutdown,
@@ -952,6 +1020,14 @@ impl RankWorker {
                                     request_states.drop_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
+                                WorkerCommand::LoadLoraAdapter {
+                                    name,
+                                    adapter,
+                                    resp,
+                                } => {
+                                    let result = lane.load_lora_adapter(name, adapter);
+                                    let _ = resp.send(result);
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -1000,6 +1076,22 @@ impl RankWorker {
         resp_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker dropped drop_request response"))?
+    }
+
+    fn load_lora_adapter(
+        &self,
+        name: String,
+        adapter: crate::lora::LoraAdapter,
+    ) -> Result<channel::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::LoadLoraAdapter {
+                name,
+                adapter,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA load"))?;
+        Ok(resp_rx)
     }
 
     fn shutdown(&mut self) {

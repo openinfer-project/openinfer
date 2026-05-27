@@ -1,10 +1,19 @@
 use std::collections::{BTreeSet, HashMap};
+use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use axum::Json;
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::extract::{Request, State};
+use axum::http::{HeaderName, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use log::{info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,11 +36,106 @@ use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use pegainfer_engine::engine::{
-    EngineHandle, FinishReason, GenerateRequest, TokenEvent, TokenLogprob,
+    EngineControlError, EngineHandle, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
+    TokenEvent, TokenLogprob,
 };
 use pegainfer_engine::sampler::SamplingParams;
 
 const ENGINE_INDEX: u32 = 0;
+const PROXY_BODY_LIMIT: usize = 128 * 1024 * 1024;
+
+#[derive(Clone)]
+struct LoraRouteState {
+    handle: EngineHandle,
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    client: reqwest::Client,
+    upstream_base_url: Arc<str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadLoraAdapterHttpRequest {
+    lora_name: String,
+    lora_path: PathBuf,
+    #[serde(default)]
+    load_inplace: bool,
+    #[serde(default)]
+    is_3d_lora_weight: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+pub fn lora_routes(handle: EngineHandle) -> Router {
+    Router::new()
+        .route("/v1/load_lora_adapter", post(load_lora_adapter))
+        .with_state(LoraRouteState { handle })
+}
+
+async fn load_lora_adapter(
+    axum::extract::State(state): axum::extract::State<LoraRouteState>,
+    Json(request): Json<LoadLoraAdapterHttpRequest>,
+) -> Response {
+    if request.lora_name.is_empty() {
+        return bad_request("lora_name must not be empty");
+    }
+    if request.lora_path.as_os_str().is_empty() {
+        return bad_request("lora_path must not be empty");
+    }
+    if request.load_inplace {
+        return bad_request("load_inplace=true is not supported by Qwen3 LoRA PR1");
+    }
+    if request.is_3d_lora_weight {
+        return bad_request("is_3d_lora_weight=true is not supported by Qwen3 LoRA PR1");
+    }
+
+    let lora_name = request.lora_name.clone();
+    match state
+        .handle
+        .load_lora_adapter(LoadLoraAdapterRequest {
+            lora_name: request.lora_name,
+            lora_path: request.lora_path,
+        })
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            format!("Success: LoRA adapter '{lora_name}' added successfully."),
+        )
+            .into_response(),
+        Err(EngineControlError::Unsupported(message)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: message.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(EngineControlError::ChannelClosed) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: EngineControlError::ChannelClosed.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(EngineControlError::OperationFailed(message)) => {
+            (StatusCode::BAD_REQUEST, Json(ErrorBody { error: message })).into_response()
+        }
+    }
+}
+
+fn bad_request(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: message.into(),
+        }),
+    )
+        .into_response()
+}
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {
@@ -251,10 +355,102 @@ pub async fn serve_model(
     max_model_len: u32,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let model_id = model_id.into();
+    serve_model_on_host(
+        handle,
+        model_id,
+        served_model_name,
+        "0.0.0.0".to_string(),
+        port,
+        max_model_len,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_model_with_lora_routes(
+    handle: EngineHandle,
+    model_id: impl Into<String>,
+    served_model_name: Vec<String>,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let model_id = model_id.into();
+    let lora_router = lora_routes(handle.clone());
+    let mut last_error = None;
+    for attempt in 1..=5 {
+        let internal_port = reserve_loopback_port()?;
+        let upstream_base_url: Arc<str> = format!("http://127.0.0.1:{internal_port}").into();
+        let internal_shutdown = shutdown.child_token();
+        let mut internal_task = tokio::spawn(serve_model_on_host(
+            handle.clone(),
+            model_id.clone(),
+            served_model_name.clone(),
+            "127.0.0.1".to_string(),
+            internal_port,
+            max_model_len,
+            internal_shutdown.clone(),
+        ));
+
+        let mut internal_task_finished = false;
+        let health_result = tokio::select! {
+            result = wait_for_http_health(&upstream_base_url, &shutdown) => result,
+            result = &mut internal_task => {
+                internal_task_finished = true;
+                match result {
+                    Ok(Ok(())) => Err(anyhow!("internal vLLM server exited before becoming healthy")),
+                    Ok(Err(error)) => Err(error).context("internal vLLM server exited before becoming healthy"),
+                    Err(error) => Err(error).context("LoRA internal server task panicked"),
+                }
+            }
+        };
+
+        if let Err(error) = health_result {
+            internal_shutdown.cancel();
+            if !internal_task_finished {
+                let _ = internal_task.await;
+            }
+            if attempt == 5 {
+                return Err(error).context("failed to start internal vLLM server for LoRA routes");
+            }
+            warn!(
+                "retrying LoRA internal vLLM server startup after attempt {} failed: {error:#}",
+                attempt
+            );
+            last_error = Some(error);
+            continue;
+        }
+
+        info!(
+            "serving LoRA route proxy: public_port={}, upstream={}",
+            port, upstream_base_url
+        );
+        let proxy_result =
+            serve_lora_proxy(port, upstream_base_url, lora_router, shutdown.child_token()).await;
+
+        internal_shutdown.cancel();
+        let internal_result = internal_task
+            .await
+            .context("LoRA internal server task panicked")?;
+        return proxy_result.and(internal_result);
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("internal vLLM server startup was not attempted")))
+}
+
+async fn serve_model_on_host(
+    handle: EngineHandle,
+    model_id: String,
+    served_model_name: Vec<String>,
+    host: String,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let namespace = local_ipc_namespace()?;
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
-    let model_id = model_id.into();
 
     let bridge = LocalEngineBridge {
         input_address: input_address.clone(),
@@ -279,10 +475,7 @@ pub async fn serve_model(
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
         served_model_name,
-        listener_mode: HttpListenerMode::BindTcp {
-            host: "0.0.0.0".to_string(),
-            port,
-        },
+        listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser: ParserSelection::default(),
         reasoning_parser: ParserSelection::default(),
         renderer: RendererSelection::default(),
@@ -299,6 +492,139 @@ pub async fn serve_model(
     bridge_task.abort();
     let _ = std::fs::remove_dir_all(namespace);
     result
+}
+
+fn reserve_loopback_port() -> Result<u16> {
+    let listener = StdTcpListener::bind(("127.0.0.1", 0))
+        .context("failed to reserve loopback port for internal vLLM server")?;
+    Ok(listener.local_addr()?.port())
+}
+
+async fn wait_for_http_health(upstream_base_url: &str, shutdown: &CancellationToken) -> Result<()> {
+    let client = reqwest::Client::new();
+    let health_url = format!("{upstream_base_url}/health");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for internal vLLM server health at {health_url}");
+        }
+        match client
+            .get(&health_url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(_) | Err(_) => {}
+        }
+    }
+}
+
+async fn serve_lora_proxy(
+    port: u16,
+    upstream_base_url: Arc<str>,
+    lora_router: Router,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let state = ProxyState {
+        client: reqwest::Client::new(),
+        upstream_base_url,
+    };
+    let proxy_router = Router::new().fallback(proxy_to_upstream).with_state(state);
+    let app = proxy_router.merge(lora_router);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .with_context(|| format!("failed to bind LoRA route proxy on 0.0.0.0:{port}"))?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .context("LoRA route proxy failed")
+}
+
+async fn proxy_to_upstream(State(state): State<ProxyState>, request: Request) -> Response {
+    match proxy_to_upstream_inner(state, request).await {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorBody {
+                error: format!("failed to proxy request to internal vLLM server: {error:#}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn proxy_to_upstream_inner(state: ProxyState, request: Request) -> Result<Response> {
+    let (parts, body) = request.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    let upstream_url = format!("{}{}", state.upstream_base_url, path_and_query);
+    let body = to_bytes(body, PROXY_BODY_LIMIT)
+        .await
+        .context("failed to read proxy request body")?;
+
+    let mut upstream = state.client.request(parts.method, upstream_url);
+    for (name, value) in &parts.headers {
+        if should_forward_request_header(name) {
+            upstream = upstream.header(name.as_str(), value);
+        }
+    }
+
+    let response = upstream
+        .body(body)
+        .send()
+        .await
+        .context("upstream request failed")?;
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .context("upstream returned invalid status")?;
+    let mut builder = Response::builder().status(status);
+    for (name, value) in response.headers() {
+        if should_forward_response_header(name) {
+            builder = builder.header(name, value);
+        }
+    }
+
+    builder
+        .body(Body::from_stream(response.bytes_stream()))
+        .context("failed to build proxy response")
+}
+
+fn should_forward_request_header(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn should_forward_response_header(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "connection"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 async fn run_request_stream(
@@ -612,7 +938,7 @@ async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> R
     }
 }
 
-fn load_max_model_len(model_path: &Path) -> Option<u32> {
+pub fn load_max_model_len(model_path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(model_path.join("config.json")).ok()?;
     serde_json::from_str::<ModelLenConfig>(&content)
         .ok()?
@@ -634,6 +960,46 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn load_lora_adapter_route_reports_unsupported_engine() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let state = LoraRouteState {
+            handle: EngineHandle::new(submit_tx),
+        };
+        let response = load_lora_adapter(
+            axum::extract::State(state),
+            Json(LoadLoraAdapterHttpRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_path: PathBuf::from("/tmp/adapter-a"),
+                load_inplace: false,
+                is_3d_lora_weight: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let state = LoraRouteState {
+            handle: EngineHandle::new(submit_tx),
+        };
+        let response = load_lora_adapter(
+            axum::extract::State(state),
+            Json(LoadLoraAdapterHttpRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_path: PathBuf::from("/tmp/adapter-a"),
+                load_inplace: true,
+                is_3d_lora_weight: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn rejected_request_is_reported_as_error() {
