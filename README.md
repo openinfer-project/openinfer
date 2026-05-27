@@ -130,9 +130,11 @@ cargo run --release --bin pegainfer -- --model-path models/Qwen3-4B
 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | Greedy + sampling |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling |
+| DeepSeek-V2-Lite | MoE + EP | feature-gated | `--features deepseek-v2-lite`, 2-GPU path |
 | [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention, MP8 checkpoint | 671B total / 37B active | Initial greedy, feature-gated, 8-GPU MP8 |
+| Kimi-K2 | MLA + MoE + Marlin INT4 | feature-gated | `--features kimi-k2`, 8-GPU EP path |
 
-Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory.
+Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Feature-gated model lines require rebuilding `pegainfer-server` with the matching `--features ...` flag before launch.
 
 DeepSeek V4 support is intentionally narrower than the Qwen paths in the initial PR: it requires `--features deepseek-v4`, uses CUDA devices `0..7`, serves greedy requests only, terminates unsupported logprobs and non-greedy sampling requests with an explicit `stop_reason`, and does not use CUDA Graph yet.
 
