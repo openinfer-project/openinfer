@@ -80,6 +80,7 @@ fn generate_tokens(
             prompt_tokens,
             params: SamplingParams::default(), // greedy
             max_tokens,
+            lora_adapter: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -202,6 +203,7 @@ fn test_e2e_generation() {
                 prompt_tokens,
                 params: SamplingParams::default(),
                 max_tokens: 10,
+                lora_adapter: None,
                 token_tx,
                 logprobs: 0,
                 echo: false,

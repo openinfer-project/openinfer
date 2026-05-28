@@ -161,6 +161,7 @@ fn generate_tokens(
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
+    lora_adapter: Option<String>,
 ) -> (Vec<u32>, FinishReason) {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
@@ -172,6 +173,7 @@ fn generate_tokens(
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
+            lora_adapter,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -219,7 +221,13 @@ fn qwen3_lora_loads_adapter_and_generates() {
     load_adapter(&handle, adapter_path);
 
     let tokenizer = common::load_tokenizer(&model_path);
-    let (tokens, finish_reason) = generate_tokens(&handle, &tokenizer, "Hello", 4);
+    let (tokens, finish_reason) = generate_tokens(
+        &handle,
+        &tokenizer,
+        "Hello",
+        4,
+        Some("zero-smoke".to_string()),
+    );
     assert!(
         !tokens.is_empty(),
         "LoRA smoke generation returned no tokens"

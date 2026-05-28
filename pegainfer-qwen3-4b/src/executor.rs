@@ -14,7 +14,7 @@ use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use pegainfer_kv_cache::{KvBuffer, KvCacheManager, KvView};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) u64);
 
 impl RequestId {
@@ -64,7 +64,7 @@ impl PrefillStepItem {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DecodeStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_id: u32,
@@ -392,12 +392,23 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 
+    fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
+        if let Some(adapter) = adapter {
+            anyhow::bail!("Qwen3 LoRA adapter {adapter} is not loaded");
+        }
+        Ok(())
+    }
+
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         anyhow::bail!(
             "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
             request.lora_name,
             request.lora_path.display()
         )
+    }
+
+    fn list_lora_adapters(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -590,6 +601,10 @@ impl Qwen3Executor {
         <Self as ModelExecutor>::execute_unified(self, plan)
     }
 
+    pub fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
+        <Self as ModelExecutor>::activate_lora_adapter(self, adapter)
+    }
+
     fn wait_for_step_ack(
         pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
         op_name: &'static str,
@@ -622,6 +637,40 @@ impl Qwen3Executor {
             .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
         Self::wait_for_step_ack(pending, step.kind())?;
         Ok(primary_result)
+    }
+
+    fn run_worker_command(
+        &self,
+        command: impl Fn(&RankWorker) -> Result<channel::Receiver<Result<()>>>,
+        op_name: &'static str,
+    ) -> Result<()> {
+        let primary = command(&self.primary)?;
+        let mut pending = Vec::with_capacity(self.workers.len());
+        for worker in &self.workers {
+            pending.push(command(worker)?);
+        }
+
+        let mut errors = Vec::new();
+        match primary.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => errors.push(format!("rank 0: {err:#}")),
+            Err(_) => errors.push(format!("rank 0: dropped {op_name} response")),
+        }
+        for (index, response) in pending.into_iter().enumerate() {
+            let rank = index + 1;
+            match response.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => errors.push(format!("rank {rank}: {err:#}")),
+                Err(_) => errors.push(format!("rank {rank}: dropped {op_name} response")),
+            }
+        }
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "failed to run Qwen3 {op_name} on tensor-parallel ranks: {}",
+                errors.join("; ")
+            );
+        }
+        Ok(())
     }
 }
 
@@ -818,6 +867,13 @@ impl ModelExecutor for Qwen3Executor {
         Ok(result)
     }
 
+    fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
+        self.run_worker_command(
+            |worker| worker.activate_lora_adapter(adapter.map(str::to_string)),
+            "LoRA activation",
+        )
+    }
+
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         let adapter = crate::lora::load_lora_adapter(&request.lora_path, &self.metadata.config)?;
         let world_size = self.workers.len() + 1;
@@ -903,6 +959,10 @@ impl ModelExecutor for Qwen3Executor {
             world_size
         );
         Ok(())
+    }
+
+    fn list_lora_adapters(&self) -> Vec<String> {
+        self.primary.list_lora_adapters().unwrap_or_default()
     }
 }
 
@@ -1055,8 +1115,15 @@ impl LocalQwen3Lane {
     fn load_lora_adapter(&mut self, name: String, adapter: crate::lora::LoraAdapter) -> Result<()> {
         let device_adapter =
             crate::lora::load_device_lora_adapter(self.model.device_ctx(), name, adapter)?;
-        self.model.set_lora_adapter(device_adapter);
-        Ok(())
+        self.model.install_lora_adapter(device_adapter)
+    }
+
+    fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
+        self.model.activate_lora_adapter(adapter)
+    }
+
+    fn list_lora_adapters(&self) -> Vec<String> {
+        self.model.lora_adapter_names()
     }
 }
 
@@ -1099,6 +1166,13 @@ enum WorkerCommand {
         name: String,
         adapter: crate::lora::LoraAdapter,
         resp: channel::Sender<Result<()>>,
+    },
+    ActivateLoraAdapter {
+        name: Option<String>,
+        resp: channel::Sender<Result<()>>,
+    },
+    ListLoraAdapters {
+        resp: channel::Sender<Result<Vec<String>>>,
     },
     Shutdown,
 }
@@ -1156,6 +1230,13 @@ impl RankWorker {
                                     let result = lane.load_lora_adapter(name, adapter);
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::ActivateLoraAdapter { name, resp } => {
+                                    let result = lane.activate_lora_adapter(name.as_deref());
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::ListLoraAdapters { resp } => {
+                                    let _ = resp.send(Ok(lane.list_lora_adapters()));
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -1205,6 +1286,31 @@ impl RankWorker {
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA load"))?;
         Ok(resp_rx)
+    }
+
+    fn activate_lora_adapter(&self, name: Option<String>) -> Result<channel::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::ActivateLoraAdapter {
+                name,
+                resp: resp_tx,
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("tensor-parallel worker channel closed on LoRA activation")
+            })?;
+        Ok(resp_rx)
+    }
+
+    fn list_lora_adapters(&self) -> Result<Vec<String>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::ListLoraAdapters { resp: resp_tx })
+            .map_err(|_| {
+                anyhow::anyhow!("tensor-parallel worker channel closed on LoRA adapter list")
+            })?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("tensor-parallel worker dropped LoRA adapter list"))?
     }
 
     fn shutdown(&mut self) {

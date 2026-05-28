@@ -196,6 +196,7 @@ mod tests {
                 prompt_tokens: vec![7, 9],
                 params: SamplingParams::default(),
                 max_tokens: 3,
+                lora_adapter: None,
                 token_tx,
                 logprobs: 1,
                 echo: false,

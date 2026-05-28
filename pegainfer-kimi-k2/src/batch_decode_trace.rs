@@ -133,6 +133,7 @@ pub fn trace_runtime_decode_kernel_calls(
                     ignore_eos: true,
                 },
                 max_tokens: 2,
+                lora_adapter: None,
                 token_tx,
                 logprobs: 0,
                 echo: false,

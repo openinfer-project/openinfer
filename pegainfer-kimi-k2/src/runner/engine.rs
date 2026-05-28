@@ -840,6 +840,7 @@ mod tests {
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
+            lora_adapter: None,
             token_tx,
             logprobs: 0,
             echo: false,

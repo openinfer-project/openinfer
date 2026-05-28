@@ -4,6 +4,8 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::{Config, TensorParallelConfig};
+use std::collections::HashMap;
+
 use crate::lora::{DeviceLoraAdapter, DeviceLoraLayer};
 use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use pegainfer_core::weight_loader::{
@@ -79,7 +81,8 @@ pub(crate) struct Qwen3Model {
     pub(super) enable_cuda_graph: bool,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) tp_comm: Option<Comm>,
-    pub(super) lora_adapter: Option<DeviceLoraAdapter>,
+    pub(super) lora_adapters: HashMap<String, DeviceLoraAdapter>,
+    pub(super) active_lora_adapter: Option<String>,
 }
 
 // SAFETY: Each model instance is pinned to a single CUDA device and is only
@@ -327,7 +330,8 @@ impl Qwen3Model {
             enable_cuda_graph: runtime.enable_cuda_graph,
             tensor_parallel,
             tp_comm: None,
-            lora_adapter: None,
+            lora_adapters: HashMap::new(),
+            active_lora_adapter: None,
         };
 
         if model.enable_cuda_graph {
@@ -375,17 +379,44 @@ impl Qwen3Model {
         self.tp_comm = Some(comm);
     }
 
-    pub(crate) fn set_lora_adapter(&mut self, adapter: DeviceLoraAdapter) {
+    pub(crate) fn install_lora_adapter(&mut self, adapter: DeviceLoraAdapter) -> Result<()> {
+        anyhow::ensure!(
+            !self.lora_adapters.contains_key(&adapter.name),
+            "Qwen3 LoRA adapter {} is already loaded",
+            adapter.name
+        );
         debug!(
-            "Activating Qwen3 LoRA adapter {} from {}",
+            "Installing Qwen3 LoRA adapter {} from {}",
             adapter.name,
             adapter.manifest.path.display()
         );
-        self.lora_adapter = Some(adapter);
+        self.lora_adapters.insert(adapter.name.clone(), adapter);
+        Ok(())
+    }
+
+    pub(crate) fn activate_lora_adapter(&mut self, name: Option<&str>) -> Result<()> {
+        match name {
+            Some(name) => {
+                anyhow::ensure!(
+                    self.lora_adapters.contains_key(name),
+                    "Qwen3 LoRA adapter {name} is not loaded"
+                );
+                self.active_lora_adapter = Some(name.to_string());
+            }
+            None => self.active_lora_adapter = None,
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lora_adapter_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.lora_adapters.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub(crate) fn lora_layer(&self, layer_idx: usize) -> Option<(&DeviceLoraLayer, f32)> {
-        self.lora_adapter.as_ref().and_then(|adapter| {
+        self.active_lora_adapter.as_ref().and_then(|name| {
+            let adapter = self.lora_adapters.get(name)?;
             adapter
                 .layers
                 .get(layer_idx)

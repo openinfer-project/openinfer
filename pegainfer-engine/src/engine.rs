@@ -56,6 +56,7 @@ pub struct GenerateRequest {
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
     pub max_tokens: usize,
+    pub lora_adapter: Option<String>,
     pub token_tx: mpsc::UnboundedSender<TokenEvent>,
     pub logprobs: usize,
     pub echo: bool,
@@ -71,6 +72,9 @@ pub enum EngineControlRequest {
     LoadLoraAdapter {
         request: LoadLoraAdapterRequest,
         response_tx: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    ListLoraAdapters {
+        response_tx: oneshot::Sender<std::result::Result<Vec<String>, String>>,
     },
 }
 
@@ -234,6 +238,27 @@ impl EngineHandle {
             )),
         }
     }
+
+    pub async fn list_lora_adapters(&self) -> EngineControlResult<Vec<String>> {
+        match self.inner.command_tx.as_ref() {
+            Some(command_tx) => {
+                let (response_tx, response_rx) = oneshot::channel();
+                command_tx
+                    .send(EngineCommand::Control(
+                        EngineControlRequest::ListLoraAdapters { response_tx },
+                    ))
+                    .map_err(|_| EngineControlError::ChannelClosed)?;
+
+                response_rx
+                    .await
+                    .map_err(|_| EngineControlError::ChannelClosed)?
+                    .map_err(EngineControlError::OperationFailed)
+            }
+            None => Err(EngineControlError::Unsupported(
+                "engine does not support dynamic LoRA adapter loading",
+            )),
+        }
+    }
 }
 
 impl Drop for EngineInner {
@@ -311,10 +336,42 @@ mod tests {
                 assert_eq!(actual, request);
                 response_tx.send(Ok(())).expect("send load result");
             }
+            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+                panic!("expected LoRA load command")
+            }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),
         }
 
         load.await.expect("join load task").expect("load succeeded");
+    }
+
+    #[tokio::test]
+    async fn list_lora_adapters_sends_control_command() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
+        let handle = EngineHandle::new_with_command_channel(command_tx);
+
+        let list = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.list_lora_adapters().await }
+        });
+
+        let command = command_rx.recv().await.expect("control command");
+        match command {
+            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { response_tx }) => {
+                response_tx
+                    .send(Ok(vec!["adapter-a".to_string()]))
+                    .expect("send list result");
+            }
+            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
+                panic!("expected LoRA list command")
+            }
+            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
+        }
+
+        assert_eq!(
+            list.await.expect("join list task").expect("list succeeded"),
+            vec!["adapter-a"]
+        );
     }
 
     #[tokio::test]

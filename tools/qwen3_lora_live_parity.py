@@ -361,7 +361,7 @@ def main() -> int:
             )
             completion = pegainfer_completion(
                 server_url,
-                model_name=str(model_path),
+                model_name=args.lora_name,
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
             )

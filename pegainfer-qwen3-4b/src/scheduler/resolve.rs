@@ -74,6 +74,7 @@ fn resolve_prefill_outputs(
         effects.pending.push(PendingEffect::Promote {
             state: ActiveRequestState {
                 request_id: req.request_id,
+                lora_adapter: req.lora_adapter,
                 token_tx: req.token_tx,
                 last_token: result.first_token,
                 generated_count: 1,

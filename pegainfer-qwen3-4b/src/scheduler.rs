@@ -9,7 +9,7 @@ mod effects;
 mod plan;
 mod resolve;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::thread;
 
 use anyhow::Result;
@@ -33,6 +33,7 @@ use self::resolve::resolve_step;
 /// An in-flight request being decoded.
 pub(super) struct ActiveRequestState {
     pub(super) request_id: RequestId,
+    pub(super) lora_adapter: Option<String>,
     pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
     pub(super) last_token: u32,
     pub(super) generated_count: usize,
@@ -45,6 +46,7 @@ pub(super) struct ActiveRequestState {
 
 pub(super) struct PendingRequest {
     pub(super) request_id: RequestId,
+    pub(super) lora_adapter: Option<String>,
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) params: SamplingParams,
     pub(super) max_tokens: usize,
@@ -57,6 +59,7 @@ impl PendingRequest {
     fn from_scheduler_request(request_id: RequestId, req: GenerateRequest) -> Self {
         Self {
             request_id,
+            lora_adapter: req.lora_adapter,
             prompt_tokens: req.prompt_tokens,
             params: req.params,
             max_tokens: req.max_tokens,
@@ -170,8 +173,13 @@ fn scheduler_loop<E>(
             }
         }
 
+        let lora_validation = reject_unknown_lora_requests(deferred, &executor);
+        for rejected in &lora_validation.rejected {
+            send_unknown_lora_rejection(rejected);
+        }
+
         let admission = admit_deferred_requests(
-            deferred,
+            lora_validation.accepted,
             &active,
             executor.block_size(),
             executor.available_blocks(),
@@ -270,8 +278,13 @@ fn scheduler_loop_with_lora_control<E>(
             }
         }
 
+        let lora_validation = reject_unknown_lora_requests(deferred, &executor);
+        for rejected in &lora_validation.rejected {
+            send_unknown_lora_rejection(rejected);
+        }
+
         let admission = admit_deferred_requests(
-            deferred,
+            lora_validation.accepted,
             &active,
             executor.block_size(),
             executor.available_blocks(),
@@ -363,6 +376,9 @@ fn handle_control_request(executor: &mut impl ModelExecutor, control: EngineCont
                     .map_err(|error| error.to_string()),
             );
         }
+        EngineControlRequest::ListLoraAdapters { response_tx } => {
+            let _ = response_tx.send(Ok(executor.list_lora_adapters()));
+        }
     }
 }
 
@@ -378,6 +394,37 @@ struct AdmissionOutcome {
     pending: Vec<PendingRequest>,
     deferred: Vec<PendingRequest>,
     rejected: Vec<PendingRequest>,
+}
+
+struct LoraValidationOutcome {
+    accepted: Vec<PendingRequest>,
+    rejected: Vec<PendingRequest>,
+}
+
+fn reject_unknown_lora_requests(
+    deferred: Vec<PendingRequest>,
+    executor: &impl ModelExecutor,
+) -> LoraValidationOutcome {
+    if !deferred.iter().any(|req| req.lora_adapter.is_some()) {
+        return LoraValidationOutcome {
+            accepted: deferred,
+            rejected: Vec::new(),
+        };
+    }
+
+    let loaded_lora_adapters = executor.list_lora_adapters();
+    let loaded_lora_adapters: HashSet<_> = loaded_lora_adapters.into_iter().collect();
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+
+    for req in deferred {
+        match req.lora_adapter.as_ref() {
+            Some(adapter) if !loaded_lora_adapters.contains(adapter) => rejected.push(req),
+            _ => accepted.push(req),
+        }
+    }
+
+    LoraValidationOutcome { accepted, rejected }
 }
 
 fn blocks_needed(token_count: usize, block_size: usize) -> usize {
@@ -456,6 +503,15 @@ fn send_rejection(req: &PendingRequest) {
             req.prompt_tokens.len(),
             max_tokens
         ),
+        prompt_tokens: req.prompt_tokens.len(),
+        completion_tokens: 0,
+    });
+}
+
+fn send_unknown_lora_rejection(req: &PendingRequest) {
+    let adapter = req.lora_adapter.as_deref().unwrap_or("<missing>");
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message: format!("LoRA adapter is not loaded: {adapter}"),
         prompt_tokens: req.prompt_tokens.len(),
         completion_tokens: 0,
     });
@@ -543,6 +599,9 @@ mod tests {
         held_tokens: HashMap<RequestId, usize>,
         fail_decode_once: bool,
         decode_delay: Duration,
+        loaded_lora_adapters: HashSet<String>,
+        active_lora_adapter: Option<String>,
+        lora_activations: Arc<Mutex<Vec<Option<String>>>>,
         dropped: Arc<Mutex<Vec<u64>>>,
     }
 
@@ -555,6 +614,9 @@ mod tests {
                 held_tokens: HashMap::new(),
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
+                loaded_lora_adapters: HashSet::new(),
+                active_lora_adapter: None,
+                lora_activations: Arc::new(Mutex::new(Vec::new())),
                 dropped,
             }
         }
@@ -566,6 +628,16 @@ mod tests {
 
         fn with_decode_delay(mut self, delay: Duration) -> Self {
             self.decode_delay = delay;
+            self
+        }
+
+        fn with_lora_adapters(
+            mut self,
+            names: &[&str],
+            activations: Arc<Mutex<Vec<Option<String>>>>,
+        ) -> Self {
+            self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
+            self.lora_activations = activations;
             self
         }
 
@@ -610,6 +682,26 @@ mod tests {
             }
             self.dropped.lock().unwrap().push(request_id.get());
             Ok(())
+        }
+
+        fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
+            if let Some(adapter) = adapter {
+                if !self.loaded_lora_adapters.contains(adapter) {
+                    anyhow::bail!("LoRA adapter is not loaded: {adapter}");
+                }
+            }
+            self.active_lora_adapter = adapter.map(ToString::to_string);
+            self.lora_activations
+                .lock()
+                .unwrap()
+                .push(self.active_lora_adapter.clone());
+            Ok(())
+        }
+
+        fn list_lora_adapters(&self) -> Vec<String> {
+            let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
+            names.sort();
+            names
         }
 
         fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -711,6 +803,7 @@ mod tests {
         let (token_tx, _token_rx) = mpsc::unbounded_channel();
         let after_prefill = ActiveRequestState {
             request_id: RequestId(8),
+            lora_adapter: None,
             token_tx,
             last_token: 100,
             generated_count: 1,
@@ -725,6 +818,7 @@ mod tests {
         let (token_tx, _token_rx) = mpsc::unbounded_channel();
         let after_one_decode = ActiveRequestState {
             request_id: RequestId(9),
+            lora_adapter: None,
             token_tx,
             last_token: 200,
             generated_count: 2,
@@ -807,12 +901,23 @@ mod tests {
                 prompt_tokens: vec![1; prompt_len],
                 params: SamplingParams::default(),
                 max_tokens,
+                lora_adapter: None,
                 token_tx,
                 logprobs: 0,
                 echo: false,
             },
             token_rx,
         )
+    }
+
+    fn request_with_lora(
+        prompt_len: usize,
+        max_tokens: usize,
+        lora_adapter: Option<&str>,
+    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
+        let (mut request, token_rx) = request(prompt_len, max_tokens);
+        request.lora_adapter = lora_adapter.map(ToString::to_string);
+        (request, token_rx)
     }
 
     fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -856,6 +961,84 @@ mod tests {
         assert!(
             matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
             "later fitting request should finish"
+        );
+    }
+
+    #[test]
+    fn mixed_lora_prefill_requests_run_in_adapter_groups() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let activations = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(4, Arc::clone(&dropped))
+            .with_lora_adapters(&["adapter-a"], Arc::clone(&activations));
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut active = Vec::new();
+
+        let (adapter, _adapter_rx) = request_with_lora(16, 1, Some("adapter-a"));
+        let (base, _base_rx) = request_with_lora(16, 1, None);
+        let pending = vec![
+            PendingRequest::from_scheduler_request(RequestId(0), adapter),
+            PendingRequest::from_scheduler_request(RequestId(1), base),
+        ];
+
+        let artifacts = plan::execute_plan(
+            &mut executor,
+            &mut active,
+            plan::ExecutionPlan::Prefill { pending },
+            &mut rng,
+        )
+        .expect("execute grouped prefill");
+        let plan::ExecutionArtifacts::Prefill { result, .. } = artifacts else {
+            panic!("expected prefill artifacts");
+        };
+
+        assert_eq!(
+            result
+                .requests
+                .iter()
+                .map(|request| request.request_id)
+                .collect::<Vec<_>>(),
+            vec![RequestId(0), RequestId(1)]
+        );
+        assert_eq!(
+            *activations.lock().unwrap(),
+            vec![None, Some("adapter-a".to_string())]
+        );
+    }
+
+    #[test]
+    fn unknown_lora_request_is_rejected_without_blocking_base_request() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
+        let handle = start_with_executor(executor, 42);
+
+        let (unknown, mut unknown_rx) = request_with_lora(16, 1, Some("missing-adapter"));
+        let (base, mut base_rx) = request_with_lora(16, 1, None);
+        handle.submit(unknown).expect("submit unknown adapter");
+        handle.submit(base).expect("submit base");
+
+        match unknown_rx.blocking_recv() {
+            Some(TokenEvent::Rejected {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            }) => {
+                assert!(message.contains("LoRA adapter is not loaded: missing-adapter"));
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 0);
+            }
+            _ => panic!("unknown adapter request should be rejected"),
+        }
+
+        assert!(
+            matches!(
+                base_rx.blocking_recv(),
+                Some(TokenEvent::Token { id: 101, .. })
+            ),
+            "base request should still run after unknown adapter rejection"
+        );
+        assert!(
+            matches!(base_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            "base request should finish"
         );
     }
 
