@@ -1057,7 +1057,7 @@ impl BenchModel for DeepSeekV2LiteBenchModel {
     fn validate_concurrency(&self, concurrency: usize) -> Result<()> {
         ensure!(
             concurrency > 0 && concurrency <= 8,
-            "DeepSeek-V2-Lite direct benchmark supports --concurrency 1..=8 through the narrow same-prompt lockstep batch path, got {concurrency}"
+            "DeepSeek-V2-Lite direct benchmark supports --concurrency 1..=8; concurrency=1 is the single-row control and >1 uses the narrow same-prompt batched decode path, got {concurrency}"
         );
         Ok(())
     }

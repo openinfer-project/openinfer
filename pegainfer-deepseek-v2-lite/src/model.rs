@@ -414,3 +414,15 @@ pub(crate) fn dense_mlp_forward(
     ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act);
     ops::gemm(ctx, &mlp.down_proj, &act)
 }
+
+pub(crate) fn dense_mlp_forward_per_token(
+    ctx: &DeviceContext,
+    mlp: &DenseMlp,
+    input: &HiddenStates,
+) -> Result<HiddenStates> {
+    activate(ctx)?;
+    let gate_up = ops::gemm_per_token(ctx, &mlp.gate_up_proj, input)?;
+    let mut act = HiddenStates::zeros(ctx, gate_up.hidden_dim / 2, input.seq_len)?;
+    ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act);
+    ops::gemm_per_token(ctx, &mlp.down_proj, &act)
+}

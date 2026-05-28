@@ -85,6 +85,19 @@ pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Res
     Ok(out)
 }
 
+/// Per-token GEMM: each row is computed through the same N=1 cuBLAS boundary
+/// used by decode. This is useful for narrow batch-shaped accuracy gates where
+/// row-wise parity with the serial decode oracle matters more than throughput.
+pub fn gemm_per_token(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+) -> Result<HiddenStates> {
+    let mut out = HiddenStates::zeros(ctx, weight.rows, x.seq_len)?;
+    gemm_per_token_into_checked(ctx, weight, x, &mut out)?;
+    Ok(out)
+}
+
 /// GEMM into pre-allocated output buffer (zero allocation).
 /// For seq_len=1, uses the graph-safe cuBLAS handle (no workspace) for lower
 /// latency while preserving numerical parity with the prefill path.
@@ -118,6 +131,64 @@ pub fn gemm_graphsafe_into_checked(
     out: &mut HiddenStates,
 ) -> Result<()> {
     gemm_into_with_policy(ctx, weight, x, out, true)
+}
+
+pub fn gemm_per_token_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(
+        weight.cols, x.hidden_dim,
+        "weight cols {} != hidden_dim {}",
+        weight.cols, x.hidden_dim
+    );
+    assert_eq!(
+        out.hidden_dim, weight.rows,
+        "out hidden_dim {} != weight rows {}",
+        out.hidden_dim, weight.rows
+    );
+    assert_eq!(
+        out.seq_len, x.seq_len,
+        "out seq_len {} != x seq_len {}",
+        out.seq_len, x.seq_len
+    );
+
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        let status = ffi::gemm_per_token_cuda(
+            w_ptr as *const ffi::Half,
+            x_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            weight.rows as i32,
+            x.seq_len as i32,
+            weight.cols as i32,
+            ctx.stream.cu_stream(),
+        );
+        if status != 0 {
+            if status >= 100000 {
+                bail!(
+                    "cuBLAS per-token GEMM failed: cublas_status={}, m={}, batch={}, k={}",
+                    status - 100000,
+                    weight.rows,
+                    x.seq_len,
+                    weight.cols
+                );
+            }
+            bail!(
+                "CUDA per-token GEMM launch failed: cuda_status={}, m={}, batch={}, k={}",
+                status,
+                weight.rows,
+                x.seq_len,
+                weight.cols
+            );
+        }
+    }
+    Ok(())
 }
 
 fn gemm_into_with_policy(

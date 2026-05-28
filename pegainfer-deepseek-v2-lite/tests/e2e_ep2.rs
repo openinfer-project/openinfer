@@ -11,9 +11,9 @@ use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 const EXPECTED_GENERATED_TOKENS: usize = 16;
 const EXPECTED_OUTPUT_TOKEN_SHA256: &str =
-    "d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8";
+    "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225";
 const EXPECTED_OUTPUT_TEXT_SHA256: &str =
-    "4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6";
+    "0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347";
 const DSV2_LITE_HIDDEN_SIZE: usize = 2048;
 const DSV2_LITE_MOE_LAYERS: usize = 26;
 const E2E_JSON_OUT_ENV: &str = "PEGAINFER_DSV2_LITE_E2E_JSON_OUT";

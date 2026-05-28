@@ -142,6 +142,37 @@ pub(crate) fn append_kv_and_build_queries(
     }
 }
 
+pub(crate) fn append_kv_and_build_queries_decode_batch(
+    config: &Config,
+    q_host: &[f32],
+    kv_a_host: &[f32],
+    kv_b_host: &[f32],
+    position: usize,
+    queries: &mut [f32],
+    caches: &mut [&mut LayerCache],
+) {
+    let batch_size = caches.len();
+    assert_eq!(q_host.len(), config.q_proj_rows() * batch_size);
+    assert_eq!(kv_a_host.len(), config.kv_a_proj_rows() * batch_size);
+    assert_eq!(kv_b_host.len(), config.kv_b_proj_rows() * batch_size);
+    let query_stride = config.num_attention_heads * config.query_head_dim();
+    assert_eq!(queries.len(), query_stride * batch_size);
+
+    for row in 0..batch_size {
+        assert_eq!(caches[row].len(config), position);
+        append_kv_and_build_queries(
+            config,
+            &q_host[row * config.q_proj_rows()..(row + 1) * config.q_proj_rows()],
+            &kv_a_host[row * config.kv_a_proj_rows()..(row + 1) * config.kv_a_proj_rows()],
+            &kv_b_host[row * config.kv_b_proj_rows()..(row + 1) * config.kv_b_proj_rows()],
+            position,
+            1,
+            &mut queries[row * query_stride..(row + 1) * query_stride],
+            caches[row],
+        );
+    }
+}
+
 fn apply_deepseek_v2_rope(
     input: &[f32],
     pos: usize,
@@ -261,6 +292,33 @@ pub(crate) fn compute_attention_host(
                 }
             }
         }
+    }
+
+    out
+}
+
+pub(crate) fn compute_attention_host_decode_batch(
+    config: &Config,
+    queries: &[f32],
+    caches: &[&LayerCache],
+    position: usize,
+) -> Vec<f32> {
+    let batch_size = caches.len();
+    let query_stride = config.num_attention_heads * config.query_head_dim();
+    assert_eq!(queries.len(), batch_size * query_stride);
+    let mut out = vec![0.0f32; batch_size * config.o_proj_cols()];
+
+    for row in 0..batch_size {
+        let cache = caches[row];
+        assert_eq!(cache.len(config), position + 1);
+        let row_out = compute_attention_host(
+            config,
+            &queries[row * query_stride..(row + 1) * query_stride],
+            cache,
+            position,
+            1,
+        );
+        out[row * config.o_proj_cols()..(row + 1) * config.o_proj_cols()].copy_from_slice(&row_out);
     }
 
     out
@@ -454,5 +512,116 @@ mod tests {
         let experts: Vec<_> = routes[0].iter().map(|(expert, _)| *expert).collect();
 
         assert_eq!(experts, vec![7, 10, 20, 41, 54, 58]);
+    }
+
+    #[test]
+    fn decode_batch_attention_matches_independent_single_row_caches() {
+        let mut config = test_lite_config();
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = 2;
+        config.kv_lora_rank = 3;
+        config.qk_nope_head_dim = 2;
+        config.qk_rope_head_dim = 2;
+        config.v_head_dim = 2;
+        config.rope_scaling = None;
+
+        let batch_size = 2;
+        let position = 2;
+        let mut single_caches = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let q_host = patterned(row, config.q_proj_rows() * position, 0.01);
+            let kv_a_host = patterned(row + 10, config.kv_a_proj_rows() * position, 0.02);
+            let kv_b_host = patterned(row + 20, config.kv_b_proj_rows() * position, 0.03);
+            let mut cache = LayerCache::default();
+            let mut queries =
+                vec![0.0; config.num_attention_heads * config.query_head_dim() * position];
+            append_kv_and_build_queries(
+                &config,
+                &q_host,
+                &kv_a_host,
+                &kv_b_host,
+                0,
+                position,
+                &mut queries,
+                &mut cache,
+            );
+            single_caches.push(cache);
+        }
+        let mut batch_caches: Vec<_> = single_caches
+            .iter()
+            .map(|cache| LayerCache {
+                keys: cache.keys.clone(),
+                values: cache.values.clone(),
+            })
+            .collect();
+
+        let mut q_decode = Vec::new();
+        let mut kv_a_decode = Vec::new();
+        let mut kv_b_decode = Vec::new();
+        let mut expected = Vec::new();
+        for row in 0..batch_size {
+            let q_host = patterned(row + 30, config.q_proj_rows(), 0.04);
+            let kv_a_host = patterned(row + 40, config.kv_a_proj_rows(), 0.05);
+            let kv_b_host = patterned(row + 50, config.kv_b_proj_rows(), 0.06);
+            q_decode.extend_from_slice(&q_host);
+            kv_a_decode.extend_from_slice(&kv_a_host);
+            kv_b_decode.extend_from_slice(&kv_b_host);
+
+            let mut queries = vec![0.0; config.num_attention_heads * config.query_head_dim()];
+            append_kv_and_build_queries(
+                &config,
+                &q_host,
+                &kv_a_host,
+                &kv_b_host,
+                position,
+                1,
+                &mut queries,
+                &mut single_caches[row],
+            );
+            expected.extend(compute_attention_host(
+                &config,
+                &queries,
+                &single_caches[row],
+                position,
+                1,
+            ));
+        }
+
+        let mut batch_queries =
+            vec![0.0; batch_size * config.num_attention_heads * config.query_head_dim()];
+        let mut batch_cache_refs: Vec<_> = batch_caches.iter_mut().collect();
+        append_kv_and_build_queries_decode_batch(
+            &config,
+            &q_decode,
+            &kv_a_decode,
+            &kv_b_decode,
+            position,
+            &mut batch_queries,
+            &mut batch_cache_refs,
+        );
+        let batch_cache_views: Vec<_> = batch_cache_refs
+            .iter()
+            .map(|cache| &**cache as &LayerCache)
+            .collect();
+        let actual = compute_attention_host_decode_batch(
+            &config,
+            &batch_queries,
+            &batch_cache_views,
+            position,
+        );
+
+        assert_eq!(actual, expected);
+        for cache in batch_cache_refs {
+            assert_eq!(cache.len(&config), position + 1);
+        }
+    }
+
+    fn patterned(seed: usize, len: usize, scale: f32) -> Vec<f32> {
+        (0..len)
+            .map(|idx| {
+                let value = ((seed * 31 + idx * 17) % 23) as f32 - 11.0;
+                value * scale
+            })
+            .collect()
     }
 }

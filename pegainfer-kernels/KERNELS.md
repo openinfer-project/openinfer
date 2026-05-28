@@ -4,6 +4,13 @@
 
 Use this file as the LLM entrypoint before editing kernels. Start from `op_id`, then jump to the Rust wrapper, FFI symbol, and source file.
 
+## Shared Dense And Sampling Helpers
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `shared.linear.gemm_per_token` | model-specific decode accuracy gates | `ops::gemm_per_token` / `ops::gemm_per_token_into_checked` | `gemm_per_token_cuda` | `csrc/linear.cu` | cuBLAS | computes each row through the N=1 decode GEMM boundary; used when row-wise parity is required before performance optimization |
+| `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
+
 ## Qwen3-4B Dense Full-Attention Path
 
 Qwen3-4B uses bf16 dense full attention with `hidden_size=2560`, `num_attention_heads=32`, `num_key_value_heads=8`, `head_dim=128`, and GQA group size 4. TP shards these head/intermediate dimensions per rank; the kernel IDs remain the same.

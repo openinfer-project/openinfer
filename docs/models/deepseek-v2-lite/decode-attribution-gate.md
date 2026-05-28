@@ -104,13 +104,13 @@ The HF oracle needs a Python environment that can load DeepSeek-V2-Lite with `tr
 
 ## Latest Validation
 
-The full gate was last rerun on 2026-05-26 with DeepSeek-V2-Lite, `prompt="Hello"`, `output_len=16`, and 2x A800-SXM4-80GB. The refreshed token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model snapshot as the Rust E2E gate.
+The full gate was last rerun on 2026-05-27 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. The refreshed token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model snapshot as the Rust E2E gate.
 
-The earlier 2026-05-24 hash is superseded because that record did not preserve enough HF/runtime provenance to reproduce the truth-source environment. Treat only the hash below as the active oracle. This refresh does not claim a model-runtime improvement, a manual-loop root cause, or a transport issue.
+The earlier 2026-05-26 hash is superseded for the active gate because it was produced from a different local model snapshot. Treat only the hash below as the active oracle for snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`. This refresh does not claim a model-runtime improvement, a manual-loop root cause, or a transport issue.
 
 - HF / host-staged / NCCL comparison: `all_token_text_exact`.
-- Token SHA256: `d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8`.
-- Text SHA256: `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6`.
+- Token SHA256: `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`.
+- Text SHA256: `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 - Host-staged attribution: `dispatch_calls=416`, `combine_calls=416`, `dispatch_elements=5111808`, `combine_elements=5111808`, `local_route_count=1284`, `remote_route_count=1212`.
 - NCCL attribution: `nccl_exchange_calls=416`, `nccl_combine_calls=416`, `nccl_exchange_elements=851968`, `nccl_combine_elements=851968`, `local_route_count=1284`, `remote_route_count=1212`.
 - GPU event timing: selected GPU/NCCL attribution sections are reported separately from CPU-side section timing; host-staged emitted `gpu_timing.sample_count=5056`, NCCL emitted `gpu_timing.sample_count=5888`, and both reported `gpu_timing.failure_count=0`.

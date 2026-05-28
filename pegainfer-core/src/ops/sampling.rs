@@ -4,7 +4,9 @@ use cudarc::driver::CudaSlice;
 use crate::sampler::SamplingParams;
 use crate::tensor::{DeviceContext, DeviceVec};
 
-pub use pegainfer_kernels::ops::{argmax, flashinfer_topk_row_states_bytes};
+pub use pegainfer_kernels::ops::{
+    argmax, argmax_batch_bf16_into, flashinfer_topk_row_states_bytes,
+};
 
 /// GPU sampling: temperature -> softmax -> top-k -> top-p -> multinomial.
 ///

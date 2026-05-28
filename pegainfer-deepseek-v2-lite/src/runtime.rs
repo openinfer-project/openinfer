@@ -19,14 +19,15 @@ use crate::{
     device::activate,
     ep::ExpertParallelConfig,
     host_ops::{
-        DecodeCache, LayerCache, append_kv_and_build_queries, compute_attention_host,
-        gate_logits_host, hidden_from_bf16_host, hidden_from_f32_host, hidden_to_bf16,
-        hidden_to_f32, normalize_compressed_kv, rms_norm_hidden_host, rms_norm_host,
-        topk_softmax_routes,
+        DecodeCache, LayerCache, append_kv_and_build_queries,
+        append_kv_and_build_queries_decode_batch, compute_attention_host,
+        compute_attention_host_decode_batch, gate_logits_host, hidden_from_bf16_host,
+        hidden_from_f32_host, hidden_to_bf16, hidden_to_f32, normalize_compressed_kv,
+        rms_norm_hidden_host, rms_norm_host, topk_softmax_routes,
     },
     model::{
         AttentionWeights, DriverRankModel, ExpertMlp, ExpertRankModel, MlpWeights, MoeMlp,
-        dense_mlp_forward,
+        dense_mlp_forward, dense_mlp_forward_per_token,
     },
     nccl_backend::NaiveNcclEp2Backend,
     weights::{ModelManifest, RankLoadPlan},
@@ -284,7 +285,9 @@ impl DeepSeekV2LiteEp2Generator {
         let mut caches: Vec<_> = (0..batch_size)
             .map(|_| DecodeCache::new(&self.config))
             .collect();
-        let mut generated = vec![Vec::with_capacity(max_new_tokens); batch_size];
+        let mut generated: Vec<Vec<u32>> = (0..batch_size)
+            .map(|_| Vec::with_capacity(max_new_tokens))
+            .collect();
         let mut prefill_next_token_us = Vec::with_capacity(batch_size);
 
         for row in 0..batch_size {
@@ -310,27 +313,26 @@ impl DeepSeekV2LiteEp2Generator {
                 .collect();
             let position = prompt_tokens.len() + token_index - 1;
             let decode_start = Instant::now();
-            // This is a correctness-first lockstep batch benchmark path. All
-            // rows advance under one batch decode step/timing sample, while the
-            // row forward reuses the already-gated single-row EP2 oracle until a
-            // fused batched DSV2-Lite forward has its own accuracy gate.
-            let mut next_tokens = Vec::with_capacity(batch_size);
-            for row in 0..batch_size {
-                next_tokens.push(self.decode_next_token(
-                    input_tokens[row],
-                    position,
-                    &mut caches[row],
-                    &mut stats,
-                    &mut attribution,
-                    token_index,
-                )?);
-            }
+            let next_tokens = self.decode_next_tokens_batch(
+                &input_tokens,
+                position,
+                &mut caches,
+                &mut stats,
+                &mut attribution,
+                token_index,
+            )?;
+            ensure!(
+                next_tokens.len() == batch_size,
+                "batched decode returned {} tokens for batch_size={batch_size}",
+                next_tokens.len()
+            );
             per_token_decode_us.push(duration_micros(decode_start.elapsed()));
             for (row, token) in next_tokens.into_iter().enumerate() {
                 generated[row].push(token);
             }
         }
 
+        ensure_same_prompt_batch_rows_match(&generated)?;
         Ok(BatchedGenerationResult {
             tokens: generated,
             prefill_next_token_us,
@@ -471,6 +473,51 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
+    fn decode_next_tokens_batch(
+        &mut self,
+        tokens: &[u32],
+        position: usize,
+        caches: &mut [DecodeCache],
+        stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
+        token_index: usize,
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !tokens.is_empty(),
+            "batched decode tokens must not be empty"
+        );
+        ensure!(
+            tokens.len() == caches.len(),
+            "batched decode token/cache mismatch: tokens={}, caches={}",
+            tokens.len(),
+            caches.len()
+        );
+        let mut hidden = attribution.record_result(
+            "decode",
+            "embedding",
+            || "decode.batch_embedding",
+            None,
+            Some(token_index),
+            || self.embed_tokens(tokens),
+        )?;
+        hidden = self.forward_layers_decode_batch(
+            hidden,
+            position,
+            caches,
+            stats,
+            attribution,
+            token_index,
+        )?;
+        attribution.record_result(
+            "decode",
+            "sample_last_token",
+            || "decode.batch_sample_tokens",
+            None,
+            Some(token_index),
+            || self.sample_tokens(&hidden),
+        )
+    }
+
     fn embed_tokens(&self, token_ids: &[u32]) -> Result<HiddenStates> {
         activate(&self.rank0.ctx)?;
         let token_ids_gpu = self.rank0.ctx.stream.clone_htod(token_ids)?;
@@ -512,6 +559,47 @@ impl DeepSeekV2LiteEp2Generator {
                     token_index,
                 )
                 .with_context(|| format!("DeepSeek-V2-Lite layer {layer_idx}"))?;
+        }
+        Ok(hidden)
+    }
+
+    fn forward_layers_decode_batch(
+        &mut self,
+        mut hidden: HiddenStates,
+        position: usize,
+        caches: &mut [DecodeCache],
+        stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
+        token_index: usize,
+    ) -> Result<HiddenStates> {
+        ensure!(
+            caches.len() == hidden.seq_len,
+            "batched decode cache count {} must match hidden seq_len {}",
+            caches.len(),
+            hidden.seq_len
+        );
+        ensure!(
+            caches
+                .iter()
+                .all(|cache| cache.layers.len() == self.rank0.layers.len()),
+            "batched decode cache layer count mismatch"
+        );
+        for layer_idx in 0..self.rank0.layers.len() {
+            let mut layer_caches: Vec<_> = caches
+                .iter_mut()
+                .map(|cache| &mut cache.layers[layer_idx])
+                .collect();
+            hidden = self
+                .forward_layer_decode_batch(
+                    layer_idx,
+                    &hidden,
+                    position,
+                    &mut layer_caches,
+                    stats,
+                    attribution,
+                    token_index,
+                )
+                .with_context(|| format!("DeepSeek-V2-Lite batched layer {layer_idx}"))?;
         }
         Ok(hidden)
     }
@@ -591,8 +679,15 @@ impl DeepSeekV2LiteEp2Generator {
                 0,
             ),
             MlpWeights::Moe(moe) => {
-                let (ffn_out, local_routes, remote_routes) =
-                    self.moe_forward(layer_idx, &ffn_norm, moe, attribution, phase, token_index)?;
+                let (ffn_out, local_routes, remote_routes) = self.moe_forward(
+                    layer_idx,
+                    &ffn_norm,
+                    moe,
+                    attribution,
+                    phase,
+                    token_index,
+                    false,
+                )?;
                 match self.backend.kind() {
                     EpBackendKind::HostStaged => {
                         stats.record_host_staged_moe(
@@ -615,6 +710,121 @@ impl DeepSeekV2LiteEp2Generator {
             || format!("layer.{layer_idx}.ffn_residual_add"),
             Some(layer_idx),
             token_index,
+            || ops::add_batch(&self.rank0.ctx, &after_attn, &ffn_out),
+        )
+    }
+
+    fn forward_layer_decode_batch(
+        &mut self,
+        layer_idx: usize,
+        hidden: &HiddenStates,
+        position: usize,
+        caches: &mut [&mut LayerCache],
+        stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
+        token_index: usize,
+    ) -> Result<HiddenStates> {
+        ensure!(
+            hidden.seq_len == caches.len(),
+            "batched layer hidden seq_len {} must match cache rows {}",
+            hidden.seq_len,
+            caches.len()
+        );
+        activate(&self.rank0.ctx)?;
+
+        let layer = &self.rank0.layers[layer_idx];
+        let normed = attribution.record_result(
+            "decode",
+            "host_rms_norm",
+            || format!("layer.{layer_idx}.batch_input_rms_norm"),
+            Some(layer_idx),
+            Some(token_index),
+            || self.rms_norm_hidden(hidden, &layer.input_layernorm_host),
+        )?;
+
+        let attn = attribution.record_result(
+            "decode",
+            "attention_host_path",
+            || format!("layer.{layer_idx}.batch_attention_host_path"),
+            Some(layer_idx),
+            Some(token_index),
+            || self.attention_forward_decode_batch(&normed, &layer.attention, position, caches),
+        )?;
+        activate(&self.rank0.ctx)?;
+        let attn_projected = attribution.record_gpu_result(
+            &self.rank0.ctx,
+            "decode",
+            "gpu_o_proj_enqueue",
+            || format!("layer.{layer_idx}.batch_attention_o_proj"),
+            Some(layer_idx),
+            Some(token_index),
+            || ops::gemm_per_token(&self.rank0.ctx, &layer.attention.o_proj, &attn),
+        )?;
+        let after_attn = attribution.record_gpu_result(
+            &self.rank0.ctx,
+            "decode",
+            "gpu_residual_add_enqueue",
+            || format!("layer.{layer_idx}.batch_attention_residual_add"),
+            Some(layer_idx),
+            Some(token_index),
+            || ops::add_batch(&self.rank0.ctx, hidden, &attn_projected),
+        )?;
+
+        let ffn_norm = attribution.record_result(
+            "decode",
+            "host_rms_norm",
+            || format!("layer.{layer_idx}.batch_post_attention_rms_norm"),
+            Some(layer_idx),
+            Some(token_index),
+            || self.rms_norm_hidden(&after_attn, &layer.post_attention_layernorm_host),
+        )?;
+
+        let (ffn_out, local_routes, remote_routes) = match &layer.mlp {
+            MlpWeights::Dense(dense) => (
+                attribution.record_gpu_result(
+                    &self.rank0.ctx,
+                    "decode",
+                    "dense_mlp_enqueue",
+                    || format!("layer.{layer_idx}.batch_dense_mlp"),
+                    Some(layer_idx),
+                    Some(token_index),
+                    || dense_mlp_forward_per_token(&self.rank0.ctx, dense, &ffn_norm),
+                )?,
+                0,
+                0,
+            ),
+            MlpWeights::Moe(moe) => {
+                let (ffn_out, local_routes, remote_routes) = self.moe_forward(
+                    layer_idx,
+                    &ffn_norm,
+                    moe,
+                    attribution,
+                    "decode",
+                    Some(token_index),
+                    true,
+                )?;
+                match self.backend.kind() {
+                    EpBackendKind::HostStaged => {
+                        stats.record_host_staged_moe(
+                            ffn_norm.hidden_dim,
+                            local_routes + remote_routes,
+                        );
+                    }
+                    EpBackendKind::Nccl => {
+                        stats.record_nccl_moe_collectives(ffn_norm.hidden_dim, ffn_norm.seq_len);
+                    }
+                }
+                (ffn_out, local_routes, remote_routes)
+            }
+        };
+        stats.record_routes(self.backend.kind(), local_routes, remote_routes);
+        attribution.record_gpu_result(
+            &self.rank0.ctx,
+            "decode",
+            "gpu_residual_add_enqueue",
+            || format!("layer.{layer_idx}.batch_ffn_residual_add"),
+            Some(layer_idx),
+            Some(token_index),
             || ops::add_batch(&self.rank0.ctx, &after_attn, &ffn_out),
         )
     }
@@ -680,6 +890,75 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
+    fn attention_forward_decode_batch(
+        &self,
+        input: &HiddenStates,
+        attn: &AttentionWeights,
+        position: usize,
+        caches: &mut [&mut LayerCache],
+    ) -> Result<HiddenStates> {
+        activate(&self.rank0.ctx)?;
+        ensure!(
+            input.seq_len == caches.len(),
+            "batched attention input seq_len {} must match cache rows {}",
+            input.seq_len,
+            caches.len()
+        );
+        for (row, cache) in caches.iter().enumerate() {
+            ensure!(
+                cache.len(&self.config) == position,
+                "batched attention cache row {row} position mismatch: cache_len={}, position={position}",
+                cache.len(&self.config)
+            );
+        }
+
+        let q = ops::gemm_per_token(&self.rank0.ctx, &attn.q_proj, input)?;
+        let kv_a = ops::gemm_per_token(&self.rank0.ctx, &attn.kv_a_proj, input)?;
+        let q_host = hidden_to_f32(&self.rank0.ctx, &q)?;
+        let kv_a_host = hidden_to_f32(&self.rank0.ctx, &kv_a)?;
+
+        let compressed_norm = normalize_compressed_kv(
+            &self.config,
+            &kv_a_host,
+            &attn.kv_a_norm_host,
+            input.seq_len,
+        );
+        let compressed = hidden_from_bf16_host(
+            &self.rank0.ctx,
+            &compressed_norm,
+            self.config.kv_lora_rank,
+            input.seq_len,
+        )?;
+        activate(&self.rank0.ctx)?;
+        let kv_b = ops::gemm_per_token(&self.rank0.ctx, &attn.kv_b_proj, &compressed)?;
+        let kv_b_host = hidden_to_f32(&self.rank0.ctx, &kv_b)?;
+
+        let mut queries =
+            vec![
+                0.0f32;
+                input.seq_len * self.config.num_attention_heads * self.config.query_head_dim()
+            ];
+        append_kv_and_build_queries_decode_batch(
+            &self.config,
+            &q_host,
+            &kv_a_host,
+            &kv_b_host,
+            position,
+            &mut queries,
+            caches,
+        );
+
+        let cache_views: Vec<_> = caches.iter().map(|cache| &**cache as &LayerCache).collect();
+        let out_host =
+            compute_attention_host_decode_batch(&self.config, &queries, &cache_views, position);
+        hidden_from_f32_host(
+            &self.rank0.ctx,
+            &out_host,
+            self.config.o_proj_cols(),
+            input.seq_len,
+        )
+    }
+
     fn moe_forward(
         &self,
         layer_idx: usize,
@@ -688,14 +967,28 @@ impl DeepSeekV2LiteEp2Generator {
         attribution: &mut DecodeAttributionProfile,
         phase: &'static str,
         token_index: Option<usize>,
+        shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         match &self.backend {
-            EpBackendRuntime::HostStaged => {
-                self.moe_forward_host_staged(layer_idx, input, moe, attribution, phase, token_index)
-            }
-            EpBackendRuntime::Nccl(nccl) => {
-                self.moe_forward_nccl(nccl, layer_idx, input, moe, attribution, phase, token_index)
-            }
+            EpBackendRuntime::HostStaged => self.moe_forward_host_staged(
+                layer_idx,
+                input,
+                moe,
+                attribution,
+                phase,
+                token_index,
+                shared_per_token_gemm,
+            ),
+            EpBackendRuntime::Nccl(nccl) => self.moe_forward_nccl(
+                nccl,
+                layer_idx,
+                input,
+                moe,
+                attribution,
+                phase,
+                token_index,
+                shared_per_token_gemm,
+            ),
         }
     }
 
@@ -707,6 +1000,7 @@ impl DeepSeekV2LiteEp2Generator {
         attribution: &mut DecodeAttributionProfile,
         phase: &'static str,
         token_index: Option<usize>,
+        shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
         let (input_host, routes) = attribution.record_result(
@@ -730,9 +1024,16 @@ impl DeepSeekV2LiteEp2Generator {
             || format!("layer.{layer_idx}.shared_expert"),
             Some(layer_idx),
             token_index,
-            || dense_mlp_forward(&self.rank0.ctx, &moe.shared, input),
+            || {
+                if shared_per_token_gemm {
+                    dense_mlp_forward_per_token(&self.rank0.ctx, &moe.shared, input)
+                } else {
+                    dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)
+                }
+            },
         )?;
-        let mut routed_accum = vec![0.0f32; input.seq_len * self.config.hidden_size];
+        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
+        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
 
@@ -750,6 +1051,11 @@ impl DeepSeekV2LiteEp2Generator {
                     &self.rank0.ctx
                 } else {
                     &self.rank1.ctx
+                };
+                let dst = if owner_rank == 0 {
+                    &mut rank0_contrib
+                } else {
+                    &mut rank1_contrib
                 };
                 let (out, is_remote) = attribution.record_gpu_result(
                     expert_ctx,
@@ -773,7 +1079,7 @@ impl DeepSeekV2LiteEp2Generator {
                     Some(layer_idx),
                     token_index,
                     || {
-                        for (dst, value) in routed_accum[offset..offset + self.config.hidden_size]
+                        for (dst, value) in dst[offset..offset + self.config.hidden_size]
                             .iter_mut()
                             .zip(out)
                         {
@@ -784,6 +1090,11 @@ impl DeepSeekV2LiteEp2Generator {
                 )?;
             }
         }
+        let routed_accum: Vec<_> = rank0_contrib
+            .into_iter()
+            .zip(rank1_contrib)
+            .map(|(rank0, rank1)| rank0 + rank1)
+            .collect();
 
         let routed = attribution.record_gpu_result(
             &self.rank0.ctx,
@@ -823,6 +1134,7 @@ impl DeepSeekV2LiteEp2Generator {
         attribution: &mut DecodeAttributionProfile,
         phase: &'static str,
         token_index: Option<usize>,
+        shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
         let routes = attribution.record_result(
@@ -849,7 +1161,13 @@ impl DeepSeekV2LiteEp2Generator {
             || format!("layer.{layer_idx}.shared_expert"),
             Some(layer_idx),
             token_index,
-            || dense_mlp_forward(&self.rank0.ctx, &moe.shared, input),
+            || {
+                if shared_per_token_gemm {
+                    dense_mlp_forward_per_token(&self.rank0.ctx, &moe.shared, input)
+                } else {
+                    dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)
+                }
+            },
         )?;
         let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
         let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
@@ -1007,9 +1325,41 @@ impl DeepSeekV2LiteEp2Generator {
     }
 
     fn sample_last_token(&self, hidden: &HiddenStates) -> Result<u32> {
+        self.sample_token_at(hidden, hidden.seq_len - 1)
+    }
+
+    fn sample_tokens(&self, hidden: &HiddenStates) -> Result<Vec<u32>> {
         activate(&self.rank0.ctx)?;
-        let last = ops::extract_vec(&self.rank0.ctx, hidden, hidden.seq_len - 1)?;
-        let normed = self.rms_norm_vec(&last, &self.rank0.norm_host)?;
+        ensure!(hidden.seq_len != 0, "cannot sample an empty hidden batch");
+
+        let normed = self.rms_norm_hidden(hidden, &self.rank0.norm_host)?;
+        activate(&self.rank0.ctx)?;
+        let logits = ops::gemm_per_token(&self.rank0.ctx, &self.rank0.lm_head, &normed)?;
+        let mut values = self.rank0.ctx.stream.alloc_zeros(hidden.seq_len)?;
+        let mut out = self.rank0.ctx.stream.alloc_zeros(hidden.seq_len)?;
+        ops::argmax_batch_bf16_into(&self.rank0.ctx, &logits, &mut values, &mut out)?;
+
+        let out_host = self.rank0.ctx.stream.clone_dtoh(&out)?;
+        self.rank0.ctx.sync()?;
+
+        out_host
+            .into_iter()
+            .map(|token| {
+                ensure!(token >= 0, "argmax returned negative token id {token}");
+                Ok(token as u32)
+            })
+            .collect()
+    }
+
+    fn sample_token_at(&self, hidden: &HiddenStates, row: usize) -> Result<u32> {
+        activate(&self.rank0.ctx)?;
+        ensure!(
+            row < hidden.seq_len,
+            "sample row {row} out of range for seq_len {}",
+            hidden.seq_len
+        );
+        let state = ops::extract_vec(&self.rank0.ctx, hidden, row)?;
+        let normed = self.rms_norm_vec(&state, &self.rank0.norm_host)?;
         let logits = ops::linear(&self.rank0.ctx, &normed, &self.rank0.lm_head)?;
         ops::argmax(&self.rank0.ctx, &logits)
     }
@@ -1074,6 +1424,27 @@ fn token_sha256(tokens: &[u32]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn ensure_same_prompt_batch_rows_match(rows: &[Vec<u32>]) -> Result<()> {
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
+    for (row_idx, row) in rows.iter().enumerate().skip(1) {
+        if row != first {
+            let first_diff = first
+                .iter()
+                .zip(row)
+                .position(|(lhs, rhs)| lhs != rhs)
+                .unwrap_or_else(|| first.len().min(row.len()));
+            bail!(
+                "same-prompt batched decode row {row_idx} differs from row 0 at generated token index {first_diff}: row0_sha256={}, row_sha256={}",
+                token_sha256(first),
+                token_sha256(row)
+            );
+        }
+    }
+    Ok(())
+}
+
 fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -1113,6 +1484,23 @@ mod tests {
 
         assert_eq!(finish_reason, None);
         assert_eq!(generated, vec![10, 11, 100_001]);
+    }
+
+    #[test]
+    fn same_prompt_batch_rows_must_match() {
+        ensure_same_prompt_batch_rows_match(&[
+            vec![11, 304, 608],
+            vec![11, 304, 608],
+            vec![11, 304, 608],
+        ])
+        .unwrap();
+
+        let err = ensure_same_prompt_batch_rows_match(&[vec![11, 304, 608], vec![11, 463, 608]])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("generated token index 1"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

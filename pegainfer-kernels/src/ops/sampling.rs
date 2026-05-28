@@ -30,14 +30,56 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
         }
     }
 
-    ctx.sync()?;
-
     let result = ctx
         .stream
         .clone_dtoh(&out_gpu)
         .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
+    ctx.sync()?;
 
     Ok(result[0] as u32)
+}
+
+pub fn argmax_batch_bf16_into(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    values: &mut CudaSlice<half::bf16>,
+    out: &mut CudaSlice<i32>,
+) -> Result<()> {
+    let rows = logits.seq_len;
+    if rows == 0 {
+        return Err(anyhow!("argmax batch requires at least one row"));
+    }
+    if values.len() < rows {
+        return Err(anyhow!(
+            "argmax batch values scratch too small: have {}, need {}",
+            values.len(),
+            rows
+        ));
+    }
+    if out.len() < rows {
+        return Err(anyhow!(
+            "argmax batch output too small: have {}, need {}",
+            out.len(),
+            rows
+        ));
+    }
+
+    let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (values_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::argmax_batch_bf16_cuda(
+            logits_ptr as *const ffi::Half,
+            values_ptr as *mut ffi::Half,
+            out_ptr as *mut i32,
+            rows as i32,
+            logits.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
 }
 
 /// GPU sampling: temperature → softmax → top-k → top-p → multinomial.
@@ -154,12 +196,11 @@ fn gpu_sample_core(
             );
         }
     }
-    ctx.sync()?;
-
     let result = ctx
         .stream
         .clone_dtoh(out)
         .map_err(|e| anyhow!("D2H sample read failed: {}", e))?;
+    ctx.sync()?;
 
     Ok(result[0] as u32)
 }

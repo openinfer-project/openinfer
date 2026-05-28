@@ -24,8 +24,8 @@ pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_deco
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{
-    gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_rows_into,
-    gemm_rows_into_checked, gemv, linear,
+    gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_per_token,
+    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemv, linear,
 };
 pub use norm::{
     fused_add_rms_norm_batch_into, fused_add_rms_norm_into, fused_add_rms_norm_round_batch_into,
@@ -33,6 +33,6 @@ pub use norm::{
     rms_norm_into, rms_norm_offset_into,
 };
 pub use sampling::{
-    argmax, flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes, gpu_sample,
-    gpu_sample_into,
+    argmax, argmax_batch_bf16_into, flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
+    gpu_sample, gpu_sample_into,
 };
