@@ -34,17 +34,17 @@ members = [
     "pegainfer-comm/crates/pegainfer-comm-p2p-all-to-all",
     "pegainfer-comm/crates/pegainfer-comm-python-ext",
     # ---- dynamo kvbm (ported, Apache-2.0) ----
-    "dynamo-tokens",
-    "dynamo-memory",
-    "dynamo-kv-hashing",
-    "dynamo-kv-router",
-    "kvbm-common",
-    "kvbm-config",
-    "kvbm-consolidator",
-    "kvbm-engine",
-    "kvbm-kernels",
-    "kvbm-logical",
-    "kvbm-physical",
+    "kvbm/dynamo-tokens",
+    "kvbm/dynamo-memory",
+    "kvbm/dynamo-kv-hashing",
+    "kvbm/dynamo-kv-router",
+    "kvbm/kvbm-common",
+    "kvbm/kvbm-config",
+    "kvbm/kvbm-consolidator",
+    "kvbm/kvbm-engine",
+    "kvbm/kvbm-kernels",
+    "kvbm/kvbm-logical",
+    "kvbm/kvbm-physical",
 ]
 
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
@@ -60,17 +60,17 @@ keywords = ["llm", "genai", "inference", "nvidia", "distributed"]
 
 [workspace.dependencies]
 # ---- dynamo kvbm internal crates ----
-dynamo-tokens = { path = "dynamo-tokens" }
-dynamo-memory = { path = "dynamo-memory" }
-dynamo-kv-hashing = { path = "dynamo-kv-hashing" }
-dynamo-kv-router = { path = "dynamo-kv-router", features = ["metrics"] }
-kvbm-common = { path = "kvbm-common" }
-kvbm-config = { path = "kvbm-config" }
-kvbm-consolidator = { path = "kvbm-consolidator" }
-kvbm-engine = { path = "kvbm-engine" }
-kvbm-kernels = { path = "kvbm-kernels" }
-kvbm-logical = { path = "kvbm-logical" }
-kvbm-physical = { path = "kvbm-physical" }
+dynamo-tokens = { path = "kvbm/dynamo-tokens" }
+dynamo-memory = { path = "kvbm/dynamo-memory" }
+dynamo-kv-hashing = { path = "kvbm/dynamo-kv-hashing" }
+dynamo-kv-router = { path = "kvbm/dynamo-kv-router", features = ["metrics"] }
+kvbm-common = { path = "kvbm/kvbm-common" }
+kvbm-config = { path = "kvbm/kvbm-config" }
+kvbm-consolidator = { path = "kvbm/kvbm-consolidator" }
+kvbm-engine = { path = "kvbm/kvbm-engine" }
+kvbm-kernels = { path = "kvbm/kvbm-kernels" }
+kvbm-logical = { path = "kvbm/kvbm-logical" }
+kvbm-physical = { path = "kvbm/kvbm-physical" }
 # ---- third-party ----
 anyhow = "1.0"
 async-nats = { version = "0.45.0", features = ["service"] }
