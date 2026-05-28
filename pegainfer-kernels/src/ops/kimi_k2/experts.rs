@@ -51,35 +51,39 @@ pub fn kimi_add_f32_bf16_to_bf16<const DIM: usize>(
     Ok(())
 }
 
-pub fn kimi_scaled_add_f32_bf16_to_bf16<const DIM: usize>(
+pub fn kimi_residual_add_scaled_f32<const DIM: usize>(
     ctx: &DeviceContext,
-    a: &CudaSlice<f32>,
+    hidden: &GpuTensor<DIM>,
+    projected: &GpuTensor<DIM>,
+    routed_f32: &CudaSlice<f32>,
     scale: f32,
-    b: &GpuTensor<DIM>,
     out: &mut GpuTensor<DIM>,
 ) -> Result<()> {
-    let elems = DIM * b.seq_len;
+    let elems = DIM * hidden.seq_len;
     ensure!(
-        out.seq_len == b.seq_len,
-        "Kimi scaled f32 add seq_len mismatch: b={}, output={}",
-        b.seq_len,
+        projected.seq_len == hidden.seq_len && out.seq_len == hidden.seq_len,
+        "Kimi residual_add_scaled_f32 seq_len mismatch: hidden={}, projected={}, out={}",
+        hidden.seq_len,
+        projected.seq_len,
         out.seq_len
     );
     ensure!(
-        a.len() >= elems,
-        "Kimi scaled f32 add input too small: have {}, need {}",
-        a.len(),
+        routed_f32.len() >= elems,
+        "Kimi residual_add_scaled_f32 routed_f32 too small: have {}, need {}",
+        routed_f32.len(),
         elems
     );
 
-    let (a_ptr, _a_guard) = a.device_ptr(&ctx.stream);
-    let (b_ptr, _b_guard) = b.data.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+    let (hidden_ptr, _g0) = hidden.data.device_ptr(&ctx.stream);
+    let (projected_ptr, _g1) = projected.data.device_ptr(&ctx.stream);
+    let (routed_ptr, _g2) = routed_f32.device_ptr(&ctx.stream);
+    let (out_ptr, _g3) = out.data.device_ptr_mut(&ctx.stream);
     let result = unsafe {
-        ffi::kimi_scaled_add_f32_bf16_to_bf16_cuda(
-            a_ptr as *const f32,
+        ffi::kimi_residual_add_scaled_f32_cuda(
+            hidden_ptr as *const ffi::Half,
+            projected_ptr as *const ffi::Half,
+            routed_ptr as *const f32,
             scale,
-            b_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             elems as i32,
             ctx.stream.cu_stream(),

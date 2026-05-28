@@ -32,7 +32,7 @@ use pegainfer_kernels::{
         kimi_marlin_w13_swiglu_pplx, kimi_marlin_wna16_pplx_w2_gemm,
         kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
         kimi_moe_marlin_align_block_size, kimi_pplx_build_marlin_routing_on_stream,
-        kimi_router_noaux_tc_launch, kimi_scaled_add_f32_bf16_to_bf16,
+        kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
         kimi_scatter_marlin_routes_to_compact,
     },
     tensor::{DeviceContext, GpuTensor, NormWeight},
@@ -436,20 +436,15 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         )
         .with_context(|| format!("pplx combine_recv layer {layer_idx}"))?;
     }
-    // Combine: hidden = hidden + shared + routed * scale
-    typed_ops::add_into(
+    kimi_residual_add_scaled_f32(
         ctx,
         &scratch.mla.hidden,
         &scratch.mla.projected,
-        &mut scratch.mla.normed,
-    )?;
-    kimi_scaled_add_f32_bf16_to_bf16(
-        ctx,
         &pplx.pplx_routed_f32,
         KIMI_K2_ROUTER_SCALE,
-        &scratch.mla.normed,
-        &mut scratch.mla.hidden,
+        &mut scratch.mla.normed,
     )?;
+    std::mem::swap(&mut scratch.mla.hidden, &mut scratch.mla.normed);
     Ok(())
 }
 
@@ -675,14 +670,14 @@ pub(super) fn forward_moe_layer_prefill_pplx(
         .with_context(|| format!("pplx prefill combine_recv layer {layer_idx}"))?;
     }
 
-    // ---- 12. Combine: hidden = hidden + shared + routed * scale ----
-    typed_ops::add_into(ctx, hidden, &shared_out, next_hidden)?;
-    kimi_scaled_add_f32_bf16_to_bf16(
+    kimi_residual_add_scaled_f32(
         ctx,
+        hidden,
+        &shared_out,
         &pplx.pplx_routed_f32,
         KIMI_K2_ROUTER_SCALE,
         next_hidden,
-        hidden,
     )?;
+    std::mem::swap(hidden, next_hidden);
     Ok(())
 }

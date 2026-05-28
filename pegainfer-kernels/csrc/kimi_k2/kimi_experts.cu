@@ -221,16 +221,19 @@ __global__ void kimi_add_f32_bf16_to_bf16_kernel(
   out[idx] = __float2bfloat16(a[idx] + __bfloat162float(b[idx]));
 }
 
-__global__ void kimi_scaled_add_f32_bf16_to_bf16_kernel(
-    const float* __restrict__ a,
+__global__ void kimi_residual_add_scaled_f32_kernel(
+    const __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ projected,
+    const float* __restrict__ routed_f32,
     float scale,
-    const __nv_bfloat16* __restrict__ b,
     __nv_bfloat16* __restrict__ out,
     int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n) return;
-  float scaled = __fmul_rn(a[idx], scale);
-  float sum = __fadd_rn(scaled, __bfloat162float(b[idx]));
+  __nv_bfloat16 rounded = __float2bfloat16(
+      __bfloat162float(hidden[idx]) + __bfloat162float(projected[idx]));
+  float scaled = __fmul_rn(routed_f32[idx], scale);
+  float sum = __fadd_rn(scaled, __bfloat162float(rounded));
   out[idx] = __float2bfloat16(sum);
 }
 
@@ -605,21 +608,23 @@ CUresult kimi_add_f32_bf16_to_bf16_cuda(
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
-CUresult kimi_scaled_add_f32_bf16_to_bf16_cuda(
-    const float* a,
+CUresult kimi_residual_add_scaled_f32_cuda(
+    const __nv_bfloat16* hidden,
+    const __nv_bfloat16* projected,
+    const float* routed_f32,
     float scale,
-    const __nv_bfloat16* b,
     __nv_bfloat16* out,
     int n,
     cudaStream_t stream) {
-  if (a == nullptr || b == nullptr || out == nullptr || n < 0) {
+  if (hidden == nullptr || projected == nullptr || routed_f32 == nullptr ||
+      out == nullptr || n < 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (n == 0) return CUDA_SUCCESS;
   constexpr int threads = 256;
   int blocks = (n + threads - 1) / threads;
-  kimi_scaled_add_f32_bf16_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
-      a, scale, b, out, n);
+  kimi_residual_add_scaled_f32_kernel<<<blocks, threads, 0, stream>>>(
+      hidden, projected, routed_f32, scale, out, n);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }

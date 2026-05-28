@@ -269,10 +269,11 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_scaled_add_f32_bf16_to_bf16_cuda(
-        a: *const f32,
+    pub fn kimi_residual_add_scaled_f32_cuda(
+        hidden: *const Half,
+        projected: *const Half,
+        routed_f32: *const f32,
         scale: f32,
-        b: *const Half,
         out: *mut Half,
         n: i32,
         stream: CUstream,
@@ -284,6 +285,18 @@ unsafe extern "C" {
         compressed: *mut Half,
         k_rope: *mut Half,
         seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_split_qkv_a_norm_cuda(
+        qkv_a: *const Half,
+        q_a_weight: *const Half,
+        ckv_weight: *const Half,
+        q_a_normed: *mut Half,
+        ckv_normed: *mut Half,
+        k_rope: *mut Half,
+        eps: f32,
+        batch_size: i32,
         stream: CUstream,
     ) -> CUresult;
 

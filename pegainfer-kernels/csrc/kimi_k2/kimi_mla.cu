@@ -84,6 +84,129 @@ __global__ void split_qkv_a_kernel(const DType* __restrict__ qkv_a,
   }
 }
 
+__device__ __forceinline__ float fi_rsqrt_norm(float x) {
+  float y;
+  asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float fi_shfl_xor(float x, int lane_mask) {
+  return __shfl_xor_sync(0xffffffff, x, lane_mask);
+}
+
+__global__ void split_qkv_a_norm_kernel(
+    const DType* __restrict__ qkv_a,
+    const DType* __restrict__ q_a_weight,
+    const DType* __restrict__ ckv_weight,
+    DType* __restrict__ q_a_normed,
+    DType* __restrict__ ckv_normed,
+    DType* __restrict__ k_rope_out,
+    float eps,
+    int batch_size) {
+
+  const int token = blockIdx.x;
+  if (token >= batch_size) return;
+
+  const uint32_t tx = threadIdx.x;
+  const uint32_t ty = threadIdx.y;
+  constexpr uint32_t kWarpSize = 32;
+  const uint32_t thread_id = tx + ty * kWarpSize;
+
+  constexpr int VEC = 8;
+  constexpr int CKV_THREADS = kKvLoraRank / VEC;
+  constexpr int ROPE_THREADS = kRopeDim / VEC;
+  constexpr int Q_WARPS = 6;
+  constexpr int CKV_WARPS = 2;
+
+  extern __shared__ float smem[];
+  float* smem_q = smem;
+  float* smem_ckv = smem + Q_WARPS;
+
+  const DType* token_qkv = qkv_a + token * kQkvAOut;
+
+  float q_vals[VEC];
+  float sum_sq_q = 0.f;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+  {
+    const DType* src = token_qkv + thread_id * VEC;
+#pragma unroll
+    for (int j = 0; j < VEC; j++) {
+      q_vals[j] = __bfloat162float(src[j]);
+      sum_sq_q += q_vals[j] * q_vals[j];
+    }
+  }
+
+  float ckv_vals[VEC];
+  float sum_sq_ckv = 0.f;
+  if (thread_id < CKV_THREADS) {
+    const DType* src = token_qkv + kQLoraRank + thread_id * VEC;
+#pragma unroll
+    for (int j = 0; j < VEC; j++) {
+      ckv_vals[j] = __bfloat162float(src[j]);
+      sum_sq_ckv += ckv_vals[j] * ckv_vals[j];
+    }
+  }
+
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+    sum_sq_q += fi_shfl_xor(sum_sq_q, offset);
+  smem_q[ty] = sum_sq_q;
+
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+    sum_sq_ckv += fi_shfl_xor(sum_sq_ckv, offset);
+  smem_ckv[ty] = sum_sq_ckv;
+
+  __syncthreads();
+
+  if (ty == 0) {
+    float total_q = (tx < Q_WARPS) ? smem_q[tx] : 0.f;
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+      total_q += fi_shfl_xor(total_q, offset);
+    smem_q[0] = total_q;
+
+    float total_ckv = (tx < CKV_WARPS) ? smem_ckv[tx] : 0.f;
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2)
+      total_ckv += fi_shfl_xor(total_ckv, offset);
+    smem_ckv[0] = total_ckv;
+  }
+  __syncthreads();
+
+  float rms_rcp_q = fi_rsqrt_norm(smem_q[0] / float(kQLoraRank) + eps);
+  float rms_rcp_ckv = fi_rsqrt_norm(smem_ckv[0] / float(kKvLoraRank) + eps);
+
+  {
+    DType* dst = q_a_normed + token * kQLoraRank + thread_id * VEC;
+    const DType* w = q_a_weight + thread_id * VEC;
+#pragma unroll
+    for (int j = 0; j < VEC; j++)
+      dst[j] = __float2bfloat16(q_vals[j] * rms_rcp_q * __bfloat162float(w[j]));
+  }
+
+  if (thread_id < CKV_THREADS) {
+    DType* dst = ckv_normed + token * kKvLoraRank + thread_id * VEC;
+    const DType* w = ckv_weight + thread_id * VEC;
+#pragma unroll
+    for (int j = 0; j < VEC; j++)
+      dst[j] = __float2bfloat16(ckv_vals[j] * rms_rcp_ckv * __bfloat162float(w[j]));
+  }
+
+  if (thread_id < ROPE_THREADS) {
+    const DType* src = token_qkv + kQLoraRank + kKvLoraRank + thread_id * VEC;
+    DType* dst = k_rope_out + token * kRopeDim + thread_id * VEC;
+#pragma unroll
+    for (int j = 0; j < VEC; j++)
+      dst[j] = src[j];
+  }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 __device__ __forceinline__ DType rope_out(DType even, DType odd, DType cos_v,
                                           DType sin_v, bool upper) {
   float x_even = __bfloat162float(even);
@@ -270,6 +393,28 @@ cudaError_t kimi_mla_split_qkv_a_cuda(const DType* qkv_a,
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
   split_qkv_a_kernel<<<blocks, threads, 0, stream>>>(qkv_a, q_a, compressed, k_rope, seq_len);
+  return cudaGetLastError();
+}
+
+cudaError_t kimi_mla_split_qkv_a_norm_cuda(const DType* qkv_a,
+                                            const DType* q_a_weight,
+                                            const DType* ckv_weight,
+                                            DType* q_a_normed,
+                                            DType* ckv_normed,
+                                            DType* k_rope,
+                                            float eps,
+                                            int batch_size,
+                                            cudaStream_t stream) {
+  if (batch_size <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int Q_WARPS = 6;
+  int smem_bytes = (Q_WARPS + Q_WARPS) * static_cast<int>(sizeof(float));
+  dim3 grid(batch_size);
+  dim3 block(32, Q_WARPS);
+  split_qkv_a_norm_kernel<<<grid, block, smem_bytes, stream>>>(
+      qkv_a, q_a_weight, ckv_weight,
+      q_a_normed, ckv_normed, k_rope, eps, batch_size);
   return cudaGetLastError();
 }
 

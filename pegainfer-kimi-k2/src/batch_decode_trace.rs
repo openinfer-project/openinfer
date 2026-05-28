@@ -199,26 +199,22 @@ fn push_attention_layer(
         batch,
     ));
     calls.push(
-        KernelCall::new("kimi_mla_split_qkv_a", format!("{prefix}.split_qkv_a"))
-            .input("qkv_a", hidden(KIMI_K2_MLA_QKV_A_OUT, batch))
-            .output("q_a", hidden(KIMI_K2_Q_LORA_RANK, batch))
-            .output("compressed_kv", hidden(KIMI_K2_MLA_KV_LORA_RANK, batch))
-            .output("k_rope", hidden(KIMI_K2_MLA_ROPE_DIM, batch)),
+        KernelCall::new(
+            "kimi_mla_split_qkv_a_norm",
+            format!("{prefix}.split_qkv_a_norm"),
+        )
+        .input("qkv_a", hidden(KIMI_K2_MLA_QKV_A_OUT, batch))
+        .output("q_a_normed", hidden(KIMI_K2_Q_LORA_RANK, batch))
+        .output(
+            "compressed_kv_normed",
+            hidden(KIMI_K2_MLA_KV_LORA_RANK, batch),
+        )
+        .output("k_rope", hidden(KIMI_K2_MLA_ROPE_DIM, batch)),
     );
-    calls.push(rms_dim(
-        &format!("{prefix}.q_a_norm"),
-        KIMI_K2_Q_LORA_RANK,
-        batch,
-    ));
     calls.push(gemm(
         &format!("{prefix}.q_b"),
         KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
         KIMI_K2_Q_LORA_RANK,
-        batch,
-    ));
-    calls.push(rms_dim(
-        &format!("{prefix}.kv_a_norm"),
-        KIMI_K2_MLA_KV_LORA_RANK,
         batch,
     ));
     calls.push(
@@ -465,17 +461,17 @@ fn push_moe_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
         EP_WORLD_SIZE,
         "f32",
     ));
-    calls.push(add(&format!("{prefix}.shared_residual"), batch));
     calls.push(
         KernelCall::new(
-            "kimi_scaled_add_f32_bf16_to_bf16",
-            format!("{prefix}.routed_residual"),
+            "kimi_residual_add_scaled_f32",
+            format!("{prefix}.residual_add_scaled"),
         )
+        .input("hidden", hidden(KIMI_K2_HIDDEN, batch))
+        .input("projected", hidden(KIMI_K2_HIDDEN, batch))
         .input(
-            "a",
+            "routed_f32",
             TensorSpec::new::<F32, Contiguous1D>([AxisSpec::named("elem", batch * KIMI_K2_HIDDEN)]),
         )
-        .input("b", hidden(KIMI_K2_HIDDEN, batch))
         .output("out", hidden(KIMI_K2_HIDDEN, batch))
         .attr("scale", KIMI_K2_ROUTER_SCALE.to_string()),
     );

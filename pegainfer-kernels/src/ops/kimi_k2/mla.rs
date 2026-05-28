@@ -3,7 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::{
     ffi,
-    tensor::{DeviceContext, GpuTensor, GpuWeight},
+    tensor::{DeviceContext, GpuTensor, GpuWeight, NormWeight},
 };
 
 pub const KIMI_K2_MLA_LOCAL_HEADS_TP8: usize = 8;
@@ -160,6 +160,49 @@ pub fn kimi_mla_split_qkv_a(
             q_a_ptr as *mut ffi::Half,
             compressed_ptr as *mut ffi::Half,
             k_rope_ptr as *mut ffi::Half,
+            qkv_a.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+pub fn kimi_mla_split_qkv_a_norm(
+    ctx: &DeviceContext,
+    qkv_a: &GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
+    q_a_weight: &NormWeight<KIMI_K2_MLA_Q_LORA_RANK>,
+    ckv_weight: &NormWeight<KIMI_K2_MLA_KV_LORA_RANK>,
+    q_a_normed: &mut GpuTensor<KIMI_K2_MLA_Q_LORA_RANK>,
+    ckv_normed: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    k_rope: &mut GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
+    eps: f32,
+) -> Result<()> {
+    ensure!(
+        q_a_normed.seq_len == qkv_a.seq_len
+            && ckv_normed.seq_len == qkv_a.seq_len
+            && k_rope.seq_len == qkv_a.seq_len,
+        "Kimi MLA split+norm seq_len mismatch: qkv_a={}, q_a_normed={}, ckv_normed={}, k_rope={}",
+        qkv_a.seq_len,
+        q_a_normed.seq_len,
+        ckv_normed.seq_len,
+        k_rope.seq_len
+    );
+    let (qkv_a_ptr, _g0) = qkv_a.data.device_ptr(&ctx.stream);
+    let (q_w_ptr, _g1) = q_a_weight.data.device_ptr(&ctx.stream);
+    let (ckv_w_ptr, _g2) = ckv_weight.data.device_ptr(&ctx.stream);
+    let (q_out_ptr, _g3) = q_a_normed.data.device_ptr_mut(&ctx.stream);
+    let (ckv_out_ptr, _g4) = ckv_normed.data.device_ptr_mut(&ctx.stream);
+    let (rope_ptr, _g5) = k_rope.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::kimi_mla_split_qkv_a_norm_cuda(
+            qkv_a_ptr as *const ffi::Half,
+            q_w_ptr as *const ffi::Half,
+            ckv_w_ptr as *const ffi::Half,
+            q_out_ptr as *mut ffi::Half,
+            ckv_out_ptr as *mut ffi::Half,
+            rope_ptr as *mut ffi::Half,
+            eps,
             qkv_a.seq_len as i32,
             ctx.stream.cu_stream(),
         )

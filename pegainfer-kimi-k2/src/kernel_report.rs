@@ -15,14 +15,15 @@ use pegainfer_kernels::{
         fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla, kimi_marlin_sum_topk_rows_f32,
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
-        kimi_mla_absorb_q_nope, kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
-        kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
-        kimi_scaled_add_f32_bf16_to_bf16, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
-        scale_f32_in_place, silu_mul_batch_into,
+        kimi_mla_absorb_q_nope, kimi_mla_rope_split_decode, kimi_mla_split_qkv_a,
+        kimi_mla_split_qkv_a_norm, kimi_mla_v_up, kimi_moe_marlin_align_block_size,
+        kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
+        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
+        silu_mul_batch_into,
     },
     tensor::{
         DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, KernelCall,
-        TensorSpec,
+        NormWeight, TensorSpec,
     },
 };
 use serde::Serialize;
@@ -55,10 +56,11 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "add_batch" => Some(measure_add(call, iters)?),
         "scale_f32_in_place" => Some(measure_scale_f32(call, iters)?),
         "kimi_add_f32_bf16_to_bf16" => Some(measure_add_f32_bf16(call, iters)?),
-        "kimi_scaled_add_f32_bf16_to_bf16" => Some(measure_scaled_add_f32_bf16(call, iters)?),
+        "kimi_residual_add_scaled_f32" => Some(measure_residual_add_scaled_f32(call, iters)?),
         "embedding_batch_vocab_shard" => Some(measure_embedding(call, iters)?),
         "top1_batch" => Some(measure_top1(call, iters)?),
         "kimi_mla_split_qkv_a" => Some(measure_mla_split_qkv_a(call, iters)?),
+        "kimi_mla_split_qkv_a_norm" => Some(measure_mla_split_qkv_a_norm(call, iters)?),
         "kimi_mla_rope_split_decode" => Some(measure_mla_rope_split(call, iters)?),
         "kimi_mla_absorb_q_nope" => Some(measure_mla_absorb_q(call, iters)?),
         "kimi_mla_v_up" => Some(measure_mla_v_up(call, iters)?),
@@ -288,13 +290,13 @@ fn measure_add_f32_bf16(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     })
 }
 
-fn measure_scaled_add_f32_bf16(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
-    let b = input(call, "b")?;
-    let hidden = axis(b, "hidden")?;
-    let batch = axis(b, "batch")?;
+fn measure_residual_add_scaled_f32(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let h = input(call, "hidden")?;
+    let hidden = axis(h, "hidden")?;
+    let batch = axis(h, "batch")?;
     ensure!(
         hidden == KIMI_K2_HIDDEN,
-        "{} typed Kimi scaled-add expects hidden={KIMI_K2_HIDDEN}, got {hidden}",
+        "{} expects hidden={KIMI_K2_HIDDEN}, got {hidden}",
         call.label
     );
     let scale = call
@@ -304,11 +306,12 @@ fn measure_scaled_add_f32_bf16(call: &KernelCall, iters: u64) -> Result<LatencyS
         .and_then(|attr| attr.value.parse::<f32>().ok())
         .unwrap_or(2.827);
     let ctx = DeviceContext::new()?;
-    let a: CudaSlice<f32> = ctx.stream.alloc_zeros(hidden * batch)?;
-    let b = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, batch)?;
+    let hidden_t = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, batch)?;
+    let projected = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, batch)?;
+    let routed_f32: CudaSlice<f32> = ctx.stream.alloc_zeros(KIMI_K2_HIDDEN * batch)?;
     let mut out = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, batch)?;
     measure_loop(&ctx, iters, || {
-        kimi_scaled_add_f32_bf16_to_bf16(&ctx, &a, scale, &b, &mut out)
+        kimi_residual_add_scaled_f32(&ctx, &hidden_t, &projected, &routed_f32, scale, &mut out)
     })
 }
 
@@ -352,6 +355,34 @@ fn measure_mla_split_qkv_a(call: &KernelCall, iters: u64) -> Result<LatencyStats
     let mut k_rope = GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch)?;
     measure_loop(&ctx, iters, || {
         kimi_mla_split_qkv_a(&ctx, &qkv_a, &mut q_a, &mut compressed, &mut k_rope)
+    })
+}
+
+fn measure_mla_split_qkv_a_norm(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let qkv_a_spec = input(call, "qkv_a")?;
+    let batch = axis(qkv_a_spec, "batch")?;
+    let ctx = DeviceContext::new()?;
+    let qkv_a = GpuTensor::<KIMI_K2_MLA_QKV_A_OUT>::zeros(&ctx, batch)?;
+    let q_a_weight = NormWeight::<{ crate::config::KIMI_K2_Q_LORA_RANK }> {
+        data: ctx.stream.alloc_zeros(crate::config::KIMI_K2_Q_LORA_RANK)?,
+    };
+    let ckv_weight = NormWeight::<KIMI_K2_MLA_KV_LORA_RANK> {
+        data: ctx.stream.alloc_zeros(KIMI_K2_MLA_KV_LORA_RANK)?,
+    };
+    let mut q_a_normed = GpuTensor::<{ crate::config::KIMI_K2_Q_LORA_RANK }>::zeros(&ctx, batch)?;
+    let mut ckv_normed = GpuTensor::<KIMI_K2_MLA_KV_LORA_RANK>::zeros(&ctx, batch)?;
+    let mut k_rope = GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch)?;
+    measure_loop(&ctx, iters, || {
+        kimi_mla_split_qkv_a_norm(
+            &ctx,
+            &qkv_a,
+            &q_a_weight,
+            &ckv_weight,
+            &mut q_a_normed,
+            &mut ckv_normed,
+            &mut k_rope,
+            1e-6,
+        )
     })
 }
 

@@ -201,32 +201,21 @@ pub(super) fn forward_mla_decode_layer_into(
         &scratch.mla.normed,
         &mut scratch.mla.qkv_a,
     )?;
-    kimi_mla_split_qkv_a(
+    kimi_mla_split_qkv_a_norm(
         ctx,
         &scratch.mla.qkv_a,
-        &mut scratch.mla.q_a,
-        &mut scratch.mla.compressed_kv,
-        &mut scratch.mla.k_rope,
-    )?;
-    typed_ops::rms_norm_into(
-        ctx,
-        &scratch.mla.q_a,
         &attention.q_a_norm,
-        KIMI_K2_RMS_NORM_EPS,
+        &attention.kv_a_norm,
         &mut scratch.mla.q_a_normed,
+        &mut scratch.mla.compressed_normed,
+        &mut scratch.mla.k_rope,
+        KIMI_K2_RMS_NORM_EPS,
     )?;
     typed_ops::gemm_dm_typed_to_hs_graphsafe(
         ctx,
         &attention.q_b_proj,
         &scratch.mla.q_a_normed,
         &mut scratch.mla.q_proj,
-    )?;
-    typed_ops::rms_norm_into(
-        ctx,
-        &scratch.mla.compressed_kv,
-        &attention.kv_a_norm,
-        KIMI_K2_RMS_NORM_EPS,
-        &mut scratch.mla.compressed_normed,
     )?;
     kimi_mla_rope_split_decode_rt(
         ctx,
@@ -999,18 +988,14 @@ fn forward_moe_layer_decode_normed_after_event_into(
         nccl_comm,
     )?;
 
-    typed_ops::add_into(
+    kimi_residual_add_scaled_f32(
         ctx,
         &scratch.mla.hidden,
         &scratch.mla.projected,
-        &mut scratch.mla.normed,
-    )?;
-    kimi_scaled_add_f32_bf16_to_bf16(
-        ctx,
         &scratch.comm.routed_out_f32,
         KIMI_K2_ROUTER_SCALE,
-        &scratch.mla.normed,
-        &mut scratch.mla.hidden,
+        &mut scratch.mla.normed,
     )?;
+    std::mem::swap(&mut scratch.mla.hidden, &mut scratch.mla.normed);
     Ok(())
 }
