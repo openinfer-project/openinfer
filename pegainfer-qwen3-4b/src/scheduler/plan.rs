@@ -56,6 +56,7 @@ pub(super) fn execute_plan(
                 .map(|r| PrefillStepItem {
                     request_id: r.request_id,
                     prompt_tokens: r.prompt_tokens.clone(),
+                    max_output_tokens: r.max_tokens,
                     params: r.params,
                     logprobs: r.logprobs,
                     echo: r.echo,
@@ -91,6 +92,7 @@ pub(super) fn execute_plan(
                 .map(|r| PrefillStepItem {
                     request_id: r.request_id,
                     prompt_tokens: r.prompt_tokens.clone(),
+                    max_output_tokens: r.max_tokens,
                     params: r.params,
                     logprobs: r.logprobs,
                     echo: r.echo,

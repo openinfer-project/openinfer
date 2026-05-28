@@ -8,10 +8,11 @@ use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
 use pegainfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob};
-use pegainfer_core::kv_pool::{KvPool, KvState};
+use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_kv_cache::{KvBuffer, KvCacheManager, KvView};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct RequestId(pub(crate) u64);
@@ -30,6 +31,7 @@ impl RequestId {
 pub struct PrefillStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) max_output_tokens: usize,
     pub(crate) params: SamplingParams,
     pub(crate) logprobs: usize,
     pub(crate) echo: bool,
@@ -40,6 +42,7 @@ impl PrefillStepItem {
     pub fn new(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
+        max_output_tokens: usize,
         params: SamplingParams,
         logprobs: usize,
         echo: bool,
@@ -48,6 +51,7 @@ impl PrefillStepItem {
         Self {
             request_id,
             prompt_tokens,
+            max_output_tokens,
             params,
             logprobs,
             echo,
@@ -85,127 +89,6 @@ impl DecodeStepItem {
             random_val,
         }
     }
-}
-
-type RequestStateBatch = Vec<(RequestId, KvState)>;
-
-struct RequestStateStore {
-    states: HashMap<RequestId, KvState>,
-}
-
-impl RequestStateStore {
-    fn new() -> Self {
-        Self {
-            states: HashMap::new(),
-        }
-    }
-
-    fn ensure_with<F>(&mut self, request_ids: &[RequestId], mut alloc: F)
-    where
-        F: FnMut() -> KvState,
-    {
-        for &request_id in request_ids {
-            self.states.entry(request_id).or_insert_with(&mut alloc);
-        }
-    }
-
-    fn drop_request(&mut self, request_id: RequestId) {
-        self.states.remove(&request_id);
-    }
-
-    fn take_batch(
-        &mut self,
-        request_ids: &[RequestId],
-        missing_context: &'static str,
-    ) -> Result<RequestStateBatch> {
-        request_ids
-            .iter()
-            .map(|request_id| {
-                self.states
-                    .remove(request_id)
-                    .ok_or_else(|| anyhow::anyhow!("{missing_context} for {:?}", request_id))
-                    .map(|kv| (*request_id, kv))
-            })
-            .collect()
-    }
-
-    fn restore_batch(&mut self, batch: RequestStateBatch) {
-        for (request_id, kv_state) in batch {
-            let replaced = self.states.insert(request_id, kv_state);
-            debug_assert!(replaced.is_none(), "request state restored twice");
-        }
-    }
-}
-
-fn kv_state_refs(batch: &mut RequestStateBatch) -> Vec<&mut KvState> {
-    batch.iter_mut().map(|(_, kv_state)| kv_state).collect()
-}
-
-fn execute_prefill_on_lane(
-    lane: &mut LocalQwen3Lane,
-    request_states: &mut RequestStateStore,
-    requests: &[PrefillStepItem],
-    echo: bool,
-    missing_context: &'static str,
-) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
-    let request_ids: Vec<RequestId> = requests.iter().map(|req| req.request_id).collect();
-    request_states.ensure_with(&request_ids, || lane.alloc_kv());
-    let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
-    let mut request_state_batch = request_states.take_batch(&request_ids, missing_context)?;
-    let mut kv_states = kv_state_refs(&mut request_state_batch);
-    let result = lane.execute_prefill(&prompts, &mut kv_states, echo);
-    request_states.restore_batch(request_state_batch);
-    result
-}
-
-fn execute_decode_on_lane(
-    lane: &mut LocalQwen3Lane,
-    request_states: &mut RequestStateStore,
-    requests: &[DecodeStepItem],
-    missing_context: &'static str,
-) -> Result<()> {
-    let request_ids: Vec<RequestId> = requests.iter().map(|req| req.request_id).collect();
-    let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
-    let mut request_state_batch = request_states.take_batch(&request_ids, missing_context)?;
-    let mut kv_states = kv_state_refs(&mut request_state_batch);
-    let result = lane.execute_decode(&token_ids, &mut kv_states);
-    request_states.restore_batch(request_state_batch);
-    result
-}
-
-fn execute_unified_on_lane(
-    lane: &mut LocalQwen3Lane,
-    request_states: &mut RequestStateStore,
-    prefill_requests: &[PrefillStepItem],
-    decode_requests: &[DecodeStepItem],
-    prefill_missing_context: &'static str,
-    decode_missing_context: &'static str,
-) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
-    let prefill_request_ids: Vec<RequestId> =
-        prefill_requests.iter().map(|req| req.request_id).collect();
-    let decode_request_ids: Vec<RequestId> =
-        decode_requests.iter().map(|req| req.request_id).collect();
-    request_states.ensure_with(&prefill_request_ids, || lane.alloc_kv());
-    let prefill_prompts: Vec<&[u32]> = prefill_requests
-        .iter()
-        .map(PrefillStepItem::as_slice)
-        .collect();
-    let decode_tokens: Vec<u32> = decode_requests.iter().map(|req| req.token_id).collect();
-    let mut prefill_request_state_batch =
-        request_states.take_batch(&prefill_request_ids, prefill_missing_context)?;
-    let mut decode_request_state_batch =
-        request_states.take_batch(&decode_request_ids, decode_missing_context)?;
-    let mut prefill_kv_states = kv_state_refs(&mut prefill_request_state_batch);
-    let mut decode_kv_states = kv_state_refs(&mut decode_request_state_batch);
-    let result = lane.execute_unified(
-        &prefill_prompts,
-        &mut prefill_kv_states,
-        &decode_tokens,
-        &mut decode_kv_states,
-    );
-    request_states.restore_batch(prefill_request_state_batch);
-    request_states.restore_batch(decode_request_state_batch);
-    result
 }
 
 fn build_prefill_request_results(
@@ -286,19 +169,17 @@ fn build_decode_request_results(
 
 fn execute_step_on_lane(
     lane: &mut LocalQwen3Lane,
-    request_states: &mut RequestStateStore,
     step: &StepCommand,
     collect_result: bool,
 ) -> Result<WorkerStepOutcome> {
     match step {
-        StepCommand::Prefill { requests, echo } => {
-            let (logits, all_position_logits) = execute_prefill_on_lane(
-                lane,
-                request_states,
-                requests,
-                *echo,
-                "missing local request state",
-            )?;
+        StepCommand::Prefill {
+            requests,
+            kv_views,
+            echo,
+        } => {
+            let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
+            let (logits, all_position_logits) = lane.execute_prefill(&prompts, kv_views, *echo)?;
             if collect_result {
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
@@ -313,13 +194,9 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
-        StepCommand::Decode { requests } => {
-            execute_decode_on_lane(
-                lane,
-                request_states,
-                requests,
-                "missing local decode request state",
-            )?;
+        StepCommand::Decode { requests, kv_views } => {
+            let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
+            lane.execute_decode(&token_ids, kv_views)?;
             if collect_result {
                 let logits: Vec<DeviceVec> = (0..requests.len())
                     .map(|i| ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i))
@@ -333,15 +210,20 @@ fn execute_step_on_lane(
         }
         StepCommand::Unified {
             prefill_requests,
+            prefill_kv_views,
             decode_requests,
+            decode_kv_views,
         } => {
-            let (prefill_logits, decode_logits) = execute_unified_on_lane(
-                lane,
-                request_states,
-                prefill_requests,
-                decode_requests,
-                "missing local unified prefill request state",
-                "missing local unified decode request state",
+            let prefill_prompts: Vec<&[u32]> = prefill_requests
+                .iter()
+                .map(PrefillStepItem::as_slice)
+                .collect();
+            let decode_tokens: Vec<u32> = decode_requests.iter().map(|req| req.token_id).collect();
+            let (prefill_logits, decode_logits) = lane.execute_unified(
+                &prefill_prompts,
+                prefill_kv_views,
+                &decode_tokens,
+                decode_kv_views,
             )?;
             if collect_result {
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
@@ -500,9 +382,9 @@ pub struct UnifiedResult {
 }
 
 pub(crate) trait ModelExecutor: Send {
-    fn page_size(&self) -> usize;
-    fn max_request_pages(&self) -> usize;
-    fn available_pages(&self) -> usize;
+    fn block_size(&self) -> usize;
+    fn max_request_blocks(&self) -> usize;
+    fn available_blocks(&self) -> usize;
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
 
@@ -520,30 +402,46 @@ pub(crate) trait ModelExecutor: Send {
 }
 
 struct Qwen3ExecutorMetadata {
-    page_size: usize,
+    block_size: usize,
     stop_token_ids: Vec<u32>,
     config: Config,
 }
 
 pub struct Qwen3Executor {
     metadata: Qwen3ExecutorMetadata,
-    kv_pools: Vec<KvPool>,
+    kv_mgr: KvCacheManager,
+    request_kvs: HashMap<RequestId, pegainfer_kv_cache::RequestKv>,
     primary: RankWorker,
     workers: Vec<RankWorker>,
 }
 
 impl Qwen3Executor {
     pub(crate) fn single(model: Qwen3Model) -> Result<Self> {
+        let budget = model.kv_budget();
+        let kv_mgr = KvCacheManager::new(
+            &model.device_ctx().stream,
+            budget.num_layers,
+            budget.num_kv_heads,
+            budget.head_dim,
+            budget.block_size,
+            budget.num_blocks,
+        )?;
         let metadata = Qwen3ExecutorMetadata {
-            page_size: model.kv_pool().layout().page_size,
+            block_size: budget.block_size,
             stop_token_ids: model.config().stop_token_ids.clone(),
             config: model.config().clone(),
         };
-        let kv_pool = model.kv_pool().clone();
+        let kv_buffer = kv_mgr.buffer().clone();
+        let total_blocks = kv_mgr.total_blocks();
+        let padding_block_id = kv_mgr.padding_block_id();
         Ok(Self {
             metadata,
-            kv_pools: vec![kv_pool],
-            primary: RankWorker::spawn(0, LocalQwen3Lane::new(model)?)?,
+            kv_mgr,
+            request_kvs: HashMap::new(),
+            primary: RankWorker::spawn(
+                0,
+                LocalQwen3Lane::new(model, kv_buffer, total_blocks, padding_block_id)?,
+            )?,
             workers: Vec::new(),
         })
     }
@@ -582,11 +480,37 @@ impl Qwen3Executor {
             )?);
         }
 
+        // Compute budget from first model (all ranks share geometry).
+        let budget = models[0].kv_budget();
+
+        // Create the centralized KvCacheManager on rank 0's stream.
+        let kv_mgr = KvCacheManager::new(
+            &models[0].device_ctx().stream,
+            budget.num_layers,
+            budget.num_kv_heads,
+            budget.head_dim,
+            budget.block_size,
+            budget.num_blocks,
+        )?;
+
         let metadata = Qwen3ExecutorMetadata {
-            page_size: models[0].kv_pool().layout().page_size,
+            block_size: budget.block_size,
             stop_token_ids: models[0].config().stop_token_ids.clone(),
             config: models[0].config().clone(),
         };
+
+        // Create extra KvBuffers for ranks 1+ on their respective streams.
+        let mut extra_kv_buffers = Vec::with_capacity(world_size - 1);
+        for model in &models[1..] {
+            extra_kv_buffers.push(KvBuffer::new(
+                &model.device_ctx().stream,
+                budget.num_layers,
+                budget.num_kv_heads,
+                budget.head_dim,
+                budget.block_size,
+                budget.num_blocks,
+            )?);
+        }
 
         let streams = models
             .iter()
@@ -598,36 +522,52 @@ impl Qwen3Executor {
             model.attach_tp_comm(comm);
         }
 
-        let kv_pools = models.iter().map(|model| model.kv_pool().clone()).collect();
-        let mut lanes = models
-            .into_iter()
-            .map(LocalQwen3Lane::new)
-            .collect::<Result<Vec<_>>>()?;
-        let primary = RankWorker::spawn(0, lanes.remove(0))?;
-        let workers = lanes
-            .into_iter()
+        let total_blocks = kv_mgr.total_blocks();
+        let padding_block_id = kv_mgr.padding_block_id();
+
+        // Primary rank gets the KvBuffer from the centralized manager.
+        let primary_buffer = kv_mgr.buffer().clone();
+        let mut models_iter = models.into_iter();
+        let primary_model = models_iter.next().unwrap();
+        let primary = RankWorker::spawn(
+            0,
+            LocalQwen3Lane::new(
+                primary_model,
+                primary_buffer,
+                total_blocks,
+                padding_block_id,
+            )?,
+        )?;
+
+        // Worker ranks get their own extra KvBuffers.
+        let workers = models_iter
+            .zip(extra_kv_buffers)
             .enumerate()
-            .map(|(index, lane)| RankWorker::spawn(index + 1, lane))
+            .map(|(index, (model, buffer))| {
+                let lane = LocalQwen3Lane::new(model, buffer, total_blocks, padding_block_id)?;
+                RankWorker::spawn(index + 1, lane)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             metadata,
-            kv_pools,
+            kv_mgr,
+            request_kvs: HashMap::new(),
             primary,
             workers,
         })
     }
 
-    pub fn page_size(&self) -> usize {
-        <Self as ModelExecutor>::page_size(self)
+    pub fn block_size(&self) -> usize {
+        <Self as ModelExecutor>::block_size(self)
     }
 
-    pub fn max_request_pages(&self) -> usize {
-        <Self as ModelExecutor>::max_request_pages(self)
+    pub fn max_request_blocks(&self) -> usize {
+        <Self as ModelExecutor>::max_request_blocks(self)
     }
 
-    pub fn available_pages(&self) -> usize {
-        <Self as ModelExecutor>::available_pages(self)
+    pub fn available_blocks(&self) -> usize {
+        <Self as ModelExecutor>::available_blocks(self)
     }
 
     pub fn is_stop_token(&self, token_id: u32) -> bool {
@@ -686,24 +626,16 @@ impl Qwen3Executor {
 }
 
 impl ModelExecutor for Qwen3Executor {
-    fn page_size(&self) -> usize {
-        self.metadata.page_size
+    fn block_size(&self) -> usize {
+        self.metadata.block_size
     }
 
-    fn max_request_pages(&self) -> usize {
-        self.kv_pools
-            .iter()
-            .map(|pool| pool.capacity_pages().saturating_sub(1))
-            .min()
-            .unwrap_or(0)
+    fn max_request_blocks(&self) -> usize {
+        self.kv_mgr.max_request_blocks()
     }
 
-    fn available_pages(&self) -> usize {
-        self.kv_pools
-            .iter()
-            .map(KvPool::available_pages)
-            .min()
-            .unwrap_or(0)
+    fn available_blocks(&self) -> usize {
+        self.kv_mgr.available_blocks()
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -711,52 +643,179 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
-        self.primary.drop_request(request_id)?;
-        for worker in &self.workers {
-            worker.drop_request(request_id)?;
-        }
+        // Remove and drop — RAII on SchedulableSequence's block guards
+        // returns all allocated blocks regardless of lifecycle state.
+        self.request_kvs.remove(&request_id);
         Ok(())
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+        // 1. Create RequestKvs and schedule prefill
+        for req in plan.requests {
+            let mut rkv = self
+                .kv_mgr
+                .new_request(req.prompt_tokens.clone(), req.max_output_tokens);
+            rkv.schedule_prefill(req.prompt_tokens.len(), &self.kv_mgr)
+                .map_err(|e| {
+                    anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
+                })?;
+            self.request_kvs.insert(req.request_id, rkv);
+        }
+
+        // 2. Build KvViews
+        let kv_views: Vec<KvView> = plan
+            .requests
+            .iter()
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.prompt_tokens.len()))
+            .collect();
+
+        // 3. Execute forward
         let step = StepCommand::Prefill {
             requests: plan.requests.to_vec(),
+            kv_views,
             echo: plan.echo,
         };
-        match self.run_step(&step)? {
-            WorkerStepOutcome::Prefill(result) => Ok(result),
-            other => Err(anyhow::anyhow!(
-                "prefill step returned unexpected payload: {}",
-                other.kind()
-            )),
+        let outcome = self.run_step(&step)?;
+
+        // 4. Apply prefill
+        let result = match outcome {
+            WorkerStepOutcome::Prefill(result) => result,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "prefill returned unexpected: {}",
+                    other.kind()
+                ));
+            }
+        };
+        for req_result in &result.requests {
+            let rkv = self
+                .request_kvs
+                .get_mut(&req_result.request_id)
+                .expect("request must exist after prefill");
+            rkv.apply_prefill(req_result.first_token, &self.kv_mgr)?;
         }
+
+        Ok(result)
     }
 
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+        // 1. Schedule decode for all active requests
+        for req in plan.requests {
+            let rkv = self
+                .request_kvs
+                .get_mut(&req.request_id)
+                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
+            rkv.schedule_decode(&self.kv_mgr).map_err(|e| {
+                anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
+            })?;
+        }
+
+        // 2. Build KvViews
+        let kv_views: Vec<KvView> = plan
+            .requests
+            .iter()
+            .map(|req| self.request_kvs[&req.request_id].decode_view())
+            .collect();
+
+        // 3. Execute forward
         let step = StepCommand::Decode {
             requests: plan.requests.to_vec(),
+            kv_views,
         };
-        match self.run_step(&step)? {
-            WorkerStepOutcome::Decode(result) => Ok(result),
-            other => Err(anyhow::anyhow!(
-                "decode step returned unexpected payload: {}",
-                other.kind()
-            )),
+        let outcome = self.run_step(&step)?;
+
+        // 4. Apply decode
+        let result = match outcome {
+            WorkerStepOutcome::Decode(result) => result,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "decode returned unexpected: {}",
+                    other.kind()
+                ));
+            }
+        };
+        for req_result in &result.requests {
+            let rkv = self
+                .request_kvs
+                .get_mut(&req_result.request_id)
+                .expect("request must exist after decode");
+            rkv.apply_decode(req_result.token, &self.kv_mgr)?;
         }
+
+        Ok(result)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+        // 1. Create RequestKvs for prefill requests and schedule
+        for req in plan.prefill_requests {
+            let mut rkv = self
+                .kv_mgr
+                .new_request(req.prompt_tokens.clone(), req.max_output_tokens);
+            rkv.schedule_prefill(req.prompt_tokens.len(), &self.kv_mgr)
+                .map_err(|e| {
+                    anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
+                })?;
+            self.request_kvs.insert(req.request_id, rkv);
+        }
+
+        // Schedule decode for active requests
+        for req in plan.decode_requests {
+            let rkv = self
+                .request_kvs
+                .get_mut(&req.request_id)
+                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
+            rkv.schedule_decode(&self.kv_mgr).map_err(|e| {
+                anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
+            })?;
+        }
+
+        // 2. Build KvViews
+        let prefill_kv_views: Vec<KvView> = plan
+            .prefill_requests
+            .iter()
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.prompt_tokens.len()))
+            .collect();
+        let decode_kv_views: Vec<KvView> = plan
+            .decode_requests
+            .iter()
+            .map(|req| self.request_kvs[&req.request_id].decode_view())
+            .collect();
+
+        // 3. Execute forward
         let step = StepCommand::Unified {
             prefill_requests: plan.prefill_requests.to_vec(),
+            prefill_kv_views,
             decode_requests: plan.decode_requests.to_vec(),
+            decode_kv_views,
         };
-        match self.run_step(&step)? {
-            WorkerStepOutcome::Unified(result) => Ok(result),
-            other => Err(anyhow::anyhow!(
-                "unified step returned unexpected payload: {}",
-                other.kind()
-            )),
+        let outcome = self.run_step(&step)?;
+
+        // 4. Apply both prefill and decode
+        let result = match outcome {
+            WorkerStepOutcome::Unified(result) => result,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unified returned unexpected: {}",
+                    other.kind()
+                ));
+            }
+        };
+        for req_result in &result.prefill_requests {
+            let rkv = self
+                .request_kvs
+                .get_mut(&req_result.request_id)
+                .expect("request must exist after unified prefill");
+            rkv.apply_prefill(req_result.first_token, &self.kv_mgr)?;
         }
+        for req_result in &result.decode_requests {
+            let rkv = self
+                .request_kvs
+                .get_mut(&req_result.request_id)
+                .expect("request must exist after unified decode");
+            rkv.apply_decode(req_result.token, &self.kv_mgr)?;
+        }
+
+        Ok(result)
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -816,17 +875,44 @@ impl Drop for Qwen3Executor {
 
 struct LocalQwen3Lane {
     model: Qwen3Model,
+    kv_buffer: KvBuffer,
+    layout: KvLayout,
     bufs: BatchDecodeBuffers,
     sample_scratch: SamplingScratch,
 }
 
 impl LocalQwen3Lane {
-    fn new(model: Qwen3Model) -> Result<Self> {
+    fn new(
+        model: Qwen3Model,
+        kv_buffer: KvBuffer,
+        total_blocks: usize,
+        padding_block_id: i32,
+    ) -> Result<Self> {
+        let buf_layout = kv_buffer.layout();
+        let layout = KvLayout::new(
+            buf_layout.num_layers,
+            buf_layout.num_kv_heads,
+            buf_layout.head_dim,
+            buf_layout.page_size,
+        );
         let max_bucket = *BATCH_BUCKETS.last().unwrap();
-        let bufs = model.create_batch_decode_bufs(max_bucket)?;
+        let bufs = BatchDecodeBuffers::new(
+            model.device_ctx(),
+            model.config().hidden_size,
+            model.local_q_dim(),
+            model.local_kv_dim(),
+            model.local_intermediate_size(),
+            model.config().vocab_size,
+            max_bucket,
+            total_blocks,
+            padding_block_id,
+            model.local_num_attention_heads(),
+        )?;
         let sample_scratch = SamplingScratch::new(model.device_ctx(), model.config().vocab_size)?;
         Ok(Self {
             model,
+            kv_buffer,
+            layout,
             bufs,
             sample_scratch,
         })
@@ -835,10 +921,6 @@ impl LocalQwen3Lane {
     fn bind(&self) -> Result<CublasThreadGuard> {
         bind_model_thread(&self.model)?;
         Ok(CublasThreadGuard)
-    }
-
-    fn alloc_kv(&self) -> KvState {
-        self.model.alloc_kv()
     }
 
     fn sample_from_logits(
@@ -889,29 +971,42 @@ impl LocalQwen3Lane {
     fn execute_prefill(
         &mut self,
         prompts: &[&[u32]],
-        kv_states: &mut [&mut KvState],
+        kv_views: &[KvView],
         echo: bool,
     ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
-        self.model.batch_prefill(prompts, kv_states, echo)
+        self.model.batch_prefill(
+            prompts,
+            kv_views,
+            self.kv_buffer.buffer(),
+            &self.layout,
+            echo,
+        )
     }
 
-    fn execute_decode(&mut self, token_ids: &[u32], kv_states: &mut [&mut KvState]) -> Result<()> {
-        self.model
-            .batch_decode(token_ids, kv_states, &mut self.bufs)
+    fn execute_decode(&mut self, token_ids: &[u32], kv_views: &[KvView]) -> Result<()> {
+        self.model.batch_decode(
+            token_ids,
+            kv_views,
+            self.kv_buffer.buffer(),
+            &self.layout,
+            &mut self.bufs,
+        )
     }
 
     fn execute_unified(
         &mut self,
         prefill_prompts: &[&[u32]],
-        prefill_kv_states: &mut [&mut KvState],
+        prefill_views: &[KvView],
         decode_tokens: &[u32],
-        decode_kv_states: &mut [&mut KvState],
+        decode_views: &[KvView],
     ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
         self.model.unified_step(
             prefill_prompts,
-            prefill_kv_states,
+            prefill_views,
             decode_tokens,
-            decode_kv_states,
+            decode_views,
+            self.kv_buffer.buffer(),
+            &self.layout,
         )
     }
 
@@ -927,14 +1022,18 @@ impl LocalQwen3Lane {
 enum StepCommand {
     Prefill {
         requests: Vec<PrefillStepItem>,
+        kv_views: Vec<KvView>,
         echo: bool,
     },
     Decode {
         requests: Vec<DecodeStepItem>,
+        kv_views: Vec<KvView>,
     },
     Unified {
         prefill_requests: Vec<PrefillStepItem>,
+        prefill_kv_views: Vec<KvView>,
         decode_requests: Vec<DecodeStepItem>,
+        decode_kv_views: Vec<KvView>,
     },
 }
 
@@ -953,10 +1052,6 @@ enum WorkerCommand {
         step: StepCommand,
         collect_result: bool,
         resp: channel::Sender<Result<WorkerStepOutcome>>,
-    },
-    DropRequest {
-        request_id: RequestId,
-        resp: channel::Sender<Result<()>>,
     },
     LoadLoraAdapter {
         name: String,
@@ -996,7 +1091,6 @@ impl RankWorker {
         let handle = thread::Builder::new()
             .name(format!("qwen3-tp-rank-{rank}"))
             .spawn(move || {
-                let mut request_states = RequestStateStore::new();
                 let startup = lane.bind();
                 match startup {
                     Ok(_guard) => {
@@ -1008,17 +1102,9 @@ impl RankWorker {
                                     collect_result,
                                     resp,
                                 } => {
-                                    let result = execute_step_on_lane(
-                                        &mut lane,
-                                        &mut request_states,
-                                        &step,
-                                        collect_result,
-                                    );
+                                    let result =
+                                        execute_step_on_lane(&mut lane, &step, collect_result);
                                     let _ = resp.send(result);
-                                }
-                                WorkerCommand::DropRequest { request_id, resp } => {
-                                    request_states.drop_request(request_id);
-                                    let _ = resp.send(Ok(()));
                                 }
                                 WorkerCommand::LoadLoraAdapter {
                                     name,
@@ -1061,21 +1147,6 @@ impl RankWorker {
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
         Ok(resp_rx)
-    }
-
-    fn drop_request(&self, request_id: RequestId) -> Result<()> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::DropRequest {
-                request_id,
-                resp: resp_tx,
-            })
-            .map_err(|_| {
-                anyhow::anyhow!("tensor-parallel worker channel closed on drop_request")
-            })?;
-        resp_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker dropped drop_request response"))?
     }
 
     fn load_lora_adapter(

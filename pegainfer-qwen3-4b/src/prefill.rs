@@ -1,12 +1,15 @@
 use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use half::bf16;
 
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::lora::apply_lora_projection_delta;
-use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use pegainfer_kv_cache::KvView;
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 /// Created once per prefill pass, eliminating
@@ -316,30 +319,33 @@ impl Qwen3Model {
     pub(crate) fn batch_prefill(
         &self,
         prompts: &[&[u32]],
-        kv_states: &mut [&mut KvState],
+        kv_views: &[KvView],
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
         echo: bool,
     ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
-        assert_eq!(batch_size, kv_states.len());
+        assert_eq!(batch_size, kv_views.len());
 
         let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
-        let start_positions: Vec<usize> = kv_states.iter().map(|kv| kv.seq_len()).collect();
+        let start_positions: Vec<usize> = kv_views
+            .iter()
+            .zip(prompts.iter())
+            .map(|(v, p)| v.seq_len() - p.len())
+            .collect();
 
         // Concatenate all tokens
         let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
         let hidden = self.get_embeddings_batch(&all_tokens)?;
 
-        // Allocate pages and advance for each request
-        for (i, kv) in kv_states.iter_mut().enumerate() {
-            kv.ensure_capacity(start_positions[i] + seq_lens[i])?;
-            kv.advance(seq_lens[i]);
-        }
-
-        // Build batch plan (all descs must reflect post-advance state)
-        let descs: Vec<_> = kv_states.iter().map(|kv| kv.desc()).collect();
-        let plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
+        // Build batch plan from views
+        let page_indices: Vec<Vec<i32>> =
+            kv_views.iter().map(|v| v.page_indices().to_vec()).collect();
+        let last_page_lens: Vec<usize> = kv_views.iter().map(|v| v.last_page_len()).collect();
+        let plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,
-            &descs,
+            &page_indices,
+            &last_page_lens,
             &start_positions,
             &seq_lens,
             self.local_num_attention_heads(),
@@ -349,9 +355,7 @@ impl Qwen3Model {
         )?;
 
         // Forward through all layers
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
-        let hidden = self.process_all_layers_batch_multi(hidden, &layout, kv_buffer, &plan)?;
+        let hidden = self.process_all_layers_batch_multi(hidden, layout, kv_buffer, &plan)?;
 
         // All-position logits for echo (before we extract last-token logits)
         let all_logits = if echo {

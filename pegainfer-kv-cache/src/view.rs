@@ -8,6 +8,7 @@ use crate::layout::KvLayout;
 ///
 /// Built from a `SchedulableSequence`'s assigned block IDs before each
 /// forward pass. Block lifecycle is managed externally by `BlockManager`.
+#[derive(Clone)]
 pub struct KvView {
     page_indices: Vec<i32>,
     seq_len: usize,

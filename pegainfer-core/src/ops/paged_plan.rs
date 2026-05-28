@@ -120,6 +120,33 @@ impl PrefillPagedPlan {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_raw_batch_with_cta_tile_q(
+        ctx: &DeviceContext,
+        page_indices: &[Vec<i32>],
+        last_page_lens: &[usize],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: pegainfer_kernels::ops::PrefillPagedPlan::new_batch_with_cta_tile_q(
+                ctx,
+                page_indices,
+                last_page_lens,
+                start_positions,
+                seq_lens,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                cta_tile_q_override,
+            )?,
+        })
+    }
+
     pub fn page_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.page_indices_d()
     }

@@ -38,14 +38,34 @@ pub fn trace_decode_kernel_calls(
             device_ordinal: 0,
         },
     )?;
-    let mut kv_states = (0..batch_size)
+    let budget = model.kv_budget();
+    let kv_mgr = pegainfer_kv_cache::KvCacheManager::new(
+        &model.device_ctx().stream,
+        budget.num_layers,
+        budget.num_kv_heads,
+        budget.head_dim,
+        budget.block_size,
+        budget.num_blocks,
+    )?;
+    let layout = pegainfer_core::kv_pool::KvLayout::new(
+        budget.num_layers,
+        budget.num_kv_heads,
+        budget.head_dim,
+        budget.block_size,
+    );
+
+    // Build dummy RequestKvs with the target kv_len
+    let dummy_prompt_len = if kv_len > 1 { kv_len - 1 } else { 1 };
+    let mut rkvs = (0..batch_size)
         .map(|_| {
-            let mut kv = model.alloc_kv();
-            if kv_len > 1 {
-                kv.ensure_capacity(kv_len - 1)?;
-                kv.advance(kv_len - 1);
-            }
-            Ok(kv)
+            let mut rkv = kv_mgr.new_request(vec![0; dummy_prompt_len], 1);
+            rkv.schedule_prefill(dummy_prompt_len, &kv_mgr)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            rkv.apply_prefill(0, &kv_mgr)?;
+            // Now kv_position == dummy_prompt_len. Schedule one decode step.
+            rkv.schedule_decode(&kv_mgr)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(rkv)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -57,14 +77,20 @@ pub fn trace_decode_kernel_calls(
         model.local_intermediate_size(),
         model.config().vocab_size,
         batch_size,
-        model.kv_pool.capacity_pages(),
-        model.kv_pool.padding_page_id(),
+        kv_mgr.total_blocks(),
+        kv_mgr.padding_block_id(),
         model.local_num_attention_heads(),
     )?;
     let token_ids = vec![0_u32; batch_size];
+    let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
     let ((), calls) = call_trace::collect_result(|| {
-        let mut kv_refs = kv_states.iter_mut().collect::<Vec<_>>();
-        model.batch_decode(&token_ids, &mut kv_refs, &mut bufs)
+        model.batch_decode(
+            &token_ids,
+            &views,
+            kv_mgr.buffer().buffer(),
+            &layout,
+            &mut bufs,
+        )
     })?;
     Ok(calls)
 }

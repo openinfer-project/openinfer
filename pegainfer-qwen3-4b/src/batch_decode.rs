@@ -2,16 +2,20 @@
 
 use anyhow::Result;
 
+use cudarc::driver::CudaSlice;
+use half::bf16;
+
 use super::batch_decode_buffers::{
     BATCH_BUCKETS, BatchDecodeBuffers, DecodeAttentionPath, bucket_for,
 };
 use super::batch_decode_dag::BatchDecodeDag;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::lora::apply_lora_projection_delta;
-use pegainfer_core::kv_pool::{KvLayout, KvState};
+use pegainfer_core::kv_pool::KvLayout;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops;
 use pegainfer_kernels::tensor::{KvDim, QDim};
+use pegainfer_kv_cache::KvView;
 
 #[cfg(feature = "kernel-call-trace")]
 macro_rules! dag_label {
@@ -47,21 +51,17 @@ impl Qwen3Model {
     pub(crate) fn batch_decode(
         &self,
         token_ids: &[u32],
-        kv_states: &mut [&mut KvState],
+        kv_views: &[KvView],
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         let bs = token_ids.len();
-        assert_eq!(bs, kv_states.len());
+        assert_eq!(bs, kv_views.len());
         assert!(bs > 0);
 
-        // Grow pages and advance seq_len for each request
-        let mut positions = Vec::with_capacity(bs);
-        for kv in kv_states.iter_mut() {
-            let pos = kv.seq_len();
-            kv.ensure_capacity(pos + 1)?;
-            kv.advance(1);
-            positions.push(pos as i32);
-        }
+        // Derive positions from views (seq_len - 1 = position of the new token)
+        let mut positions: Vec<i32> = kv_views.iter().map(|v| (v.seq_len() - 1) as i32).collect();
 
         // Pad to bucket size for CUDA Graph stability
         let padded_bs = if self.enable_cuda_graph {
@@ -85,15 +85,11 @@ impl Qwen3Model {
             .stream
             .memcpy_htod(&positions, &mut bufs.positions_d)?;
 
-        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
+        let kv_refs: Vec<&KvView> = kv_views.iter().collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
         let attention_path = bufs.attention_path(padded_bs);
         #[cfg(feature = "kernel-call-trace")]
-        let trace_kv_len = kv_refs.iter().map(|kv| kv.seq_len()).max().unwrap_or(0);
-
-        // Forward pass — with or without CUDA Graph
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
+        let trace_kv_len = kv_views.iter().map(|v| v.seq_len()).max().unwrap_or(0);
         if self.enable_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
@@ -101,14 +97,14 @@ impl Qwen3Model {
             let mut graphs = std::mem::take(&mut bufs.graphs);
             let result = graphs[graph_idx].run_or_capture(&self.ctx, || {
                 trace_decode_kv_len!(trace_kv_len, {
-                    self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)
+                    self.batch_decode_kernels(kv_buffer, layout, padded_bs, attention_path, bufs)
                 })
             });
             bufs.graphs = graphs;
             result?;
         } else {
             trace_decode_kv_len!(trace_kv_len, {
-                self.batch_decode_kernels(kv_buffer, &layout, padded_bs, attention_path, bufs)
+                self.batch_decode_kernels(kv_buffer, layout, padded_bs, attention_path, bufs)
             })?;
         }
 
@@ -370,6 +366,7 @@ mod tests {
     use pegainfer_core::ops;
     use pegainfer_core::sampler::SamplingParams;
     use pegainfer_core::tensor::DeviceVec;
+    use pegainfer_kv_cache::{KvCacheManager, RequestKv};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use std::path::Path;
@@ -389,6 +386,24 @@ mod tests {
                 None
             }
         }
+    }
+
+    fn make_kv_mgr(model: &Qwen3Model) -> KvCacheManager {
+        let budget = model.kv_budget();
+        KvCacheManager::new(
+            &model.ctx.stream,
+            budget.num_layers,
+            budget.num_kv_heads,
+            budget.head_dim,
+            budget.block_size,
+            budget.num_blocks,
+        )
+        .unwrap()
+    }
+
+    fn core_layout(mgr: &KvCacheManager) -> KvLayout {
+        let l = mgr.buffer().layout();
+        KvLayout::new(l.num_layers, l.num_kv_heads, l.head_dim, l.page_size)
     }
 
     fn sample_batch_tokens(
@@ -467,33 +482,43 @@ mod tests {
 
     fn prefill_one(
         model: &Qwen3Model,
+        mgr: &KvCacheManager,
+        layout: &KvLayout,
         prompt_tokens: &[u32],
         params: &SamplingParams,
         rng: &mut StdRng,
-    ) -> (KvState, u32) {
-        let mut kv_state = model.kv_pool.alloc();
-        let prompts: Vec<&[u32]> = vec![prompt_tokens];
-        let mut kv_refs: Vec<&mut KvState> = vec![&mut kv_state];
-        let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
+    ) -> (RequestKv, u32) {
+        let mut rkv = mgr.new_request(prompt_tokens.to_vec(), 256);
+        rkv.schedule_prefill(prompt_tokens.len(), mgr).unwrap();
+        let view = rkv.prefill_view(prompt_tokens.len());
+        let (logits_vec, _) = model
+            .batch_prefill(
+                &[prompt_tokens],
+                &[view],
+                mgr.buffer().buffer(),
+                layout,
+                false,
+            )
+            .unwrap();
         let first_token = sample_logits(model, &logits_vec[0], params, rng);
-        (kv_state, first_token)
+        rkv.apply_prefill(first_token, mgr).unwrap();
+        (rkv, first_token)
     }
 
-    /// Run single-request decode via batch_decode(bs=1) for a prompt, return generated token IDs.
-    ///
-    /// Uses batch_prefill and batch_decode with bs=1 so the decode path
-    /// is identical to the multi-request batch — same cuBLAS handle, same FlashInfer
-    /// BatchDecode kernel.
     fn sequential_decode(
         model: &Qwen3Model,
+        mgr: &KvCacheManager,
+        layout: &KvLayout,
         prompt_tokens: &[u32],
         num_decode_steps: usize,
         seed: u64,
     ) -> Vec<u32> {
-        let params = SamplingParams::default(); // greedy
+        let params = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(seed);
 
-        let (mut kv_state, first_token) = prefill_one(model, prompt_tokens, &params, &mut rng);
+        let (mut rkv, first_token) =
+            prefill_one(model, mgr, layout, prompt_tokens, &params, &mut rng);
+
         let mut bufs = BatchDecodeBuffers::new(
             &model.ctx,
             model.config.hidden_size,
@@ -502,8 +527,8 @@ mod tests {
             model.local_intermediate_size(),
             model.config.vocab_size,
             1,
-            model.kv_pool.capacity_pages(),
-            model.kv_pool.padding_page_id(),
+            mgr.total_blocks(),
+            mgr.padding_block_id(),
             model.local_num_attention_heads(),
         )
         .unwrap();
@@ -511,20 +536,30 @@ mod tests {
         let mut tokens = vec![first_token];
         for _ in 1..num_decode_steps {
             let token_ids = [*tokens.last().unwrap()];
-            let mut kv_refs: Vec<&mut KvState> = vec![&mut kv_state];
+            rkv.schedule_decode(mgr).unwrap();
+            let view = rkv.decode_view();
             model
-                .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
+                .batch_decode(
+                    &token_ids,
+                    &[view],
+                    mgr.buffer().buffer(),
+                    layout,
+                    &mut bufs,
+                )
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = vec![&params];
             let batch_tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
+            rkv.apply_decode(batch_tokens[0], mgr).unwrap();
             tokens.push(batch_tokens[0]);
         }
+        rkv.release().unwrap();
         tokens
     }
 
-    /// Run batch decode for multiple prompts, return per-request generated tokens.
     fn batch_decode_run(
         model: &Qwen3Model,
+        mgr: &KvCacheManager,
+        layout: &KvLayout,
         prompts: &[&[u32]],
         num_decode_steps: usize,
         seed: u64,
@@ -533,17 +568,31 @@ mod tests {
         let params = SamplingParams::default();
         let mut rng = StdRng::seed_from_u64(seed);
 
-        let mut kv_states: Vec<KvState> = (0..bs).map(|_| model.kv_pool.alloc()).collect();
-        let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
-        let (logits_vec, _) = model.batch_prefill(prompts, &mut kv_refs, false).unwrap();
+        // Prefill all requests
+        let mut rkvs: Vec<RequestKv> = Vec::with_capacity(bs);
+        for &prompt in prompts {
+            let mut rkv = mgr.new_request(prompt.to_vec(), 256);
+            rkv.schedule_prefill(prompt.len(), mgr).unwrap();
+            rkvs.push(rkv);
+        }
+        let views: Vec<_> = rkvs
+            .iter()
+            .zip(prompts.iter())
+            .map(|(r, p)| r.prefill_view(p.len()))
+            .collect();
+        let (logits_vec, _) = model
+            .batch_prefill(prompts, &views, mgr.buffer().buffer(), layout, false)
+            .unwrap();
         let first_tokens: Vec<u32> = logits_vec
             .iter()
             .map(|logits| sample_logits(model, logits, &params, &mut rng))
             .collect();
+        for (rkv, &tok) in rkvs.iter_mut().zip(&first_tokens) {
+            rkv.apply_prefill(tok, mgr).unwrap();
+        }
 
         let mut all_tokens: Vec<Vec<u32>> = first_tokens.iter().map(|&t| vec![t]).collect();
 
-        // Allocate buffers at bucket size (graph padding may exceed actual bs)
         let max_bs = if model.enable_cuda_graph {
             bucket_for(bs)
         } else {
@@ -557,38 +606,42 @@ mod tests {
             model.local_intermediate_size(),
             model.config.vocab_size,
             max_bs,
-            model.kv_pool.capacity_pages(),
-            model.kv_pool.padding_page_id(),
+            mgr.total_blocks(),
+            mgr.padding_block_id(),
             model.local_num_attention_heads(),
         )
         .unwrap();
 
         for _ in 1..num_decode_steps {
             let token_ids: Vec<u32> = all_tokens.iter().map(|t| *t.last().unwrap()).collect();
-            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
+            for rkv in &mut rkvs {
+                rkv.schedule_decode(mgr).unwrap();
+            }
+            let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
             model
-                .batch_decode(&token_ids, &mut kv_refs, &mut bufs)
+                .batch_decode(&token_ids, &views, mgr.buffer().buffer(), layout, &mut bufs)
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
             let tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             for (i, &tok) in tokens.iter().enumerate() {
+                rkvs[i].apply_decode(tok, mgr).unwrap();
                 all_tokens[i].push(tok);
             }
         }
 
+        for rkv in &mut rkvs {
+            rkv.release().unwrap();
+        }
         all_tokens
     }
 
-    /// Verify batch prefill, batch decode, and batch decode with CUDA Graph all match
-    /// sequential single-request results. Runs as one test to avoid parallel model loads
-    /// OOM-ing on a single GPU.
     #[test]
     fn batch_matches_sequential() {
         let Some(model_path) = get_model_path_or_skip() else {
             return;
         };
-        let prompt_a: Vec<u32> = vec![9707]; // "Hello"
-        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17]; // "What is 2+2"
+        let prompt_a: Vec<u32> = vec![9707];
+        let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
         let num_steps = 10;
         let seed = 42;
 
@@ -603,8 +656,10 @@ mod tests {
                 },
             )
             .unwrap();
+            let mgr = make_kv_mgr(&model);
+            let layout = core_layout(&mgr);
 
-            // Batch prefill: multi-token prompts so both paths use GEMM prefill
+            // Batch prefill: multi-token prompts
             let prefill_a: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
             let prefill_b: Vec<u32> = (1..65).collect();
             let prefill_c: Vec<u32> = (1..129).collect();
@@ -613,20 +668,39 @@ mod tests {
             let mut seq_first_tokens = Vec::new();
             for prompt in [&prefill_a, &prefill_b, &prefill_c] {
                 let mut rng = StdRng::seed_from_u64(seed);
-                let (_kv_state, token) = prefill_one(&model, prompt.as_slice(), &params, &mut rng);
+                let (_rkv, token) =
+                    prefill_one(&model, &mgr, &layout, prompt.as_slice(), &params, &mut rng);
                 seq_first_tokens.push(token);
             }
 
+            // Batch prefill all three at once
             let prompts: Vec<&[u32]> = vec![&prefill_a, &prefill_b, &prefill_c];
-            let mut kv_states: Vec<KvState> = (0..3).map(|_| model.kv_pool.alloc()).collect();
-            let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
-            let (logits_vec, _) = model.batch_prefill(&prompts, &mut kv_refs, false).unwrap();
+            let mut rkvs: Vec<RequestKv> = prompts
+                .iter()
+                .map(|p| {
+                    let mut r = mgr.new_request(p.to_vec(), 256);
+                    r.schedule_prefill(p.len(), &mgr).unwrap();
+                    r
+                })
+                .collect();
+            let views: Vec<_> = rkvs
+                .iter()
+                .zip(&prompts)
+                .map(|(r, p)| r.prefill_view(p.len()))
+                .collect();
+            let (logits_vec, _) = model
+                .batch_prefill(&prompts, &views, mgr.buffer().buffer(), &layout, false)
+                .unwrap();
 
             let mut batch_first_tokens = Vec::new();
-            for logits in &logits_vec {
+            for (i, logits) in logits_vec.iter().enumerate() {
                 let mut rng = StdRng::seed_from_u64(seed);
                 let token = sample_logits(&model, logits, &params, &mut rng);
+                rkvs[i].apply_prefill(token, &mgr).unwrap();
                 batch_first_tokens.push(token);
+            }
+            for rkv in &mut rkvs {
+                rkv.release().unwrap();
             }
 
             for (i, (seq_tok, batch_tok)) in seq_first_tokens
@@ -640,23 +714,20 @@ mod tests {
                 );
             }
 
-            // Batch decode (no graph)
-            let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
-            let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
-            let batch = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
+            let seq_a = sequential_decode(&model, &mgr, &layout, &prompt_a, num_steps, seed);
+            let seq_b = sequential_decode(&model, &mgr, &layout, &prompt_b, num_steps, seed);
+            let batch = batch_decode_run(
+                &model,
+                &mgr,
+                &layout,
+                &[&prompt_a, &prompt_b],
+                num_steps,
+                seed,
+            );
 
-            assert_eq!(
-                batch[0], seq_a,
-                "Decode request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
-                batch[0], seq_a
-            );
-            assert_eq!(
-                batch[1], seq_b,
-                "Decode request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
-                batch[1], seq_b
-            );
+            assert_eq!(batch[0], seq_a, "Decode request A mismatch");
+            assert_eq!(batch[1], seq_b, "Decode request B mismatch");
         }
-        // model dropped, GPU memory freed
 
         // --- Phase 2: batch decode with CUDA Graph ---
         {
@@ -669,21 +740,22 @@ mod tests {
                 },
             )
             .unwrap();
+            let mgr = make_kv_mgr(&model);
+            let layout = core_layout(&mgr);
 
-            let seq_a = sequential_decode(&model, &prompt_a, num_steps, seed);
-            let seq_b = sequential_decode(&model, &prompt_b, num_steps, seed);
-            let batch = batch_decode_run(&model, &[&prompt_a, &prompt_b], num_steps, seed);
+            let seq_a = sequential_decode(&model, &mgr, &layout, &prompt_a, num_steps, seed);
+            let seq_b = sequential_decode(&model, &mgr, &layout, &prompt_b, num_steps, seed);
+            let batch = batch_decode_run(
+                &model,
+                &mgr,
+                &layout,
+                &[&prompt_a, &prompt_b],
+                num_steps,
+                seed,
+            );
 
-            assert_eq!(
-                batch[0], seq_a,
-                "Graph request A mismatch:\n  batch: {:?}\n  seq:   {:?}",
-                batch[0], seq_a
-            );
-            assert_eq!(
-                batch[1], seq_b,
-                "Graph request B mismatch:\n  batch: {:?}\n  seq:   {:?}",
-                batch[1], seq_b
-            );
+            assert_eq!(batch[0], seq_a, "Graph request A mismatch");
+            assert_eq!(batch[1], seq_b, "Graph request B mismatch");
         }
     }
 }

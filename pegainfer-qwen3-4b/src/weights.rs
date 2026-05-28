@@ -11,6 +11,14 @@ use pegainfer_core::weight_loader::{
     load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 
+pub(crate) struct KvBudget {
+    pub(crate) num_layers: usize,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) block_size: usize,
+    pub(crate) num_blocks: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelRuntimeConfig {
     pub(crate) enable_cuda_graph: bool,
@@ -69,7 +77,6 @@ pub(crate) struct Qwen3Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
-    pub(super) kv_pool: pegainfer_core::kv_pool::KvPool,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) tp_comm: Option<Comm>,
     pub(super) lora_adapter: Option<DeviceLoraAdapter>,
@@ -308,33 +315,6 @@ impl Qwen3Model {
         );
         info!("GPU model loaded successfully");
 
-        let page_size = 16;
-        let layout = pegainfer_core::kv_pool::KvLayout::new(
-            config.num_hidden_layers,
-            config.local_num_key_value_heads(tensor_parallel),
-            config.head_dim,
-            page_size,
-        );
-        let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
-        let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
-            .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
-        let kv_budget = (free_bytes as f64 * 0.85) as usize;
-        let num_pages = (kv_budget / bytes_per_page).max(64);
-        let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
-        info!(
-            "KV cache: {num_pages} pages ({kv_mb} MB, {:.0}% of {:.0} MB free)",
-            kv_budget as f64 / free_bytes as f64 * 100.0,
-            free_bytes as f64 / 1024.0 / 1024.0
-        );
-        let kv_pool = pegainfer_core::kv_pool::KvPool::new(
-            &ctx,
-            config.num_hidden_layers,
-            config.local_num_key_value_heads(tensor_parallel),
-            config.head_dim,
-            page_size,
-            num_pages,
-        )?;
-
         let model = Self {
             ctx,
             config,
@@ -345,7 +325,6 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
-            kv_pool,
             tensor_parallel,
             tp_comm: None,
             lora_adapter: None,
@@ -443,31 +422,32 @@ impl Qwen3Model {
         Ok(())
     }
 
-    /// Allocate a fresh (empty) per-request KV state from the shared pool.
-    pub(crate) fn alloc_kv(&self) -> pegainfer_core::kv_pool::KvState {
-        self.kv_pool.alloc()
-    }
-
-    pub(crate) fn kv_pool(&self) -> &pegainfer_core::kv_pool::KvPool {
-        &self.kv_pool
-    }
-
-    /// Create pre-allocated batch decode buffers.
-    pub(crate) fn create_batch_decode_bufs(
-        &self,
-        max_batch_size: usize,
-    ) -> anyhow::Result<super::batch_decode_buffers::BatchDecodeBuffers> {
-        super::batch_decode_buffers::BatchDecodeBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            self.local_q_dim(),
-            self.local_kv_dim(),
-            self.local_intermediate_size(),
-            self.config.vocab_size,
-            max_batch_size,
-            self.kv_pool.capacity_pages(),
-            self.kv_pool.padding_page_id(),
-            self.local_num_attention_heads(),
-        )
+    /// KV cache geometry and budget for the executor to create a KvCacheManager.
+    pub(crate) fn kv_budget(&self) -> KvBudget {
+        let page_size = 16;
+        let num_kv_heads = self.local_num_key_value_heads();
+        let layout = pegainfer_kv_cache::KvLayout::new(
+            self.config.num_hidden_layers,
+            num_kv_heads,
+            self.config.head_dim,
+            page_size,
+        );
+        let bytes_per_block = layout.page_stride * std::mem::size_of::<half::bf16>();
+        let (free_bytes, _) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo failed");
+        let kv_budget_bytes = (free_bytes as f64 * 0.85) as usize;
+        let num_blocks = (kv_budget_bytes / bytes_per_block).max(64);
+        let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
+        log::info!(
+            "KV cache: {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+            kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
+            free_bytes as f64 / 1024.0 / 1024.0
+        );
+        KvBudget {
+            num_layers: self.config.num_hidden_layers,
+            num_kv_heads,
+            head_dim: self.config.head_dim,
+            block_size: page_size,
+            num_blocks,
+        }
     }
 }

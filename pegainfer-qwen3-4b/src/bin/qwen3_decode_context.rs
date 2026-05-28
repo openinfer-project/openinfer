@@ -174,6 +174,7 @@ fn prefill_one(
     let requests = [PrefillStepItem::new(
         request_id,
         prompt.to_vec(),
+        4096,
         params,
         0,
         false,

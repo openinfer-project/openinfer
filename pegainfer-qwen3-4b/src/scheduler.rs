@@ -173,9 +173,9 @@ fn scheduler_loop<E>(
         let admission = admit_deferred_requests(
             deferred,
             &active,
-            executor.page_size(),
-            executor.available_pages(),
-            executor.max_request_pages(),
+            executor.block_size(),
+            executor.available_blocks(),
+            executor.max_request_blocks(),
         );
         for rejected in &admission.rejected {
             send_rejection(rejected);
@@ -273,9 +273,9 @@ fn scheduler_loop_with_lora_control<E>(
         let admission = admit_deferred_requests(
             deferred,
             &active,
-            executor.page_size(),
-            executor.available_pages(),
-            executor.max_request_pages(),
+            executor.block_size(),
+            executor.available_blocks(),
+            executor.max_request_blocks(),
         );
         for rejected in &admission.rejected {
             send_rejection(rejected);
@@ -380,8 +380,8 @@ struct AdmissionOutcome {
     rejected: Vec<PendingRequest>,
 }
 
-fn pages_needed(token_count: usize, page_size: usize) -> usize {
-    token_count.div_ceil(page_size)
+fn blocks_needed(token_count: usize, block_size: usize) -> usize {
+    token_count.div_ceil(block_size)
 }
 
 // Prefill samples the first output token but does not append it to KV. A
@@ -404,12 +404,12 @@ fn current_active_tokens(req: &ActiveRequestState) -> usize {
         .saturating_add(req.generated_count.saturating_sub(1))
 }
 
-fn active_future_pages(active: &[ActiveRequestState], page_size: usize) -> usize {
+fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usize {
     active
         .iter()
         .map(|req| {
-            pages_needed(max_active_tokens(req), page_size)
-                .saturating_sub(pages_needed(current_active_tokens(req), page_size))
+            blocks_needed(max_active_tokens(req), block_size)
+                .saturating_sub(blocks_needed(current_active_tokens(req), block_size))
         })
         .sum()
 }
@@ -417,18 +417,18 @@ fn active_future_pages(active: &[ActiveRequestState], page_size: usize) -> usize
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
-    page_size: usize,
-    available_pages: usize,
-    max_request_pages: usize,
+    block_size: usize,
+    available_blocks: usize,
+    max_request_blocks: usize,
 ) -> AdmissionOutcome {
-    let mut budget = available_pages.saturating_sub(active_future_pages(active, page_size));
+    let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
 
     for req in deferred {
-        let max_needed = pages_needed(max_request_tokens(&req), page_size);
-        if max_needed > max_request_pages {
+        let max_needed = blocks_needed(max_request_tokens(&req), block_size);
+        if max_needed > max_request_blocks {
             rejected.push(req);
             continue;
         }
@@ -452,7 +452,7 @@ fn send_rejection(req: &PendingRequest) {
     let max_tokens = max_request_tokens(req);
     let _ = req.token_tx.send(TokenEvent::Rejected {
         message: format!(
-            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
+            "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
             req.prompt_tokens.len(),
             max_tokens
         ),
@@ -537,9 +537,9 @@ mod tests {
     };
 
     struct FakeExecutor {
-        page_size: usize,
-        max_request_pages: usize,
-        available_pages: usize,
+        block_size: usize,
+        max_request_blocks: usize,
+        available_blocks: usize,
         held_tokens: HashMap<RequestId, usize>,
         fail_decode_once: bool,
         decode_delay: Duration,
@@ -547,11 +547,11 @@ mod tests {
     }
 
     impl FakeExecutor {
-        fn new(max_request_pages: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
+        fn new(max_request_blocks: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
             Self {
-                page_size: 16,
-                max_request_pages,
-                available_pages: max_request_pages,
+                block_size: 16,
+                max_request_blocks,
+                available_blocks: max_request_blocks,
                 held_tokens: HashMap::new(),
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
@@ -575,29 +575,29 @@ mod tests {
             token_count: usize,
         ) -> Result<()> {
             let current_tokens = self.held_tokens.get(&request_id).copied().unwrap_or(0);
-            let current_pages = pages_needed(current_tokens, self.page_size);
-            let needed_pages = pages_needed(token_count, self.page_size);
-            let grow = needed_pages.saturating_sub(current_pages);
-            if grow > self.available_pages {
+            let current_blocks = blocks_needed(current_tokens, self.block_size);
+            let needed_blocks = blocks_needed(token_count, self.block_size);
+            let grow = needed_blocks.saturating_sub(current_blocks);
+            if grow > self.available_blocks {
                 anyhow::bail!("fake KV capacity exhausted");
             }
-            self.available_pages -= grow;
+            self.available_blocks -= grow;
             self.held_tokens.insert(request_id, token_count);
             Ok(())
         }
     }
 
     impl ModelExecutor for FakeExecutor {
-        fn page_size(&self) -> usize {
-            self.page_size
+        fn block_size(&self) -> usize {
+            self.block_size
         }
 
-        fn max_request_pages(&self) -> usize {
-            self.max_request_pages
+        fn max_request_blocks(&self) -> usize {
+            self.max_request_blocks
         }
 
-        fn available_pages(&self) -> usize {
-            self.available_pages
+        fn available_blocks(&self) -> usize {
+            self.available_blocks
         }
 
         fn is_stop_token(&self, _token_id: u32) -> bool {
@@ -606,7 +606,7 @@ mod tests {
 
         fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
             if let Some(tokens) = self.held_tokens.remove(&request_id) {
-                self.available_pages += pages_needed(tokens, self.page_size);
+                self.available_blocks += blocks_needed(tokens, self.block_size);
             }
             self.dropped.lock().unwrap().push(request_id.get());
             Ok(())
@@ -706,7 +706,7 @@ mod tests {
         let (pending_req, _pending_rx) = request(16, 1);
         let pending = PendingRequest::from_scheduler_request(RequestId(7), pending_req);
         assert_eq!(max_request_tokens(&pending), 16);
-        assert_eq!(pages_needed(max_request_tokens(&pending), 16), 1);
+        assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 1);
 
         let (token_tx, _token_rx) = mpsc::unbounded_channel();
         let after_prefill = ActiveRequestState {
@@ -842,7 +842,7 @@ mod tests {
             }) => {
                 assert_eq!(prompt_tokens, 16);
                 assert_eq!(completion_tokens, 0);
-                assert!(message.contains("requires more KV pages"));
+                assert!(message.contains("requires more KV blocks"));
             }
             _ => panic!("oversized request should be rejected"),
         }
