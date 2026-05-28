@@ -1,0 +1,25 @@
+The following components are derived from NVIDIA Dynamo
+(https://github.com/ai-dynamo/dynamo), licensed under the Apache License 2.0.
+
+The full text of the Apache License 2.0 is available in
+THIRD_PARTY_LICENSES_DYNAMO.txt in this directory.
+
+Ported crates (copied with modifications):
+  dynamo-tokens/        — Token management, PositionalLineageHash, PositionalRadixTree
+  dynamo-memory/        — Memory utilities
+  dynamo-kv-hashing/    — KV cache hash computation
+  dynamo-kv-router/     — KV-aware request routing with radix tree indexing
+  dynamo-runtime/       — Runtime configuration and transport abstractions
+  kvbm-common/          — Shared KVBM types
+  kvbm-config/          — KVBM configuration
+  kvbm-consolidator/    — KV event consolidation
+  kvbm-engine/          — KVBM engine (leader/worker coordination)
+  kvbm-kernels/         — KVBM CUDA kernels
+  kvbm-logical/         — Core block lifecycle management (type-safe state machine,
+                          registry, pool system, event pipeline, block manager)
+  kvbm-physical/        — Physical block layout and transfer management
+
+Original copyright:
+  Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Each source file retains its original SPDX license header.
