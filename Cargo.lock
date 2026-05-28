@@ -5332,6 +5332,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-kv-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "kvbm-logical",
+ "pegainfer-kernels",
+]
+
+[[package]]
 name = "pegainfer-qwen3-4b"
 version = "0.1.0"
 dependencies = [
@@ -5347,6 +5358,7 @@ dependencies = [
  "pegainfer-core",
  "pegainfer-cupti",
  "pegainfer-kernels",
+ "pegainfer-kv-cache",
  "pegainfer-vllm-support",
  "rand 0.10.1",
  "safetensors",

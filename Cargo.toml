@@ -15,6 +15,7 @@ members = [
     "pegainfer-kimi-k2",
     "pegainfer-qwen3-4b",
     "pegainfer-qwen35-4b",
+    "pegainfer-kv-cache",
     # ---- pegainfer-comm (EP all-to-all) ----
     "pegainfer-comm",
     "pegainfer-comm/crates/pegainfer-comm-build-utils",
@@ -122,6 +123,7 @@ ordered-float = "4"
 oneshot = "0.1.11"
 parking_lot = "0.12.5"
 pegainfer-core = { path = "pegainfer-core" }
+pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
 pegainfer-engine = { path = "pegainfer-engine" }

@@ -13,6 +13,7 @@ clap = { workspace = true, optional = true }
 comfy-table = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true }
+pegainfer-kv-cache = { workspace = true }
 fastrace = { workspace = true }
 half = { workspace = true }
 hex = { workspace = true, optional = true }

@@ -1,0 +1,14 @@
+[package]
+name = "pegainfer-kv-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pegainfer-kernels = { workspace = true }
+kvbm-logical = { workspace = true }
+anyhow = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+
+[lints]
+workspace = true
