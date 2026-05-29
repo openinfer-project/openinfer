@@ -603,6 +603,8 @@ mod tests {
         active_lora_adapter: Option<String>,
         lora_activations: Arc<Mutex<Vec<Option<String>>>>,
         dropped: Arc<Mutex<Vec<u64>>>,
+        prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
+        decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
     }
 
     impl FakeExecutor {
@@ -618,6 +620,8 @@ mod tests {
                 active_lora_adapter: None,
                 lora_activations: Arc::new(Mutex::new(Vec::new())),
                 dropped,
+                prefill_batches: Arc::new(Mutex::new(Vec::new())),
+                decode_batches: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -638,6 +642,16 @@ mod tests {
         ) -> Self {
             self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
             self.lora_activations = activations;
+            self
+        }
+
+        fn with_batch_records(
+            mut self,
+            prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
+            decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
+        ) -> Self {
+            self.prefill_batches = prefill_batches;
+            self.decode_batches = decode_batches;
             self
         }
 
@@ -705,6 +719,12 @@ mod tests {
         }
 
         fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+            self.prefill_batches.lock().unwrap().push(
+                plan.requests
+                    .iter()
+                    .map(|request| request.request_id)
+                    .collect(),
+            );
             for req in plan.requests {
                 self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
             }
@@ -734,6 +754,12 @@ mod tests {
                 anyhow::bail!("fake decode KV capacity exhausted");
             }
 
+            self.decode_batches.lock().unwrap().push(
+                plan.requests
+                    .iter()
+                    .map(|request| request.request_id)
+                    .collect(),
+            );
             for req in plan.requests {
                 let current_tokens = self
                     .held_tokens
@@ -757,6 +783,18 @@ mod tests {
         }
 
         fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+            self.prefill_batches.lock().unwrap().push(
+                plan.prefill_requests
+                    .iter()
+                    .map(|request| request.request_id)
+                    .collect(),
+            );
+            self.decode_batches.lock().unwrap().push(
+                plan.decode_requests
+                    .iter()
+                    .map(|request| request.request_id)
+                    .collect(),
+            );
             for req in plan.prefill_requests {
                 self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
             }
@@ -968,16 +1006,21 @@ mod tests {
     fn mixed_lora_prefill_requests_run_in_adapter_groups() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let activations = Arc::new(Mutex::new(Vec::new()));
+        let prefill_batches = Arc::new(Mutex::new(Vec::new()));
+        let decode_batches = Arc::new(Mutex::new(Vec::new()));
         let mut executor = FakeExecutor::new(4, Arc::clone(&dropped))
-            .with_lora_adapters(&["adapter-a"], Arc::clone(&activations));
+            .with_lora_adapters(&["adapter-a", "adapter-b"], Arc::clone(&activations))
+            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches));
         let mut rng = StdRng::seed_from_u64(42);
         let mut active = Vec::new();
 
-        let (adapter, _adapter_rx) = request_with_lora(16, 1, Some("adapter-a"));
         let (base, _base_rx) = request_with_lora(16, 1, None);
+        let (adapter_a, _adapter_a_rx) = request_with_lora(16, 1, Some("adapter-a"));
+        let (adapter_b, _adapter_b_rx) = request_with_lora(16, 1, Some("adapter-b"));
         let pending = vec![
-            PendingRequest::from_scheduler_request(RequestId(0), adapter),
+            PendingRequest::from_scheduler_request(RequestId(0), adapter_b),
             PendingRequest::from_scheduler_request(RequestId(1), base),
+            PendingRequest::from_scheduler_request(RequestId(2), adapter_a),
         ];
 
         let artifacts = plan::execute_plan(
@@ -997,11 +1040,24 @@ mod tests {
                 .iter()
                 .map(|request| request.request_id)
                 .collect::<Vec<_>>(),
-            vec![RequestId(0), RequestId(1)]
+            vec![RequestId(0), RequestId(1), RequestId(2)]
         );
         assert_eq!(
             *activations.lock().unwrap(),
-            vec![None, Some("adapter-a".to_string())]
+            vec![
+                None,
+                Some("adapter-a".to_string()),
+                Some("adapter-b".to_string())
+            ]
+        );
+        assert_eq!(
+            *prefill_batches.lock().unwrap(),
+            vec![vec![RequestId(1)], vec![RequestId(2)], vec![RequestId(0)]],
+            "one execution plan should be split into base, adapter-a, and adapter-b groups"
+        );
+        assert!(
+            decode_batches.lock().unwrap().is_empty(),
+            "prefill-only plan should not execute decode batches"
         );
     }
 
