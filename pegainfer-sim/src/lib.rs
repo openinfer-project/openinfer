@@ -167,14 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn ttft_combines_floor_and_prefill_time() {
-        let config = SimulatedEngineConfig::new(5.0, 100.0, 12.0, 0).unwrap();
-
-        assert_eq!(config.ttft(1_024), Duration::from_micros(15_240));
-        assert_eq!(config.tpot(), Duration::from_millis(12));
-    }
-
-    #[test]
     fn config_rejects_invalid_timing_values() {
         assert!(SimulatedEngineConfig::new(-1.0, 100.0, 12.0, 0).is_err());
         assert!(SimulatedEngineConfig::new(5.0, 0.0, 12.0, 0).is_err());

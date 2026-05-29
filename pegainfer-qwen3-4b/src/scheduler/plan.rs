@@ -239,3 +239,53 @@ fn sort_prefill_results(results: &mut [crate::executor::PrefillRequestResult]) {
 fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
     results.sort_by_key(|result| result.request_id);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::RequestId;
+    use pegainfer_core::sampler::SamplingParams;
+
+    fn pending() -> PendingRequest {
+        let (token_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        PendingRequest {
+            request_id: RequestId::new(0),
+            lora_adapter: None,
+            prompt_tokens: vec![1, 2, 3],
+            params: SamplingParams::default(),
+            max_tokens: 8,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        }
+    }
+
+    // The plan selector is the whole batch-formation policy: what the scheduler
+    // does each tick is fully determined by (have_active, has_pending). Pin the
+    // 2×2 truth table so a policy regression can't slip through silently.
+    #[test]
+    fn plan_selection_follows_active_and_pending_state() {
+        assert!(
+            build_next_plan(false, vec![]).is_none(),
+            "idle scheduler (no active, no pending) produces no plan"
+        );
+        assert!(
+            matches!(build_next_plan(true, vec![]), Some(ExecutionPlan::Decode)),
+            "active-only ticks decode the running batch"
+        );
+        assert!(
+            matches!(
+                build_next_plan(false, vec![pending()]),
+                Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+            ),
+            "pending-only prefills the new arrivals"
+        );
+        assert!(
+            matches!(
+                build_next_plan(true, vec![pending()]),
+                Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
+            ),
+            "active + pending fuses prefill and decode into one unified step"
+        );
+    }
+}

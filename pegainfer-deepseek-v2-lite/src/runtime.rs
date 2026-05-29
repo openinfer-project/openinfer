@@ -1467,21 +1467,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stop_token_is_not_appended_when_eos_is_enabled() {
+    fn append_generated_token_handles_eos_stop_vs_ignore() {
+        // EOS hit with ignore_eos=false: stop, do not append the EOS token.
         let mut generated = vec![10, 11];
-
         let finish_reason = append_generated_token(&mut generated, 100_001, 100_001, false);
-
         assert_eq!(finish_reason, Some(FinishReason::Stop));
         assert_eq!(generated, vec![10, 11]);
-    }
 
-    #[test]
-    fn stop_token_is_appended_when_eos_is_ignored() {
+        // EOS hit with ignore_eos=true: keep going, append the token.
         let mut generated = vec![10, 11];
-
         let finish_reason = append_generated_token(&mut generated, 100_001, 100_001, true);
-
         assert_eq!(finish_reason, None);
         assert_eq!(generated, vec![10, 11, 100_001]);
     }
@@ -1515,19 +1510,11 @@ mod tests {
     }
 
     #[test]
-    fn ep_backend_defaults_to_host_staged() {
+    fn ep_backend_parsing() {
         assert_eq!(parse_backend(None).unwrap(), EpBackendKind::HostStaged);
-    }
-
-    #[test]
-    fn ep_backend_accepts_nccl() {
         assert_eq!(parse_backend(Some("nccl")).unwrap(), EpBackendKind::Nccl);
-    }
 
-    #[test]
-    fn ep_backend_rejects_unknown_backend() {
         let err = parse_backend(Some("pplx")).unwrap_err();
-
         assert!(
             err.to_string()
                 .contains("supported backends: host-staged, nccl"),

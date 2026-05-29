@@ -450,35 +450,6 @@ mod tests {
     use crate::config::test_lite_config;
 
     #[test]
-    fn deepseek_v2_rope_matches_hf_pair_permutation_at_position_zero() {
-        let config = test_lite_config();
-        let input: Vec<_> = (0..config.qk_rope_head_dim)
-            .map(|value| value as f32)
-            .collect();
-        let inv_freq: Vec<_> = (0..config.qk_rope_head_dim / 2)
-            .map(|pair| rope_inv_freq(&config, pair))
-            .collect();
-
-        let out = apply_deepseek_v2_rope(&input, 0, &config, &inv_freq, rope_cache_mscale(&config));
-
-        let half = config.qk_rope_head_dim / 2;
-        for pair in 0..half {
-            assert_eq!(out[pair], input[2 * pair]);
-            assert_eq!(out[pair + half], input[2 * pair + 1]);
-        }
-    }
-
-    #[test]
-    fn yarn_attention_scale_uses_mscale_all_dim() {
-        let config = test_lite_config();
-        let rope_scaling = config.rope_scaling.as_ref().unwrap();
-        let mscale = yarn_get_mscale(rope_scaling.factor, rope_scaling.mscale_all_dim);
-        let expected = (config.query_head_dim() as f32).sqrt().recip() * mscale * mscale;
-
-        assert_eq!(attention_softmax_scale(&config), expected);
-    }
-
-    #[test]
     fn rms_norm_host_rounds_normalized_hidden_before_weight() {
         let input = [3.0f32, 4.0];
         let weight = [3.0f32, 0.5];

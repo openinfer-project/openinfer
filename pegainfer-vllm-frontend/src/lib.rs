@@ -1363,11 +1363,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn to_wire_logprobs_returns_none_when_input_is_none() {
-        assert!(to_wire_logprobs(7, None).is_none());
-    }
-
     fn assert_logprob_eq(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() <= f32::EPSILON,

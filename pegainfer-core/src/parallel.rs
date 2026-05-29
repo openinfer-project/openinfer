@@ -51,33 +51,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tp8_dp1() {
-        let cfg = ParallelConfig::new(8, 1);
-        assert_eq!(cfg.ep_world, 8);
-        let c = cfg.coord(3);
-        assert_eq!(c.tp_rank, 3);
-        assert_eq!(c.dp_rank, 0);
-        assert_eq!(c.ep_rank, 3);
-    }
-
-    #[test]
-    fn tp1_dp8() {
-        let cfg = ParallelConfig::new(1, 8);
-        assert_eq!(cfg.ep_world, 8);
-        let c = cfg.coord(3);
-        assert_eq!(c.tp_rank, 0);
-        assert_eq!(c.dp_rank, 3);
-        assert_eq!(c.ep_rank, 3);
-    }
-
-    #[test]
-    fn tp2_dp4() {
-        let cfg = ParallelConfig::new(2, 4);
-        assert_eq!(cfg.ep_world, 8);
-        let c = cfg.coord(5);
-        assert_eq!(c.tp_rank, 1);
-        assert_eq!(c.dp_rank, 2);
-        assert_eq!(c.ep_rank, 5);
-        assert_eq!(cfg.tp_group(2), 4..6);
+    fn coord_maps_rank_to_tp_dp_ep() {
+        // (tp_size, dp_size, rank) -> (tp_rank, dp_rank, ep_rank)
+        let cases = [(8, 1, 3, 3, 0, 3), (1, 8, 3, 0, 3, 3), (2, 4, 5, 1, 2, 5)];
+        for (tp, dp, rank, tp_rank, dp_rank, ep_rank) in cases {
+            let cfg = ParallelConfig::new(tp, dp);
+            assert_eq!(cfg.ep_world, tp * dp, "tp{tp} dp{dp}");
+            let c = cfg.coord(rank);
+            assert_eq!(
+                (c.tp_rank, c.dp_rank, c.ep_rank),
+                (tp_rank, dp_rank, ep_rank),
+                "tp{tp} dp{dp} rank{rank}"
+            );
+        }
+        // tp_group spans the contiguous tp ranks inside a dp group
+        assert_eq!(ParallelConfig::new(2, 4).tp_group(2), 4..6);
     }
 }

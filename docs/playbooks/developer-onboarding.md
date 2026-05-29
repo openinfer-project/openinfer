@@ -49,7 +49,7 @@ First build takes ~30s. Compiles CUDA kernels (`pegainfer-kernels/csrc/*.cu`) an
 
 ```bash
 cargo test -r --workspace --lib   # unit tests (~9s)
-cargo test -r -p pegainfer-qwen3-4b --test e2e     # Qwen3 e2e (~50s, needs GPU + model)
+cargo test -r -p pegainfer-qwen3-4b --test hf_golden_gate   # Qwen3-4B logits vs HF golden (~7s, needs GPU + model)
 ```
 
 > **Always use `--release`**. Debug builds are extremely slow for GPU code and will timeout.
@@ -109,23 +109,31 @@ Benchmark:
 cargo run -r --bin bench_serving -- --model-path models/Qwen3.5-4B request
 ```
 
-E2E tests - Qwen3 and Qwen3.5 live in separate model crates:
+Accuracy tests live in each model crate:
 
 ```bash
-cargo test -r -p pegainfer-qwen3-4b --test e2e     # Qwen3-4B exact greedy regression
-cargo test -r -p pegainfer-qwen35-4b --test e2e    # Qwen3.5-4B exact greedy regression
+cargo test -r -p pegainfer-qwen3-4b  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
+cargo test -r -p pegainfer-qwen35-4b --test e2e              # Qwen3.5-4B exact greedy regression
 ```
 
-### Regenerating Test Data
+Qwen3-4B no longer pins exact greedy text: a bit-wise baseline false-positives across GPUs (per-card bf16 GEMM drifts the low bits). `hf_golden_gate` instead teacher-forces a fixed set of sequences and asserts pegainfer's logprobs land within the bf16 noise floor of a stored HuggingFace reference — across bs=1, batched, and the CUDA-graph path. The reasoning and tolerances are in `docs/models/qwen3/accuracy-gate.md`.
 
-After kernel changes that affect numerical output, regenerate greedy reference data:
+### Regenerating Reference Data
+
+After a change that alters numerical output, regenerate the reference. The Qwen3-4B golden is recomputed on GPU through HuggingFace:
 
 ```bash
-cargo test -r -p pegainfer-qwen3-4b --test regen_test_data -- --ignored    # writes test_data/Qwen3-4B.json
+uv run --no-project python tools/accuracy/dump_qwen3_4b_hf_golden.py \
+    --model-path models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
+```
+
+Qwen3.5-4B still uses an exact greedy baseline:
+
+```bash
 cargo test -r -p pegainfer-qwen35-4b --test regen_test_data -- --ignored   # writes test_data/Qwen3.5-4B.json
 ```
 
-Then re-run the e2e tests to confirm the new baselines pass.
+Then re-run the corresponding accuracy test to confirm the new reference passes.
 
 ## Next Steps
 

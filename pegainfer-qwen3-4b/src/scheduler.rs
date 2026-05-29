@@ -898,6 +898,56 @@ mod tests {
     }
 
     #[test]
+    fn admission_splits_deferred_into_pending_deferred_and_rejected() {
+        // block_size 16, per-request cap 4 blocks (max 64 tokens). One active
+        // request is mid-flight and will grow into 2 more blocks, so it
+        // pre-reserves them out of the budget.
+        let (token_tx, _rx) = mpsc::unbounded_channel();
+        let active = [ActiveRequestState {
+            request_id: RequestId(0),
+            lora_adapter: None,
+            token_tx,
+            last_token: 1,
+            generated_count: 1, // current tokens = prompt_len (16) -> 1 block
+            max_tokens: 18,     // max tokens = 16 + 17 = 33 -> 3 blocks; future growth = 2
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }];
+
+        let mk = |id: u64, prompt_len, max_tokens| {
+            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        };
+        let deferred = vec![
+            mk(1, 16, 1), // 16 tokens -> 1 block: admitted
+            mk(2, 16, 1), // 1 block: admitted, budget now 0
+            mk(3, 16, 1), // 1 block: no budget left -> stays deferred
+            mk(4, 80, 1), // 80 tokens -> 5 blocks > cap of 4 -> rejected outright
+        ];
+
+        // available 4 blocks - 2 reserved for active growth = budget of 2.
+        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4);
+
+        let ids =
+            |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&outcome.pending),
+            vec![1, 2],
+            "admit in order until the budget is spent"
+        );
+        assert_eq!(
+            ids(&outcome.deferred),
+            vec![3],
+            "budget-starved requests stay deferred, not dropped"
+        );
+        assert_eq!(
+            ids(&outcome.rejected),
+            vec![4],
+            "requests larger than the per-request cap are rejected outright"
+        );
+    }
+
+    #[test]
     fn one_token_completion_on_page_boundary_fits_one_page() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(1, Arc::clone(&dropped));

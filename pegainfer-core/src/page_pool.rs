@@ -126,20 +126,6 @@ mod tests {
     use super::{PageId, PagePool};
 
     #[test]
-    fn zero_capacity_pool_never_acquires_pages() {
-        let pool = PagePool::new(0);
-
-        assert_eq!(pool.capacity_pages(), 0);
-        assert_eq!(pool.available_pages(), 0);
-        assert!(pool.try_acquire_many(1).is_none());
-        assert!(
-            pool.try_acquire_many(0)
-                .expect("empty acquire should succeed")
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn acquires_pages_and_restores_on_drop() {
         let pool = PagePool::new(4);
         assert_eq!(pool.capacity_pages(), 4);

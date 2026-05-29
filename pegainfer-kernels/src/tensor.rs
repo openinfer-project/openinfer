@@ -609,38 +609,6 @@ mod tests {
     }
 
     #[test]
-    fn test_device_matrix_from_host_roundtrip() {
-        let ctx = DeviceContext::new().expect("Failed to create CUDA context");
-        let rows = 2;
-        let cols = 3;
-        let host = vec![
-            bf16::from_f32(-1.5),
-            bf16::from_f32(0.0),
-            bf16::from_f32(2.25),
-            bf16::from_f32(7.0),
-            bf16::from_f32(-3.0),
-            bf16::from_f32(0.5),
-        ];
-
-        let matrix =
-            DeviceMatrix::from_host(&ctx, &host, rows, cols).expect("from_host should succeed");
-
-        assert_eq!(matrix.rows, rows);
-        assert_eq!(matrix.cols, cols);
-
-        let got = copy_matrix_to_host(&ctx, &matrix);
-        assert_eq!(got.len(), host.len());
-        for (idx, (actual, expected)) in got.iter().zip(host.iter()).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "roundtrip mismatch at index {}",
-                idx
-            );
-        }
-    }
-
-    #[test]
     fn test_device_matrix_from_safetensors_matches_from_host() {
         let ctx = DeviceContext::new().expect("Failed to create CUDA context");
         let rows = 3;

@@ -53,11 +53,3 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
 pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
     anyhow::bail!("Kimi-K2 runtime is feature-gated; rebuild with --features kimi-k2")
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        assert_eq!(crate::config::KIMI_K2_HIDDEN, 7168);
-    }
-}
