@@ -5034,6 +5034,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "pegainfer-kernels",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pegainfer-comm"
 version = "0.0.0"
 dependencies = [
@@ -5320,6 +5331,7 @@ dependencies = [
  "cudarc",
  "half",
  "memmap2",
+ "pegainfer-bench",
  "pegainfer-comm",
  "pegainfer-core",
  "pegainfer-cupti",
@@ -5355,6 +5367,7 @@ dependencies = [
  "half",
  "hex",
  "log",
+ "pegainfer-bench",
  "pegainfer-core",
  "pegainfer-cupti",
  "pegainfer-kernels",

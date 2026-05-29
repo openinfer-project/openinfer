@@ -1,6 +1,12 @@
-use anyhow::{Result, anyhow, bail, ensure};
-use cudarc::driver::{CudaSlice, sys};
+use anyhow::{Result, bail, ensure};
+use cudarc::driver::CudaSlice;
 use half::bf16;
+// The model-agnostic harness — timing loop, latency stats, `KernelCall` accessors —
+// lives in `pegainfer-bench`. Re-export the types the report bins consume so their
+// `pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key}` imports
+// keep resolving here; only Kimi's `measure_*` providers and `measure_call` are local.
+pub use pegainfer_bench::{LatencyStats, MeasuredCall, bench_key};
+use pegainfer_bench::{attr_usize, axis, input, measure_loop, output, zero_matrix, zero_weight};
 use pegainfer_kernels::{
     ops::{
         KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_INT4_GROUP_SIZE,
@@ -21,31 +27,8 @@ use pegainfer_kernels::{
         repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
         silu_mul_batch_into,
     },
-    tensor::{
-        DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, KernelCall,
-        NormWeight, TensorSpec,
-    },
+    tensor::{DeviceContext, DeviceVec, GpuTensor, HiddenStates, KernelCall, NormWeight},
 };
-use serde::Serialize;
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LatencyStats {
-    pub iters: u64,
-    pub mean_us: f64,
-    pub stddev_us: f64,
-    pub min_us: f64,
-    pub p50_us: f64,
-    pub p95_us: f64,
-    pub p99_us: f64,
-    pub max_us: f64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MeasuredCall {
-    pub supported: bool,
-    pub reason: Option<String>,
-    pub stats: Option<LatencyStats>,
-}
 
 pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
     let stats = match call.op.as_str() {
@@ -115,49 +98,6 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         reason: None,
         stats,
     })
-}
-
-pub fn bench_key(call: &KernelCall) -> Result<String> {
-    Ok(serde_json::to_string(&serde_json::json!({
-        "op": call.op,
-        "inputs": call.inputs,
-        "outputs": call.outputs,
-        "attrs": call.attrs,
-    }))?)
-}
-
-pub fn axis(spec: &TensorSpec, name: &str) -> Result<usize> {
-    spec.axes
-        .iter()
-        .find(|axis| axis.name == name)
-        .map(|axis| axis.size)
-        .ok_or_else(|| anyhow!("missing axis `{name}` in {}", spec.compact()))
-}
-
-pub fn input<'a>(call: &'a KernelCall, name: &str) -> Result<&'a TensorSpec> {
-    call.inputs
-        .iter()
-        .find(|arg| arg.name == name)
-        .map(|arg| &arg.spec)
-        .ok_or_else(|| anyhow!("{} missing input `{name}`", call.label))
-}
-
-pub fn output<'a>(call: &'a KernelCall, name: &str) -> Result<&'a TensorSpec> {
-    call.outputs
-        .iter()
-        .find(|arg| arg.name == name)
-        .map(|arg| &arg.spec)
-        .ok_or_else(|| anyhow!("{} missing output `{name}`", call.label))
-}
-
-pub fn attr_usize(call: &KernelCall, name: &str) -> Result<usize> {
-    call.attrs
-        .iter()
-        .find(|attr| attr.name == name)
-        .ok_or_else(|| anyhow!("{} missing attr `{name}`", call.label))?
-        .value
-        .parse()
-        .map_err(|err| anyhow!("{} invalid attr `{name}`: {err}", call.label))
 }
 
 fn measure_gemm(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
@@ -719,85 +659,4 @@ fn measure_mla_decode(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             sm_scale,
         )
     })
-}
-
-fn measure_loop(
-    ctx: &DeviceContext,
-    iters: u64,
-    mut launch: impl FnMut() -> Result<()>,
-) -> Result<LatencyStats> {
-    if iters == 0 {
-        bail!("iters must be greater than zero");
-    }
-    for _ in 0..3 {
-        launch()?;
-    }
-    ctx.sync()?;
-    let start = ctx
-        .ctx
-        .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-    let end = ctx
-        .ctx
-        .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-    let mut samples = Vec::with_capacity(iters as usize);
-    for _ in 0..iters {
-        start.record(&ctx.stream)?;
-        launch()?;
-        end.record(&ctx.stream)?;
-        samples.push(f64::from(start.elapsed_ms(&end)?) * 1_000.0);
-    }
-    ctx.sync()?;
-    LatencyStats::from_samples(iters, samples)
-}
-
-impl LatencyStats {
-    pub fn from_samples(iters: u64, mut samples: Vec<f64>) -> Result<Self> {
-        if samples.is_empty() {
-            bail!("latency sample set is empty");
-        }
-        samples.sort_by(f64::total_cmp);
-        let mean_us = samples.iter().sum::<f64>() / samples.len() as f64;
-        let stddev_us = if samples.len() > 1 {
-            let variance = samples
-                .iter()
-                .map(|sample| {
-                    let delta = sample - mean_us;
-                    delta * delta
-                })
-                .sum::<f64>()
-                / (samples.len() - 1) as f64;
-            variance.sqrt()
-        } else {
-            0.0
-        };
-        Ok(Self {
-            iters,
-            mean_us,
-            stddev_us,
-            min_us: samples[0],
-            p50_us: percentile(&samples, 0.50),
-            p95_us: percentile(&samples, 0.95),
-            p99_us: percentile(&samples, 0.99),
-            max_us: samples[samples.len() - 1],
-        })
-    }
-}
-
-fn percentile(sorted: &[f64], quantile: f64) -> f64 {
-    let idx = ((sorted.len() as f64 - 1.0) * quantile).ceil() as usize;
-    sorted[idx.min(sorted.len() - 1)]
-}
-
-fn zero_matrix(ctx: &DeviceContext, rows: usize, cols: usize) -> Result<DeviceMatrix> {
-    Ok(DeviceMatrix {
-        data: ctx.stream.alloc_zeros(rows * cols)?,
-        rows,
-        cols,
-    })
-}
-
-fn zero_weight<const OUT: usize, const IN: usize>(
-    ctx: &DeviceContext,
-) -> Result<GpuWeight<OUT, IN>> {
-    GpuWeight::from_device_matrix(zero_matrix(ctx, OUT, IN)?)
 }

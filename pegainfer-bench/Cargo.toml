@@ -1,0 +1,14 @@
+[package]
+name = "pegainfer-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+cudarc = { workspace = true }
+pegainfer-kernels = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

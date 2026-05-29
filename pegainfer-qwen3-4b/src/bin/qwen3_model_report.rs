@@ -8,11 +8,10 @@ use clap::Parser;
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use cudarc::driver::{CudaSlice, sys};
 use half::bf16;
+use pegainfer_bench::{LatencyStats, attr_usize, axis, input, output, zero_matrix};
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
-use pegainfer_kernels::tensor::{
-    DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, KernelCall, TensorSpec,
-};
+use pegainfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates, KernelCall, TensorSpec};
 use pegainfer_qwen3_4b::batch_decode_trace::{
     HEAD_DIM_VALUE, KV_DIM_VALUE, MODEL, NUM_KV_HEADS, NUM_LAYERS, NUM_Q_HEADS, PHASE_DECODE,
     RMS_NORM_EPS, normalize_call_site, trace_decode_kernel_calls,
@@ -102,18 +101,6 @@ struct CoverageRow {
     key: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
-struct LatencyStats {
-    iters: u64,
-    mean_us: f64,
-    stddev_us: f64,
-    min_us: f64,
-    p50_us: f64,
-    p95_us: f64,
-    p99_us: f64,
-    max_us: f64,
-}
-
 #[derive(Clone)]
 struct BenchEntry {
     key: String,
@@ -135,55 +122,6 @@ struct SiteAccum {
     total_p99_us: f64,
     sum_stddev_us: f64,
     sum_p99_us: f64,
-}
-
-impl LatencyStats {
-    fn zero(iters: u64) -> Self {
-        Self {
-            iters,
-            mean_us: 0.0,
-            stddev_us: 0.0,
-            min_us: 0.0,
-            p50_us: 0.0,
-            p95_us: 0.0,
-            p99_us: 0.0,
-            max_us: 0.0,
-        }
-    }
-
-    fn from_samples(iters: u64, mut samples: Vec<f64>) -> Result<Self> {
-        anyhow::ensure!(!samples.is_empty(), "latency sample set is empty");
-        samples.sort_by(f64::total_cmp);
-        let mean_us = samples.iter().sum::<f64>() / samples.len() as f64;
-        let stddev_us = if samples.len() > 1 {
-            let variance = samples
-                .iter()
-                .map(|sample| {
-                    let delta = sample - mean_us;
-                    delta * delta
-                })
-                .sum::<f64>()
-                / (samples.len() - 1) as f64;
-            variance.sqrt()
-        } else {
-            0.0
-        };
-        Ok(Self {
-            iters,
-            mean_us,
-            stddev_us,
-            min_us: samples[0],
-            p50_us: percentile(&samples, 0.50),
-            p95_us: percentile(&samples, 0.95),
-            p99_us: percentile(&samples, 0.99),
-            max_us: samples[samples.len() - 1],
-        })
-    }
-}
-
-fn percentile(sorted: &[f64], quantile: f64) -> f64 {
-    let idx = ((sorted.len() as f64 - 1.0) * quantile).ceil() as usize;
-    sorted[idx.min(sorted.len() - 1)]
 }
 
 fn main() -> Result<()> {
@@ -809,38 +747,6 @@ fn measure_loop(
     LatencyStats::from_samples(iters, samples)
 }
 
-fn zero_matrix(ctx: &DeviceContext, rows: usize, cols: usize) -> Result<DeviceMatrix> {
-    Ok(DeviceMatrix {
-        data: ctx.stream.alloc_zeros(rows * cols)?,
-        rows,
-        cols,
-    })
-}
-
-fn input<'a>(call: &'a KernelCall, name: &str) -> Result<&'a TensorSpec> {
-    call.inputs
-        .iter()
-        .find(|arg| arg.name == name)
-        .map(|arg| &arg.spec)
-        .ok_or_else(|| anyhow!("call `{}` missing input `{name}`", call.label))
-}
-
-fn output<'a>(call: &'a KernelCall, name: &str) -> Result<&'a TensorSpec> {
-    call.outputs
-        .iter()
-        .find(|arg| arg.name == name)
-        .map(|arg| &arg.spec)
-        .ok_or_else(|| anyhow!("call `{}` missing output `{name}`", call.label))
-}
-
-fn axis(spec: &TensorSpec, name: &str) -> Result<usize> {
-    spec.axes
-        .iter()
-        .find(|axis| axis.name == name)
-        .map(|axis| axis.size)
-        .ok_or_else(|| anyhow!("{} missing axis `{name}`", spec.compact()))
-}
-
 fn first_axis_size(spec: &TensorSpec) -> Result<usize> {
     spec.axes
         .first()
@@ -854,12 +760,6 @@ fn attr_string(call: &KernelCall, name: &str) -> Result<String> {
         .find(|attr| attr.name == name)
         .map(|attr| attr.value.clone())
         .ok_or_else(|| anyhow!("call `{}` missing attr `{name}`", call.label))
-}
-
-fn attr_usize(call: &KernelCall, name: &str) -> Result<usize> {
-    attr_string(call, name)?
-        .parse::<usize>()
-        .with_context(|| format!("call `{}` attr `{name}` is not usize", call.label))
 }
 
 fn is_noop_all_reduce(call: &KernelCall) -> bool {

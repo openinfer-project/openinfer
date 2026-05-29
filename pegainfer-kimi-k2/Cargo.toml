@@ -13,6 +13,7 @@ crossbeam-channel = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
 memmap2 = { workspace = true }
+pegainfer-bench = { workspace = true }
 pegainfer-cupti = { workspace = true, optional = true }
 pegainfer-comm = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }

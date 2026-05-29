@@ -10,6 +10,7 @@ members = [
     "pegainfer-core",
     "pegainfer-cupti",
     "pegainfer-kernels",
+    "pegainfer-bench",
     "pegainfer-deepseek-v4",
     "pegainfer-deepseek-v2-lite",
     "pegainfer-kimi-k2",
@@ -122,6 +123,7 @@ opentelemetry_sdk = { version = "0.31.0", features = ["trace", "logs", "rt-tokio
 ordered-float = "4"
 oneshot = "0.1.11"
 parking_lot = "0.12.5"
+pegainfer-bench = { path = "pegainfer-bench" }
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
