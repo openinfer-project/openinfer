@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -151,6 +152,7 @@ def wait_for_health(server_url: str, timeout_s: float, process: subprocess.Popen
 
 
 def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
+    assert_port_available(args.port)
     env = os.environ.copy()
     env.setdefault("PEGAINFER_CUDA_SM", "80")
     compat = "/usr/local/cuda-12.9/compat"
@@ -193,6 +195,15 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
     print(f"server_log={log.name}", file=sys.stderr)
     log.close()
     return process
+
+
+def assert_port_available(port: int) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise RuntimeError(
+                f"port {port} is already accepting connections; stop the stale server or choose another port"
+            )
 
 
 def stop_server(process: subprocess.Popen | None) -> None:
