@@ -328,7 +328,7 @@ def pegainfer_completion(
 
 def main() -> int:
     args = parse_args()
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     model_path = Path(args.model_path).resolve()
     if args.adapter_path:
         adapter_path = Path(args.adapter_path).resolve()

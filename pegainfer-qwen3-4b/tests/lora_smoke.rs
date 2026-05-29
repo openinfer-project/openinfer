@@ -216,6 +216,7 @@ fn qwen3_lora_loads_adapter_and_generates() {
             seed: 42,
             ..EngineLoadOptions::default()
         },
+        pegainfer_qwen3_4b::Qwen3LoraOptions::default(),
     )
     .expect("start LoRA-capable Qwen3 engine");
 

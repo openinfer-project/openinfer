@@ -20,6 +20,49 @@ use pegainfer_core::engine::{EngineHandle, EngineLoadOptions, ModelInfo};
 
 pub use kernel_plan::kernel_plan;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen3LoraOptions {
+    pub max_loras: usize,
+    pub max_lora_rank: usize,
+}
+
+impl Qwen3LoraOptions {
+    pub const DEFAULT_MAX_LORAS: usize = 1;
+    pub const DEFAULT_MAX_LORA_RANK: usize = 16;
+    pub const SUPPORTED_MAX_LORA_RANKS: [usize; 9] = [1, 8, 16, 32, 64, 128, 256, 320, 512];
+
+    pub fn validate(self) -> Result<Self> {
+        anyhow::ensure!(self.max_loras > 0, "max_loras must be >= 1");
+        anyhow::ensure!(
+            Self::is_supported_max_lora_rank(self.max_lora_rank),
+            "max_lora_rank must be one of: {}",
+            Self::supported_max_lora_ranks_display()
+        );
+        Ok(self)
+    }
+
+    pub fn is_supported_max_lora_rank(rank: usize) -> bool {
+        Self::SUPPORTED_MAX_LORA_RANKS.contains(&rank)
+    }
+
+    pub fn supported_max_lora_ranks_display() -> String {
+        Self::SUPPORTED_MAX_LORA_RANKS
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl Default for Qwen3LoraOptions {
+    fn default() -> Self {
+        Self {
+            max_loras: Self::DEFAULT_MAX_LORAS,
+            max_lora_rank: Self::DEFAULT_MAX_LORA_RANK,
+        }
+    }
+}
+
 /// Low-level Qwen3 execution interface.
 ///
 /// This is the production phase boundary used by the Qwen3 scheduler and by
@@ -71,6 +114,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
 pub fn start_engine_with_lora_control(
     model_path: &Path,
     options: EngineLoadOptions,
+    lora_options: Qwen3LoraOptions,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -81,5 +125,11 @@ pub fn start_engine_with_lora_control(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    scheduler::start_qwen3_with_lora_control(model_path, enable_cuda_graph, &device_ordinals, seed)
+    scheduler::start_qwen3_with_lora_control(
+        model_path,
+        enable_cuda_graph,
+        &device_ordinals,
+        seed,
+        lora_options.validate()?,
+    )
 }

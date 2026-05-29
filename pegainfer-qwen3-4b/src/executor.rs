@@ -4,6 +4,7 @@ use std::thread;
 use anyhow::Result;
 use crossbeam_channel as channel;
 
+use crate::Qwen3LoraOptions;
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
@@ -450,6 +451,7 @@ pub struct Qwen3Executor {
     /// block hashes so KV computed under different adapters never mixes.
     active_lora_adapter: Option<String>,
     prefix_cache_enabled: bool,
+    lora_options: Qwen3LoraOptions,
 }
 
 impl Qwen3Executor {
@@ -483,6 +485,7 @@ impl Qwen3Executor {
             loaded_lora_adapters: HashSet::new(),
             active_lora_adapter: None,
             prefix_cache_enabled: true,
+            lora_options: Qwen3LoraOptions::default(),
         })
     }
 
@@ -491,6 +494,21 @@ impl Qwen3Executor {
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
     ) -> Result<Self> {
+        Self::from_runtime_with_lora_options(
+            model_path,
+            enable_cuda_graph,
+            device_ordinals,
+            Qwen3LoraOptions::default(),
+        )
+    }
+
+    pub fn from_runtime_with_lora_options(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        lora_options: Qwen3LoraOptions,
+    ) -> Result<Self> {
+        let lora_options = lora_options.validate()?;
         anyhow::ensure!(
             !device_ordinals.is_empty(),
             "Qwen3 executor requires at least one device"
@@ -504,7 +522,9 @@ impl Qwen3Executor {
                     device_ordinal: device_ordinals[0],
                 },
             )?;
-            return Self::single(model);
+            let mut executor = Self::single(model)?;
+            executor.lora_options = lora_options;
+            return Ok(executor);
         }
 
         let world_size = device_ordinals.len();
@@ -598,6 +618,7 @@ impl Qwen3Executor {
             loaded_lora_adapters: HashSet::new(),
             active_lora_adapter: None,
             prefix_cache_enabled: true,
+            lora_options,
         })
     }
 
@@ -711,6 +732,24 @@ impl Qwen3Executor {
         }
         Ok(())
     }
+}
+
+fn ensure_lora_capacity(
+    loaded_lora_adapters: &HashSet<String>,
+    lora_name: &str,
+    max_loras: usize,
+) -> Result<()> {
+    if loaded_lora_adapters.contains(lora_name) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        loaded_lora_adapters.len() < max_loras,
+        "Qwen3 LoRA adapter capacity exceeded: max_loras={}, loaded_adapters={}, requested={}",
+        max_loras,
+        loaded_lora_adapters.len(),
+        lora_name
+    );
+    Ok(())
 }
 
 impl ModelExecutor for Qwen3Executor {
@@ -933,7 +972,16 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
-        let adapter = crate::lora::load_lora_adapter(&request.lora_path, &self.metadata.config)?;
+        ensure_lora_capacity(
+            &self.loaded_lora_adapters,
+            &request.lora_name,
+            self.lora_options.max_loras,
+        )?;
+        let adapter = crate::lora::load_lora_adapter(
+            &request.lora_path,
+            &self.metadata.config,
+            self.lora_options.max_lora_rank,
+        )?;
         let world_size = self.workers.len() + 1;
         let projection_count: usize = adapter
             .layers
@@ -1069,6 +1117,31 @@ impl ModelExecutor for Qwen3Executor {
         let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
         names.sort();
         names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_lora_capacity;
+    use std::collections::HashSet;
+
+    #[test]
+    fn lora_capacity_rejects_new_adapter_at_limit() {
+        let loaded = HashSet::from(["adapter-a".to_string()]);
+
+        let error = ensure_lora_capacity(&loaded, "adapter-b", 1)
+            .expect_err("new adapter should exceed capacity")
+            .to_string();
+
+        assert!(error.contains("max_loras=1"));
+        assert!(error.contains("requested=adapter-b"));
+    }
+
+    #[test]
+    fn lora_capacity_allows_existing_adapter_replacement_at_limit() {
+        let loaded = HashSet::from(["adapter-a".to_string()]);
+
+        ensure_lora_capacity(&loaded, "adapter-a", 1).expect("existing adapter should fit");
     }
 }
 

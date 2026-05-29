@@ -151,8 +151,12 @@ impl LoraAdapter {
     }
 }
 
-pub(crate) fn load_lora_adapter(path: &Path, config: &Config) -> Result<LoraAdapter> {
-    let (manifest, raw_weights) = inspect_lora_adapter(path, config)?;
+pub(crate) fn load_lora_adapter(
+    path: &Path,
+    config: &Config,
+    max_lora_rank: usize,
+) -> Result<LoraAdapter> {
+    let (manifest, raw_weights) = inspect_lora_adapter(path, config, max_lora_rank)?;
     let tensors = SafeTensors::deserialize(&raw_weights).with_context(|| {
         format!(
             "failed to parse {}",
@@ -229,11 +233,19 @@ pub(crate) fn apply_lora_projection_delta(
     ops::scaled_add_rows_into(ctx, &delta, scale, out, row_offset)
 }
 
-fn inspect_lora_adapter(path: &Path, config: &Config) -> Result<(LoraAdapterManifest, Vec<u8>)> {
+fn inspect_lora_adapter(
+    path: &Path,
+    config: &Config,
+    max_lora_rank: usize,
+) -> Result<(LoraAdapterManifest, Vec<u8>)> {
     let adapter_config = load_adapter_config(path)?;
     let rank = adapter_config.lora_rank;
     let alpha = adapter_config.alpha;
     ensure!(rank > 0, "LoRA rank must be > 0");
+    ensure!(
+        rank <= max_lora_rank,
+        "LoRA rank {rank} exceeds max_lora_rank {max_lora_rank}"
+    );
     ensure!(alpha > 0, "LoRA alpha must be > 0");
     if let Some(peft_type) = &adapter_config.peft_type {
         ensure!(
@@ -701,9 +713,13 @@ mod tests {
         write_adapter_config(&path, targets, 2);
         write_adapter_weights(&path, &config, targets, 2);
 
-        let manifest = load_lora_adapter(&path, &config)
-            .expect("load adapter")
-            .manifest;
+        let manifest = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter")
+        .manifest;
 
         assert_eq!(manifest.rank, 2);
         assert_eq!(manifest.alpha, 16);
@@ -721,7 +737,12 @@ mod tests {
         write_adapter_config(&path, &["q_proj", "down_proj"], 2);
         write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
 
-        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let adapter = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter");
 
         assert_eq!(adapter.manifest.rank, 2);
         assert_eq!(adapter.layers.len(), config.num_hidden_layers);
@@ -769,7 +790,12 @@ mod tests {
         safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
             .expect("write safetensors");
 
-        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let adapter = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter");
         let q_proj = adapter.layers[0].projections.get("q_proj").expect("q_proj");
 
         assert_eq!(q_proj.a.data[0].to_f32(), bf16::from_f32(1.5).to_f32());
@@ -783,9 +809,28 @@ mod tests {
         write_adapter_config(&path, &["q_proj", "embed_tokens"], 2);
         write_adapter_weights(&path, &config, &["q_proj"], 2);
 
-        let error = load_lora_adapter(&path, &config).expect_err("unsupported target");
+        let error = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect_err("unsupported target");
 
         assert!(error.to_string().contains("unsupported Qwen3 LoRA target"));
+    }
+
+    #[test]
+    fn rejects_lora_rank_above_configured_limit() {
+        let config = tiny_config();
+        let path = temp_adapter_dir("rank-limit");
+        write_adapter_config(&path, &["q_proj"], 2);
+        write_adapter_weights(&path, &config, &["q_proj"], 2);
+
+        let error = load_lora_adapter(&path, &config, 1)
+            .expect_err("rank above max_lora_rank should fail")
+            .to_string();
+
+        assert!(error.contains("LoRA rank 2 exceeds max_lora_rank 1"));
     }
 
     #[test]
@@ -814,7 +859,12 @@ mod tests {
         safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
             .expect("write safetensors");
 
-        let error = load_lora_adapter(&path, &config).expect_err("bad tensor shape");
+        let error = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect_err("bad tensor shape");
 
         assert!(error.to_string().contains("shape mismatch"));
     }
@@ -867,7 +917,12 @@ mod tests {
         let path = temp_adapter_dir("tp-shard");
         write_adapter_config(&path, &["q_proj", "down_proj"], 2);
         write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
-        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let adapter = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter");
 
         let sharded = adapter
             .shard_for_tensor_parallel(

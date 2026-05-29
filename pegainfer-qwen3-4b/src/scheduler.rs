@@ -18,6 +18,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
+use crate::Qwen3LoraOptions;
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use pegainfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, TokenEvent,
@@ -87,8 +88,14 @@ pub(crate) fn start_qwen3_with_lora_control(
     enable_cuda_graph: bool,
     device_ordinals: &[usize],
     seed: u64,
+    lora_options: Qwen3LoraOptions,
 ) -> Result<EngineHandle> {
-    let executor = Qwen3Executor::from_runtime(model_path, enable_cuda_graph, device_ordinals)?;
+    let executor = Qwen3Executor::from_runtime_with_lora_options(
+        model_path,
+        enable_cuda_graph,
+        device_ordinals,
+        lora_options,
+    )?;
     Ok(start_with_executor_with_lora_control(executor, seed))
 }
 
