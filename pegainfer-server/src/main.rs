@@ -6,6 +6,7 @@ use clap::Parser;
 use log::info;
 use pegainfer::logging;
 use pegainfer::server_engine::{ModelType, detect_model_type};
+use pegainfer::vllm_frontend::LoraModule;
 use pegainfer_core::engine::EngineLoadOptions;
 
 #[cfg(not(target_env = "msvc"))]
@@ -38,6 +39,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     enable_lora: bool,
 
+    /// LoRA modules to load at startup. Accepts vLLM-style `name=path`, JSON
+    /// object, or JSON list object entries with `name` and `path`.
+    #[arg(long = "lora-modules", value_parser = parse_lora_modules_arg)]
+    lora_modules: Vec<LoraModule>,
+
     /// CUDA device ordinal for single-GPU Qwen3 loads
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
@@ -63,6 +69,9 @@ async fn main() -> anyhow::Result<()> {
             args.model_path.display()
         )
     })?;
+    if !args.enable_lora && !args.lora_modules.is_empty() {
+        bail!("--lora-modules requires --enable-lora");
+    }
     if args.enable_lora && !matches!(model_type, ModelType::Qwen3) {
         bail!("--enable-lora is currently supported only for Qwen3");
     }
@@ -190,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
             handle,
             args.model_path.to_string_lossy().into_owned(),
             args.served_model_name.into_iter().collect(),
+            args.lora_modules,
             args.port,
             max_model_len,
             pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
@@ -208,4 +218,111 @@ async fn main() -> anyhow::Result<()> {
     .context("vLLM frontend server failed")?;
 
     Ok(())
+}
+
+fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> {
+    if let Some((name, path)) = value.split_once('=') {
+        return parse_lora_module_fields(name, path);
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(value).map_err(|error| format!("invalid --lora-modules: {error}"))?;
+    match json {
+        serde_json::Value::Object(map) => {
+            let name = map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "--lora-modules JSON object requires string field `name`".to_string()
+                })?;
+            let path = map
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "--lora-modules JSON object requires string field `path`".to_string()
+                })?;
+            parse_lora_module_fields(name, path)
+        }
+        serde_json::Value::Array(entries) if entries.len() == 1 => {
+            let Some(entry) = entries.into_iter().next() else {
+                unreachable!("array length checked")
+            };
+            let serde_json::Value::Object(map) = entry else {
+                return Err("--lora-modules JSON list entries must be objects".to_string());
+            };
+            let name = map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "--lora-modules JSON object requires string field `name`".to_string()
+                })?;
+            let path = map
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "--lora-modules JSON object requires string field `path`".to_string()
+                })?;
+            parse_lora_module_fields(name, path)
+        }
+        serde_json::Value::Array(_) => Err(
+            "pass multiple --lora-modules values instead of one JSON list with multiple entries"
+                .to_string(),
+        ),
+        _ => Err(
+            "--lora-modules must be `name=path`, a JSON object, or a single-entry JSON list"
+                .to_string(),
+        ),
+    }
+}
+
+fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String> {
+    if name.is_empty() {
+        return Err("--lora-modules name must not be empty".to_string());
+    }
+    if path.is_empty() {
+        return Err("--lora-modules path must not be empty".to_string());
+    }
+    Ok(LoraModule {
+        name: name.to_string(),
+        path: PathBuf::from(path),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lora_modules_name_equals_path() {
+        assert_eq!(
+            parse_lora_modules_arg("adapter-a=/tmp/adapter-a").expect("parse module"),
+            LoraModule {
+                name: "adapter-a".to_string(),
+                path: PathBuf::from("/tmp/adapter-a"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_lora_modules_json_object() {
+        assert_eq!(
+            parse_lora_modules_arg(r#"{"name":"adapter-a","path":"/tmp/adapter-a"}"#)
+                .expect("parse module"),
+            LoraModule {
+                name: "adapter-a".to_string(),
+                path: PathBuf::from("/tmp/adapter-a"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_lora_modules_single_entry_json_list() {
+        assert_eq!(
+            parse_lora_modules_arg(r#"[{"name":"adapter-a","path":"/tmp/adapter-a"}]"#)
+                .expect("parse module"),
+            LoraModule {
+                name: "adapter-a".to_string(),
+                path: PathBuf::from("/tmp/adapter-a"),
+            }
+        );
+    }
 }

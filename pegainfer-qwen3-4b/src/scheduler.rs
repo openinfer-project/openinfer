@@ -376,6 +376,20 @@ fn handle_control_request(executor: &mut impl ModelExecutor, control: EngineCont
                     .map_err(|error| error.to_string()),
             );
         }
+        EngineControlRequest::UnloadLoraAdapter {
+            request,
+            response_tx,
+        } => {
+            info!(
+                "LoRA adapter unload requested while scheduler is idle: name={}",
+                request.lora_name
+            );
+            let _ = response_tx.send(
+                executor
+                    .unload_lora_adapter(&request)
+                    .map_err(|error| error.to_string()),
+            );
+        }
         EngineControlRequest::ListLoraAdapters { response_tx } => {
             let _ = response_tx.send(Ok(executor.list_lora_adapters()));
         }
@@ -584,7 +598,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
-    use pegainfer_core::engine::{EngineControlError, LoadLoraAdapterRequest};
+    use pegainfer_core::engine::{
+        EngineControlError, LoadLoraAdapterRequest, UnloadLoraAdapterRequest,
+    };
 
     use super::*;
     use crate::executor::{
@@ -716,6 +732,18 @@ mod tests {
             let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
             names.sort();
             names
+        }
+
+        fn unload_lora_adapter(&mut self, request: &UnloadLoraAdapterRequest) -> Result<()> {
+            anyhow::ensure!(
+                self.loaded_lora_adapters.remove(&request.lora_name),
+                "LoRA adapter is not loaded: {}",
+                request.lora_name
+            );
+            if self.active_lora_adapter.as_deref() == Some(request.lora_name.as_str()) {
+                self.active_lora_adapter = None;
+            }
+            Ok(())
         }
 
         fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -1198,6 +1226,30 @@ mod tests {
             }
             other => panic!("unexpected control error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn lora_control_unloads_adapter_when_idle() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped))
+            .with_lora_adapters(&["adapter-a"], Arc::new(Mutex::new(Vec::new())));
+        let handle = start_with_executor_with_lora_control(executor, 42);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build runtime");
+        runtime
+            .block_on(handle.unload_lora_adapter(UnloadLoraAdapterRequest {
+                lora_name: "adapter-a".to_string(),
+                lora_int_id: None,
+            }))
+            .expect("unload adapter");
+        assert_eq!(
+            runtime
+                .block_on(handle.list_lora_adapters())
+                .expect("list adapters"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

@@ -394,6 +394,17 @@ impl Qwen3Model {
         Ok(())
     }
 
+    pub(crate) fn uninstall_lora_adapter(&mut self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.lora_adapters.remove(name).is_some(),
+            "Qwen3 LoRA adapter {name} is not loaded"
+        );
+        if self.active_lora_adapter.as_deref() == Some(name) {
+            self.active_lora_adapter = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn activate_lora_adapter(&mut self, name: Option<&str>) -> Result<()> {
         match name {
             Some(name) => {
