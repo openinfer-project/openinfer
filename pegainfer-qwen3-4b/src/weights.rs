@@ -419,12 +419,6 @@ impl Qwen3Model {
         Ok(())
     }
 
-    pub(crate) fn lora_adapter_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.lora_adapters.keys().cloned().collect();
-        names.sort();
-        names
-    }
-
     pub(crate) fn lora_layer(&self, layer_idx: usize) -> Option<(&DeviceLoraLayer, f32)> {
         self.active_lora_adapter.as_ref().and_then(|name| {
             let adapter = self.lora_adapters.get(name)?;

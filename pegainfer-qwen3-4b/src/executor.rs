@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 
 use anyhow::Result;
@@ -431,6 +431,7 @@ pub struct Qwen3Executor {
     request_kvs: HashMap<RequestId, pegainfer_kv_cache::RequestKv>,
     primary: RankWorker,
     workers: Vec<RankWorker>,
+    loaded_lora_adapters: HashSet<String>,
 }
 
 impl Qwen3Executor {
@@ -461,6 +462,7 @@ impl Qwen3Executor {
                 LocalQwen3Lane::new(model, kv_buffer, total_blocks, padding_block_id)?,
             )?,
             workers: Vec::new(),
+            loaded_lora_adapters: HashSet::new(),
         })
     }
 
@@ -573,6 +575,7 @@ impl Qwen3Executor {
             request_kvs: HashMap::new(),
             primary,
             workers,
+            loaded_lora_adapters: HashSet::new(),
         })
     }
 
@@ -972,6 +975,7 @@ impl ModelExecutor for Qwen3Executor {
             world_size,
             request.load_inplace
         );
+        self.loaded_lora_adapters.insert(request.lora_name.clone());
         Ok(())
     }
 
@@ -1009,11 +1013,14 @@ impl ModelExecutor for Qwen3Executor {
         }
 
         log::info!("Unloaded Qwen3 LoRA adapter {}", request.lora_name);
+        self.loaded_lora_adapters.remove(&request.lora_name);
         Ok(())
     }
 
     fn list_lora_adapters(&self) -> Vec<String> {
-        self.primary.list_lora_adapters().unwrap_or_default()
+        let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
+        names.sort();
+        names
     }
 }
 
@@ -1182,10 +1189,6 @@ impl LocalQwen3Lane {
     fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
         self.model.activate_lora_adapter(adapter)
     }
-
-    fn list_lora_adapters(&self) -> Vec<String> {
-        self.model.lora_adapter_names()
-    }
 }
 
 #[derive(Clone)]
@@ -1236,9 +1239,6 @@ enum WorkerCommand {
     ActivateLoraAdapter {
         name: Option<String>,
         resp: channel::Sender<Result<()>>,
-    },
-    ListLoraAdapters {
-        resp: channel::Sender<Result<Vec<String>>>,
     },
     Shutdown,
 }
@@ -1305,9 +1305,6 @@ impl RankWorker {
                                 WorkerCommand::ActivateLoraAdapter { name, resp } => {
                                     let result = lane.activate_lora_adapter(name.as_deref());
                                     let _ = resp.send(result);
-                                }
-                                WorkerCommand::ListLoraAdapters { resp } => {
-                                    let _ = resp.send(Ok(lane.list_lora_adapters()));
                                 }
                                 WorkerCommand::Shutdown => break,
                             }
@@ -1384,18 +1381,6 @@ impl RankWorker {
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA unload"))?;
         Ok(resp_rx)
-    }
-
-    fn list_lora_adapters(&self) -> Result<Vec<String>> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::ListLoraAdapters { resp: resp_tx })
-            .map_err(|_| {
-                anyhow::anyhow!("tensor-parallel worker channel closed on LoRA adapter list")
-            })?;
-        resp_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker dropped LoRA adapter list"))?
     }
 
     fn shutdown(&mut self) {
