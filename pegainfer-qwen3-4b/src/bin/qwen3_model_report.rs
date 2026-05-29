@@ -8,7 +8,10 @@ use clap::Parser;
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use cudarc::driver::{CudaSlice, sys};
 use half::bf16;
-use pegainfer_bench::{LatencyStats, attr_usize, axis, input, output, zero_matrix};
+use pegainfer_bench::{
+    Accum, CallSiteRow, LatencyStats, RollupRow, accumulate, attr_usize, axis, call_site_row,
+    input, output, rollup_row, zero_matrix,
+};
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates, KernelCall, TensorSpec};
@@ -67,31 +70,6 @@ struct ReportConfig {
 }
 
 #[derive(Clone, Serialize)]
-struct RollupRow {
-    op: String,
-    calls: usize,
-    total_us: f64,
-    total_p99_us: f64,
-    per_call_us: f64,
-    stddev_us: f64,
-    p99_us: f64,
-    pct: f64,
-}
-
-#[derive(Clone, Serialize)]
-struct CallSiteRow {
-    call_site: String,
-    op: String,
-    calls: usize,
-    per_call_us: f64,
-    stddev_us: f64,
-    p99_us: f64,
-    total_us: f64,
-    total_p99_us: f64,
-    pct: f64,
-}
-
-#[derive(Clone, Serialize)]
 struct CoverageRow {
     call_site: String,
     op: String,
@@ -105,23 +83,6 @@ struct CoverageRow {
 struct BenchEntry {
     key: String,
     stats: LatencyStats,
-}
-
-struct OpAccum {
-    calls: usize,
-    total_us: f64,
-    total_p99_us: f64,
-    sum_stddev_us: f64,
-    sum_p99_us: f64,
-}
-
-struct SiteAccum {
-    op: String,
-    calls: usize,
-    total_us: f64,
-    total_p99_us: f64,
-    sum_stddev_us: f64,
-    sum_p99_us: f64,
 }
 
 fn main() -> Result<()> {
@@ -245,33 +206,21 @@ fn compose_report(
     schedule: Vec<KernelCall>,
     catalog: &HashMap<String, BenchEntry>,
 ) -> Result<ModelReport> {
-    let mut op_rows: BTreeMap<String, OpAccum> = BTreeMap::new();
-    let mut site_rows: BTreeMap<String, SiteAccum> = BTreeMap::new();
+    let mut op_rows: BTreeMap<String, Accum> = BTreeMap::new();
+    let mut site_rows: BTreeMap<String, (String, Accum)> = BTreeMap::new();
     let mut coverage_rows: BTreeMap<(String, String), CoverageRow> = BTreeMap::new();
-    let mut total = 0.0;
-    let mut total_p99 = 0.0;
     let mut missing = Vec::new();
 
     for call in &schedule {
         let site = normalize_call_site(&call.label);
         if is_noop_all_reduce(call) {
-            let op_entry = op_rows.entry(call.op.clone()).or_insert_with(|| OpAccum {
-                calls: 0,
-                total_us: 0.0,
-                total_p99_us: 0.0,
-                sum_stddev_us: 0.0,
-                sum_p99_us: 0.0,
-            });
-            op_entry.calls += 1;
-            let site_entry = site_rows.entry(site.clone()).or_insert_with(|| SiteAccum {
-                op: call.op.clone(),
-                calls: 0,
-                total_us: 0.0,
-                total_p99_us: 0.0,
-                sum_stddev_us: 0.0,
-                sum_p99_us: 0.0,
-            });
-            site_entry.calls += 1;
+            // Counted toward call totals but contributes zero time on a single rank.
+            let zero = LatencyStats::zero(iters);
+            accumulate(op_rows.entry(call.op.clone()).or_default(), &zero);
+            let (_, site_accum) = site_rows
+                .entry(site.clone())
+                .or_insert_with(|| (call.op.clone(), Accum::default()));
+            accumulate(site_accum, &zero);
             coverage_rows
                 .entry((site.clone(), call.op.clone()))
                 .and_modify(|row| row.calls += 1)
@@ -280,7 +229,7 @@ fn compose_report(
                     op: call.op.clone(),
                     status: "no_op".to_string(),
                     calls: 1,
-                    latency: Some(LatencyStats::zero(iters)),
+                    latency: Some(zero),
                     key: None,
                 });
             continue;
@@ -297,34 +246,11 @@ fn compose_report(
             continue;
         };
 
-        total += entry.stats.mean_us;
-        total_p99 += entry.stats.p99_us;
-        let op_entry = op_rows.entry(call.op.clone()).or_insert_with(|| OpAccum {
-            calls: 0,
-            total_us: 0.0,
-            total_p99_us: 0.0,
-            sum_stddev_us: 0.0,
-            sum_p99_us: 0.0,
-        });
-        op_entry.calls += 1;
-        op_entry.total_us += entry.stats.mean_us;
-        op_entry.total_p99_us += entry.stats.p99_us;
-        op_entry.sum_stddev_us += entry.stats.stddev_us;
-        op_entry.sum_p99_us += entry.stats.p99_us;
-
-        let site_entry = site_rows.entry(site.clone()).or_insert_with(|| SiteAccum {
-            op: call.op.clone(),
-            calls: 0,
-            total_us: 0.0,
-            total_p99_us: 0.0,
-            sum_stddev_us: 0.0,
-            sum_p99_us: 0.0,
-        });
-        site_entry.calls += 1;
-        site_entry.total_us += entry.stats.mean_us;
-        site_entry.total_p99_us += entry.stats.p99_us;
-        site_entry.sum_stddev_us += entry.stats.stddev_us;
-        site_entry.sum_p99_us += entry.stats.p99_us;
+        accumulate(op_rows.entry(call.op.clone()).or_default(), &entry.stats);
+        let (_, site_accum) = site_rows
+            .entry(site.clone())
+            .or_insert_with(|| (call.op.clone(), Accum::default()));
+        accumulate(site_accum, &entry.stats);
 
         coverage_rows
             .entry((site.clone(), call.op.clone()))
@@ -343,40 +269,24 @@ fn compose_report(
         bail!("missing bench result:\n{}", missing.join("\n\n"));
     }
 
+    // Re-derived from the per-op accumulators (no-op all-reduce contributes 0),
+    // so totals are summed in op order rather than schedule order — a sub-ULP
+    // reshuffle that only touches this untracked target/ report.
+    let total = op_rows.values().map(|accum| accum.total_us).sum::<f64>();
+    let total_p99 = op_rows
+        .values()
+        .map(|accum| accum.total_p99_us)
+        .sum::<f64>();
+
     let mut by_op: Vec<_> = op_rows
         .into_iter()
-        .map(|(op, row)| {
-            let calls = row.calls.max(1) as f64;
-            RollupRow {
-                op,
-                calls: row.calls,
-                total_us: row.total_us,
-                total_p99_us: row.total_p99_us,
-                per_call_us: row.total_us / calls,
-                stddev_us: row.sum_stddev_us / calls,
-                p99_us: row.sum_p99_us / calls,
-                pct: pct(row.total_us, total),
-            }
-        })
+        .map(|(op, accum)| rollup_row(op, accum, total))
         .collect();
     by_op.sort_by(|a, b| b.total_us.total_cmp(&a.total_us).then(a.op.cmp(&b.op)));
 
     let mut by_call_site: Vec<_> = site_rows
         .into_iter()
-        .map(|(call_site, row)| {
-            let calls = row.calls.max(1) as f64;
-            CallSiteRow {
-                call_site,
-                op: row.op,
-                calls: row.calls,
-                per_call_us: row.total_us / calls,
-                stddev_us: row.sum_stddev_us / calls,
-                p99_us: row.sum_p99_us / calls,
-                total_us: row.total_us,
-                total_p99_us: row.total_p99_us,
-                pct: pct(row.total_us, total),
-            }
-        })
+        .map(|(call_site, (op, accum))| call_site_row(call_site, op, accum, total))
         .collect();
     by_call_site.sort_by(|a, b| {
         b.total_us
@@ -405,14 +315,6 @@ fn compose_report(
         by_call_site,
         coverage: coverage_rows.into_values().collect(),
     })
-}
-
-fn pct(value: f64, total: f64) -> f64 {
-    if total == 0.0 {
-        0.0
-    } else {
-        value / total * 100.0
-    }
 }
 
 fn measure_catalog(calls: &[KernelCall], iters: u64) -> Result<HashMap<String, BenchEntry>> {

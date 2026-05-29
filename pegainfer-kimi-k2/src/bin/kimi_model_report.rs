@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use pegainfer_bench::{Accum, CallSiteRow, RollupRow, accumulate, call_site_row, rollup_row};
 use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kimi_k2::batch_decode_trace::{
     MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site, trace_decode_kernel_calls,
@@ -74,31 +75,6 @@ struct ReportConfig {
 }
 
 #[derive(Serialize)]
-struct RollupRow {
-    op: String,
-    calls: usize,
-    total_us: f64,
-    total_p99_us: f64,
-    per_call_us: f64,
-    stddev_us: f64,
-    p99_us: f64,
-    pct: f64,
-}
-
-#[derive(Serialize)]
-struct CallSiteRow {
-    call_site: String,
-    op: String,
-    calls: usize,
-    per_call_us: f64,
-    stddev_us: f64,
-    p99_us: f64,
-    total_us: f64,
-    total_p99_us: f64,
-    pct: f64,
-}
-
-#[derive(Serialize)]
 struct CoverageRow {
     call_site: String,
     op: String,
@@ -120,14 +96,6 @@ struct MissingOpRow {
 struct BenchEntry {
     key: String,
     measured: MeasuredCall,
-}
-
-struct Accum {
-    calls: usize,
-    total_us: f64,
-    total_p99_us: f64,
-    sum_stddev_us: f64,
-    sum_p99_us: f64,
 }
 
 #[derive(Default)]
@@ -320,61 +288,6 @@ fn load_schedule(
     match source {
         TraceSource::Runtime => trace_runtime_decode_kernel_calls(model_path, batch_size, kv_len),
         TraceSource::Static => trace_decode_kernel_calls(model_path, batch_size, kv_len),
-    }
-}
-
-impl Default for Accum {
-    fn default() -> Self {
-        Self {
-            calls: 0,
-            total_us: 0.0,
-            total_p99_us: 0.0,
-            sum_stddev_us: 0.0,
-            sum_p99_us: 0.0,
-        }
-    }
-}
-
-fn accumulate(accum: &mut Accum, stats: &LatencyStats) {
-    accum.calls += 1;
-    accum.total_us += stats.mean_us;
-    accum.total_p99_us += stats.p99_us;
-    accum.sum_stddev_us += stats.stddev_us;
-    accum.sum_p99_us += stats.p99_us;
-}
-
-fn rollup_row(op: String, accum: Accum, total: f64) -> RollupRow {
-    RollupRow {
-        op,
-        calls: accum.calls,
-        total_us: accum.total_us,
-        total_p99_us: accum.total_p99_us,
-        per_call_us: accum.total_us / accum.calls.max(1) as f64,
-        stddev_us: accum.sum_stddev_us / accum.calls.max(1) as f64,
-        p99_us: accum.sum_p99_us / accum.calls.max(1) as f64,
-        pct: pct(accum.total_us, total),
-    }
-}
-
-fn call_site_row(call_site: String, op: String, accum: Accum, total: f64) -> CallSiteRow {
-    CallSiteRow {
-        call_site,
-        op,
-        calls: accum.calls,
-        total_us: accum.total_us,
-        total_p99_us: accum.total_p99_us,
-        per_call_us: accum.total_us / accum.calls.max(1) as f64,
-        stddev_us: accum.sum_stddev_us / accum.calls.max(1) as f64,
-        p99_us: accum.sum_p99_us / accum.calls.max(1) as f64,
-        pct: pct(accum.total_us, total),
-    }
-}
-
-fn pct(value: f64, total: f64) -> f64 {
-    if total == 0.0 {
-        0.0
-    } else {
-        value / total * 100.0
     }
 }
 

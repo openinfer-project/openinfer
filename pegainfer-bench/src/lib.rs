@@ -1,10 +1,12 @@
 //! Model-agnostic kernel benchmarking harness.
 //!
-//! Every model crate's kernel-report tooling needs the same three things: a
-//! CUDA-event timing loop, latency statistics, and accessors over the
-//! [`KernelCall`] schedule that the report bins serialize. Those pieces carry no
-//! model knowledge, so they live here and each model crate keeps only its own
-//! `measure_*` providers, which call into [`measure_loop`].
+//! Every model crate's kernel-report tooling needs the same building blocks: a
+//! CUDA-event timing loop, latency statistics, accessors over the
+//! [`KernelCall`] schedule that the report bins serialize, and the rollup that
+//! folds per-call latencies into per-op / per-call-site report rows. Those
+//! pieces carry no model knowledge, so they live here and each model crate
+//! keeps only its own `measure_*` providers (which call into [`measure_loop`])
+//! and its own schedule walk (which feeds [`accumulate`]).
 
 use anyhow::{Result, anyhow, bail};
 use cudarc::driver::sys;
@@ -170,4 +172,96 @@ pub fn zero_weight<const OUT: usize, const IN: usize>(
     ctx: &DeviceContext,
 ) -> Result<GpuWeight<OUT, IN>> {
     GpuWeight::from_device_matrix(zero_matrix(ctx, OUT, IN)?)
+}
+
+// ── Model-report rollup ─────────────────────────────────────────────────
+//
+// A model report folds per-call latencies into per-op and per-call-site rows,
+// each carrying its share of the measured total. The aggregation math is
+// identical across models; only the schedule walk that feeds it (how a model
+// handles no-op collectives or ops without a provider) is model-specific, so
+// that loop stays in each report bin.
+
+/// Running aggregate of one op's or call-site's per-call [`LatencyStats`].
+#[derive(Clone, Debug, Default)]
+pub struct Accum {
+    pub calls: usize,
+    pub total_us: f64,
+    pub total_p99_us: f64,
+    sum_stddev_us: f64,
+    sum_p99_us: f64,
+}
+
+/// Fold one call's stats into an accumulator.
+pub fn accumulate(accum: &mut Accum, stats: &LatencyStats) {
+    accum.calls += 1;
+    accum.total_us += stats.mean_us;
+    accum.total_p99_us += stats.p99_us;
+    accum.sum_stddev_us += stats.stddev_us;
+    accum.sum_p99_us += stats.p99_us;
+}
+
+/// One per-op row of a model report.
+#[derive(Clone, Debug, Serialize)]
+pub struct RollupRow {
+    pub op: String,
+    pub calls: usize,
+    pub total_us: f64,
+    pub total_p99_us: f64,
+    pub per_call_us: f64,
+    pub stddev_us: f64,
+    pub p99_us: f64,
+    pub pct: f64,
+}
+
+/// One per-call-site row of a model report.
+#[derive(Clone, Debug, Serialize)]
+pub struct CallSiteRow {
+    pub call_site: String,
+    pub op: String,
+    pub calls: usize,
+    pub per_call_us: f64,
+    pub stddev_us: f64,
+    pub p99_us: f64,
+    pub total_us: f64,
+    pub total_p99_us: f64,
+    pub pct: f64,
+}
+
+pub fn rollup_row(op: String, accum: Accum, total: f64) -> RollupRow {
+    let calls = accum.calls.max(1) as f64;
+    RollupRow {
+        op,
+        calls: accum.calls,
+        total_us: accum.total_us,
+        total_p99_us: accum.total_p99_us,
+        per_call_us: accum.total_us / calls,
+        stddev_us: accum.sum_stddev_us / calls,
+        p99_us: accum.sum_p99_us / calls,
+        pct: pct(accum.total_us, total),
+    }
+}
+
+pub fn call_site_row(call_site: String, op: String, accum: Accum, total: f64) -> CallSiteRow {
+    let calls = accum.calls.max(1) as f64;
+    CallSiteRow {
+        call_site,
+        op,
+        calls: accum.calls,
+        per_call_us: accum.total_us / calls,
+        stddev_us: accum.sum_stddev_us / calls,
+        p99_us: accum.sum_p99_us / calls,
+        total_us: accum.total_us,
+        total_p99_us: accum.total_p99_us,
+        pct: pct(accum.total_us, total),
+    }
+}
+
+/// Percentage share of `value` within `total`, guarding against divide-by-zero.
+fn pct(value: f64, total: f64) -> f64 {
+    if total == 0.0 {
+        0.0
+    } else {
+        value / total * 100.0
+    }
 }
