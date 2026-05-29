@@ -152,6 +152,7 @@ fn load_adapter(handle: &EngineHandle, adapter_path: PathBuf) {
         .block_on(handle.load_lora_adapter(LoadLoraAdapterRequest {
             lora_name: "zero-smoke".to_string(),
             lora_path: adapter_path,
+            load_inplace: false,
         }))
         .expect("load LoRA adapter");
 }

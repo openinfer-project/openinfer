@@ -1,6 +1,8 @@
 use anyhow::Result;
 use cudarc::nccl::safe::{Comm, ReduceOp};
 use log::{debug, info};
+#[cfg(test)]
+use std::path::Path;
 use std::time::Instant;
 
 use super::config::{Config, TensorParallelConfig};
@@ -379,19 +381,17 @@ impl Qwen3Model {
         self.tp_comm = Some(comm);
     }
 
-    pub(crate) fn install_lora_adapter(&mut self, adapter: DeviceLoraAdapter) -> Result<()> {
-        anyhow::ensure!(
-            !self.lora_adapters.contains_key(&adapter.name),
-            "Qwen3 LoRA adapter {} is already loaded",
-            adapter.name
-        );
+    pub(crate) fn install_lora_adapter(
+        &mut self,
+        adapter: DeviceLoraAdapter,
+        load_inplace: bool,
+    ) -> Result<()> {
         debug!(
             "Installing Qwen3 LoRA adapter {} from {}",
             adapter.name,
             adapter.manifest.path.display()
         );
-        self.lora_adapters.insert(adapter.name.clone(), adapter);
-        Ok(())
+        install_lora_adapter_in_registry(&mut self.lora_adapters, adapter, load_inplace)
     }
 
     pub(crate) fn uninstall_lora_adapter(&mut self, name: &str) -> Result<()> {
@@ -491,5 +491,88 @@ impl Qwen3Model {
             block_size: page_size,
             num_blocks,
         }
+    }
+}
+
+fn install_lora_adapter_in_registry(
+    lora_adapters: &mut HashMap<String, DeviceLoraAdapter>,
+    adapter: DeviceLoraAdapter,
+    load_inplace: bool,
+) -> Result<()> {
+    if !load_inplace {
+        anyhow::ensure!(
+            !lora_adapters.contains_key(&adapter.name),
+            "Qwen3 LoRA adapter {} is already loaded",
+            adapter.name
+        );
+    }
+    lora_adapters.insert(adapter.name.clone(), adapter);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lora::{DeviceLoraLayer, LoraAdapterManifest};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "pegainfer-qwen3-lora-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn test_device_adapter(name: &str, path: &Path) -> DeviceLoraAdapter {
+        DeviceLoraAdapter {
+            name: name.to_string(),
+            manifest: LoraAdapterManifest {
+                path: path.to_path_buf(),
+                rank: 1,
+                alpha: 1,
+                target_modules: vec!["q_proj".to_string()],
+                tensor_count: 0,
+            },
+            scale: 1.0,
+            layers: vec![DeviceLoraLayer::default()],
+        }
+    }
+
+    #[test]
+    fn install_lora_adapter_requires_load_inplace_to_replace_existing_name() {
+        let mut adapters = HashMap::new();
+        let first_path = temp_path("replace-first");
+        let second_path = temp_path("replace-second");
+
+        let first = test_device_adapter("adapter-a", &first_path);
+        install_lora_adapter_in_registry(&mut adapters, first, false)
+            .expect("install first adapter");
+        assert_eq!(
+            adapters
+                .get("adapter-a")
+                .map(|adapter| adapter.manifest.path.as_path()),
+            Some(first_path.as_path()),
+        );
+
+        let duplicate = test_device_adapter("adapter-a", &second_path);
+        let error = install_lora_adapter_in_registry(&mut adapters, duplicate, false)
+            .expect_err("duplicate adapter without load_inplace should fail")
+            .to_string();
+        assert!(error.contains("already loaded"));
+        assert_eq!(
+            adapters
+                .get("adapter-a")
+                .map(|adapter| adapter.manifest.path.as_path()),
+            Some(first_path.as_path()),
+        );
+
+        let replacement = test_device_adapter("adapter-a", &second_path);
+        install_lora_adapter_in_registry(&mut adapters, replacement, true)
+            .expect("replace adapter");
+        assert_eq!(
+            adapters
+                .get("adapter-a")
+                .map(|adapter| adapter.manifest.path.as_path()),
+            Some(second_path.as_path()),
+        );
     }
 }

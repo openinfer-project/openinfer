@@ -122,9 +122,6 @@ async fn load_lora_adapter(
     if request.lora_path.as_os_str().is_empty() {
         return bad_request("lora_path must not be empty");
     }
-    if request.load_inplace {
-        return bad_request("load_inplace=true is not supported by Qwen3 LoRA PR1");
-    }
     if request.is_3d_lora_weight {
         return bad_request("is_3d_lora_weight=true is not supported by Qwen3 LoRA PR1");
     }
@@ -135,6 +132,7 @@ async fn load_lora_adapter(
         .load_lora_adapter(LoadLoraAdapterRequest {
             lora_name: request.lora_name,
             lora_path: request.lora_path,
+            load_inplace: request.load_inplace,
         })
         .await
     {
@@ -549,6 +547,7 @@ async fn load_startup_lora_modules(
             .load_lora_adapter(LoadLoraAdapterRequest {
                 lora_name: module.name.clone(),
                 lora_path: module.path.clone(),
+                load_inplace: false,
             })
             .await
             .with_context(|| {
@@ -1219,8 +1218,8 @@ mod tests {
             Json(LoadLoraAdapterHttpRequest {
                 lora_name: "adapter-a".to_string(),
                 lora_path: PathBuf::from("/tmp/adapter-a"),
-                load_inplace: true,
-                is_3d_lora_weight: false,
+                load_inplace: false,
+                is_3d_lora_weight: true,
             }),
         )
         .await;

@@ -1216,6 +1216,7 @@ mod tests {
             .block_on(handle.load_lora_adapter(LoadLoraAdapterRequest {
                 lora_name: "adapter-a".to_string(),
                 lora_path: "/tmp/adapter-a".into(),
+                load_inplace: false,
             }))
             .expect_err("adapter load should be a stub error");
 
@@ -1279,6 +1280,7 @@ mod tests {
                 .block_on(load_handle.load_lora_adapter(LoadLoraAdapterRequest {
                     lora_name: "adapter-a".to_string(),
                     lora_path: "/tmp/adapter-a".into(),
+                    load_inplace: false,
                 }));
             load_done_thread.store(true, std::sync::atomic::Ordering::SeqCst);
             result

@@ -919,9 +919,11 @@ impl ModelExecutor for Qwen3Executor {
         let primary_adapter = sharded_adapters
             .next()
             .expect("rank 0 adapter must exist for nonzero world_size");
-        let primary_response = self
-            .primary
-            .load_lora_adapter(request.lora_name.clone(), primary_adapter)?;
+        let primary_response = self.primary.load_lora_adapter(
+            request.lora_name.clone(),
+            primary_adapter,
+            request.load_inplace,
+        )?;
         let mut pending = Vec::with_capacity(self.workers.len());
         for (index, worker) in self.workers.iter().enumerate() {
             let rank = index + 1;
@@ -930,7 +932,11 @@ impl ModelExecutor for Qwen3Executor {
                 .expect("worker adapter must exist for every tensor-parallel rank");
             pending.push((
                 rank,
-                worker.load_lora_adapter(request.lora_name.clone(), rank_adapter)?,
+                worker.load_lora_adapter(
+                    request.lora_name.clone(),
+                    rank_adapter,
+                    request.load_inplace,
+                )?,
             ));
         }
 
@@ -956,14 +962,15 @@ impl ModelExecutor for Qwen3Executor {
         }
 
         log::info!(
-            "Loaded Qwen3 LoRA adapter {} from {} (rank={}, targets={}, projections={}, bf16_elements={}, tp_world_size={})",
+            "Loaded Qwen3 LoRA adapter {} from {} (rank={}, targets={}, projections={}, bf16_elements={}, tp_world_size={}, load_inplace={})",
             request.lora_name,
             path,
             rank,
             targets,
             projection_count,
             element_count,
-            world_size
+            world_size,
+            request.load_inplace
         );
         Ok(())
     }
@@ -1156,10 +1163,16 @@ impl LocalQwen3Lane {
         )
     }
 
-    fn load_lora_adapter(&mut self, name: String, adapter: crate::lora::LoraAdapter) -> Result<()> {
+    fn load_lora_adapter(
+        &mut self,
+        name: String,
+        adapter: crate::lora::LoraAdapter,
+        load_inplace: bool,
+    ) -> Result<()> {
         let device_adapter =
             crate::lora::load_device_lora_adapter(self.model.device_ctx(), name, adapter)?;
-        self.model.install_lora_adapter(device_adapter)
+        self.model
+            .install_lora_adapter(device_adapter, load_inplace)
     }
 
     fn unload_lora_adapter(&mut self, name: &str) -> Result<()> {
@@ -1213,6 +1226,7 @@ enum WorkerCommand {
     LoadLoraAdapter {
         name: String,
         adapter: crate::lora::LoraAdapter,
+        load_inplace: bool,
         resp: channel::Sender<Result<()>>,
     },
     UnloadLoraAdapter {
@@ -1277,9 +1291,11 @@ impl RankWorker {
                                 WorkerCommand::LoadLoraAdapter {
                                     name,
                                     adapter,
+                                    load_inplace,
                                     resp,
                                 } => {
-                                    let result = lane.load_lora_adapter(name, adapter);
+                                    let result =
+                                        lane.load_lora_adapter(name, adapter, load_inplace);
                                     let _ = resp.send(result);
                                 }
                                 WorkerCommand::UnloadLoraAdapter { name, resp } => {
@@ -1332,12 +1348,14 @@ impl RankWorker {
         &self,
         name: String,
         adapter: crate::lora::LoraAdapter,
+        load_inplace: bool,
     ) -> Result<channel::Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::LoadLoraAdapter {
                 name,
                 adapter,
+                load_inplace,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA load"))?;

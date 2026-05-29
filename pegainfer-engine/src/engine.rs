@@ -66,6 +66,7 @@ pub struct GenerateRequest {
 pub struct LoadLoraAdapterRequest {
     pub lora_name: String,
     pub lora_path: PathBuf,
+    pub load_inplace: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,6 +358,7 @@ mod tests {
         let request = LoadLoraAdapterRequest {
             lora_name: "adapter-a".to_string(),
             lora_path: PathBuf::from("/tmp/adapter-a"),
+            load_inplace: false,
         };
         let load = tokio::spawn({
             let handle = handle.clone();
@@ -425,6 +427,7 @@ mod tests {
             .load_lora_adapter(LoadLoraAdapterRequest {
                 lora_name: "adapter-a".to_string(),
                 lora_path: PathBuf::from("/tmp/adapter-a"),
+                load_inplace: false,
             })
             .await
             .expect_err("control should be unsupported");
