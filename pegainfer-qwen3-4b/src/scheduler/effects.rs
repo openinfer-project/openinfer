@@ -153,6 +153,8 @@ pub(super) fn apply_effects(
             }
         }
     }
+    to_retire.sort_unstable();
+    to_retire.dedup();
     for &i in to_retire.iter().rev() {
         active.swap_remove(i);
     }

@@ -1205,6 +1205,71 @@ mod tests {
     }
 
     #[test]
+    fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(8, Arc::clone(&dropped));
+        let mut active = Vec::new();
+
+        for request_id in [RequestId(10), RequestId(1), RequestId(7)] {
+            let (token_tx, _token_rx) = mpsc::unbounded_channel();
+            active.push(ActiveRequestState {
+                request_id,
+                lora_adapter: None,
+                token_tx,
+                last_token: 100,
+                generated_count: 1,
+                max_tokens: 2,
+                prompt_len: 16,
+                params: SamplingParams::default(),
+                logprobs: 0,
+            });
+            executor
+                .ensure_request_tokens(request_id, 16)
+                .expect("seed fake request state");
+        }
+
+        apply_effects(
+            &mut executor,
+            &mut active,
+            effects::StepEffects {
+                prompt_echoes: Vec::new(),
+                pending: Vec::new(),
+                decode: vec![
+                    effects::DecodeEffect::EmitAndFinish {
+                        request_id: RequestId(1),
+                        token: 201,
+                        logprob: None,
+                        finish_reason: pegainfer_core::engine::FinishReason::Length,
+                        completion_tokens: 2,
+                    },
+                    effects::DecodeEffect::EmitAndFinish {
+                        request_id: RequestId(10),
+                        token: 210,
+                        logprob: None,
+                        finish_reason: pegainfer_core::engine::FinishReason::Length,
+                        completion_tokens: 2,
+                    },
+                    effects::DecodeEffect::EmitAndFinish {
+                        request_id: RequestId(7),
+                        token: 207,
+                        logprob: None,
+                        finish_reason: pegainfer_core::engine::FinishReason::Length,
+                        completion_tokens: 2,
+                    },
+                ],
+            },
+        );
+
+        assert!(
+            active.is_empty(),
+            "all finished requests should retire without index drift"
+        );
+        let mut dropped = dropped.lock().unwrap().clone();
+        dropped.sort_unstable();
+        assert_eq!(dropped, vec![1, 7, 10]);
+    }
+
+    #[test]
     fn lora_control_reports_unimplemented_when_idle() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(4, Arc::clone(&dropped));
