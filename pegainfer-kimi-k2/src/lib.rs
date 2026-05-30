@@ -4,6 +4,11 @@
 //! text-only config probing. CUDA/runtime bodies land behind these headers.
 
 #![allow(incomplete_features)]
+// `use super::*` is the flat-module-layout idiom for these tightly-coupled
+// submodules (weights.rs + weights/*, runner/worker.rs + worker/*), and the
+// safetensors-mirroring field names (gate_proj, weight_packed, …) read clearer
+// with their shared affix than without. Both are pedantic-only lints.
+#![allow(clippy::wildcard_imports, clippy::struct_field_names)]
 #![feature(generic_const_exprs)]
 
 use std::path::Path;

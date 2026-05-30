@@ -185,21 +185,16 @@ impl KimiRankWorker {
         );
         let (tx, rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
-        let worker_thread_placement = thread_placement.clone();
-        let worker_weight_names = weight_names.clone();
-        let worker_sliced_load_plan = sliced_load_plan.clone();
-        let worker_ctx = ctx.clone();
-        let worker_collective_barrier = Arc::clone(&collective_barrier);
         let handle = thread::Builder::new()
             .name(format!("kimi-k2-rank-{}", placement.rank))
             .spawn(move || {
-                pin_rank_worker_thread(&worker_thread_placement);
+                pin_rank_worker_thread(&thread_placement);
                 match bind_rank_thread(
-                    worker_ctx,
-                    worker_weight_names,
-                    worker_sliced_load_plan,
+                    ctx,
+                    weight_names,
+                    sliced_load_plan,
                     local_dims,
-                    worker_collective_barrier,
+                    collective_barrier,
                     enable_cuda_graph,
                 ) {
                     Ok(state) => {
@@ -589,6 +584,10 @@ fn bind_rank_thread(
     })
 }
 
+// The worker owns its command channel for the lifetime of the loop: taking
+// `&Receiver` would leave the channel alive in the caller and break the
+// "senders dropped → loop exits" shutdown signal.
+#[allow(clippy::needless_pass_by_value)]
 fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadState) {
     while let Ok(cmd) = rx.recv() {
         match cmd {

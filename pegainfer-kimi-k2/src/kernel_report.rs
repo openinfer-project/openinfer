@@ -58,8 +58,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
                 .attrs
                 .iter()
                 .find(|attr| attr.name == "ep_world_size" || attr.name == "world_size")
-                .map(|attr| attr.value.as_str())
-                .unwrap_or("unknown");
+                .map_or("unknown", |attr| attr.value.as_str());
             return Ok(MeasuredCall {
                 supported: false,
                 reason: Some(format!(
@@ -73,8 +72,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
                 .attrs
                 .iter()
                 .find(|attr| attr.name == "tp_world_size" || attr.name == "world_size")
-                .map(|attr| attr.value.as_str())
-                .unwrap_or("unknown");
+                .map_or("unknown", |attr| attr.value.as_str());
             return Ok(MeasuredCall {
                 supported: false,
                 reason: Some(format!(

@@ -109,9 +109,9 @@ impl KimiK2WeightManifest {
         );
         ensure!(
             self.parallel.ep_world > 0
-                && KIMI_K2_ROUTED_EXPERTS % self.parallel.ep_world == 0
-                && crate::config::KIMI_K2_HEADS % self.parallel.tp_world == 0
-                && crate::config::KIMI_K2_VOCAB % self.parallel.tp_world == 0,
+                && KIMI_K2_ROUTED_EXPERTS.is_multiple_of(self.parallel.ep_world)
+                && crate::config::KIMI_K2_HEADS.is_multiple_of(self.parallel.tp_world)
+                && crate::config::KIMI_K2_VOCAB.is_multiple_of(self.parallel.tp_world),
             "Kimi parallel shape TP{}/DP{}/EP{} does not evenly divide model dimensions",
             self.parallel.tp_world,
             self.parallel.dp_world,

@@ -17,3 +17,18 @@ repos:
       - id: fmt
       - id: clippy
         args: [--release, --all-targets]
+
+  # The hook above lints `default-members` (pegainfer-server) with default
+  # features, so the feature-gated kimi-k2 crate is never compiled and never
+  # linted. This local hook closes that hole — but only when kimi-k2 source
+  # changes (the CUDA build is expensive), and `--no-deps` keeps it scoped to
+  # the crate itself rather than its shared workspace dependencies.
+  - repo: local
+    hooks:
+      - id: clippy-kimi-k2
+        name: clippy (kimi-k2, -D warnings)
+        entry: cargo clippy -p pegainfer-kimi-k2 --no-deps --release --features kimi-k2,kernel-report --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        files: ^pegainfer-kimi-k2/
+        pass_filenames: false

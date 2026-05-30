@@ -141,8 +141,9 @@ pub fn trace_runtime_decode_kernel_calls(
             receivers.push(std::thread::spawn(move || -> Result<()> {
                 while let Some(event) = token_rx.blocking_recv() {
                     match event {
-                        TokenEvent::Scheduled { .. } | TokenEvent::Token { .. } => {}
-                        TokenEvent::PromptTokens { .. } => {}
+                        TokenEvent::Scheduled { .. }
+                        | TokenEvent::Token { .. }
+                        | TokenEvent::PromptTokens { .. } => {}
                         TokenEvent::Finished { .. } => return Ok(()),
                         TokenEvent::Error { message, .. } => {
                             anyhow::bail!("Kimi runtime trace request failed: {message}")

@@ -232,7 +232,7 @@ pub(super) fn sample_local_top1_with_value_reuse(
     out: &mut CudaSlice<i32>,
 ) -> Result<(u32, f32)> {
     ensure!(
-        top1_value_scratch.len() >= 1 && out.len() >= 1,
+        !top1_value_scratch.is_empty() && !out.is_empty(),
         "Kimi top1 scratch must have scalar value/id outputs"
     );
     ensure!(

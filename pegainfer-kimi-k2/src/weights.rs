@@ -418,8 +418,7 @@ unsafe impl Sync for KimiRankGpuContext {}
 fn dtype_element_bytes(dtype: Dtype) -> Result<usize> {
     match dtype {
         Dtype::BF16 => Ok(2),
-        Dtype::F32 => Ok(4),
-        Dtype::I32 => Ok(4),
+        Dtype::F32 | Dtype::I32 => Ok(4),
         Dtype::U8 => Ok(1),
         other => bail!("Kimi loader does not support dtype {:?}", other),
     }

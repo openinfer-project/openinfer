@@ -154,7 +154,7 @@ impl KimiRankThreadState {
         let loaded = self.loaded.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Kimi rank weights must be loaded before batch decode")
         })?;
-        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
+        let tp_comm_ref = self.tp_comm.as_ref().map(super::OwnedRankComm::get);
         let device_ctx = self.ctx.as_device_context();
         let decode_aux_ctx = DeviceContext {
             ctx: Arc::clone(&self.decode_aux_ctx.ctx),
@@ -307,7 +307,7 @@ impl KimiRankThreadState {
         let loaded = self.loaded.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Kimi rank weights must be loaded before prompt_len1 batch")
         })?;
-        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
+        let tp_comm_ref = self.tp_comm.as_ref().map(super::OwnedRankComm::get);
         let device_ctx = self.ctx.as_device_context();
         let KimiRankLoadedWeights {
             gpu,
@@ -477,7 +477,7 @@ impl KimiRankThreadState {
             .loaded
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Kimi rank weights must be loaded before forward"))?;
-        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
+        let tp_comm_ref = self.tp_comm.as_ref().map(super::OwnedRankComm::get);
         let device_ctx = self.ctx.as_device_context();
         let KimiRankLoadedWeights {
             gpu,

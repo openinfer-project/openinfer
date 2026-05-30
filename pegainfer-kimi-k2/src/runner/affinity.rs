@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, ensure};
 use pegainfer_core::cpu_topology::{
@@ -37,17 +37,17 @@ impl KimiRankThreadPlacementPlan {
         let reserved_cpus = [CpuId::new(SYSTEM_RESERVED_CPU)?, CpuId::new(SCHEDULER_CPU)?];
 
         let mut rank_nodes = Vec::with_capacity(devices.len());
-        let mut numa_nodes = BTreeMap::new();
+        let mut numa_nodes = BTreeSet::new();
         for (rank, &device_ordinal) in devices.iter().enumerate() {
             let numa_node = cuda_device_numa_node(device_ordinal).with_context(|| {
                 format!("read NUMA node for Kimi rank {rank} cuda:{device_ordinal}")
             })?;
             rank_nodes.push(RankNumaNode { rank, numa_node });
-            numa_nodes.insert(numa_node, ());
+            numa_nodes.insert(numa_node);
         }
 
         let pools = numa_nodes
-            .keys()
+            .iter()
             .map(|&node| read_numa_cpu_pool(node))
             .collect::<Result<Vec<_>>>()?;
         let slices = split_rank_cpu_slices(&pools, &rank_nodes, &allowed_cpus, &reserved_cpus)?;

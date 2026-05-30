@@ -27,19 +27,17 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
                 .with_context(|| format!("missing tensor {} in {}", spec.name, path.display()))?;
             let shape = spec.slice.local_shape(view.shape())?;
             let bytes = spec.slice.local_bytes(view.shape(), view.dtype())?;
-            let data = match spec.slice {
-                KimiTensorLoadSlice::Full => ctx
-                    .stream
+            let data = if spec.slice == KimiTensorLoadSlice::Full {
+                ctx.stream
                     .clone_htod(view.data())
-                    .with_context(|| format!("failed to copy Kimi tensor {} to GPU", spec.name))?,
-                _ => {
-                    let sliced =
-                        sliced_tensor_bytes(view.data(), view.shape(), view.dtype(), &spec.slice)
-                            .with_context(|| format!("failed to slice Kimi tensor {}", spec.name))?;
-                    ctx.stream.clone_htod(sliced.as_slice()).with_context(|| {
-                        format!("failed to copy Kimi tensor {} to GPU", spec.name)
-                    })?
-                }
+                    .with_context(|| format!("failed to copy Kimi tensor {} to GPU", spec.name))?
+            } else {
+                let sliced =
+                    sliced_tensor_bytes(view.data(), view.shape(), view.dtype(), &spec.slice)
+                        .with_context(|| format!("failed to slice Kimi tensor {}", spec.name))?;
+                ctx.stream
+                    .clone_htod(sliced.as_slice())
+                    .with_context(|| format!("failed to copy Kimi tensor {} to GPU", spec.name))?
             };
             let tensor = KimiGpuRawTensor {
                 name: spec.name.clone(),

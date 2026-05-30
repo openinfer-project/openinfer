@@ -47,7 +47,7 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     );
 
     match (parallel.tp_world, parallel.dp_world) {
-        (8, 1) => start_engine_tp8_dp1(model_path, options, parallel),
+        (8, 1) => start_engine_tp8_dp1(model_path, &options, parallel),
         (1, _) => start_engine_tp1_dp(model_path, options, parallel),
         _ => bail!(
             "Kimi-K2 TP{}/DP{} not yet supported (v1: TP8DP1 or TP1DP8)",
@@ -106,12 +106,12 @@ fn build_runner_config(
 
 fn start_engine_tp8_dp1(
     model_path: &Path,
-    options: EngineLoadOptions,
+    options: &EngineLoadOptions,
     parallel: ParallelConfig,
 ) -> Result<EngineHandle> {
     let runtime_config = build_runner_config(
         model_path,
-        &options,
+        options,
         parallel,
         KimiK2ParallelShape::tp8_ep8(),
     )?;
@@ -122,7 +122,7 @@ fn start_engine_tp8_dp1(
         .name("kimi-k2-scheduler".into())
         .spawn(move || {
             pin_scheduler_thread(&runtime_config.thread_placement);
-            let mut scheduler = match KimiK2Scheduler::new(runtime_config) {
+            let mut scheduler = match KimiK2Scheduler::new(&runtime_config) {
                 Ok(scheduler) => scheduler,
                 Err(err) => {
                     let _ = init_tx.send(Err(err));
@@ -216,7 +216,7 @@ struct ActiveKimiRequest {
 }
 
 impl KimiK2Scheduler {
-    fn new(config: KimiK2RunnerConfig) -> Result<Self> {
+    fn new(config: &KimiK2RunnerConfig) -> Result<Self> {
         let runtime = KimiK2Runtime::spawn(config)?;
         runtime
             .ensure_decode_batch(KIMI_RUNNER_MAX_BATCH)
@@ -228,7 +228,7 @@ impl KimiK2Scheduler {
             .collect::<Vec<_>>();
         let warm_slots = (0..KIMI_RUNNER_MAX_BATCH).collect::<Vec<_>>();
         let _ = runtime
-            .forward_prompt_len1_batch_next_tokens(warm_tokens, warm_slots, KIMI_RUNNER_MAX_BATCH)
+            .forward_prompt_len1_batch_next_tokens(&warm_tokens, &warm_slots, KIMI_RUNNER_MAX_BATCH)
             .with_context(|| {
                 format!("Kimi-K2 warm prompt_len1 bs{KIMI_RUNNER_MAX_BATCH} before serving")
             })?;
@@ -328,9 +328,9 @@ impl KimiK2Scheduler {
                 .collect::<Vec<_>>();
             let slots = active.iter().map(|req| req.slot).collect::<Vec<_>>();
             let reports = match self.runtime.forward_decode_batch_next_tokens(
-                token_ids,
-                append_positions,
-                slots,
+                &token_ids,
+                &append_positions,
+                &slots,
                 decode_batch_size,
             ) {
                 Ok(reports) => reports,
@@ -408,7 +408,7 @@ impl KimiK2Scheduler {
     ) -> Option<ActiveKimiRequest> {
         let completion_tokens = 0usize;
         let last_token = match self.runtime.forward_prompt_next_token_in_slot(
-            req.prompt_tokens.clone(),
+            &req.prompt_tokens,
             slot,
             decode_batch_size,
         ) {
@@ -495,8 +495,8 @@ impl KimiK2Scheduler {
             .collect::<Vec<_>>();
         let slots = group.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
         let reports = match self.runtime.forward_prompt_len1_batch_next_tokens(
-            token_ids,
-            slots.clone(),
+            &token_ids,
+            &slots,
             decode_batch_size,
         ) {
             Ok(reports) => reports,
@@ -533,7 +533,7 @@ impl KimiK2Scheduler {
             return;
         }
 
-        for ((slot, req), report) in group.into_iter().zip(reports.into_iter()) {
+        for ((slot, req), report) in group.into_iter().zip(reports) {
             let token_id = report.local_next_token_global_id;
             if req
                 .token_tx
@@ -598,15 +598,15 @@ struct KimiK2Runtime {
 }
 
 impl KimiK2Runtime {
-    fn spawn(config: KimiK2RunnerConfig) -> Result<Self> {
-        let workers = spawn_workers(&config)?;
+    fn spawn(config: &KimiK2RunnerConfig) -> Result<Self> {
+        let workers = spawn_workers(config)?;
         let rank_weight_reports =
             maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
         init_tp_nccl(&workers)?;
 
         #[cfg(feature = "pplx-ep")]
         {
-            install_pplx_backends(&config, &workers)?;
+            install_pplx_backends(config, &workers)?;
             eprintln!(
                 "kimi-k2: pplx EP backends installed on all {} ranks",
                 workers.len()
@@ -617,7 +617,6 @@ impl KimiK2Runtime {
             workers,
             weight_reports: rank_weight_reports,
         };
-        let _ = config;
         Ok(Self { executor })
     }
 
@@ -635,33 +634,33 @@ impl KimiK2Runtime {
 
     fn forward_prompt_next_token_in_slot(
         &self,
-        input_ids: Vec<u32>,
+        input_ids: &[u32],
         slot: usize,
         decode_batch_size: usize,
     ) -> Result<crate::runner::worker::KimiOneTokenForwardReport> {
         self.executor
-            .forward_prefill(&input_ids, slot, decode_batch_size, 0)
+            .forward_prefill(input_ids, slot, decode_batch_size, 0)
     }
 
     fn forward_prompt_len1_batch_next_tokens(
         &self,
-        token_ids: Vec<u32>,
-        slots: Vec<usize>,
+        token_ids: &[u32],
+        slots: &[usize],
         decode_batch_size: usize,
     ) -> Result<Vec<crate::runner::worker::KimiOneTokenForwardReport>> {
         self.executor
-            .forward_prompt_len1_batch(&token_ids, &slots, decode_batch_size)
+            .forward_prompt_len1_batch(token_ids, slots, decode_batch_size)
     }
 
     fn forward_decode_batch_next_tokens(
         &self,
-        token_ids: Vec<u32>,
-        append_positions: Vec<usize>,
-        slots: Vec<usize>,
+        token_ids: &[u32],
+        append_positions: &[usize],
+        slots: &[usize],
         decode_batch_size: usize,
     ) -> Result<Vec<crate::runner::worker::KimiOneTokenForwardReport>> {
         self.executor
-            .forward_decode_batch(&token_ids, &append_positions, &slots, decode_batch_size)
+            .forward_decode_batch(token_ids, append_positions, slots, decode_batch_size)
     }
 }
 
@@ -721,7 +720,7 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
         .iter()
         .zip(config.rank_weight_names.iter().cloned())
         .zip(config.rank_sliced_load_plans.iter().cloned())
-        .zip(contexts.into_iter())
+        .zip(contexts)
     {
         let thread_placement = config.thread_placement.rank(placement.rank)?;
         let worker = KimiRankWorker::spawn(
