@@ -2232,6 +2232,7 @@ mod tests {
                 prefill_next_token_us: vec![20_000, 21_000],
                 per_token_decode_us: vec![19_000, 18_000],
                 total_generation_us: 80_000,
+                stats: pegainfer_deepseek_v2_lite::GenerationStats::default(),
             },
             3,
         );

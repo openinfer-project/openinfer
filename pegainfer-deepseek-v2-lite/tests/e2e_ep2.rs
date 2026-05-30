@@ -10,10 +10,18 @@ use sha2::{Digest, Sha256};
 use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 const EXPECTED_GENERATED_TOKENS: usize = 16;
-const EXPECTED_OUTPUT_TOKEN_SHA256: &str =
-    "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225";
-const EXPECTED_OUTPUT_TEXT_SHA256: &str =
-    "0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347";
+const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
+    (
+        "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225",
+        "0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347",
+        "DeepSeek-V2-Lite snapshot 604d5664 on 2x RTX 5090, torch 2.7.0, transformers 4.40.2",
+    ),
+    (
+        "d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8",
+        "4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6",
+        "DeepSeek-V2-Lite snapshot 604d5664 on 2x A800-SXM4-80GB, torch 2.7.0, transformers 4.40.2",
+    ),
+];
 const DSV2_LITE_HIDDEN_SIZE: usize = 2048;
 const DSV2_LITE_MOE_LAYERS: usize = 26;
 const E2E_JSON_OUT_ENV: &str = "PEGAINFER_DSV2_LITE_E2E_JSON_OUT";
@@ -179,6 +187,8 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
     let mut hasher = Sha256::new();
     hasher.update(output_text.as_bytes());
     let output_text_sha256 = hex::encode(hasher.finalize());
+    let matched_output_oracle =
+        matched_expected_output_oracle(&result.stats.output_token_sha256, &output_text_sha256);
     let payload = serde_json::json!({
         "model_path": model_path_label,
         "gpu_count": 2,
@@ -194,6 +204,7 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
         "generated_text": &output_text,
         "output_token_sha256": result.stats.output_token_sha256,
         "output_text_sha256": output_text_sha256,
+        "matched_output_oracle": matched_output_oracle,
         "token_sha256_algorithm": "sha256 over generated token ids encoded as little-endian u32",
         "text_sha256_algorithm": "sha256 over UTF-8 generated text bytes",
         "host_dispatch_calls": result.stats.host_dispatch_calls,
@@ -226,18 +237,22 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
     }
     println!("{payload_text}");
     ensure!(
-        result.stats.output_token_sha256 == EXPECTED_OUTPUT_TOKEN_SHA256,
-        "DeepSeek-V2-Lite E2E token hash drift: got {}, expected {}",
+        matched_output_oracle.is_some(),
+        "DeepSeek-V2-Lite E2E hash drift: got token_sha256={} text_sha256={}, expected one HF-confirmed pair from {:?}",
         result.stats.output_token_sha256,
-        EXPECTED_OUTPUT_TOKEN_SHA256
-    );
-    ensure!(
-        output_text_sha256 == EXPECTED_OUTPUT_TEXT_SHA256,
-        "DeepSeek-V2-Lite E2E text hash drift: got {}, expected {}",
         output_text_sha256,
-        EXPECTED_OUTPUT_TEXT_SHA256
+        EXPECTED_OUTPUT_SHA256_PAIRS
     );
     Ok(())
+}
+
+fn matched_expected_output_oracle(token_sha256: &str, text_sha256: &str) -> Option<&'static str> {
+    EXPECTED_OUTPUT_SHA256_PAIRS
+        .iter()
+        .find(|(expected_token, expected_text, _)| {
+            token_sha256 == *expected_token && text_sha256 == *expected_text
+        })
+        .map(|(_, _, source)| *source)
 }
 
 fn current_backend() -> String {

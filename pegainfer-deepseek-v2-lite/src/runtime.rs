@@ -74,6 +74,7 @@ pub struct BatchedGenerationResult {
     pub prefill_next_token_us: Vec<u64>,
     pub per_token_decode_us: Vec<u64>,
     pub total_generation_us: u64,
+    pub stats: GenerationStats,
 }
 
 pub struct DeepSeekV2LiteEp2Generator {
@@ -251,6 +252,42 @@ impl DeepSeekV2LiteEp2Generator {
         max_new_tokens: usize,
         ignore_eos: bool,
     ) -> Result<BatchedGenerationResult> {
+        let mut attribution = DecodeAttributionProfile::disabled();
+        self.generate_greedy_batch_same_prompt_inner(
+            prompt_tokens,
+            batch_size,
+            max_new_tokens,
+            ignore_eos,
+            &mut attribution,
+        )
+    }
+
+    pub fn generate_greedy_batch_same_prompt_with_attribution(
+        &mut self,
+        prompt_tokens: &[u32],
+        batch_size: usize,
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<(BatchedGenerationResult, DecodeAttributionProfile)> {
+        let mut attribution = DecodeAttributionProfile::enabled();
+        let result = self.generate_greedy_batch_same_prompt_inner(
+            prompt_tokens,
+            batch_size,
+            max_new_tokens,
+            ignore_eos,
+            &mut attribution,
+        )?;
+        Ok((result, attribution))
+    }
+
+    fn generate_greedy_batch_same_prompt_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        batch_size: usize,
+        max_new_tokens: usize,
+        ignore_eos: bool,
+        attribution: &mut DecodeAttributionProfile,
+    ) -> Result<BatchedGenerationResult> {
         ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
         ensure!(batch_size > 0, "batch_size must be positive");
         ensure!(
@@ -273,7 +310,6 @@ impl DeepSeekV2LiteEp2Generator {
         );
 
         let generation_start = Instant::now();
-        let mut attribution = DecodeAttributionProfile::disabled();
         let mut stats = GenerationStats {
             model_path: self.model_path.clone(),
             device_ordinals: self.device_ordinals.clone(),
@@ -291,12 +327,8 @@ impl DeepSeekV2LiteEp2Generator {
         let mut prefill_next_token_us = Vec::with_capacity(batch_size);
 
         for row in 0..batch_size {
-            let next = self.prefill_next_token(
-                prompt_tokens,
-                &mut caches[row],
-                &mut stats,
-                &mut attribution,
-            )?;
+            let next =
+                self.prefill_next_token(prompt_tokens, &mut caches[row], &mut stats, attribution)?;
             prefill_next_token_us.push(duration_micros(generation_start.elapsed()));
             generated[row].push(next);
         }
@@ -318,7 +350,7 @@ impl DeepSeekV2LiteEp2Generator {
                 position,
                 &mut caches,
                 &mut stats,
-                &mut attribution,
+                attribution,
                 token_index,
             )?;
             ensure!(
@@ -326,18 +358,25 @@ impl DeepSeekV2LiteEp2Generator {
                 "batched decode returned {} tokens for batch_size={batch_size}",
                 next_tokens.len()
             );
-            per_token_decode_us.push(duration_micros(decode_start.elapsed()));
+            let decode_elapsed = decode_start.elapsed();
+            per_token_decode_us.push(duration_micros(decode_elapsed));
+            attribution.push_decode_token(decode_elapsed);
             for (row, token) in next_tokens.into_iter().enumerate() {
                 generated[row].push(token);
             }
         }
 
         ensure_same_prompt_batch_rows_match(&generated)?;
+        stats.generated_tokens = generated.iter().map(Vec::len).sum();
+        stats.output_token_sha256 = token_sha256(&generated[0]);
+        let total_generation = generation_start.elapsed();
+        attribution.set_total_generation(total_generation);
         Ok(BatchedGenerationResult {
             tokens: generated,
             prefill_next_token_us,
             per_token_decode_us,
-            total_generation_us: duration_micros(generation_start.elapsed()),
+            total_generation_us: duration_micros(total_generation),
+            stats,
         })
     }
 

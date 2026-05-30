@@ -76,15 +76,22 @@ On Blackwell-class GPUs, make sure the selected NCCL runtime supports the device
 
 ## Latest Evidence
 
-2026-05-27, single-node 2 GPU validation with the same `models/DeepSeek-V2-Lite` snapshot for all three outputs. The model snapshot metadata recorded commit `604d5664dddd88a0433dbae533b7fe9472482de0`. The HF truth source used `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` with `torch==2.7.0+cu128` and `transformers==4.40.2`:
+2026-05-30, single-node 2 GPU validation with the same `models/DeepSeek-V2-Lite` snapshot for all three outputs. The model snapshot metadata recorded commit `604d5664dddd88a0433dbae533b7fe9472482de0`. The HF truth source used `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` with `torch==2.7.0+cu128` and `transformers==4.40.2` on 2x A800-SXM4-80GB:
 
-The earlier 2026-05-26 hash is superseded for the active gate because it was produced from a different local model snapshot. Treat only the hash below as the active oracle for snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`. This refresh does not claim a model-runtime improvement, a manual-loop root cause, or a transport issue.
+The comparison gate must be run with an HF JSON dumped on the same model directory and runtime as the pegainfer outputs. The Rust E2E keeps known HF-confirmed hash pairs for this narrow `Hello`/16 shape because the same snapshot has produced different greedy text on RTX 5090 and A800 while still matching HF on each host. This does not claim a model-runtime improvement, a manual-loop root cause, or a transport issue.
 
 | Source | Backend | Tokens | Token SHA256 | Text SHA256 | Text |
 | --- | --- | ---: | --- | --- | --- |
-| HF | `generate(use_cache=true)` | 16 | `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225` | `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347` | `, I am a 19 year old girl from the UK. I am` |
-| pegainfer | host-staged | 16 | `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225` | `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347` | `, I am a 19 year old girl from the UK. I am` |
-| pegainfer | NCCL | 16 | `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225` | `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347` | `, I am a 19 year old girl from the UK. I am` |
+| HF | `generate(use_cache=true)` | 16 | `d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8` | `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6` | `, I am a 20 year old female and I have been having a` |
+| pegainfer | host-staged | 16 | `d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8` | `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6` | `, I am a 20 year old female and I have been having a` |
+| pegainfer | NCCL | 16 | `d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8` | `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6` | `, I am a 20 year old female and I have been having a` |
+
+Known HF-confirmed static E2E pairs for snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`:
+
+| Host | Token SHA256 | Text SHA256 | Text |
+| --- | --- | --- | --- |
+| 2x RTX 5090, torch 2.7.0, transformers 4.40.2 | `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225` | `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347` | `, I am a 19 year old girl from the UK. I am` |
+| 2x A800-SXM4-80GB, torch 2.7.0, transformers 4.40.2 | `d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8` | `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6` | `, I am a 20 year old female and I have been having a` |
 
 Classification: `all_token_text_exact`.
 
