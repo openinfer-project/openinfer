@@ -2,10 +2,7 @@ use super::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KimiK2WeightManifest {
-    pub total_size: Option<u64>,
     pub text_tensor_count: usize,
-    pub ignored_non_text_tensor_count: usize,
-    pub shard_count: usize,
     pub token_embedding: KimiTensorEntry,
     pub final_norm: KimiTensorEntry,
     pub lm_head: KimiTensorEntry,
@@ -27,10 +24,6 @@ impl KimiK2WeightManifest {
     }
 
     pub(crate) fn from_index_json(json: &Value) -> Result<Self> {
-        let total_size = json
-            .get("metadata")
-            .and_then(|metadata| metadata.get("total_size"))
-            .and_then(Value::as_u64);
         let weight_map = json
             .get("weight_map")
             .and_then(Value::as_object)
@@ -62,20 +55,10 @@ impl KimiK2WeightManifest {
         }
 
         let manifest = Self {
-            total_size,
             text_tensor_count: weight_map
                 .keys()
                 .filter(|name| name.starts_with(TEXT_PREFIX))
                 .count(),
-            ignored_non_text_tensor_count: weight_map
-                .keys()
-                .filter(|name| !name.starts_with(TEXT_PREFIX))
-                .count(),
-            shard_count: weight_map
-                .values()
-                .filter_map(Value::as_str)
-                .collect::<BTreeSet<_>>()
-                .len(),
             token_embedding,
             final_norm,
             lm_head,
@@ -136,21 +119,13 @@ impl KimiK2WeightManifest {
         let local_expert_range =
             ep_rank * self.parallel.local_experts..(ep_rank + 1) * self.parallel.local_experts;
         let names = self.rank_tensor_names(rank)?;
-        let shard_count = names
-            .iter()
-            .map(|entry| entry.shard.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
         Ok(KimiRankWeightPlan {
-            rank,
             tp_rank,
             ep_rank,
             attention_head_range,
             vocab_range,
             local_expert_range,
-            replicated_router: true,
             tensor_count: names.len(),
-            shard_count,
         })
     }
 

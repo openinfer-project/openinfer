@@ -114,15 +114,12 @@ pub(crate) struct KimiLayerManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KimiRankWeightPlan {
-    pub rank: usize,
     pub tp_rank: usize,
     pub ep_rank: usize,
     pub attention_head_range: Range<usize>,
     pub vocab_range: Range<usize>,
     pub local_expert_range: Range<usize>,
-    pub replicated_router: bool,
     pub tensor_count: usize,
-    pub shard_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,15 +316,11 @@ impl KimiInt4ProjectionRole {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KimiExpertMajorProjectionPlan {
-    pub role: KimiInt4ProjectionRole,
     pub local_experts: usize,
     pub out_dim: usize,
     pub in_dim: usize,
-    pub packed_i32_shape_per_expert: [usize; 2],
-    pub scale_bf16_shape_per_expert: [usize; 2],
     pub packed_bytes: usize,
     pub scale_bytes: usize,
-    pub shape_bytes: usize,
 }
 
 pub(crate) struct KimiExpertMajorProjectionMarlinBuffers {

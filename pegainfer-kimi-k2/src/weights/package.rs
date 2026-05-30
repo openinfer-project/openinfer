@@ -268,7 +268,6 @@ fn validate_expert_major_projection<'a>(
     let shape_i32_shape = [2];
     let mut packed_bytes = 0usize;
     let mut scale_bytes = 0usize;
-    let mut shape_bytes = 0usize;
     for projection in &projections {
         validate_raw_tensor(
             projection.weight_packed,
@@ -290,18 +289,13 @@ fn validate_expert_major_projection<'a>(
         )?;
         packed_bytes += projection.weight_packed.bytes;
         scale_bytes += projection.weight_scale.bytes;
-        shape_bytes += projection.weight_shape.bytes;
     }
     Ok(KimiExpertMajorProjectionPlan {
-        role,
         local_experts: projections.len(),
         out_dim,
         in_dim,
-        packed_i32_shape_per_expert: packed_i32_shape,
-        scale_bf16_shape_per_expert: scale_bf16_shape,
         packed_bytes,
         scale_bytes,
-        shape_bytes,
     })
 }
 
