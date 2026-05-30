@@ -26,10 +26,10 @@ use pegainfer_kernels::ops::{
 pub const MODEL: &str = "kimi-k2";
 pub const PHASE_DECODE: &str = "decode";
 pub const TP_WORLD_SIZE: usize = 8;
-pub const EP_WORLD_SIZE: usize = 8;
-pub const DENSE_LAYERS: usize = KIMI_K2_LAYERS - KIMI_K2_MOE_LAYERS;
-pub const LOCAL_DENSE_INTERMEDIATE: usize = KIMI_K2_DENSE_INTERMEDIATE / TP_WORLD_SIZE;
-pub const LOCAL_SHARED_INTERMEDIATE: usize = KIMI_K2_EXPERT_INTERMEDIATE / TP_WORLD_SIZE;
+const EP_WORLD_SIZE: usize = 8;
+const DENSE_LAYERS: usize = KIMI_K2_LAYERS - KIMI_K2_MOE_LAYERS;
+const LOCAL_DENSE_INTERMEDIATE: usize = KIMI_K2_DENSE_INTERMEDIATE / TP_WORLD_SIZE;
+const LOCAL_SHARED_INTERMEDIATE: usize = KIMI_K2_EXPERT_INTERMEDIATE / TP_WORLD_SIZE;
 
 pub fn trace_decode_kernel_calls(
     _model_path: &str,
@@ -39,10 +39,7 @@ pub fn trace_decode_kernel_calls(
     trace_static_decode_kernel_calls(batch_size, kv_len)
 }
 
-pub fn trace_static_decode_kernel_calls(
-    batch_size: usize,
-    kv_len: usize,
-) -> Result<Vec<KernelCall>> {
+fn trace_static_decode_kernel_calls(batch_size: usize, kv_len: usize) -> Result<Vec<KernelCall>> {
     ensure!(batch_size > 0, "batch_size must be greater than zero");
     ensure!(kv_len > 0, "kv_len must be greater than zero");
 
