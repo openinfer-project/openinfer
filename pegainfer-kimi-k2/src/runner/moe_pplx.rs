@@ -139,7 +139,6 @@ fn pplx_recv_capacity(max_total_tokens: usize) -> Result<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn forward_moe_layer_decode_pplx_normed(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
