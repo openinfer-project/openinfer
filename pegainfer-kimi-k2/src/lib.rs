@@ -18,7 +18,7 @@ use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 #[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;
-pub mod config;
+pub(crate) mod config;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
 #[cfg(feature = "kimi-k2")]
@@ -28,7 +28,7 @@ mod typed_scratch;
 #[cfg(feature = "kimi-k2")]
 mod weights;
 
-pub use config::probe_config_json;
+pub use config::{KIMI_K2_LAYERS, probe_config_json};
 
 #[cfg(feature = "kimi-k2")]
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
