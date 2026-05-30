@@ -72,4 +72,4 @@ The gate prints the full delta distribution and the worst position (`seq`, `pos`
 
 ## Next step
 
-Replicate this for the other model lines as they are cleaned up — see `subsystems/correctness/logits-golden-gate.md` for the portable pattern. Qwen3.5-4B now has its own HF logits gate and PegaInfer rand/hash corpus; see `models/qwen35/accuracy.md` for its graph-only replay shape.
+Replicate this for the other model lines as they are cleaned up — see `subsystems/correctness/logits-golden-gate.md` for the portable pattern. Qwen3.5-4B now has its own HF logits gate; see `models/qwen35/accuracy.md` for its graph-only replay shape.

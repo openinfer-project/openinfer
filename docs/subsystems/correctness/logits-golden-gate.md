@@ -66,4 +66,4 @@ The single worst token is the **same** one across bs=1 / eager-9 / graph-9 — a
 2. **Gate** (`tests/hf_golden_gate.rs`) — load the golden, teacher-force the same sequences, apply the regret + mean + p99 guards, replay the paths that model line actually owns: bs=1, batched eager when it exists, and graph-padded bucket straddles.
 3. **Calibrate** — measure the floor, set tolerances as a small recorded multiple, write them down.
 
-Qwen3-4B and Qwen3.5-4B are done. Qwen3.5 currently has no eager batched decode path, so its instance covers sequential graph replay plus bucket-straddling batched graph replay; its broader accepted-baseline guard lives in `tests/rand_hash_regression.rs`.
+Qwen3-4B and Qwen3.5-4B are done. Qwen3.5 currently has no eager batched decode path, so its instance covers sequential graph replay plus bucket-straddling batched graph replay.
