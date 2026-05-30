@@ -1,9 +1,6 @@
 //! Kimi-K2.6 text-only constants, config probing, and derived shapes.
 
-use std::path::Path;
-
 use anyhow::{Context, Result, bail, ensure};
-use pegainfer_core::engine::ModelInfo;
 use serde_json::Value;
 
 pub const KIMI_K2_HIDDEN: usize = 7168;
@@ -40,73 +37,16 @@ pub const KIMI_K2_YARN_BETA_SLOW: f32 = 1.0;
 pub const KIMI_K2_ROUTED_SCALING_FACTOR: f32 = 2.827;
 pub const KIMI_K2_RMS_NORM_EPS: f32 = 1.0e-5;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KimiModelKind {
-    KimiK25Outer,
-    KimiK2Text,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct KimiK2TextConfig {
-    pub kind: KimiModelKind,
-    pub outer_model_type: String,
-    pub text_model_type: String,
-    pub hidden_size: usize,
-    pub vocab_size: usize,
-    pub num_hidden_layers: usize,
-    pub first_k_dense_replace: usize,
-    pub max_position_embeddings: usize,
-    pub num_attention_heads: usize,
-    pub q_lora_rank: usize,
-    pub kv_lora_rank: usize,
-    pub qk_nope_head_dim: usize,
-    pub qk_rope_head_dim: usize,
-    pub v_head_dim: usize,
-    pub n_routed_experts: usize,
-    pub num_experts_per_tok: usize,
-    pub n_shared_experts: usize,
-    pub moe_intermediate_size: usize,
-    pub dense_intermediate_size: usize,
-    pub routed_scaling_factor: f64,
-    pub rms_norm_eps: f64,
-    pub rope_theta: f64,
-    pub rope_scaling_type: Option<String>,
-    pub quant_method: Option<String>,
-    pub quant_format: Option<String>,
-}
-
-pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
-    let config_path = model_path.join("config.json");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let json: Value = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
-    let config = match probe_config_json(&json) {
-        Ok(config) => config,
-        Err(_) => return Ok(None),
-    };
-
-    Ok(Some(ModelInfo {
-        id: "kimi-k2.6",
-        display_name: "Kimi-K2.6 text".to_string(),
-        model_path: model_path.to_path_buf(),
-        max_model_len: u32::try_from(config.max_position_embeddings).ok(),
-    }))
-}
-
-pub fn probe_config_json(json: &Value) -> Result<KimiK2TextConfig> {
+/// Validate that `json` is a Kimi-K2.6 text config and that every dimension
+/// matches the constants this crate is compiled against. This is a pure gate:
+/// callers only care whether it succeeds, so nothing is materialized.
+pub fn probe_config_json(json: &Value) -> Result<()> {
     let outer_model_type = string_field(json, "model_type")?;
-    let (kind, text) = if outer_model_type == "kimi_k25" {
-        (
-            KimiModelKind::KimiK25Outer,
-            json.get("text_config")
-                .ok_or_else(|| anyhow::anyhow!("Kimi outer config missing text_config"))?,
-        )
+    let text = if outer_model_type == "kimi_k25" {
+        json.get("text_config")
+            .ok_or_else(|| anyhow::anyhow!("Kimi outer config missing text_config"))?
     } else if outer_model_type == "kimi_k2" {
-        (KimiModelKind::KimiK2Text, json)
+        json
     } else {
         bail!("not a Kimi-K2 config: model_type={outer_model_type}");
     };
@@ -303,33 +243,7 @@ pub fn probe_config_json(json: &Value) -> Result<KimiK2TextConfig> {
         quant_format
     );
 
-    Ok(KimiK2TextConfig {
-        kind,
-        outer_model_type,
-        text_model_type,
-        hidden_size,
-        vocab_size,
-        num_hidden_layers,
-        first_k_dense_replace,
-        max_position_embeddings,
-        num_attention_heads,
-        q_lora_rank,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-        n_routed_experts,
-        num_experts_per_tok,
-        n_shared_experts,
-        moe_intermediate_size,
-        dense_intermediate_size,
-        routed_scaling_factor,
-        rms_norm_eps,
-        rope_theta,
-        rope_scaling_type,
-        quant_method,
-        quant_format,
-    })
+    Ok(())
 }
 
 fn string_field(json: &Value, key: &str) -> Result<String> {
