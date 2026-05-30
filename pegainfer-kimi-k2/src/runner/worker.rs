@@ -18,10 +18,11 @@ use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::ops::call_trace;
 use pegainfer_kernels::{
     ops::{
-        KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_Q_HEAD_DIM,
-        KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE,
-        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
+        KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
+        KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
+        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
+        KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
         kimi_flashinfer_single_prefill_mla_rt, kimi_marlin_sum_topk_rows_f32,
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
@@ -45,7 +46,6 @@ use crate::{
         KIMI_K2_ROPE_THETA, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST,
         KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR, KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
-    layers::experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
     runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,

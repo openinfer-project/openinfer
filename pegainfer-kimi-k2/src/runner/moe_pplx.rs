@@ -27,13 +27,13 @@ use cudarc::nccl::safe::Comm;
 use pegainfer_comm::{EpBackend, ScalarType};
 use pegainfer_kernels::{
     ops::{
-        KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, kimi_marlin_w13_swiglu,
-        kimi_marlin_w13_swiglu_pplx, kimi_marlin_wna16_pplx_w2_gemm,
-        kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
-        kimi_moe_marlin_align_block_size, kimi_pplx_build_marlin_routing_on_stream,
-        kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
-        kimi_scatter_marlin_routes_to_compact,
+        KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
+        KimiMarlinWna16Workspace, KimiRouterBatch, KimiRouterConfig, KimiRouterOutput,
+        KimiRouterScratch, kimi_marlin_w13_swiglu, kimi_marlin_w13_swiglu_pplx,
+        kimi_marlin_wna16_pplx_w2_gemm, kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm,
+        kimi_marlin_wna16_w13_gemm, kimi_moe_marlin_align_block_size,
+        kimi_pplx_build_marlin_routing_on_stream, kimi_residual_add_scaled_f32,
+        kimi_router_noaux_tc_launch, kimi_scatter_marlin_routes_to_compact,
     },
     tensor::{DeviceContext, GpuTensor, NormWeight},
     typed_ops,
@@ -46,7 +46,6 @@ use crate::{
         KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROUTED_EXPERTS,
         KIMI_K2_TOPK,
     },
-    layers::experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
     weights::KimiRankExpertMarlinWeights,
 };
 
@@ -110,7 +109,7 @@ impl KimiMoePplxScratch {
             max_local_output_tokens,
             expert_padding: PPLX_EXPERT_PADDING,
             pplx_recv_capacity,
-            recv_tokens_per_expert: ctx.stream.alloc_zeros(KIMI_K2_EP8_LOCAL_EXPERTS)?,
+            recv_tokens_per_expert: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS)?,
             pplx_recv_hidden: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
             pplx_expert_output: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
             pplx_w13_out: GpuTensor::zeros(ctx, pplx_recv_capacity)?,
@@ -130,7 +129,7 @@ fn pplx_recv_capacity(max_total_tokens: usize) -> Result<usize> {
     let max_routes = max_total_tokens
         .checked_mul(KIMI_K2_TOPK)
         .ok_or_else(|| anyhow::anyhow!("Kimi PPLX routed-token capacity overflow"))?;
-    let active_experts = max_routes.min(KIMI_K2_EP8_LOCAL_EXPERTS);
+    let active_experts = max_routes.min(KIMI_K2_LOCAL_EXPERTS);
     let padding_rows = active_experts
         .checked_mul(PPLX_EXPERT_PADDING - 1)
         .ok_or_else(|| anyhow::anyhow!("Kimi PPLX expert padding capacity overflow"))?;
@@ -159,7 +158,7 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         && ep.dp_size() == 1
         && ep.node_size() == ep.world_size()
         && ep.canonicalize_duplicate_sources()
-        && KIMI_K2_EP8_LOCAL_EXPERTS * KIMI_K2_EP_WORLD == KIMI_K2_ROUTED_EXPERTS;
+        && KIMI_K2_LOCAL_EXPERTS * KIMI_K2_EP_WORLD == KIMI_K2_ROUTED_EXPERTS;
     if comm.is_some() {
         anyhow::ensure!(
             use_tp8_dp1_duplicate_routes,

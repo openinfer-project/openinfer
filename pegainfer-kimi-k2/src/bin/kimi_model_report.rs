@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use pegainfer_bench::{Accum, CallSiteRow, RollupRow, accumulate, call_site_row, rollup_row};
+use pegainfer_kernels::ops::KIMI_K2_EP_WORLD;
 use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kimi_k2::batch_decode_trace::{
     MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site, trace_decode_kernel_calls,
@@ -12,7 +13,6 @@ use pegainfer_kimi_k2::batch_decode_trace::{
 };
 use pegainfer_kimi_k2::config::KIMI_K2_LAYERS;
 use pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key, measure_call};
-use pegainfer_kimi_k2::layers::experts::KIMI_K2_EP_WORLD;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 16;

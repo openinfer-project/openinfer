@@ -117,7 +117,7 @@ pub(super) fn kimi_mla_softmax_scale() -> f32 {
 pub(super) fn kimi_marlin_block_size(active_tokens: usize) -> usize {
     for block_size in [8usize, 16, 32, 48, KIMI_MARLIN_MAX_BLOCK_SIZE] {
         let routes_per_expert_block = active_tokens as f32 * KIMI_K2_TOPK as f32
-            / KIMI_K2_EP8_LOCAL_EXPERTS as f32
+            / KIMI_K2_LOCAL_EXPERTS as f32
             / block_size as f32;
         if routes_per_expert_block < 0.9 {
             return block_size;
