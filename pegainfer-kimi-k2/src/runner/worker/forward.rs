@@ -651,7 +651,6 @@ pub(super) fn forward_moe_layer_batch_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn forward_moe_layer_prefill_scratch_into(
     ctx: &DeviceContext,
     comm: Option<&Comm>,
@@ -818,7 +817,6 @@ pub(super) fn forward_moe_layer_prefill_scratch_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_moe_layer_decode_normed_into(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
@@ -847,7 +845,6 @@ fn forward_moe_layer_decode_normed_into(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_moe_layer_decode_normed_after_event_into(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
