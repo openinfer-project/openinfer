@@ -369,7 +369,6 @@ struct KimiRankThreadState {
     local_dims: crate::config::KimiLocalDims,
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
-    weight_report: Option<KimiRankWeightLoadReport>,
     loaded: Option<KimiRankLoadedWeights>,
     #[cfg(feature = "pplx-ep")]
     ep_backend: Option<pegainfer_comm::EpBackend>,
@@ -575,7 +574,6 @@ fn bind_rank_thread(
         local_dims,
         collective_barrier,
         enable_cuda_graph,
-        weight_report: None,
         loaded: None,
         #[cfg(feature = "pplx-ep")]
         ep_backend: None,

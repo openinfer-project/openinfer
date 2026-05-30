@@ -87,7 +87,6 @@ impl KimiRankThreadState {
             report.expert_kernel_layers
         );
         self.loaded = Some(loaded);
-        self.weight_report = Some(report.clone());
         Ok(report)
     }
 
