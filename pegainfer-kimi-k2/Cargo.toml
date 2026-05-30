@@ -9,8 +9,10 @@ autotests = false
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
+log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-bench = { workspace = true }
 pegainfer-comm = { workspace = true, optional = true }

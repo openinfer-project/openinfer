@@ -1,13 +1,11 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Barrier,
-        mpsc::{self, Receiver, Sender, SyncSender},
-    },
+    sync::{Arc, Barrier},
     thread,
 };
 
 use anyhow::{Context, Result, ensure};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use cudarc::nccl::{
     ReduceOp,
@@ -109,40 +107,40 @@ pub(super) struct KimiOneTokenForwardReport {
 enum KimiRankCommand {
     LoadSlicedWeights {
         model_path: PathBuf,
-        resp: SyncSender<Result<KimiRankWeightLoadReport>>,
+        resp: Sender<Result<KimiRankWeightLoadReport>>,
     },
     InitTpComm {
         id: Id,
         world_size: usize,
-        resp: SyncSender<Result<()>>,
+        resp: Sender<Result<()>>,
     },
     EnsureDecodeArena {
         decode_batch_size: usize,
-        resp: SyncSender<Result<()>>,
+        resp: Sender<Result<()>>,
     },
     ForwardPromptNextToken {
         slot: usize,
         decode_batch_size: usize,
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
-        resp: SyncSender<Result<KimiOneTokenForwardReport>>,
+        resp: Sender<Result<KimiOneTokenForwardReport>>,
     },
     ForwardPromptLen1BatchNextTokens {
         token_ids: Vec<u32>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
+        resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     ForwardDecodeBatchNextTokens {
         token_ids: Vec<u32>,
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
+        resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     EnablePplx {
         ep_backend: pegainfer_comm::EpBackend,
-        resp: SyncSender<Result<()>>,
+        resp: Sender<Result<()>>,
     },
     Shutdown,
 }
@@ -182,8 +180,8 @@ impl KimiRankWorker {
             thread_placement.rank,
             placement.rank
         );
-        let (tx, rx) = mpsc::channel();
-        let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
+        let (tx, rx) = unbounded();
+        let (startup_tx, startup_rx) = bounded::<Result<()>>(1);
         let handle = thread::Builder::new()
             .name(format!("kimi-k2-rank-{}", placement.rank))
             .spawn(move || {
@@ -224,7 +222,7 @@ impl KimiRankWorker {
         &self,
         model_path: &Path,
     ) -> Result<Receiver<Result<KimiRankWeightLoadReport>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::LoadSlicedWeights {
                 model_path: model_path.to_path_buf(),
@@ -239,7 +237,7 @@ impl KimiRankWorker {
         id: Id,
         world_size: usize,
     ) -> Result<Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::InitTpComm {
                 id,
@@ -254,7 +252,7 @@ impl KimiRankWorker {
         &self,
         decode_batch_size: usize,
     ) -> Result<Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::EnsureDecodeArena {
                 decode_batch_size,
@@ -271,7 +269,7 @@ impl KimiRankWorker {
         decode_batch_size: usize,
         ep_max_seq_len: usize,
     ) -> Result<Receiver<Result<KimiOneTokenForwardReport>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::ForwardPromptNextToken {
                 slot,
@@ -291,7 +289,7 @@ impl KimiRankWorker {
         slots: Vec<usize>,
         decode_batch_size: usize,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::ForwardDecodeBatchNextTokens {
                 token_ids,
@@ -310,7 +308,7 @@ impl KimiRankWorker {
         slots: Vec<usize>,
         decode_batch_size: usize,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::ForwardPromptLen1BatchNextTokens {
                 token_ids,
@@ -325,7 +323,7 @@ impl KimiRankWorker {
         &self,
         ep_backend: pegainfer_comm::EpBackend,
     ) -> Result<Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(KimiRankCommand::EnablePplx {
                 ep_backend,

@@ -5327,8 +5327,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossbeam-channel",
  "cudarc",
  "half",
+ "log",
  "memmap2",
  "pegainfer-bench",
  "pegainfer-comm",

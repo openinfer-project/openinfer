@@ -116,13 +116,15 @@ async fn main() -> anyhow::Result<()> {
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, device_ordinal={}, tp_size={}",
+        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, device_ordinal={}, tp_size={}, dp_size={}, ep_backend={:?}",
         args.model_path.display(),
         args.cuda_graph,
         effective_cuda_graph,
         args.enable_lora,
         args.device_ordinal,
-        args.tp_size
+        args.tp_size,
+        args.dp_size,
+        args.ep_backend
     );
 
     let handle = match model_type {

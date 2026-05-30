@@ -10,6 +10,7 @@ mod lifecycle;
 use crate::runner::executor::ForwardExecutor;
 use anyhow::{Context, Result};
 use lifecycle::schedule_prefill_candidate;
+use log::error;
 use pegainfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
 use tokio::sync::mpsc;
 
@@ -112,7 +113,7 @@ impl KimiK2Scheduler {
                 self.executor.gpu_weight_ready_count(),
                 self.executor.worker_count()
             );
-            eprintln!("kimi-k2: {message}");
+            error!("kimi-k2: {message}");
             for req in prefill_reqs {
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message: message.clone(),
@@ -162,7 +163,7 @@ impl KimiK2Scheduler {
                         self.executor.gpu_weight_ready_count(),
                         self.executor.worker_count()
                     );
-                    eprintln!("kimi-k2: {message}");
+                    error!("kimi-k2: {message}");
                     for req in active.drain(..) {
                         let _ = req.token_tx.send(TokenEvent::Error {
                             message: message.clone(),
@@ -313,7 +314,7 @@ impl KimiK2Scheduler {
                     self.executor.gpu_weight_ready_count(),
                     self.executor.worker_count()
                 );
-                eprintln!("kimi-k2: {message}");
+                error!("kimi-k2: {message}");
                 for (_, req) in group {
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message: message.clone(),

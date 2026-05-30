@@ -1,11 +1,13 @@
 use std::{
     collections::BTreeSet,
     path::Path,
-    sync::{Arc, Barrier, mpsc as std_mpsc},
+    sync::{Arc, Barrier},
     thread,
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use crossbeam_channel::bounded;
+use log::info;
 use pegainfer_core::{
     engine::{EngineHandle, EngineLoadOptions, EpBackend, GenerateRequest},
     parallel::ParallelConfig,
@@ -101,7 +103,7 @@ fn start_engine_tp8_dp1(
     let executor = build_tp8_dp1_executor(&config)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
-    let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
+    let (init_tx, init_rx) = bounded::<Result<()>>(1);
     let scheduler_handle = thread::Builder::new()
         .name("kimi-k2-scheduler".into())
         .spawn(move || {
@@ -147,7 +149,7 @@ fn start_engine_tp1_dp8(
     let lb = DpLoadBalancer::new(dp_world);
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
-    let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
+    let (init_tx, init_rx) = bounded::<Result<()>>(1);
     let coord_handle = thread::Builder::new()
         .name("kimi-k2-dp-coord".into())
         .spawn(move || {
@@ -159,7 +161,7 @@ fn start_engine_tp1_dp8(
         .recv()
         .map_err(|err| anyhow::anyhow!("Kimi-K2 DP coordinator init failed: {err}"))??;
 
-    eprintln!("kimi-k2: TP1 DP{dp_world} coordinated engine started");
+    info!("kimi-k2: TP1 DP{dp_world} coordinated engine started");
     Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
 }
 
@@ -170,7 +172,7 @@ fn build_tp8_dp1_executor(config: &KimiK2RunnerConfig) -> Result<Box<dyn Forward
     init_tp_nccl(&workers)?;
     if config.ep_backend == EpBackend::Pplx {
         install_pplx_backends(config, &workers)?;
-        eprintln!(
+        info!(
             "kimi-k2: pplx EP backends installed on all {} ranks",
             workers.len()
         );

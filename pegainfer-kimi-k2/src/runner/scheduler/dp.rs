@@ -1,6 +1,6 @@
-use std::sync::mpsc as std_mpsc;
-
 use anyhow::Result;
+use crossbeam_channel::{Receiver, Sender, bounded};
+use log::error;
 use pegainfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
 use tokio::sync::mpsc;
 
@@ -25,8 +25,8 @@ pub(in crate::runner) struct DpCoordinator {
     dp_world: usize,
     ranks: Vec<DpRankState>,
     executors: Vec<Box<dyn ForwardExecutor + Send>>,
-    step_txs: Vec<std_mpsc::SyncSender<StepCommand>>,
-    result_rxs: Vec<std_mpsc::Receiver<StepResult>>,
+    step_txs: Vec<Sender<StepCommand>>,
+    result_rxs: Vec<Receiver<StepResult>>,
 }
 
 pub(in crate::runner) struct DpRankState {
@@ -133,8 +133,8 @@ impl DpCoordinator {
         let mut handles = Vec::with_capacity(self.dp_world);
 
         for (dp_rank, executor) in self.executors.drain(..).enumerate() {
-            let (cmd_tx, cmd_rx) = std_mpsc::sync_channel::<StepCommand>(1);
-            let (res_tx, res_rx) = std_mpsc::sync_channel::<StepResult>(1);
+            let (cmd_tx, cmd_rx) = bounded::<StepCommand>(1);
+            let (res_tx, res_rx) = bounded::<StepResult>(1);
             step_txs.push(cmd_tx);
             result_rxs.push(res_rx);
 
@@ -304,7 +304,7 @@ impl DpCoordinator {
         let owner_report = match owner_result {
             Ok(StepResult::Prefill(Ok(report))) => report,
             Ok(StepResult::Prefill(Err(err))) => {
-                eprintln!("kimi-k2: DP rank {dp_rank} prefill failed: {err:#}");
+                error!("kimi-k2: DP rank {dp_rank} prefill failed: {err:#}");
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message: format!("Kimi-K2 DP rank {dp_rank} prefill failed: {err:#}"),
                     prompt_tokens: prompt_len,
@@ -315,7 +315,7 @@ impl DpCoordinator {
             Ok(StepResult::Decode(_)) => {
                 let message =
                     format!("Kimi-K2 DP rank {dp_rank} returned decode result during prefill");
-                eprintln!("kimi-k2: {message}");
+                error!("kimi-k2: {message}");
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message,
                     prompt_tokens: prompt_len,
@@ -328,7 +328,7 @@ impl DpCoordinator {
 
         if !padding_errors.is_empty() {
             let message = padding_errors.join("; ");
-            eprintln!("kimi-k2: {message}");
+            error!("kimi-k2: {message}");
             let _ = req.token_tx.send(TokenEvent::Error {
                 message,
                 prompt_tokens: prompt_len,
@@ -408,7 +408,7 @@ impl DpCoordinator {
                     let message = format!(
                         "Kimi-K2 DP rank {dp_rank} returned prefill result during prompt_len1 decode"
                     );
-                    eprintln!("kimi-k2: {message}");
+                    error!("kimi-k2: {message}");
                     self.fail_prompt_len1_rows(dp_rank, rows, &message);
                     continue;
                 }
@@ -422,7 +422,7 @@ impl DpCoordinator {
             let reports = match result {
                 Ok(reports) => reports,
                 Err(err) => {
-                    eprintln!("kimi-k2: DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
+                    error!("kimi-k2: DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
                     let message =
                         format!("Kimi-K2 DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
                     self.fail_prompt_len1_rows(dp_rank, rows, &message);
@@ -554,7 +554,7 @@ impl DpCoordinator {
             let result = match self.result_rxs[dp_rank].recv() {
                 Ok(StepResult::Decode(Ok(reports))) => reports,
                 Ok(StepResult::Decode(Err(err))) => {
-                    eprintln!("kimi-k2: DP rank {dp_rank} decode failed: {err:#}");
+                    error!("kimi-k2: DP rank {dp_rank} decode failed: {err:#}");
                     self.ranks[dp_rank].fail_all_active(&err);
                     continue;
                 }
@@ -562,7 +562,7 @@ impl DpCoordinator {
                     let err = anyhow::anyhow!(
                         "Kimi-K2 DP rank {dp_rank} returned prefill result during decode"
                     );
-                    eprintln!("kimi-k2: {err:#}");
+                    error!("kimi-k2: {err:#}");
                     self.ranks[dp_rank].fail_all_active(&err);
                     continue;
                 }
@@ -717,27 +717,22 @@ fn build_decode_command_from_inputs(inputs: &[DecodeInput]) -> StepCommand {
     }
 }
 
-fn send_step_command(
-    tx: &std_mpsc::SyncSender<StepCommand>,
-    dp_rank: usize,
-    phase: &str,
-    command: StepCommand,
-) {
+fn send_step_command(tx: &Sender<StepCommand>, dp_rank: usize, phase: &str, command: StepCommand) {
     if tx.send(command).is_err() {
-        eprintln!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped before {phase}");
+        error!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped before {phase}");
         std::process::abort();
     }
 }
 
 fn abort_dropped_result_channel(dp_rank: usize, phase: &str) -> ! {
-    eprintln!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped during {phase}");
+    error!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped during {phase}");
     std::process::abort();
 }
 
 fn rank_forward_loop(
     executor: Box<dyn ForwardExecutor + Send>,
-    cmd_rx: std_mpsc::Receiver<StepCommand>,
-    res_tx: std_mpsc::SyncSender<StepResult>,
+    cmd_rx: Receiver<StepCommand>,
+    res_tx: Sender<StepResult>,
 ) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use log::info;
 use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kimi_k2::batch_decode_trace::{
     MODEL, trace_decode_kernel_calls, trace_runtime_decode_kernel_calls,
@@ -81,6 +82,7 @@ struct KernelReport {
 }
 
 fn main() -> Result<()> {
+    pegainfer_core::logging::init_default();
     match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Trace(args) => trace(args),
@@ -119,7 +121,7 @@ fn run(args: RunArgs) -> Result<()> {
     });
     write_json(&out, &report)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
-    eprintln!("wrote {}", out.display());
+    info!("wrote {}", out.display());
     Ok(())
 }
 
@@ -136,7 +138,7 @@ fn trace(args: TraceArgs) -> Result<()> {
     });
     write_json(&out, &schedule)?;
     println!("{}", serde_json::to_string_pretty(&schedule)?);
-    eprintln!("wrote {}", out.display());
+    info!("wrote {}", out.display());
     Ok(())
 }
 
