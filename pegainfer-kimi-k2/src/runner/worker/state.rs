@@ -462,7 +462,7 @@ impl KimiRankThreadState {
         result
     }
 
-    pub(super) fn forward_prompt_next_token_inner(
+    fn forward_prompt_next_token_inner(
         &mut self,
         slot: usize,
         decode_batch_size: usize,

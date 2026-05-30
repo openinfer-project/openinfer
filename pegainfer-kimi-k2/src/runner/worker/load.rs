@@ -131,7 +131,7 @@ pub(super) fn raw_tensor<'a>(
         .with_context(|| format!("missing Kimi forward tensor {name}"))
 }
 
-pub(super) fn ensure_dense_mlp_shapes(
+fn ensure_dense_mlp_shapes(
     label: &str,
     gate: &DeviceMatrix,
     up: &DeviceMatrix,

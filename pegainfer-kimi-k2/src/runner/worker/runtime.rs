@@ -31,7 +31,7 @@ pub(super) fn all_reduce_f32_in_place(values: &mut CudaSlice<f32>, comm: &Comm) 
         .map_err(|err| anyhow::anyhow!("Kimi TP/EP f32 sum failed: status={:?}", err.0))
 }
 
-pub(super) fn all_reduce_f32_bulk_in_place(
+fn all_reduce_f32_bulk_in_place(
     values: &mut CudaSlice<f32>,
     rows: usize,
     row_len: usize,
@@ -163,7 +163,7 @@ pub(super) fn build_yarn_rope_cache(seq_len: usize) -> (Vec<half::bf16>, Vec<hal
     (cos, sin)
 }
 
-pub(super) fn yarn_find_correction_range(
+fn yarn_find_correction_range(
     low_rot: f32,
     high_rot: f32,
     dim: usize,
@@ -178,7 +178,7 @@ pub(super) fn yarn_find_correction_range(
     )
 }
 
-pub(super) fn yarn_find_correction_dim(
+fn yarn_find_correction_dim(
     num_rotations: f32,
     dim: usize,
     base: f32,
@@ -189,7 +189,7 @@ pub(super) fn yarn_find_correction_dim(
         / (2.0 * base.ln())
 }
 
-pub(super) fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
+fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
     if scale <= 1.0 {
         1.0
     } else {
@@ -197,7 +197,7 @@ pub(super) fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
     }
 }
 
-pub(super) fn yarn_linear_ramp_mask(value: f32, min: f32, max: f32) -> f32 {
+fn yarn_linear_ramp_mask(value: f32, min: f32, max: f32) -> f32 {
     let denom = if (max - min).abs() < f32::EPSILON {
         0.001
     } else {

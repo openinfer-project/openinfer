@@ -161,7 +161,7 @@ pub(super) fn forward_decode_batch_next_token_kernels(
     )
 }
 
-pub(super) fn forward_mla_decode_layer_into(
+fn forward_mla_decode_layer_into(
     ctx: &DeviceContext,
     attention: &KimiAttentionForwardCache,
     arena: &mut KimiWorkerDecodeArena,
@@ -475,7 +475,7 @@ pub(super) fn forward_dense_mlp_prefill_scratch_into(
     Ok(())
 }
 
-pub(super) fn forward_dense_mlp_decode_normed_into(
+fn forward_dense_mlp_decode_normed_into(
     ctx: &DeviceContext,
     comm: Option<&Comm>,
     dense: &KimiDenseForwardCache,
@@ -819,7 +819,7 @@ pub(super) fn forward_moe_layer_prefill_scratch_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn forward_moe_layer_decode_normed_into(
+fn forward_moe_layer_decode_normed_into(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
     comm: Option<&Comm>,

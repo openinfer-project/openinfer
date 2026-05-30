@@ -19,7 +19,7 @@ pub(super) struct KimiRankThreadPlacement {
 }
 
 impl KimiRankThreadPlacement {
-    pub(super) fn cpu_slice_display(&self) -> String {
+    fn cpu_slice_display(&self) -> String {
         format_cpu_list(&self.cpu_slice)
     }
 }
@@ -72,7 +72,7 @@ impl KimiRankThreadPlacementPlan {
         })
     }
 
-    pub(super) fn scheduler_cpu(&self) -> Option<CpuId> {
+    fn scheduler_cpu(&self) -> Option<CpuId> {
         self.scheduler_cpu
     }
 
