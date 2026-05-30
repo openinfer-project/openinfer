@@ -35,7 +35,7 @@ use crate::config::{
     KIMI_K2_QK_NOPE_HEAD_DIM, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_V_HEAD_DIM, KimiK2ParallelShape,
 };
 
-pub(crate) const KIMI_K2_WEIGHT_INDEX: &str = "model.safetensors.index.json";
+const KIMI_K2_WEIGHT_INDEX: &str = "model.safetensors.index.json";
 const TEXT_PREFIX: &str = "language_model.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,7 +287,7 @@ pub(crate) struct KimiRouterDeviceWeights {
     pub e_score_correction_bias: CudaSlice<f32>,
 }
 
-pub(crate) struct KimiInt4ProjectionGpuWeights<'a> {
+struct KimiInt4ProjectionGpuWeights<'a> {
     pub weight_packed: &'a KimiGpuRawTensor,
     pub weight_scale: &'a KimiGpuRawTensor,
     pub weight_shape: &'a KimiGpuRawTensor,
@@ -339,7 +339,7 @@ pub(crate) struct KimiExpertMajorProjectionMarlinBuffers {
 }
 
 impl KimiExpertMajorProjectionMarlinBuffers {
-    pub(crate) fn as_marlin_weight(&self) -> KimiMarlinInt4Weight<'_> {
+    fn as_marlin_weight(&self) -> KimiMarlinInt4Weight<'_> {
         KimiMarlinInt4Weight {
             manifest: self.manifest,
             weight_packed_uint4b8: &self.weight_packed_marlin_uint4b8,
@@ -363,7 +363,7 @@ pub(crate) struct KimiExpertMajorW13MarlinBuffers {
 }
 
 impl KimiExpertMajorW13MarlinBuffers {
-    pub(crate) fn as_marlin_weight(&self) -> KimiMarlinFusedW13Int4Weight<'_> {
+    fn as_marlin_weight(&self) -> KimiMarlinFusedW13Int4Weight<'_> {
         KimiMarlinFusedW13Int4Weight {
             local_experts: self.local_experts,
             in_dim: self.in_dim,
