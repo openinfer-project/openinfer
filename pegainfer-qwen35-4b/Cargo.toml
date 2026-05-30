@@ -21,6 +21,7 @@ tokio = { workspace = true, features = ["sync"] }
 [dev-dependencies]
 criterion = { workspace = true }
 pegainfer-vllm-support = { workspace = true }
+sha2 = { workspace = true }
 vllm-text = { workspace = true }
 
 [lints]

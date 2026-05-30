@@ -1,6 +1,6 @@
 # Numerical correctness: the logits golden gate
 
-**TL;DR**: How to guard that a model's logits stay correct across prompts, hardware, and batch size — *without* binding to one GPU's exact bits. The pattern: store a reference (HuggingFace bf16) of top-K logprobs for fixed teacher-forced sequences, replay them through pegainfer, and assert (a) a structural *regret* check on the argmax and (b) the **mean** and **p99** of the per-token logprob delta stay at the bf16 noise floor. NOT exact text, NOT a hash, NOT bit-identical-across-batch, NOT the absolute max. Qwen3-4B is the reference implementation (`pegainfer-qwen3-4b/tests/hf_golden_gate.rs`, see `models/qwen3/accuracy-gate.md`); replicate it per model line.
+**TL;DR**: How to guard that a model's logits stay correct across prompts, hardware, and batch size — *without* binding to one GPU's exact bits. The pattern: store a reference (HuggingFace bf16) of top-K logprobs for fixed teacher-forced sequences, replay them through pegainfer, and assert (a) a structural *regret* check on the argmax and (b) the **mean** and **p99** of the per-token logprob delta stay at the bf16 noise floor. NOT exact text, NOT a hash, NOT bit-identical-across-batch, NOT the absolute max. Qwen3-4B is the reference implementation (`pegainfer-qwen3-4b/tests/hf_golden_gate.rs`, see `models/qwen3/accuracy-gate.md`); Qwen3.5-4B applies the same method with an HF `past_key_values` oracle and graph-only replay (`pegainfer-qwen35-4b/tests/hf_golden_gate.rs`, see `models/qwen35/accuracy.md`).
 
 Last touched: 2026-05
 
@@ -63,7 +63,7 @@ The single worst token is the **same** one across bs=1 / eager-9 / graph-9 — a
 ## Applying it to a new model line
 
 1. **Dumper** (`tools/accuracy/dump_<model>_hf_golden.py`) — seed-pinned fixed sequences spanning short→long prompts (cover multi-block KV / high RoPE positions) plus a teacher-forced decode tail; HF bf16; top-K logprobs at positions `P-1 .. P+D-1`; safetensors out.
-2. **Gate** (`tests/hf_golden_gate.rs`) — load the golden, teacher-force the same sequences, apply the regret + mean + p99 guards, replay bs=1 / batched-eager / graph-padded.
+2. **Gate** (`tests/hf_golden_gate.rs`) — load the golden, teacher-force the same sequences, apply the regret + mean + p99 guards, replay the paths that model line actually owns: bs=1, batched eager when it exists, and graph-padded bucket straddles.
 3. **Calibrate** — measure the floor, set tolerances as a small recorded multiple, write them down.
 
-Qwen3-4B is done. Qwen3.5-4B still uses an exact-greedy e2e (`pegainfer-qwen35-4b/tests/e2e.rs`) and is the next candidate.
+Qwen3-4B and Qwen3.5-4B are done. Qwen3.5 currently has no eager batched decode path, so its instance covers sequential graph replay plus bucket-straddling batched graph replay; its broader accepted-baseline guard lives in `tests/rand_hash_regression.rs`.

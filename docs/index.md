@@ -38,7 +38,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): fast and decode-correct, but a live long-prompt accuracy failure (GSM8K ~2% vs HF ~79%), no logits gate (#186, blocked on a teacher-forcing executor), ~640MB HND prefill staging + 20k cap, pre-#85 admission semantics. Sequenced Now/Next/Later + cleanup ledger. |
 | `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 225ms, TPOT 11.81ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9). |
-| `models/qwen35/accuracy.md` | Qwen3.5-4B HF parity work: major decode-state bugs are fixed, `conv1d` now matches HF's bf16 pre-`SiLU` rounding, exact HF matches improved to 11/13, and only two small-logit-drift cases remain. |
+| `models/qwen35/accuracy.md` | Qwen3.5-4B accuracy gates: HF bf16 logits golden through `past_key_values` (`qwen35-4b-hf-golden.safetensors`) plus deterministic PegaInfer rand/hash corpus (`qwen35-4b-rand-hash.json`); exact-text JSON remains regression-only. |
 | `models/qwen35/model-crate.md` | `pegainfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, Qwen3.5 e2e, and scheduler e2e pass. |
 | `models/qwen35/e2e-gibberish.md` | Qwen3.5 e2e gibberish fixed: scheduler threads now bind CUDA context and initialize thread-local cuBLAS handles; Qwen3.5 greedy stays on FlashInfer top1, and the default e2e remains an exact golden-text regression. |
 

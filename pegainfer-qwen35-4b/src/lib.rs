@@ -2,6 +2,7 @@ mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
 mod decode_buffers;
+mod executor;
 mod ffi;
 mod ops;
 mod prefill;
@@ -23,6 +24,10 @@ use pegainfer_core::engine::{EngineHandle, EngineLoadOptions, ModelInfo};
 /// should use `start_engine` instead.
 pub mod runtime {
     pub use crate::batch_decode_graph::MAX_BATCH;
+    pub use crate::executor::{
+        DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
+        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen35Executor, RequestId,
+    };
     pub use crate::scheduler::{start as start_with_model, start_with_capacity};
     pub use crate::weights::Qwen35Model;
 }

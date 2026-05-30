@@ -1,22 +1,24 @@
 # Qwen3.5-4B Accuracy
 
-> **TL;DR:** Accuracy work is defined as matching Hugging Face Qwen3.5-4B, not matching pegainfer's self-generated JSON. The large decode-state bugs are fixed: the broken HD256 full-attention decode kernel is no longer used, `conv1d_prefill` handoff across repeated `seq_len=1` calls is corrected, argmax tie-break now matches host semantics, and `conv1d` now matches HF's bf16 pre-`SiLU` rounding behavior. HF exact-match coverage improved to `11/13`, but parity is still incomplete. The remaining gap is now concentrated in two late, small-logit-drift cases, and the correct truth source for generated tokens remains HF's real incremental path with `past_key_values`, not reconstructed full-prefill.
+> **TL;DR:** Qwen3.5 accuracy now has two separate gates: a small HF-backed logits golden (`tests/hf_golden_gate.rs` + `test_data/qwen35-4b-hf-golden.safetensors`) and a broader PegaInfer-owned rand/hash corpus (`tests/rand_hash_regression.rs` + `test_data/qwen35-4b-rand-hash.json`). The HF fixture uses `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so it matches pegainfer's prefill + decode shape. The older exact-text `test_data/Qwen3.5-4B.json` remains regression-only.
 >
-> **Status:** Active. Updated 2026-05-05: Qwen3.5 runtime code lives in top-level `pegainfer-qwen35-4b`. Current regression commands are crate-local: `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture` and `... --test e2e_scheduler -- --nocapture`. The all-case gibberish failure seen during the split was traced to the older thread-local cuBLAS change and fixed in `docs/models/qwen35/e2e-gibberish.md`; both crate-local Qwen3.5 e2e commands now pass on this machine. Historical command logs below retain the paths that were run at the time.
+> **Status:** Active. Updated 2026-05-30: HF logits gate and rand/hash corpus pass on A800 `sm_80`. Current regression commands are crate-local and need an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`, `cargo test --release -p pegainfer-qwen35-4b --test rand_hash_regression -- --nocapture`, plus the existing exact-text `e2e` / `e2e_scheduler` checks when that surface changes.
 
 ## Goal
 
-- External truth source: Hugging Face Transformers Qwen3.5-4B in `eval()` mode with deterministic greedy behavior.
-- Short-term success: the first layer (index `0`, linear attention) matches HF within expected bf16/fp32 tolerance on prefill.
-- Medium-term success: the first full-attention layer (index `3`) also matches; then expand to full prefill and the first decode token.
-- End-to-end success: prompt-level drift is either eliminated or explained by known numeric tolerance.
+- External truth source: Hugging Face Transformers Qwen3.5-4B in `eval()` mode with `use_cache=True` / `past_key_values` for the small logits gate.
+- Short-term success: the HF logits gate stays green under the calibrated regret / mean / p99 tolerances.
+- Regression success: the PegaInfer-owned rand/hash corpus catches broad generated-token drift after the HF gate is accepted.
+- Debugging success: any future prompt-level drift is either eliminated or explained by a recorded numeric tolerance.
 
 ## Current State
 
 - Reusable debugging method now lives in [../../playbooks/accuracy-parity-playbook.md](../../playbooks/accuracy-parity-playbook.md).
-- `pegainfer-qwen35-4b/tests/e2e.rs` checks outputs against `test_data/Qwen3.5-4B.json`.
-- `pegainfer-qwen35-4b/tests/regen_test_data.rs` regenerates that JSON from pegainfer itself.
-- That makes the current Qwen3.5 e2e useful as a regression guard after a baseline is accepted, but not as an HF accuracy check.
+- `pegainfer-qwen35-4b/tests/hf_golden_gate.rs` checks pegainfer logits against `test_data/qwen35-4b-hf-golden.safetensors`, a pinned HF bf16 `past_key_values` oracle.
+- `pegainfer-qwen35-4b/tests/rand_hash_regression.rs` checks 32 deterministic random-token prompts against `test_data/qwen35-4b-rand-hash.json`, a PegaInfer-owned broad regression corpus.
+- `pegainfer-qwen35-4b/tests/e2e.rs` still checks outputs against `test_data/Qwen3.5-4B.json`.
+- `pegainfer-qwen35-4b/tests/regen_test_data.rs` regenerates that exact-text JSON from pegainfer itself.
+- The exact-text JSON is useful as a regression guard after a baseline is accepted, but not as an HF accuracy check.
 - `docs/models/qwen35/optimization.md` records that the refreshed chunk-wise baseline changed `6/13` prompts. Once such a baseline is accepted, the current e2e no longer tells us where pegainfer differs from HF.
 - Existing low-level tests already narrow the search space:
   - `src/ops/tests.rs`: `test_flash_attention_prefill_hd256_matches_cpu_reference`
@@ -32,6 +34,61 @@
   - `tools/accuracy/compare_qwen35_dump.py` reports `max_abs` / `mean_abs` per checkpoint
   - `src/bin/qwen35_dump_decode_layer_ids.rs` dumps the real production-path incremental step for an explicit token-id prefix
   - `tools/accuracy/hf_dump_qwen35_decode_layer_ids.py` dumps the matching HF incremental step through `past_key_values`
+
+## Current Accuracy Gates
+
+### HF logits golden
+
+- Fixture: `test_data/qwen35-4b-hf-golden.safetensors` (~59 KiB).
+- Dumper: `tools/accuracy/dump_qwen35_4b_hf_golden.py`.
+- Oracle path: HF `AutoModelForCausalLM.eval()` in bf16, prompt prefill with `use_cache=True`, then one-token teacher-forced decode through `past_key_values`.
+- Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
+- Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.
+- Shape: 12 seed-fixed prompt-token sequences, prompt length 1-128, 8 teacher-forced decode tokens, 108 scored positions, top-64 HF logprobs per position.
+- Tolerances: regret `0.20`, mean head-delta `0.06`, p99 head-delta `0.20`; max is printed only.
+- Replay surface: sequential bs=1 through the Qwen3.5 graph decode path, then batched graph passes at 5->8 and 3->4 bucket straddles. Qwen3.5 currently has no eager batched decode path.
+
+Verified on A800 `sm_80`:
+
+```bash
+PEGAINFER_CUDA_SM=80 \
+PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/pegainfer-issue186-qwen35-oracle/models/Qwen3.5-4B \
+cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture
+```
+
+Observed floor:
+
+| Pass | positions | mean | p50 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sequential bs=1 graph | 108 | 0.0224 | 0.0130 | 0.0792 | 0.1130 |
+| batched graph (5 padded) | 45 | 0.0265 | 0.0187 | 0.1033 | 0.1805 |
+| batched graph (3 padded) | 27 | 0.0280 | 0.0169 | 0.1033 | 0.1805 |
+
+### PegaInfer rand/hash corpus
+
+- Fixture: `test_data/qwen35-4b-rand-hash.json` (~61 KiB).
+- Producer: PegaInfer at commit `8eab9b3802166e08a39896f0a78e8d9a81cd8fdb`.
+- Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
+- Shape: 32 seed-fixed random-token prompts, prompt length 1-192, vocab ceiling 100000, max new tokens 16.
+- Seeds: prompt seed `0x000000005eed3535`, engine seed `42`.
+- Check: compare generated token ids first, then token SHA256 as the compact review signal.
+- Claim boundary: this is an exact PegaInfer regression corpus for an accepted model/config/runtime baseline. It is broader than the HF gate, but it is not the portable external oracle; if a new GPU or CUDA stack flips a tie, first adjudicate through the HF logits gate before treating the hash drift as a correctness bug.
+
+Verified on the same A800:
+
+```bash
+PEGAINFER_CUDA_SM=80 \
+PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/pegainfer-issue186-qwen35-oracle/models/Qwen3.5-4B \
+cargo test --release -p pegainfer-qwen35-4b --test rand_hash_regression -- --nocapture
+```
+
+Regeneration command that wrote the current corpus:
+
+```bash
+PEGAINFER_CUDA_SM=80 \
+PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/pegainfer-issue186-qwen35-oracle/models/Qwen3.5-4B \
+cargo test --release -p pegainfer-qwen35-4b --test rand_hash_regression regen_qwen35_rand_hash_corpus -- --ignored --nocapture
+```
 
 ## Progress Log
 
