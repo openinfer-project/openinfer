@@ -45,10 +45,11 @@ impl KimiGpuRawTensor {
 }
 
 impl KimiRankGpuWeights {
-    pub fn typed_view<'a>(
-        &'a self,
-        names: &'a KimiRankWeightNames,
-    ) -> Result<KimiRankTypedGpuWeights<'a>> {
+    /// Validate that every planned tensor is present on the GPU with the
+    /// expected dtype and that the loaded count matches the plan. The check is
+    /// exhaustive (`validate_rank_tensor_catalog` walks all top/attention/MoE
+    /// names with their dtypes), so no typed view needs to be materialized.
+    pub fn validate_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
         ensure!(
             self.rank == names.rank,
             "Kimi GPU rank {} does not match typed names rank {}",
@@ -57,86 +58,6 @@ impl KimiRankGpuWeights {
         );
         validate_rank_tensor_catalog(names, self.tensors.len(), |name, dtype| {
             self.expect_tensor(name, dtype).map(|_| ())
-        })?;
-
-        let top = KimiTopGpuWeights {
-            token_embedding: self.expect_tensor(&names.top.token_embedding, Dtype::BF16)?,
-            final_norm: self.expect_tensor(&names.top.final_norm, Dtype::BF16)?,
-            lm_head: self.expect_tensor(&names.top.lm_head, Dtype::BF16)?,
-        };
-        let mut layers = Vec::with_capacity(names.layers.len());
-        for layer in &names.layers {
-            let attention = KimiAttentionGpuWeights {
-                input_layernorm: self
-                    .expect_tensor(&layer.attention.input_layernorm, Dtype::BF16)?,
-                q_a_proj: self.expect_tensor(&layer.attention.q_a_proj, Dtype::BF16)?,
-                q_a_layernorm: self.expect_tensor(&layer.attention.q_a_layernorm, Dtype::BF16)?,
-                q_b_proj: self.expect_tensor(&layer.attention.q_b_proj, Dtype::BF16)?,
-                kv_a_proj_with_mqa: self
-                    .expect_tensor(&layer.attention.kv_a_proj_with_mqa, Dtype::BF16)?,
-                kv_a_layernorm: self.expect_tensor(&layer.attention.kv_a_layernorm, Dtype::BF16)?,
-                kv_b_proj: self.expect_tensor(&layer.attention.kv_b_proj, Dtype::BF16)?,
-                o_proj: self.expect_tensor(&layer.attention.o_proj, Dtype::BF16)?,
-                post_attention_layernorm: self
-                    .expect_tensor(&layer.attention.post_attention_layernorm, Dtype::BF16)?,
-            };
-            let kind = match &layer.kind {
-                KimiLayerWeightKindNames::Dense(mlp) => {
-                    KimiLayerKindGpuWeights::Dense(KimiDenseMlpGpuWeights {
-                        gate_proj: self.expect_tensor(&mlp.gate_proj, Dtype::BF16)?,
-                        up_proj: self.expect_tensor(&mlp.up_proj, Dtype::BF16)?,
-                        down_proj: self.expect_tensor(&mlp.down_proj, Dtype::BF16)?,
-                    })
-                }
-                KimiLayerWeightKindNames::Moe(moe) => {
-                    let routed_experts = moe
-                        .routed_experts
-                        .iter()
-                        .map(|expert| self.routed_expert_view(expert))
-                        .collect::<Result<Vec<_>>>()?;
-                    KimiLayerKindGpuWeights::Moe(KimiMoeLayerGpuWeights {
-                        router: KimiRouterGpuWeights {
-                            gate_weight: self
-                                .expect_tensor(&moe.router.gate_weight, Dtype::BF16)?,
-                            e_score_correction_bias: self
-                                .expect_tensor(&moe.router.e_score_correction_bias, Dtype::F32)?,
-                        },
-                        shared_experts: KimiSharedExpertGpuWeights {
-                            gate_proj: self
-                                .expect_tensor(&moe.shared_experts.gate_proj, Dtype::BF16)?,
-                            up_proj: self
-                                .expect_tensor(&moe.shared_experts.up_proj, Dtype::BF16)?,
-                            down_proj: self
-                                .expect_tensor(&moe.shared_experts.down_proj, Dtype::BF16)?,
-                        },
-                        routed_experts,
-                    })
-                }
-            };
-            layers.push(KimiLayerGpuWeights {
-                layer_idx: layer.layer_idx,
-                attention,
-                kind,
-            });
-        }
-
-        Ok(KimiRankTypedGpuWeights {
-            rank: self.rank,
-            plan: &names.plan,
-            top,
-            layers,
-        })
-    }
-
-    fn routed_expert_view<'a>(
-        &'a self,
-        expert: &'a KimiRoutedExpertWeightNames,
-    ) -> Result<KimiRoutedExpertGpuWeights<'a>> {
-        Ok(KimiRoutedExpertGpuWeights {
-            global_expert: expert.global_expert,
-            gate_proj: self.int4_projection_view(&expert.gate_proj)?,
-            up_proj: self.int4_projection_view(&expert.up_proj)?,
-            down_proj: self.int4_projection_view(&expert.down_proj)?,
         })
     }
 
@@ -304,149 +225,6 @@ impl KimiRankGpuWeights {
             dtype
         );
         Ok(tensor)
-    }
-}
-
-impl KimiRankTypedGpuWeights<'_> {
-    pub fn expert_major_weight_plan(&self) -> Result<KimiRankExpertMajorWeightPlan> {
-        let mut layers = Vec::with_capacity(KIMI_K2_MOE_LAYERS);
-        for layer in &self.layers {
-            let KimiLayerKindGpuWeights::Moe(moe) = &layer.kind else {
-                continue;
-            };
-            ensure!(
-                moe.routed_experts.len() == self.plan.local_expert_range.len(),
-                "Kimi rank {} layer {} expected {} local routed experts, got {}",
-                self.rank,
-                layer.layer_idx,
-                self.plan.local_expert_range.len(),
-                moe.routed_experts.len()
-            );
-            for (offset, expert) in moe.routed_experts.iter().enumerate() {
-                let expected = self.plan.local_expert_range.start + offset;
-                ensure!(
-                    expert.global_expert == expected,
-                    "Kimi rank {} layer {} local expert offset {} expected global expert {}, got {}",
-                    self.rank,
-                    layer.layer_idx,
-                    offset,
-                    expected,
-                    expert.global_expert
-                );
-            }
-            let gate = validate_expert_major_projection(
-                KimiInt4ProjectionRole::Gate,
-                moe.routed_experts.iter().map(|expert| &expert.gate_proj),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to validate Kimi rank {} layer {} gate expert-major weights",
-                    self.rank, layer.layer_idx
-                )
-            })?;
-            let up = validate_expert_major_projection(
-                KimiInt4ProjectionRole::Up,
-                moe.routed_experts.iter().map(|expert| &expert.up_proj),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to validate Kimi rank {} layer {} up expert-major weights",
-                    self.rank, layer.layer_idx
-                )
-            })?;
-            let down = validate_expert_major_projection(
-                KimiInt4ProjectionRole::Down,
-                moe.routed_experts.iter().map(|expert| &expert.down_proj),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to validate Kimi rank {} layer {} down expert-major weights",
-                    self.rank, layer.layer_idx
-                )
-            })?;
-            let total_bytes = gate.total_bytes() + up.total_bytes() + down.total_bytes();
-            layers.push(KimiMoeLayerExpertMajorPlan {
-                layer_idx: layer.layer_idx,
-                first_global_expert: self.plan.local_expert_range.start,
-                local_experts: self.plan.local_expert_range.len(),
-                gate,
-                up,
-                down,
-                total_bytes,
-            });
-        }
-        ensure!(
-            layers.len() == KIMI_K2_MOE_LAYERS,
-            "Kimi rank {} expected {KIMI_K2_MOE_LAYERS} MoE layers, got {}",
-            self.rank,
-            layers.len()
-        );
-        let total_bytes = layers.iter().map(|layer| layer.total_bytes).sum();
-        Ok(KimiRankExpertMajorWeightPlan {
-            rank: self.rank,
-            local_expert_range: self.plan.local_expert_range.clone(),
-            layers,
-            total_bytes,
-        })
-    }
-
-    pub fn pack_expert_major_layer_marlin_weights(
-        &self,
-        ctx: &KimiRankGpuContext,
-        layer_idx: usize,
-    ) -> Result<KimiMoeLayerExpertMarlinWeights> {
-        ctx.set_current()?;
-        let layer = self
-            .layers
-            .iter()
-            .find(|layer| layer.layer_idx == layer_idx)
-            .with_context(|| format!("missing Kimi rank {} layer {layer_idx}", self.rank))?;
-        let KimiLayerKindGpuWeights::Moe(moe) = &layer.kind else {
-            bail!(
-                "Kimi rank {} layer {layer_idx} is dense, not MoE",
-                self.rank
-            );
-        };
-        validate_local_expert_order(
-            self.rank,
-            layer.layer_idx,
-            self.plan.local_expert_range.clone(),
-            &moe.routed_experts,
-        )?;
-
-        let gate = pack_expert_major_projection_marlin_buffers(
-            ctx,
-            self.plan.ep_rank,
-            KimiInt4ProjectionRole::Gate,
-            moe.routed_experts.iter().map(|expert| &expert.gate_proj),
-        )?;
-        let up = pack_expert_major_projection_marlin_buffers(
-            ctx,
-            self.plan.ep_rank,
-            KimiInt4ProjectionRole::Up,
-            moe.routed_experts.iter().map(|expert| &expert.up_proj),
-        )?;
-        let w13 = fuse_expert_major_w13_marlin_buffers(ctx, &gate, &up)?;
-        let down = pack_expert_major_projection_marlin_buffers(
-            ctx,
-            self.plan.ep_rank,
-            KimiInt4ProjectionRole::Down,
-            moe.routed_experts.iter().map(|expert| &expert.down_proj),
-        )?;
-        let raw_source_bytes =
-            gate.plan.total_bytes() + up.plan.total_bytes() + down.plan.total_bytes();
-        let total_bytes = w13.package_bytes() + down.package_bytes();
-        let weights = KimiMoeLayerExpertMarlinWeights {
-            layer_idx: layer.layer_idx,
-            first_global_expert: self.plan.local_expert_range.start,
-            local_experts: self.plan.local_expert_range.len(),
-            w13,
-            down,
-            raw_source_bytes,
-            total_bytes,
-        };
-        weights.as_marlin_weights().validate()?;
-        Ok(weights)
     }
 }
 
@@ -777,35 +555,6 @@ fn copy_projection_component_to_typed_contiguous<'a, T: DeviceRepr>(
         offset == expected_bytes,
         "Kimi expert-major {component} copied {offset} bytes, expected {expected_bytes}"
     );
-    Ok(())
-}
-
-fn validate_local_expert_order(
-    rank: usize,
-    layer_idx: usize,
-    local_expert_range: Range<usize>,
-    routed_experts: &[KimiRoutedExpertGpuWeights<'_>],
-) -> Result<()> {
-    ensure!(
-        routed_experts.len() == local_expert_range.len(),
-        "Kimi rank {} layer {} expected {} local routed experts, got {}",
-        rank,
-        layer_idx,
-        local_expert_range.len(),
-        routed_experts.len()
-    );
-    for (offset, expert) in routed_experts.iter().enumerate() {
-        let expected = local_expert_range.start + offset;
-        ensure!(
-            expert.global_expert == expected,
-            "Kimi rank {} layer {} local expert offset {} expected global expert {}, got {}",
-            rank,
-            layer_idx,
-            offset,
-            expected,
-            expert.global_expert
-        );
-    }
     Ok(())
 }
 

@@ -35,12 +35,14 @@ impl KimiRankThreadState {
                         self.sliced_load_plan.rank
                     )
                 })?;
-        weights.typed_view(&self.weight_names).with_context(|| {
-            format!(
-                "failed to validate Kimi rank {} typed GPU weight view",
-                self.sliced_load_plan.rank
-            )
-        })?;
+        weights
+            .validate_typed_view(&self.weight_names)
+            .with_context(|| {
+                format!(
+                    "failed to validate Kimi rank {} typed GPU weight view",
+                    self.sliced_load_plan.rank
+                )
+            })?;
         let tensor_count = weights.tensors.len();
         let total_bytes = weights.total_bytes;
         let expert_kernel_weights = weights

@@ -283,30 +283,6 @@ pub struct KimiRankGpuWeights {
     pub total_bytes: usize,
 }
 
-pub struct KimiTopGpuWeights<'a> {
-    pub token_embedding: &'a KimiGpuRawTensor,
-    pub final_norm: &'a KimiGpuRawTensor,
-    pub lm_head: &'a KimiGpuRawTensor,
-}
-
-pub struct KimiAttentionGpuWeights<'a> {
-    pub input_layernorm: &'a KimiGpuRawTensor,
-    pub q_a_proj: &'a KimiGpuRawTensor,
-    pub q_a_layernorm: &'a KimiGpuRawTensor,
-    pub q_b_proj: &'a KimiGpuRawTensor,
-    pub kv_a_proj_with_mqa: &'a KimiGpuRawTensor,
-    pub kv_a_layernorm: &'a KimiGpuRawTensor,
-    pub kv_b_proj: &'a KimiGpuRawTensor,
-    pub o_proj: &'a KimiGpuRawTensor,
-    pub post_attention_layernorm: &'a KimiGpuRawTensor,
-}
-
-pub struct KimiDenseMlpGpuWeights<'a> {
-    pub gate_proj: &'a KimiGpuRawTensor,
-    pub up_proj: &'a KimiGpuRawTensor,
-    pub down_proj: &'a KimiGpuRawTensor,
-}
-
 pub struct KimiRouterGpuWeights<'a> {
     pub gate_weight: &'a KimiGpuRawTensor,
     pub e_score_correction_bias: &'a KimiGpuRawTensor,
@@ -317,47 +293,10 @@ pub struct KimiRouterDeviceWeights {
     pub e_score_correction_bias: CudaSlice<f32>,
 }
 
-pub struct KimiSharedExpertGpuWeights<'a> {
-    pub gate_proj: &'a KimiGpuRawTensor,
-    pub up_proj: &'a KimiGpuRawTensor,
-    pub down_proj: &'a KimiGpuRawTensor,
-}
-
 pub struct KimiInt4ProjectionGpuWeights<'a> {
     pub weight_packed: &'a KimiGpuRawTensor,
     pub weight_scale: &'a KimiGpuRawTensor,
     pub weight_shape: &'a KimiGpuRawTensor,
-}
-
-pub struct KimiRoutedExpertGpuWeights<'a> {
-    pub global_expert: usize,
-    pub gate_proj: KimiInt4ProjectionGpuWeights<'a>,
-    pub up_proj: KimiInt4ProjectionGpuWeights<'a>,
-    pub down_proj: KimiInt4ProjectionGpuWeights<'a>,
-}
-
-pub struct KimiMoeLayerGpuWeights<'a> {
-    pub router: KimiRouterGpuWeights<'a>,
-    pub shared_experts: KimiSharedExpertGpuWeights<'a>,
-    pub routed_experts: Vec<KimiRoutedExpertGpuWeights<'a>>,
-}
-
-pub enum KimiLayerKindGpuWeights<'a> {
-    Dense(KimiDenseMlpGpuWeights<'a>),
-    Moe(KimiMoeLayerGpuWeights<'a>),
-}
-
-pub struct KimiLayerGpuWeights<'a> {
-    pub layer_idx: usize,
-    pub attention: KimiAttentionGpuWeights<'a>,
-    pub kind: KimiLayerKindGpuWeights<'a>,
-}
-
-pub struct KimiRankTypedGpuWeights<'a> {
-    pub rank: usize,
-    pub plan: &'a KimiRankWeightPlan,
-    pub top: KimiTopGpuWeights<'a>,
-    pub layers: Vec<KimiLayerGpuWeights<'a>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -395,25 +334,6 @@ pub struct KimiExpertMajorProjectionPlan {
     pub packed_bytes: usize,
     pub scale_bytes: usize,
     pub shape_bytes: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiMoeLayerExpertMajorPlan {
-    pub layer_idx: usize,
-    pub first_global_expert: usize,
-    pub local_experts: usize,
-    pub gate: KimiExpertMajorProjectionPlan,
-    pub up: KimiExpertMajorProjectionPlan,
-    pub down: KimiExpertMajorProjectionPlan,
-    pub total_bytes: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiRankExpertMajorWeightPlan {
-    pub rank: usize,
-    pub local_expert_range: Range<usize>,
-    pub layers: Vec<KimiMoeLayerExpertMajorPlan>,
-    pub total_bytes: usize,
 }
 
 pub struct KimiExpertMajorProjectionMarlinBuffers {
