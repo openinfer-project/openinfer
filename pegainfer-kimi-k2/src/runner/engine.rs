@@ -597,7 +597,7 @@ impl DpCoordinator {
 }
 
 impl DpRankState {
-    pub(super) fn active_count(&self) -> usize {
+    fn active_count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
