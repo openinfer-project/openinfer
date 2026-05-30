@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiK2WeightManifest {
+pub(crate) struct KimiK2WeightManifest {
     pub total_size: Option<u64>,
     pub text_tensor_count: usize,
     pub ignored_non_text_tensor_count: usize,
@@ -14,11 +14,11 @@ pub struct KimiK2WeightManifest {
 }
 
 impl KimiK2WeightManifest {
-    pub fn from_model_dir(model_path: &Path) -> Result<Self> {
+    pub(crate) fn from_model_dir(model_path: &Path) -> Result<Self> {
         Self::from_index_file(&model_path.join(KIMI_K2_WEIGHT_INDEX))
     }
 
-    pub fn from_index_file(index_path: &Path) -> Result<Self> {
+    pub(crate) fn from_index_file(index_path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(index_path)
             .with_context(|| format!("failed to read {}", index_path.display()))?;
         let json: Value = serde_json::from_str(&content)
@@ -26,7 +26,7 @@ impl KimiK2WeightManifest {
         Self::from_index_json(&json)
     }
 
-    pub fn from_index_json(json: &Value) -> Result<Self> {
+    pub(crate) fn from_index_json(json: &Value) -> Result<Self> {
         let total_size = json
             .get("metadata")
             .and_then(|metadata| metadata.get("total_size"))
@@ -86,13 +86,13 @@ impl KimiK2WeightManifest {
         Ok(manifest)
     }
 
-    pub fn with_parallel_shape(mut self, shape: KimiK2ParallelShape) -> Result<Self> {
+    pub(crate) fn with_parallel_shape(mut self, shape: KimiK2ParallelShape) -> Result<Self> {
         self.parallel = shape;
         self.validate()?;
         Ok(self)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.layers.len() == KIMI_K2_LAYERS,
             "Kimi manifest expected {KIMI_K2_LAYERS} layers, got {}",
@@ -120,7 +120,7 @@ impl KimiK2WeightManifest {
         Ok(())
     }
 
-    pub fn rank_plan(&self, rank: usize) -> Result<KimiRankWeightPlan> {
+    pub(crate) fn rank_plan(&self, rank: usize) -> Result<KimiRankWeightPlan> {
         ensure!(
             rank < self.parallel.ep_world,
             "Kimi rank {rank} outside EP{}",
@@ -154,7 +154,7 @@ impl KimiK2WeightManifest {
         })
     }
 
-    pub fn rank_tensor_names(&self, rank: usize) -> Result<Vec<&KimiTensorEntry>> {
+    pub(crate) fn rank_tensor_names(&self, rank: usize) -> Result<Vec<&KimiTensorEntry>> {
         let local_expert_range = self.rank_local_expert_range(rank)?;
         let mut names = Vec::new();
         names.push(&self.token_embedding);
@@ -183,7 +183,7 @@ impl KimiK2WeightManifest {
         Ok(names)
     }
 
-    pub fn rank_sliced_load_plan(&self, rank: usize) -> Result<KimiRankSlicedLoadPlan> {
+    pub(crate) fn rank_sliced_load_plan(&self, rank: usize) -> Result<KimiRankSlicedLoadPlan> {
         let entries = self.rank_tensor_load_specs(rank)?;
         let mut by_shard: BTreeMap<String, Vec<KimiTensorLoadSpec>> = BTreeMap::new();
         for entry in entries {
@@ -201,7 +201,7 @@ impl KimiK2WeightManifest {
         })
     }
 
-    pub fn rank_tensor_load_specs(&self, rank: usize) -> Result<Vec<KimiTensorLoadSpec>> {
+    pub(crate) fn rank_tensor_load_specs(&self, rank: usize) -> Result<Vec<KimiTensorLoadSpec>> {
         let plan = self.rank_plan(rank)?;
         let local_expert_range = self.rank_local_expert_range(rank)?;
         let mut specs = Vec::with_capacity(plan.tensor_count);
@@ -281,7 +281,7 @@ impl KimiK2WeightManifest {
         Ok(specs)
     }
 
-    pub fn rank_weight_names(&self, rank: usize) -> Result<KimiRankWeightNames> {
+    pub(crate) fn rank_weight_names(&self, rank: usize) -> Result<KimiRankWeightNames> {
         let plan = self.rank_plan(rank)?;
         let local_expert_range = self.rank_local_expert_range(rank)?;
         let top = KimiTopWeightNames {
@@ -335,7 +335,7 @@ impl KimiK2WeightManifest {
         })
     }
 
-    pub fn rank_local_expert_range(&self, rank: usize) -> Result<Range<usize>> {
+    pub(crate) fn rank_local_expert_range(&self, rank: usize) -> Result<Range<usize>> {
         let ep_rank = self.parallel.parallel_config().coord(rank).ep_rank;
         ensure!(
             ep_rank < self.parallel.ep_world,
@@ -347,7 +347,7 @@ impl KimiK2WeightManifest {
 }
 
 impl KimiRankWeightNames {
-    pub fn required_tensor_names(&self) -> Result<Vec<&str>> {
+    pub(crate) fn required_tensor_names(&self) -> Result<Vec<&str>> {
         let mut required = Vec::with_capacity(self.plan.tensor_count);
         required.push(self.top.token_embedding.as_str());
         required.push(self.top.final_norm.as_str());

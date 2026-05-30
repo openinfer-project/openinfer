@@ -49,7 +49,7 @@ impl KimiRankGpuWeights {
     /// expected dtype and that the loaded count matches the plan. The check is
     /// exhaustive (`validate_rank_tensor_catalog` walks all top/attention/MoE
     /// names with their dtypes), so no typed view needs to be materialized.
-    pub fn validate_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
+    pub(crate) fn validate_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
         ensure!(
             self.rank == names.rank,
             "Kimi GPU rank {} does not match typed names rank {}",
@@ -72,7 +72,7 @@ impl KimiRankGpuWeights {
         })
     }
 
-    pub fn pack_rank_expert_marlin_weights(
+    pub(crate) fn pack_rank_expert_marlin_weights(
         &mut self,
         ctx: &KimiRankGpuContext,
         names: &KimiRankWeightNames,
@@ -126,17 +126,12 @@ impl KimiRankGpuWeights {
                     .collect::<Vec<_>>()
                     .as_slice(),
             )?;
-            let raw_source_bytes =
-                gate.plan.total_bytes() + up.plan.total_bytes() + down.plan.total_bytes();
             let w13 = fuse_expert_major_w13_marlin_buffers(ctx, &gate, &up)?;
             let total_bytes = w13.package_bytes() + down.package_bytes();
             let weights = KimiMoeLayerExpertMarlinWeights {
                 layer_idx: layer.layer_idx,
-                first_global_expert: names.plan.local_expert_range.start,
-                local_experts: names.plan.local_expert_range.len(),
                 w13,
                 down,
-                raw_source_bytes,
                 total_bytes,
             };
             weights.as_marlin_weights().validate()?;
@@ -149,13 +144,11 @@ impl KimiRankGpuWeights {
             self.rank,
             layers.len()
         );
-        let raw_source_bytes = layers.iter().map(|layer| layer.raw_source_bytes).sum();
         let total_bytes = layers.iter().map(|layer| layer.total_bytes).sum();
         Ok(KimiRankExpertMarlinWeights {
             rank: self.rank,
             local_expert_range: names.plan.local_expert_range.clone(),
             layers,
-            raw_source_bytes,
             total_bytes,
         })
     }
@@ -229,7 +222,7 @@ impl KimiRankGpuWeights {
 }
 
 impl KimiRouterGpuWeights<'_> {
-    pub fn copy_to_device_weights(
+    pub(crate) fn copy_to_device_weights(
         &self,
         ctx: &KimiRankGpuContext,
     ) -> Result<KimiRouterDeviceWeights> {
@@ -257,12 +250,6 @@ impl KimiRouterGpuWeights<'_> {
             })?,
             e_score_correction_bias,
         })
-    }
-}
-
-impl KimiExpertMajorProjectionPlan {
-    fn total_bytes(&self) -> usize {
-        self.packed_bytes + self.scale_bytes + self.shape_bytes
     }
 }
 

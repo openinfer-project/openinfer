@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn ensure_text_only_model_index(model_path: &Path) -> Result<KimiK2WeightManifest> {
+pub(crate) fn ensure_text_only_model_index(model_path: &Path) -> Result<KimiK2WeightManifest> {
     let manifest = KimiK2WeightManifest::from_model_dir(model_path)?;
     if manifest.text_tensor_count == 0 {
         bail!("Kimi safetensors index contains no language_model tensors");
@@ -8,7 +8,7 @@ pub fn ensure_text_only_model_index(model_path: &Path) -> Result<KimiK2WeightMan
     Ok(manifest)
 }
 
-pub fn load_rank_sliced_weights_to_gpu(
+pub(crate) fn load_rank_sliced_weights_to_gpu(
     ctx: &KimiRankGpuContext,
     model_path: &Path,
     load_plan: &KimiRankSlicedLoadPlan,
@@ -43,7 +43,6 @@ pub fn load_rank_sliced_weights_to_gpu(
             };
             let tensor = KimiGpuRawTensor {
                 name: spec.name.clone(),
-                shard: shard.shard.clone(),
                 dtype: view.dtype(),
                 shape,
                 bytes,

@@ -4,14 +4,13 @@ use pegainfer_core::parallel::ParallelConfig;
 
 use crate::runner::affinity::KimiRankThreadPlacementPlan;
 use crate::runner::worker::KimiK2RankPlacement;
-use crate::weights::{KimiK2WeightManifest, KimiRankSlicedLoadPlan, KimiRankWeightNames};
+use crate::weights::{KimiRankSlicedLoadPlan, KimiRankWeightNames};
 
 #[derive(Clone, Debug)]
-pub struct KimiK2RunnerConfig {
+pub(crate) struct KimiK2RunnerConfig {
     pub model_path: PathBuf,
     pub parallel: ParallelConfig,
     pub local_dims: crate::config::KimiLocalDims,
-    pub weight_manifest: KimiK2WeightManifest,
     pub rank_weight_names: Vec<KimiRankWeightNames>,
     pub rank_sliced_load_plans: Vec<KimiRankSlicedLoadPlan>,
     pub placements: Vec<KimiK2RankPlacement>,

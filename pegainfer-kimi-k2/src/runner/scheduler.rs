@@ -94,7 +94,6 @@ fn build_runner_config(
         model_path: model_path.to_path_buf(),
         parallel,
         local_dims: shape.local_dims(),
-        weight_manifest,
         rank_weight_names,
         rank_sliced_load_plans,
         placements,

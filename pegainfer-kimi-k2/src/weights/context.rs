@@ -1,7 +1,7 @@
 use super::*;
 
 impl KimiRankGpuContext {
-    pub fn new(device_ordinal: usize) -> Result<Self> {
+    pub(crate) fn new(device_ordinal: usize) -> Result<Self> {
         Self::set_current_device(device_ordinal)?;
         let ctx = CudaContext::new(device_ordinal).with_context(|| {
             format!("failed to create CUDA context for device {device_ordinal}")
@@ -22,7 +22,7 @@ impl KimiRankGpuContext {
         })
     }
 
-    pub fn set_current(&self) -> Result<()> {
+    pub(crate) fn set_current(&self) -> Result<()> {
         Self::set_current_device(self.device_ordinal)?;
         self.ctx.bind_to_thread().with_context(|| {
             format!(
@@ -49,7 +49,7 @@ impl KimiRankGpuContext {
         Ok(())
     }
 
-    pub fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
             .with_context(|| format!("failed to synchronize Kimi device {}", self.device_ordinal))

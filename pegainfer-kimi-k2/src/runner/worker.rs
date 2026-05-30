@@ -65,13 +65,13 @@ const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
 const KIMI_DECODE_ROPE_CACHE_TOKENS: usize = KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KimiK2RankPlacement {
+pub(crate) struct KimiK2RankPlacement {
     pub rank: usize,
     pub device_ordinal: usize,
 }
 
 impl KimiK2RankPlacement {
-    pub fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
+    pub(crate) fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
         ensure!(rank < 8, "Kimi-K2 rank must be < 8, got {rank}");
         Ok(Self {
             rank,
