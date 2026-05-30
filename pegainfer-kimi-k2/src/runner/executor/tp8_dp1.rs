@@ -15,6 +15,10 @@ pub(in crate::runner) struct Tp8Dp1ForwardExecutor {
 }
 
 impl ForwardExecutor for Tp8Dp1ForwardExecutor {
+    fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()> {
+        self.ensure_decode_arena(decode_batch_size)
+    }
+
     fn forward_prefill(
         &self,
         input_ids: &[u32],
@@ -213,7 +217,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
 }
 
 impl Tp8Dp1ForwardExecutor {
-    pub(in crate::runner) fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()> {
+    fn ensure_decode_arena(&self, decode_batch_size: usize) -> Result<()> {
         if self.workers.is_empty() {
             bail!("Kimi TP8 executor has no rank workers");
         }

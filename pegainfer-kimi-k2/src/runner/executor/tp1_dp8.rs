@@ -5,7 +5,7 @@ use crate::{
     runner::worker::{KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker},
 };
 
-use super::ForwardExecutor;
+use super::{DP_MAX_BATCH_PER_RANK, ForwardExecutor};
 
 pub(in crate::runner) struct Tp1Dp8ForwardExecutor {
     pub(in crate::runner) worker: KimiRankWorker,
@@ -13,6 +13,14 @@ pub(in crate::runner) struct Tp1Dp8ForwardExecutor {
 }
 
 impl ForwardExecutor for Tp1Dp8ForwardExecutor {
+    fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()> {
+        ensure!(
+            decode_batch_size <= DP_MAX_BATCH_PER_RANK,
+            "Kimi TP1 decode batch size {decode_batch_size} exceeds per-rank arena capacity {DP_MAX_BATCH_PER_RANK}"
+        );
+        Ok(())
+    }
+
     fn forward_prefill(
         &self,
         input_ids: &[u32],

@@ -8,7 +8,13 @@ use anyhow::Result;
 
 use super::worker::KimiOneTokenForwardReport;
 
+pub(super) const DP_MAX_BATCH_PER_RANK: usize = 8;
+
 pub(super) trait ForwardExecutor {
+    /// Ensure `slot < decode_batch_size` is valid for following prefill/decode calls.
+    fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()>;
+
+    /// Forward one prompt into `slot` inside a stable arena of `decode_batch_size` rows.
     fn forward_prefill(
         &self,
         input_ids: &[u32],
@@ -17,6 +23,7 @@ pub(super) trait ForwardExecutor {
         ep_max_seq_len: usize,
     ) -> Result<KimiOneTokenForwardReport>;
 
+    /// Return exactly one report per input row, in the same order.
     fn forward_prompt_len1_batch(
         &self,
         token_ids: &[u32],
@@ -24,6 +31,7 @@ pub(super) trait ForwardExecutor {
         decode_batch_size: usize,
     ) -> Result<Vec<KimiOneTokenForwardReport>>;
 
+    /// Return exactly one report per input row, in the same order.
     fn forward_decode_batch(
         &self,
         token_ids: &[u32],

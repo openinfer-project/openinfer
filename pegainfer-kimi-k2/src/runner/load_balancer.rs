@@ -1,4 +1,4 @@
-use super::engine::DpRankState;
+use super::scheduler::dp::DpRankState;
 
 #[derive(Clone, Copy)]
 pub(super) struct DpLoadBalancer {
