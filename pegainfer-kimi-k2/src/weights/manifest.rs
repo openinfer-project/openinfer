@@ -413,30 +413,6 @@ impl KimiRankWeightNames {
     }
 }
 
-impl KimiRankWeightHeaders {
-    pub fn validate_typed_names(&self, names: &KimiRankWeightNames) -> Result<()> {
-        ensure!(
-            self.rank == names.rank,
-            "Kimi header rank {} does not match typed names rank {}",
-            self.rank,
-            names.rank
-        );
-        validate_rank_tensor_catalog(names, self.tensors.len(), |name, dtype| {
-            let tensor = self
-                .tensors
-                .get(name)
-                .with_context(|| format!("missing Kimi tensor header {name}"))?;
-            ensure!(
-                tensor.dtype == dtype,
-                "Kimi tensor {name} dtype {:?} does not match expected {:?}",
-                tensor.dtype,
-                dtype
-            );
-            Ok(())
-        })
-    }
-}
-
 impl KimiAttentionWeightNames {
     fn from_manifest(manifest: &KimiAttentionManifest) -> Self {
         Self {

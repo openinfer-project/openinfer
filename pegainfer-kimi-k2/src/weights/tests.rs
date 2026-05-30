@@ -1,10 +1,5 @@
 use super::*;
-use safetensors::tensor::{TensorView, serialize};
 use serde_json::json;
-use std::{
-    fs,
-    time::{SystemTime, UNIX_EPOCH},
-};
 
 #[test]
 fn rank_tensor_names_filter_local_experts() {
@@ -162,117 +157,6 @@ fn rank_sliced_load_plan_applies_tp8_ep8_slices() {
 }
 
 #[test]
-fn rank_weight_headers_validate_typed_gpu_view_contract() {
-    let manifest = tiny_manifest();
-    let names = manifest.rank_weight_names(1).unwrap();
-    let headers = headers_for_names(&names);
-    headers.validate_typed_names(&names).unwrap();
-    assert_eq!(names.required_tensor_names().unwrap().len(), 26_775);
-}
-
-#[test]
-fn rank_weight_headers_reject_wrong_typed_dtype() {
-    let manifest = tiny_manifest();
-    let names = manifest.rank_weight_names(1).unwrap();
-    let mut headers = headers_for_names(&names);
-    let bias_name = match &names.layers[1].kind {
-        KimiLayerWeightKindNames::Moe(moe) => &moe.router.e_score_correction_bias,
-        KimiLayerWeightKindNames::Dense(_) => panic!("layer1 must be MoE"),
-    };
-    headers.tensors.get_mut(bias_name).unwrap().dtype = Dtype::BF16;
-    let err = headers.validate_typed_names(&names).unwrap_err();
-    assert!(err.to_string().contains("expected F32"));
-}
-
-#[test]
-fn load_rank_weight_headers_reads_planned_shards() {
-    let dir = make_temp_dir();
-    let shard0 = dir.join("model-00001-of-000002.safetensors");
-    let shard1 = dir.join("model-00002-of-000002.safetensors");
-    write_safetensor(
-        &shard0,
-        &[
-            ("a.weight", Dtype::BF16, vec![2], vec![1, 2, 3, 4]),
-            ("b.weight", Dtype::F32, vec![1], vec![5, 6, 7, 8]),
-        ],
-    );
-    write_safetensor(
-        &shard1,
-        &[("c.weight", Dtype::U8, vec![3], vec![9, 10, 11])],
-    );
-    let shard_plan = KimiRankShardPlan {
-        rank: 3,
-        shards: vec![
-            KimiShardTensorPlan {
-                shard: "model-00001-of-000002.safetensors".to_owned(),
-                tensors: vec!["a.weight".to_owned(), "b.weight".to_owned()],
-            },
-            KimiShardTensorPlan {
-                shard: "model-00002-of-000002.safetensors".to_owned(),
-                tensors: vec!["c.weight".to_owned()],
-            },
-        ],
-        tensor_count: 3,
-    };
-    let headers = load_rank_weight_headers(&dir, &shard_plan).unwrap();
-    assert_eq!(headers.rank, 3);
-    assert_eq!(headers.total_bytes, 11);
-    assert_eq!(headers.tensors["a.weight"].dtype, Dtype::BF16);
-    assert_eq!(headers.tensors["a.weight"].shape, vec![2]);
-    assert_eq!(
-        headers.tensors["c.weight"].shard,
-        "model-00002-of-000002.safetensors"
-    );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn load_rank_sliced_weight_headers_reports_local_shapes_and_bytes() {
-    let dir = make_temp_dir();
-    write_safetensor(
-        &dir.join("model-00001-of-000001.safetensors"),
-        &[
-            ("row.weight", Dtype::BF16, vec![6, 4], (0..48).collect()),
-            ("col.weight", Dtype::BF16, vec![3, 6], (0..36).collect()),
-            ("full.weight", Dtype::U8, vec![5], (0..5).collect()),
-        ],
-    );
-    let load_plan = KimiRankSlicedLoadPlan {
-        rank: 2,
-        shards: vec![KimiShardTensorLoadPlan {
-            shard: "model-00001-of-000001.safetensors".to_owned(),
-            tensors: vec![
-                KimiTensorLoadSpec {
-                    name: "row.weight".to_owned(),
-                    shard: "model-00001-of-000001.safetensors".to_owned(),
-                    slice: KimiTensorLoadSlice::RowRange { start: 2, end: 5 },
-                },
-                KimiTensorLoadSpec {
-                    name: "col.weight".to_owned(),
-                    shard: "model-00001-of-000001.safetensors".to_owned(),
-                    slice: KimiTensorLoadSlice::ColRange { start: 1, end: 5 },
-                },
-                KimiTensorLoadSpec {
-                    name: "full.weight".to_owned(),
-                    shard: "model-00001-of-000001.safetensors".to_owned(),
-                    slice: KimiTensorLoadSlice::Full,
-                },
-            ],
-        }],
-        tensor_count: 3,
-    };
-    let headers = load_rank_sliced_weight_headers(&dir, &load_plan).unwrap();
-    assert_eq!(headers.rank, 2);
-    assert_eq!(headers.tensors["row.weight"].shape, vec![3, 4]);
-    assert_eq!(headers.tensors["row.weight"].bytes, 24);
-    assert_eq!(headers.tensors["col.weight"].shape, vec![3, 4]);
-    assert_eq!(headers.tensors["col.weight"].bytes, 24);
-    assert_eq!(headers.tensors["full.weight"].shape, vec![5]);
-    assert_eq!(headers.total_bytes, 53);
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn sliced_tensor_bytes_packs_col_slice_as_row_major() {
     let data = (0u8..24).collect::<Vec<_>>();
     let out = sliced_tensor_bytes(
@@ -286,23 +170,15 @@ fn sliced_tensor_bytes_packs_col_slice_as_row_major() {
 }
 
 #[test]
-fn load_rank_weight_headers_rejects_missing_tensor() {
-    let dir = make_temp_dir();
-    write_safetensor(
-        &dir.join("model-00001-of-000001.safetensors"),
-        &[("present", Dtype::U8, vec![1], vec![1])],
-    );
-    let shard_plan = KimiRankShardPlan {
-        rank: 0,
-        shards: vec![KimiShardTensorPlan {
-            shard: "model-00001-of-000001.safetensors".to_owned(),
-            tensors: vec!["missing".to_owned()],
-        }],
-        tensor_count: 1,
-    };
-    let err = load_rank_weight_headers(&dir, &shard_plan).unwrap_err();
-    assert!(err.to_string().contains("missing tensor missing"));
-    fs::remove_dir_all(dir).unwrap();
+fn scanner_rejects_missing_required_text_tensor() {
+    let json = json!({
+        "metadata": {"total_size": 1},
+        "weight_map": {
+            "language_model.model.embed_tokens.weight": "model-00001-of-000064.safetensors"
+        }
+    });
+    let err = KimiK2WeightManifest::from_index_json(&json).unwrap_err();
+    assert!(err.to_string().contains("language_model.model.norm.weight"));
 }
 
 fn find_load_spec<'a>(plan: &'a KimiRankSlicedLoadPlan, name: &str) -> &'a KimiTensorLoadSpec {
@@ -398,119 +274,4 @@ fn top(name: &str) -> KimiTensorEntry {
         name: name.to_owned(),
         shard: "model-00001-of-000064.safetensors".to_owned(),
     }
-}
-
-fn headers_for_names(names: &KimiRankWeightNames) -> KimiRankWeightHeaders {
-    let mut tensors = BTreeMap::new();
-    insert_header(&mut tensors, &names.top.token_embedding, Dtype::BF16);
-    insert_header(&mut tensors, &names.top.final_norm, Dtype::BF16);
-    insert_header(&mut tensors, &names.top.lm_head, Dtype::BF16);
-    for layer in &names.layers {
-        insert_attention_headers(&mut tensors, &layer.attention);
-        match &layer.kind {
-            KimiLayerWeightKindNames::Dense(mlp) => {
-                insert_header(&mut tensors, &mlp.gate_proj, Dtype::BF16);
-                insert_header(&mut tensors, &mlp.up_proj, Dtype::BF16);
-                insert_header(&mut tensors, &mlp.down_proj, Dtype::BF16);
-            }
-            KimiLayerWeightKindNames::Moe(moe) => {
-                insert_header(&mut tensors, &moe.router.gate_weight, Dtype::BF16);
-                insert_header(
-                    &mut tensors,
-                    &moe.router.e_score_correction_bias,
-                    Dtype::F32,
-                );
-                insert_header(&mut tensors, &moe.shared_experts.gate_proj, Dtype::BF16);
-                insert_header(&mut tensors, &moe.shared_experts.up_proj, Dtype::BF16);
-                insert_header(&mut tensors, &moe.shared_experts.down_proj, Dtype::BF16);
-                for expert in &moe.routed_experts {
-                    insert_int4_projection_headers(&mut tensors, &expert.gate_proj);
-                    insert_int4_projection_headers(&mut tensors, &expert.up_proj);
-                    insert_int4_projection_headers(&mut tensors, &expert.down_proj);
-                }
-            }
-        }
-    }
-    KimiRankWeightHeaders {
-        rank: names.rank,
-        total_bytes: tensors.len(),
-        tensors,
-    }
-}
-
-fn insert_attention_headers(
-    tensors: &mut BTreeMap<String, KimiTensorHeader>,
-    attention: &KimiAttentionWeightNames,
-) {
-    insert_header(tensors, &attention.input_layernorm, Dtype::BF16);
-    insert_header(tensors, &attention.q_a_proj, Dtype::BF16);
-    insert_header(tensors, &attention.q_a_layernorm, Dtype::BF16);
-    insert_header(tensors, &attention.q_b_proj, Dtype::BF16);
-    insert_header(tensors, &attention.kv_a_proj_with_mqa, Dtype::BF16);
-    insert_header(tensors, &attention.kv_a_layernorm, Dtype::BF16);
-    insert_header(tensors, &attention.kv_b_proj, Dtype::BF16);
-    insert_header(tensors, &attention.o_proj, Dtype::BF16);
-    insert_header(tensors, &attention.post_attention_layernorm, Dtype::BF16);
-}
-
-fn insert_int4_projection_headers(
-    tensors: &mut BTreeMap<String, KimiTensorHeader>,
-    projection: &KimiInt4ProjectionWeightNames,
-) {
-    insert_header(tensors, &projection.weight_packed, Dtype::I32);
-    insert_header(tensors, &projection.weight_scale, Dtype::BF16);
-    insert_header(tensors, &projection.weight_shape, Dtype::I32);
-}
-
-fn insert_header(tensors: &mut BTreeMap<String, KimiTensorHeader>, name: &str, dtype: Dtype) {
-    let previous = tensors.insert(
-        name.to_owned(),
-        KimiTensorHeader {
-            name: name.to_owned(),
-            shard: "model-00001-of-000064.safetensors".to_owned(),
-            dtype,
-            shape: vec![1],
-            bytes: 1,
-        },
-    );
-    assert!(previous.is_none(), "duplicate test tensor {name}");
-}
-
-fn make_temp_dir() -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "pegainfer-kimi-k2-weights-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn write_safetensor(path: &Path, tensors: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) {
-    let views = tensors
-        .iter()
-        .map(|(name, dtype, shape, data)| {
-            (
-                *name,
-                TensorView::new(*dtype, shape.clone(), data.as_slice()).unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let bytes = serialize(views, None).unwrap();
-    fs::write(path, bytes).unwrap();
-}
-
-#[test]
-fn scanner_rejects_missing_required_text_tensor() {
-    let json = json!({
-        "metadata": {"total_size": 1},
-        "weight_map": {
-            "language_model.model.embed_tokens.weight": "model-00001-of-000064.safetensors"
-        }
-    });
-    let err = KimiK2WeightManifest::from_index_json(&json).unwrap_err();
-    assert!(err.to_string().contains("language_model.model.norm.weight"));
 }

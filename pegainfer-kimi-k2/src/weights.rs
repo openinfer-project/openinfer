@@ -281,22 +281,6 @@ pub struct KimiRankWeightNames {
     pub layers: Vec<KimiLayerWeightNames>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiTensorHeader {
-    pub name: String,
-    pub shard: String,
-    pub dtype: Dtype,
-    pub shape: Vec<usize>,
-    pub bytes: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiRankWeightHeaders {
-    pub rank: usize,
-    pub tensors: BTreeMap<String, KimiTensorHeader>,
-    pub total_bytes: usize,
-}
-
 pub struct KimiGpuRawTensor {
     pub name: String,
     pub shard: String,
@@ -555,7 +539,6 @@ use manifest::validate_rank_tensor_catalog;
 mod tests;
 
 pub use load::{
-    ensure_text_only_model_index, load_rank_sliced_weight_headers, load_rank_sliced_weights_to_gpu,
-    load_rank_weight_headers, load_rank_weights_to_gpu,
+    ensure_text_only_model_index, load_rank_sliced_weights_to_gpu, load_rank_weights_to_gpu,
 };
 pub use manifest::KimiK2WeightManifest;

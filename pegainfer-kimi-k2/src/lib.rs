@@ -37,11 +37,10 @@ pub use weights::{
     KIMI_K2_WEIGHT_INDEX, KimiAttentionGpuWeights, KimiDenseMlpGpuWeights,
     KimiInt4ProjectionGpuWeights, KimiK2WeightManifest, KimiLayerGpuWeights,
     KimiLayerKindGpuWeights, KimiMoeLayerGpuWeights, KimiRankGpuContext, KimiRankGpuWeights,
-    KimiRankShardPlan, KimiRankSlicedLoadPlan, KimiRankTypedGpuWeights, KimiRankWeightHeaders,
-    KimiRankWeightNames, KimiRankWeightPlan, KimiRoutedExpertGpuWeights, KimiRouterGpuWeights,
-    KimiShardTensorLoadPlan, KimiSharedExpertGpuWeights, KimiTensorHeader, KimiTensorLoadSlice,
-    KimiTensorLoadSpec, KimiTopGpuWeights, load_rank_sliced_weight_headers,
-    load_rank_sliced_weights_to_gpu, load_rank_weight_headers, load_rank_weights_to_gpu,
+    KimiRankShardPlan, KimiRankSlicedLoadPlan, KimiRankTypedGpuWeights, KimiRankWeightNames,
+    KimiRankWeightPlan, KimiRoutedExpertGpuWeights, KimiRouterGpuWeights, KimiShardTensorLoadPlan,
+    KimiSharedExpertGpuWeights, KimiTensorLoadSlice, KimiTensorLoadSpec, KimiTopGpuWeights,
+    load_rank_sliced_weights_to_gpu, load_rank_weights_to_gpu,
 };
 
 #[cfg(feature = "kimi-k2")]
