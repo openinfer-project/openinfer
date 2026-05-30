@@ -2,8 +2,8 @@ use super::*;
 use super::{
     load::dtype_element_bytes,
     manifest::{
-        KimiInt4ProjectionWeightNames, KimiLayerWeightKindNames, KimiMoeLayerWeightNames,
-        KimiRankWeightNames, KimiRoutedExpertWeightNames, validate_rank_tensor_catalog,
+        KimiAttentionWeightNames, KimiInt4ProjectionWeightNames, KimiLayerWeightKindNames,
+        KimiMoeLayerWeightNames, KimiRankWeightNames, KimiRoutedExpertWeightNames,
     },
 };
 
@@ -188,20 +188,34 @@ impl KimiGpuRawTensor {
 }
 
 impl KimiRankGpuWeights {
-    /// Validate that every planned tensor is present on the GPU with the
-    /// expected dtype and that the loaded count matches the plan. The check is
-    /// exhaustive (`validate_rank_tensor_catalog` walks all top/attention/MoE
-    /// names with their dtypes), so no typed view needs to be materialized.
-    pub(crate) fn validate_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
+    pub(crate) fn validate_non_expert_typed_view(&self, names: &KimiRankWeightNames) -> Result<()> {
         ensure!(
             self.rank == names.rank,
             "Kimi GPU rank {} does not match typed names rank {}",
             self.rank,
             names.rank
         );
-        validate_rank_tensor_catalog(names, self.tensors.len(), |name, dtype| {
-            self.expect_tensor(name, dtype).map(|_| ())
-        })
+        self.expect_tensor(&names.top.token_embedding, Dtype::BF16)?;
+        self.expect_tensor(&names.top.final_norm, Dtype::BF16)?;
+        self.expect_tensor(&names.top.lm_head, Dtype::BF16)?;
+        for layer in &names.layers {
+            validate_attention_resident_tensors(self, &layer.attention)?;
+            match &layer.kind {
+                KimiLayerWeightKindNames::Dense(mlp) => {
+                    self.expect_tensor(&mlp.gate_proj, Dtype::BF16)?;
+                    self.expect_tensor(&mlp.up_proj, Dtype::BF16)?;
+                    self.expect_tensor(&mlp.down_proj, Dtype::BF16)?;
+                }
+                KimiLayerWeightKindNames::Moe(moe) => {
+                    self.expect_tensor(&moe.router.gate_weight, Dtype::BF16)?;
+                    self.expect_tensor(&moe.router.e_score_correction_bias, Dtype::F32)?;
+                    self.expect_tensor(&moe.shared_experts.gate_proj, Dtype::BF16)?;
+                    self.expect_tensor(&moe.shared_experts.up_proj, Dtype::BF16)?;
+                    self.expect_tensor(&moe.shared_experts.down_proj, Dtype::BF16)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn int4_projection_view<'a>(
@@ -215,11 +229,13 @@ impl KimiRankGpuWeights {
         })
     }
 
-    pub(crate) fn pack_rank_expert_marlin_weights(
+    pub(crate) fn pack_loaded_expert_marlin_layers(
         &mut self,
         ctx: &KimiRankGpuContext,
         names: &KimiRankWeightNames,
-    ) -> Result<KimiRankExpertMarlinWeights> {
+        packed_layers: &mut BTreeSet<usize>,
+        out: &mut Vec<KimiMoeLayerExpertMarlinWeights>,
+    ) -> Result<()> {
         ensure!(
             self.rank == names.rank,
             "Kimi GPU rank {} does not match typed names rank {}",
@@ -227,73 +243,21 @@ impl KimiRankGpuWeights {
             names.rank
         );
         ctx.set_current()?;
-        let mut layers = Vec::with_capacity(KIMI_K2_MOE_LAYERS);
         for layer in &names.layers {
             let KimiLayerWeightKindNames::Moe(moe) = &layer.kind else {
                 continue;
             };
-            validate_local_expert_name_order(
-                names.rank,
-                layer.layer_idx,
-                names.plan.local_expert_range.clone(),
-                &moe.routed_experts,
-            )?;
-
-            let gate = self.pack_projection_marlin_buffers_from_names(
-                ctx,
-                names.plan.ep_rank,
-                KimiInt4ProjectionRole::Gate,
-                moe.routed_experts
-                    .iter()
-                    .map(|expert| &expert.gate_proj)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            let up = self.pack_projection_marlin_buffers_from_names(
-                ctx,
-                names.plan.ep_rank,
-                KimiInt4ProjectionRole::Up,
-                moe.routed_experts
-                    .iter()
-                    .map(|expert| &expert.up_proj)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            let down = self.pack_projection_marlin_buffers_from_names(
-                ctx,
-                names.plan.ep_rank,
-                KimiInt4ProjectionRole::Down,
-                moe.routed_experts
-                    .iter()
-                    .map(|expert| &expert.down_proj)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            let w13 = fuse_expert_major_w13_marlin_buffers(ctx, &gate, &up)?;
-            let total_bytes = w13.package_bytes() + down.package_bytes();
-            let weights = KimiMoeLayerExpertMarlinWeights {
-                layer_idx: layer.layer_idx,
-                w13,
-                down,
-                total_bytes,
-            };
+            if packed_layers.contains(&layer.layer_idx) || !self.has_all_routed_expert_raw(moe) {
+                continue;
+            }
+            let weights =
+                self.pack_moe_layer_expert_marlin_weights(ctx, names, layer.layer_idx, moe)?;
             weights.as_marlin_weights().validate()?;
-            layers.push(weights);
             self.remove_packaged_routed_expert_raw_tensors(&[moe])?;
+            packed_layers.insert(layer.layer_idx);
+            out.push(weights);
         }
-        ensure!(
-            layers.len() == KIMI_K2_MOE_LAYERS,
-            "Kimi rank {} expected {KIMI_K2_MOE_LAYERS} MoE Marlin weight layers, got {}",
-            self.rank,
-            layers.len()
-        );
-        let total_bytes = layers.iter().map(|layer| layer.total_bytes).sum();
-        Ok(KimiRankExpertMarlinWeights {
-            rank: self.rank,
-            local_expert_range: names.plan.local_expert_range.clone(),
-            layers,
-            total_bytes,
-        })
+        Ok(())
     }
 
     fn pack_projection_marlin_buffers_from_names(
@@ -308,6 +272,68 @@ impl KimiRankGpuWeights {
             .map(|projection| self.int4_projection_view(projection))
             .collect::<Result<Vec<_>>>()?;
         pack_expert_major_projection_marlin_buffers(ctx, ep_rank, role, projections.iter())
+    }
+
+    fn pack_moe_layer_expert_marlin_weights(
+        &self,
+        ctx: &KimiRankGpuContext,
+        names: &KimiRankWeightNames,
+        layer_idx: usize,
+        moe: &KimiMoeLayerWeightNames,
+    ) -> Result<KimiMoeLayerExpertMarlinWeights> {
+        validate_local_expert_name_order(
+            names.rank,
+            layer_idx,
+            names.plan.local_expert_range.clone(),
+            &moe.routed_experts,
+        )?;
+
+        let gate = self.pack_projection_marlin_buffers_from_names(
+            ctx,
+            names.plan.ep_rank,
+            KimiInt4ProjectionRole::Gate,
+            moe.routed_experts
+                .iter()
+                .map(|expert| &expert.gate_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let up = self.pack_projection_marlin_buffers_from_names(
+            ctx,
+            names.plan.ep_rank,
+            KimiInt4ProjectionRole::Up,
+            moe.routed_experts
+                .iter()
+                .map(|expert| &expert.up_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let down = self.pack_projection_marlin_buffers_from_names(
+            ctx,
+            names.plan.ep_rank,
+            KimiInt4ProjectionRole::Down,
+            moe.routed_experts
+                .iter()
+                .map(|expert| &expert.down_proj)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let w13 = fuse_expert_major_w13_marlin_buffers(ctx, &gate, &up)?;
+        let total_bytes = w13.package_bytes() + down.package_bytes();
+        Ok(KimiMoeLayerExpertMarlinWeights {
+            layer_idx,
+            w13,
+            down,
+            total_bytes,
+        })
+    }
+
+    fn has_all_routed_expert_raw(&self, moe: &KimiMoeLayerWeightNames) -> bool {
+        moe.routed_experts.iter().all(|expert| {
+            has_int4_projection_raw(&self.tensors, &expert.gate_proj)
+                && has_int4_projection_raw(&self.tensors, &expert.up_proj)
+                && has_int4_projection_raw(&self.tensors, &expert.down_proj)
+        })
     }
 
     fn remove_packaged_routed_expert_raw_tensors(
@@ -362,6 +388,31 @@ impl KimiRankGpuWeights {
         );
         Ok(tensor)
     }
+}
+
+fn validate_attention_resident_tensors(
+    weights: &KimiRankGpuWeights,
+    attention: &KimiAttentionWeightNames,
+) -> Result<()> {
+    weights.expect_tensor(&attention.input_layernorm, Dtype::BF16)?;
+    weights.expect_tensor(&attention.q_a_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.q_a_layernorm, Dtype::BF16)?;
+    weights.expect_tensor(&attention.q_b_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.kv_a_proj_with_mqa, Dtype::BF16)?;
+    weights.expect_tensor(&attention.kv_a_layernorm, Dtype::BF16)?;
+    weights.expect_tensor(&attention.kv_b_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.o_proj, Dtype::BF16)?;
+    weights.expect_tensor(&attention.post_attention_layernorm, Dtype::BF16)?;
+    Ok(())
+}
+
+fn has_int4_projection_raw(
+    tensors: &BTreeMap<String, KimiGpuRawTensor>,
+    projection: &KimiInt4ProjectionWeightNames,
+) -> bool {
+    tensors.contains_key(&projection.weight_packed)
+        && tensors.contains_key(&projection.weight_scale)
+        && tensors.contains_key(&projection.weight_shape)
 }
 
 impl KimiRouterGpuWeights<'_> {

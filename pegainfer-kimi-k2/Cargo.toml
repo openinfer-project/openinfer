@@ -8,6 +8,7 @@ autotests = false
 
 [dependencies]
 anyhow = { workspace = true }
+bytesize = { workspace = true }
 clap = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }

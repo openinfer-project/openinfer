@@ -2,15 +2,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
     thread,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
+use bytesize::ByteSize;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use cudarc::nccl::{
     ReduceOp,
     safe::{Comm, Id},
 };
+use log::debug;
 use pegainfer_core::cuda_graph::CudaGraphState;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;

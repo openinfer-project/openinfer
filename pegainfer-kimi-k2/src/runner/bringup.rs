@@ -3,11 +3,13 @@ use std::{
     path::Path,
     sync::{Arc, Barrier},
     thread,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use bytesize::ByteSize;
 use crossbeam_channel::bounded;
-use log::info;
+use log::{debug, info};
 use pegainfer_core::{
     engine::{EngineHandle, EngineLoadOptions, EpBackend, GenerateRequest},
     parallel::ParallelConfig,
@@ -29,6 +31,15 @@ use crate::{
 
 pub(crate) fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
     let parallel = resolve_parallel_config(options);
+    info!(
+        "kimi-k2: resolving engine startup: model_path={}, tp_size={}, dp_size={}, ep_size={}, ep_backend={:?}, devices={:?}",
+        model_path.display(),
+        parallel.tp_world(),
+        parallel.dp_world(),
+        parallel.ep_world(),
+        options.ep_backend,
+        options.device_ordinals
+    );
     ensure!(
         options.device_ordinals.len() == parallel.ep_world(),
         "Kimi-K2 {:?} requires {} devices, got {:?}",
@@ -60,6 +71,8 @@ fn build_runner_config(
     parallel: ParallelConfig,
     shape: KimiK2ParallelShape,
 ) -> Result<KimiK2RunnerConfig> {
+    let started = Instant::now();
+    info!("kimi-k2: start build runner config");
     let mut weight_manifest = ensure_text_only_model_index(model_path)?;
     weight_manifest = weight_manifest.with_parallel_shape(shape)?;
     let placements = build_placements(&options.device_ordinals)?;
@@ -75,7 +88,7 @@ fn build_runner_config(
     let pplx_thread_placement = pegainfer_core::cpu_topology::RankThreadPlacementPlan::for_devices(
         &options.device_ordinals,
     )?;
-    Ok(KimiK2RunnerConfig {
+    let config = KimiK2RunnerConfig {
         model_path: model_path.to_path_buf(),
         parallel,
         local_dims: shape.local_dims(),
@@ -86,7 +99,21 @@ fn build_runner_config(
         pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
         ep_backend: options.ep_backend,
-    })
+    };
+    info!(
+        "kimi-k2: build runner config cost {:.2}s: ranks={}",
+        started.elapsed().as_secs_f64(),
+        config.placements.len()
+    );
+    debug!(
+        "kimi-k2: runner config detail: tensors_per_rank={:?}",
+        config
+            .rank_sliced_load_plans
+            .iter()
+            .map(|plan| plan.tensor_count)
+            .collect::<Vec<_>>()
+    );
+    Ok(config)
 }
 
 fn start_engine_tp8_dp1(
@@ -94,6 +121,7 @@ fn start_engine_tp8_dp1(
     options: &EngineLoadOptions,
     parallel: ParallelConfig,
 ) -> Result<EngineHandle> {
+    info!("kimi-k2: starting TP8/DP1 engine");
     let config = build_runner_config(
         model_path,
         options,
@@ -133,6 +161,7 @@ fn start_engine_tp1_dp8(
     options: &EngineLoadOptions,
     parallel: ParallelConfig,
 ) -> Result<EngineHandle> {
+    info!("kimi-k2: starting TP1/DP8 engine");
     ensure!(
         options.ep_backend == EpBackend::Pplx,
         "Kimi-K2 TP1/DP8 requires --ep-backend=pplx"
@@ -166,27 +195,35 @@ fn start_engine_tp1_dp8(
 }
 
 fn build_tp8_dp1_executor(config: &KimiK2RunnerConfig) -> Result<Box<dyn ForwardExecutor + Send>> {
+    let started = Instant::now();
+    info!("kimi-k2: start build TP8/DP1 executor");
     let workers = spawn_workers(config)?;
     let weight_reports =
         maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
     init_tp_nccl(&workers)?;
     if config.ep_backend == EpBackend::Pplx {
         install_pplx_backends(config, &workers)?;
-        info!(
+        debug!(
             "kimi-k2: pplx EP backends installed on all {} ranks",
             workers.len()
         );
     }
-
-    Ok(Box::new(Tp8Dp1ForwardExecutor {
+    let executor: Box<dyn ForwardExecutor + Send> = Box::new(Tp8Dp1ForwardExecutor {
         workers,
         weight_reports,
-    }))
+    });
+    info!(
+        "kimi-k2: build TP8/DP1 executor cost {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(executor)
 }
 
 fn build_tp1_dp8_executors(
     config: &KimiK2RunnerConfig,
 ) -> Result<Vec<Box<dyn ForwardExecutor + Send>>> {
+    let started = Instant::now();
+    info!("kimi-k2: start build TP1/DP8 executors");
     let workers = spawn_workers(config)?;
     let weight_reports =
         maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
@@ -200,6 +237,10 @@ fn build_tp1_dp8_executors(
             weight_report,
         }));
     }
+    info!(
+        "kimi-k2: build TP1/DP8 executors cost {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(executors)
 }
 
@@ -208,6 +249,8 @@ fn maybe_load_rank_weights(
     load_plans: &[KimiRankSlicedLoadPlan],
     workers: &[KimiRankWorker],
 ) -> Result<Vec<KimiRankWeightLoadReport>> {
+    let started = Instant::now();
+    info!("kimi-k2: start load rank weights: ranks={}", workers.len());
     ensure_weight_payload_available(model_path, load_plans)?;
     let receivers = workers
         .iter()
@@ -215,6 +258,7 @@ fn maybe_load_rank_weights(
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(workers.len());
     for (worker, receiver) in workers.iter().zip(receivers) {
+        let rank = worker.placement().rank;
         let report = receiver
             .recv()
             .map_err(|_| {
@@ -229,13 +273,26 @@ fn maybe_load_rank_weights(
                     worker.placement().rank
                 )
             })?;
+        debug!(
+            "kimi-k2: rank {rank} weights loaded: tensors={}, bytes={}, expert_layers={}",
+            report.tensor_count,
+            ByteSize(report.total_bytes as u64),
+            report.expert_kernel_layers
+        );
         reports.push(report);
     }
+    info!(
+        "kimi-k2: load rank weights cost {:.2}s: ranks={}",
+        started.elapsed().as_secs_f64(),
+        reports.len()
+    );
     Ok(reports)
 }
 
 fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
+    let started = Instant::now();
     let n = config.placements.len();
+    info!("kimi-k2: start spawn rank workers: ranks={n}");
     ensure!(
         config.rank_weight_names.len() == n && config.rank_sliced_load_plans.len() == n,
         "Kimi-K2 names/sliced counts must match {} placements",
@@ -269,10 +326,17 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
         debug_assert_eq!(worker.placement(), placement);
         workers.push(worker);
     }
+    info!(
+        "kimi-k2: spawn rank workers cost {:.2}s: ranks={}",
+        started.elapsed().as_secs_f64(),
+        workers.len()
+    );
     Ok(workers)
 }
 
 fn init_tp_nccl(workers: &[KimiRankWorker]) -> Result<()> {
+    let started = Instant::now();
+    info!("kimi-k2: start TP NCCL init: ranks={}", workers.len());
     let nccl_id = cudarc::nccl::safe::Id::new()
         .map_err(|err| anyhow::anyhow!("Kimi TP NCCL unique id creation failed: {err:?}"))?;
     let comm_receivers = workers
@@ -285,10 +349,25 @@ fn init_tp_nccl(workers: &[KimiRankWorker]) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped TP comm init response"))?
             .with_context(|| format!("Kimi rank {rank} TP comm init"))?;
     }
+    info!(
+        "kimi-k2: TP NCCL init cost {:.2}s: ranks={}",
+        started.elapsed().as_secs_f64(),
+        workers.len()
+    );
     Ok(())
 }
 
 fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]) -> Result<()> {
+    let started = Instant::now();
+    info!(
+        "kimi-k2: start install PPLX EP backend: ranks={}",
+        workers.len()
+    );
+    let build_started = Instant::now();
+    debug!(
+        "kimi-k2: start build PPLX EP backends: ranks={}",
+        workers.len()
+    );
     let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
         n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
         n_activated_experts: crate::config::KIMI_K2_TOPK,
@@ -310,6 +389,15 @@ fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]
         pplx_params,
     )?;
     std::mem::forget(resources);
+    debug!(
+        "kimi-k2: build PPLX EP backends cost {:.2}s",
+        build_started.elapsed().as_secs_f64()
+    );
+    let enable_started = Instant::now();
+    debug!(
+        "kimi-k2: start enable PPLX EP backends: ranks={}",
+        workers.len()
+    );
     let pplx_receivers = workers
         .iter()
         .zip(backends)
@@ -321,6 +409,15 @@ fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]
             .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped PPLX enable response"))?
             .with_context(|| format!("Kimi rank {rank} PPLX EP backend enable"))?;
     }
+    debug!(
+        "kimi-k2: enable PPLX EP backends cost {:.2}s: ranks={}",
+        enable_started.elapsed().as_secs_f64(),
+        workers.len()
+    );
+    info!(
+        "kimi-k2: PPLX EP backend install cost {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 

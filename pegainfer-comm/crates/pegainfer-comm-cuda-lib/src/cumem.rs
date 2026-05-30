@@ -21,6 +21,23 @@ use crate::{
     error::{CudaError, CudaResult},
 };
 
+fn set_location_device(
+    location: &mut cuda_sys::CUmemLocation,
+    device_id: CudaDeviceId,
+) {
+    location.type_ = cuda_sys::CU_MEM_LOCATION_TYPE_DEVICE;
+    // CUDA 12.8 exposes `id` through a bindgen anonymous union, while CUDA
+    // 13.1 exposes it as a direct field. The C ABI layout is stable: `type_`
+    // is followed by the 4-byte location id.
+    unsafe {
+        let id_ptr = (location as *mut cuda_sys::CUmemLocation)
+            .cast::<u8>()
+            .add(std::mem::size_of::<cuda_sys::CUmemLocationType>())
+            .cast::<i32>();
+        id_ptr.write(device_id.0 as i32);
+    }
+}
+
 /// The list of supported IPC handles.
 #[derive(Clone, Copy, Debug)]
 pub enum CUMemHandleKind {
@@ -67,8 +84,7 @@ impl CUMemAlloc {
         // Allow read/write access to the memory.
         let mut access_desc =
             unsafe { std::mem::zeroed::<cuda_sys::CUmemAccessDesc>() };
-        access_desc.location.type_ = cuda_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-        access_desc.location.id = device_id.0 as i32;
+        set_location_device(&mut access_desc.location, device_id);
         access_desc.flags = cuda_sys::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         cuda_check!(cuda_sys::cuMemSetAccess(ptr, alloc.size(), &access_desc, 1,))?;
 
@@ -105,8 +121,7 @@ impl CUMemAlloc {
         // Allow read/write access to the memory.
         let mut access_desc =
             unsafe { std::mem::zeroed::<cuda_sys::CUmemAccessDesc>() };
-        access_desc.location.type_ = cuda_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-        access_desc.location.id = mapping.handle.device_id.0 as i32;
+        set_location_device(&mut access_desc.location, mapping.handle.device_id);
         access_desc.flags = cuda_sys::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         cuda_check!(cuda_sys::cuMemSetAccess(
             mapping.handle.ptr,
@@ -169,8 +184,7 @@ impl CUMemAllocHandle {
     ) -> CudaResult<Self> {
         let mut props = unsafe { std::mem::zeroed::<cuda_sys::CUmemAllocationProp>() };
         props.type_ = cuda_sys::CU_MEM_ALLOCATION_TYPE_PINNED;
-        props.location.type_ = cuda_sys::CU_MEM_LOCATION_TYPE_DEVICE;
-        props.location.id = device_id.0 as i32;
+        set_location_device(&mut props.location, device_id);
         props.requestedHandleTypes = match handle_kind {
             CUMemHandleKind::Local => cuda_sys::CU_MEM_HANDLE_TYPE_NONE,
             CUMemHandleKind::FileDescriptor => {

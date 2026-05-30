@@ -81,6 +81,7 @@ axum = "0.8"
 bincode = "2.0.1"
 bindgen = "0.72.1"
 bytes = { version = "1.10.1", features = ["serde"] }
+bytesize = "2.3.1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 cc = "1.2"
 clap = { version = "4.6.1", features = ["derive"] }

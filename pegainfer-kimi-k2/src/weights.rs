@@ -10,6 +10,7 @@ use std::{
     ops::Range,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -18,6 +19,7 @@ use cudarc::driver::{
     result as cuda_result,
 };
 use half::bf16;
+use log::debug;
 use memmap2::Mmap;
 use pegainfer_kernels::ffi;
 use pegainfer_kernels::ops::{

@@ -188,7 +188,7 @@ impl PplxThreadPlacementPlan {
 
     fn emit_startup_info(&self) {
         for p in &self.ranks {
-            log::info!(
+            log::debug!(
                 "pplx thread placement rank={} cuda:{} numa={} cpu_slice={} \
                  rank_worker_cpu={} te_worker_cpu={} a2a_worker_cpu={} uvm_worker_cpu={}",
                 p.rank,
