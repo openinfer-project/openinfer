@@ -8,63 +8,6 @@ pub fn ensure_text_only_model_index(model_path: &Path) -> Result<KimiK2WeightMan
     Ok(manifest)
 }
 
-pub fn load_rank_weights_to_gpu(
-    ctx: &KimiRankGpuContext,
-    model_path: &Path,
-    shard_plan: &KimiRankShardPlan,
-) -> Result<KimiRankGpuWeights> {
-    ctx.set_current()?;
-    let mut tensors = BTreeMap::new();
-    let mut total_bytes = 0usize;
-    for shard in &shard_plan.shards {
-        let path = model_path.join(&shard.shard);
-        let mmap = mmap_file(&path)?;
-        let safetensors = SafeTensors::deserialize(&mmap)
-            .with_context(|| format!("failed to deserialize {}", path.display()))?;
-        for name in &shard.tensors {
-            let view = safetensors
-                .tensor(name)
-                .with_context(|| format!("missing tensor {name} in {}", path.display()))?;
-            let data = ctx
-                .stream
-                .clone_htod(view.data())
-                .with_context(|| format!("failed to copy Kimi tensor {name} to GPU"))?;
-            let tensor = KimiGpuRawTensor {
-                name: name.clone(),
-                shard: shard.shard.clone(),
-                dtype: view.dtype(),
-                shape: view.shape().to_vec(),
-                bytes: view.data().len(),
-                data,
-            };
-            total_bytes += tensor.bytes;
-            ensure!(
-                tensors.insert(name.clone(), tensor).is_none(),
-                "duplicate Kimi tensor {name} in rank {} shard plan",
-                shard_plan.rank
-            );
-        }
-    }
-    ensure!(
-        tensors.len() == shard_plan.tensor_count,
-        "Kimi rank {} GPU tensor count {} does not match shard plan {}",
-        shard_plan.rank,
-        tensors.len(),
-        shard_plan.tensor_count
-    );
-    ctx.sync().with_context(|| {
-        format!(
-            "failed to finish Kimi rank {} GPU tensor copies",
-            shard_plan.rank
-        )
-    })?;
-    Ok(KimiRankGpuWeights {
-        rank: shard_plan.rank,
-        tensors,
-        total_bytes,
-    })
-}
-
 pub fn load_rank_sliced_weights_to_gpu(
     ctx: &KimiRankGpuContext,
     model_path: &Path,

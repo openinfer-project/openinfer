@@ -86,9 +86,6 @@ fn build_runner_config(
     let rank_weight_names = (0..placements.len())
         .map(|rank| weight_manifest.rank_weight_names(rank))
         .collect::<Result<Vec<_>>>()?;
-    let rank_shard_plans = (0..placements.len())
-        .map(|rank| weight_manifest.rank_shard_plan(rank))
-        .collect::<Result<Vec<_>>>()?;
     let rank_sliced_load_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_sliced_load_plan(rank))
         .collect::<Result<Vec<_>>>()?;
@@ -103,7 +100,6 @@ fn build_runner_config(
         weight_manifest,
         rank_weight_plans,
         rank_weight_names,
-        rank_shard_plans,
         rank_sliced_load_plans,
         placements,
         thread_placement,
@@ -716,9 +712,8 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
     ensure!(
         config.rank_weight_plans.len() == n
             && config.rank_weight_names.len() == n
-            && config.rank_shard_plans.len() == n
             && config.rank_sliced_load_plans.len() == n,
-        "Kimi-K2 plan/names/shard/sliced counts must match {} placements",
+        "Kimi-K2 plan/names/sliced counts must match {} placements",
         n
     );
     let contexts = config
@@ -728,12 +723,11 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
         .collect::<Result<Vec<_>>>()?;
     let collective_barrier = Arc::new(Barrier::new(config.parallel.tp_world));
     let mut workers = Vec::with_capacity(n);
-    for (((((&placement, weight_plan), weight_names), shard_plan), sliced_load_plan), ctx) in config
+    for ((((&placement, weight_plan), weight_names), sliced_load_plan), ctx) in config
         .placements
         .iter()
         .zip(config.rank_weight_plans.iter().cloned())
         .zip(config.rank_weight_names.iter().cloned())
-        .zip(config.rank_shard_plans.iter().cloned())
         .zip(config.rank_sliced_load_plans.iter().cloned())
         .zip(contexts.into_iter())
     {
@@ -742,7 +736,6 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
             placement,
             weight_plan,
             weight_names,
-            shard_plan,
             sliced_load_plan,
             thread_placement,
             config.local_dims,

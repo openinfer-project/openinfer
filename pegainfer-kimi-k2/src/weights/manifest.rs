@@ -183,27 +183,6 @@ impl KimiK2WeightManifest {
         Ok(names)
     }
 
-    pub fn rank_shard_plan(&self, rank: usize) -> Result<KimiRankShardPlan> {
-        let entries = self.rank_tensor_names(rank)?;
-        let mut by_shard: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for entry in entries {
-            by_shard
-                .entry(entry.shard.clone())
-                .or_default()
-                .push(entry.name.clone());
-        }
-        let tensor_count = by_shard.values().map(Vec::len).sum();
-        let shards = by_shard
-            .into_iter()
-            .map(|(shard, tensors)| KimiShardTensorPlan { shard, tensors })
-            .collect();
-        Ok(KimiRankShardPlan {
-            rank,
-            shards,
-            tensor_count,
-        })
-    }
-
     pub fn rank_sliced_load_plan(&self, rank: usize) -> Result<KimiRankSlicedLoadPlan> {
         let entries = self.rank_tensor_load_specs(rank)?;
         let mut by_shard: BTreeMap<String, Vec<KimiTensorLoadSpec>> = BTreeMap::new();

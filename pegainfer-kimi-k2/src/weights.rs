@@ -126,19 +126,6 @@ pub struct KimiRankWeightPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiShardTensorPlan {
-    pub shard: String,
-    pub tensors: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KimiRankShardPlan {
-    pub rank: usize,
-    pub shards: Vec<KimiShardTensorPlan>,
-    pub tensor_count: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KimiTensorLoadSlice {
     Full,
     RowRange { start: usize, end: usize },
@@ -538,7 +525,5 @@ use manifest::validate_rank_tensor_catalog;
 #[cfg(test)]
 mod tests;
 
-pub use load::{
-    ensure_text_only_model_index, load_rank_sliced_weights_to_gpu, load_rank_weights_to_gpu,
-};
+pub use load::{ensure_text_only_model_index, load_rank_sliced_weights_to_gpu};
 pub use manifest::KimiK2WeightManifest;

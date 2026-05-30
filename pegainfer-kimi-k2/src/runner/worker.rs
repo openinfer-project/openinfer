@@ -49,7 +49,7 @@ use crate::{
     runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
-        KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights, KimiRankShardPlan,
+        KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights,
         KimiRankSlicedLoadPlan, KimiRankWeightNames, KimiRankWeightPlan, KimiRouterDeviceWeights,
         KimiRouterGpuWeights, load_rank_sliced_weights_to_gpu,
     },
@@ -159,7 +159,6 @@ impl KimiRankWorker {
         placement: KimiK2RankPlacement,
         weight_plan: KimiRankWeightPlan,
         weight_names: KimiRankWeightNames,
-        shard_plan: KimiRankShardPlan,
         sliced_load_plan: KimiRankSlicedLoadPlan,
         thread_placement: KimiRankThreadPlacement,
         local_dims: crate::config::KimiLocalDims,
@@ -177,12 +176,6 @@ impl KimiRankWorker {
             weight_names.rank == weight_plan.rank,
             "Kimi rank weight names {} do not match weight plan {}",
             weight_names.rank,
-            weight_plan.rank
-        );
-        ensure!(
-            shard_plan.rank == weight_plan.rank,
-            "Kimi rank shard plan {} does not match weight plan {}",
-            shard_plan.rank,
             weight_plan.rank
         );
         ensure!(
