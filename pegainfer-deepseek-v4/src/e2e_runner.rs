@@ -108,6 +108,7 @@ pub fn run(options: &E2eOptions) -> Result<E2eSummary> {
                 enable_prefill_profile: false,
                 device_ordinals: options.device_ordinals.clone(),
                 seed: options.seed,
+                ..EngineLoadOptions::default()
             },
         )
         .with_context(|| {

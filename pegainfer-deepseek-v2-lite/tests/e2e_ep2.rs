@@ -44,6 +44,7 @@ fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
             enable_prefill_profile: false,
             device_ordinals: vec![0, 0],
             seed: 42,
+            ..EngineLoadOptions::default()
         },
     )
     .err()
@@ -77,6 +78,7 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
             enable_prefill_profile: false,
             device_ordinals: vec![0, 1],
             seed: 42,
+            ..EngineLoadOptions::default()
         },
     )?;
     let result = generator.generate_greedy(&prompt_tokens, 16, false)?;

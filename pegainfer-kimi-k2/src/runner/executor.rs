@@ -1,8 +1,6 @@
-#[cfg(feature = "pplx-ep")]
 mod tp1_dp8;
 mod tp8_dp1;
 
-#[cfg(feature = "pplx-ep")]
 pub(super) use tp1_dp8::Tp1Dp8ForwardExecutor;
 pub(super) use tp8_dp1::Tp8Dp1ForwardExecutor;
 

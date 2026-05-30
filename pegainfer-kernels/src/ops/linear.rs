@@ -170,10 +170,10 @@ pub fn gemm_per_token_into_checked(
             ctx.stream.cu_stream(),
         );
         if status != 0 {
-            if status >= 100000 {
+            if status >= 100_000 {
                 bail!(
                     "cuBLAS per-token GEMM failed: cublas_status={}, m={}, batch={}, k={}",
-                    status - 100000,
+                    status - 100_000,
                     weight.rows,
                     x.seq_len,
                     weight.cols
@@ -263,10 +263,10 @@ fn launch_gemm(
             )
         };
         if status != 0 {
-            if status >= 100000 {
+            if status >= 100_000 {
                 bail!(
                     "cuBLAS GEMM failed: cublas_status={}, m={}, n={}, k={}, graphsafe={}",
-                    status - 100000,
+                    status - 100_000,
                     m,
                     n,
                     k,

@@ -183,7 +183,7 @@ pub fn zero_weight<const OUT: usize, const IN: usize>(
 // that loop stays in each report bin.
 
 /// Running aggregate of one op's or call-site's per-call [`LatencyStats`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Accum {
     pub calls: usize,
     pub total_us: f64,

@@ -280,7 +280,7 @@ impl FabricEngine {
     }
 
     pub fn poll_transfer_completion(&self) -> Option<TransferCompletionEntry> {
-        for (_, ctx) in self.workers.iter() {
+        for ctx in self.workers.values() {
             if let Ok(completion) = ctx.worker.cq_rx.try_recv() {
                 return Some(completion);
             }
@@ -291,7 +291,7 @@ impl FabricEngine {
 
     pub fn stop(&self) {
         self.stop_signal.store(true, SeqCst);
-        for (_, ctx) in self.workers.iter() {
+        for ctx in self.workers.values() {
             ctx.worker.stop();
         }
     }

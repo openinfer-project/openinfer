@@ -115,11 +115,11 @@ pub(super) fn validate_paged_layout(
         "Kimi MLA cache page strides must cover page_size * token_stride"
     );
     ensure!(
-        page_indices_d.len() > 0,
+        !page_indices_d.is_empty(),
         "Kimi MLA page_indices must contain active decode pages"
     );
     ensure!(
-        page_indptr_d.len() >= layout.batch_size + 1,
+        page_indptr_d.len() > layout.batch_size,
         "Kimi MLA page_indptr too small: got {}, need {}",
         page_indptr_d.len(),
         layout.batch_size + 1

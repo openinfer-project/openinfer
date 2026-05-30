@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use pegainfer_core::parallel::ParallelConfig;
+use pegainfer_core::{engine::EpBackend, parallel::ParallelConfig};
 
 use crate::runner::affinity::KimiRankThreadPlacementPlan;
 use crate::runner::worker::KimiK2RankPlacement;
@@ -15,7 +15,7 @@ pub(crate) struct KimiK2RunnerConfig {
     pub rank_sliced_load_plans: Vec<KimiRankSlicedLoadPlan>,
     pub placements: Vec<KimiK2RankPlacement>,
     pub(crate) thread_placement: KimiRankThreadPlacementPlan,
-    #[cfg(feature = "pplx-ep")]
     pub(crate) pplx_thread_placement: pegainfer_core::cpu_topology::RankThreadPlacementPlan,
     pub enable_cuda_graph: bool,
+    pub ep_backend: EpBackend,
 }

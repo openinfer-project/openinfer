@@ -310,8 +310,6 @@ impl KimiK2ParallelShape {
         Self::new(8, 1)
     }
 
-    // Only the pplx-ep EP backend drives TP1/DP8; gate to match its caller.
-    #[cfg(feature = "pplx-ep")]
     #[must_use]
     pub(crate) fn tp1_dp8() -> Self {
         Self::new(1, 8)

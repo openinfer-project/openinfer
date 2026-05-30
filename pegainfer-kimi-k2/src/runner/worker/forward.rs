@@ -34,11 +34,8 @@ pub(super) fn forward_decode_batch_next_token_kernels(
     decode_arena: &mut KimiWorkerDecodeArena,
     active_len: usize,
     local_heads: usize,
-    #[cfg(feature = "pplx-ep")] mut pplx: Option<&mut PplxDecodeContext<'_>>,
+    mut pplx: Option<&mut PplxDecodeContext<'_>>,
 ) -> Result<()> {
-    #[cfg(not(feature = "pplx-ep"))]
-    let _ = active_len;
-
     typed_ops::embedding_vocab_shard_into(
         device_ctx,
         &cache.token_embedding,
@@ -89,7 +86,6 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                 })?;
             }
             KimiLayerForwardKindCache::Moe(moe) => {
-                #[cfg(feature = "pplx-ep")]
                 if let Some(pplx_ctx) = pplx.as_mut() {
                     let arena_seq_len = decode_arena.scratch.mla.hidden.seq_len;
                     decode_arena.scratch.set_moe_seq_len(active_len)?;
@@ -110,19 +106,6 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                         format!("Kimi MoE PPLX batch decode layer {}", layer.layer_idx)
                     })?;
                 } else {
-                    forward_moe_layer_decode_normed_into(
-                        device_ctx,
-                        decode_aux_ctx,
-                        comm,
-                        layer.layer_idx,
-                        moe,
-                        expert_kernels,
-                        &mut decode_arena.scratch,
-                    )
-                    .with_context(|| format!("Kimi MoE batch decode layer {}", layer.layer_idx))?;
-                }
-                #[cfg(not(feature = "pplx-ep"))]
-                {
                     forward_moe_layer_decode_normed_into(
                         device_ctx,
                         decode_aux_ctx,

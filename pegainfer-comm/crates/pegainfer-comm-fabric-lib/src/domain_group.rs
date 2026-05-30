@@ -387,7 +387,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
             GroupTransferRouting::AllDomainsShardPeers => {
                 let dst_range = divide_evenly(request.dsts.len(), self.domains.len());
                 for ((domain_idx, domain), (beg, end)) in
-                    self.domains.iter_mut().enumerate().zip(dst_range.into_iter())
+                    self.domains.iter_mut().enumerate().zip(dst_range)
                 {
                     let src_desc = domain.get_mem_desc(request.src_mr.ptr)?;
                     let op = GroupWriteOp::Scatter(ScatterGroupWriteOp {

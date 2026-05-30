@@ -1,13 +1,17 @@
 use super::engine::DpRankState;
 
-pub(super) struct DpLoadBalancer;
+#[derive(Clone, Copy)]
+pub(super) struct DpLoadBalancer {
+    dp_world: usize,
+}
 
 impl DpLoadBalancer {
-    pub(super) fn new(_dp_world: usize) -> Self {
-        Self
+    pub(super) fn new(dp_world: usize) -> Self {
+        Self { dp_world }
     }
 
-    pub(super) fn pick_rank(&self, ranks: &[DpRankState]) -> Option<usize> {
+    pub(super) fn pick_rank(self, ranks: &[DpRankState]) -> Option<usize> {
+        debug_assert_eq!(ranks.len(), self.dp_world);
         ranks
             .iter()
             .enumerate()

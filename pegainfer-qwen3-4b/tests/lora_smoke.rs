@@ -214,6 +214,7 @@ fn qwen3_lora_loads_adapter_and_generates() {
             enable_prefill_profile: false,
             device_ordinals: vec![get_device_ordinal()],
             seed: 42,
+            ..EngineLoadOptions::default()
         },
     )
     .expect("start LoRA-capable Qwen3 engine");

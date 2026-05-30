@@ -113,6 +113,7 @@ pub fn trace_runtime_decode_kernel_calls(
             enable_prefill_profile: false,
             device_ordinals: (0..TP_WORLD_SIZE).collect(),
             seed: 42,
+            ..EngineLoadOptions::default()
         },
     )?;
     let ((), calls) = call_trace::collect_result(|| {

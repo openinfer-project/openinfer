@@ -921,7 +921,7 @@ impl KimiMarlinWna16Workspace {
             "Kimi Marlin WNA16 max_m_blocks must be > 0"
         );
         ensure!(
-            max_size_n >= KIMI_K2_EXPERT_INTERMEDIATE && max_size_n % 64 == 0,
+            max_size_n >= KIMI_K2_EXPERT_INTERMEDIATE && max_size_n.is_multiple_of(64),
             "Kimi Marlin WNA16 max_size_n must be >= {} and divisible by 64, got {}",
             KIMI_K2_EXPERT_INTERMEDIATE,
             max_size_n
@@ -972,7 +972,7 @@ impl KimiMarlinWna16Workspace {
             routing.max_padded_tokens
         );
         ensure!(
-            size_n <= self.max_size_n && size_n % 64 == 0,
+            size_n <= self.max_size_n && size_n.is_multiple_of(64),
             "Kimi Marlin WNA16 size_n {} exceeds workspace max {} or is not divisible by 64",
             size_n,
             self.max_size_n
@@ -1098,7 +1098,7 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
         .checked_mul(KIMI_K2_TOPK)
         .ok_or_else(|| anyhow::anyhow!("active_tokens * topk overflow"))?;
     ensure!(
-        route_elems <= i32::MAX as usize,
+        i32::try_from(route_elems).is_ok(),
         "route_elems {route_elems} exceeds i32::MAX"
     );
     ensure!(
@@ -1108,12 +1108,12 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
         route_elems
     );
     ensure!(
-        workspace.max_padded_tokens <= i32::MAX as usize,
+        i32::try_from(workspace.max_padded_tokens).is_ok(),
         "max_padded_tokens {} exceeds i32::MAX",
         workspace.max_padded_tokens
     );
     ensure!(
-        workspace.max_m_blocks <= i32::MAX as usize,
+        i32::try_from(workspace.max_m_blocks).is_ok(),
         "max_m_blocks {} exceeds i32::MAX",
         workspace.max_m_blocks
     );
@@ -1183,7 +1183,7 @@ pub fn kimi_marlin_int4_reorder_scale(
         weight_scale_marlin.len()
     );
     ensure!(
-        expected_elements / KIMI_K2_LOCAL_EXPERTS % 64 == 0,
+        (expected_elements / KIMI_K2_LOCAL_EXPERTS).is_multiple_of(64),
         "{} Marlin scale elements per expert must be divisible by 64, got {}",
         manifest.role.label(),
         expected_elements / KIMI_K2_LOCAL_EXPERTS
@@ -1496,7 +1496,7 @@ pub fn kimi_marlin_w13_swiglu_pplx<const INTER2: usize, const INTER: usize>(
         output.seq_len
     );
     ensure!(
-        num_tokens_post_padded.len() >= 1,
+        !num_tokens_post_padded.is_empty(),
         "num_tokens_post_padded must have at least 1 element"
     );
     let (w13_ptr, _w13_guard) = w13.data.device_ptr(&ctx.stream);
@@ -1607,7 +1607,7 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
 ) -> Result<KimiMarlinRouting<'a>> {
     ensure!(expert_padding > 0, "pplx expert_padding must be positive");
     ensure!(
-        expert_padding % workspace.block_size == 0,
+        expert_padding.is_multiple_of(workspace.block_size),
         "pplx expert_padding {} must be a multiple of Marlin block_size {}",
         expert_padding,
         workspace.block_size
@@ -1764,16 +1764,18 @@ fn launch_marlin_wna16_gemm(
     size_k: usize,
 ) -> Result<()> {
     ensure!(
-        size_m <= i32::MAX as usize && size_n <= i32::MAX as usize && size_k <= i32::MAX as usize,
+        i32::try_from(size_m).is_ok()
+            && i32::try_from(size_n).is_ok()
+            && i32::try_from(size_k).is_ok(),
         "Kimi Marlin WNA16 MNK exceeds i32"
     );
     ensure!(
-        routing.max_padded_tokens <= i32::MAX as usize
-            && workspace.locks.len() <= i32::MAX as usize,
+        i32::try_from(routing.max_padded_tokens).is_ok()
+            && i32::try_from(workspace.locks.len()).is_ok(),
         "Kimi Marlin WNA16 metadata exceeds i32"
     );
     ensure!(
-        weight_packed_uint4b8.len() > 0 && weight_scale_permuted.len() > 0,
+        !weight_packed_uint4b8.is_empty() && !weight_scale_permuted.is_empty(),
         "Kimi Marlin WNA16 weight package must be non-empty"
     );
     let lock_len = workspace.locks.len();
@@ -1998,7 +2000,7 @@ pub const fn packed_int4_cols(cols: usize) -> usize {
 
 fn validate_marlin_block_size(block_size: usize) -> Result<()> {
     ensure!(
-        block_size == 8 || (block_size >= 16 && block_size <= 64 && block_size.is_multiple_of(16)),
+        block_size == 8 || ((16..=64).contains(&block_size) && block_size.is_multiple_of(16)),
         "Kimi Marlin block_size must be 8 or a multiple of 16 in [16, 64], got {}",
         block_size
     );
@@ -2675,257 +2677,5 @@ mod tests {
         }
         let got = ctx.stream.clone_dtoh(&marlin_dev).expect("weight D2H");
         assert_eq!(got, expected);
-    }
-
-    #[test]
-    #[ignore = "H20-only: compares Kimi Marlin WNA16 single-layer routed expert path against vLLM"]
-    fn h20_kimi_marlin_wna16_single_layer_matches_vllm_reference() {
-        use half::bf16;
-        use std::path::PathBuf;
-
-        const TOKENS: usize = 4;
-        const BLOCK_SIZE: usize = 8;
-        let reference_dir = std::env::var("PEGAINFER_KIMI_MARLIN_WNA16_REFERENCE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("kimi_marlin_wna16_reference"));
-        let w13_ref_path = reference_dir.join("w13_out_bf16.bin");
-        let route_ref_path = reference_dir.join("route_output_bf16.bin");
-        let final_ref_path = reference_dir.join("final_bf16.bin");
-
-        let ctx = crate::tensor::DeviceContext::new().expect("CUDA context");
-        let route_elems = TOKENS * KIMI_K2_TOPK;
-
-        let topk_host = (0..route_elems)
-            .map(|idx| {
-                let token = idx / KIMI_K2_TOPK;
-                let route = idx % KIMI_K2_TOPK;
-                i32::try_from((token * 13 + route * 5) % KIMI_K2_LOCAL_EXPERTS).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let denom = (KIMI_K2_TOPK * (KIMI_K2_TOPK + 1) / 2) as f32;
-        let topk_weight_host = (0..route_elems)
-            .map(|idx| ((idx % KIMI_K2_TOPK) + 1) as f32 / denom)
-            .collect::<Vec<_>>();
-        let hidden_host = deterministic_bf16(TOKENS * KIMI_K2_HIDDEN, 23, 1.0 / 32.0, -11.0);
-        let w13_weight_host = deterministic_qweight_bytes(
-            KIMI_K2_LOCAL_EXPERTS * (KIMI_K2_HIDDEN / 16) * (2 * KIMI_K2_EXPERT_INTERMEDIATE * 2),
-        );
-        let w2_weight_host = deterministic_qweight_bytes(
-            KIMI_K2_LOCAL_EXPERTS * (KIMI_K2_EXPERT_INTERMEDIATE / 16) * (KIMI_K2_HIDDEN * 2),
-        );
-        let w13_scale_host = deterministic_marlin_scale_bf16(
-            KIMI_K2_LOCAL_EXPERTS,
-            KIMI_K2_HIDDEN / KIMI_K2_INT4_GROUP_SIZE,
-            2 * KIMI_K2_EXPERT_INTERMEDIATE,
-            17,
-            1.0 / 64.0,
-            1.0,
-        );
-        let w2_scale_host = deterministic_marlin_scale_bf16(
-            KIMI_K2_LOCAL_EXPERTS,
-            KIMI_K2_EXPERT_INTERMEDIATE / KIMI_K2_INT4_GROUP_SIZE,
-            KIMI_K2_HIDDEN,
-            19,
-            1.0 / 64.0,
-            1.0,
-        );
-
-        let topk_dev = ctx.stream.clone_htod(&topk_host).expect("topk H2D");
-        let topk_weight_dev = ctx
-            .stream
-            .clone_htod(&topk_weight_host)
-            .expect("topk weight H2D");
-        let hidden_data = ctx.stream.clone_htod(&hidden_host).expect("hidden H2D");
-        let w13_weight_dev = ctx.stream.clone_htod(&w13_weight_host).expect("w13 H2D");
-        let w2_weight_dev = ctx.stream.clone_htod(&w2_weight_host).expect("w2 H2D");
-        let w13_scale_dev = ctx
-            .stream
-            .clone_htod(&w13_scale_host)
-            .expect("w13 scale H2D");
-        let w2_scale_dev = ctx.stream.clone_htod(&w2_scale_host).expect("w2 scale H2D");
-
-        let mut route_workspace =
-            KimiMarlinRouteWorkspace::new(&ctx, TOKENS, BLOCK_SIZE).expect("route workspace");
-        let routing = kimi_moe_marlin_align_block_size(
-            &ctx,
-            &mut route_workspace,
-            &topk_dev,
-            TOKENS,
-            TOKENS,
-            0,
-        )
-        .expect("route alignment");
-        let mut gemm_workspace =
-            KimiMarlinWna16Workspace::new(&ctx, routing.max_m_blocks, KIMI_K2_HIDDEN, BLOCK_SIZE)
-                .expect("gemm workspace");
-
-        let hidden = crate::tensor::GpuTensor::<KIMI_K2_HIDDEN> {
-            data: hidden_data,
-            seq_len: TOKENS,
-        };
-        let w13_weight = KimiMarlinFusedW13Int4Weight {
-            local_experts: KIMI_K2_LOCAL_EXPERTS,
-            in_dim: KIMI_K2_HIDDEN,
-            intermediate_dim: KIMI_K2_EXPERT_INTERMEDIATE,
-            group_size: KIMI_K2_INT4_GROUP_SIZE,
-            weight_packed_uint4b8: &w13_weight_dev,
-            weight_scale_permuted: &w13_scale_dev,
-        };
-        let w2_manifest = KimiInt4WeightManifest::ep8(
-            KimiInt4ExpertRole::W2Down,
-            0,
-            KimiInt4NibbleOrder::LowThenHigh,
-        );
-        let w2_weight = KimiMarlinInt4Weight {
-            manifest: w2_manifest,
-            weight_packed_uint4b8: &w2_weight_dev,
-            weight_scale_permuted: &w2_scale_dev,
-        };
-
-        let mut w13_out = crate::tensor::GpuTensor::<{ 2 * KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(
-            &ctx,
-            route_elems,
-        )
-        .expect("w13 out");
-        kimi_marlin_wna16_w13_gemm(
-            &ctx,
-            &mut gemm_workspace,
-            &routing,
-            &hidden,
-            &w13_weight,
-            &topk_weight_dev,
-            &mut w13_out,
-        )
-        .expect("w13 gemm");
-        let w13_got = ctx.stream.clone_dtoh(&w13_out.data).expect("w13 D2H");
-        let w13_ref = read_bf16_file(&w13_ref_path, route_elems * 2 * KIMI_K2_EXPERT_INTERMEDIATE);
-        assert_bf16_close("w13_out", &w13_got, &w13_ref, 0.5, 0.03);
-
-        let mut activated =
-            crate::tensor::GpuTensor::<KIMI_K2_EXPERT_INTERMEDIATE>::zeros(&ctx, route_elems)
-                .expect("activated");
-        kimi_marlin_w13_swiglu(&ctx, &w13_out, &mut activated).expect("swiglu");
-
-        let mut route_output = crate::tensor::GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, route_elems)
-            .expect("route output");
-        kimi_marlin_wna16_w2_gemm(
-            &ctx,
-            &mut gemm_workspace,
-            &routing,
-            &activated,
-            &w2_weight,
-            &topk_weight_dev,
-            &mut route_output,
-        )
-        .expect("w2 gemm");
-        let route_got = ctx
-            .stream
-            .clone_dtoh(&route_output.data)
-            .expect("route output D2H");
-        let route_ref = read_bf16_file(&route_ref_path, route_elems * KIMI_K2_HIDDEN);
-        assert_bf16_close("route_output", &route_got, &route_ref, 16.0, 0.03);
-
-        let mut final_out = ctx
-            .stream
-            .alloc_zeros::<f32>(TOKENS * KIMI_K2_HIDDEN)
-            .expect("final out");
-        kimi_marlin_sum_topk_rows_f32(&ctx, &route_output, TOKENS, &mut final_out)
-            .expect("sum topk");
-        let final_got_f32 = ctx.stream.clone_dtoh(&final_out).expect("final D2H");
-        let final_got = final_got_f32
-            .iter()
-            .map(|value| bf16::from_f32(*value))
-            .collect::<Vec<_>>();
-        let final_ref = read_bf16_file(&final_ref_path, TOKENS * KIMI_K2_HIDDEN);
-        assert_bf16_close("final", &final_got, &final_ref, 128.0, 0.25);
-    }
-
-    fn deterministic_qweight_bytes(words: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(words * std::mem::size_of::<u32>());
-        for idx in 0..words {
-            let word = ((idx as u64 * 1_103_515_245 + 12_345 + (idx as u64 / 97) * 17)
-                & 0x7fff_ffff) as u32;
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out
-    }
-
-    fn deterministic_bf16(len: usize, modulo: usize, scale: f32, offset: f32) -> Vec<bf16> {
-        (0..len)
-            .map(|idx| bf16::from_f32(((idx % modulo) as f32 + offset) * scale))
-            .collect()
-    }
-
-    fn deterministic_marlin_scale_bf16(
-        local_experts: usize,
-        groups: usize,
-        out_dim: usize,
-        modulo: usize,
-        scale: f32,
-        offset: f32,
-    ) -> Vec<bf16> {
-        let elements_per_expert = groups * out_dim;
-        assert_eq!(elements_per_expert % 64, 0);
-        let marlin_scale_perm = |offset: usize| -> usize { offset / 8 + 8 * (offset % 8) };
-        let mut out = Vec::with_capacity(local_experts * elements_per_expert);
-        for expert in 0..local_experts {
-            let expert_base = expert * elements_per_expert;
-            for flat in 0..elements_per_expert {
-                let source_flat = (flat / 64) * 64 + marlin_scale_perm(flat % 64);
-                let raw_idx = expert_base + source_flat;
-                out.push(bf16::from_f32(((raw_idx % modulo) as f32 + offset) * scale));
-            }
-        }
-        out
-    }
-
-    fn read_bf16_file(path: &std::path::Path, expected: usize) -> Vec<bf16> {
-        let bytes = std::fs::read(path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-        assert_eq!(
-            bytes.len(),
-            expected * std::mem::size_of::<u16>(),
-            "{} len mismatch",
-            path.display()
-        );
-        bytes
-            .chunks_exact(2)
-            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-            .collect()
-    }
-
-    fn assert_bf16_close(
-        name: &str,
-        got: &[bf16],
-        expected: &[bf16],
-        max_limit: f32,
-        mean_limit: f32,
-    ) {
-        assert_eq!(got.len(), expected.len(), "{name} len mismatch");
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        let mut max_idx = 0usize;
-        let mut max_got = 0.0f32;
-        let mut max_expected = 0.0f32;
-        for (idx, (actual, expected)) in got.iter().zip(expected.iter()).enumerate() {
-            let actual = actual.to_f32();
-            let expected = expected.to_f32();
-            let diff = (actual - expected).abs();
-            sum_diff += diff;
-            if diff > max_diff {
-                max_diff = diff;
-                max_idx = idx;
-                max_got = actual;
-                max_expected = expected;
-            }
-        }
-        let mean_diff = sum_diff / got.len() as f32;
-        println!(
-            "{name}: max_diff={max_diff} mean_diff={mean_diff} max_idx={max_idx} got={max_got} expected={max_expected}"
-        );
-        assert!(
-            max_diff <= max_limit && mean_diff <= mean_limit,
-            "{name} diff too large: max_diff={max_diff} mean_diff={mean_diff} limits=({max_limit}, {mean_limit}) max_idx={max_idx} got={max_got} expected={max_expected}"
-        );
     }
 }

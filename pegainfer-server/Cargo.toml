@@ -49,7 +49,6 @@ default = []
 deepseek-v4 = ["dep:pegainfer-deepseek-v4", "pegainfer-deepseek-v4/deepseek-v4"]
 deepseek-v2-lite = ["dep:pegainfer-deepseek-v2-lite", "pegainfer-deepseek-v2-lite/deepseek-v2-lite"]
 kimi-k2 = ["dep:pegainfer-kimi-k2", "pegainfer-kimi-k2/kimi-k2"]
-kimi-k2-pplx-ep = ["kimi-k2", "pegainfer-kimi-k2/pplx-ep"]
 pplx-ep = ["deepseek-v4", "pegainfer-deepseek-v4/pplx-ep"]
 deepseek-v4-cutedsl-diagnostic = [
     "deepseek-v4",

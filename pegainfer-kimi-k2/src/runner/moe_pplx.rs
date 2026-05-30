@@ -1,4 +1,4 @@
-//! pplx-garden NVLink + RDMA MoE all-to-all decode path (feature `pplx-ep`).
+//! pplx-garden NVLink + RDMA MoE all-to-all decode path.
 //!
 //! Drop-in replacement for the NCCL AG/RS `forward_moe_layer_decode_into`:
 //! same shared-expert + routed-expert flow, but cross-rank token movement

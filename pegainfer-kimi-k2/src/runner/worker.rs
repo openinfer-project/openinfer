@@ -140,7 +140,6 @@ enum KimiRankCommand {
         decode_batch_size: usize,
         resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
-    #[cfg(feature = "pplx-ep")]
     EnablePplx {
         ep_backend: pegainfer_comm::EpBackend,
         resp: SyncSender<Result<()>>,
@@ -322,8 +321,6 @@ impl KimiRankWorker {
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
         Ok(resp_rx)
     }
-
-    #[cfg(feature = "pplx-ep")]
     pub(super) fn enable_pplx_async(
         &self,
         ep_backend: pegainfer_comm::EpBackend,
@@ -370,9 +367,7 @@ struct KimiRankThreadState {
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
     loaded: Option<KimiRankLoadedWeights>,
-    #[cfg(feature = "pplx-ep")]
     ep_backend: Option<pegainfer_comm::EpBackend>,
-    #[cfg(feature = "pplx-ep")]
     moe_pplx_scratch: Option<super::moe_pplx::KimiMoePplxScratch>,
 }
 
@@ -565,9 +560,7 @@ fn bind_rank_thread(
         collective_barrier,
         enable_cuda_graph,
         loaded: None,
-        #[cfg(feature = "pplx-ep")]
         ep_backend: None,
-        #[cfg(feature = "pplx-ep")]
         moe_pplx_scratch: None,
     })
 }
@@ -641,7 +634,6 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 );
                 let _ = resp.send(result);
             }
-            #[cfg(feature = "pplx-ep")]
             KimiRankCommand::EnablePplx { ep_backend, resp } => {
                 let result = state.enable_pplx(ep_backend);
                 let _ = resp.send(result);
@@ -654,11 +646,8 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
 mod cache;
 mod load;
 mod runtime;
-#[cfg(feature = "pplx-ep")]
 pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
 mod state;
-
-#[cfg(feature = "pplx-ep")]
 struct PplxDecodeContext<'a> {
     ep: &'a mut pegainfer_comm::EpBackend,
     scratch: &'a mut super::moe_pplx::KimiMoePplxScratch,

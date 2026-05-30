@@ -91,6 +91,7 @@ fn scheduler_survives_consumer_drop() {
             enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
+            ..EngineLoadOptions::default()
         },
     )
     .expect("failed to start engine");

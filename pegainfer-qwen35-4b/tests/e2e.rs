@@ -110,6 +110,7 @@ fn test_e2e_qwen35_generation() {
             enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
+            ..EngineLoadOptions::default()
         },
     )
     .expect("Failed to start engine");

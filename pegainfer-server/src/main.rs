@@ -2,12 +2,15 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use log::info;
 use pegainfer::logging;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::vllm_frontend::LoraModule;
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_core::{
+    engine::{EngineLoadOptions, EpBackend},
+    parallel::ParallelConfig,
+};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -52,9 +55,32 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     tp_size: usize,
 
+    /// Data-parallel world size for Kimi-K2
+    #[arg(long, default_value_t = 8)]
+    dp_size: usize,
+
+    /// Expert-parallel backend for Kimi-K2
+    #[arg(long, default_value = "pplx")]
+    ep_backend: CliEpBackend,
+
     /// Emit synchronized DeepSeek V4 prefill phase timing records.
     #[arg(long, default_value_t = false)]
     deepseek_prefill_profile: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliEpBackend {
+    Nccl,
+    Pplx,
+}
+
+impl From<CliEpBackend> for EpBackend {
+    fn from(value: CliEpBackend) -> Self {
+        match value {
+            CliEpBackend::Nccl => Self::Nccl,
+            CliEpBackend::Pplx => Self::Pplx,
+        }
+    }
 }
 
 #[tokio::main]
@@ -108,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
                     enable_cuda_graph: false,
                     enable_prefill_profile: args.deepseek_prefill_profile,
                     device_ordinals: (0..8).collect(),
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: 42,
                 },
             )
@@ -125,6 +153,8 @@ async fn main() -> anyhow::Result<()> {
                     enable_cuda_graph: false,
                     enable_prefill_profile: false,
                     device_ordinals: vec![0, 1],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: 42,
                 },
             )?;
@@ -135,12 +165,15 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {
+            let parallel = kimi_parallel_config(args.tp_size, args.dp_size)?;
             let handle = pegainfer_kimi_k2::start_engine(
                 &args.model_path,
                 EngineLoadOptions {
                     enable_cuda_graph: args.cuda_graph,
                     enable_prefill_profile: false,
-                    device_ordinals: (0..8).collect(),
+                    device_ordinals: (0..parallel.ep_world()).collect(),
+                    parallel_config: Some(parallel),
+                    ep_backend: args.ep_backend.into(),
                     seed: 42,
                 },
             )
@@ -160,6 +193,8 @@ async fn main() -> anyhow::Result<()> {
                 enable_cuda_graph: effective_cuda_graph,
                 enable_prefill_profile: false,
                 device_ordinals,
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
                 seed: 42,
             };
             let handle = if args.enable_lora {
@@ -181,6 +216,8 @@ async fn main() -> anyhow::Result<()> {
                     enable_cuda_graph: args.cuda_graph,
                     enable_prefill_profile: false,
                     device_ordinals: vec![args.device_ordinal],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: 42,
                 },
             )
@@ -218,6 +255,14 @@ async fn main() -> anyhow::Result<()> {
     .context("vLLM frontend server failed")?;
 
     Ok(())
+}
+
+#[cfg(feature = "kimi-k2")]
+fn kimi_parallel_config(tp_size: usize, dp_size: usize) -> anyhow::Result<ParallelConfig> {
+    if tp_size == 0 || dp_size == 0 {
+        bail!("--tp-size and --dp-size must be positive");
+    }
+    Ok(ParallelConfig::new(tp_size, dp_size))
 }
 
 fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> {

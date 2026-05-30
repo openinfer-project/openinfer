@@ -97,11 +97,7 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
     }
 
     fn gpu_weight_ready_count(&self) -> usize {
-        if self.weight_report.loaded_to_gpu && self.weight_report.typed_view_validated {
-            1
-        } else {
-            0
-        }
+        usize::from(self.weight_report.loaded_to_gpu && self.weight_report.typed_view_validated)
     }
 }
 

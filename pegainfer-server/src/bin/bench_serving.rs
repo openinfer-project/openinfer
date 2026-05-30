@@ -28,7 +28,10 @@ use pegainfer::logging;
 use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
 use pegainfer::server_engine::{ModelType, detect_model_type};
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_core::{
+    engine::{EngineLoadOptions, EpBackend},
+    parallel::ParallelConfig,
+};
 use pegainfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -92,6 +95,21 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliEpBackend {
+    Nccl,
+    Pplx,
+}
+
+impl From<CliEpBackend> for EpBackend {
+    fn from(value: CliEpBackend) -> Self {
+        match value {
+            CliEpBackend::Nccl => Self::Nccl,
+            CliEpBackend::Pplx => Self::Pplx,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Measure one request shape end-to-end.
@@ -141,6 +159,18 @@ struct Cli {
     /// Capture only measured iterations for nsys `-c cudaProfilerApi`
     #[arg(long, default_value_t = false)]
     cuda_profiler_capture: bool,
+
+    /// Tensor-parallel world size for Kimi-K2
+    #[arg(long, default_value_t = 1)]
+    tp_size: usize,
+
+    /// Data-parallel world size for Kimi-K2
+    #[arg(long, default_value_t = 8)]
+    dp_size: usize,
+
+    /// Expert-parallel backend for Kimi-K2
+    #[arg(long, default_value = "pplx")]
+    ep_backend: CliEpBackend,
 
     #[command(subcommand)]
     command: Command,
@@ -1268,6 +1298,13 @@ fn command_seed(cli: &Cli) -> u64 {
     }
 }
 
+#[cfg(feature = "kimi-k2")]
+fn kimi_parallel_config(tp_size: usize, dp_size: usize) -> Result<ParallelConfig> {
+    ensure!(tp_size > 0, "--tp-size must be positive");
+    ensure!(dp_size > 0, "--dp-size must be positive");
+    Ok(ParallelConfig::new(tp_size, dp_size))
+}
+
 fn normalize_sizes(values: &[usize], flag: &str) -> Result<Vec<usize>> {
     ensure!(!values.is_empty(), "{flag} must not be empty");
     ensure!(values.iter().all(|v| *v > 0), "{flag} values must be > 0");
@@ -2069,6 +2106,8 @@ fn main() -> Result<()> {
                     enable_cuda_graph: false,
                     enable_prefill_profile: false,
                     device_ordinals: vec![0, 1],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
             )?;
@@ -2085,6 +2124,8 @@ fn main() -> Result<()> {
                     enable_cuda_graph: false,
                     enable_prefill_profile: false,
                     device_ordinals: (0..8).collect(),
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
             )?;
@@ -2095,12 +2136,15 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {
+            let parallel = kimi_parallel_config(cli.tp_size, cli.dp_size)?;
             let handle = pegainfer_kimi_k2::start_engine(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
                     enable_prefill_profile: false,
-                    device_ordinals: (0..8).collect(),
+                    device_ordinals: (0..parallel.ep_world()).collect(),
+                    parallel_config: Some(parallel),
+                    ep_backend: cli.ep_backend.into(),
                     seed: command_seed(&cli),
                 },
             )?;
@@ -2123,6 +2167,8 @@ fn main() -> Result<()> {
                     enable_cuda_graph: cli.cuda_graph,
                     enable_prefill_profile: false,
                     device_ordinals: vec![0],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
             )?;
@@ -2145,6 +2191,8 @@ fn main() -> Result<()> {
                     enable_cuda_graph: cli.cuda_graph,
                     enable_prefill_profile: false,
                     device_ordinals: vec![0],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
                 4,

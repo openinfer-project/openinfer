@@ -279,9 +279,9 @@ impl KimiK2WeightManifest {
             "Kimi rank {rank} outside EP{}",
             self.parallel.ep_world
         );
-        let coord = self.parallel.parallel_config().coord(rank);
-        let tp_rank = coord.tp_rank;
-        let ep_rank = coord.ep_rank;
+        let parallel = self.parallel.parallel_config();
+        let tp_rank = parallel.tp_rank(rank);
+        let ep_rank = parallel.ep_rank(rank);
         let attention_head_range =
             tp_rank * self.parallel.heads_per_tp..(tp_rank + 1) * self.parallel.heads_per_tp;
         let vocab_range =
@@ -481,7 +481,7 @@ impl KimiK2WeightManifest {
     }
 
     fn rank_local_expert_range(&self, rank: usize) -> Result<Range<usize>> {
-        let ep_rank = self.parallel.parallel_config().coord(rank).ep_rank;
+        let ep_rank = self.parallel.parallel_config().ep_rank(rank);
         ensure!(
             ep_rank < self.parallel.ep_world,
             "Kimi EP rank {ep_rank} outside EP{}",

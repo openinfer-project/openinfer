@@ -251,8 +251,6 @@ impl KimiWorkerDecodeScratch {
         )?;
         Ok(())
     }
-
-    #[cfg(feature = "pplx-ep")]
     pub(crate) fn set_moe_seq_len(&mut self, seq_len: usize) -> Result<()> {
         set_gpu_tensor_seq_len("mla.hidden", &mut self.mla.hidden, seq_len)?;
         set_gpu_tensor_seq_len("mla.normed", &mut self.mla.normed, seq_len)?;

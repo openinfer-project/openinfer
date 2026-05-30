@@ -31,8 +31,9 @@ mod weights;
 pub use config::{KIMI_K2_LAYERS, probe_config_json};
 
 #[cfg(feature = "kimi-k2")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    runner::start_engine(model_path, options)
+    runner::start_engine(model_path, &options)
 }
 
 #[cfg(not(feature = "kimi-k2"))]

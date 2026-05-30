@@ -6,14 +6,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail, ensure};
-use pegainfer_core::{
-    engine::{EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent},
-    parallel::ParallelConfig,
-};
-use tokio::sync::mpsc;
-
-#[cfg(feature = "pplx-ep")]
 use crate::runner::{
     engine::DpCoordinator, executor::Tp1Dp8ForwardExecutor, load_balancer::DpLoadBalancer,
 };
@@ -27,6 +19,14 @@ use crate::{
     },
     weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
 };
+use anyhow::{Context, Result, bail, ensure};
+use pegainfer_core::{
+    engine::{
+        EngineHandle, EngineLoadOptions, EpBackend, FinishReason, GenerateRequest, TokenEvent,
+    },
+    parallel::ParallelConfig,
+};
+use tokio::sync::mpsc;
 
 const KIMI_RUNNER_MAX_BATCH: usize = 64;
 // Prompt-len=1 service TTFT is dominated by microbatch stair-stepping. Larger
@@ -36,36 +36,31 @@ const KIMI_PROMPT_LEN1_PREFILL_MICROBATCH: usize = 64;
 const KIMI_PREFILL_BATCH_COALESCE: Duration = Duration::from_millis(100);
 const KIMI_PREFILL_BATCH_POLL: Duration = Duration::from_micros(50);
 
-pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    let parallel = resolve_parallel_config(&options)?;
+pub(crate) fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
+    let parallel = resolve_parallel_config(options);
     ensure!(
-        options.device_ordinals.len() == parallel.ep_world,
+        options.device_ordinals.len() == parallel.ep_world(),
         "Kimi-K2 {:?} requires {} devices, got {:?}",
         parallel,
-        parallel.ep_world,
+        parallel.ep_world(),
         options.device_ordinals
     );
 
-    match (parallel.tp_world, parallel.dp_world) {
-        (8, 1) => start_engine_tp8_dp1(model_path, &options, parallel),
-        (1, _) => start_engine_tp1_dp(model_path, options, parallel),
+    match (parallel.tp_world(), parallel.dp_world()) {
+        (8, 1) => start_engine_tp8_dp1(model_path, options, parallel),
+        (1, 8) => start_engine_tp1_dp(model_path, options, parallel),
         _ => bail!(
             "Kimi-K2 TP{}/DP{} not yet supported (v1: TP8DP1 or TP1DP8)",
-            parallel.tp_world,
-            parallel.dp_world
+            parallel.tp_world(),
+            parallel.dp_world()
         ),
     }
 }
 
-fn resolve_parallel_config(_options: &EngineLoadOptions) -> Result<ParallelConfig> {
-    if let Ok(mode) = std::env::var("PEGAINFER_KIMI_PARALLEL") {
-        match mode.as_str() {
-            "tp8dp1" | "tp8_dp1" => return Ok(ParallelConfig::new(8, 1)),
-            "tp1dp8" | "tp1_dp8" => return Ok(ParallelConfig::new(1, 8)),
-            other => bail!("PEGAINFER_KIMI_PARALLEL={other}: expected tp8dp1 or tp1dp8"),
-        }
-    }
-    Ok(ParallelConfig::new(8, 1))
+fn resolve_parallel_config(options: &EngineLoadOptions) -> ParallelConfig {
+    options
+        .parallel_config
+        .unwrap_or_else(|| ParallelConfig::new(8, 1))
 }
 
 fn build_runner_config(
@@ -86,7 +81,6 @@ fn build_runner_config(
     let rank_sliced_load_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_sliced_load_plan(rank))
         .collect::<Result<Vec<_>>>()?;
-    #[cfg(feature = "pplx-ep")]
     let pplx_thread_placement = pegainfer_core::cpu_topology::RankThreadPlacementPlan::for_devices(
         &options.device_ordinals,
     )?;
@@ -98,9 +92,9 @@ fn build_runner_config(
         rank_sliced_load_plans,
         placements,
         thread_placement,
-        #[cfg(feature = "pplx-ep")]
         pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
+        ep_backend: options.ep_backend,
     })
 }
 
@@ -142,25 +136,19 @@ fn start_engine_tp8_dp1(
     ))
 }
 
-#[cfg(not(feature = "pplx-ep"))]
-fn start_engine_tp1_dp(
-    _model_path: &Path,
-    _options: EngineLoadOptions,
-    _parallel: ParallelConfig,
-) -> Result<EngineHandle> {
-    bail!("Kimi-K2 TP1 DP requires pplx-ep feature (PPLX is the only EP backend for TP1)")
-}
-
-#[cfg(feature = "pplx-ep")]
 fn start_engine_tp1_dp(
     model_path: &Path,
-    options: EngineLoadOptions,
+    options: &EngineLoadOptions,
     parallel: ParallelConfig,
 ) -> Result<EngineHandle> {
-    let dp_world = parallel.dp_world;
+    ensure!(
+        options.ep_backend == EpBackend::Pplx,
+        "Kimi-K2 TP1/DP8 requires --ep-backend=pplx"
+    );
+    let dp_world = parallel.dp_world();
     let runtime_config = build_runner_config(
         model_path,
-        &options,
+        options,
         parallel,
         KimiK2ParallelShape::tp1_dp8(),
     )?;
@@ -174,7 +162,7 @@ fn start_engine_tp1_dp(
     install_pplx_backends(&runtime_config, &workers)?;
 
     let mut executors: Vec<Box<dyn ForwardExecutor + Send>> = Vec::with_capacity(dp_world);
-    for (worker, weight_report) in workers.into_iter().zip(weight_reports.into_iter()) {
+    for (worker, weight_report) in workers.into_iter().zip(weight_reports) {
         executors.push(Box::new(Tp1Dp8ForwardExecutor {
             worker,
             weight_report,
@@ -603,9 +591,7 @@ impl KimiK2Runtime {
         let rank_weight_reports =
             maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
         init_tp_nccl(&workers)?;
-
-        #[cfg(feature = "pplx-ep")]
-        {
+        if config.ep_backend == EpBackend::Pplx {
             install_pplx_backends(config, &workers)?;
             eprintln!(
                 "kimi-k2: pplx EP backends installed on all {} ranks",
@@ -713,7 +699,7 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
         .iter()
         .map(|placement| KimiRankGpuContext::new(placement.device_ordinal))
         .collect::<Result<Vec<_>>>()?;
-    let collective_barrier = Arc::new(Barrier::new(config.parallel.tp_world));
+    let collective_barrier = Arc::new(Barrier::new(config.parallel.tp_world()));
     let mut workers = Vec::with_capacity(n);
     for (((&placement, weight_names), sliced_load_plan), ctx) in config
         .placements
@@ -754,8 +740,6 @@ fn init_tp_nccl(workers: &[KimiRankWorker]) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(feature = "pplx-ep")]
 fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]) -> Result<()> {
     let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
         n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
@@ -767,8 +751,8 @@ fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]
         max_num_tokens: 2048,
         expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
         out_dtype: pegainfer_comm::ScalarType::F32,
-        canonicalize_duplicate_sources: config.parallel.tp_world > 1
-            && config.parallel.dp_world == 1,
+        canonicalize_duplicate_sources: config.parallel.tp_world() > 1
+            && config.parallel.dp_world() == 1,
         ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
     };
     let (backends, resources) = pegainfer_comm::bootstrap::build_intra_node_backends(

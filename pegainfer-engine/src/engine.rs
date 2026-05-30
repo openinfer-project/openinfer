@@ -8,6 +8,7 @@ use std::{
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
 
 #[derive(Clone, Debug)]
@@ -15,6 +16,8 @@ pub struct EngineLoadOptions {
     pub enable_cuda_graph: bool,
     pub enable_prefill_profile: bool,
     pub device_ordinals: Vec<usize>,
+    pub parallel_config: Option<ParallelConfig>,
+    pub ep_backend: EpBackend,
     pub seed: u64,
 }
 
@@ -24,9 +27,18 @@ impl Default for EngineLoadOptions {
             enable_cuda_graph: true,
             enable_prefill_profile: false,
             device_ordinals: vec![0],
+            parallel_config: None,
+            ep_backend: EpBackend::Nccl,
             seed: 42,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EpBackend {
+    #[default]
+    Nccl,
+    Pplx,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +213,7 @@ impl EngineHandle {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn submit(
         &self,
         req: GenerateRequest,

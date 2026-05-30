@@ -68,7 +68,7 @@ impl Default for PplxBootstrapParams {
             max_private_tokens: None,
             out_dtype: ScalarType::BF16,
             nets_per_gpu: 1,
-            imm_base: 0x80000000,
+            imm_base: 0x8000_0000,
             canonicalize_duplicate_sources: false,
         }
     }
@@ -250,7 +250,6 @@ pub fn build_intra_node_backends(
             let sizing = &sizing;
             let topology_groups = &topology_groups;
             let placement = thread_placement.rank(rank);
-            let params = params;
             s.spawn(move || {
                 *slot = Some(placement.and_then(|placement| {
                     run_phase1(
@@ -258,7 +257,7 @@ pub fn build_intra_node_backends(
                         dev_ord,
                         sizing,
                         topology_groups,
-                        placement,
+                        &placement,
                         params,
                     )
                 }));
@@ -275,8 +274,8 @@ pub fn build_intra_node_backends(
         })
         .collect::<Result<_>>()?;
 
-    let cross: Arc<Vec<CrossRankView>> =
-        Arc::new(phase1.iter().map(|p| p.cross.clone()).collect());
+    let cross: Arc<[CrossRankView]> =
+        Arc::from(phase1.iter().map(|p| p.cross.clone()).collect::<Vec<_>>());
     let mut local_slots: Vec<Option<PplxRankResources>> =
         phase1.into_iter().map(|p| Some(p.resources)).collect();
     let mut phase2_slots: Vec<Option<Result<(EpBackend, PplxRankResources)>>> =
@@ -293,13 +292,12 @@ pub fn build_intra_node_backends(
             let cross = Arc::clone(&cross);
             let sizing = &sizing;
             let placement = thread_placement.rank(rank);
-            let params = params;
             s.spawn(move || {
                 let resources =
                     local_slot.take().expect("phase2 entered without phase1 resources");
                 *out_slot = Some(placement.and_then(|placement| {
                     run_phase2(
-                        rank, dev_ord, resources, cross, sizing, placement, params,
+                        rank, dev_ord, resources, &cross, sizing, &placement, params,
                     )
                 }));
             });
@@ -324,7 +322,7 @@ fn run_phase1(
     dev_ord: usize,
     sizing: &Sizing,
     topology_groups: &[TopologyGroup],
-    placement: PplxRankThreadPlacement,
+    placement: &PplxRankThreadPlacement,
     params: PplxBootstrapParams,
 ) -> Result<Phase1Output> {
     crate::raw::cuda_lib::rt::cudaSetDevice(dev_ord as i32)
@@ -431,9 +429,9 @@ fn run_phase2(
     rank: usize,
     dev_ord: usize,
     mut resources: PplxRankResources,
-    cross: Arc<Vec<CrossRankView>>,
+    cross: &[CrossRankView],
     sizing: &Sizing,
-    placement: PplxRankThreadPlacement,
+    placement: &PplxRankThreadPlacement,
     params: PplxBootstrapParams,
 ) -> Result<(EpBackend, PplxRankResources)> {
     crate::raw::cuda_lib::rt::cudaSetDevice(dev_ord as i32)
@@ -493,7 +491,7 @@ fn run_phase2(
         scale_elemsize: sizing.scale_elemsize,
     };
     let buffers = EpRankBuffers {
-        num_routed_ptr: resources.num_routed_host.ptr.as_ptr() as *mut u32,
+        num_routed_ptr: resources.num_routed_host.ptr.as_ptr().cast::<u32>(),
         num_routed_mr: resources.num_routed_mr,
         send_buffer_ptr: resources.send_mapping.data_ptr().as_ptr(),
         send_buffer_mr: resources.send_buffer_mr,
@@ -601,7 +599,7 @@ fn compute_sizing(
 fn build_te_for(
     dev: usize,
     topology_groups: &[TopologyGroup],
-    placement: PplxRankThreadPlacement,
+    placement: &PplxRankThreadPlacement,
     nets_per_gpu: u8,
 ) -> Result<Arc<TransferEngine>> {
     let group = topology_groups
