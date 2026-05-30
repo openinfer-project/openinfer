@@ -9,19 +9,16 @@ autotests = false
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, optional = true }
-crossbeam-channel = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-bench = { workspace = true }
-pegainfer-cupti = { workspace = true, optional = true }
 pegainfer-comm = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }
 pegainfer-kernels = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [features]
@@ -31,7 +28,6 @@ pplx-ep = ["kimi-k2", "dep:pegainfer-comm"]
 kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
 kernel-report = [
     "dep:clap",
-    "dep:pegainfer-cupti",
     "kimi-k2",
     "kernel-call-trace",
 ]

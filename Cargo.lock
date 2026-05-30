@@ -5327,19 +5327,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "crossbeam-channel",
  "cudarc",
  "half",
  "memmap2",
  "pegainfer-bench",
  "pegainfer-comm",
  "pegainfer-core",
- "pegainfer-cupti",
  "pegainfer-kernels",
  "safetensors",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
 ]
 
