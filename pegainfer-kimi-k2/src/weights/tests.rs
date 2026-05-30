@@ -1,4 +1,12 @@
 use super::*;
+use super::{
+    load::{KimiTensorLoadSlice, KimiTensorLoadSpec, sliced_tensor_bytes},
+    manifest::{
+        KimiAttentionManifest, KimiDenseMlpManifest, KimiInt4ProjectionManifest,
+        KimiK2WeightManifest, KimiLayerKindManifest, KimiLayerManifest, KimiMoeLayerManifest,
+        KimiRoutedExpertManifest, KimiRouterManifest, KimiSharedExpertManifest, KimiTensorEntry,
+    },
+};
 use serde_json::json;
 
 #[test]

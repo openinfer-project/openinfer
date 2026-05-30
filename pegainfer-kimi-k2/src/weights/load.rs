@@ -1,5 +1,60 @@
 use super::*;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KimiTensorLoadSlice {
+    Full,
+    RowRange { start: usize, end: usize },
+    ColRange { start: usize, end: usize },
+}
+
+impl KimiTensorLoadSlice {
+    fn local_shape(&self, full_shape: &[usize]) -> Result<Vec<usize>> {
+        match *self {
+            Self::Full => Ok(full_shape.to_vec()),
+            Self::RowRange { start, end } => {
+                ensure!(
+                    full_shape.len() == 2 && start <= end && end <= full_shape[0],
+                    "Kimi row slice [{start}..{end}) is invalid for shape {:?}",
+                    full_shape
+                );
+                Ok(vec![end - start, full_shape[1]])
+            }
+            Self::ColRange { start, end } => {
+                ensure!(
+                    full_shape.len() == 2 && start <= end && end <= full_shape[1],
+                    "Kimi col slice [{start}..{end}) is invalid for shape {:?}",
+                    full_shape
+                );
+                Ok(vec![full_shape[0], end - start])
+            }
+        }
+    }
+
+    fn local_bytes(&self, full_shape: &[usize], dtype: Dtype) -> Result<usize> {
+        Ok(self.local_shape(full_shape)?.iter().product::<usize>() * dtype_element_bytes(dtype)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiTensorLoadSpec {
+    pub name: String,
+    pub shard: String,
+    pub slice: KimiTensorLoadSlice,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiShardTensorLoadPlan {
+    pub shard: String,
+    pub tensors: Vec<KimiTensorLoadSpec>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRankSlicedLoadPlan {
+    pub rank: usize,
+    pub shards: Vec<KimiShardTensorLoadPlan>,
+    pub tensor_count: usize,
+}
+
 pub(crate) fn ensure_text_only_model_index(model_path: &Path) -> Result<KimiK2WeightManifest> {
     let manifest = KimiK2WeightManifest::from_model_dir(model_path)?;
     if manifest.text_tensor_count == 0 {
@@ -28,14 +83,14 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
             let shape = spec.slice.local_shape(view.shape())?;
             let bytes = spec.slice.local_bytes(view.shape(), view.dtype())?;
             let data = if spec.slice == KimiTensorLoadSlice::Full {
-                ctx.stream
+                ctx.stream()
                     .clone_htod(view.data())
                     .with_context(|| format!("failed to copy Kimi tensor {} to GPU", spec.name))?
             } else {
                 let sliced =
                     sliced_tensor_bytes(view.data(), view.shape(), view.dtype(), &spec.slice)
                         .with_context(|| format!("failed to slice Kimi tensor {}", spec.name))?;
-                ctx.stream
+                ctx.stream()
                     .clone_htod(sliced.as_slice())
                     .with_context(|| format!("failed to copy Kimi tensor {} to GPU", spec.name))?
             };
@@ -128,4 +183,13 @@ fn mmap_file(path: &Path) -> Result<Mmap> {
     // SAFETY: checkpoint shards are opened read-only and the mapping is only
     // consumed while reading safetensors metadata or copying tensor bytes.
     unsafe { Mmap::map(&file) }.with_context(|| format!("failed to mmap {}", path.display()))
+}
+
+pub(super) fn dtype_element_bytes(dtype: Dtype) -> Result<usize> {
+    match dtype {
+        Dtype::BF16 => Ok(2),
+        Dtype::F32 | Dtype::I32 => Ok(4),
+        Dtype::U8 => Ok(1),
+        other => bail!("Kimi loader does not support dtype {:?}", other),
+    }
 }

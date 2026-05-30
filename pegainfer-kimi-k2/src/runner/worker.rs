@@ -550,17 +550,7 @@ fn bind_rank_thread(
     enable_cuda_graph: bool,
 ) -> Result<KimiRankThreadState> {
     ctx.set_current()?;
-    let decode_aux_stream = ctx.ctx.new_stream().with_context(|| {
-        format!(
-            "failed to create Kimi decode aux stream for device {}",
-            ctx.device_ordinal
-        )
-    })?;
-    let decode_aux_ctx = DeviceContext {
-        ctx: Arc::clone(&ctx.ctx),
-        stream: decode_aux_stream,
-        device_ordinal: ctx.device_ordinal,
-    };
+    let decode_aux_ctx = ctx.auxiliary_device_context("decode aux")?;
     unsafe {
         pegainfer_kernels::ffi::cublas_init();
     }

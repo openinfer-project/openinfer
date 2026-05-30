@@ -1,4 +1,81 @@
+use super::load::{
+    KimiRankSlicedLoadPlan, KimiShardTensorLoadPlan, KimiTensorLoadSlice, KimiTensorLoadSpec,
+};
 use super::*;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiTensorEntry {
+    pub name: String,
+    pub shard: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiAttentionManifest {
+    pub input_layernorm: KimiTensorEntry,
+    pub q_a_proj: KimiTensorEntry,
+    pub q_a_layernorm: KimiTensorEntry,
+    pub q_b_proj: KimiTensorEntry,
+    pub kv_a_proj_with_mqa: KimiTensorEntry,
+    pub kv_a_layernorm: KimiTensorEntry,
+    pub kv_b_proj: KimiTensorEntry,
+    pub o_proj: KimiTensorEntry,
+    pub post_attention_layernorm: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiDenseMlpManifest {
+    pub gate_proj: KimiTensorEntry,
+    pub up_proj: KimiTensorEntry,
+    pub down_proj: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRouterManifest {
+    pub gate_weight: KimiTensorEntry,
+    pub e_score_correction_bias: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiSharedExpertManifest {
+    pub gate_proj: KimiTensorEntry,
+    pub up_proj: KimiTensorEntry,
+    pub down_proj: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiInt4ProjectionManifest {
+    pub weight_packed: KimiTensorEntry,
+    pub weight_scale: KimiTensorEntry,
+    pub weight_shape: KimiTensorEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRoutedExpertManifest {
+    pub expert_idx: usize,
+    pub gate_proj: KimiInt4ProjectionManifest,
+    pub up_proj: KimiInt4ProjectionManifest,
+    pub down_proj: KimiInt4ProjectionManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiMoeLayerManifest {
+    pub router: KimiRouterManifest,
+    pub shared_experts: KimiSharedExpertManifest,
+    pub routed_experts: Vec<KimiRoutedExpertManifest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KimiLayerKindManifest {
+    Dense(KimiDenseMlpManifest),
+    Moe(KimiMoeLayerManifest),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiLayerManifest {
+    pub layer_idx: usize,
+    pub attention: KimiAttentionManifest,
+    pub kind: KimiLayerKindManifest,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KimiK2WeightManifest {
@@ -8,6 +85,99 @@ pub(crate) struct KimiK2WeightManifest {
     pub lm_head: KimiTensorEntry,
     pub layers: Vec<KimiLayerManifest>,
     pub parallel: KimiK2ParallelShape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRankWeightPlan {
+    pub tp_rank: usize,
+    pub ep_rank: usize,
+    pub attention_head_range: Range<usize>,
+    pub vocab_range: Range<usize>,
+    pub local_expert_range: Range<usize>,
+    pub tensor_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiTopWeightNames {
+    pub token_embedding: String,
+    pub final_norm: String,
+    pub lm_head: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiAttentionWeightNames {
+    pub input_layernorm: String,
+    pub q_a_proj: String,
+    pub q_a_layernorm: String,
+    pub q_b_proj: String,
+    pub kv_a_proj_with_mqa: String,
+    pub kv_a_layernorm: String,
+    pub kv_b_proj: String,
+    pub o_proj: String,
+    pub post_attention_layernorm: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiDenseMlpWeightNames {
+    pub gate_proj: String,
+    pub up_proj: String,
+    pub down_proj: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRouterWeightNames {
+    pub gate_weight: String,
+    pub e_score_correction_bias: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiSharedExpertWeightNames {
+    pub gate_proj: String,
+    pub up_proj: String,
+    pub down_proj: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiInt4ProjectionWeightNames {
+    pub weight_packed: String,
+    pub weight_scale: String,
+    pub weight_shape: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRoutedExpertWeightNames {
+    pub global_expert: usize,
+    pub gate_proj: KimiInt4ProjectionWeightNames,
+    pub up_proj: KimiInt4ProjectionWeightNames,
+    pub down_proj: KimiInt4ProjectionWeightNames,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiMoeLayerWeightNames {
+    pub router: KimiRouterWeightNames,
+    pub shared_experts: KimiSharedExpertWeightNames,
+    pub routed_experts: Vec<KimiRoutedExpertWeightNames>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KimiLayerWeightKindNames {
+    Dense(KimiDenseMlpWeightNames),
+    Moe(KimiMoeLayerWeightNames),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiLayerWeightNames {
+    pub layer_idx: usize,
+    pub attention: KimiAttentionWeightNames,
+    pub kind: KimiLayerWeightKindNames,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KimiRankWeightNames {
+    pub rank: usize,
+    pub plan: KimiRankWeightPlan,
+    pub top: KimiTopWeightNames,
+    pub layers: Vec<KimiLayerWeightNames>,
 }
 
 impl KimiK2WeightManifest {

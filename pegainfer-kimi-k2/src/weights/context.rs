@@ -1,5 +1,17 @@
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct KimiRankGpuContext {
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    device_ordinal: usize,
+}
+
+// SAFETY: each Kimi rank owns one CUDA context/stream pair and the runner
+// drives that pair from the rank worker thread.
+unsafe impl Send for KimiRankGpuContext {}
+unsafe impl Sync for KimiRankGpuContext {}
+
 impl KimiRankGpuContext {
     pub(crate) fn new(device_ordinal: usize) -> Result<Self> {
         Self::set_current_device(device_ordinal)?;
@@ -38,6 +50,24 @@ impl KimiRankGpuContext {
             stream: Arc::clone(&self.stream),
             device_ordinal: self.device_ordinal,
         }
+    }
+
+    pub(crate) fn auxiliary_device_context(&self, role: &str) -> Result<DeviceContext> {
+        let stream = self.ctx.new_stream().with_context(|| {
+            format!(
+                "failed to create Kimi {role} stream for device {}",
+                self.device_ordinal
+            )
+        })?;
+        Ok(DeviceContext {
+            ctx: Arc::clone(&self.ctx),
+            stream,
+            device_ordinal: self.device_ordinal,
+        })
+    }
+
+    pub(in crate::weights) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     fn set_current_device(device_ordinal: usize) -> Result<()> {

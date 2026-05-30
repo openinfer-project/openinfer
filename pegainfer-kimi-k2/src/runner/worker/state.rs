@@ -17,7 +17,8 @@ impl KimiRankThreadState {
         );
         self.ctx.set_current()?;
         let rank = self.sliced_load_plan.rank;
-        let comm = Comm::from_rank(self.ctx.stream.clone(), rank, world_size, id)
+        let device_ctx = self.ctx.as_device_context();
+        let comm = Comm::from_rank(device_ctx.stream, rank, world_size, id)
             .map_err(|err| anyhow::anyhow!("Kimi rank {rank} NCCL init failed: {err:?}"))?;
         self.tp_comm = Some(OwnedRankComm(comm));
         Ok(())
