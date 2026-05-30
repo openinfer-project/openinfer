@@ -13,35 +13,17 @@ use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 #[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;
-#[cfg(feature = "kimi-k2")]
-pub mod collectives;
 pub mod config;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
 #[cfg(feature = "kimi-k2")]
-pub mod layers;
-#[cfg(feature = "kimi-k2")]
 mod runner;
-pub mod tensor;
-pub mod tokenizer;
 #[cfg(feature = "kimi-k2")]
 mod typed_scratch;
 #[cfg(feature = "kimi-k2")]
-pub mod weights;
+mod weights;
 
-pub use config::{KimiK2TextConfig, KimiModelKind, probe_config_json, probe_model};
-#[cfg(feature = "kimi-k2")]
-pub use runner::{KimiK2RankPlacement, KimiK2RunnerConfig};
-#[cfg(feature = "kimi-k2")]
-pub use weights::{
-    KIMI_K2_WEIGHT_INDEX, KimiAttentionGpuWeights, KimiDenseMlpGpuWeights,
-    KimiInt4ProjectionGpuWeights, KimiK2WeightManifest, KimiLayerGpuWeights,
-    KimiLayerKindGpuWeights, KimiMoeLayerGpuWeights, KimiRankGpuContext, KimiRankGpuWeights,
-    KimiRankSlicedLoadPlan, KimiRankTypedGpuWeights, KimiRankWeightNames, KimiRankWeightPlan,
-    KimiRoutedExpertGpuWeights, KimiRouterGpuWeights, KimiShardTensorLoadPlan,
-    KimiSharedExpertGpuWeights, KimiTensorLoadSlice, KimiTensorLoadSpec, KimiTopGpuWeights,
-    load_rank_sliced_weights_to_gpu,
-};
+pub use config::probe_config_json;
 
 #[cfg(feature = "kimi-k2")]
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
