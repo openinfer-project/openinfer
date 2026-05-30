@@ -430,7 +430,7 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
 
 fn dist(deltas: &[f32]) -> (f32, f32, f32, f32) {
     let mut s = deltas.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s.sort_by(f32::total_cmp);
     let pct = |q: f64| s[((s.len() as f64 * q) as usize).min(s.len() - 1)];
     (
         s.iter().sum::<f32>() / s.len() as f32,
