@@ -12,13 +12,23 @@ use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 const PROMPT: &str = "Hello";
 const OUTPUT_LEN: usize = 16;
-const EXPECTED_OUTPUT_TOKEN_SHA256: &str =
-    "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225";
-const EXPECTED_OUTPUT_TEXT_SHA256: &str =
-    "0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347";
+const MAX_BATCH_SIZE: usize = 8;
+const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
+    (
+        "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225",
+        "0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347",
+        "DeepSeek-V2-Lite snapshot 604d5664 on 2x RTX 5090, torch 2.7.0, transformers 4.40.2",
+    ),
+    (
+        "d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8",
+        "4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6",
+        "DeepSeek-V2-Lite snapshot 604d5664 on 2x A800-SXM4-80GB, torch 2.7.0, transformers 4.40.2",
+    ),
+];
 
 struct Cli {
     model_path: String,
+    batch_size: usize,
     out: Option<PathBuf>,
 }
 
@@ -52,53 +62,58 @@ fn main() -> Result<()> {
             seed: 42,
         },
     )?;
-    let (result, attribution) =
-        generator.generate_greedy_with_attribution(&prompt_tokens, OUTPUT_LEN, false)?;
+    let report = if cli.batch_size == 1 {
+        let (result, attribution) =
+            generator.generate_greedy_with_attribution(&prompt_tokens, OUTPUT_LEN, false)?;
+        single_report(&tokenizer, &prompt_tokens, result, attribution)?
+    } else {
+        let (result, attribution) = generator.generate_greedy_batch_same_prompt_with_attribution(
+            &prompt_tokens,
+            cli.batch_size,
+            OUTPUT_LEN,
+            true,
+        )?;
+        batch_report(&tokenizer, &prompt_tokens, result, attribution)?
+    };
+
+    let text = serde_json::to_string_pretty(&report)?;
+    if let Some(out) = cli.out {
+        let path = resolve_workspace_path(out);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        fs::write(&path, format!("{text}\n"))
+            .with_context(|| format!("write {}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
+    println!("{text}");
+    Ok(())
+}
+
+fn single_report(
+    tokenizer: &HuggingFaceTokenizer,
+    prompt_tokens: &[u32],
+    result: pegainfer_deepseek_v2_lite::GenerationResult,
+    attribution: pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+) -> Result<Value> {
     let generated_text = tokenizer
         .decode(&result.tokens, false)
         .map_err(|err| anyhow::anyhow!("decode output failed: {err:?}"))?;
     let text_sha256 = sha256_text(&generated_text);
-
-    ensure!(
-        result.stats.output_token_sha256 == EXPECTED_OUTPUT_TOKEN_SHA256,
-        "DeepSeek-V2-Lite attribution token hash drift: got {}, expected {}",
-        result.stats.output_token_sha256,
-        EXPECTED_OUTPUT_TOKEN_SHA256
-    );
-    ensure!(
-        text_sha256 == EXPECTED_OUTPUT_TEXT_SHA256,
-        "DeepSeek-V2-Lite attribution text hash drift: got {}, expected {}",
-        text_sha256,
-        EXPECTED_OUTPUT_TEXT_SHA256
-    );
+    let (expected_token_sha256, expected_text_sha256, matched_oracle) =
+        expect_output_oracle(&result.stats.output_token_sha256, &text_sha256)?;
 
     let by_section = attribution.by_section();
     let by_gpu_section = attribution.by_gpu_section();
     let by_gpu_call_site = attribution.by_gpu_call_site();
-    let by_op: Vec<Value> = by_section
-        .iter()
-        .map(|row| {
-            json!({
-                "op": row.section,
-                "calls": row.calls,
-                "total_us": row.total_us,
-                "mean_us": row.mean_us,
-                "min_us": row.min_us,
-                "p50_us": row.p50_us,
-                "p95_us": row.p95_us,
-                "p99_us": row.p99_us,
-                "max_us": row.max_us,
-                "pct": row.pct,
-            })
-        })
-        .collect();
+    let by_op = by_op_rows(&by_section);
     let mut per_output_token_us = Vec::with_capacity(OUTPUT_LEN);
     if let Some(prefill_next_token_us) = attribution.prefill_next_token_us() {
         per_output_token_us.push(prefill_next_token_us);
     }
     per_output_token_us.extend_from_slice(attribution.per_token_decode_us());
 
-    let report = json!({
+    Ok(json!({
         "schema": 1,
         "report_type": "deepseek-v2-lite-ep2-decode-attribution",
         "model": "DeepSeek-V2-Lite",
@@ -117,8 +132,10 @@ fn main() -> Result<()> {
             "generated_text": &generated_text,
             "token_sha256": &result.stats.output_token_sha256,
             "text_sha256": &text_sha256,
-            "expected_token_sha256": EXPECTED_OUTPUT_TOKEN_SHA256,
-            "expected_text_sha256": EXPECTED_OUTPUT_TEXT_SHA256,
+            "expected_token_sha256": expected_token_sha256,
+            "expected_text_sha256": expected_text_sha256,
+            "matched_output_oracle": matched_oracle,
+            "known_output_sha256_pairs": expected_output_sha256_pairs(),
             "token_hash_exact": true,
             "text_hash_exact": true,
         },
@@ -146,27 +163,118 @@ fn main() -> Result<()> {
         "by_call_site": attribution.by_call_site(),
         "by_gpu_section": by_gpu_section,
         "by_gpu_call_site": by_gpu_call_site,
-        "coverage": coverage_rows(&result.stats.ep_backend, &attribution),
+        "coverage": coverage_rows(&result.stats.ep_backend, 1, &attribution),
         "ep": ep_report(&result.stats),
         "claim_boundary": "Attribution only for the covered EP2 Hello/16 decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
-    });
+    }))
+}
 
-    let text = serde_json::to_string_pretty(&report)?;
-    if let Some(out) = cli.out {
-        let path = resolve_workspace_path(out);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        fs::write(&path, format!("{text}\n"))
-            .with_context(|| format!("write {}", path.display()))?;
-        eprintln!("wrote {}", path.display());
+fn batch_report(
+    tokenizer: &HuggingFaceTokenizer,
+    prompt_tokens: &[u32],
+    result: pegainfer_deepseek_v2_lite::BatchedGenerationResult,
+    attribution: pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+) -> Result<Value> {
+    ensure!(
+        result.per_token_decode_us == attribution.per_token_decode_us(),
+        "batch result decode timings differ from attribution decode timings"
+    );
+    let mut generated_text_by_row = Vec::with_capacity(result.tokens.len());
+    let mut token_sha256_by_row = Vec::with_capacity(result.tokens.len());
+    let mut text_sha256_by_row = Vec::with_capacity(result.tokens.len());
+    for row in &result.tokens {
+        let generated_text = tokenizer
+            .decode(row, false)
+            .map_err(|err| anyhow::anyhow!("decode batch output failed: {err:?}"))?;
+        token_sha256_by_row.push(sha256_tokens(row));
+        text_sha256_by_row.push(sha256_text(&generated_text));
+        generated_text_by_row.push(generated_text);
     }
-    println!("{text}");
-    Ok(())
+    ensure!(
+        token_sha256_by_row
+            .iter()
+            .all(|hash| hash == &token_sha256_by_row[0])
+            && text_sha256_by_row
+                .iter()
+                .all(|hash| hash == &text_sha256_by_row[0]),
+        "DeepSeek-V2-Lite batch attribution rows are not hash-identical"
+    );
+    let (expected_token_sha256, expected_text_sha256, matched_oracle) =
+        expect_output_oracle(&token_sha256_by_row[0], &text_sha256_by_row[0])?;
+
+    let by_section = attribution.by_section();
+    let by_gpu_section = attribution.by_gpu_section();
+    let by_gpu_call_site = attribution.by_gpu_call_site();
+    let by_op = by_op_rows(&by_section);
+
+    Ok(json!({
+        "schema": 1,
+        "report_type": "deepseek-v2-lite-ep2-decode-attribution",
+        "model": "DeepSeek-V2-Lite",
+        "phase": "decode",
+        "backend": &result.stats.ep_backend,
+        "config": {
+            "batch_size": result.tokens.len(),
+            "prompt": PROMPT,
+            "prompt_token_ids": prompt_tokens,
+            "output_len": OUTPUT_LEN,
+            "ignore_eos": true,
+            "ep_size": result.stats.ep_size,
+            "device_ordinals": &result.stats.device_ordinals,
+        },
+        "accuracy": {
+            "generated_token_ids": &result.tokens[0],
+            "generated_text": &generated_text_by_row[0],
+            "token_sha256": &token_sha256_by_row[0],
+            "text_sha256": &text_sha256_by_row[0],
+            "generated_token_ids_by_row": &result.tokens,
+            "generated_text_by_row": &generated_text_by_row,
+            "token_sha256_by_row": &token_sha256_by_row,
+            "text_sha256_by_row": &text_sha256_by_row,
+            "same_prompt_rows_exact": true,
+            "expected_token_sha256": expected_token_sha256,
+            "expected_text_sha256": expected_text_sha256,
+            "matched_output_oracle": matched_oracle,
+            "known_output_sha256_pairs": expected_output_sha256_pairs(),
+            "token_hash_exact": true,
+            "text_hash_exact": true,
+        },
+        "timing": {
+            "source": "CPU-side wall-clock sections around the existing DeepSeek-V2-Lite EP2 same-prompt batched greedy path",
+            "total_generation_us": result.total_generation_us,
+            "prefill_next_token_us_by_row": &result.prefill_next_token_us,
+            "per_shared_decode_step_us": &result.per_token_decode_us,
+            "decode_step_count": result.per_token_decode_us.len(),
+            "per_token_decode_us": attribution.per_token_decode_us(),
+            "per_token_decode_stats": latency_stats(attribution.per_token_decode_us()),
+        },
+        "attribution_source": "DeepSeekV2LiteEp2Generator::generate_greedy_batch_same_prompt_with_attribution; CPU sections use host wall-clock timers, and selected GPU/NCCL sections also carry CUDA event timing plus optional NVTX ranges.",
+        "gpu_timing": {
+            "source": "CUDA event timing around selected DeepSeek-V2-Lite EP2 GPU/NCCL stream sections in the explicit batched attribution path",
+            "sample_count": attribution.gpu_sample_count(),
+            "failure_count": attribution.gpu_timing_failure_count(),
+            "nvtx_enabled": attribution.nvtx_enabled(),
+            "nvtx_range_count": attribution.nvtx_range_count(),
+            "scope": "selected GPU/NCCL sections only; host routing, host accumulation, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+        },
+        "schedule_source": format!(
+            "fixed DeepSeek-V2-Lite EP2 greedy gate: batch_size={}, prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
+            result.tokens.len()
+        ),
+        "by_section": by_section,
+        "by_op": by_op,
+        "by_call_site": attribution.by_call_site(),
+        "by_gpu_section": by_gpu_section,
+        "by_gpu_call_site": by_gpu_call_site,
+        "coverage": coverage_rows(&result.stats.ep_backend, result.tokens.len(), &attribution),
+        "ep": ep_report(&result.stats),
+        "claim_boundary": "Attribution only for the covered EP2 Hello/16 same-prompt batched decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
+    }))
 }
 
 fn parse_cli() -> Result<Cli> {
     let mut model_path = "models/DeepSeek-V2-Lite".to_string();
+    let mut batch_size = 1;
     let mut out = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -176,6 +284,17 @@ fn parse_cli() -> Result<Cli> {
                     .next()
                     .context("--model-path requires a path argument")?;
             }
+            "--batch-size" => {
+                batch_size = args
+                    .next()
+                    .context("--batch-size requires an integer argument")?
+                    .parse()
+                    .context("--batch-size must be an integer")?;
+                ensure!(
+                    (1..=MAX_BATCH_SIZE).contains(&batch_size),
+                    "--batch-size must be in 1..={MAX_BATCH_SIZE}, got {batch_size}"
+                );
+            }
             "--out" => {
                 out = Some(PathBuf::from(
                     args.next().context("--out requires a path argument")?,
@@ -183,16 +302,20 @@ fn parse_cli() -> Result<Cli> {
             }
             "-h" | "--help" => {
                 println!(
-                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--out PATH]\n\nThe gate is intentionally fixed to batch=1, prompt=Hello, output_len=16. Select NCCL with PEGAINFER_DSV2_LITE_EP_BACKEND=nccl."
+                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with PEGAINFER_DSV2_LITE_EP_BACKEND=nccl."
                 );
                 std::process::exit(0);
             }
             other => bail!(
-                "unsupported argument `{other}`; supported flags: --model-path PATH, --out PATH"
+                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --out PATH"
             ),
         }
     }
-    Ok(Cli { model_path, out })
+    Ok(Cli {
+        model_path,
+        batch_size,
+        out,
+    })
 }
 
 fn ep_report(stats: &pegainfer_deepseek_v2_lite::GenerationStats) -> Value {
@@ -226,8 +349,28 @@ fn ep_report(stats: &pegainfer_deepseek_v2_lite::GenerationStats) -> Value {
     })
 }
 
+fn by_op_rows(rows: &[pegainfer_deepseek_v2_lite::SectionRollup]) -> Vec<Value> {
+    rows.iter()
+        .map(|row| {
+            json!({
+                "op": row.section,
+                "calls": row.calls,
+                "total_us": row.total_us,
+                "mean_us": row.mean_us,
+                "min_us": row.min_us,
+                "p50_us": row.p50_us,
+                "p95_us": row.p95_us,
+                "p99_us": row.p99_us,
+                "max_us": row.max_us,
+                "pct": row.pct,
+            })
+        })
+        .collect()
+}
+
 fn coverage_rows(
     backend: &str,
+    batch_size: usize,
     attribution: &pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
 ) -> Vec<Value> {
     vec![
@@ -259,7 +402,7 @@ fn coverage_rows(
         json!({
             "item": "throughput_or_production_ep_readiness",
             "status": "not_claimed",
-            "source": "single batch=1 prompt=Hello output_len=16 diagnostic gate only",
+            "source": format!("batch={batch_size} prompt=Hello output_len=16 diagnostic gate only"),
         }),
     ]
 }
@@ -274,6 +417,43 @@ fn gpu_timing_status(attribution: &pegainfer_deepseek_v2_lite::DecodeAttribution
         (_, 0) => "measured",
         (_, _) => "measured_with_failures",
     }
+}
+
+fn expect_output_oracle(
+    token_sha256: &str,
+    text_sha256: &str,
+) -> Result<(&'static str, &'static str, &'static str)> {
+    matched_expected_output_oracle(token_sha256, text_sha256).with_context(|| {
+        format!(
+            "DeepSeek-V2-Lite attribution hash drift: got token_sha256={token_sha256} text_sha256={text_sha256}, expected one HF-confirmed pair from {:?}",
+            EXPECTED_OUTPUT_SHA256_PAIRS
+        )
+    })
+}
+
+fn matched_expected_output_oracle(
+    token_sha256: &str,
+    text_sha256: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    EXPECTED_OUTPUT_SHA256_PAIRS
+        .iter()
+        .find(|(expected_token, expected_text, _)| {
+            token_sha256 == *expected_token && text_sha256 == *expected_text
+        })
+        .copied()
+}
+
+fn expected_output_sha256_pairs() -> Vec<Value> {
+    EXPECTED_OUTPUT_SHA256_PAIRS
+        .iter()
+        .map(|(token_sha256, text_sha256, source)| {
+            json!({
+                "token_sha256": token_sha256,
+                "text_sha256": text_sha256,
+                "source": source,
+            })
+        })
+        .collect()
 }
 
 fn latency_stats(samples: &[u64]) -> Value {
@@ -312,6 +492,14 @@ fn percentile(sorted: &[u64], quantile: f64) -> u64 {
 fn sha256_text(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn sha256_tokens(tokens: &[u32]) -> String {
+    let mut hasher = Sha256::new();
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
