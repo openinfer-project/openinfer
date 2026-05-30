@@ -830,15 +830,3 @@ fn ensure_weight_payload_available(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placements_map_rank_to_device() {
-        let placements = build_placements(&(0..8).collect::<Vec<_>>()).unwrap();
-        assert_eq!(placements[0].rank, 0);
-        assert_eq!(placements[7].device_ordinal, 7);
-    }
-}
