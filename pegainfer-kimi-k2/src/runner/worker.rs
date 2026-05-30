@@ -50,8 +50,8 @@ use crate::{
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
         KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights,
-        KimiRankSlicedLoadPlan, KimiRankWeightNames, KimiRankWeightPlan, KimiRouterDeviceWeights,
-        KimiRouterGpuWeights, load_rank_sliced_weights_to_gpu,
+        KimiRankSlicedLoadPlan, KimiRankWeightNames, KimiRouterDeviceWeights, KimiRouterGpuWeights,
+        load_rank_sliced_weights_to_gpu,
     },
 };
 
@@ -157,7 +157,6 @@ pub(super) struct KimiRankWorker {
 impl KimiRankWorker {
     pub(super) fn spawn(
         placement: KimiK2RankPlacement,
-        weight_plan: KimiRankWeightPlan,
         weight_names: KimiRankWeightNames,
         sliced_load_plan: KimiRankSlicedLoadPlan,
         thread_placement: KimiRankThreadPlacement,
@@ -167,28 +166,22 @@ impl KimiRankWorker {
         enable_cuda_graph: bool,
     ) -> Result<Self> {
         ensure!(
-            placement.rank == weight_plan.rank,
-            "Kimi rank placement {} does not match weight plan {}",
-            placement.rank,
-            weight_plan.rank
-        );
-        ensure!(
-            weight_names.rank == weight_plan.rank,
-            "Kimi rank weight names {} do not match weight plan {}",
+            weight_names.rank == placement.rank,
+            "Kimi rank weight names {} do not match placement {}",
             weight_names.rank,
-            weight_plan.rank
+            placement.rank
         );
         ensure!(
-            sliced_load_plan.rank == weight_plan.rank,
-            "Kimi rank sliced load plan {} does not match weight plan {}",
+            sliced_load_plan.rank == placement.rank,
+            "Kimi rank sliced load plan {} does not match placement {}",
             sliced_load_plan.rank,
-            weight_plan.rank
+            placement.rank
         );
         ensure!(
-            thread_placement.rank == weight_plan.rank,
-            "Kimi rank thread placement {} does not match weight plan {}",
+            thread_placement.rank == placement.rank,
+            "Kimi rank thread placement {} does not match placement {}",
             thread_placement.rank,
-            weight_plan.rank
+            placement.rank
         );
         let (tx, rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);

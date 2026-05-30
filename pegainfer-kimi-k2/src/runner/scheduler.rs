@@ -80,9 +80,6 @@ fn build_runner_config(
     let thread_placement = crate::runner::affinity::KimiRankThreadPlacementPlan::for_devices(
         &options.device_ordinals,
     )?;
-    let rank_weight_plans = (0..placements.len())
-        .map(|rank| weight_manifest.rank_plan(rank))
-        .collect::<Result<Vec<_>>>()?;
     let rank_weight_names = (0..placements.len())
         .map(|rank| weight_manifest.rank_weight_names(rank))
         .collect::<Result<Vec<_>>>()?;
@@ -98,7 +95,6 @@ fn build_runner_config(
         parallel,
         local_dims: shape.local_dims(),
         weight_manifest,
-        rank_weight_plans,
         rank_weight_names,
         rank_sliced_load_plans,
         placements,
@@ -710,10 +706,8 @@ fn maybe_load_rank_weights(
 fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
     let n = config.placements.len();
     ensure!(
-        config.rank_weight_plans.len() == n
-            && config.rank_weight_names.len() == n
-            && config.rank_sliced_load_plans.len() == n,
-        "Kimi-K2 plan/names/sliced counts must match {} placements",
+        config.rank_weight_names.len() == n && config.rank_sliced_load_plans.len() == n,
+        "Kimi-K2 names/sliced counts must match {} placements",
         n
     );
     let contexts = config
@@ -723,10 +717,9 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
         .collect::<Result<Vec<_>>>()?;
     let collective_barrier = Arc::new(Barrier::new(config.parallel.tp_world));
     let mut workers = Vec::with_capacity(n);
-    for ((((&placement, weight_plan), weight_names), sliced_load_plan), ctx) in config
+    for (((&placement, weight_names), sliced_load_plan), ctx) in config
         .placements
         .iter()
-        .zip(config.rank_weight_plans.iter().cloned())
         .zip(config.rank_weight_names.iter().cloned())
         .zip(config.rank_sliced_load_plans.iter().cloned())
         .zip(contexts.into_iter())
@@ -734,7 +727,6 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
         let thread_placement = config.thread_placement.rank(placement.rank)?;
         let worker = KimiRankWorker::spawn(
             placement,
-            weight_plan,
             weight_names,
             sliced_load_plan,
             thread_placement,
