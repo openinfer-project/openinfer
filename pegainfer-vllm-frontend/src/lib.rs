@@ -844,6 +844,7 @@ async fn run_request_stream(
 ) {
     let mut first_token_events = None;
     let mut first_token_prefill_stats = None;
+    let mut has_sent_token_output = false;
     let mut pending_event = None;
     loop {
         let event = match pending_event.take() {
@@ -878,9 +879,13 @@ async fn run_request_stream(
                 });
             }
             TokenEvent::Token { id, logprob } => {
-                // Yield once so a token burst from the engine can accumulate
-                // before we drain the ready queue into one bridge output.
-                tokio::task::yield_now().await;
+                // Keep the first streamed token on the direct path so TTFT
+                // does not pay an extra scheduler turn. Later decode bursts
+                // still benefit from one-turn coalescing before draining the
+                // ready queue into one bridge output.
+                if has_sent_token_output {
+                    tokio::task::yield_now().await;
+                }
                 let (token_ids, batched_logprobs, next_event) =
                     collect_ready_token_batch(id, logprob, &mut token_rx);
                 pending_event = next_event;
@@ -896,6 +901,7 @@ async fn run_request_stream(
                 {
                     return;
                 }
+                has_sent_token_output = true;
             }
             TokenEvent::PromptTokens { .. } => {
                 // Prompt logprobs are intentionally deferred for this bridge.
@@ -1075,6 +1081,10 @@ fn collect_ready_token_batch(
         if let Some(position) = to_wire_position_logprobs(token_id, logprob) {
             has_logprobs = true;
             positions.push(position);
+        } else {
+            positions.push(PositionLogprobs {
+                entries: Vec::new(),
+            });
         }
     };
     push_token(first_id, first_logprob);
@@ -1543,6 +1553,47 @@ mod tests {
         assert!(first_batch.outputs[0].prefill_stats.is_some());
         assert!(second_batch.outputs[0].events.is_none());
         assert!(second_batch.outputs[0].prefill_stats.is_none());
+        assert!(output_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_logprob_batch_keeps_token_alignment() {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        token_tx
+            .send(TokenEvent::Token {
+                id: 31,
+                logprob: None,
+            })
+            .expect("send token without logprob");
+        token_tx
+            .send(TokenEvent::Token {
+                id: 32,
+                logprob: Some(TokenLogprob {
+                    logprob: -0.3,
+                    top_logprobs: vec![(32, -0.3), (33, -0.7)],
+                }),
+            })
+            .expect("send token with logprob");
+        drop(token_tx);
+
+        run_request_stream("req-3".to_string(), token_rx, output_tx).await;
+
+        let batch = output_rx.recv().await.expect("batched output");
+        let direct = match batch.outputs[0]
+            .new_logprobs
+            .as_ref()
+            .expect("batched logprobs")
+        {
+            MaybeWireLogprobs::Direct(direct) => direct,
+            MaybeWireLogprobs::Wire(_) => panic!("expected direct batched logprobs"),
+        };
+
+        assert_eq!(batch.outputs[0].new_token_ids, vec![31, 32]);
+        assert_eq!(direct.positions.len(), 2);
+        assert!(direct.positions[0].entries.is_empty());
+        assert_eq!(direct.positions[1].entries[0].token_id, 32);
         assert!(output_rx.recv().await.is_none());
     }
 
