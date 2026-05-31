@@ -323,6 +323,17 @@
   - Decision: stop standalone tuning unless production NCU identifies a concrete cuBLAS scheduling gap, or a dense down+residual fusion clears the full-bench gate.
 - Both rows now explicitly say production NCU is pending because `h20-100` still times out on `ncu --version`.
 
+### Step 24: Embedding and dense elementwise reports
+- Added `docs/models/kimi-k2/embedding_report.md` for `decode.embedding`.
+  - H20 evidence: `6.83-7.24us`, `31.7-33.6GB/s` payload-equivalent; source launch `224 x 256`.
+  - Decision: classify as `control/lookup` and stop standalone tuning.
+- Added `docs/models/kimi-k2/dense_swiglu_report.md` for `decode.dense.swiglu`.
+  - H20 evidence: `7.79us`, `113.6GB/s` payload-equivalent; source launch `576 x 256`.
+  - Decision: classify as `control/elementwise` and stop standalone tuning; future only as dense MLP fusion.
+- Added `docs/models/kimi-k2/dense_residual_add_report.md` for `decode.dense.residual_add`.
+  - H20 evidence: `6.81-7.51us`, `45.8-50.5GB/s` payload-equivalent; source launch `224 x 256`.
+  - Decision: classify as `control/elementwise` and stop standalone tuning; future only as down-GEMM epilogue fusion.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.

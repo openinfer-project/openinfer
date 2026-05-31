@@ -108,11 +108,11 @@ Columns:
 
 | # | Stage | Op | Kernel/provider | Calls | Shape / dtype | Step latency | Per call | Throughput | H20 roofline | Peak gap | Scope |
 |---:|---|---|---|---:|---|---:|---:|---:|---|---|---|
-| 1 | embedding | `decode.embedding` | `embedding_batch_vocab_shard` | 1 | vocab=163840, hidden=7168, rows=8, BF16 | 7.2 us | 7.2 us | 31.7 GB/s | memory | 0.7% / gap 99.3% | measured |
+| 1 | embedding | `decode.embedding` | `embedding_batch_vocab_shard` | 1 | vocab=163840, hidden=7168, rows=8, BF16 | 7.2 us | 7.2 us | 31.7 GB/s payload-equivalent | control/lookup | - | measured |
 | 2 | dense | `decode.dense.gate_up` | `gemm_dm_typed_to_hs_graphsafe` | 1 | rows=8, out=36864, in=7168, BF16 | 147.9 us | 147.9 us | 28.58 TF/s | memory | 74.5% / gap 25.5% | measured; production NCU pending |
-| 3 | dense | `decode.dense.swiglu` | `silu_mul_hs_fused_into` | 1 | hidden=18432, batch=8, BF16 | 7.8 us | 7.8 us | 113.4 GB/s | memory | 2.4% / gap 97.6% | measured |
+| 3 | dense | `decode.dense.swiglu` | `silu_mul_hs_fused_into` | 1 | hidden=18432, batch=8, BF16 | 7.8 us | 7.8 us | 113.4 GB/s payload-equivalent | control/elementwise | - | measured; production NCU pending |
 | 4 | dense | `decode.dense.down` | `gemm_dm_hs_to_typed_graphsafe` | 1 | rows=8, out=7168, in=18432, BF16 | 85.3 us | 85.3 us | 24.77 TF/s | memory | 64.6% / gap 35.4% | measured; production NCU pending |
-| 5 | dense | `decode.dense.residual_add` | `add_batch` | 1 | hidden=7168, batch=8, BF16 | 6.8 us | 6.8 us | 50.5 GB/s | memory | 1.1% / gap 98.9% | measured |
+| 5 | dense | `decode.dense.residual_add` | `add_batch` | 1 | hidden=7168, batch=8, BF16 | 6.8 us | 6.8 us | 50.5 GB/s payload-equivalent | control/elementwise | - | measured; production NCU pending |
 | 6 | attention | `decode.attention.input_norm` | `rms_norm_batch` | 61 | rows=8, hidden=7168, BF16 | 476.3 us | 7.8 us | 57.3 GB/s payload-equivalent | control/tiny-grid | - | measured |
 | 7 | attention | `decode.attention.qkv_a` | `gemm_graphsafe` | 61 | rows=8, out=2112, in=7168, BF16 | 1.256 ms | 20.6 us | 11.77 TF/s | memory | 30.8% / gap 69.2% | measured |
 | 8 | attention | `decode.attention.qkv_a_split_norm` | `kimi_mla_split_qkv_a_norm` | 61 | elems=16896, BF16 | 501.1 us | 8.2 us | 0.01 TF/s | memory | 0.3% / gap 99.7% | measured |
@@ -216,3 +216,6 @@ Initial report targets:
 | 19 | `attention_post_attn_add_norm_report.md` | Exists; exact-preserving fused add + RMSNorm round is a tiny-grid/control row (`8` CTAs, `896` threads/CTA, `28,784B` dynamic smem, `8.65-8.69us/call`). Production NCU is pending; standalone tuning is stopped unless a downstream prologue fusion preserves BF16 rounding and clears the full-bench gate. |
 | 20 | `dense_gate_up_report.md` | Exists; dense layer0 gate/up GEMM is memory-bound by event roofline (`147.96us`, `3.58TB/s`, `74.5%` HBM) and called once, so standalone tuning is stopped unless NCU finds a concrete cuBLAS scheduling gap. |
 | 21 | `dense_down_report.md` | Exists; dense layer0 down GEMM is memory-bound by event roofline (`85.48us`, `3.10TB/s`, `64.5%` HBM) and called once, so standalone tuning is stopped unless NCU or a dense down+residual fusion clears the full-bench gate. |
+| 22 | `embedding_report.md` | Exists; embedding lookup is a small control/lookup row (`6.83-7.24us`, `224` CTAs, `31.7-33.6GB/s` payload-equivalent), so standalone tuning is stopped. |
+| 23 | `dense_swiglu_report.md` | Exists; dense layer0 SwiGLU is a one-call elementwise activation (`7.79us`, `576` CTAs, `113.6GB/s` payload-equivalent), so standalone tuning is stopped and only dense MLP fusion remains plausible. |
+| 24 | `dense_residual_add_report.md` | Exists; dense residual add is a tiny elementwise helper (`6.81-7.51us`, `224` CTAs, `45.8-50.5GB/s` payload-equivalent), so standalone tuning is stopped and only down-GEMM epilogue fusion remains plausible. |
