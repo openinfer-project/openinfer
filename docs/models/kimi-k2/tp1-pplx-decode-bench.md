@@ -305,6 +305,15 @@
   - same-shape FlashInfer RMSNorm NCU: `8` CTAs, `0.05` waves/SM, `0.70-0.74%` DRAM, `60-61%` scheduler no eligible.
 - Decision: reclassify final norm as `control/tiny-grid` and stop standalone tuning. Also corrected master row 6 (`decode.attention.input_norm`) to the same control/tiny-grid classification already documented in `attention_input_norm_report.md`.
 
+### Step 22: Attention post_attn_add_norm report
+- Added `docs/models/kimi-k2/attention_post_attn_add_norm_report.md` for `decode.attention.post_attn_add_norm`.
+- Evidence reused from H20 bench artifacts and source launch geometry in `pegainfer-kernels/csrc/flashinfer_norm.cu`:
+  - target shape: `rows=8`, `hidden=7168`, BF16 hidden/residual/output plus BF16 norm weight.
+  - source launch: `8` CTAs x `896` threads, `28,784B` dynamic shared memory per CTA.
+  - H20 timing: `527.74-530.03us/step`, `8.65-8.69us/call`, `~79GB/s` payload-equivalent.
+- NCU status: fresh production NCU is still unavailable because `ncu --version` times out on `h20-100`.
+- Decision: reclassify row 16 from memory to `control/tiny-grid` and stop standalone tuning. The only plausible follow-up is a downstream prologue fusion that preserves Kimi's BF16 rounding boundary and passes the full TP1 PPLX gate.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
