@@ -272,6 +272,15 @@
   - NCU: `silu_mul_fused_kernel`, `64 x 256` launch, `0.10` waves/SM, `0.51%` DRAM read, `2.53%` SM, `93.39%` scheduler no eligible.
 - Decision: reclassify row 22 as `control/tiny-grid` in the master table and stop standalone SwiGLU tuning. Future work should only revisit this row as row21 -> row22 gated-dual GEMM or row22 -> row23 activation-prologue fusion, with full TP1 PPLX bench proof.
 
+### Step 18: FlashInfer MLA decode ctx sweep report
+- Added `docs/models/kimi-k2/attention_flashinfer_mla_decode_report.md` for `decode.attention.flashinfer_mla_decode`.
+- Evidence reused from `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json`:
+  - At `bs=8,ctx=1`: `624.6us/step`, `10.24us/call`, `211GB/s` payload-equivalent.
+  - At `bs=8,ctx=8192`: `103.50ms/step`, `1.697ms/call`, `2.85TB/s` payload-equivalent, about `59%` of the H20 HBM roofline.
+  - `active_rows=1,2,4,8` are nearly identical for this row because attention uses fixed `arena_rows=8`; MoE rows are the active-row-sensitive part of the bench.
+- KernelWiki points to FlashInfer MLA fast decode plan, Hopper backend selection, and FP8 KV cache as plausible directions.
+- NCU status: `h20-100` is reachable, but `/usr/local/cuda-12.9/bin/ncu --version` currently times out. Decision: do not adopt a code change from event timing alone; this row remains active pending production NCU.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
