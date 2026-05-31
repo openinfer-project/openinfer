@@ -2,7 +2,7 @@
 
 > **TL;DR:** `decode.moe.shared_gate_up` is a memory-bound BF16 skinny GEMM on H20 (`AI ~= 7.98 flop/byte`, below the `30.83 flop/byte` ridge). Adopted Kimi-specific cuBLASLt for exact shape `M=4096,K=7168,batch_size=1..64`, improving TP1 PPLX `bs=8,ctx=1` from `1.818ms` to `1.505ms` per 60 MoE layers (`1.21x`).
 >
-> **Last touched:** 2026-05
+> **Last touched:** 2026-06
 
 ## KernelWiki Conclusion
 
@@ -39,6 +39,7 @@ Conclusion: the row is not compute-bound and is not at the H20 memory limit. It 
 | Standalone cuBLASLt first heuristic, zero workspace | `18.673 us` per call, `1.120 ms` for 60 calls, `3.153 TB/s`, `65.69%` HBM peak. | Best local baseline. |
 | Production Kimi cuBLASLt path | TP1 PPLX bench `bs=8,ctx=1`: `1.505 ms` for 60 calls, `18.72 TF/s`, `2.348 TB/s`, `48.9%` HBM peak. | Adopted. |
 | Non-power-of-two batch check | TP1 PPLX bench `bs=3,ctx=1`: `1.524 ms`, provider `kimi_shared_gate_up_cublaslt`. | Confirms `batch_size=1..64` support; no power-of-two fallback bug. |
+| CUTLASS example 45 dual-GEMM + fused SwiGLU prototype | `profile/kimi-shared-gated-dual-gemm-h20-prototype/`: default `128x64x32` tile measured `207.5us/call`; tuned `16x64x64` measured `69.2us/call`; tuned `16x32x64` measured `68.7us/call`. Current same-harness cuBLASLt + SwiGLU baseline is `21.1-21.3us/call`. NCU for `16x32x64` shows `73.22us`, `64` CTAs, `0.12` waves/SM, `17.06%` DRAM, `14.69%` compute, and `77.12%` no eligible. | Rejected. The stock CUTLASS dual-GEMM path is not shaped for Kimi decode `M=8`; it loses badly to the adopted cuBLASLt baseline despite eliminating the activation launch. |
 
 ## Final Conclusion
 
@@ -50,4 +51,4 @@ Current accepted result:
 |---|---:|---:|---:|---|
 | H20 TP1/DP8/EP8 PPLX decode, per-rank `bs=8`, global `bs~=64`, `ctx=1` | `1.818 ms` | `1.505 ms` | `1.21x` | memory |
 
-Stop condition for this row: do not continue tuning standalone GEMM unless the next attempt beats cuBLASLt in the full TP1 PPLX bench. The more plausible next target is fusion around row 21/22 (`shared_gate_up + SwiGLU`) because the accepted cuBLASLt row still writes an intermediate BF16 gate/up buffer that the next kernel immediately rereads.
+Stop condition for this row: do not continue tuning standalone GEMM unless the next attempt beats cuBLASLt in the full TP1 PPLX bench. The stock CUTLASS dual-GEMM/SwiGLU route is also stopped for now: at the Kimi decode shape it is `~3.2x` slower than cuBLASLt + current SwiGLU in the standalone harness. A future row 21/22 fusion would need a decode-specific small-M schedule, not the example 45 schedule.

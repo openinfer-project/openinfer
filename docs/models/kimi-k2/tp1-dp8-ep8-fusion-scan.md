@@ -1,8 +1,8 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Fusion Scan
 
-> **TL;DR:** Phase 2 fusion scan has NCU evidence for three adjacent pairs. `shared_gate_up -> shared_swiglu` still needs a custom gated-dual-GEMM; `attention input RMSNorm -> qkv_a` is small-grid plus skinny-GEMM limited (`RMSNormKernel<8,bf16>` launches only `8` blocks; qkv_a cuBLAS main GEMM launches `72` blocks and reaches `51-53%` DRAM); `qkv_a_split_norm -> q_b` is split between a tiny-grid norm kernel (`8` blocks, `~0.2%` DRAM) and a cuBLAS skinny GEMM (`64` blocks, `59-61%` DRAM). qkv_a cuBLASLt was tried and rejected (`0.8-1.7%` bench-provider gain). No fusion is accepted yet.
+> **TL;DR:** Phase 2 fusion scan has NCU evidence for three adjacent pairs. `shared_gate_up -> shared_swiglu` remains plausible only as a decode-specific gated-dual-GEMM; stock CUTLASS example 45 was tried and rejected (`68.7us/call` best tested tile vs `21.1-21.3us/call` for cuBLASLt + current SwiGLU). `attention input RMSNorm -> qkv_a` is small-grid plus skinny-GEMM limited (`RMSNormKernel<8,bf16>` launches only `8` blocks; qkv_a cuBLAS main GEMM launches `72` blocks and reaches `51-53%` DRAM). `qkv_a_split_norm -> q_b` is split between a tiny-grid norm kernel (`8` blocks, `~0.2%` DRAM) and a cuBLAS skinny GEMM (`64` blocks, `59-61%` DRAM). qkv_a cuBLASLt was tried and rejected (`0.8-1.7%` bench-provider gain). No fusion is accepted yet.
 >
-> **Last touched:** 2026-05
+> **Last touched:** 2026-06
 
 ## Inputs
 
@@ -13,6 +13,7 @@
 - NCU run: `profile/kimi-attention-row6-row7-h20-baseline/` on `h20-100`
 - NCU run: `profile/kimi-attention-row8-row9-h20-baseline/` on `h20-100`
 - Rejected attempt: `profile/kimi-qkv-a-cublaslt-h20-baseline/` on `h20-100`
+- Rejected attempt: `profile/kimi-shared-gated-dual-gemm-h20-prototype/` on `h20-100`
 
 Current row values at `bs=8,ctx=1`:
 
@@ -182,13 +183,33 @@ NCU details:
 
 Diagnosis: row 8 alone is not HBM-bound; it is a tiny launch with too few CTAs to fill H20. Row 9 is the real bandwidth user and is already stronger than qkv_a in DRAM percentage, but it is still constrained by low-batch wave quantization and low reuse. The row 8/9 fusion opportunity is therefore not "make row 8 reach bandwidth peak"; it is to delete or absorb the row-8 launch/intermediate traffic while keeping row 9 at least as fast as the current cuBLAS kernel.
 
+### Row 21/22 CUTLASS dual-GEMM attempt
+
+Prototype run:
+
+```bash
+profile/kimi-shared-gated-dual-gemm-h20-prototype/harness/build_command.sh
+profile/kimi-shared-gated-dual-gemm-h20-prototype/harness/shared_gated_dual_gemm
+```
+
+The harness compares the same Kimi shared-expert shape (`batch=8, hidden=7168, inter=2048`) between the current `cuBLASLt shared_gate_up + silu_mul_fused_cuda` path and CUTLASS example 45 dual-GEMM with fused `LeftSiLUAndMul`.
+
+| Variant | Tile | Time/call | Step-equivalent for 60 calls | Decision |
+|---|---|---:|---:|---|
+| current baseline in standalone harness | cuBLASLt + SwiGLU | `21.1-21.3us` | `1.27ms` | Keep as baseline. |
+| CUTLASS example 45 | `128x64x32` | `207.5us` | `12.45ms` | Rejected; huge M waste for `batch=8`. |
+| CUTLASS example 45 | `16x64x64` | `69.2us` | `4.15ms` | Rejected. |
+| CUTLASS example 45 | `16x32x64` | `68.7us` | `4.12ms` | Rejected. |
+
+NCU for the best tested CUTLASS tile (`16x32x64`) reports `73.22us`, `64` CTAs, `0.12` waves/SM, `17.06%` DRAM, `14.69%` compute, `1.56%` achieved occupancy, and `77.12%` scheduler no eligible. This confirms the stock CUTLASS dual-GEMM schedule is not the right row-21/22 implementation for Kimi decode. A future accepted fusion would need a decode-specific small-M schedule, not example 45 with a smaller tile.
+
 ## Candidate Scan
 
 | Candidate | Rows | Feasibility | Evidence | Decision |
 |---|---|---|---|---|
 | Attention RMSNorm -> qkv_a GEMM prologue | 6-7 | Requires custom GEMM prologue or CUTLASS-style visitor; standard cuBLASLt does not encode full RMSNorm over the input row. | NCU done: row 6 is `8` blocks / `0.05` waves/SM; row 7 is cuBLAS split-K, main GEMM `72` blocks / `0.92` waves/SM / `51-53%` DRAM plus `~3us` reduce. qkv_a cuBLASLt provider was rejected: `0.8-1.7%` bench-provider gain only. | Keep in scan queue, but do not tune RMSNorm alone and do not adopt qkv_a cuBLASLt. Only a true RMSNorm-prologue/custom GEMM path remains worth trying here. |
 | qkv_a split/norm cleanup | 8-9 | Possible only inside Kimi MLA custom kernels; row 8 already fuses split plus two norms and feeds both q_b and MLA cache. | NCU done: row 8 is `8` blocks / `0.01` waves/SM / `~0.2%` DRAM, while row 9 is cuBLAS `64` blocks / `0.82` waves/SM / `59-61%` DRAM. | Keep in scan queue only as a true row 8/9 fusion or q_b custom-prologue path. Do not tune row 8 as a standalone bandwidth kernel. |
-| shared_gate_up -> shared_swiglu | 21-22 | Requires gated-dual-GEMM custom/CUTLASS/CuTe kernel; cuBLASLt cannot express SwiGLU over the two halves of a single output. | KernelWiki gated-dual-GEMM pattern applies. NCU says row 22 is tiny-grid/latency-bound, not bandwidth-bound. Current cuBLASLt row 21 is strong at `1.505 ms`. | Do not replace cuBLASLt without a full TP1 PPLX bench win. Prototype only if it targets gated-dual-GEMM, not elementwise-only tuning. |
+| shared_gate_up -> shared_swiglu | 21-22 | Requires gated-dual-GEMM custom/CUTLASS/CuTe kernel; cuBLASLt cannot express SwiGLU over the two halves of a single output. | KernelWiki gated-dual-GEMM pattern applies. NCU says row 22 is tiny-grid/latency-bound, not bandwidth-bound. Current cuBLASLt row 21 is strong at `1.505 ms`. CUTLASS example 45 dual-GEMM was tested and rejected: best tested tile `16x32x64` is `68.7us/call` vs `21.1-21.3us/call` for cuBLASLt + SwiGLU. | Do not replace cuBLASLt without a full TP1 PPLX bench win. Stock CUTLASS dual-GEMM is rejected for this shape; only a decode-specific small-M fused schedule remains plausible. |
 | shared_swiglu -> shared_down prologue | 22-23 | Would require activation transform in the GEMM input path; standard cuBLASLt has no arbitrary BF16 input prologue. | Row 23 is `902.2 us`; row 22 standalone is small, but full bench row is `473.3 us`. | Lower priority than row 21/22; revisit after gated-dual-GEMM result. |
 | Dequant into routed Marlin GEMM | 25/27 | Not scan-ready because routed PPLX Marlin rows are estimate-only in the current single-rank bench. | Master ledger marks PPLX W13/W2 as estimate-only; EP comm is excluded but local routed compute still needs an all-rank harness. | Blocked on all-rank PPLX local-compute timing, not on communication optimization. |
 
