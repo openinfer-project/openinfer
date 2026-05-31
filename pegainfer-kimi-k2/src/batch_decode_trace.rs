@@ -168,7 +168,7 @@ pub fn trace_runtime_decode_kernel_calls_with_options(
             engine.submit(GenerateRequest {
                 request_id: Some(format!("kimi-trace-{request_idx}")),
                 queued_at_unix_s: None,
-                prompt_tokens: vec![0_u32; prompt_len],
+                prompt_tokens: runtime_trace_prompt_tokens(request_idx, prompt_len),
                 params: SamplingParams {
                     temperature: 0.0,
                     top_k: 1,
@@ -212,6 +212,14 @@ pub fn trace_runtime_decode_kernel_calls_with_options(
         "Kimi runtime decode trace produced no KernelCall records"
     );
     Ok(calls)
+}
+
+#[cfg(feature = "kernel-call-trace")]
+fn runtime_trace_prompt_tokens(request_idx: usize, prompt_len: usize) -> Vec<u32> {
+    let vocab = crate::config::KIMI_K2_VOCAB as u64;
+    (0..prompt_len)
+        .map(|pos| (1 + (request_idx as u64 * 9_973 + pos as u64 * 7_919) % (vocab - 1)) as u32)
+        .collect()
 }
 
 pub fn normalize_call_site(label: &str) -> String {
