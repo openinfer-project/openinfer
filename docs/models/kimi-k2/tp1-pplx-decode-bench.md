@@ -378,6 +378,21 @@
   - Pulling/listing the remote profile directory later timed out on `h20-100`, so the full NCU report has not been retrieved or parsed locally yet.
 - Decision: keep row 13 active. The next concrete action is to retrieve and parse `ctx8192_full.ncu-rep`; do not change FlashInfer MLA decode code from event timing or kernel-name evidence alone.
 
+### Step 30: Row 13 selected NCU metrics and FlashInfer split-K audit
+- Ran a narrower NCU stdout metrics pass for `decode.attention.flashinfer_mla_decode` at `bs=8,ctx=8192` and parsed it locally into `profile/kimi-flashinfer-mla-decode-ctx8192-h20/analysis/ctx8192_metrics_summary.json`.
+- Key metrics:
+  - Kernel: `BatchDecodeWithPagedKVCacheKernelMLA<2,16,2,32,8,1,2,...>`.
+  - Launch: grid `(8,4,1)` = `32` CTAs, block `(32,8,1)` = `256` threads, `0.41` waves/SM on H20.
+  - Resource pressure: `254` registers/thread, `22,528B` dynamic shared memory/block, `12.50%` active warps.
+  - Throughput counters: `28.77%` SM throughput, `22.74%` compute-memory throughput, `0.87%` DRAM throughput, `48.22%` L2 sector hit rate.
+- Applied the ncu-report-skill diagnosis playbook: `launch__waves_per_multiprocessor < 0.5` and grid smaller than SM count match the small-grid / SM-idle pattern; the first candidate fix is splitting long KV work across more CTAs.
+- Queried KernelWiki with `uv run --with pyyaml --no-project python scripts/query.py ...`; relevant hits were `wiki/patterns/low-sm-utilization.md`, `pr-flashinfer-2530`, `pr-flashinfer-844`, and `pr-vllm-34597`.
+- Inspected the repo-local FlashInfer submodule:
+  - `BatchDecodeWithPagedKVCacheDispatchedMLA` in `include/flashinfer/attention/decode.cuh` forces `partition_kv=false` when `tmp_v == nullptr`.
+  - FlashInfer's TVM-FFI path runs `BatchDecodeWithPagedKVCachePlanMLA`, then passes planned `request_indices`, `kv_tile_indices`, `o_indptr`, `kv_chunk_size_ptr`, `tmp_v`, and `tmp_s`.
+  - The current Kimi wrapper in `pegainfer-kernels/csrc/kimi_k2/kimi_mla.cu` sets `o_indptr=nullptr` and passes `tmp_v/tmp_s=nullptr`, so it cannot enter FlashInfer's split-K branch.
+- Decision: update `attention_flashinfer_mla_decode_report.md` and the master ledger. The next code experiment should be a bench-scoped planned `partition_kv` path; no production code change is adopted yet because no speedup has been measured.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
@@ -399,3 +414,4 @@
 - **Follow-ups**:
   - Run NCU on trace replay p95/max W13/W2 before changing Marlin scheduling or tiling.
   - Add an all-rank PPLX harness for dispatch/combine timing; trace replay covers local compute only and intentionally excludes EP transport.
+  - For row 13, try a planned FlashInfer MLA `partition_kv` bench path and compare `ctx=1024/4096/8192` before touching production decode.
