@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Optimization Master
 
-> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`), and final argmax split-vocab reduction (`125.3us -> 12.7us`). Router NCU is done; the fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
+> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`), final argmax split-vocab reduction (`125.3us -> 12.7us`), and router post-GEMM score/topk fusion (`3.655ms -> 3.514ms`). Router fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
 >
 > **Last touched:** 2026-06
 
@@ -75,6 +75,7 @@ Accepted optimizations:
 | `decode.attention.absorb_q_nope` | `attention_absorb_q_nope_report.md` | `973.6 us` | `748.5 us` | `1.30x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-mla-cublaslt-bs8-lazy128.json`, `profile/kimi-mla-cublaslt-h20/`, `bs=8,ctx=1` |
 | `decode.attention.v_up` | `attention_v_up_report.md` | `781.0 us` | `738.5 us` | `1.06x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-mla-cublaslt-bs8-lazy128.json`, `profile/kimi-mla-cublaslt-h20/`, `bs=8,ctx=1` |
 | `decode.final.argmax` | `final_argmax_report.md` | `125.3 us` | `12.7 us` | `9.85x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-argmax-split-bs8.json`, `profile/kimi-final-argmax-h20-baseline/`, TP1 DP8 bs64/o5 token A/B `0/64` mismatch |
+| `decode.moe.router` | `kimi_router_noaux_tc_report.md` | `3.655 ms` | `3.514 ms` | `1.04x` | control | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-router-fused-bs8.json`, `profile/kimi-router-fused-h20/`, TP1 DP8 bs64/o5 token A/B `0/64` mismatch |
 
 ## Commit Queue
 
@@ -85,6 +86,7 @@ Accepted optimizations:
 | 3 | `opt(attention_o_proj)` | Kimi-specific cuBLASLt o_proj code path, `attention_o_proj_report.md`, and this master table's accepted-result update. | fusion-scan experiments or other kernel changes. |
 | 4 | `opt(mla_batched_gemm)` | Kimi TP1 cuBLASLt strided-batched path for `absorb_q_nope` and `v_up`, both reports, token A/B note, and this master table's accepted-result update. | router math-mode changes, fusion experiments, or PPLX comm changes. |
 | 5 | `opt(final_argmax)` | Split-vocab CUDA argmax path, `final_argmax_report.md`, and this master table's accepted-result update. | q_b rejection docs or other kernel experiments. |
+| 6 | `opt(router_post_gemm)` | Fused post-GEMM router score/topk selector, `kimi_router_noaux_tc_report.md`, and this master table's accepted-result update. | logits GEMM math-mode changes or other MoE kernels. |
 
 The baseline milestone is already split from the first optimization. Future entries should follow the same pattern: one measured win, one code/report/master-table commit.
 
@@ -118,7 +120,7 @@ Columns:
 | 17 | final | `decode.final.norm` | `rms_norm_batch` | 1 | elems=57344, BF16 | 8.1 us | 8.1 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
 | 18 | final | `decode.final.lm_head` | `gemm_graphsafe` | 1 | rows=8, out=163840, in=7168, BF16 | 542.7 us | 542.7 us | 34.62 TF/s | memory | 90.3% / gap 9.7% | measured |
 | 19 | final | `decode.final.argmax` | `argmax_batch_bf16_split` | 1 | elems=1310720, BF16, tile=4096 | 12.7 us | 12.7 us | 206.0 GB/s | memory | 4.3% / gap 95.7% | measured |
-| 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.687 ms | 61.4 us | 92.1 GB/s | control | - | measured |
+| 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` fused selector | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.514 ms | 58.6 us | 96.6 GB/s | control | - | measured |
 | 21 | moe_shared | `decode.moe.shared_gate_up` | `kimi_shared_gate_up_cublaslt` | 60 | rows=8, out=4096, in=7168, BF16 | 1.505 ms | 25.1 us | 18.72 TF/s | memory | 48.9% / gap 51.1% | measured |
 | 22 | moe_shared | `decode.moe.shared_swiglu` | `silu_mul_hs_fused_into` | 60 | rows=8, gate_up=4096, out=2048, BF16 | 410.2 us | 6.8 us | 14.4 GB/s | memory | 0.3% / gap 99.7% | measured |
 | 23 | moe_shared | `decode.moe.shared_down` | `gemm_dm_hs_to_typed_graphsafe` | 60 | rows=8, out=7168, in=2048, BF16 | 904.1 us | 15.1 us | 15.59 TF/s | memory | 40.8% / gap 59.2% | measured |
@@ -138,7 +140,7 @@ Measured rows sorted by step latency at `bs=8,ctx=1`:
 
 | Rank | Op | Step latency | Current direction |
 |---:|---|---:|---|
-| 1 | `decode.moe.router` | 3.655 ms | NCU done in `kimi_router_noaux_tc_report.md`: small-grid/control limited. Fast `CUBLAS_COMPUTE_32F` logits GEMM gave `3.655ms -> 1.687ms`, but is rejected due `30/64` TP1 DP8 bs64/o5 token-trace mismatches. |
+| 1 | `decode.moe.router` | 3.514 ms | Post-GEMM score/topk fusion accepted; NCU still says small-grid/control limited (`8` CTAs, `0.03` waves/SM). Fast `CUBLAS_COMPUTE_32F` logits GEMM gave `3.655ms -> 1.687ms`, but remains rejected due `30/64` TP1 DP8 bs64/o5 token-trace mismatches. |
 | 2 | attention `o_proj` (`kimi_o_proj_cublaslt`) | 2.374 ms | cuBLASLt accepted; NCU still shows memory/skinny-grid limit (`56` CTAs, `73.9-75.9%` DRAM). Treat this as the new baseline for any future fusion/custom GEMM work. |
 | 3 | `decode.moe.shared_gate_up` | 1.519 ms | cuBLASLt accepted; next work should treat this as the baseline for row 21/22 fusion scans. |
 | 4 | attention `decode.attention.qkv_a` (`gemm_graphsafe`) | 1.262 ms | NCU done: cuBLAS split-K skinny GEMM, main kernel `72` blocks/`0.92` waves/SM/`51-53%` DRAM plus `~3us` split-K reduce. cuBLASLt exact-shape provider was rejected because TP1 bench gain was only `0.8-1.7%`. |
