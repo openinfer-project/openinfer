@@ -334,6 +334,15 @@
   - H20 evidence: `6.81-7.51us`, `45.8-50.5GB/s` payload-equivalent; source launch `224 x 256`.
   - Decision: classify as `control/elementwise` and stop standalone tuning; future only as down-GEMM epilogue fusion.
 
+### Step 25: PPLX residual scaled-add report
+- Added `docs/models/kimi-k2/pplx_residual_add_scaled_report.md` for `decode.moe.residual_add_scaled`.
+- Evidence reused from H20 bench artifacts and source launch geometry in `pegainfer-kernels/csrc/kimi_k2/kimi_experts.cu`:
+  - target shape: `rows=8`, `hidden=7168`, BF16 hidden + BF16 projected + F32 routed + BF16 output, scale `2.827`.
+  - source launch: `224 x 256` for `57344` elements per MoE layer.
+  - H20 timing: `408.3-410.1us/step`, `6.81-6.83us/call`, `~84GB/s` payload-equivalent.
+- NCU status: fresh production NCU is still unavailable because `ncu --version` times out on `h20-100`.
+- Decision: reclassify row 28 from memory to `control/elementwise` and stop standalone tuning. Future work only makes sense as a launch-removing fusion that preserves the current BF16 rounding boundary after `hidden + projected`.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
