@@ -20,14 +20,32 @@ Practical conclusion: for `ctx=1`, the row is launch/control overhead. For `ctx>
 
 ## NCU Conclusion
 
-Fresh production NCU has not been collected for this row yet. Earlier attempts failed because `ncu --version` timed out; on 2026-06-01 `/usr/local/cuda-12.9/bin/ncu --version` did return `Version 2025.2.0.0` once, but the follow-up `h20-100` SSH commands timed out before the row-13 collection could run.
+Fresh production NCU has started for this row but has not been parsed yet. Earlier attempts failed because `ncu --version` timed out; on 2026-06-01 `/usr/local/cuda-12.9/bin/ncu --version` did return `Version 2025.2.0.0`.
 
 ```bash
 timeout 20s ssh -o ConnectTimeout=5 h20-100 '/usr/local/cuda-12.9/bin/ncu --version'
-# 2026-06-01: returned Version 2025.2.0.0 once; later short ssh commands timed out.
+# 2026-06-01: returned Version 2025.2.0.0 once; h20-100 filesystem access later timed out while retrieving the report.
 ```
 
-The NCU conclusion for this row is therefore intentionally incomplete: do not adopt a code optimization from CUDA-event timing alone. The next NCU run should isolate:
+The first full NCU collection completed on `h20-100` with this kernel:
+
+```text
+flashinfer::BatchDecodeWithPagedKVCacheKernelMLA<
+  2, 16, 2, 32, 8, 1, 2,
+  flashinfer::DefaultAttention<false, false, false, false>,
+  flashinfer::BatchDecodeParamsMLA<bf16, bf16, bf16, int>
+>
+```
+
+Remote artifact:
+
+```text
+/root/develop/xingming/pegainfer/profile/kimi-flashinfer-mla-decode-ctx8192-h20/reports/ctx8192_full.ncu-rep
+```
+
+The report still needs to be retrieved and parsed. A source-counter collection was attempted with `--set source --section SourceCounters`, but it did not finish after several minutes and was killed from the local SSH side. The NCU conclusion for this row is therefore still intentionally incomplete: do not adopt a code optimization until the full report is parsed or a narrower source run succeeds.
+
+The next completed NCU run should isolate:
 
 ```bash
 target/release/kimi_tp1_pplx_decode_bench \

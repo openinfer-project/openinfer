@@ -371,8 +371,12 @@
   - `target/release/kimi_tp1_pplx_decode_bench` exists on `h20-100` and supports `--labels`.
   - `/usr/local/cuda-12.9/bin/ncu --version` returned `Version 2025.2.0.0` once during this session.
   - Running through `/root/.cargo/bin/cargo` without a CUDA PATH failed because `pegainfer-comm-a2a-kernels` could not find `nvcc`; the next attempt should use the existing release binary directly or set `PATH=/usr/local/cuda-12.9/bin:$PATH`.
-  - Subsequent short `ssh h20-100` commands timed out, so no production NCU report was collected in this step.
-- Decision: keep row 13 active. The next concrete action is to rerun the existing-binary NCU command when `h20-100` SSH is stable; do not change FlashInfer MLA decode code from event timing alone.
+  - Existing-binary smoke passed at `ctx=8192`: `1693.95us/call`, `103.33ms/step`, `2.85TB/s` payload-equivalent.
+  - Full NCU collection completed for `flashinfer::BatchDecodeWithPagedKVCacheKernelMLA<...>` and wrote `/root/develop/xingming/pegainfer/profile/kimi-flashinfer-mla-decode-ctx8192-h20/reports/ctx8192_full.ncu-rep`.
+  - The NCU-run event row under profiler overhead was `1793.02us/call`, `109.37ms/step`, `2.70TB/s` payload-equivalent.
+  - SourceCounters collection did not finish after several minutes and was killed from the local SSH side.
+  - Pulling/listing the remote profile directory later timed out on `h20-100`, so the full NCU report has not been retrieved or parsed locally yet.
+- Decision: keep row 13 active. The next concrete action is to retrieve and parse `ctx8192_full.ncu-rep`; do not change FlashInfer MLA decode code from event timing or kernel-name evidence alone.
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
