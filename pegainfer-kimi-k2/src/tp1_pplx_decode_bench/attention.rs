@@ -236,7 +236,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
         .notes("absorbed-V projection: latent MLA output x kv_b V slice -> TP1 attention output"),
     );
     specs.push(gemm_spec(
-        "gemm_dm_hs_to_typed_graphsafe",
+        "kimi_o_proj_cublaslt",
         "decode.attention.o_proj",
         Stage::Attention,
         active_rows,
