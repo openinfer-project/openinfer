@@ -1,6 +1,6 @@
 # kimi_router_noaux_tc Report
 
-> **TL;DR:** `decode.moe.router` is control/launch limited on H20, not memory-bandwidth-bound. Baseline TP1 PPLX `bs=8,ctx=1` was `60.91us/call` (`3.655ms` per 60 MoE layers). The adopted post-GEMM fusion keeps the pedantic BF16->F32 logits GEMM and fuses sigmoid+bias+topk+normalize into one CUDA selector, improving the row to `58.57us/call` (`3.514ms`, `1.04x`) with TP1 DP8 bs64/o5 token A/B `0/64` mismatches. The faster tensor-op logits GEMM remains rejected because it changed generated token traces (`30/64` mismatches).
+> **TL;DR:** `decode.moe.router` is control/launch limited on H20, not memory-bandwidth-bound. Baseline TP1 PPLX `bs=8,ctx=1` was `60.91us/call` (`3.655ms` per 60 MoE layers). The adopted post-GEMM fusion keeps the pedantic BF16->F32 logits GEMM and fuses sigmoid+bias+topk+normalize into one CUDA selector, improving the row to `58.57us/call` (`3.514ms`, `1.04x`) with TP1 DP8 bs64/o5 token A/B `0/64` mismatches. Faster logits-GEMM attempts remain rejected: tensor-op cuBLAS changed generated token traces (`30/64` mismatches), and the scalar custom GEMM failed the bs64/o5 gate with non-finite final logits.
 >
 > **Last touched:** 2026-06
 
@@ -47,6 +47,7 @@ The fused selector keeps the same one-block-per-token shape, writes compatible `
 | cuBLASLt logits GEMM with current pedantic semantics | Standalone harness: cuBLAS `79.26 us/call`, cuBLASLt `79.28 us/call`. | Rejected; no speedup when preserving pedantic math. |
 | cuBLAS logits GEMM with `CUBLAS_COMPUTE_32F` tensor-op path | Standalone harness: `9.61 us/call`; production router row: `28.122 us/call`, `1.687 ms` per step (`2.17x` row speedup). | Rejected; TP1 DP8 bs64/o5 token trace has `30/64` mismatches versus baseline. |
 | cuBLASLt logits GEMM with `CUBLAS_COMPUTE_32F` tensor-op path | Standalone harness: `13.72 us/call`. | Rejected; slower than cuBLAS fast32 and shares the same correctness risk. |
+| Hand-written scalar FP32 logits GEMM, one CTA per expert | TP1 PPLX microbench `bs=8,ctx=1`: `21.781 us/call`, `1.307 ms` per 60 MoE layers. | Rejected; TP1 DP8 PPLX bs64/o5 failed before token A/B with `Kimi TP1 decode rank 6/7 report has non-finite top logit -inf` during prompt_len1 decode. Candidate code was reverted. |
 
 Correctness evidence for the rejected fast32 path:
 
@@ -59,7 +60,7 @@ Correctness evidence for the rejected fast32 path:
 
 ## Final Conclusion
 
-Adopt the post-GEMM fused selector and keep `CUBLAS_COMPUTE_32F_PEDANTIC` for router logits. The row remains the largest measured local-compute bottleneck, but the fastest tested logits GEMM path changes generated tokens and stays rejected.
+Adopt the post-GEMM fused selector and keep `CUBLAS_COMPUTE_32F_PEDANTIC` for router logits. The row remains the largest measured local-compute bottleneck, but faster tested logits GEMM paths either change generated tokens or fail the TP1 DP8 bs64/o5 gate.
 
 Next viable directions:
 
