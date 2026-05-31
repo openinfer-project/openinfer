@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Optimization Master
 
-> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), and MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`). Router NCU is done; the fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
+> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), and MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`). Router NCU is done; the fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
 >
 > **Last touched:** 2026-06
 
@@ -140,7 +140,7 @@ Measured rows sorted by step latency at `bs=8,ctx=1`:
 | 2 | attention `o_proj` (`kimi_o_proj_cublaslt`) | 2.374 ms | cuBLASLt accepted; NCU still shows memory/skinny-grid limit (`56` CTAs, `73.9-75.9%` DRAM). Treat this as the new baseline for any future fusion/custom GEMM work. |
 | 3 | `decode.moe.shared_gate_up` | 1.519 ms | cuBLASLt accepted; next work should treat this as the baseline for row 21/22 fusion scans. |
 | 4 | attention `decode.attention.qkv_a` (`gemm_graphsafe`) | 1.262 ms | NCU done: cuBLAS split-K skinny GEMM, main kernel `72` blocks/`0.92` waves/SM/`51-53%` DRAM plus `~3us` split-K reduce. cuBLASLt exact-shape provider was rejected because TP1 bench gain was only `0.8-1.7%`. |
-| 5 | attention `q_b_proj` | 1.057 ms | NCU done: cuBLAS skinny GEMM `64` blocks/`0.82` waves/SM/`59-61%` DRAM, low L2 hit (`2.7-2.8%`); row 8/9 fusion would need a custom prologue while preserving MLA cache outputs. |
+| 5 | attention `q_b_proj` | 1.057 ms | `q_b_proj_report.md`: NCU says cuBLAS skinny GEMM is memory/low-wave limited (`64` blocks/`0.82` waves/SM/`59-61%` DRAM, low L2 hit). Standalone cuBLASLt exact-shape sweep was rejected at target `batch_size=8` (`8.899us -> 8.746us`, `1.0175x`); row 8/9 fusion would need a custom prologue while preserving MLA cache outputs. |
 | 6 | `decode.moe.shared_down` | 904.8 us | cuBLASLt standalone sweep showed no meaningful gain; possible shared_gate/SwiGLU/down sequence review only if fused. |
 | 7 | attention `absorb_q_nope` (`kimi_mla_absorb_q_nope_rt` cuBLASLt TP1 path) | 748.5 us | cuBLASLt accepted for `local_heads=64,batch_size<=8`; NCU still shows low-wave memory limit (`78` CTAs, `1.00` waves/SM, `28.4%` DRAM read peak). |
 | 8 | attention `v_up` (`kimi_mla_v_up_rt` cuBLASLt TP1 path) | 738.5 us | cuBLASLt accepted for `local_heads=64,batch_size<=8`; NCU still shows low-wave memory limit (`64` CTAs, `0.82` waves/SM, `30.3%` DRAM read peak). |
@@ -188,7 +188,7 @@ Initial report targets:
 | 2 | `attention_o_proj_report.md` | Exists for the accepted cuBLASLt optimization; revisit only if a fused/custom row beats cuBLASLt in full TP1 PPLX bench. |
 | 3 | `shared_gate_up_report.md` | Exists for the accepted cuBLASLt optimization; revisit only if row 21/22 fusion or a stronger custom kernel beats cuBLASLt. |
 | 4 | `qkv_a_proj_report.md` | Large per-layer GEMM and fusion candidate with preceding norm. |
-| 5 | `q_b_proj_report.md` | Skinny GEMM with nontrivial total cost. |
+| 5 | `q_b_proj_report.md` | Exists; standalone cuBLASLt exact-shape sweep was rejected because `batch_size=8` improved only `1.0175x`. Future work should be true row 8/9 fusion/custom prologue. |
 | 6 | `pplx_marlin_compute_report.md` | Estimate-only rows block honest MoE ranking; needs provider/harness work, not EP comm optimization. |
 | 7 | `attention_absorb_q_nope_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
 | 8 | `attention_v_up_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
