@@ -12,22 +12,24 @@ use pegainfer_kernels::{
         KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_INT4_GROUP_SIZE,
         KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
         KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
-        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_TOPK,
-        KimiInt4ExpertRole, KimiInt4NibbleOrder, KimiInt4WeightManifest,
-        KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight, KimiMarlinRouteWorkspace,
-        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
-        KimiRouterOutput, KimiRouterScratch, add_batch_into, embedding_batch_vocab_shard,
-        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
-        fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
-        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla, kimi_marlin_sum_topk_rows_f32,
-        kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
-        kimi_mla_absorb_q_nope, kimi_mla_rope_split_decode, kimi_mla_split_qkv_a,
-        kimi_mla_split_qkv_a_norm, kimi_mla_v_up, kimi_moe_marlin_align_block_size,
-        kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
-        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
-        silu_mul_batch_into,
+        KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_TOPK, KimiInt4ExpertRole, KimiInt4NibbleOrder,
+        KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight,
+        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
+        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, add_batch_into,
+        argmax_batch_bf16_into, embedding_batch_vocab_shard, flashinfer_top1_batch_into,
+        flashinfer_topk_row_states_bytes, fused_add_rms_norm_round_batch_into,
+        gemm_graphsafe_into_checked, kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla,
+        kimi_flashinfer_batch_decode_mla_rt, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
+        kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope,
+        kimi_mla_absorb_q_nope_rt, kimi_mla_rope_split_decode, kimi_mla_rope_split_decode_rt,
+        kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up, kimi_mla_v_up_rt,
+        kimi_moe_marlin_align_block_size, kimi_residual_add_scaled_f32,
+        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
+        scale_f32_in_place, silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceVec, GpuTensor, HiddenStates, KernelCall, NormWeight},
+    typed_ops,
 };
 
 pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
@@ -42,16 +44,24 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "kimi_residual_add_scaled_f32" => Some(measure_residual_add_scaled_f32(call, iters)?),
         "embedding_batch_vocab_shard" => Some(measure_embedding(call, iters)?),
         "top1_batch" => Some(measure_top1(call, iters)?),
+        "argmax_batch_bf16" => Some(measure_argmax_batch_bf16(call, iters)?),
         "kimi_mla_split_qkv_a" => Some(measure_mla_split_qkv_a(call, iters)?),
         "kimi_mla_split_qkv_a_norm" => Some(measure_mla_split_qkv_a_norm(call, iters)?),
         "kimi_mla_rope_split_decode" => Some(measure_mla_rope_split(call, iters)?),
+        "kimi_mla_rope_split_decode_rt" => Some(measure_mla_rope_split_rt(call, iters)?),
         "kimi_mla_absorb_q_nope" => Some(measure_mla_absorb_q(call, iters)?),
+        "kimi_mla_absorb_q_nope_rt" => Some(measure_mla_absorb_q_rt(call, iters)?),
         "kimi_mla_v_up" => Some(measure_mla_v_up(call, iters)?),
+        "kimi_mla_v_up_rt" => Some(measure_mla_v_up_rt(call, iters)?),
         "kimi_router_noaux_tc" => Some(measure_router(call, iters)?),
+        "gemm_dm_typed_to_hs_graphsafe" => Some(measure_gemm_dm_typed_to_hs(call, iters)?),
+        "gemm_dm_hs_to_typed_graphsafe" => Some(measure_gemm_dm_hs_to_typed(call, iters)?),
+        "silu_mul_hs_fused_into" => Some(measure_silu_hs_fused(call, iters)?),
         "kimi_moe_marlin_align_block_size" => Some(measure_marlin_align(call, iters)?),
         "kimi_marlin_sum_topk_rows_f32" => Some(measure_sum_topk(call, iters)?),
         "kimi_marlin_w13_swiglu" => Some(measure_marlin_swiglu(call, iters)?),
         "kimi_flashinfer_batch_decode_mla" => Some(measure_mla_decode(call, iters)?),
+        "kimi_flashinfer_batch_decode_mla_rt" => Some(measure_mla_decode_rt(call, iters)?),
         "repeat_f32_for_reduce_scatter" => Some(measure_repeat_f32_for_rs(call, iters)?),
         "all_gather" | "reduce_scatter" => {
             let rank_hint = call
@@ -283,6 +293,19 @@ fn measure_top1(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     })
 }
 
+fn measure_argmax_batch_bf16(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let logits = input(call, "logits")?;
+    let vocab = axis(logits, "hidden")?;
+    let batch = axis(logits, "batch")?;
+    let ctx = DeviceContext::new()?;
+    let logits = HiddenStates::zeros(&ctx, vocab, batch)?;
+    let mut values: CudaSlice<bf16> = ctx.stream.alloc_zeros(batch)?;
+    let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
+    measure_loop(&ctx, iters, || {
+        argmax_batch_bf16_into(&ctx, &logits, &mut values, &mut out)
+    })
+}
+
 fn measure_mla_split_qkv_a(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let qkv_a_spec = input(call, "qkv_a")?;
     let batch = axis(qkv_a_spec, "batch")?;
@@ -354,6 +377,51 @@ fn measure_mla_rope_split(call: &KernelCall, iters: u64) -> Result<LatencyStats>
     })
 }
 
+fn measure_mla_rope_split_rt(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let q_proj_spec = input(call, "q_proj")?;
+    let q_proj_hidden = axis(q_proj_spec, "hidden")?;
+    let batch = axis(q_proj_spec, "batch")?;
+    ensure!(
+        q_proj_hidden.is_multiple_of(crate::config::KIMI_K2_Q_HEAD_DIM),
+        "{} q_proj hidden={} must be divisible by q_head_dim={}",
+        call.label,
+        q_proj_hidden,
+        crate::config::KIMI_K2_Q_HEAD_DIM
+    );
+    let local_heads = q_proj_hidden / crate::config::KIMI_K2_Q_HEAD_DIM;
+    let ctx = DeviceContext::new()?;
+    let q_proj = HiddenStates::zeros(&ctx, q_proj_hidden, batch)?;
+    let k_rope = GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch)?;
+    let cos: CudaSlice<bf16> = ctx.stream.alloc_zeros(KIMI_K2_MLA_ROPE_DIM)?;
+    let sin: CudaSlice<bf16> = ctx.stream.alloc_zeros(KIMI_K2_MLA_ROPE_DIM)?;
+    let positions_d = ctx.stream.clone_htod(&vec![0_i32; batch])?;
+    let mut q_nope = HiddenStates::zeros(
+        &ctx,
+        local_heads * crate::config::KIMI_K2_QK_NOPE_HEAD_DIM,
+        batch,
+    )?;
+    let mut q_pe = HiddenStates::zeros(
+        &ctx,
+        local_heads * crate::config::KIMI_K2_QK_ROPE_HEAD_DIM,
+        batch,
+    )?;
+    let mut append_kpe = GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch)?;
+    measure_loop(&ctx, iters, || {
+        kimi_mla_rope_split_decode_rt(
+            &ctx,
+            &q_proj,
+            &k_rope,
+            &cos,
+            &sin,
+            &positions_d,
+            &mut q_nope,
+            &mut q_pe,
+            &mut append_kpe,
+            local_heads,
+        )
+    })
+}
+
 fn measure_mla_absorb_q(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let q_nope_spec = input(call, "q_nope")?;
     let batch = axis(q_nope_spec, "batch")?;
@@ -369,6 +437,31 @@ fn measure_mla_absorb_q(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     })
 }
 
+fn measure_mla_absorb_q_rt(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let q_nope_spec = input(call, "q_nope")?;
+    let q_nope_hidden = axis(q_nope_spec, "hidden")?;
+    let batch = axis(q_nope_spec, "batch")?;
+    ensure!(
+        q_nope_hidden.is_multiple_of(crate::config::KIMI_K2_QK_NOPE_HEAD_DIM),
+        "{} q_nope hidden={} must be divisible by nope_dim={}",
+        call.label,
+        q_nope_hidden,
+        crate::config::KIMI_K2_QK_NOPE_HEAD_DIM
+    );
+    let local_heads = q_nope_hidden / crate::config::KIMI_K2_QK_NOPE_HEAD_DIM;
+    let ctx = DeviceContext::new()?;
+    let kv_b_proj = zero_matrix(
+        &ctx,
+        local_heads * (crate::config::KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_MLA_V_HEAD_DIM),
+        KIMI_K2_MLA_KV_LORA_RANK,
+    )?;
+    let q_nope = HiddenStates::zeros(&ctx, q_nope_hidden, batch)?;
+    let mut q_abs_nope = HiddenStates::zeros(&ctx, local_heads * KIMI_K2_MLA_KV_LORA_RANK, batch)?;
+    measure_loop(&ctx, iters, || {
+        kimi_mla_absorb_q_nope_rt(&ctx, &kv_b_proj, &q_nope, &mut q_abs_nope, local_heads)
+    })
+}
+
 fn measure_mla_v_up(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let latent_spec = input(call, "latent")?;
     let batch = axis(latent_spec, "batch")?;
@@ -378,6 +471,31 @@ fn measure_mla_v_up(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let mut out = GpuTensor::<KIMI_K2_MLA_O_LOCAL_IN_TP8>::zeros(&ctx, batch)?;
     measure_loop(&ctx, iters, || {
         kimi_mla_v_up(&ctx, &kv_b_proj, &latent, &mut out)
+    })
+}
+
+fn measure_mla_v_up_rt(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let latent_spec = input(call, "latent")?;
+    let latent_hidden = axis(latent_spec, "hidden")?;
+    let batch = axis(latent_spec, "batch")?;
+    ensure!(
+        latent_hidden.is_multiple_of(KIMI_K2_MLA_KV_LORA_RANK),
+        "{} latent hidden={} must be divisible by kv_lora_rank={}",
+        call.label,
+        latent_hidden,
+        KIMI_K2_MLA_KV_LORA_RANK
+    );
+    let local_heads = latent_hidden / KIMI_K2_MLA_KV_LORA_RANK;
+    let ctx = DeviceContext::new()?;
+    let kv_b_proj = zero_matrix(
+        &ctx,
+        local_heads * (crate::config::KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_MLA_V_HEAD_DIM),
+        KIMI_K2_MLA_KV_LORA_RANK,
+    )?;
+    let latent = HiddenStates::zeros(&ctx, latent_hidden, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, local_heads * KIMI_K2_MLA_V_HEAD_DIM, batch)?;
+    measure_loop(&ctx, iters, || {
+        kimi_mla_v_up_rt(&ctx, &kv_b_proj, &latent, &mut out, local_heads)
     })
 }
 
@@ -426,6 +544,90 @@ fn measure_router(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             &mut scratch,
             &mut output,
         )
+    })
+}
+
+fn measure_gemm_dm_typed_to_hs(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let weight = input(call, "weight")?;
+    let out_dim = axis(weight, "out")?;
+    let in_dim = axis(weight, "in")?;
+    let x = input(call, "x")?;
+    let batch = axis(x, "batch")?;
+    match in_dim {
+        KIMI_K2_HIDDEN => {
+            measure_gemm_dm_typed_to_hs_const::<KIMI_K2_HIDDEN>(out_dim, batch, iters)
+        }
+        dim if dim == crate::config::KIMI_K2_Q_LORA_RANK => measure_gemm_dm_typed_to_hs_const::<
+            { crate::config::KIMI_K2_Q_LORA_RANK },
+        >(out_dim, batch, iters),
+        _ => bail!(
+            "{} unsupported DM→HS input dim for typed provider: in_dim={in_dim}, out_dim={out_dim}, batch={batch}",
+            call.label
+        ),
+    }
+}
+
+fn measure_gemm_dm_typed_to_hs_const<const IN: usize>(
+    out_dim: usize,
+    batch: usize,
+    iters: u64,
+) -> Result<LatencyStats> {
+    let ctx = DeviceContext::new()?;
+    let weight = zero_matrix(&ctx, out_dim, IN)?;
+    let x = GpuTensor::<IN>::zeros(&ctx, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, out_dim, batch)?;
+    measure_loop(&ctx, iters, || {
+        typed_ops::gemm_dm_typed_to_hs_graphsafe(&ctx, &weight, &x, &mut out)
+    })
+}
+
+fn measure_gemm_dm_hs_to_typed(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let weight = input(call, "weight")?;
+    let out_dim = axis(weight, "out")?;
+    let in_dim = axis(weight, "in")?;
+    let x = input(call, "x")?;
+    let batch = axis(x, "batch")?;
+    match out_dim {
+        KIMI_K2_HIDDEN => measure_gemm_dm_hs_to_typed_const::<KIMI_K2_HIDDEN>(in_dim, batch, iters),
+        _ => bail!(
+            "{} unsupported HS→typed output dim for typed provider: out_dim={out_dim}, in_dim={in_dim}, batch={batch}",
+            call.label
+        ),
+    }
+}
+
+fn measure_gemm_dm_hs_to_typed_const<const OUT: usize>(
+    in_dim: usize,
+    batch: usize,
+    iters: u64,
+) -> Result<LatencyStats> {
+    let ctx = DeviceContext::new()?;
+    let weight = zero_matrix(&ctx, OUT, in_dim)?;
+    let x = HiddenStates::zeros(&ctx, in_dim, batch)?;
+    let mut out = GpuTensor::<OUT>::zeros(&ctx, batch)?;
+    measure_loop(&ctx, iters, || {
+        typed_ops::gemm_dm_hs_to_typed_graphsafe(&ctx, &weight, &x, &mut out)
+    })
+}
+
+fn measure_silu_hs_fused(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let gate_up = input(call, "gate_up").or_else(|_| input(call, "x"))?;
+    let out = output(call, "out")?;
+    let gate_up_dim = axis(gate_up, "hidden")?;
+    let inter = axis(out, "hidden")?;
+    let batch = axis(gate_up, "batch")?;
+    ensure!(
+        gate_up_dim == 2 * inter,
+        "{} fused SiLU-mul expects gate_up hidden={} to equal 2*out hidden={}",
+        call.label,
+        gate_up_dim,
+        inter
+    );
+    let ctx = DeviceContext::new()?;
+    let gate_up = HiddenStates::zeros(&ctx, gate_up_dim, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, inter, batch)?;
+    measure_loop(&ctx, iters, || {
+        typed_ops::silu_mul_hs_fused_into(&ctx, &gate_up, &mut out)
     })
 }
 
@@ -655,6 +857,72 @@ fn measure_mla_decode(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             &kv_tile_indices_d,
             &kv_chunk_size_d,
             sm_scale,
+        )
+    })
+}
+
+fn measure_mla_decode_rt(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let q = input(call, "q_abs_nope")?;
+    let q_abs_hidden = axis(q, "hidden")?;
+    let batch = axis(q, "batch")?;
+    ensure!(
+        q_abs_hidden.is_multiple_of(KIMI_K2_MLA_KV_LORA_RANK),
+        "{} q_abs hidden={} must be divisible by kv_lora_rank={}",
+        call.label,
+        q_abs_hidden,
+        KIMI_K2_MLA_KV_LORA_RANK
+    );
+    let local_heads = q_abs_hidden / KIMI_K2_MLA_KV_LORA_RANK;
+    let kv_len = attr_usize(call, "kv_len")?;
+    let page_size = 16usize;
+    let pages_per_request = kv_len.div_ceil(page_size);
+    let max_pages = pages_per_request * batch;
+    let ctx = DeviceContext::new()?;
+    let layout = KimiMlaPagedKvLayout::separate_contiguous(max_pages, page_size, batch);
+    let q_abs = HiddenStates::zeros(&ctx, q_abs_hidden, batch)?;
+    let q_pe = HiddenStates::zeros(&ctx, local_heads * KIMI_K2_MLA_ROPE_DIM, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, q_abs_hidden, batch)?;
+    let ckv_cache = ctx.stream.alloc_zeros::<bf16>(layout.required_ckv_len()?)?;
+    let kpe_cache = ctx.stream.alloc_zeros::<bf16>(layout.required_kpe_len()?)?;
+    let mut page_indices = Vec::with_capacity(max_pages);
+    let mut page_indptr = Vec::with_capacity(batch + 1);
+    page_indptr.push(0);
+    for request in 0..batch {
+        for page in 0..pages_per_request {
+            page_indices.push((request * pages_per_request + page) as i32);
+        }
+        page_indptr.push(page_indices.len() as i32);
+    }
+    let last_page = match kv_len % page_size {
+        0 => page_size,
+        rem => rem,
+    } as i32;
+    let page_indices_d = ctx.stream.clone_htod(&page_indices)?;
+    let page_indptr_d = ctx.stream.clone_htod(&page_indptr)?;
+    let last_page_len_d = ctx.stream.clone_htod(&vec![last_page; batch])?;
+    let request_indices_d = ctx
+        .stream
+        .clone_htod(&(0..batch as i32).collect::<Vec<_>>())?;
+    let kv_tile_indices_d = ctx.stream.clone_htod(&vec![0_i32; batch])?;
+    let kv_chunk_size_d = ctx.stream.clone_htod(&vec![kv_len as i32; batch])?;
+    let sm_scale = 1.0f32 / ((KIMI_K2_MLA_KV_LORA_RANK + KIMI_K2_MLA_ROPE_DIM) as f32).sqrt();
+    measure_loop(&ctx, iters, || {
+        kimi_flashinfer_batch_decode_mla_rt(
+            &ctx,
+            &q_abs,
+            &q_pe,
+            &mut out,
+            &ckv_cache,
+            &kpe_cache,
+            layout,
+            &page_indices_d,
+            &page_indptr_d,
+            &last_page_len_d,
+            &request_indices_d,
+            &kv_tile_indices_d,
+            &kv_chunk_size_d,
+            sm_scale,
+            local_heads,
         )
     })
 }

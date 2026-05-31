@@ -23,6 +23,8 @@ pub(crate) mod config;
 pub mod kernel_report;
 #[cfg(feature = "kimi-k2")]
 mod runner;
+#[cfg(feature = "kernel-report")]
+pub mod tp1_pplx_decode_bench;
 #[cfg(feature = "kimi-k2")]
 mod typed_scratch;
 #[cfg(feature = "kimi-k2")]

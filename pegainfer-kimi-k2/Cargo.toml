@@ -44,5 +44,10 @@ name = "kimi_model_report"
 path = "src/bin/kimi_model_report.rs"
 required-features = ["kernel-report"]
 
+[[bin]]
+name = "kimi_tp1_pplx_decode_bench"
+path = "src/bin/kimi_tp1_pplx_decode_bench.rs"
+required-features = ["kernel-report"]
+
 [lints]
 workspace = true
