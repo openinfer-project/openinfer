@@ -115,7 +115,7 @@ Columns:
 | 5 | dense | `decode.dense.residual_add` | `add_batch` | 1 | hidden=7168, batch=8, BF16 | 6.8 us | 6.8 us | 50.5 GB/s payload-equivalent | control/elementwise | - | measured; production NCU pending |
 | 6 | attention | `decode.attention.input_norm` | `rms_norm_batch` | 61 | rows=8, hidden=7168, BF16 | 476.3 us | 7.8 us | 57.3 GB/s payload-equivalent | control/tiny-grid | - | measured |
 | 7 | attention | `decode.attention.qkv_a` | `gemm_graphsafe` | 61 | rows=8, out=2112, in=7168, BF16 | 1.256 ms | 20.6 us | 11.77 TF/s | memory | 30.8% / gap 69.2% | measured |
-| 8 | attention | `decode.attention.qkv_a_split_norm` | `kimi_mla_split_qkv_a_norm` | 61 | elems=16896, BF16 | 501.1 us | 8.2 us | 0.01 TF/s | memory | 0.3% / gap 99.7% | measured |
+| 8 | attention | `decode.attention.qkv_a_split_norm` | `kimi_mla_split_qkv_a_norm` | 61 | `qkv_a=[8,2112] -> q_a_normed=[8,1536], ckv_normed=[8,512], k_rope=[8,64]`, BF16 | 501.1 us | 8.2 us | 12.2 GB/s payload-equivalent | control/tiny-grid | - | measured |
 | 9 | attention | `decode.attention.q_b` | `gemm_dm_typed_to_hs_graphsafe` | 61 | rows=8, out=12288, in=1536, BF16 | 1.052 ms | 17.2 us | 17.51 TF/s | memory | 45.9% / gap 54.1% | measured |
 | 10 | attention | `decode.attention.rope_split` | `kimi_mla_rope_split_decode_rt` | 61 | batch=8, local_heads=64, q_head_dim=192, BF16 | 441.8 us | 7.2 us | 54.4 GB/s payload-equivalent | control/elementwise | - | measured; production NCU pending |
 | 11 | attention | `decode.attention.absorb_q_nope` | `kimi_mla_absorb_q_nope_rt` cuBLASLt TP1 path | 61 | rows=8, out=32768, in=128, BF16 | 748.5 us | 12.3 us | 5.47 TF/s | memory | 15.1% / gap 84.9% | measured |

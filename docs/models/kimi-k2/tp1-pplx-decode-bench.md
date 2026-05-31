@@ -359,6 +359,11 @@
   - H20 replay p95: `12.66us/call`, `759.7us/step`, `217.4GB/s` payload-equivalent.
 - Decision: reclassify row 26 from memory to `compute/elementwise` and stop standalone activation tuning. Future work needs W13/W2 fusion or a tighter route-aware launch bound.
 
+### Step 28: Master row 8 consistency fix
+- Corrected `docs/models/kimi-k2/tp1-dp8-ep8-decode-optimization-master.md` row 8 for `decode.attention.qkv_a_split_norm`.
+- Evidence was already in `attention_qkv_a_split_norm_report.md`: H20 NCU reports `8` CTAs, `0.01` waves/SM, `0.19-0.20%` DRAM, `0.37-0.39%` compute, and `93.4-93.7%` scheduler no eligible.
+- Decision: classify row 8 as `control/tiny-grid` with payload-equivalent throughput instead of the stale memory-bound `0.3% / gap 99.7%` entry.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
