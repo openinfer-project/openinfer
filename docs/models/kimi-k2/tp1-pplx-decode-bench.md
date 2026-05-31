@@ -141,6 +141,16 @@
   - Result: passed; the JSON contained exactly the two requested rows with shapes `elems=57344` and `rows=8,out=2112,in=7168`.
 - Verified on `h20-100` with the same label filter before collecting row 6/7 NCU artifacts under `profile/kimi-attention-row6-row7-h20-baseline/`.
 
+### Step 8: shared_down isolated profile
+- Ran a filtered H20 bench for `decode.moe.shared_down`:
+  - `cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench -- --active-rows 8 --ctx-lens 1 --labels decode.moe.shared_down --iters 256 --format json --out target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-shared-down-bs8.json`
+  - Result: `14.9519us/call`, `897.112us` per 60 MoE layers, `15.709 TF/s`, `1.974 TB/s`, `41.115%` HBM roofline.
+- Ran NCU full profile on the same filtered row:
+  - Main cuBLAS kernel: `nvjet_tst_128x8_64x12_4x1_v_bz_TNT`.
+  - Main duration: `10.78us`; grid `56` blocks; block `384` threads; `0.93` waves/SM.
+  - Memory throughput: `2.73 TB/s`; DRAM throughput `55.94%`; SM throughput `15.74%`; achieved occupancy `14.25%`; L2 hit rate `2.37%`; no eligible `82.37%`.
+- Recorded the conclusion in `shared_down_report.md`: the row is memory-bound and small-grid limited, but exact-shape cuBLASLt replacement was already measured as a no-op (`11.000us -> 10.995us`), so the standalone provider swap is rejected.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.

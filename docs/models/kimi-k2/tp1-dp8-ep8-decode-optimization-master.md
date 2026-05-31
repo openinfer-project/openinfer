@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Optimization Master
 
-> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`), final argmax split-vocab reduction (`125.3us -> 12.7us`), and router post-GEMM score/topk fusion (`3.655ms -> 3.514ms`). Router fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
+> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`), final argmax split-vocab reduction (`125.3us -> 12.7us`), and router post-GEMM score/topk fusion (`3.655ms -> 3.514ms`). Router fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`), and shared_down standalone cuBLASLt was rejected (`11.000us -> 10.995us`, `~1.0005x`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
 >
 > **Last touched:** 2026-06
 
@@ -123,7 +123,7 @@ Columns:
 | 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` fused selector | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.514 ms | 58.6 us | 96.6 GB/s | control | - | measured |
 | 21 | moe_shared | `decode.moe.shared_gate_up` | `kimi_shared_gate_up_cublaslt` | 60 | rows=8, out=4096, in=7168, BF16 | 1.505 ms | 25.1 us | 18.72 TF/s | memory | 48.9% / gap 51.1% | measured |
 | 22 | moe_shared | `decode.moe.shared_swiglu` | `silu_mul_hs_fused_into` | 60 | rows=8, gate_up=4096, out=2048, BF16 | 410.2 us | 6.8 us | 14.4 GB/s | memory | 0.3% / gap 99.7% | measured |
-| 23 | moe_shared | `decode.moe.shared_down` | `gemm_dm_hs_to_typed_graphsafe` | 60 | rows=8, out=7168, in=2048, BF16 | 904.1 us | 15.1 us | 15.59 TF/s | memory | 40.8% / gap 59.2% | measured |
+| 23 | moe_shared | `decode.moe.shared_down` | `gemm_dm_hs_to_typed_graphsafe` | 60 | rows=8, out=7168, in=2048, BF16 | 897.1 us | 15.0 us | 15.71 TF/s | memory | 41.1% / gap 58.9% | measured |
 | 24 | moe_pplx_compute | `decode.moe.pplx_build_marlin_routing` | `kimi_pplx_build_marlin_routing_on_stream` | 60 | recv_capacity=848, local_experts=48 | - | - | - | control | - | estimate-only |
 | 25 | moe_pplx_compute | `decode.moe.pplx_marlin_w13` | `kimi_marlin_wna16_pplx_w13_gemm` | 60 | rows=848, out=4096, in=7168, WNA16 INT4 weights + BF16 activations | - | - | - | estimate-only | - | estimate-only |
 | 26 | moe_pplx_compute | `decode.moe.pplx_swiglu` | `kimi_marlin_w13_swiglu_pplx` | 60 | rows=848, gate_up=4096, out=2048, BF16 | - | - | - | estimate-only | - | estimate-only |
@@ -145,7 +145,7 @@ Measured rows sorted by step latency at `bs=8,ctx=1`:
 | 3 | `decode.moe.shared_gate_up` | 1.519 ms | cuBLASLt accepted; next work should treat this as the baseline for row 21/22 fusion scans. |
 | 4 | attention `decode.attention.qkv_a` (`gemm_graphsafe`) | 1.262 ms | NCU done: cuBLAS split-K skinny GEMM, main kernel `72` blocks/`0.92` waves/SM/`51-53%` DRAM plus `~3us` split-K reduce. cuBLASLt exact-shape provider was rejected because TP1 bench gain was only `0.8-1.7%`. |
 | 5 | attention `q_b_proj` | 1.057 ms | `q_b_proj_report.md`: NCU says cuBLAS skinny GEMM is memory/low-wave limited (`64` blocks/`0.82` waves/SM/`59-61%` DRAM, low L2 hit). Standalone cuBLASLt exact-shape sweep was rejected at target `batch_size=8` (`8.899us -> 8.746us`, `1.0175x`); row 8/9 fusion would need a custom prologue while preserving MLA cache outputs. |
-| 6 | `decode.moe.shared_down` | 904.8 us | cuBLASLt standalone sweep showed no meaningful gain; possible shared_gate/SwiGLU/down sequence review only if fused. |
+| 6 | `decode.moe.shared_down` | 897.1 us | `shared_down_report.md`: NCU says memory-bound skinny GEMM (`56` CTAs, `0.93` waves/SM, `55.94%` DRAM, `82.37%` no eligible). Standalone cuBLASLt exact-shape sweep was rejected (`11.000us -> 10.995us`); only a real `shared_swiglu -> shared_down` fusion remains plausible. |
 | 7 | attention `absorb_q_nope` (`kimi_mla_absorb_q_nope_rt` cuBLASLt TP1 path) | 748.5 us | cuBLASLt accepted for `local_heads=64,batch_size<=8`; NCU still shows low-wave memory limit (`78` CTAs, `1.00` waves/SM, `28.4%` DRAM read peak). |
 | 8 | attention `v_up` (`kimi_mla_v_up_rt` cuBLASLt TP1 path) | 738.5 us | cuBLASLt accepted for `local_heads=64,batch_size<=8`; NCU still shows low-wave memory limit (`64` CTAs, `0.82` waves/SM, `30.3%` DRAM read peak). |
 | 9 | MLA decode | 624.6 us at `ctx=1` | Context-sensitive; use longer ctx rows for real cache-traffic optimization. |
@@ -193,7 +193,8 @@ Initial report targets:
 | 3 | `shared_gate_up_report.md` | Exists for the accepted cuBLASLt optimization; revisit only if row 21/22 fusion or a stronger custom kernel beats cuBLASLt. |
 | 4 | `qkv_a_proj_report.md` | Large per-layer GEMM and fusion candidate with preceding norm. |
 | 5 | `q_b_proj_report.md` | Exists; standalone cuBLASLt exact-shape sweep was rejected because `batch_size=8` improved only `1.0175x`. Future work should be true row 8/9 fusion/custom prologue. |
-| 6 | `pplx_marlin_compute_report.md` | Estimate-only rows block honest MoE ranking; needs provider/harness work, not EP comm optimization. |
-| 7 | `attention_absorb_q_nope_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
-| 8 | `attention_v_up_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
-| 9 | `final_argmax_report.md` | Exists for the accepted split-vocab CUDA argmax optimization. |
+| 6 | `shared_down_report.md` | Exists; standalone cuBLASLt exact-shape sweep was rejected because `batch_size=8` improved only `~1.0005x`. Future work should be true row 22/23 fusion. |
+| 7 | `pplx_marlin_compute_report.md` | Estimate-only rows block honest MoE ranking; needs provider/harness work, not EP comm optimization. |
+| 8 | `attention_absorb_q_nope_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
+| 9 | `attention_v_up_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
+| 10 | `final_argmax_report.md` | Exists for the accepted split-vocab CUDA argmax optimization. |
