@@ -1,6 +1,6 @@
 # pplx_marlin_compute Report
 
-> **TL;DR:** PPLX routed local compute is measurable without timing EP communication. `kimi_tp1_pplx_decode_bench` keeps the synthetic stress point (`recv_capacity=848`, `64` expected local routes, `400` padded rows/rank), while `kimi_pplx_marlin_replay` now consumes runtime `kimi_pplx_route_histogram` rows directly. On H20, replaying `tp1-dp8-pplx-route-hist-bs64-kv2-varied.json` with `iters=16` gives padded-row p50/p95/max `96/224/336`; W13 is `114.5/250.6/368.6us` per call and W2 is `66.4/138.5/200.3us` per call. The p95 row (`recv=67`, `padded=224`, active experts `28`) is memory-bound at `38.9%`/`35.4%` H20 HBM for W13/W2. Synthetic `400` rows remain a stress case, not the serving-shape baseline.
+> **TL;DR:** PPLX routed local compute is measurable without timing EP communication. `kimi_tp1_pplx_decode_bench` keeps the synthetic stress point (`recv_capacity=848`, `64` expected local routes, `400` padded rows/rank), while `kimi_pplx_marlin_replay` now consumes runtime `kimi_pplx_route_histogram` rows directly. On H20, replaying `tp1-dp8-pplx-route-hist-bs64-kv2-varied.json` with `iters=16` gives padded-row p50/p95/max `96/224/336`; W13 is `114.5/250.6/368.6us` per call and W2 is `66.4/138.5/200.3us` per call. The p95 row (`recv=67`, `padded=224`, active experts `28`) is memory-bound by the H20 roofline model at `38.9%`/`35.4%` HBM for W13/W2, but NCU says the kernel is not at the device limit: W13/W2 are `1` wave/SM, `76KB` dynamic shared memory, `18.8%` theoretical occupancy, `4-5%` L2 hit, and only `13-14%` tensor-pipe elapsed utilization. Synthetic `400` rows remain a stress case, not the serving-shape baseline.
 >
 > **Last touched:** 2026-06
 
@@ -44,6 +44,15 @@ Trace replay H20 bench (`target/kernel_reports/kimi-k2/pplx-marlin-replay-bs64-k
 
 The roofline label flips between memory and compute because the actual active-expert count changes the weight-byte term. This is exactly why PPLX Marlin must be optimized against a route histogram, not only against padded-row count.
 
+Trace replay p95 NCU (`profile/kimi-pplx-marlin-replay-p95-h20/`, full + source reports):
+
+| Kernel | Duration | Grid / block | Waves/SM | Dynamic shared memory | Theoretical / achieved occupancy | SM throughput | Tensor pipe | DRAM read BW | L2 hit | Main NCU rules |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| W13 p95 | `265.6us` | `234 x 128` | `1.00` | `76,458 B` | `18.75% / 17.50%` | `58.07%` | `14.08%` | `1.75 TB/s` | `4.45%` | latency issue; theoretical occupancy limited by shared memory, est. `41.1%`; non-fused FP32, est. `22.3%` |
+| W2 p95 | `144.3us` | `234 x 128` | `1.00` | `76,458 B` | `18.75% / 17.67%` | `55.94%` | `13.00%` | `1.60 TB/s` | `5.07%` | latency issue; theoretical occupancy limited by shared memory, est. `42.5%`; non-fused FP32, est. `21.3%`; shared-store bank conflicts, est. `5.5%` |
+
+Source-counter reports were collected, but the current release build does not include CUDA line info for this Marlin TU, so `action.source_info(pc)` has no file/line mapping. The aggregate source counters still matter: W13 reports `11,360` excessive shared wavefronts; W2 reports `61,552` excessive shared wavefronts and `1,523` excessive global sectors. The actionable NCU conclusion is therefore at kernel-structure level: the p95 replay shape is limited by low occupancy / one wave per SM / low L2 reuse, not by saturated HBM.
+
 ## Attempts
 
 | Attempt | Result | Decision |
@@ -54,9 +63,11 @@ The roofline label flips between memory and compute because the actual active-ex
 | Add runtime `kimi_pplx_route_histogram` trace | `kimi_kernel_report` / `kimi_model_report` runtime traces can be run with `--tp-world 1 --dp-world 8 --ep-backend pplx` and record real per-layer recv histograms without timing EP transport. | Kept as diagnostic infrastructure. No `opt(...)` commit: it does not change kernel latency. |
 | H20 varied-prompt route histogram | `batch_size=64`, `kv_len=2`, TP1/DP8/PPLX, artifact `tp1-dp8-pplx-route-hist-bs64-kv2-varied.json`. Near-target active8 rows: `recv_total_routes` p50/p95/max `63/161/282`, `padded_rows` p50/p95/max `80/216/336`, active local experts p50/p95/max `3/24/32`. Worst near-target layer padded sum was `1744` rows across ranks for `504` routes. | Kept as the source histogram for local-compute replay. It still includes admission waves, so replay filters active rows and non-empty local routes explicitly. |
 | Add trace-driven replay provider | `kernel_report` PPLX providers accept `pplx_recv_counts`; `kimi_pplx_marlin_replay` selects p0/p50/p90/p95/p99/p100 non-empty active rows from the H20 trace and replays routing/W13/SwiGLU/W2 locally. H20 p95 W13/W2 are `250.64us` / `138.51us`, much lower than synthetic `436.43us` / `236.80us`. | Kept as baseline infrastructure. No `opt(...)` commit: it improves measurement truth, not kernel latency. |
+| Add replay filters for NCU isolation | `kimi_pplx_marlin_replay --quantiles p95 --ops w13,w2` isolates one route histogram and one/two Marlin providers without relying on NCU launch-skip over unrelated samples. | Kept as profiling infrastructure. |
+| NCU p95 W13/W2 replay | Full/source NCU collected under `profile/kimi-pplx-marlin-replay-p95-h20/`. Both kernels are one-wave and shared-memory-limited; source line mapping is absent because the release TU has no line info. | Use as the current p95 diagnosis. No optimization adopted yet. |
 
 ## Final Conclusion
 
 The immediate gap for PPLX routed local compute was measurement coverage, not a code optimization. The master table should use the trace replay p95 row for PPLX W13/SwiGLU/W2/routing and keep the synthetic `400` padded-row result as a stress reference.
 
-Do not commit an `opt(...)` change from this report: no faster kernel was adopted. The next optimization step is to run NCU on trace replay p95/max W13/W2, then decide whether the single-wave Marlin layout is worth changing. If the replay-profile bottleneck is launch geometry or variable expert work rather than HBM bandwidth, tune scheduling/tiling; if it is already near the route-specific roofline, move focus to the next decode-path row.
+Do not commit an `opt(...)` change from this report: no faster kernel was adopted. The next optimization step is to test a targeted Marlin scheduling/tile variant only if it attacks the measured structure: lower shared-memory footprint, more CTAs/waves for small-M experts, or better route-aware grouping. If a variant cannot improve p95 W13/W2 over the replay baseline by more than noise, stop this kernel and move focus to the next decode-path row.

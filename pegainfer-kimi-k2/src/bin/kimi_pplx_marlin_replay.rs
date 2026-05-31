@@ -32,6 +32,10 @@ struct Cli {
     iters: u64,
     #[arg(long, default_value_t = DEFAULT_MIN_ACTIVE_ROWS)]
     min_active_rows: usize,
+    #[arg(long)]
+    quantiles: Option<String>,
+    #[arg(long)]
+    ops: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
     #[arg(long)]
@@ -64,6 +68,10 @@ struct ReplayConfig {
     iters: u64,
     min_active_rows: usize,
     quantiles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantile_filter: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op_filter: Option<Vec<String>>,
     peak_tflops: f64,
     peak_gbps: f64,
     ridge_flop_per_byte: f64,
@@ -121,7 +129,7 @@ enum ReplayBound {
     Unsupported,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplayOp {
     Routing,
     W13,
@@ -182,11 +190,25 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read trace {}", cli.trace.display()))?;
     let calls: Vec<KernelCall> = serde_json::from_slice(&trace_bytes)
         .with_context(|| format!("failed to parse trace {}", cli.trace.display()))?;
-    let samples = select_samples(parse_route_samples(&calls)?, cli.min_active_rows)?;
+    let quantile_filter = cli
+        .quantiles
+        .as_deref()
+        .map(parse_quantile_csv)
+        .transpose()?;
+    let op_filter = cli.ops.as_deref().map(parse_ops_csv).transpose()?;
+    let op_filter_labels = op_filter
+        .as_ref()
+        .map(|ops| ops.iter().map(|op| op.short_name().to_string()).collect());
+    let samples = select_samples(
+        parse_route_samples(&calls)?,
+        cli.min_active_rows,
+        quantile_filter.as_deref(),
+    )?;
+    let replay_ops = op_filter.unwrap_or_else(|| ReplayOp::ALL.to_vec());
     let mut reports = Vec::with_capacity(samples.len());
     for sample in samples {
         let mut measured = Vec::new();
-        for replay_op in ReplayOp::ALL {
+        for replay_op in replay_ops.iter().copied() {
             measured.push(measure_replay_op(
                 &sample,
                 replay_op,
@@ -207,6 +229,8 @@ fn main() -> Result<()> {
             iters: cli.iters,
             min_active_rows: cli.min_active_rows,
             quantiles: QUANTILES.iter().map(|q| format!("p{q}")).collect(),
+            quantile_filter,
+            op_filter: op_filter_labels,
             peak_tflops: cli.peak_tflops,
             peak_gbps: cli.peak_gbps,
             ridge_flop_per_byte,
@@ -223,6 +247,48 @@ fn main() -> Result<()> {
         OutputFormat::Text => print_text(&report, &out),
     }
     Ok(())
+}
+
+fn parse_quantile_csv(value: &str) -> Result<Vec<String>> {
+    let mut quantiles = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        ensure!(!part.is_empty(), "--quantiles entries must be non-empty");
+        let quantile = if let Some(rest) = part.strip_prefix('p') {
+            rest.parse::<usize>()
+                .with_context(|| format!("invalid quantile `{part}`"))?
+        } else {
+            part.parse::<usize>()
+                .with_context(|| format!("invalid quantile `{part}`"))?
+        };
+        ensure!(
+            QUANTILES.contains(&quantile),
+            "unsupported quantile `{part}`; supported values are p0,p50,p90,p95,p99,p100"
+        );
+        quantiles.push(format!("p{quantile}"));
+    }
+    ensure!(!quantiles.is_empty(), "--quantiles must not be empty");
+    Ok(quantiles)
+}
+
+fn parse_ops_csv(value: &str) -> Result<Vec<ReplayOp>> {
+    let mut ops = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        ensure!(!part.is_empty(), "--ops entries must be non-empty");
+        let op = match part {
+            "routing" | "kimi_pplx_build_marlin_routing_on_stream" => ReplayOp::Routing,
+            "w13" | "kimi_marlin_wna16_pplx_w13_gemm" => ReplayOp::W13,
+            "swiglu" | "kimi_marlin_w13_swiglu_pplx" => ReplayOp::SwiGlu,
+            "w2" | "kimi_marlin_wna16_pplx_w2_gemm" => ReplayOp::W2,
+            _ => bail!("unsupported op `{part}`; supported values are routing,w13,swiglu,w2"),
+        };
+        if !ops.contains(&op) {
+            ops.push(op);
+        }
+    }
+    ensure!(!ops.is_empty(), "--ops must not be empty");
+    Ok(ops)
 }
 
 fn parse_route_samples(calls: &[KernelCall]) -> Result<Vec<RouteSample>> {
@@ -290,7 +356,11 @@ fn route_sample_from_call(source_index: usize, call: &KernelCall) -> Result<Rout
     })
 }
 
-fn select_samples(samples: Vec<RouteSample>, min_active_rows: usize) -> Result<Vec<RouteSample>> {
+fn select_samples(
+    samples: Vec<RouteSample>,
+    min_active_rows: usize,
+    quantile_filter: Option<&[String]>,
+) -> Result<Vec<RouteSample>> {
     let mut samples = samples
         .into_iter()
         .filter(|sample| {
@@ -323,14 +393,24 @@ fn select_samples(samples: Vec<RouteSample>, min_active_rows: usize) -> Result<V
             .or_default()
             .push(format!("p{quantile}"));
     }
-    Ok(selected
+    let selected = selected
         .into_iter()
-        .map(|(index, quantiles)| {
+        .filter_map(|(index, mut quantiles)| {
+            if let Some(filter) = quantile_filter {
+                quantiles.retain(|quantile| filter.iter().any(|wanted| wanted == quantile));
+                if quantiles.is_empty() {
+                    return None;
+                }
+            }
             let mut sample = samples[index].clone();
             sample.quantiles = quantiles;
-            sample
+            Some(sample)
         })
-        .collect())
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        bail!("quantile filter matched no selected PPLX route histogram samples");
+    }
+    Ok(selected)
 }
 
 fn percentile_index(len: usize, quantile: usize) -> usize {

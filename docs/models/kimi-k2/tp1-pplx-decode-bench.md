@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements plus p95 NCU isolation; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 
@@ -204,6 +204,23 @@
   - p100 `recv=207,padded=336,active_experts=26`: W13 `368.57us`, W2 `200.31us`.
 - Decision: update the master table to use trace replay p95 for PPLX local compute rows. No `opt(...)` commit: this is measurement infrastructure and baseline correction, not a faster kernel.
 
+### Step 13: PPLX Marlin p95 NCU isolation
+- Added replay filters:
+  - `--quantiles p95,p100` selects the already-ranked histogram samples instead of remeasuring every quantile.
+  - `--ops w13,w2` selects local replay providers without relying on NCU launch-skip over unrelated ops.
+- H20 filtered replay smoke:
+  - `PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python /root/.cargo/bin/cargo run --release -p pegainfer-kimi-k2 --features kimi-k2,kernel-report --bin kimi_pplx_marlin_replay -- --trace target/kernel_reports/kimi-k2/tp1-dp8-pplx-route-hist-bs64-kv2-varied.json --iters 2 --quantiles p95 --ops w13,w2 --format text --out target/kernel_reports/kimi-k2/pplx-marlin-replay-filter-h20-smoke.json`
+  - Result: W13 `250.96us`, W2 `139.70us`, matching the unfiltered p95 replay.
+- NCU full/source reports:
+  - Run directory: `profile/kimi-pplx-marlin-replay-p95-h20/`.
+  - Reports: `w13_p95_full.ncu-rep`, `w13_p95_source.ncu-rep`, `w2_p95_full.ncu-rep`, `w2_p95_source.ncu-rep`.
+  - Parsed metrics: `analysis/p95_full_metrics.json`, `analysis/p95_source_metrics.json`.
+- NCU summary:
+  - W13 p95: `265.6us`, grid `234 x 128`, `1.0` waves/SM, `76,458 B` dynamic shared memory, theoretical/achieved occupancy `18.75%/17.50%`, SM throughput `58.07%`, tensor pipe `14.08%`, DRAM read `1.75 TB/s`, L2 hit `4.45%`.
+  - W2 p95: `144.3us`, grid `234 x 128`, `1.0` waves/SM, `76,458 B` dynamic shared memory, theoretical/achieved occupancy `18.75%/17.67%`, SM throughput `55.94%`, tensor pipe `13.00%`, DRAM read `1.60 TB/s`, L2 hit `5.07%`.
+  - Source-counter reports have no file/line mapping because the release Marlin TU was not built with CUDA line info. Aggregate counters still show W13 `11,360` excessive shared wavefronts and W2 `61,552` excessive shared wavefronts.
+- Decision: PPLX Marlin p95 is not at H20 bandwidth or tensor-core limits. Only pursue variants that improve one-wave/smem/route-grouping behavior; otherwise stop this kernel.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
@@ -213,7 +230,7 @@
 
 ## Debrief
 
-- **Outcome**: Dedicated TP1 DP8 PPLX decode bench binary is implemented and checked. It covers embedding, dense layer0 MLP, 61-layer attention aggregate, final norm/lm_head/top1, MoE router/shared expert, PPLX routed compute accounting, PPLX comm accounting across active batch sizes and context lengths, runtime PPLX route histograms, and trace-driven PPLX Marlin replay.
+- **Outcome**: Dedicated TP1 DP8 PPLX decode bench binary is implemented and checked. It covers embedding, dense layer0 MLP, 61-layer attention aggregate, final norm/lm_head/top1, MoE router/shared expert, PPLX routed compute accounting, PPLX comm accounting across active batch sizes and context lengths, runtime PPLX route histograms, trace-driven PPLX Marlin replay, and NCU-isolated p95 replay profiling.
 - **Pitfalls encountered**:
   - CLI value parsing needed explicit owned strings to avoid clap's Vec parser mismatch.
   - TP1 MLA must use runtime-dim `_rt` providers; old TP8 typed providers would make the bench look valid while measuring the wrong local-head shape.
