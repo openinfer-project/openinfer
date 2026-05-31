@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -843,7 +844,15 @@ async fn run_request_stream(
 ) {
     let mut first_token_events = None;
     let mut first_token_prefill_stats = None;
-    while let Some(event) = token_rx.recv().await {
+    let mut pending_event = None;
+    loop {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => match token_rx.recv().await {
+                Some(event) => event,
+                None => return,
+            },
+        };
         match event {
             TokenEvent::Scheduled {
                 queued_at_unix_s,
@@ -869,11 +878,17 @@ async fn run_request_stream(
                 });
             }
             TokenEvent::Token { id, logprob } => {
+                // Yield once so a token burst from the engine can accumulate
+                // before we drain the ready queue into one bridge output.
+                tokio::task::yield_now().await;
+                let (token_ids, batched_logprobs, next_event) =
+                    collect_ready_token_batch(id, logprob, &mut token_rx);
+                pending_event = next_event;
                 if send_token_output(
                     &output_tx,
                     &request_id,
-                    id,
-                    logprob,
+                    token_ids,
+                    batched_logprobs,
                     first_token_events.take(),
                     first_token_prefill_stats.take(),
                 )
@@ -933,8 +948,8 @@ async fn output_loop(
 fn send_token_output(
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     request_id: &str,
-    token_id: u32,
-    logprob: Option<TokenLogprob>,
+    token_ids: Vec<u32>,
+    logprobs: Option<MaybeWireLogprobs>,
     events: Option<Vec<EngineCoreEvent>>,
     prefill_stats: Option<PrefillStats>,
 ) -> Result<()> {
@@ -944,8 +959,8 @@ fn send_token_output(
             engine_index: ENGINE_INDEX,
             outputs: vec![engine_output(
                 request_id.to_string(),
-                vec![token_id],
-                to_wire_logprobs(token_id, logprob),
+                token_ids,
+                logprobs,
                 None,
                 None,
                 events,
@@ -1046,7 +1061,57 @@ fn engine_output(
     }
 }
 
+fn collect_ready_token_batch(
+    first_id: u32,
+    first_logprob: Option<TokenLogprob>,
+    token_rx: &mut mpsc::UnboundedReceiver<TokenEvent>,
+) -> (Vec<u32>, Option<MaybeWireLogprobs>, Option<TokenEvent>) {
+    let mut token_ids = Vec::with_capacity(4);
+    let mut positions = Vec::with_capacity(4);
+    let mut has_logprobs = false;
+
+    let mut push_token = |token_id: u32, logprob: Option<TokenLogprob>| {
+        token_ids.push(token_id);
+        if let Some(position) = to_wire_position_logprobs(token_id, logprob) {
+            has_logprobs = true;
+            positions.push(position);
+        }
+    };
+    push_token(first_id, first_logprob);
+
+    loop {
+        match token_rx.try_recv() {
+            Ok(TokenEvent::Token { id, logprob }) => push_token(id, logprob),
+            Ok(other) => {
+                return (
+                    token_ids,
+                    has_logprobs.then(|| MaybeWireLogprobs::Direct(Logprobs { positions })),
+                    Some(other),
+                );
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                return (
+                    token_ids,
+                    has_logprobs.then(|| MaybeWireLogprobs::Direct(Logprobs { positions })),
+                    None,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn to_wire_logprobs(token_id: u32, logprob: Option<TokenLogprob>) -> Option<MaybeWireLogprobs> {
+    let position = to_wire_position_logprobs(token_id, logprob)?;
+    Some(MaybeWireLogprobs::Direct(Logprobs {
+        positions: vec![position],
+    }))
+}
+
+fn to_wire_position_logprobs(
+    token_id: u32,
+    logprob: Option<TokenLogprob>,
+) -> Option<PositionLogprobs> {
     let lp = logprob?;
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
     // pegainfer-core does not currently expose the sampled token's vocab rank.
@@ -1068,9 +1133,7 @@ fn to_wire_logprobs(token_id: u32, logprob: Option<TokenLogprob>) -> Option<Mayb
             rank: (index + 1) as u32,
         });
     }
-    Some(MaybeWireLogprobs::Direct(Logprobs {
-        positions: vec![PositionLogprobs { entries }],
-    }))
+    Some(PositionLogprobs { entries })
 }
 
 fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
@@ -1361,6 +1424,126 @@ mod tests {
                 "request is too large for KV cache".to_string()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn consecutive_tokens_are_batched_into_one_output() {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        token_tx
+            .send(TokenEvent::Scheduled {
+                queued_at_unix_s: 1.0,
+                scheduled_at_unix_s: 2.0,
+                prompt_tokens: 16,
+            })
+            .expect("send scheduled");
+        token_tx
+            .send(TokenEvent::Token {
+                id: 11,
+                logprob: Some(TokenLogprob {
+                    logprob: -0.1,
+                    top_logprobs: vec![(11, -0.1), (12, -0.5)],
+                }),
+            })
+            .expect("send token 1");
+        token_tx
+            .send(TokenEvent::Token {
+                id: 21,
+                logprob: Some(TokenLogprob {
+                    logprob: -0.2,
+                    top_logprobs: vec![(21, -0.2), (22, -0.6)],
+                }),
+            })
+            .expect("send token 2");
+        token_tx
+            .send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 16,
+                completion_tokens: 2,
+            })
+            .expect("send finished");
+        drop(token_tx);
+
+        run_request_stream("req-1".to_string(), token_rx, output_tx).await;
+
+        let token_outputs = output_rx.recv().await.expect("token output");
+        assert_eq!(token_outputs.outputs.len(), 1);
+        assert_eq!(token_outputs.outputs[0].request_id, "req-1");
+        assert_eq!(token_outputs.outputs[0].new_token_ids, vec![11, 21]);
+        assert!(token_outputs.outputs[0].finish_reason.is_none());
+        assert!(token_outputs.outputs[0].events.is_some());
+        assert!(token_outputs.outputs[0].prefill_stats.is_some());
+
+        let direct = match token_outputs.outputs[0]
+            .new_logprobs
+            .as_ref()
+            .expect("batched logprobs")
+        {
+            MaybeWireLogprobs::Direct(direct) => direct,
+            MaybeWireLogprobs::Wire(_) => panic!("expected direct batched logprobs"),
+        };
+        assert_eq!(direct.positions.len(), 2);
+        assert_eq!(direct.positions[0].entries[0].token_id, 11);
+        assert_eq!(direct.positions[1].entries[0].token_id, 21);
+
+        let terminal = output_rx.recv().await.expect("terminal output");
+        assert_eq!(
+            terminal.outputs[0].finish_reason,
+            Some(EngineCoreFinishReason::Length)
+        );
+        assert!(
+            terminal
+                .finished_requests
+                .as_ref()
+                .is_some_and(|requests| requests.contains("req-1"))
+        );
+        assert!(output_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn first_token_metadata_is_only_sent_with_first_batch() {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        token_tx
+            .send(TokenEvent::Scheduled {
+                queued_at_unix_s: 1.0,
+                scheduled_at_unix_s: 2.0,
+                prompt_tokens: 8,
+            })
+            .expect("send scheduled");
+        token_tx
+            .send(TokenEvent::Token {
+                id: 1,
+                logprob: None,
+            })
+            .expect("send first token");
+        token_tx
+            .send(TokenEvent::PromptTokens {
+                ids: vec![9],
+                logprobs: vec![None],
+            })
+            .expect("send prompt token metadata");
+        token_tx
+            .send(TokenEvent::Token {
+                id: 2,
+                logprob: None,
+            })
+            .expect("send second token");
+        drop(token_tx);
+
+        run_request_stream("req-2".to_string(), token_rx, output_tx).await;
+
+        let first_batch = output_rx.recv().await.expect("first batch");
+        let second_batch = output_rx.recv().await.expect("second batch");
+        assert_eq!(first_batch.outputs[0].new_token_ids, vec![1]);
+        assert_eq!(second_batch.outputs[0].new_token_ids, vec![2]);
+        assert!(first_batch.outputs[0].events.is_some());
+        assert!(first_batch.outputs[0].prefill_stats.is_some());
+        assert!(second_batch.outputs[0].events.is_none());
+        assert!(second_batch.outputs[0].prefill_stats.is_none());
+        assert!(output_rx.recv().await.is_none());
     }
 
     fn assert_logprob_eq(actual: f32, expected: f32) {
