@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Optimization Master
 
-> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. The first accepted optimization is `shared_gate_up` cuBLASLt: `1.818ms -> 1.505ms` per 60 MoE layers. EP communication rows are included for path coverage but excluded from optimization.
+> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. The first accepted optimization is `shared_gate_up` cuBLASLt: `1.818ms -> 1.505ms` per 60 MoE layers. Phase 2 fusion scan is tracked in `tp1-dp8-ep8-fusion-scan.md`; EP communication rows are included for path coverage but excluded from optimization.
 >
 > **Last touched:** 2026-05
 
@@ -152,7 +152,7 @@ Start Phase 2 from the rows above:
 |---|---|---|---|
 | Attention RMSNorm -> qkv_a GEMM prologue | rows 6-7 | Norm is launch/memory heavy and immediately feeds a skinny GEMM. | NCU on both kernels plus cuBLASLt/prologue feasibility check. |
 | qkv_a split/norm cleanup | row 8 with row 9 input | Split qkv_a and normalize q_lora/ckv before q_b/MLA cache. | Confirm memory traffic and launch overhead dominate. |
-| MoE shared gate_up + SwiGLU | rows 21-22 | Gate/up output is consumed only by SwiGLU; avoids writing/reading 4096 BF16 per row per layer. | Compare cuBLASLt epilogue feasibility vs custom kernel; must beat cuBLASLt baseline. |
+| MoE shared gate_up + SwiGLU | rows 21-22 | Gate/up output is consumed only by SwiGLU; avoids writing/reading 4096 BF16 per row per layer. | Initial NCU done in `tp1-dp8-ep8-fusion-scan.md`: row 22 is tiny-grid/latency-bound; accepted fusion requires gated-dual-GEMM beating cuBLASLt in the full TP1 PPLX bench. |
 | Shared SwiGLU + down prologue | rows 22-23 | Activation output is consumed only by down GEMM. | cuBLASLt epilogue/prologue support or CUTLASS prototype; correctness gate on BF16 rounding. |
 | Dequant into routed Marlin GEMM | rows 25 and 27 | INT4/WNA16 path should not materialize dequant separately. | Provider/all-rank harness first; then NCU. |
 
