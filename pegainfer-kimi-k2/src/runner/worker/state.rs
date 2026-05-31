@@ -374,7 +374,7 @@ impl KimiRankThreadState {
                         })?;
                     }
                     KimiLayerForwardKindCache::Moe(moe) => {
-                        forward_moe_layer_prefill_scratch_into(
+                        crate::runner::moe_nccl::forward_moe_layer_prefill_scratch_into(
                             &device_ctx,
                             tp_comm_ref,
                             layer.layer_idx,
@@ -764,7 +764,7 @@ impl KimiRankThreadState {
         normed: &mut GpuTensor<KIMI_K2_HIDDEN>,
         next_hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
     ) -> Result<()> {
-        forward_moe_layer_batch_into(
+        crate::runner::moe_nccl::forward_moe_layer_batch_into(
             ctx,
             comm,
             layer_idx,

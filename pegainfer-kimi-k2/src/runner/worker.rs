@@ -19,20 +19,14 @@ use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::ops::call_trace;
 use pegainfer_kernels::{
     ops::{
-        KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
+        KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
         KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
-        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
-        KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
-        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
-        kimi_flashinfer_single_prefill_mla_rt, kimi_marlin_sum_topk_rows_f32,
-        kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
+        KIMI_K2_MLA_V_HEAD_DIM, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
+        KimiMlaPagedKvLayout, flashinfer_topk_row_states_bytes,
+        kimi_flashinfer_batch_decode_mla_rt, kimi_flashinfer_single_prefill_mla_rt,
         kimi_mla_absorb_q_nope_rt, kimi_mla_extract_prefill_v_rt, kimi_mla_paged_kv_append,
         kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt,
         kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up_rt,
-        kimi_moe_marlin_align_block_size, kimi_residual_add_scaled_f32,
-        kimi_router_noaux_tc_launch, kimi_router_noaux_tc_per_token_launch,
-        repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
     },
     tensor::{
         DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, NormWeight,
@@ -42,10 +36,10 @@ use pegainfer_kernels::{
 
 use crate::{
     config::{
-        KIMI_K2_DENSE_LAYERS, KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_LAYERS,
-        KIMI_K2_MOE_LAYERS, KIMI_K2_Q_LORA_RANK, KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS,
-        KIMI_K2_ROPE_THETA, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST,
-        KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR, KIMI_K2_YARN_ORIGINAL_MAX_POS,
+        KIMI_K2_DENSE_LAYERS, KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS,
+        KIMI_K2_Q_LORA_RANK, KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROPE_THETA,
+        KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR,
+        KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
     runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
     weights::{
@@ -647,7 +641,12 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
 mod cache;
 mod load;
 mod runtime;
-pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
+// Collective + Marlin helpers shared with the sibling `moe_nccl` backend.
+pub(super) use runtime::{
+    all_reduce_bf16_rows_in_place, all_reduce_f32_in_place, all_reduce_f32_rows_in_place,
+    kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
+    reduce_scatter_f32_hidden_into,
+};
 mod state;
 struct PplxDecodeContext<'a> {
     ep: &'a mut pegainfer_comm::EpBackend,

@@ -25,10 +25,41 @@ pub(in crate::runner) fn maybe_all_reduce_hidden_via_f32_in_place<const DIM: usi
     }
 }
 
-pub(super) fn all_reduce_f32_in_place(values: &mut CudaSlice<f32>, comm: &Comm) -> Result<()> {
+// The `pub(in crate::runner)` collective + Marlin helpers below are re-exported
+// by `worker.rs` for the sibling `moe_nccl` backend, which is why their
+// visibility is widened past the usual `pub(super)`.
+pub(in crate::runner) fn all_reduce_f32_in_place(
+    values: &mut CudaSlice<f32>,
+    comm: &Comm,
+) -> Result<()> {
     comm.all_reduce_in_place(values, &ReduceOp::Sum)
         .map(|_| ())
         .map_err(|err| anyhow::anyhow!("Kimi TP/EP f32 sum failed: status={:?}", err.0))
+}
+
+pub(in crate::runner) fn all_reduce_bf16_rows_in_place(
+    values: &mut CudaSlice<half::bf16>,
+    rows: usize,
+    row_len: usize,
+    comm: &Comm,
+) -> Result<()> {
+    ensure!(
+        values.len() >= rows * row_len,
+        "Kimi row-wise bf16 all-reduce len {} < rows {} * row_len {}",
+        values.len(),
+        rows,
+        row_len
+    );
+    for row in 0..rows {
+        let start = row * row_len;
+        let end = start + row_len;
+        let mut view = values.slice_mut(start..end);
+        comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
+            .map_err(|err| {
+                anyhow::anyhow!("Kimi row-wise bf16 all-reduce failed: status={:?}", err.0)
+            })?;
+    }
+    Ok(())
 }
 
 fn all_reduce_f32_bulk_in_place(
@@ -50,7 +81,7 @@ fn all_reduce_f32_bulk_in_place(
         .map_err(|err| anyhow::anyhow!("Kimi bulk f32 all-reduce failed: status={:?}", err.0))
 }
 
-pub(super) fn all_reduce_f32_rows_in_place(
+pub(in crate::runner) fn all_reduce_f32_rows_in_place(
     values: &mut CudaSlice<f32>,
     rows: usize,
     row_len: usize,
@@ -75,7 +106,7 @@ pub(super) fn all_reduce_f32_rows_in_place(
     Ok(())
 }
 
-pub(super) fn reduce_scatter_f32_hidden_into(
+pub(in crate::runner) fn reduce_scatter_f32_hidden_into(
     global: &CudaSlice<f32>,
     global_rows: usize,
     row_len: usize,
@@ -114,7 +145,7 @@ pub(super) fn kimi_mla_softmax_scale() -> f32 {
     base * mscale * mscale
 }
 
-pub(super) fn kimi_marlin_block_size(active_tokens: usize) -> usize {
+pub(in crate::runner) fn kimi_marlin_block_size(active_tokens: usize) -> usize {
     for block_size in [8usize, 16, 32, 48, KIMI_MARLIN_MAX_BLOCK_SIZE] {
         let routes_per_expert_block = active_tokens as f32 * KIMI_K2_TOPK as f32
             / KIMI_K2_LOCAL_EXPERTS as f32

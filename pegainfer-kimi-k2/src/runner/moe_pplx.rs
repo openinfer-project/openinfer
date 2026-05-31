@@ -1,6 +1,6 @@
 //! pplx-garden NVLink + RDMA MoE all-to-all decode path.
 //!
-//! Drop-in replacement for the NCCL AG/RS `forward_moe_layer_decode_into`:
+//! Drop-in replacement for the NCCL AG/RS backend in [`super::moe_nccl`]:
 //! same shared-expert + routed-expert flow, but cross-rank token movement
 //! uses the four-step pipeline (`dispatch_send → dispatch_recv →
 //! combine_send → combine_recv`) wrapped by [`pegainfer_comm::EpBackend`].
