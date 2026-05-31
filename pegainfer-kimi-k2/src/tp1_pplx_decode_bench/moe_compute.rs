@@ -16,7 +16,9 @@ const CALLS_PER_DECODE_STEP: usize = 60;
 const _: [(); CALLS_PER_DECODE_STEP] = [(); KIMI_K2_MOE_LAYERS];
 
 pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Vec<BenchSpec> {
-    let routed_rows = pplx_recv_capacity_rows(arena_rows);
+    let recv_capacity_rows = pplx_recv_capacity_rows(arena_rows);
+    let expected_active_experts = pplx_expected_active_experts(active_rows);
+    let expected_padded_rows = pplx_expected_padded_rows(active_rows);
 
     vec![
         spec(
@@ -85,11 +87,14 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
             active_rows,
             arena_rows,
             ctx_len,
-            routed_rows,
+            recv_capacity_rows,
             None,
             0,
-            pplx_routing_bytes(routed_rows),
-            "PPLX routing uses recv capacity; device-side num_tokens_post_padded may be lower for the actual routed count",
+            pplx_routing_bytes(recv_capacity_rows),
+            format!(
+                "PPLX routing uses recv capacity; synthetic expected local routes={} and expected padded rows={expected_padded_rows}",
+                pplx_expected_local_route_rows(active_rows)
+            ),
         ),
         spec(
             "kimi_marlin_wna16_pplx_w13_gemm",
@@ -99,11 +104,18 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
             active_rows,
             arena_rows,
             ctx_len,
-            routed_rows,
-            Some((routed_rows, MARLIN_W13_OUT, KIMI_K2_HIDDEN)),
-            gemm_flops(routed_rows, MARLIN_W13_OUT, KIMI_K2_HIDDEN),
-            marlin_gemm_bytes(routed_rows, MARLIN_W13_OUT, KIMI_K2_HIDDEN),
-            "PPLX routed W13 consumes expert-major recv rows; actual device-side rows may be lower than capacity",
+            expected_padded_rows,
+            Some((expected_padded_rows, MARLIN_W13_OUT, KIMI_K2_HIDDEN)),
+            gemm_flops(expected_padded_rows, MARLIN_W13_OUT, KIMI_K2_HIDDEN),
+            marlin_gemm_bytes(
+                expected_padded_rows,
+                MARLIN_W13_OUT,
+                KIMI_K2_HIDDEN,
+                expected_active_experts,
+            ),
+            format!(
+                "PPLX routed W13 uses recv_capacity={recv_capacity_rows}; work rows are synthetic expected padded rows"
+            ),
         ),
         spec(
             "kimi_marlin_w13_swiglu_pplx",
@@ -113,11 +125,13 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
             active_rows,
             arena_rows,
             ctx_len,
-            routed_rows,
+            expected_padded_rows,
             None,
             0,
-            swiglu_bytes(routed_rows),
-            "PPLX SwiGLU reads num_tokens_post_padded on device and skips sentinel rows within the host capacity",
+            swiglu_bytes(expected_padded_rows),
+            format!(
+                "PPLX SwiGLU reads num_tokens_post_padded on device; recv_capacity={recv_capacity_rows}"
+            ),
         ),
         spec(
             "kimi_marlin_wna16_pplx_w2_gemm",
@@ -127,11 +141,26 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
             active_rows,
             arena_rows,
             ctx_len,
-            routed_rows,
-            Some((routed_rows, KIMI_K2_HIDDEN, KIMI_K2_EXPERT_INTERMEDIATE)),
-            gemm_flops(routed_rows, KIMI_K2_HIDDEN, KIMI_K2_EXPERT_INTERMEDIATE),
-            marlin_gemm_bytes(routed_rows, KIMI_K2_HIDDEN, KIMI_K2_EXPERT_INTERMEDIATE),
-            "PPLX routed W2 applies received topk weights locally; capacity rows may exceed the device-side actual routed count; dispatch/combine communication is owned by the comm manifest",
+            expected_padded_rows,
+            Some((
+                expected_padded_rows,
+                KIMI_K2_HIDDEN,
+                KIMI_K2_EXPERT_INTERMEDIATE,
+            )),
+            gemm_flops(
+                expected_padded_rows,
+                KIMI_K2_HIDDEN,
+                KIMI_K2_EXPERT_INTERMEDIATE,
+            ),
+            marlin_gemm_bytes(
+                expected_padded_rows,
+                KIMI_K2_HIDDEN,
+                KIMI_K2_EXPERT_INTERMEDIATE,
+                expected_active_experts,
+            ),
+            format!(
+                "PPLX routed W2 applies received topk weights locally; recv_capacity={recv_capacity_rows}; dispatch/combine communication is owned by the comm manifest"
+            ),
         ),
         spec(
             "kimi_residual_add_scaled_f32",
@@ -181,6 +210,10 @@ fn spec(
         | "gemm_dm_typed_to_hs_graphsafe"
         | "silu_mul_hs_fused_into"
         | "gemm_dm_hs_to_typed_graphsafe"
+        | "kimi_pplx_build_marlin_routing_on_stream"
+        | "kimi_marlin_wna16_pplx_w13_gemm"
+        | "kimi_marlin_w13_swiglu_pplx"
+        | "kimi_marlin_wna16_pplx_w2_gemm"
         | "kimi_residual_add_scaled_f32" => spec.measured(),
         _ => spec.estimate_only(),
     };
@@ -212,6 +245,24 @@ fn pplx_recv_capacity_rows(arena_rows: usize) -> usize {
     max_routes + active_experts * (PPLX_EXPERT_PADDING - 1)
 }
 
+fn pplx_expected_local_route_rows(active_rows: usize) -> usize {
+    active_rows * KIMI_K2_TOPK
+}
+
+fn pplx_expected_active_experts(active_rows: usize) -> usize {
+    pplx_expected_local_route_rows(active_rows).min(KIMI_K2_LOCAL_EXPERTS)
+}
+
+fn pplx_expected_padded_rows(active_rows: usize) -> usize {
+    let route_rows = pplx_expected_local_route_rows(active_rows);
+    let active_experts = pplx_expected_active_experts(active_rows);
+    if active_experts == 0 {
+        return 0;
+    }
+    let full_padding_bumps = (route_rows - active_experts).div_ceil(PPLX_EXPERT_PADDING);
+    active_experts * PPLX_EXPERT_PADDING + full_padding_bumps * PPLX_EXPERT_PADDING
+}
+
 fn gemm_flops(m: usize, n: usize, k: usize) -> u128 {
     2 * m as u128 * n as u128 * k as u128 * CALLS_PER_DECODE_STEP as u128
 }
@@ -222,16 +273,16 @@ fn bf16_gemm_bytes(m: usize, n: usize, k: usize) -> u128 {
         * (m as u128 * k as u128 + n as u128 * k as u128 + m as u128 * n as u128)
 }
 
-fn marlin_gemm_bytes(m: usize, n: usize, k: usize) -> u128 {
+fn marlin_gemm_bytes(m: usize, n: usize, k: usize, active_experts: usize) -> u128 {
     CALLS_PER_DECODE_STEP as u128
         * (m as u128 * k as u128 * BF16_BYTES as u128
-            + int4_weight_bytes(n, k)
+            + int4_weight_bytes(n, k, active_experts)
             + m as u128 * n as u128 * BF16_BYTES as u128)
 }
 
-fn int4_weight_bytes(out_dim: usize, in_dim: usize) -> u128 {
-    let packed = KIMI_K2_LOCAL_EXPERTS as u128 * out_dim as u128 * in_dim.div_ceil(2) as u128;
-    let scales = KIMI_K2_LOCAL_EXPERTS as u128
+fn int4_weight_bytes(out_dim: usize, in_dim: usize, active_experts: usize) -> u128 {
+    let packed = active_experts as u128 * out_dim as u128 * in_dim.div_ceil(2) as u128;
+    let scales = active_experts as u128
         * out_dim as u128
         * (in_dim / KIMI_K2_INT4_GROUP_SIZE) as u128
         * BF16_BYTES as u128;

@@ -605,6 +605,87 @@ fn kernel_call(spec: &BenchSpec) -> Option<KernelCall> {
                     ),
             )
         }
+        "kimi_pplx_build_marlin_routing_on_stream" => {
+            let rows = spec.elem_count?;
+            Some(
+                KernelCall::new("kimi_pplx_build_marlin_routing_on_stream", spec.label)
+                    .input(
+                        "recv_tokens_per_expert",
+                        TensorSpec::new::<I32, Contiguous1D>([AxisSpec::named(
+                            "local_experts",
+                            crate_local_experts(),
+                        )]),
+                    )
+                    .output(
+                        "sorted_token_ids",
+                        TensorSpec::new::<I32, Contiguous1D>([AxisSpec::named(
+                            "recv_capacity",
+                            rows,
+                        )]),
+                    )
+                    .output(
+                        "expert_ids",
+                        TensorSpec::new::<I32, Contiguous1D>([AxisSpec::named(
+                            "m_blocks",
+                            rows.div_ceil(pplx_expert_padding()),
+                        )]),
+                    )
+                    .attr("pplx_route_elems", pplx_route_elems(spec).to_string())
+                    .attr("pplx_recv_capacity", rows.to_string())
+                    .attr("expert_padding", pplx_expert_padding().to_string()),
+            )
+        }
+        "kimi_marlin_wna16_pplx_w13_gemm" => {
+            let capacity = pplx_recv_capacity(spec);
+            Some(
+                KernelCall::new("kimi_marlin_wna16_pplx_w13_gemm", spec.label)
+                    .input("x", hidden(crate_hidden(), capacity))
+                    .input(
+                        "weight",
+                        TensorSpec::new::<U32, Contiguous1D>([AxisSpec::named(
+                            "packed_u32",
+                            crate_local_experts()
+                                * (crate_hidden() / 16)
+                                * (crate_expert_intermediate() * 4),
+                        )]),
+                    )
+                    .output("out", hidden(2 * crate_expert_intermediate(), capacity))
+                    .attr("pplx_route_elems", pplx_route_elems(spec).to_string())
+                    .attr("pplx_recv_capacity", capacity.to_string())
+                    .attr("expert_padding", pplx_expert_padding().to_string()),
+            )
+        }
+        "kimi_marlin_w13_swiglu_pplx" => {
+            let capacity = pplx_recv_capacity(spec);
+            Some(
+                KernelCall::new("kimi_marlin_w13_swiglu_pplx", spec.label)
+                    .input("x", hidden(2 * crate_expert_intermediate(), capacity))
+                    .output("out", hidden(crate_expert_intermediate(), capacity))
+                    .attr("pplx_route_elems", pplx_route_elems(spec).to_string())
+                    .attr("pplx_recv_capacity", capacity.to_string())
+                    .attr("expert_padding", pplx_expert_padding().to_string()),
+            )
+        }
+        "kimi_marlin_wna16_pplx_w2_gemm" => {
+            let capacity = pplx_recv_capacity(spec);
+            Some(
+                KernelCall::new("kimi_marlin_wna16_pplx_w2_gemm", spec.label)
+                    .input("x", hidden(crate_expert_intermediate(), capacity))
+                    .input(
+                        "weight",
+                        TensorSpec::new::<U32, Contiguous1D>([AxisSpec::named(
+                            "packed_u32",
+                            crate_local_experts()
+                                * (crate_expert_intermediate() / 16)
+                                * (crate_hidden() * 2),
+                        )]),
+                    )
+                    .output("out", hidden(crate_hidden(), capacity))
+                    .attr("pplx_route_elems", pplx_route_elems(spec).to_string())
+                    .attr("pplx_recv_capacity", capacity.to_string())
+                    .attr("expert_padding", pplx_expert_padding().to_string()),
+            )
+        }
         "kimi_residual_add_scaled_f32" => {
             let batch = spec.active_rows;
             Some(
@@ -680,6 +761,28 @@ fn crate_routed_experts() -> usize {
 }
 
 fn crate_topk() -> usize {
+    8
+}
+
+fn crate_local_experts() -> usize {
+    48
+}
+
+fn pplx_expert_padding() -> usize {
+    8
+}
+
+fn pplx_route_elems(spec: &BenchSpec) -> usize {
+    spec.active_rows * crate_topk()
+}
+
+fn pplx_recv_capacity(spec: &BenchSpec) -> usize {
+    let max_routes = spec.arena_rows * crate_ep_world() * crate_topk();
+    let active_experts = max_routes.min(crate_local_experts());
+    max_routes + active_experts * (pplx_expert_padding() - 1)
+}
+
+fn crate_ep_world() -> usize {
     8
 }
 

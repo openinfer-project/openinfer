@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, and router post-GEMM score/topk fusion; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, and synthetic expected-local-route PPLX Marlin compute providers; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 
@@ -150,6 +150,21 @@
   - Main duration: `10.78us`; grid `56` blocks; block `384` threads; `0.93` waves/SM.
   - Memory throughput: `2.73 TB/s`; DRAM throughput `55.94%`; SM throughput `15.74%`; achieved occupancy `14.25%`; L2 hit rate `2.37%`; no eligible `82.37%`.
 - Recorded the conclusion in `shared_down_report.md`: the row is memory-bound and small-grid limited, but exact-shape cuBLASLt replacement was already measured as a no-op (`11.000us -> 10.995us`), so the standalone provider swap is rejected.
+
+### Step 9: PPLX Marlin local compute providers
+- Added measured providers for the non-communication PPLX local compute rows:
+  - `decode.moe.pplx_build_marlin_routing`
+  - `decode.moe.pplx_marlin_w13`
+  - `decode.moe.pplx_swiglu`
+  - `decode.moe.pplx_marlin_w2`
+- The provider models the target `bs=8/rank, global~=64` load as `64` expected local routes per EP rank, `400` expected padded work rows, and `recv_capacity=848`; it does not time EP dispatch/combine and does not claim all-rank route imbalance.
+- H20 filtered bench:
+  - routing: `9.489us/call`, `569.3us` per 60 MoE layers.
+  - W13: `436.432us/call`, `26.186ms` per 60 MoE layers.
+  - PPLX SwiGLU: `14.135us/call`, `848.1us` per 60 MoE layers.
+  - W2: `236.797us/call`, `14.208ms` per 60 MoE layers.
+- NCU artifacts are under `profile/kimi-pplx-marlin-compute-h20-baseline/`; W13/W2 Marlin kernels run with `234` CTAs, `1` wave/SM, `56.8-58.7%` SM throughput, and `32.6-34.7%` DRAM throughput.
+- Verified the PPLX Marlin provider across `active_rows=1,2,4,8` with `iters=4`; W13/W2 roofline percentages now stay below `39%` after using expected padded work rows and active-expert weight bytes instead of full recv-capacity bytes.
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.

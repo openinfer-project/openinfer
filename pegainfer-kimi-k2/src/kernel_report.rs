@@ -24,11 +24,13 @@ use pegainfer_kernels::{
         fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla,
         kimi_flashinfer_batch_decode_mla_rt, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
-        kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope,
-        kimi_mla_absorb_q_nope_rt, kimi_mla_rope_split_decode, kimi_mla_rope_split_decode_rt,
-        kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up, kimi_mla_v_up_rt,
-        kimi_moe_marlin_align_block_size, kimi_o_proj_cublaslt_into,
-        kimi_o_proj_cublaslt_supports_batch_size, kimi_residual_add_scaled_f32,
+        kimi_marlin_w13_swiglu_pplx, kimi_marlin_wna16_pplx_w2_gemm,
+        kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
+        kimi_mla_absorb_q_nope, kimi_mla_absorb_q_nope_rt, kimi_mla_rope_split_decode,
+        kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm,
+        kimi_mla_v_up, kimi_mla_v_up_rt, kimi_moe_marlin_align_block_size,
+        kimi_o_proj_cublaslt_into, kimi_o_proj_cublaslt_supports_batch_size,
+        kimi_pplx_build_marlin_routing_on_stream, kimi_residual_add_scaled_f32,
         kimi_router_noaux_tc_launch, kimi_shared_gate_up_cublaslt_into,
         kimi_shared_gate_up_cublaslt_supports_batch_size, repeat_f32_for_reduce_scatter_into,
         rms_norm_batch_into, scale_f32_in_place, silu_mul_batch_into,
@@ -67,6 +69,12 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "kimi_moe_marlin_align_block_size" => Some(measure_marlin_align(call, iters)?),
         "kimi_marlin_sum_topk_rows_f32" => Some(measure_sum_topk(call, iters)?),
         "kimi_marlin_w13_swiglu" => Some(measure_marlin_swiglu(call, iters)?),
+        "kimi_pplx_build_marlin_routing_on_stream" => {
+            Some(measure_pplx_marlin_routing(call, iters)?)
+        }
+        "kimi_marlin_wna16_pplx_w13_gemm" => Some(measure_pplx_marlin_w13(call, iters)?),
+        "kimi_marlin_w13_swiglu_pplx" => Some(measure_pplx_marlin_swiglu(call, iters)?),
+        "kimi_marlin_wna16_pplx_w2_gemm" => Some(measure_pplx_marlin_w2(call, iters)?),
         "kimi_flashinfer_batch_decode_mla" => Some(measure_mla_decode(call, iters)?),
         "kimi_flashinfer_batch_decode_mla_rt" => Some(measure_mla_decode_rt(call, iters)?),
         "repeat_f32_for_reduce_scatter" => Some(measure_repeat_f32_for_rs(call, iters)?),
@@ -785,6 +793,221 @@ fn measure_marlin_swiglu(call: &KernelCall, iters: u64) -> Result<LatencyStats> 
     let w13 = GpuTensor::<{ 2 * crate::config::KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(&ctx, batch)?;
     let mut out = GpuTensor::<{ crate::config::KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(&ctx, batch)?;
     measure_loop(&ctx, iters, || kimi_marlin_w13_swiglu(&ctx, &w13, &mut out))
+}
+
+fn measure_pplx_marlin_routing(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let cfg = pplx_marlin_cfg(call)?;
+    let ctx = DeviceContext::new()?;
+    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
+        cfg.route_elems,
+        cfg.expert_padding,
+    )?)?;
+    let mut route_workspace =
+        KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
+    measure_loop(&ctx, iters, || {
+        kimi_pplx_build_marlin_routing_on_stream(
+            &ctx,
+            &mut route_workspace,
+            &recv_counts,
+            cfg.expert_padding,
+            cfg.recv_capacity,
+        )
+        .map(|_| ())
+    })
+}
+
+fn measure_pplx_marlin_w13(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let cfg = pplx_marlin_cfg(call)?;
+    let ctx = DeviceContext::new()?;
+    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
+        cfg.route_elems,
+        cfg.expert_padding,
+    )?)?;
+    let mut route_workspace =
+        KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
+    let route_workspace_m_blocks = route_workspace.max_m_blocks;
+    let routing = kimi_pplx_build_marlin_routing_on_stream(
+        &ctx,
+        &mut route_workspace,
+        &recv_counts,
+        cfg.expert_padding,
+        cfg.recv_capacity,
+    )?;
+    let mut workspace =
+        KimiMarlinWna16Workspace::new(&ctx, route_workspace_m_blocks, KIMI_K2_HIDDEN, 8)?;
+    let input = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, cfg.recv_capacity)?;
+    let mut output =
+        GpuTensor::<{ 2 * KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(&ctx, cfg.recv_capacity)?;
+    let packed_len = KIMI_K2_LOCAL_EXPERTS
+        * (KIMI_K2_HIDDEN / 16)
+        * (KIMI_K2_EXPERT_INTERMEDIATE * 4)
+        * std::mem::size_of::<u32>();
+    let scale_len = KIMI_K2_LOCAL_EXPERTS
+        * (KIMI_K2_HIDDEN / KIMI_K2_INT4_GROUP_SIZE)
+        * (2 * KIMI_K2_EXPERT_INTERMEDIATE);
+    let packed = ctx.stream.alloc_zeros::<u8>(packed_len)?;
+    let scale = ctx.stream.alloc_zeros::<bf16>(scale_len)?;
+    let topk_weight = ctx.stream.clone_htod(&vec![1.0f32; cfg.recv_capacity])?;
+    let weight = KimiMarlinFusedW13Int4Weight {
+        local_experts: KIMI_K2_LOCAL_EXPERTS,
+        in_dim: KIMI_K2_HIDDEN,
+        intermediate_dim: KIMI_K2_EXPERT_INTERMEDIATE,
+        group_size: KIMI_K2_INT4_GROUP_SIZE,
+        weight_packed_uint4b8: &packed,
+        weight_scale_permuted: &scale,
+    };
+    measure_loop(&ctx, iters, || {
+        kimi_marlin_wna16_pplx_w13_gemm(
+            &ctx,
+            &mut workspace,
+            &routing,
+            &input,
+            &weight,
+            &topk_weight,
+            &mut output,
+        )
+    })
+}
+
+fn measure_pplx_marlin_swiglu(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let cfg = pplx_marlin_cfg(call)?;
+    let ctx = DeviceContext::new()?;
+    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
+        cfg.route_elems,
+        cfg.expert_padding,
+    )?)?;
+    let mut route_workspace =
+        KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
+    let routing = kimi_pplx_build_marlin_routing_on_stream(
+        &ctx,
+        &mut route_workspace,
+        &recv_counts,
+        cfg.expert_padding,
+        cfg.recv_capacity,
+    )?;
+    let w13 = GpuTensor::<{ 2 * KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(&ctx, cfg.recv_capacity)?;
+    let mut out = GpuTensor::<KIMI_K2_EXPERT_INTERMEDIATE>::zeros(&ctx, cfg.recv_capacity)?;
+    measure_loop(&ctx, iters, || {
+        kimi_marlin_w13_swiglu_pplx(&ctx, &w13, routing.num_tokens_post_padded, &mut out)
+    })
+}
+
+fn measure_pplx_marlin_w2(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let cfg = pplx_marlin_cfg(call)?;
+    let ctx = DeviceContext::new()?;
+    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
+        cfg.route_elems,
+        cfg.expert_padding,
+    )?)?;
+    let mut route_workspace =
+        KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
+    let route_workspace_m_blocks = route_workspace.max_m_blocks;
+    let routing = kimi_pplx_build_marlin_routing_on_stream(
+        &ctx,
+        &mut route_workspace,
+        &recv_counts,
+        cfg.expert_padding,
+        cfg.recv_capacity,
+    )?;
+    let mut workspace =
+        KimiMarlinWna16Workspace::new(&ctx, route_workspace_m_blocks, KIMI_K2_HIDDEN, 8)?;
+    let input = GpuTensor::<KIMI_K2_EXPERT_INTERMEDIATE>::zeros(&ctx, cfg.recv_capacity)?;
+    let mut output = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, cfg.recv_capacity)?;
+    let manifest = KimiInt4WeightManifest::ep8(
+        KimiInt4ExpertRole::W2Down,
+        0,
+        KimiInt4NibbleOrder::LowThenHigh,
+    );
+    let packed = ctx
+        .stream
+        .alloc_zeros::<u8>(manifest.packed_shape.elements())?;
+    let scale = ctx
+        .stream
+        .alloc_zeros::<bf16>(manifest.scale_shape.elements())?;
+    let topk_weight = ctx.stream.clone_htod(&vec![1.0f32; cfg.recv_capacity])?;
+    let weight = KimiMarlinInt4Weight {
+        manifest,
+        weight_packed_uint4b8: &packed,
+        weight_scale_permuted: &scale,
+    };
+    measure_loop(&ctx, iters, || {
+        kimi_marlin_wna16_pplx_w2_gemm(
+            &ctx,
+            &mut workspace,
+            &routing,
+            &input,
+            &weight,
+            &topk_weight,
+            &mut output,
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PplxMarlinCfg {
+    route_elems: usize,
+    recv_capacity: usize,
+    expert_padding: usize,
+    block_size: usize,
+}
+
+fn pplx_marlin_cfg(call: &KernelCall) -> Result<PplxMarlinCfg> {
+    let route_elems = attr_usize(call, "pplx_route_elems")?;
+    let recv_capacity = attr_usize(call, "pplx_recv_capacity")?;
+    let expert_padding = attr_usize(call, "expert_padding")?;
+    ensure!(
+        route_elems > 0,
+        "{} route_elems must be positive",
+        call.label
+    );
+    ensure!(
+        recv_capacity >= route_elems,
+        "{} recv_capacity {recv_capacity} must cover route_elems {route_elems}",
+        call.label
+    );
+    ensure!(
+        expert_padding > 0,
+        "{} expert_padding must be positive",
+        call.label
+    );
+    Ok(PplxMarlinCfg {
+        route_elems,
+        recv_capacity,
+        expert_padding,
+        block_size: 8,
+    })
+}
+
+fn synthetic_pplx_recv_counts(route_elems: usize, expert_padding: usize) -> Result<Vec<i32>> {
+    ensure!(
+        expert_padding > 0,
+        "PPLX synthetic expert_padding must be positive"
+    );
+    ensure!(
+        route_elems > 0,
+        "PPLX synthetic route_elems must be positive"
+    );
+    let mut counts = vec![0usize; KIMI_K2_LOCAL_EXPERTS];
+    let active_experts = route_elems.min(KIMI_K2_LOCAL_EXPERTS);
+    for count in counts.iter_mut().take(active_experts) {
+        *count = 1;
+    }
+    let mut remaining = route_elems - active_experts;
+    let bump = expert_padding;
+    let mut expert = 0usize;
+    while remaining > 0 {
+        let add = remaining.min(bump);
+        counts[expert] += add;
+        remaining -= add;
+        expert = (expert + 1) % KIMI_K2_LOCAL_EXPERTS;
+    }
+    counts
+        .into_iter()
+        .map(|count| {
+            i32::try_from(count)
+                .map_err(|_| anyhow::anyhow!("PPLX synthetic count {count} exceeds i32"))
+        })
+        .collect()
 }
 
 fn measure_marlin_wna16(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
