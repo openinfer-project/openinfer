@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, and runtime TP1/DP8/PPLX trace knobs that emit real `kimi_pplx_route_histogram` rows; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, and runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 
@@ -175,6 +175,17 @@
   - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report`
   - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report`
   - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench`
+
+### Step 11: H20 route histogram artifact
+- Changed runtime trace prompts from all-zero token ids to deterministic varied token ids. All-zero prompts made the router collapse onto a few experts and produced a misleading `max_count_per_expert=63` pattern.
+- H20 verification:
+  - `cargo check --release -p pegainfer-kimi-k2 --features kimi-k2,kernel-report --bin kimi_kernel_report`
+  - Runtime TP1/DP8/PPLX trace wrote `target/kernel_reports/kimi-k2/tp1-dp8-pplx-route-hist-bs64-kv2-varied.json`.
+- Artifact summary:
+  - `8008` total trace calls, `1920` `kimi_pplx_route_histogram` calls.
+  - Two admission waves had `active_rows=1`; two near-target waves had rank0 `active_rows=7` and ranks1-7 `active_rows=8`, for `504` routed tokens per wave.
+  - active8 rank rows: `padded_rows` p50/p95/max `80/216/336`, `recv_total_routes` p50/p95/max `63/161/282`, active local experts p50/p95/max `3/24/32`.
+- Decision: keep the synthetic PPLX Marlin latency rows until a replay provider or cleaner steady trace can use these histograms directly. The trace already shows the synthetic `400` padded rows/rank is conservative.
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
