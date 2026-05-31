@@ -314,6 +314,15 @@
 - NCU status: fresh production NCU is still unavailable because `ncu --version` times out on `h20-100`.
 - Decision: reclassify row 16 from memory to `control/tiny-grid` and stop standalone tuning. The only plausible follow-up is a downstream prologue fusion that preserves Kimi's BF16 rounding boundary and passes the full TP1 PPLX gate.
 
+### Step 23: Dense layer0 GEMM reports
+- Added `docs/models/kimi-k2/dense_gate_up_report.md` for `decode.dense.gate_up`.
+  - H20 evidence: `147.96us`, `28.57TF/s`, `3.58TB/s`, `74.5%` H20 HBM payload model.
+  - Decision: stop standalone tuning because it is one call per decode step and already a high-bandwidth BF16 skinny GEMM.
+- Added `docs/models/kimi-k2/dense_down_report.md` for `decode.dense.down`.
+  - H20 evidence: `85.48us`, `24.73TF/s`, `3.10TB/s`, `64.5%` H20 HBM payload model.
+  - Decision: stop standalone tuning unless production NCU identifies a concrete cuBLAS scheduling gap, or a dense down+residual fusion clears the full-bench gate.
+- Both rows now explicitly say production NCU is pending because `h20-100` still times out on `ncu --version`.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
