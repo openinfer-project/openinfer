@@ -297,6 +297,14 @@
 - NCU status: `/usr/local/cuda-12.9/bin/ncu --version` still times out on `h20-100`, so the report does not claim stall breakdown.
 - Decision: reclassify the master row from memory-bound to `control/elementwise` and stop standalone tuning. Reopen only for a launch-removing MLA prep fusion or a production NCU result with a concrete `>3%` full-bench path.
 
+### Step 21: Final norm report
+- Added `docs/models/kimi-k2/final_norm_report.md` for `decode.final.norm`.
+- Evidence reused from `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-o-proj-cublaslt-bs8.json` and the same-shape row-6 NCU in `profile/kimi-attention-row6-row7-h20-baseline/`:
+  - final norm shape: `rows=8`, `hidden=7168`, BF16, one `rms_norm_batch` call before `lm_head`.
+  - H20 final norm: `8.01us/call`, `57.27GB/s` payload-equivalent, `1.19%` H20 HBM on the bench model.
+  - same-shape FlashInfer RMSNorm NCU: `8` CTAs, `0.05` waves/SM, `0.70-0.74%` DRAM, `60-61%` scheduler no eligible.
+- Decision: reclassify final norm as `control/tiny-grid` and stop standalone tuning. Also corrected master row 6 (`decode.attention.input_norm`) to the same control/tiny-grid classification already documented in `attention_input_norm_report.md`.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.

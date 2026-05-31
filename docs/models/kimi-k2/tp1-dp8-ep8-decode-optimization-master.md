@@ -113,7 +113,7 @@ Columns:
 | 3 | dense | `decode.dense.swiglu` | `silu_mul_hs_fused_into` | 1 | hidden=18432, batch=8, BF16 | 7.8 us | 7.8 us | 113.4 GB/s | memory | 2.4% / gap 97.6% | measured |
 | 4 | dense | `decode.dense.down` | `gemm_dm_hs_to_typed_graphsafe` | 1 | rows=8, out=7168, in=18432, BF16 | 85.3 us | 85.3 us | 24.77 TF/s | memory | 64.6% / gap 35.4% | measured |
 | 5 | dense | `decode.dense.residual_add` | `add_batch` | 1 | hidden=7168, batch=8, BF16 | 6.8 us | 6.8 us | 50.5 GB/s | memory | 1.1% / gap 98.9% | measured |
-| 6 | attention | `decode.attention.input_norm` | `rms_norm_batch` | 61 | elems=57344, BF16 | 476.3 us | 7.8 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
+| 6 | attention | `decode.attention.input_norm` | `rms_norm_batch` | 61 | rows=8, hidden=7168, BF16 | 476.3 us | 7.8 us | 57.3 GB/s payload-equivalent | control/tiny-grid | - | measured |
 | 7 | attention | `decode.attention.qkv_a` | `gemm_graphsafe` | 61 | rows=8, out=2112, in=7168, BF16 | 1.256 ms | 20.6 us | 11.77 TF/s | memory | 30.8% / gap 69.2% | measured |
 | 8 | attention | `decode.attention.qkv_a_split_norm` | `kimi_mla_split_qkv_a_norm` | 61 | elems=16896, BF16 | 501.1 us | 8.2 us | 0.01 TF/s | memory | 0.3% / gap 99.7% | measured |
 | 9 | attention | `decode.attention.q_b` | `gemm_dm_typed_to_hs_graphsafe` | 61 | rows=8, out=12288, in=1536, BF16 | 1.052 ms | 17.2 us | 17.51 TF/s | memory | 45.9% / gap 54.1% | measured |
@@ -124,7 +124,7 @@ Columns:
 | 14 | attention | `decode.attention.v_up` | `kimi_mla_v_up_rt` cuBLASLt TP1 path | 61 | rows=8, out=8192, in=512, BF16 | 738.5 us | 12.1 us | 5.54 TF/s | memory | 14.7% / gap 85.3% | measured |
 | 15 | attention | `decode.attention.o_proj` | `kimi_o_proj_cublaslt` | 61 | rows=8, out=7168, in=8192, BF16 | 2.374 ms | 38.9 us | 24.15 TF/s | memory | 63.0% / gap 37.0% | measured |
 | 16 | attention | `decode.attention.post_attn_add_norm` | `fused_add_rms_norm_round_batch` | 61 | elems=57344, BF16 | 530.0 us | 8.7 us | 0.05 TF/s | memory | 1.6% / gap 98.4% | measured |
-| 17 | final | `decode.final.norm` | `rms_norm_batch` | 1 | elems=57344, BF16 | 8.1 us | 8.1 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
+| 17 | final | `decode.final.norm` | `rms_norm_batch` | 1 | rows=8, hidden=7168, BF16 | 8.1 us | 8.1 us | 57.3 GB/s payload-equivalent | control/tiny-grid | - | measured; same-shape NCU |
 | 18 | final | `decode.final.lm_head` | `gemm_graphsafe` | 1 | rows=8, out=163840, in=7168, BF16 | 542.7 us | 542.7 us | 34.62 TF/s | memory | 90.3% / gap 9.7% | measured |
 | 19 | final | `decode.final.argmax` | `argmax_batch_bf16_split` | 1 | elems=1310720, BF16, tile=4096 | 12.7 us | 12.7 us | 206.0 GB/s | memory | 4.3% / gap 95.7% | measured |
 | 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` fused selector | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.514 ms | 58.6 us | 96.6 GB/s | control | - | measured |
@@ -212,3 +212,4 @@ Initial report targets:
 | 15 | `attention_flashinfer_mla_decode_report.md` | Exists; H20 ctx sweep says `ctx=1` is launch/control-heavy (`10.24us/call`) while `ctx=8192` is memory-bound (`1.697ms/call`, `~2.85TB/s`, `~59%` HBM). Production NCU is pending because `ncu` currently times out on `h20-100`; no code optimization is adopted from event timing alone. |
 | 16 | `final_lm_head_report.md` | Exists; BF16 full-vocab LM head is memory-bound and already near H20 HBM roofline (`542.7us`, `4.33TB/s`, `90.3%`), so standalone tuning is stopped unless quantized/FP8 format work changes the bytes moved. |
 | 17 | `attention_rope_split_report.md` | Exists; `rope_split_decode_kernel` is a control/elementwise MLA prep helper (`441.8us/step`, `7.24us/call`, `~54GB/s` payload-equivalent). Production NCU is pending because `ncu` currently times out on `h20-100`; standalone tuning is stopped and only launch-removing MLA prep fusion remains plausible. |
+| 18 | `final_norm_report.md` | Exists; final RMSNorm is the same FlashInfer `RMSNormKernel<8,bf16>` shape as `attention_input_norm` but called once (`8.01us`, `57.3GB/s` payload-equivalent). Same-shape NCU says `8` CTAs, `0.05` waves/SM, `<1%` DRAM, so standalone tuning is stopped. |
