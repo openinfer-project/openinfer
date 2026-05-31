@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Optimization Master
 
-> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), and MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`). Router NCU is done; the fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
+> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. Accepted optimizations so far are `shared_gate_up` cuBLASLt (`1.818ms -> 1.505ms`), attention `o_proj` cuBLASLt (`2.715ms -> 2.374ms`), MLA `absorb_q_nope` / `v_up` cuBLASLt strided-batched GEMM (`973.6us -> 748.5us`, `781.0us -> 738.5us`), and final argmax split-vocab reduction (`125.3us -> 12.7us`). Router NCU is done; the fast tensor-op logits path was rejected because TP1 DP8 bs64/o5 token traces changed (`30/64` mismatches). q_b standalone cuBLASLt was rejected (`8.899us -> 8.746us`, `1.0175x` at `batch_size=8`). Phase 2 fusion scan has H20 NCU evidence for row 21/22, row 6/7, and row 8/9; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
 >
 > **Last touched:** 2026-06
 
@@ -74,6 +74,7 @@ Accepted optimizations:
 | `decode.attention.o_proj` | `attention_o_proj_report.md` | `2.715 ms` | `2.374 ms` | `1.14x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-o-proj-cublaslt-bs8.json`, `profile/kimi-attention-o-proj-h20-cublaslt/`, `bs=8,ctx=1` |
 | `decode.attention.absorb_q_nope` | `attention_absorb_q_nope_report.md` | `973.6 us` | `748.5 us` | `1.30x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-mla-cublaslt-bs8-lazy128.json`, `profile/kimi-mla-cublaslt-h20/`, `bs=8,ctx=1` |
 | `decode.attention.v_up` | `attention_v_up_report.md` | `781.0 us` | `738.5 us` | `1.06x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-mla-cublaslt-bs8-lazy128.json`, `profile/kimi-mla-cublaslt-h20/`, `bs=8,ctx=1` |
+| `decode.final.argmax` | `final_argmax_report.md` | `125.3 us` | `12.7 us` | `9.85x` | memory | `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-argmax-split-bs8.json`, `profile/kimi-final-argmax-h20-baseline/`, TP1 DP8 bs64/o5 token A/B `0/64` mismatch |
 
 ## Commit Queue
 
@@ -83,6 +84,7 @@ Accepted optimizations:
 | 2 | `opt(shared_gate_up)` | Kimi-specific cuBLASLt code path, `shared_gate_up_report.md`, and this master table's accepted-result update. | unrelated bench scaffolding or other kernel changes. |
 | 3 | `opt(attention_o_proj)` | Kimi-specific cuBLASLt o_proj code path, `attention_o_proj_report.md`, and this master table's accepted-result update. | fusion-scan experiments or other kernel changes. |
 | 4 | `opt(mla_batched_gemm)` | Kimi TP1 cuBLASLt strided-batched path for `absorb_q_nope` and `v_up`, both reports, token A/B note, and this master table's accepted-result update. | router math-mode changes, fusion experiments, or PPLX comm changes. |
+| 5 | `opt(final_argmax)` | Split-vocab CUDA argmax path, `final_argmax_report.md`, and this master table's accepted-result update. | q_b rejection docs or other kernel experiments. |
 
 The baseline milestone is already split from the first optimization. Future entries should follow the same pattern: one measured win, one code/report/master-table commit.
 
@@ -115,7 +117,7 @@ Columns:
 | 16 | attention | `decode.attention.post_attn_add_norm` | `fused_add_rms_norm_round_batch` | 61 | elems=57344, BF16 | 530.0 us | 8.7 us | 0.05 TF/s | memory | 1.6% / gap 98.4% | measured |
 | 17 | final | `decode.final.norm` | `rms_norm_batch` | 1 | elems=57344, BF16 | 8.1 us | 8.1 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
 | 18 | final | `decode.final.lm_head` | `gemm_graphsafe` | 1 | rows=8, out=163840, in=7168, BF16 | 542.7 us | 542.7 us | 34.62 TF/s | memory | 90.3% / gap 9.7% | measured |
-| 19 | final | `decode.final.argmax` | `argmax_batch_bf16` | 1 | elems=1310720, BF16 | 125.3 us | 125.3 us | 20.9 GB/s | memory | 0.4% / gap 99.6% | measured |
+| 19 | final | `decode.final.argmax` | `argmax_batch_bf16_split` | 1 | elems=1310720, BF16, tile=4096 | 12.7 us | 12.7 us | 206.0 GB/s | memory | 4.3% / gap 95.7% | measured |
 | 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.687 ms | 61.4 us | 92.1 GB/s | control | - | measured |
 | 21 | moe_shared | `decode.moe.shared_gate_up` | `kimi_shared_gate_up_cublaslt` | 60 | rows=8, out=4096, in=7168, BF16 | 1.505 ms | 25.1 us | 18.72 TF/s | memory | 48.9% / gap 51.1% | measured |
 | 22 | moe_shared | `decode.moe.shared_swiglu` | `silu_mul_hs_fused_into` | 60 | rows=8, gate_up=4096, out=2048, BF16 | 410.2 us | 6.8 us | 14.4 GB/s | memory | 0.3% / gap 99.7% | measured |
@@ -192,3 +194,4 @@ Initial report targets:
 | 6 | `pplx_marlin_compute_report.md` | Estimate-only rows block honest MoE ranking; needs provider/harness work, not EP comm optimization. |
 | 7 | `attention_absorb_q_nope_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
 | 8 | `attention_v_up_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
+| 9 | `final_argmax_report.md` | Exists for the accepted split-vocab CUDA argmax optimization. |

@@ -320,6 +320,8 @@ pub(super) fn launch_local_top1_batch(
     active_rows: usize,
     top1_values: &mut CudaSlice<half::bf16>,
     out: &mut CudaSlice<i32>,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
 ) -> Result<()> {
     ensure!(
         active_rows > 0 && active_rows <= logits.seq_len,
@@ -333,16 +335,33 @@ pub(super) fn launch_local_top1_batch(
         out.len(),
         active_rows
     );
+    let partials = pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len(
+        active_rows,
+        logits.hidden_dim,
+    );
+    ensure!(
+        partial_values.len() >= partials && partial_indices.len() >= partials,
+        "Kimi batched top1 partial scratch too small: values={}, indices={}, need={}",
+        partial_values.len(),
+        partial_indices.len(),
+        partials
+    );
     {
         let (logits_ptr, _logits_guard) = logits.data.device_ptr(&ctx.stream);
         let (value_ptr, _value_guard) = top1_values.device_ptr_mut(&ctx.stream);
         let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+        let (partial_values_ptr, _partial_values_guard) =
+            partial_values.device_ptr_mut(&ctx.stream);
+        let (partial_indices_ptr, _partial_indices_guard) =
+            partial_indices.device_ptr_mut(&ctx.stream);
 
         unsafe {
-            ffi::argmax_batch_bf16_cuda(
+            ffi::argmax_batch_bf16_split_cuda(
                 logits_ptr as *const ffi::Half,
                 value_ptr as *mut ffi::Half,
                 out_ptr as *mut i32,
+                partial_values_ptr as *mut f32,
+                partial_indices_ptr as *mut i32,
                 active_rows as i32,
                 logits.hidden_dim as i32,
                 ctx.stream.cu_stream(),

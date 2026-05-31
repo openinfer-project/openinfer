@@ -18,8 +18,9 @@ use pegainfer_kernels::{
         KimiInt4ExpertRole, KimiInt4NibbleOrder, KimiInt4WeightManifest,
         KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight, KimiMarlinRouteWorkspace,
         KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
-        KimiRouterOutput, KimiRouterScratch, add_batch_into, argmax_batch_bf16_into,
-        embedding_batch_vocab_shard, flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
+        KimiRouterOutput, KimiRouterScratch, add_batch_into, argmax_batch_bf16_split_into,
+        argmax_batch_bf16_split_partials_len, embedding_batch_vocab_shard,
+        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
         fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla,
         kimi_flashinfer_batch_decode_mla_rt, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
@@ -307,8 +308,18 @@ fn measure_argmax_batch_bf16(call: &KernelCall, iters: u64) -> Result<LatencySta
     let logits = HiddenStates::zeros(&ctx, vocab, batch)?;
     let mut values: CudaSlice<bf16> = ctx.stream.alloc_zeros(batch)?;
     let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
+    let partials = argmax_batch_bf16_split_partials_len(batch, vocab);
+    let mut partial_values: CudaSlice<f32> = ctx.stream.alloc_zeros(partials)?;
+    let mut partial_indices: CudaSlice<i32> = ctx.stream.alloc_zeros(partials)?;
     measure_loop(&ctx, iters, || {
-        argmax_batch_bf16_into(&ctx, &logits, &mut values, &mut out)
+        argmax_batch_bf16_split_into(
+            &ctx,
+            &logits,
+            &mut values,
+            &mut out,
+            &mut partial_values,
+            &mut partial_indices,
+        )
     })
 }
 

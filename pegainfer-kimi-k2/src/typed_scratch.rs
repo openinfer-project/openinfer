@@ -7,11 +7,11 @@ use pegainfer_kernels::tensor::{DeviceContext, GpuTensor, HiddenStates};
 
 use crate::config::{
     KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_Q_LORA_RANK, KIMI_K2_ROUTED_EXPERTS,
-    KIMI_K2_TOPK, KimiLocalDims,
+    KIMI_K2_TOPK, KIMI_K2_VOCAB, KimiLocalDims,
 };
 use pegainfer_kernels::ops::{
     KIMI_K2_EP_WORLD, KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-    KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
+    KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, argmax_batch_bf16_split_partials_len,
 };
 
 pub(crate) const MARLIN_W13_OUT_DIM: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
@@ -175,13 +175,18 @@ impl CommScratch {
 pub(crate) struct SamplingScratch {
     pub(crate) top1_value_scratch: CudaSlice<half::bf16>,
     pub(crate) top1_out: CudaSlice<i32>,
+    pub(crate) top1_partial_values: CudaSlice<f32>,
+    pub(crate) top1_partial_indices: CudaSlice<i32>,
 }
 
 impl SamplingScratch {
     pub(crate) fn new(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
+        let partials = argmax_batch_bf16_split_partials_len(batch_size, KIMI_K2_VOCAB);
         Ok(Self {
             top1_value_scratch: ctx.stream.alloc_zeros(batch_size)?,
             top1_out: ctx.stream.alloc_zeros(batch_size)?,
+            top1_partial_values: ctx.stream.alloc_zeros(partials)?,
+            top1_partial_indices: ctx.stream.alloc_zeros(partials)?,
         })
     }
 }

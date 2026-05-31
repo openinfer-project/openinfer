@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current Kimi-specific cuBLASLt paths cover shared_gate_up and attention o_proj for batch_size `1..=64`, plus TP1 MLA absorb/v_up for `local_heads=64,batch_size<=8`; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, and final argmax split-vocab reduction; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 

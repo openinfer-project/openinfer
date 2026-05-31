@@ -10,6 +10,7 @@ Use this file as the LLM entrypoint before editing kernels. Start from `op_id`, 
 | --- | --- | --- | --- | --- | --- | --- |
 | `shared.linear.gemm_per_token` | model-specific decode accuracy gates | `ops::gemm_per_token` / `ops::gemm_per_token_into_checked` | `gemm_per_token_cuda` | `csrc/linear.cu` | cuBLAS | computes each row through the N=1 decode GEMM boundary; used when row-wise parity is required before performance optimization |
 | `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
+| `shared.sampling.argmax_batch_bf16_split` | Kimi-K2 TP1 DP8 decode top1 | `ops::argmax_batch_bf16_split_into` | `argmax_batch_bf16_split_cuda` | `csrc/argmax.cu` | CUDA | split-vocab BF16 top-1 over contiguous `HiddenStates` logits; requires partial `(value,index)` scratch |
 
 ## Qwen3-4B Dense Full-Attention Path
 

@@ -116,6 +116,8 @@ pub(super) fn forward_decode_batch_next_token_kernels(
         active_len,
         &mut decode_arena.scratch.sampling.top1_value_scratch,
         &mut decode_arena.scratch.sampling.top1_out,
+        &mut decode_arena.scratch.sampling.top1_partial_values,
+        &mut decode_arena.scratch.sampling.top1_partial_indices,
     )
 }
 
