@@ -33,6 +33,7 @@ constexpr int kMarlinMaxThreadN = max_thread_n;
 constexpr int kMarlinPipeStages = pipe_stages;
 
 ThreadConfig small_batch_thread_configs[] = {
+    {64, 64, 128},
     {128, 128, 256},
     {64, 128, 128},
 };
@@ -179,6 +180,7 @@ MarlinFuncPtr get_marlin_kernel(
   }
   KIMI_MARLIN_COMMON_GET_IF_M1(8, 8, 256)
   KIMI_MARLIN_COMMON_GET_IF_M1(8, 4, 128)
+  KIMI_MARLIN_COMMON_GET_IF_M1(4, 4, 128)
   KIMI_MARLIN_COMMON_GET_IF_M234(16, 4, 256)
   KIMI_MARLIN_COMMON_GET_IF_M234(8, 4, 128)
   return kernel;

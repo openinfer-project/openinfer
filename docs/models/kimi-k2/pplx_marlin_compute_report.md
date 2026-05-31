@@ -1,12 +1,12 @@
 # pplx_marlin_compute Report
 
-> **TL;DR:** PPLX routed local compute is measurable without timing EP communication. `kimi_tp1_pplx_decode_bench` keeps the synthetic stress point (`recv_capacity=848`, `64` expected local routes, `400` padded rows/rank), while `kimi_pplx_marlin_replay` now consumes runtime `kimi_pplx_route_histogram` rows directly. On H20, replaying `tp1-dp8-pplx-route-hist-bs64-kv2-varied.json` with `iters=16` gives padded-row p50/p95/max `96/224/336`; W13 is `114.5/250.6/368.6us` per call and W2 is `66.4/138.5/200.3us` per call. The p95 row (`recv=67`, `padded=224`, active experts `28`) is memory-bound by the H20 roofline model at `38.9%`/`35.4%` HBM for W13/W2, but NCU says the kernel is not at the device limit: W13/W2 are `1` wave/SM, `76KB` dynamic shared memory, `18.8%` theoretical occupancy, `4-5%` L2 hit, and only `13-14%` tensor-pipe elapsed utilization. Synthetic `400` rows remain a stress case, not the serving-shape baseline.
+> **TL;DR:** PPLX routed local compute is measurable without timing EP communication. `kimi_tp1_pplx_decode_bench` keeps the synthetic stress point (`recv_capacity=848`, `64` expected local routes, `400` padded rows/rank), while `kimi_pplx_marlin_replay` now consumes runtime `kimi_pplx_route_histogram` rows directly. On H20, replay p95 (`recv=67`, `padded=224`, active experts `28`) originally had W13/W2 at `250.64us` / `138.51us` per call. The adopted small-N Marlin tile `{thread_k=64, thread_n=64, num_threads=128}` cuts p95 W13/W2 to `161.45us` / `98.14us` (`1.55x` / `1.41x`, `1.50x` combined) and raises roofline read to `60.3%` / `50.0%` HBM. p50/p95/p100 W13 are now `77.14/161.45/236.13us`; W2 is `50.30/98.14/139.23us`. NCU p95 says the accepted tile launches `312` CTAs, uses `57.09KB` dynamic shared memory, has `25.0% / 18.09%` theoretical/achieved occupancy, and is still one-wave/scheduler-stall limited.
 >
 > **Last touched:** 2026-06
 
 ## KernelWiki Conclusion
 
-KernelWiki's `wiki/kernels/fused-moe.md` and `wiki/kernels/grouped-gemm.md` pages match the direction: MoE local compute should be treated as grouped/masked expert GEMM with variable per-expert M, where launch count, padding, and load imbalance are first-class performance variables. The relevant caution is that decode uses small per-expert M; padding and masked layouts can waste compute, while grouped scheduling helps only when the route distribution is represented honestly.
+KernelWiki's `wiki/kernels/fused-moe.md`, `wiki/kernels/grouped-gemm.md`, `wiki/patterns/moe-load-imbalance.md`, and `wiki/patterns/low-sm-utilization.md` pages match the direction: MoE local compute should be treated as grouped/masked expert GEMM with variable per-expert M, where launch count, padding, and load imbalance are first-class performance variables. The relevant caution is that decode uses small per-expert M; padding and masked layouts can waste compute, while grouped scheduling helps only when the route distribution is represented honestly. KernelWiki's practical recommendations for this symptom class are dynamic tile assignment, persistent scheduling, contiguous/masked layout choice, and smaller effective-M waste; on H20, the accepted small-N tile improves the current template by cutting shared-memory footprint and increasing the launch grid from `234` to `312` CTAs. Any next step should be a route-aware grouped/persistent Marlin schedule rather than another broad config sweep.
 
 For this report, the bench provider deliberately excludes EP dispatch/combine transport and only times the local PPLX compute kernels after synthetic recv counts have been materialized. That makes the rows measurable for NCU and master-table accounting. Runtime decode traces now record `kimi_pplx_route_histogram` after `dispatch_recv`, including `recv_counts`, `recv_total_routes`, `active_local_experts`, `max_count_per_expert`, `padded_rows`, `num_tokens_post_padded`, `recv_capacity`, `expert_padding`, and `block_size`; the final optimization target still needs an H20 all-rank artifact using those fields.
 
@@ -53,6 +53,16 @@ Trace replay p95 NCU (`profile/kimi-pplx-marlin-replay-p95-h20/`, full + source 
 
 Source-counter reports were collected, but the current release build does not include CUDA line info for this Marlin TU, so `action.source_info(pc)` has no file/line mapping. The aggregate source counters still matter: W13 reports `11,360` excessive shared wavefronts; W2 reports `61,552` excessive shared wavefronts and `1,523` excessive global sectors. The actionable NCU conclusion is therefore at kernel-structure level: the p95 replay shape is limited by low occupancy / one wave per SM / low L2 reuse, not by saturated HBM.
 
+Accepted small-N tile H20 replay (`target/kernel_reports/kimi-k2/pplx-marlin-replay-n64-tile-confirm.json`, `iters=32`):
+
+| Quantile | Source | recv / padded / experts | W13 | W2 | Roofline read |
+|---|---|---:|---:|---:|---|
+| p50 | L31 rank1 | `56 / 96 / 8` | `77.14us` | `50.30us` | W13/W2 compute-bound by AI, `49.4%` / `37.9%` BF16 peak |
+| p95 | L11 rank7 | `67 / 224 / 28` | `161.45us` | `98.14us` | W13/W2 memory-bound, `60.3%` / `50.0%` HBM |
+| p100 | L17 rank5 | `207 / 336 / 26` | `236.13us` | `139.23us` | W13/W2 compute-bound by AI, `56.5%` / `47.9%` BF16 peak |
+
+Accepted small-N tile NCU p95 (`profile/kimi-pplx-marlin-n64-p95-h20/reports/p95_w13_w2_full.ncu-rep`) uses NCU timing for structure only; the stable latency numbers above come from CUDA-event replay. Both W13/W2 instantiate `Marlin<..., THREAD_N_BLOCKS=4, THREAD_K_BLOCKS=4, NUM_THREADS=128>`, launch `312` CTAs (`4 * 78 SMs`), and report `57.09KB` dynamic shared memory, `92` registers/thread, `25.0%` theoretical occupancy, `18.09%` achieved occupancy, `~87%` compute-SM throughput, `~21.6-22.0%` L2 hit, and `~89.9%` no eligible. Compared with the previous p95 NCU, the important structural change is lower dynamic shared memory (`76KB -> 57KB`) and higher useful launch grid (`234 -> 312` CTAs).
+
 ## Attempts
 
 | Attempt | Result | Decision |
@@ -66,9 +76,10 @@ Source-counter reports were collected, but the current release build does not in
 | Add replay filters for NCU isolation | `kimi_pplx_marlin_replay --quantiles p95 --ops w13,w2` isolates one route histogram and one/two Marlin providers without relying on NCU launch-skip over unrelated samples. | Kept as profiling infrastructure. |
 | NCU p95 W13/W2 replay | Full/source NCU collected under `profile/kimi-pplx-marlin-replay-p95-h20/`. Both kernels are one-wave and shared-memory-limited; source line mapping is absent because the release TU has no line info. | Use as the current p95 diagnosis. No optimization adopted yet. |
 | Force small-batch 256-thread Marlin config | Hard-coded `thread_m_blocks==1` to pick the existing `{thread_k=128, thread_n=128, num_threads=256}` config instead of the current `{64,128,128}`. H20 p95 replay regressed W13 `250.64us -> 303.50us` and W2 `138.51us -> 187.31us`. | Rejected and reverted. The current 128-thread config remains better for the p95 route histogram. |
+| Add small-N M1 tile `{thread_k=64, thread_n=64, num_threads=128}` | Adds the `M1,N4,K4` Marlin instantiation and puts it first in `small_batch_thread_configs`. H20 replay p95 improves W13 `250.64us -> 161.45us` and W2 `138.51us -> 98.14us`; combined W13+W2 p95 improves `1.50x`. | Accepted. This is the current PPLX Marlin W13/W2 baseline. |
 
 ## Final Conclusion
 
-The immediate gap for PPLX routed local compute was measurement coverage, not a code optimization. The master table should use the trace replay p95 row for PPLX W13/SwiGLU/W2/routing and keep the synthetic `400` padded-row result as a stress reference.
+Adopt the `{thread_k=64, thread_n=64, num_threads=128}` small-N tile for PPLX Marlin W13/W2. The master table should use the trace replay p95 row for PPLX W13/SwiGLU/W2/routing and keep the synthetic `400` padded-row result as a stress reference.
 
-Do not commit an `opt(...)` change from this report: no faster kernel was adopted. The next optimization step is to test a targeted Marlin scheduling/tile variant only if it attacks the measured structure: lower shared-memory footprint, more CTAs/waves for small-M experts, or better route-aware grouping. If a variant cannot improve p95 W13/W2 over the replay baseline by more than noise, stop this kernel and move focus to the next decode-path row.
+This kernel is not at H20's theoretical limit, but the accepted tile moves the p95 row from roughly `39%` / `35%` HBM to `60%` / `50%` HBM. Further work should be treated as a new route-aware grouped/persistent Marlin project: change tile mapping, reduce remaining scheduler stalls, or improve route grouping. Do not keep sweeping template knobs without a profile-backed hypothesis.
