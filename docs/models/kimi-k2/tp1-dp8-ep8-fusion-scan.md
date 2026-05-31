@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Fusion Scan
 
-> **TL;DR:** Phase 2 fusion scan has NCU evidence for two adjacent pairs. `shared_gate_up -> shared_swiglu` still needs a custom gated-dual-GEMM; `attention input RMSNorm -> qkv_a` is small-grid plus skinny-GEMM limited (`RMSNormKernel<8,bf16>` launches only `8` blocks; qkv_a cuBLAS main GEMM launches `72` blocks and reaches `51-53%` DRAM). No fusion is accepted yet: row 6/7 fusion must beat the current cuBLAS split-K qkv_a baseline, while row 21/22 fusion must beat the current cuBLASLt shared_gate_up baseline in the full TP1 PPLX bench.
+> **TL;DR:** Phase 2 fusion scan has NCU evidence for two adjacent pairs. `shared_gate_up -> shared_swiglu` still needs a custom gated-dual-GEMM; `attention input RMSNorm -> qkv_a` is small-grid plus skinny-GEMM limited (`RMSNormKernel<8,bf16>` launches only `8` blocks; qkv_a cuBLAS main GEMM launches `72` blocks and reaches `51-53%` DRAM). qkv_a cuBLASLt was tried and rejected (`0.8-1.7%` bench-provider gain). No fusion is accepted yet: row 6/7 fusion must beat the current cuBLAS split-K qkv_a baseline, while row 21/22 fusion must beat the current cuBLASLt shared_gate_up baseline in the full TP1 PPLX bench.
 >
 > **Last touched:** 2026-05
 
@@ -11,6 +11,7 @@
 - Baseline H20 artifact: `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json`
 - NCU run: `profile/kimi-shared-swiglu-h20-baseline/` on `h20-100`
 - NCU run: `profile/kimi-attention-row6-row7-h20-baseline/` on `h20-100`
+- Rejected attempt: `profile/kimi-qkv-a-cublaslt-h20-baseline/` on `h20-100`
 
 Current row values at `bs=8,ctx=1`:
 
@@ -126,13 +127,15 @@ NCU details:
 | 7 | `nvjet_tst_128x8_64x12_2x1_v_bz_splitK_TNT` | `11.84-12.22us` | `72 x 384` | `0.92` | `51-53%` | `15-16%` | skinny GEMM with low waves, low L2 hit, and scoreboard stalls |
 | 7 | `cublasLt::splitKreduce_kernel<...>` | `3.04-3.14us` | `66 x 512` | `0.21` | `1.8-1.9%` | `5-6%` | extra reduce launch with very small grid |
 
-Diagnosis: row 6/7 together are not at the H20 limit. The pair is dominated by launch count, intermediate traffic, and skinny-GEMM wave quantization. A fusion has about `488.5us/step` gross upside from deleting row 6, but a custom prologue GEMM must not lose more than about `8us/call` versus cuBLAS qkv_a or the win disappears. The next fair baseline is qkv_a cuBLASLt/exact-shape or small-GEMM tuning before a custom RMSNorm-prologue GEMM is accepted.
+Diagnosis: row 6/7 together are not at the H20 limit. The pair is dominated by launch count, intermediate traffic, and skinny-GEMM wave quantization. A fusion has about `488.5us/step` gross upside from deleting row 6, but a custom prologue GEMM must not lose more than about `8us/call` versus cuBLAS qkv_a or the win disappears.
+
+Rejected attempt: qkv_a cuBLASLt exact-shape provider. Standalone contiguous-loop timing improved from `15.119us` to `14.052-14.179us` per GEMM, but the temporary `kimi_tp1_pplx_decode_bench` provider measured only `20.407us -> 20.070us` at 64 iters and `20.407us -> 20.242us` at 256 iters. That is below the `>3%` adoption threshold, so no qkv_a cuBLASLt code is kept.
 
 ## Candidate Scan
 
 | Candidate | Rows | Feasibility | Evidence | Decision |
 |---|---|---|---|---|
-| Attention RMSNorm -> qkv_a GEMM prologue | 6-7 | Requires custom GEMM prologue or CUTLASS-style visitor; standard cuBLASLt does not encode full RMSNorm over the input row. | NCU done: row 6 is `8` blocks / `0.05` waves/SM; row 7 is cuBLAS split-K, main GEMM `72` blocks / `0.92` waves/SM / `51-53%` DRAM plus `~3us` reduce. | Keep in scan queue, but do not tune RMSNorm alone. First compare qkv_a against a cuBLASLt exact-shape baseline; accept fusion only if full TP1 PPLX bench wins. |
+| Attention RMSNorm -> qkv_a GEMM prologue | 6-7 | Requires custom GEMM prologue or CUTLASS-style visitor; standard cuBLASLt does not encode full RMSNorm over the input row. | NCU done: row 6 is `8` blocks / `0.05` waves/SM; row 7 is cuBLAS split-K, main GEMM `72` blocks / `0.92` waves/SM / `51-53%` DRAM plus `~3us` reduce. qkv_a cuBLASLt provider was rejected: `0.8-1.7%` bench-provider gain only. | Keep in scan queue, but do not tune RMSNorm alone and do not adopt qkv_a cuBLASLt. Only a true RMSNorm-prologue/custom GEMM path remains worth trying here. |
 | qkv_a split/norm cleanup | 8-9 | Possible only inside Kimi MLA custom kernels; row 8 already fuses split plus two norms. | Row 8 is `501.1 us`; correctness-sensitive because q_lora and ckv BF16 rounding feeds q_b and MLA cache. | Keep in scan queue; needs NCU and first-diff correctness gate. |
 | shared_gate_up -> shared_swiglu | 21-22 | Requires gated-dual-GEMM custom/CUTLASS/CuTe kernel; cuBLASLt cannot express SwiGLU over the two halves of a single output. | KernelWiki gated-dual-GEMM pattern applies. NCU says row 22 is tiny-grid/latency-bound, not bandwidth-bound. Current cuBLASLt row 21 is strong at `1.505 ms`. | Do not replace cuBLASLt without a full TP1 PPLX bench win. Prototype only if it targets gated-dual-GEMM, not elementwise-only tuning. |
 | shared_swiglu -> shared_down prologue | 22-23 | Would require activation transform in the GEMM input path; standard cuBLASLt has no arbitrary BF16 input prologue. | Row 23 is `902.2 us`; row 22 standalone is small, but full bench row is `473.3 us`. | Lower priority than row 21/22; revisit after gated-dual-GEMM result. |
@@ -142,7 +145,7 @@ Diagnosis: row 6/7 together are not at the H20 limit. The pair is dominated by l
 
 Phase 2 is not complete yet. The next useful proof is either:
 
-- compare row 7 (`decode.attention.qkv_a`) against a cuBLASLt exact-shape baseline before investing in a custom RMSNorm-prologue GEMM, or
+- build a true row 6/7 RMSNorm-prologue GEMM prototype only if it can preserve the current qkv_a cuBLAS speed; the cuBLASLt-only qkv_a swap was already rejected, or
 - build a small CUTLASS/CuTe gated-dual-GEMM prototype for row 21/22 and compare it against `shared_gate_up + shared_swiglu = 1.978 ms` in the full TP1 PPLX bench.
 
 Do not accept a fusion based on standalone microbench speed alone. The adopted threshold stays the project rule: reproducible H20 improvement above noise, preferably `>3%`, with code plus this scan/master table update in one commit.

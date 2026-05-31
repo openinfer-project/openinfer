@@ -134,7 +134,7 @@ Measured rows sorted by step latency at `bs=8,ctx=1`:
 | 1 | `decode.moe.router` | 3.687 ms | Profile first: likely control/launch plus router scoring; correctness-sensitive. |
 | 2 | attention `o_proj` (`gemm_dm_hs_to_typed_graphsafe`) | 2.715 ms | cuBLASLt skinny GEMM baseline; candidate for RMSNorm/GEMM sequence review only after profile. |
 | 3 | `decode.moe.shared_gate_up` | 1.505 ms | cuBLASLt accepted; next work should treat this as the baseline for row 21/22 fusion scans. |
-| 4 | attention `decode.attention.qkv_a` (`gemm_graphsafe`) | 1.256 ms | NCU done: cuBLAS split-K skinny GEMM, main kernel `72` blocks/`0.92` waves/SM/`51-53%` DRAM plus `~3us` split-K reduce. Next fair baseline is cuBLASLt exact-shape before custom prologue fusion. |
+| 4 | attention `decode.attention.qkv_a` (`gemm_graphsafe`) | 1.256 ms | NCU done: cuBLAS split-K skinny GEMM, main kernel `72` blocks/`0.92` waves/SM/`51-53%` DRAM plus `~3us` split-K reduce. cuBLASLt exact-shape provider was rejected because TP1 bench gain was only `0.8-1.7%`. |
 | 5 | attention `q_b_proj` | 1.052 ms | cuBLASLt baseline and skinny GEMM profile. |
 | 6 | attention `absorb_q_nope` | 955.0 us | Small-K GEMM, profile wave/grid utilization. |
 | 7 | `decode.moe.shared_down` | 904.1 us | cuBLASLt baseline; possible shared_gate/SwiGLU/down sequence review. |
@@ -150,7 +150,7 @@ Start Phase 2 from the rows above:
 
 | Candidate | Rows touched | Why it is plausible | First proof required |
 |---|---|---|---|
-| Attention RMSNorm -> qkv_a GEMM prologue | rows 6-7 | Norm is launch/memory heavy and immediately feeds a skinny GEMM. | NCU done in `tp1-dp8-ep8-fusion-scan.md`: row 6 is tiny-grid (`8` blocks, `0.05` waves/SM), row 7 is cuBLAS split-K skinny GEMM. Next: qkv_a cuBLASLt exact-shape baseline before any custom RMSNorm-prologue GEMM. |
+| Attention RMSNorm -> qkv_a GEMM prologue | rows 6-7 | Norm is launch/memory heavy and immediately feeds a skinny GEMM. | NCU done in `tp1-dp8-ep8-fusion-scan.md`: row 6 is tiny-grid (`8` blocks, `0.05` waves/SM), row 7 is cuBLAS split-K skinny GEMM. qkv_a cuBLASLt exact-shape swap was measured and rejected; remaining path is custom RMSNorm-prologue GEMM only if it wins full TP1 PPLX bench. |
 | qkv_a split/norm cleanup | row 8 with row 9 input | Split qkv_a and normalize q_lora/ckv before q_b/MLA cache. | Confirm memory traffic and launch overhead dominate. |
 | MoE shared gate_up + SwiGLU | rows 21-22 | Gate/up output is consumed only by SwiGLU; avoids writing/reading 4096 BF16 per row per layer. | Initial NCU done in `tp1-dp8-ep8-fusion-scan.md`: row 22 is tiny-grid/latency-bound; accepted fusion requires gated-dual-GEMM beating cuBLASLt in the full TP1 PPLX bench. |
 | Shared SwiGLU + down prologue | rows 22-23 | Activation output is consumed only by down GEMM. | cuBLASLt epilogue/prologue support or CUTLASS prototype; correctness gate on BF16 rounding. |
