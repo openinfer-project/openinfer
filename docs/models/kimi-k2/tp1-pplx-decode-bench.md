@@ -257,6 +257,13 @@
   - NCU: FlashInfer `RMSNormKernel<8,bf16>`, `8 x 896` launch, `0.05` waves/SM, `0.70-0.74%` DRAM, `60-61%` scheduler no eligible.
 - Decision: stop standalone RMSNorm tuning. Future work should only revisit this row as RMSNorm -> qkv_a prologue/custom skinny-GEMM fusion, and only if the full TP1 PPLX bench beats the current cuBLAS qkv_a path by more than noise.
 
+### Step 16: Attention qkv_a_split_norm report
+- Added `docs/models/kimi-k2/attention_qkv_a_split_norm_report.md` to close the standalone Phase 3 direction for `decode.attention.qkv_a_split_norm`.
+- Evidence reused from `profile/kimi-attention-row8-row9-h20-baseline/`:
+  - Event timing: `8.217us/call`, `501.2us/step` for `61` layers at `bs=8,ctx=1`.
+  - NCU: `split_qkv_a_norm_kernel`, `8 x 192` launch, `0.01` waves/SM, `0.19-0.20%` DRAM, `93.4-93.7%` scheduler no eligible.
+- Decision: stop standalone row-8 tuning. Future work should only revisit this row as row8 -> q_b prologue/custom skinny-GEMM fusion that preserves `ckv_normed` and `k_rope`.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
