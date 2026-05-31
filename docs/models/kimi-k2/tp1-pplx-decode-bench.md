@@ -343,6 +343,14 @@
 - NCU status: fresh production NCU is still unavailable because `ncu --version` times out on `h20-100`.
 - Decision: reclassify row 28 from memory to `control/elementwise` and stop standalone tuning. Future work only makes sense as a launch-removing fusion that preserves the current BF16 rounding boundary after `hidden + projected`.
 
+### Step 26: PPLX Marlin routing report
+- Added `docs/models/kimi-k2/pplx_build_marlin_routing_report.md` for `decode.moe.pplx_build_marlin_routing`.
+- Evidence reused from `pplx_marlin_compute_report.md`, `profile/kimi-pplx-marlin-compute-h20-baseline/`, and trace replay artifacts:
+  - source launch: `1 x 64` in `pegainfer-kernels/csrc/kimi_k2/kimi_experts.cu`.
+  - NCU: `5.28-5.31us`, `0.00` waves/SM, `0.04%` DRAM, `87-88%` scheduler no eligible.
+  - H20 replay p95: `recv=67`, `padded=224`, active experts `28`, `9.87us/call`, `592.3us/step`.
+- Decision: keep row 24 as `control`, stop standalone routing metadata tuning, and only revisit it as part of route-aware Marlin scheduling or launch-removing fusion.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
