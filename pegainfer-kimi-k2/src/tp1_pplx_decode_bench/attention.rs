@@ -27,6 +27,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "rms_norm_batch",
+            "decode.attention.input_norm",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -42,6 +43,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     );
     specs.push(gemm_spec(
         "gemm_graphsafe",
+        "decode.attention.qkv_a",
         Stage::Attention,
         active_rows,
         arena_rows,
@@ -55,6 +57,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "kimi_mla_split_qkv_a_norm",
+            "decode.attention.qkv_a_split_norm",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -84,6 +87,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     );
     specs.push(gemm_spec(
         "gemm_dm_typed_to_hs_graphsafe",
+        "decode.attention.q_b",
         Stage::Attention,
         active_rows,
         arena_rows,
@@ -97,6 +101,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "kimi_mla_rope_split_decode_rt",
+            "decode.attention.rope_split",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -119,6 +124,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "kimi_mla_absorb_q_nope_rt",
+            "decode.attention.absorb_q_nope",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -148,6 +154,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "kimi_mla_paged_kv_append",
+            "decode.attention.paged_kv_append",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -170,6 +177,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "kimi_flashinfer_batch_decode_mla_rt",
+            "decode.attention.flashinfer_mla_decode",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -200,6 +208,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "kimi_mla_v_up_rt",
+            "decode.attention.v_up",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -228,6 +237,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     );
     specs.push(gemm_spec(
         "gemm_dm_hs_to_typed_graphsafe",
+        "decode.attention.o_proj",
         Stage::Attention,
         active_rows,
         arena_rows,
@@ -241,6 +251,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "fused_add_rms_norm_round_batch",
+            "decode.attention.post_attn_add_norm",
             Stage::Attention,
             active_rows,
             arena_rows,
@@ -259,6 +270,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "rms_norm_batch",
+            "decode.final.norm",
             Stage::Final,
             active_rows,
             arena_rows,
@@ -274,6 +286,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     );
     specs.push(gemm_spec(
         "gemm_graphsafe",
+        "decode.final.lm_head",
         Stage::Final,
         active_rows,
         arena_rows,
@@ -287,6 +300,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
     specs.push(
         base(
             "argmax_batch_bf16",
+            "decode.final.argmax",
             Stage::Final,
             active_rows,
             arena_rows,
@@ -306,6 +320,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
 
 fn base(
     op: &'static str,
+    label: &'static str,
     stage: Stage,
     active_rows: usize,
     arena_rows: usize,
@@ -313,11 +328,13 @@ fn base(
     calls_per_decode_step: usize,
 ) -> BenchSpec {
     BenchSpec::new(op, stage, active_rows, arena_rows, ctx_len)
+        .label(label)
         .calls_per_decode_step(calls_per_decode_step)
 }
 
 fn gemm_spec(
     op: &'static str,
+    label: &'static str,
     stage: Stage,
     active_rows: usize,
     arena_rows: usize,
@@ -330,6 +347,7 @@ fn gemm_spec(
 ) -> BenchSpec {
     base(
         op,
+        label,
         stage,
         active_rows,
         arena_rows,

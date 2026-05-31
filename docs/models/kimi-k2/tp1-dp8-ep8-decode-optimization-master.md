@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 Decode Optimization Master
 
-> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. The first accepted optimization is `shared_gate_up` cuBLASLt: `1.818ms -> 1.505ms` per 60 MoE layers. Phase 2 fusion scan is tracked in `tp1-dp8-ep8-fusion-scan.md`; EP communication rows are included for path coverage but excluded from optimization.
+> **TL;DR:** Master ledger for Kimi-K2 TP1/DP8/EP8 decode optimization on H20. Phase 1 baseline is anchored at per-DP-rank `bs=8`, global `bs~=64`, `ctx=1`: every decode-path operator is listed below with shape, latency, H20 roofline class, and peak gap. The first accepted optimization is `shared_gate_up` cuBLASLt: `1.818ms -> 1.505ms` per 60 MoE layers. Phase 2 fusion scan now has H20 NCU evidence for row 21/22 and row 6/7; no fusion is accepted yet. EP communication rows are included for path coverage but excluded from optimization.
 >
 > **Last touched:** 2026-05
 
@@ -97,20 +97,20 @@ Columns:
 | 3 | dense | `decode.dense.swiglu` | `silu_mul_hs_fused_into` | 1 | hidden=18432, batch=8, BF16 | 7.8 us | 7.8 us | 113.4 GB/s | memory | 2.4% / gap 97.6% | measured |
 | 4 | dense | `decode.dense.down` | `gemm_dm_hs_to_typed_graphsafe` | 1 | rows=8, out=7168, in=18432, BF16 | 85.3 us | 85.3 us | 24.77 TF/s | memory | 64.6% / gap 35.4% | measured |
 | 5 | dense | `decode.dense.residual_add` | `add_batch` | 1 | hidden=7168, batch=8, BF16 | 6.8 us | 6.8 us | 50.5 GB/s | memory | 1.1% / gap 98.9% | measured |
-| 6 | attention | `rms_norm_batch` | `rms_norm_batch` | 61 | elems=57344, BF16 | 476.3 us | 7.8 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
-| 7 | attention | `gemm_graphsafe` | `gemm_graphsafe` | 61 | rows=8, out=2112, in=7168, BF16 | 1.256 ms | 20.6 us | 11.77 TF/s | memory | 30.8% / gap 69.2% | measured |
-| 8 | attention | `kimi_mla_split_qkv_a_norm` | `kimi_mla_split_qkv_a_norm` | 61 | elems=16896, BF16 | 501.1 us | 8.2 us | 0.01 TF/s | memory | 0.3% / gap 99.7% | measured |
-| 9 | attention | `gemm_dm_typed_to_hs_graphsafe` | `gemm_dm_typed_to_hs_graphsafe` | 61 | rows=8, out=12288, in=1536, BF16 | 1.052 ms | 17.2 us | 17.51 TF/s | memory | 45.9% / gap 54.1% | measured |
-| 10 | attention | `kimi_mla_rope_split_decode_rt` | `kimi_mla_rope_split_decode_rt` | 61 | elems=98816, BF16 | 441.8 us | 7.2 us | 0.03 TF/s | memory | 1.1% / gap 98.9% | measured |
-| 11 | attention | `kimi_mla_absorb_q_nope_rt` | `kimi_mla_absorb_q_nope_rt` | 61 | rows=8, out=32768, in=128, BF16 | 955.0 us | 15.7 us | 4.29 TF/s | memory | 11.9% / gap 88.1% | measured |
-| 12 | attention | `kimi_mla_paged_kv_append` | `kimi_mla_paged_kv_append` | 61 | elems=4608, BF16 | - | - | - | estimate-only | - | estimate-only |
-| 13 | attention | `kimi_flashinfer_batch_decode_mla_rt` | `kimi_flashinfer_batch_decode_mla_rt` | 61 | elems=512, BF16 | 624.6 us | 10.2 us | 0.11 TF/s | memory | 4.4% / gap 95.6% | measured |
-| 14 | attention | `kimi_mla_v_up_rt` | `kimi_mla_v_up_rt` | 61 | rows=8, out=8192, in=512, BF16 | 771.3 us | 12.6 us | 5.31 TF/s | memory | 14.1% / gap 85.9% | measured |
-| 15 | attention | `gemm_dm_hs_to_typed_graphsafe` | `gemm_dm_hs_to_typed_graphsafe` | 61 | rows=8, out=7168, in=8192, BF16 | 2.715 ms | 44.5 us | 21.11 TF/s | memory | 55.1% / gap 44.9% | measured |
-| 16 | attention | `fused_add_rms_norm_round_batch` | `fused_add_rms_norm_round_batch` | 61 | elems=57344, BF16 | 530.0 us | 8.7 us | 0.05 TF/s | memory | 1.6% / gap 98.4% | measured |
-| 17 | final | `rms_norm_batch` | `rms_norm_batch` | 1 | elems=57344, BF16 | 8.1 us | 8.1 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
-| 18 | final | `gemm_graphsafe` | `gemm_graphsafe` | 1 | rows=8, out=163840, in=7168, BF16 | 542.7 us | 542.7 us | 34.62 TF/s | memory | 90.3% / gap 9.7% | measured |
-| 19 | final | `argmax_batch_bf16` | `argmax_batch_bf16` | 1 | elems=1310720, BF16 | 125.3 us | 125.3 us | 20.9 GB/s | memory | 0.4% / gap 99.6% | measured |
+| 6 | attention | `decode.attention.input_norm` | `rms_norm_batch` | 61 | elems=57344, BF16 | 476.3 us | 7.8 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
+| 7 | attention | `decode.attention.qkv_a` | `gemm_graphsafe` | 61 | rows=8, out=2112, in=7168, BF16 | 1.256 ms | 20.6 us | 11.77 TF/s | memory | 30.8% / gap 69.2% | measured |
+| 8 | attention | `decode.attention.qkv_a_split_norm` | `kimi_mla_split_qkv_a_norm` | 61 | elems=16896, BF16 | 501.1 us | 8.2 us | 0.01 TF/s | memory | 0.3% / gap 99.7% | measured |
+| 9 | attention | `decode.attention.q_b` | `gemm_dm_typed_to_hs_graphsafe` | 61 | rows=8, out=12288, in=1536, BF16 | 1.052 ms | 17.2 us | 17.51 TF/s | memory | 45.9% / gap 54.1% | measured |
+| 10 | attention | `decode.attention.rope_split` | `kimi_mla_rope_split_decode_rt` | 61 | elems=98816, BF16 | 441.8 us | 7.2 us | 0.03 TF/s | memory | 1.1% / gap 98.9% | measured |
+| 11 | attention | `decode.attention.absorb_q_nope` | `kimi_mla_absorb_q_nope_rt` | 61 | rows=8, out=32768, in=128, BF16 | 955.0 us | 15.7 us | 4.29 TF/s | memory | 11.9% / gap 88.1% | measured |
+| 12 | attention | `decode.attention.paged_kv_append` | `kimi_mla_paged_kv_append` | 61 | elems=4608, BF16 | - | - | - | estimate-only | - | estimate-only |
+| 13 | attention | `decode.attention.flashinfer_mla_decode` | `kimi_flashinfer_batch_decode_mla_rt` | 61 | elems=512, BF16 | 624.6 us | 10.2 us | 0.11 TF/s | memory | 4.4% / gap 95.6% | measured |
+| 14 | attention | `decode.attention.v_up` | `kimi_mla_v_up_rt` | 61 | rows=8, out=8192, in=512, BF16 | 771.3 us | 12.6 us | 5.31 TF/s | memory | 14.1% / gap 85.9% | measured |
+| 15 | attention | `decode.attention.o_proj` | `gemm_dm_hs_to_typed_graphsafe` | 61 | rows=8, out=7168, in=8192, BF16 | 2.715 ms | 44.5 us | 21.11 TF/s | memory | 55.1% / gap 44.9% | measured |
+| 16 | attention | `decode.attention.post_attn_add_norm` | `fused_add_rms_norm_round_batch` | 61 | elems=57344, BF16 | 530.0 us | 8.7 us | 0.05 TF/s | memory | 1.6% / gap 98.4% | measured |
+| 17 | final | `decode.final.norm` | `rms_norm_batch` | 1 | elems=57344, BF16 | 8.1 us | 8.1 us | 0.04 TF/s | memory | 1.2% / gap 98.8% | measured |
+| 18 | final | `decode.final.lm_head` | `gemm_graphsafe` | 1 | rows=8, out=163840, in=7168, BF16 | 542.7 us | 542.7 us | 34.62 TF/s | memory | 90.3% / gap 9.7% | measured |
+| 19 | final | `decode.final.argmax` | `argmax_batch_bf16` | 1 | elems=1310720, BF16 | 125.3 us | 125.3 us | 20.9 GB/s | memory | 0.4% / gap 99.6% | measured |
 | 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.687 ms | 61.4 us | 92.1 GB/s | control | - | measured |
 | 21 | moe_shared | `decode.moe.shared_gate_up` | `kimi_shared_gate_up_cublaslt` | 60 | rows=8, out=4096, in=7168, BF16 | 1.505 ms | 25.1 us | 18.72 TF/s | memory | 48.9% / gap 51.1% | measured |
 | 22 | moe_shared | `decode.moe.shared_swiglu` | `silu_mul_hs_fused_into` | 60 | rows=8, gate_up=4096, out=2048, BF16 | 410.2 us | 6.8 us | 14.4 GB/s | memory | 0.3% / gap 99.7% | measured |
@@ -134,7 +134,7 @@ Measured rows sorted by step latency at `bs=8,ctx=1`:
 | 1 | `decode.moe.router` | 3.687 ms | Profile first: likely control/launch plus router scoring; correctness-sensitive. |
 | 2 | attention `o_proj` (`gemm_dm_hs_to_typed_graphsafe`) | 2.715 ms | cuBLASLt skinny GEMM baseline; candidate for RMSNorm/GEMM sequence review only after profile. |
 | 3 | `decode.moe.shared_gate_up` | 1.505 ms | cuBLASLt accepted; next work should treat this as the baseline for row 21/22 fusion scans. |
-| 4 | attention `fused_qkv_a_proj` (`gemm_graphsafe`) | 1.256 ms | cuBLASLt baseline and prologue fusion candidate. |
+| 4 | attention `decode.attention.qkv_a` (`gemm_graphsafe`) | 1.256 ms | NCU done: cuBLAS split-K skinny GEMM, main kernel `72` blocks/`0.92` waves/SM/`51-53%` DRAM plus `~3us` split-K reduce. Next fair baseline is cuBLASLt exact-shape before custom prologue fusion. |
 | 5 | attention `q_b_proj` | 1.052 ms | cuBLASLt baseline and skinny GEMM profile. |
 | 6 | attention `absorb_q_nope` | 955.0 us | Small-K GEMM, profile wave/grid utilization. |
 | 7 | `decode.moe.shared_down` | 904.1 us | cuBLASLt baseline; possible shared_gate/SwiGLU/down sequence review. |
@@ -150,7 +150,7 @@ Start Phase 2 from the rows above:
 
 | Candidate | Rows touched | Why it is plausible | First proof required |
 |---|---|---|---|
-| Attention RMSNorm -> qkv_a GEMM prologue | rows 6-7 | Norm is launch/memory heavy and immediately feeds a skinny GEMM. | NCU on both kernels plus cuBLASLt/prologue feasibility check. |
+| Attention RMSNorm -> qkv_a GEMM prologue | rows 6-7 | Norm is launch/memory heavy and immediately feeds a skinny GEMM. | NCU done in `tp1-dp8-ep8-fusion-scan.md`: row 6 is tiny-grid (`8` blocks, `0.05` waves/SM), row 7 is cuBLAS split-K skinny GEMM. Next: qkv_a cuBLASLt exact-shape baseline before any custom RMSNorm-prologue GEMM. |
 | qkv_a split/norm cleanup | row 8 with row 9 input | Split qkv_a and normalize q_lora/ckv before q_b/MLA cache. | Confirm memory traffic and launch overhead dominate. |
 | MoE shared gate_up + SwiGLU | rows 21-22 | Gate/up output is consumed only by SwiGLU; avoids writing/reading 4096 BF16 per row per layer. | Initial NCU done in `tp1-dp8-ep8-fusion-scan.md`: row 22 is tiny-grid/latency-bound; accepted fusion requires gated-dual-GEMM beating cuBLASLt in the full TP1 PPLX bench. |
 | Shared SwiGLU + down prologue | rows 22-23 | Activation output is consumed only by down GEMM. | cuBLASLt epilogue/prologue support or CUTLASS prototype; correctness gate on BF16 rounding. |

@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields. Current Kimi-specific cuBLASLt shared_gate_up path supports batch_size `1..=64`; H20 `bs=8,ctx=1` shared_gate_up improves from the Phase 1 baseline `1.818ms` to `1.505ms` per 60 MoE layers.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current Kimi-specific cuBLASLt shared_gate_up path supports batch_size `1..=64`; H20 `bs=8,ctx=1` shared_gate_up improves from the Phase 1 baseline `1.818ms` to `1.505ms` per 60 MoE layers.
 >
 > **Last touched:** 2026-05
 
@@ -114,6 +114,32 @@
   - TP1 PPLX bench provider after wiring Kimi path: `bs=8,ctx=1` shared_gate_up is `1.505ms` for 60 calls, versus the Phase 1 baseline row `1.818ms`.
   - Non-power-of-two active batches are valid: `bs=3,ctx=1` measured `1.524ms` and the row op is `kimi_shared_gate_up_cublaslt`.
 - Production decision: put a Kimi-specific cuBLASLt wrapper under `pegainfer-kernels/src/ops/kimi_k2/shared_gate_up.rs` plus `pegainfer-kernels/csrc/kimi_k2/kimi_shared_gate_up.cu`, gated by exact shape `M=4096,K=7168,batch_size=1..=64`. The old typed GEMM remains fallback for other shapes.
+
+### Step 7: Add row filters for NCU isolation
+- Updated attention/final manifest labels so repeated providers are distinguishable:
+  - `decode.attention.input_norm`
+  - `decode.attention.qkv_a`
+  - `decode.attention.qkv_a_split_norm`
+  - `decode.attention.q_b`
+  - `decode.attention.rope_split`
+  - `decode.attention.absorb_q_nope`
+  - `decode.attention.paged_kv_append`
+  - `decode.attention.flashinfer_mla_decode`
+  - `decode.attention.v_up`
+  - `decode.attention.o_proj`
+  - `decode.attention.post_attn_add_norm`
+  - `decode.final.norm`
+  - `decode.final.lm_head`
+  - `decode.final.argmax`
+- Added CLI filters:
+  - `--ops <csv>` filters by provider/op name.
+  - `--labels <csv>` filters by unique manifest label.
+  - Empty filter result fails early with `filters matched no TP1 PPLX decode bench rows`.
+- Verified locally:
+  - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench`
+  - `cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench -- --active-rows 8 --ctx-lens 1 --measure false --format json --labels decode.attention.input_norm,decode.attention.qkv_a --out target/kernel_reports/kimi-k2/tp1-pplx-decode-filter-smoke.json`
+  - Result: passed; the JSON contained exactly the two requested rows with shapes `elems=57344` and `rows=8,out=2112,in=7168`.
+- Verified on `h20-100` with the same label filter before collecting row 6/7 NCU artifacts under `profile/kimi-attention-row6-row7-h20-baseline/`.
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.

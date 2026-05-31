@@ -38,6 +38,10 @@ struct Cli {
     format: String,
     #[arg(long)]
     out: Option<PathBuf>,
+    #[arg(long = "ops")]
+    ops: Option<String>,
+    #[arg(long = "labels")]
+    labels: Option<String>,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     measure: bool,
     #[arg(long)]
@@ -61,6 +65,10 @@ struct BenchReport {
 struct BenchConfig {
     active_rows: Vec<usize>,
     ctx_lens: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op_filter: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label_filter: Option<Vec<String>>,
     arena_rows: usize,
     iters: u64,
     measure: bool,
@@ -127,11 +135,16 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| default_ctx_lens().to_vec());
     validate_rows(&active_rows)?;
     validate_ctx_lens(&ctx_lens)?;
+    let op_filter = cli.ops.as_deref().map(parse_string_csv).transpose()?;
+    let label_filter = cli.labels.as_deref().map(parse_string_csv).transpose()?;
 
     let mut rows = Vec::new();
     for &ctx_len in &ctx_lens {
         for &active in &active_rows {
             for spec in specs(active, TP1_PPLX_ARENA_ROWS, ctx_len) {
+                if !matches_filters(&spec, op_filter.as_deref(), label_filter.as_deref()) {
+                    continue;
+                }
                 let measured = if cli.measure {
                     measure_spec(&spec, cli.iters)?
                 } else {
@@ -147,6 +160,9 @@ fn main() -> Result<()> {
             }
         }
     }
+    if rows.is_empty() {
+        bail!("filters matched no TP1 PPLX decode bench rows");
+    }
 
     let report = BenchReport {
         schema: 1,
@@ -155,6 +171,8 @@ fn main() -> Result<()> {
         config: BenchConfig {
             active_rows,
             ctx_lens,
+            op_filter,
+            label_filter,
             arena_rows: TP1_PPLX_ARENA_ROWS,
             iters: cli.iters,
             measure: cli.measure,
@@ -186,6 +204,29 @@ fn parse_usize_csv(value: &str) -> Result<Vec<usize>> {
                 .with_context(|| format!("invalid usize `{part}`"))
         })
         .collect()
+}
+
+fn parse_string_csv(value: &str) -> Result<Vec<String>> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(String::is_empty) {
+        bail!("filter lists must be comma-separated non-empty strings");
+    }
+    Ok(values)
+}
+
+fn matches_filters(
+    spec: &BenchSpec,
+    op_filter: Option<&[String]>,
+    label_filter: Option<&[String]>,
+) -> bool {
+    let op_match = op_filter.is_none_or(|ops| ops.iter().any(|op| op == spec.op));
+    let label_match =
+        label_filter.is_none_or(|labels| labels.iter().any(|label| label == spec.label));
+    op_match && label_match
 }
 
 fn validate_rows(rows: &[usize]) -> Result<()> {
