@@ -364,6 +364,16 @@
 - Evidence was already in `attention_qkv_a_split_norm_report.md`: H20 NCU reports `8` CTAs, `0.01` waves/SM, `0.19-0.20%` DRAM, `0.37-0.39%` compute, and `93.4-93.7%` scheduler no eligible.
 - Decision: classify row 8 as `control/tiny-grid` with payload-equivalent throughput instead of the stale memory-bound `0.3% / gap 99.7%` entry.
 
+### Step 29: NCU priority audit and row 13 collection attempt
+- Spawned a read-only audit sub-agent to rank remaining NCU gaps across master rows 1-28. The recommended order is now recorded in `tp1-dp8-ep8-decode-optimization-master.md`: row 13 `flashinfer_mla_decode`, row 16 `post_attn_add_norm`, row 10 `rope_split`, row 12 `paged_kv_append`, then row 28 `residual_add_scaled`.
+- Attempted to start `decode.attention.flashinfer_mla_decode` `ctx=8192` NCU collection under `profile/kimi-flashinfer-mla-decode-ctx8192-h20/`.
+- Remote state observed:
+  - `target/release/kimi_tp1_pplx_decode_bench` exists on `h20-100` and supports `--labels`.
+  - `/usr/local/cuda-12.9/bin/ncu --version` returned `Version 2025.2.0.0` once during this session.
+  - Running through `/root/.cargo/bin/cargo` without a CUDA PATH failed because `pegainfer-comm-a2a-kernels` could not find `nvcc`; the next attempt should use the existing release binary directly or set `PATH=/usr/local/cuda-12.9/bin:$PATH`.
+  - Subsequent short `ssh h20-100` commands timed out, so no production NCU report was collected in this step.
+- Decision: keep row 13 active. The next concrete action is to rerun the existing-binary NCU command when `h20-100` SSH is stable; do not change FlashInfer MLA decode code from event timing alone.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.

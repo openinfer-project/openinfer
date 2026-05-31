@@ -20,18 +20,17 @@ Practical conclusion: for `ctx=1`, the row is launch/control overhead. For `ctx>
 
 ## NCU Conclusion
 
-Fresh production NCU is currently unavailable on `h20-100`:
+Fresh production NCU has not been collected for this row yet. Earlier attempts failed because `ncu --version` timed out; on 2026-06-01 `/usr/local/cuda-12.9/bin/ncu --version` did return `Version 2025.2.0.0` once, but the follow-up `h20-100` SSH commands timed out before the row-13 collection could run.
 
 ```bash
 timeout 20s ssh -o ConnectTimeout=5 h20-100 '/usr/local/cuda-12.9/bin/ncu --version'
-# exits 124 with no output
+# 2026-06-01: returned Version 2025.2.0.0 once; later short ssh commands timed out.
 ```
 
 The NCU conclusion for this row is therefore intentionally incomplete: do not adopt a code optimization from CUDA-event timing alone. The next NCU run should isolate:
 
 ```bash
-cargo run --release -p pegainfer-kimi-k2 --features kernel-report \
-  --bin kimi_tp1_pplx_decode_bench -- \
+target/release/kimi_tp1_pplx_decode_bench \
   --active-rows 8 --ctx-lens 1,128,1024,4096,8192 \
   --labels decode.attention.flashinfer_mla_decode \
   --iters 16 --format json \

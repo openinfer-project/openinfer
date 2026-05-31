@@ -160,6 +160,20 @@ Measured rows sorted by step latency at `bs=8,ctx=1`:
 
 All non-communication local compute rows now have H20 provider benches. `decode.attention.paged_kv_append` still needs a production-metadata NCU report once Nsight Compute works on `h20-100`, but the H20 latency row is no longer estimate-only. PPLX routed local compute has a synthetic stress provider plus a trace replay provider for local routing/W13/SwiGLU/W2; an all-rank harness is still required before turning those rows into EP transport or end-to-end serving-throughput claims. EP communication rows remain excluded from optimization but must stay visible in this table.
 
+## NCU Priority Queue
+
+Next production NCU collection order for rows that still have weak or stale profile evidence:
+
+| Priority | Row | Op | Current evidence gap | Why this order |
+|---:|---:|---|---|---|
+| 1 | 13 | `decode.attention.flashinfer_mla_decode` | CUDA-event ctx sweep only; no production NCU backend, DRAM/L2, partition-KV, or stall breakdown. | Highest long-context impact: `ctx=8192` is `103.5ms/step`, about `2.85TB/s` payload-equivalent. |
+| 2 | 16 | `decode.attention.post_attn_add_norm` | Source geometry + event timing only; no `FusedAddRMSNormRoundKernel` NCU. | `530us/step` across 61 calls; NCU decides whether downstream prologue fusion is worth carrying. |
+| 3 | 10 | `decode.attention.rope_split` | Event timing + source geometry only; no production `rope_split_decode_kernel` NCU. | `441.8us/step` with `384` CTAs, so the bottleneck could be tail/cache/control rather than a pure tiny-grid launch. |
+| 4 | 12 | `decode.attention.paged_kv_append` | Production-metadata event timing exists; only compact-metadata NCU is available as directional evidence. | `431.0us/step` and directly touches MLA cache metadata; production page stride changed after the old NCU. |
+| 5 | 28 | `decode.moe.residual_add_scaled` | Event timing + source geometry only; no production stall/memory/instruction counters. | `408.3us/step` across 60 calls; NCU can confirm the stop decision or justify launch-removing fusion work. |
+
+`decode.final.lm_head` is intentionally below this queue despite its `542.7us` latency because the current BF16 GEMM already reaches about `90%` of the H20 HBM roofline by the bench model.
+
 ## Fusion Scan Queue
 
 Start Phase 2 from the rows above:
