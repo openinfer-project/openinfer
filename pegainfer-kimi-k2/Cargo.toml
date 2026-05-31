@@ -49,5 +49,10 @@ name = "kimi_tp1_pplx_decode_bench"
 path = "src/bin/kimi_tp1_pplx_decode_bench.rs"
 required-features = ["kernel-report"]
 
+[[bin]]
+name = "kimi_pplx_marlin_replay"
+path = "src/bin/kimi_pplx_marlin_replay.rs"
+required-features = ["kernel-report"]
+
 [lints]
 workspace = true

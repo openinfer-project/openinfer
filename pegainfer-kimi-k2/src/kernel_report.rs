@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use std::cell::Cell;
@@ -798,10 +798,8 @@ fn measure_marlin_swiglu(call: &KernelCall, iters: u64) -> Result<LatencyStats> 
 fn measure_pplx_marlin_routing(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let cfg = pplx_marlin_cfg(call)?;
     let ctx = DeviceContext::new()?;
-    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
-        cfg.route_elems,
-        cfg.expert_padding,
-    )?)?;
+    let recv_counts = pplx_recv_counts_for_call(call, cfg)?;
+    let recv_counts = ctx.stream.clone_htod(&recv_counts)?;
     let mut route_workspace =
         KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
     measure_loop(&ctx, iters, || {
@@ -819,10 +817,8 @@ fn measure_pplx_marlin_routing(call: &KernelCall, iters: u64) -> Result<LatencyS
 fn measure_pplx_marlin_w13(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let cfg = pplx_marlin_cfg(call)?;
     let ctx = DeviceContext::new()?;
-    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
-        cfg.route_elems,
-        cfg.expert_padding,
-    )?)?;
+    let recv_counts = pplx_recv_counts_for_call(call, cfg)?;
+    let recv_counts = ctx.stream.clone_htod(&recv_counts)?;
     let mut route_workspace =
         KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
     let route_workspace_m_blocks = route_workspace.max_m_blocks;
@@ -872,10 +868,8 @@ fn measure_pplx_marlin_w13(call: &KernelCall, iters: u64) -> Result<LatencyStats
 fn measure_pplx_marlin_swiglu(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let cfg = pplx_marlin_cfg(call)?;
     let ctx = DeviceContext::new()?;
-    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
-        cfg.route_elems,
-        cfg.expert_padding,
-    )?)?;
+    let recv_counts = pplx_recv_counts_for_call(call, cfg)?;
+    let recv_counts = ctx.stream.clone_htod(&recv_counts)?;
     let mut route_workspace =
         KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
     let routing = kimi_pplx_build_marlin_routing_on_stream(
@@ -895,10 +889,8 @@ fn measure_pplx_marlin_swiglu(call: &KernelCall, iters: u64) -> Result<LatencySt
 fn measure_pplx_marlin_w2(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let cfg = pplx_marlin_cfg(call)?;
     let ctx = DeviceContext::new()?;
-    let recv_counts = ctx.stream.clone_htod(&synthetic_pplx_recv_counts(
-        cfg.route_elems,
-        cfg.expert_padding,
-    )?)?;
+    let recv_counts = pplx_recv_counts_for_call(call, cfg)?;
+    let recv_counts = ctx.stream.clone_htod(&recv_counts)?;
     let mut route_workspace =
         KimiMarlinRouteWorkspace::new(&ctx, cfg.recv_capacity, cfg.block_size)?;
     let route_workspace_m_blocks = route_workspace.max_m_blocks;
@@ -975,6 +967,87 @@ fn pplx_marlin_cfg(call: &KernelCall) -> Result<PplxMarlinCfg> {
         recv_capacity,
         expert_padding,
         block_size: 8,
+    })
+}
+
+fn attr_value<'a>(call: &'a KernelCall, name: &str) -> Option<&'a str> {
+    call.attrs
+        .iter()
+        .find(|attr| attr.name == name)
+        .map(|attr| attr.value.as_str())
+}
+
+fn pplx_recv_counts_for_call(call: &KernelCall, cfg: PplxMarlinCfg) -> Result<Vec<i32>> {
+    let counts = match attr_value(call, "pplx_recv_counts") {
+        Some(value) => parse_pplx_recv_counts(call, value)?,
+        None => synthetic_pplx_recv_counts(cfg.route_elems, cfg.expert_padding)?,
+    };
+    let route_elems = pplx_route_elems_from_counts(&counts)?;
+    ensure!(
+        route_elems == cfg.route_elems,
+        "{} pplx_recv_counts sum {route_elems} must match pplx_route_elems {}",
+        call.label,
+        cfg.route_elems
+    );
+    let padded_rows = pplx_padded_rows_from_counts(&counts, cfg.expert_padding)?;
+    ensure!(
+        padded_rows <= cfg.recv_capacity,
+        "{} pplx_recv_counts padded rows {padded_rows} exceed recv_capacity {}",
+        call.label,
+        cfg.recv_capacity
+    );
+    Ok(counts)
+}
+
+fn parse_pplx_recv_counts(call: &KernelCall, value: &str) -> Result<Vec<i32>> {
+    let mut counts = Vec::new();
+    for (idx, part) in value.split(',').enumerate() {
+        let part = part.trim();
+        ensure!(
+            !part.is_empty(),
+            "{} pplx_recv_counts entry {idx} is empty",
+            call.label
+        );
+        let count = part
+            .parse::<i32>()
+            .with_context(|| format!("{} invalid pplx_recv_counts entry `{part}`", call.label))?;
+        ensure!(
+            count >= 0,
+            "{} pplx_recv_counts entry {idx} is negative: {count}",
+            call.label
+        );
+        counts.push(count);
+    }
+    ensure!(
+        counts.len() == KIMI_K2_LOCAL_EXPERTS,
+        "{} pplx_recv_counts len {} must equal local experts {KIMI_K2_LOCAL_EXPERTS}",
+        call.label,
+        counts.len()
+    );
+    Ok(counts)
+}
+
+fn pplx_route_elems_from_counts(counts: &[i32]) -> Result<usize> {
+    counts.iter().try_fold(0usize, |acc, &count| {
+        let count = usize::try_from(count)
+            .map_err(|_| anyhow::anyhow!("negative PPLX recv count {count}"))?;
+        acc.checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("PPLX recv count sum overflows usize"))
+    })
+}
+
+fn pplx_padded_rows_from_counts(counts: &[i32], expert_padding: usize) -> Result<usize> {
+    ensure!(expert_padding > 0, "PPLX expert_padding must be positive");
+    counts.iter().try_fold(0usize, |acc, &count| {
+        let count = usize::try_from(count)
+            .map_err(|_| anyhow::anyhow!("negative PPLX recv count {count}"))?;
+        let padded = if count == 0 {
+            0
+        } else {
+            count.div_ceil(expert_padding) * expert_padding
+        };
+        acc.checked_add(padded)
+            .ok_or_else(|| anyhow::anyhow!("PPLX padded row sum overflows usize"))
     })
 }
 

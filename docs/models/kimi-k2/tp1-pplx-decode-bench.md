@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, and runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 
@@ -185,7 +185,24 @@
   - `8008` total trace calls, `1920` `kimi_pplx_route_histogram` calls.
   - Two admission waves had `active_rows=1`; two near-target waves had rank0 `active_rows=7` and ranks1-7 `active_rows=8`, for `504` routed tokens per wave.
   - active8 rank rows: `padded_rows` p50/p95/max `80/216/336`, `recv_total_routes` p50/p95/max `63/161/282`, active local experts p50/p95/max `3/24/32`.
-- Decision: keep the synthetic PPLX Marlin latency rows until a replay provider or cleaner steady trace can use these histograms directly. The trace already shows the synthetic `400` padded rows/rank is conservative.
+- Decision at this step: keep the synthetic PPLX Marlin latency rows until a replay provider or cleaner steady trace can use these histograms directly. Step 12 supersedes this by adding trace replay and moving the master table to replay p95 rows.
+
+### Step 12: PPLX Marlin trace replay
+- Extended the PPLX providers in `pegainfer-kimi-k2/src/kernel_report.rs` to accept a `pplx_recv_counts` attr. When absent, they keep using the existing synthetic expected-local-route counts, so the original bench rows remain runnable.
+- Added `pegainfer-kimi-k2/src/bin/kimi_pplx_marlin_replay.rs`. It reads runtime trace JSON, filters non-empty `kimi_pplx_route_histogram` rows with `active_rows>=7`, selects p0/p50/p90/p95/p99/p100 by padded rows, and replays routing/W13/SwiGLU/W2 against the local providers.
+- Local verification:
+  - `cargo fmt --all -- --check`
+  - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_pplx_marlin_replay`
+  - `cargo clippy -p pegainfer-kimi-k2 --no-deps --release --features kimi-k2,kernel-report --all-targets -- -D warnings`
+  - Smoke replay with `--iters 1` on `target/kernel_reports/kimi-k2/tp1-dp8-pplx-route-hist-bs64-kv2-varied.json`.
+- H20 verification:
+  - `PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python /root/.cargo/bin/cargo check --release -p pegainfer-kimi-k2 --features kimi-k2,kernel-report --bin kimi_pplx_marlin_replay`
+  - `PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python /root/.cargo/bin/cargo run --release -p pegainfer-kimi-k2 --features kimi-k2,kernel-report --bin kimi_pplx_marlin_replay -- --trace target/kernel_reports/kimi-k2/tp1-dp8-pplx-route-hist-bs64-kv2-varied.json --iters 16 --format text --out target/kernel_reports/kimi-k2/pplx-marlin-replay-bs64-kv2-varied.json`
+- H20 replay summary:
+  - p50 `recv=56,padded=96,active_experts=8`: W13 `114.52us`, W2 `66.39us`.
+  - p95 `recv=67,padded=224,active_experts=28`: W13 `250.64us`, W2 `138.51us`.
+  - p100 `recv=207,padded=336,active_experts=26`: W13 `368.57us`, W2 `200.31us`.
+- Decision: update the master table to use trace replay p95 for PPLX local compute rows. No `opt(...)` commit: this is measurement infrastructure and baseline correction, not a faster kernel.
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
@@ -196,7 +213,7 @@
 
 ## Debrief
 
-- **Outcome**: Dedicated TP1 DP8 PPLX decode bench binary is implemented and checked. It covers embedding, dense layer0 MLP, 61-layer attention aggregate, final norm/lm_head/top1, MoE router/shared expert, PPLX routed compute accounting, and PPLX comm accounting across active batch sizes and context lengths.
+- **Outcome**: Dedicated TP1 DP8 PPLX decode bench binary is implemented and checked. It covers embedding, dense layer0 MLP, 61-layer attention aggregate, final norm/lm_head/top1, MoE router/shared expert, PPLX routed compute accounting, PPLX comm accounting across active batch sizes and context lengths, runtime PPLX route histograms, and trace-driven PPLX Marlin replay.
 - **Pitfalls encountered**:
   - CLI value parsing needed explicit owned strings to avoid clap's Vec parser mismatch.
   - TP1 MLA must use runtime-dim `_rt` providers; old TP8 typed providers would make the bench look valid while measuring the wrong local-head shape.
@@ -206,4 +223,5 @@
   - Bench rows should distinguish `arena_rows` from `active_rows`; the current TP1 path uses arena rows for attention/final and active rows after `set_moe_seq_len(active_len)` for MoE/top1.
   - Estimate-only rows are useful when they are explicit: they preserve the operator inventory without fabricating single-rank numbers for EP collectives.
 - **Follow-ups**:
-  - Add an all-rank PPLX harness for dispatch/combine timing and PPLX routed Marlin providers once the harness can create real recv counts/topk weights.
+  - Run NCU on trace replay p95/max W13/W2 before changing Marlin scheduling or tiling.
+  - Add an all-rank PPLX harness for dispatch/combine timing; trace replay covers local compute only and intentionally excludes EP transport.
