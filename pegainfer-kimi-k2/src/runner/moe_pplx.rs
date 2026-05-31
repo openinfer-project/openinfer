@@ -25,6 +25,10 @@ use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use cudarc::nccl::safe::Comm;
 use pegainfer_comm::{EpBackend, ScalarType};
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_core::ops::call_trace;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kernels::{
     ops::{
         KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_ROUTER_SCALE, KIMI_K2_SHARED_GATE_UP,
@@ -378,6 +382,19 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
             pplx.pplx_recv_capacity,
         )
         .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
+        #[cfg(feature = "kernel-call-trace")]
+        record_pplx_route_histogram(
+            ctx,
+            expert_kernels.rank,
+            layer_idx,
+            batch_size,
+            expert_kernels.local_expert_range.start,
+            &pplx.recv_tokens_per_expert,
+            pplx.expert_padding,
+            pplx.pplx_recv_capacity,
+            pplx.max_local_output_tokens,
+            &routing,
+        )?;
 
         // ---- 7. Marlin W13 (gate+up) GEMM ----
         pplx.pplx_recv_hidden.seq_len = routing.route_elems;
@@ -455,6 +472,71 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         &mut scratch.mla.normed,
     )?;
     std::mem::swap(&mut scratch.mla.hidden, &mut scratch.mla.normed);
+    Ok(())
+}
+
+#[cfg(feature = "kernel-call-trace")]
+fn record_pplx_route_histogram(
+    ctx: &DeviceContext,
+    rank: usize,
+    layer_idx: usize,
+    active_rows: usize,
+    local_expert_start: usize,
+    recv_tokens_per_expert: &CudaSlice<i32>,
+    expert_padding: usize,
+    recv_capacity: usize,
+    arena_rows: usize,
+    routing: &pegainfer_kernels::ops::KimiMarlinRouting<'_>,
+) -> Result<()> {
+    if !call_trace::is_enabled() {
+        return Ok(());
+    }
+
+    let counts = ctx.stream.clone_dtoh(recv_tokens_per_expert)?;
+    let num_tokens_post_padded = ctx.stream.clone_dtoh(routing.num_tokens_post_padded)?;
+    let counts = &counts[..KIMI_K2_LOCAL_EXPERTS.min(counts.len())];
+    let recv_total_routes = counts.iter().copied().map(i64::from).sum::<i64>();
+    let active_local_experts = counts.iter().filter(|&&count| count > 0).count();
+    let max_count_per_expert = counts.iter().copied().max().unwrap_or(0).max(0);
+    let padded_rows = counts
+        .iter()
+        .copied()
+        .filter(|&count| count > 0)
+        .map(|count| {
+            let count = usize::try_from(count).unwrap_or(0);
+            count.div_ceil(expert_padding) * expert_padding
+        })
+        .sum::<usize>();
+    let count_csv = counts
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let device_padded_rows = num_tokens_post_padded.first().copied().unwrap_or(0).max(0);
+
+    call_trace::record_call(
+        KernelCall::new(
+            "kimi_pplx_route_histogram",
+            format!("L{layer_idx}.moe.pplx.route_hist.rank{rank}"),
+        )
+        .attr("phase", "decode".to_string())
+        .attr("rank", rank.to_string())
+        .attr("ep_rank", rank.to_string())
+        .attr("layer_idx", layer_idx.to_string())
+        .attr("active_rows", active_rows.to_string())
+        .attr("arena_rows", arena_rows.to_string())
+        .attr("local_expert_start", local_expert_start.to_string())
+        .attr("local_experts", KIMI_K2_LOCAL_EXPERTS.to_string())
+        .attr("recv_counts", count_csv)
+        .attr("recv_total_routes", recv_total_routes.to_string())
+        .attr("active_local_experts", active_local_experts.to_string())
+        .attr("max_count_per_expert", max_count_per_expert.to_string())
+        .attr("padded_rows", padded_rows.to_string())
+        .attr("num_tokens_post_padded", device_padded_rows.to_string())
+        .attr("recv_capacity", recv_capacity.to_string())
+        .attr("expert_padding", expert_padding.to_string())
+        .attr("block_size", routing.block_size.to_string()),
+    );
     Ok(())
 }
 

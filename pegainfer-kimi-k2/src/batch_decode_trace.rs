@@ -1,8 +1,9 @@
 use anyhow::{Result, ensure};
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::{
-    engine::{EngineLoadOptions, GenerateRequest, TokenEvent},
+    engine::{EngineLoadOptions, EpBackend, GenerateRequest, TokenEvent},
     ops::call_trace,
+    parallel::ParallelConfig,
     sampler::SamplingParams,
 };
 use pegainfer_kernels::tensor::{
@@ -97,13 +98,56 @@ fn trace_static_decode_kernel_calls(batch_size: usize, kv_len: usize) -> Result<
 }
 
 #[cfg(feature = "kernel-call-trace")]
+#[derive(Clone, Debug)]
+pub struct RuntimeTraceOptions {
+    pub parallel: ParallelConfig,
+    pub ep_backend: EpBackend,
+    pub device_ordinals: Vec<usize>,
+}
+
+#[cfg(feature = "kernel-call-trace")]
+impl RuntimeTraceOptions {
+    #[must_use]
+    pub fn tp8_dp1() -> Self {
+        Self {
+            parallel: ParallelConfig::new(8, 1),
+            ep_backend: EpBackend::Nccl,
+            device_ordinals: (0..TP_WORLD_SIZE).collect(),
+        }
+    }
+}
+
+#[cfg(feature = "kernel-call-trace")]
 pub fn trace_runtime_decode_kernel_calls(
     model_path: &str,
     batch_size: usize,
     kv_len: usize,
 ) -> Result<Vec<KernelCall>> {
+    trace_runtime_decode_kernel_calls_with_options(
+        model_path,
+        batch_size,
+        kv_len,
+        RuntimeTraceOptions::tp8_dp1(),
+    )
+}
+
+#[cfg(feature = "kernel-call-trace")]
+pub fn trace_runtime_decode_kernel_calls_with_options(
+    model_path: &str,
+    batch_size: usize,
+    kv_len: usize,
+    options: RuntimeTraceOptions,
+) -> Result<Vec<KernelCall>> {
     ensure!(batch_size > 0, "batch_size must be greater than zero");
     ensure!(kv_len > 1, "runtime decode trace requires --kv-len > 1");
+    ensure!(
+        options.device_ordinals.len() == options.parallel.ep_world(),
+        "runtime decode trace TP{}/DP{} requires {} devices, got {:?}",
+        options.parallel.tp_world(),
+        options.parallel.dp_world(),
+        options.parallel.ep_world(),
+        options.device_ordinals
+    );
 
     let prompt_len = kv_len - 1;
     let engine = crate::start_engine(
@@ -111,9 +155,10 @@ pub fn trace_runtime_decode_kernel_calls(
         EngineLoadOptions {
             enable_cuda_graph: false,
             enable_prefill_profile: false,
-            device_ordinals: (0..TP_WORLD_SIZE).collect(),
+            device_ordinals: options.device_ordinals,
+            parallel_config: Some(options.parallel),
+            ep_backend: options.ep_backend,
             seed: 42,
-            ..EngineLoadOptions::default()
         },
     )?;
     let ((), calls) = call_trace::collect_result(|| {

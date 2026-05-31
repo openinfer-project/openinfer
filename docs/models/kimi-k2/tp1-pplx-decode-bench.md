@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, and synthetic expected-local-route PPLX Marlin compute providers; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, and runtime TP1/DP8/PPLX trace knobs that emit real `kimi_pplx_route_histogram` rows; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 
@@ -165,6 +165,16 @@
   - W2: `236.797us/call`, `14.208ms` per 60 MoE layers.
 - NCU artifacts are under `profile/kimi-pplx-marlin-compute-h20-baseline/`; W13/W2 Marlin kernels run with `234` CTAs, `1` wave/SM, `56.8-58.7%` SM throughput, and `32.6-34.7%` DRAM throughput.
 - Verified the PPLX Marlin provider across `active_rows=1,2,4,8` with `iters=4`; W13/W2 roofline percentages now stay below `39%` after using expected padded work rows and active-expert weight bytes instead of full recv-capacity bytes.
+
+### Step 10: Runtime PPLX route histogram trace
+- Extended the runtime trace entry point so `kimi_kernel_report` and `kimi_model_report` can use non-default parallelism and EP backend selection instead of being fixed to TP8/DP1/NCCL.
+- Added `kimi_pplx_route_histogram` trace rows immediately after PPLX `dispatch_recv` and Marlin routing construction. Each row records rank, layer, active rows, local expert range, `recv_counts`, total received routes, active local expert count, max per-expert count, host-computed padded rows, device `num_tokens_post_padded`, receive capacity, expert padding, and routing block size.
+- This is diagnostic infrastructure for replacing synthetic PPLX Marlin shapes with real TP1/DP8/PPLX histograms. It does not time or optimize EP communication kernels.
+- Local verification:
+  - `cargo fmt --all -- --check`
+  - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report`
+  - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report`
+  - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench`
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.

@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::info;
+use pegainfer_core::{engine::EpBackend, parallel::ParallelConfig};
 use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kimi_k2::batch_decode_trace::{
-    MODEL, trace_decode_kernel_calls, trace_runtime_decode_kernel_calls,
+    MODEL, RuntimeTraceOptions, trace_decode_kernel_calls,
+    trace_runtime_decode_kernel_calls_with_options,
 };
 use pegainfer_kimi_k2::kernel_report::{MeasuredCall, bench_key, measure_call};
 use serde::Serialize;
@@ -44,6 +46,12 @@ struct RunArgs {
     model_path: String,
     #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
     source: TraceSource,
+    #[arg(long = "tp-world", default_value_t = 8)]
+    tp_world: usize,
+    #[arg(long = "dp-world", default_value_t = 1)]
+    dp_world: usize,
+    #[arg(long = "ep-backend", value_enum, default_value_t = EpBackendArg::Nccl)]
+    ep_backend: EpBackendArg,
 }
 
 #[derive(Parser)]
@@ -58,12 +66,33 @@ struct TraceArgs {
     model_path: String,
     #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
     source: TraceSource,
+    #[arg(long = "tp-world", default_value_t = 8)]
+    tp_world: usize,
+    #[arg(long = "dp-world", default_value_t = 1)]
+    dp_world: usize,
+    #[arg(long = "ep-backend", value_enum, default_value_t = EpBackendArg::Nccl)]
+    ep_backend: EpBackendArg,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TraceSource {
     Runtime,
     Static,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EpBackendArg {
+    Nccl,
+    Pplx,
+}
+
+impl From<EpBackendArg> for EpBackend {
+    fn from(value: EpBackendArg) -> Self {
+        match value {
+            EpBackendArg::Nccl => EpBackend::Nccl,
+            EpBackendArg::Pplx => EpBackend::Pplx,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -91,7 +120,15 @@ fn main() -> Result<()> {
 
 fn run(args: RunArgs) -> Result<()> {
     validate_common(args.batch_size, args.kv_len, args.iters)?;
-    let schedule = load_schedule(args.source, &args.model_path, args.batch_size, args.kv_len)?;
+    let schedule = load_schedule(
+        args.source,
+        &args.model_path,
+        args.batch_size,
+        args.kv_len,
+        args.tp_world,
+        args.dp_world,
+        args.ep_backend,
+    )?;
     let call = schedule
         .iter()
         .find(|call| call.op == args.op)
@@ -129,7 +166,15 @@ fn trace(args: TraceArgs) -> Result<()> {
     if args.batch_size == 0 || args.kv_len == 0 {
         bail!("--batch-size and --kv-len must be greater than zero");
     }
-    let schedule = load_schedule(args.source, &args.model_path, args.batch_size, args.kv_len)?;
+    let schedule = load_schedule(
+        args.source,
+        &args.model_path,
+        args.batch_size,
+        args.kv_len,
+        args.tp_world,
+        args.dp_world,
+        args.ep_backend,
+    )?;
     let out = args.out.unwrap_or_else(|| {
         PathBuf::from(format!(
             "target/kernel_reports/{MODEL}/decode-trace-rank0-bs{}-kv{}.json",
@@ -147,9 +192,24 @@ fn load_schedule(
     model_path: &str,
     batch_size: usize,
     kv_len: usize,
+    tp_world: usize,
+    dp_world: usize,
+    ep_backend: EpBackendArg,
 ) -> Result<Vec<KernelCall>> {
     match source {
-        TraceSource::Runtime => trace_runtime_decode_kernel_calls(model_path, batch_size, kv_len),
+        TraceSource::Runtime => {
+            let parallel = ParallelConfig::new(tp_world, dp_world);
+            trace_runtime_decode_kernel_calls_with_options(
+                model_path,
+                batch_size,
+                kv_len,
+                RuntimeTraceOptions {
+                    parallel,
+                    ep_backend: ep_backend.into(),
+                    device_ordinals: (0..parallel.ep_world()).collect(),
+                },
+            )
+        }
         TraceSource::Static => trace_decode_kernel_calls(model_path, batch_size, kv_len),
     }
 }

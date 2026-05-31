@@ -86,8 +86,8 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/kimi-k2/attention_v_up_report.md` | `decode.attention.v_up` H20 report：TP1 MLA strided-batched BF16 GEMM，采用 cuBLASLt path，TP1 PPLX `bs=8,ctx=1` 从 `781.0us` 到 `738.5us` per 61 attention layers。 |
 | `models/kimi-k2/q_b_proj_report.md` | `decode.attention.q_b` H20 report：memory-bound skinny BF16 GEMM，cuBLASLt exact-shape sweep 在目标 `batch_size=8` 只有 `8.899us -> 8.746us` (`1.0175x`)，已拒绝 standalone 替换；后续只看 row 8/9 fusion。 |
 | `models/kimi-k2/final_argmax_report.md` | `decode.final.argmax` H20 report：把 one-CTA-per-row BF16 top1 改成 split-vocab partial reduction，TP1 PPLX `bs=8,ctx=1` 从 `125.3us` 到 `12.7us`，TP1 DP8 bs64/o5 token A/B `0/64` mismatch。 |
-| `models/kimi-k2/pplx_marlin_compute_report.md` | PPLX routed local compute H20 report：synthetic expected-local-route provider 覆盖 routing/W13/SwiGLU/W2；`bs=8,ctx=1` 下 W13 `26.18ms`、W2 `14.21ms` per 60 MoE layers，仍需 all-rank route histogram。 |
-| `models/kimi-k2/tp1-pplx-decode-bench.md` | Implemented `kimi_tp1_pplx_decode_bench`: TP1/PPLX operator bench with roofline fields plus `--ops`/`--labels` filters for NCU isolation; current accepted paths and synthetic PPLX Marlin local-compute providers are recorded. |
+| `models/kimi-k2/pplx_marlin_compute_report.md` | PPLX routed local compute H20 report：synthetic expected-local-route provider 覆盖 routing/W13/SwiGLU/W2；runtime trace 已能记录真实 `recv_tokens_per_expert` histogram，仍需 H20 all-rank artifact 替换 synthetic shape。 |
+| `models/kimi-k2/tp1-pplx-decode-bench.md` | Implemented `kimi_tp1_pplx_decode_bench`: TP1/PPLX operator bench with roofline fields plus `--ops`/`--labels` filters for NCU isolation; current accepted paths、synthetic PPLX Marlin providers、runtime TP1/DP8/PPLX route histogram trace are recorded. |
 | `models/kimi-k2/source-layout.md` | Kimi-K2 source files over 1k lines were split by responsibility; the largest Rust file under `pegainfer-kimi-k2/src` is now `layers/attention.rs` at 950 lines. |
 | `models/kimi-k2/dp-design.md` | TP×DP 可配置并行：每 DP rank 是独立 decode engine，EP all-to-all 天然 sync，轻量 load balancer 做 request 路由。首批 TP1×DP8 + TP8×DP1。 |
 

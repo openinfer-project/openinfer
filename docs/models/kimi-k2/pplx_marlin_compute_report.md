@@ -1,6 +1,6 @@
 # pplx_marlin_compute Report
 
-> **TL;DR:** PPLX routed local compute is now measurable in `kimi_tp1_pplx_decode_bench` without timing EP communication. For TP1 PPLX `bs=8,ctx=1`, the synthetic expected-local-route provider uses `recv_capacity=848`, `64` expected local routes per EP rank, and `400` expected padded work rows. H20 event timing is `pplx_build_marlin_routing=9.49us/call`, `pplx_marlin_w13=436.43us/call`, `pplx_swiglu=14.13us/call`, and `pplx_marlin_w2=236.80us/call`. W13/W2 sit near the H20 ridge (`AI ~= 29 flop/byte`) and are memory-bound by the bench roofline, while NCU still shows substantial SM pipe use (`56.8-58.7%`). This remains a synthetic local-compute baseline, not an all-rank route-imbalance claim.
+> **TL;DR:** PPLX routed local compute is measurable in `kimi_tp1_pplx_decode_bench` without timing EP communication, and runtime decode tracing can now emit per-layer `kimi_pplx_route_histogram` rows after `dispatch_recv`. For TP1 PPLX `bs=8,ctx=1`, the synthetic expected-local-route provider uses `recv_capacity=848`, `64` expected local routes per EP rank, and `400` expected padded work rows. H20 event timing is `pplx_build_marlin_routing=9.49us/call`, `pplx_marlin_w13=436.43us/call`, `pplx_swiglu=14.13us/call`, and `pplx_marlin_w2=236.80us/call`. W13/W2 sit near the H20 ridge (`AI ~= 29 flop/byte`) and are memory-bound by the bench roofline, while NCU still shows substantial SM pipe use (`56.8-58.7%`). This remains a synthetic local-compute baseline until an H20 all-rank route histogram artifact replaces it.
 >
 > **Last touched:** 2026-06
 
@@ -8,7 +8,7 @@
 
 KernelWiki's `wiki/kernels/fused-moe.md` and `wiki/kernels/grouped-gemm.md` pages match the direction: MoE local compute should be treated as grouped/masked expert GEMM with variable per-expert M, where launch count, padding, and load imbalance are first-class performance variables. The relevant caution is that decode uses small per-expert M; padding and masked layouts can waste compute, while grouped scheduling helps only when the route distribution is represented honestly.
 
-For this report, the bench provider deliberately excludes EP dispatch/combine transport and only times the local PPLX compute kernels after synthetic recv counts have been materialized. That makes the rows measurable for NCU and master-table accounting, but the final optimization target still needs an all-rank histogram to confirm actual per-expert counts.
+For this report, the bench provider deliberately excludes EP dispatch/combine transport and only times the local PPLX compute kernels after synthetic recv counts have been materialized. That makes the rows measurable for NCU and master-table accounting. Runtime decode traces now record `kimi_pplx_route_histogram` after `dispatch_recv`, including `recv_counts`, `recv_total_routes`, `active_local_experts`, `max_count_per_expert`, `padded_rows`, `num_tokens_post_padded`, `recv_capacity`, `expert_padding`, and `block_size`; the final optimization target still needs an H20 all-rank artifact using those fields.
 
 ## NCU Conclusion
 
@@ -39,9 +39,10 @@ Conclusion: W13/W2 are the dominant PPLX local-compute rows in this synthetic ba
 | Add TP1 PPLX local-compute providers to `kimi_tp1_pplx_decode_bench` | Rows 24-27 now measure through existing Rust/CUDA wrappers with synthetic recv counts: `64` expected local routes, `400` expected padded rows, and `recv_capacity=848` at `bs=8`. | Kept as baseline coverage. This is bench/report infrastructure, not an optimization. |
 | Worst-case synthetic counts using global `512` routes on one EP rank | W13 `905.95us/call`, W2 `485.03us/call`; this filled the local rank to capacity and contradicted the target global `bs~=64` expected load. | Rejected as the default provider shape. It remains a useful stress case, but not the anchor workload. |
 | Expected-local-route synthetic counts | W13 `436.43us/call`, W2 `236.80us/call`; NCU captures the Marlin kernels cleanly. | Adopted for the bench baseline until an all-rank route histogram replaces it. |
+| Add runtime `kimi_pplx_route_histogram` trace | `kimi_kernel_report` / `kimi_model_report` runtime traces can be run with `--tp-world 1 --dp-world 8 --ep-backend pplx` and record real per-layer recv histograms without timing EP transport. | Kept as diagnostic infrastructure. No `opt(...)` commit: it does not change kernel latency. |
 
 ## Final Conclusion
 
 The immediate gap for PPLX routed local compute was measurement coverage, not a code optimization. The master table should no longer treat W13/SwiGLU/W2/routing as invisible estimate-only rows.
 
-Do not commit an `opt(...)` change from this report: no faster kernel was adopted. The next optimization step should use an all-rank harness or route histogram to replace synthetic counts, then target W13/W2 if they remain top bottlenecks under the real distribution.
+Do not commit an `opt(...)` change from this report: no faster kernel was adopted. The next optimization step is to collect H20 all-rank runtime traces with real `recv_tokens_per_expert` histograms, replace the synthetic W13/W2 shapes in the master table, then target Marlin W13/W2 only if they remain top bottlenecks under the real distribution.

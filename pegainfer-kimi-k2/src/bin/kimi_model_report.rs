@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use pegainfer_bench::{Accum, CallSiteRow, RollupRow, accumulate, call_site_row, rollup_row};
+use pegainfer_core::{engine::EpBackend, parallel::ParallelConfig};
 use pegainfer_kernels::ops::KIMI_K2_EP_WORLD;
 use pegainfer_kernels::tensor::KernelCall;
 use pegainfer_kimi_k2::KIMI_K2_LAYERS;
 use pegainfer_kimi_k2::batch_decode_trace::{
-    MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site, trace_decode_kernel_calls,
-    trace_runtime_decode_kernel_calls,
+    MODEL, PHASE_DECODE, RuntimeTraceOptions, TP_WORLD_SIZE, normalize_call_site,
+    trace_decode_kernel_calls, trace_runtime_decode_kernel_calls_with_options,
 };
 use pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key, measure_call};
 use serde::Serialize;
@@ -35,12 +36,33 @@ struct Cli {
     model_path: String,
     #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
     source: TraceSource,
+    #[arg(long = "tp-world", default_value_t = TP_WORLD_SIZE)]
+    tp_world: usize,
+    #[arg(long = "dp-world", default_value_t = 1)]
+    dp_world: usize,
+    #[arg(long = "ep-backend", value_enum, default_value_t = EpBackendArg::Nccl)]
+    ep_backend: EpBackendArg,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TraceSource {
     Runtime,
     Static,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EpBackendArg {
+    Nccl,
+    Pplx,
+}
+
+impl From<EpBackendArg> for EpBackend {
+    fn from(value: EpBackendArg) -> Self {
+        match value {
+            EpBackendArg::Nccl => EpBackend::Nccl,
+            EpBackendArg::Pplx => EpBackend::Pplx,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -117,7 +139,15 @@ fn main() -> Result<()> {
         bail!("--format must be `text` or `json`");
     }
 
-    let schedule = load_schedule(cli.source, &cli.model_path, cli.batch_size, cli.kv_len)?;
+    let schedule = load_schedule(
+        cli.source,
+        &cli.model_path,
+        cli.batch_size,
+        cli.kv_len,
+        cli.tp_world,
+        cli.dp_world,
+        cli.ep_backend,
+    )?;
     let catalog = measure_catalog(&schedule, cli.iters)?;
     let report = compose_report(
         cli.batch_size,
@@ -281,9 +311,24 @@ fn load_schedule(
     model_path: &str,
     batch_size: usize,
     kv_len: usize,
+    tp_world: usize,
+    dp_world: usize,
+    ep_backend: EpBackendArg,
 ) -> Result<Vec<KernelCall>> {
     match source {
-        TraceSource::Runtime => trace_runtime_decode_kernel_calls(model_path, batch_size, kv_len),
+        TraceSource::Runtime => {
+            let parallel = ParallelConfig::new(tp_world, dp_world);
+            trace_runtime_decode_kernel_calls_with_options(
+                model_path,
+                batch_size,
+                kv_len,
+                RuntimeTraceOptions {
+                    parallel,
+                    ep_backend: ep_backend.into(),
+                    device_ordinals: (0..parallel.ep_world()).collect(),
+                },
+            )
+        }
         TraceSource::Static => trace_decode_kernel_calls(model_path, batch_size, kv_len),
     }
 }
