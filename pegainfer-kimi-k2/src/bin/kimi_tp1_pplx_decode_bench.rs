@@ -24,6 +24,8 @@ use serde::Serialize;
 const DEFAULT_ITERS: u64 = 32;
 const DEFAULT_H20_BF16_TFLOPS: f64 = 148.0;
 const DEFAULT_H20_HBM_GBPS: f64 = 4_800.0;
+const KIMI_DECODE_PAGE_SIZE: usize = 16;
+const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
 
 #[derive(Parser)]
 #[command(about = "Kimi-K2 TP1 DP8 PPLX decode operator bench")]
@@ -256,6 +258,15 @@ fn validate_ctx_lens(ctx_lens: &[usize]) -> Result<()> {
 fn measure_spec(spec: &BenchSpec, iters: u64) -> Result<MeasuredCall> {
     if spec.measure != MeasureKind::ExistingProvider {
         return Ok(unsupported("estimate-only spec has no local provider"));
+    }
+    if spec.op == "kimi_mla_paged_kv_append"
+        && spec.ctx_len > KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST
+    {
+        return Ok(unsupported(format!(
+            "kv_len={} exceeds decode arena capacity {} for production page metadata",
+            spec.ctx_len,
+            KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST
+        )));
     }
     let Some(call) = kernel_call(spec) else {
         return Ok(unsupported("no KernelCall adapter for TP1 PPLX spec"));
@@ -516,6 +527,15 @@ fn kernel_call(spec: &BenchSpec) -> Option<KernelCall> {
                         "q_abs_nope",
                         hidden(local_heads * KIMI_K2_MLA_KV_LORA_RANK, batch),
                     ),
+            )
+        }
+        "kimi_mla_paged_kv_append" => {
+            let batch = spec.arena_rows;
+            Some(
+                KernelCall::new("kimi_mla_paged_kv_append", spec.label)
+                    .input("append_ckv", hidden(KIMI_K2_MLA_KV_LORA_RANK, batch))
+                    .input("append_kpe", hidden(KIMI_K2_MLA_ROPE_DIM, batch))
+                    .attr("kv_len", spec.ctx_len.to_string()),
             )
         }
         "kimi_flashinfer_batch_decode_mla_rt" => {

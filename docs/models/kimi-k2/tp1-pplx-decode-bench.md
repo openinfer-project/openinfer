@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements plus p95 NCU isolation; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, MLA paged-KV append provider coverage with production page metadata, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements plus p95 NCU isolation; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
 >
 > **Last touched:** 2026-06
 
@@ -221,6 +221,35 @@
   - Source-counter reports have no file/line mapping because the release Marlin TU was not built with CUDA line info. Aggregate counters still show W13 `11,360` excessive shared wavefronts and W2 `61,552` excessive shared wavefronts.
 - Decision: PPLX Marlin p95 is not at H20 bandwidth or tensor-core limits. Only pursue variants that improve one-wave/smem/route-grouping behavior; otherwise stop this kernel.
 
+### Step 14: MLA paged KV append provider
+- Added a real provider for `decode.attention.paged_kv_append` instead of leaving the row estimate-only:
+  - `pegainfer-kimi-k2/src/tp1_pplx_decode_bench/attention.rs` now marks the row measured.
+  - `pegainfer-kimi-k2/src/bin/kimi_tp1_pplx_decode_bench.rs` emits a `kimi_mla_paged_kv_append` `KernelCall` with `append_ckv`, `append_kpe`, and `kv_len`.
+  - `pegainfer-kimi-k2/src/kernel_report.rs` builds synthetic paged MLA cache metadata and times `kimi_mla_paged_kv_append`.
+- Local verification:
+  - `cargo fmt --all --check`
+  - `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench`
+  - `cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench -- --active-rows 8 --ctx-lens 1 --labels decode.attention.paged_kv_append --iters 2 --format json --out target/kernel_reports/kimi-k2/tp1-pplx-decode-kv-append-local-smoke.json`
+- Local smoke result on the development GPU: `6.688us/call`, `407.97us` per 61 attention layers. This is not a H20 baseline and must not be promoted into the master table.
+- H20 verification:
+  - First filtered H20 run used compact page metadata and is no longer a production baseline after review. It measured `7.342us/call`, `447.9us` per 61 layers; NCU was directionally tiny-grid/control limited (`78 x 256`, `0.12` waves/SM, DRAM `0.09%`, no eligible `97.90%`).
+  - Review fixes:
+    - manifest row now uses `BoundKind::Control`, so JSON/text output does not compute an HBM peak percentage.
+    - provider now uses production decode arena metadata: `page_size=16`, `128` pages/request, and page base `request_idx * 128`.
+  - Local production-metadata smoke passed:
+    - `cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench -- --active-rows 8 --ctx-lens 1 --labels decode.attention.paged_kv_append --iters 2 --format json --out target/kernel_reports/kimi-k2/tp1-pplx-decode-kv-append-local-production-metadata-smoke.json`
+    - Result: `6.256us/call`, `381.62us/step`, `roofline_bound=control`, `roofline_peak_pct=null`.
+  - Local default-ctx filtered sweep passed:
+    - `cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench -- --active-rows 8 --labels decode.attention.paged_kv_append --iters 1 --format json --out target/kernel_reports/kimi-k2/tp1-pplx-decode-kv-append-default-ctx-local.json`
+    - `ctx=4096/8192` rows report `supported=false` with `kv_len exceeds decode arena capacity 2048` instead of aborting the run.
+  - H20 production-metadata bench passed after rebuilding the target binary with `cargo +nightly build`:
+    - command shape: `--active-rows 8 --ctx-lens 1,128,1024,2048 --labels decode.attention.paged_kv_append --iters 128 --format json --out /tmp/kimi_kv_h20_prod.json`
+    - `ctx=1`: `7.066us/call`, `431.03us/step`, `achieved_gbps=2.63`, `roofline_bound=control`, `roofline_peak_pct=null`.
+    - `ctx=128/1024/2048`: `7.233/7.245/7.358us/call`; the row stays control/tiny-grid across valid arena lengths.
+    - `ctx=4096/8192` is invalid for this provider because the represented production decode arena has `128 * 16 = 2048` tokens/request; the default sweep keeps those rows but reports `supported=false` with an explicit capacity reason instead of measuring an invalid page table.
+  - NCU production-metadata rerun is still pending. `/usr/local/cuda/bin/ncu --version` currently times out on `h20-100`; `--set full` did not produce a usable report. The compact-metadata NCU remains directional evidence for the control/tiny-grid diagnosis, not a promoted production NCU report.
+- Decision: promote the H20 production-metadata latency into the master table, but do not claim production-metadata NCU coverage yet.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
@@ -230,7 +259,7 @@
 
 ## Debrief
 
-- **Outcome**: Dedicated TP1 DP8 PPLX decode bench binary is implemented and checked. It covers embedding, dense layer0 MLP, 61-layer attention aggregate, final norm/lm_head/top1, MoE router/shared expert, PPLX routed compute accounting, PPLX comm accounting across active batch sizes and context lengths, runtime PPLX route histograms, trace-driven PPLX Marlin replay, and NCU-isolated p95 replay profiling.
+- **Outcome**: Dedicated TP1 DP8 PPLX decode bench binary is implemented and checked. It covers embedding, dense layer0 MLP, 61-layer attention aggregate including MLA paged-KV append provider coverage, final norm/lm_head/top1, MoE router/shared expert, PPLX routed compute accounting, PPLX comm accounting across active batch sizes and context lengths, runtime PPLX route histograms, trace-driven PPLX Marlin replay, and NCU-isolated p95 replay profiling.
 - **Pitfalls encountered**:
   - CLI value parsing needed explicit owned strings to avoid clap's Vec parser mismatch.
   - TP1 MLA must use runtime-dim `_rt` providers; old TP8 typed providers would make the bench look valid while measuring the wrong local-head shape.

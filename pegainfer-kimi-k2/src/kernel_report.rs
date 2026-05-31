@@ -26,18 +26,22 @@ use pegainfer_kernels::{
         kimi_flashinfer_batch_decode_mla_rt, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
         kimi_marlin_w13_swiglu_pplx, kimi_marlin_wna16_pplx_w2_gemm,
         kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
-        kimi_mla_absorb_q_nope, kimi_mla_absorb_q_nope_rt, kimi_mla_rope_split_decode,
-        kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm,
-        kimi_mla_v_up, kimi_mla_v_up_rt, kimi_moe_marlin_align_block_size,
-        kimi_o_proj_cublaslt_into, kimi_o_proj_cublaslt_supports_batch_size,
-        kimi_pplx_build_marlin_routing_on_stream, kimi_residual_add_scaled_f32,
-        kimi_router_noaux_tc_launch, kimi_shared_gate_up_cublaslt_into,
-        kimi_shared_gate_up_cublaslt_supports_batch_size, repeat_f32_for_reduce_scatter_into,
-        rms_norm_batch_into, scale_f32_in_place, silu_mul_batch_into,
+        kimi_mla_absorb_q_nope, kimi_mla_absorb_q_nope_rt, kimi_mla_paged_kv_append,
+        kimi_mla_rope_split_decode, kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a,
+        kimi_mla_split_qkv_a_norm, kimi_mla_v_up, kimi_mla_v_up_rt,
+        kimi_moe_marlin_align_block_size, kimi_o_proj_cublaslt_into,
+        kimi_o_proj_cublaslt_supports_batch_size, kimi_pplx_build_marlin_routing_on_stream,
+        kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
+        kimi_shared_gate_up_cublaslt_into, kimi_shared_gate_up_cublaslt_supports_batch_size,
+        repeat_f32_for_reduce_scatter_into, rms_norm_batch_into, scale_f32_in_place,
+        silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceVec, GpuTensor, HiddenStates, KernelCall, NormWeight},
     typed_ops,
 };
+
+const KIMI_REPORT_DECODE_PAGE_SIZE: usize = 16;
+const KIMI_REPORT_DECODE_PAGES_PER_REQUEST: usize = 128;
 
 pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
     let stats = match call.op.as_str() {
@@ -56,6 +60,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "kimi_mla_split_qkv_a_norm" => Some(measure_mla_split_qkv_a_norm(call, iters)?),
         "kimi_mla_rope_split_decode" => Some(measure_mla_rope_split(call, iters)?),
         "kimi_mla_rope_split_decode_rt" => Some(measure_mla_rope_split_rt(call, iters)?),
+        "kimi_mla_paged_kv_append" => Some(measure_mla_paged_kv_append(call, iters)?),
         "kimi_mla_absorb_q_nope" => Some(measure_mla_absorb_q(call, iters)?),
         "kimi_mla_absorb_q_nope_rt" => Some(measure_mla_absorb_q_rt(call, iters)?),
         "kimi_mla_v_up" => Some(measure_mla_v_up(call, iters)?),
@@ -443,6 +448,92 @@ fn measure_mla_rope_split_rt(call: &KernelCall, iters: u64) -> Result<LatencySta
             &mut q_pe,
             &mut append_kpe,
             local_heads,
+        )
+    })
+}
+
+fn measure_mla_paged_kv_append(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let append_ckv_spec = input(call, "append_ckv")?;
+    let ckv_hidden = axis(append_ckv_spec, "hidden")?;
+    let batch = axis(append_ckv_spec, "batch")?;
+    ensure!(
+        ckv_hidden == KIMI_K2_MLA_KV_LORA_RANK,
+        "{} append_ckv hidden={} must equal kv_lora_rank={}",
+        call.label,
+        ckv_hidden,
+        KIMI_K2_MLA_KV_LORA_RANK
+    );
+    let append_kpe_spec = input(call, "append_kpe")?;
+    ensure!(
+        axis(append_kpe_spec, "hidden")? == KIMI_K2_MLA_ROPE_DIM
+            && axis(append_kpe_spec, "batch")? == batch,
+        "{} append_kpe shape must be hidden={}, batch={}",
+        call.label,
+        KIMI_K2_MLA_ROPE_DIM,
+        batch
+    );
+
+    let kv_len = attr_usize(call, "kv_len")?;
+    ensure!(kv_len > 0, "{} kv_len must be positive", call.label);
+    let page_size = KIMI_REPORT_DECODE_PAGE_SIZE;
+    let pages_per_request = KIMI_REPORT_DECODE_PAGES_PER_REQUEST;
+    ensure!(
+        kv_len <= page_size * pages_per_request,
+        "{} kv_len={} exceeds decode arena capacity {}",
+        call.label,
+        kv_len,
+        page_size * pages_per_request
+    );
+    let max_pages = pages_per_request * batch;
+    let ctx = DeviceContext::new()?;
+    let layout = KimiMlaPagedKvLayout::separate_contiguous(max_pages, page_size, batch);
+    let mut ckv_cache = ctx.stream.alloc_zeros::<bf16>(layout.required_ckv_len()?)?;
+    let mut kpe_cache = ctx.stream.alloc_zeros::<bf16>(layout.required_kpe_len()?)?;
+    let append_ckv = GpuTensor::<KIMI_K2_MLA_KV_LORA_RANK>::zeros(&ctx, batch)?;
+    let append_kpe = GpuTensor::<KIMI_K2_MLA_ROPE_DIM>::zeros(&ctx, batch)?;
+
+    let mut page_indices = vec![0i32; max_pages];
+    let mut page_indptr = Vec::with_capacity(batch + 1);
+    let mut cursor = 0usize;
+    for request_idx in 0..batch {
+        page_indptr.push(cursor as i32);
+        let cached_tokens_after_append = kv_len;
+        let pages = cached_tokens_after_append.div_ceil(page_size);
+        let request_page_base = request_idx
+            .checked_mul(pages_per_request)
+            .ok_or_else(|| anyhow::anyhow!("{} request page base overflow", call.label))?;
+        for local_page in 0..pages {
+            page_indices[cursor] = (request_page_base + local_page) as i32;
+            cursor += 1;
+        }
+    }
+    page_indptr.push(cursor as i32);
+    let last_page = match kv_len % page_size {
+        0 => page_size,
+        rem => rem,
+    } as i32;
+    let positions = vec![(kv_len - 1) as i32; batch];
+    let page_indices_d = ctx.stream.clone_htod(&page_indices)?;
+    let page_indptr_d = ctx.stream.clone_htod(&page_indptr)?;
+    let last_page_len_d = ctx.stream.clone_htod(&vec![last_page; batch])?;
+    let batch_indices_d = ctx
+        .stream
+        .clone_htod(&(0..batch as i32).collect::<Vec<_>>())?;
+    let positions_d = ctx.stream.clone_htod(&positions)?;
+
+    measure_loop(&ctx, iters, || {
+        kimi_mla_paged_kv_append(
+            &ctx,
+            &mut ckv_cache,
+            &mut kpe_cache,
+            layout,
+            &page_indices_d,
+            &page_indptr_d,
+            &last_page_len_d,
+            &append_ckv,
+            &append_kpe,
+            &batch_indices_d,
+            &positions_d,
         )
     })
 }

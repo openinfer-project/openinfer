@@ -171,7 +171,8 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
                 + arena_rows * I32_BYTES * 4 * layer_calls,
         )
         .flops(0)
-        .bound(BoundKind::Memory)
+        .bound(BoundKind::Control)
+        .measured()
         .notes("append compressed_kv and k_rope into paged MLA cache for the arena rows"),
     );
     specs.push(
