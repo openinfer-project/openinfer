@@ -129,7 +129,7 @@ Columns:
 | 19 | final | `decode.final.argmax` | `argmax_batch_bf16_split` | 1 | elems=1310720, BF16, tile=4096 | 12.7 us | 12.7 us | 206.0 GB/s | memory | 4.3% / gap 95.7% | measured |
 | 20 | moe_router | `decode.moe.router` | `kimi_router_noaux_tc` fused selector | 60 | rows=8, experts=384, topk=8, BF16/F32 | 3.514 ms | 58.6 us | 96.6 GB/s | control | - | measured |
 | 21 | moe_shared | `decode.moe.shared_gate_up` | `kimi_shared_gate_up_cublaslt` | 60 | rows=8, out=4096, in=7168, BF16 | 1.505 ms | 25.1 us | 18.72 TF/s | memory | 48.9% / gap 51.1% | measured |
-| 22 | moe_shared | `decode.moe.shared_swiglu` | `silu_mul_hs_fused_into` | 60 | rows=8, gate_up=4096, out=2048, BF16 | 410.2 us | 6.8 us | 14.4 GB/s | memory | 0.3% / gap 99.7% | measured |
+| 22 | moe_shared | `decode.moe.shared_swiglu` | `silu_mul_hs_fused_into` | 60 | rows=8, gate_up=4096, out=2048, BF16 | 410.2 us | 6.8 us | 14.4 GB/s | control/tiny-grid | - | measured |
 | 23 | moe_shared | `decode.moe.shared_down` | `gemm_dm_hs_to_typed_graphsafe` | 60 | rows=8, out=7168, in=2048, BF16 | 897.1 us | 15.0 us | 15.71 TF/s | memory | 41.1% / gap 58.9% | measured |
 | 24 | moe_pplx_compute | `decode.moe.pplx_build_marlin_routing` | `kimi_pplx_build_marlin_routing_on_stream` | 60 | trace replay p95: recv=67, padded=224, local_experts=48, recv_capacity=848 | 592.3 us | 9.9 us | 0.41 GB/s | control | - | measured trace replay |
 | 25 | moe_pplx_compute | `decode.moe.pplx_marlin_w13` | `kimi_marlin_wna16_pplx_w13_gemm` small-N tile | 60 | trace replay p95: work rows=224, recv=67, active_experts=28, recv_capacity=848, out=4096, in=7168, WNA16 INT4 weights + BF16 activations; p50/max padded=96/336 | 9.687 ms | 161.5 us | 81.48 TF/s / 2.90 TB/s | memory | 60.3% / gap 39.7% | measured trace replay |
@@ -208,3 +208,4 @@ Initial report targets:
 | 11 | `attention_paged_kv_append_report.md` | Exists; provider now uses production page stride, H20 bench is measured, and production NCU is pending because `ncu` currently times out on `h20-100`. |
 | 12 | `attention_input_norm_report.md` | Exists; H20 NCU says standalone FlashInfer RMSNorm is tiny-grid/launch limited (`8` CTAs, `0.05` waves/SM, `<1%` DRAM), so standalone tuning is stopped and only RMSNorm -> qkv_a prologue fusion remains. |
 | 13 | `attention_qkv_a_split_norm_report.md` | Exists; H20 NCU says standalone split/norm is tiny-grid/launch limited (`8` CTAs, `0.01` waves/SM, `0.19-0.20%` DRAM), so standalone tuning is stopped and only row8 -> q_b prologue/custom GEMM remains. |
+| 14 | `shared_swiglu_report.md` | Exists; H20 NCU says standalone shared SwiGLU is tiny-grid/latency limited (`64` CTAs, `0.10` waves/SM, `0.51%` DRAM read), so standalone tuning is stopped and only row21/22 or row22/23 custom fusion remains. |

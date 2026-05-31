@@ -264,6 +264,14 @@
   - NCU: `split_qkv_a_norm_kernel`, `8 x 192` launch, `0.01` waves/SM, `0.19-0.20%` DRAM, `93.4-93.7%` scheduler no eligible.
 - Decision: stop standalone row-8 tuning. Future work should only revisit this row as row8 -> q_b prologue/custom skinny-GEMM fusion that preserves `ckv_normed` and `k_rope`.
 
+### Step 17: Shared SwiGLU report
+- Added `docs/models/kimi-k2/shared_swiglu_report.md` to close the standalone Phase 3 direction for `decode.moe.shared_swiglu`.
+- Evidence reused from `profile/kimi-shared-swiglu-h20-baseline/`, and parsed with the `ncu-report-skill` helper using the local Nsight Compute Python module:
+  - Full TP1 PPLX bench artifacts: `410.2-473.3us/step` for `60` calls at `bs=8,ctx=1`.
+  - Standalone event timing: `202.2us/step`, `3.37us/call`.
+  - NCU: `silu_mul_fused_kernel`, `64 x 256` launch, `0.10` waves/SM, `0.51%` DRAM read, `2.53%` SM, `93.39%` scheduler no eligible.
+- Decision: reclassify row 22 as `control/tiny-grid` in the master table and stop standalone SwiGLU tuning. Future work should only revisit this row as row21 -> row22 gated-dual GEMM or row22 -> row23 activation-prologue fusion, with full TP1 PPLX bench proof.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
