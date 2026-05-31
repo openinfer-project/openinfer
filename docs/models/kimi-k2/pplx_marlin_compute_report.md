@@ -65,6 +65,7 @@ Source-counter reports were collected, but the current release build does not in
 | Add trace-driven replay provider | `kernel_report` PPLX providers accept `pplx_recv_counts`; `kimi_pplx_marlin_replay` selects p0/p50/p90/p95/p99/p100 non-empty active rows from the H20 trace and replays routing/W13/SwiGLU/W2 locally. H20 p95 W13/W2 are `250.64us` / `138.51us`, much lower than synthetic `436.43us` / `236.80us`. | Kept as baseline infrastructure. No `opt(...)` commit: it improves measurement truth, not kernel latency. |
 | Add replay filters for NCU isolation | `kimi_pplx_marlin_replay --quantiles p95 --ops w13,w2` isolates one route histogram and one/two Marlin providers without relying on NCU launch-skip over unrelated samples. | Kept as profiling infrastructure. |
 | NCU p95 W13/W2 replay | Full/source NCU collected under `profile/kimi-pplx-marlin-replay-p95-h20/`. Both kernels are one-wave and shared-memory-limited; source line mapping is absent because the release TU has no line info. | Use as the current p95 diagnosis. No optimization adopted yet. |
+| Force small-batch 256-thread Marlin config | Hard-coded `thread_m_blocks==1` to pick the existing `{thread_k=128, thread_n=128, num_threads=256}` config instead of the current `{64,128,128}`. H20 p95 replay regressed W13 `250.64us -> 303.50us` and W2 `138.51us -> 187.31us`. | Rejected and reverted. The current 128-thread config remains better for the p95 route histogram. |
 
 ## Final Conclusion
 
