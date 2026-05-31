@@ -351,6 +351,14 @@
   - H20 replay p95: `recv=67`, `padded=224`, active experts `28`, `9.87us/call`, `592.3us/step`.
 - Decision: keep row 24 as `control`, stop standalone routing metadata tuning, and only revisit it as part of route-aware Marlin scheduling or launch-removing fusion.
 
+### Step 27: PPLX SwiGLU report
+- Added `docs/models/kimi-k2/pplx_swiglu_report.md` for `decode.moe.pplx_swiglu`.
+- Evidence reused from `pplx_marlin_compute_report.md`, `profile/kimi-pplx-marlin-compute-h20-baseline/`, and trace replay artifacts:
+  - source launch at p95: `recv_capacity=848`, `intermediate=2048`, so `6784 x 256`; actual p95 work is `224 * 2048` elements read from `num_tokens_post_padded[0]`.
+  - NCU: `10.62us`, DRAM `6.32%`, SM throughput `55.40%`, occupancy `76.05%`, scheduler no eligible `34.20%`.
+  - H20 replay p95: `12.66us/call`, `759.7us/step`, `217.4GB/s` payload-equivalent.
+- Decision: reclassify row 26 from memory to `compute/elementwise` and stop standalone activation tuning. Future work needs W13/W2 fusion or a tighter route-aware launch bound.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
