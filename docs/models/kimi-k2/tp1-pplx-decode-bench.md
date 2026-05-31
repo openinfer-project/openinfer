@@ -288,6 +288,15 @@
   - `tp1-pplx-decode-bench-h20-100.json`: active rows `1,2,4,8` all measure the same fixed `arena_rows=8` final row shape at `541.95-542.69us`.
 - Decision: stop standalone BF16 LM-head tuning. Future work only makes sense with NCU-backed evidence of a real bottleneck, a library upgrade beating `542.7us` by `>3%`, or a quantized/FP8 LM-head format change with correctness gates.
 
+### Step 20: Attention rope_split report
+- Added `docs/models/kimi-k2/attention_rope_split_report.md` for `decode.attention.rope_split`.
+- Evidence reused from `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json` and the source launch in `pegainfer-kernels/csrc/kimi_k2/kimi_mla.cu`:
+  - target shape: `batch_size=8`, `local_heads=64`, `q_head_dim=192`, launch `384 x 256`.
+  - `bs=8,ctx=1`: `441.76us/step`, `7.24us/call`, `0.027TF/s`, `54.44GB/s` payload-equivalent.
+  - `ctx=128/1024/4096/8192` stays in the same `~421-544us/step` band; this row only indexes a different RoPE cache position, so long-context cost belongs to MLA decode, not this helper.
+- NCU status: `/usr/local/cuda-12.9/bin/ncu --version` still times out on `h20-100`, so the report does not claim stall breakdown.
+- Decision: reclassify the master row from memory-bound to `control/elementwise` and stop standalone tuning. Reopen only for a launch-removing MLA prep fusion or a production NCU result with a concrete `>3%` full-bench path.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
