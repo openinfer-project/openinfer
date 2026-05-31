@@ -76,7 +76,8 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/kimi-k2/dp1-tp8-ep8-performance.md` | DP1 TP8 EP8 性能优化 ledger：从 correctness baseline `72c770b` 起步，目标 bs64 超过 vLLM baseline output `583.9 tok/s` / TPOT median `109.00ms`，每个优化必须带正确性 gate 和 commit。 |
 | `models/kimi-k2/tp1-dp8-ep8-performance.md` | TP1 DP8 EP8 性能优化 ledger：目标 H20 bs64 超过 vLLM TP1 DP8 EP8 baseline；记录 vLLM DPLB/CUDA Graph bucket cliff（8x8 `48ms`，9/8 skew `96ms`），统一压测/profile 命令，并按 profile → 动机预期收益 → microbench → correctness → performance 记录每个优化。 |
 | `models/kimi-k2/tp1-dp8-ep8-decode-optimization-master.md` | Kimi-K2 TP1 DP8 EP8 decode 优化 master ledger：H20 per-rank bs=8/global bs≈64 全 decode 算子表、roofline 分类、peak gap、fusion 扫描队列和单 kernel report 队列；EP 通信行可见但排除优化。 |
-| `models/kimi-k2/tp1-pplx-decode-bench.md` | Implemented `kimi_tp1_pplx_decode_bench`: current-code TP1/PPLX shapes, active-row and ctx-len sweeps, per-kernel bound classification, FLOPs/bytes, achieved TFLOP/s and bandwidth; PPLX comm/routed Marlin timing remains estimate-only until an all-rank harness exists. |
+| `models/kimi-k2/shared_gate_up_report.md` | `decode.moe.shared_gate_up` H20 report：memory-bound BF16 skinny GEMM，采用 Kimi 专用 cuBLASLt exact-shape path，TP1 PPLX `bs=8,ctx=1` 从 `1.818ms` 到 `1.505ms` per 60 MoE layers。 |
+| `models/kimi-k2/tp1-pplx-decode-bench.md` | Implemented `kimi_tp1_pplx_decode_bench`: TP1/PPLX operator bench with roofline fields; current Kimi-specific cuBLASLt shared_gate_up supports batch_size `1..=64` and improves H20 `bs=8,ctx=1` from Phase 1 baseline `1.818ms` to `1.505ms`. |
 | `models/kimi-k2/source-layout.md` | Kimi-K2 source files over 1k lines were split by responsibility; the largest Rust file under `pegainfer-kimi-k2/src` is now `layers/attention.rs` at 950 lines. |
 | `models/kimi-k2/dp-design.md` | TP×DP 可配置并行：每 DP rank 是独立 decode engine，EP all-to-all 天然 sync，轻量 load balancer 做 request 路由。首批 TP1×DP8 + TP8×DP1。 |
 

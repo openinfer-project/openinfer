@@ -344,6 +344,15 @@ fn kernel_call(spec: &BenchSpec) -> Option<KernelCall> {
                     .output("out", hidden(out_dim, rows)),
             )
         }
+        "kimi_shared_gate_up_cublaslt" => {
+            let (rows, out_dim, in_dim) = (spec.m?, spec.n?, spec.k?);
+            Some(
+                KernelCall::new("kimi_shared_gate_up_cublaslt", spec.label)
+                    .input("weight", weight(out_dim, in_dim))
+                    .input("x", hidden(in_dim, rows))
+                    .output("out", hidden(out_dim, rows)),
+            )
+        }
         "gemm_dm_hs_to_typed_graphsafe" => {
             let (rows, out_dim, in_dim) = (spec.m?, spec.n?, spec.k?);
             Some(

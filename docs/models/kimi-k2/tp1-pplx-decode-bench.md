@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench that reports per-op shape, latency, bound class, FLOPs, bytes, achieved TFLOP/s, and achieved bandwidth across active-row and ctx-len sweeps; PPLX comm and PPLX routed Marlin stages are explicit estimate-only rows until an all-rank harness exists.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields. Current Kimi-specific cuBLASLt shared_gate_up path supports batch_size `1..=64`; H20 `bs=8,ctx=1` shared_gate_up improves from the Phase 1 baseline `1.818ms` to `1.505ms` per 60 MoE layers.
 >
 > **Last touched:** 2026-05
 
@@ -109,18 +109,18 @@
 - Standalone same-shape cuBLAS harness on H20 with `M=4096,K=7168,N=8,layers=60` measured `~22us` per call, or `~1.32ms` for 60 calls.
 - NCU shows the cuBLAS path is memory-bound and under-occupies H20 (`64` blocks for `78` SMs, low L2 hit rate, split-K reduce overhead), but it is not trivially replaceable.
 - KernelWiki's closest SM90 lead was FlashInfer `tinygemm2`. The repo-local FlashInfer submodule has only Python/JIT exposure plus an internal `.cu` launcher, not a stable public C++ header. A direct C++ smoke using the internal launcher measured roughly `31-33us` for `N=1,2,4` and `30.6us` for `N=8`, slower than cuBLAS.
-- Post-baseline cuBLASLt candidate evidence is better for this shape than both generic cuBLAS and tinygemm smoke:
+- cuBLASLt first heuristic is better for this shape than both generic cuBLAS and tinygemm smoke:
   - standalone `N=8`: `18.673us` per call, `1.120ms` for 60 calls, zero workspace.
-  - TP1 PPLX bench provider after wiring Kimi path: `bs=8,ctx=1` shared_gate_up is `1.505ms` for 60 calls, versus old generic-cuBLAS report row `1.854ms`.
+  - TP1 PPLX bench provider after wiring Kimi path: `bs=8,ctx=1` shared_gate_up is `1.505ms` for 60 calls, versus the Phase 1 baseline row `1.818ms`.
   - Non-power-of-two active batches are valid: `bs=3,ctx=1` measured `1.524ms` and the row op is `kimi_shared_gate_up_cublaslt`.
-- Queue for next commit: put a Kimi-specific cuBLASLt wrapper under `pegainfer-kernels/src/ops/kimi_k2/shared_gate_up.rs` plus `pegainfer-kernels/csrc/kimi_k2/kimi_shared_gate_up.cu`, gated by exact shape `M=4096,K=7168,batch_size=1..=64`. The old typed GEMM remains fallback for other shapes.
+- Production decision: put a Kimi-specific cuBLASLt wrapper under `pegainfer-kernels/src/ops/kimi_k2/shared_gate_up.rs` plus `pegainfer-kernels/csrc/kimi_k2/kimi_shared_gate_up.cu`, gated by exact shape `M=4096,K=7168,batch_size=1..=64`. The old typed GEMM remains fallback for other shapes.
 
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
 - The existing Kimi kernel report providers were TP8-shaped for MLA decode internals. Added runtime-dim TP1 provider paths instead of reusing TP8 constants.
-- FlashInfer is repo-local at `pegainfer-kernels/third_party/flashinfer`; using an external checkout can hide source-layout and API-boundary differences. `AGENTS.md` now records this submodule path.
-- cuBLASLt candidate note: active rows are batch size, not graph bucket. The queued implementation must prebuild plans for every `1..=64`, so `bs=3` does not fall back to generic cuBLAS.
+- FlashInfer is repo-local at `pegainfer-kernels/third_party/flashinfer`; using an external checkout can hide source-layout and API-boundary differences. Keep this path in the repo instructions so future kernel work starts from the submodule.
+- The first cuBLASLt implementation incorrectly treated active batch as graph bucket and only supported `1,2,4,8,16,32,64`. Fixed to name the dimension `batch_size` and prebuild plans for every `1..=64`, so `bs=3` does not fall back to generic cuBLAS.
 
 ## Debrief
 

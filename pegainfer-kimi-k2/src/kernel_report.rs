@@ -1,6 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use std::cell::Cell;
 // The model-agnostic harness — timing loop, latency stats, `KernelCall` accessors —
 // lives in `pegainfer-bench`. Re-export the types the report bins consume so their
 // `pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key}` imports
@@ -13,20 +14,22 @@ use pegainfer_kernels::{
         KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8,
         KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8,
         KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_TOPK, KimiInt4ExpertRole, KimiInt4NibbleOrder,
-        KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight,
-        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, add_batch_into,
-        argmax_batch_bf16_into, embedding_batch_vocab_shard, flashinfer_top1_batch_into,
-        flashinfer_topk_row_states_bytes, fused_add_rms_norm_round_batch_into,
-        gemm_graphsafe_into_checked, kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla,
+        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_SHARED_GATE_UP, KIMI_K2_TOPK, KimiInt4ExpertRole,
+        KimiInt4NibbleOrder, KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight,
+        KimiMarlinInt4Weight, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
+        KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig, KimiRouterOutput,
+        KimiRouterScratch, add_batch_into, argmax_batch_bf16_into, embedding_batch_vocab_shard,
+        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
+        fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
+        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla,
         kimi_flashinfer_batch_decode_mla_rt, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
         kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope,
         kimi_mla_absorb_q_nope_rt, kimi_mla_rope_split_decode, kimi_mla_rope_split_decode_rt,
         kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up, kimi_mla_v_up_rt,
         kimi_moe_marlin_align_block_size, kimi_residual_add_scaled_f32,
-        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, rms_norm_batch_into,
-        scale_f32_in_place, silu_mul_batch_into,
+        kimi_router_noaux_tc_launch, kimi_shared_gate_up_cublaslt_into,
+        kimi_shared_gate_up_cublaslt_supports_batch_size, repeat_f32_for_reduce_scatter_into,
+        rms_norm_batch_into, scale_f32_in_place, silu_mul_batch_into,
     },
     tensor::{DeviceContext, DeviceVec, GpuTensor, HiddenStates, KernelCall, NormWeight},
     typed_ops,
@@ -55,6 +58,7 @@ pub fn measure_call(call: &KernelCall, iters: u64) -> Result<MeasuredCall> {
         "kimi_mla_v_up_rt" => Some(measure_mla_v_up_rt(call, iters)?),
         "kimi_router_noaux_tc" => Some(measure_router(call, iters)?),
         "gemm_dm_typed_to_hs_graphsafe" => Some(measure_gemm_dm_typed_to_hs(call, iters)?),
+        "kimi_shared_gate_up_cublaslt" => Some(measure_kimi_shared_gate_up_cublaslt(call, iters)?),
         "gemm_dm_hs_to_typed_graphsafe" => Some(measure_gemm_dm_hs_to_typed(call, iters)?),
         "silu_mul_hs_fused_into" => Some(measure_silu_hs_fused(call, iters)?),
         "kimi_moe_marlin_align_block_size" => Some(measure_marlin_align(call, iters)?),
@@ -578,6 +582,56 @@ fn measure_gemm_dm_typed_to_hs_const<const IN: usize>(
     let mut out = HiddenStates::zeros(&ctx, out_dim, batch)?;
     measure_loop(&ctx, iters, || {
         typed_ops::gemm_dm_typed_to_hs_graphsafe(&ctx, &weight, &x, &mut out)
+    })
+}
+
+fn measure_kimi_shared_gate_up_cublaslt(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let weight = input(call, "weight")?;
+    let out_dim = axis(weight, "out")?;
+    let in_dim = axis(weight, "in")?;
+    let x = input(call, "x")?;
+    let batch_size = axis(x, "batch")?;
+    ensure!(
+        out_dim == KIMI_K2_SHARED_GATE_UP && in_dim == KIMI_K2_HIDDEN,
+        "{} Kimi shared_gate_up cuBLASLt expects weight [{KIMI_K2_SHARED_GATE_UP},{KIMI_K2_HIDDEN}], got [{out_dim},{in_dim}]",
+        call.label
+    );
+    ensure!(
+        kimi_shared_gate_up_cublaslt_supports_batch_size(batch_size),
+        "{} Kimi shared_gate_up cuBLASLt unsupported batch_size={batch_size}",
+        call.label
+    );
+    let ctx = DeviceContext::new()?;
+    ensure_kimi_shared_gate_up_cublaslt_init()?;
+    let weight = zero_matrix(&ctx, out_dim, in_dim)?;
+    let x = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, batch_size)?;
+    let mut out = HiddenStates::zeros(&ctx, out_dim, batch_size)?;
+    measure_loop(&ctx, iters, || {
+        kimi_shared_gate_up_cublaslt_into(&ctx, &weight, &x, &mut out)
+    })
+}
+
+thread_local! {
+    static KIMI_SHARED_GATE_UP_CUBLASLT_READY: Cell<bool> = const { Cell::new(false) };
+}
+
+fn ensure_kimi_shared_gate_up_cublaslt_init() -> Result<()> {
+    KIMI_SHARED_GATE_UP_CUBLASLT_READY.with(|ready| {
+        if ready.get() {
+            return Ok(());
+        }
+        let status = unsafe { pegainfer_kernels::ffi::kimi_shared_gate_up_cublaslt_init_cuda() };
+        if status == 0 {
+            ready.set(true);
+        } else if status >= 100_000 {
+            bail!(
+                "Kimi shared_gate_up cuBLASLt init failed: cublas_status={}",
+                status - 100_000
+            );
+        } else {
+            bail!("Kimi shared_gate_up cuBLASLt init failed: cuda_status={status}");
+        }
+        Ok(())
     })
 }
 

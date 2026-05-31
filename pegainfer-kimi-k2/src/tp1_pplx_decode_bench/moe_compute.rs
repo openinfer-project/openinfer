@@ -36,7 +36,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
             ),
         ),
         spec(
-            "gemm_dm_typed_to_hs_graphsafe",
+            "kimi_shared_gate_up_cublaslt",
             "decode.moe.shared_gate_up",
             Stage::MoeShared,
             BoundKind::Compute,
@@ -47,7 +47,7 @@ pub(crate) fn specs(active_rows: usize, arena_rows: usize, ctx_len: usize) -> Ve
             Some((active_rows, SHARED_GATE_UP, KIMI_K2_HIDDEN)),
             gemm_flops(active_rows, SHARED_GATE_UP, KIMI_K2_HIDDEN),
             bf16_gemm_bytes(active_rows, SHARED_GATE_UP, KIMI_K2_HIDDEN),
-            "shared expert uses active_rows because set_moe_seq_len(active_len) is applied before PPLX MoE",
+            "Kimi TP1 shared expert gate/up uses active_rows as batch_size because set_moe_seq_len(active_len) is applied before PPLX MoE",
         ),
         spec(
             "silu_mul_hs_fused_into",
@@ -177,6 +177,7 @@ fn spec(
         .note(note);
     let spec = match op {
         "kimi_router_noaux_tc"
+        | "kimi_shared_gate_up_cublaslt"
         | "gemm_dm_typed_to_hs_graphsafe"
         | "silu_mul_hs_fused_into"
         | "gemm_dm_hs_to_typed_graphsafe"
