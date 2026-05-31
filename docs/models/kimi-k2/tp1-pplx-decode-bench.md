@@ -250,6 +250,13 @@
   - NCU production-metadata rerun is still pending. `/usr/local/cuda/bin/ncu --version` currently times out on `h20-100`; `--set full` did not produce a usable report. The compact-metadata NCU remains directional evidence for the control/tiny-grid diagnosis, not a promoted production NCU report.
 - Decision: promote the H20 production-metadata latency into the master table, but do not claim production-metadata NCU coverage yet.
 
+### Step 15: Attention input_norm report
+- Added `docs/models/kimi-k2/attention_input_norm_report.md` to close the standalone Phase 3 direction for `decode.attention.input_norm`.
+- Evidence reused from `profile/kimi-attention-row6-row7-h20-baseline/`:
+  - Event timing: `8.008us/call`, `488.5us/step` for `61` layers at `bs=8,ctx=1`.
+  - NCU: FlashInfer `RMSNormKernel<8,bf16>`, `8 x 896` launch, `0.05` waves/SM, `0.70-0.74%` DRAM, `60-61%` scheduler no eligible.
+- Decision: stop standalone RMSNorm tuning. Future work should only revisit this row as RMSNorm -> qkv_a prologue/custom skinny-GEMM fusion, and only if the full TP1 PPLX bench beats the current cuBLAS qkv_a path by more than noise.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.

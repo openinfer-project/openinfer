@@ -206,3 +206,4 @@ Initial report targets:
 | 9 | `attention_v_up_report.md` | Exists for the accepted cuBLASLt strided-batched MLA optimization. |
 | 10 | `final_argmax_report.md` | Exists for the accepted split-vocab CUDA argmax optimization. |
 | 11 | `attention_paged_kv_append_report.md` | Exists; provider now uses production page stride, H20 bench is measured, and production NCU is pending because `ncu` currently times out on `h20-100`. |
+| 12 | `attention_input_norm_report.md` | Exists; H20 NCU says standalone FlashInfer RMSNorm is tiny-grid/launch limited (`8` CTAs, `0.05` waves/SM, `<1%` DRAM), so standalone tuning is stopped and only RMSNorm -> qkv_a prologue fusion remains. |
