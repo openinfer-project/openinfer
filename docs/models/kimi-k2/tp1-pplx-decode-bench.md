@@ -281,6 +281,13 @@
 - KernelWiki points to FlashInfer MLA fast decode plan, Hopper backend selection, and FP8 KV cache as plausible directions.
 - NCU status: `h20-100` is reachable, but `/usr/local/cuda-12.9/bin/ncu --version` currently times out. Decision: do not adopt a code change from event timing alone; this row remains active pending production NCU.
 
+### Step 19: Final lm_head report
+- Added `docs/models/kimi-k2/final_lm_head_report.md` for `decode.final.lm_head`.
+- Evidence reused from H20 TP1 PPLX bench artifacts:
+  - `tp1-pplx-decode-bench-o-proj-cublaslt-bs8.json`: `542.68us`, `34.63TF/s`, `4.333TB/s`, `90.28%` H20 HBM.
+  - `tp1-pplx-decode-bench-h20-100.json`: active rows `1,2,4,8` all measure the same fixed `arena_rows=8` final row shape at `541.95-542.69us`.
+- Decision: stop standalone BF16 LM-head tuning. Future work only makes sense with NCU-backed evidence of a real bottleneck, a library upgrade beating `542.7us` by `>3%`, or a quantized/FP8 LM-head format change with correctness gates.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
