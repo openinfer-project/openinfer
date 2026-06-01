@@ -3733,7 +3733,10 @@ dependencies = [
  "clap",
  "pegainfer-engine",
  "pegainfer-vllm-frontend",
+ "reqwest",
+ "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

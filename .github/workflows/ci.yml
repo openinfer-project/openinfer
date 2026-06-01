@@ -30,3 +30,6 @@ jobs:
 
       - name: Check locked Cargo metadata
         run: cargo metadata --locked --no-deps --format-version 1
+
+      - name: Run simulated frontend e2e tests
+        run: cargo test --release -p pegainfer-sim --test frontend_e2e

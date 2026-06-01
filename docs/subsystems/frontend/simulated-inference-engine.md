@@ -2,7 +2,8 @@
 
 **Created**: 2026-05-16
 **Status**: ready for PR review
-**TL;DR**: `pegainfer-sim` is a CPU-only simulated model crate that serves through the existing vLLM/OpenAI frontend with configurable TTFT/TPOT. It is a benchmark and frontend validation harness, not a real-model performance path.
+**Last touched**: 2026-05
+**TL;DR**: `pegainfer-sim` is a CPU-only simulated model crate that serves through the existing vLLM/OpenAI frontend with configurable TTFT/TPOT and lightweight HTTP e2e coverage. It is a benchmark and frontend validation harness, not a real-model performance path.
 
 ## Scope
 
@@ -28,6 +29,19 @@ Out of scope:
 The timing model is intentionally simple: TTFT is `base_ttft_ms + prompt_len / prefill_tokens_per_ms`, and TPOT is a fixed delay between generated tokens. Output token ids cycle through the prompt tokens, using the fallback id for empty prompts.
 
 The frontend still needs tokenizer/model metadata, but the simulator never loads model weights.
+
+## Frontend Metadata Contract
+
+`pegainfer-sim` does not load model weights, but serving it through the
+vLLM/OpenAI frontend still constructs the normal text/chat backend. That
+frontend path requires enough local model metadata to initialize tokenization
+and detokenization.
+
+For CPU-only tests that do not intend to exercise tokenizer encoding, use
+token-id prompts. Generated token ids still pass through detokenization, so the
+test fixture must provide at least a tokenizer source such as `tokenizer.json`.
+`tokenizer_config.json` and `config.json` are useful for EOS and context-window
+metadata, but no weight files are required.
 
 ## Implementation Details
 
