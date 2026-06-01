@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_NAME: &str = "pegainfer-sim-e2e";
+const SERVER_START_ATTEMPTS: usize = 5;
 static TEMP_MODEL_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct SimServer {
@@ -27,6 +29,33 @@ impl SimServer {
     }
 
     async fn spawn_with_model_dir(model_dir: TempModelDir) -> Result<Self> {
+        let mut last_error = None;
+        for attempt in 1..=SERVER_START_ATTEMPTS {
+            match Self::spawn_once(&model_dir).await {
+                Ok(started) => {
+                    return Ok(Self {
+                        base_url: started.base_url,
+                        shutdown: started.shutdown,
+                        task: started.task,
+                        _model_dir: model_dir,
+                    });
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < SERVER_START_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("sim frontend startup was not attempted")))
+            .with_context(|| {
+                format!("failed to start sim frontend after {SERVER_START_ATTEMPTS} attempts")
+            })
+    }
+
+    async fn spawn_once(model_dir: &TempModelDir) -> Result<StartedSimServer> {
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
@@ -45,9 +74,9 @@ impl SimServer {
             .await
         });
 
-        let client = Client::new();
-        tokio::select! {
-            result = wait_for_health(&client, &base_url) => result?,
+        let client = test_client()?;
+        let health_result = tokio::select! {
+            result = wait_for_health(&client, &base_url) => result,
             result = &mut task => {
                 return match result {
                     Ok(Ok(())) => Err(anyhow!("sim frontend exited before becoming healthy")),
@@ -55,13 +84,18 @@ impl SimServer {
                     Err(error) => Err(error).context("sim frontend task panicked"),
                 };
             }
+        };
+
+        if let Err(error) = health_result {
+            shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+            return Err(error);
         }
 
-        Ok(Self {
+        Ok(StartedSimServer {
             base_url,
             shutdown,
             task,
-            _model_dir: model_dir,
         })
     }
 
@@ -72,6 +106,12 @@ impl SimServer {
             .context("timed out waiting for sim frontend shutdown")?
             .context("sim frontend task panicked")?
     }
+}
+
+struct StartedSimServer {
+    base_url: String,
+    shutdown: CancellationToken,
+    task: JoinHandle<Result<()>>,
 }
 
 struct TempModelDir {
@@ -124,7 +164,7 @@ impl Drop for TempModelDir {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
     let server = SimServer::spawn().await?;
-    let client = Client::new();
+    let client = test_client()?;
 
     assert_models_endpoint(&client, &server.base_url).await?;
     assert_non_streaming_completion_has_output(&client, &server.base_url).await?;
@@ -136,7 +176,7 @@ async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_streaming_completion_returns_nonempty_output_for_positive_max_tokens() -> Result<()> {
     let server = SimServer::spawn().await?;
-    let client = Client::new();
+    let client = test_client()?;
 
     assert_non_streaming_completion_has_output(&client, &server.base_url).await?;
 
@@ -146,7 +186,7 @@ async fn non_streaming_completion_returns_nonempty_output_for_positive_max_token
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_completion_emits_terminal_done() -> Result<()> {
     let server = SimServer::spawn().await?;
-    let client = Client::new();
+    let client = test_client()?;
 
     assert_streaming_completion_emits_done(&client, &server.base_url).await?;
 
@@ -244,6 +284,13 @@ async fn post_completion_stream(client: &Client, base_url: &str) -> Result<Strin
         .text()
         .await
         .context("failed to read streaming completion response")
+}
+
+fn test_client() -> Result<Client> {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("failed to build HTTP test client")
 }
 
 fn completion_body(stream: bool) -> Value {
