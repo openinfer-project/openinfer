@@ -8,8 +8,8 @@ Use this file as the LLM entrypoint before editing kernels. Start from `op_id`, 
 
 | op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `shared.linear.gemm_per_token` | model-specific decode accuracy gates | `ops::gemm_per_token` / `ops::gemm_per_token_into_checked` | `gemm_per_token_cuda` | `csrc/linear.cu` | cuBLAS | computes each row through the N=1 decode GEMM boundary; used when row-wise parity is required before performance optimization |
-| `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
+| `shared.linear.gemm_per_token` | model-specific decode accuracy gates | `ops::gemm_per_token` / `ops::gemm_per_token_into_checked` | `gemm_per_token_cuda` | `csrc/shared/linear.cu` | cuBLAS | computes each row through the N=1 decode GEMM boundary; used when row-wise parity is required before performance optimization |
+| `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/shared/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
 
 ## Qwen3-4B Dense Full-Attention Path
 
@@ -17,20 +17,20 @@ Qwen3-4B uses bf16 dense full attention with `hidden_size=2560`, `num_attention_
 
 | op_id | Phase | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `qwen3_4b.embedding.batch` | prefill/unified | `ops::embedding_batch` | `embedding_batched_cuda` | `csrc/elementwise.cu` | CUDA | token ids u32, output `HiddenStates` column-major `[hidden, tokens]` |
-| `qwen3_4b.norm.rms_batch` | prefill/decode/unified | `ops::rms_norm_batch_into` | `rms_norm_batched_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | bf16 hidden states, one row per token |
-| `qwen3_4b.norm.rms_vec` | logits | `ops::rms_norm` / `ops::rms_norm_into` | `rms_norm_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | bf16 vector |
-| `qwen3_4b.linear.gemm_rows` | qkv projection | `ops::gemm_rows_into` | `gemm_cuda` | `csrc/linear.cu` | cuBLAS | row slices from fused QKV matrix |
-| `qwen3_4b.linear.gemm` | o/mlp/lm_head | `ops::gemm_into` / `ops::gemm` | `gemm_cuda` | `csrc/linear.cu` | cuBLAS | weight row-major, hidden column-major |
-| `qwen3_4b.attn.qk_norm_rope` | attention prep | `ops::qk_norm_rope_batch_decode_into` or direct FFI in unified path | `qk_norm_rope_batched_decode_cuda` | `csrc/prefill_attention.cu` | CUDA | full RoPE, `head_dim=128`, per-token positions |
-| `qwen3_4b.kv.scatter` | prefill/decode/unified | direct FFI from model paths | `paged_kv_scatter_cuda` | `csrc/paged_attention.cu` | FlashInfer-layout CUDA wrapper | page-first `KvLayout`, NHD K/V blocks |
-| `qwen3_4b.attn.prefill_paged` | prefill/unified | `ops::prefill_attention_paged_into` or direct FFI in unified path | `batch_prefill_paged_cuda` | `csrc/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, causal, paged KV |
-| `qwen3_4b.attn.decode_paged` | decode/unified | `ops::paged_attention_batch_decode_into` or direct FFI in unified path | `paged_attention_decode_cuda` | `csrc/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, no partition-KV |
-| `qwen3_4b.norm.fused_add_rms` | residual | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | residual add plus RMSNorm over batch |
-| `qwen3_4b.mlp.silu_mul_fused` | MLP | `ops::silu_mul_fused_batch_into` | `silu_mul_fused_cuda` | `csrc/fused_proj.cu` | CUDA | input `[2 * intermediate, batch]`, output `[intermediate, batch]` |
-| `qwen3_4b.elementwise.add` | residual/unified | `ops::add_batch_into` | `add_cuda` | `csrc/elementwise.cu` | CUDA | same-shape `HiddenStates` |
-| `qwen3_4b.sampling.greedy` | decode output | `ops::gpu_sample_into` | `argmax_cuda` | `csrc/argmax.cu` | CUDA | greedy top-1 path, preserves lower-token-id tie-break |
-| `qwen3_4b.sampling.random` | decode output | `ops::gpu_sample_into` | `gpu_sample_flashinfer_cuda` | `csrc/flashinfer_sampling.cu` | FlashInfer CUDA | temperature/top-k/top-p path |
+| `qwen3_4b.embedding.batch` | prefill/unified | `ops::embedding_batch` | `embedding_batched_cuda` | `csrc/shared/elementwise.cu` | CUDA | token ids u32, output `HiddenStates` column-major `[hidden, tokens]` |
+| `qwen3_4b.norm.rms_batch` | prefill/decode/unified | `ops::rms_norm_batch_into` | `rms_norm_batched_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | bf16 hidden states, one row per token |
+| `qwen3_4b.norm.rms_vec` | logits | `ops::rms_norm` / `ops::rms_norm_into` | `rms_norm_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | bf16 vector |
+| `qwen3_4b.linear.gemm_rows` | qkv projection | `ops::gemm_rows_into` | `gemm_cuda` | `csrc/shared/linear.cu` | cuBLAS | row slices from fused QKV matrix |
+| `qwen3_4b.linear.gemm` | o/mlp/lm_head | `ops::gemm_into` / `ops::gemm` | `gemm_cuda` | `csrc/shared/linear.cu` | cuBLAS | weight row-major, hidden column-major |
+| `qwen3_4b.attn.qk_norm_rope` | attention prep | `ops::qk_norm_rope_batch_decode_into` or direct FFI in unified path | `qk_norm_rope_batched_decode_cuda` | `csrc/shared/prefill_attention.cu` | CUDA | full RoPE, `head_dim=128`, per-token positions |
+| `qwen3_4b.kv.scatter` | prefill/decode/unified | direct FFI from model paths | `paged_kv_scatter_cuda` | `csrc/shared/paged_attention.cu` | FlashInfer-layout CUDA wrapper | page-first `KvLayout`, NHD K/V blocks |
+| `qwen3_4b.attn.prefill_paged` | prefill/unified | `ops::prefill_attention_paged_into` or direct FFI in unified path | `batch_prefill_paged_cuda` | `csrc/shared/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, causal, paged KV |
+| `qwen3_4b.attn.decode_paged` | decode/unified | `ops::paged_attention_batch_decode_into` or direct FFI in unified path | `paged_attention_decode_cuda` | `csrc/shared/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, no partition-KV |
+| `qwen3_4b.norm.fused_add_rms` | residual | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | residual add plus RMSNorm over batch |
+| `qwen3_4b.mlp.silu_mul_fused` | MLP | `ops::silu_mul_fused_batch_into` | `silu_mul_fused_cuda` | `csrc/shared/fused_proj.cu` | CUDA | input `[2 * intermediate, batch]`, output `[intermediate, batch]` |
+| `qwen3_4b.elementwise.add` | residual/unified | `ops::add_batch_into` | `add_cuda` | `csrc/shared/elementwise.cu` | CUDA | same-shape `HiddenStates` |
+| `qwen3_4b.sampling.greedy` | decode output | `ops::gpu_sample_into` | `argmax_cuda` | `csrc/shared/argmax.cu` | CUDA | greedy top-1 path, preserves lower-token-id tie-break |
+| `qwen3_4b.sampling.random` | decode output | `ops::gpu_sample_into` | `gpu_sample_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | temperature/top-k/top-p path |
 
 ## DeepSeek V4 MP8 Path
 
@@ -87,11 +87,11 @@ pplx-garden EP rather than NCCL AG/RS.
 
 | op_id | Runtime owner | Rust wrapper | FFI symbols | Source | Backend | Shape / layout notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `kimi_k2.norm.rms_batch` | `pegainfer-kimi-k2` | `ops::rms_norm_batch_into` | `rms_norm_batched_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | BF16 hidden states, one row per token; Kimi hidden `7168`, q LoRA `1536`, and kv LoRA `512` all use the parameterized wrapper. This is not a fallback path. |
-| `kimi_k2.norm.rms_vec` | `pegainfer-kimi-k2` | `ops::rms_norm_into` | `rms_norm_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | BF16 single vector path; exposed in `pegainfer-kimi-k2` headers as `RmsNormBackend::FlashInferVec`. |
-| `kimi_k2.norm.fused_add_rms` | `pegainfer-kimi-k2` | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/flashinfer_norm.cu` | FlashInfer CUDA | Residual add plus RMSNorm over bs > 1 token batches. |
-| `kimi_k2.linear.dense_bf16` | `pegainfer-kimi-k2` | `ops::gemm_into` / `ops::gemm_rows_into` | `gemm_cuda` | `csrc/linear.cu` | cuBLAS | BF16 attention, dense MLP, shared expert, router gate, and lm_head shard projections. |
-| `kimi_k2.attn.mla_fused_qkv_a` | `pegainfer-kimi-k2` | `ops::gemm_graphsafe_into_checked` | `gemm_graphsafe_cuda` | `csrc/linear.cu` | graph-safe cuBLAS GEMM | Load-time `DeviceMatrix::vstack(q_a_proj, kv_a_proj_with_mqa)` creates weight `[2112,7168]`; decode writes `qkv_a [B,2112]` without D2H or step-time allocation. |
+| `kimi_k2.norm.rms_batch` | `pegainfer-kimi-k2` | `ops::rms_norm_batch_into` | `rms_norm_batched_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | BF16 hidden states, one row per token; Kimi hidden `7168`, q LoRA `1536`, and kv LoRA `512` all use the parameterized wrapper. This is not a fallback path. |
+| `kimi_k2.norm.rms_vec` | `pegainfer-kimi-k2` | `ops::rms_norm_into` | `rms_norm_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | BF16 single vector path; exposed in `pegainfer-kimi-k2` headers as `RmsNormBackend::FlashInferVec`. |
+| `kimi_k2.norm.fused_add_rms` | `pegainfer-kimi-k2` | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | Residual add plus RMSNorm over bs > 1 token batches. |
+| `kimi_k2.linear.dense_bf16` | `pegainfer-kimi-k2` | `ops::gemm_into` / `ops::gemm_rows_into` | `gemm_cuda` | `csrc/shared/linear.cu` | cuBLAS | BF16 attention, dense MLP, shared expert, router gate, and lm_head shard projections. |
+| `kimi_k2.attn.mla_fused_qkv_a` | `pegainfer-kimi-k2` | `ops::gemm_graphsafe_into_checked` | `gemm_graphsafe_cuda` | `csrc/shared/linear.cu` | graph-safe cuBLAS GEMM | Load-time `DeviceMatrix::vstack(q_a_proj, kv_a_proj_with_mqa)` creates weight `[2112,7168]`; decode writes `qkv_a [B,2112]` without D2H or step-time allocation. |
 | `kimi_k2.attn.mla_split_qkv_a` | `pegainfer-kimi-k2` | `ops::kimi_mla_split_qkv_a` | `kimi_mla_split_qkv_a_cuda` | `csrc/kimi_k2/kimi_mla.cu` | CUDA | Splits fused `qkv_a [B,2112]` into `q_a [B,1536]`, compressed KV `[B,512]`, and raw `k_rope [B,64]`. This replaces the old separate `kv_a` split path. |
 | `kimi_k2.attn.mla_rope_split_decode` | `pegainfer-kimi-k2` | `ops::kimi_mla_rope_split_decode` | `kimi_mla_rope_split_decode_cuda` | `csrc/kimi_k2/kimi_mla.cu` | CUDA | Decode-step split+RoPE prep: `q_proj [B,8,192]` and current `k_rope [B,64]` plus device positions produce `q_nope [B,8,128]`, `q_pe [B,8,64]`, and `append_kpe [B,64]` in Kimi split-half RoPE layout. |
 | `kimi_k2.attn.mla_absorb_q` | `pegainfer-kimi-k2` | `ops::kimi_mla_absorb_q_nope` | `kimi_mla_absorb_q_nope_cuda` | `csrc/kimi_k2/kimi_mla.cu` | graph-safe cuBLAS strided-batched GEMM | Uses the `W_UK` slice inside `kv_b_proj [8,256,512]` directly: `q_nope [B,8,128] -> q_abs_nope [B,8,512]`, one cuBLAS batch per local head, no weight repack. |
@@ -113,8 +113,8 @@ pplx-garden EP rather than NCCL AG/RS.
 
 The crate still builds CUDA/Triton symbols needed by the current root binary:
 
-- Qwen3.5 HD256 full-attention kernels: `prefill_attention_hd256.cu`, `paged_attention.cu`.
-- Qwen3.5 linear-attention decode kernels: `conv1d.cu`, `gated_delta_rule.cu`.
+- Qwen3.5 HD256 full-attention kernels: `csrc/qwen35/prefill_attention_hd256.cu`, `csrc/shared/paged_attention.cu`.
+- Qwen3.5 linear-attention decode kernels: `csrc/qwen35/conv1d.cu`, `csrc/qwen35/gated_delta_rule.cu`.
 - Qwen3.5 chunk-wise GDR prefill Triton AOT kernels: `tools/triton/gated_delta_rule_chunkwise_kernels.py`.
 
 These are preserved for build compatibility. They are not part of the Qwen3-4B Phase 1 API surface.

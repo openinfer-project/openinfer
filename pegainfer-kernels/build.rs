@@ -1142,6 +1142,8 @@ fn main() {
             "-O3".to_string(),
             "-I".to_string(),
             cuda_include.to_string_lossy().to_string(),
+            "-I".to_string(),
+            csrc_dir.to_string_lossy().to_string(),
         ];
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
