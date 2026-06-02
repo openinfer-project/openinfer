@@ -2,7 +2,7 @@ use super::Half;
 use cudarc::driver::sys::{CUresult, CUstream};
 
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
-// Sources: csrc/{gated_delta_rule,conv1d,prefill_attention_hd256,paged_attention}.cu
+// Sources: csrc/qwen35/*.cu; the *_hd256 paged variants live in csrc/shared/paged_attention.cu.
 unsafe extern "C" {
     // Qwen3.5 full-attention prefill prep: Q/K norm + partial RoPE + KV cache write.
     pub fn prefill_attention_hd256_prep_cuda(
