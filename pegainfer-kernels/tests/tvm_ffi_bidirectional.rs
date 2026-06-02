@@ -34,7 +34,7 @@ fn shell_quote(path: &Path) -> String {
 
 fn run_command(command: &str, context: &str) -> Result<std::process::Output> {
     let output = Command::new("sh")
-        .arg("-lc")
+        .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .output()

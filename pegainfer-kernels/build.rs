@@ -1384,10 +1384,6 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", root.join("csrc").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("tests/fixtures/tvm_ffi_fixture.cc").display()
-    );
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
