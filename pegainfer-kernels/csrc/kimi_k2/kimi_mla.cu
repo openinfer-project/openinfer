@@ -14,6 +14,19 @@
 
 extern thread_local cublasHandle_t g_cublas_handle;
 
+extern "C" int kimi_mla_absorb_q_nope_cublaslt_cuda(const __nv_bfloat16* kv_b_proj,
+                                                    const __nv_bfloat16* q_nope,
+                                                    __nv_bfloat16* q_abs_nope,
+                                                    int batch_size,
+                                                    int local_heads,
+                                                    cudaStream_t stream);
+extern "C" int kimi_mla_v_up_cublaslt_cuda(const __nv_bfloat16* kv_b_proj,
+                                           const __nv_bfloat16* latent,
+                                           __nv_bfloat16* output,
+                                           int batch_size,
+                                           int local_heads,
+                                           cudaStream_t stream);
+
 namespace {
 
 using DType = __nv_bfloat16;
@@ -34,6 +47,8 @@ constexpr int kKvBHeadDim = kNopeDim + kVHeadDim;
 constexpr int kLocalHeads = 8;
 constexpr int kQLoraRank = 1536;
 constexpr int kQkvAOut = kQLoraRank + kKvLoraRank + kRopeDim;
+constexpr int kMlaLtLocalHeads = 64;
+constexpr int kMlaLtMaxBatch = 8;
 
 flashinfer::paged_kv_mla_t<DType, IdType> make_paged_kv_mla(void* ckv_cache,
                                                              void* kpe_cache,
@@ -573,6 +588,14 @@ int kimi_mla_absorb_q_nope_cuda(const DType* kv_b_proj,
     return static_cast<int>(cudaErrorInvalidResourceHandle);
   }
 
+  if (local_heads == kMlaLtLocalHeads && batch_size <= kMlaLtMaxBatch) {
+    int lt_status = kimi_mla_absorb_q_nope_cublaslt_cuda(
+        kv_b_proj, q_nope, q_abs_nope, batch_size, local_heads, stream);
+    if (lt_status != static_cast<int>(cudaErrorInvalidResourceHandle)) {
+      return lt_status;
+    }
+  }
+
   // kv_b_proj is row-major [local_heads, k_nope + v, kv_lora_rank].
   // Row-major [k_nope, kv_lora_rank] is the same memory as column-major
   // [kv_lora_rank, k_nope], which is exactly W_UK_T for q absorption.
@@ -624,6 +647,14 @@ int kimi_mla_v_up_cuda(const DType* kv_b_proj,
   }
 
   const DType* w_uv = kv_b_proj + static_cast<int64_t>(kNopeDim) * kKvLoraRank;
+  if (local_heads == kMlaLtLocalHeads && batch_size <= kMlaLtMaxBatch) {
+    int lt_status = kimi_mla_v_up_cublaslt_cuda(
+        kv_b_proj, latent, output, batch_size, local_heads, stream);
+    if (lt_status != static_cast<int>(cudaErrorInvalidResourceHandle)) {
+      return lt_status;
+    }
+  }
+
   status = cublasGemmStridedBatchedEx(
       g_cublas_handle,
       CUBLAS_OP_T,
