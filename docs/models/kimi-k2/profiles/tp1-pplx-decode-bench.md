@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 PPLX Decode Bench
 
-> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, MLA paged-KV append provider coverage with production page metadata, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements plus p95 NCU isolation; H20 `bs=8,ctx=1` accepted rows are tracked in the decode optimization master.
+> **TL;DR:** Implemented `kimi_tp1_pplx_decode_bench`: a TP1 DP8 PPLX decode operator bench with per-op roofline fields and `--ops` / `--labels` filters for NCU isolation. Current accepted Kimi paths cover shared_gate_up and attention o_proj cuBLASLt for batch_size `1..=64`, TP1 MLA absorb/v_up cuBLASLt for `local_heads=64,batch_size<=8`, final argmax split-vocab reduction, router post-GEMM score/topk fusion, MLA paged-KV append provider coverage with production page metadata, synthetic expected-local-route PPLX Marlin compute providers, runtime TP1/DP8/PPLX route histogram tracing with deterministic varied prompt ids, and `kimi_pplx_marlin_replay` for trace-driven local W13/SwiGLU/W2 measurements plus p95 NCU isolation. A bench-scoped FlashInfer MLA `partition_kv` probe showed H20 synthetic ctx4096/8192 near-2x latency reduction; under the current production cap, graph-safe fixed-grid p32 improved ctx1024/2048 from `13.37/26.24ms` to `7.31/13.85ms` with synthetic output-equivalence passing. Production PPLX wiring was tried and rejected because global bs64 runtime gates failed before the partition branch could be validated; the unused partition kernel/FFI/bench code was removed and no `opt(...)` commit is appropriate.
 >
 > **Last touched:** 2026-06
 
@@ -101,8 +101,8 @@
 - Copied the JSON back locally to `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json` for analysis.
 - H20 summary:
   - 460 measured rows and 180 estimate-only rows.
-  - Local measured subtotal for `bs=8`: `17.48ms` at ctx `1`, `18.94ms` at ctx `128`, `30.09ms` at ctx `1024`, `70.46ms` at ctx `4096`, and `121.94ms` at ctx `8192`.
-  - At `bs=8, ctx=8192`, `kimi_flashinfer_batch_decode_mla_rt` alone was `103.50ms`, so long-context local measured time is dominated by MLA decode cache traffic.
+  - Local measured subtotal for per-rank `active_rows=8`: `17.48ms` at ctx `1`, `18.94ms` at ctx `128`, `30.09ms` at ctx `1024`, `70.46ms` at ctx `4096`, and `121.94ms` at ctx `8192`.
+  - At per-rank `active_rows=8, ctx=8192`, `kimi_flashinfer_batch_decode_mla_rt` alone was `103.50ms`, so long-context local measured time is dominated by MLA decode cache traffic.
 
 ### Step 6: shared_gate_up backend check and optimization
 - `shared_gate_up` maps to `pegainfer-kernels/csrc/linear.cu` and uses `cublasGemmEx(... CUBLAS_OP_T, CUBLAS_OP_N, CUDA_R_16BF, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP)`.
@@ -111,7 +111,7 @@
 - KernelWiki's closest SM90 lead was FlashInfer `tinygemm2`. The repo-local FlashInfer submodule has only Python/JIT exposure plus an internal `.cu` launcher, not a stable public C++ header. A direct C++ smoke using the internal launcher measured roughly `31-33us` for `N=1,2,4` and `30.6us` for `N=8`, slower than cuBLAS.
 - cuBLASLt first heuristic is better for this shape than both generic cuBLAS and tinygemm smoke:
   - standalone `N=8`: `18.673us` per call, `1.120ms` for 60 calls, zero workspace.
-  - TP1 PPLX bench provider after wiring Kimi path: `bs=8,ctx=1` shared_gate_up is `1.505ms` for 60 calls, versus the Phase 1 baseline row `1.818ms`.
+  - TP1 PPLX bench provider after wiring Kimi path: per-rank `active_rows=8,ctx=1` shared_gate_up is `1.505ms` for 60 calls, versus the Phase 1 baseline row `1.818ms`.
   - Non-power-of-two active batches are valid: `bs=3,ctx=1` measured `1.524ms` and the row op is `kimi_shared_gate_up_cublaslt`.
 - Production decision: put a Kimi-specific cuBLASLt wrapper under `pegainfer-kernels/src/ops/kimi_k2/shared_gate_up.rs` plus `pegainfer-kernels/csrc/kimi_k2/kimi_shared_gate_up.cu`, gated by exact shape `M=4096,K=7168,batch_size=1..=64`. The old typed GEMM remains fallback for other shapes.
 
@@ -251,54 +251,54 @@
 - Decision: promote the H20 production-metadata latency into the master table, but do not claim production-metadata NCU coverage yet.
 
 ### Step 15: Attention input_norm report
-- Added `docs/models/kimi-k2/attention_input_norm_report.md` to close the standalone Phase 3 direction for `decode.attention.input_norm`.
+- Added `attention_input_norm_report.md` to close the standalone Phase 3 direction for `decode.attention.input_norm`.
 - Evidence reused from `profile/kimi-attention-row6-row7-h20-baseline/`:
-  - Event timing: `8.008us/call`, `488.5us/step` for `61` layers at `bs=8,ctx=1`.
+  - Event timing: `8.008us/call`, `488.5us/step` for `61` layers at per-rank `active_rows=8,ctx=1`.
   - NCU: FlashInfer `RMSNormKernel<8,bf16>`, `8 x 896` launch, `0.05` waves/SM, `0.70-0.74%` DRAM, `60-61%` scheduler no eligible.
 - Decision: stop standalone RMSNorm tuning. Future work should only revisit this row as RMSNorm -> qkv_a prologue/custom skinny-GEMM fusion, and only if the full TP1 PPLX bench beats the current cuBLAS qkv_a path by more than noise.
 
 ### Step 16: Attention qkv_a_split_norm report
-- Added `docs/models/kimi-k2/attention_qkv_a_split_norm_report.md` to close the standalone Phase 3 direction for `decode.attention.qkv_a_split_norm`.
+- Added `attention_qkv_a_split_norm_report.md` to close the standalone Phase 3 direction for `decode.attention.qkv_a_split_norm`.
 - Evidence reused from `profile/kimi-attention-row8-row9-h20-baseline/`:
-  - Event timing: `8.217us/call`, `501.2us/step` for `61` layers at `bs=8,ctx=1`.
+  - Event timing: `8.217us/call`, `501.2us/step` for `61` layers at per-rank `active_rows=8,ctx=1`.
   - NCU: `split_qkv_a_norm_kernel`, `8 x 192` launch, `0.01` waves/SM, `0.19-0.20%` DRAM, `93.4-93.7%` scheduler no eligible.
 - Decision: stop standalone row-8 tuning. Future work should only revisit this row as row8 -> q_b prologue/custom skinny-GEMM fusion that preserves `ckv_normed` and `k_rope`.
 
 ### Step 17: Shared SwiGLU report
-- Added `docs/models/kimi-k2/shared_swiglu_report.md` to close the standalone Phase 3 direction for `decode.moe.shared_swiglu`.
+- Added `shared_swiglu_report.md` to close the standalone Phase 3 direction for `decode.moe.shared_swiglu`.
 - Evidence reused from `profile/kimi-shared-swiglu-h20-baseline/`, and parsed with the `ncu-report-skill` helper using the local Nsight Compute Python module:
-  - Full TP1 PPLX bench artifacts: `410.2-473.3us/step` for `60` calls at `bs=8,ctx=1`.
+  - Full TP1 PPLX bench artifacts: `410.2-473.3us/step` for `60` calls at per-rank `active_rows=8,ctx=1`.
   - Standalone event timing: `202.2us/step`, `3.37us/call`.
   - NCU: `silu_mul_fused_kernel`, `64 x 256` launch, `0.10` waves/SM, `0.51%` DRAM read, `2.53%` SM, `93.39%` scheduler no eligible.
 - Decision: reclassify row 22 as `control/tiny-grid` in the master table and stop standalone SwiGLU tuning. Future work should only revisit this row as row21 -> row22 gated-dual GEMM or row22 -> row23 activation-prologue fusion, with full TP1 PPLX bench proof.
 
 ### Step 18: FlashInfer MLA decode ctx sweep report
-- Added `docs/models/kimi-k2/attention_flashinfer_mla_decode_report.md` for `decode.attention.flashinfer_mla_decode`.
+- Added `attention_flashinfer_mla_decode_report.md` for `decode.attention.flashinfer_mla_decode`.
 - Evidence reused from `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json`:
-  - At `bs=8,ctx=1`: `624.6us/step`, `10.24us/call`, `211GB/s` payload-equivalent.
-  - At `bs=8,ctx=8192`: `103.50ms/step`, `1.697ms/call`, `2.85TB/s` payload-equivalent, about `59%` of the H20 HBM roofline.
+  - At per-rank `active_rows=8,ctx=1`: `624.6us/step`, `10.24us/call`, `211GB/s` payload-equivalent.
+  - At per-rank `active_rows=8,ctx=8192`: `103.50ms/step`, `1.697ms/call`, `2.85TB/s` payload-equivalent, about `59%` of the H20 HBM roofline.
   - `active_rows=1,2,4,8` are nearly identical for this row because attention uses fixed `arena_rows=8`; MoE rows are the active-row-sensitive part of the bench.
 - KernelWiki points to FlashInfer MLA fast decode plan, Hopper backend selection, and FP8 KV cache as plausible directions.
 - NCU status: `h20-100` is reachable, but `/usr/local/cuda-12.9/bin/ncu --version` currently times out. Decision: do not adopt a code change from event timing alone; this row remains active pending production NCU.
 
 ### Step 19: Final lm_head report
-- Added `docs/models/kimi-k2/final_lm_head_report.md` for `decode.final.lm_head`.
+- Added `final_lm_head_report.md` for `decode.final.lm_head`.
 - Evidence reused from H20 TP1 PPLX bench artifacts:
   - `tp1-pplx-decode-bench-o-proj-cublaslt-bs8.json`: `542.68us`, `34.63TF/s`, `4.333TB/s`, `90.28%` H20 HBM.
   - `tp1-pplx-decode-bench-h20-100.json`: active rows `1,2,4,8` all measure the same fixed `arena_rows=8` final row shape at `541.95-542.69us`.
 - Decision: stop standalone BF16 LM-head tuning. Future work only makes sense with NCU-backed evidence of a real bottleneck, a library upgrade beating `542.7us` by `>3%`, or a quantized/FP8 LM-head format change with correctness gates.
 
 ### Step 20: Attention rope_split report
-- Added `docs/models/kimi-k2/attention_rope_split_report.md` for `decode.attention.rope_split`.
+- Added `attention_rope_split_report.md` for `decode.attention.rope_split`.
 - Evidence reused from `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json` and the source launch in `pegainfer-kernels/csrc/kimi_k2/kimi_mla.cu`:
   - target shape: `batch_size=8`, `local_heads=64`, `q_head_dim=192`, launch `384 x 256`.
-  - `bs=8,ctx=1`: `441.76us/step`, `7.24us/call`, `0.027TF/s`, `54.44GB/s` payload-equivalent.
+  - Per-rank `active_rows=8,ctx=1`: `441.76us/step`, `7.24us/call`, `0.027TF/s`, `54.44GB/s` payload-equivalent.
   - `ctx=128/1024/4096/8192` stays in the same `~421-544us/step` band; this row only indexes a different RoPE cache position, so long-context cost belongs to MLA decode, not this helper.
 - NCU status: `/usr/local/cuda-12.9/bin/ncu --version` still times out on `h20-100`, so the report does not claim stall breakdown.
 - Decision: reclassify the master row from memory-bound to `control/elementwise` and stop standalone tuning. Reopen only for a launch-removing MLA prep fusion or a production NCU result with a concrete `>3%` full-bench path.
 
 ### Step 21: Final norm report
-- Added `docs/models/kimi-k2/final_norm_report.md` for `decode.final.norm`.
+- Added `final_norm_report.md` for `decode.final.norm`.
 - Evidence reused from `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-o-proj-cublaslt-bs8.json` and the same-shape row-6 NCU in `profile/kimi-attention-row6-row7-h20-baseline/`:
   - final norm shape: `rows=8`, `hidden=7168`, BF16, one `rms_norm_batch` call before `lm_head`.
   - H20 final norm: `8.01us/call`, `57.27GB/s` payload-equivalent, `1.19%` H20 HBM on the bench model.
@@ -306,7 +306,7 @@
 - Decision: reclassify final norm as `control/tiny-grid` and stop standalone tuning. Also corrected master row 6 (`decode.attention.input_norm`) to the same control/tiny-grid classification already documented in `attention_input_norm_report.md`.
 
 ### Step 22: Attention post_attn_add_norm report
-- Added `docs/models/kimi-k2/attention_post_attn_add_norm_report.md` for `decode.attention.post_attn_add_norm`.
+- Added `attention_post_attn_add_norm_report.md` for `decode.attention.post_attn_add_norm`.
 - Evidence reused from H20 bench artifacts and source launch geometry in `pegainfer-kernels/csrc/flashinfer_norm.cu`:
   - target shape: `rows=8`, `hidden=7168`, BF16 hidden/residual/output plus BF16 norm weight.
   - source launch: `8` CTAs x `896` threads, `28,784B` dynamic shared memory per CTA.
@@ -315,27 +315,27 @@
 - Decision: reclassify row 16 from memory to `control/tiny-grid` and stop standalone tuning. The only plausible follow-up is a downstream prologue fusion that preserves Kimi's BF16 rounding boundary and passes the full TP1 PPLX gate.
 
 ### Step 23: Dense layer0 GEMM reports
-- Added `docs/models/kimi-k2/dense_gate_up_report.md` for `decode.dense.gate_up`.
+- Added `dense_gate_up_report.md` for `decode.dense.gate_up`.
   - H20 evidence: `147.96us`, `28.57TF/s`, `3.58TB/s`, `74.5%` H20 HBM payload model.
   - Decision: stop standalone tuning because it is one call per decode step and already a high-bandwidth BF16 skinny GEMM.
-- Added `docs/models/kimi-k2/dense_down_report.md` for `decode.dense.down`.
+- Added `dense_down_report.md` for `decode.dense.down`.
   - H20 evidence: `85.48us`, `24.73TF/s`, `3.10TB/s`, `64.5%` H20 HBM payload model.
   - Decision: stop standalone tuning unless production NCU identifies a concrete cuBLAS scheduling gap, or a dense down+residual fusion clears the full-bench gate.
 - Both rows now explicitly say production NCU is pending because `h20-100` still times out on `ncu --version`.
 
 ### Step 24: Embedding and dense elementwise reports
-- Added `docs/models/kimi-k2/embedding_report.md` for `decode.embedding`.
+- Added `embedding_report.md` for `decode.embedding`.
   - H20 evidence: `6.83-7.24us`, `31.7-33.6GB/s` payload-equivalent; source launch `224 x 256`.
   - Decision: classify as `control/lookup` and stop standalone tuning.
-- Added `docs/models/kimi-k2/dense_swiglu_report.md` for `decode.dense.swiglu`.
+- Added `dense_swiglu_report.md` for `decode.dense.swiglu`.
   - H20 evidence: `7.79us`, `113.6GB/s` payload-equivalent; source launch `576 x 256`.
   - Decision: classify as `control/elementwise` and stop standalone tuning; future only as dense MLP fusion.
-- Added `docs/models/kimi-k2/dense_residual_add_report.md` for `decode.dense.residual_add`.
+- Added `dense_residual_add_report.md` for `decode.dense.residual_add`.
   - H20 evidence: `6.81-7.51us`, `45.8-50.5GB/s` payload-equivalent; source launch `224 x 256`.
   - Decision: classify as `control/elementwise` and stop standalone tuning; future only as down-GEMM epilogue fusion.
 
 ### Step 25: PPLX residual scaled-add report
-- Added `docs/models/kimi-k2/pplx_residual_add_scaled_report.md` for `decode.moe.residual_add_scaled`.
+- Added `pplx_residual_add_scaled_report.md` for `decode.moe.residual_add_scaled`.
 - Evidence reused from H20 bench artifacts and source launch geometry in `pegainfer-kernels/csrc/kimi_k2/kimi_experts.cu`:
   - target shape: `rows=8`, `hidden=7168`, BF16 hidden + BF16 projected + F32 routed + BF16 output, scale `2.827`.
   - source launch: `224 x 256` for `57344` elements per MoE layer.
@@ -344,7 +344,7 @@
 - Decision: reclassify row 28 from memory to `control/elementwise` and stop standalone tuning. Future work only makes sense as a launch-removing fusion that preserves the current BF16 rounding boundary after `hidden + projected`.
 
 ### Step 26: PPLX Marlin routing report
-- Added `docs/models/kimi-k2/pplx_build_marlin_routing_report.md` for `decode.moe.pplx_build_marlin_routing`.
+- Added `pplx_build_marlin_routing_report.md` for `decode.moe.pplx_build_marlin_routing`.
 - Evidence reused from `pplx_marlin_compute_report.md`, `profile/kimi-pplx-marlin-compute-h20-baseline/`, and trace replay artifacts:
   - source launch: `1 x 64` in `pegainfer-kernels/csrc/kimi_k2/kimi_experts.cu`.
   - NCU: `5.28-5.31us`, `0.00` waves/SM, `0.04%` DRAM, `87-88%` scheduler no eligible.
@@ -352,7 +352,7 @@
 - Decision: keep row 24 as `control`, stop standalone routing metadata tuning, and only revisit it as part of route-aware Marlin scheduling or launch-removing fusion.
 
 ### Step 27: PPLX SwiGLU report
-- Added `docs/models/kimi-k2/pplx_swiglu_report.md` for `decode.moe.pplx_swiglu`.
+- Added `pplx_swiglu_report.md` for `decode.moe.pplx_swiglu`.
 - Evidence reused from `pplx_marlin_compute_report.md`, `profile/kimi-pplx-marlin-compute-h20-baseline/`, and trace replay artifacts:
   - source launch at p95: `recv_capacity=848`, `intermediate=2048`, so `6784 x 256`; actual p95 work is `224 * 2048` elements read from `num_tokens_post_padded[0]`.
   - NCU: `10.62us`, DRAM `6.32%`, SM throughput `55.40%`, occupancy `76.05%`, scheduler no eligible `34.20%`.
@@ -360,7 +360,7 @@
 - Decision: reclassify row 26 from memory to `compute/elementwise` and stop standalone activation tuning. Future work needs W13/W2 fusion or a tighter route-aware launch bound.
 
 ### Step 28: Master row 8 consistency fix
-- Corrected `docs/models/kimi-k2/tp1-dp8-ep8-decode-optimization-master.md` row 8 for `decode.attention.qkv_a_split_norm`.
+- Corrected `tp1-dp8-ep8-decode-optimization-master.md` row 8 for `decode.attention.qkv_a_split_norm`.
 - Evidence was already in `attention_qkv_a_split_norm_report.md`: H20 NCU reports `8` CTAs, `0.01` waves/SM, `0.19-0.20%` DRAM, `0.37-0.39%` compute, and `93.4-93.7%` scheduler no eligible.
 - Decision: classify row 8 as `control/tiny-grid` with payload-equivalent throughput instead of the stale memory-bound `0.3% / gap 99.7%` entry.
 
@@ -379,7 +379,7 @@
 - Decision: keep row 13 active. The next concrete action is to retrieve and parse `ctx8192_full.ncu-rep`; do not change FlashInfer MLA decode code from event timing or kernel-name evidence alone.
 
 ### Step 30: Row 13 selected NCU metrics and FlashInfer split-K audit
-- Ran a narrower NCU stdout metrics pass for `decode.attention.flashinfer_mla_decode` at `bs=8,ctx=8192` and parsed it locally into `profile/kimi-flashinfer-mla-decode-ctx8192-h20/analysis/ctx8192_metrics_summary.json`.
+- Ran a narrower NCU stdout metrics pass for `decode.attention.flashinfer_mla_decode` at per-rank `active_rows=8,ctx=8192` and parsed it locally into `profile/kimi-flashinfer-mla-decode-ctx8192-h20/analysis/ctx8192_metrics_summary.json`.
 - Key metrics:
   - Kernel: `BatchDecodeWithPagedKVCacheKernelMLA<2,16,2,32,8,1,2,...>`.
   - Launch: grid `(8,4,1)` = `32` CTAs, block `(32,8,1)` = `256` threads, `0.41` waves/SM on H20.
@@ -393,12 +393,315 @@
   - The current Kimi wrapper in `pegainfer-kernels/csrc/kimi_k2/kimi_mla.cu` sets `o_indptr=nullptr` and passes `tmp_v/tmp_s=nullptr`, so it cannot enter FlashInfer's split-K branch.
 - Decision: update `attention_flashinfer_mla_decode_report.md` and the master ledger. The next code experiment should be a bench-scoped planned `partition_kv` path; no production code change is adopted yet because no speedup has been measured.
 
+### Step 31: Bench-scoped MLA partition-KV probe
+- Added a local WIP probe behind `kimi_tp1_pplx_decode_bench --mla-decode-partition-pages <pages>`; this code was removed in Step 41 after the production adoption was rejected, so the artifacts below are historical evidence rather than current CLI support:
+  - CUDA wrapper: `kimi_flashinfer_batch_decode_mla_partitioned_cuda`.
+  - Rust wrapper: `kimi_flashinfer_batch_decode_mla_partitioned_rt`.
+  - Bench provider: `kimi_flashinfer_batch_decode_mla_partitioned_rt` is selected only when the new CLI flag is present; the default baseline path is unchanged.
+  - Metadata is generated with FlashInfer-style `request_indices`, `kv_tile_indices`, `o_indptr`, one `kv_chunk_size`, and `tmp_v/tmp_s`.
+- Local verification:
+  - `PEGAINFER_CUDA_SM=90 cargo build --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench` passed.
+  - `cargo fmt --all --check` and `git diff --check` passed.
+  - Local same-shape sanity at per-rank `active_rows=8,ctx=8192,iters=2`:
+    - baseline: `1517.904us/call`, `92.592ms/step`.
+    - `--mla-decode-partition-pages 256`: `770.496us/call`, `47.000ms/step`.
+    - `--mla-decode-partition-pages 128`: `773.664us/call`, `47.194ms/step`.
+- H20 status:
+  - Original workspace writes on `h20-100:/root/develop/xingming/pegainfer` still hang intermittently, so the WIP source was packaged locally as `/tmp/pegainfer-kimi-partition-src.tar.zst` and built from `/dev/shm/pegainfer-kimi-partition-src`.
+  - Remote build needed `HOME=/dev/shm/pegainfer-cargo-home` and direct nightly toolchain binaries; `/root/.cargo/bin/cargo` hangs through the rustup shim in the default HOME/cwd environment.
+  - H20 build passed from tmpfs:
+    - `PATH=/root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/usr/local/cuda/bin:/usr/local/cuda-12.9/bin:$PATH HOME=/dev/shm/pegainfer-cargo-home CARGO_HOME=/root/.cargo TMPDIR=/dev/shm/pegainfer-tmp RUSTC=/root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc PEGAINFER_CUDA_SM=90 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python CARGO_TARGET_DIR=/dev/shm/pegainfer-kimi-partition-target /root/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/cargo build --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench`
+  - H20 bench artifacts pulled locally:
+    - `target/kernel_reports/kimi-k2/kimi_mla_baseline_h20.json`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p256_h20.json`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p128_h20.json`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p64_h20.json`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p128_confirm_h20.json`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p128_ncu_ctx8192_metrics.csv`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p128_check4096_h20.json`
+    - `target/kernel_reports/kimi-k2/kimi_mla_p128_check8192_h20.json`
+  - H20 `iters=8` sweep:
+    - `ctx=1024`: baseline `13.379ms`; p256/p128/p64 all `13.566-13.567ms`, a small regression.
+    - `ctx=4096`: baseline `51.975ms`; p128 `26.631ms` (`1.95x`), p64 `26.807ms` (`1.94x`), p256 no win.
+    - `ctx=8192`: baseline `103.269ms`; p256 `52.355ms` (`1.97x`), p128 `52.517ms` (`1.97x`), p64 `52.851ms` (`1.95x`).
+  - H20 `iters=16` p128 confirmation reproduced the signal: baseline `51.983/103.336ms`, p128 `26.664/52.535ms` at `ctx=4096/8192`.
+  - Selected NCU for p128 `ctx=8192` with `/usr/local/cuda/bin/ncu`:
+    - decode kernel grid `(32,4,1)` = `128` CTAs, `1.64` waves/SM, `254` regs/thread, `57.29%` SM throughput, `3.44%` DRAM throughput.
+    - merge kernel grid `(546,1,1)`, `0.70` waves/SM, `48` regs/thread, `39.85%` SM throughput, `7.29%` DRAM throughput.
+  - Added `--mla-decode-partition-check` to compare baseline and partition outputs on deterministic BF16 q/cache data before measuring:
+    - Local `ctx=1024,pages=128`: `max_abs=0`, `mean_abs=0`.
+    - H20 `ctx=4096,pages=128`: `max_abs=0.001953`, `mean_abs=0.000170`.
+    - H20 `ctx=8192,pages=128`: `max_abs=0.001953`, `mean_abs=0.000101`.
+- Decision: do not commit the code as an optimization yet. The H20 speedup is real for the bench path and synthetic output-equivalence passes, but the probe still lacks production CUDA-graph metadata/temp-buffer ownership and an end-to-end decode/token gate.
+- Production caveat found while reading the runner:
+  - `pegainfer-kimi-k2/src/runner/worker.rs` fixes `KIMI_DECODE_PAGE_SIZE=16` and `KIMI_DECODE_PAGES_PER_REQUEST=128`, so current production decode has a `2048` token/request arena.
+  - The H20 `ctx=4096/8192` measurements are still valid kernel-bench evidence, but not a direct production-runner shape.
+  - H20 production-cap sweep landed for baseline vs `64/32/16` page chunks at `ctx=1024/2048`:
+
+    | Config | ctx1024 step | ctx2048 step | Check result |
+    |---|---:|---:|---|
+    | baseline | `13.371ms` | `26.236ms` | baseline |
+    | p64 | `13.572ms` (`0.99x`) | `13.747ms` (`1.91x`) | max_abs `0/0.001953`, mean_abs `0/0.000161` |
+    | p32 | `7.284ms` (`1.84x`) | `13.837ms` (`1.90x`) | max_abs `0.001953/0.001953`, mean_abs `0.000360/0.000245` |
+    | p16 | `7.424ms` (`1.80x`) | `14.123ms` (`1.86x`) | max_abs `0.001953/0.001953`, mean_abs `0.000222/0.000250` |
+
+  - Decision from the production-cap sweep: p32 is the current candidate because it wins both `ctx=1024` and `ctx=2048`. p64 is slightly faster at `ctx=2048` alone, but it regresses `ctx=1024`.
+  - Added graph-safe fixed-grid metadata support to the bench path:
+    - CLI flag: `--mla-decode-partition-max-pages-per-request`.
+    - CUDA wrapper now accepts `block_valid_mask`.
+    - Rust wrapper accepts `Option<&CudaSlice<u8>>` and validates mask/temp sizes.
+    - Bench metadata pads to `batch * ceil(max_pages_per_request / kv_chunk_pages)` and masks invalid chunks.
+  - Local fixed-grid p32 smoke passed at `ctx=1024/2048` with `max_abs=0.001953`.
+  - H20 fixed-grid p32 artifact: `target/kernel_reports/kimi-k2/kimi_mla_p32_fixed_ctx2048_h20.json`.
+    - `--mla-decode-partition-pages 32 --mla-decode-partition-max-pages-per-request 128 --iters 8`.
+    - `ctx=1024`: `7.309ms/step`, `1.83x` vs baseline `13.371ms`.
+    - `ctx=2048`: `13.854ms/step`, `1.89x` vs baseline `26.236ms`.
+    - Equivalence: both rows `max_abs=0.001953`, mean abs `0.000362/0.000245`.
+  - Decision: fixed-grid p32 keeps the real-padded p32 gain while matching the CUDA Graph launch-shape requirement. The next code step is production arena ownership and full decode/token validation, not more bench-only tuning.
+
+### Step 32: Production PPLX MLA partition rejection
+- Wired the fixed-grid p32 plan into the production PPLX non-graph decode path, including arena-owned metadata/temp buffers and a `.partitioned_actual` `kernel-call-trace` marker.
+- Verification:
+  - Local `cargo fmt --all --check` passed.
+  - Local `cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_tp1_pplx_decode_bench` passed.
+  - Local `cargo check --release -p pegainfer-kimi-k2 --features kimi-k2,kernel-report --bin kimi_kernel_report` passed.
+  - H20 `cargo check --release -p pegainfer-kimi-k2 --features kimi-k2,kernel-report --bin kimi_kernel_report` passed from `/dev/shm/pegainfer-kimi-partition-src`.
+  - H20 runtime gate failed: global bs64/kv513 long-prefill trace hit rank7 non-finite top logit `NaN`; trace-only decode growth to kv513 hit prompt_len1 decode non-finite top logit `-inf`; minimal global bs64/kv2 PPLX trace also hit prompt_len1 decode `-inf`.
+- Decision: reject and remove the production runner wiring from this WIP. The bench artifacts remain useful evidence, but this optimization is not accepted and must not be committed.
+
+### Step 33: Post-attention add+RMSNorm NCU stop
+- Moved to row 16 `decode.attention.post_attn_add_norm` after rejecting production MLA partition adoption.
+- H20 NCU command:
+
+  ```bash
+  /usr/local/cuda-12.9/bin/ncu --target-processes all \
+    --kernel-name-base demangled --print-kernel-base demangled --set full \
+    -k regex:FusedAddRMSNormRoundKernel \
+    -o /dev/shm/kimi-post-attn-add-norm-ncu/reports/post_attn_add_norm_full \
+    --force-overwrite /dev/shm/pegainfer-kimi-partition-target/release/kimi_tp1_pplx_decode_bench \
+    --active-rows 8 --ctx-lens 1 --iters 1 --format text \
+    --labels decode.attention.post_attn_add_norm \
+    --out /dev/shm/kimi-post-attn-add-norm-ncu/post_attn_add_norm_ncu.json
+  ```
+
+- Result:
+  - NCU report: `/dev/shm/kimi-post-attn-add-norm-ncu/reports/post_attn_add_norm_full.ncu-rep`.
+  - Key counters: `8` CTAs, `0.05` waves/SM, `32` regs/thread, `28.78KiB` dynamic shared memory/block, `2.29%` SM throughput, `1.11%` DRAM throughput, `64.78%` no-eligible scheduler cycles.
+  - NCU rule engine flags the launch as too small (`8` blocks on `78` SMs). Shared-memory conflicts show a local `~15%` hint, but that is not enough to clear the full-bench bar without deleting the launch.
+- Decision: stop standalone tuning for `post_attn_add_norm`. Only a downstream prologue fusion that preserves the BF16 rounding boundary is worth reopening. Updated `attention_post_attn_add_norm_report.md`, the master ledger, and `profile/kimi-attention-post-attn-add-norm-h20/REPORT.md`.
+
+### Step 34: Attention rope_split NCU stop
+- Moved to row 10 `decode.attention.rope_split`.
+- H20 filtered bench sanity on the existing tmpfs target binary passed:
+
+  ```bash
+  /dev/shm/pegainfer-kimi-partition-target/release/kimi_tp1_pplx_decode_bench \
+    --active-rows 8 --ctx-lens 1 --iters 4 --format text \
+    --labels decode.attention.rope_split \
+    --out /dev/shm/kimi_rope_probe.json
+  ```
+
+  The sanity run measured `483.61us/step`; the master baseline remains the earlier `441.8us/step` artifact because this was a short NCU-prep probe on a bench-scoped tmpfs binary.
+- H20 selected NCU command:
+
+  ```bash
+  /usr/local/cuda/bin/ncu --target-processes all \
+    --kernel-name-base demangled --print-kernel-base demangled \
+    --section LaunchStats --section Occupancy --section SpeedOfLight \
+    --section SchedulerStats --section WarpStateStats \
+    --section MemoryWorkloadAnalysis \
+    --launch-skip 3 --launch-count 1 \
+    -k regex:rope_split_decode_kernel \
+    -o /dev/shm/kimi-rope-split-ncu/reports/rope_split_selected \
+    --force-overwrite /dev/shm/pegainfer-kimi-partition-target/release/kimi_tp1_pplx_decode_bench \
+    --active-rows 8 --ctx-lens 1 --iters 1 --format text \
+    --labels decode.attention.rope_split \
+    --out /dev/shm/kimi-rope-split-ncu/rope_split_ncu.json
+  ```
+
+- Result:
+  - NCU report: `profile/kimi-attention-rope-split-h20/reports/rope_split_selected.ncu-rep`.
+  - Parsed details: `profile/kimi-attention-rope-split-h20/analysis/rope_split_details.csv`.
+  - Key counters: `384` CTAs, `0.62` waves/SM, `22` regs/thread, `0B` dynamic shared memory, `10.51%` SM throughput, `1.27%` DRAM throughput, `61.96GB/s` memory throughput, `48.67%` achieved occupancy, and `77.03%` no-eligible scheduler cycles.
+  - The NCU rule engine reports the launch has only `0.6` full waves across SMs; the bench JSON row under NCU replay reports `73s` and must not be used as latency evidence.
+- Decision: stop standalone tuning for `rope_split`. The only remaining direction is launch-removing MLA-prep fusion that preserves `q_nope`, `q_pe`, and `append_kpe`. Updated `attention_rope_split_report.md`, the master ledger, and `profile/kimi-attention-rope-split-h20/REPORT.md`.
+
+### Step 35: MLA paged KV append production-metadata NCU stop
+- Moved to row 12 `decode.attention.paged_kv_append`.
+- H20 selected NCU command:
+
+  ```bash
+  /usr/local/cuda/bin/ncu --target-processes all \
+    --kernel-name-base demangled --print-kernel-base demangled \
+    --section LaunchStats --section Occupancy --section SpeedOfLight \
+    --section SchedulerStats --section WarpStateStats \
+    --section MemoryWorkloadAnalysis \
+    --launch-skip 3 --launch-count 1 \
+    -k regex:AppendPagedKVMlaCacheKernel \
+    -o /dev/shm/kimi-kv-append-prod-ncu/reports/kv_append_selected \
+    --force-overwrite /dev/shm/pegainfer-kimi-partition-target/release/kimi_tp1_pplx_decode_bench \
+    --active-rows 8 --ctx-lens 1 --iters 1 --format text \
+    --labels decode.attention.paged_kv_append \
+    --out /dev/shm/kimi-kv-append-prod-ncu/kv_append_ncu.json
+  ```
+
+- Result:
+  - Remote NCU report: `/dev/shm/kimi-kv-append-prod-ncu/reports/kv_append_selected.ncu-rep`.
+  - Parsed details copied locally: `profile/kimi-mla-paged-kv-append-prod-h20/analysis/kv_append_details.csv`.
+  - Key counters: `78` CTAs, `0.12` waves/SM, `28` regs/thread, `0B` dynamic shared memory, `1.50%` SM throughput, `0.09%` DRAM throughput, `4.40GB/s` memory throughput, `8.71%` achieved occupancy, and `97.63%` no-eligible scheduler cycles.
+  - The NCU rule engine reports only `0.1` full waves across SMs. The bench JSON row under NCU replay reports `75s` and must not be used as latency evidence.
+  - Repeated rsync attempts for the `.ncu-rep` timed out; the exported details CSV and remote report path are recorded in `profile/kimi-mla-paged-kv-append-prod-h20/REPORT.md`.
+- Decision: stop standalone tuning for `paged_kv_append`. Keep the production-metadata provider and only reopen if MLA cache-prep fusion can remove the launch. Updated `attention_paged_kv_append_report.md`, the master ledger, and `profile/kimi-mla-paged-kv-append-prod-h20/REPORT.md`.
+
+### Step 36: PPLX residual_add_scaled NCU stop
+- Moved to row 28 `decode.moe.residual_add_scaled`.
+- H20 selected NCU command:
+
+  ```bash
+  /usr/local/cuda/bin/ncu --target-processes all \
+    --kernel-name-base demangled --print-kernel-base demangled \
+    --section LaunchStats --section Occupancy --section SpeedOfLight \
+    --section SchedulerStats --section WarpStateStats \
+    --section MemoryWorkloadAnalysis \
+    --launch-skip 3 --launch-count 1 \
+    -k regex:kimi_residual_add_scaled_f32_kernel \
+    -o /dev/shm/kimi-residual-add-scaled-ncu/reports/residual_add_scaled_selected \
+    --force-overwrite /dev/shm/pegainfer-kimi-partition-target/release/kimi_tp1_pplx_decode_bench \
+    --active-rows 8 --ctx-lens 1 --iters 1 --format text \
+    --labels decode.moe.residual_add_scaled \
+    --out /dev/shm/kimi-residual-add-scaled-ncu/residual_add_scaled_ncu.json
+  ```
+
+- Result:
+  - Remote NCU report: `/dev/shm/kimi-residual-add-scaled-ncu/reports/residual_add_scaled_selected.ncu-rep`.
+  - Parsed details copied locally: `profile/kimi-pplx-residual-add-scaled-h20/analysis/residual_add_scaled_details.csv`.
+  - Key counters: `224` CTAs, `0.36` waves/SM, `16` regs/thread, `0B` dynamic shared memory, `8.37%` SM throughput, `3.33%` DRAM throughput, `162.16GB/s` memory throughput, `34.03%` achieved occupancy, and `91.25%` no-eligible scheduler cycles.
+  - The NCU rule engine reports only `0.4` full waves across SMs. The bench JSON row under NCU replay reports `72s` and must not be used as latency evidence.
+- Decision: stop standalone tuning for `residual_add_scaled`. Keep the exact-preserving post-combine helper and reopen only for a launch-removing fusion across the PPLX combine boundary. Updated `pplx_residual_add_scaled_report.md`, the master ledger, and `profile/kimi-pplx-residual-add-scaled-h20/REPORT.md`.
+
+### Step 37: CUDA Tile C++ probe
+- Investigated CUDA 13.3's CUDA Tile C++ surface for a possible PPLX Marlin successor prototype.
+- Local headers:
+  - `/usr/local/cuda-13.3/targets/x86_64-linux/include/cuda_tile.h` is the public include.
+  - `/usr/local/cuda-13.3/targets/x86_64-linux/include/crt/cuda_tile.h` owns the `cuda::tiles::inline __1` API.
+  - `/usr/local/cuda-13.3/bin/tileiras` is the Tile IR optimizing assembler.
+- Toolchain facts:
+  - `#include <cuda_tile.h>` requires `nvcc -std=c++20 -enable-tile`; without `-enable-tile`, tile annotations are ignored and the header fails in host parsing.
+  - `__tile_global__` kernels launch with ordinary CUDA launch syntax. The local probe used `<<<grid, 1>>>`.
+- Scratch probes under `target/cuda_tile_probe/`:
+  - `tile_add.cu`: `shape<128>` + `iota/load_masked/store_masked`; local `sm_120` run passed.
+  - `tile_matmul.cu`: `partition_view + matmul` for `16x16` FP32; local `sm_120` run passed.
+  - `tile_bf16_matmul.cu`: `16x16` BF16 matmul; local `sm_120` run passed, but `tileiras` reported Tensor Core failure with MMA shape `[1,1,1]`, so it lowered to scalar `FMUL/FADD`.
+  - `tile_bf16_matmul64.cu`: `64x64` BF16 matmul; local `sm_120` run passed, and `sm_90 -tilecubin` `tileiras` reported Tensor Core success with shape `[64,64,16]`; SASS contains `HGMMA.64x64x16.F32.BF16`.
+  - `tile_i8_matmul64.cu`: `64x64` INT8 matmul; `sm_90 -tilecubin` `tileiras` reported Tensor Core success with shape `[64,64,32]`; SASS contains `IGMMA.64x64x32.S8.S8.SAT`.
+- Negative finding:
+  - The CUDA 13.3 header has no `int4`, `uint4`, `fp4`, `nvfp4`, `e2m1`, `nibble`, or subbyte element type exposed through `cuda::tiles::matmul`.
+  - The current Marlin WNA16 packed INT4 path cannot be expressed as a direct CUDA Tile matmul without custom unpack/dequant or a weight-format change.
+- H20 note:
+  - `sm_90 -tilecubin` generation works locally, but `h20-100` SSH commands were timing out during this probe, so no H20 runtime number was recorded.
+- Decision: CUDA Tile C++ is viable for a small standalone BF16/INT8 tile prototype and useful for understanding the Tile compiler, but it is not a direct replacement for packed W4A16 Marlin. Any Marlin experiment should start with a trace-replay harness and an explicit packed-int4 unpack/dequant design; otherwise keep optimizing current CUDA Marlin scheduling.
+
+### Step 38: Local SM120 Marlin baseline correction
+- Re-centered the CUDA Tile investigation on the real target: Kimi WNA16 uses BF16 activations with packed INT4 weights. BF16/INT8 CUDA Tile probes only prove Tile compiler behavior; they are not an apples-to-apples comparison with Marlin.
+- Confirmed local machine:
+  - GPU: RTX 5070 Ti, compute capability `12.0`.
+  - Build target: `PEGAINFER_CUDA_SM=120`; build.rs warns that nvcc does not list `compute_120f`, so kernels compile for raw `sm_120`.
+- Ran current PPLX Marlin providers locally:
+
+  ```bash
+  PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-kimi-k2 \
+    --features kernel-report --bin kimi_tp1_pplx_decode_bench -- \
+    --active-rows 8 --ctx-lens 1 \
+    --labels decode.moe.pplx_marlin_w13,decode.moe.pplx_marlin_w2 \
+    --iters 16 --format text \
+    --out target/kernel_reports/kimi-k2/tp1-pplx-marlin-sm120-local.json
+  ```
+
+  Result on the synthetic stress provider (`rows=400`, `recv_capacity=848`):
+  - W13: `15.436ms/step` across 60 layers, `91.30 TF/s`, `3.116 TB/s`.
+  - W2: `8.825ms/step` across 60 layers, `79.85 TF/s`, `2.745 TB/s`.
+- Ran trace-replay p95 locally:
+
+  ```bash
+  PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-kimi-k2 \
+    --features kimi-k2,kernel-report --bin kimi_pplx_marlin_replay -- \
+    --trace target/kernel_reports/kimi-k2/tp1-dp8-pplx-route-hist-bs64-kv2-varied.json \
+    --iters 16 --quantiles p95 --ops w13,w2 --format text \
+    --out target/kernel_reports/kimi-k2/pplx-marlin-replay-p95-sm120-local.json
+  ```
+
+  Result for H20-derived p95 route shape (`recv=67`, `padded=224`, active experts `28`):
+  - W13: `149.82us`, `3.120 TB/s`, `65.01%` of the local assumed `4.8TB/s` roofline.
+  - W2: `89.53us`, `2.629 TB/s`, `54.76%` of the local assumed `4.8TB/s` roofline.
+  - Relative to the H20 accepted p95 rows (`161.45us` / `98.14us`), local `sm_120` is only about `1.08x` / `1.10x` faster for this Marlin path.
+- KernelWiki check:
+  - `kernel-grouped-gemm` points to grouped/persistent scheduling as the right MoE direction, with small-M and load imbalance as the practical bottlenecks.
+  - `pr-cutlass-3091` is about Hopper CuTe DSL grouped GEMM examples, not packed W4A16 Marlin.
+  - `pr-cutlass-2865` notes SM120 interactions with SM90 mainloops / SM100 scheduler plumbing; useful context for local `sm_120` checks, but not an INT4 Tile answer.
+- Decision: local Marlin can and does run. CUDA Tile has no direct packed-INT4 matmul surface, so the next valid CUDA Tile comparison would be an explicit W4A16 toy: load packed nibbles, dequant to a Tensor-Core-friendly BF16/INT8 tile, then compare against Marlin on the same replay shape. Until that exists, the current Marlin numbers above are the real local INT4 baseline.
+
+### Step 39: Local CUDA Tile W4A16 toy vs Marlin
+- Added a scratch-only CUDA Tile W4A16 microbench under `target/cuda_tile_probe/tile_w4a16_perf.cu`; this file is ignored and is not a production candidate.
+- The toy uses plain row-major packed nibbles, not Marlin's production layout:
+  - activation: BF16 `[M,K]`;
+  - weight: packed INT4 `[K,N/2]`, two output-column weights per byte;
+  - kernel: unpack nibble, convert `int4 -> float -> BF16`, then call `cuda::tiles::mma` over `64x64` tiles.
+- Built and ran locally on RTX 5070 Ti / `sm_120`:
+
+  ```bash
+  /usr/local/cuda-13.3/bin/nvcc -std=c++20 -enable-tile -arch=sm_120 \
+    target/cuda_tile_probe/tile_w4a16_perf.cu -lcublas \
+    -o target/cuda_tile_probe/tile_w4a16_w13_perf_sm120
+
+  /usr/local/cuda-13.3/bin/nvcc -std=c++20 -enable-tile -arch=sm_120 \
+    -DPROBLEM_NAME='"w2"' -DPROBLEM_M=224 -DPROBLEM_K=2048 -DPROBLEM_N=7168 \
+    -DMARLIN_PREV_US=89.53f \
+    target/cuda_tile_probe/tile_w4a16_perf.cu -lcublas \
+    -o target/cuda_tile_probe/tile_w4a16_w2_perf_sm120
+
+  ./target/cuda_tile_probe/tile_w4a16_w13_perf_sm120 --iters 30
+  ./target/cuda_tile_probe/tile_w4a16_w2_perf_sm120 --iters 30
+  ```
+
+  Results:
+
+  | Problem | Shape | CUDA Tile W4A16 toy | CUDA Tile BF16-weight toy | cuBLAS BF16-weight | current Marlin local p95 |
+  |---|---:|---:|---:|---:|---:|
+  | W13 | `M=224,K=7168,N=4096` | `1609.62us` / `8.17 TF/s` | `1664.38us` / `7.90 TF/s` | `160.29us` / `82.06 TF/s` | `149.82us` |
+  | W2 | `M=224,K=2048,N=7168` | `821.88us` / `8.00 TF/s` | `809.68us` / `8.12 TF/s` | `90.13us` / `72.97 TF/s` | `89.53us` |
+
+- Compiler evidence:
+  - `-tilecubin -Xtileiras --remarks=all,...` says the toy `mma` optimized to Tensor Cores.
+  - On local `sm_120`, the reported instruction family is `Tensor-core SM80` with shape `[16,8,16]`, and SASS contains `HMMA.16816.F32.BF16`, not a Blackwell-specific packed-INT4 instruction.
+- Interpretation:
+  - The naive CUDA Tile W4A16 toy is about `10.7x` slower than Marlin for W13 and `9.2x` slower for W2.
+  - The BF16-weight CUDA Tile variant is almost as slow as the W4 unpack variant, so the main gap is the generated Tile kernel shape/scheduling, not only nibble unpack.
+  - cuBLAS BF16 at the same shapes is close to current local Marlin (`160.29us` vs `149.82us` W13, `90.13us` vs `89.53us` W2), which gives a useful sanity baseline for the local GPU.
+- Decision: do not pursue this CUDA Tile C++ path as a Marlin replacement. A serious successor still needs a route-aware grouped/persistent design or a library/kernel path that directly supports packed W4A16/NVFP4-style operands. CUDA Tile remains useful for small compiler probes, not for the current Kimi Marlin hot path.
+
+### Step 40: Profile doc consolidation
+- Created `docs/models/kimi-k2/profiles/` as the Kimi-K2 decode profiling home.
+- Moved the TP1/DP8/EP8 master ledger, TP1 PPLX bench log, fusion scan, and every Kimi kernel `*_report.md` into that directory.
+- Added `README.md` as the local entry point and updated `docs/index.md` so profile docs route through `profiles/`.
+- Kept root-level Kimi docs for architecture, correctness, serving/performance ledgers, and model-wide context.
+
+### Step 41: Remove rejected partition-KV kernel code
+- Removed the unused FlashInfer MLA partition probe from live code after review:
+  - CUDA symbol `kimi_flashinfer_batch_decode_mla_partitioned_cuda`.
+  - FFI binding `kimi_flashinfer_batch_decode_mla_partitioned_cuda`.
+  - Rust runtime wrapper `kimi_flashinfer_batch_decode_mla_partitioned_rt`.
+  - `kimi_tp1_pplx_decode_bench` partition CLI flags and measurement/check adapters.
+- Kept the H20 artifacts and conclusions in this doc and `attention_flashinfer_mla_decode_report.md`.
+- Result: production and bench binaries now expose only the accepted non-partitioned MLA decode path; reopening split-K requires reintroducing it as a fresh experiment after the global-bs64 runtime gate is healthy.
+
 ### Unexpected
 - `--measure false` initially failed because clap's default bool flag handling did not accept an explicit value. Fixed by using `ArgAction::Set`.
 - `Option<Vec<usize>>` with a CSV parser caused a clap downcast panic. Fixed by accepting raw strings and parsing CSV in the binary.
 - The existing Kimi kernel report providers were TP8-shaped for MLA decode internals. Added runtime-dim TP1 provider paths instead of reusing TP8 constants.
 - FlashInfer is repo-local at `pegainfer-kernels/third_party/flashinfer`; using an external checkout can hide source-layout and API-boundary differences. Keep this path in the repo instructions so future kernel work starts from the submodule.
 - The first cuBLASLt implementation incorrectly treated active batch as graph bucket and only supported `1,2,4,8,16,32,64`. Fixed to name the dimension `batch_size` and prebuild plans for every `1..=64`, so `bs=3` does not fall back to generic cuBLAS.
+- Runtime trace and operator bench use different batch terms: `kimi_tp1_pplx_decode_bench --active-rows 8` is a single DP-rank shape, while `kimi_kernel_report trace --batch-size 64 --tp-world 1 --dp-world 8` is the matching global-bs64 production trace. A `--batch-size 8` runtime trace is global bs8 and must not be used as the target-load gate.
+- The FlashInfer MLA `partition_kv` production attempt failed before reaching the partition threshold. Record it as a rejected production adoption, not as a kernel win; unused probe code should not stay in the live kernel surface.
 
 ## Debrief
 
@@ -411,7 +714,8 @@
 - **Lessons learned**:
   - Bench rows should distinguish `arena_rows` from `active_rows`; the current TP1 path uses arena rows for attention/final and active rows after `set_moe_seq_len(active_len)` for MoE/top1.
   - Estimate-only rows are useful when they are explicit: they preserve the operator inventory without fabricating single-rank numbers for EP collectives.
+  - Kimi decode profile evidence belongs under `docs/models/kimi-k2/profiles/`; root-level model docs should stay as higher-level routing and design context.
 - **Follow-ups**:
   - Run NCU on trace replay p95/max W13/W2 before changing Marlin scheduling or tiling.
   - Add an all-rank PPLX harness for dispatch/combine timing; trace replay covers local compute only and intentionally excludes EP transport.
-  - For row 13, try a planned FlashInfer MLA `partition_kv` bench path and compare `ctx=1024/4096/8192` before touching production decode.
+  - For row 13, reopen FlashInfer MLA `partition_kv` only after the base TP1/DP8/PPLX global-bs64 runtime trace has a passing token gate; then reintroduce a fresh bench path before touching production decode.

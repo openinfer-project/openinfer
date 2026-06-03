@@ -1,6 +1,6 @@
 # pplx_residual_add_scaled Report
 
-> **TL;DR:** `decode.moe.residual_add_scaled` / `kimi_residual_add_scaled_f32` is a small fused PPLX post-combine elementwise row, not a useful standalone HBM target. At TP1/DP8/PPLX `bs=8,ctx=1`, it launches `224 x 256` threads per MoE layer for `rows=8, hidden=7168` and costs `408.3-410.1us/step` across `60` calls (`6.81-6.83us/call`, about `84GB/s` payload-equivalent). Classify it as `control/elementwise`, keep the current fused scaled-add kernel, and only revisit it as part of a launch-removing epilogue/prologue fusion that preserves Kimi's BF16 rounding boundary.
+> **TL;DR:** `decode.moe.residual_add_scaled` / `kimi_residual_add_scaled_f32` is a small fused PPLX post-combine elementwise row, not a useful standalone HBM target. At TP1/DP8/PPLX `bs=8,ctx=1`, it launches `224 x 256` threads per MoE layer for `rows=8, hidden=7168` and costs `408.3-410.1us/step` across `60` calls (`6.81-6.83us/call`, about `84GB/s` payload-equivalent). H20 selected NCU confirms low utilization (`224` CTAs, `0.36` waves/SM, `8.37%` SM, `3.33%` DRAM, `91.25%` no-eligible). Keep the current fused scaled-add kernel and only revisit it as part of a launch-removing epilogue/prologue fusion that preserves Kimi's BF16 rounding boundary.
 >
 > **Last touched:** 2026-06
 
@@ -19,8 +19,6 @@ round_bf16(hidden + projected) + routed_f32 * KIMI_K2_ROUTER_SCALE
 That BF16 rounding point is part of the production math and must be preserved by any fused variant.
 
 ## NCU Conclusion
-
-Fresh production NCU is still pending because `h20-100` currently times out even on `/usr/local/cuda-12.9/bin/ncu --version`. Do not promote a stall breakdown for this row until Nsight Compute is usable again.
 
 Event-timing evidence from H20 artifacts:
 
@@ -49,7 +47,39 @@ scaled = routed_f32[idx] * scale;
 out[idx] = bf16(scaled + float(rounded));
 ```
 
-The payload-equivalent bandwidth is low because the launch is tiny and the arithmetic is sparse. That does not mean a hand-tuned standalone elementwise kernel has a `50x` opportunity; it means the row is dominated by fixed overhead and limited work.
+Selected H20 NCU:
+
+```bash
+/usr/local/cuda/bin/ncu --target-processes all \
+  --kernel-name-base demangled --print-kernel-base demangled \
+  --section LaunchStats --section Occupancy --section SpeedOfLight \
+  --section SchedulerStats --section WarpStateStats \
+  --section MemoryWorkloadAnalysis \
+  --launch-skip 3 --launch-count 1 \
+  -k regex:kimi_residual_add_scaled_f32_kernel \
+  -o /dev/shm/kimi-residual-add-scaled-ncu/reports/residual_add_scaled_selected \
+  --force-overwrite /dev/shm/pegainfer-kimi-partition-target/release/kimi_tp1_pplx_decode_bench \
+  --active-rows 8 --ctx-lens 1 --iters 1 --format text \
+  --labels decode.moe.residual_add_scaled \
+  --out /dev/shm/kimi-residual-add-scaled-ncu/residual_add_scaled_ncu.json
+```
+
+| Metric | Value |
+|---|---:|
+| NCU kernel | `kimi_residual_add_scaled_f32_kernel` |
+| NCU duration | `2.85us` |
+| Grid / block | `224` CTAs x `256` threads |
+| Waves / SM | `0.36` |
+| Registers/thread | `16` |
+| Dynamic shared memory/block | `0 B` |
+| Memory throughput | `162.16GB/s`, `3.33%` DRAM throughput |
+| Compute throughput | `8.37%` |
+| Achieved occupancy | `34.03%` |
+| L1/TEX / L2 hit rate | `8.25%` / `31.76%` |
+| Scheduler no eligible | `91.25%` |
+| Top rule | Grid/workload too small; issue slot utilization local speedup estimate `91.25%` |
+
+The payload-equivalent bandwidth is low because the launch is small and the arithmetic is sparse. NCU confirms this is not HBM- or compute-bound; it is dominated by fixed launch/control work and limited independent work.
 
 ## Attempts
 
@@ -57,7 +87,7 @@ The payload-equivalent bandwidth is low because the launch is tiny and the arith
 |---|---|---|
 | Current fused PPLX residual path | One kernel already combines residual hidden, shared projection, routed F32 output, router scale, and BF16 output rounding. H20 `bs=8,ctx=1` is `6.81-6.83us/call`. | Keep. This is already the local fused helper for the PPLX combine boundary. |
 | Treat row as memory-bound roofline target | The bench model reported only `~1.75%` of H20 HBM, but the row is a small `224`-CTA elementwise launch with `573KB` modeled payload per call. | Reject the memory-bound classification. Use `control/elementwise` in the master table. |
-| Standalone CUDA retune | No NCU evidence currently points to uncoalesced memory, bank conflicts, or a specific instruction bottleneck. | Do not spend code churn here without production NCU evidence and a full-bench improvement over noise. |
+| Standalone CUDA retune | Selected NCU points to small-grid/control behavior, not a specific memory or instruction ceiling. | Reject. |
 
 ## Final Conclusion
 
@@ -66,5 +96,4 @@ Stop standalone optimization for `decode.moe.residual_add_scaled`. The current k
 Reopen only under one of these conditions:
 
 - A future upstream/downstream fusion removes the launch and preserves `round_bf16(hidden + projected)` before adding scaled routed F32.
-- Production NCU becomes available and shows a concrete issue with a credible `>3%` full TP1 PPLX decode gain.
 - The PPLX combine boundary changes so routed output can be accumulated directly into the final hidden-state format without a separate post-combine pass.

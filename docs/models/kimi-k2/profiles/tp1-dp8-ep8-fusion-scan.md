@@ -6,7 +6,7 @@
 
 ## Inputs
 
-- Master ledger: `docs/models/kimi-k2/tp1-dp8-ep8-decode-optimization-master.md`
+- Master ledger: `tp1-dp8-ep8-decode-optimization-master.md`
 - Current H20 optimized bench artifact: `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-cublaslt-bs3-bs8.json`
 - Baseline H20 artifact: `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json`
 - NCU run: `profile/kimi-shared-swiglu-h20-baseline/` on `h20-100`

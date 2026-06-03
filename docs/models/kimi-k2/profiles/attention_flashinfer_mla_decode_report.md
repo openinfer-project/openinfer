@@ -1,6 +1,6 @@
 # Attention FlashInfer MLA Decode Report
 
-> **TL;DR:** `decode.attention.flashinfer_mla_decode` calls FlashInfer `BatchDecodeWithPagedKVCacheDispatchedMLA` through `kimi_flashinfer_batch_decode_mla_rt`. At the anchor `bs=8/rank,ctx=1` it costs `624.6us/step` (`10.24us/call`) across 61 attention layers, but it is the long-context cliff: `ctx=8192` costs `103.50ms/step` (`1.697ms/call`) and reaches about `2.85 TB/s` payload-equivalent bandwidth (`~59%` of the H20 HBM roofline model). A selected NCU metrics pass for `ctx=8192` does not confirm HBM saturation: it launches only `32` CTAs (`0.41` waves/SM), uses `254` registers/thread, reaches `12.5%` active warps, and reports `0.87%` DRAM throughput / `22.74%` memory throughput. The current Kimi wrapper passes no FlashInfer split-K temporary buffers, so FlashInfer forces `partition_kv=false`; the next real experiment is to wire a planned `partition_kv` path or prove another backend is better, not to tune the current fixed-grid launch blindly.
+> **TL;DR:** `decode.attention.flashinfer_mla_decode` calls FlashInfer `BatchDecodeWithPagedKVCacheDispatchedMLA` through `kimi_flashinfer_batch_decode_mla_rt`. At the anchor `bs=8/rank,ctx=1` it costs `624.6us/step` (`10.24us/call`) across 61 attention layers, but it is the long-context cliff: `ctx=8192` costs `103.50ms/step` (`1.697ms/call`). Baseline NCU for `ctx=8192` shows only `32` CTAs (`0.41` waves/SM), `254` registers/thread, and no DRAM saturation. A bench-scoped planned `partition_kv` probe with `--mla-decode-partition-pages 128` improved H20 synthetic `ctx=4096/8192` from `51.98/103.34ms` to `26.66/52.53ms` per decode step (`~1.95x/1.97x`) by raising the decode launch to `128` CTAs plus a merge kernel. Under the current production decode cap (`2048` tokens/request), graph-safe fixed-grid p32 (`max_pages_per_request=128`, `block_valid_mask`) improved H20 `ctx=1024/2048` from `13.37/26.24ms` to `7.31/13.85ms` with synthetic output-equivalence passing (`max_abs=0.001953`). Production PPLX wiring was rejected: global bs64 runtime gates failed before the partition branch could be validated, including `kv_len=513` long-prefill `NaN` and prompt_len1 decode `-inf` failures, and even the minimal global bs64 `kv_len=2` trace failed under the WIP. The unused partition kernel/FFI/bench code has been removed from the live codebase.
 >
 > **Last touched:** 2026-06
 
@@ -72,6 +72,19 @@ Interpretation:
 - Register pressure is also severe: `254` registers/thread limits active blocks and active warps.
 - The full `.ncu-rep` and a shorter source-counter run are still needed for stall attribution, but a split-K / partition-KV experiment is now justified by evidence.
 
+The partitioned probe has its own selected NCU artifact at `target/kernel_reports/kimi-k2/kimi_mla_p128_ncu_ctx8192_metrics.csv`. For `ctx=8192`, `partition_pages=128`, the first two profiled kernels are:
+
+| Kernel | Grid | Block | Waves/SM | Regs/thread | Dynamic smem | SM throughput | Compute-memory throughput | DRAM throughput | DRAM read | L2 hit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `BatchDecodeWithPagedKVCacheKernelMLA<...>` | `(32,4,1)` = `128` CTAs | `(32,8,1)` | `1.64` | `254` | `22,528 B` | `57.29%` | `45.32%` | `3.44%` | `165.4 GB/s` | `35.51%` |
+| `PersistentVariableLengthMergeStatesKernel<...>` | `(546,1,1)` = `546` CTAs | `(32,4,1)` | `0.70` | `48` | `16,896 B` | `39.85%` | `36.89%` | `7.29%` | `355.2 GB/s` | `37.34%` |
+
+Interpretation:
+
+- The partitioned path validates the small-grid diagnosis: the decode kernel moves from `32` CTAs / `0.41` waves/SM to `128` CTAs / `1.64` waves/SM.
+- The new path is not a pure drop-in single-kernel improvement. It adds `PersistentVariableLengthMergeStatesKernel`, so the bench payload roofline model reports impossible `>100%` HBM percentages. For partitioned rows, use latency and NCU geometry/counters rather than the old payload `%peak`.
+- Even after partitioning, NCU still does not show physical HBM saturation. The next bottleneck is likely register pressure in the decode kernel plus merge overhead/tile scheduling, not raw DRAM bandwidth.
+
 The next completed NCU run should isolate:
 
 | Question | Why it matters |
@@ -79,7 +92,7 @@ The next completed NCU run should isolate:
 | Which FlashInfer MLA kernel/backend is dispatched? | KernelWiki records backend selection regressions on Hopper; the source call alone is not enough. |
 | DRAM read throughput and L2 hit rate at `ctx=8192` | The bench-derived payload is `~2.85 TB/s`, but NCU must confirm actual bytes and cache behavior. |
 | Wave count, occupancy, and scheduler stalls at `ctx=1` | Short context is only `10.24us/call`; it may be launch/control limited rather than bandwidth limited. |
-| Split-K / partition-KV behavior | Current wrapper passes `partition_kv=false`; NCU must show whether long-context work fills H20 well enough without partitioning. |
+| Split-K / partition-KV behavior | Bench path now proves higher parallelism; production path still needs correctness, graph-safe metadata ownership, and merge overhead analysis. |
 
 ## Bench Evidence
 
@@ -112,9 +125,68 @@ H20 artifact: `target/kernel_reports/kimi-k2/tp1-pplx-decode-bench-h20-100.json`
 
 Roofline interpretation:
 
-- Long-context arithmetic intensity from the bench model is about `3.78 flop/byte`, below the H20 ridge point recorded in the master table (`30.83 flop/byte`), so long context is memory-bound.
+- Long-context arithmetic intensity from the bench model is about `1.89 flop/byte`, below the H20 ridge point recorded in the master table (`30.83 flop/byte`), so long context is memory-shaped by the payload model.
 - `ctx=1` has too little KV work to saturate bandwidth; the row is dominated by FlashInfer launch/control and metadata overhead.
 - The event-level roofline row is a payload model, not a proof that physical DRAM is saturated. The selected NCU metrics show `32` CTAs and low DRAM throughput, so the next optimization should test whether FlashInfer's partitioned plan raises parallelism before assuming the only remaining option is reducing bytes.
+
+Bench-scoped partition probe artifacts:
+
+| Artifact | Meaning |
+|---|---|
+| `target/kernel_reports/kimi-k2/kimi_mla_baseline_h20.json` | H20 baseline, per-rank `active_rows=8`, `ctx=1024,4096,8192`, `iters=8`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p256_h20.json` | Same sweep with `--mla-decode-partition-pages 256`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p128_h20.json` | Same sweep with `--mla-decode-partition-pages 128`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p64_h20.json` | Same sweep with `--mla-decode-partition-pages 64`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p128_confirm_h20.json` | H20 confirm run for p128 at `ctx=4096,8192`, `iters=16`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p128_ncu_ctx8192_metrics.csv` | Selected NCU stdout metrics for p128 at `ctx=8192`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p128_check4096_h20.json` | H20 synthetic output-equivalence check for p128 at `ctx=4096`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p128_check8192_h20.json` | H20 synthetic output-equivalence check for p128 at `ctx=8192`. |
+| `target/kernel_reports/kimi-k2/kimi_mla_p32_fixed_ctx2048_h20.json` | H20 production-cap p32 with fixed graph-size metadata: `max_pages_per_request=128`, `block_valid_mask`, `iters=8`. |
+
+Production decode capacity caveat:
+
+- The current runner arena in `pegainfer-kimi-k2/src/runner/worker.rs` fixes `KIMI_DECODE_PAGES_PER_REQUEST=128` and `KIMI_DECODE_PAGE_SIZE=16`, so production decode currently represents up to `2048` cached tokens per request.
+- The `ctx=4096/8192` partition numbers above are valid H20 kernel-bench evidence, but they are synthetic long-context shapes outside the current runner arena.
+- The production-cap H20 sweep now proves a `ctx<=2048` event-timing win with smaller chunks. `partition_pages=32` is the best current candidate because it improves both `ctx=1024` and `ctx=2048`; `p64` is slightly better at `ctx=2048` alone but regresses `ctx=1024`.
+- The graph-safe fixed-grid p32 bench uses `padded_batch_size = batch * ceil(128 / 32)` plus `block_valid_mask`, matching FlashInfer's CUDA-graph plan shape. It is only `~0.3%` slower than real-padded p32 at `ctx=2048`.
+- A production `partition_kv` change was attempted and then removed from the runner WIP. The bench artifacts remain useful evidence, but the unused kernel/FFI/bench code has been removed until the base TP1/DP8/PPLX runtime trace gate is healthy at global bs64.
+
+H20 latency comparison:
+
+| ctx | Baseline step | p256 step / speedup | p128 step / speedup | p64 step / speedup |
+|---:|---:|---:|---:|---:|
+| 1024 | `13.379 ms` | `13.567 ms` / `0.99x` | `13.566 ms` / `0.99x` | `13.567 ms` / `0.99x` |
+| 4096 | `51.975 ms` | `52.226 ms` / `1.00x` | `26.631 ms` / `1.95x` | `26.807 ms` / `1.94x` |
+| 8192 | `103.269 ms` | `52.355 ms` / `1.97x` | `52.517 ms` / `1.97x` | `52.851 ms` / `1.95x` |
+
+The `iters=16` confirmation for p128 reproduced the result: baseline `51.983/103.336ms` at `ctx=4096/8192`, p128 `26.664/52.535ms`.
+
+H20 production-cap latency comparison:
+
+| ctx | Baseline step | p64 real / speedup | p32 real / speedup | p32 fixed-grid / speedup | p16 real / speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | `13.371 ms` | `13.572 ms` / `0.99x` | `7.284 ms` / `1.84x` | `7.309 ms` / `1.83x` | `7.424 ms` / `1.80x` |
+| 2048 | `26.236 ms` | `13.747 ms` / `1.91x` | `13.837 ms` / `1.90x` | `13.854 ms` / `1.89x` | `14.123 ms` / `1.86x` |
+
+This makes `partition_pages=32` the current production-cap candidate: it halves valid long-context latency at `ctx=2048` and also helps `ctx=1024`, while `p64` only wins the `ctx=2048` micro-point by `~0.09ms`. The fixed-grid variant keeps almost all of the p32 gain while preserving the launch shape needed by CUDA Graph replay.
+
+Synthetic output-equivalence checks compare the non-partition and p128 partition outputs on deterministic BF16 q/cache data:
+
+| ctx | Compared elems | Max abs diff | Mean abs diff |
+|---:|---:|---:|---:|
+| 4096 | `262144` | `0.001953` | `0.000170` |
+| 8192 | `262144` | `0.001953` | `0.000101` |
+
+Production-cap output-equivalence checks:
+
+| Partition pages | ctx | Compared elems | Max abs diff | Mean abs diff |
+|---:|---:|---:|---:|---:|
+| 64 | 1024 | `262144` | `0` | `0` |
+| 64 | 2048 | `262144` | `0.001953` | `0.000161` |
+| 32 | 1024 | `262144` | `0.001953` | `0.000360` |
+| 32 | 2048 | `262144` | `0.001953` | `0.000245` |
+| 16 | 1024 | `262144` | `0.001953` | `0.000222` |
+| 16 | 2048 | `262144` | `0.001953` | `0.000250` |
 
 FlashInfer source notes:
 
@@ -133,19 +205,22 @@ FlashInfer source notes:
 | Fresh production NCU full report | Full `--set full` capture completed and wrote `ctx8192_full.ncu-rep` remotely, but retrieval/parsing still times out. SourceCounters run did not finish after several minutes. | Keep trying narrower parse/source runs; do not claim final stall attribution yet. |
 | Selected NCU stdout metrics | Parsed raw metrics show `32` CTAs, `0.41` waves/SM, `254` registers/thread, `12.5%` active warps, `0.87%` DRAM throughput. | Treat the current launch as low-grid/register-limited until the full report proves otherwise. |
 | Flip `partition_kv` / split-K | Source inspection complete. It is not a one-flag change: the Kimi wrapper must provide planned `request_indices`, `kv_tile_indices`, `o_indptr`, `kv_chunk_size`, `tmp_v`, `tmp_s`, and possibly `block_valid_mask`. | Next code experiment should wire a FlashInfer-style plan for the bench path first, then measure `ctx=1024..8192`. |
+| Bench-scoped `partition_kv` probe | Historical local WIP behind `--mla-decode-partition-pages`; default path unchanged. H20 per-rank `active_rows=8,iters=8`: p128 improves synthetic `ctx=4096/8192` from `51.975/103.269ms` to `26.631/52.517ms` per step; p256 only helps at `ctx=8192`; p64 is slightly slower than p128. Selected NCU shows decode grid `32x4=128` CTAs plus a merge kernel. Synthetic H20 output-equivalence vs baseline passes at ctx4096/8192 with max abs diff `0.001953`. Production-cap H20 sweep identifies p32 as the best current candidate: real-padded `ctx=1024/2048` improves from `13.371/26.236ms` to `7.284/13.837ms`; graph-safe fixed-grid p32 is `7.309/13.854ms`, also with max abs diff `0.001953`. | Strong candidate, not adopted: production validation failed first, so the unused kernel/FFI/bench code was removed from live code. |
+| Production PPLX forward WIP | Fixed-grid p32 arena metadata/temp buffers and a `.partitioned_actual` trace marker were wired into PPLX non-graph decode, then tested on H20. Compile passed locally and on H20, but runtime gates failed before validating the partition branch. | Rejected and removed from the runner WIP. Do not commit this path. |
+| Global bs64 runtime trace | Correct command shape is `kimi_kernel_report trace --batch-size 64 --kv-len 513 --tp-world 1 --dp-world 8 --ep-backend pplx`, where `--batch-size` is global request count. H20 results: original long-prefill trace failed on rank7 with non-finite top logit `NaN`; a trace-only decode-growth workaround failed at prompt_len1 decode with non-finite top logit `-inf`; the minimal global bs64 `kv_len=2` PPLX trace also failed with prompt_len1 decode `-inf`. | Failed gate. This is not an SSH artifact and not a partition-kernel win; stop production adoption and move to the next kernel. |
 | FP8 KV cache | Not attempted. KernelWiki/vLLM direction is promising for bandwidth, but it changes cache dtype and correctness envelope. | Candidate only with an explicit accuracy gate and cache-layout plan. |
 | FlashInfer backend/version swap | Not attempted. KernelWiki shows Hopper backend selection can matter. | Candidate only after identifying the exact dispatched kernel/backend in NCU. |
 
 ## Final Conclusion
 
-Keep the current FlashInfer MLA decode path as the baseline for now. This row is not stopped as an optimization target: it is the highest-priority attention row for long context, and the first evidence-backed code experiment is a planned `partition_kv` path that increases CTAs for long context.
+Keep the current FlashInfer MLA decode path as the accepted production baseline for now. The bench-scoped `partition_kv` path had real synthetic long-context and production-cap microbench speedup signals, but production adoption is stopped for this pass because the TP1/DP8/PPLX runtime gate fails before the partition branch can be validated. The attempted runner wiring and unused probe kernel code were removed from the WIP and must not be committed as an optimization.
 
 Adoption bar for any future change:
 
 | Direction | Required proof |
 |---|---|
 | Backend/plan selection | NCU identifies the current backend and shows a replacement improves `ctx=8192` H20 latency by `>3%` without hurting `ctx=1`. |
-| `partition_kv` / split-K | Wire all FlashInfer plan metadata and temp buffers; full bench improves at `ctx>=1024` and short context does not regress materially. |
+| `partition_kv` / split-K | Reopen only after the base TP1/DP8/PPLX global-bs64 runtime trace has a passing token gate. Then reintroduce fixed-grid p32 metadata and verify full decode/token output plus latency at `ctx=1024/2048`. |
 | FP8 KV cache | Token/logit correctness gate plus H20 bench improvement from lower KV bytes; report must record cache dtype/layout changes. |
 
-No `opt(...)` commit is appropriate from this report alone. Reopen for code once the planned `partition_kv` bench path or another backend has a reproducible H20 speedup.
+No `opt(...)` commit is appropriate from this report alone. The next kernel should proceed while this row stays on the accepted baseline.
