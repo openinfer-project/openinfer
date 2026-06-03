@@ -3,7 +3,6 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 // Kimi K2 private kernels (feature `kimi-k2`).
 // Sources: csrc/kimi_k2/*.cu (+ vendored vllm-marlin headers).
-#[cfg(feature = "kimi-k2")]
 unsafe extern "C" {
     pub fn kimi_add_f32_bf16_to_bf16_cuda(
         a: *const f32,

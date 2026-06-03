@@ -111,7 +111,7 @@ unsafe extern "C" {
         N: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     pub fn gemm_graphsafe_cuda(
         W: *const Half,
@@ -121,7 +121,7 @@ unsafe extern "C" {
         N: i32,
         K: i32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(
