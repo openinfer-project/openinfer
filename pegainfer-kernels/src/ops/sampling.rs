@@ -82,6 +82,69 @@ pub fn argmax_batch_bf16_into(
     Ok(())
 }
 
+pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize {
+    const TILE_ELEMS: usize = 4096;
+    rows * vocab.div_ceil(TILE_ELEMS)
+}
+
+pub fn argmax_batch_bf16_split_into(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    values: &mut CudaSlice<half::bf16>,
+    out: &mut CudaSlice<i32>,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+) -> Result<()> {
+    let rows = logits.seq_len;
+    if rows == 0 {
+        return Err(anyhow!("split argmax batch requires at least one row"));
+    }
+    if values.len() < rows {
+        return Err(anyhow!(
+            "split argmax values scratch too small: have {}, need {}",
+            values.len(),
+            rows
+        ));
+    }
+    if out.len() < rows {
+        return Err(anyhow!(
+            "split argmax output too small: have {}, need {}",
+            out.len(),
+            rows
+        ));
+    }
+    let partials = argmax_batch_bf16_split_partials_len(rows, logits.hidden_dim);
+    if partial_values.len() < partials || partial_indices.len() < partials {
+        return Err(anyhow!(
+            "split argmax partial scratch too small: values={}, indices={}, need {}",
+            partial_values.len(),
+            partial_indices.len(),
+            partials
+        ));
+    }
+
+    let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (values_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let (partial_values_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
+    let (partial_indices_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::argmax_batch_bf16_split_cuda(
+            logits_ptr as *const ffi::Half,
+            values_ptr as *mut ffi::Half,
+            out_ptr as *mut i32,
+            partial_values_ptr as *mut f32,
+            partial_indices_ptr as *mut i32,
+            rows as i32,
+            logits.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// GPU sampling: temperature → softmax → top-k → top-p → multinomial.
 /// Allocates a temporary output buffer — use `gpu_sample_into` for the decode loop.
 pub fn gpu_sample(

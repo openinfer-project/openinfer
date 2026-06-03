@@ -152,6 +152,17 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn argmax_batch_bf16_split_cuda(
+        x: *const Half,
+        values: *mut Half,
+        indices: *mut i32,
+        partial_values: *mut f32,
+        partial_indices: *mut i32,
+        rows: i32,
+        n: i32,
+        stream: CUstream,
+    );
+
     pub fn flashinfer_top1_cuda(
         logits: *const Half,
         top1_value_scratch: *mut Half,
