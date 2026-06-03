@@ -90,6 +90,85 @@ __global__ void router_topk_normalize_kernel(const float *__restrict__ scores,
   }
 }
 
+__global__ void router_scores_topk_normalize_kernel(
+    const float *__restrict__ logits,
+    const float *__restrict__ e_score_correction_bias,
+    float *__restrict__ scores_out,
+    float *__restrict__ choice_scores_out,
+    float *__restrict__ topk_weight,
+    int *__restrict__ topk_idx,
+    int active_tokens,
+    int padded_tokens,
+    int n_experts,
+    int topk,
+    float route_scale) {
+  int token = blockIdx.x;
+  int tid = threadIdx.x;
+  if (token >= padded_tokens) return;
+
+  extern __shared__ char shared[];
+  float *scores = reinterpret_cast<float *>(shared);
+  float *choice_scores = scores + blockDim.x;
+  float *reduce_values = choice_scores + blockDim.x;
+  int *reduce_indices = reinterpret_cast<int *>(reduce_values + blockDim.x);
+  float *selected_scores = reinterpret_cast<float *>(reduce_indices + blockDim.x);
+
+  const int row_base = token * n_experts;
+  const int expert = tid;
+  if (expert < n_experts) {
+    float score = 1.0f / (1.0f + expf(-logits[row_base + expert]));
+    scores[tid] = score;
+    choice_scores[tid] = score + e_score_correction_bias[expert];
+    scores_out[row_base + expert] = scores[tid];
+    choice_scores_out[row_base + expert] = choice_scores[tid];
+  } else {
+    scores[tid] = 0.0f;
+    choice_scores[tid] = -CUDART_INF_F;
+  }
+  if (token >= active_tokens) return;
+  __syncthreads();
+
+  float selected_sum = 0.0f;
+  for (int route = 0; route < topk; ++route) {
+    reduce_values[tid] = choice_scores[tid];
+    reduce_indices[tid] = expert < n_experts ? expert : n_experts;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        const float other_value = reduce_values[tid + stride];
+        const int other_idx = reduce_indices[tid + stride];
+        if (better_router_choice(other_value, other_idx, reduce_values[tid], reduce_indices[tid])) {
+          reduce_values[tid] = other_value;
+          reduce_indices[tid] = other_idx;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const int best_idx = reduce_indices[0];
+      const float route_score = best_idx < n_experts ? scores[best_idx] : 0.0f;
+      selected_scores[route] = route_score;
+      topk_idx[token * topk + route] = best_idx;
+      topk_weight[token * topk + route] = route_score;
+      selected_sum += route_score;
+      if (best_idx < n_experts) {
+        choice_scores[best_idx] = -CUDART_INF_F;
+        choice_scores_out[row_base + best_idx] = -CUDART_INF_F;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const float scale = selected_sum > 0.0f ? route_scale / selected_sum : 0.0f;
+    for (int route = 0; route < topk; ++route) {
+      topk_weight[token * topk + route] = selected_scores[route] * scale;
+    }
+  }
+}
+
 CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaSuccess) return CUDA_SUCCESS;
   if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
@@ -216,18 +295,12 @@ CUresult kimi_k2_router_noaux_tc_cuda(
       hidden, gate_weight, logits, padded_tokens, hidden_dim, n_experts, stream);
   if (result != CUDA_SUCCESS) return result;
 
-  int total_scores = padded_tokens * n_experts;
-  int blocks = (total_scores + kRouterThreads - 1) / kRouterThreads;
-  router_scores_kernel<<<blocks, kRouterThreads, 0, stream>>>(
-      logits, e_score_correction_bias, scores, choice_scores, total_scores, n_experts);
-  result = consume_last_cuda_error();
-  if (result != CUDA_SUCCESS) return result;
-
   size_t select_smem =
-      static_cast<size_t>(kRouterSelectThreads) * (sizeof(float) + sizeof(int)) +
+      static_cast<size_t>(kRouterSelectThreads) * (3 * sizeof(float) + sizeof(int)) +
       static_cast<size_t>(topk) * sizeof(float);
-  router_topk_normalize_kernel<<<active_tokens, kRouterSelectThreads, select_smem, stream>>>(
-      scores, choice_scores, topk_weight, topk_idx, active_tokens, n_experts, topk, route_scale);
+  router_scores_topk_normalize_kernel<<<padded_tokens, kRouterSelectThreads, select_smem, stream>>>(
+      logits, e_score_correction_bias, scores, choice_scores, topk_weight, topk_idx, active_tokens,
+      padded_tokens, n_experts, topk, route_scale);
   result = consume_last_cuda_error();
   if (result != CUDA_SUCCESS) return result;
 
