@@ -656,11 +656,11 @@ mod tests {
         fail_decode_once: bool,
         decode_delay: Duration,
         loaded_lora_adapters: HashSet<String>,
-        active_lora_adapter: Option<String>,
-        lora_activations: Arc<Mutex<Vec<Option<String>>>>,
         dropped: Arc<Mutex<Vec<u64>>>,
         prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
         decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
+        prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
+        decode_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
     }
 
     impl FakeExecutor {
@@ -674,11 +674,11 @@ mod tests {
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
                 loaded_lora_adapters: HashSet::new(),
-                active_lora_adapter: None,
-                lora_activations: Arc::new(Mutex::new(Vec::new())),
                 dropped,
                 prefill_batches: Arc::new(Mutex::new(Vec::new())),
                 decode_batches: Arc::new(Mutex::new(Vec::new())),
+                prefill_lora_batches: Arc::new(Mutex::new(Vec::new())),
+                decode_lora_batches: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -697,13 +697,8 @@ mod tests {
             self
         }
 
-        fn with_lora_adapters(
-            mut self,
-            names: &[&str],
-            activations: Arc<Mutex<Vec<Option<String>>>>,
-        ) -> Self {
+        fn with_lora_adapters(mut self, names: &[&str]) -> Self {
             self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
-            self.lora_activations = activations;
             self
         }
 
@@ -714,6 +709,16 @@ mod tests {
         ) -> Self {
             self.prefill_batches = prefill_batches;
             self.decode_batches = decode_batches;
+            self
+        }
+
+        fn with_lora_batch_records(
+            mut self,
+            prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
+            decode_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
+        ) -> Self {
+            self.prefill_lora_batches = prefill_lora_batches;
+            self.decode_lora_batches = decode_lora_batches;
             self
         }
 
@@ -764,20 +769,6 @@ mod tests {
             Ok(())
         }
 
-        fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
-            if let Some(adapter) = adapter {
-                if !self.loaded_lora_adapters.contains(adapter) {
-                    anyhow::bail!("LoRA adapter is not loaded: {adapter}");
-                }
-            }
-            self.active_lora_adapter = adapter.map(ToString::to_string);
-            self.lora_activations
-                .lock()
-                .unwrap()
-                .push(self.active_lora_adapter.clone());
-            Ok(())
-        }
-
         fn list_lora_adapters(&self) -> Vec<String> {
             let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
             names.sort();
@@ -790,9 +781,6 @@ mod tests {
                 "LoRA adapter is not loaded: {}",
                 request.lora_name
             );
-            if self.active_lora_adapter.as_deref() == Some(request.lora_name.as_str()) {
-                self.active_lora_adapter = None;
-            }
             Ok(())
         }
 
@@ -801,6 +789,12 @@ mod tests {
                 plan.requests
                     .iter()
                     .map(|request| request.request_id)
+                    .collect(),
+            );
+            self.prefill_lora_batches.lock().unwrap().push(
+                plan.requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
                     .collect(),
             );
             for req in plan.requests {
@@ -839,6 +833,12 @@ mod tests {
                     .map(|request| request.request_id)
                     .collect(),
             );
+            self.decode_lora_batches.lock().unwrap().push(
+                plan.requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
+                    .collect(),
+            );
             for req in plan.requests {
                 let current_tokens = self
                     .held_tokens
@@ -868,10 +868,22 @@ mod tests {
                     .map(|request| request.request_id)
                     .collect(),
             );
+            self.prefill_lora_batches.lock().unwrap().push(
+                plan.prefill_requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
+                    .collect(),
+            );
             self.decode_batches.lock().unwrap().push(
                 plan.decode_requests
                     .iter()
                     .map(|request| request.request_id)
+                    .collect(),
+            );
+            self.decode_lora_batches.lock().unwrap().push(
+                plan.decode_requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
                     .collect(),
             );
             for req in plan.prefill_requests {
@@ -1219,14 +1231,19 @@ mod tests {
     }
 
     #[test]
-    fn mixed_lora_prefill_requests_run_in_adapter_groups() {
+    fn mixed_lora_prefill_requests_run_in_one_batch() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let activations = Arc::new(Mutex::new(Vec::new()));
         let prefill_batches = Arc::new(Mutex::new(Vec::new()));
         let decode_batches = Arc::new(Mutex::new(Vec::new()));
+        let prefill_lora_batches = Arc::new(Mutex::new(Vec::new()));
+        let decode_lora_batches = Arc::new(Mutex::new(Vec::new()));
         let mut executor = FakeExecutor::new(4, Arc::clone(&dropped))
-            .with_lora_adapters(&["adapter-a", "adapter-b"], Arc::clone(&activations))
-            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches));
+            .with_lora_adapters(&["adapter-a", "adapter-b"])
+            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches))
+            .with_lora_batch_records(
+                Arc::clone(&prefill_lora_batches),
+                Arc::clone(&decode_lora_batches),
+            );
         let mut rng = StdRng::seed_from_u64(42);
         let mut active = Vec::new();
 
@@ -1245,7 +1262,7 @@ mod tests {
             plan::ExecutionPlan::Prefill { pending },
             &mut rng,
         )
-        .expect("execute grouped prefill");
+        .expect("execute mixed-LoRA prefill");
         let plan::ExecutionArtifacts::Prefill { result, .. } = artifacts else {
             panic!("expected prefill artifacts");
         };
@@ -1259,21 +1276,26 @@ mod tests {
             vec![RequestId(0), RequestId(1), RequestId(2)]
         );
         assert_eq!(
-            *activations.lock().unwrap(),
-            vec![
-                None,
-                Some("adapter-a".to_string()),
-                Some("adapter-b".to_string())
-            ]
+            *prefill_batches.lock().unwrap(),
+            vec![vec![RequestId(0), RequestId(1), RequestId(2)]],
+            "one execution plan should run as one mixed-LoRA prefill batch"
         );
         assert_eq!(
-            *prefill_batches.lock().unwrap(),
-            vec![vec![RequestId(1)], vec![RequestId(2)], vec![RequestId(0)]],
-            "one execution plan should be split into base, adapter-a, and adapter-b groups"
+            *prefill_lora_batches.lock().unwrap(),
+            vec![vec![
+                Some("adapter-b".to_string()),
+                None,
+                Some("adapter-a".to_string())
+            ]],
+            "mixed-LoRA batch should preserve per-request adapter metadata"
         );
         assert!(
             decode_batches.lock().unwrap().is_empty(),
             "prefill-only plan should not execute decode batches"
+        );
+        assert!(
+            decode_lora_batches.lock().unwrap().is_empty(),
+            "prefill-only plan should not record decode LoRA metadata"
         );
     }
 
@@ -1485,8 +1507,8 @@ mod tests {
     #[test]
     fn lora_control_unloads_adapter_when_idle() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped))
-            .with_lora_adapters(&["adapter-a"], Arc::new(Mutex::new(Vec::new())));
+        let executor =
+            FakeExecutor::new(4, Arc::clone(&dropped)).with_lora_adapters(&["adapter-a"]);
         let handle = start_with_executor_with_lora_control(executor, 42);
 
         let runtime = tokio::runtime::Builder::new_current_thread()

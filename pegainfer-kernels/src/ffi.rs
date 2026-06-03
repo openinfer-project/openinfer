@@ -7,10 +7,12 @@ pub type Half = u16;
 mod deepseek;
 #[cfg(feature = "kimi-k2")]
 mod kimi;
+mod lora;
 mod qwen35;
 mod shared;
 pub use deepseek::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi::*;
+pub use lora::*;
 pub use qwen35::*;
 pub use shared::*;

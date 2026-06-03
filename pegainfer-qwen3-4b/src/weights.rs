@@ -8,8 +8,13 @@ use std::time::Instant;
 use super::config::{Config, TensorParallelConfig};
 use std::collections::HashMap;
 
-use crate::lora::{DeviceLoraAdapter, DeviceLoraLayer};
-use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::lora::{
+    DeviceLoraAdapter, DeviceLoraLayer, DeviceLoraProjection, LoraProjectionKind, LoraTokenRange,
+    apply_lora_projection_delta_indexed, apply_lora_projection_delta_range,
+    group_lora_token_ranges,
+};
+use half::bf16;
+use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use pegainfer_core::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
     load_tensor_2d_row_shard, mmap_shards, precompute_rope,
@@ -28,6 +33,8 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) enable_cuda_graph: bool,
     pub(crate) tensor_parallel: Option<TensorParallelConfig>,
     pub(crate) device_ordinal: usize,
+    pub(crate) max_loras: usize,
+    pub(crate) max_lora_rank: usize,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -36,6 +43,8 @@ impl Default for ModelRuntimeConfig {
             enable_cuda_graph: true,
             tensor_parallel: None,
             device_ordinal: 0,
+            max_loras: crate::Qwen3LoraOptions::DEFAULT_MAX_LORAS,
+            max_lora_rank: crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         }
     }
 }
@@ -70,6 +79,204 @@ pub(super) struct TransformerBlock {
     pub(super) mlp: MLP,
 }
 
+pub(crate) struct PackedLoraProjection {
+    pub(crate) a: cudarc::driver::CudaSlice<bf16>,
+    pub(crate) b: cudarc::driver::CudaSlice<bf16>,
+    pub(crate) scales: cudarc::driver::CudaSlice<f32>,
+    pub(crate) max_loras: usize,
+    pub(crate) max_rank: usize,
+    pub(crate) rank: usize,
+    pub(crate) in_dim: usize,
+    pub(crate) out_dim: usize,
+    slot_ranks: Vec<usize>,
+}
+
+impl PackedLoraProjection {
+    fn new(
+        ctx: &DeviceContext,
+        max_loras: usize,
+        max_rank: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<Self> {
+        let a_elems = max_loras * max_rank * in_dim;
+        let b_elems = max_loras * out_dim * max_rank;
+        let a = ctx
+            .stream
+            .alloc_zeros(a_elems)
+            .map_err(|e| anyhow::anyhow!("packed LoRA A alloc failed: {e}"))?;
+        let b = ctx
+            .stream
+            .alloc_zeros(b_elems)
+            .map_err(|e| anyhow::anyhow!("packed LoRA B alloc failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .alloc_zeros(max_loras)
+            .map_err(|e| anyhow::anyhow!("packed LoRA scales alloc failed: {e}"))?;
+        Ok(Self {
+            a,
+            b,
+            scales,
+            max_loras,
+            max_rank,
+            rank: 0,
+            in_dim,
+            out_dim,
+            slot_ranks: vec![0; max_loras],
+        })
+    }
+
+    fn write_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        projection: &DeviceLoraProjection,
+        scale: f32,
+    ) -> Result<()> {
+        anyhow::ensure!(slot < self.max_loras, "packed LoRA slot out of range");
+        anyhow::ensure!(
+            projection.a.rows <= self.max_rank && projection.a.cols == self.in_dim,
+            "inconsistent LoRA A shape in packed projection"
+        );
+        anyhow::ensure!(
+            projection.b.rows == self.out_dim && projection.b.cols == projection.a.rows,
+            "inconsistent LoRA B shape in packed projection"
+        );
+        self.clear_slot(ctx, slot)?;
+
+        let rank = projection.a.rows;
+        let a_src = projection.a.data.slice(..rank * self.in_dim);
+        let a_offset = slot * self.max_rank * self.in_dim;
+        let mut a_dst = self.a.slice_mut(a_offset..a_offset + rank * self.in_dim);
+        ctx.stream
+            .memcpy_dtod(&a_src, &mut a_dst)
+            .map_err(|e| anyhow::anyhow!("packed LoRA A copy failed: {e}"))?;
+
+        for row in 0..self.out_dim {
+            let src = projection.b.data.slice(row * rank..(row + 1) * rank);
+            let dst_offset = slot * self.out_dim * self.max_rank + row * self.max_rank;
+            let mut dst = self.b.slice_mut(dst_offset..dst_offset + rank);
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow::anyhow!("packed LoRA B copy failed: {e}"))?;
+        }
+
+        let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
+        ctx.stream
+            .memcpy_htod(&[scale], &mut scale_slot)
+            .map_err(|e| anyhow::anyhow!("packed LoRA scale copy failed: {e}"))?;
+        self.slot_ranks[slot] = rank;
+        self.refresh_rank();
+        Ok(())
+    }
+
+    fn clear_slot(&mut self, ctx: &DeviceContext, slot: usize) -> Result<()> {
+        anyhow::ensure!(slot < self.max_loras, "packed LoRA slot out of range");
+
+        let zero_a = vec![bf16::ZERO; self.max_rank * self.in_dim];
+        let a_offset = slot * self.max_rank * self.in_dim;
+        let mut a_dst = self
+            .a
+            .slice_mut(a_offset..a_offset + self.max_rank * self.in_dim);
+        ctx.stream
+            .memcpy_htod(&zero_a, &mut a_dst)
+            .map_err(|e| anyhow::anyhow!("packed LoRA A clear failed: {e}"))?;
+
+        let zero_b = vec![bf16::ZERO; self.out_dim * self.max_rank];
+        let b_offset = slot * self.out_dim * self.max_rank;
+        let mut b_dst = self
+            .b
+            .slice_mut(b_offset..b_offset + self.out_dim * self.max_rank);
+        ctx.stream
+            .memcpy_htod(&zero_b, &mut b_dst)
+            .map_err(|e| anyhow::anyhow!("packed LoRA B clear failed: {e}"))?;
+
+        let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
+        ctx.stream
+            .memcpy_htod(&[0.0f32], &mut scale_slot)
+            .map_err(|e| anyhow::anyhow!("packed LoRA scale clear failed: {e}"))?;
+        self.slot_ranks[slot] = 0;
+        self.refresh_rank();
+        Ok(())
+    }
+
+    fn refresh_rank(&mut self) {
+        self.rank = self.slot_ranks.iter().copied().max().unwrap_or(0);
+    }
+}
+
+pub(crate) struct PackedLoraLayer {
+    pub(crate) projections: Vec<Option<PackedLoraProjection>>,
+}
+
+impl PackedLoraLayer {
+    fn empty() -> Self {
+        Self {
+            projections: (0..LoraProjectionKind::ALL.len())
+                .map(|_| None)
+                .collect::<Vec<Option<PackedLoraProjection>>>(),
+        }
+    }
+
+    pub(crate) fn projection(&self, kind: LoraProjectionKind) -> Option<&PackedLoraProjection> {
+        self.projections
+            .get(kind.index())
+            .and_then(Option::as_ref)
+            .filter(|projection| projection.rank > 0)
+    }
+}
+
+pub(crate) struct PackedLoraRegistry {
+    slots_by_name: HashMap<String, usize>,
+    slot_names: Vec<Option<String>>,
+    packed_layers: Vec<PackedLoraLayer>,
+}
+
+impl PackedLoraRegistry {
+    fn empty(max_loras: usize, num_layers: usize) -> Self {
+        Self {
+            slots_by_name: HashMap::new(),
+            slot_names: vec![None; max_loras],
+            packed_layers: (0..num_layers).map(|_| PackedLoraLayer::empty()).collect(),
+        }
+    }
+
+    pub(crate) fn slot_for(&self, name: &str) -> Option<usize> {
+        self.slots_by_name.get(name).copied()
+    }
+
+    pub(crate) fn layer(&self, layer_idx: usize) -> Option<&PackedLoraLayer> {
+        self.packed_layers.get(layer_idx)
+    }
+
+    fn slot_for_install(&self, name: &str, load_inplace: bool) -> Result<usize> {
+        if let Some(slot) = self.slot_for(name) {
+            anyhow::ensure!(load_inplace, "Qwen3 LoRA adapter {name} is already loaded");
+            return Ok(slot);
+        }
+        self.slot_names
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 LoRA adapter capacity exceeded"))
+    }
+
+    fn bind_slot(&mut self, slot: usize, name: &str) {
+        if let Some(previous_name) = self.slot_names[slot].replace(name.to_string()) {
+            self.slots_by_name.remove(&previous_name);
+        }
+        self.slots_by_name.insert(name.to_string(), slot);
+    }
+
+    fn release_slot(&mut self, name: &str) -> Result<usize> {
+        let slot = self
+            .slots_by_name
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 LoRA adapter {name} is not loaded"))?;
+        self.slot_names[slot] = None;
+        Ok(slot)
+    }
+}
+
 /// Qwen3 model — weights and config only. Request state is owned by the executor.
 pub(crate) struct Qwen3Model {
     pub(super) ctx: DeviceContext,
@@ -84,7 +291,9 @@ pub(crate) struct Qwen3Model {
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) tp_comm: Option<Comm>,
     pub(super) lora_adapters: HashMap<String, DeviceLoraAdapter>,
-    pub(super) active_lora_adapter: Option<String>,
+    pub(super) packed_lora: PackedLoraRegistry,
+    pub(super) max_loras: usize,
+    pub(super) max_lora_rank: usize,
 }
 
 // SAFETY: Each model instance is pinned to a single CUDA device and is only
@@ -324,6 +533,7 @@ impl Qwen3Model {
         );
         info!("GPU model loaded successfully");
 
+        let num_hidden_layers = config.num_hidden_layers;
         let model = Self {
             ctx,
             config,
@@ -337,7 +547,9 @@ impl Qwen3Model {
             tensor_parallel,
             tp_comm: None,
             lora_adapters: HashMap::new(),
-            active_lora_adapter: None,
+            packed_lora: PackedLoraRegistry::empty(runtime.max_loras, num_hidden_layers),
+            max_loras: runtime.max_loras,
+            max_lora_rank: runtime.max_lora_rank,
         };
 
         if model.enable_cuda_graph {
@@ -395,42 +607,181 @@ impl Qwen3Model {
             adapter.name,
             adapter.manifest.path.display()
         );
-        install_lora_adapter_in_registry(&mut self.lora_adapters, adapter, load_inplace)
+        let name = adapter.name.clone();
+        let slot = self.packed_lora.slot_for_install(&name, load_inplace)?;
+        self.update_packed_lora_slot(slot, &adapter)?;
+        install_lora_adapter_in_registry(&mut self.lora_adapters, adapter, load_inplace)?;
+        self.packed_lora.bind_slot(slot, &name);
+        Ok(())
     }
 
     pub(crate) fn uninstall_lora_adapter(&mut self, name: &str) -> Result<()> {
-        anyhow::ensure!(
-            self.lora_adapters.remove(name).is_some(),
-            "Qwen3 LoRA adapter {name} is not loaded"
-        );
-        if self.active_lora_adapter.as_deref() == Some(name) {
-            self.active_lora_adapter = None;
-        }
+        let slot = self
+            .packed_lora
+            .slot_for(name)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3 LoRA adapter {name} is not loaded"))?;
+        self.clear_packed_lora_slot(slot)?;
+        self.packed_lora.release_slot(name)?;
+        self.lora_adapters
+            .remove(name)
+            .expect("packed LoRA slot map and adapter registry must be consistent");
         Ok(())
     }
 
-    pub(crate) fn activate_lora_adapter(&mut self, name: Option<&str>) -> Result<()> {
-        match name {
-            Some(name) => {
-                anyhow::ensure!(
-                    self.lora_adapters.contains_key(name),
-                    "Qwen3 LoRA adapter {name} is not loaded"
-                );
-                self.active_lora_adapter = Some(name.to_string());
-            }
-            None => self.active_lora_adapter = None,
-        }
-        Ok(())
-    }
-
-    pub(crate) fn lora_layer(&self, layer_idx: usize) -> Option<(&DeviceLoraLayer, f32)> {
-        self.active_lora_adapter.as_ref().and_then(|name| {
-            let adapter = self.lora_adapters.get(name)?;
+    pub(crate) fn lora_layer_for(
+        &self,
+        name: &str,
+        layer_idx: usize,
+    ) -> Option<(&DeviceLoraLayer, f32)> {
+        self.lora_adapters.get(name).and_then(|adapter| {
             adapter
                 .layers
                 .get(layer_idx)
                 .map(|layer| (layer, adapter.scale))
         })
+    }
+
+    pub(crate) fn apply_lora_projection_ranges(
+        &self,
+        layer_idx: usize,
+        ranges: &[LoraTokenRange<'_>],
+        projection: impl for<'a> Fn(&'a DeviceLoraLayer) -> Option<&'a DeviceLoraProjection>,
+        input: &HiddenStates,
+        out: &mut HiddenStates,
+        row_offset: usize,
+    ) -> Result<()> {
+        for group in group_lora_token_ranges(ranges) {
+            let Some((layer, scale)) = self.lora_layer_for(group.adapter, layer_idx) else {
+                anyhow::bail!("Qwen3 LoRA adapter {} is not loaded", group.adapter);
+            };
+            if let Some(projection) = projection(layer) {
+                if group.ranges.len() == 1 {
+                    let range = group.ranges[0];
+                    apply_lora_projection_delta_range(
+                        &self.ctx,
+                        projection,
+                        input,
+                        out,
+                        row_offset,
+                        range.token_offset,
+                        range.token_len,
+                        scale,
+                    )?;
+                } else {
+                    let mut token_indices = Vec::with_capacity(group.token_count);
+                    for grouped_range in group.ranges {
+                        token_indices.extend(
+                            (grouped_range.token_offset
+                                ..grouped_range.token_offset + grouped_range.token_len)
+                                .map(|idx| idx as i32),
+                        );
+                    }
+                    apply_lora_projection_delta_indexed(
+                        &self.ctx,
+                        projection,
+                        input,
+                        out,
+                        row_offset,
+                        &token_indices,
+                        scale,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_lora_slots(&self, adapters: &[Option<&str>]) -> Result<Option<Vec<i32>>> {
+        let mut slots = Vec::with_capacity(adapters.len());
+        let mut any_lora = false;
+        for adapter in adapters {
+            match adapter {
+                Some(name) => {
+                    let Some(slot) = self.packed_lora.slot_for(name) else {
+                        anyhow::bail!("Qwen3 LoRA adapter {name} is not loaded");
+                    };
+                    slots.push(slot as i32);
+                    any_lora = true;
+                }
+                None => slots.push(-1),
+            }
+        }
+        Ok(any_lora.then_some(slots))
+    }
+
+    pub(crate) fn packed_lora_projection(
+        &self,
+        layer_idx: usize,
+        kind: LoraProjectionKind,
+    ) -> Option<&PackedLoraProjection> {
+        self.packed_lora
+            .layer(layer_idx)
+            .and_then(|layer| layer.projection(kind))
+    }
+
+    fn update_packed_lora_slot(&mut self, slot: usize, adapter: &DeviceLoraAdapter) -> Result<()> {
+        self.clear_packed_lora_slot(slot)?;
+        for layer_idx in 0..self.config.num_hidden_layers {
+            let Some(layer) = adapter.layers.get(layer_idx) else {
+                continue;
+            };
+            for kind in LoraProjectionKind::ALL {
+                let Some(projection) = layer.projection(kind) else {
+                    continue;
+                };
+                self.pack_lora_projection_slot(slot, projection, adapter.scale, layer_idx, kind)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_packed_lora_projection_slot(
+        &mut self,
+        slot: usize,
+        layer_idx: usize,
+        kind: LoraProjectionKind,
+    ) -> Result<()> {
+        if let Some(packed) =
+            self.packed_lora.packed_layers[layer_idx].projections[kind.index()].as_mut()
+        {
+            packed.clear_slot(&self.ctx, slot)?;
+        }
+        Ok(())
+    }
+
+    fn clear_packed_lora_slot(&mut self, slot: usize) -> Result<()> {
+        for layer_idx in 0..self.config.num_hidden_layers {
+            for kind in LoraProjectionKind::ALL {
+                self.clear_packed_lora_projection_slot(slot, layer_idx, kind)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn pack_lora_projection_slot(
+        &mut self,
+        slot: usize,
+        projection: &DeviceLoraProjection,
+        scale: f32,
+        layer_idx: usize,
+        kind: LoraProjectionKind,
+    ) -> Result<()> {
+        let max_loras = self.max_loras;
+        let max_rank = self.max_lora_rank;
+        let packed_slot = &mut self.packed_lora.packed_layers[layer_idx].projections[kind.index()];
+        if packed_slot.is_none() {
+            *packed_slot = Some(PackedLoraProjection::new(
+                &self.ctx,
+                max_loras,
+                max_rank,
+                projection.a.cols,
+                projection.b.rows,
+            )?);
+        }
+        let packed = packed_slot
+            .as_mut()
+            .expect("packed LoRA projection was initialized");
+        packed.write_slot(&self.ctx, slot, projection, scale)
     }
 
     pub(crate) fn all_reduce_hidden(
@@ -572,5 +923,40 @@ mod tests {
                 .map(|adapter| adapter.manifest.path.as_path()),
             Some(second_path.as_path()),
         );
+    }
+
+    #[test]
+    fn packed_lora_registry_keeps_fixed_slots() {
+        let mut registry = PackedLoraRegistry::empty(2, 1);
+
+        let slot_a = registry
+            .slot_for_install("adapter-a", false)
+            .expect("first slot");
+        assert_eq!(slot_a, 0);
+        registry.bind_slot(slot_a, "adapter-a");
+        assert_eq!(registry.slot_for("adapter-a"), Some(0));
+
+        let slot_b = registry
+            .slot_for_install("adapter-b", false)
+            .expect("second slot");
+        assert_eq!(slot_b, 1);
+        registry.bind_slot(slot_b, "adapter-b");
+
+        let replacement_slot = registry
+            .slot_for_install("adapter-a", true)
+            .expect("replacement slot");
+        assert_eq!(replacement_slot, 0);
+
+        let duplicate = registry
+            .slot_for_install("adapter-a", false)
+            .expect_err("duplicate without load_inplace should fail")
+            .to_string();
+        assert!(duplicate.contains("already loaded"));
+
+        assert_eq!(registry.release_slot("adapter-a").expect("release"), 0);
+        let slot_c = registry
+            .slot_for_install("adapter-c", false)
+            .expect("released slot should be reused");
+        assert_eq!(slot_c, 0);
     }
 }

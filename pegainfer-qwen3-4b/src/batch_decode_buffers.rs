@@ -72,6 +72,7 @@ pub(crate) struct BatchDecodeBuffers {
     // GPU metadata
     pub(crate) token_ids_d: CudaSlice<u32>,
     pub(crate) positions_d: CudaSlice<i32>,
+    pub(crate) lora_token_slots_d: CudaSlice<i32>,
 
     // Paged attention metadata (concatenated across requests, CSR format)
     pub(crate) page_indices_d: CudaSlice<i32>,
@@ -132,6 +133,7 @@ impl BatchDecodeBuffers {
             logits: HiddenStates::zeros(ctx, vocab_size, bs)?,
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
+            lora_token_slots_d: ctx.stream.alloc_zeros(bs)?,
             // Paged attention: worst case all requests use max_total_pages + padding slots
             page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,

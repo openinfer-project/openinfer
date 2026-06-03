@@ -4,7 +4,7 @@ use half::bf16;
 
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::lora::apply_lora_projection_delta;
+use crate::lora::{LoraTokenRange, build_lora_token_ranges};
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
@@ -84,6 +84,7 @@ impl Qwen3Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &pegainfer_core::kv_pool::KvLayout,
         plan: &PrefillPagedPlan,
+        lora_ranges: &[LoraTokenRange<'_>],
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {
         let num_heads = self.local_num_attention_heads();
@@ -110,18 +111,14 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.q_batch,
         );
-        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
-            && let Some(projection) = &lora_layer.q_proj
-        {
-            apply_lora_projection_delta(
-                &self.ctx,
-                projection,
-                &bufs.normed,
-                &mut bufs.q_batch,
-                0,
-                scale,
-            )?;
-        }
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.q_proj.as_ref(),
+            &bufs.normed,
+            &mut bufs.q_batch,
+            0,
+        )?;
         ops::gemm_rows_into(
             &self.ctx,
             &layer.attention.qkv_proj,
@@ -130,18 +127,14 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.k_batch,
         );
-        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
-            && let Some(projection) = &lora_layer.k_proj
-        {
-            apply_lora_projection_delta(
-                &self.ctx,
-                projection,
-                &bufs.normed,
-                &mut bufs.k_batch,
-                0,
-                scale,
-            )?;
-        }
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.k_proj.as_ref(),
+            &bufs.normed,
+            &mut bufs.k_batch,
+            0,
+        )?;
         ops::gemm_rows_into(
             &self.ctx,
             &layer.attention.qkv_proj,
@@ -150,18 +143,14 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v_batch,
         );
-        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
-            && let Some(projection) = &lora_layer.v_proj
-        {
-            apply_lora_projection_delta(
-                &self.ctx,
-                projection,
-                &bufs.normed,
-                &mut bufs.v_batch,
-                0,
-                scale,
-            )?;
-        }
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.v_proj.as_ref(),
+            &bufs.normed,
+            &mut bufs.v_batch,
+            0,
+        )?;
 
         // 3. Paged prefill: norm+RoPE → append K/V to paged → batch attention
         ops::prefill_attention_paged_into(
@@ -191,18 +180,14 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
-        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
-            && let Some(projection) = &lora_layer.o_proj
-        {
-            apply_lora_projection_delta(
-                &self.ctx,
-                projection,
-                &bufs.attn_output,
-                &mut bufs.o_buf,
-                0,
-                scale,
-            )?;
-        }
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.o_proj.as_ref(),
+            &bufs.attn_output,
+            &mut bufs.o_buf,
+            0,
+        )?;
         self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 5+6. Residual add + MLP RMSNorm (fused): hidden += o_buf; normed = rms_norm(hidden)
@@ -233,28 +218,22 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.up_out,
         );
-        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx) {
-            if let Some(projection) = &lora_layer.gate_proj {
-                apply_lora_projection_delta(
-                    &self.ctx,
-                    projection,
-                    &bufs.normed,
-                    &mut bufs.gate_out,
-                    0,
-                    scale,
-                )?;
-            }
-            if let Some(projection) = &lora_layer.up_proj {
-                apply_lora_projection_delta(
-                    &self.ctx,
-                    projection,
-                    &bufs.normed,
-                    &mut bufs.up_out,
-                    0,
-                    scale,
-                )?;
-            }
-        }
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.gate_proj.as_ref(),
+            &bufs.normed,
+            &mut bufs.gate_out,
+            0,
+        )?;
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.up_proj.as_ref(),
+            &bufs.normed,
+            &mut bufs.up_out,
+            0,
+        )?;
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
@@ -262,18 +241,14 @@ impl Qwen3Model {
             &bufs.act_out,
             &mut bufs.o_buf,
         );
-        if let Some((lora_layer, scale)) = self.lora_layer(layer_idx)
-            && let Some(projection) = &lora_layer.down_proj
-        {
-            apply_lora_projection_delta(
-                &self.ctx,
-                projection,
-                &bufs.act_out,
-                &mut bufs.o_buf,
-                0,
-                scale,
-            )?;
-        }
+        self.apply_lora_projection_ranges(
+            layer_idx,
+            lora_ranges,
+            |layer| layer.down_proj.as_ref(),
+            &bufs.act_out,
+            &mut bufs.o_buf,
+            0,
+        )?;
         self.all_reduce_hidden(&mut bufs.o_buf)?;
 
         // 8. Residual add: attn_residual + mlp_out → bufs.hidden_out (old hidden_in, free to overwrite)
@@ -318,14 +293,18 @@ impl Qwen3Model {
         &self,
         prompts: &[&[u32]],
         kv_views: &[KvView],
+        lora_adapters: &[Option<&str>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
         echo: bool,
     ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
         assert_eq!(batch_size, kv_views.len());
+        assert_eq!(batch_size, lora_adapters.len());
 
         let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+        let lora_ranges =
+            build_lora_token_ranges(seq_lens.iter().copied(), lora_adapters.iter().copied());
         let start_positions: Vec<usize> = kv_views
             .iter()
             .zip(prompts.iter())
@@ -353,7 +332,8 @@ impl Qwen3Model {
         )?;
 
         // Forward through all layers
-        let hidden = self.process_all_layers_batch_multi(hidden, layout, kv_buffer, &plan)?;
+        let hidden =
+            self.process_all_layers_batch_multi(hidden, layout, kv_buffer, &plan, &lora_ranges)?;
 
         // All-position logits for echo (before we extract last-token logits)
         let all_logits = if echo {
@@ -388,6 +368,7 @@ impl Qwen3Model {
         layout: &KvLayout,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         plan: &PrefillPagedPlan,
+        lora_ranges: &[LoraTokenRange<'_>],
     ) -> Result<HiddenStates> {
         let total_tokens = hidden.seq_len;
         let inter_dim = self.local_intermediate_size();
@@ -411,6 +392,7 @@ impl Qwen3Model {
                 kv_buffer,
                 layout,
                 plan,
+                lora_ranges,
                 &mut bufs,
             )?;
         }

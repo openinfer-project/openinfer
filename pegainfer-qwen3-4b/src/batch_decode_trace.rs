@@ -36,6 +36,7 @@ pub fn trace_decode_kernel_calls(
             enable_cuda_graph: false,
             tensor_parallel: None,
             device_ordinal: 0,
+            ..Default::default()
         },
     )?;
     let budget = model.kv_budget();
@@ -89,6 +90,7 @@ pub fn trace_decode_kernel_calls(
         model.batch_decode(
             &token_ids,
             &views,
+            &vec![None; batch_size],
             kv_mgr.buffer().buffer(),
             &layout,
             &mut bufs,

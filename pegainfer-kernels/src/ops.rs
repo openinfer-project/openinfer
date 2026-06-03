@@ -6,6 +6,7 @@ mod embedding;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
 mod linear;
+mod lora;
 mod norm;
 mod sampling;
 
@@ -16,8 +17,9 @@ pub use attention::{
 };
 pub use elementwise::{
     add_batch, add_batch_into, bf16_hidden_to_f32_into, extract_vec, extract_vec_into,
-    f32_to_bf16_hidden_into, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
-    scaled_add_batch_into, scaled_add_rows_into, silu_mul_batch, silu_mul_batch_into,
+    f32_to_bf16_hidden_into, gather_hidden_tokens_into, repeat_f32_for_reduce_scatter_into,
+    scale_f32_in_place, scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
+    scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into,
     silu_mul_fused_batch_into, write_vec_into,
 };
 pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
@@ -25,7 +27,11 @@ pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_deco
 pub use kimi_k2::*;
 pub use linear::{
     gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_per_token,
-    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemv, linear,
+    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
+    gemm_token_range_into_checked, gemv, linear,
+};
+pub use lora::{
+    LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,
 };
 pub use norm::{
     fused_add_rms_norm_batch_into, fused_add_rms_norm_into, fused_add_rms_norm_round_batch_into,

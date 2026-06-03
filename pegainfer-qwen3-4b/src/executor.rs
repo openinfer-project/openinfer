@@ -36,6 +36,7 @@ pub struct PrefillStepItem {
     pub(crate) params: SamplingParams,
     pub(crate) logprobs: usize,
     pub(crate) echo: bool,
+    pub(crate) lora_adapter: Option<String>,
     pub(crate) random_val: f32,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
@@ -60,6 +61,7 @@ impl PrefillStepItem {
             params,
             logprobs,
             echo,
+            lora_adapter: None,
             random_val,
             cached_tokens: 0,
         }
@@ -81,6 +83,7 @@ pub struct DecodeStepItem {
     pub(crate) token_id: u32,
     pub(crate) params: SamplingParams,
     pub(crate) logprobs: usize,
+    pub(crate) lora_adapter: Option<String>,
     pub(crate) random_val: f32,
 }
 
@@ -97,6 +100,7 @@ impl DecodeStepItem {
             token_id,
             params,
             logprobs,
+            lora_adapter: None,
             random_val,
         }
     }
@@ -191,7 +195,12 @@ fn execute_step_on_lane(
             echo,
         } => {
             let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
-            let (logits, all_position_logits) = lane.execute_prefill(&prompts, kv_views, *echo)?;
+            let lora_adapters: Vec<Option<&str>> = requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+            let (logits, all_position_logits) =
+                lane.execute_prefill(&prompts, kv_views, &lora_adapters, *echo)?;
             if collect_result {
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
@@ -208,7 +217,11 @@ fn execute_step_on_lane(
         }
         StepCommand::Decode { requests, kv_views } => {
             let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
-            lane.execute_decode(&token_ids, kv_views)?;
+            let lora_adapters: Vec<Option<&str>> = requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+            lane.execute_decode(&token_ids, kv_views, &lora_adapters)?;
             if collect_result {
                 let logits: Vec<DeviceVec> = (0..requests.len())
                     .map(|i| ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i))
@@ -231,11 +244,21 @@ fn execute_step_on_lane(
                 .map(PrefillStepItem::as_slice)
                 .collect();
             let decode_tokens: Vec<u32> = decode_requests.iter().map(|req| req.token_id).collect();
+            let prefill_lora_adapters: Vec<Option<&str>> = prefill_requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+            let decode_lora_adapters: Vec<Option<&str>> = decode_requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
             let (prefill_logits, decode_logits) = lane.execute_unified(
                 &prefill_prompts,
                 prefill_kv_views,
+                &prefill_lora_adapters,
                 &decode_tokens,
                 decode_kv_views,
+                &decode_lora_adapters,
             )?;
             if collect_result {
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
@@ -407,13 +430,6 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 
-    fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
-        if let Some(adapter) = adapter {
-            anyhow::bail!("Qwen3 LoRA adapter {adapter} is not loaded");
-        }
-        Ok(())
-    }
-
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         anyhow::bail!(
             "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
@@ -447,9 +463,6 @@ pub struct Qwen3Executor {
     primary: RankWorker,
     workers: Vec<RankWorker>,
     loaded_lora_adapters: HashSet<String>,
-    /// Adapter currently activated on the workers; scopes prefix-cache
-    /// block hashes so KV computed under different adapters never mixes.
-    active_lora_adapter: Option<String>,
     prefix_cache_enabled: bool,
     lora_options: Qwen3LoraOptions,
 }
@@ -483,7 +496,6 @@ impl Qwen3Executor {
             )?,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
-            active_lora_adapter: None,
             prefix_cache_enabled: true,
             lora_options: Qwen3LoraOptions::default(),
         })
@@ -520,6 +532,8 @@ impl Qwen3Executor {
                     enable_cuda_graph,
                     tensor_parallel: None,
                     device_ordinal: device_ordinals[0],
+                    max_loras: lora_options.max_loras,
+                    max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
             let mut executor = Self::single(model)?;
@@ -536,6 +550,8 @@ impl Qwen3Executor {
                     enable_cuda_graph,
                     tensor_parallel: Some(TensorParallelConfig { rank, world_size }),
                     device_ordinal,
+                    max_loras: lora_options.max_loras,
+                    max_lora_rank: lora_options.max_lora_rank,
                 },
             )?);
         }
@@ -616,7 +632,6 @@ impl Qwen3Executor {
             primary,
             workers,
             loaded_lora_adapters: HashSet::new(),
-            active_lora_adapter: None,
             prefix_cache_enabled: true,
             lora_options,
         })
@@ -652,10 +667,6 @@ impl Qwen3Executor {
 
     pub fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
         <Self as ModelExecutor>::execute_unified(self, plan)
-    }
-
-    pub fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
-        <Self as ModelExecutor>::activate_lora_adapter(self, adapter)
     }
 
     /// Prefix caching is on by default; tests that assert bit-identical
@@ -697,40 +708,6 @@ impl Qwen3Executor {
             .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
         Self::wait_for_step_ack(pending, step.kind())?;
         Ok(primary_result)
-    }
-
-    fn run_worker_command(
-        &self,
-        command: impl Fn(&RankWorker) -> Result<channel::Receiver<Result<()>>>,
-        op_name: &'static str,
-    ) -> Result<()> {
-        let primary = command(&self.primary)?;
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for worker in &self.workers {
-            pending.push(command(worker)?);
-        }
-
-        let mut errors = Vec::new();
-        match primary.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => errors.push(format!("rank 0: {err:#}")),
-            Err(_) => errors.push(format!("rank 0: dropped {op_name} response")),
-        }
-        for (index, response) in pending.into_iter().enumerate() {
-            let rank = index + 1;
-            match response.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => errors.push(format!("rank {rank}: {err:#}")),
-                Err(_) => errors.push(format!("rank {rank}: dropped {op_name} response")),
-            }
-        }
-        if !errors.is_empty() {
-            anyhow::bail!(
-                "failed to run Qwen3 {op_name} on tensor-parallel ranks: {}",
-                errors.join("; ")
-            );
-        }
-        Ok(())
     }
 }
 
@@ -787,7 +764,7 @@ impl ModelExecutor for Qwen3Executor {
             let mut rkv = self.kv_mgr.pool().new_request(
                 req.prompt_tokens.clone(),
                 req.max_output_tokens,
-                self.active_lora_adapter.as_deref(),
+                req.lora_adapter.as_deref(),
             );
             // Echo needs logits for every prompt position; cached positions
             // are never forwarded, so echo requests prefill from scratch.
@@ -891,7 +868,7 @@ impl ModelExecutor for Qwen3Executor {
             let mut rkv = self.kv_mgr.pool().new_request(
                 req.prompt_tokens.clone(),
                 req.max_output_tokens,
-                self.active_lora_adapter.as_deref(),
+                req.lora_adapter.as_deref(),
             );
             if self.prefix_cache_enabled && !req.echo {
                 req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
@@ -960,15 +937,6 @@ impl ModelExecutor for Qwen3Executor {
         }
 
         Ok(result)
-    }
-
-    fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
-        self.run_worker_command(
-            |worker| worker.activate_lora_adapter(adapter.map(str::to_string)),
-            "LoRA activation",
-        )?;
-        self.active_lora_adapter = adapter.map(str::to_string);
-        Ok(())
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -1253,21 +1221,29 @@ impl LocalQwen3Lane {
         &mut self,
         prompts: &[&[u32]],
         kv_views: &[KvView],
+        lora_adapters: &[Option<&str>],
         echo: bool,
     ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
         self.model.batch_prefill(
             prompts,
             kv_views,
+            lora_adapters,
             self.kv_buffer.buffer(),
             &self.layout,
             echo,
         )
     }
 
-    fn execute_decode(&mut self, token_ids: &[u32], kv_views: &[KvView]) -> Result<()> {
+    fn execute_decode(
+        &mut self,
+        token_ids: &[u32],
+        kv_views: &[KvView],
+        lora_adapters: &[Option<&str>],
+    ) -> Result<()> {
         self.model.batch_decode(
             token_ids,
             kv_views,
+            lora_adapters,
             self.kv_buffer.buffer(),
             &self.layout,
             &mut self.bufs,
@@ -1278,14 +1254,18 @@ impl LocalQwen3Lane {
         &mut self,
         prefill_prompts: &[&[u32]],
         prefill_views: &[KvView],
+        prefill_lora_adapters: &[Option<&str>],
         decode_tokens: &[u32],
         decode_views: &[KvView],
+        decode_lora_adapters: &[Option<&str>],
     ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
         self.model.unified_step(
             prefill_prompts,
             prefill_views,
+            prefill_lora_adapters,
             decode_tokens,
             decode_views,
+            decode_lora_adapters,
             self.kv_buffer.buffer(),
             &self.layout,
         )
@@ -1305,10 +1285,6 @@ impl LocalQwen3Lane {
 
     fn unload_lora_adapter(&mut self, name: &str) -> Result<()> {
         self.model.uninstall_lora_adapter(name)
-    }
-
-    fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
-        self.model.activate_lora_adapter(adapter)
     }
 }
 
@@ -1355,10 +1331,6 @@ enum WorkerCommand {
     },
     UnloadLoraAdapter {
         name: String,
-        resp: channel::Sender<Result<()>>,
-    },
-    ActivateLoraAdapter {
-        name: Option<String>,
         resp: channel::Sender<Result<()>>,
     },
     Shutdown,
@@ -1423,10 +1395,6 @@ impl RankWorker {
                                     let result = lane.unload_lora_adapter(&name);
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::ActivateLoraAdapter { name, resp } => {
-                                    let result = lane.activate_lora_adapter(name.as_deref());
-                                    let _ = resp.send(result);
-                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -1477,19 +1445,6 @@ impl RankWorker {
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA load"))?;
-        Ok(resp_rx)
-    }
-
-    fn activate_lora_adapter(&self, name: Option<String>) -> Result<channel::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::ActivateLoraAdapter {
-                name,
-                resp: resp_tx,
-            })
-            .map_err(|_| {
-                anyhow::anyhow!("tensor-parallel worker channel closed on LoRA activation")
-            })?;
         Ok(resp_rx)
     }
 
