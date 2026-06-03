@@ -9,6 +9,7 @@ use crate::tensor::{AxisSpec, DeviceContext, GpuTensor, HiddenStates, KernelCall
 
 pub const KIMI_K2_HIDDEN: usize = 7168;
 pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
+pub const KIMI_K2_SHARED_GATE_UP: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
 pub const KIMI_K2_ROUTED_EXPERTS: usize = 384;
 pub const KIMI_K2_EP_WORLD: usize = 8;
 pub const KIMI_K2_LOCAL_EXPERTS: usize = KIMI_K2_ROUTED_EXPERTS / KIMI_K2_EP_WORLD;

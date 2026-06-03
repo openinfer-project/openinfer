@@ -526,6 +526,7 @@ struct KimiCublasThreadGuard;
 impl Drop for KimiCublasThreadGuard {
     fn drop(&mut self) {
         unsafe {
+            pegainfer_kernels::ffi::kimi_shared_gate_up_cublaslt_destroy_cuda();
             pegainfer_kernels::ffi::cublas_destroy();
         }
     }
@@ -543,6 +544,19 @@ fn bind_rank_thread(
     let decode_aux_ctx = ctx.auxiliary_device_context("decode aux")?;
     unsafe {
         pegainfer_kernels::ffi::cublas_init();
+        let status = pegainfer_kernels::ffi::kimi_shared_gate_up_cublaslt_init_cuda();
+        if status != 0 {
+            if status >= 100_000 {
+                anyhow::bail!(
+                    "Kimi shared_gate_up cuBLASLt init failed: cublas_status={}",
+                    status - 100_000
+                );
+            }
+            anyhow::bail!(
+                "Kimi shared_gate_up cuBLASLt init failed: cuda_status={}",
+                status
+            );
+        }
     }
     Ok(KimiRankThreadState {
         ctx,

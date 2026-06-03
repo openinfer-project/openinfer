@@ -1376,6 +1376,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
+    println!("cargo:rustc-link-lib=cublasLt");
     if !cutedsl_runtime_lib_dirs.is_empty() {
         println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
     }

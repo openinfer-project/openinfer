@@ -27,13 +27,14 @@ use cudarc::nccl::safe::Comm;
 use pegainfer_comm::{EpBackend, ScalarType};
 use pegainfer_kernels::{
     ops::{
-        KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
-        KimiMarlinWna16Workspace, KimiRouterBatch, KimiRouterConfig, KimiRouterOutput,
-        KimiRouterScratch, kimi_marlin_w13_swiglu, kimi_marlin_w13_swiglu_pplx,
+        KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_ROUTER_SCALE, KIMI_K2_SHARED_GATE_UP,
+        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch, KimiRouterConfig,
+        KimiRouterOutput, KimiRouterScratch, kimi_marlin_w13_swiglu, kimi_marlin_w13_swiglu_pplx,
         kimi_marlin_wna16_pplx_w2_gemm, kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm,
         kimi_marlin_wna16_w13_gemm, kimi_moe_marlin_align_block_size,
         kimi_pplx_build_marlin_routing_on_stream, kimi_residual_add_scaled_f32,
         kimi_router_noaux_tc_launch, kimi_scatter_marlin_routes_to_compact,
+        kimi_shared_gate_up_cublaslt_into, kimi_shared_gate_up_cublaslt_supports_batch_size,
     },
     tensor::{DeviceContext, GpuTensor, NormWeight},
     typed_ops,
@@ -150,7 +151,7 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
     scratch: &mut KimiWorkerDecodeScratch,
     pplx: &mut KimiMoePplxScratch,
 ) -> Result<()> {
-    let seq_len = scratch.mla.hidden.seq_len;
+    let batch_size = scratch.mla.hidden.seq_len;
     let stream_raw = ctx.stream.cu_stream() as u64;
     let use_tp8_dp1_duplicate_routes = comm.is_some()
         && ep.world_size() == KIMI_K2_EP_WORLD
@@ -190,9 +191,9 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
             aux_ctx,
             KimiRouterConfig::kimi_k2(),
             KimiRouterBatch {
-                batch_size: seq_len,
-                active_tokens: seq_len,
-                padded_tokens: seq_len,
+                batch_size,
+                active_tokens: batch_size,
+                padded_tokens: batch_size,
             },
             &scratch.mla.normed,
             &moe.router.gate_weight,
@@ -206,12 +207,23 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         .record_event(None)
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} record route_ready"))?;
 
-    typed_ops::gemm_dm_typed_to_hs_graphsafe(
-        ctx,
-        &moe.shared_gate_up_proj,
-        &scratch.mla.normed,
-        &mut scratch.shared_expert.gate_up,
-    )?;
+    if moe.shared_gate_up_proj.rows == KIMI_K2_SHARED_GATE_UP
+        && kimi_shared_gate_up_cublaslt_supports_batch_size(batch_size)
+    {
+        kimi_shared_gate_up_cublaslt_into(
+            ctx,
+            &moe.shared_gate_up_proj,
+            &scratch.mla.normed,
+            &mut scratch.shared_expert.gate_up,
+        )?;
+    } else {
+        typed_ops::gemm_dm_typed_to_hs_graphsafe(
+            ctx,
+            &moe.shared_gate_up_proj,
+            &scratch.mla.normed,
+            &mut scratch.shared_expert.gate_up,
+        )?;
+    }
     typed_ops::silu_mul_hs_fused_into(
         ctx,
         &scratch.shared_expert.gate_up,
@@ -242,7 +254,7 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
             .data
             .device_ptr(&ctx.stream);
         ep.dispatch_send_route_only(
-            seq_len,
+            batch_size,
             idx_ptr as *const i32,
             KIMI_K2_TOPK,
             w_ptr as *const f32,
@@ -261,7 +273,7 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
             .device_ptr(&ctx.stream);
         let x_stride = KIMI_K2_HIDDEN * std::mem::size_of::<u16>();
         ep.dispatch_send(
-            seq_len,
+            batch_size,
             x_ptr as *const c_void,
             x_stride,
             ptr::null(),
@@ -301,8 +313,8 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
             ctx,
             &mut scratch.marlin_route_workspace,
             &scratch.router.router_topk_idx.data,
-            seq_len,
-            seq_len,
+            batch_size,
+            batch_size,
             expert_kernels.local_expert_range.start,
         )
         .with_context(|| format!("pplx tp8 build NCCL-layout routing layer {layer_idx}"))?;
@@ -419,7 +431,7 @@ pub(super) fn forward_moe_layer_decode_pplx_normed(
         let (idx_ptr, _g1) = scratch.router.router_topk_idx.data.device_ptr(&ctx.stream);
         let (w_ptr, _g2) = pplx.pplx_dummy_topk_weight.device_ptr(&ctx.stream);
         ep.combine_recv(
-            seq_len,
+            batch_size,
             0,
             ScalarType::BF16,
             out_ptr as *mut c_void,
