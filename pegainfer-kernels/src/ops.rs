@@ -32,6 +32,7 @@ pub use linear::{
 };
 pub use lora::{
     LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,
+    pack_lora_b_rows_into,
 };
 pub use norm::{
     fused_add_rms_norm_batch_into, fused_add_rms_norm_into, fused_add_rms_norm_round_batch_into,

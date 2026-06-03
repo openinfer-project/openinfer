@@ -30,6 +30,21 @@ static size_t lora_rank_smem_bytes(int rank) {
   return static_cast<size_t>(floats) * sizeof(float);
 }
 
+__global__ void lora_pack_b_rows_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    __nv_bfloat16 *__restrict__ dst,
+    int rank,
+    int max_rank,
+    int out_dim) {
+  int total = out_dim * rank;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    int row = idx / rank;
+    int col = idx - row * rank;
+    dst[static_cast<int64_t>(row) * max_rank + col] = src[idx];
+  }
+}
+
 __global__ void lora_decode_fused_delta_kernel(
     const __nv_bfloat16 *__restrict__ a_packed,
     const __nv_bfloat16 *__restrict__ b_packed,
@@ -639,6 +654,26 @@ static CUresult launch_lora_decode_fused_delta_group3(
 }
 
 extern "C" {
+
+CUresult lora_pack_b_rows_cuda(
+    const __nv_bfloat16 *src,
+    __nv_bfloat16 *dst,
+    int rank,
+    int max_rank,
+    int out_dim,
+    cudaStream_t stream) {
+  if (src == nullptr || dst == nullptr || rank <= 0 || max_rank <= 0 ||
+      rank > max_rank || out_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  int total = out_dim * rank;
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  lora_pack_b_rows_kernel<<<grid, block, 0, stream>>>(
+      src, dst, rank, max_rank, out_dim);
+  return (CUresult)cudaGetLastError();
+}
 
 CUresult lora_decode_fused_delta_cuda(
     const __nv_bfloat16 *a_packed,

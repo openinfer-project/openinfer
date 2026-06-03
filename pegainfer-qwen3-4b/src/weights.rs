@@ -152,14 +152,17 @@ impl PackedLoraProjection {
             .memcpy_dtod(&a_src, &mut a_dst)
             .map_err(|e| anyhow::anyhow!("packed LoRA A copy failed: {e}"))?;
 
-        for row in 0..self.out_dim {
-            let src = projection.b.data.slice(row * rank..(row + 1) * rank);
-            let dst_offset = slot * self.out_dim * self.max_rank + row * self.max_rank;
-            let mut dst = self.b.slice_mut(dst_offset..dst_offset + rank);
-            ctx.stream
-                .memcpy_dtod(&src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("packed LoRA B copy failed: {e}"))?;
-        }
+        let b_offset = slot * self.out_dim * self.max_rank;
+        pegainfer_core::ops::pack_lora_b_rows_into(
+            ctx,
+            &projection.b.data,
+            &mut self.b,
+            b_offset,
+            rank,
+            self.max_rank,
+            self.out_dim,
+        )
+        .map_err(|e| anyhow::anyhow!("packed LoRA B copy failed: {e}"))?;
 
         let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
         ctx.stream

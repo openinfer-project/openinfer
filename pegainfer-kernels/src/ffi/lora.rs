@@ -3,6 +3,15 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 // Qwen3 LoRA fused decode kernels.
 unsafe extern "C" {
+    pub fn lora_pack_b_rows_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        rank: i32,
+        max_rank: i32,
+        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn lora_decode_fused_delta_cuda(
         a_packed: *const Half,
         b_packed: *const Half,

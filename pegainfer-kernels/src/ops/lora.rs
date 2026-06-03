@@ -16,6 +16,44 @@ pub struct LoraDecodeGroupedProjection<'a> {
     pub out_dim: usize,
 }
 
+pub fn pack_lora_b_rows_into(
+    ctx: &DeviceContext,
+    src: &CudaSlice<half::bf16>,
+    dst: &mut CudaSlice<half::bf16>,
+    dst_offset: usize,
+    rank: usize,
+    max_rank: usize,
+    out_dim: usize,
+) -> Result<()> {
+    assert!(rank > 0, "LoRA rank must be > 0");
+    assert!(rank <= max_rank, "LoRA rank exceeds packed max_rank");
+    assert!(
+        src.len() >= out_dim * rank,
+        "LoRA B source is smaller than out_dim * rank"
+    );
+    assert!(
+        dst.len() >= dst_offset + out_dim * max_rank,
+        "LoRA B destination slot exceeds packed storage"
+    );
+
+    let (src_ptr, _gs) = src.device_ptr(&ctx.stream);
+    let (dst_ptr, _gd) = dst.device_ptr_mut(&ctx.stream);
+    let dst_ptr = dst_ptr + (dst_offset * std::mem::size_of::<half::bf16>()) as u64;
+    let result = unsafe {
+        ffi::lora_pack_b_rows_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            rank as i32,
+            max_rank as i32,
+            out_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn lora_decode_fused_delta_into(
     ctx: &DeviceContext,
