@@ -589,11 +589,10 @@ int kimi_mla_absorb_q_nope_cuda(const DType* kv_b_proj,
   }
 
   if (local_heads == kMlaLtLocalHeads && batch_size <= kMlaLtMaxBatch) {
-    int lt_status = kimi_mla_absorb_q_nope_cublaslt_cuda(
-        kv_b_proj, q_nope, q_abs_nope, batch_size, local_heads, stream);
-    if (lt_status != static_cast<int>(cudaErrorInvalidResourceHandle)) {
-      return lt_status;
-    }
+    // cuBLASLt owns this shape; a failure propagates as an error instead of
+    // silently falling back to the reference GEMM below.
+    return kimi_mla_absorb_q_nope_cublaslt_cuda(kv_b_proj, q_nope, q_abs_nope,
+                                                batch_size, local_heads, stream);
   }
 
   // kv_b_proj is row-major [local_heads, k_nope + v, kv_lora_rank].
@@ -648,11 +647,10 @@ int kimi_mla_v_up_cuda(const DType* kv_b_proj,
 
   const DType* w_uv = kv_b_proj + static_cast<int64_t>(kNopeDim) * kKvLoraRank;
   if (local_heads == kMlaLtLocalHeads && batch_size <= kMlaLtMaxBatch) {
-    int lt_status = kimi_mla_v_up_cublaslt_cuda(
-        kv_b_proj, latent, output, batch_size, local_heads, stream);
-    if (lt_status != static_cast<int>(cudaErrorInvalidResourceHandle)) {
-      return lt_status;
-    }
+    // cuBLASLt owns this shape; a failure propagates as an error instead of
+    // silently falling back to the reference GEMM below.
+    return kimi_mla_v_up_cublaslt_cuda(kv_b_proj, latent, output, batch_size,
+                                       local_heads, stream);
   }
 
   status = cublasGemmStridedBatchedEx(
