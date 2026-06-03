@@ -231,6 +231,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn kimi_o_proj_cublaslt_init_cuda() -> i32;
+
+    pub fn kimi_o_proj_cublaslt_destroy_cuda();
+
+    pub fn kimi_o_proj_cublaslt_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn kimi_int4_expert_metadata_probe_cuda(
         weight_shape: *const i32,
         weight_shape_entries: usize,

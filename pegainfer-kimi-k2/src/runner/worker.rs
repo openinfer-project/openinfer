@@ -21,12 +21,13 @@ use pegainfer_kernels::{
     ops::{
         KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
         KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-        KIMI_K2_MLA_V_HEAD_DIM, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
-        KimiMlaPagedKvLayout, flashinfer_topk_row_states_bytes,
+        KIMI_K2_MLA_V_HEAD_DIM, KIMI_O_PROJ_CUBLASLT_INPUT, KimiMarlinRouteWorkspace,
+        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, flashinfer_topk_row_states_bytes,
         kimi_flashinfer_batch_decode_mla_rt, kimi_flashinfer_single_prefill_mla_rt,
         kimi_mla_absorb_q_nope_rt, kimi_mla_extract_prefill_v_rt, kimi_mla_paged_kv_append,
         kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt,
         kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up_rt,
+        kimi_o_proj_cublaslt_into, kimi_o_proj_cublaslt_supports_batch_size,
     },
     tensor::{
         DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, NormWeight,
@@ -526,6 +527,7 @@ struct KimiCublasThreadGuard;
 impl Drop for KimiCublasThreadGuard {
     fn drop(&mut self) {
         unsafe {
+            pegainfer_kernels::ffi::kimi_o_proj_cublaslt_destroy_cuda();
             pegainfer_kernels::ffi::kimi_shared_gate_up_cublaslt_destroy_cuda();
             pegainfer_kernels::ffi::cublas_destroy();
         }
@@ -556,6 +558,18 @@ fn bind_rank_thread(
                 "Kimi shared_gate_up cuBLASLt init failed: cuda_status={}",
                 status
             );
+        }
+        if local_dims.o_proj_in == KIMI_O_PROJ_CUBLASLT_INPUT {
+            let status = pegainfer_kernels::ffi::kimi_o_proj_cublaslt_init_cuda();
+            if status != 0 {
+                if status >= 100_000 {
+                    anyhow::bail!(
+                        "Kimi o_proj cuBLASLt init failed: cublas_status={}",
+                        status - 100_000
+                    );
+                }
+                anyhow::bail!("Kimi o_proj cuBLASLt init failed: cuda_status={}", status);
+            }
         }
     }
     Ok(KimiRankThreadState {
