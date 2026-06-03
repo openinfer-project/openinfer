@@ -1,8 +1,8 @@
 # Kimi-K2 TP1 DP8 EP8 performance
 
-> TL;DR: This ledger tracks pegainfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. The vLLM sustained bs64 `~106ms` TPOT is now explained by a DPLB/CUDA-graph bucket cliff: an uneven DP distribution such as `9,8,8,8,8,8,8,7` pads every rank from graph bucket 8 to 16 and doubles TPOT. Every pegainfer optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
+> TL;DR: This ledger tracks pegainfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. The vLLM sustained bs64 `~106ms` TPOT is now explained by a DPLB/CUDA-graph bucket cliff: an uneven DP distribution such as `9,8,8,8,8,8,8,7` pads every rank from graph bucket 8 to 16 and doubles TPOT. O2 landed five production decode-kernel picks (cuBLASLt fixed-shape shared_gate_up / o_proj / MLA strided-batch, split-vocab argmax, fused router selector); accuracy held at the bf16 ULP floor by a base-vs-opt prefill logits A/B, and the PPLX Marlin small-N tile was identified as the messy branch's real accuracy break (`-inf` logits + SIGSEGV at small per-rank N) and rejected. bs64 TPOT is unchanged within noise (p50 `40.58 -> 40.09ms`): the per-kernel wins do not resolve above the ±1ms band at this shape. Every pegainfer optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
 >
-> Last touched: 2026-05-25
+> Last touched: 2026-06-04
 
 ## Target
 
@@ -63,8 +63,13 @@ LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
 cargo build --release -p pegainfer-server \
-  --features kimi-k2-pplx-ep --bin pegainfer --bin bench_serving
+  --features kimi-k2 --bin pegainfer --bin bench_serving
 ```
+
+(The old `kimi-k2-pplx-ep` feature and `PEGAINFER_KIMI_PARALLEL` env existed only on the
+pre-merge branch; on main the feature is `kimi-k2` and parallel shape is selected by the
+`--tp-size/--dp-size/--ep-backend` CLI flags below. nvcc must also be on `PATH` — the
+`pegainfer-comm` cc-rs build looks it up there, not via `$NVCC`.)
 
 In-process bs64:
 
@@ -75,10 +80,10 @@ NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
-PEGAINFER_KIMI_PARALLEL=tp1dp8 \
 target/release/bench_serving \
   --model-path "$MODEL_DIR" \
   --cuda-graph false \
+  --tp-size 1 --dp-size 8 --ep-backend pplx \
   --format json \
   --out "$RESULT_ROOT/kimi-tp1dp8/tp1dp8_bs64_o128_${COMMIT}.json" \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
@@ -93,8 +98,8 @@ NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
-PEGAINFER_KIMI_PARALLEL=tp1dp8 \
-target/release/pegainfer --model-path "$MODEL_DIR" --port 8124 --cuda-graph false
+target/release/pegainfer --model-path "$MODEL_DIR" --served-model-name kimi-k2.5 \
+  --port 8124 --cuda-graph false --tp-size 1 --dp-size 8 --ep-backend pplx
 ```
 
 ```bash
@@ -361,6 +366,73 @@ Decision:
   separate reference gate before using TP1 DP8 as an accuracy baseline. Follow-up profiles should
   focus on lowering pegainfer service TPOT from `47ms` toward the H200-reported 30ms-class
   expectation if that target is confirmed on comparable hardware.
+
+### O2 - decode kernel cherry-pick: cuBLASLt fixed-shape GEMMs, argmax split, router fusion
+
+Status: keep (5 commits). One candidate rejected as a real accuracy break (below).
+
+Context: these kernels were developed together on one branch (`opt/kimi-tp1-dp8-decode`)
+along with ~2.4k lines of microbench scaffolding, and that branch produced wrong output
+with no obvious culprit. Salvage was done by production-only cherry-picks onto a clean
+base (`3bec64f`, kimi code identical to main `927a00c`), validating after every pick;
+docs and scaffolding were not picked.
+
+Landed commits (microbench numbers from each commit message; H20, TP1 PPLX, bs=8, ctx=1):
+
+| commit | opt | isolated microbench |
+| --- | --- | --- |
+| `257c9f4` | shared_gate_up cuBLASLt fixed-shape | `1.818ms -> 1.505ms` (1.21x) |
+| `fc9327c` | attention o_proj cuBLASLt fixed-shape | `2.715ms -> 2.374ms` (1.14x) |
+| `f77f729` | MLA absorb/v_up cuBLASLt strided batches | absorb `973.6us -> 748.5us` (1.30x) |
+| `0d52e73` | final argmax split-vocab reduction | `125.3us -> 12.7us` (9.85x) |
+| `8cf932f` | router post-GEMM fused score+topk selector | `3.655ms -> 3.514ms` (1.04x) |
+
+Per-pick validation (in-process bench_serving, TP1 DP8 PPLX, cuda-graph false):
+
+- c1 o128 determinism A/B vs base (concurrency=1 is bitwise reproducible; bs64 is not):
+  all five picks stay coherent (len 128, degenerate 0/64). The greedy hash legitimately
+  changes at the first cuBLASLt pick (bf16 rounding tie-breaks) and then stays at
+  `cb1954bb77d652fb` — the MLA, argmax, and router picks changed nothing further.
+- bs64 o128 steady TPOT p50/p99: base `40.58/44.06ms` -> cumulative 5-opt
+  `40.09/42.87ms`. That is inside the ±1ms run-to-run band at warmup=1/iters=1, so the
+  honest end-to-end claim is "no regression": the per-kernel wins do not resolve above
+  noise at this shape.
+
+Rejected: PPLX Marlin small-N tile (messy-branch `dd69876`) — the accuracy break.
+
+- concurrency=1: `non-finite top logit -inf` on the serving rank -> panic (exit 101).
+- bs64: SIGSEGV (exit 139) with `-inf` on multiple ranks. It never produced one valid bench.
+- Why it hid: its isolated microbench (`250.64 -> 161.45us`, 1.50x) never checks numerics,
+  and a small-N tile only activates at small per-rank token counts — exactly the decode
+  regime, not the regime perf sweeps exercise hardest. Re-land only behind a real small-N
+  decode numeric gate.
+
+Accuracy gate: base-vs-opt prefill logits A/B. GSM8K-class evals are too coarse for
+ULP-level kernel drift, so the gate follows `subsystems/correctness/logits-golden-gate.md`
+with base-pegainfer itself as the reference at the same TP1 DP8 PPLX config: a throwaway
+(uncommitted) hook after the prefill lm_head GEMM in `runner/worker/state.rs` dumps
+full-vocab bf16 logits at every prompt position for 12 fixed raw prompts (en/zh/code/math,
+1..90 tokens) sent through `/v1/completions` at `max_tokens=1`, identical patch on base
+`3bec64f` and the 5-opt tip.
+
+| metric | value | reading |
+| --- | --- | --- |
+| positions | 236 | 12 prompts, every prefill position scored |
+| bit-identical positions | 145/236 | 10/12 prompts fully untouched -> router fusion is bit-exact |
+| head-token abs-dlogprob mean / p50 | 0.0355 / 0.0000 | at the bf16 reduction-order floor (Qwen3-4B floor: 0.032) |
+| top-1 token delta mean / max | 0.029 / 0.283 | drift confined to the 2 prompts whose GEMM shapes engage the cuBLASLt paths |
+| argmax agreement | 233/236 | |
+| worst regret | 0.125 nat | = 1 ULP at logit magnitude ~16; all 3 flips are genuine ties, under the 0.20 tie tolerance |
+
+Coverage note: prefill exercises shared_gate_up / o_proj / router. The MLA strided-batch
+pick is decode-absorb-only and is covered by the c1 greedy hash being bit-identical before
+and after that pick (zero argmax flips over 128 decode steps); the argmax split changes
+selection only, not logit values.
+
+Decision: keep the five production commits; reject the small-N Marlin tile until it passes
+a small-N decode numeric gate. The next perf step at this shape is not more skinny-GEMM
+tuning — re-profile for the dominant decode cost (collectives / MoE path) and measure with
+enough iters to resolve sub-millisecond moves.
 
 ## Open Questions
 

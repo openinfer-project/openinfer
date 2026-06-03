@@ -74,7 +74,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/kimi-k2/pplx-ep-decode.md` | PPLX EP decode bs=1 TPOT 37ms → 17.94ms（−52%），超过 NCCL no-graph 18.52ms。根因是 expert_padding=64 导致 Marlin 98% 计算浪费 + <<<1,1>>> 串行 routing kernel。含完整优化 log、failed approaches、nsys 对比数据。 |
 | `models/kimi-k2/pplx-ep-correctness.md` | TP8/EP8 PPLX correctness baseline：H20 64-token token trace 与 TP8/EP8 NCCL 完全一致，hash `4920f088c2338236`；记录 recv capacity、routed-row top-k weight、F32 combine 边界。 |
 | `models/kimi-k2/dp1-tp8-ep8-performance.md` | DP1 TP8 EP8 性能优化 ledger：从 correctness baseline `72c770b` 起步，目标 bs64 超过 vLLM baseline output `583.9 tok/s` / TPOT median `109.00ms`，每个优化必须带正确性 gate 和 commit。 |
-| `models/kimi-k2/tp1-dp8-ep8-performance.md` | TP1 DP8 EP8 性能优化 ledger：目标 H20 bs64 超过 vLLM TP1 DP8 EP8 baseline；记录 vLLM DPLB/CUDA Graph bucket cliff（8x8 `48ms`，9/8 skew `96ms`），统一压测/profile 命令，并按 profile → 动机预期收益 → microbench → correctness → performance 记录每个优化。 |
+| `models/kimi-k2/tp1-dp8-ep8-performance.md` | TP1 DP8 EP8 性能优化 ledger：O1 prompt_len1 decode admission 过 vLLM bs64 gate；O2 落地 5 个 decode kernel cherry-pick（cuBLASLt fixed-shape GEMM、argmax split、router fusion），精度由 base-vs-opt prefill logits A/B 压在 bf16 ULP 底，PPLX Marlin small-N tile 因 `-inf`/SIGSEGV 被定性为原分支精度破坏点并拒绝；bs64 TPOT 噪声内持平（p50 `40.58→40.09ms`）。 |
 | `models/kimi-k2/source-layout.md` | Kimi-K2 source files over 1k lines were split by responsibility; the largest Rust file under `pegainfer-kimi-k2/src` is now `layers/attention.rs` at 950 lines. |
 | `models/kimi-k2/dp-design.md` | TP×DP 可配置并行：每 DP rank 是独立 decode engine，EP all-to-all 天然 sync，轻量 load balancer 做 request 路由。首批 TP1×DP8 + TP8×DP1。 |
 
