@@ -2,6 +2,34 @@
 #include <cuda.h>
 #include <cstdint>
 
+__device__ __forceinline__ float block_reduce_sum(float value,
+                                                  float *scratch) {
+  int lane = threadIdx.x & (warpSize - 1);
+  int warp = threadIdx.x / warpSize;
+  int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+
+  value = warp_reduce_sum(value);
+  if (lane == 0) {
+    scratch[warp] = value;
+  }
+  __syncthreads();
+
+  value = threadIdx.x < num_warps ? scratch[lane] : 0.0f;
+  if (warp == 0) {
+    value = warp_reduce_sum(value);
+  }
+  if (threadIdx.x == 0) {
+    scratch[0] = value;
+  }
+  __syncthreads();
+  return scratch[0];
+}
+
+static size_t lora_rank_smem_bytes(int rank) {
+  int floats = rank == 1 ? 32 : rank;
+  return static_cast<size_t>(floats) * sizeof(float);
+}
+
 __global__ void lora_decode_fused_delta_kernel(
     const __nv_bfloat16 *__restrict__ a_packed,
     const __nv_bfloat16 *__restrict__ b_packed,
@@ -103,13 +131,24 @@ __global__ void lora_decode_fused_delta_rank_kernel(
   const __nv_bfloat16 *x =
       input + (static_cast<int64_t>(token) * in_dim);
 
-  for (int r = threadIdx.x; r < RANK; r += blockDim.x) {
+  if (RANK == 1) {
     float rank_val = 0.0f;
-    const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
-    for (int col = 0; col < in_dim; ++col) {
-      rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
+    for (int col = threadIdx.x; col < in_dim; col += blockDim.x) {
+      rank_val += __bfloat162float(a[col]) * __bfloat162float(x[col]);
     }
-    rank_buf[r] = rank_val;
+    rank_val = block_reduce_sum(rank_val, rank_buf);
+    if (threadIdx.x == 0) {
+      rank_buf[0] = rank_val;
+    }
+  } else {
+    for (int r = threadIdx.x; r < RANK; r += blockDim.x) {
+      float rank_val = 0.0f;
+      const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
+      for (int col = 0; col < in_dim; ++col) {
+        rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
+      }
+      rank_buf[r] = rank_val;
+    }
   }
   __syncthreads();
 
@@ -209,13 +248,24 @@ __device__ void apply_lora_decode_projection_rank(
   const __nv_bfloat16 *b =
       b_packed + (static_cast<int64_t>(slot) * out_dim * max_rank);
 
-  for (int r = threadIdx.x; r < RANK; r += blockDim.x) {
+  if (RANK == 1) {
     float rank_val = 0.0f;
-    const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
-    for (int col = 0; col < in_dim; ++col) {
-      rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
+    for (int col = threadIdx.x; col < in_dim; col += blockDim.x) {
+      rank_val += __bfloat162float(a[col]) * __bfloat162float(x[col]);
     }
-    rank_buf[r] = rank_val;
+    rank_val = block_reduce_sum(rank_val, rank_buf);
+    if (threadIdx.x == 0) {
+      rank_buf[0] = rank_val;
+    }
+  } else {
+    for (int r = threadIdx.x; r < RANK; r += blockDim.x) {
+      float rank_val = 0.0f;
+      const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
+      for (int col = 0; col < in_dim; ++col) {
+        rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
+      }
+      rank_buf[r] = rank_val;
+    }
   }
   __syncthreads();
 
@@ -377,7 +427,7 @@ static CUresult launch_lora_decode_fused_delta_rank(
     cudaStream_t stream) {
   dim3 block(256);
   dim3 grid(batch);
-  size_t smem_bytes = static_cast<size_t>(RANK) * sizeof(float);
+  size_t smem_bytes = lora_rank_smem_bytes(RANK);
   lora_decode_fused_delta_rank_kernel<RANK><<<grid, block, smem_bytes, stream>>>(
       a_packed, b_packed, scales, token_slots, input, out, batch, max_loras,
       max_rank, in_dim, out_dim, out_hidden_dim, row_offset);
@@ -440,7 +490,7 @@ static CUresult launch_lora_decode_fused_delta(
   default:
     dim3 block(256);
     dim3 grid(batch);
-    size_t smem_bytes = static_cast<size_t>(rank) * sizeof(float);
+    size_t smem_bytes = lora_rank_smem_bytes(rank);
     lora_decode_fused_delta_kernel<<<grid, block, smem_bytes, stream>>>(
         a_packed, b_packed, scales, token_slots, input, out, batch, max_loras,
         max_rank, rank, in_dim, out_dim, out_hidden_dim, row_offset);
@@ -480,7 +530,7 @@ static CUresult launch_lora_decode_fused_delta_group3_rank(
     cudaStream_t stream) {
   dim3 block(256);
   dim3 grid(batch);
-  size_t smem_bytes = static_cast<size_t>(RANK) * sizeof(float);
+  size_t smem_bytes = lora_rank_smem_bytes(RANK);
   lora_decode_fused_delta_group3_rank_kernel<RANK>
       <<<grid, block, smem_bytes, stream>>>(
           a0, b0, scales0, out0, rank0, out_dim0, out_hidden_dim0, a1, b1,
@@ -578,7 +628,7 @@ static CUresult launch_lora_decode_fused_delta_group3(
   default:
     dim3 block(256);
     dim3 grid(batch);
-    size_t smem_bytes = static_cast<size_t>(shared_rank) * sizeof(float);
+    size_t smem_bytes = lora_rank_smem_bytes(shared_rank);
     lora_decode_fused_delta_group3_kernel<<<grid, block, smem_bytes, stream>>>(
         a0, b0, scales0, out0, rank0, out_dim0, out_hidden_dim0, a1, b1,
         scales1, out1, rank1, out_dim1, out_hidden_dim1, a2, b2, scales2,
