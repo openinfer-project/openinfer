@@ -30,6 +30,75 @@ static size_t lora_rank_smem_bytes(int rank) {
   return static_cast<size_t>(floats) * sizeof(float);
 }
 
+template <int RANK>
+__device__ __forceinline__ void compute_lora_rank_dot(
+    const __nv_bfloat16 *__restrict__ a,
+    const __nv_bfloat16 *__restrict__ x,
+    int rank,
+    int in_dim,
+    float *__restrict__ rank_buf) {
+  if (RANK == 1) {
+    float rank_val = 0.0f;
+    for (int col = threadIdx.x; col < in_dim; col += blockDim.x) {
+      rank_val += __bfloat162float(a[col]) * __bfloat162float(x[col]);
+    }
+    rank_val = block_reduce_sum(rank_val, rank_buf);
+    if (threadIdx.x == 0) {
+      rank_buf[0] = rank_val;
+    }
+    return;
+  }
+
+  constexpr int WARPS_PER_BLOCK = 8;
+  int lane = threadIdx.x & (warpSize - 1);
+  int warp = threadIdx.x / warpSize;
+  for (int r = warp; r < rank; r += WARPS_PER_BLOCK) {
+    float rank_val = 0.0f;
+    const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
+    for (int col = lane; col < in_dim; col += warpSize) {
+      rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
+    }
+    rank_val = warp_reduce_sum(rank_val);
+    if (lane == 0) {
+      rank_buf[r] = rank_val;
+    }
+  }
+}
+
+__device__ __forceinline__ void compute_lora_rank_dot_runtime(
+    const __nv_bfloat16 *__restrict__ a,
+    const __nv_bfloat16 *__restrict__ x,
+    int rank,
+    int in_dim,
+    float *__restrict__ rank_buf) {
+  if (rank == 1) {
+    float rank_val = 0.0f;
+    for (int col = threadIdx.x; col < in_dim; col += blockDim.x) {
+      rank_val += __bfloat162float(a[col]) * __bfloat162float(x[col]);
+    }
+    rank_val = block_reduce_sum(rank_val, rank_buf);
+    if (threadIdx.x == 0) {
+      rank_buf[0] = rank_val;
+    }
+    return;
+  }
+
+  constexpr int WARPS_PER_BLOCK = 8;
+  int lane = threadIdx.x & (warpSize - 1);
+  int warp = threadIdx.x / warpSize;
+  for (int r = warp; r < rank; r += WARPS_PER_BLOCK) {
+    float rank_val = 0.0f;
+    const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
+    for (int col = lane; col < in_dim; col += warpSize) {
+      rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
+    }
+    rank_val = warp_reduce_sum(rank_val);
+    if (lane == 0) {
+      rank_buf[r] = rank_val;
+    }
+  }
+}
+
 __global__ void lora_pack_b_rows_kernel(
     const __nv_bfloat16 *__restrict__ src,
     __nv_bfloat16 *__restrict__ dst,
@@ -84,14 +153,7 @@ __global__ void lora_decode_fused_delta_kernel(
   const __nv_bfloat16 *x =
       input + (static_cast<int64_t>(token) * in_dim);
 
-  for (int r = threadIdx.x; r < rank; r += blockDim.x) {
-    float rank_val = 0.0f;
-    const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
-    for (int col = 0; col < in_dim; ++col) {
-      rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
-    }
-    rank_buf[r] = rank_val;
-  }
+  compute_lora_rank_dot_runtime(a, x, rank, in_dim, rank_buf);
   __syncthreads();
 
   for (int row = threadIdx.x; row < out_dim; row += blockDim.x) {
@@ -146,25 +208,7 @@ __global__ void lora_decode_fused_delta_rank_kernel(
   const __nv_bfloat16 *x =
       input + (static_cast<int64_t>(token) * in_dim);
 
-  if (RANK == 1) {
-    float rank_val = 0.0f;
-    for (int col = threadIdx.x; col < in_dim; col += blockDim.x) {
-      rank_val += __bfloat162float(a[col]) * __bfloat162float(x[col]);
-    }
-    rank_val = block_reduce_sum(rank_val, rank_buf);
-    if (threadIdx.x == 0) {
-      rank_buf[0] = rank_val;
-    }
-  } else {
-    for (int r = threadIdx.x; r < RANK; r += blockDim.x) {
-      float rank_val = 0.0f;
-      const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
-      for (int col = 0; col < in_dim; ++col) {
-        rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
-      }
-      rank_buf[r] = rank_val;
-    }
-  }
+  compute_lora_rank_dot<RANK>(a, x, RANK, in_dim, rank_buf);
   __syncthreads();
 
   for (int row = threadIdx.x; row < out_dim; row += blockDim.x) {
@@ -209,14 +253,7 @@ __device__ void apply_lora_decode_projection(
   const __nv_bfloat16 *b =
       b_packed + (static_cast<int64_t>(slot) * out_dim * max_rank);
 
-  for (int r = threadIdx.x; r < rank; r += blockDim.x) {
-    float rank_val = 0.0f;
-    const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
-    for (int col = 0; col < in_dim; ++col) {
-      rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
-    }
-    rank_buf[r] = rank_val;
-  }
+  compute_lora_rank_dot_runtime(a, x, rank, in_dim, rank_buf);
   __syncthreads();
 
   for (int row = threadIdx.x; row < out_dim; row += blockDim.x) {
@@ -263,25 +300,7 @@ __device__ void apply_lora_decode_projection_rank(
   const __nv_bfloat16 *b =
       b_packed + (static_cast<int64_t>(slot) * out_dim * max_rank);
 
-  if (RANK == 1) {
-    float rank_val = 0.0f;
-    for (int col = threadIdx.x; col < in_dim; col += blockDim.x) {
-      rank_val += __bfloat162float(a[col]) * __bfloat162float(x[col]);
-    }
-    rank_val = block_reduce_sum(rank_val, rank_buf);
-    if (threadIdx.x == 0) {
-      rank_buf[0] = rank_val;
-    }
-  } else {
-    for (int r = threadIdx.x; r < RANK; r += blockDim.x) {
-      float rank_val = 0.0f;
-      const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
-      for (int col = 0; col < in_dim; ++col) {
-        rank_val += __bfloat162float(a_row[col]) * __bfloat162float(x[col]);
-      }
-      rank_buf[r] = rank_val;
-    }
-  }
+  compute_lora_rank_dot<RANK>(a, x, RANK, in_dim, rank_buf);
   __syncthreads();
 
   for (int row = threadIdx.x; row < out_dim; row += blockDim.x) {
