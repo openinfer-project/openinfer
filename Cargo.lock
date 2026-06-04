@@ -4232,6 +4232,7 @@ version = "2.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "805bfd7352166bae857ee569628b52bcd85a1cecf7810861ebceb1686b72b75d"
 dependencies = [
+ "indexmap 2.14.0",
  "memo-map",
  "serde",
  "serde_json",
@@ -5462,13 +5463,13 @@ dependencies = [
  "axum",
  "log",
  "pegainfer-engine",
- "reqwest",
  "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "tower",
  "uuid",
  "vllm-engine-core-client",
  "vllm-server",
@@ -9106,7 +9107,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -9141,7 +9142,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -9175,7 +9176,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -9194,7 +9195,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "prometheus-client",
 ]
@@ -9202,7 +9203,7 @@ dependencies = [
 [[package]]
 name = "vllm-reasoning-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "thiserror 2.0.18",
  "vllm-tokenizer",
@@ -9211,7 +9212,7 @@ dependencies = [
 [[package]]
 name = "vllm-server"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -9251,7 +9252,7 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -9275,7 +9276,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -9294,8 +9295,9 @@ dependencies = [
 [[package]]
 name = "vllm-tool-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=65b7a812a2dabd212d78c7b5b8a320b4efb9750d#65b7a812a2dabd212d78c7b5b8a320b4efb9750d"
+source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
 dependencies = [
+ "easy-ext",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

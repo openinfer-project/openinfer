@@ -28,10 +28,22 @@ impl SimServer {
         Self::spawn_with_model_dir(TempModelDir::with_minimal_metadata()?).await
     }
 
+    async fn spawn_with_lora_routes() -> Result<Self> {
+        Self::spawn_with_model_dir_and_lora_routes(TempModelDir::with_minimal_metadata()?, true)
+            .await
+    }
+
     async fn spawn_with_model_dir(model_dir: TempModelDir) -> Result<Self> {
+        Self::spawn_with_model_dir_and_lora_routes(model_dir, false).await
+    }
+
+    async fn spawn_with_model_dir_and_lora_routes(
+        model_dir: TempModelDir,
+        enable_lora_routes: bool,
+    ) -> Result<Self> {
         let mut last_error = None;
         for attempt in 1..=SERVER_START_ATTEMPTS {
-            match Self::spawn_once(&model_dir).await {
+            match Self::spawn_once(&model_dir, enable_lora_routes).await {
                 Ok(started) => {
                     return Ok(Self {
                         base_url: started.base_url,
@@ -55,7 +67,10 @@ impl SimServer {
             })
     }
 
-    async fn spawn_once(model_dir: &TempModelDir) -> Result<StartedSimServer> {
+    async fn spawn_once(
+        model_dir: &TempModelDir,
+        enable_lora_routes: bool,
+    ) -> Result<StartedSimServer> {
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
@@ -63,15 +78,28 @@ impl SimServer {
         let server_shutdown = shutdown.clone();
         let model_path = model_dir.path.to_string_lossy().into_owned();
         let mut task = tokio::spawn(async move {
-            pegainfer_vllm_frontend::serve_model(
-                engine,
-                model_path,
-                vec![MODEL_NAME.to_string()],
-                port,
-                128,
-                server_shutdown,
-            )
-            .await
+            if enable_lora_routes {
+                pegainfer_vllm_frontend::serve_model_with_lora_routes(
+                    engine,
+                    model_path,
+                    vec![MODEL_NAME.to_string()],
+                    Vec::new(),
+                    port,
+                    128,
+                    server_shutdown,
+                )
+                .await
+            } else {
+                pegainfer_vllm_frontend::serve_model(
+                    engine,
+                    model_path,
+                    vec![MODEL_NAME.to_string()],
+                    port,
+                    128,
+                    server_shutdown,
+                )
+                .await
+            }
         });
 
         let client = test_client()?;
@@ -169,6 +197,35 @@ async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
     assert_models_endpoint(&client, &server.base_url).await?;
     assert_non_streaming_completion_has_output(&client, &server.base_url).await?;
     assert_streaming_completion_emits_done(&client, &server.base_url).await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_lora_routes_are_mounted_on_openai_frontend() -> Result<()> {
+    let server = SimServer::spawn_with_lora_routes().await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/load_lora_adapter", server.base_url))
+        .json(&json!({
+            "lora_name": "adapter-a",
+            "lora_path": "/tmp/adapter-a"
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body: Value = response.json().await?;
+    if status != reqwest::StatusCode::NOT_FOUND {
+        bail!("expected mounted LoRA route to report unsupported engine, got {status}: {body}");
+    }
+    let error = body["error"]
+        .as_str()
+        .ok_or_else(|| anyhow!("LoRA route response has no error string: {body}"))?;
+    if !error.contains("dynamic LoRA adapter loading") {
+        bail!("LoRA route returned unexpected error: {body}");
+    }
 
     server.shutdown().await
 }

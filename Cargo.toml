@@ -163,16 +163,17 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "1.1"
+tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing-opentelemetry = "0.32.0"
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
 velo = "0.1.0"
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "65b7a812a2dabd212d78c7b5b8a320b4efb9750d" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "4aaed4ca225a3745aa1e18864dad0599d3ac7626" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "4aaed4ca225a3745aa1e18864dad0599d3ac7626" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "4aaed4ca225a3745aa1e18864dad0599d3ac7626" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "4aaed4ca225a3745aa1e18864dad0599d3ac7626" }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
 zeromq = { version = "0.6.0", default-features = false, features = [
     "tokio-runtime",

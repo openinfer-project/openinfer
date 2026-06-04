@@ -1,31 +1,34 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, Method, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header::CONTENT_LENGTH};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::logprobs::{
     Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob as WireTokenLogprob,
 };
+use vllm_engine_core_client::protocol::utility::{
+    UtilityCallId, UtilityOutput, UtilityResultEnvelope,
+};
 use vllm_engine_core_client::protocol::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
     EngineCoreOutputs, EngineCoreRequest, EngineCoreRequestType, EngineCoreSamplingParams,
-    StopReason, UtilityOutput, UtilityResultEnvelope, encode_msgpack, stats::PrefillStats,
+    ModelDtype, StopReason, encode_msgpack, stats::PrefillStats,
 };
 use vllm_engine_core_client::{EngineId, TransportMode};
 use vllm_server::{
@@ -43,7 +46,7 @@ use pegainfer_engine::engine::{
 use pegainfer_engine::sampler::SamplingParams;
 
 const ENGINE_INDEX: u32 = 0;
-const PROXY_BODY_LIMIT: usize = 128 * 1024 * 1024;
+const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
 #[derive(Clone)]
@@ -53,9 +56,8 @@ struct LoraRouteState {
 }
 
 #[derive(Clone)]
-struct ProxyState {
-    client: reqwest::Client,
-    upstream_base_url: Arc<str>,
+struct LoraOpenAiState {
+    vllm_router: Router,
     base_model_name: String,
     served_model_names: Vec<String>,
     adapter_names: Arc<RwLock<HashSet<String>>>,
@@ -109,6 +111,24 @@ pub fn lora_routes(handle: EngineHandle, adapter_names: Arc<RwLock<HashSet<Strin
         .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
         .with_state(LoraRouteState {
             handle,
+            adapter_names,
+        })
+}
+
+fn lora_openai_routes(
+    vllm_router: Router,
+    base_model_name: String,
+    served_model_names: Vec<String>,
+    adapter_names: Arc<RwLock<HashSet<String>>>,
+) -> Router {
+    Router::new()
+        .route("/v1/models", get(lora_models))
+        .route("/v1/completions", post(forward_lora_openai_request))
+        .route("/v1/chat/completions", post(forward_lora_openai_request))
+        .with_state(LoraOpenAiState {
+            vllm_router,
+            base_model_name,
+            served_model_names,
             adapter_names,
         })
 }
@@ -261,7 +281,8 @@ impl LocalEngineBridge {
             max_model_len: self.max_model_len as u64,
             num_gpu_blocks: 0,
             dp_stats_address: None,
-            dtype: None,
+            dtype: ModelDtype::BFloat16,
+            vllm_version: "pegainfer-local-bridge".to_string(),
         };
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))
@@ -351,8 +372,12 @@ impl LocalEngineBridge {
                 Ok(())
             }
             ty if ty == EngineCoreRequestType::Utility.to_frame().as_ref() => {
-                let (_client_index, call_id, method_name, _args): (u32, i64, String, rmpv::Value) =
-                    rmp_serde::from_slice(&frames[1])?;
+                let (_client_index, call_id, method_name, _args): (
+                    u32,
+                    UtilityCallId,
+                    String,
+                    rmpv::Value,
+                ) = rmp_serde::from_slice(&frames[1])?;
                 send_utility_response(output_tx, call_id, &method_name)
             }
             other => bail!("unsupported local engine request type frame: {other:?}"),
@@ -464,78 +489,30 @@ pub async fn serve_model_with_lora_routes(
     let model_id = model_id.into();
     let adapter_names = Arc::new(RwLock::new(HashSet::new()));
     load_startup_lora_modules(&handle, &adapter_names, &lora_modules).await?;
-    let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
     let base_model_name = served_model_name
         .first()
         .cloned()
         .unwrap_or_else(|| model_id.clone());
-    let mut last_error = None;
-    for attempt in 1..=5 {
-        let internal_port = reserve_loopback_port()?;
-        let upstream_base_url: Arc<str> = format!("http://127.0.0.1:{internal_port}").into();
-        let internal_shutdown = shutdown.child_token();
-        let mut internal_task = tokio::spawn(serve_model_on_host(
-            handle.clone(),
-            model_id.clone(),
-            served_model_name.clone(),
-            "127.0.0.1".to_string(),
-            internal_port,
-            max_model_len,
-            internal_shutdown.clone(),
-        ));
-
-        let mut internal_task_finished = false;
-        let health_result = tokio::select! {
-            result = wait_for_http_health(&upstream_base_url, &shutdown) => result,
-            result = &mut internal_task => {
-                internal_task_finished = true;
-                match result {
-                    Ok(Ok(())) => Err(anyhow!("internal vLLM server exited before becoming healthy")),
-                    Ok(Err(error)) => Err(error).context("internal vLLM server exited before becoming healthy"),
-                    Err(error) => Err(error).context("LoRA internal server task panicked"),
-                }
-            }
-        };
-
-        if let Err(error) = health_result {
-            internal_shutdown.cancel();
-            if !internal_task_finished {
-                let _ = internal_task.await;
-            }
-            if attempt == 5 {
-                return Err(error).context("failed to start internal vLLM server for LoRA routes");
-            }
-            warn!(
-                "retrying LoRA internal vLLM server startup after attempt {} failed: {error:#}",
-                attempt
+    serve_model_on_host_with_router_extension(
+        handle.clone(),
+        model_id,
+        served_model_name.clone(),
+        "0.0.0.0".to_string(),
+        port,
+        max_model_len,
+        shutdown,
+        move |router| {
+            let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
+            let openai_router = lora_openai_routes(
+                router.clone(),
+                base_model_name,
+                served_model_name,
+                Arc::clone(&adapter_names),
             );
-            last_error = Some(error);
-            continue;
-        }
-
-        info!(
-            "serving LoRA route proxy: public_port={}, upstream={}",
-            port, upstream_base_url
-        );
-        let proxy_result = serve_lora_proxy(
-            port,
-            upstream_base_url,
-            base_model_name.clone(),
-            served_model_name.clone(),
-            Arc::clone(&adapter_names),
-            lora_router,
-            shutdown.child_token(),
-        )
-        .await;
-
-        internal_shutdown.cancel();
-        let internal_result = internal_task
-            .await
-            .context("LoRA internal server task panicked")?;
-        return proxy_result.and(internal_result);
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow!("internal vLLM server startup was not attempted")))
+            openai_router.merge(lora_router).fallback_service(router)
+        },
+    )
+    .await
 }
 
 async fn load_startup_lora_modules(
@@ -572,6 +549,32 @@ async fn serve_model_on_host(
     max_model_len: u32,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    serve_model_on_host_with_router_extension(
+        handle,
+        model_id,
+        served_model_name,
+        host,
+        port,
+        max_model_len,
+        shutdown,
+        |router| router,
+    )
+    .await
+}
+
+async fn serve_model_on_host_with_router_extension<F>(
+    handle: EngineHandle,
+    model_id: String,
+    served_model_name: Vec<String>,
+    host: String,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+    extend_router: F,
+) -> Result<()>
+where
+    F: FnOnce(Router) -> Router,
+{
     let namespace = local_ipc_namespace()?;
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
@@ -607,137 +610,64 @@ async fn serve_model_on_host(
         default_chat_template_kwargs: None,
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         enable_log_requests: true,
+        enable_request_id_headers: false,
         disable_log_stats: true,
         grpc_port: None,
         shutdown_timeout: Duration::from_secs(10),
     };
 
-    let result = vllm_server::serve(config, shutdown).await;
+    let result = vllm_server::serve_with_router_extension(config, shutdown, extend_router).await;
     bridge_task.abort();
     let _ = std::fs::remove_dir_all(namespace);
     result
 }
 
-fn reserve_loopback_port() -> Result<u16> {
-    let listener = StdTcpListener::bind(("127.0.0.1", 0))
-        .context("failed to reserve loopback port for internal vLLM server")?;
-    Ok(listener.local_addr()?.port())
+async fn lora_models(State(state): State<LoraOpenAiState>) -> Response {
+    lora_models_response(
+        &state.served_model_names,
+        &state.base_model_name,
+        &state.adapter_names,
+    )
+    .await
 }
 
-async fn wait_for_http_health(upstream_base_url: &str, shutdown: &CancellationToken) -> Result<()> {
-    let client = reqwest::Client::new();
-    let health_url = format!("{upstream_base_url}/health");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return Ok(()),
-            () = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for internal vLLM server health at {health_url}");
-        }
-        match client
-            .get(&health_url)
-            .timeout(Duration::from_secs(1))
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(_) | Err(_) => {}
-        }
-    }
-}
-
-async fn serve_lora_proxy(
-    port: u16,
-    upstream_base_url: Arc<str>,
-    base_model_name: String,
-    served_model_names: Vec<String>,
-    adapter_names: Arc<RwLock<HashSet<String>>>,
-    lora_router: Router,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let state = ProxyState {
-        client: reqwest::Client::new(),
-        upstream_base_url,
-        base_model_name,
-        served_model_names,
-        adapter_names,
-    };
-    let proxy_router = Router::new().fallback(proxy_to_upstream).with_state(state);
-    let app = proxy_router.merge(lora_router);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .with_context(|| format!("failed to bind LoRA route proxy on 0.0.0.0:{port}"))?;
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await
-        .context("LoRA route proxy failed")
-}
-
-async fn proxy_to_upstream(State(state): State<ProxyState>, request: Request) -> Response {
-    match proxy_to_upstream_inner(state, request).await {
+async fn forward_lora_openai_request(
+    State(state): State<LoraOpenAiState>,
+    request: Request,
+) -> Response {
+    match forward_lora_openai_request_inner(state, request).await {
         Ok(response) => response,
         Err(error) => (
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: format!("failed to proxy request to internal vLLM server: {error:#}"),
+                error: format!("failed to prepare LoRA request: {error:#}"),
             }),
         )
             .into_response(),
     }
 }
 
-async fn proxy_to_upstream_inner(state: ProxyState, request: Request) -> Result<Response> {
-    let (parts, body) = request.into_parts();
-    if parts.method == Method::GET && parts.uri.path() == "/v1/models" {
-        return Ok(lora_models_response(
-            &state.served_model_names,
-            &state.base_model_name,
-            &state.adapter_names,
-        )
-        .await);
-    }
-    let path_and_query = parts
-        .uri
-        .path_and_query()
-        .map_or("/", axum::http::uri::PathAndQuery::as_str);
-    let upstream_url = format!("{}{}", state.upstream_base_url, path_and_query);
-    let mut body = to_bytes(body, PROXY_BODY_LIMIT)
+async fn forward_lora_openai_request_inner(
+    state: LoraOpenAiState,
+    request: Request,
+) -> Result<Response> {
+    let (mut parts, body) = request.into_parts();
+    let mut body = to_bytes(body, LORA_ROUTE_BODY_LIMIT)
         .await
-        .context("failed to read proxy request body")?;
-    if parts.method == Method::POST
-        && matches!(parts.uri.path(), "/v1/completions" | "/v1/chat/completions")
-    {
-        let _ = rewrite_lora_request_body(&mut body, &state.base_model_name, &state.adapter_names)
-            .await?;
-    }
+        .context("failed to read OpenAI request body")?;
+    let _ =
+        rewrite_lora_request_body(&mut body, &state.base_model_name, &state.adapter_names).await?;
+    parts.headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string())
+            .context("rewritten body length is invalid")?,
+    );
 
-    let mut upstream = state.client.request(parts.method, upstream_url);
-    for (name, value) in &parts.headers {
-        if should_forward_request_header(name) {
-            upstream = upstream.header(name.as_str(), value);
-        }
-    }
-
-    let response = upstream
-        .body(body)
-        .send()
+    state
+        .vllm_router
+        .oneshot(Request::from_parts(parts, Body::from(body)))
         .await
-        .context("upstream request failed")?;
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .context("upstream returned invalid status")?;
-    let mut builder = Response::builder().status(status);
-    for (name, value) in response.headers() {
-        if should_forward_response_header(name) {
-            builder = builder.header(name, value);
-        }
-    }
-
-    builder
-        .body(Body::from_stream(response.bytes_stream()))
-        .context("failed to build proxy response")
+        .context("vLLM router failed to handle LoRA request")
 }
 
 async fn rewrite_lora_request_body(
@@ -804,37 +734,6 @@ async fn lora_models_response(
             .collect(),
     })
     .into_response()
-}
-
-fn should_forward_request_header(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str(),
-        "connection"
-            | "content-length"
-            | "host"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
-}
-
-fn should_forward_response_header(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str(),
-        "connection"
-            | "content-length"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
 }
 
 async fn run_request_stream(
@@ -1006,7 +905,7 @@ fn send_terminal_output(
 
 fn send_utility_response(
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
-    call_id: i64,
+    call_id: UtilityCallId,
     method_name: &str,
 ) -> Result<()> {
     let result = match method_name {
@@ -1363,6 +1262,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lora_openai_forwarder_rewrites_then_calls_vllm_router() {
+        let adapter_names = Arc::new(RwLock::new(HashSet::from(["adapter-a".to_string()])));
+        let vllm_router = Router::new().route(
+            "/v1/completions",
+            post(|headers: axum::http::HeaderMap, body: Bytes| async move {
+                let content_length = headers
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("content-length header");
+                assert_eq!(content_length, body.len());
+                Json(serde_json::from_slice::<serde_json::Value>(&body).expect("json body"))
+            }),
+        );
+        let state = LoraOpenAiState {
+            vllm_router,
+            base_model_name: "base-model".to_string(),
+            served_model_names: vec!["base-model".to_string()],
+            adapter_names,
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "adapter-a",
+                    "prompt": "hello"
+                })
+                .to_string(),
+            ))
+            .expect("request");
+
+        let response = forward_lora_openai_request_inner(state, request)
+            .await
+            .expect("forward request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), LORA_ROUTE_BODY_LIMIT)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(value["model"], "base-model");
+        assert_eq!(value["prompt"], "hello");
+        assert_eq!(value["vllm_xargs"][LORA_ADAPTER_XARG], "adapter-a");
+    }
+
+    #[tokio::test]
     async fn lora_models_response_includes_base_and_loaded_adapters() {
         let adapter_names = Arc::new(RwLock::new(HashSet::from([
             "adapter-b".to_string(),
@@ -1372,7 +1318,7 @@ mod tests {
         let response =
             lora_models_response(&["served-base".to_string()], "model-path", &adapter_names).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), PROXY_BODY_LIMIT)
+        let body = to_bytes(response.into_body(), LORA_ROUTE_BODY_LIMIT)
             .await
             .expect("read body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("models JSON");
