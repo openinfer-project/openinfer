@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 pegainfer-kernels = { workspace = true }
 kvbm-logical = { workspace = true }
+dynamo-kv-hashing = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }

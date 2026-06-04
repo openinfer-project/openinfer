@@ -445,6 +445,9 @@ pub struct Qwen3Executor {
     primary: RankWorker,
     workers: Vec<RankWorker>,
     loaded_lora_adapters: HashSet<String>,
+    /// Adapter currently activated on the workers; scopes prefix-cache
+    /// block hashes so KV computed under different adapters never mixes.
+    active_lora_adapter: Option<String>,
     prefix_cache_enabled: bool,
 }
 
@@ -477,6 +480,7 @@ impl Qwen3Executor {
             )?,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
+            active_lora_adapter: None,
             prefix_cache_enabled: true,
         })
     }
@@ -591,6 +595,7 @@ impl Qwen3Executor {
             primary,
             workers,
             loaded_lora_adapters: HashSet::new(),
+            active_lora_adapter: None,
             prefix_cache_enabled: true,
         })
     }
@@ -735,9 +740,11 @@ impl ModelExecutor for Qwen3Executor {
         // 1. Create RequestKvs, reuse cached prefix blocks, schedule the rest
         let mut requests = plan.requests.to_vec();
         for req in &mut requests {
-            let mut rkv = self
-                .kv_mgr
-                .new_request(req.prompt_tokens.clone(), req.max_output_tokens);
+            let mut rkv = self.kv_mgr.new_request(
+                req.prompt_tokens.clone(),
+                req.max_output_tokens,
+                self.active_lora_adapter.as_deref(),
+            );
             // Echo needs logits for every prompt position; cached positions
             // are never forwarded, so echo requests prefill from scratch.
             if self.prefix_cache_enabled && !req.echo {
@@ -837,9 +844,11 @@ impl ModelExecutor for Qwen3Executor {
         // blocks, and schedule the rest
         let mut prefill_requests = plan.prefill_requests.to_vec();
         for req in &mut prefill_requests {
-            let mut rkv = self
-                .kv_mgr
-                .new_request(req.prompt_tokens.clone(), req.max_output_tokens);
+            let mut rkv = self.kv_mgr.new_request(
+                req.prompt_tokens.clone(),
+                req.max_output_tokens,
+                self.active_lora_adapter.as_deref(),
+            );
             if self.prefix_cache_enabled && !req.echo {
                 req.cached_tokens = rkv.match_and_add_prefix(&self.kv_mgr)?;
             }
@@ -913,7 +922,9 @@ impl ModelExecutor for Qwen3Executor {
         self.run_worker_command(
             |worker| worker.activate_lora_adapter(adapter.map(str::to_string)),
             "LoRA activation",
-        )
+        )?;
+        self.active_lora_adapter = adapter.map(str::to_string);
+        Ok(())
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {

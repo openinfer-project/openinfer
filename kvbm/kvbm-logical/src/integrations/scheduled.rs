@@ -154,7 +154,7 @@ use crate::blocks::BlockMetadata;
 use crate::manager::BlockManager;
 
 use super::request::RequestSequence;
-use dynamo_tokens::Token;
+use dynamo_tokens::{SaltHash, Token};
 
 // =============================================================================
 // State types
@@ -276,6 +276,10 @@ pub struct SchedulableSequenceParams {
     block_size: u32,
     #[builder(default, setter(custom))]
     delegate: Option<Arc<dyn SequenceDelegate>>,
+    /// Prefix-cache isolation key (e.g. derived from a LoRA adapter name).
+    /// Sequences with different salts never match each other's blocks.
+    #[builder(default)]
+    salt_hash: Option<SaltHash>,
 }
 
 impl SchedulableSequenceBuilder {
@@ -291,6 +295,7 @@ impl SchedulableSequenceBuilder {
             params.max_output_tokens,
             params.block_size,
             params.delegate,
+            params.salt_hash,
         ))
     }
 }
@@ -386,8 +391,9 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         max_output_tokens: usize,
         block_size: u32,
         delegate: Option<Arc<dyn SequenceDelegate>>,
+        salt_hash: Option<SaltHash>,
     ) -> Self {
-        let inner = RequestSequence::new(tokens, max_output_tokens, block_size);
+        let inner = RequestSequence::new(tokens, max_output_tokens, block_size, salt_hash);
         let delegate = delegate.unwrap_or_else(|| Arc::new(NoopDelegate));
         delegate.on_event(&SequenceEvent::Created {
             num_input_tokens: inner.num_input_tokens(),
@@ -1077,6 +1083,7 @@ mod tests {
             10,
             BLOCK_SIZE,
             Some(delegate.clone()),
+            None,
         );
 
         assert_eq!(seq.state(), SequenceState::Idle);
@@ -1107,8 +1114,13 @@ mod tests {
     #[test]
     fn test_schedule_prefill_requires_idle() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.schedule_prefill(4, &manager).unwrap_err();
@@ -1118,8 +1130,13 @@ mod tests {
     #[test]
     fn test_schedule_decode_requires_idle() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         // Prefill first
         seq.schedule_prefill(4, &manager).unwrap();
@@ -1134,8 +1151,13 @@ mod tests {
     #[test]
     fn test_apply_prefill_requires_scheduled() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let err = seq.apply_prefill(None, &manager).unwrap_err();
         assert!(matches!(err, ApplyError::WrongState { .. }));
@@ -1144,8 +1166,13 @@ mod tests {
     #[test]
     fn test_apply_decode_requires_scheduled() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let err = seq.apply_decode(100, &manager).unwrap_err();
         assert!(matches!(err, ApplyError::WrongState { .. }));
@@ -1154,8 +1181,13 @@ mod tests {
     #[test]
     fn test_decode_requires_prefill_complete() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let err = seq.schedule_decode(&manager).unwrap_err();
         assert!(matches!(err, ScheduleError::PrefillNotComplete { .. }));
@@ -1164,8 +1196,13 @@ mod tests {
     #[test]
     fn test_speculative_requires_prefill_complete() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let err = seq.schedule_speculative(3, &manager).unwrap_err();
         assert!(matches!(err, ScheduleError::PrefillNotComplete { .. }));
@@ -1178,8 +1215,13 @@ mod tests {
     #[test]
     fn test_prefill_single_chunk() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         // Schedule and apply the full prefill (no gen block allocated)
         seq.schedule_prefill(8, &manager).unwrap();
@@ -1204,8 +1246,13 @@ mod tests {
     #[test]
     fn test_prefill_chunked() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         // Chunk 1: first 4 tokens (1 block, non-final)
         seq.schedule_prefill(4, &manager).unwrap();
@@ -1229,8 +1276,13 @@ mod tests {
     #[test]
     fn test_prefill_final_with_first_token() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         seq.apply_prefill(Some(100), &manager).unwrap();
@@ -1245,8 +1297,13 @@ mod tests {
     #[test]
     fn test_prefill_token_on_non_final_rejected() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.apply_prefill(Some(100), &manager).unwrap_err();
@@ -1256,8 +1313,13 @@ mod tests {
     #[test]
     fn test_prefill_overrun_rejected() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let err = seq.schedule_prefill(9, &manager).unwrap_err();
         assert!(matches!(err, ScheduleError::PrefillOverrun { .. }));
@@ -1266,8 +1328,13 @@ mod tests {
     #[test]
     fn test_prefill_allocation_failure() {
         let manager = create_test_manager::<TestMeta>(1); // only 1 block
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let err = seq.schedule_prefill(8, &manager).unwrap_err();
         assert!(matches!(err, ScheduleError::AllocationFailed { .. }));
@@ -1278,8 +1345,13 @@ mod tests {
     #[test]
     fn test_schedule_prefill_after_complete_rejected() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         seq.apply_prefill(Some(1000), &manager).unwrap();
@@ -1291,8 +1363,13 @@ mod tests {
     #[test]
     fn test_apply_prefill_none_on_final_rejected() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.apply_prefill(None, &manager).unwrap_err();
@@ -1317,6 +1394,7 @@ mod tests {
             max_output,
             BLOCK_SIZE,
             noop_delegate(),
+            None,
         );
         if num_input > 0 {
             seq.schedule_prefill(num_input, manager).unwrap();
@@ -1463,7 +1541,7 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(20);
         let delegate = Arc::new(CollectingDelegate::new());
         let mut seq =
-            SchedulableSequence::new(make_tokens(4), 10, BLOCK_SIZE, Some(delegate.clone()));
+            SchedulableSequence::new(make_tokens(4), 10, BLOCK_SIZE, Some(delegate.clone()), None);
         seq.schedule_prefill(4, &manager).unwrap();
         seq.apply_prefill(Some(1000), &manager).unwrap();
         // After prefill: total=5, assigned=1, unassigned=0
@@ -1568,8 +1646,13 @@ mod tests {
     #[test]
     fn test_revert_prefill() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let avail_before = manager.available_blocks();
         seq.schedule_prefill(4, &manager).unwrap();
@@ -1621,8 +1704,13 @@ mod tests {
     #[test]
     fn test_revert_returns_blocks_to_manager() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let avail_before = manager.available_blocks();
         seq.schedule_prefill(8, &manager).unwrap();
@@ -1698,6 +1786,7 @@ mod tests {
             3,
             BLOCK_SIZE,
             Some(delegate.clone()),
+            None,
         );
 
         // Prefill
@@ -1736,8 +1825,13 @@ mod tests {
     fn test_full_lifecycle_prefill_decode_release() {
         let manager = create_test_manager::<TestMeta>(20);
         // max_output=7: 1 from prefill + 6 decodes
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(6), 7, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(6),
+            7,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         // Prefill 6 tokens → 1 complete block + 2 partial
         seq.schedule_prefill(6, &manager).unwrap();
@@ -1777,8 +1871,13 @@ mod tests {
     #[test]
     fn test_preempt_and_reacquire() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         // Prefill
         seq.schedule_prefill(8, &manager).unwrap();
@@ -1828,7 +1927,8 @@ mod tests {
             .collect();
         drop(registered);
 
-        let mut seq = SchedulableSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, noop_delegate());
+        let mut seq =
+            SchedulableSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, noop_delegate(), None);
         let matched = seq.match_and_add_prefix(&manager).unwrap();
         assert_eq!(matched, 1);
         assert_eq!(seq.prefill_position(), 4); // 1 block * 4 tokens
@@ -1858,7 +1958,8 @@ mod tests {
             .collect();
         drop(registered);
 
-        let mut seq = SchedulableSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, noop_delegate());
+        let mut seq =
+            SchedulableSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, noop_delegate(), None);
         // Cap: (8 - 1) / 4 = 1 block, even though 2 would match.
         let matched = seq.match_and_add_prefix(&manager).unwrap();
         assert_eq!(matched, 1);
@@ -1879,8 +1980,13 @@ mod tests {
     #[test]
     fn test_match_and_add_prefix_no_hits() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         let matched = seq.match_and_add_prefix(&manager).unwrap();
         assert_eq!(matched, 0);
@@ -1894,7 +2000,8 @@ mod tests {
     #[test]
     fn test_empty_tokens_prefill() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq = SchedulableSequence::<TestMeta>::new(vec![], 10, BLOCK_SIZE, noop_delegate());
+        let mut seq =
+            SchedulableSequence::<TestMeta>::new(vec![], 10, BLOCK_SIZE, noop_delegate(), None);
 
         assert!(seq.is_prefill_complete());
 
@@ -1918,8 +2025,13 @@ mod tests {
     #[test]
     fn test_zero_max_output_no_gen_block() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(4), 0, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            0,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         seq.apply_prefill(None, &manager).unwrap();
@@ -1934,8 +2046,13 @@ mod tests {
 
     #[test]
     fn test_debug_impl() {
-        let seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
         let debug_str = format!("{seq:?}");
         assert!(debug_str.contains("SchedulableSequence"));
         assert!(debug_str.contains("Idle"));
@@ -1943,8 +2060,13 @@ mod tests {
 
     #[test]
     fn test_revert_idle_rejected() {
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
         let err = seq.revert_schedule().unwrap_err();
         assert!(matches!(err, ApplyError::WrongState { .. }));
     }
@@ -1952,8 +2074,13 @@ mod tests {
     #[test]
     fn test_release_while_scheduled_rejected() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.release().unwrap_err();
@@ -1963,8 +2090,13 @@ mod tests {
     #[test]
     fn test_reacquire_while_scheduled_rejected() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.reacquire(&manager).unwrap_err();
@@ -1978,8 +2110,13 @@ mod tests {
     #[test]
     fn test_dangling_tokens_tracking() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 20, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            20,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         // Before prefill: all tokens are "not yet computed"
         assert_eq!(seq.kv_position(), 0);
@@ -2009,7 +2146,8 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(20);
 
         // 0 dangling: empty sequence with no tokens
-        let mut seq = SchedulableSequence::<TestMeta>::new(vec![], 10, BLOCK_SIZE, noop_delegate());
+        let mut seq =
+            SchedulableSequence::<TestMeta>::new(vec![], 10, BLOCK_SIZE, noop_delegate(), None);
         let err = seq.schedule_decode(&manager).unwrap_err();
         assert!(matches!(
             err,
@@ -2035,7 +2173,8 @@ mod tests {
     #[test]
     fn test_append_tokens_creates_dangling() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq = SchedulableSequence::<TestMeta>::new(vec![], 10, BLOCK_SIZE, noop_delegate());
+        let mut seq =
+            SchedulableSequence::<TestMeta>::new(vec![], 10, BLOCK_SIZE, noop_delegate(), None);
 
         assert_eq!(seq.tail_tokens(), 0);
 
@@ -2053,7 +2192,8 @@ mod tests {
 
     #[test]
     fn test_append_tokens_exceeding_remaining_returns_error_without_mutation() {
-        let mut seq = SchedulableSequence::<TestMeta>::new(vec![], 1, BLOCK_SIZE, noop_delegate());
+        let mut seq =
+            SchedulableSequence::<TestMeta>::new(vec![], 1, BLOCK_SIZE, noop_delegate(), None);
 
         let err = seq.append_tokens(&[100, 101]).unwrap_err();
 
@@ -2074,8 +2214,13 @@ mod tests {
     #[test]
     fn test_kv_position_through_lifecycle() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(8), 20, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(8),
+            20,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         assert_eq!(seq.kv_position(), 0);
 
@@ -2103,8 +2248,13 @@ mod tests {
     fn test_pending_completion_staged_during_decode() {
         let manager = create_test_manager::<TestMeta>(20);
         // 7 input tokens: block 0 complete (0-3), block 1 partial (4-6)
-        let mut seq =
-            SchedulableSequence::<TestMeta>::new(make_tokens(7), 10, BLOCK_SIZE, noop_delegate());
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(7),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
 
         seq.schedule_prefill(7, &manager).unwrap();
         seq.apply_prefill(Some(1000), &manager).unwrap();

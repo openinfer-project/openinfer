@@ -39,7 +39,7 @@ use crate::error::KvHashingError;
 /// `lib/kv-router/src/protocols.rs:79` (`options.lora_name.filter(|n| !n.is_empty())`)
 /// so a client that sends `lora_name = ""` shares the cache with a client that sends
 /// `lora_name = None`.
-pub(crate) fn compute_salt_hash(
+pub fn compute_salt_hash(
     salt: Option<&str>,
     lora_name: Option<&str>,
 ) -> Result<SaltHash, KvHashingError> {

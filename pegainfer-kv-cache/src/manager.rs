@@ -101,12 +101,25 @@ impl KvCacheManager {
         self.block_manager.total_blocks().saturating_sub(1)
     }
 
-    pub fn new_request(&self, prompt_tokens: Vec<u32>, max_output_tokens: usize) -> RequestKv {
+    /// `lora_name` scopes the prefix cache: blocks registered under one
+    /// adapter (or the base model, `None`) never match a request running
+    /// under a different adapter — the name is folded into the block-hash
+    /// chain as a salt, so K/V computed with different weights can't be
+    /// silently reused.
+    pub fn new_request(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_output_tokens: usize,
+        lora_name: Option<&str>,
+    ) -> RequestKv {
+        let salt_hash = dynamo_kv_hashing::compute_salt_hash(None, lora_name)
+            .expect("salt hash from lora name is infallible");
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
             self.block_size as u32,
             None,
+            Some(salt_hash),
         );
         RequestKv { seq }
     }

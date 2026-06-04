@@ -58,7 +58,7 @@ pub fn trace_decode_kernel_calls(
     let dummy_prompt_len = if kv_len > 1 { kv_len - 1 } else { 1 };
     let mut rkvs = (0..batch_size)
         .map(|_| {
-            let mut rkv = kv_mgr.new_request(vec![0; dummy_prompt_len], 1);
+            let mut rkv = kv_mgr.new_request(vec![0; dummy_prompt_len], 1, None);
             rkv.schedule_prefill(dummy_prompt_len, &kv_mgr)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             rkv.apply_prefill(0, &kv_mgr)?;

@@ -16,7 +16,7 @@ fn single_request_prefill_decode_release() {
     assert_eq!(initial_avail, 31); // 32 - 1 padding
 
     // New request: 10-token prompt, up to 6 output tokens
-    let mut req = mgr.new_request(vec![1; 10], 6);
+    let mut req = mgr.new_request(vec![1; 10], 6, None);
     assert_eq!(req.kv_position(), 0);
 
     // Schedule prefill for 10 tokens → needs 1 block (ceil(10/16))
@@ -55,7 +55,7 @@ fn multiple_requests_share_capacity() {
     assert_eq!(mgr.available_blocks(), 9);
 
     // Request A: 16 tokens prompt → 1 block, max 16 output → needs ceil(31/16)=2 blocks total
-    let mut a = mgr.new_request(vec![1; 16], 16);
+    let mut a = mgr.new_request(vec![1; 16], 16, None);
     a.schedule_prefill(16, &mgr).expect("a prefill schedule");
     a.apply_prefill(42, &mgr).expect("a prefill apply");
 
@@ -63,7 +63,7 @@ fn multiple_requests_share_capacity() {
     assert!(after_a < 9);
 
     // Request B: 16 tokens prompt → 1 block
-    let mut b = mgr.new_request(vec![2; 16], 1);
+    let mut b = mgr.new_request(vec![2; 16], 1, None);
     b.schedule_prefill(16, &mgr).expect("b prefill schedule");
     b.apply_prefill(43, &mgr).expect("b prefill apply");
 
@@ -82,7 +82,7 @@ fn page_boundary_crossing() {
 
     // Prompt exactly 16 tokens (fills block 0 exactly), then decode
     // 1 token which should cross into block 1.
-    let mut req = mgr.new_request(vec![1; 16], 2);
+    let mut req = mgr.new_request(vec![1; 16], 2, None);
     req.schedule_prefill(16, &mgr).expect("schedule_prefill");
 
     let view = req.prefill_view(16);
@@ -106,7 +106,7 @@ fn page_boundary_crossing() {
 #[test]
 fn kv_view_desc_has_correct_layout() {
     let mgr = make_manager(10);
-    let mut req = mgr.new_request(vec![1; 5], 1);
+    let mut req = mgr.new_request(vec![1; 5], 1, None);
 
     req.schedule_prefill(5, &mgr).expect("schedule_prefill");
     let view = req.prefill_view(5);
@@ -130,7 +130,7 @@ fn padding_block_id_is_stable() {
     let pid = mgr.padding_block_id();
     assert!(pid >= 0);
     // Allocate and release — padding ID must not change.
-    let mut req = mgr.new_request(vec![1; 8], 1);
+    let mut req = mgr.new_request(vec![1; 8], 1, None);
     req.schedule_prefill(8, &mgr).unwrap();
     req.apply_prefill(1, &mgr).unwrap();
     req.release().unwrap();
@@ -144,7 +144,7 @@ fn exhaust_capacity_returns_error() {
     // Each request with 16-token prompt needs 1 block.
     let mut reqs: Vec<_> = (0..3)
         .map(|_| {
-            let mut r = mgr.new_request(vec![1; 16], 1);
+            let mut r = mgr.new_request(vec![1; 16], 1, None);
             r.schedule_prefill(16, &mgr).expect("schedule");
             r.apply_prefill(42, &mgr).expect("apply");
             r
@@ -154,7 +154,7 @@ fn exhaust_capacity_returns_error() {
     assert_eq!(mgr.available_blocks(), 0);
 
     // Next request should fail to schedule.
-    let mut overflow = mgr.new_request(vec![1; 16], 1);
+    let mut overflow = mgr.new_request(vec![1; 16], 1, None);
     let result = overflow.schedule_prefill(16, &mgr);
     assert!(result.is_err(), "should fail when no blocks available");
 
@@ -172,7 +172,7 @@ fn schedule_without_apply_returns_blocks_on_drop() {
     let before = mgr.available_blocks();
 
     {
-        let mut req = mgr.new_request(vec![1; 32], 1);
+        let mut req = mgr.new_request(vec![1; 32], 1, None);
         // 32 tokens → ceil(32/16) = 2 blocks scheduled
         req.schedule_prefill(32, &mgr).expect("schedule_prefill");
         assert!(mgr.available_blocks() < before);
@@ -187,7 +187,7 @@ fn schedule_without_apply_returns_blocks_on_drop() {
 #[test]
 fn ensure_capacity_rejects_insufficient_pages() {
     let mgr = make_manager(10);
-    let mut req = mgr.new_request(vec![1; 8], 1);
+    let mut req = mgr.new_request(vec![1; 8], 1, None);
 
     req.schedule_prefill(8, &mgr).expect("schedule_prefill");
     let view = req.prefill_view(8);
@@ -210,7 +210,7 @@ fn ensure_capacity_rejects_insufficient_pages() {
 #[test]
 fn decode_view_seq_len_invariant() {
     let mgr = make_manager(10);
-    let mut req = mgr.new_request(vec![1; 10], 4);
+    let mut req = mgr.new_request(vec![1; 10], 4, None);
 
     req.schedule_prefill(10, &mgr).unwrap();
     req.apply_prefill(42, &mgr).unwrap();
@@ -235,7 +235,7 @@ fn decode_view_seq_len_invariant() {
 #[test]
 fn prefill_view_covers_target_seq_len() {
     let mgr = make_manager(10);
-    let mut req = mgr.new_request(vec![1; 20], 1);
+    let mut req = mgr.new_request(vec![1; 20], 1, None);
 
     req.schedule_prefill(20, &mgr).unwrap();
     let view = req.prefill_view(20);
@@ -250,4 +250,38 @@ fn prefill_view_covers_target_seq_len() {
 
     req.apply_prefill(42, &mgr).unwrap();
     req.release().unwrap();
+}
+
+#[test]
+fn lora_salt_isolates_prefix_cache() {
+    let mgr = make_manager(32);
+    let prompt = vec![7u32; 48]; // 3 full blocks
+
+    // Register the prompt's blocks under adapter "a"; release leaves them
+    // in the inactive pool, still matchable.
+    let mut a = mgr.new_request(prompt.clone(), 4, Some("a"));
+    a.schedule_prefill(48, &mgr).expect("a prefill schedule");
+    a.apply_prefill(42, &mgr).expect("a prefill apply");
+    a.release().expect("a release");
+
+    // Base model (no adapter): same tokens, different salt — zero hits.
+    let mut base = mgr.new_request(prompt.clone(), 4, None);
+    assert_eq!(
+        base.match_and_add_prefix(&mgr).expect("base match"),
+        0,
+        "base request must not reuse KV computed under adapter 'a'"
+    );
+
+    // Different adapter: same tokens — zero hits.
+    let mut b = mgr.new_request(prompt.clone(), 4, Some("b"));
+    assert_eq!(
+        b.match_and_add_prefix(&mgr).expect("b match"),
+        0,
+        "adapter 'b' must not reuse KV computed under adapter 'a'"
+    );
+
+    // Same adapter: hits, capped to leave the last block for prefill
+    // ((48-1)/16 = 2 blocks = 32 tokens).
+    let mut a2 = mgr.new_request(prompt, 4, Some("a"));
+    assert_eq!(a2.match_and_add_prefix(&mgr).expect("a2 match"), 32);
 }

@@ -5355,6 +5355,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cudarc",
+ "dynamo-kv-hashing",
  "half",
  "kvbm-logical",
  "pegainfer-kernels",

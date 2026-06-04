@@ -10,6 +10,7 @@ Last touched: 2026-06
 - Matching is full-block only (block = 16 tokens), keyed on kvbm `SequenceHash` (positional lineage hash of token content). Partial tail blocks never match.
 - **Full-block cap**: `SchedulableSequence::match_and_add_prefix` caps matches at `(num_input_tokens - 1) / block_size` — a fully-cached prompt still recomputes ≥ 1 token (vLLM does the same). Without the cap the schedule/apply state machine deadlocks: prefill is "complete" with no forward pass to emit the first token, and the dangling-block count is wrong.
 - **Echo requests skip matching** — prompt logprobs need every position forwarded.
+- **LoRA-scoped**: the active adapter name is folded into the block-hash chain as a salt (`compute_salt_hash`, upstream router-parity recipe), so KV computed under one adapter (or the base model) never matches a request running under another. Same tokens + same adapter still share.
 - Eviction safety: matched blocks are held as `ImmutableBlock` (strong Arc) in the sequence's assignments for the request lifetime; the inactive-pool LRU cannot reclaim them mid-request.
 - Toggle: `Qwen3Executor::set_prefix_cache_enabled(false)` — used by tests that need cold determinism; there is no server flag.
 
