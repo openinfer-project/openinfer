@@ -25,6 +25,9 @@ jobs:
           toolchain: nightly
           components: rustfmt, clippy
 
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Check formatting
         run: cargo fmt --all --check
 
