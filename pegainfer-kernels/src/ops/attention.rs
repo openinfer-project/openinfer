@@ -304,8 +304,9 @@ impl PrefillPagedPlan {
 
 /// Per-layer paged prefill: QK norm + RoPE, append K/V to paged, batch prefill attention.
 ///
-/// Supports both single-request and multi-request plans. For single-request,
-/// uses scalar start_pos for RoPE. For multi-request, uses per-token positions.
+/// Token positions (RoPE, scatter, attention) come from the plan's per-token
+/// position array, so chunked or prefix-cached prefill (start > 0) works for
+/// any batch size.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_paged_into(
     ctx: &DeviceContext,
@@ -324,7 +325,6 @@ pub fn prefill_attention_paged_into(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    start_pos: usize,
     rms_eps: f32,
 ) -> Result<()> {
     let total_tokens = plan.total_tokens;
@@ -359,41 +359,26 @@ pub fn prefill_attention_paged_into(
     let stream = ctx.stream.cu_stream();
 
     unsafe {
-        if plan.batch_size == 1 {
-            // Single-request: scalar start_pos (no GPU positions array needed)
-            ffi::prefill_qk_norm_rope_only_cuda(
-                q_ptr as *mut ffi::Half,
-                k_ptr as *mut ffi::Half,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                total_tokens as i32,
-                start_pos as i32,
-                rms_eps,
-                stream,
-            );
-        } else {
-            // Multi-request: per-token positions from plan
-            ffi::qk_norm_rope_batched_decode_cuda(
-                q_ptr as *mut ffi::Half,
-                k_ptr as *mut ffi::Half,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                pos_ptr as *const i32,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                total_tokens as i32,
-                rms_eps,
-                stream,
-            );
-        }
+        // RoPE positions always come from the plan's per-token array — it is
+        // the single source of truth for each token's absolute position. A
+        // scalar-start_pos fast path for batch_size == 1 used to live here;
+        // it silently rotated prefix-cache-hit suffixes from position 0 and
+        // both entry points launch the same kernel anyway.
+        ffi::qk_norm_rope_batched_decode_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            total_tokens as i32,
+            rms_eps,
+            stream,
+        );
 
         let src_stride_n = kv_dim as i64;
         let src_stride_h = head_dim as i64;

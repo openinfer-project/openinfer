@@ -610,23 +610,6 @@ unsafe extern "C" {
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;
 
-    // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
-    pub fn prefill_qk_norm_rope_only_cuda(
-        q_batch: *mut Half,
-        k_batch: *mut Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        start_pos: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    );
-
     // Qwen3.5 full-attention prefill prep: Q/K norm + partial RoPE + KV cache write.
     pub fn prefill_attention_hd256_prep_cuda(
         q_full_batch: *const Half,

@@ -156,6 +156,9 @@ struct Stats {
     argmax_violations: Vec<String>,
     head_deltas: Vec<f32>, // |pega - HF| logprob on the head tokens
     worst: Option<(f32, usize, usize, u32, f32, f32)>, // delta, seq, pos, token, pega, hf
+    /// Prompt tokens served from the prefix cache, summed over all prefills.
+    /// Zero when caching is disabled; the cached-replay passes assert it is not.
+    cached_tokens: usize,
 }
 
 /// Fold one position into `stats`. `hf` and `pega` are top-K `(token, logprob)`,
@@ -315,6 +318,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
             })
             .expect("prefill");
         for (i, &s) in seqs.iter().enumerate() {
+            stats.cached_tokens += pr.requests[i].cached_tokens;
             fold(
                 &mut stats,
                 s,
@@ -352,6 +356,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
                     echo: false,
                 })
                 .expect("prefill");
+            stats.cached_tokens += pr.requests[0].cached_tokens;
             fold(
                 &mut stats,
                 seq,
@@ -444,6 +449,10 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     {
         let mut ex =
             Qwen3Executor::from_runtime(&model_path, false, &[0]).expect("build eager executor");
+        // The determinism and isolation passes need bit-replayable prefill: a
+        // prefix-cache hit shrinks the prefill GEMM to the uncached suffix,
+        // which drifts logits by bf16 ULPs. Caching gets its own pass below.
+        ex.set_prefix_cache_enabled(false);
 
         // bs=1 sequential over *every* golden sequence — this is the breadth of
         // the prompt/length coverage (one request's KV at a time, so it scales to
@@ -468,6 +477,24 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
         let n = BUCKET_STRADDLES[0];
         let (batched, _) = run(&golden, &mut ex, &all[..n], true);
         report_and_assert(&format!("batched eager ({n}, no pad)"), &batched);
+
+        // Prefix-cached replay. Every block is already registered (the runs
+        // above register blocks even with matching disabled), so these rerun
+        // with warm caches: prefill skips the cached prefix and attention spans
+        // cached KV + recomputed suffix (kv_len > q_len). Same HF tolerances —
+        // a wrong RoPE offset, mask, or stale page would blow far past them.
+        ex.set_prefix_cache_enabled(true);
+        let (cached, _) = run(&golden, &mut ex, &all, false);
+        assert!(
+            cached.cached_tokens > 0,
+            "cached replay matched no prefix blocks — the cache path was not exercised"
+        );
+        report_and_assert("sequential bs=1 eager cached replay", &cached);
+        let (cached_batched, _) = run(&golden, &mut ex, &all[..n], true);
+        report_and_assert(
+            &format!("batched eager cached replay ({n})"),
+            &cached_batched,
+        );
     }
 
     // CUDA-graph decode is captured per bucket and pads the batch up to it, so
@@ -476,9 +503,21 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     {
         let mut ex = Qwen3Executor::from_runtime(&model_path, true, &[0])
             .expect("build cuda-graph executor");
+        ex.set_prefix_cache_enabled(false);
         for n in BUCKET_STRADDLES {
             let (batched, _) = run(&golden, &mut ex, &all[..n], true);
             report_and_assert(&format!("batched cuda-graph ({n} padded)"), &batched);
         }
+
+        // Graph decode over shared cached pages: the captured graph reads page
+        // tables that now point at blocks written by earlier requests.
+        ex.set_prefix_cache_enabled(true);
+        let n = BUCKET_STRADDLES[1];
+        let (cached, _) = run(&golden, &mut ex, &all[..n], true);
+        assert!(
+            cached.cached_tokens > 0,
+            "cuda-graph cached replay matched no prefix blocks"
+        );
+        report_and_assert(&format!("batched cuda-graph cached replay ({n})"), &cached);
     }
 }

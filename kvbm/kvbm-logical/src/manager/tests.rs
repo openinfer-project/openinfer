@@ -2584,6 +2584,7 @@ mod race_regression_tests {
 // `#[should_panic]` mismatch flags the regression.
 // ============================================================================
 
+#[cfg(debug_assertions)]
 mod lock_order_enforcement_tests {
     use tracing_mutex::parkinglot::Mutex;
 
@@ -2593,6 +2594,12 @@ mod lock_order_enforcement_tests {
     /// real locks use under `#[cfg(test)]`. The DAG must detect the
     /// cycle and panic. Failing this test means lock-order
     /// enforcement is no longer in place crate-wide.
+    ///
+    /// Debug-only: `tracing_mutex::parkinglot::Mutex` is a plain
+    /// parking_lot mutex in release builds (no DAG, no panic), so the
+    /// `#[should_panic]` expectation can only hold under
+    /// `debug_assertions` — exactly where the enforcement it guards
+    /// exists.
     #[test]
     #[should_panic(expected = "Found cycle in mutex dependency graph")]
     fn deliberate_inversion_is_caught_by_tracing_mutex_dag() {

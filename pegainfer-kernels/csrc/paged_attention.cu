@@ -315,7 +315,7 @@ int paged_kv_scatter_cuda(
 //
 // Reads Q from col-major [q_dim, seq_len] layout (= HiddenStates).
 // Reads K/V from paged layout (page-first, NHD within each block).
-// No RoPE inside (caller does RoPE beforehand via prefill_qk_norm_rope_only_cuda).
+// No RoPE inside (caller does RoPE beforehand via qk_norm_rope_batched_decode_cuda).
 // Causal mask, no split-KV (partition_kv=false).
 //
 // Plan metadata (request_indices, qo_tile_indices, etc.) is pre-computed by Rust

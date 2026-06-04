@@ -410,15 +410,22 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
     /// Match and add prefix blocks from the manager's pools.
     ///
     /// Advances `prefill_position` by `matched_blocks * block_size`.
+    ///
+    /// Matching is capped so at least one input token remains uncached:
+    /// the final prefill chunk must run to emit the first generated token,
+    /// and a full-prompt match would otherwise leave the state machine
+    /// with prefill complete but zero dangling tokens — no legal next step.
     pub fn match_and_add_prefix(
         &mut self,
         manager: &BlockManager<T>,
     ) -> Result<usize, ScheduleError> {
         self.require_idle()?;
 
+        let bs = self.inner.block_size();
+        let max_blocks = self.inner.num_input_tokens().saturating_sub(1) / bs;
         let count = self
             .inner
-            .match_and_add_prefix(manager)
+            .match_and_add_prefix(manager, max_blocks)
             .unwrap_or_else(|_| panic!("prefix match should not produce duplicates"));
 
         if count > 0 {
@@ -1834,6 +1841,39 @@ mod tests {
         assert_eq!(seq.assigned_blocks(), 2);
         assert_eq!(seq.unassigned_blocks(), 0); // no gen block
         assert_eq!(seq.tail_tokens(), 1);
+    }
+
+    #[test]
+    fn test_match_and_add_prefix_full_match_keeps_one_prefill_token() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let tokens = make_tokens(8); // exactly 2 full blocks
+
+        // Populate cache with ALL blocks of the prompt.
+        let seq_for_populate = crate::BlockSequence::new(tokens.clone(), BLOCK_SIZE, None);
+        let mutables = manager.allocate_blocks(2).unwrap();
+        let registered: Vec<_> = mutables
+            .into_iter()
+            .zip(seq_for_populate.blocks().iter())
+            .map(|(m, tb)| manager.register_block(m.complete(tb).unwrap()))
+            .collect();
+        drop(registered);
+
+        let mut seq = SchedulableSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, noop_delegate());
+        // Cap: (8 - 1) / 4 = 1 block, even though 2 would match.
+        let matched = seq.match_and_add_prefix(&manager).unwrap();
+        assert_eq!(matched, 1);
+        assert_eq!(seq.prefill_position(), 4);
+        assert!(!seq.is_prefill_complete());
+
+        // The remaining block prefills normally and can emit a token.
+        seq.schedule_prefill(4, &manager).unwrap();
+        seq.apply_prefill(Some(1000), &manager).unwrap();
+        assert!(seq.is_prefill_complete());
+        assert_eq!(seq.tail_tokens(), 1);
+
+        // Decode proceeds — the state machine is not bricked.
+        seq.schedule_decode(&manager).unwrap();
+        seq.apply_decode(100, &manager).unwrap();
     }
 
     #[test]

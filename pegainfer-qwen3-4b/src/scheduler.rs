@@ -765,6 +765,7 @@ mod tests {
                         first_token: 100 + req.request_id.get() as u32,
                         first_token_logprob: None,
                         prompt_logprobs: None,
+                        cached_tokens: 0,
                     })
                     .collect(),
             })
@@ -844,6 +845,7 @@ mod tests {
                         first_token: 100 + req.request_id.get() as u32,
                         first_token_logprob: None,
                         prompt_logprobs: None,
+                        cached_tokens: 0,
                     })
                     .collect(),
                 decode_requests: plan

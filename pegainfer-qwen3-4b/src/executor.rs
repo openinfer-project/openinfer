@@ -36,6 +36,10 @@ pub struct PrefillStepItem {
     pub(crate) logprobs: usize,
     pub(crate) echo: bool,
     pub(crate) random_val: f32,
+    /// Leading prompt tokens whose KV came from the prefix cache.
+    /// Set by the executor after matching; the forward pass only computes
+    /// the remaining suffix.
+    pub(crate) cached_tokens: usize,
 }
 
 impl PrefillStepItem {
@@ -56,11 +60,17 @@ impl PrefillStepItem {
             logprobs,
             echo,
             random_val,
+            cached_tokens: 0,
         }
     }
 
+    /// Prompt tokens that still need prefill (cached prefix excluded).
     fn as_slice(&self) -> &[u32] {
-        &self.prompt_tokens
+        &self.prompt_tokens[self.cached_tokens..]
+    }
+
+    fn suffix_len(&self) -> usize {
+        self.prompt_tokens.len() - self.cached_tokens
     }
 }
 
@@ -134,12 +144,13 @@ fn build_prefill_request_results(
         } else {
             None
         };
-        token_offset += req.prompt_tokens.len();
+        token_offset += req.suffix_len();
         outputs.push(PrefillRequestResult {
             request_id: req.request_id,
             first_token,
             first_token_logprob,
             prompt_logprobs,
+            cached_tokens: req.cached_tokens,
         });
     }
     Ok(outputs)
@@ -359,6 +370,8 @@ pub struct PrefillRequestResult {
     pub first_token: u32,
     pub first_token_logprob: Option<TokenLogprob>,
     pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
+    /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
+    pub cached_tokens: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +445,7 @@ pub struct Qwen3Executor {
     primary: RankWorker,
     workers: Vec<RankWorker>,
     loaded_lora_adapters: HashSet<String>,
+    prefix_cache_enabled: bool,
 }
 
 impl Qwen3Executor {
@@ -463,6 +477,7 @@ impl Qwen3Executor {
             )?,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
+            prefix_cache_enabled: true,
         })
     }
 
@@ -576,6 +591,7 @@ impl Qwen3Executor {
             primary,
             workers,
             loaded_lora_adapters: HashSet::new(),
+            prefix_cache_enabled: true,
         })
     }
 
@@ -613,6 +629,13 @@ impl Qwen3Executor {
 
     pub fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
         <Self as ModelExecutor>::activate_lora_adapter(self, adapter)
+    }
+
+    /// Prefix caching is on by default; tests that assert bit-identical
+    /// replay disable it (a cache hit changes prefill GEMM shapes, which
+    /// drifts logits by bf16 ULPs).
+    pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
+        self.prefix_cache_enabled = enabled;
     }
 
     fn wait_for_step_ack(
@@ -709,28 +732,33 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        // 1. Create RequestKvs and schedule prefill
-        for req in plan.requests {
+        // 1. Create RequestKvs, reuse cached prefix blocks, schedule the rest
+        let mut requests = plan.requests.to_vec();
+        for req in &mut requests {
             let mut rkv = self
                 .kv_mgr
                 .new_request(req.prompt_tokens.clone(), req.max_output_tokens);
-            rkv.schedule_prefill(req.prompt_tokens.len(), &self.kv_mgr)
+            // Echo needs logits for every prompt position; cached positions
+            // are never forwarded, so echo requests prefill from scratch.
+            if self.prefix_cache_enabled && !req.echo {
+                req.cached_tokens = rkv.match_and_add_prefix(&self.kv_mgr)?;
+            }
+            rkv.schedule_prefill(req.suffix_len(), &self.kv_mgr)
                 .map_err(|e| {
                     anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
                 })?;
             self.request_kvs.insert(req.request_id, rkv);
         }
 
-        // 2. Build KvViews
-        let kv_views: Vec<KvView> = plan
-            .requests
+        // 2. Build KvViews (seq_len = cached prefix + new suffix)
+        let kv_views: Vec<KvView> = requests
             .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.prompt_tokens.len()))
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.suffix_len()))
             .collect();
 
         // 3. Execute forward
         let step = StepCommand::Prefill {
-            requests: plan.requests.to_vec(),
+            requests,
             kv_views,
             echo: plan.echo,
         };
@@ -805,12 +833,17 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        // 1. Create RequestKvs for prefill requests and schedule
-        for req in plan.prefill_requests {
+        // 1. Create RequestKvs for prefill requests, reuse cached prefix
+        // blocks, and schedule the rest
+        let mut prefill_requests = plan.prefill_requests.to_vec();
+        for req in &mut prefill_requests {
             let mut rkv = self
                 .kv_mgr
                 .new_request(req.prompt_tokens.clone(), req.max_output_tokens);
-            rkv.schedule_prefill(req.prompt_tokens.len(), &self.kv_mgr)
+            if self.prefix_cache_enabled && !req.echo {
+                req.cached_tokens = rkv.match_and_add_prefix(&self.kv_mgr)?;
+            }
+            rkv.schedule_prefill(req.suffix_len(), &self.kv_mgr)
                 .map_err(|e| {
                     anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
                 })?;
@@ -829,10 +862,9 @@ impl ModelExecutor for Qwen3Executor {
         }
 
         // 2. Build KvViews
-        let prefill_kv_views: Vec<KvView> = plan
-            .prefill_requests
+        let prefill_kv_views: Vec<KvView> = prefill_requests
             .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.prompt_tokens.len()))
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.suffix_len()))
             .collect();
         let decode_kv_views: Vec<KvView> = plan
             .decode_requests
@@ -842,7 +874,7 @@ impl ModelExecutor for Qwen3Executor {
 
         // 3. Execute forward
         let step = StepCommand::Unified {
-            prefill_requests: plan.prefill_requests.to_vec(),
+            prefill_requests,
             prefill_kv_views,
             decode_requests: plan.decode_requests.to_vec(),
             decode_kv_views,

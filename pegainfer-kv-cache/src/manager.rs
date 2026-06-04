@@ -121,6 +121,23 @@ pub struct RequestKv {
 }
 
 impl RequestKv {
+    // ── Prefix cache ───────────────────────────────────────────────────
+
+    /// Match the prompt's full blocks against registered blocks and skip
+    /// their prefill. Returns the number of cached tokens; `kv_position()`
+    /// advances by the same amount. Must be called on a fresh request,
+    /// before the first `schedule_prefill`.
+    ///
+    /// Matching always leaves at least one prompt token uncached so the
+    /// final prefill chunk can emit the first generated token.
+    pub fn match_and_add_prefix(&mut self, manager: &KvCacheManager) -> anyhow::Result<usize> {
+        let blocks = self
+            .seq
+            .match_and_add_prefix(&manager.block_manager)
+            .map_err(|e| anyhow::anyhow!("match_and_add_prefix: {e}"))?;
+        Ok(blocks * self.seq.block_size())
+    }
+
     // ── Scheduling (allocates blocks) ──────────────────────────────────
 
     pub fn schedule_prefill(

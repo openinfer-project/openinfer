@@ -207,6 +207,7 @@ fn build_prefill_items(
                 logprobs: r.logprobs,
                 echo: r.echo,
                 random_val: rand::RngExt::random(rng),
+                cached_tokens: 0,
             }
         })
         .collect()

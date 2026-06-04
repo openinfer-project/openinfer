@@ -760,7 +760,6 @@ impl AttentionPrefillCase {
             NUM_QO_HEADS,
             NUM_KV_HEADS,
             HEAD_DIM,
-            0,
             1.0e-6,
         )
     }
@@ -806,42 +805,24 @@ impl AttentionPrefillCase {
         let (cos_ptr, _cos_guard) = self.cos_cache.data.device_ptr(&self.ctx.stream);
         let (sin_ptr, _sin_guard) = self.sin_cache.data.device_ptr(&self.ctx.stream);
 
+        let (positions_ptr, _positions_guard) =
+            self.plan.positions_d().device_ptr(&self.ctx.stream);
         unsafe {
-            if self.plan.batch_size() == 1 {
-                ffi::prefill_qk_norm_rope_only_cuda(
-                    q_ptr as *mut ffi::Half,
-                    k_ptr as *mut ffi::Half,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    NUM_QO_HEADS as i32,
-                    NUM_KV_HEADS as i32,
-                    HEAD_DIM as i32,
-                    total_tokens as i32,
-                    0,
-                    1.0e-6,
-                    self.ctx.stream.cu_stream(),
-                );
-            } else {
-                let (positions_ptr, _positions_guard) =
-                    self.plan.positions_d().device_ptr(&self.ctx.stream);
-                ffi::qk_norm_rope_batched_decode_cuda(
-                    q_ptr as *mut ffi::Half,
-                    k_ptr as *mut ffi::Half,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    positions_ptr as *const i32,
-                    NUM_QO_HEADS as i32,
-                    NUM_KV_HEADS as i32,
-                    HEAD_DIM as i32,
-                    total_tokens as i32,
-                    1.0e-6,
-                    self.ctx.stream.cu_stream(),
-                );
-            }
+            ffi::qk_norm_rope_batched_decode_cuda(
+                q_ptr as *mut ffi::Half,
+                k_ptr as *mut ffi::Half,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                positions_ptr as *const i32,
+                NUM_QO_HEADS as i32,
+                NUM_KV_HEADS as i32,
+                HEAD_DIM as i32,
+                total_tokens as i32,
+                1.0e-6,
+                self.ctx.stream.cu_stream(),
+            );
         }
     }
 

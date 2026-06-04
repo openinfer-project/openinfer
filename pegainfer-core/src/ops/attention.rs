@@ -28,7 +28,6 @@ pub fn prefill_attention_paged_into(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    start_pos: usize,
     rms_eps: f32,
 ) -> Result<()> {
     pegainfer_kernels::ops::prefill_attention_paged_into(
@@ -48,7 +47,6 @@ pub fn prefill_attention_paged_into(
         num_q_heads,
         num_kv_heads,
         head_dim,
-        start_pos,
         rms_eps,
     )
 }

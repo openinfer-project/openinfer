@@ -159,7 +159,7 @@
 
 ### Step 12: Split prefill stages
 - Treated `prefill_attention_paged_into` as a wrapper over three separately measurable kernel stages:
-  - `prefill_qk_norm_rope`: `prefill_qk_norm_rope_only_cuda`
+  - `prefill_qk_norm_rope`: `qk_norm_rope_batched_decode_cuda` (per-token positions; the scalar `prefill_qk_norm_rope_only_cuda` wrapper was removed with the prefix-cache RoPE fix)
   - `prefill_kv_scatter`: `paged_kv_scatter_cuda`
   - `prefill_attention_core`: `batch_prefill_paged_cuda`
 - Added `PrefillStage` launch paths in `kernel_bench.rs`. For stage reports, prerequisites run outside the timed/profiled launch and then L2 is swept before the measured stage. This keeps each stage report tied to one target kernel while still preparing valid inputs.

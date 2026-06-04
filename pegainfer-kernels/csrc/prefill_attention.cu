@@ -94,40 +94,11 @@ __global__ void prefill_qk_norm_rope_kernel(
 extern "C" {
 
 // ============================================================================
-// C API: QK norm + RoPE only (no cache write).
+// Batched QK norm + RoPE with per-token positions from a GPU array.
 //
-// Same as prefill_attention_prep_cuda but skips the KV cache write kernel.
-// Used when KV is written to paged layout separately (via AppendPagedKVCache).
-// ============================================================================
-void prefill_qk_norm_rope_only_cuda(
-    __nv_bfloat16* q_batch,          // [q_dim, seq_len] modified in-place (normed+RoPE'd)
-    __nv_bfloat16* k_batch,          // [kv_dim, seq_len] modified in-place (normed+RoPE'd)
-    const __nv_bfloat16* q_norm_weight,
-    const __nv_bfloat16* k_norm_weight,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int seq_len,
-    int start_pos,
-    float rms_eps,
-    cudaStream_t stream
-) {
-    int q_dim = num_q_heads * head_dim;
-    int kv_dim = num_kv_heads * head_dim;
-
-    dim3 norm_grid(num_q_heads + num_kv_heads, seq_len);
-    prefill_qk_norm_rope_kernel<<<norm_grid, head_dim, 0, stream>>>(
-        q_batch, k_batch, q_norm_weight, k_norm_weight,
-        cos_cache, sin_cache,
-        num_q_heads, num_kv_heads, head_dim,
-        seq_len, q_dim, kv_dim, start_pos, /*start_pos_d=*/nullptr, rms_eps
-    );
-}
-
-// ============================================================================
-// Batched QK norm + RoPE for decode: per-request positions from GPU array.
+// Serves both decode (one token per request) and paged prefill (the plan's
+// positions array carries each token's absolute position, so requests
+// resuming from a cached prefix rotate at their true offsets).
 //
 // Q layout: [q_dim, batch_size], K layout: [kv_dim, batch_size]
 // Grid: (num_q_heads + num_kv_heads, batch_size), Block: head_dim

@@ -42,7 +42,7 @@
 //! // total_tokens=8, num_blocks=2, nothing allocated yet
 //!
 //! // 2. Prefix match against the cache
-//! let matched_count = seq.match_and_add_prefix(&manager).unwrap();
+//! let matched_count = seq.match_and_add_prefix(&manager, usize::MAX).unwrap();
 //!
 //! // 3. Allocate blocks for the rest
 //! let remaining = seq.num_blocks() - matched_count;
@@ -176,6 +176,11 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// sequence. Combines [`match_prefix`](Self::match_prefix) and
     /// [`add_matched_blocks`](Self::add_matched_blocks).
     ///
+    /// At most `max_blocks` matched blocks are added; the rest are dropped
+    /// (their `ImmutableBlock` handles return to the pools via RAII).
+    /// Callers that drive a prefill protocol use this to keep at least one
+    /// input token uncached so the final prefill chunk can emit a token.
+    ///
     /// # Panics
     ///
     /// Panics if the sequence already has assigned blocks (i.e. this is
@@ -183,12 +188,14 @@ impl<T: BlockMetadata> RequestSequence<T> {
     pub fn match_and_add_prefix(
         &mut self,
         manager: &BlockManager<T>,
+        max_blocks: usize,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         assert!(
             self.assignments.is_empty(),
             "match_and_add_prefix called on sequence with existing assignments"
         );
-        let matched = self.match_prefix(manager);
+        let mut matched = self.match_prefix(manager);
+        matched.truncate(max_blocks);
         if matched.is_empty() {
             return Ok(0);
         }
@@ -563,7 +570,7 @@ mod tests {
     ) -> Option<RequestSequence<TestMeta>> {
         let mut seq = RequestSequence::new(tokens, max_output_tokens, block_size);
         let completed_blocks = seq.num_blocks();
-        let matched_count = seq.match_and_add_prefix(manager).ok()?;
+        let matched_count = seq.match_and_add_prefix(manager, usize::MAX).ok()?;
         let remaining_complete = completed_blocks - matched_count;
         let needs_generation = max_output_tokens > 0;
         let total_to_allocate = remaining_complete + usize::from(needs_generation);
@@ -864,7 +871,7 @@ mod tests {
         drop(registered);
 
         let mut seq = RequestSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE);
-        let matched_count = seq.match_and_add_prefix(&manager).unwrap();
+        let matched_count = seq.match_and_add_prefix(&manager, usize::MAX).unwrap();
         assert_eq!(matched_count, 1);
         assert_eq!(seq.prefix_matched_blocks(), 1);
 

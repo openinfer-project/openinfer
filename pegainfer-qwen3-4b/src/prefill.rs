@@ -81,7 +81,6 @@ impl Qwen3Model {
         layer_idx: usize,
         layer: &TransformerBlock,
         hidden: &mut HiddenStates,
-        start_pos: usize,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &pegainfer_core::kv_pool::KvLayout,
         plan: &PrefillPagedPlan,
@@ -182,7 +181,6 @@ impl Qwen3Model {
             num_heads,
             num_kv_heads,
             head_dim,
-            start_pos,
             self.config.rms_norm_eps,
         )?;
 
@@ -410,7 +408,6 @@ impl Qwen3Model {
                 layer_idx,
                 layer,
                 &mut hidden,
-                0, // start_pos unused for multi-request (plan has per-token positions)
                 kv_buffer,
                 layout,
                 plan,
