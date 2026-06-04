@@ -46,11 +46,14 @@ fn apply_default_module_levels(mut filter: String) -> String {
     filter
 }
 
+fn resolved_filter_string(level: String, rust_log: Option<String>) -> String {
+    apply_default_module_levels(rust_log.unwrap_or(level))
+}
+
 fn init(config: LoggingConfig) {
     INIT.call_once(|| {
         let LoggingConfig { level, colored } = config;
-        let filter_str =
-            std::env::var("RUST_LOG").unwrap_or_else(|_| apply_default_module_levels(level));
+        let filter_str = resolved_filter_string(level, std::env::var("RUST_LOG").ok());
         let filter =
             logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str)
                 .build();
@@ -78,13 +81,35 @@ fn init(config: LoggingConfig) {
     });
 }
 
-pub fn init_stderr(level: &str) {
-    init(LoggingConfig {
-        level: level.to_string(),
-        colored: false,
-    });
-}
-
 pub fn init_default() {
     init(LoggingConfig::default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolved_filter_string;
+
+    #[test]
+    fn applies_default_noisy_module_levels_when_rust_log_is_debug() {
+        let filter = resolved_filter_string("info".to_string(), Some("debug".to_string()));
+
+        assert!(filter.starts_with("debug"));
+        assert!(filter.contains("h2=warn"));
+        assert!(filter.contains("hyper=warn"));
+        assert!(filter.contains("hyper_util=warn"));
+        assert!(filter.contains("axum=warn"));
+        assert!(filter.contains("tower=warn"));
+    }
+
+    #[test]
+    fn preserves_explicit_module_overrides_from_rust_log() {
+        let filter = resolved_filter_string("info".to_string(), Some("debug,h2=trace".to_string()));
+
+        assert!(filter.starts_with("debug,h2=trace"));
+        assert!(filter.contains("hyper=warn"));
+        assert!(filter.contains("hyper_util=warn"));
+        assert!(filter.contains("axum=warn"));
+        assert!(filter.contains("tower=warn"));
+        assert!(!filter.contains("h2=warn"));
+    }
 }
