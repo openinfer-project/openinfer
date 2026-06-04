@@ -60,7 +60,7 @@ PR #196 extends attribution for the same direct diagnostic shapes. The latest A8
 
 In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, a manual same-model snapshot was collected with `vllm bench serve` concurrency pressure `1`, `4`, and `8`.
 
-This table is retained only to document the current gap. It is not a completed fair production-serving parity claim, and `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal PegaInfer batch size.
+This table is retained only to document the current gap. It is not evidence of a complete, fair production-serving parity comparison, and `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal PegaInfer batch size.
 
 | Engine | Mode | conc=1 TPOT ms | conc=4 TPOT ms | conc=8 TPOT ms | Output tok/s at 1/4/8 |
 | --- | --- | ---: | ---: | ---: | --- |
