@@ -415,6 +415,11 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_lora_default_rank_is_64() {
+        assert_eq!(Qwen3LoraOptions::default().max_lora_rank, 64);
+    }
+
+    #[test]
     fn rejects_unsupported_max_lora_rank() {
         let error = parse_max_lora_rank_arg("7").expect_err("rank should be unsupported");
 

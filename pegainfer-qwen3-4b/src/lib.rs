@@ -28,7 +28,7 @@ pub struct Qwen3LoraOptions {
 
 impl Qwen3LoraOptions {
     pub const DEFAULT_MAX_LORAS: usize = 1;
-    pub const DEFAULT_MAX_LORA_RANK: usize = 16;
+    pub const DEFAULT_MAX_LORA_RANK: usize = 64;
     pub const SUPPORTED_MAX_LORA_RANKS: [usize; 9] = [1, 8, 16, 32, 64, 128, 256, 320, 512];
 
     pub fn validate(self) -> Result<Self> {

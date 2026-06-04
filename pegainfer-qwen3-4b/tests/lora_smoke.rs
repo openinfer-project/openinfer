@@ -88,16 +88,17 @@ fn temp_adapter_dir() -> PathBuf {
     path
 }
 
-fn write_zero_lora_adapter(path: &Path, config: &ModelConfig) {
-    let rank = 1;
+fn write_zero_lora_adapter(path: &Path, config: &ModelConfig, rank: usize) {
     fs::write(
         path.join("adapter_config.json"),
-        r#"{
+        format!(
+            r#"{{
   "peft_type": "LORA",
-  "r": 1,
-  "lora_alpha": 1,
+  "r": {rank},
+  "lora_alpha": {rank},
   "target_modules": ["q_proj", "v_proj"]
-}"#,
+}}"#
+        ),
     )
     .expect("write adapter_config.json");
 
@@ -145,12 +146,12 @@ fn tensor_name(layer_idx: usize, path_segment: &str, lora_side: &str) -> String 
     format!("base_model.model.model.layers.{layer_idx}.{path_segment}.{lora_side}.weight")
 }
 
-fn load_adapter(handle: &EngineHandle, adapter_path: PathBuf) {
+fn load_adapter(handle: &EngineHandle, adapter_name: &str, adapter_path: PathBuf) {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build runtime")
         .block_on(handle.load_lora_adapter(LoadLoraAdapterRequest {
-            lora_name: "zero-smoke".to_string(),
+            lora_name: adapter_name.to_string(),
             lora_path: adapter_path,
             load_inplace: false,
         }))
@@ -197,6 +198,16 @@ fn generate_tokens(
 #[test]
 #[ignore = "requires Qwen3-4B weights and a CUDA GPU"]
 fn qwen3_lora_loads_adapter_and_generates() {
+    qwen3_lora_loads_rank_and_generates(1, "zero-smoke");
+}
+
+#[test]
+#[ignore = "requires Qwen3-4B weights and a CUDA GPU"]
+fn qwen3_lora_loads_rank64_adapter_and_generates() {
+    qwen3_lora_loads_rank_and_generates(64, "zero-rank64-smoke");
+}
+
+fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
     let model_path = get_model_path();
     let config = load_model_config(&model_path);
     assert!(
@@ -205,7 +216,7 @@ fn qwen3_lora_loads_adapter_and_generates() {
     );
 
     let adapter_path = temp_adapter_dir();
-    write_zero_lora_adapter(&adapter_path, &config);
+    write_zero_lora_adapter(&adapter_path, &config, rank);
 
     let handle = pegainfer_qwen3_4b::start_engine_with_lora_control(
         Path::new(&model_path),
@@ -221,7 +232,7 @@ fn qwen3_lora_loads_adapter_and_generates() {
     .expect("start LoRA-capable Qwen3 engine");
 
     assert!(handle.supports_lora_control());
-    load_adapter(&handle, adapter_path);
+    load_adapter(&handle, adapter_name, adapter_path);
 
     let tokenizer = common::load_tokenizer(&model_path);
     let (tokens, finish_reason) = generate_tokens(
@@ -229,7 +240,7 @@ fn qwen3_lora_loads_adapter_and_generates() {
         &tokenizer,
         "Hello",
         4,
-        Some("zero-smoke".to_string()),
+        Some(adapter_name.to_string()),
     );
     assert!(
         !tokens.is_empty(),
