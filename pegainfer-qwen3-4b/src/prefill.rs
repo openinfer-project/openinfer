@@ -4,7 +4,7 @@ use half::bf16;
 
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::lora::{LoraTokenRange, build_lora_token_ranges};
+use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_token_groups};
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
@@ -84,7 +84,7 @@ impl Qwen3Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &pegainfer_core::kv_pool::KvLayout,
         plan: &PrefillPagedPlan,
-        lora_ranges: &[LoraTokenRange<'_>],
+        lora_groups: &[DeviceLoraTokenGroup<'_>],
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {
         let num_heads = self.local_num_attention_heads();
@@ -113,7 +113,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.q_proj.as_ref(),
             &bufs.normed,
             &mut bufs.q_batch,
@@ -129,7 +129,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.k_proj.as_ref(),
             &bufs.normed,
             &mut bufs.k_batch,
@@ -145,7 +145,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.v_proj.as_ref(),
             &bufs.normed,
             &mut bufs.v_batch,
@@ -182,7 +182,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.o_proj.as_ref(),
             &bufs.attn_output,
             &mut bufs.o_buf,
@@ -220,7 +220,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.gate_proj.as_ref(),
             &bufs.normed,
             &mut bufs.gate_out,
@@ -228,7 +228,7 @@ impl Qwen3Model {
         )?;
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.up_proj.as_ref(),
             &bufs.normed,
             &mut bufs.up_out,
@@ -243,7 +243,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.down_proj.as_ref(),
             &bufs.act_out,
             &mut bufs.o_buf,
@@ -305,6 +305,7 @@ impl Qwen3Model {
         let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
         let lora_ranges =
             build_lora_token_ranges(seq_lens.iter().copied(), lora_adapters.iter().copied());
+        let lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
         let start_positions: Vec<usize> = kv_views
             .iter()
             .zip(prompts.iter())
@@ -333,7 +334,7 @@ impl Qwen3Model {
 
         // Forward through all layers
         let hidden =
-            self.process_all_layers_batch_multi(hidden, layout, kv_buffer, &plan, &lora_ranges)?;
+            self.process_all_layers_batch_multi(hidden, layout, kv_buffer, &plan, &lora_groups)?;
 
         // All-position logits for echo (before we extract last-token logits)
         let all_logits = if echo {
@@ -368,7 +369,7 @@ impl Qwen3Model {
         layout: &KvLayout,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         plan: &PrefillPagedPlan,
-        lora_ranges: &[LoraTokenRange<'_>],
+        lora_groups: &[DeviceLoraTokenGroup<'_>],
     ) -> Result<HiddenStates> {
         let total_tokens = hidden.seq_len;
         let inter_dim = self.local_intermediate_size();
@@ -392,7 +393,7 @@ impl Qwen3Model {
                 kv_buffer,
                 layout,
                 plan,
-                lora_ranges,
+                lora_groups,
                 &mut bufs,
             )?;
         }

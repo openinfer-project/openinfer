@@ -9,9 +9,8 @@ use super::config::{Config, TensorParallelConfig};
 use std::collections::HashMap;
 
 use crate::lora::{
-    DeviceLoraAdapter, DeviceLoraLayer, DeviceLoraProjection, LoraProjectionKind, LoraTokenRange,
-    apply_lora_projection_delta_indexed, apply_lora_projection_delta_range,
-    group_lora_token_ranges,
+    DeviceLoraAdapter, DeviceLoraLayer, DeviceLoraProjection, DeviceLoraTokenGroup,
+    LoraProjectionKind, apply_lora_projection_delta_indexed, apply_lora_projection_delta_range,
 };
 use half::bf16;
 use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
@@ -647,13 +646,13 @@ impl Qwen3Model {
     pub(crate) fn apply_lora_projection_ranges(
         &self,
         layer_idx: usize,
-        ranges: &[LoraTokenRange<'_>],
+        groups: &[DeviceLoraTokenGroup<'_>],
         projection: impl for<'a> Fn(&'a DeviceLoraLayer) -> Option<&'a DeviceLoraProjection>,
         input: &HiddenStates,
         out: &mut HiddenStates,
         row_offset: usize,
     ) -> Result<()> {
-        for group in group_lora_token_ranges(ranges) {
+        for group in groups {
             let Some((layer, scale)) = self.lora_layer_for(group.adapter, layer_idx) else {
                 anyhow::bail!("Qwen3 LoRA adapter {} is not loaded", group.adapter);
             };
@@ -671,21 +670,18 @@ impl Qwen3Model {
                         scale,
                     )?;
                 } else {
-                    let mut token_indices = Vec::with_capacity(group.token_count);
-                    for grouped_range in group.ranges {
-                        token_indices.extend(
-                            (grouped_range.token_offset
-                                ..grouped_range.token_offset + grouped_range.token_len)
-                                .map(|idx| idx as i32),
-                        );
-                    }
+                    let token_indices_d = group
+                        .token_indices_d
+                        .as_ref()
+                        .expect("non-contiguous LoRA token group must have device indices");
                     apply_lora_projection_delta_indexed(
                         &self.ctx,
                         projection,
                         input,
                         out,
                         row_offset,
-                        &token_indices,
+                        token_indices_d,
+                        group.token_count,
                         scale,
                     )?;
                 }

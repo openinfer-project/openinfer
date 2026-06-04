@@ -26,7 +26,7 @@ __device__ __forceinline__ float block_reduce_sum(float value,
 }
 
 static size_t lora_rank_smem_bytes(int rank) {
-  int floats = rank == 1 ? 32 : rank;
+  int floats = rank < 32 ? 32 : rank;
   return static_cast<size_t>(floats) * sizeof(float);
 }
 

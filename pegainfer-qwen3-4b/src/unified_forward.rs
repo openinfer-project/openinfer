@@ -11,7 +11,7 @@ use half::bf16;
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::lora::{LoraTokenRange, build_lora_token_ranges};
+use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_token_groups};
 use pegainfer_core::ffi;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
@@ -113,6 +113,7 @@ impl Qwen3Model {
                 range
             }),
         );
+        let lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
 
         // ── 1. Concatenate all tokens and get embeddings ──────────────
         let mut all_tokens: Vec<u32> = Vec::with_capacity(total_tokens);
@@ -175,7 +176,7 @@ impl Qwen3Model {
             &positions_d,
             &prefill_plan,
             &decode_meta,
-            &lora_ranges,
+            &lora_groups,
             kv_buffer,
             layout,
         )?;
@@ -224,7 +225,7 @@ impl Qwen3Model {
         positions_d: &CudaSlice<i32>,
         prefill_plan: &PrefillPagedPlan,
         decode_meta: &DecodeAttentionMeta,
-        lora_ranges: &[LoraTokenRange<'_>],
+        lora_groups: &[DeviceLoraTokenGroup<'_>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
     ) -> Result<HiddenStates> {
@@ -253,7 +254,7 @@ impl Qwen3Model {
                 positions_d,
                 prefill_plan,
                 decode_meta,
-                lora_ranges,
+                lora_groups,
                 kv_buffer,
                 layout,
             )?;
@@ -274,7 +275,7 @@ impl Qwen3Model {
         positions_d: &CudaSlice<i32>,
         prefill_plan: &PrefillPagedPlan,
         decode_meta: &DecodeAttentionMeta,
-        lora_ranges: &[LoraTokenRange<'_>],
+        lora_groups: &[DeviceLoraTokenGroup<'_>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
     ) -> Result<()> {
@@ -312,7 +313,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.q_proj.as_ref(),
             &bufs.normed,
             &mut bufs.q_batch,
@@ -328,7 +329,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.k_proj.as_ref(),
             &bufs.normed,
             &mut bufs.k_batch,
@@ -344,7 +345,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.v_proj.as_ref(),
             &bufs.normed,
             &mut bufs.v_batch,
@@ -581,7 +582,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.o_proj.as_ref(),
             &bufs.attn_output,
             &mut bufs.o_buf,
@@ -617,7 +618,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.gate_proj.as_ref(),
             &bufs.normed,
             &mut bufs.gate_out,
@@ -625,7 +626,7 @@ impl Qwen3Model {
         )?;
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.up_proj.as_ref(),
             &bufs.normed,
             &mut bufs.up_out,
@@ -640,7 +641,7 @@ impl Qwen3Model {
         );
         self.apply_lora_projection_ranges(
             layer_idx,
-            lora_ranges,
+            lora_groups,
             |layer| layer.down_proj.as_ref(),
             &bufs.act_out,
             &mut bufs.o_buf,

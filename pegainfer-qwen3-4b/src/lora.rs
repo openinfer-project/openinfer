@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+use cudarc::driver::CudaSlice;
 use half::{bf16, f16};
 use pegainfer_core::ops;
 use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
@@ -142,6 +143,13 @@ pub(crate) struct LoraTokenGroup<'a> {
     pub(crate) token_count: usize,
 }
 
+pub(crate) struct DeviceLoraTokenGroup<'a> {
+    pub(crate) adapter: &'a str,
+    pub(crate) ranges: Vec<&'a LoraTokenRange<'a>>,
+    pub(crate) token_count: usize,
+    pub(crate) token_indices_d: Option<CudaSlice<i32>>,
+}
+
 pub(crate) fn build_lora_token_ranges<'a>(
     seq_lens: impl IntoIterator<Item = usize>,
     adapters: impl IntoIterator<Item = Option<&'a str>>,
@@ -190,6 +198,39 @@ pub(crate) fn group_lora_token_ranges<'a>(
         }
     }
     groups
+}
+
+pub(crate) fn prepare_lora_token_groups<'a>(
+    ctx: &DeviceContext,
+    ranges: &'a [LoraTokenRange<'a>],
+) -> Result<Vec<DeviceLoraTokenGroup<'a>>> {
+    let mut prepared = Vec::new();
+    for group in group_lora_token_ranges(ranges) {
+        let token_indices_d = if group.ranges.len() == 1 {
+            None
+        } else {
+            let mut token_indices = Vec::with_capacity(group.token_count);
+            for grouped_range in &group.ranges {
+                token_indices.extend(
+                    (grouped_range.token_offset
+                        ..grouped_range.token_offset + grouped_range.token_len)
+                        .map(|idx| idx as i32),
+                );
+            }
+            Some(
+                ctx.stream
+                    .clone_htod(&token_indices)
+                    .map_err(|e| anyhow::anyhow!("LoRA indexed token copy failed: {e}"))?,
+            )
+        };
+        prepared.push(DeviceLoraTokenGroup {
+            adapter: group.adapter,
+            ranges: group.ranges,
+            token_count: group.token_count,
+            token_indices_d,
+        });
+    }
+    Ok(prepared)
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,25 +397,15 @@ pub(crate) fn apply_lora_projection_delta_indexed(
     input: &HiddenStates,
     out: &mut HiddenStates,
     row_offset: usize,
-    token_indices: &[i32],
+    token_indices_d: &CudaSlice<i32>,
+    token_count: usize,
     scale: f32,
 ) -> Result<()> {
-    if token_indices.is_empty() {
+    if token_count == 0 {
         return Ok(());
     }
-    let token_indices_d = ctx
-        .stream
-        .clone_htod(token_indices)
-        .map_err(|e| anyhow::anyhow!("LoRA indexed token copy failed: {e}"))?;
-    let token_count = token_indices.len();
     let mut compact_input = HiddenStates::zeros(ctx, input.hidden_dim, token_count)?;
-    ops::gather_hidden_tokens_into(
-        ctx,
-        input,
-        &token_indices_d,
-        token_count,
-        &mut compact_input,
-    )?;
+    ops::gather_hidden_tokens_into(ctx, input, token_indices_d, token_count, &mut compact_input)?;
 
     let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_count)?;
     ops::gemm_into_checked(ctx, &projection.a, &compact_input, &mut rank_out)?;
@@ -384,7 +415,7 @@ pub(crate) fn apply_lora_projection_delta_indexed(
         ctx,
         &delta,
         scale,
-        &token_indices_d,
+        token_indices_d,
         token_count,
         out,
         row_offset,
@@ -1019,6 +1050,32 @@ mod tests {
         assert_eq!(groups[1].adapter, "adapter-b");
         assert_eq!(groups[1].token_count, 3);
         assert_eq!(groups[1].ranges.len(), 1);
+    }
+
+    #[test]
+    fn prepares_indexed_lora_ranges_once_per_adapter_group() {
+        let Ok(ctx) = DeviceContext::new() else {
+            eprintln!("skipping CUDA test");
+            return;
+        };
+        let ranges = build_lora_token_ranges(
+            [2usize, 3, 1, 4],
+            [
+                Some("adapter-a"),
+                Some("adapter-b"),
+                Some("adapter-a"),
+                None,
+            ],
+        );
+
+        let groups = prepare_lora_token_groups(&ctx, &ranges).expect("prepare LoRA token groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].adapter, "adapter-a");
+        assert_eq!(groups[0].token_count, 3);
+        assert!(groups[0].token_indices_d.is_some());
+        assert_eq!(groups[1].adapter, "adapter-b");
+        assert_eq!(groups[1].token_count, 3);
+        assert!(groups[1].token_indices_d.is_none());
     }
 
     #[test]
