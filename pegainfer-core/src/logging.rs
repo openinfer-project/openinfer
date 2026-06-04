@@ -54,9 +54,7 @@ fn init(config: LoggingConfig) {
     INIT.call_once(|| {
         let LoggingConfig { level, colored } = config;
         let filter_str = resolved_filter_string(level, std::env::var("RUST_LOG").ok());
-        let filter =
-            logforth::filter::env_filter::EnvFilterBuilder::from_env_or("RUST_LOG", filter_str)
-                .build();
+        let filter = logforth::filter::env_filter::EnvFilterBuilder::from_spec(filter_str).build();
 
         let mut builder = logforth::starter_log::builder();
         if colored {
