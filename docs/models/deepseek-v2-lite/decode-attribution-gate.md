@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite EP2 Decode Attribution Gate
 
-> **TL;DR:** DeepSeek-V2-Lite now has a narrow EP2 decode attribution report for the same correctness shape as the HF gate and the true-batch benchmark follow-up: `prompt="Hello"`, `output_len=16`, `batch-size=1/4/8`, host-staged backend, and NCCL backend. The report combines CPU-side attribution, selected CUDA event timing, optional NVTX ranges, and route/transfer counts; it is evidence for the next bottleneck decision, not a throughput or production EP claim.
+> **TL;DR:** DeepSeek-V2-Lite now has a narrow EP2 decode attribution report for the same correctness shape as the HF gate and the true-batch benchmark follow-up: `prompt="Hello"`, `output_len=16`, `batch-size=1/4/8`, host-staged backend, and NCCL backend. The report combines CPU-side attribution, selected CUDA event timing, optional NVTX ranges, route/transfer counts, and a fail-closed CUDA Graph readiness section; it is evidence for the next bottleneck decision, not a throughput or production EP claim.
 >
 > **Status:** Passing for the covered EP2 `Hello` / 16-token host-staged and NCCL attribution gate. The batch attribution mode is diagnostic and uses the same-prompt, fixed-length shape as the direct benchmark path.
 
@@ -34,7 +34,8 @@ Out of scope:
 - `gpu_timing`, `by_gpu_section`, and `by_gpu_call_site` with CUDA event timing for selected GPU/NCCL stream sections, plus a `failure_count` for event-timing failures that did not replace the token/text hash oracle;
 - `by_section`, `by_op`, and `by_call_site` rollups in the same vocabulary family as the Qwen3 model report;
 - `coverage` rows that distinguish CPU section timing, selected GPU event timing, optional NVTX ranges, and unclaimed throughput;
-- `ep` counters for host-staged dispatch/combine and NCCL dense exchange/combine plus local/remote route counts.
+- `ep` counters for host-staged dispatch/combine and NCCL dense exchange/combine plus local/remote route counts;
+- `cuda_graph_readiness` with backend, batch size, fail-closed blockers, route/collective metrics, and an optional NCCL graph smoke result.
 
 Host-staged `dispatch_calls` / `combine_calls` count MoE layer invocations in the fixed greedy run. Host-staged `dispatch_elements` / `combine_elements` count selected routed hidden vectors, so the value is route count times hidden size. NCCL `exchange` and `combine` counters count the dense all-reduce calls and elements used by the current naive NCCL gate.
 
@@ -108,6 +109,21 @@ done
 
 For an Nsight Systems pass, run the same attribution command under the profiler and set `PEGAINFER_DSV2_LITE_NVTX=1`; the JSON `coverage` row then records `nvtx_ranges=emitted`. The NVTX labels are correlation markers for the selected GPU/NCCL sections, not timing evidence by themselves. Their wall-clock span can include CPU-side wrapper work, event setup, and synchronization around the section, so compare JSON `by_gpu_*` rows only with CUDA event timing, not with raw NVTX range duration.
 
+To inspect the CUDA Graph readiness boundary for the current NCCL backend, run the attribution binary with the optional smoke flag:
+
+```bash
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --release -p pegainfer-deepseek-v2-lite \
+  --features deepseek-v2-lite \
+  --bin dsv2_lite_ep2_decode_attribution \
+  -- --model-path models/DeepSeek-V2-Lite \
+  --batch-size 1 \
+  --nccl-graph-smoke \
+  --out target/accuracy/dsv2-lite-ep2/nccl-graph-smoke.json
+```
+
+The smoke uses one preallocated f32 NCCL all-reduce over the existing two rank streams. With `--nccl-graph-smoke`, the command exits non-zero unless capture, replay, and verification all pass. Passing proves only basic collective capture/replay in this runtime. It does not prove full decode CUDA Graph coverage.
+
 ## Environment Notes
 
 The NCCL path depends on a runtime that supports the selected GPU. On newer GPUs, older NCCL runtimes may fail communicator initialization before the model-level comparison runs, for example with a shared-memory init error like:
@@ -123,7 +139,7 @@ The HF oracle needs a Python environment that can load DeepSeek-V2-Lite with `tr
 
 ## Latest Validation
 
-The full gate was last rerun on 2026-05-30 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x A800-SXM4-80GB. The token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model directory as the Rust E2E and attribution gates.
+The strict same-host accuracy gate was last rerun on 2026-06-04 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x A800-SXM4-80GB. The token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model directory as the Rust E2E gate.
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, but the comparison gate remains stricter: HF, host-staged, and NCCL JSON must be dumped from the same model/runtime and compared with `--require-all-exact`. This refresh does not claim a model-runtime improvement, a manual-loop root cause, or a transport issue.
 
@@ -131,6 +147,17 @@ The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for thi
 - Token SHA256: `d05a7b0f0ac6435fb51040582a337d8b6d72844dd61194daa1b3090fa0e16ce8`.
 - Text SHA256: `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6`.
 - Generated text: `, I am a 20 year old female and I have been having a`.
+
+The graph-readiness diagnostic was rerun on 2026-06-04 on the same model snapshot and 2x A800-SXM4-80GB:
+
+- `full_decode_capture_ready=false`;
+- `status=blocked_full_decode_path`;
+- NCCL blockers reported: per-call dense-exchange allocation/sync, host-side route iteration, host-side contribution accumulation, combine H2D copy, combine allocation, combine sync, and combine D2H copy;
+- optional `nccl_cuda_graph_smoke=captured_replayed_verified`;
+- smoke capture mode: `thread_local`;
+- smoke result: `captured=true`, `replayed=true`, `verified=true`, `rank0_value=3.0`, `rank1_value=3.0`, with no `capture_error`, `replay_error`, or `verification_error`.
+
+The attribution table below is the retained 2026-05-30 batch `1/4/8` diagnostic snapshot.
 
 | Backend | Batch | Decode steps | Mean shared decode us | GPU event samples | GPU failures | Route / collective counters |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |

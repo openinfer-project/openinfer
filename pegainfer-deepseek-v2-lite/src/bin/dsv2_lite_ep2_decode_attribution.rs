@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use pegainfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
+use pegainfer_deepseek_v2_lite::{DecodeGraphReadinessReport, DeepSeekV2LiteEp2Generator};
 use pegainfer_engine::engine::EngineLoadOptions;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
 struct Cli {
     model_path: String,
     batch_size: usize,
+    nccl_graph_smoke: bool,
     out: Option<PathBuf>,
 }
 
@@ -66,7 +67,15 @@ fn main() -> Result<()> {
     let report = if cli.batch_size == 1 {
         let (result, attribution) =
             generator.generate_greedy_with_attribution(&prompt_tokens, OUTPUT_LEN, false)?;
-        single_report(&tokenizer, &prompt_tokens, result, attribution)?
+        let graph_readiness =
+            generator.decode_graph_readiness_report(&result.stats, 1, cli.nccl_graph_smoke)?;
+        single_report(
+            &tokenizer,
+            &prompt_tokens,
+            result,
+            attribution,
+            graph_readiness,
+        )?
     } else {
         let (result, attribution) = generator.generate_greedy_batch_same_prompt_with_attribution(
             &prompt_tokens,
@@ -74,7 +83,18 @@ fn main() -> Result<()> {
             OUTPUT_LEN,
             true,
         )?;
-        batch_report(&tokenizer, &prompt_tokens, result, attribution)?
+        let graph_readiness = generator.decode_graph_readiness_report(
+            &result.stats,
+            cli.batch_size,
+            cli.nccl_graph_smoke,
+        )?;
+        batch_report(
+            &tokenizer,
+            &prompt_tokens,
+            result,
+            attribution,
+            graph_readiness,
+        )?
     };
 
     let text = serde_json::to_string_pretty(&report)?;
@@ -96,6 +116,7 @@ fn single_report(
     prompt_tokens: &[u32],
     result: pegainfer_deepseek_v2_lite::GenerationResult,
     attribution: pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+    graph_readiness: DecodeGraphReadinessReport,
 ) -> Result<Value> {
     let generated_text = tokenizer
         .decode(&result.tokens, false)
@@ -164,8 +185,9 @@ fn single_report(
         "by_call_site": attribution.by_call_site(),
         "by_gpu_section": by_gpu_section,
         "by_gpu_call_site": by_gpu_call_site,
-        "coverage": coverage_rows(&result.stats.ep_backend, 1, &attribution),
+        "coverage": coverage_rows(&result.stats.ep_backend, 1, &attribution, &graph_readiness),
         "ep": ep_report(&result.stats),
+        "cuda_graph_readiness": graph_readiness,
         "claim_boundary": "Attribution only for the covered EP2 Hello/16 decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
     }))
 }
@@ -175,6 +197,7 @@ fn batch_report(
     prompt_tokens: &[u32],
     result: pegainfer_deepseek_v2_lite::BatchedGenerationResult,
     attribution: pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+    graph_readiness: DecodeGraphReadinessReport,
 ) -> Result<Value> {
     ensure!(
         result.per_token_decode_us == attribution.per_token_decode_us(),
@@ -267,8 +290,9 @@ fn batch_report(
         "by_call_site": attribution.by_call_site(),
         "by_gpu_section": by_gpu_section,
         "by_gpu_call_site": by_gpu_call_site,
-        "coverage": coverage_rows(&result.stats.ep_backend, result.tokens.len(), &attribution),
+        "coverage": coverage_rows(&result.stats.ep_backend, result.tokens.len(), &attribution, &graph_readiness),
         "ep": ep_report(&result.stats),
+        "cuda_graph_readiness": graph_readiness,
         "claim_boundary": "Attribution only for the covered EP2 Hello/16 same-prompt batched decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
     }))
 }
@@ -276,6 +300,7 @@ fn batch_report(
 fn parse_cli() -> Result<Cli> {
     let mut model_path = "models/DeepSeek-V2-Lite".to_string();
     let mut batch_size = 1;
+    let mut nccl_graph_smoke = false;
     let mut out = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -301,20 +326,24 @@ fn parse_cli() -> Result<Cli> {
                     args.next().context("--out requires a path argument")?,
                 ));
             }
+            "--nccl-graph-smoke" => {
+                nccl_graph_smoke = true;
+            }
             "-h" | "--help" => {
                 println!(
-                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with PEGAINFER_DSV2_LITE_EP_BACKEND=nccl."
+                    "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--nccl-graph-smoke] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with PEGAINFER_DSV2_LITE_EP_BACKEND=nccl. Use --nccl-graph-smoke to run a preallocated f32 NCCL all-reduce CUDA Graph capture/replay smoke after attribution."
                 );
                 std::process::exit(0);
             }
             other => bail!(
-                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --out PATH"
+                "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --nccl-graph-smoke, --out PATH"
             ),
         }
     }
     Ok(Cli {
         model_path,
         batch_size,
+        nccl_graph_smoke,
         out,
     })
 }
@@ -373,6 +402,7 @@ fn coverage_rows(
     backend: &str,
     batch_size: usize,
     attribution: &pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+    graph_readiness: &DecodeGraphReadinessReport,
 ) -> Vec<Value> {
     vec![
         json!({
@@ -404,6 +434,16 @@ fn coverage_rows(
             "item": "throughput_or_production_ep_readiness",
             "status": "not_claimed",
             "source": format!("batch={batch_size} prompt=Hello output_len=16 diagnostic gate only"),
+        }),
+        json!({
+            "item": "full_decode_cuda_graph_capture",
+            "status": if graph_readiness.full_decode_capture_ready() { "ready" } else { "blocked" },
+            "source": format!("{} blocker(s) reported by the DeepSeek-V2-Lite EP2 graph-readiness diagnostic", graph_readiness.blocker_count()),
+        }),
+        json!({
+            "item": "nccl_cuda_graph_smoke",
+            "status": graph_readiness.nccl_graph_smoke_status(),
+            "source": "optional preallocated f32 NCCL all-reduce capture/replay smoke; this is not full decode graph coverage",
         }),
     ]
 }

@@ -13,6 +13,7 @@ Last touched: 2026-06
 | HF token/text/hash gate | Available | PR #154 establishes the HF / host-staged / NCCL comparison; PR #176 refreshes it to Transformers `generate(..., use_cache=true)`. |
 | Decode attribution | Available | PR #162 and PR #169 add CPU/GPU attribution, route counts, NCCL counters, CUDA event timing, and optional NVTX correlation. |
 | Direct same-prompt diagnostic batch | Available | PR #184 and PR #196 cover batch sizes `1`, `4`, and `8` for the fixed same-prompt direct path. |
+| NCCL CUDA Graph readiness | Diagnostic only | The attribution binary now emits `cuda_graph_readiness`. Current NCCL full decode capture is blocked; the optional preallocated f32 NCCL graph smoke captures, replays, and verifies. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
 | vLLM production parity | Not claimed | The manual vLLM snapshot below is for understanding the gap requested in issue #170. |
 
@@ -97,6 +98,8 @@ Do not claim:
 ## Next Gates
 
 Issue #205 records the model roadmap. Maintainer feedback there calls out NCCL plus CUDA Graph as the likely best decode direction, with host staging possibly deprecated later. Treat that as a future direction, not as current evidence.
+
+The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. A basic preallocated f32 NCCL all-reduce smoke now captures, replays, and verifies on the latest A800 run, but that proves only the collective smoke shape. It is not full decode CUDA Graph coverage. HF, host-staged, and NCCL remain token/text exact for the narrow greedy gate.
 
 The next implementation should be chosen from measured evidence:
 

@@ -6,12 +6,19 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use cudarc::{
-    driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUstream},
+    driver::{
+        CudaSlice, DevicePtr, DevicePtrMut,
+        sys::{
+            CUdeviceptr, CUgraph, CUgraphExec, CUstream,
+            CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        },
+    },
     nccl::sys::{ncclComm_t, ncclDataType_t, ncclRedOp_t, ncclResult_t},
 };
 use half::bf16;
 use libloading::Library;
 use pegainfer_core::tensor::{DeviceContext, HiddenStates};
+use serde::Serialize;
 
 use crate::device::activate;
 
@@ -35,6 +42,50 @@ type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 pub(crate) struct NaiveNcclEp2Backend {
     lib: Arc<RawNcclLib>,
     comms: Vec<ncclComm_t>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct NcclGraphSmokeReport {
+    attempted: bool,
+    captured: bool,
+    replayed: bool,
+    verified: bool,
+    count: usize,
+    expected_sum: f32,
+    rank0_value: Option<f32>,
+    rank1_value: Option<f32>,
+    capture_error: Option<String>,
+    replay_error: Option<String>,
+    verification_error: Option<String>,
+    capture_mode: &'static str,
+}
+
+impl NcclGraphSmokeReport {
+    pub(crate) fn coverage_status(&self) -> &'static str {
+        if self.verified {
+            "captured_replayed_verified"
+        } else if self.replayed {
+            "replayed_but_not_verified"
+        } else if self.captured {
+            "captured_but_not_replayed"
+        } else {
+            "failed"
+        }
+    }
+
+    pub(crate) fn verified(&self) -> bool {
+        self.verified
+    }
+
+    pub(crate) fn failure_summary(&self) -> String {
+        format!(
+            "status={}, capture_error={:?}, replay_error={:?}, verification_error={:?}",
+            self.coverage_status(),
+            self.capture_error,
+            self.replay_error,
+            self.verification_error
+        )
+    }
 }
 
 struct RawNcclLib {
@@ -222,6 +273,147 @@ impl NaiveNcclEp2Backend {
         Ok(())
     }
 
+    pub(crate) fn graph_smoke_all_reduce_f32(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+    ) -> NcclGraphSmokeReport {
+        let mut report = NcclGraphSmokeReport {
+            attempted: true,
+            captured: false,
+            replayed: false,
+            verified: false,
+            count: 1,
+            expected_sum: 3.0,
+            rank0_value: None,
+            rank1_value: None,
+            capture_error: None,
+            replay_error: None,
+            verification_error: None,
+            capture_mode: "thread_local",
+        };
+
+        if let Err(err) = self.graph_smoke_all_reduce_f32_inner(rank0, rank1, &mut report) {
+            let message = format!("{err:#}");
+            if report.captured {
+                report.replay_error = Some(message);
+            } else {
+                report.capture_error = Some(message);
+            }
+        }
+        report
+    }
+
+    fn graph_smoke_all_reduce_f32_inner(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        report: &mut NcclGraphSmokeReport,
+    ) -> Result<()> {
+        activate(rank0)?;
+        let rank0_send = rank0.stream.clone_htod(&[1.0f32])?;
+        let mut rank0_recv = rank0.stream.alloc_zeros::<f32>(report.count)?;
+        activate(rank1)?;
+        let rank1_send = rank1.stream.clone_htod(&[2.0f32])?;
+        let mut rank1_recv = rank1.stream.alloc_zeros::<f32>(report.count)?;
+        rank0.sync()?;
+        rank1.sync()?;
+
+        let rank0_stream = rank0.stream.clone();
+        let rank1_stream = rank1.stream.clone();
+        let (rank0_send_ptr, rank0_send_guard) = rank0_send.device_ptr(&rank0_stream);
+        let (rank0_recv_ptr, rank0_recv_guard) = rank0_recv.device_ptr_mut(&rank0_stream);
+        let (rank1_send_ptr, rank1_send_guard) = rank1_send.device_ptr(&rank1_stream);
+        let (rank1_recv_ptr, rank1_recv_guard) = rank1_recv.device_ptr_mut(&rank1_stream);
+
+        let graph0;
+        let graph1;
+        let mut rank0_capture_started = false;
+        let mut rank1_capture_started = false;
+        let capture_result = (|| -> Result<(RawCudaGraph, RawCudaGraph)> {
+            begin_capture(rank0.stream.cu_stream(), "rank0")?;
+            rank0_capture_started = true;
+            begin_capture(rank1.stream.cu_stream(), "rank1")?;
+            rank1_capture_started = true;
+
+            self.grouped(
+                "DeepSeek-V2-Lite NCCL graph smoke all-reduce capture",
+                || {
+                    self.all_reduce_f32_raw(
+                        0,
+                        rank0_send_ptr,
+                        rank0_recv_ptr,
+                        report.count,
+                        rank0.stream.cu_stream(),
+                        "DeepSeek-V2-Lite NCCL graph smoke rank0 all-reduce",
+                    )?;
+                    self.all_reduce_f32_raw(
+                        1,
+                        rank1_send_ptr,
+                        rank1_recv_ptr,
+                        report.count,
+                        rank1.stream.cu_stream(),
+                        "DeepSeek-V2-Lite NCCL graph smoke rank1 all-reduce",
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            let captured0 = end_capture(rank0.stream.cu_stream(), "rank0")?;
+            rank0_capture_started = false;
+            let captured1 = end_capture(rank1.stream.cu_stream(), "rank1")?;
+            rank1_capture_started = false;
+            report.captured = true;
+            let graph0 = captured0.instantiate("rank0")?;
+            let graph1 = captured1.instantiate("rank1")?;
+            Ok((graph0, graph1))
+        })();
+
+        match capture_result {
+            Ok((captured0, captured1)) => {
+                graph0 = captured0;
+                graph1 = captured1;
+            }
+            Err(err) => {
+                cleanup_capture(rank0, rank0_capture_started);
+                cleanup_capture(rank1, rank1_capture_started);
+                return Err(err);
+            }
+        }
+
+        graph0
+            .launch(rank0.stream.cu_stream(), "rank0")
+            .context("launch captured rank0 NCCL CUDA Graph")?;
+        graph1
+            .launch(rank1.stream.cu_stream(), "rank1")
+            .context("launch captured rank1 NCCL CUDA Graph")?;
+        report.replayed = true;
+        rank0.sync()?;
+        rank1.sync()?;
+        drop(rank0_send_guard);
+        drop(rank0_recv_guard);
+        drop(rank1_send_guard);
+        drop(rank1_recv_guard);
+
+        activate(rank0)?;
+        let rank0_values = rank0.stream.clone_dtoh(&rank0_recv)?;
+        rank0.sync()?;
+        activate(rank1)?;
+        let rank1_values = rank1.stream.clone_dtoh(&rank1_recv)?;
+        rank1.sync()?;
+        report.rank0_value = rank0_values.first().copied();
+        report.rank1_value = rank1_values.first().copied();
+        if rank0_values == [report.expected_sum] && rank1_values == [report.expected_sum] {
+            report.verified = true;
+        } else {
+            report.verification_error = Some(format!(
+                "expected [{expected}], got rank0={rank0_values:?}, rank1={rank1_values:?}",
+                expected = report.expected_sum
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_communicators(&self, expected_ordinals: &[c_int; 2]) -> Result<()> {
         for (rank, expected_ordinal) in expected_ordinals.iter().copied().enumerate() {
             let comm = self.comm(rank)?;
@@ -305,6 +497,38 @@ impl NaiveNcclEp2Backend {
         let status = unsafe {
             // SAFETY: Device pointers come from cudarc allocations and `count`
             // was checked against both buffers before enqueueing the collective.
+            self.enqueue_all_reduce_f32(rank, send_ptr, recv_ptr, count, stream)?
+        };
+        self.lib.check(status, context)
+    }
+
+    fn all_reduce_f32_raw(
+        &self,
+        rank: usize,
+        send_ptr: CUdeviceptr,
+        recv_ptr: CUdeviceptr,
+        count: usize,
+        stream: CUstream,
+        context: &str,
+    ) -> Result<()> {
+        let status = unsafe {
+            // SAFETY: The caller pre-validates that pointers come from live
+            // device allocations with at least `count` f32 elements and keeps
+            // the cudarc access guards alive until capture/enqueue completes.
+            self.enqueue_all_reduce_f32(rank, send_ptr, recv_ptr, count, stream)?
+        };
+        self.lib.check(status, context)
+    }
+
+    unsafe fn enqueue_all_reduce_f32(
+        &self,
+        rank: usize,
+        send_ptr: CUdeviceptr,
+        recv_ptr: CUdeviceptr,
+        count: usize,
+        stream: CUstream,
+    ) -> Result<ncclResult_t> {
+        Ok(unsafe {
             (self.lib.all_reduce)(
                 send_ptr as *const c_void,
                 recv_ptr as *mut c_void,
@@ -314,8 +538,7 @@ impl NaiveNcclEp2Backend {
                 self.comm(rank)?,
                 stream,
             )
-        };
-        self.lib.check(status, context)
+        })
     }
 
     fn comm(&self, rank: usize) -> Result<ncclComm_t> {
@@ -345,6 +568,114 @@ impl NaiveNcclEp2Backend {
         op_result?;
         end_result
     }
+}
+
+fn cleanup_capture(ctx: &DeviceContext, capture_started: bool) {
+    if capture_started {
+        let _ = end_capture(ctx.stream.cu_stream(), "cleanup");
+    }
+}
+
+struct CapturedCudaGraph {
+    graph: CUgraph,
+}
+
+impl CapturedCudaGraph {
+    fn instantiate(mut self, rank_label: &str) -> Result<RawCudaGraph> {
+        let mut exec = ptr::null_mut();
+        let status = unsafe {
+            // SAFETY: `graph` was returned by `cuStreamEndCapture` and is
+            // still owned by this captured graph wrapper.
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut exec, self.graph, 0)
+        };
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS || exec.is_null() {
+            bail!("instantiate CUDA Graph on {rank_label} stream failed with {status:?}");
+        }
+        let graph = self.graph;
+        self.graph = ptr::null_mut();
+        Ok(RawCudaGraph { graph, exec })
+    }
+}
+
+impl Drop for CapturedCudaGraph {
+    fn drop(&mut self) {
+        if !self.graph.is_null() {
+            let _ = unsafe {
+                // SAFETY: Best-effort destruction for an uninstantiated graph
+                // owned by the smoke helper.
+                cudarc::driver::sys::cuGraphDestroy(self.graph)
+            };
+            self.graph = ptr::null_mut();
+        }
+    }
+}
+
+struct RawCudaGraph {
+    graph: CUgraph,
+    exec: CUgraphExec,
+}
+
+impl RawCudaGraph {
+    fn launch(&self, stream: CUstream, label: &str) -> Result<()> {
+        let status = unsafe {
+            // SAFETY: `exec` is instantiated from the graph captured on this
+            // rank stream, and launch is part of the paired NCCL graph smoke.
+            cudarc::driver::sys::cuGraphLaunch(self.exec, stream)
+        };
+        ensure!(
+            status == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "{label}: cuGraphLaunch failed with {status:?}"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for RawCudaGraph {
+    fn drop(&mut self) {
+        if !self.exec.is_null() {
+            let _ = unsafe {
+                // SAFETY: Best-effort destruction for graph exec owned by this
+                // smoke helper.
+                cudarc::driver::sys::cuGraphExecDestroy(self.exec)
+            };
+            self.exec = ptr::null_mut();
+        }
+        if !self.graph.is_null() {
+            let _ = unsafe {
+                // SAFETY: Best-effort destruction for graph owned by this
+                // smoke helper.
+                cudarc::driver::sys::cuGraphDestroy(self.graph)
+            };
+            self.graph = ptr::null_mut();
+        }
+    }
+}
+
+fn begin_capture(stream: CUstream, rank_label: &str) -> Result<()> {
+    let status = unsafe {
+        // SAFETY: `stream` is a live rank stream. This smoke intentionally
+        // avoids context rebinding inside the capture window to match
+        // nccl-tests' per-stream capture shape.
+        cudarc::driver::sys::cuStreamBeginCapture_v2(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+    };
+    ensure!(
+        status == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "begin CUDA Graph capture on {rank_label} stream failed with {status:?}"
+    );
+    Ok(())
+}
+
+fn end_capture(stream: CUstream, rank_label: &str) -> Result<CapturedCudaGraph> {
+    let mut graph = ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: Matches `begin_capture` on the same live rank stream.
+        cudarc::driver::sys::cuStreamEndCapture(stream, &mut graph)
+    };
+    ensure!(
+        status == cudarc::driver::sys::CUresult::CUDA_SUCCESS && !graph.is_null(),
+        "end CUDA Graph capture on {rank_label} stream failed with {status:?}"
+    );
+    Ok(CapturedCudaGraph { graph })
 }
 
 impl Drop for NaiveNcclEp2Backend {

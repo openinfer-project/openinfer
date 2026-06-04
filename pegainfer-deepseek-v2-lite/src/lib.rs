@@ -19,7 +19,8 @@ pub use config::Config;
 use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;
 pub use runtime::{
-    BatchedGenerationResult, DeepSeekV2LiteEp2Generator, GenerationResult, GenerationStats,
+    BatchedGenerationResult, DecodeGraphReadinessReport, DeepSeekV2LiteEp2Generator,
+    GenerationResult, GenerationStats,
 };
 
 pub fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
