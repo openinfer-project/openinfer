@@ -331,14 +331,17 @@ impl NaiveNcclEp2Backend {
         let mut rank0_capture_started = false;
         let mut rank1_capture_started = false;
         let capture_result = (|| -> Result<(RawCudaGraph, RawCudaGraph)> {
+            activate(rank0)?;
             begin_capture(rank0.stream.cu_stream(), "rank0")?;
             rank0_capture_started = true;
+            activate(rank1)?;
             begin_capture(rank1.stream.cu_stream(), "rank1")?;
             rank1_capture_started = true;
 
             self.grouped(
                 "DeepSeek-V2-Lite NCCL graph smoke all-reduce capture",
                 || {
+                    activate(rank0)?;
                     self.all_reduce_f32_raw(
                         0,
                         rank0_send_ptr,
@@ -347,6 +350,7 @@ impl NaiveNcclEp2Backend {
                         rank0.stream.cu_stream(),
                         "DeepSeek-V2-Lite NCCL graph smoke rank0 all-reduce",
                     )?;
+                    activate(rank1)?;
                     self.all_reduce_f32_raw(
                         1,
                         rank1_send_ptr,
@@ -359,12 +363,16 @@ impl NaiveNcclEp2Backend {
                 },
             )?;
 
+            activate(rank0)?;
             let captured0 = end_capture(rank0.stream.cu_stream(), "rank0")?;
             rank0_capture_started = false;
+            activate(rank1)?;
             let captured1 = end_capture(rank1.stream.cu_stream(), "rank1")?;
             rank1_capture_started = false;
             report.captured = true;
+            activate(rank0)?;
             let graph0 = captured0.instantiate("rank0")?;
+            activate(rank1)?;
             let graph1 = captured1.instantiate("rank1")?;
             Ok((graph0, graph1))
         })();
@@ -381,9 +389,11 @@ impl NaiveNcclEp2Backend {
             }
         }
 
+        activate(rank0)?;
         graph0
             .launch(rank0.stream.cu_stream(), "rank0")
             .context("launch captured rank0 NCCL CUDA Graph")?;
+        activate(rank1)?;
         graph1
             .launch(rank1.stream.cu_stream(), "rank1")
             .context("launch captured rank1 NCCL CUDA Graph")?;
@@ -572,6 +582,7 @@ impl NaiveNcclEp2Backend {
 
 fn cleanup_capture(ctx: &DeviceContext, capture_started: bool) {
     if capture_started {
+        let _ = activate(ctx);
         let _ = end_capture(ctx.stream.cu_stream(), "cleanup");
     }
 }
