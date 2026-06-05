@@ -57,7 +57,11 @@ const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
 const KIMI_DECODE_MAX_BATCH: usize = 64;
 const KIMI_DECODE_BATCH_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, KIMI_DECODE_MAX_BATCH];
 const KIMI_DECODE_PAGE_SIZE: usize = 16;
-const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
+// Per-slot page count covers the advertised serving window exactly; the
+// scheduler admission guard and `max_model_len` both derive from the same
+// constant, so an admitted request can never overrun its page range.
+const KIMI_DECODE_PAGES_PER_REQUEST: usize =
+    crate::config::KIMI_K2_SERVING_CONTEXT_TOKENS.div_ceil(KIMI_DECODE_PAGE_SIZE);
 const KIMI_DECODE_ROPE_CACHE_TOKENS: usize = KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

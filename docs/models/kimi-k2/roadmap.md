@@ -1,6 +1,6 @@
 # Kimi-K2 Roadmap
 
-> **TL;DR:** Kimi-K2 decode performance is ahead of vLLM on the same H20 ×8 hardware (TP1+DP8+EP8 service bs64: output `1336 tok/s` vs vLLM `594 tok/s`, TPOT p50 `47.3ms` vs `107.2ms`), but the crate still trails Qwen3-4B on the serving contract and correctness surface: prompts over 2048 tokens overrun the KV arena unchecked, and no accuracy gate is reproducible from a fresh clone. Landed: EOS/stop-token handling (#238) and sampling honor-or-reject (#237, non-greedy rejected at admission, param surface audited in [serving-contract.md](serving-contract.md)). The roadmap sequence is: serving-contract correctness + a git-versioned accuracy gate first, then the TTFT/prefill and HTTP-overhead perf gaps, then the continuous-batching→KV-lifecycle→prefix-cache chain and the PPLX/decode-throughput chain. Findings verified 2026-06-04 against `6ee9247`.
+> **TL;DR:** Kimi-K2 decode performance is ahead of vLLM on the same H20 ×8 hardware (TP1+DP8+EP8 service bs64: output `1336 tok/s` vs vLLM `594 tok/s`, TPOT p50 `47.3ms` vs `107.2ms`), but the crate still trails Qwen3-4B on the serving contract and correctness surface: no accuracy gate is reproducible from a fresh clone. Landed: EOS/stop-token handling (#238), sampling honor-or-reject (#237), and the context-window guard (#239 first half: `max_model_len` advertised as the real 2048 KV window, over-long prompts refused, `max_tokens` clamped) — param surface audited in [serving-contract.md](serving-contract.md). The roadmap sequence is: serving-contract correctness + a git-versioned accuracy gate first, then the TTFT/prefill and HTTP-overhead perf gaps, then the continuous-batching→KV-lifecycle→prefix-cache chain and the PPLX/decode-throughput chain. Findings verified 2026-06-04 against `6ee9247`.
 >
 > **Last touched:** 2026-06
 
@@ -12,7 +12,7 @@ Status ledgers: [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) (active
 | --- | --- | --- | --- |
 | EOS / stop-token detection | ✓ per-step `is_stop_token` | ✓ per-step on both paths, honors `ignore_eos` (issue #238) | `config.rs::load_stop_token_ids`; checks in `runner/scheduler.rs` + `runner/scheduler/dp.rs`; e2e `scripts/e2e_serving_contract.py` |
 | Sampling params | ✓ FlashInfer greedy + non-greedy | ✓ honor-or-reject (#237): greedy honored, non-greedy rejected at admission; param surface audited | `runner/scheduler/lifecycle.rs::finish_unschedulable`; [serving-contract.md](serving-contract.md) |
-| Prompt-length guard | ✓ KV-budget admission rejects impossible requests | ✗ 2048-token arena cap (`worker.rs:60-61`), `append_position` unchecked → silent overrun | `runner/scheduler.rs:148-151` |
+| Prompt-length guard | ✓ KV-budget admission rejects impossible requests | ✓ `max_model_len` advertised as the real 2048 window: HTTP refuses over-long prompts, clamps `max_tokens`; admission guard backstops direct submitters (#239) | `config.rs::KIMI_K2_SERVING_CONTEXT_TOKENS`; `lifecycle.rs::finish_unschedulable`; e2e `scripts/e2e_serving_contract.py` |
 | KV admission control | ✓ full-lifetime budget, deferral, rejection (issue #85 fix) | ✗ slot-count only on both paths | qwen3 `scheduler.rs:478-510` |
 | Continuous batching | ✓ | TP1/DP8: ✓ (`DpCoordinator` per-step admission, waiting queue); TP8/DP1: ✗ strict batch-then-drain | `runner/scheduler/dp.rs:168,189-236` vs `runner/scheduler.rs:140-207` |
 | Prefix cache | ✓ kvbm full-block matching (PR #216) | ✗ fixed per-slot arena, no block table / free pool | `runner/worker/cache.rs:391-396` |
@@ -28,7 +28,7 @@ Status ledgers: [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) (active
 - **TP8+EP8 NCCL (graph path):** bs4 TPOT `14.39ms` synthetic. Wave-batched, reference/history path.
 - **TTFT is the open perf gap:** HTTP decode-heavy bs4 TTFT p50 `313ms` / p99 `4240ms` vs vLLM `69.6/135.4ms` (4.5×/31× worse). Short-prompt streaming TTFT ~`2.0s`.
 - **HTTP vs in-process:** `19.13ms` vs `14.39ms` TPOT at bs4 — ~33% serving overhead, unattributed.
-- No claim of: non-greedy sampling, >2048-token prompts, long-context decode correctness, prefix reuse, multi-node.
+- No claim of: non-greedy sampling, >2048-token prompts (now refused at the HTTP layer instead of accepted-and-corrupted), long-context decode correctness, prefix reuse, multi-node.
 
 ## Sequencing — what blocks what
 
@@ -49,8 +49,8 @@ The engine is fast but does not honor the OpenAI contract it serves. All items a
 
 1. **EOS/stop-token handling.** ✓ Done (issue #238): `config.rs::load_stop_token_ids` (generation_config.json with config.json fallback), per-step checks on both scheduler paths, `ignore_eos` honored end-to-end (also fixed the frontend `convert_sampling` derivation that voided it), `FinishReason::Stop` emitted. Verified on both shapes with `scripts/e2e_serving_contract.py`.
 2. **Sampling params: honor or reject.** ✓ Done (issue #237): non-greedy requests are rejected at scheduler admission with a clear error (the decode path is split-vocab argmax and cannot sample); the full OpenAI param surface is audited in [serving-contract.md](serving-contract.md) — every parameter is honored / rejected / documented-ignored, nothing silent. Real sampling support (full-logits gather + shared FlashInfer ops) is future feature work.
-3. **Prompt-length guard.** Reject prompts whose `prompt + max_tokens` exceeds the 2048-token per-slot arena instead of overrunning KV pages.
-4. **KV admission + abort-on-disconnect.** Port the qwen3 admission pattern (budget, deferral, rejection) to both paths; wire disconnect-abort when the server-wide #215 lands.
+3. **Prompt-length guard.** ✓ Done (issue #239 first half): `max_model_len` is now advertised as the engine's real per-request KV window (`KIMI_K2_SERVING_CONTEXT_TOKENS` = 2048, which also derives the decode page-table geometry), so the HTTP layer refuses over-long prompts with a clear message and clamps `max_tokens` to the remaining window; scheduler admission carries the same guard for direct engine submitters — previously an over-capacity request errored mid-batch, taking every co-scheduled request down with it. Verified with `scripts/e2e_serving_contract.py` (over-long refusal + exact window-saturating clamp).
+4. **KV admission + abort-on-disconnect.** (#239 second half) Port the qwen3 admission pattern (budget, deferral, rejection) to both paths; wire disconnect-abort when the server-wide #215 lands.
 5. **`tests/` directory.** Scheduler-robustness ITs (CPU-runnable: admission, coalesce, slot-lifecycle edges) so the above gets regression coverage. Kimi-K2 is the only model crate without integration tests.
 
 ### Now — M2: accuracy gate in git

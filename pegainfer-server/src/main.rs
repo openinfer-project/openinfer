@@ -231,9 +231,24 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let config_model_len =
+        pegainfer::vllm_frontend::load_max_model_len(&args.model_path).unwrap_or(4096);
+    let max_model_len = match model_type {
+        // Advertise the engine's real per-request KV window, not the model's
+        // trained context: the HTTP layer rejects over-long prompts and clamps
+        // max_tokens against this value (issue #239).
+        #[cfg(feature = "kimi-k2")]
+        ModelType::KimiK2 => {
+            config_model_len.min(pegainfer_kimi_k2::KIMI_K2_SERVING_CONTEXT_TOKENS as u32)
+        }
+        #[cfg(feature = "deepseek-v2-lite")]
+        ModelType::DeepSeekV2Lite => config_model_len,
+        #[cfg(feature = "deepseek-v4")]
+        ModelType::DeepSeekV4 => config_model_len,
+        ModelType::Qwen3 | ModelType::Qwen35 => config_model_len,
+    };
+
     if args.enable_lora {
-        let max_model_len =
-            pegainfer::vllm_frontend::load_max_model_len(&args.model_path).unwrap_or(4096);
         pegainfer::vllm_frontend::serve_model_with_lora_routes(
             handle,
             args.model_path.to_string_lossy().into_owned(),
@@ -245,11 +260,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
     } else {
-        pegainfer::vllm_frontend::serve(
+        pegainfer::vllm_frontend::serve_model(
             handle,
-            &args.model_path,
-            args.served_model_name.as_deref(),
+            args.model_path.to_string_lossy().into_owned(),
+            args.served_model_name.into_iter().collect(),
             args.port,
+            max_model_len,
             pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
         )
         .await

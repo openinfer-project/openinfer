@@ -28,7 +28,7 @@ mod typed_scratch;
 #[cfg(feature = "kimi-k2")]
 mod weights;
 
-pub use config::{KIMI_K2_LAYERS, probe_config_json};
+pub use config::{KIMI_K2_LAYERS, KIMI_K2_SERVING_CONTEXT_TOKENS, probe_config_json};
 
 #[cfg(feature = "kimi-k2")]
 #[allow(clippy::needless_pass_by_value)]

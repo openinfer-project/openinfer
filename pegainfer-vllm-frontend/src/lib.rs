@@ -434,28 +434,6 @@ impl LocalEngineBridge {
     }
 }
 
-pub async fn serve(
-    handle: EngineHandle,
-    model_path: &Path,
-    served_model_name: Option<&str>,
-    port: u16,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let max_model_len = load_max_model_len(model_path).unwrap_or(4096);
-    serve_model(
-        handle,
-        model_path.to_string_lossy().into_owned(),
-        served_model_name
-            .into_iter()
-            .map(|name| name.to_string())
-            .collect(),
-        port,
-        max_model_len,
-        shutdown,
-    )
-    .await
-}
-
 pub async fn serve_model(
     handle: EngineHandle,
     model_id: impl Into<String>,

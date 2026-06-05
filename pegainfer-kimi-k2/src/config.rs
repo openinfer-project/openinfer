@@ -12,6 +12,14 @@ pub(crate) const KIMI_K2_DENSE_LAYERS: usize = 1;
 pub(crate) const KIMI_K2_MOE_LAYERS: usize = 60;
 const KIMI_K2_MAX_CONTEXT: usize = 262_144;
 
+/// The serving window the engine can actually hold per request: each decode
+/// slot owns a fixed KV page range sized from this value (`runner/worker.rs`).
+/// The model's trained context is [`KIMI_K2_MAX_CONTEXT`]; advertising that
+/// would admit prompts the KV arena cannot store. The server reports this as
+/// `max_model_len` so over-long prompts are refused at the HTTP layer and
+/// `max_tokens` is clamped to the remaining window.
+pub const KIMI_K2_SERVING_CONTEXT_TOKENS: usize = 2048;
+
 pub(crate) const KIMI_K2_HEADS: usize = 64;
 pub(crate) const KIMI_K2_Q_LORA_RANK: usize = 1536;
 const KIMI_K2_KV_LORA_RANK: usize = 512;

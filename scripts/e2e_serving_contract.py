@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """E2E checks for the Kimi-K2 serving contract against a running server.
 
-Three checks through `/v1/completions` (issues #238, #237):
+Five checks through `/v1/completions` (issues #238, #237, #239):
 
 1. EOS stop: the answer must end early with `finish_reason: "stop"` and fewer
    than `max_tokens` completion tokens;
@@ -11,6 +11,11 @@ Three checks through `/v1/completions` (issues #238, #237):
    and produce no completion — silently-greedy output is the one forbidden
    state. (The vllm-server HTTP layer collapses engine rejections into a
    generic 500; the "decodes greedy only" reason appears in the server log.)
+4. over-long prompt: a prompt beyond the advertised context window must be
+   refused with a "maximum context length" error, not overrun the KV arena;
+5. max_tokens clamp: a request asking for more tokens than the window holds
+   must be clamped to `window - prompt_tokens` and run to `length` — proving
+   generation saturates the window without overrunning it.
 
 The default prompt is in Kimi-K2 chat format; pass --prompt for other models.
 
@@ -82,6 +87,7 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--prompt", default=KIMI_PROMPT)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--context-window", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args()
 
@@ -114,6 +120,49 @@ def main() -> int:
         choice.get("text") or "" for choice in sampling_payload.get("choices", [])
     )
 
+    # One word per token is a safe lower bound for simple repeats, so 2x the
+    # window in words is comfortably over it.
+    over_long_prompt = " hello" * (args.context_window * 2)
+    over_long_status, over_long_payload = post_completion(
+        args.base_url,
+        {
+            "model": args.model,
+            "prompt": over_long_prompt,
+            "max_tokens": 8,
+            "temperature": 0.0,
+        },
+        args.timeout,
+    )
+    over_long_body = json.dumps(over_long_payload, ensure_ascii=False)
+    print(f"over-long prompt run: HTTP {over_long_status}")
+    print(f"  body: {over_long_body[:300]}")
+
+    # ~93% of the window in words: repeated " hello" tokenizes to ~1 token/word
+    # for the Kimi tokenizer, and the clamp assertion below self-corrects via
+    # the server-reported prompt_tokens anyway. max_tokens=window forces the
+    # clamp to kick in.
+    near_window_prompt = " hello" * (args.context_window * 15 // 16)
+    clamp_status, clamp_payload = post_completion(
+        args.base_url,
+        {
+            "model": args.model,
+            "prompt": near_window_prompt,
+            "max_tokens": args.context_window,
+            "temperature": 0.0,
+            "ignore_eos": True,
+        },
+        args.timeout,
+    )
+    if clamp_status != 200:
+        raise RuntimeError(f"clamp request failed with HTTP {clamp_status}: {clamp_payload}")
+    clamp_finish = clamp_payload["choices"][0]["finish_reason"]
+    clamp_prompt_tokens = clamp_payload["usage"]["prompt_tokens"]
+    clamp_completion_tokens = clamp_payload["usage"]["completion_tokens"]
+    print(
+        f"clamp run: {clamp_finish}, {clamp_prompt_tokens} prompt + "
+        f"{clamp_completion_tokens} completion tokens"
+    )
+
     ok = True
     ok &= check(
         "EOS stops generation",
@@ -139,6 +188,18 @@ def main() -> int:
         "non-greedy is explicitly rejected",
         sampling_status != 200 and not sampling_text,
         f"HTTP {sampling_status}, generated text: {sampling_text!r}",
+    )
+    ok &= check(
+        "over-long prompt is refused",
+        over_long_status != 200 and "maximum context length" in over_long_body,
+        f"HTTP {over_long_status}",
+    )
+    ok &= check(
+        "max_tokens is clamped to the window",
+        clamp_finish == "length"
+        and clamp_completion_tokens == args.context_window - clamp_prompt_tokens,
+        f"finish_reason={clamp_finish}, {clamp_completion_tokens} == "
+        f"{args.context_window} - {clamp_prompt_tokens}",
     )
     return 0 if ok else 1
 
