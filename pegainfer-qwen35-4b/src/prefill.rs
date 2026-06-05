@@ -17,6 +17,22 @@ use pegainfer_core::kv_cache::KVCache;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::{DeviceVec, HiddenStates};
 
+fn checked_prefill_end_pos(
+    base_pos: usize,
+    seq_len: usize,
+    max_position_embeddings: usize,
+) -> Result<usize> {
+    let end_pos = base_pos.checked_add(seq_len).ok_or_else(|| {
+        anyhow::anyhow!("Qwen3.5 prefill position overflow: base_pos={base_pos}, seq_len={seq_len}")
+    })?;
+    anyhow::ensure!(
+        end_pos <= MAX_SEQ,
+        "Qwen3.5 prefill HND staging supports end_pos <= {MAX_SEQ}, requested end_pos={end_pos}; max_position_embeddings={}",
+        max_position_embeddings
+    );
+    Ok(end_pos)
+}
+
 impl Qwen35Model {
     pub(super) fn prefill_forward(
         &self,
@@ -28,6 +44,9 @@ impl Qwen35Model {
         let seq_len = token_ids.len();
         anyhow::ensure!(seq_len > 0, "prefill_forward requires at least one token");
         let c = &self.config;
+        let base_pos = kv_state.seq_len();
+        let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
+        self.ensure_rope_cache_covers(end_pos)?;
 
         kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
 
@@ -48,9 +67,7 @@ impl Qwen35Model {
         )?;
 
         // Advance paged KV state and build prefill plan (shared across all layers).
-        let base_pos = kv_state.seq_len();
-        self.ensure_rope_cache_covers(base_pos + seq_len)?;
-        kv_state.ensure_capacity(base_pos + seq_len)?;
+        kv_state.ensure_capacity(end_pos)?;
         kv_state.advance(seq_len);
         let kv_desc = kv_state.desc();
         let prefill_plan = PrefillPagedPlan::new(
@@ -446,5 +463,39 @@ impl Qwen35Model {
         let mut out = HiddenStates::zeros(&self.ctx, x.hidden_dim, x.seq_len)?;
         ops::rms_norm_batch_offset_into(&self.ctx, x, weight, eps, &mut out)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SEQ, checked_prefill_end_pos};
+
+    #[test]
+    fn checked_prefill_end_pos_accepts_staging_cap() {
+        assert_eq!(
+            checked_prefill_end_pos(0, MAX_SEQ, 262_144).unwrap(),
+            MAX_SEQ
+        );
+        assert_eq!(
+            checked_prefill_end_pos(MAX_SEQ - 1, 1, 262_144).unwrap(),
+            MAX_SEQ
+        );
+    }
+
+    #[test]
+    fn checked_prefill_end_pos_rejects_past_staging_cap() {
+        let err = checked_prefill_end_pos(0, MAX_SEQ + 1, 262_144)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("end_pos <= 20000"));
+        assert!(err.contains("requested end_pos=20001"));
+    }
+
+    #[test]
+    fn checked_prefill_end_pos_rejects_overflow() {
+        let err = checked_prefill_end_pos(usize::MAX, 1, 262_144)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prefill position overflow"));
     }
 }

@@ -164,6 +164,11 @@ def main() -> int:
         )
 
     model = load_model(args.model_path, args.dtype, args.device_map)
+    if args.vocab_ceiling > model.config.vocab_size:
+        parser.error(
+            f"--vocab-ceiling ({args.vocab_ceiling}) cannot exceed "
+            f"model vocab_size ({model.config.vocab_size})"
+        )
     dev = input_device(model)
 
     prompt_flat: list[int] = []

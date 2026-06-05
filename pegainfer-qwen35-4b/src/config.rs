@@ -99,6 +99,7 @@ impl Config35 {
         );
 
         let rotary_dim = (t.head_dim as f64 * t.rope_parameters.partial_rotary_factor) as usize;
+        anyhow::ensure!(rotary_dim > 0, "Qwen3.5 rotary_dim must be positive");
         let max_position_embeddings = t
             .max_position_embeddings
             .or(root_max_position_embeddings)
