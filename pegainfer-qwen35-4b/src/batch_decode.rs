@@ -147,6 +147,7 @@ impl Qwen35Model {
         let mut positions = Vec::with_capacity(bs);
         for (i, kv) in kv_states.iter_mut().enumerate() {
             let pos = kv.seq_len();
+            self.ensure_rope_cache_covers(pos + 1)?;
             kv.ensure_capacity(pos + 1)?;
             kv.advance(1);
             graph_state.slot_states[i].seq_len += 1;

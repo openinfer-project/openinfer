@@ -102,11 +102,12 @@ impl Qwen35Model {
 
         let config = Config35::from_file(model_path)?;
         debug!(
-            "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}",
+            "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}",
             config.hidden_size,
             config.num_hidden_layers,
             config.num_full_attention_layers(),
-            config.num_hidden_layers - config.num_full_attention_layers()
+            config.num_hidden_layers - config.num_full_attention_layers(),
+            config.max_position_embeddings
         );
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
@@ -290,11 +291,15 @@ impl Qwen35Model {
         let norm = load_tensor_1d(&ctx, &shards, &weight_map, &format!("{}.norm.weight", wp))?;
 
         debug!(
-            "Precomputing partial RoPE cache (rotary_dim={})",
-            config.rotary_dim
+            "Precomputing partial RoPE cache (rotary_dim={}, max_position_embeddings={})",
+            config.rotary_dim, config.max_position_embeddings
         );
-        let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.rotary_dim, 4096, config.rope_theta)?;
+        let (cos_cache, sin_cache) = precompute_rope(
+            &ctx,
+            config.rotary_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+        )?;
 
         ctx.sync()?;
         info!(
@@ -358,6 +363,16 @@ impl Qwen35Model {
 
     pub(crate) fn config(&self) -> &Config35 {
         &self.config
+    }
+
+    pub(crate) fn ensure_rope_cache_covers(&self, positions: usize) -> Result<()> {
+        let cache_positions = self.cos_cache.len / self.config.rotary_dim;
+        anyhow::ensure!(
+            positions <= cache_positions,
+            "Qwen3.5 RoPE cache covers {cache_positions} positions, requested {positions}; max_position_embeddings={}",
+            self.config.max_position_embeddings
+        );
+        Ok(())
     }
 
     pub(crate) fn device_ctx(&self) -> &DeviceContext {

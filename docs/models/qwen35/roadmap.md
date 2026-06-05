@@ -1,6 +1,6 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is fast and decode-correct — GDR kernels optimized, CUDA-graph decode, TTFT/TPOT at vLLM parity, current bench snapshots — but it still has a **live long-prompt accuracy failure** (GSM8K 8-shot scores ~2% vs ~79% on HF; the current HF logits gate is a short fixed-sequence oracle). The #186 gate now adds a model-local teacher-forcing executor, HF bf16 logits golden, graph-decode replay, slot-compaction replay, and retires the brittle exact-text e2e / baseline-regeneration ritual. Remaining structural items: long-prompt root cause, monolithic HND prefill staging (~640MB transient per request, hard 20k-token cap), prompt-only admission with no rejection path, and zero CPU-testable scheduler logic. Findings originally verified 2026-06-04 against `6ee9247`; #186 gate status updated 2026-06-05.
+> **TL;DR:** Qwen3.5-4B is fast and decode-correct — GDR kernels optimized, CUDA-graph decode, TTFT/TPOT at vLLM parity, current bench snapshots — and now has a long-prompt logits gate over the old 4096-position RoPE cache boundary. The current #250 slice fixes the Qwen3.5 RoPE cache to use `max_position_embeddings`, adds fail-closed cache coverage checks, verifies 4097/8192-token HF bf16 logits replay, and recovers full GSM8K 8-shot within 0.15 percentage points of the HF baseline (`strict-match` 79.38%, `flexible-extract` 79.30% vs HF 79.45%). Remaining structural items: monolithic HND prefill staging (~640MB transient per request, hard 20k-token cap), prompt-only admission with no rejection path, and zero CPU-testable scheduler logic. Findings originally verified 2026-06-04 against `6ee9247`; #186 gate status updated 2026-06-05, #250 long-prompt and GSM8K status updated 2026-06-05.
 >
 > **Last touched:** 2026-06
 
@@ -12,11 +12,11 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | --- | --- | --- |
 | Decode perf | ✓ GDR fused recurrent optimized; CUDA-graph decode; parity with vLLM | `docs/projects/qwen35-4b-optimization.md` |
 | Bench snapshots | ✓ current (unlike qwen3's) | `bench_snapshots/` |
-| **Long-prompt accuracy** | ✗ **GSM8K 8-shot ≈2% vs HF ≈79%** — catastrophic divergence on long prompts; current gate is short fixed-sequence logits coverage | eval run 2026-06; long-prompt case still follow-up |
-| Accuracy gate | ✓ small HF bf16 logits gate for pinned Qwen3.5-4B; exact-text e2e/regen retired; broader rand/hash corpus deferred until cross-arch policy exists | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, `docs/models/qwen35/accuracy.md` |
+| **Long-prompt accuracy** | Recovered for the measured path: the 4097/8192-token HF logits replay passes after the RoPE cache fix; full GSM8K 8-shot at `batch_size=1` recovers to `strict-match` 79.38% / `flexible-extract` 79.30% vs HF 79.45% | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-long-golden.safetensors`, `docs/benchmarks/accuracy-eval-results.md`, issue #250 |
+| Accuracy gate | ✓ small and long HF bf16 logits gates for pinned Qwen3.5-4B; exact-text e2e/regen retired; broader rand/hash corpus deferred until cross-arch policy exists | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, `test_data/qwen35-4b-hf-long-golden.safetensors`, `docs/models/qwen35/accuracy.md` |
 | Teacher forcing | ✓ model-local test executor can force fixed token IDs through prefill + graph decode; serving scheduler still free-runs user requests | `src/executor.rs`, `tests/hf_golden_gate.rs` |
 | Prefill memory | ✗ monolithic HND staging ≈640MB transient per request; `MAX_SEQ = 20000` hard cap | `prefill.rs` |
-| Long context | ✗ RoPE cache 4096 positions vs `max_position_embeddings: 262144` — sibling of qwen3 #220 | `weights.rs:297` |
+| Long context | ✓ current #250 slice sizes the RoPE cache from `max_position_embeddings` and checks prefill/decode requests against that cache before use | `config.rs`, `weights.rs`, `prefill.rs`, `batch_decode.rs` |
 | Admission | ✗ prompt-only KV sizing, no `Rejected` event, KV exhaustion mid-decode aborts the whole batch — pre-#85-fix semantics | `scheduler.rs` |
 | Scheduler tests | ✗ zero CPU-level tests; all logic behind GPU-coupled paths | — |
 | TP | ✗ absent (single GPU only) | — |
@@ -26,9 +26,9 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 ### Now
 
-1. **Long-prompt accuracy bug.** The single most important item: bisect where the prefill diverges as prompt length grows (RoPE indexing past some boundary, GDR chunk recurrence at long T, staging-path numeric, and the 4096 RoPE cache are all candidates — the cache alone can't explain failures *below* 4096 if they exist, so first establish the onset length). Reproducible on one GPU with lm-eval against the OpenAI endpoint. The fix lands with a long-prompt case in whatever gate exists at that point.
-2. **HF gate widening after the long-prompt root cause.** #186 now provides the teacher-forced HF logits gate and qwen35 replay surfaces: sequential graph decode, bucket-straddling graph decode, and slot-compaction replay. The next accuracy-gate work is to add the long-prompt case once #250 is root-caused, then add recurrent-state handoff coverage once prefix work creates that surface.
-3. **RoPE cache sibling fix.** Same shape as qwen3 #220: cache built for 4096, config admits 262144. Size from config + crash-early at admission. Community-friendly; coordinate with the qwen3 fix so both crates use the same pattern (and both inherit the YaRN #8 caveat for scaled checkpoints).
+1. **Keep #250's score evidence attached to the PR.** The current #250 slice proves a concrete long-prompt logits gate at 4097/8192 tokens, fixes the RoPE cache boundary, and passes full GSM8K 8-shot against `/v1/completions`: `strict-match` 79.38%, `flexible-extract` 79.30%, compared with the HF reference 79.45%.
+2. **HF gate widening after the long-prompt root cause.** #186 provides the teacher-forced HF logits gate and qwen35 replay surfaces: sequential graph decode, bucket-straddling graph decode, and slot-compaction replay. #250 adds the first long-prompt case. Future widening should add recurrent-state handoff coverage once prefix work creates that surface.
+3. **RoPE cache sibling follow-through.** Qwen3.5 now follows the qwen3 #220 shape: cache length comes from config and runtime checks fail closed before prefill/decode uses a missing position. Keep the YaRN #8 caveat for scaled checkpoints when porting or comparing model families.
 
 ### Next
 

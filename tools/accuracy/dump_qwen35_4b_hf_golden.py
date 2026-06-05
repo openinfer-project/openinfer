@@ -87,6 +87,21 @@ def input_device(model) -> str:
         return "cuda"
 
 
+def parse_prompt_lens(value: str) -> list[int]:
+    lens = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        length = int(part)
+        if length <= 0:
+            raise argparse.ArgumentTypeError("prompt lengths must be positive")
+        lens.append(length)
+    if not lens:
+        raise argparse.ArgumentTypeError("at least one prompt length is required")
+    return lens
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -99,14 +114,54 @@ def main() -> int:
     )
     parser.add_argument("--model-revision", default=None)
     parser.add_argument("--tokenizer-revision", default=None)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--num-seqs", type=int, default=NUM_SEQS)
+    parser.add_argument("--min-prompt-len", type=int, default=MIN_PROMPT_LEN)
+    parser.add_argument("--max-prompt-len", type=int, default=MAX_PROMPT_LEN)
+    parser.add_argument(
+        "--prompt-lens",
+        type=parse_prompt_lens,
+        default=None,
+        help="comma-separated fixed prompt lengths; overrides --num-seqs/min/max",
+    )
+    parser.add_argument("--decode-tokens", type=int, default=DECODE_TOKENS)
+    parser.add_argument("--top-k", type=int, default=TOP_K)
+    parser.add_argument("--vocab-ceiling", type=int, default=VOCAB_CEILING)
     args = parser.parse_args()
 
-    gen = torch.Generator().manual_seed(SEED)
+    if args.num_seqs <= 0:
+        parser.error("--num-seqs must be positive")
+    if args.min_prompt_len <= 0:
+        parser.error("--min-prompt-len must be positive")
+    if args.max_prompt_len < args.min_prompt_len:
+        parser.error("--max-prompt-len must be >= --min-prompt-len")
+    if args.decode_tokens <= 0:
+        parser.error("--decode-tokens must be positive")
+    if args.top_k <= 0:
+        parser.error("--top-k must be positive")
+    if args.vocab_ceiling <= 1:
+        parser.error("--vocab-ceiling must be greater than 1")
+
+    gen = torch.Generator().manual_seed(args.seed)
     prompts, decodes = [], []
-    for _ in range(NUM_SEQS):
-        plen = int(torch.randint(MIN_PROMPT_LEN, MAX_PROMPT_LEN + 1, (1,), generator=gen).item())
-        prompts.append(torch.randint(1, VOCAB_CEILING, (plen,), generator=gen).tolist())
-        decodes.append(torch.randint(1, VOCAB_CEILING, (DECODE_TOKENS,), generator=gen).tolist())
+    prompt_lens = args.prompt_lens
+    if prompt_lens is None:
+        prompt_lens = [
+            int(
+                torch.randint(
+                    args.min_prompt_len,
+                    args.max_prompt_len + 1,
+                    (1,),
+                    generator=gen,
+                ).item()
+            )
+            for _ in range(args.num_seqs)
+        ]
+    for plen in prompt_lens:
+        prompts.append(torch.randint(1, args.vocab_ceiling, (plen,), generator=gen).tolist())
+        decodes.append(
+            torch.randint(1, args.vocab_ceiling, (args.decode_tokens,), generator=gen).tolist()
+        )
 
     model = load_model(args.model_path, args.dtype, args.device_map)
     dev = input_device(model)
@@ -137,8 +192,8 @@ def main() -> int:
 
         logprobs = F.log_softmax(torch.stack(logits_steps), dim=-1)
         ids_seq, lp_seq = [], []
-        for pos in range(DECODE_TOKENS + 1):
-            vals, idx = torch.topk(logprobs[pos], TOP_K)
+        for pos in range(args.decode_tokens + 1):
+            vals, idx = torch.topk(logprobs[pos], args.top_k)
             ids_seq.append(idx.tolist())
             lp_seq.append(vals.tolist())
         ids_all.append(ids_seq)
@@ -164,13 +219,14 @@ def main() -> int:
         "dtype": args.dtype,
         "backend": "HuggingFace AutoModelForCausalLM eval, use_cache=True",
         "forward_path": "prompt prefill, then one-token teacher-forced decode through past_key_values",
-        "seed": str(SEED),
-        "top_k": str(TOP_K),
-        "decode_tokens": str(DECODE_TOKENS),
-        "num_seqs": str(NUM_SEQS),
-        "prompt_len_min": str(MIN_PROMPT_LEN),
-        "prompt_len_max": str(MAX_PROMPT_LEN),
-        "vocab_ceiling": str(VOCAB_CEILING),
+        "seed": str(args.seed),
+        "top_k": str(args.top_k),
+        "decode_tokens": str(args.decode_tokens),
+        "num_seqs": str(len(prompts)),
+        "prompt_len_min": str(min(prompt_lens)),
+        "prompt_len_max": str(max(prompt_lens)),
+        "prompt_lens": ",".join(str(length) for length in prompt_lens),
+        "vocab_ceiling": str(args.vocab_ceiling),
         "margin_tol": "0.20",
         "mean_tol": "0.06",
         "p99_tol": "0.20",
@@ -181,8 +237,9 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out), metadata=meta)
     print(
-        f"wrote {out}: {NUM_SEQS} sequences, "
-        f"{NUM_SEQS * (DECODE_TOKENS + 1)} positions, top{TOP_K}, {args.dtype}, "
+        f"wrote {out}: {len(prompts)} sequences, "
+        f"{len(prompts) * (args.decode_tokens + 1)} positions, top{args.top_k}, {args.dtype}, "
+        f"prompt_lens={prompt_lens}, "
         f"model_revision={model_revision}"
     )
     return 0

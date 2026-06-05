@@ -27,6 +27,11 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../test_data/qwen35-4b-hf-golden.safetensors"
 );
+const LONG_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../test_data/qwen35-4b-hf-long-golden.safetensors"
+);
+const GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_GOLDEN";
 
 const LOGPROBS: usize = 64;
 const MAX_EXECUTOR_BATCH: usize = 8;
@@ -290,7 +295,13 @@ struct Golden {
 
 impl Golden {
     fn load() -> Golden {
-        let bytes = std::fs::read(GOLDEN).unwrap_or_else(|e| panic!("read {GOLDEN}: {e}"));
+        let path = std::env::var(GOLDEN_ENV).unwrap_or_else(|_| GOLDEN.to_string());
+        Self::load_path(path)
+    }
+
+    fn load_path(path: impl AsRef<Path>) -> Golden {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let metadata = safetensors_metadata(&bytes);
         let st = SafeTensors::deserialize(&bytes).expect("parse golden safetensors");
         let (prompt_tokens, _) = as_i32(&st, "prompt_tokens");
@@ -326,6 +337,10 @@ impl Golden {
             .collect()
     }
 
+    fn prompt_len(&self, seq: usize) -> usize {
+        self.prompt_lens[seq] as usize
+    }
+
     fn decode(&self, seq: usize, step: usize) -> u32 {
         self.decode_tokens[seq * self.decode_len + step] as u32
     }
@@ -336,6 +351,15 @@ impl Golden {
             .map(|j| (self.topk_ids[base + j] as u32, self.topk_lp[base + j]))
             .collect()
     }
+}
+
+fn report_fixture_shape(golden: &Golden) {
+    eprintln!(
+        "qwen35 hf_golden_gate fixture: {} sequences, decode_len {}, prompt_lens [{}]",
+        golden.num_seqs,
+        golden.decode_len,
+        prompt_lens_label(golden)
+    );
 }
 
 fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
@@ -429,6 +453,13 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
         }
     }
     (stats, fingerprint)
+}
+
+fn prompt_lens_label(g: &Golden) -> String {
+    (0..g.num_seqs)
+        .map(|seq| format!("{seq}:{}", g.prompt_len(seq)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn run_with_slot_compaction(
@@ -577,6 +608,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     if !check_fixture_metadata(&model_path, &golden.metadata) {
         return;
     }
+    report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
     {
@@ -591,25 +623,61 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
         );
 
         for n in BUCKET_STRADDLES {
-            let (batched, _) = run(&golden, &mut ex, &all[..n], true);
-            report_and_assert(&format!("batched graph ({n} padded)"), &batched);
+            if all.len() >= n {
+                let (batched, _) = run(&golden, &mut ex, &all[..n], true);
+                report_and_assert(&format!("batched graph ({n} padded)"), &batched);
+            } else {
+                eprintln!(
+                    "qwen35 hf_golden_gate: skipping batched graph ({n} padded); fixture has only {} sequence(s)",
+                    all.len()
+                );
+            }
         }
     }
 
-    let fp1 = {
-        let mut ex = build_executor(&model_path);
-        let (compacted, fp) =
-            run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
-        report_and_assert("slot-compaction graph", &compacted);
-        fp
+    if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
+        let fp1 = {
+            let mut ex = build_executor(&model_path);
+            let (compacted, fp) =
+                run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
+            report_and_assert("slot-compaction graph", &compacted);
+            fp
+        };
+        let fp2 = {
+            let mut ex = build_executor(&model_path);
+            let (_, fp) = run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
+            fp
+        };
+        assert_eq!(
+            fp1, fp2,
+            "slot-compaction Qwen3.5 replay must reproduce identical logprobs"
+        );
+    } else {
+        eprintln!(
+            "qwen35 hf_golden_gate: skipping slot-compaction graph; fixture has {} sequence(s), decode_len {}",
+            golden.num_seqs, golden.decode_len
+        );
+    }
+}
+
+#[test]
+fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
     };
-    let fp2 = {
-        let mut ex = build_executor(&model_path);
-        let (_, fp) = run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
-        fp
-    };
+    let golden = Golden::load_path(LONG_GOLDEN);
+    if !check_fixture_metadata(&model_path, &golden.metadata) {
+        return;
+    }
+    report_fixture_shape(&golden);
+    let all: Vec<usize> = (0..golden.num_seqs).collect();
+
+    let mut ex = build_executor(&model_path);
+    let (stats, fp1) = run(&golden, &mut ex, &all, false);
+    report_and_assert("long sequential bs=1 graph", &stats);
+    let (_, fp2) = run(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
-        "slot-compaction Qwen3.5 replay must reproduce identical logprobs"
+        "long sequential Qwen3.5 replay must reproduce identical logprobs"
     );
 }

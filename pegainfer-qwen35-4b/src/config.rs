@@ -31,12 +31,14 @@ struct TextConfig {
     linear_num_value_heads: usize,
     linear_value_head_dim: usize,
     rope_parameters: RopeParameters,
+    max_position_embeddings: Option<usize>,
     eos_token_id: u32,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     text_config: TextConfig,
+    max_position_embeddings: Option<usize>,
 }
 
 /// Qwen3.5 model configuration (text-only).
@@ -65,6 +67,7 @@ pub(crate) struct Config35 {
     // RoPE
     pub(crate) rope_theta: f32,
     pub(crate) rotary_dim: usize,
+    pub(crate) max_position_embeddings: usize,
 
     // Layer layout
     pub(crate) layer_types: Vec<LayerType>,
@@ -75,6 +78,7 @@ impl Config35 {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
+        let root_max_position_embeddings = raw.max_position_embeddings;
         let t = raw.text_config;
 
         let layer_types: Vec<LayerType> = t
@@ -95,6 +99,14 @@ impl Config35 {
         );
 
         let rotary_dim = (t.head_dim as f64 * t.rope_parameters.partial_rotary_factor) as usize;
+        let max_position_embeddings = t
+            .max_position_embeddings
+            .or(root_max_position_embeddings)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 config missing max_position_embeddings"))?;
+        anyhow::ensure!(
+            max_position_embeddings > 0,
+            "Qwen3.5 max_position_embeddings must be positive"
+        );
 
         Ok(Self {
             hidden_size: t.hidden_size,
@@ -113,6 +125,7 @@ impl Config35 {
             linear_conv_kernel_dim: t.linear_conv_kernel_dim,
             rope_theta: t.rope_parameters.rope_theta as f32,
             rotary_dim,
+            max_position_embeddings,
             layer_types,
         })
     }

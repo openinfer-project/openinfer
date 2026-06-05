@@ -1,23 +1,26 @@
 # Qwen3.5-4B Accuracy
 
-> **TL;DR:** Qwen3.5 accuracy now has a small HF-backed logits golden (`tests/hf_golden_gate.rs` + `test_data/qwen35-4b-hf-golden.safetensors`). The HF fixture uses `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so it matches pegainfer's prefill + decode shape. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `e2e_scheduler` remains only a scheduler liveness/integration check. A broader PegaInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
+> **TL;DR:** Qwen3.5 accuracy now has short and long HF-backed logits goldens (`tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, and `test_data/qwen35-4b-hf-long-golden.safetensors`). The HF fixtures use `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so they match pegainfer's prefill + decode shape. The long fixture crosses the old 4096-position RoPE cache boundary with 4097- and 8192-token prompts, and the #250 fix recovers full GSM8K 8-shot at `batch_size=1` to `strict-match` 79.38% / `flexible-extract` 79.30% vs the HF 79.45% baseline. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `e2e_scheduler` remains only a scheduler liveness/integration check. A broader PegaInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
 >
-> **Status:** Active. Updated 2026-06-05: the HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, and slot-compaction replay after a mid-batch request drop. Current accuracy command is crate-local and needs an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request flow changes.
+> **Status:** Active. Updated 2026-06-05: the HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request flow changes.
 
 ## Goal
 
 - External truth source: Hugging Face Transformers Qwen3.5-4B in `eval()` mode with `use_cache=True` / `past_key_values` for the small logits gate.
-- Short-term success: the HF logits gate stays green under the calibrated regret / mean / p99 tolerances.
+- Short-term success: the short and long HF logits gates stay green under the calibrated regret / mean / p99 tolerances, and GSM8K 8-shot stays within the HF baseline band for task-score regressions.
 - Debugging success: any future prompt-level drift is either eliminated or explained by a recorded numeric tolerance.
 
 ## Current State
 
 - Reusable debugging method now lives in [../../playbooks/accuracy-parity-playbook.md](../../playbooks/accuracy-parity-playbook.md).
-- `pegainfer-qwen35-4b/tests/hf_golden_gate.rs` checks pegainfer logits against `test_data/qwen35-4b-hf-golden.safetensors`, a pinned HF bf16 `past_key_values` oracle.
+- `pegainfer-qwen35-4b/tests/hf_golden_gate.rs` checks pegainfer logits against two pinned HF bf16 `past_key_values` oracles:
+  - `test_data/qwen35-4b-hf-golden.safetensors` for the short mixed-shape replay surfaces.
+  - `test_data/qwen35-4b-hf-long-golden.safetensors` for the long 4097/8192-token replay surface.
 - `pegainfer-qwen35-4b/tests/e2e.rs`, `pegainfer-qwen35-4b/tests/regen_test_data.rs`, and `test_data/Qwen3.5-4B.json` are retired. They were exact-text PegaInfer self-baselines, not HF accuracy gates.
 - `pegainfer-qwen35-4b/tests/e2e_scheduler.rs` still loads the model and exercises sequential, repeated, concurrent, and consumer-drop scheduler paths, but it no longer reads an exact-text JSON fixture.
 - A broader PegaInfer-owned rand/hash corpus was considered for issue #186, but checked-in exact token/hash data may drift across GPU architectures (`sm_80`, `sm_90`, `sm_120`). Keep that as follow-up design work until the cross-architecture stability policy is explicit.
 - `docs/models/qwen35/optimization.md` records historical exact-text baseline churn. New accuracy work should use the HF logits gate before interpreting prompt-level text drift.
+- The #250 GSM8K 8-shot recovery run now closes the task-score side of the old long-prompt divergence: pegainfer scored `strict-match` 79.38% and `flexible-extract` 79.30% vs the HF 79.45% baseline.
 - Existing low-level tests already narrow the search space:
   - `src/ops/tests.rs`: `test_flash_attention_prefill_hd256_matches_cpu_reference`
   - `src/ops/tests.rs`: `test_prefill_attention_hd256_batch_matches_cpu_reference`
@@ -49,9 +52,12 @@
 Verified on RTX 5090 `sm_120` with Triton 3.4.0 for build-time AOT:
 
 ```bash
+export MODEL_PATH=/path/to/Qwen3.5-4B
+export TRITON_PYTHON=/path/to/triton34-venv/bin/python
+
 PEGAINFER_CUDA_SM=120 \
-PEGAINFER_TRITON_PYTHON=/root/autodl-tmp/triton34-venv/bin/python \
-PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/models/Qwen3.5-4B \
+PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
+PEGAINFER_TEST_MODEL_PATH=$MODEL_PATH \
 PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
 cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture
 ```
@@ -69,6 +75,78 @@ This table is the current PR validation snapshot. It supersedes the older A800
 `sm_80` observation for this doc section; per-architecture bf16/CUDA reduction
 differences should not be read as an accuracy improvement or regression by
 themselves.
+
+### Long-prompt HF logits golden
+
+- Fixture: `test_data/qwen35-4b-hf-long-golden.safetensors` (~58 KiB).
+- Dumper: `tools/accuracy/dump_qwen35_4b_hf_golden.py` with `--prompt-lens 4097,8192 --decode-tokens 8`.
+- Oracle path: same HF `AutoModelForCausalLM.eval()` bf16 `past_key_values` path as the short golden.
+- Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
+- Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.
+- Shape: 2 seed-fixed prompt-token sequences, prompt lengths 4097 and 8192, 8 teacher-forced decode tokens, 18 scored positions, top-64 HF logprobs per position.
+- Purpose: protects the RoPE cache boundary and long prefill-to-decode logits path. This logits-level gate is paired with the full GSM8K 8-shot run below for task-score evidence.
+
+Verified on RTX 5090 `sm_120` with CUDA 12.8 and Triton 3.4.0 for build-time AOT:
+
+```bash
+export MODEL_PATH=/path/to/Qwen3.5-4B
+export TRITON_PYTHON=/path/to/triton34-venv/bin/python
+
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
+PEGAINFER_TEST_MODEL_PATH=$MODEL_PATH \
+PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture
+```
+
+Observed long-prompt floor from that run:
+
+| Pass | positions | mean | p50 | p99 | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| long sequential bs=1 graph | 18 | 0.0216 | 0.0238 | 0.0700 | 0.0747 |
+
+### GSM8K 8-shot task-score recovery
+
+The #250 fix was also checked through the serving path with `lm-eval==0.4.11`
+and `local-completions` pointed at the full `/v1/completions` endpoint.
+The run used all 1,319 GSM8K examples, no `--limit`, `batch_size=1`, and the
+cached `openai/gsm8k` dataset snapshot.
+
+```bash
+export MODEL_PATH=/path/to/Qwen3.5-4B
+export TRITON_PYTHON=/path/to/triton34-venv/bin/python
+export LM_EVAL_BIN=/path/to/lm_eval
+export RESULT_ROOT=results/qwen35-gsm8k-8shot-pegainfer-issue250
+
+# Terminal 1: start the server.
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
+cargo +nightly run --release -p pegainfer-server --bin pegainfer -- \
+  --model-path "$MODEL_PATH" \
+  --served-model-name qwen35-eval \
+  --port 18082
+
+# Terminal 2: run lm-eval after `/v1/completions` is ready.
+$LM_EVAL_BIN run \
+  --model local-completions \
+  --model_args "model=qwen35-eval,base_url=http://127.0.0.1:18082/v1/completions,tokenizer_backend=huggingface,tokenizer=$MODEL_PATH,tokenized_requests=False" \
+  --tasks gsm8k \
+  --num_fewshot 8 \
+  --batch_size 1 \
+  --output_path "$RESULT_ROOT"
+```
+
+Result file:
+`results/qwen35-gsm8k-8shot-pegainfer-issue250/qwen35-eval/results_*.json`
+
+| Filter | exact_match | stderr | Delta vs HF 79.45% |
+| --- | ---: | ---: | ---: |
+| strict-match | 79.38% | 1.11% | -0.07 pp |
+| flexible-extract | 79.30% | 1.12% | -0.15 pp |
+
+This proves the issue #250 slice recovers GSM8K 8-shot for the measured
+serving path. It does not make claims about MMLU, HellaSwag, ARC, long-context
+admission, non-greedy sampling, or `batch_size > 1` task-score evals.
 
 ### Deferred rand/hash corpus
 

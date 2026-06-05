@@ -49,6 +49,7 @@ impl Qwen35Model {
 
         // Advance paged KV state and build prefill plan (shared across all layers).
         let base_pos = kv_state.seq_len();
+        self.ensure_rope_cache_covers(base_pos + seq_len)?;
         kv_state.ensure_capacity(base_pos + seq_len)?;
         kv_state.advance(seq_len);
         let kv_desc = kv_state.desc();
