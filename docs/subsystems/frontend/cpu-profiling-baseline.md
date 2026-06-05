@@ -71,14 +71,33 @@ python3 scripts/bench_http_serving.py \
 
 ### Run with perf profiling
 
-```bash
-SIM_PID=$(pgrep -f "target/release/pegainfer-sim")
+In a separate terminal after starting the server and confirming it responds:
 
+```bash
+# Summary stats (IPC, cache misses, branch mispredictions)
+SIM_PID=$(pgrep -f "target/release/pegainfer-sim")
 perf stat -p $SIM_PID \
   -e cycles,instructions,cache-references,cache-misses,branch-misses,task-clock,context-switches,cpu-migrations \
-  -- <benchmark-command>
+  -- timeout 15 python3 scripts/bench_http_serving.py \
+    --base-url http://127.0.0.1:8732 \
+    --model /tmp/pegainfer-sim-model \
+    --num-requests 200 \
+    --concurrency 16 \
+    --prompt-words 128 \
+    --max-tokens 64 \
+    --warmup 4
 
-perf record -g -p $SIM_PID -o /tmp/sim-perf.data -- <benchmark-command>
+# Function-level hotspot capture
+perf record -g -p $SIM_PID -o /tmp/sim-perf.data -- \
+  timeout 10 python3 scripts/bench_http_serving.py \
+    --base-url http://127.0.0.1:8732 \
+    --model /tmp/pegainfer-sim-model \
+    --num-requests 100 \
+    --concurrency 16 \
+    --prompt-words 128 \
+    --max-tokens 32 \
+    --warmup 2
+
 perf report -i /tmp/sim-perf.data --stdio --no-children --percent-limit 1
 ```
 
@@ -141,28 +160,45 @@ From `perf record -g` during the 200-req run:
 
 1. **No dominant hotspot.** The top single function (`malloc`) is only 3.2%. The cost is spread across many small contributors typical of async Rust / tokio workloads.
 
-2. **Heap allocation is the largest category** (~10% combined). `RawVecInner::finish_grow` and `bytes::shared_to_vec` suggest growing buffers in the streaming response path. This is a known Rust async pattern — per-chunk Vec/Bytes allocation during SSE framing.
+2. **Heap allocation is the largest measured category** (~10% combined self). `malloc` 3.2% + `cfree` 1.3% + `realloc` chains 3.9% + `RawVecInner::finish_grow` 1.5% + `bytes::shared_to_vec` 1.2%. These originate from per-token `EngineCoreOutputs` construction, msgpack encode/decode buffers, and SSE framing in hyper. This is a measured frontend cost — the simulated engine itself is only 0.9%.
 
-3. **Stream polling overhead** (~5%) comes from the `mpsc::UnboundedReceiver` → vLLM `GenerateOutputStream` chain. Each token event requires multiple `poll_next` calls through `Instrumented` wrappers.
+3. **Stream polling is the second-largest category** (~7.5% combined self). `poll_next_unpin` 4.7% + `Instrumented::poll_next` 2.8%. Each token traverses a 5-layer poll chain: `mpsc::UnboundedReceiver` → `EngineCoreOutputStream` → `GenerateOutputStream` → `decoded_text_event_stream` → `completion_chunk_stream`. The `Instrumented` wrapper appears at every layer, doubling the poll overhead per hop.
 
-4. **TTFT overhead decomposition**: The simulated TTFT floor is ~5ms, but observed is ~150ms. Given the perf profile, the ~145ms overhead likely breaks down as:
-   - Tokenization + request parsing: ~10-20ms
-   - IPC bridge (msgpack encode/decode + ZMQ round-trip): ~30-50ms
-   - Scheduler queueing + tokio task wake latency: ~50-80ms
-   - Stream setup + first token emit: ~10-20ms
+4. **The ~145ms TTFT overhead is measured but not decomposed.** The simulated floor is ~5ms; the observed p50 is ~155ms. Perf measures *where CPU is spent* but cannot directly attribute wall-clock latency to individual functions in an async workload. The 145ms gap is real and frontend-attributed (sim engine does `tokio::time::sleep(5ms)` then immediately sends the first token), but its internal breakdown requires instrumentation timestamps, not inference from perf samples.
 
-5. **IPC is visible but not dominant** (~1% CPU). The `PushSocket::send` + `mpsc` cost is proportional to token count, not request count. The ZMQ IPC bridge adds latency but not throughput bottleneck at this QPS level.
+5. **IPC bridge CPU is low (~1%), but latency contribution is unknown.** `PushSocket::send` 0.7% + `mpsc::Tx::push` 0.7% show the ZMQ path is not CPU-bound. Whether it contributes 5ms or 50ms to the 145ms TTFT overhead cannot be determined from perf alone — that depends on syscall + scheduling latency per hop, which perf stat does not capture.
 
-6. **Low IPC (0.25)** indicates heavy memory-bound workload — cache miss rate of 58% confirms this. The tokio runtime with many small heap allocations and pointer-chasing is expected to be cache-unfriendly.
+6. **Low instructions-per-cycle (0.25) and 58% cache miss rate** are consistent with the pointer-heavy, allocation-scattered profile. This is a measured system property, not a model-side artifact.
 
-## Open Questions
+## Proposed Optimization Directions
 
-- The ~300ms ITL spikes in the profile are caused by request scheduling waves under concurrency. Is this inherent to the IPC bridge's batch-at-a-time pattern, or can it be smoothed?
-- The TTFT floor of ~5ms vs ~150ms observed — how much of that 145ms is vLLM-frontend bookkeeping (tokenizer, sampling params) vs IPC bridge vs tokio scheduling?
-- Would replacing the ZMQ IPC bridge with a direct in-process channel (for the single-engine case) reduce the TTFT overhead meaningfully?
+Each direction below is tied to the specific measured frontend overhead from the perf data above.
 
-## Next Steps
+### 1. Reduce IPC bridge hops for single-engine deployments
 
-1. Add instrumentation timestamps inside `LocalEngineBridge::start_request` and `run_request_stream` to decompose the 145ms TTFT overhead.
-2. Profile with `perf record -g --call-graph dwarf` for better symbol resolution (many `[unknown]` frames in the current profile).
-3. Compare with the real Qwen3-4B engine to see if the frontend overhead is similar or if the sim path has unique costs.
+**Measured basis**: The data path crosses 5 mpsc channels + 1 ZMQ Unix socket between `run_simulated_request` and `completion_sse_stream` (confirmed by source trace in `pegainfer-vllm-frontend/src/lib.rs` lines 303–847). The `output_loop` serializes all requests through a single `PushSocket`.
+
+**Direction**: For single-engine (non-distributed) deployments, bypass ZMQ and connect `LocalEngineBridge` directly through an in-process mpsc channel. This would remove the `encode_msgpack` → ZMQ send → ZMQ recv → `decode_msgpack` round-trip and its associated allocation (`rmp_serde::Decoder::any_inner` at 0.5%).
+
+**Risk**: Changes the `LocalEngineBridge` abstraction; must not break multi-engine transport mode.
+
+### 2. Reduce per-token allocation in EngineCoreOutputs construction
+
+**Measured basis**: Heap allocation is 10% of measured CPU (`malloc` 3.2%, `realloc` 3.9%, `RawVecInner::finish_grow` 1.5%). `send_token_output()` creates a new `EngineCoreOutputs` with nested `Vec`s on every token batch.
+
+**Direction**: Pre-allocate reusable output buffers on the bridge task and clear/reuse them across token emissions. Batch more tokens per output (the existing `collect_ready_token_batch` already does this for decode tokens) to amortize allocation.
+
+**Risk**: Requires careful buffer lifecycle management across the async output path.
+
+### 3. Flatten the stream poll chain
+
+**Measured basis**: Stream polling overhead is 7.5% of measured CPU (`poll_next_unpin` 4.7% + `Instrumented::poll_next` 2.8%). Each token traverses 5 `#[try_stream]` generator layers.
+
+**Direction**: Merge adjacent stream layers where possible. The `completion_chunk_stream` → `completion_sse_stream` → `Sse::new` chain could be collapsed into a single stream that yields `Event` directly, removing 2 poll hops and their associated `Instrumented` overhead. This is constrained by the vllm-server crate boundary (external dependency).
+
+**Risk**: Tight coupling to vllm-server internal APIs; upstream changes may require rework.
+
+### Investigation needed (not yet a proposal)
+
+- **TTFT overhead decomposition**: Add `Instant::now()` timestamps at `LocalEngineBridge::start_request` entry, after `handle.submit()`, after first `token_rx.recv()`, and at `send_token_output` to decompose the 145ms gap into measured phases. Without this data, any per-phase latency estimate would be speculation.
+- **ITL spike characterization**: The ~300ms ITL spikes at p95/p99 appear in both load levels. Determine whether these originate from `output_loop` serialization, tokio scheduling starvation, or ZMQ back-pressure.
