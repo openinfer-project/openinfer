@@ -34,6 +34,11 @@ kernel-report = [
     "kernel-call-trace",
 ]
 
+[[test]]
+name = "vllm_golden_gate"
+path = "tests/vllm_golden_gate.rs"
+required-features = ["kimi-k2"]
+
 [[bin]]
 name = "kimi_kernel_report"
 path = "src/bin/kimi_kernel_report.rs"
