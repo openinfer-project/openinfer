@@ -42,6 +42,11 @@ struct FlashInferIncludes {
     cutlass: PathBuf,
     cutlass_util: PathBuf,
     spdlog: PathBuf,
+    /// Vendored CCCL (cub, libcudacxx, thrust). Must be passed as `-I` while the
+    /// CTK include dir is `-isystem`, so these override the toolkit's older CCCL
+    /// copy — FlashInfer v0.6+ uses APIs (e.g. `cuda::fast_mod_div`) that older
+    /// CTK CCCL lacks. Mirrors upstream flashinfer/jit/cpp_ext.py ordering.
+    cccl: Vec<PathBuf>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -688,6 +693,18 @@ fn flashinfer_includes_from_include(include: PathBuf) -> FlashInferIncludes {
         ],
         flashinfer_root.join("spdlog/include"),
     );
+    let cccl_root = first_existing_dir(
+        &[
+            flashinfer_root.join("3rdparty/cccl"),
+            flashinfer_root.join("cccl"),
+        ],
+        flashinfer_root.join("3rdparty/cccl"),
+    );
+    let cccl = vec![
+        cccl_root.join("cub"),
+        cccl_root.join("libcudacxx/include"),
+        cccl_root.join("thrust"),
+    ];
 
     FlashInferIncludes {
         include,
@@ -695,6 +712,7 @@ fn flashinfer_includes_from_include(include: PathBuf) -> FlashInferIncludes {
         cutlass,
         cutlass_util,
         spdlog,
+        cccl,
     }
 }
 
@@ -1140,7 +1158,7 @@ fn main() {
             "-o".to_string(),
             obj_file.to_string_lossy().to_string(),
             "-O3".to_string(),
-            "-I".to_string(),
+            "-isystem".to_string(),
             cuda_include.to_string_lossy().to_string(),
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
@@ -1155,6 +1173,9 @@ fn main() {
             || stem == "flashinfer_top1"
             || stem.starts_with("deepseek_")
         {
+            for dir in &flashinfer.cccl {
+                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
+            }
             nvcc_args.extend([
                 "--std=c++17".to_string(),
                 "-I".to_string(),
@@ -1186,6 +1207,9 @@ fn main() {
         }
 
         if stem.starts_with("kimi_") {
+            for dir in &flashinfer.cccl {
+                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
+            }
             nvcc_args.extend([
                 "--std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
