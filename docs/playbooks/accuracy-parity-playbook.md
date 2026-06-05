@@ -89,7 +89,9 @@
   --layer 0
 ```
 
-最后才回到 case-level 覆盖率：
+历史 case-level 覆盖率排查命令如下。`test_data/Qwen3.5-4B.json`
+已经退役，新排查应优先走 `pegainfer-qwen35-4b/tests/hf_golden_gate.rs`
+或重建同等的 HF `past_key_values` token-id/logits dump：
 
 ```bash
 ./target/release/qwen35_generate_cases \

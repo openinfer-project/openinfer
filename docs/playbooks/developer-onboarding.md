@@ -114,7 +114,7 @@ Accuracy tests live in each model crate:
 ```bash
 cargo test -r -p pegainfer-qwen3-4b  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
 cargo test -r -p pegainfer-qwen35-4b --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p pegainfer-qwen35-4b --test e2e              # Qwen3.5-4B exact greedy regression
+cargo test -r -p pegainfer-qwen35-4b --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
 ```
 
 Qwen3-4B no longer pins exact greedy text: a bit-wise baseline false-positives across GPUs (per-card bf16 GEMM drifts the low bits). `hf_golden_gate` instead teacher-forces a fixed set of sequences and asserts pegainfer's logprobs land within the bf16 noise floor of a stored HuggingFace reference — across bs=1, batched, and the CUDA-graph path. The reasoning and tolerances are in `docs/models/qwen3/accuracy-gate.md`.
@@ -137,13 +137,7 @@ python3 tools/accuracy/dump_qwen35_4b_hf_golden.py \
     --model-path models/Qwen3.5-4B --out test_data/qwen35-4b-hf-golden.safetensors
 ```
 
-The older exact greedy baseline is still available:
-
-```bash
-cargo test -r -p pegainfer-qwen35-4b --test regen_test_data -- --ignored   # writes test_data/Qwen3.5-4B.json
-```
-
-Then re-run the corresponding accuracy test to confirm the new reference passes.
+The older Qwen3.5 exact greedy JSON baseline and regeneration test are retired. Re-run the corresponding HF logits gate to confirm the new reference passes.
 
 ## Next Steps
 

@@ -197,9 +197,10 @@ pegainfer-qwen3-4b      pegainfer-qwen35-4b     pegainfer-deepseek-v4
 # Unit tests
 cargo test --release --workspace --lib
 
-# E2E greedy regression (needs GPU + model weights)
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e
+# Accuracy and integration tests (need GPU + model weights)
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler
 PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test e2e
 ```
 
@@ -242,13 +243,13 @@ pegainfer-kernels/                 # Shared GPU kernel/runtime crate
 
 pegainfer-qwen3-4b/                # Qwen3-4B model-owned engine crate
 ├── src/                           # Config, weights, prefill/decode/unified, scheduler/executor
-├── tests/                         # Qwen3 e2e, paged attention, regression data generation
+├── tests/                         # Qwen3 HF logits gate and integration coverage
 ├── benches/                       # Qwen3 model-level benchmarks
 └── src/kernel_plan.rs             # Model DAG phase -> kernel routing index
 
 pegainfer-qwen35-4b/               # Qwen3.5-4B model-owned engine crate
 ├── src/                           # Config, weights, prefill/decode/unified, recurrent state, scheduler
-├── tests/                         # Qwen3.5 exact e2e, scheduler e2e, regression data generation
+├── tests/                         # Qwen3.5 HF logits gate and scheduler integration
 └── benches/                       # Qwen3.5 recurrent/norm operator benchmarks
 ```
 

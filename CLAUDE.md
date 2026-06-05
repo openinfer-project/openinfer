@@ -40,15 +40,16 @@ cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
 # Unit tests (~9s)
 cargo test --release --workspace --lib
 
-# E2E greedy regression — requires GPU + model weights
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e
+# Accuracy and integration tests — require GPU + model weights
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler
 
 # Single test
 cargo test --release embedding_variants -- --nocapture
 ```
 
-E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines after any change that affects numerical output.
+Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 exact-text JSON baselines are retired; keep `e2e_scheduler` for scheduler liveness and request-flow coverage.
 
 ## Architecture
 

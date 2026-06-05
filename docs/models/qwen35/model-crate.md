@@ -2,14 +2,14 @@
 
 **Created**: 2026-05-05
 **Status**: complete
-**TL;DR**: `crates/pegainfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, e2e tests, regen test, and Qwen3.5 op benches. Root `pegainfer` loads Qwen3.5 through `pegainfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `pegainfer::model::Qwen35Model` or `pegainfer::scheduler_qwen35`. Build/check/clippy, root `bench_serving` smoke, Qwen3.5 e2e, and Qwen3.5 scheduler e2e pass.
+**TL;DR**: `crates/pegainfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. Root `pegainfer` loads Qwen3.5 through `pegainfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `pegainfer::model::Qwen35Model` or `pegainfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
 ## Preparation
 
 - **Read**:
   - `docs/index.md` - identified the existing core split, Qwen3 model crate split, and Qwen3.5 accuracy/optimization docs.
   - `docs/models/qwen3/model-crate.md` - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
-  - `docs/models/qwen35/accuracy.md` - Qwen3.5 e2e tests are regression guards against `test_data/Qwen3.5-4B.json`; parity tooling mentioned there is partly absent in the current tree.
+  - `docs/models/qwen35/accuracy.md` - at the time of this migration, Qwen3.5 e2e tests were regression guards against `test_data/Qwen3.5-4B.json`; current accuracy coverage is the HF logits gate recorded there.
   - `docs/models/qwen35/optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
   - GitHub issue #79 - acceptance criteria require `crates/pegainfer-qwen35-4b`, removal of root `pegainfer::model::Qwen35Model` and `pegainfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
   - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `crates/pegainfer-qwen3-4b/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
@@ -45,10 +45,11 @@
   - `runtime_ops` for Qwen3.5-local operator benches.
 
 ### Step 2: Move tests and benches
-- Moved root Qwen3.5 tests to the model crate:
+- Moved root Qwen3.5 tests to the model crate at the time:
   - `crates/pegainfer-qwen35-4b/tests/e2e.rs`
   - `crates/pegainfer-qwen35-4b/tests/e2e_scheduler.rs`
   - `crates/pegainfer-qwen35-4b/tests/regen_test_data.rs`
+- The exact-text `e2e.rs` and `regen_test_data.rs` were later removed by the Qwen3.5 HF logits gate work; `e2e_scheduler.rs` remains as request-flow coverage.
 - Moved Qwen3.5-specific op benches to `crates/pegainfer-qwen35-4b/benches/qwen35_ops.rs`.
 - Moved the `conv1d_prefill_handoff_matches_single_prefill` operator test into `crates/pegainfer-qwen35-4b/src/recurrent.rs`, next to the wrapper it validates.
 - Removed Qwen3.5-specific GEMV shapes from the root generic `ops_bench`; the model-specific benches now live with Qwen3.5.
@@ -87,7 +88,7 @@
 
 ## Debrief
 
-- **Outcome**: Qwen3.5 is now an independent model crate with the same root-facing engine style as Qwen3-4B. Root retains model detection/frontend/bench orchestration, but not Qwen3.5 model internals. The follow-up e2e corruption fix restored Qwen3.5 e2e and scheduler e2e.
+- **Outcome**: Qwen3.5 is now an independent model crate with the same root-facing engine style as Qwen3-4B. Root retains model detection/frontend/bench orchestration, but not Qwen3.5 model internals. The follow-up e2e corruption fix restored the then-current exact-text e2e and scheduler e2e; the exact-text gate was later retired in favor of the HF logits gate.
 - **Pitfalls encountered**:
   - The first e2e run used a relative `PEGAINFER_TEST_MODEL_PATH`; package tests execute with a crate-oriented working directory, so absolute model paths are safer for crate-local tests.
   - Qwen3.5 e2e initially looked like a crate-split regression, but git history showed the corruption started earlier when cuBLAS handles became thread-local without equivalent Qwen3.5 scheduler thread binding.

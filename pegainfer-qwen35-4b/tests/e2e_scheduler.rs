@@ -2,11 +2,9 @@
 ///
 /// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
 /// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use log::info;
-use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use pegainfer_core::engine::FinishReason;
@@ -18,37 +16,67 @@ mod common;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 
+const CASES: &[TestCase] = &[
+    TestCase {
+        name: "tell_story",
+        prompt: "Tell me a story",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "my_name",
+        prompt: "My name is",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "math",
+        prompt: "What is 2 + 2?",
+        max_new_tokens: 30,
+    },
+    TestCase {
+        name: "chinese_weather",
+        prompt: "The weather is nice today",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "chinese_capital",
+        prompt: "Introduce the capital city of China",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "python_code",
+        prompt: "Write a Python function to reverse a string",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "kanye_album",
+        prompt: "My favorite Kanye West album is",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "coldplay_ghost",
+        prompt: "Coldplay's Ghost Stories album feels",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "oyster_riddle",
+        prompt: "An oyster cooked in a pan becomes",
+        max_new_tokens: 50,
+    },
+    TestCase {
+        name: "monkey_king_lake",
+        prompt: "A clever monkey jumps into a lake and returns as",
+        max_new_tokens: 50,
+    },
+];
+
 fn get_model_path() -> String {
     std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
 }
 
-fn get_test_data_path(model_path: &str) -> PathBuf {
-    let name = Path::new(model_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(model_path);
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../test_data")
-        .join(format!("{name}.json"))
-}
-
-#[derive(Deserialize)]
-struct TestData {
-    cases: Vec<TestCase>,
-}
-
-#[derive(Deserialize)]
 struct TestCase {
-    name: String,
-    prompt: String,
+    name: &'static str,
+    prompt: &'static str,
     max_new_tokens: usize,
-}
-
-fn load_test_cases(path: &Path) -> Vec<TestCase> {
-    let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
-    let data: TestData = serde_json::from_str(&content).expect("Failed to parse JSON");
-    data.cases
 }
 
 fn generate_tokens(
@@ -95,8 +123,6 @@ fn test_e2e_qwen35_scheduler() {
     // logging intentionally left to the test harness
 
     let model_path = get_model_path();
-    let test_data_path = get_test_data_path(&model_path);
-    let cases = load_test_cases(&test_data_path);
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
@@ -111,7 +137,7 @@ fn test_e2e_qwen35_scheduler() {
 
     // ── 1. Sequential scheduler requests ────────────────────────────────
     info!("=== Phase 1: Qwen3.5 sequential scheduler requests ===");
-    for case in &cases {
+    for case in CASES {
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
         let (tokens, finish_reason) =
@@ -139,7 +165,7 @@ fn test_e2e_qwen35_scheduler() {
 
     // ── 2. Multi-request (scheduler state reuse) ────────────────────────
     info!("=== Phase 2: Multi-request ===");
-    for case in &cases {
+    for case in CASES {
         let (tokens, _) = generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
@@ -156,7 +182,7 @@ fn test_e2e_qwen35_scheduler() {
         let mut receivers: Vec<(String, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
 
         // Submit all cases concurrently
-        for case in &cases {
+        for case in CASES {
             let prompt_tokens = tokenizer
                 .encode(&case.prompt, false)
                 .expect("encode failed");
@@ -174,7 +200,7 @@ fn test_e2e_qwen35_scheduler() {
                     echo: false,
                 })
                 .expect("submit failed");
-            receivers.push((case.name.clone(), token_rx));
+            receivers.push((case.name.to_string(), token_rx));
         }
 
         // Collect all results

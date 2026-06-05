@@ -2,7 +2,7 @@
 
 **Created**: 2026-05-05
 **Status**: complete
-**TL;DR**: Fixed Qwen3.5 e2e gibberish. The regression first appears at `6a5b826` after cuBLAS handles became thread-local: Qwen3.5 loaded the model on one thread but ran scheduler prefill/decode on another without rebinding the CUDA context or initializing that thread's cuBLAS handles. Qwen3.5 greedy remains on FlashInfer top1, and the default Qwen3.5 e2e remains an exact golden-text regression against `test_data/Qwen3.5-4B.json`.
+**TL;DR**: Historical debug record for the retired Qwen3.5 exact-text e2e. The gibberish regression first appeared at `6a5b826` after cuBLAS handles became thread-local: Qwen3.5 loaded the model on one thread but ran scheduler prefill/decode on another without rebinding the CUDA context or initializing that thread's cuBLAS handles. Qwen3.5 greedy stayed on FlashInfer top1; current accuracy coverage has moved to the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
 ## Preparation
 
@@ -13,6 +13,8 @@
 - **Relevant history**:
   - `docs/models/qwen35/model-crate.md` - old HEAD and the model-crate split both fail all 10 Qwen3.5 e2e cases with similar gibberish.
   - Commit history has a suspicious sampling change: `020970b refactor(sampling): switch greedy decode to flashinfer top1 (#73)`.
+- **Current note**:
+  - The exact-text `e2e` and `test_data/Qwen3.5-4B.json` from this record were retired by the Qwen3.5 HF logits gate. `e2e_scheduler` remains as scheduler request-flow coverage.
 - **Plan**:
   1. Use a temporary clean worktree so the current model-crate diff stays untouched.
   2. Copy or reuse the local FlashInfer third-party tree and set `PEGAINFER_TRITON_PYTHON`.
@@ -55,8 +57,8 @@
 - A temporary Qwen3.5-side `argmax_into` branch made exact baselines deterministic, but it added model-side maintenance surface.
 - The chosen fix keeps Qwen3.5 greedy on the existing FlashInfer `TopKDispatch(..., k=1)` path. A per-dispatch `cudaMemsetAsync` of `RadixRowState` was tested and removed because FlashInfer's wrapper zero-initializes the cached scratch and the radix top-k kernel resets its row state at the end of the launch.
 - Two-run same-seed regen checks on the default engine produced byte-identical JSON in one sampled run (`FLASH_RESET_REGEN_DETERMINISTIC`), while reduced-capacity scheduler runs can still pick a different equal-logit branch because the engine shape changes.
-- `test_data/Qwen3.5-4B.json` was refreshed to the current FlashInfer top1 output and is the hard golden for the default Qwen3.5 e2e.
-- Qwen3.5 `e2e` compares every prompt against exact text in `test_data/Qwen3.5-4B.json`. `e2e_scheduler` remains a scheduler integration test for the reduced-capacity path (`max_batch=8`) and checks liveness/finish behavior rather than replacing the default exact regression.
+- At the time, `test_data/Qwen3.5-4B.json` was refreshed to the current FlashInfer top1 output and used as the hard golden for the default Qwen3.5 e2e.
+- That exact-text gate has since been retired. `e2e_scheduler` remains a scheduler integration test for the reduced-capacity path (`max_batch=8`) and checks liveness/finish behavior.
 
 ### Step 5: Validation
 - Passed:
@@ -71,10 +73,10 @@
 
 ## Debrief
 
-- **Outcome**: Qwen3.5 e2e and scheduler e2e pass again on the crate-split branch.
+- **Outcome**: The then-current Qwen3.5 exact-text e2e and scheduler e2e passed again on the crate-split branch. Current accuracy work should use the HF logits gate.
 - **Pitfalls encountered**:
   - The first control run against an older worktree was misleading until the historical `third_party/flashinfer` layout and Triton Python environment were repaired.
   - The visible symptom had two layers: thread-local cuBLAS misuse caused true gibberish, while FlashInfer top1 caused deterministic-baseline instability after the main corruption was fixed.
 - **Lessons learned**:
   - Any runtime that moves a model onto a worker thread must bind the CUDA context and initialize thread-local CUDA library handles inside that worker thread.
-  - Greedy e2e baselines can be sensitive to equal-logit top1 choices. Keeping FlashInfer as the selector is lower maintenance, and the exact text comparison is tied to the default engine shape used by `tests/e2e.rs`.
+  - Greedy e2e baselines can be sensitive to equal-logit top1 choices. This is why the current accuracy gate compares HF-backed logprobs instead of exact generated text.
