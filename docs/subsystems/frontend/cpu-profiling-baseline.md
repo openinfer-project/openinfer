@@ -2,7 +2,7 @@
 
 **Created**: 2026-06-05
 **Last touched**: 2026-06
-**TL;DR**: CPU-side profiling of the vLLM/OpenAI frontend path using `pegainfer-sim` with fixed TTFT=5ms / TPOT=12ms. At 200 req / concurrency=16 / prompt=128 words / output=64 tokens the frontend adds ~140ms TTFT overhead above the 5ms simulated floor and shows no throughput bottleneck (QPS=18.2, 0 failures). Top hotspots: heap allocation (malloc/realloc ~10%), stream polling (~5%), clock_gettime (~2%), JSON serialization (~1%). No single frontend bottleneck dominates — the overhead is distributed across tokio runtime, IPC bridge, and HTTP framing.
+**TL;DR**: CPU-side profiling of the vLLM/OpenAI frontend path using `pegainfer-sim` with fixed TTFT=5ms / TPOT=12ms. At 200 req / concurrency=16 / prompt=128 words / output=64 tokens the frontend adds ~150ms TTFT overhead above the 5ms simulated floor and shows no throughput bottleneck (QPS=18.2, 0 failures). Top hotspots: heap allocation (malloc/realloc ~10%), stream polling (~7.5%), clock_gettime (~2%), JSON serialization (~1%). No single frontend bottleneck dominates — the overhead is distributed across tokio runtime, IPC bridge, and HTTP framing.
 
 ## Reproducible Benchmark
 
@@ -146,7 +146,7 @@ From `perf record -g` during the 200-req run:
 | Category | Self % | Function(s) |
 |---|---|---|
 | **Heap allocation** | ~10% | `malloc` (3.2%), `cfree` (1.3%), `realloc` chains (3.9%) |
-| **Stream polling** | ~5% | `futures_util::stream::StreamExt::poll_next_unpin` (4.7%), `Instrumented::poll_next` (2.8%) |
+| **Stream polling** | ~7.5% | `futures_util::stream::StreamExt::poll_next_unpin` (4.7%), `Instrumented::poll_next` (2.8%) |
 | **Clock / timing** | ~2% | `__vdso_clock_gettime` (1.3%), `Timespec::now` (1.8%) |
 | **Tokio runtime** | ~3% | `Context::run` (1.0%), `process_at_time` (1.2%), `Steal::steal_into` (0.7%) |
 | **HTTP framing** | ~2% | `hyper::Dispatcher::poll_catch` (1.3%), `http_body_util::MapErr::poll_frame` (0.9%), `hyper::Buffered::poll_flush` (0.5%), `ChunkSize::new` (1.0%) |
