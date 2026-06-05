@@ -49,10 +49,10 @@ __device__ __forceinline__ void compute_lora_rank_dot(
     return;
   }
 
-  constexpr int WARPS_PER_BLOCK = 8;
   int lane = threadIdx.x & (warpSize - 1);
   int warp = threadIdx.x / warpSize;
-  for (int r = warp; r < rank; r += WARPS_PER_BLOCK) {
+  int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+  for (int r = warp; r < rank; r += num_warps) {
     float rank_val = 0.0f;
     const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
     for (int col = lane; col < in_dim; col += warpSize) {
@@ -83,10 +83,10 @@ __device__ __forceinline__ void compute_lora_rank_dot_runtime(
     return;
   }
 
-  constexpr int WARPS_PER_BLOCK = 8;
   int lane = threadIdx.x & (warpSize - 1);
   int warp = threadIdx.x / warpSize;
-  for (int r = warp; r < rank; r += WARPS_PER_BLOCK) {
+  int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+  for (int r = warp; r < rank; r += num_warps) {
     float rank_val = 0.0f;
     const __nv_bfloat16 *a_row = a + static_cast<int64_t>(r) * in_dim;
     for (int col = lane; col < in_dim; col += warpSize) {

@@ -10,9 +10,7 @@ use super::batch_decode_buffers::{
 };
 use super::batch_decode_dag::BatchDecodeDag;
 use super::weights::{PackedLoraProjection, Qwen3Model, TransformerBlock};
-use crate::lora::{
-    DeviceLoraTokenGroup, LoraProjectionKind, build_lora_token_ranges, prepare_lora_token_groups,
-};
+use crate::lora::LoraProjectionKind;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_kernels::tensor::{KvDim, QDim};
@@ -64,11 +62,9 @@ impl Qwen3Model {
         assert_eq!(bs, kv_views.len());
         assert_eq!(bs, lora_adapters.len());
         assert!(bs > 0);
-        let lora_ranges =
-            build_lora_token_ranges(std::iter::repeat_n(1, bs), lora_adapters.iter().copied());
-        let lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
         let lora_slots = self.decode_lora_slots(lora_adapters)?;
-        let use_cuda_graph = self.enable_cuda_graph && lora_ranges.is_empty();
+        let use_lora = lora_slots.is_some();
+        let use_cuda_graph = self.enable_cuda_graph && lora_slots.is_none();
 
         // Derive positions from views (seq_len - 1 = position of the new token)
         let mut positions: Vec<i32> = kv_views.iter().map(|v| (v.seq_len() - 1) as i32).collect();
@@ -113,8 +109,7 @@ impl Qwen3Model {
                         layout,
                         padded_bs,
                         attention_path,
-                        &lora_groups,
-                        lora_slots.is_some(),
+                        use_lora,
                         bufs,
                     )
                 })
@@ -128,8 +123,7 @@ impl Qwen3Model {
                     layout,
                     padded_bs,
                     attention_path,
-                    &lora_groups,
-                    lora_slots.is_some(),
+                    use_lora,
                     bufs,
                 )
             })?;
@@ -144,8 +138,7 @@ impl Qwen3Model {
         layout: &KvLayout,
         bs: usize,
         attention_path: DecodeAttentionPath,
-        lora_groups: &[DeviceLoraTokenGroup<'_>],
-        use_fused_lora: bool,
+        use_lora: bool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         let num_layers = self.layers.len();
@@ -163,7 +156,7 @@ impl Qwen3Model {
         );
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.batch_decode_layer(layer_idx, layer, &dag, lora_groups, use_fused_lora, bufs)?;
+            self.batch_decode_layer(layer_idx, layer, &dag, use_lora, bufs)?;
 
             let next_weight = if layer_idx + 1 < num_layers {
                 &self.layers[layer_idx + 1].input_layernorm
@@ -200,8 +193,7 @@ impl Qwen3Model {
         layer_idx: usize,
         layer: &TransformerBlock,
         dag: &BatchDecodeDag<'_>,
-        lora_groups: &[DeviceLoraTokenGroup<'_>],
-        use_fused_lora: bool,
+        use_lora: bool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
         // Match prefill numerics: compute Q/K/V via row-sliced GEMMs instead of
@@ -239,8 +231,7 @@ impl Qwen3Model {
             LoraProjectionKind::Q,
             LoraProjectionKind::K,
             LoraProjectionKind::V,
-            lora_groups,
-            use_fused_lora,
+            use_lora,
             &bufs.normed,
             &mut bufs.q,
             &mut bufs.k,
@@ -275,8 +266,7 @@ impl Qwen3Model {
         self.apply_decode_lora_projection(
             layer_idx,
             LoraProjectionKind::O,
-            lora_groups,
-            use_fused_lora,
+            use_lora,
             &bufs.attn_out,
             &mut bufs.attn_proj,
             0,
@@ -313,8 +303,7 @@ impl Qwen3Model {
             layer_idx,
             LoraProjectionKind::Gate,
             LoraProjectionKind::Up,
-            lora_groups,
-            use_fused_lora,
+            use_lora,
             &bufs.normed,
             &mut bufs.gate_out,
             &mut bufs.up_out,
@@ -335,8 +324,7 @@ impl Qwen3Model {
         self.apply_decode_lora_projection(
             layer_idx,
             LoraProjectionKind::Down,
-            lora_groups,
-            use_fused_lora,
+            use_lora,
             &bufs.mlp_act,
             &mut bufs.mlp_out,
             0,
@@ -356,30 +344,13 @@ impl Qwen3Model {
         layer_idx: usize,
         kind0: LoraProjectionKind,
         kind1: LoraProjectionKind,
-        lora_groups: &[DeviceLoraTokenGroup<'_>],
-        use_fused_lora: bool,
+        use_lora: bool,
         input: &pegainfer_core::tensor::HiddenStates,
         out0: &mut pegainfer_core::tensor::HiddenStates,
         out1: &mut pegainfer_core::tensor::HiddenStates,
         token_slots: &CudaSlice<i32>,
     ) -> Result<()> {
-        if !use_fused_lora {
-            self.apply_lora_projection_ranges(
-                layer_idx,
-                lora_groups,
-                |layer| layer.projection(kind0),
-                input,
-                out0,
-                0,
-            )?;
-            self.apply_lora_projection_ranges(
-                layer_idx,
-                lora_groups,
-                |layer| layer.projection(kind1),
-                input,
-                out1,
-                0,
-            )?;
+        if !use_lora {
             return Ok(());
         }
 
@@ -395,39 +366,14 @@ impl Qwen3Model {
         kind0: LoraProjectionKind,
         kind1: LoraProjectionKind,
         kind2: LoraProjectionKind,
-        lora_groups: &[DeviceLoraTokenGroup<'_>],
-        use_fused_lora: bool,
+        use_lora: bool,
         input: &pegainfer_core::tensor::HiddenStates,
         out0: &mut pegainfer_core::tensor::HiddenStates,
         out1: &mut pegainfer_core::tensor::HiddenStates,
         out2: &mut pegainfer_core::tensor::HiddenStates,
         token_slots: &CudaSlice<i32>,
     ) -> Result<()> {
-        if !use_fused_lora {
-            self.apply_lora_projection_ranges(
-                layer_idx,
-                lora_groups,
-                |layer| layer.projection(kind0),
-                input,
-                out0,
-                0,
-            )?;
-            self.apply_lora_projection_ranges(
-                layer_idx,
-                lora_groups,
-                |layer| layer.projection(kind1),
-                input,
-                out1,
-                0,
-            )?;
-            self.apply_lora_projection_ranges(
-                layer_idx,
-                lora_groups,
-                |layer| layer.projection(kind2),
-                input,
-                out2,
-                0,
-            )?;
+        if !use_lora {
             return Ok(());
         }
 
@@ -452,22 +398,14 @@ impl Qwen3Model {
         &self,
         layer_idx: usize,
         kind: LoraProjectionKind,
-        lora_groups: &[DeviceLoraTokenGroup<'_>],
-        use_fused_lora: bool,
+        use_lora: bool,
         input: &pegainfer_core::tensor::HiddenStates,
         out: &mut pegainfer_core::tensor::HiddenStates,
         row_offset: usize,
         token_slots: &CudaSlice<i32>,
     ) -> Result<()> {
-        if !use_fused_lora {
-            return self.apply_lora_projection_ranges(
-                layer_idx,
-                lora_groups,
-                |layer| layer.projection(kind),
-                input,
-                out,
-                row_offset,
-            );
+        if !use_lora {
+            return Ok(());
         }
 
         let Some(packed) = self.packed_lora_projection(layer_idx, kind) else {
