@@ -107,8 +107,8 @@ int gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfl
 }
 
 // Batched per-token GEMM: each row is computed as the same N=1 GEMM used by
-// the decode path. This preserves row-wise numerical parity with the serial
-// prompt_len=1 path while keeping a batch-shaped Rust API.
+// decode, preserving row-wise numerical parity while keeping a batch-shaped
+// Rust API.
 int gemm_per_token_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                  __nv_bfloat16 *Y, int M, int batch, int K,
                                  cudaStream_t stream) {

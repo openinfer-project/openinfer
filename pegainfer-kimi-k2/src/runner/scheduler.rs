@@ -15,10 +15,7 @@ use pegainfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
 use tokio::sync::mpsc;
 
 const KIMI_RUNNER_MAX_BATCH: usize = 64;
-// Prompt-len=1 service TTFT is dominated by microbatch stair-stepping. Larger
-// row-wise batches have recorded TP8/NCCL trace drift, so this stays tied to
-// the performance ledger rather than treated as exact-token parity.
-const KIMI_PROMPT_LEN1_PREFILL_MICROBATCH: usize = 64;
+const KIMI_DECODE_ADMISSION_MICROBATCH: usize = 64;
 const KIMI_PREFILL_BATCH_COALESCE: Duration = Duration::from_millis(100);
 const KIMI_PREFILL_BATCH_POLL: Duration = Duration::from_micros(50);
 
@@ -51,11 +48,17 @@ impl KimiK2Scheduler {
         let warm_tokens = (0..KIMI_RUNNER_MAX_BATCH)
             .map(|idx| 100 + (idx % 1000) as u32)
             .collect::<Vec<_>>();
+        let warm_positions = vec![0; KIMI_RUNNER_MAX_BATCH];
         let warm_slots = (0..KIMI_RUNNER_MAX_BATCH).collect::<Vec<_>>();
         let _ = executor
-            .forward_prompt_len1_batch(&warm_tokens, &warm_slots, KIMI_RUNNER_MAX_BATCH)
+            .forward_decode_batch(
+                &warm_tokens,
+                &warm_positions,
+                &warm_slots,
+                KIMI_RUNNER_MAX_BATCH,
+            )
             .with_context(|| {
-                format!("Kimi-K2 warm prompt_len1 bs{KIMI_RUNNER_MAX_BATCH} before serving")
+                format!("Kimi-K2 warm decode admission bs{KIMI_RUNNER_MAX_BATCH} before serving")
             })?;
         Ok(Self {
             executor,
@@ -131,19 +134,34 @@ impl KimiK2Scheduler {
             }
             return;
         }
-        let mut active = if prefill_reqs.len() > 1
-            && prefill_reqs.iter().all(|req| req.prompt_tokens.len() == 1)
-        {
-            self.prefill_prompt_len1_batch(prefill_reqs, decode_batch_size)
-        } else {
-            let mut active = Vec::with_capacity(prefill_reqs.len());
-            for (slot, req) in prefill_reqs.into_iter().enumerate() {
-                if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
-                    active.push(active_req);
+        let mut active = Vec::with_capacity(prefill_reqs.len());
+        let mut decode_admissions = Vec::with_capacity(KIMI_DECODE_ADMISSION_MICROBATCH);
+        for (slot, req) in prefill_reqs.into_iter().enumerate() {
+            if req.prompt_tokens.len() == 1 {
+                decode_admissions.push((slot, req));
+                if decode_admissions.len() == KIMI_DECODE_ADMISSION_MICROBATCH {
+                    self.decode_admission_microbatch(
+                        std::mem::take(&mut decode_admissions),
+                        decode_batch_size,
+                        &mut active,
+                    );
                 }
+                continue;
             }
-            active
-        };
+            if !decode_admissions.is_empty() {
+                self.decode_admission_microbatch(
+                    std::mem::take(&mut decode_admissions),
+                    decode_batch_size,
+                    &mut active,
+                );
+            }
+            if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
+                active.push(active_req);
+            }
+        }
+        if !decode_admissions.is_empty() {
+            self.decode_admission_microbatch(decode_admissions, decode_batch_size, &mut active);
+        }
 
         while !active.is_empty() {
             let decode_batch_size = active[0].decode_batch_size;
@@ -296,30 +314,7 @@ impl KimiK2Scheduler {
         })
     }
 
-    fn prefill_prompt_len1_batch(
-        &mut self,
-        prefill_reqs: Vec<GenerateRequest>,
-        decode_batch_size: usize,
-    ) -> Vec<ActiveKimiRequest> {
-        let mut active = Vec::with_capacity(prefill_reqs.len());
-        let mut group = Vec::with_capacity(KIMI_PROMPT_LEN1_PREFILL_MICROBATCH);
-        for (slot, req) in prefill_reqs.into_iter().enumerate() {
-            group.push((slot, req));
-            if group.len() == KIMI_PROMPT_LEN1_PREFILL_MICROBATCH {
-                self.prefill_prompt_len1_microbatch(
-                    std::mem::take(&mut group),
-                    decode_batch_size,
-                    &mut active,
-                );
-            }
-        }
-        if !group.is_empty() {
-            self.prefill_prompt_len1_microbatch(group, decode_batch_size, &mut active);
-        }
-        active
-    }
-
-    fn prefill_prompt_len1_microbatch(
+    fn decode_admission_microbatch(
         &mut self,
         group: Vec<(usize, GenerateRequest)>,
         decode_batch_size: usize,
@@ -329,16 +324,18 @@ impl KimiK2Scheduler {
             .iter()
             .map(|(_, req)| req.prompt_tokens[0])
             .collect::<Vec<_>>();
+        let append_positions = vec![0; token_ids.len()];
         let slots = group.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
-        let reports = match self.executor.forward_prompt_len1_batch(
+        let reports = match self.executor.forward_decode_batch(
             &token_ids,
+            &append_positions,
             &slots,
             decode_batch_size,
         ) {
             Ok(reports) => reports,
             Err(err) => {
                 let message = format!(
-                    "Kimi-K2 prompt_len1 batch forward failed after {}/{} ranks loaded: {err:#}",
+                    "Kimi-K2 decode admission forward failed after {}/{} ranks loaded: {err:#}",
                     self.executor.gpu_weight_ready_count(),
                     self.executor.worker_count()
                 );
@@ -393,5 +390,166 @@ impl KimiK2Scheduler {
                 decode_batch_size,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use pegainfer_core::sampler::SamplingParams;
+
+    use crate::runner::worker::KimiOneTokenForwardReport;
+
+    use super::*;
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum ForwardCall {
+        EnsureDecodeBatch(usize),
+        Prefill {
+            input_ids: Vec<u32>,
+            slot: usize,
+            decode_batch_size: usize,
+        },
+        Decode {
+            token_ids: Vec<u32>,
+            append_positions: Vec<usize>,
+            slots: Vec<usize>,
+            decode_batch_size: usize,
+        },
+    }
+
+    struct RecordingExecutor {
+        calls: Arc<Mutex<Vec<ForwardCall>>>,
+    }
+
+    impl RecordingExecutor {
+        fn new(calls: Arc<Mutex<Vec<ForwardCall>>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl ForwardExecutor for RecordingExecutor {
+        fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(ForwardCall::EnsureDecodeBatch(decode_batch_size));
+            Ok(())
+        }
+
+        fn forward_prefill(
+            &self,
+            input_ids: &[u32],
+            slot: usize,
+            decode_batch_size: usize,
+            _ep_max_seq_len: usize,
+        ) -> Result<KimiOneTokenForwardReport> {
+            self.calls.lock().unwrap().push(ForwardCall::Prefill {
+                input_ids: input_ids.to_vec(),
+                slot,
+                decode_batch_size,
+            });
+            Ok(report(slot, *input_ids.last().unwrap(), 1000 + slot as u32))
+        }
+
+        fn forward_decode_batch(
+            &self,
+            token_ids: &[u32],
+            append_positions: &[usize],
+            slots: &[usize],
+            decode_batch_size: usize,
+        ) -> Result<Vec<KimiOneTokenForwardReport>> {
+            self.calls.lock().unwrap().push(ForwardCall::Decode {
+                token_ids: token_ids.to_vec(),
+                append_positions: append_positions.to_vec(),
+                slots: slots.to_vec(),
+                decode_batch_size,
+            });
+            Ok(token_ids
+                .iter()
+                .zip(slots)
+                .enumerate()
+                .map(|(row, (token_id, slot))| report(*slot, *token_id, 2000 + row as u32))
+                .collect())
+        }
+
+        fn worker_count(&self) -> usize {
+            1
+        }
+
+        fn gpu_weight_ready_count(&self) -> usize {
+            1
+        }
+    }
+
+    fn report(slot: usize, input_token_id: u32, next_token_id: u32) -> KimiOneTokenForwardReport {
+        KimiOneTokenForwardReport {
+            rank: 0,
+            batch_slot: slot,
+            input_token_id,
+            local_next_token_id: next_token_id,
+            local_next_token_global_id: next_token_id,
+            local_top_logit_f32: 0.0,
+            vocab_start: 0,
+            vocab_rows: 1,
+            dense_layers_executed: 0,
+            moe_layers_executed: 0,
+        }
+    }
+
+    fn request(prompt_tokens: Vec<u32>) -> GenerateRequest {
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens,
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        }
+    }
+
+    #[test]
+    fn mixed_prompt_batch_routes_single_token_requests_to_decode() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = RecordingExecutor::new(Arc::clone(&calls));
+        let mut scheduler = KimiK2Scheduler {
+            executor: Box::new(executor),
+            stop_token_ids: Vec::new(),
+        };
+
+        scheduler.handle_request_batch(vec![
+            request(vec![11]),
+            request(vec![22, 33]),
+            request(vec![44]),
+        ]);
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ForwardCall::EnsureDecodeBatch(3),
+                ForwardCall::Decode {
+                    token_ids: vec![11],
+                    append_positions: vec![0],
+                    slots: vec![0],
+                    decode_batch_size: 3,
+                },
+                ForwardCall::Prefill {
+                    input_ids: vec![22, 33],
+                    slot: 1,
+                    decode_batch_size: 3,
+                },
+                ForwardCall::Decode {
+                    token_ids: vec![44],
+                    append_positions: vec![0],
+                    slots: vec![2],
+                    decode_batch_size: 3,
+                },
+            ]
+        );
     }
 }

@@ -24,14 +24,6 @@ pub(super) trait ForwardExecutor {
     ) -> Result<KimiOneTokenForwardReport>;
 
     /// Return exactly one report per input row, in the same order.
-    fn forward_prompt_len1_batch(
-        &self,
-        token_ids: &[u32],
-        slots: &[usize],
-        decode_batch_size: usize,
-    ) -> Result<Vec<KimiOneTokenForwardReport>>;
-
-    /// Return exactly one report per input row, in the same order.
     fn forward_decode_batch(
         &self,
         token_ids: &[u32],

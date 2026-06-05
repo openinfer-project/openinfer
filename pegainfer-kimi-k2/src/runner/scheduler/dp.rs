@@ -43,7 +43,7 @@ struct RequestState {
     last_token: u32,
 }
 
-struct PromptLen1Admission {
+struct DecodeAdmission {
     slot: usize,
     req: GenerateRequest,
 }
@@ -55,12 +55,12 @@ struct DecodeInput {
     slot: usize,
 }
 
-enum PromptLen1DecodeRow {
+enum DecodeBatchRow {
     Active(DecodeInput),
-    Admission(PromptLen1Admission),
+    Admission(DecodeAdmission),
 }
 
-impl PromptLen1DecodeRow {
+impl DecodeBatchRow {
     fn token_id(&self) -> u32 {
         match self {
             Self::Active(input) => input.token_id,
@@ -198,7 +198,7 @@ impl DpCoordinator {
         lb: DpLoadBalancer,
     ) {
         let mut still_pending = Vec::new();
-        let mut prompt_len1_batch = self.empty_prompt_len1_batch();
+        let mut decode_admissions = self.empty_decode_admissions();
         let mut reserved_free_slots = self.free_slot_lists();
 
         for req in pending_reqs.drain(..) {
@@ -213,11 +213,11 @@ impl DpCoordinator {
                 };
                 let slot = reserved_free_slots[rank].remove(0);
                 send_scheduled(&req);
-                prompt_len1_batch[rank].push(PromptLen1Admission { slot, req });
+                decode_admissions[rank].push(DecodeAdmission { slot, req });
                 continue;
             }
 
-            self.flush_prompt_len1_batch(&mut prompt_len1_batch);
+            self.flush_decode_admissions(&mut decode_admissions);
             reserved_free_slots = self.free_slot_lists();
 
             let dp_rank = lb.pick_rank(&self.ranks);
@@ -238,11 +238,11 @@ impl DpCoordinator {
             }
         }
 
-        self.flush_prompt_len1_batch(&mut prompt_len1_batch);
+        self.flush_decode_admissions(&mut decode_admissions);
         *pending_reqs = still_pending;
     }
 
-    fn empty_prompt_len1_batch(&self) -> Vec<Vec<PromptLen1Admission>> {
+    fn empty_decode_admissions(&self) -> Vec<Vec<DecodeAdmission>> {
         (0..self.dp_world).map(|_| Vec::new()).collect()
     }
 
@@ -262,12 +262,12 @@ impl DpCoordinator {
         Some(slots)
     }
 
-    fn flush_prompt_len1_batch(&mut self, batch: &mut Vec<Vec<PromptLen1Admission>>) {
+    fn flush_decode_admissions(&mut self, batch: &mut Vec<Vec<DecodeAdmission>>) {
         if batch.iter().all(Vec::is_empty) {
             return;
         }
-        let ready = std::mem::replace(batch, self.empty_prompt_len1_batch());
-        self.synchronized_prompt_len1_decode(ready);
+        let ready = std::mem::replace(batch, self.empty_decode_admissions());
+        self.synchronized_decode_admissions(ready);
     }
 
     fn admit_request(
@@ -383,24 +383,24 @@ impl DpCoordinator {
         });
     }
 
-    fn synchronized_prompt_len1_decode(&mut self, batch: Vec<Vec<PromptLen1Admission>>) {
+    fn synchronized_decode_admissions(&mut self, batch: Vec<Vec<DecodeAdmission>>) {
         let mut rows_by_rank = Vec::with_capacity(self.dp_world);
         for (dp_rank, rank_batch) in batch.into_iter().enumerate() {
             let mut rows = self.ranks[dp_rank]
                 .active_decode_inputs()
                 .into_iter()
-                .map(PromptLen1DecodeRow::Active)
+                .map(DecodeBatchRow::Active)
                 .collect::<Vec<_>>();
-            rows.extend(rank_batch.into_iter().map(PromptLen1DecodeRow::Admission));
+            rows.extend(rank_batch.into_iter().map(DecodeBatchRow::Admission));
             if rows.len() > MAX_BATCH_PER_DP {
                 let message = format!(
-                    "Kimi-K2 DP rank {dp_rank} prompt_len1 decode rows exceed arena capacity {MAX_BATCH_PER_DP}"
+                    "Kimi-K2 DP rank {dp_rank} decode rows exceed arena capacity {MAX_BATCH_PER_DP}"
                 );
-                self.fail_prompt_len1_rows(dp_rank, rows, &message);
+                self.fail_decode_rows(dp_rank, rows, &message);
                 send_step_command(
                     &self.step_txs[dp_rank],
                     dp_rank,
-                    "prompt_len1 overflow padding decode",
+                    "decode admission overflow padding",
                     build_padding_decode_command(),
                 );
                 rows_by_rank.push(Vec::new());
@@ -412,7 +412,7 @@ impl DpCoordinator {
             } else {
                 build_decode_command_from_rows(&rows)
             };
-            send_step_command(&self.step_txs[dp_rank], dp_rank, "prompt_len1 decode", cmd);
+            send_step_command(&self.step_txs[dp_rank], dp_rank, "decode admission", cmd);
             rows_by_rank.push(rows);
         }
 
@@ -421,51 +421,57 @@ impl DpCoordinator {
                 Ok(StepResult::Decode(result)) => result,
                 Ok(StepResult::Prefill(_)) => {
                     let message = format!(
-                        "Kimi-K2 DP rank {dp_rank} returned prefill result during prompt_len1 decode"
+                        "Kimi-K2 DP rank {dp_rank} returned prefill result during decode admission"
                     );
                     error!("kimi-k2: {message}");
-                    self.fail_prompt_len1_rows(dp_rank, rows, &message);
+                    self.fail_decode_rows(dp_rank, rows, &message);
                     continue;
                 }
-                Err(_) => abort_dropped_result_channel(dp_rank, "prompt_len1 decode"),
+                Err(_) => abort_dropped_result_channel(dp_rank, "decode admission"),
+            };
+
+            let reports = match result {
+                Ok(reports) => reports,
+                Err(err) if rows.is_empty() => {
+                    error!(
+                        "kimi-k2: fatal: DP rank {dp_rank} padding decode failed during decode admission: {err:#}"
+                    );
+                    std::process::abort();
+                }
+                Err(err) => {
+                    error!("kimi-k2: DP rank {dp_rank} decode admission failed: {err:#}");
+                    let message =
+                        format!("Kimi-K2 DP rank {dp_rank} decode admission failed: {err:#}");
+                    self.fail_decode_rows(dp_rank, rows, &message);
+                    continue;
+                }
             };
 
             if rows.is_empty() {
                 continue;
             }
 
-            let reports = match result {
-                Ok(reports) => reports,
-                Err(err) => {
-                    error!("kimi-k2: DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
-                    let message =
-                        format!("Kimi-K2 DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
-                    self.fail_prompt_len1_rows(dp_rank, rows, &message);
-                    continue;
-                }
-            };
-
             for (row, report) in rows.into_iter().zip(reports) {
                 match row {
-                    PromptLen1DecodeRow::Active(input) => {
+                    DecodeBatchRow::Active(input) => {
                         self.ranks[dp_rank].process_decode_report(
                             input.slot,
                             &report,
                             &self.stop_token_ids,
                         );
                     }
-                    PromptLen1DecodeRow::Admission(admission) => {
-                        self.install_prompt_len1_decode_result(dp_rank, admission, &report);
+                    DecodeBatchRow::Admission(admission) => {
+                        self.install_decode_admission_result(dp_rank, admission, &report);
                     }
                 }
             }
         }
     }
 
-    fn install_prompt_len1_decode_result(
+    fn install_decode_admission_result(
         &mut self,
         dp_rank: usize,
-        admission: PromptLen1Admission,
+        admission: DecodeAdmission,
         report: &KimiOneTokenForwardReport,
     ) {
         let token_id = report.local_next_token_global_id;
@@ -509,22 +515,17 @@ impl DpCoordinator {
         });
     }
 
-    fn fail_prompt_len1_rows(
-        &mut self,
-        dp_rank: usize,
-        rows: Vec<PromptLen1DecodeRow>,
-        message: &str,
-    ) {
+    fn fail_decode_rows(&mut self, dp_rank: usize, rows: Vec<DecodeBatchRow>, message: &str) {
         if rows
             .iter()
-            .any(|row| matches!(row, PromptLen1DecodeRow::Active(_)))
+            .any(|row| matches!(row, DecodeBatchRow::Active(_)))
         {
             let err = anyhow::anyhow!(message.to_string());
             self.ranks[dp_rank].fail_all_active(&err);
         }
 
         for row in rows {
-            let PromptLen1DecodeRow::Admission(admission) = row else {
+            let DecodeBatchRow::Admission(admission) = row else {
                 continue;
             };
             let _ = admission.req.token_tx.send(TokenEvent::Error {
@@ -745,14 +746,11 @@ fn build_padding_decode_command() -> StepCommand {
     }
 }
 
-fn build_decode_command_from_rows(rows: &[PromptLen1DecodeRow]) -> StepCommand {
+fn build_decode_command_from_rows(rows: &[DecodeBatchRow]) -> StepCommand {
     StepCommand::Decode {
-        token_ids: rows.iter().map(PromptLen1DecodeRow::token_id).collect(),
-        positions: rows
-            .iter()
-            .map(PromptLen1DecodeRow::append_position)
-            .collect(),
-        slots: rows.iter().map(PromptLen1DecodeRow::slot).collect(),
+        token_ids: rows.iter().map(DecodeBatchRow::token_id).collect(),
+        positions: rows.iter().map(DecodeBatchRow::append_position).collect(),
+        slots: rows.iter().map(DecodeBatchRow::slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
     }
 }
@@ -913,14 +911,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_len1_rows_merge_active_decode_and_new_admission() {
+    fn decode_rows_merge_active_decode_and_new_admission() {
         let rows = vec![
-            PromptLen1DecodeRow::Active(DecodeInput {
+            DecodeBatchRow::Active(DecodeInput {
                 token_id: 11,
                 append_position: 5,
                 slot: 3,
             }),
-            PromptLen1DecodeRow::Admission(PromptLen1Admission {
+            DecodeBatchRow::Admission(DecodeAdmission {
                 slot: 7,
                 req: dummy_request(vec![99], 8),
             }),

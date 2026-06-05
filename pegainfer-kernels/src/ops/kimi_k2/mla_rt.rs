@@ -6,10 +6,7 @@ use crate::{
     tensor::{DeviceContext, DeviceMatrix, GpuTensor, HiddenStates},
 };
 
-use super::mla::{
-    KIMI_K2_MLA_NOPE_DIM, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_MLA_V_HEAD_DIM, KimiMlaPagedKvLayout,
-    validate_paged_layout,
-};
+use super::mla::{KIMI_K2_MLA_ROPE_DIM, KimiMlaPagedKvLayout, validate_paged_layout};
 
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_mla_rope_split_decode_rt(
@@ -197,44 +194,6 @@ pub fn kimi_mla_rope_assemble_prefill_rt(
             kc_ptr as *mut ffi::Half,
             vc_ptr as *mut ffi::Half,
             seq_len as i32,
-            local_heads as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
-pub fn kimi_mla_extract_prefill_v_rt(
-    ctx: &DeviceContext,
-    kv_b: &HiddenStates,
-    output: &mut HiddenStates,
-    local_heads: usize,
-) -> Result<()> {
-    let kv_b_head_dim = KIMI_K2_MLA_NOPE_DIM + KIMI_K2_MLA_V_HEAD_DIM;
-    let expected_kv_b = local_heads * kv_b_head_dim;
-    let expected_output = local_heads * KIMI_K2_MLA_V_HEAD_DIM;
-    anyhow::ensure!(
-        kv_b.hidden_dim == expected_kv_b,
-        "Kimi MLA prefill V extract kv_b hidden mismatch: got {}, expected {}",
-        kv_b.hidden_dim,
-        expected_kv_b
-    );
-    anyhow::ensure!(
-        output.hidden_dim == expected_output && output.seq_len == kv_b.seq_len,
-        "Kimi MLA prefill V extract output mismatch: got hidden={}, seq={}, expected hidden={}, seq={}",
-        output.hidden_dim,
-        output.seq_len,
-        expected_output,
-        kv_b.seq_len
-    );
-    let (kv_ptr, _g0) = kv_b.data.device_ptr(&ctx.stream);
-    let (out_ptr, _g1) = output.data.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::kimi_mla_extract_prefill_v_cuda(
-            kv_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            kv_b.seq_len as i32,
             local_heads as i32,
             ctx.stream.cu_stream(),
         )

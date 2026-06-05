@@ -16,13 +16,11 @@
 //! TP `Comm` (`comm.is_some()`); the TP1 / expert-parallel case must use the
 //! PPLX path instead — the routed entry points here `ensure!` a `Comm`.
 //!
-//! Three entry points, mirroring the call paths in [`super::worker`]:
+//! Two entry points, mirroring the call paths in [`super::worker`]:
 //! - [`forward_moe_layer_decode_normed_into`] — CUDA-graph-safe batch decode,
 //!   router overlapped on the aux stream, combine via `reduce_scatter`.
 //! - [`forward_moe_layer_batch_into`] — single-prompt prefill, fresh
 //!   allocations, combine via bulk `all_reduce`.
-//! - [`forward_moe_layer_prefill_scratch_into`] — `prompt_len1` batch prefill,
-//!   scratch-backed per-token GEMM, combine via row-wise `all_reduce`.
 
 use anyhow::{Context, Result};
 use cudarc::nccl::{ReduceOp, safe::Comm};
@@ -33,8 +31,7 @@ use pegainfer_kernels::{
         kimi_add_f32_bf16_to_bf16, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
         kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_moe_marlin_align_block_size,
         kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
-        kimi_router_noaux_tc_per_token_launch, repeat_f32_for_reduce_scatter_into,
-        scale_f32_in_place,
+        repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
     },
     tensor::{DeviceContext, GpuTensor, HiddenStates, NormWeight},
     typed_ops,
@@ -49,8 +46,7 @@ use crate::{
 };
 
 use super::worker::{
-    KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM,
-    all_reduce_bf16_rows_in_place, all_reduce_f32_in_place, all_reduce_f32_rows_in_place,
+    KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM, all_reduce_f32_in_place,
     kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
     reduce_scatter_f32_hidden_into,
 };
@@ -374,173 +370,5 @@ pub(super) fn forward_moe_layer_batch_into(
         add(hidden, &shared_out => next_hidden);
     }
     kimi_add_f32_bf16_to_bf16(ctx, &routed_out_f32, next_hidden, hidden)?;
-    Ok(())
-}
-
-/// `prompt_len1` batch prefill MoE: scratch-backed per-token GEMM, combine via
-/// row-wise `all_reduce` of the F32 routed buffer.
-pub(super) fn forward_moe_layer_prefill_scratch_into(
-    ctx: &DeviceContext,
-    comm: Option<&Comm>,
-    layer_idx: usize,
-    moe: &KimiMoeForwardCache,
-    post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
-    expert_kernels: &KimiRankExpertMarlinWeights,
-    scratch: &mut KimiWorkerDecodeScratch,
-) -> Result<()> {
-    let seq_len = scratch.mla.hidden.seq_len;
-    typed_ops::rms_norm_into(
-        ctx,
-        &scratch.mla.hidden,
-        post_attention_norm,
-        KIMI_K2_RMS_NORM_EPS,
-        &mut scratch.mla.normed,
-    )?;
-    typed_ops::gemm_dm_typed_to_hs_per_token(
-        ctx,
-        &moe.shared_gate_up_proj,
-        &scratch.mla.normed,
-        &mut scratch.shared_expert.gate_up,
-    )?;
-    typed_ops::silu_mul_hs_fused_into(
-        ctx,
-        &scratch.shared_expert.gate_up,
-        &mut scratch.shared_expert.activated,
-    )?;
-    typed_ops::gemm_dm_hs_to_typed_per_token(
-        ctx,
-        &moe.shared_down_proj,
-        &scratch.shared_expert.activated,
-        &mut scratch.mla.projected,
-    )?;
-    if let Some(comm) = comm {
-        all_reduce_bf16_rows_in_place(
-            &mut scratch.mla.projected.data,
-            seq_len,
-            KIMI_K2_HIDDEN,
-            comm,
-        )?;
-    }
-
-    {
-        let mut router_scratch = KimiRouterScratch {
-            logits: &mut scratch.router.router_logits.data,
-            scores: &mut scratch.router.router_scores.data,
-            choice_scores: &mut scratch.router.router_choice_scores.data,
-        };
-        let mut router_output = KimiRouterOutput {
-            topk_weight: &mut scratch.router.router_topk_weight.data,
-            topk_idx: &mut scratch.router.router_topk_idx.data,
-        };
-        let router_batch = KimiRouterBatch {
-            batch_size: seq_len,
-            active_tokens: seq_len,
-            padded_tokens: seq_len,
-        };
-        kimi_router_noaux_tc_per_token_launch(
-            ctx,
-            KimiRouterConfig::kimi_k2(),
-            router_batch,
-            &scratch.mla.normed,
-            &moe.router.gate_weight,
-            &moe.router.e_score_correction_bias,
-            &mut router_scratch,
-            &mut router_output,
-        )?;
-    }
-
-    let routing = kimi_moe_marlin_align_block_size(
-        ctx,
-        &mut scratch.prompt_len1_moe.route_workspace,
-        &scratch.router.router_topk_idx.data,
-        seq_len,
-        seq_len,
-        expert_kernels.local_expert_range.start,
-    )?;
-    let layer_weights = expert_kernels
-        .layers
-        .iter()
-        .find(|layer| layer.layer_idx == layer_idx)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Kimi rank expert Marlin package missing layer {layer_idx}")
-        })?
-        .as_marlin_weights();
-
-    scratch.marlin.w13_out.seq_len = routing.route_elems;
-    scratch.marlin.activated.seq_len = routing.route_elems;
-    scratch.marlin.expert_output.seq_len = routing.route_elems;
-    {
-        let mut active_w13 = scratch
-            .marlin
-            .w13_out
-            .data
-            .slice_mut(0..routing.route_elems * MARLIN_W13_OUT_DIM);
-        ctx.stream
-            .memset_zeros(&mut active_w13)
-            .with_context(|| format!("Kimi MoE layer {layer_idx} zero prompt w13 scratch"))?;
-    }
-    kimi_marlin_wna16_w13_gemm(
-        ctx,
-        &mut scratch.prompt_len1_moe.marlin_workspace,
-        &routing,
-        &scratch.mla.normed,
-        &layer_weights.w13,
-        &scratch.router.router_topk_weight.data,
-        &mut scratch.marlin.w13_out,
-    )?;
-    kimi_marlin_w13_swiglu(ctx, &scratch.marlin.w13_out, &mut scratch.marlin.activated)?;
-    {
-        let mut active_expert = scratch
-            .marlin
-            .expert_output
-            .data
-            .slice_mut(0..routing.route_elems * KIMI_K2_HIDDEN);
-        ctx.stream
-            .memset_zeros(&mut active_expert)
-            .with_context(|| format!("Kimi MoE layer {layer_idx} zero prompt expert scratch"))?;
-    }
-    kimi_marlin_wna16_w2_gemm(
-        ctx,
-        &mut scratch.prompt_len1_moe.marlin_workspace,
-        &routing,
-        &scratch.marlin.activated,
-        &layer_weights.w2_down,
-        &scratch.router.router_topk_weight.data,
-        &mut scratch.marlin.expert_output,
-    )?;
-
-    kimi_marlin_sum_topk_rows_f32(
-        ctx,
-        &scratch.marlin.expert_output,
-        seq_len,
-        &mut scratch.comm.routed_out_f32,
-    )?;
-    let nccl_comm = comm.ok_or_else(|| {
-        anyhow::anyhow!("NCCL MoE batch routed path requires TP comm (use PPLX for TP1)")
-    })?;
-    all_reduce_f32_rows_in_place(
-        &mut scratch.comm.routed_out_f32,
-        seq_len,
-        KIMI_K2_HIDDEN,
-        nccl_comm,
-    )?;
-    scale_f32_in_place(
-        ctx,
-        &mut scratch.comm.routed_out_f32,
-        seq_len * KIMI_K2_HIDDEN,
-        KIMI_K2_ROUTER_SCALE,
-    )?;
-    typed_ops::add_into(
-        ctx,
-        &scratch.mla.hidden,
-        &scratch.mla.projected,
-        &mut scratch.mla.normed,
-    )?;
-    kimi_add_f32_bf16_to_bf16(
-        ctx,
-        &scratch.comm.routed_out_f32,
-        &scratch.mla.normed,
-        &mut scratch.mla.hidden,
-    )?;
     Ok(())
 }

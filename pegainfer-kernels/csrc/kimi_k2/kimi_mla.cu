@@ -300,23 +300,6 @@ __global__ void assemble_v_cache_kernel(const DType* __restrict__ kv_b,
   v_cache[dst] = kv_b[src];
 }
 
-__global__ void extract_prefill_v_kernel(const DType* __restrict__ kv_b,
-                                         DType* __restrict__ output,
-                                         int batch_size,
-                                         int local_heads) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = batch_size * local_heads * kVHeadDim;
-  if (idx >= total) {
-    return;
-  }
-  int dim = idx % kVHeadDim;
-  int head_token = idx / kVHeadDim;
-  int head = head_token % local_heads;
-  int token = head_token / local_heads;
-  int src = token * local_heads * kKvBHeadDim + head * kKvBHeadDim + kNopeDim + dim;
-  output[idx] = kv_b[src];
-}
-
 __global__ void rope_split_decode_kernel(const DType* __restrict__ q_proj,
                                          const DType* __restrict__ k_rope,
                                          const DType* __restrict__ cos,
@@ -459,22 +442,6 @@ cudaError_t kimi_mla_rope_assemble_prefill_cuda(const DType* q_proj,
   int v_total = seq_len * local_heads * kVHeadDim;
   int v_blocks = (v_total + threads - 1) / threads;
   assemble_v_cache_kernel<<<v_blocks, threads, 0, stream>>>(kv_b, v_cache, seq_len, local_heads);
-  return cudaGetLastError();
-}
-
-cudaError_t kimi_mla_extract_prefill_v_cuda(const DType* kv_b,
-                                            DType* output,
-                                            int batch_size,
-                                            int local_heads,
-                                            cudaStream_t stream) {
-  if (batch_size <= 0 || local_heads <= 0) {
-    return cudaErrorInvalidValue;
-  }
-  int total = batch_size * local_heads * kVHeadDim;
-  int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  extract_prefill_v_kernel<<<blocks, threads, 0, stream>>>(
-      kv_b, output, batch_size, local_heads);
   return cudaGetLastError();
 }
 

@@ -347,7 +347,6 @@ pub(crate) struct KimiK2ParallelShape {
 pub(crate) struct KimiLocalDims {
     pub(crate) local_heads: usize,
     pub(crate) q_proj_out: usize,
-    pub(crate) kv_b_out: usize,
     pub(crate) o_proj_in: usize,
     pub(crate) q_nope_out: usize,
     pub(crate) q_pe_out: usize,
@@ -388,7 +387,6 @@ impl KimiK2ParallelShape {
         KimiLocalDims {
             local_heads: h,
             q_proj_out: h * KIMI_K2_Q_HEAD_DIM,
-            kv_b_out: h * (KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_V_HEAD_DIM),
             o_proj_in: h * KIMI_K2_V_HEAD_DIM,
             q_nope_out: h * KIMI_K2_QK_NOPE_HEAD_DIM,
             q_pe_out: h * KIMI_K2_QK_ROPE_HEAD_DIM,

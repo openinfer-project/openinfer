@@ -244,59 +244,6 @@ pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
         .map_err(|err| anyhow!("Kimi router CUDA launch failed: {err}"))
 }
 
-pub fn kimi_router_noaux_tc_per_token_launch<const DIM: usize>(
-    ctx: &DeviceContext,
-    config: KimiRouterConfig,
-    batch: KimiRouterBatch,
-    hidden: &GpuTensor<DIM>,
-    gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
-    e_score_correction_bias: &CudaSlice<f32>,
-    scratch: &mut KimiRouterScratch<'_>,
-    output: &mut KimiRouterOutput<'_>,
-) -> Result<()> {
-    validate_kimi_router_shapes(
-        config,
-        batch,
-        hidden,
-        gate_weight,
-        e_score_correction_bias,
-        scratch,
-        output,
-    )?;
-
-    let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
-    let (gate_ptr, _gate_guard) = gate_weight.data.device_ptr(&ctx.stream);
-    let (bias_ptr, _bias_guard) = e_score_correction_bias.device_ptr(&ctx.stream);
-    let (logits_ptr, _logits_guard) = scratch.logits.device_ptr_mut(&ctx.stream);
-    let (scores_ptr, _scores_guard) = scratch.scores.device_ptr_mut(&ctx.stream);
-    let (choice_ptr, _choice_guard) = scratch.choice_scores.device_ptr_mut(&ctx.stream);
-    let (weight_ptr, _weight_guard) = output.topk_weight.device_ptr_mut(&ctx.stream);
-    let (idx_ptr, _idx_guard) = output.topk_idx.device_ptr_mut(&ctx.stream);
-
-    let result = unsafe {
-        ffi::kimi_k2_router_noaux_tc_per_token_cuda(
-            hidden_ptr as *const ffi::Half,
-            gate_ptr as *const ffi::Half,
-            bias_ptr as *const f32,
-            logits_ptr as *mut f32,
-            scores_ptr as *mut f32,
-            choice_ptr as *mut f32,
-            weight_ptr as *mut f32,
-            idx_ptr as *mut i32,
-            batch.active_tokens as i32,
-            batch.padded_tokens as i32,
-            config.hidden_dim as i32,
-            config.n_experts as i32,
-            config.topk as i32,
-            config.route_scale,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result
-        .result()
-        .map_err(|err| anyhow!("Kimi per-token router CUDA launch failed: {err}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

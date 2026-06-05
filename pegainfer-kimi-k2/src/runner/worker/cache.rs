@@ -295,15 +295,6 @@ impl KimiWorkerDecodeArena {
         Ok(())
     }
 
-    pub(super) fn configure_batch_prompt_len1(
-        &mut self,
-        ctx: &DeviceContext,
-        slots: &[usize],
-    ) -> Result<()> {
-        let append_positions = vec![0usize; slots.len()];
-        self.configure_batch_decode(ctx, slots, &append_positions)
-    }
-
     pub(super) fn upload_batch_tokens(
         &mut self,
         ctx: &DeviceContext,
@@ -427,7 +418,6 @@ impl KimiWorkerDecodeScratch {
             marlin: crate::typed_scratch::MarlinExpertScratch::new(ctx, batch_size)?,
             marlin_route_workspace,
             marlin_workspace,
-            prompt_len1_moe: crate::typed_scratch::PromptLen1MoeScratch::new(ctx, batch_size)?,
             comm: crate::typed_scratch::CommScratch::new(ctx, batch_size)?,
             sampling: crate::typed_scratch::SamplingScratch::new(ctx, batch_size)?,
         })

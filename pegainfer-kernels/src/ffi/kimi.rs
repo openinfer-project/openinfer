@@ -74,24 +74,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_k2_router_noaux_tc_per_token_cuda(
-        hidden: *const Half,
-        gate_weight: *const Half,
-        e_score_correction_bias: *const f32,
-        logits: *mut f32,
-        scores: *mut f32,
-        choice_scores: *mut f32,
-        topk_weight: *mut f32,
-        topk_idx: *mut i32,
-        active_tokens: i32,
-        padded_tokens: i32,
-        hidden_dim: i32,
-        n_experts: i32,
-        topk: i32,
-        route_scale: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn kimi_marlin_int4_fuse_w13_cuda(
         gate_weight_packed_marlin: *const u8,
         up_weight_packed_marlin: *const u8,
@@ -185,14 +167,6 @@ unsafe extern "C" {
         local_heads: i32,
         stream: CUstream,
     ) -> i32;
-
-    pub fn kimi_mla_extract_prefill_v_cuda(
-        kv_b: *const Half,
-        output: *mut Half,
-        batch_size: i32,
-        local_heads: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn kimi_mla_paged_kv_append_cuda(
         ckv_cache: *mut Half,

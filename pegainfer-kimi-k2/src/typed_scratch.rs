@@ -15,7 +15,6 @@ use pegainfer_kernels::ops::{
 };
 
 pub(crate) const MARLIN_W13_OUT_DIM: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
-const PROMPT_LEN1_MARLIN_BLOCK_SIZE: usize = 8;
 
 pub(crate) struct MlaDecodeScratch {
     // TP-independent (global model dims)
@@ -23,9 +22,7 @@ pub(crate) struct MlaDecodeScratch {
     pub(crate) normed: GpuTensor<KIMI_K2_HIDDEN>,
     pub(crate) projected: GpuTensor<KIMI_K2_HIDDEN>,
     pub(crate) qkv_a: GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
-    pub(crate) q_a: GpuTensor<KIMI_K2_Q_LORA_RANK>,
     pub(crate) q_a_normed: GpuTensor<KIMI_K2_Q_LORA_RANK>,
-    pub(crate) compressed_kv: GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
     pub(crate) k_rope: GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
     pub(crate) compressed_normed: GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
     pub(crate) append_kpe: GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
@@ -35,7 +32,6 @@ pub(crate) struct MlaDecodeScratch {
     pub(crate) q_nope: HiddenStates,
     pub(crate) q_pe: HiddenStates,
     pub(crate) q_abs_nope: HiddenStates,
-    pub(crate) kv_b: HiddenStates,
     pub(crate) latent: HiddenStates,
     pub(crate) attn_out: HiddenStates,
 }
@@ -51,9 +47,7 @@ impl MlaDecodeScratch {
             normed: GpuTensor::zeros(ctx, batch_size)?,
             projected: GpuTensor::zeros(ctx, batch_size)?,
             qkv_a: GpuTensor::zeros(ctx, batch_size)?,
-            q_a: GpuTensor::zeros(ctx, batch_size)?,
             q_a_normed: GpuTensor::zeros(ctx, batch_size)?,
-            compressed_kv: GpuTensor::zeros(ctx, batch_size)?,
             k_rope: GpuTensor::zeros(ctx, batch_size)?,
             compressed_normed: GpuTensor::zeros(ctx, batch_size)?,
             append_kpe: GpuTensor::zeros(ctx, batch_size)?,
@@ -61,7 +55,6 @@ impl MlaDecodeScratch {
             q_nope: HiddenStates::zeros(ctx, dims.q_nope_out, batch_size)?,
             q_pe: HiddenStates::zeros(ctx, dims.q_pe_out, batch_size)?,
             q_abs_nope: HiddenStates::zeros(ctx, dims.abs_q_out, batch_size)?,
-            kv_b: HiddenStates::zeros(ctx, dims.kv_b_out, batch_size)?,
             latent: HiddenStates::zeros(ctx, dims.abs_q_out, batch_size)?,
             attn_out: HiddenStates::zeros(ctx, dims.o_proj_in, batch_size)?,
         })
@@ -131,28 +124,6 @@ impl MarlinExpertScratch {
     }
 }
 
-pub(crate) struct PromptLen1MoeScratch {
-    pub(crate) route_workspace: KimiMarlinRouteWorkspace,
-    pub(crate) marlin_workspace: KimiMarlinWna16Workspace,
-}
-
-impl PromptLen1MoeScratch {
-    pub(crate) fn new(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
-        let route_workspace =
-            KimiMarlinRouteWorkspace::new(ctx, batch_size, PROMPT_LEN1_MARLIN_BLOCK_SIZE)?;
-        let marlin_workspace = KimiMarlinWna16Workspace::new(
-            ctx,
-            route_workspace.max_m_blocks,
-            KIMI_K2_HIDDEN,
-            PROMPT_LEN1_MARLIN_BLOCK_SIZE,
-        )?;
-        Ok(Self {
-            route_workspace,
-            marlin_workspace,
-        })
-    }
-}
-
 pub(crate) struct CommScratch {
     pub(crate) routed_out_f32: CudaSlice<f32>,
     pub(crate) routed_reduce_scatter_send_f32: CudaSlice<f32>,
@@ -199,63 +170,11 @@ pub(crate) struct KimiWorkerDecodeScratch {
     pub(crate) marlin: MarlinExpertScratch,
     pub(crate) marlin_route_workspace: KimiMarlinRouteWorkspace,
     pub(crate) marlin_workspace: KimiMarlinWna16Workspace,
-    pub(crate) prompt_len1_moe: PromptLen1MoeScratch,
     pub(crate) comm: CommScratch,
     pub(crate) sampling: SamplingScratch,
 }
 
 impl KimiWorkerDecodeScratch {
-    pub(crate) fn set_prompt_seq_len(&mut self, seq_len: usize) -> Result<()> {
-        set_gpu_tensor_seq_len("mla.hidden", &mut self.mla.hidden, seq_len)?;
-        set_gpu_tensor_seq_len("mla.normed", &mut self.mla.normed, seq_len)?;
-        set_gpu_tensor_seq_len("mla.projected", &mut self.mla.projected, seq_len)?;
-        set_gpu_tensor_seq_len("mla.qkv_a", &mut self.mla.qkv_a, seq_len)?;
-        set_gpu_tensor_seq_len("mla.q_a", &mut self.mla.q_a, seq_len)?;
-        set_gpu_tensor_seq_len("mla.q_a_normed", &mut self.mla.q_a_normed, seq_len)?;
-        set_gpu_tensor_seq_len("mla.compressed_kv", &mut self.mla.compressed_kv, seq_len)?;
-        set_gpu_tensor_seq_len("mla.k_rope", &mut self.mla.k_rope, seq_len)?;
-        set_gpu_tensor_seq_len(
-            "mla.compressed_normed",
-            &mut self.mla.compressed_normed,
-            seq_len,
-        )?;
-        set_gpu_tensor_seq_len("mla.append_kpe", &mut self.mla.append_kpe, seq_len)?;
-        set_hidden_states_seq_len("mla.q_proj", &mut self.mla.q_proj, seq_len)?;
-        set_hidden_states_seq_len("mla.q_nope", &mut self.mla.q_nope, seq_len)?;
-        set_hidden_states_seq_len("mla.q_pe", &mut self.mla.q_pe, seq_len)?;
-        set_hidden_states_seq_len("mla.q_abs_nope", &mut self.mla.q_abs_nope, seq_len)?;
-        set_hidden_states_seq_len("mla.kv_b", &mut self.mla.kv_b, seq_len)?;
-        set_hidden_states_seq_len("mla.latent", &mut self.mla.latent, seq_len)?;
-        set_hidden_states_seq_len("mla.attn_out", &mut self.mla.attn_out, seq_len)?;
-        set_hidden_states_seq_len("dense_mlp.gate_up", &mut self.dense_mlp.gate_up, seq_len)?;
-        set_hidden_states_seq_len(
-            "dense_mlp.activated",
-            &mut self.dense_mlp.activated,
-            seq_len,
-        )?;
-        set_hidden_states_seq_len(
-            "shared_expert.gate_up",
-            &mut self.shared_expert.gate_up,
-            seq_len,
-        )?;
-        set_hidden_states_seq_len(
-            "shared_expert.activated",
-            &mut self.shared_expert.activated,
-            seq_len,
-        )?;
-        self.router.set_batch_size(seq_len);
-        let route_elems = seq_len
-            .checked_mul(KIMI_K2_TOPK)
-            .ok_or_else(|| anyhow::anyhow!("Kimi prompt route elem count overflow"))?;
-        set_gpu_tensor_seq_len("marlin.w13_out", &mut self.marlin.w13_out, route_elems)?;
-        set_gpu_tensor_seq_len("marlin.activated", &mut self.marlin.activated, route_elems)?;
-        set_gpu_tensor_seq_len(
-            "marlin.expert_output",
-            &mut self.marlin.expert_output,
-            route_elems,
-        )?;
-        Ok(())
-    }
     pub(crate) fn set_moe_seq_len(&mut self, seq_len: usize) -> Result<()> {
         set_gpu_tensor_seq_len("mla.hidden", &mut self.mla.hidden, seq_len)?;
         set_gpu_tensor_seq_len("mla.normed", &mut self.mla.normed, seq_len)?;

@@ -24,10 +24,10 @@ use pegainfer_kernels::{
         KIMI_K2_MLA_V_HEAD_DIM, KIMI_O_PROJ_CUBLASLT_INPUT, KimiMarlinRouteWorkspace,
         KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, flashinfer_topk_row_states_bytes,
         kimi_flashinfer_batch_decode_mla_rt, kimi_flashinfer_single_prefill_mla_rt,
-        kimi_mla_absorb_q_nope_rt, kimi_mla_extract_prefill_v_rt, kimi_mla_paged_kv_append,
-        kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt,
-        kimi_mla_split_qkv_a, kimi_mla_split_qkv_a_norm, kimi_mla_v_up_rt,
-        kimi_o_proj_cublaslt_into, kimi_o_proj_cublaslt_supports_batch_size,
+        kimi_mla_absorb_q_nope_rt, kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe,
+        kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a,
+        kimi_mla_split_qkv_a_norm, kimi_mla_v_up_rt, kimi_o_proj_cublaslt_into,
+        kimi_o_proj_cublaslt_supports_batch_size,
     },
     tensor::{
         DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, NormWeight,
@@ -122,12 +122,6 @@ enum KimiRankCommand {
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
         resp: Sender<Result<KimiOneTokenForwardReport>>,
-    },
-    ForwardPromptLen1BatchNextTokens {
-        token_ids: Vec<u32>,
-        slots: Vec<usize>,
-        decode_batch_size: usize,
-        resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     ForwardDecodeBatchNextTokens {
         token_ids: Vec<u32>,
@@ -300,23 +294,6 @@ impl KimiRankWorker {
         Ok(resp_rx)
     }
 
-    pub(super) fn forward_prompt_len1_batch_next_tokens_async(
-        &self,
-        token_ids: Vec<u32>,
-        slots: Vec<usize>,
-        decode_batch_size: usize,
-    ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
-        let (resp_tx, resp_rx) = bounded(1);
-        self.tx
-            .send(KimiRankCommand::ForwardPromptLen1BatchNextTokens {
-                token_ids,
-                slots,
-                decode_batch_size,
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
-        Ok(resp_rx)
-    }
     pub(super) fn enable_pplx_async(
         &self,
         ep_backend: pegainfer_comm::EpBackend,
@@ -655,19 +632,6 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 );
                 let _ = resp.send(result);
             }
-            KimiRankCommand::ForwardPromptLen1BatchNextTokens {
-                token_ids,
-                slots,
-                decode_batch_size,
-                resp,
-            } => {
-                let result = state.forward_prompt_len1_batch_next_tokens(
-                    &token_ids,
-                    &slots,
-                    decode_batch_size,
-                );
-                let _ = resp.send(result);
-            }
             KimiRankCommand::EnablePplx { ep_backend, resp } => {
                 let result = state.enable_pplx(ep_backend);
                 let _ = resp.send(result);
@@ -682,8 +646,7 @@ mod load;
 mod runtime;
 // Collective + Marlin helpers shared with the sibling `moe_nccl` backend.
 pub(super) use runtime::{
-    all_reduce_bf16_rows_in_place, all_reduce_f32_in_place, all_reduce_f32_rows_in_place,
-    kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
+    all_reduce_f32_in_place, kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
     reduce_scatter_f32_hidden_into,
 };
 mod state;
