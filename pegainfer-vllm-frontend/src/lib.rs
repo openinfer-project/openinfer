@@ -825,6 +825,9 @@ async fn run_request_stream(
             }
             TokenEvent::Rejected { message, .. } => {
                 // Rejected means the request could not be admitted, not that it completed cleanly.
+                // The vllm-server HTTP layer collapses engine errors into a generic 500, so this
+                // log line is the only place the rejection reason is visible.
+                warn!("engine rejected request {request_id}: {message}");
                 let _ = send_terminal_output(
                     &output_tx,
                     request_id,
