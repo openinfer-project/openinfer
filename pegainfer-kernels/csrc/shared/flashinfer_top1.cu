@@ -1,5 +1,8 @@
 #include "common.cuh"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
 
@@ -10,8 +13,19 @@ extern "C" void flashinfer_top1_cuda(const __nv_bfloat16* logits,
   auto* row_states =
       reinterpret_cast<flashinfer::sampling::RadixRowState*>(row_states_scratch);
   auto* input = const_cast<__nv_bfloat16*>(logits);
-  (void)flashinfer::sampling::TopKDispatch<__nv_bfloat16, int>(
-      input, output, top1_value_scratch, 1, 1, vocab_size, row_states, stream);
+  // deterministic=true: bf16 logits tie at the max in practice (8 mantissa
+  // bits), and the non-deterministic collect picks an arbitrary winner per
+  // run. Deterministic collect resolves ties to the smallest index (matching
+  // torch.argmax) for ~2us extra latency.
+  cudaError_t err = flashinfer::sampling::TopKDispatch<__nv_bfloat16, int>(
+      input, output, top1_value_scratch, 1, 1, vocab_size, row_states,
+      /*sorted_output=*/false, /*deterministic=*/true,
+      flashinfer::sampling::TopKTieBreak::None, stream);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "flashinfer_top1_cuda: TopKDispatch failed: %s\n",
+            cudaGetErrorString(err));
+    abort();
+  }
 }
 
 extern "C" void flashinfer_top1_batch_cuda(const __nv_bfloat16* logits,
@@ -24,8 +38,14 @@ extern "C" void flashinfer_top1_batch_cuda(const __nv_bfloat16* logits,
       reinterpret_cast<flashinfer::sampling::RadixRowState*>(row_states_scratch);
   for (int row = 0; row < num_rows; ++row) {
     auto* input = const_cast<__nv_bfloat16*>(logits + row * vocab_size);
-    (void)flashinfer::sampling::TopKDispatch<__nv_bfloat16, int>(
+    cudaError_t err = flashinfer::sampling::TopKDispatch<__nv_bfloat16, int>(
         input, output + row, top1_values + row, 1, 1, vocab_size, row_states,
-        stream);
+        /*sorted_output=*/false, /*deterministic=*/true,
+        flashinfer::sampling::TopKTieBreak::None, stream);
+    if (err != cudaSuccess) {
+      fprintf(stderr, "flashinfer_top1_batch_cuda: TopKDispatch failed: %s\n",
+              cudaGetErrorString(err));
+      abort();
+    }
   }
 }
