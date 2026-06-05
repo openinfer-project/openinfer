@@ -1046,12 +1046,19 @@ fn to_wire_position_logprobs(
 }
 
 fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
+    // The vLLM frontend lowers a client `ignore_eos=true` to `_eos_token_id:
+    // None`, but `_all_stop_token_ids` always carries the model EOS set (it
+    // exists for min_tokens masking, not stop detection). Deriving ignore_eos
+    // from all_stop_token_ids would therefore void every ignore_eos request on
+    // models with a real EOS. Only `_eos_token_id` and the client's explicit
+    // `stop_token_ids` express a stop intent.
+    let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
     if params.temperature <= 0.0 {
         return SamplingParams {
             temperature: 0.0,
             top_k: -1,
             top_p: 1.0,
-            ignore_eos: params.eos_token_id.is_none() && params.all_stop_token_ids.is_empty(),
+            ignore_eos,
         };
     }
 
@@ -1063,7 +1070,7 @@ fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
             i32::try_from(params.top_k).unwrap_or(i32::MAX)
         },
         top_p: params.top_p,
-        ignore_eos: params.eos_token_id.is_none() && params.all_stop_token_ids.is_empty(),
+        ignore_eos,
     }
 }
 
@@ -1329,6 +1336,25 @@ mod tests {
             .map(|entry| entry["id"].as_str().expect("id string"))
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["adapter-a", "adapter-b", "served-base"]);
+    }
+
+    #[test]
+    fn convert_sampling_honors_ignore_eos_lowering() {
+        // ignore_eos=true lowering: _eos_token_id=None while
+        // _all_stop_token_ids still carries the model EOS set.
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.all_stop_token_ids = BTreeSet::from([163586]);
+        assert!(convert_sampling(&params).ignore_eos);
+
+        // Normal request: _eos_token_id present.
+        params.eos_token_id = Some(163586);
+        assert!(!convert_sampling(&params).ignore_eos);
+
+        // Explicit client stop tokens keep EOS detection on even when the
+        // frontend dropped _eos_token_id.
+        params.eos_token_id = None;
+        params.stop_token_ids = vec![42];
+        assert!(!convert_sampling(&params).ignore_eos);
     }
 
     #[test]
