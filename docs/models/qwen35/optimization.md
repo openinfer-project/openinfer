@@ -1,8 +1,8 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT `225ms`, TPOT `11.81ms` (+1%). After the accuracy-parity refactor (#40) regressed decode by +4%, restoring the dedicated GDR decode kernel (#9) recovered it fully.
+> **TL;DR:** Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT `234ms` (+2%), TPOT `11.77ms` (+1%) — see the [E2E Dashboard](#e2e-dashboard) for the authoritative ledger. After the accuracy-parity refactor (#40) regressed decode by +4%, restoring the dedicated GDR decode kernel (#9) recovered it fully.
 >
-> **Status:** Active. Updated 2026-06-05: Qwen3.5 runtime code lives in top-level `pegainfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+> **Last touched:** 2026-06. Qwen3.5 runtime code lives in top-level `pegainfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
 Historical command logs below keep the command paths that were actually run at the time. For new Qwen3.5 accuracy tests, use `-p pegainfer-qwen35-4b --test hf_golden_gate`; for serving benchmarks, continue using root `cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B ...`.
 

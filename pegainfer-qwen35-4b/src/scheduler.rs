@@ -78,11 +78,6 @@ impl SampleScratch {
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
-/// Start the Qwen3.5 scheduler thread with default max batch size (64).
-pub fn start(model: Qwen35Model, seed: u64) -> Result<SchedulerHandle> {
-    start_with_capacity(model, seed, crate::batch_decode_graph::MAX_BATCH)
-}
-
 /// Start the Qwen3.5 scheduler thread with a custom max batch size.
 ///
 /// Lower `max_batch` reduces GPU memory usage (each slot holds a full

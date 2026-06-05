@@ -36,11 +36,10 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): fast and decode-correct, #186 adds the teacher-forced HF logits gate, and #250 covers the old 4096 RoPE boundary with a 4097/8192-token HF logits replay plus a recovered GSM8K 8-shot score; ~640MB HND prefill staging remains, pre-#85 admission semantics still open, and current scheduler admission/slot/compaction policy is now CPU-tested. |
-| `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 225ms, TPOT 11.81ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9). |
+| `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): fast and decode-correct, #186 adds the teacher-forced HF logits gate, and #250 covers the old 4096 RoPE boundary with a 4097/8192-token HF logits replay plus a recovered GSM8K 8-shot score; ~640MB HND prefill staging remains, with the 20k cap now fail-closed, pre-#85 admission semantics still open, and current scheduler admission/slot/compaction policy is now CPU-tested. |
+| `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 234ms (+2%), TPOT 11.77ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9). |
 | `models/qwen35/accuracy.md` | Qwen3.5-4B HF bf16 logits goldens through `past_key_values`: short replay covers sequential graph, bucket-straddling batched graph, and slot-compaction; long replay covers 4097/8192-token prompts; full GSM8K 8-shot now matches the HF baseline within 0.15 percentage points. |
 | `models/qwen35/model-crate.md` | `pegainfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, historical Qwen3.5 e2e, and scheduler e2e records live here. |
-| `models/qwen35/e2e-gibberish.md` | Historical Qwen3.5 exact-text e2e debug record: scheduler threads now bind CUDA context and initialize thread-local cuBLAS handles. The exact-text gate is retired by the HF logits gate. |
 
 ## models / deepseek-v4
 
@@ -133,6 +132,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `lessons/moe-dplb-decode-imbalance.md` | DPLB lesson for future PegaFlow/WiDeep MoE+EP serving: decode-side DP imbalance is a sticky KV-state problem; engines should emit raw progress while external router/proxy derive load and routing. |
 | `lessons/moe-zero-prefill-long-prefill.md` | ZeRO-Prefill lesson for future long-prefill MoE serving: once a router selects long-P work, maximize batch throughput by preserving compute-bound execution, hiding expert-weight movement, respecting KV handoff boundaries, and measuring bottlenecks before committing to an AsyncEP-style backend. |
+| `lessons/exact-match-gate-thread-cublas.md` | Two durable lessons from a Qwen3.5 e2e gibberish bug: worker threads that run a model must rebind the CUDA context and init thread-local cuBLAS handles, and exact-match greedy gates are sensitive to equal-logit top1 choices (keep a single FlashInfer selector). |
 
 ## benchmarks
 

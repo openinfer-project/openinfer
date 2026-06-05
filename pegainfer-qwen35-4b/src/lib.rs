@@ -16,7 +16,7 @@ mod weights;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use pegainfer_core::engine::{EngineHandle, EngineLoadOptions, ModelInfo};
+use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 /// Low-level Qwen3.5 execution interface.
 ///
@@ -28,7 +28,7 @@ pub mod runtime {
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
         PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen35Executor, RequestId,
     };
-    pub use crate::scheduler::{start as start_with_model, start_with_capacity};
+    pub use crate::scheduler::start_with_capacity;
     pub use crate::weights::Qwen35Model;
 }
 
@@ -37,33 +37,6 @@ pub mod runtime_ops {
     pub use crate::ops::{
         gated_delta_rule_prefill_chunkwise_into, rms_norm_batch_offset_into, rms_norm_offset_into,
     };
-}
-
-pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
-    let config_path = model_path.join("config.json");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let json: serde_json::Value = serde_json::from_str(&content)?;
-    let Some(text_config) = json.get("text_config") else {
-        return Ok(None);
-    };
-    if text_config.get("layer_types").is_none() {
-        return Ok(None);
-    }
-
-    Ok(Some(ModelInfo {
-        id: "qwen35-4b",
-        display_name: "Qwen3.5-4B".to_string(),
-        model_path: model_path.to_path_buf(),
-        max_model_len: text_config
-            .get("max_position_embeddings")
-            .or_else(|| json.get("max_position_embeddings"))
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok()),
-    }))
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {

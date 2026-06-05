@@ -1,8 +1,8 @@
 # Qwen3.5-4B Model Crate
 
 **Created**: 2026-05-05
-**Status**: complete
-**TL;DR**: `crates/pegainfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. Root `pegainfer` loads Qwen3.5 through `pegainfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `pegainfer::model::Qwen35Model` or `pegainfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+**TL;DR**: `pegainfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. Root `pegainfer` loads Qwen3.5 through `pegainfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `pegainfer::model::Qwen35Model` or `pegainfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+**Last touched**: 2026-06
 
 ## Preparation
 
@@ -11,15 +11,15 @@
   - `docs/models/qwen3/model-crate.md` - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
   - `docs/models/qwen35/accuracy.md` - at the time of this migration, Qwen3.5 e2e tests were regression guards against `test_data/Qwen3.5-4B.json`; current accuracy coverage is the HF logits gate recorded there.
   - `docs/models/qwen35/optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
-  - GitHub issue #79 - acceptance criteria require `crates/pegainfer-qwen35-4b`, removal of root `pegainfer::model::Qwen35Model` and `pegainfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
-  - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `crates/pegainfer-qwen3-4b/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
+  - GitHub issue #79 - acceptance criteria require `pegainfer-qwen35-4b`, removal of root `pegainfer::model::Qwen35Model` and `pegainfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
+  - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `pegainfer-qwen3-4b/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
 - **Relevant history**:
   - `docs/models/qwen3/model-crate.md` - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
 - **Plan**:
-  1. Add `crates/pegainfer-qwen35-4b` to the workspace with dependencies mirroring the Qwen3 crate plus the root dependencies Qwen3.5 currently uses.
+  1. Add `pegainfer-qwen35-4b` to the workspace with dependencies mirroring the Qwen3 crate plus the root dependencies Qwen3.5 currently uses.
   2. Move `src/model/qwen35.rs`, `src/model/qwen35/*`, `src/scheduler_qwen35.rs`, and Qwen3.5 recurrent op wrappers into the new crate, keeping CUDA/Triton kernel sources and FFI in `pegainfer-kernels`.
   3. Rewrite imports so the new crate depends on `pegainfer-core` and `pegainfer-kernels`, not on root `pegainfer`.
-  4. Expose `probe_model`, `start_engine`, and a deliberate `runtime` module from `pegainfer-qwen35-4b`.
+  4. Expose `start_engine`, `start_engine_with_capacity`, and a deliberate `runtime` module from `pegainfer-qwen35-4b`.
   5. Update root `main.rs` and `src/bin/bench_serving.rs` to call `pegainfer_qwen35_4b::start_engine`.
   6. Move Qwen3.5 e2e tests and regen test into the model crate; adjust model/test-data paths after the move.
   7. Remove root Qwen3.5 modules and compatibility exports, then audit root with `rg`.
@@ -31,27 +31,26 @@
 ## Execution Log
 
 ### Step 1: Add model crate and move Qwen3.5 runtime
-- Added `crates/pegainfer-qwen35-4b` to the workspace and root dependencies.
+- Added `pegainfer-qwen35-4b` to the workspace and root dependencies.
 - Moved Qwen3.5-owned runtime files out of root:
   - `src/model/qwen35.rs`
   - `src/model/qwen35/*`
   - `src/scheduler_qwen35.rs`
   - `src/ops/recurrent.rs`
 - The new crate exposes:
-  - `probe_model(model_path) -> Result<Option<ModelInfo>>`
   - `start_engine(model_path, EngineLoadOptions) -> Result<EngineHandle>`
   - `start_engine_with_capacity(...)` for root benchmark capacity control
-  - `runtime::{Qwen35Model, start_with_capacity, start_with_model, MAX_BATCH}` for model-local tests/debugging
+  - `runtime::{Qwen35Model, start_with_capacity, MAX_BATCH}` for model-local tests/debugging
   - `runtime_ops` for Qwen3.5-local operator benches.
 
 ### Step 2: Move tests and benches
 - Moved root Qwen3.5 tests to the model crate at the time:
-  - `crates/pegainfer-qwen35-4b/tests/e2e.rs`
-  - `crates/pegainfer-qwen35-4b/tests/e2e_scheduler.rs`
-  - `crates/pegainfer-qwen35-4b/tests/regen_test_data.rs`
+  - `pegainfer-qwen35-4b/tests/e2e.rs`
+  - `pegainfer-qwen35-4b/tests/e2e_scheduler.rs`
+  - `pegainfer-qwen35-4b/tests/regen_test_data.rs`
 - The exact-text `e2e.rs` and `regen_test_data.rs` were later removed by the Qwen3.5 HF logits gate work; `e2e_scheduler.rs` remains as request-flow coverage.
-- Moved Qwen3.5-specific op benches to `crates/pegainfer-qwen35-4b/benches/qwen35_ops.rs`.
-- Moved the `conv1d_prefill_handoff_matches_single_prefill` operator test into `crates/pegainfer-qwen35-4b/src/recurrent.rs`, next to the wrapper it validates.
+- Moved Qwen3.5-specific op benches to `pegainfer-qwen35-4b/benches/qwen35_ops.rs`.
+- Moved the `conv1d_prefill_handoff_matches_single_prefill` operator test into `pegainfer-qwen35-4b/src/recurrent.rs`, next to the wrapper it validates.
 - Removed Qwen3.5-specific GEMV shapes from the root generic `ops_bench`; the model-specific benches now live with Qwen3.5.
 
 ### Step 3: Remove root Qwen3.5 compatibility surface
@@ -83,7 +82,7 @@
   - A temporary old-HEAD worktree at `$RESULT_ROOT/pegainfer-head` ran `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B CARGO_TARGET_DIR=$RESULT_ROOT/pegainfer-head-target cargo test --release --test e2e_qwen35 -- --nocapture`.
   - Old HEAD failed the same way on all 10 Qwen3.5 cases, so the e2e mismatch predated this crate split.
 - Follow-up fix:
-  - `docs/models/qwen35/e2e-gibberish.md` identified the first gibberish commit as `6a5b826`, fixed Qwen3.5 scheduler thread CUDA/cuBLAS binding, kept greedy sampling on FlashInfer top1, and refreshed the exact Qwen3.5 golden for the default engine shape.
+  - `docs/lessons/exact-match-gate-thread-cublas.md` identified the first gibberish commit as `6a5b826`, fixed Qwen3.5 scheduler thread CUDA/cuBLAS binding, kept greedy sampling on FlashInfer top1, and refreshed the exact Qwen3.5 golden for the default engine shape.
   - After that fix, both Qwen3.5 e2e commands above pass.
 
 ## Debrief

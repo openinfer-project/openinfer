@@ -46,7 +46,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 ## Cleanup ledger
 
 - **Issue hygiene:** #188 references a test target deleted in #194 — close as superseded by the golden gate. #203 §1 still claims qwen3 has no prefix reuse — stale since #216.
-- **Dead code:** `batch_decode_trace.rs` `HIDDEN_SIZE`/`INTERMEDIATE_SIZE` consts (pub, zero readers); `probe_model()`+`ModelInfo` uncalled (server inlines its own detection — same in qwen35; wire it or delete it).
+- **Dead code:** `batch_decode_trace.rs` `HIDDEN_SIZE`/`INTERMEDIATE_SIZE` consts (pub, zero readers); qwen3 `probe_model()`+`ModelInfo` remain uncalled (server inlines its own detection — qwen35's matching dead pair was removed in #258).
 - **File size:** `executor.rs` (1435), `scheduler.rs` (1420, ~826 of them inline tests), `kernel_bench.rs` (1112) breach the 1k-line redline.
 - **Docs:** `model-crate.md` TL;DR advertises a deleted `qwen3_kernel_snapshot` bench and, with `kernels-crate.md`, uses the obsolete `crates/` layout in every command — collapse both into one slim layout doc. `tp-design.md` describes the implemented controller/worker runtime as future direction — rewrite to past tense, promote the 3 real open items. `kv-pressure-hang.md` — lift the KV-lifetime-reservation lessons to `docs/lessons/`, then delete. `execution.md` Done list predates #216.
 
