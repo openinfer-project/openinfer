@@ -8,8 +8,9 @@
 //! path so the oracle matches pegainfer's prefill + decode shape.
 //!
 //! Qwen3.5 currently has no eager batched decode path; decode goes through the
-//! CUDA-graph bucketed path. This gate therefore covers sequential bs=1 and two
-//! bucket-straddling batched graph passes.
+//! CUDA-graph bucketed path. This gate therefore covers sequential bs=1,
+//! bucket-straddling batched graph passes, and slot compaction after a request
+//! is dropped mid-replay.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,8 @@ const P99_TOL: f32 = 0.20;
 const HEAD_K: usize = 8;
 
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
+const SLOT_COMPACTION_BATCH: usize = 5;
+const SLOT_COMPACTION_DROP_INDEX: usize = 1;
 
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
@@ -428,6 +431,91 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
     (stats, fingerprint)
 }
 
+fn run_with_slot_compaction(
+    g: &Golden,
+    ex: &mut Qwen35Executor,
+    seqs: &[usize],
+) -> (Stats, Vec<f32>) {
+    assert!(
+        seqs.len() > SLOT_COMPACTION_DROP_INDEX + 1,
+        "slot-compaction replay needs a non-tail request to drop"
+    );
+    assert!(
+        g.decode_len >= 2,
+        "slot-compaction replay needs at least two decode tokens"
+    );
+
+    let mut stats = Stats::default();
+    let mut fingerprint = Vec::new();
+    let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
+        fingerprint.push(pega[0].1);
+        check_position(stats, seq, pos, pega, &g.topk(seq, pos));
+    };
+
+    let mut live: Vec<(usize, RequestId)> = seqs
+        .iter()
+        .map(|&seq| (seq, RequestId::new(2000 + seq as u64)))
+        .collect();
+    let items: Vec<PrefillStepItem> = live
+        .iter()
+        .map(|&(seq, id)| prefill_item(id, g.prompt(seq)))
+        .collect();
+    let pr = ex
+        .execute_prefill(PrefillPlan { requests: &items })
+        .expect("prefill");
+    for (i, &(seq, _)) in live.iter().enumerate() {
+        fold(
+            &mut stats,
+            seq,
+            0,
+            &top_logprobs(pr.requests[i].first_token_logprob.as_ref()),
+        );
+    }
+
+    let step0: Vec<DecodeStepItem> = live
+        .iter()
+        .map(|&(seq, id)| decode_item(id, g.decode(seq, 0)))
+        .collect();
+    let dr = ex
+        .execute_decode(DecodePlan { requests: &step0 })
+        .expect("decode before compaction");
+    for (i, &(seq, _)) in live.iter().enumerate() {
+        fold(
+            &mut stats,
+            seq,
+            1,
+            &top_logprobs(dr.requests[i].logprob.as_ref()),
+        );
+    }
+
+    let (_, dropped_id) = live[SLOT_COMPACTION_DROP_INDEX];
+    ex.drop_request(dropped_id).expect("drop request");
+    live.swap_remove(SLOT_COMPACTION_DROP_INDEX);
+
+    for step in 1..g.decode_len {
+        let items: Vec<DecodeStepItem> = live
+            .iter()
+            .map(|&(seq, id)| decode_item(id, g.decode(seq, step)))
+            .collect();
+        let dr = ex
+            .execute_decode(DecodePlan { requests: &items })
+            .expect("decode after compaction");
+        for (i, &(seq, _)) in live.iter().enumerate() {
+            fold(
+                &mut stats,
+                seq,
+                step + 1,
+                &top_logprobs(dr.requests[i].logprob.as_ref()),
+            );
+        }
+    }
+
+    for (_, id) in live {
+        ex.drop_request(id).expect("drop request");
+    }
+    (stats, fingerprint)
+}
+
 fn dist(deltas: &[f32]) -> (f32, f32, f32, f32) {
     let mut s = deltas.to_vec();
     s.sort_by(f32::total_cmp);
@@ -475,6 +563,11 @@ fn report_and_assert(label: &str, stats: &Stats) {
     let _ = max;
 }
 
+fn build_executor(model_path: &str) -> Qwen35Executor {
+    Qwen35Executor::from_runtime_with_capacity(model_path, true, &[0], MAX_EXECUTOR_BATCH)
+        .expect("build Qwen3.5 logits executor")
+}
+
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = model_path_or_skip() else {
@@ -486,20 +579,37 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     }
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let mut ex =
-        Qwen35Executor::from_runtime_with_capacity(&model_path, true, &[0], MAX_EXECUTOR_BATCH)
-            .expect("build Qwen3.5 logits executor");
+    {
+        let mut ex = build_executor(&model_path);
 
-    let (stats, fp1) = run(&golden, &mut ex, &all, false);
-    report_and_assert("sequential bs=1 graph", &stats);
-    let (_, fp2) = run(&golden, &mut ex, &all, false);
+        let (stats, fp1) = run(&golden, &mut ex, &all, false);
+        report_and_assert("sequential bs=1 graph", &stats);
+        let (_, fp2) = run(&golden, &mut ex, &all, false);
+        assert_eq!(
+            fp1, fp2,
+            "sequential Qwen3.5 replay must reproduce identical logprobs"
+        );
+
+        for n in BUCKET_STRADDLES {
+            let (batched, _) = run(&golden, &mut ex, &all[..n], true);
+            report_and_assert(&format!("batched graph ({n} padded)"), &batched);
+        }
+    }
+
+    let fp1 = {
+        let mut ex = build_executor(&model_path);
+        let (compacted, fp) =
+            run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
+        report_and_assert("slot-compaction graph", &compacted);
+        fp
+    };
+    let fp2 = {
+        let mut ex = build_executor(&model_path);
+        let (_, fp) = run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
+        fp
+    };
     assert_eq!(
         fp1, fp2,
-        "sequential Qwen3.5 replay must reproduce identical logprobs"
+        "slot-compaction Qwen3.5 replay must reproduce identical logprobs"
     );
-
-    for n in BUCKET_STRADDLES {
-        let (batched, _) = run(&golden, &mut ex, &all[..n], true);
-        report_and_assert(&format!("batched graph ({n} padded)"), &batched);
-    }
 }

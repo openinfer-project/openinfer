@@ -2,7 +2,7 @@
 
 > **TL;DR:** Qwen3.5 accuracy now has a small HF-backed logits golden (`tests/hf_golden_gate.rs` + `test_data/qwen35-4b-hf-golden.safetensors`). The HF fixture uses `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so it matches pegainfer's prefill + decode shape. The older exact-text `test_data/Qwen3.5-4B.json` remains regression-only. A broader PegaInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
 >
-> **Status:** Active. Updated 2026-05-31: HF logits gate passes on A800 `sm_80`. Current regression commands are crate-local and need an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`, plus the existing exact-text `e2e` / `e2e_scheduler` checks when that surface changes.
+> **Status:** Active. Updated 2026-06-05: the HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, and slot-compaction replay after a mid-batch request drop. Current regression commands are crate-local and need an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture`, plus the existing exact-text `e2e` / `e2e_scheduler` checks when that surface changes.
 
 ## Goal
 
@@ -45,23 +45,31 @@
 - Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.
 - Shape: 12 seed-fixed prompt-token sequences, prompt length 1-128, 8 teacher-forced decode tokens, 108 scored positions, top-64 HF logprobs per position.
 - Tolerances: regret `0.20`, mean head-delta `0.06`, p99 head-delta `0.20`; max is printed only.
-- Replay surface: sequential bs=1 through the Qwen3.5 graph decode path, then batched graph passes at 5->8 and 3->4 bucket straddles. Qwen3.5 currently has no eager batched decode path.
+- Replay surface: sequential bs=1 through the Qwen3.5 graph decode path, batched graph passes at 5->8 and 3->4 bucket straddles, and slot-compaction replay after a mid-batch request drop. Qwen3.5 currently has no eager batched decode path.
 
-Verified on A800 `sm_80`:
+Verified on RTX 5090 `sm_120` with Triton 3.4.0 for build-time AOT:
 
 ```bash
-PEGAINFER_CUDA_SM=80 \
-PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/pegainfer-issue186-qwen35-oracle/models/Qwen3.5-4B \
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_TRITON_PYTHON=/root/autodl-tmp/triton34-venv/bin/python \
+PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/models/Qwen3.5-4B \
+PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
 cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate -- --nocapture
 ```
 
-Observed floor:
+Observed floor from that run:
 
 | Pass | positions | mean | p50 | p99 | max |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| sequential bs=1 graph | 108 | 0.0224 | 0.0130 | 0.0792 | 0.1130 |
-| batched graph (5 padded) | 45 | 0.0265 | 0.0187 | 0.1033 | 0.1805 |
-| batched graph (3 padded) | 27 | 0.0280 | 0.0169 | 0.1033 | 0.1805 |
+| sequential bs=1 graph | 108 | 0.0248 | 0.0175 | 0.0862 | 0.1193 |
+| batched graph (5 padded) | 45 | 0.0256 | 0.0199 | 0.0757 | 0.1068 |
+| batched graph (3 padded) | 27 | 0.0260 | 0.0179 | 0.1007 | 0.1206 |
+| slot-compaction graph | 38 | 0.0285 | 0.0219 | 0.1031 | 0.1168 |
+
+This table is the current PR validation snapshot. It supersedes the older A800
+`sm_80` observation for this doc section; per-architecture bf16/CUDA reduction
+differences should not be read as an accuracy improvement or regression by
+themselves.
 
 ### Deferred rand/hash corpus
 
