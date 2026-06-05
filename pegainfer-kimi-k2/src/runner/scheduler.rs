@@ -24,6 +24,7 @@ const KIMI_PREFILL_BATCH_POLL: Duration = Duration::from_micros(50);
 
 pub(super) struct KimiK2Scheduler {
     executor: Box<dyn ForwardExecutor + Send>,
+    stop_token_ids: Vec<u32>,
 }
 
 struct ActiveKimiRequest {
@@ -31,13 +32,17 @@ struct ActiveKimiRequest {
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
+    ignore_eos: bool,
     last_token: u32,
     slot: usize,
     decode_batch_size: usize,
 }
 
 impl KimiK2Scheduler {
-    pub(super) fn new(executor: Box<dyn ForwardExecutor + Send>) -> Result<Self> {
+    pub(super) fn new(
+        executor: Box<dyn ForwardExecutor + Send>,
+        stop_token_ids: Vec<u32>,
+    ) -> Result<Self> {
         executor
             .ensure_decode_batch(KIMI_RUNNER_MAX_BATCH)
             .with_context(|| {
@@ -52,7 +57,10 @@ impl KimiK2Scheduler {
             .with_context(|| {
                 format!("Kimi-K2 warm prompt_len1 bs{KIMI_RUNNER_MAX_BATCH} before serving")
             })?;
-        Ok(Self { executor })
+        Ok(Self {
+            executor,
+            stop_token_ids,
+        })
     }
 
     pub(in crate::runner) fn run(
@@ -179,6 +187,17 @@ impl KimiK2Scheduler {
                 let req = &mut active[idx];
                 let token_id = report.local_next_token_global_id;
                 req.completion_tokens += 1;
+                // EOS outranks the length limit; the stop token itself is not
+                // emitted (same contract as the Qwen schedulers).
+                if !req.ignore_eos && self.stop_token_ids.contains(&token_id) {
+                    let _ = req.token_tx.send(TokenEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens: req.completion_tokens,
+                    });
+                    retire.push(idx);
+                    continue;
+                }
                 if req
                     .token_tx
                     .send(TokenEvent::Token {
@@ -222,6 +241,14 @@ impl KimiK2Scheduler {
         ) {
             Ok(report) => {
                 let token_id = report.local_next_token_global_id;
+                if !req.params.ignore_eos && self.stop_token_ids.contains(&token_id) {
+                    let _ = req.token_tx.send(TokenEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                    return None;
+                }
                 if req
                     .token_tx
                     .send(TokenEvent::Token {
@@ -262,6 +289,7 @@ impl KimiK2Scheduler {
             prompt_len: req.prompt_tokens.len(),
             completion_tokens,
             max_tokens: req.max_tokens,
+            ignore_eos: req.params.ignore_eos,
             last_token,
             slot,
             decode_batch_size,
@@ -327,6 +355,14 @@ impl KimiK2Scheduler {
         };
         for ((slot, req), report) in group.into_iter().zip(reports) {
             let token_id = report.local_next_token_global_id;
+            if !req.params.ignore_eos && self.stop_token_ids.contains(&token_id) {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                continue;
+            }
             if req
                 .token_tx
                 .send(TokenEvent::Token {
@@ -351,6 +387,7 @@ impl KimiK2Scheduler {
                 prompt_len: req.prompt_tokens.len(),
                 completion_tokens,
                 max_tokens: req.max_tokens,
+                ignore_eos: req.params.ignore_eos,
                 last_token: token_id,
                 slot,
                 decode_batch_size,

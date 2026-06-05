@@ -27,6 +27,7 @@ pub(in crate::runner) struct DpCoordinator {
     executors: Vec<Box<dyn ForwardExecutor + Send>>,
     step_txs: Vec<Sender<StepCommand>>,
     result_rxs: Vec<Receiver<StepResult>>,
+    stop_token_ids: Vec<u32>,
 }
 
 pub(in crate::runner) struct DpRankState {
@@ -38,6 +39,7 @@ struct RequestState {
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
+    ignore_eos: bool,
     last_token: u32,
 }
 
@@ -103,7 +105,10 @@ enum StepResult {
 }
 
 impl DpCoordinator {
-    pub(in crate::runner) fn new(executors: Vec<Box<dyn ForwardExecutor + Send>>) -> Self {
+    pub(in crate::runner) fn new(
+        executors: Vec<Box<dyn ForwardExecutor + Send>>,
+        stop_token_ids: Vec<u32>,
+    ) -> Self {
         let dp_world = executors.len();
         let mut ranks = Vec::with_capacity(dp_world);
         for _ in 0..dp_world {
@@ -118,6 +123,7 @@ impl DpCoordinator {
             executors,
             step_txs: Vec::new(),
             result_rxs: Vec::new(),
+            stop_token_ids,
         }
     }
 
@@ -338,6 +344,14 @@ impl DpCoordinator {
         }
 
         let last_token = owner_report.local_next_token_global_id;
+        if !req.params.ignore_eos && self.stop_token_ids.contains(&last_token) {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+            });
+            return;
+        }
         if req
             .token_tx
             .send(TokenEvent::Token {
@@ -364,6 +378,7 @@ impl DpCoordinator {
             prompt_len,
             completion_tokens,
             max_tokens: req.max_tokens,
+            ignore_eos: req.params.ignore_eos,
             last_token,
         });
     }
@@ -433,7 +448,11 @@ impl DpCoordinator {
             for (row, report) in rows.into_iter().zip(reports) {
                 match row {
                     PromptLen1DecodeRow::Active(input) => {
-                        self.ranks[dp_rank].process_decode_report(input.slot, &report);
+                        self.ranks[dp_rank].process_decode_report(
+                            input.slot,
+                            &report,
+                            &self.stop_token_ids,
+                        );
                     }
                     PromptLen1DecodeRow::Admission(admission) => {
                         self.install_prompt_len1_decode_result(dp_rank, admission, &report);
@@ -450,6 +469,14 @@ impl DpCoordinator {
         report: &KimiOneTokenForwardReport,
     ) {
         let token_id = report.local_next_token_global_id;
+        if !admission.req.params.ignore_eos && self.stop_token_ids.contains(&token_id) {
+            let _ = admission.req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: admission.req.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            return;
+        }
         if admission
             .req
             .token_tx
@@ -477,6 +504,7 @@ impl DpCoordinator {
             prompt_len: admission.req.prompt_tokens.len(),
             completion_tokens,
             max_tokens: admission.req.max_tokens,
+            ignore_eos: admission.req.params.ignore_eos,
             last_token: token_id,
         });
     }
@@ -569,7 +597,7 @@ impl DpCoordinator {
                 Err(_) => abort_dropped_result_channel(dp_rank, "decode"),
             };
 
-            self.ranks[dp_rank].process_decode_results(result);
+            self.ranks[dp_rank].process_decode_results(result, &self.stop_token_ids);
         }
     }
 }
@@ -622,7 +650,11 @@ impl DpRankState {
             .collect()
     }
 
-    fn process_decode_results(&mut self, reports: Vec<KimiOneTokenForwardReport>) {
+    fn process_decode_results(
+        &mut self,
+        reports: Vec<KimiOneTokenForwardReport>,
+        stop_token_ids: &[u32],
+    ) {
         let active_slots: Vec<usize> = self
             .slots
             .iter()
@@ -635,17 +667,34 @@ impl DpRankState {
         }
 
         for (slot_idx, report) in active_slots.into_iter().zip(reports) {
-            self.process_decode_report(slot_idx, &report);
+            self.process_decode_report(slot_idx, &report, stop_token_ids);
         }
     }
 
-    fn process_decode_report(&mut self, slot_idx: usize, report: &KimiOneTokenForwardReport) {
+    fn process_decode_report(
+        &mut self,
+        slot_idx: usize,
+        report: &KimiOneTokenForwardReport,
+        stop_token_ids: &[u32],
+    ) {
         let Some(req) = self.slots[slot_idx].as_mut() else {
             return;
         };
 
         let token_id = report.local_next_token_global_id;
         req.completion_tokens += 1;
+
+        // EOS outranks the length limit; the stop token itself is not emitted
+        // (same contract as the Qwen schedulers).
+        if !req.ignore_eos && stop_token_ids.contains(&token_id) {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: req.prompt_len,
+                completion_tokens: req.completion_tokens,
+            });
+            self.slots[slot_idx] = None;
+            return;
+        }
 
         if req
             .token_tx
@@ -805,7 +854,23 @@ mod tests {
             prompt_len,
             completion_tokens,
             max_tokens: 16,
+            ignore_eos: false,
             last_token,
+        }
+    }
+
+    fn dummy_report(token_id: u32) -> KimiOneTokenForwardReport {
+        KimiOneTokenForwardReport {
+            rank: 0,
+            batch_slot: 0,
+            input_token_id: 0,
+            local_next_token_id: token_id,
+            local_next_token_global_id: token_id,
+            local_top_logit_f32: 0.0,
+            vocab_start: 0,
+            vocab_rows: 0,
+            dense_layers_executed: 0,
+            moe_layers_executed: 0,
         }
     }
 
@@ -820,6 +885,7 @@ mod tests {
             executors: Vec::new(),
             step_txs: Vec::new(),
             result_rxs: Vec::new(),
+            stop_token_ids: Vec::new(),
         }
     }
 
@@ -892,6 +958,62 @@ mod tests {
         assert_eq!(token_ids, vec![0]);
         assert_eq!(positions, vec![0]);
         assert_eq!(slots, vec![0]);
+    }
+
+    #[test]
+    fn decode_report_finishes_with_stop_at_eos() {
+        let mut rank = DpRankState {
+            slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
+        };
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        rank.slots[0] = Some(RequestState {
+            token_tx,
+            prompt_len: 4,
+            completion_tokens: 1,
+            max_tokens: 16,
+            ignore_eos: false,
+            last_token: 7,
+        });
+
+        rank.process_decode_report(0, &dummy_report(163_586), &[163_586]);
+
+        assert!(rank.slots[0].is_none());
+        let Ok(TokenEvent::Finished {
+            finish_reason,
+            completion_tokens,
+            ..
+        }) = token_rx.try_recv()
+        else {
+            panic!("expected Finished event");
+        };
+        assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(completion_tokens, 2);
+        // The stop token itself is not emitted.
+        assert!(token_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn decode_report_honors_ignore_eos() {
+        let mut rank = DpRankState {
+            slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
+        };
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        rank.slots[0] = Some(RequestState {
+            token_tx,
+            prompt_len: 4,
+            completion_tokens: 1,
+            max_tokens: 16,
+            ignore_eos: true,
+            last_token: 7,
+        });
+
+        rank.process_decode_report(0, &dummy_report(163_586), &[163_586]);
+
+        assert!(rank.slots[0].is_some());
+        let Ok(TokenEvent::Token { id, .. }) = token_rx.try_recv() else {
+            panic!("expected Token event");
+        };
+        assert_eq!(id, 163_586);
     }
 
     #[test]

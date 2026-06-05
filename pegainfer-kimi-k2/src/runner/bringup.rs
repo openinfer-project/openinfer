@@ -17,7 +17,7 @@ use pegainfer_core::{
 use tokio::sync::mpsc;
 
 use crate::{
-    config::KimiK2ParallelShape,
+    config::{KimiK2ParallelShape, load_stop_token_ids},
     runner::{
         affinity::pin_scheduler_thread,
         config::KimiK2RunnerConfig,
@@ -128,6 +128,7 @@ fn start_engine_tp8_dp1(
         parallel,
         KimiK2ParallelShape::tp8_ep8(),
     )?;
+    let stop_token_ids = load_stop_token_ids(model_path)?;
     let executor = build_tp8_dp1_executor(&config)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
@@ -136,7 +137,7 @@ fn start_engine_tp8_dp1(
         .name("kimi-k2-scheduler".into())
         .spawn(move || {
             pin_scheduler_thread(&config.thread_placement);
-            let mut scheduler = match KimiK2Scheduler::new(executor) {
+            let mut scheduler = match KimiK2Scheduler::new(executor, stop_token_ids) {
                 Ok(scheduler) => scheduler,
                 Err(err) => {
                     let _ = init_tx.send(Err(err));
@@ -173,8 +174,9 @@ fn start_engine_tp1_dp8(
         parallel,
         KimiK2ParallelShape::tp1_dp8(),
     )?;
+    let stop_token_ids = load_stop_token_ids(model_path)?;
     let executors = build_tp1_dp8_executors(&config)?;
-    let coordinator = DpCoordinator::new(executors);
+    let coordinator = DpCoordinator::new(executors, stop_token_ids);
     let lb = DpLoadBalancer::new(dp_world);
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
