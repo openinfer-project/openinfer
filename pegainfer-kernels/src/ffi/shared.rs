@@ -199,6 +199,7 @@ unsafe extern "C" {
         head_dim: i32,
         batch_size: i32,
         rms_eps: f32,
+        cos_max_pos: i32,
         stream: CUstream,
     );
 

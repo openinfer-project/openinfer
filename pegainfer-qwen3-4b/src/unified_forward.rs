@@ -364,6 +364,7 @@ impl Qwen3Model {
                     head_dim as i32,
                     total_tokens as i32,
                     self.config.rms_norm_eps,
+                    (self.cos_cache.data.len() / head_dim) as i32,
                     self.ctx.stream.cu_stream(),
                 );
             }

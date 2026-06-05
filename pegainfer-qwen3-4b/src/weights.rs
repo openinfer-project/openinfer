@@ -310,8 +310,12 @@ impl Qwen3Model {
         let norm = load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?;
 
         debug!("Precomputing RoPE cache on GPU");
-        let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.head_dim, 4096, config.rope_theta)?;
+        let (cos_cache, sin_cache) = precompute_rope(
+            &ctx,
+            config.head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+        )?;
 
         ctx.sync()?;
         info!(

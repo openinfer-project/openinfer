@@ -441,7 +441,15 @@ pub async fn serve(
     port: u16,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let max_model_len = load_max_model_len(model_path).unwrap_or(4096);
+    let max_model_len = load_max_model_len(model_path).unwrap_or_else(|| {
+        const FALLBACK_MAX_MODEL_LEN: u32 = 4096;
+        warn!(
+            "max_position_embeddings not found in {}/config.json; capping max_model_len at {FALLBACK_MAX_MODEL_LEN}. \
+             Requests are limited to this length — set max_position_embeddings in the model config if it supports more.",
+            model_path.display()
+        );
+        FALLBACK_MAX_MODEL_LEN
+    });
     serve_model(
         handle,
         model_path.to_string_lossy().into_owned(),

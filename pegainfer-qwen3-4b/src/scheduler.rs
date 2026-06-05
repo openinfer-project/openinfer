@@ -184,9 +184,10 @@ fn scheduler_loop<E>(
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
+            executor.max_context_tokens(),
         );
-        for rejected in &admission.rejected {
-            send_rejection(rejected);
+        for (rejected, reason) in &admission.rejected {
+            send_rejection(rejected, *reason);
         }
         let pending = admission.pending;
         deferred = admission.deferred;
@@ -289,9 +290,10 @@ fn scheduler_loop_with_lora_control<E>(
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
+            executor.max_context_tokens(),
         );
-        for rejected in &admission.rejected {
-            send_rejection(rejected);
+        for (rejected, reason) in &admission.rejected {
+            send_rejection(rejected, *reason);
         }
         let pending = admission.pending;
         deferred = admission.deferred;
@@ -404,10 +406,19 @@ struct RequestFailureTarget {
     completion_tokens: usize,
 }
 
+/// Why a request was rejected at admission, so the client gets an accurate error.
+#[derive(Clone, Copy)]
+enum RejectReason {
+    /// Worst-case length exceeds the model's position-encoding window.
+    ContextLength { limit: usize },
+    /// Worst-case length needs more KV blocks than this instance can ever provide.
+    KvBudget,
+}
+
 struct AdmissionOutcome {
     pending: Vec<PendingRequest>,
     deferred: Vec<PendingRequest>,
-    rejected: Vec<PendingRequest>,
+    rejected: Vec<(PendingRequest, RejectReason)>,
 }
 
 struct LoraValidationOutcome {
@@ -481,6 +492,7 @@ fn admit_deferred_requests(
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
+    max_context_tokens: usize,
 ) -> AdmissionOutcome {
     let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
     let mut pending = Vec::new();
@@ -488,9 +500,20 @@ fn admit_deferred_requests(
     let mut rejected = Vec::new();
 
     for req in deferred {
+        // Reject if the full sequence overflows the position-encoding window
+        if req.prompt_tokens.len().saturating_add(req.max_tokens) > max_context_tokens {
+            rejected.push((
+                req,
+                RejectReason::ContextLength {
+                    limit: max_context_tokens,
+                },
+            ));
+            continue;
+        }
+
         let max_needed = blocks_needed(max_request_tokens(&req), block_size);
         if max_needed > max_request_blocks {
-            rejected.push(req);
+            rejected.push((req, RejectReason::KvBudget));
             continue;
         }
 
@@ -509,14 +532,23 @@ fn admit_deferred_requests(
     }
 }
 
-fn send_rejection(req: &PendingRequest) {
-    let max_tokens = max_request_tokens(req);
-    let _ = req.token_tx.send(TokenEvent::Rejected {
-        message: format!(
+fn send_rejection(req: &PendingRequest, reason: RejectReason) {
+    let message = match reason {
+        RejectReason::ContextLength { limit } => format!(
+            "request exceeds this model's maximum context length of {} tokens: requested {} (prompt={} + max_tokens={})",
+            limit,
+            req.prompt_tokens.len().saturating_add(req.max_tokens),
+            req.prompt_tokens.len(),
+            req.max_tokens
+        ),
+        RejectReason::KvBudget => format!(
             "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
             req.prompt_tokens.len(),
-            max_tokens
+            max_request_tokens(req)
         ),
+    };
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message,
         prompt_tokens: req.prompt_tokens.len(),
         completion_tokens: 0,
     });
@@ -611,6 +643,7 @@ mod tests {
     struct FakeExecutor {
         block_size: usize,
         max_request_blocks: usize,
+        max_context_tokens: usize,
         available_blocks: usize,
         held_tokens: HashMap<RequestId, usize>,
         fail_decode_once: bool,
@@ -628,6 +661,7 @@ mod tests {
             Self {
                 block_size: 16,
                 max_request_blocks,
+                max_context_tokens: usize::MAX,
                 available_blocks: max_request_blocks,
                 held_tokens: HashMap::new(),
                 fail_decode_once: false,
@@ -643,6 +677,11 @@ mod tests {
 
         fn with_decode_failure(mut self) -> Self {
             self.fail_decode_once = true;
+            self
+        }
+
+        fn with_max_context_tokens(mut self, max_context_tokens: usize) -> Self {
+            self.max_context_tokens = max_context_tokens;
             self
         }
 
@@ -696,6 +735,10 @@ mod tests {
 
         fn max_request_blocks(&self) -> usize {
             self.max_request_blocks
+        }
+
+        fn max_context_tokens(&self) -> usize {
+            self.max_context_tokens
         }
 
         fn available_blocks(&self) -> usize {
@@ -928,7 +971,7 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -942,11 +985,56 @@ mod tests {
             vec![3],
             "budget-starved requests stay deferred, not dropped"
         );
+        let rejected_ids = outcome
+            .rejected
+            .iter()
+            .map(|(r, _)| r.request_id.get())
+            .collect::<Vec<_>>();
         assert_eq!(
-            ids(&outcome.rejected),
+            rejected_ids,
             vec![4],
             "requests larger than the per-request cap are rejected outright"
         );
+    }
+
+    #[test]
+    fn requests_exceeding_context_window_are_rejected() {
+        let active: [ActiveRequestState; 0] = [];
+        let mk = |id: u64, prompt_len, max_tokens| {
+            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        };
+
+        let deferred = vec![
+            mk(1, 16, 16), // reqest 1: 16 prompt + 16 max = 32 total: admitted
+            mk(2, 16, 17), // request 2: 16 prompt + 17 max = 33 total: overflows by 1 token → rejected
+            mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
+        ];
+
+        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32);
+
+        let pending_ids = outcome
+            .pending
+            .iter()
+            .map(|r| r.request_id.get())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending_ids,
+            vec![1],
+            "only the request that fits the window is admitted; overflows are rejected, not clamped"
+        );
+
+        let rejected_ids = outcome
+            .rejected
+            .iter()
+            .map(|(r, _)| r.request_id.get())
+            .collect::<Vec<_>>();
+        assert_eq!(rejected_ids, vec![2, 3]);
+        for (_, reason) in &outcome.rejected {
+            assert!(
+                matches!(reason, RejectReason::ContextLength { limit: 32 }),
+                "rejected on the context window, not the KV budget"
+            );
+        }
     }
 
     #[test]
@@ -1076,6 +1164,47 @@ mod tests {
             Some(TokenEvent::Token { id, .. }) => assert_eq!(id, 101),
             _ => panic!("later fitting request should emit a token"),
         }
+        assert!(
+            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            "later fitting request should finish"
+        );
+    }
+
+    /// End-to-end through the real scheduler loop (no GPU): a request whose
+    /// prompt + max_tokens exceeds the context window is rejected with a context-length error
+    #[test]
+    fn over_context_window_request_is_rejected_through_scheduler_loop() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        // max_positional_encoding_tokens = 32
+        let executor = FakeExecutor::new(1000, Arc::clone(&dropped)).with_max_context_tokens(32);
+        let handle = start_with_executor(executor, 42);
+
+        // prompt=16, max_new=100
+        let (too_long, mut too_long_rx) = request(16, 100);
+        handle.submit(too_long).expect("submit too_long");
+        match too_long_rx.blocking_recv() {
+            Some(TokenEvent::Rejected {
+                prompt_tokens,
+                completion_tokens,
+                message,
+            }) => {
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 0);
+                assert!(
+                    message.contains("context length"),
+                    "expected a context-length rejection, got: {message}"
+                );
+            }
+            _ => panic!("over-context request should be rejected"),
+        }
+
+        // The loop must keep serving a request that fits the window.
+        let (fits, mut fits_rx) = request(16, 1);
+        handle.submit(fits).expect("submit fits");
+        assert!(
+            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Token { .. })),
+            "later fitting request should emit a token"
+        );
         assert!(
             matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
             "later fitting request should finish"

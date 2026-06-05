@@ -377,6 +377,7 @@ pub fn prefill_attention_paged_into(
             head_dim as i32,
             total_tokens as i32,
             rms_eps,
+            (cos_cache.data.len() / head_dim) as i32,
             stream,
         );
 
@@ -490,6 +491,7 @@ pub fn qk_norm_rope_batch_decode_into(
             head_dim as i32,
             batch_size as i32,
             rms_eps,
+            (cos_cache.data.len() / head_dim) as i32,
             ctx.stream.cu_stream(),
         );
     }

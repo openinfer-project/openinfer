@@ -397,6 +397,7 @@ pub struct UnifiedResult {
 pub(crate) trait ModelExecutor: Send {
     fn block_size(&self) -> usize;
     fn max_request_blocks(&self) -> usize;
+    fn max_context_tokens(&self) -> usize;
     fn available_blocks(&self) -> usize;
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
@@ -719,6 +720,10 @@ impl ModelExecutor for Qwen3Executor {
 
     fn max_request_blocks(&self) -> usize {
         self.kv_mgr.max_request_blocks()
+    }
+
+    fn max_context_tokens(&self) -> usize {
+        self.metadata.config.max_position_embeddings
     }
 
     fn available_blocks(&self) -> usize {

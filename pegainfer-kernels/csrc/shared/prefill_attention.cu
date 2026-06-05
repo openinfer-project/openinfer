@@ -19,7 +19,8 @@ __global__ void prefill_qk_norm_rope_kernel(
     int num_q_heads, int num_kv_heads, int head_dim,
     int seq_len, int q_dim, int kv_dim, int start_pos,
     const int* start_pos_d,  // if non-null, *start_pos_d overrides start_pos (CUDA Graph safe)
-    float eps
+    float eps,
+    int cos_max_pos
 ) {
     int head_global = blockIdx.x;
     int token = blockIdx.y;
@@ -67,6 +68,7 @@ __global__ void prefill_qk_norm_rope_kernel(
     // Batched decode: start_pos_d = positions, token=batch_idx → positions[batch_idx].
     // Prefill: start_pos_d = nullptr → start_pos + token (sequential within sequence).
     int pos = start_pos_d ? __ldg(start_pos_d + token) : (start_pos + token);
+    if (pos < 0 || pos >= cos_max_pos) __trap();
 
     __nv_bfloat16 result;
     if (d < half) {
@@ -116,6 +118,7 @@ void qk_norm_rope_batched_decode_cuda(
     int head_dim,
     int batch_size,
     float rms_eps,
+    int cos_max_pos,
     cudaStream_t stream
 ) {
     int q_dim = num_q_heads * head_dim;
@@ -129,7 +132,7 @@ void qk_norm_rope_batched_decode_cuda(
         num_q_heads, num_kv_heads, head_dim,
         /*seq_len=*/batch_size, q_dim, kv_dim,
         /*start_pos=*/0, /*start_pos_d=*/positions,
-        rms_eps
+        rms_eps, cos_max_pos
     );
 }
 

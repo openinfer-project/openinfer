@@ -30,10 +30,16 @@ pub(crate) struct Config {
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
+    #[serde(default = "default_max_position_embeddings")]
+    pub(crate) max_position_embeddings: usize,
     pub(crate) eos_token_id: u32,
     pub(crate) tie_word_embeddings: bool,
     #[serde(skip)]
     pub(crate) stop_token_ids: Vec<u32>,
+}
+
+fn default_max_position_embeddings() -> usize {
+    40960
 }
 
 #[derive(Debug, Deserialize)]

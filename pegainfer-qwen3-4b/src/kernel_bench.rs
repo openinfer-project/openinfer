@@ -821,6 +821,7 @@ impl AttentionPrefillCase {
                 HEAD_DIM as i32,
                 total_tokens as i32,
                 1.0e-6,
+                (self.cos_cache.data.len() / HEAD_DIM) as i32,
                 self.ctx.stream.cu_stream(),
             );
         }
