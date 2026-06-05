@@ -101,6 +101,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
+| `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `pegainfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
 
 ## subsystems / correctness
 
