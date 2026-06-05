@@ -89,7 +89,9 @@ colored = "3"
 comfy-table = "7.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-channel = "0.5"
-cudarc = { version = "0.19.4", features = [
+# 0.19.5+ required: per-symbol lazy loading keeps the cuda-12090 binding
+# level from imposing a runtime driver floor (issue #263).
+cudarc = { version = "0.19.7", features = [
     "cuda-12090",
     "cublas",
     "f16",

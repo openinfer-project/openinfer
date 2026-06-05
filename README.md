@@ -46,8 +46,10 @@ Measured on **RTX 5070 Ti** (16 GB), BF16, CUDA Graph enabled, single request:
 ### Prerequisites
 
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
+- NVIDIA driver R535 (CUDA 12.2) or newer; driver symbols resolve lazily at call time, so the `cuda-12090` cudarc feature does not raise the driver floor
 - Python 3 + Triton (build-time only — no Python at runtime)
 - TileLang for `deepseek-v4` feature builds (build-time only)
+- `deepseek-v4` / `kimi-k2` EP paths additionally need NCCL ≥ 2.27 at runtime (`ncclAlltoAll`)
 
 ### Build & Run
 
