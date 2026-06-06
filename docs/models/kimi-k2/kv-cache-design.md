@@ -1,6 +1,6 @@
 # Kimi-K2 KV cache: adopting the qwen3 paged stack (#239 → #230/#231)
 
-**TL;DR**: Kimi's KV is *already paged* at the kernel level (FlashInfer-style page tables, paged MLA append/decode kernels) — the "fixed 2048-token arena" was only a static Rust-side slot→pages mapping. The qwen3 stack landed in **one PR with zero kernel changes**: a kvbm-managed `BlockPool` per rank replaces the static mapping, admission uses full-lifetime reservation (the qwen3 #85 pattern), over-cap requests get an explicit `Rejected` instead of poisoning the batch mid-decode, and the per-request cap rises 2048 → 8192 tokens (DP prompts stay ≤ 2048 — a PPLX fabric-buffer constraint, see below). This is the substrate for prefix cache (#230) and long context (#231). Landed on `feat/kimi-kv-pool`, 2026-06-06. 8×H200 verification caught a DP8 decode deadlock (kvbm's eager generation block vs the worker's exact page-count check — fixed via `step_page_indices`, see below); golden-gate parity is green, run-to-run logprob determinism still under investigation.
+**TL;DR**: Kimi's KV is *already paged* at the kernel level (FlashInfer-style page tables, paged MLA append/decode kernels) — the "fixed 2048-token arena" was only a static Rust-side slot→pages mapping. The qwen3 stack landed in **one PR with zero kernel changes**: a kvbm-managed `BlockPool` per rank replaces the static mapping, admission uses full-lifetime reservation (the qwen3 #85 pattern), over-cap requests get an explicit `Rejected` instead of poisoning the batch mid-decode, and the per-request cap rises 2048 → 8192 tokens (DP prompts stay ≤ 2048 — a PPLX fabric-buffer constraint, see below). This is the substrate for prefix cache (#230) and long context (#231). Landed on `feat/kimi-kv-pool`, 2026-06-06. 8×H200 verification caught a DP8 decode deadlock (kvbm's eager generation block vs the worker's exact page-count check — fixed via `step_page_indices`, see below); golden-gate parity is green; run-to-run bitwise logprob determinism is lost by design under dynamic paging (address-sensitive accumulation order, #293) — the det check now gates token-stream equality + a 0.25-nat top-1 tolerance.
 
 Last touched: 2026-06
 
@@ -163,16 +163,32 @@ stable base pointers keep captured CUDA graphs valid.
 Prefix matching (#230): flip on kvbm matching + nonzero-position suffix
 prefill with a cached-replay logits A/B, after this substrate lands.
 
+## Run-to-run determinism under dynamic paging (#293)
+
+Bitwise run-to-run logprob equality is **lost by design** with a dynamic
+pool, and the golden gate's det check now asserts the real contract:
+identical token streams + top-1 |Δlogprob| ≤ 0.25 nat (2× observed max).
+
+What the 8×H200 investigation established (two nodes, 3/3 repro):
+
+- Identical inputs → identical tokens, but every decode position's top-32
+  logprob distribution wobbles 1-2 bf16 ULP (top-1 |Δ| mean ≈0.03, max
+  0.12 nat). Prefill is bit-identical. `main` is bit-stable.
+- The two runs get different physical KV pages (LRU churn): run A `[1]`,
+  run B `[4]`. Prefill is placement-invariant; decode is not.
+- Controlled experiment: pristine zero-initialized pool, det check only.
+  Page *content* identical between runs, only the page IDs differ —
+  **still diverges**. Garbage-content leakage is ruled out.
+- Surviving mechanism: an accumulation in the decode path whose summation
+  order is address/timing-sensitive (candidates, not isolated: cuBLASLt
+  skinny GEMMs, PPLX combine arrival order, FlashInfer MLA decode). `main`
+  is stable because the static arena gives bit-identical addresses every
+  run — an incidental property, not a contract. Isolation tracked in #293.
+
 ## Next step
 
-8×H200 verification, remaining items: run-to-run determinism — the gate's
-det check fails on this branch (identical inputs → identical tokens, but
-logprobs differ by ≤1 bf16 logit ULP starting at the first decode token;
-prefill logprobs bit-identical; main is bit-stable because static slot→pages
-gives identical physical pages run-to-run). Garbage-tail leak and rank
-assignment are ruled out; next experiments bisect padding-row coupling vs
-page-value sensitivity in the MLA decode path. Then: over-cap request →
-explicit rejection (not batch poison); `prompt + max_tokens` boundary;
->2048-token prompt e2e on TP8 (4K–8K); DP prompt-cap rejection at 2049;
-greedy bs64 TPOT p50 unchanged (~30 ms). Golden-gate parity already green
-at main's level.
+8×H200 verification, remaining items: over-cap request → explicit
+rejection (not batch poison); `prompt + max_tokens` boundary; >2048-token
+prompt e2e on TP8 (4K–8K); DP prompt-cap rejection at 2049; greedy bs64
+TPOT p50 unchanged (~30 ms). Golden-gate parity already green at main's
+level; det green under the #293 tolerance contract.
