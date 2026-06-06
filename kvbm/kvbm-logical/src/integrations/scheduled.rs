@@ -1993,6 +1993,75 @@ mod tests {
         assert_eq!(seq.prefill_position(), 0);
     }
 
+    #[test]
+    fn test_prefix_cache_eviction_rematch_zero_then_recompute() {
+        let manager = create_test_manager::<TestMeta>(4);
+        let tokens = make_tokens(12);
+
+        let mut cold = SchedulableSequence::<TestMeta>::new(
+            tokens.clone(),
+            0,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        cold.schedule_prefill(12, &manager).unwrap();
+        cold.apply_prefill(None, &manager).unwrap();
+        assert_eq!(cold.assigned_blocks(), 3);
+        cold.release().unwrap();
+
+        let mut warm = SchedulableSequence::<TestMeta>::new(
+            tokens.clone(),
+            0,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        let matched = warm.match_and_add_prefix(&manager).unwrap();
+        // Same prompt is resident and hits the maximum eligible prefix.
+        assert_eq!(matched, 2);
+        assert_eq!(warm.prefill_position(), 8);
+        assert_eq!(warm.kv_position(), 8);
+        assert_eq!(warm.assigned_blocks(), 2);
+        warm.schedule_prefill(4, &manager).unwrap();
+        warm.apply_prefill(None, &manager).unwrap();
+        assert!(warm.is_prefill_complete());
+        warm.release().unwrap();
+
+        // Hold all blocks so any stale prefix match would point at reclaimed blocks.
+        let (pressure_blocks, evicted) = manager.allocate_blocks_with_evictions(4).unwrap();
+        assert_eq!(pressure_blocks.len(), 4);
+        assert_eq!(evicted.len(), 3);
+
+        let mut evicted_rematch = SchedulableSequence::<TestMeta>::new(
+            tokens.clone(),
+            0,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        let matched = evicted_rematch.match_and_add_prefix(&manager).unwrap();
+        assert_eq!(matched, 0);
+        assert_eq!(evicted_rematch.prefill_position(), 0);
+        assert_eq!(evicted_rematch.kv_position(), 0);
+        assert_eq!(evicted_rematch.assigned_blocks(), 0);
+
+        drop(pressure_blocks);
+        evicted_rematch.schedule_prefill(12, &manager).unwrap();
+        evicted_rematch.apply_prefill(None, &manager).unwrap();
+        assert!(evicted_rematch.is_prefill_complete());
+        assert_eq!(evicted_rematch.assigned_blocks(), 3);
+        evicted_rematch.release().unwrap();
+
+        let mut rewarm =
+            SchedulableSequence::<TestMeta>::new(tokens, 0, BLOCK_SIZE, noop_delegate(), None);
+        let matched = rewarm.match_and_add_prefix(&manager).unwrap();
+        assert_eq!(matched, 2);
+        assert_eq!(rewarm.prefill_position(), 8);
+        assert_eq!(rewarm.kv_position(), 8);
+        assert_eq!(rewarm.assigned_blocks(), 2);
+    }
+
     // =========================================================================
     // Edge cases
     // =========================================================================
