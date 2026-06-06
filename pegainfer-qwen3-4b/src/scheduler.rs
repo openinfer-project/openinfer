@@ -192,6 +192,7 @@ fn scheduler_loop<E>(
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
+            executor.max_decode_batch_size(),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -298,6 +299,7 @@ fn scheduler_loop_with_lora_control<E>(
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
+            executor.max_decode_batch_size(),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -500,8 +502,10 @@ fn admit_deferred_requests(
     available_blocks: usize,
     max_request_blocks: usize,
     max_context_tokens: usize,
+    max_decode_batch_size: usize,
 ) -> AdmissionOutcome {
     let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
+    let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -524,8 +528,9 @@ fn admit_deferred_requests(
             continue;
         }
 
-        if max_needed <= budget {
+        if max_needed <= budget && decode_slots > 0 {
             budget -= max_needed;
+            decode_slots -= 1;
             pending.push(req);
         } else {
             still_deferred.push(req);
@@ -751,6 +756,10 @@ mod tests {
 
         fn max_context_tokens(&self) -> usize {
             self.max_context_tokens
+        }
+
+        fn max_decode_batch_size(&self) -> usize {
+            64
         }
 
         fn available_blocks(&self) -> usize {
@@ -990,7 +999,7 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1029,7 +1038,7 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64);
 
         let pending_ids = outcome
             .pending
@@ -1054,6 +1063,40 @@ mod tests {
                 "rejected on the context window, not the KV budget"
             );
         }
+    }
+
+    #[test]
+    fn admission_respects_decode_batch_capacity() {
+        let mut active = Vec::new();
+        for id in 0..64 {
+            let (token_tx, _rx) = mpsc::unbounded_channel();
+            active.push(ActiveRequestState {
+                request_id: RequestId(id),
+                lora_adapter: None,
+                token_tx,
+                last_token: 1,
+                generated_count: 1,
+                max_tokens: 2,
+                prompt_len: 16,
+                params: SamplingParams::default(),
+                logprobs: 0,
+            });
+        }
+        let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
+
+        let outcome =
+            admit_deferred_requests(vec![pending], &active, 16, 1024, 1024, usize::MAX, 64);
+
+        assert!(
+            outcome.pending.is_empty(),
+            "new request must not be admitted past decode scratch capacity"
+        );
+        assert_eq!(
+            outcome.deferred[0].request_id,
+            RequestId(64),
+            "capacity-starved request should stay deferred"
+        );
+        assert!(outcome.rejected.is_empty());
     }
 
     #[test]

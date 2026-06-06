@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::nccl::safe::{Comm, ReduceOp};
 use log::{debug, info};
 #[cfg(test)]
@@ -611,7 +611,17 @@ impl Qwen3Model {
         );
         let name = adapter.name.clone();
         let slot = self.packed_lora.slot_for_install(&name, load_inplace)?;
-        self.update_packed_lora_slot(slot, &adapter)?;
+        if let Err(err) = self.update_packed_lora_slot(slot, &adapter) {
+            self.lora_adapters.remove(&name);
+            if self.packed_lora.slot_for(&name) == Some(slot) {
+                let _ = self.packed_lora.release_slot(&name);
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to update packed LoRA slot {slot} for adapter {name}; adapter was removed to keep packed decode state consistent"
+                )
+            });
+        }
         install_lora_adapter_in_registry(&mut self.lora_adapters, adapter, load_inplace)?;
         self.packed_lora.bind_slot(slot, &name);
         Ok(())
@@ -627,6 +637,14 @@ impl Qwen3Model {
         self.lora_adapters
             .remove(name)
             .expect("packed LoRA slot map and adapter registry must be consistent");
+        Ok(())
+    }
+
+    pub(crate) fn discard_lora_adapter(&mut self, name: &str) -> Result<()> {
+        if self.packed_lora.slot_for(name).is_some() {
+            self.packed_lora.release_slot(name)?;
+        }
+        self.lora_adapters.remove(name);
         Ok(())
     }
 

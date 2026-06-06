@@ -573,8 +573,9 @@ mod tests {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> (RequestKv, u32) {
-        let mut rkv = mgr.new_request(prompt_tokens.to_vec(), 256);
-        rkv.schedule_prefill(prompt_tokens.len(), mgr).unwrap();
+        let mut rkv = mgr.pool().new_request(prompt_tokens.to_vec(), 256, None);
+        rkv.schedule_prefill(prompt_tokens.len(), mgr.pool())
+            .unwrap();
         let view = rkv.prefill_view(prompt_tokens.len());
         let (logits_vec, _) = model
             .batch_prefill(
@@ -587,7 +588,7 @@ mod tests {
             )
             .unwrap();
         let first_token = sample_logits(model, &logits_vec[0], params, rng);
-        rkv.apply_prefill(first_token, mgr).unwrap();
+        rkv.apply_prefill(first_token, mgr.pool()).unwrap();
         (rkv, first_token)
     }
 
@@ -613,8 +614,8 @@ mod tests {
             model.local_intermediate_size(),
             model.config.vocab_size,
             1,
-            mgr.total_blocks(),
-            mgr.padding_block_id(),
+            mgr.pool().total_blocks(),
+            mgr.pool().padding_block_id(),
             model.local_num_attention_heads(),
         )
         .unwrap();
@@ -622,7 +623,7 @@ mod tests {
         let mut tokens = vec![first_token];
         for _ in 1..num_decode_steps {
             let token_ids = [*tokens.last().unwrap()];
-            rkv.schedule_decode(mgr).unwrap();
+            rkv.schedule_decode(mgr.pool()).unwrap();
             let view = rkv.decode_view();
             model
                 .batch_decode(
@@ -636,7 +637,7 @@ mod tests {
                 .unwrap();
             let params_refs: Vec<&SamplingParams> = vec![&params];
             let batch_tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
-            rkv.apply_decode(batch_tokens[0], mgr).unwrap();
+            rkv.apply_decode(batch_tokens[0], mgr.pool()).unwrap();
             tokens.push(batch_tokens[0]);
         }
         rkv.release().unwrap();
@@ -658,8 +659,8 @@ mod tests {
         // Prefill all requests
         let mut rkvs: Vec<RequestKv> = Vec::with_capacity(bs);
         for &prompt in prompts {
-            let mut rkv = mgr.new_request(prompt.to_vec(), 256);
-            rkv.schedule_prefill(prompt.len(), mgr).unwrap();
+            let mut rkv = mgr.pool().new_request(prompt.to_vec(), 256, None);
+            rkv.schedule_prefill(prompt.len(), mgr.pool()).unwrap();
             rkvs.push(rkv);
         }
         let views: Vec<_> = rkvs
@@ -682,7 +683,7 @@ mod tests {
             .map(|logits| sample_logits(model, logits, &params, &mut rng))
             .collect();
         for (rkv, &tok) in rkvs.iter_mut().zip(&first_tokens) {
-            rkv.apply_prefill(tok, mgr).unwrap();
+            rkv.apply_prefill(tok, mgr.pool()).unwrap();
         }
 
         let mut all_tokens: Vec<Vec<u32>> = first_tokens.iter().map(|&t| vec![t]).collect();
@@ -700,8 +701,8 @@ mod tests {
             model.local_intermediate_size(),
             model.config.vocab_size,
             max_bs,
-            mgr.total_blocks(),
-            mgr.padding_block_id(),
+            mgr.pool().total_blocks(),
+            mgr.pool().padding_block_id(),
             model.local_num_attention_heads(),
         )
         .unwrap();
@@ -709,7 +710,7 @@ mod tests {
         for _ in 1..num_decode_steps {
             let token_ids: Vec<u32> = all_tokens.iter().map(|t| *t.last().unwrap()).collect();
             for rkv in &mut rkvs {
-                rkv.schedule_decode(mgr).unwrap();
+                rkv.schedule_decode(mgr.pool()).unwrap();
             }
             let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
             model
@@ -725,7 +726,7 @@ mod tests {
             let params_refs: Vec<&SamplingParams> = (0..bs).map(|_| &params).collect();
             let tokens = sample_batch_tokens(model, &bufs, &params_refs, &mut rng);
             for (i, &tok) in tokens.iter().enumerate() {
-                rkvs[i].apply_decode(tok, mgr).unwrap();
+                rkvs[i].apply_decode(tok, mgr.pool()).unwrap();
                 all_tokens[i].push(tok);
             }
         }
@@ -780,8 +781,8 @@ mod tests {
             let mut rkvs: Vec<RequestKv> = prompts
                 .iter()
                 .map(|p| {
-                    let mut r = mgr.new_request(p.to_vec(), 256);
-                    r.schedule_prefill(p.len(), &mgr).unwrap();
+                    let mut r = mgr.pool().new_request(p.to_vec(), 256, None);
+                    r.schedule_prefill(p.len(), mgr.pool()).unwrap();
                     r
                 })
                 .collect();
@@ -805,7 +806,7 @@ mod tests {
             for (i, logits) in logits_vec.iter().enumerate() {
                 let mut rng = StdRng::seed_from_u64(seed);
                 let token = sample_logits(&model, logits, &params, &mut rng);
-                rkvs[i].apply_prefill(token, &mgr).unwrap();
+                rkvs[i].apply_prefill(token, mgr.pool()).unwrap();
                 batch_first_tokens.push(token);
             }
             for rkv in &mut rkvs {

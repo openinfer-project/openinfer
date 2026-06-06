@@ -422,6 +422,7 @@ pub(crate) trait ModelExecutor: Send {
     fn block_size(&self) -> usize;
     fn max_request_blocks(&self) -> usize;
     fn max_context_tokens(&self) -> usize;
+    fn max_decode_batch_size(&self) -> usize;
     fn available_blocks(&self) -> usize;
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
@@ -715,8 +716,13 @@ fn ensure_lora_capacity(
     loaded_lora_adapters: &HashSet<String>,
     lora_name: &str,
     max_loras: usize,
+    load_inplace: bool,
 ) -> Result<()> {
     if loaded_lora_adapters.contains(lora_name) {
+        anyhow::ensure!(
+            load_inplace,
+            "Qwen3 LoRA adapter {lora_name} is already loaded"
+        );
         return Ok(());
     }
     anyhow::ensure!(
@@ -740,6 +746,10 @@ impl ModelExecutor for Qwen3Executor {
 
     fn max_context_tokens(&self) -> usize {
         self.metadata.config.max_position_embeddings
+    }
+
+    fn max_decode_batch_size(&self) -> usize {
+        *BATCH_BUCKETS.last().unwrap()
     }
 
     fn available_blocks(&self) -> usize {
@@ -944,6 +954,7 @@ impl ModelExecutor for Qwen3Executor {
             &self.loaded_lora_adapters,
             &request.lora_name,
             self.lora_options.max_loras,
+            request.load_inplace,
         )?;
         let adapter = crate::lora::load_lora_adapter(
             &request.lora_path,
@@ -992,22 +1003,22 @@ impl ModelExecutor for Qwen3Executor {
             request.load_inplace,
         )?;
         let mut pending = Vec::with_capacity(self.workers.len());
+        let mut errors = Vec::new();
         for (index, worker) in self.workers.iter().enumerate() {
             let rank = index + 1;
             let rank_adapter = sharded_adapters
                 .next()
                 .expect("worker adapter must exist for every tensor-parallel rank");
-            pending.push((
-                rank,
-                worker.load_lora_adapter(
-                    request.lora_name.clone(),
-                    rank_adapter,
-                    request.load_inplace,
-                )?,
-            ));
+            match worker.load_lora_adapter(
+                request.lora_name.clone(),
+                rank_adapter,
+                request.load_inplace,
+            ) {
+                Ok(response) => pending.push((rank, response)),
+                Err(err) => errors.push(format!("rank {rank} dispatch: {err:#}")),
+            }
         }
 
-        let mut errors = Vec::new();
         match primary_response.recv() {
             Ok(Ok(())) => {}
             Ok(Err(err)) => errors.push(format!("rank 0: {err:#}")),
@@ -1021,10 +1032,46 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         if !errors.is_empty() {
+            let mut cleanup_errors = Vec::new();
+            match self.primary.discard_lora_adapter(request.lora_name.clone()) {
+                Ok(response) => match response.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => cleanup_errors.push(format!("rank 0 cleanup: {err:#}")),
+                    Err(_) => cleanup_errors
+                        .push("rank 0 cleanup: dropped LoRA discard response".to_string()),
+                },
+                Err(err) => cleanup_errors.push(format!("rank 0 cleanup dispatch: {err:#}")),
+            }
+            for (index, worker) in self.workers.iter().enumerate() {
+                let rank = index + 1;
+                match worker.discard_lora_adapter(request.lora_name.clone()) {
+                    Ok(response) => match response.recv() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            cleanup_errors.push(format!("rank {rank} cleanup: {err:#}"))
+                        }
+                        Err(_) => cleanup_errors.push(format!(
+                            "rank {rank} cleanup: dropped LoRA discard response"
+                        )),
+                    },
+                    Err(err) => {
+                        cleanup_errors.push(format!("rank {rank} cleanup dispatch: {err:#}"))
+                    }
+                }
+            }
+            if cleanup_errors.is_empty() {
+                self.loaded_lora_adapters.remove(&request.lora_name);
+            }
+            let cleanup_suffix = if cleanup_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; cleanup errors: {}", cleanup_errors.join("; "))
+            };
             anyhow::bail!(
-                "failed to load Qwen3 LoRA adapter {} on tensor-parallel ranks: {}",
+                "failed to load Qwen3 LoRA adapter {} on tensor-parallel ranks: {}{}",
                 request.lora_name,
-                errors.join("; ")
+                errors.join("; "),
+                cleanup_suffix
             );
         }
 
@@ -1097,7 +1144,7 @@ mod tests {
     fn lora_capacity_rejects_new_adapter_at_limit() {
         let loaded = HashSet::from(["adapter-a".to_string()]);
 
-        let error = ensure_lora_capacity(&loaded, "adapter-b", 1)
+        let error = ensure_lora_capacity(&loaded, "adapter-b", 1, false)
             .expect_err("new adapter should exceed capacity")
             .to_string();
 
@@ -1106,10 +1153,22 @@ mod tests {
     }
 
     #[test]
-    fn lora_capacity_allows_existing_adapter_replacement_at_limit() {
+    fn lora_capacity_allows_existing_adapter_replacement_at_limit_with_load_inplace() {
         let loaded = HashSet::from(["adapter-a".to_string()]);
 
-        ensure_lora_capacity(&loaded, "adapter-a", 1).expect("existing adapter should fit");
+        ensure_lora_capacity(&loaded, "adapter-a", 1, true)
+            .expect("existing adapter should fit with load_inplace");
+    }
+
+    #[test]
+    fn lora_capacity_rejects_duplicate_without_load_inplace() {
+        let loaded = HashSet::from(["adapter-a".to_string()]);
+
+        let error = ensure_lora_capacity(&loaded, "adapter-a", 1, false)
+            .expect_err("duplicate without load_inplace should fail")
+            .to_string();
+
+        assert!(error.contains("already loaded"));
     }
 }
 
@@ -1286,6 +1345,10 @@ impl LocalQwen3Lane {
     fn unload_lora_adapter(&mut self, name: &str) -> Result<()> {
         self.model.uninstall_lora_adapter(name)
     }
+
+    fn discard_lora_adapter(&mut self, name: &str) -> Result<()> {
+        self.model.discard_lora_adapter(name)
+    }
 }
 
 #[derive(Clone)]
@@ -1330,6 +1393,10 @@ enum WorkerCommand {
         resp: channel::Sender<Result<()>>,
     },
     UnloadLoraAdapter {
+        name: String,
+        resp: channel::Sender<Result<()>>,
+    },
+    DiscardLoraAdapter {
         name: String,
         resp: channel::Sender<Result<()>>,
     },
@@ -1395,6 +1462,10 @@ impl RankWorker {
                                     let result = lane.unload_lora_adapter(&name);
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::DiscardLoraAdapter { name, resp } => {
+                                    let result = lane.discard_lora_adapter(&name);
+                                    let _ = resp.send(result);
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -1456,6 +1527,19 @@ impl RankWorker {
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA unload"))?;
+        Ok(resp_rx)
+    }
+
+    fn discard_lora_adapter(&self, name: String) -> Result<channel::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::DiscardLoraAdapter {
+                name,
+                resp: resp_tx,
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("tensor-parallel worker channel closed on LoRA discard")
+            })?;
         Ok(resp_rx)
     }
 
