@@ -192,22 +192,30 @@ impl KimiWorkerDecodeArena {
         Ok(())
     }
 
+    /// Configure the page table and append positions for one prefill step.
+    /// `cached_tokens > 0` is a prefix-cache hit: the page table covers the
+    /// cached prefix plus the `seq_len`-token suffix, and the suffix appends
+    /// at absolute positions `cached_tokens..cached_tokens + seq_len`.
+    /// Returns the slot's offset into the uploaded page-index array so the
+    /// forward pass can gather the cached prefix from pool pages.
     pub(super) fn configure_slot_prefill(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
         seq_len: usize,
+        cached_tokens: usize,
         kv_pages: &KimiKvStepPages,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         ensure!(seq_len > 0, "Kimi prefill KV write requires tokens");
         ensure!(
             slot < self.batch_size,
             "Kimi prefill slot {slot} exceeds batch_size {}",
             self.batch_size
         );
+        let kv_tokens = cached_tokens + seq_len;
         ensure!(
-            seq_len <= KIMI_MAX_REQUEST_TOKENS,
-            "Kimi prefill seq_len {seq_len} exceeds per-request KV capacity {KIMI_MAX_REQUEST_TOKENS}"
+            kv_tokens <= KIMI_MAX_REQUEST_TOKENS,
+            "Kimi prefill kv tokens {kv_tokens} exceed per-request KV capacity {KIMI_MAX_REQUEST_TOKENS}"
         );
         ensure!(
             kv_pages.rows() == 1,
@@ -220,12 +228,14 @@ impl KimiWorkerDecodeArena {
             self.page_size,
             kv_pages,
             &[slot],
-            &[seq_len],
+            &[kv_tokens],
         )?;
+        let slot_pages_start = usize::try_from(page_indptr[slot])
+            .map_err(|_| anyhow::anyhow!("Kimi prefill slot page offset must be non-negative"))?;
         self.ensure_pool_pages(&page_indices)?;
         self.upload_page_table(ctx, &page_indices, &page_indptr, &last_page_len)?;
         let batch_indices = vec![slot as i32; seq_len];
-        let positions = (0..seq_len as i32).collect::<Vec<_>>();
+        let positions = (cached_tokens as i32..kv_tokens as i32).collect::<Vec<_>>();
         {
             let mut batch_indices_d = self.batch_indices_d.slice_mut(0..seq_len);
             ctx.stream
@@ -235,7 +245,7 @@ impl KimiWorkerDecodeArena {
             let mut positions_d = self.positions_d.slice_mut(0..seq_len);
             ctx.stream.memcpy_htod(&positions, &mut positions_d)?;
         }
-        Ok(())
+        Ok(slot_pages_start)
     }
 
     pub(super) fn configure_batch_decode(

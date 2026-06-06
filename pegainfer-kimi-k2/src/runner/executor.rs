@@ -15,15 +15,18 @@ pub(super) trait ForwardExecutor {
     fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()>;
 
     /// Forward one prompt into `slot` inside a stable arena of `decode_batch_size` rows.
-    /// `kv_pages` carries the slot's pool pages (one CSR row); `row` selects
-    /// the next token (greedy argmax vs sampling, driven by `seed`) and
-    /// requests `logprobs` for it in the report.
+    /// `input_ids` is the uncached suffix; `cached_tokens` counts the prefix
+    /// already present in the slot's pool pages (prefix cache hit), so
+    /// `kv_pages` covers `cached_tokens + input_ids.len()` tokens in one CSR
+    /// row. `row` selects the next token (greedy argmax vs sampling, driven
+    /// by `seed`) and requests `logprobs` for it in the report.
     #[allow(clippy::too_many_arguments)]
     fn forward_prefill(
         &self,
         input_ids: &[u32],
         slot: usize,
         decode_batch_size: usize,
+        cached_tokens: usize,
         ep_max_seq_len: usize,
         kv_pages: &KimiKvStepPages,
         row: KimiRowOptions,

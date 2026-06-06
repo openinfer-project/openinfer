@@ -268,6 +268,8 @@ pub fn kimi_mla_rope_assemble_prefill(
             k_cache_ptr as *mut ffi::Half,
             v_cache_ptr as *mut ffi::Half,
             seq_len as i32,
+            0, // start_pos: this typed variant is always a full (uncached) prefill
+            seq_len as i32,
             KIMI_K2_MLA_LOCAL_HEADS_TP8 as i32,
             ctx.stream.cu_stream(),
         )
@@ -432,6 +434,7 @@ pub fn kimi_flashinfer_single_prefill_mla(
             v_ptr as *const ffi::Half,
             KIMI_K2_MLA_LOCAL_HEADS_TP8 as i32,
             seq_len as i32,
+            seq_len as i32, // kv_len: this typed variant is always a full (uncached) prefill
             sm_scale,
             ctx.stream.cu_stream(),
         )

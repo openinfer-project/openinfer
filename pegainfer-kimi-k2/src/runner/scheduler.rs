@@ -359,14 +359,30 @@ impl KimiK2Scheduler {
         deferred
     }
 
-    /// Create the request's KV state and allocate its prompt pages. `None`
-    /// means the request was failed (event already sent); allocation can only
-    /// fail if the admission budget arithmetic is wrong.
-    fn schedule_request_kv(&self, req: &GenerateRequest, num_tokens: usize) -> Option<RequestKv> {
+    /// Create the request's KV state: match the prompt prefix against the
+    /// cache, then allocate pages for the uncached suffix. Returns the KV
+    /// handle and the cached-token count. `None` means the request was
+    /// failed (event already sent); allocation can only fail if the
+    /// admission budget arithmetic is wrong.
+    fn schedule_request_kv(&self, req: &GenerateRequest) -> Option<(RequestKv, usize)> {
         let mut kv = self
             .pool
             .new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-        if let Err(err) = kv.schedule_prefill(num_tokens, &self.pool) {
+        let cached_tokens = match kv.match_and_add_prefix(&self.pool) {
+            Ok(cached) => cached,
+            Err(err) => {
+                let message = format!("Kimi-K2 prefix cache matching failed: {err:#}");
+                error!("kimi-k2: {message}");
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                return None;
+            }
+        };
+        let suffix_len = req.prompt_tokens.len() - cached_tokens;
+        if let Err(err) = kv.schedule_prefill(suffix_len, &self.pool) {
             let message = format!(
                 "Kimi-K2 prefill KV block accounting violated full-lifetime reservation: {err}"
             );
@@ -378,7 +394,7 @@ impl KimiK2Scheduler {
             });
             return None;
         }
-        Some(kv)
+        Some((kv, cached_tokens))
     }
 
     fn prefill_request(
@@ -388,15 +404,17 @@ impl KimiK2Scheduler {
         decode_batch_size: usize,
     ) -> Option<ActiveKimiRequest> {
         let completion_tokens = 0usize;
-        let mut kv = self.schedule_request_kv(&req, req.prompt_tokens.len())?;
+        let (mut kv, cached_tokens) = self.schedule_request_kv(&req)?;
+        let suffix_len = req.prompt_tokens.len() - cached_tokens;
         let kv_pages = KimiKvStepPages::single(
-            kv.step_page_indices(req.prompt_tokens.len()),
+            kv.step_page_indices(suffix_len),
             self.pool.padding_block_id(),
         );
         let last_token = match self.executor.forward_prefill(
-            &req.prompt_tokens,
+            &req.prompt_tokens[cached_tokens..],
             slot,
             decode_batch_size,
+            cached_tokens,
             0,
             &kv_pages,
             row_options(&req),
@@ -478,10 +496,11 @@ impl KimiK2Scheduler {
         active: &mut Vec<ActiveKimiRequest>,
     ) {
         // 1-token prompts run their "prefill" through the decode path; the
-        // KV lifecycle is still a prefill of one token.
+        // KV lifecycle is still a prefill of one token. Prefix matching
+        // always leaves ≥1 token uncached, so cached_tokens is 0 here.
         let mut group_kv = Vec::with_capacity(group.len());
         for (slot, req) in group {
-            let Some(kv) = self.schedule_request_kv(&req, 1) else {
+            let Some((kv, _cached_tokens)) = self.schedule_request_kv(&req) else {
                 continue;
             };
             group_kv.push((slot, req, kv));
@@ -608,6 +627,7 @@ mod tests {
             input_ids: Vec<u32>,
             slot: usize,
             decode_batch_size: usize,
+            cached_tokens: usize,
             kv_row_pages: Vec<usize>,
         },
         Decode {
@@ -649,6 +669,7 @@ mod tests {
             input_ids: &[u32],
             slot: usize,
             decode_batch_size: usize,
+            cached_tokens: usize,
             _ep_max_seq_len: usize,
             kv_pages: &KimiKvStepPages,
             _row: KimiRowOptions,
@@ -658,6 +679,7 @@ mod tests {
                 input_ids: input_ids.to_vec(),
                 slot,
                 decode_batch_size,
+                cached_tokens,
                 kv_row_pages: kv_row_pages(kv_pages),
             });
             Ok(report(slot, *input_ids.last().unwrap(), 1000 + slot as u32))
@@ -775,6 +797,7 @@ mod tests {
                     input_ids: vec![22, 33],
                     slot: 1,
                     decode_batch_size: 3,
+                    cached_tokens: 0,
                     kv_row_pages: vec![1],
                 },
                 ForwardCall::Decode {
@@ -906,9 +929,57 @@ mod tests {
                     input_ids: (0..33).collect(),
                     slot: 0,
                     decode_batch_size: 1,
+                    cached_tokens: 0,
                     kv_row_pages: vec![3],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn prefix_cache_hit_prefills_only_the_suffix() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = test_scheduler(&calls, test_pool());
+
+        // First request: a 33-token prompt fills two complete 16-token
+        // blocks, which register in the prefix cache at apply_prefill.
+        let prompt_a: Vec<u32> = (100..133).collect();
+        scheduler.handle_request_batch(vec![request(prompt_a.clone())]);
+
+        // Second request shares the block-aligned 32-token prefix.
+        let mut prompt_b: Vec<u32> = prompt_a[..32].to_vec();
+        prompt_b.extend([900, 901]);
+        scheduler.handle_request_batch(vec![request(prompt_b.clone())]);
+
+        let calls = calls.lock().unwrap();
+        let prefills: Vec<_> = calls
+            .iter()
+            .filter(|call| matches!(call, ForwardCall::Prefill { .. }))
+            .collect();
+        let [
+            ForwardCall::Prefill {
+                input_ids: cold_ids,
+                cached_tokens: cold_cached,
+                ..
+            },
+            ForwardCall::Prefill {
+                input_ids: warm_ids,
+                cached_tokens: warm_cached,
+                kv_row_pages: warm_pages,
+                ..
+            },
+        ] = prefills[..]
+        else {
+            panic!("expected two prefill forwards, got {calls:?}");
+        };
+        assert_eq!(*cold_cached, 0);
+        assert_eq!(*cold_ids, prompt_a);
+        assert_eq!(*warm_cached, 32, "two full blocks hit the prefix cache");
+        assert_eq!(*warm_ids, prompt_b[32..], "only the suffix is forwarded");
+        assert_eq!(
+            *warm_pages,
+            vec![3],
+            "page row covers cached prefix + suffix"
         );
     }
 }

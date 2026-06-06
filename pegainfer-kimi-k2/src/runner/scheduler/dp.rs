@@ -149,6 +149,7 @@ enum StepCommand {
         input_ids: Vec<u32>,
         slot: usize,
         decode_batch_size: usize,
+        cached_tokens: usize,
         ep_max_seq_len: usize,
         kv_pages: KimiKvStepPages,
         row: KimiRowOptions,
@@ -423,7 +424,21 @@ impl DpCoordinator {
 
         let mut kv =
             self.pools[dp_rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-        if let Err(err) = kv.schedule_prefill(req.prompt_tokens.len(), &self.pools[dp_rank]) {
+        let cached_tokens = match kv.match_and_add_prefix(&self.pools[dp_rank]) {
+            Ok(cached) => cached,
+            Err(err) => {
+                let message = format!("Kimi-K2 prefix cache matching failed: {err:#}");
+                error!("kimi-k2: {message}");
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                return;
+            }
+        };
+        let suffix_len = req.prompt_tokens.len() - cached_tokens;
+        if let Err(err) = kv.schedule_prefill(suffix_len, &self.pools[dp_rank]) {
             let message = format!(
                 "Kimi-K2 prefill KV block accounting violated full-lifetime reservation: {err}"
             );
@@ -436,14 +451,14 @@ impl DpCoordinator {
             return;
         }
         let kv_pages = KimiKvStepPages::single(
-            kv.step_page_indices(req.prompt_tokens.len()),
+            kv.step_page_indices(suffix_len),
             self.pools[dp_rank].padding_block_id(),
         );
 
         // Prefill: all ranks run prefill in lock-step so PPLX collectives
-        // align. Owning rank processes real tokens; padding ranks process a
-        // single dummy token into a free slot (output discarded).
-        self.synchronized_prefill(dp_rank, prefill_slots, &req, &kv_pages);
+        // align. Owning rank processes the uncached suffix; padding ranks
+        // process a single dummy token into a free slot (output discarded).
+        self.synchronized_prefill(dp_rank, prefill_slots, &req, cached_tokens, &kv_pages);
 
         let prompt_len = req.prompt_tokens.len();
 
@@ -686,14 +701,19 @@ impl DpCoordinator {
         }
     }
 
+    /// `cached_tokens` is the request's prefix-cache hit length: the owning
+    /// rank forwards only the uncached suffix, so EP scratch and padding
+    /// ranks size against the suffix, not the full prompt.
     fn synchronized_prefill(
         &mut self,
         owning_rank: usize,
         prefill_slots: &[usize],
         req: &GenerateRequest,
+        cached_tokens: usize,
         kv_pages: &KimiKvStepPages,
     ) {
-        let ep_max_seq_len = req.prompt_tokens.len();
+        let suffix = &req.prompt_tokens[cached_tokens..];
+        let ep_max_seq_len = suffix.len();
         debug_assert_eq!(prefill_slots.len(), self.dp_world);
         for (dp_rank, slot) in prefill_slots
             .iter()
@@ -704,9 +724,10 @@ impl DpCoordinator {
             let seed = self.next_step_seed();
             let cmd = if dp_rank == owning_rank {
                 StepCommand::Prefill {
-                    input_ids: req.prompt_tokens.clone(),
+                    input_ids: suffix.to_vec(),
                     slot,
                     decode_batch_size: MAX_BATCH_PER_DP,
+                    cached_tokens,
                     ep_max_seq_len,
                     kv_pages: kv_pages.clone(),
                     row: row_options(req),
@@ -721,6 +742,7 @@ impl DpCoordinator {
                     input_ids: vec![0],
                     slot,
                     decode_batch_size: MAX_BATCH_PER_DP,
+                    cached_tokens: 0,
                     ep_max_seq_len,
                     kv_pages: KimiKvStepPages::single(vec![padding_page], padding_page),
                     row: KimiRowOptions::default(),
@@ -1037,6 +1059,7 @@ fn rank_forward_loop(
                 input_ids,
                 slot,
                 decode_batch_size,
+                cached_tokens,
                 ep_max_seq_len,
                 kv_pages,
                 row,
@@ -1046,6 +1069,7 @@ fn rank_forward_loop(
                     &input_ids,
                     slot,
                     decode_batch_size,
+                    cached_tokens,
                     ep_max_seq_len,
                     &kv_pages,
                     row,
