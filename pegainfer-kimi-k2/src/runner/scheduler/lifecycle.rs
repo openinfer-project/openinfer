@@ -65,12 +65,28 @@ pub(in crate::runner) fn validate_kv_capacity(
 pub(in crate::runner) fn preflight_prefill_candidate(
     req: GenerateRequest,
 ) -> Option<GenerateRequest> {
-    if finish_unschedulable(&req) {
-        send_scheduled(&req);
-        None
-    } else {
-        Some(req)
+    let Some(verdict) = unschedulable_verdict(&req) else {
+        return Some(req);
+    };
+    // Scheduled first, terminal event last — consumers stop at the terminal.
+    send_scheduled(&req);
+    match verdict {
+        UnschedulableVerdict::Finish => {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: req.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+        }
+        UnschedulableVerdict::Reject(message) => {
+            let _ = req.token_tx.send(TokenEvent::Rejected {
+                message,
+                prompt_tokens: req.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+        }
     }
+    None
 }
 
 pub(in crate::runner) fn send_scheduled(req: &GenerateRequest) {
@@ -82,32 +98,35 @@ pub(in crate::runner) fn send_scheduled(req: &GenerateRequest) {
     });
 }
 
-fn finish_unschedulable(req: &GenerateRequest) -> bool {
+enum UnschedulableVerdict {
+    Finish,
+    Reject(String),
+}
+
+fn unschedulable_verdict(req: &GenerateRequest) -> Option<UnschedulableVerdict> {
     if req.max_tokens == 0 {
-        let _ = req.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Length,
-            prompt_tokens: req.prompt_tokens.len(),
-            completion_tokens: 0,
-        });
-        return true;
+        return Some(UnschedulableVerdict::Finish);
     }
     if req.prompt_tokens.is_empty() {
-        let _ = req.token_tx.send(TokenEvent::Rejected {
-            message: "Kimi-K2 forward requires at least one prompt token".to_string(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        });
-        return true;
+        return Some(UnschedulableVerdict::Reject(
+            "Kimi-K2 forward requires at least one prompt token".to_string(),
+        ));
+    }
+    // Honor-or-reject (#236): prompt echo needs per-position prompt logprobs,
+    // which the prefill path does not compute (lm_head runs on the last
+    // position only). Reject instead of silently returning a response with
+    // the echo stripped.
+    if req.echo {
+        return Some(UnschedulableVerdict::Reject(
+            "echo is not supported on the Kimi-K2 serving path: prompt \
+             logprobs are not computed; set echo=false"
+                .to_string(),
+        ));
     }
     if let Err(message) = validate_sampling_params(req) {
-        let _ = req.token_tx.send(TokenEvent::Rejected {
-            message,
-            prompt_tokens: req.prompt_tokens.len(),
-            completion_tokens: 0,
-        });
-        return true;
+        return Some(UnschedulableVerdict::Reject(message));
     }
-    false
+    None
 }
 
 /// Honor-or-reject (#237): a request whose sampling parameters cannot be
