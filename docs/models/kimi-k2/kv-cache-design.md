@@ -188,6 +188,17 @@ warm hit also shrinks the EP collective, not just the GEMMs. The worker
 page table covers `cached + suffix` tokens and the append positions start
 at `cached` — the kernel-side append needed zero changes.
 
+Cost honesty: a warm hit does **not** skip all prefix compute. Every
+layer still gathers the cached latent and re-runs the kv_b decompression
+GEMM over it, and the materialized k/v (and the attention's K side)
+scale with `cached + suffix`. What a hit skips is everything upstream of
+attention for the cached tokens — qkv_a/q_b projections, MoE/dense MLP,
+the EP collectives — which dominates prefill, but a long cached prefix
+with a tiny suffix still pays O(cached) decompress + attention per
+layer. The alternative (persisting decompressed k/v) trades that compute
+for `heads × 320/576` more cache memory per token — rejected; the latent
+is the cache.
+
 Accuracy: the golden gate's repeated prompts now exercise the cached
 path under every bound (teacher-forced sweep requests share block-aligned
 prefixes), and the det check doubles as the warm-vs-cold A/B: run A cold,
