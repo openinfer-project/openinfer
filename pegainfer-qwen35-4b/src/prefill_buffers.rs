@@ -116,7 +116,8 @@ impl GdrChunkwiseScratch35 {
     /// 1. GDR chunkwise scratch (persists across all linear attention layers)
     /// 2. Per-layer transient peak — max of full-attention or MLP intermediates,
     ///    plus shared hidden-state buffers (temporaries freed between layers)
-    /// 3. KVCache HND write buffers (K+V per full-attention layer, allocated on first prefill)
+    /// Direct-paged prefill writes full-attention K/V into the paged pool, so
+    /// HND KVCache staging buffers are no longer part of the prefill scratch.
     pub(crate) fn estimate_bytes(config: &Config35, max_seq_len: usize) -> usize {
         let num_vh = config.linear_num_value_heads;
         let key_dim = config.linear_key_head_dim;
@@ -164,12 +165,6 @@ impl GdrChunkwiseScratch35 {
         let peak_layer = shared_layer + full_attn_temps.max(mlp_temps);
         let per_layer_bytes = peak_layer * 2; // bf16
 
-        // 3. KVCache HND write buffers: K + V per full-attention layer, bf16.
-        //    Each is num_kv_heads * max_seq_len * head_dim elements.
-        let num_full_layers = config.num_full_attention_layers();
-        let kv_cache_per_layer = config.num_key_value_heads * seq * config.head_dim * 2; // K+V
-        let kv_cache_bytes = num_full_layers * kv_cache_per_layer * 2; // bf16
-
-        gdr_bytes + per_layer_bytes + kv_cache_bytes
+        gdr_bytes + per_layer_bytes
     }
 }

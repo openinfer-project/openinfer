@@ -26,6 +26,31 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
+    pub fn prefill_attention_hd256_prep_paged_cuda(
+        q_full_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos_ptr: *const i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        stride_page: i64,
+        stream: CUstream,
+    );
+
     // Apply sigmoid(gate) from interleaved q_full onto attention output in-place.
     pub fn attention_gate_batch_hd256_cuda(
         q_full_batch: *const Half,

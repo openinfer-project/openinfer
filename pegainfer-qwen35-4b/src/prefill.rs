@@ -48,8 +48,6 @@ impl Qwen35Model {
         let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
         self.ensure_rope_cache_covers(end_pos)?;
 
-        kv_cache.init_if_needed(&self.ctx, c.head_dim)?;
-
         // Get embeddings for all tokens
         let token_ids_gpu = self
             .ctx
@@ -220,15 +218,18 @@ impl Qwen35Model {
         let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
 
         let base_pos = kv_cache.len();
-        let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, *full_idx)?;
         let mut q_prepped = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
         let start_pos_cpu: CudaSlice<i32> = self
             .ctx
             .stream
             .clone_htod(&[base_pos as i32])
             .map_err(|e| anyhow::anyhow!("H2D start_pos failed: {e}"))?;
+        let layout = kv_state.layout();
+        let layer_k_off = (*full_idx * layout.layer_stride) as i64;
+        let layer_v_off = layer_k_off + layout.kv_block_len as i64;
+        let stride_page = layout.page_stride as i64;
 
-        // Step 1: QK norm + partial RoPE + write processed K/V to HND write buffers.
+        // Step 1: QK norm + partial RoPE + direct paged K/V write.
         unsafe {
             let (qf_ptr, _) = q_full_batch.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _) = k_batch.data.device_ptr(&self.ctx.stream);
@@ -238,10 +239,10 @@ impl Qwen35Model {
             let (cos_ptr, _) = self.cos_cache.data.device_ptr(&self.ctx.stream);
             let (sin_ptr, _) = self.sin_cache.data.device_ptr(&self.ctx.stream);
             let (qp_ptr, _) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-            let (kc_ptr, _) = kc.data.device_ptr_mut(&self.ctx.stream);
-            let (vc_ptr, _) = vc.data.device_ptr_mut(&self.ctx.stream);
+            let (buf_ptr, _) = kv_state.buffer().device_ptr(&self.ctx.stream);
+            let (pi_ptr, _) = prefill_plan.page_indices_d().device_ptr(&self.ctx.stream);
             let (sp_ptr, _) = start_pos_cpu.device_ptr(&self.ctx.stream);
-            ffi::prefill_attention_hd256_prep_cuda(
+            ffi::prefill_attention_hd256_prep_paged_cuda(
                 qf_ptr as *const ffi::Half,
                 k_ptr as *const ffi::Half,
                 v_ptr as *const ffi::Half,
@@ -250,69 +251,23 @@ impl Qwen35Model {
                 cos_ptr as *const ffi::Half,
                 sin_ptr as *const ffi::Half,
                 qp_ptr as *mut ffi::Half,
-                kc_ptr as *mut ffi::Half,
-                vc_ptr as *mut ffi::Half,
+                buf_ptr as *mut ffi::Half,
+                layer_k_off,
+                layer_v_off,
+                pi_ptr as *const i32,
                 c.num_attention_heads as i32,
                 c.num_key_value_heads as i32,
                 seq_len as i32,
                 sp_ptr as *const i32,
                 c.rotary_dim as i32,
                 eps,
-                MAX_SEQ as i32,
+                layout.page_size as i32,
+                stride_page,
                 self.ctx.stream.cu_stream(),
             );
         }
 
-        // Step 2: Scatter processed K/V from HND write buffers to paged pool.
-        // Offset src by base_pos so nnz-index 0 maps to HND position base_pos.
-        let layout = kv_state.layout();
-        let layer_k_off = (*full_idx * layout.layer_stride) as i64;
-        let layer_v_off = layer_k_off + layout.kv_block_len as i64;
-        let stride_page = layout.page_stride as i64;
-        let src_stride_n = HEAD_DIM as i64;
-        let src_stride_h = (MAX_SEQ * HEAD_DIM) as i64;
-        {
-            let (buf_ptr, _gbuf) = kv_state.buffer().device_ptr(&self.ctx.stream);
-            let (kc_ptr, _gkc) = kc.data.device_ptr(&self.ctx.stream);
-            let (vc_ptr, _gvc) = vc.data.device_ptr(&self.ctx.stream);
-            // Offset by base_pos so scatter nnz-index i reads from HND position (base_pos + i)
-            let elem_off = base_pos as u64 * HEAD_DIM as u64 * 2; // bf16 = 2 bytes
-            let kc_scatter = (kc_ptr + elem_off) as *const ffi::Half;
-            let vc_scatter = (vc_ptr + elem_off) as *const ffi::Half;
-            let (pi_ptr, _gpi) = prefill_plan.page_indices_d().device_ptr(&self.ctx.stream);
-            let (pip_ptr, _gpip) = prefill_plan.page_indptr_d().device_ptr(&self.ctx.stream);
-            let (lpl_ptr, _glpl) = prefill_plan.last_page_len_d().device_ptr(&self.ctx.stream);
-            let (bi_ptr, _gbi) = prefill_plan.batch_indices_d().device_ptr(&self.ctx.stream);
-            let (pos_ptr, _gpos) = prefill_plan.positions_d().device_ptr(&self.ctx.stream);
-            let result = unsafe {
-                ffi::paged_kv_scatter_cuda(
-                    buf_ptr as *const ffi::Half,
-                    layer_k_off,
-                    layer_v_off,
-                    pi_ptr as *const i32,
-                    pip_ptr as *const i32,
-                    lpl_ptr as *const i32,
-                    kc_scatter,
-                    vc_scatter,
-                    bi_ptr as *const i32,
-                    pos_ptr as *const i32,
-                    seq_len as i32,
-                    c.num_key_value_heads as i32,
-                    HEAD_DIM as i32,
-                    layout.page_size as i32,
-                    stride_page,
-                    src_stride_n,
-                    src_stride_h,
-                    self.ctx.stream.cu_stream(),
-                )
-            };
-            anyhow::ensure!(
-                result == 0,
-                "paged_kv_scatter_cuda (prefill) failed: {result}"
-            );
-        }
-
-        // Step 3: Batch prefill paged attention (HD=256).
+        // Step 2: Batch prefill paged attention (HD=256).
         let sm_scale = 1.0f32 / f32::sqrt(HEAD_DIM as f32);
         {
             let (buf_ptr, _gbuf) = kv_state.buffer().device_ptr(&self.ctx.stream);
@@ -367,7 +322,7 @@ impl Qwen35Model {
             );
         }
 
-        // Step 4: Apply gate from q_full_batch.
+        // Step 3: Apply gate from q_full_batch.
         {
             let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&self.ctx.stream);
             let (out_ptr, _go) = attn_out_batch.data.device_ptr_mut(&self.ctx.stream);
