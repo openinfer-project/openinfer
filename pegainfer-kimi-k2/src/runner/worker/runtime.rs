@@ -1,4 +1,5 @@
 use super::*;
+use pegainfer_core::engine::TokenLogprob;
 use pegainfer_kernels::ffi;
 
 pub(in crate::runner) fn all_reduce_hidden_via_f32_in_place<const DIM: usize>(
@@ -187,6 +188,43 @@ fn yarn_linear_ramp_mask(value: f32, min: f32, max: f32) -> f32 {
     ((value - min) / denom).clamp(0.0, 1.0)
 }
 
+/// Exact log-softmax of the picked token plus the top-K, computed on the
+/// host from one full-vocab logits row. Costs one O(V) pass per row and runs
+/// only when a request asked for logprobs — never on the serving path.
+/// `vocab_start` must be 0 (unsharded vocab): a shard-local logsumexp is not
+/// the global one, so sharded callers must merge across ranks first (#236).
+pub(super) fn host_token_logprob(
+    row: &[half::bf16],
+    picked_local: usize,
+    k: usize,
+) -> TokenLogprob {
+    let mut max = f32::NEG_INFINITY;
+    for &v in row {
+        max = max.max(v.to_f32());
+    }
+    let mut sum = 0f64;
+    for &v in row {
+        sum += f64::from(v.to_f32() - max).exp();
+    }
+    let lse = max + sum.ln() as f32;
+
+    // Top-K by insertion into a K-sized sorted buffer (K ≤ 32, V ≈ 163k).
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+    for (id, &v) in row.iter().enumerate() {
+        let lp = v.to_f32() - lse;
+        if top.len() == k && lp <= top[k - 1].1 {
+            continue;
+        }
+        let pos = top.partition_point(|&(_, kept)| kept >= lp);
+        top.insert(pos, (id as u32, lp));
+        top.truncate(k);
+    }
+    TokenLogprob {
+        logprob: row[picked_local].to_f32() - lse,
+        top_logprobs: top,
+    }
+}
+
 pub(super) fn sample_local_top1_with_value(
     ctx: &DeviceContext,
     logits: &DeviceVec,
@@ -350,4 +388,47 @@ pub(super) fn read_local_top1_batch_values(
         rows.push((top_id as u32, top_values[row].to_f32()));
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_token_logprob;
+
+    #[test]
+    fn host_token_logprob_matches_exact_log_softmax() {
+        // bf16-exact inputs so the expected values are analytic.
+        let row: Vec<half::bf16> = [1.0f32, 3.0, 2.0, 0.0, 3.0]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v))
+            .collect();
+        let lse = (1f64.exp() + 3f64.exp() + 2f64.exp() + 1.0 + 3f64.exp()).ln() as f32;
+
+        let out = host_token_logprob(&row, 2, 3);
+
+        assert!((out.logprob - (2.0 - lse)).abs() < 1e-6);
+        // Top-3 sorted descending; tied logits keep ascending token-id order.
+        let ids: Vec<u32> = out.top_logprobs.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![1, 4, 2]);
+        for &(id, lp) in &out.top_logprobs {
+            assert!((lp - (row[id as usize].to_f32() - lse)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn host_token_logprob_k_larger_than_vocab() {
+        let row: Vec<half::bf16> = [0.5f32, -1.0]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v))
+            .collect();
+        let out = host_token_logprob(&row, 0, 32);
+        assert_eq!(out.top_logprobs.len(), 2);
+        assert_eq!(out.top_logprobs[0].0, 0);
+        // log-softmax sums to 1 in probability space.
+        let total: f64 = out
+            .top_logprobs
+            .iter()
+            .map(|&(_, lp)| f64::from(lp).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-6);
+    }
 }

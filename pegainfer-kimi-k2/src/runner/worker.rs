@@ -15,6 +15,7 @@ use cudarc::nccl::{
 };
 use log::debug;
 use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::engine::TokenLogprob;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
 use pegainfer_kernels::{
@@ -100,6 +101,11 @@ pub(super) struct KimiOneTokenForwardReport {
     pub vocab_rows: usize,
     pub dense_layers_executed: usize,
     pub moe_layers_executed: usize,
+    /// Exact log-softmax of the picked token plus the top-K, computed on the
+    /// host from the full-vocab logits row. `Some` only when the request
+    /// asked for logprobs (`GenerateRequest::logprobs > 0`); the serving
+    /// path never pays for it.
+    pub logprob: Option<TokenLogprob>,
 }
 
 enum KimiRankCommand {
@@ -121,6 +127,7 @@ enum KimiRankCommand {
         decode_batch_size: usize,
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
+        logprobs: usize,
         resp: Sender<Result<KimiOneTokenForwardReport>>,
     },
     ForwardDecodeBatchNextTokens {
@@ -128,6 +135,7 @@ enum KimiRankCommand {
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
+        logprobs: Vec<usize>,
         resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     EnablePplx {
@@ -260,6 +268,7 @@ impl KimiRankWorker {
         slot: usize,
         decode_batch_size: usize,
         ep_max_seq_len: usize,
+        logprobs: usize,
     ) -> Result<Receiver<Result<KimiOneTokenForwardReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -268,6 +277,7 @@ impl KimiRankWorker {
                 decode_batch_size,
                 input_ids,
                 ep_max_seq_len,
+                logprobs,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
@@ -280,6 +290,7 @@ impl KimiRankWorker {
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
+        logprobs: Vec<usize>,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -288,6 +299,7 @@ impl KimiRankWorker {
                 append_positions,
                 slots,
                 decode_batch_size,
+                logprobs,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
@@ -607,6 +619,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 decode_batch_size,
                 input_ids,
                 ep_max_seq_len,
+                logprobs,
                 resp,
             } => {
                 let result = state.forward_prompt_next_token(
@@ -614,6 +627,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                     decode_batch_size,
                     &input_ids,
                     ep_max_seq_len,
+                    logprobs,
                 );
                 let _ = resp.send(result);
             }
@@ -622,6 +636,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 append_positions,
                 slots,
                 decode_batch_size,
+                logprobs,
                 resp,
             } => {
                 let result = state.forward_decode_batch_next_tokens(
@@ -629,6 +644,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                     &append_positions,
                     &slots,
                     decode_batch_size,
+                    &logprobs,
                 );
                 let _ = resp.send(result);
             }

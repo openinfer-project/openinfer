@@ -41,6 +41,7 @@ struct RequestState {
     max_tokens: usize,
     ignore_eos: bool,
     last_token: u32,
+    logprobs: usize,
 }
 
 struct DecodeAdmission {
@@ -53,6 +54,7 @@ struct DecodeInput {
     token_id: u32,
     append_position: usize,
     slot: usize,
+    logprobs: usize,
 }
 
 enum DecodeBatchRow {
@@ -81,6 +83,13 @@ impl DecodeBatchRow {
             Self::Admission(admission) => admission.slot,
         }
     }
+
+    fn logprobs(&self) -> usize {
+        match self {
+            Self::Active(input) => input.logprobs,
+            Self::Admission(admission) => admission.req.logprobs,
+        }
+    }
 }
 
 enum StepCommand {
@@ -89,12 +98,14 @@ enum StepCommand {
         positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
+        logprobs: Vec<usize>,
     },
     Prefill {
         input_ids: Vec<u32>,
         slot: usize,
         decode_batch_size: usize,
         ep_max_seq_len: usize,
+        logprobs: usize,
     },
     Shutdown,
 }
@@ -356,7 +367,7 @@ impl DpCoordinator {
             .token_tx
             .send(TokenEvent::Token {
                 id: last_token,
-                logprob: None,
+                logprob: owner_report.logprob,
             })
             .is_err()
         {
@@ -380,6 +391,7 @@ impl DpCoordinator {
             max_tokens: req.max_tokens,
             ignore_eos: req.params.ignore_eos,
             last_token,
+            logprobs: req.logprobs,
         });
     }
 
@@ -488,7 +500,7 @@ impl DpCoordinator {
             .token_tx
             .send(TokenEvent::Token {
                 id: token_id,
-                logprob: None,
+                logprob: report.logprob.clone(),
             })
             .is_err()
         {
@@ -512,6 +524,7 @@ impl DpCoordinator {
             max_tokens: admission.req.max_tokens,
             ignore_eos: admission.req.params.ignore_eos,
             last_token: token_id,
+            logprobs: admission.req.logprobs,
         });
     }
 
@@ -556,6 +569,7 @@ impl DpCoordinator {
                     slot,
                     decode_batch_size: MAX_BATCH_PER_DP,
                     ep_max_seq_len,
+                    logprobs: req.logprobs,
                 }
             } else {
                 // All ranks run prefill so they traverse layers at the same
@@ -565,6 +579,7 @@ impl DpCoordinator {
                     slot,
                     decode_batch_size: MAX_BATCH_PER_DP,
                     ep_max_seq_len,
+                    logprobs: 0,
                 }
             };
             send_step_command(&self.step_txs[dp_rank], dp_rank, "prefill", cmd);
@@ -646,6 +661,7 @@ impl DpRankState {
                     token_id: req.last_token,
                     append_position: req.prompt_len + req.completion_tokens - 1,
                     slot,
+                    logprobs: req.logprobs,
                 })
             })
             .collect()
@@ -701,7 +717,7 @@ impl DpRankState {
             .token_tx
             .send(TokenEvent::Token {
                 id: token_id,
-                logprob: None,
+                logprob: report.logprob.clone(),
             })
             .is_err()
         {
@@ -743,6 +759,7 @@ fn build_padding_decode_command() -> StepCommand {
         positions: vec![0],
         slots: vec![0],
         decode_batch_size: MAX_BATCH_PER_DP,
+        logprobs: vec![0],
     }
 }
 
@@ -752,6 +769,7 @@ fn build_decode_command_from_rows(rows: &[DecodeBatchRow]) -> StepCommand {
         positions: rows.iter().map(DecodeBatchRow::append_position).collect(),
         slots: rows.iter().map(DecodeBatchRow::slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
+        logprobs: rows.iter().map(DecodeBatchRow::logprobs).collect(),
     }
 }
 
@@ -761,6 +779,7 @@ fn build_decode_command_from_inputs(inputs: &[DecodeInput]) -> StepCommand {
         positions: inputs.iter().map(|input| input.append_position).collect(),
         slots: inputs.iter().map(|input| input.slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
+        logprobs: inputs.iter().map(|input| input.logprobs).collect(),
     }
 }
 
@@ -788,12 +807,14 @@ fn rank_forward_loop(
                 positions,
                 slots,
                 decode_batch_size,
+                logprobs,
             } => {
                 let result = executor.forward_decode_batch(
                     &token_ids,
                     &positions,
                     &slots,
                     decode_batch_size,
+                    &logprobs,
                 );
                 let _ = res_tx.send(StepResult::Decode(result));
             }
@@ -802,9 +823,15 @@ fn rank_forward_loop(
                 slot,
                 decode_batch_size,
                 ep_max_seq_len,
+                logprobs,
             } => {
-                let result =
-                    executor.forward_prefill(&input_ids, slot, decode_batch_size, ep_max_seq_len);
+                let result = executor.forward_prefill(
+                    &input_ids,
+                    slot,
+                    decode_batch_size,
+                    ep_max_seq_len,
+                    logprobs,
+                );
                 let _ = res_tx.send(StepResult::Prefill(result));
             }
             StepCommand::Shutdown => break,
@@ -854,6 +881,7 @@ mod tests {
             max_tokens: 16,
             ignore_eos: false,
             last_token,
+            logprobs: 0,
         }
     }
 
@@ -869,6 +897,7 @@ mod tests {
             vocab_rows: 0,
             dense_layers_executed: 0,
             moe_layers_executed: 0,
+            logprob: None,
         }
     }
 
@@ -899,6 +928,7 @@ mod tests {
             positions,
             slots,
             decode_batch_size,
+            logprobs,
         } = rank.build_decode_command()
         else {
             panic!("decode command expected");
@@ -908,6 +938,7 @@ mod tests {
         assert_eq!(token_ids, vec![123]);
         assert_eq!(positions, vec![6]);
         assert_eq!(slots, vec![MAX_BATCH_PER_DP - 1]);
+        assert_eq!(logprobs, vec![0]);
     }
 
     #[test]
@@ -917,6 +948,7 @@ mod tests {
                 token_id: 11,
                 append_position: 5,
                 slot: 3,
+                logprobs: 4,
             }),
             DecodeBatchRow::Admission(DecodeAdmission {
                 slot: 7,
@@ -929,6 +961,7 @@ mod tests {
             positions,
             slots,
             decode_batch_size,
+            logprobs,
         } = build_decode_command_from_rows(&rows)
         else {
             panic!("decode command expected");
@@ -938,6 +971,7 @@ mod tests {
         assert_eq!(token_ids, vec![11, 99]);
         assert_eq!(positions, vec![5, 0]);
         assert_eq!(slots, vec![3, 7]);
+        assert_eq!(logprobs, vec![4, 0]);
     }
 
     #[test]
@@ -947,6 +981,7 @@ mod tests {
             positions,
             slots,
             decode_batch_size,
+            logprobs,
         } = build_padding_decode_command()
         else {
             panic!("decode command expected");
@@ -956,6 +991,7 @@ mod tests {
         assert_eq!(token_ids, vec![0]);
         assert_eq!(positions, vec![0]);
         assert_eq!(slots, vec![0]);
+        assert_eq!(logprobs, vec![0]);
     }
 
     #[test]
@@ -971,6 +1007,7 @@ mod tests {
             max_tokens: 16,
             ignore_eos: false,
             last_token: 7,
+            logprobs: 0,
         });
 
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586]);
@@ -1003,6 +1040,7 @@ mod tests {
             max_tokens: 16,
             ignore_eos: true,
             last_token: 7,
+            logprobs: 0,
         });
 
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586]);

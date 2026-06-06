@@ -1,6 +1,6 @@
 # Kimi-K2 accuracy gate (vLLM-golden)
 
-**TL;DR**: `pegainfer-kimi-k2/tests/vllm_golden_gate.rs` + `test_data/kimi-k2.6-vllm-golden.safetensors` give Kimi-K2 its first accuracy gate reproducible from a fresh clone (#223). Reference is vLLM (same INT4 quantized model, marlin kernels), not HF. Two passes through the public serving path: teacher-forced argmax sweep (prefill numerics, regret rule) and free-greedy decode parity (decode kernels, divergence-classified). Needs 8 GPUs + K2.6 weights; fails loudly when prerequisites are missing.
+**TL;DR**: `pegainfer-kimi-k2/tests/vllm_golden_gate.rs` + `test_data/kimi-k2.6-vllm-golden.safetensors` give Kimi-K2 its first accuracy gate reproducible from a fresh clone (#223). Reference is vLLM (same INT4 quantized model, marlin kernels), not HF. Two passes through the public serving path: teacher-forced argmax sweep (prefill numerics, regret rule + two-sided |Δlogprob| bound) and free-greedy decode parity (decode kernels, divergence-classified). The TP1/DP8 path emits exact per-token logprobs (#236), so the gate measures both engines' logprobs of the same token, like the Qwen gates. Needs 8 GPUs + K2.6 weights; fails loudly when prerequisites are missing.
 
 Last touched: 2026-06
 
@@ -20,10 +20,11 @@ gone. Everything this gate needs is committed.
 
 ## What the gate asserts
 
-The kimi engine exposes no logprobs (#236), so the gate cannot bound a
-|Δlogprob| distribution like the Qwen gates. It asserts what the public
-`EngineHandle` surface can express — which has the side benefit of testing the
-*real serving path* (DP coordinator → PPLX EP → MLA kernels, TP1/DP8/EP8):
+The TP1/DP8 path emits exact per-token logprobs — a host log-softmax over the
+full-vocab logits row, computed only when the request asks for it, so the
+serving path pays nothing. The gate requests them on every submission and
+asserts through the *real serving path* (DP coordinator → PPLX EP → MLA
+kernels, TP1/DP8/EP8):
 
 1. **Teacher-forced argmax sweep** (prefill numerics): for every tail position
    `i`, prefill `prompt + vllm_tail[..i]` with `max_tokens=1`. pegainfer's
@@ -38,7 +39,19 @@ The kimi engine exposes no logprobs (#236), so the gate cannot bound a
    regret rule (benign tie vs real bug) and ends that sequence's
    comparison. An aggregate coverage floor (`COVERAGE_FLOOR`) prevents mass
    early divergence from passing vacuously. Runs bs=1, concurrent (DP8
-   routing), plus a determinism double-run.
+   routing), plus a determinism double-run (tokens AND logprobs must be
+   bit-identical).
+
+Both passes additionally bound the **two-sided |Δlogprob|** at exact-match
+positions — pegainfer's own logprob of the agreed token against vLLM's
+stored one (mean + p99 per pass). Flip positions are excluded from that
+population on purpose: their Δ is structurally larger (the engines disagree
+about a flat distribution, which the regret rule already governs), and
+mixing the populations parks the p99 on the boundary between them — the
+same run-to-run straddling that killed fixed regret thresholds. Flip-pick
+Δ is printed for observability. A per-position internal-consistency check
+(the pick's logprob must equal the head of pegainfer's own top-K) catches
+GPU-argmax-vs-host-log-softmax disagreement on the same logits.
 
 ## Running it
 
@@ -62,11 +75,13 @@ There is no silent skip: missing `PEGAINFER_TEST_MODEL_PATH` or a missing
 fixture panics. (The qwen35 gate's env-gated skip silently reported
 "ok 0.00s" — this gate deliberately does not.)
 
-Green run on an 8×H200 node (2026-06-06, 252 s): teacher-forced 375/384 exact
-(97.7%, max in-bound flip 1.00); greedy bs=1 286/292 exact over 76.0%
-coverage; greedy concurrent 288/294 exact over 76.6% coverage; determinism
-double-run identical. Engine bringup (weights 127 s + PPLX install)
-dominates the wall time.
+Green run on an 8×H200 node (2026-06-06, 180 s, clean checkout of the
+committed tree): teacher-forced 376/384 exact (97.9%, max in-bound flip
+1.00), |Δlogprob| mean 0.032 / p99 0.288; greedy bs=1 270/276 exact over
+71.9% coverage, Δ mean 0.027 / p99 0.292; greedy concurrent 281/287 exact
+over 74.7% coverage, Δ mean 0.029 / p99 0.252; determinism double-run
+identical down to the logprobs. Engine bringup (weights 127 s + PPLX
+install) dominates the wall time.
 
 ## Tolerances
 
@@ -101,8 +116,15 @@ every observed point; its binding fit is the 1.00 @ −2.20 flip
 |---|---|---|
 | `REGRET_BASE` | 0.30 | measured confident-position flip ceiling 0.25 × 1.2 |
 | `REGRET_FLATNESS_SLOPE` | 0.35 | binding observation (1.00 nat @ lp −2.20 → 0.318), rounded up one notch |
-| `EXACT_FLOOR` | 0.95 | exact-match rate per pass, measured 97.7–98.4%; catches "many small in-bound flips" systematic drift |
-| `COVERAGE_FLOOR` | 0.70 | greedy parity must compare ≥70% of positions before benign divergences cut sequences short (measured 72–81%) |
+| `EXACT_FLOOR` | 0.95 | exact-match rate per pass, measured 97.7–98.7%; catches "many small in-bound flips" systematic drift |
+| `COVERAGE_FLOOR` | 0.60 | vacuous-pass guard (mass early divergence sits at ≤10%); measured 70.6–82.6%, and the divergence points shuffle run to run, so the floor sits below the low-water mark instead of hugging it |
+| `LOGPROB_DELTA_MEAN_TOL` | 0.05 | per-pass mean \|Δlogprob\| at exact-match positions, measured 0.024–0.031; the strict guard — a systematic logit shift moves the mean long before any per-position rule trips |
+| `LOGPROB_DELTA_P99_TOL` | 0.50 | per-pass p99, measured 0.171–0.334 (worst × 1.5); max (0.515) is printed, not asserted — order statistics past p99 are unstable at n ≈ 300–380 |
+
+The exact-position Δ tail also scales with flatness: the pick's logprob moves
+with the logsumexp, which competitor-logit drift shifts even when the argmax
+agrees. The noise floor is cross-engine INT4 plus vLLM's 1/16-grid logprob
+quantization (±0.031 per sample even at perfect agreement).
 
 Cross-engine INT4 noise (different marlin tiles, TP8 vs TP1/DP8 parallel
 split, different MoE accumulation order) is larger than the same-engine bf16
@@ -114,8 +136,10 @@ flip rate.
 
 ## Known limits / next steps
 
-- No |Δlogprob| mean/p99 bound until kimi exposes logprobs (#236); when it
-  does, extend the gate to the full methodology and tighten tolerances.
+- Logprobs exist on the TP1/DP8 path only. The TP8/DP1 path rejects
+  `logprobs > 0` loudly: each rank holds a vocab shard, and a shard-local
+  logsumexp is not the global one — the cross-rank merge is the remainder
+  of #236.
 - CUDA-graph decode path is not exercised (`enable_cuda_graph: false`) — the
   PPLX path has no graph support yet (#227); add a graph pass when it lands.
 - Fixture regeneration is manual; bump `meta.vllm_version` discipline applies

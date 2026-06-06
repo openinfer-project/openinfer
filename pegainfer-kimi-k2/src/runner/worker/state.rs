@@ -1,4 +1,5 @@
 use super::{forward::*, runtime::*, *};
+use crate::config::KIMI_K2_VOCAB;
 
 impl KimiRankThreadState {
     pub(super) fn enable_pplx(&mut self, ep_backend: pegainfer_comm::EpBackend) -> Result<()> {
@@ -102,8 +103,15 @@ impl KimiRankThreadState {
         decode_batch_size: usize,
         input_ids: &[u32],
         ep_max_seq_len: usize,
+        logprobs: usize,
     ) -> Result<KimiOneTokenForwardReport> {
-        self.forward_prompt_next_token_inner(slot, decode_batch_size, input_ids, ep_max_seq_len)
+        self.forward_prompt_next_token_inner(
+            slot,
+            decode_batch_size,
+            input_ids,
+            ep_max_seq_len,
+            logprobs,
+        )
     }
 
     pub(super) fn ensure_decode_arena(&mut self, decode_batch_size: usize) -> Result<()> {
@@ -135,6 +143,7 @@ impl KimiRankThreadState {
         append_positions: &[usize],
         slots: &[usize],
         decode_batch_size: usize,
+        logprobs: &[usize],
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
         ensure!(!token_ids.is_empty(), "Kimi batch decode requires tokens");
         ensure!(
@@ -143,6 +152,12 @@ impl KimiRankThreadState {
             token_ids.len(),
             append_positions.len(),
             slots.len()
+        );
+        ensure!(
+            logprobs.len() == token_ids.len(),
+            "Kimi batch decode logprobs length mismatch: tokens={}, logprobs={}",
+            token_ids.len(),
+            logprobs.len()
         );
         self.ctx.set_current()?;
         let loaded = self.loaded.as_mut().ok_or_else(|| {
@@ -259,8 +274,31 @@ impl KimiRankThreadState {
             &mut decode_arena.scratch.sampling.top1_value_scratch,
             &mut decode_arena.scratch.sampling.top1_out,
         )?;
+        let host_logits = if logprobs.iter().any(|&k| k > 0) {
+            ensure!(
+                cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
+                "Kimi logprobs require an unsharded vocab (TP1); a vocab shard's \
+                 logsumexp is not the global one (#236)"
+            );
+            Some(
+                device_ctx
+                    .stream
+                    .clone_dtoh(&decode_arena.logits.data)
+                    .with_context(|| format!("Kimi rank {rank} D2H decode logits for logprobs"))?,
+            )
+        } else {
+            None
+        };
         let mut reports = Vec::with_capacity(active_len);
         for (row, (local_next, local_top_logit_f32)) in local_top1.into_iter().enumerate() {
+            let logprob = match &host_logits {
+                Some(host) if logprobs[row] > 0 => Some(host_token_logprob(
+                    &host[row * cache.vocab_rows..(row + 1) * cache.vocab_rows],
+                    local_next as usize,
+                    logprobs[row],
+                )),
+                _ => None,
+            };
             reports.push(KimiOneTokenForwardReport {
                 rank,
                 batch_slot: slots[row],
@@ -272,6 +310,7 @@ impl KimiRankThreadState {
                 vocab_rows: cache.vocab_rows,
                 dense_layers_executed: KIMI_K2_DENSE_LAYERS,
                 moe_layers_executed: KIMI_K2_MOE_LAYERS,
+                logprob,
             });
         }
         Ok(reports)
@@ -283,6 +322,7 @@ impl KimiRankThreadState {
         decode_batch_size: usize,
         input_ids: &[u32],
         ep_max_seq_len: usize,
+        logprobs: usize,
     ) -> Result<KimiOneTokenForwardReport> {
         ensure!(!input_ids.is_empty(), "Kimi prompt forward requires tokens");
         self.ctx.set_current()?;
@@ -446,6 +486,20 @@ impl KimiRankThreadState {
             len: cache.vocab_rows,
         };
         let (local_next, local_top_logit_f32) = sample_local_top1_with_value(&device_ctx, &logits)?;
+        let logprob = if logprobs > 0 {
+            ensure!(
+                cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
+                "Kimi logprobs require an unsharded vocab (TP1); a vocab \
+                 shard's logsumexp is not the global one (#236)"
+            );
+            let host = device_ctx
+                .stream
+                .clone_dtoh(&logits.data)
+                .with_context(|| format!("Kimi rank {rank} D2H prefill logits"))?;
+            Some(host_token_logprob(&host, local_next as usize, logprobs))
+        } else {
+            None
+        };
 
         let report = KimiOneTokenForwardReport {
             rank,
@@ -458,6 +512,7 @@ impl KimiRankThreadState {
             vocab_rows: cache.vocab_rows,
             dense_layers_executed,
             moe_layers_executed,
+            logprob,
         };
         Ok(report)
     }

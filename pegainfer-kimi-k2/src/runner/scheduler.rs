@@ -33,6 +33,7 @@ struct ActiveKimiRequest {
     last_token: u32,
     slot: usize,
     decode_batch_size: usize,
+    logprobs: usize,
 }
 
 impl KimiK2Scheduler {
@@ -50,12 +51,14 @@ impl KimiK2Scheduler {
             .collect::<Vec<_>>();
         let warm_positions = vec![0; KIMI_RUNNER_MAX_BATCH];
         let warm_slots = (0..KIMI_RUNNER_MAX_BATCH).collect::<Vec<_>>();
+        let warm_logprobs = vec![0; KIMI_RUNNER_MAX_BATCH];
         let _ = executor
             .forward_decode_batch(
                 &warm_tokens,
                 &warm_positions,
                 &warm_slots,
                 KIMI_RUNNER_MAX_BATCH,
+                &warm_logprobs,
             )
             .with_context(|| {
                 format!("Kimi-K2 warm decode admission bs{KIMI_RUNNER_MAX_BATCH} before serving")
@@ -176,11 +179,13 @@ impl KimiK2Scheduler {
                 .map(|req| req.prompt_len + req.completion_tokens - 1)
                 .collect::<Vec<_>>();
             let slots = active.iter().map(|req| req.slot).collect::<Vec<_>>();
+            let logprobs = active.iter().map(|req| req.logprobs).collect::<Vec<_>>();
             let reports = match self.executor.forward_decode_batch(
                 &token_ids,
                 &append_positions,
                 &slots,
                 decode_batch_size,
+                &logprobs,
             ) {
                 Ok(reports) => reports,
                 Err(err) => {
@@ -220,7 +225,7 @@ impl KimiK2Scheduler {
                     .token_tx
                     .send(TokenEvent::Token {
                         id: token_id,
-                        logprob: None,
+                        logprob: report.logprob,
                     })
                     .is_err()
                 {
@@ -256,6 +261,7 @@ impl KimiK2Scheduler {
             slot,
             decode_batch_size,
             0,
+            req.logprobs,
         ) {
             Ok(report) => {
                 let token_id = report.local_next_token_global_id;
@@ -271,7 +277,7 @@ impl KimiK2Scheduler {
                     .token_tx
                     .send(TokenEvent::Token {
                         id: token_id,
-                        logprob: None,
+                        logprob: report.logprob,
                     })
                     .is_err()
                 {
@@ -311,6 +317,7 @@ impl KimiK2Scheduler {
             last_token,
             slot,
             decode_batch_size,
+            logprobs: req.logprobs,
         })
     }
 
@@ -326,11 +333,16 @@ impl KimiK2Scheduler {
             .collect::<Vec<_>>();
         let append_positions = vec![0; token_ids.len()];
         let slots = group.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+        let logprobs = group
+            .iter()
+            .map(|(_, req)| req.logprobs)
+            .collect::<Vec<_>>();
         let reports = match self.executor.forward_decode_batch(
             &token_ids,
             &append_positions,
             &slots,
             decode_batch_size,
+            &logprobs,
         ) {
             Ok(reports) => reports,
             Err(err) => {
@@ -364,7 +376,7 @@ impl KimiK2Scheduler {
                 .token_tx
                 .send(TokenEvent::Token {
                     id: token_id,
-                    logprob: None,
+                    logprob: report.logprob,
                 })
                 .is_err()
             {
@@ -388,6 +400,7 @@ impl KimiK2Scheduler {
                 last_token: token_id,
                 slot,
                 decode_batch_size,
+                logprobs: req.logprobs,
             });
         }
     }
@@ -444,6 +457,7 @@ mod tests {
             slot: usize,
             decode_batch_size: usize,
             _ep_max_seq_len: usize,
+            _logprobs: usize,
         ) -> Result<KimiOneTokenForwardReport> {
             self.calls.lock().unwrap().push(ForwardCall::Prefill {
                 input_ids: input_ids.to_vec(),
@@ -459,6 +473,7 @@ mod tests {
             append_positions: &[usize],
             slots: &[usize],
             decode_batch_size: usize,
+            _logprobs: &[usize],
         ) -> Result<Vec<KimiOneTokenForwardReport>> {
             self.calls.lock().unwrap().push(ForwardCall::Decode {
                 token_ids: token_ids.to_vec(),
@@ -495,6 +510,7 @@ mod tests {
             vocab_rows: 1,
             dense_layers_executed: 0,
             moe_layers_executed: 0,
+            logprob: None,
         }
     }
 

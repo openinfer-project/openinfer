@@ -11,9 +11,11 @@
 //! prompt token ids, vLLM's greedy tail, and vLLM's top-K logprobs per
 //! position.
 //!
-//! The kimi engine exposes no logprobs yet (#236), so unlike the Qwen gates
-//! this one cannot bound a |Δlogprob| distribution. It asserts what the public
-//! engine surface can express, in two passes through the *real serving path*
+//! The TP1/DP8 path emits exact per-token logprobs (host log-softmax of the
+//! full-vocab logits row, computed only when requested), so on top of token
+//! comparison the gate bounds a two-sided |Δlogprob| distribution: pegainfer's
+//! own logprob of its pick against vLLM's logprob of the same token. Two
+//! passes through the *real serving path*
 //! (EngineHandle → DP coordinator → PPLX EP → MLA kernels, TP1/DP8/EP8):
 //!
 //!   * teacher-forced argmax sweep — for every position i, prefill
@@ -49,7 +51,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use pegainfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, TokenEvent};
+use pegainfer_core::engine::{
+    EngineHandle, EngineLoadOptions, EpBackend, TokenEvent, TokenLogprob,
+};
 use pegainfer_core::parallel::ParallelConfig;
 use pegainfer_core::sampler::SamplingParams;
 use safetensors::{Dtype, SafeTensors};
@@ -96,8 +100,34 @@ const EXACT_FLOOR: f64 = 0.95;
 /// Free-greedy parity must compare at least this fraction of all tail
 /// positions before benign divergences cut the sequences short. Guards
 /// against "every sequence tie-flips at position 0" passing as vacuously
-/// green. Measured 72–81% across runs and modes.
-const COVERAGE_FLOOR: f64 = 0.70;
+/// green — that failure mode sits at ≤10% coverage. Measured 70.6–82.6%
+/// across runs and modes: where each sequence diverges shuffles run to run,
+/// so the floor sits well below the observed low-water mark rather than
+/// hugging it.
+const COVERAGE_FLOOR: f64 = 0.60;
+
+/// Two-sided |Δlogprob| bounds over *exact-match* positions: where both
+/// engines pick the same token, Δ between pegainfer's exact host log-softmax
+/// and vLLM's stored logprob is pure numerical drift — the same shape as the
+/// Qwen golden gates, measured through a different engine. Flip positions are
+/// deliberately excluded: their Δ is structurally larger (the engines
+/// disagree about a flat distribution, which the regret rule already
+/// governs), and mixing the two populations puts the p99 right on the
+/// boundary between them — the same run-to-run straddling that killed fixed
+/// regret thresholds. The noise floor here is cross-engine INT4 (different
+/// marlin tiles, TP8 vs TP1/DP8 split) plus vLLM's 1/16-grid logprob
+/// quantization (±0.031 per sample even at perfect agreement), so the bounds
+/// sit well above the Qwen same-engine bf16 ULP floor. The exact-position Δ
+/// tail also scales with flatness — the pick's logprob moves with the LSE,
+/// which competitor-logit drift shifts even when the argmax agrees.
+///
+/// Calibration (8×H200 runs, 2026-06-06): per pass, mean 0.024–0.031 and
+/// p99 0.171–0.334 (max 0.515, printed not asserted — order statistics past
+/// p99 are unstable at n ≈ 300–380). Mean is the strict guard: a systematic
+/// logit shift moves it long before any per-position rule trips. The p99
+/// bound is 1.5× the worst measured tail.
+const LOGPROB_DELTA_MEAN_TOL: f64 = 0.05;
+const LOGPROB_DELTA_P99_TOL: f32 = 0.50;
 
 /// Per-request wait budget. Decode of a 32-token tail takes ~1 s at bs=64
 /// TPOT; teacher-forced waves prefill up to 32 requests. A request that
@@ -278,6 +308,7 @@ fn submit(
     label: String,
     prompt: &[u32],
     max_tokens: usize,
+    logprobs: usize,
 ) -> PendingRequest {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     engine
@@ -294,7 +325,7 @@ fn submit(
             max_tokens,
             lora_adapter: None,
             token_tx: tx,
-            logprobs: 0,
+            logprobs,
             echo: false,
         })
         .expect("submit to kimi engine");
@@ -302,14 +333,25 @@ fn submit(
 }
 
 impl PendingRequest {
-    /// Drain the event stream to completion, returning the generated tokens.
+    /// Drain the event stream to completion, returning the generated tokens
+    /// and their logprobs. A token arriving without a logprob when one was
+    /// requested is an engine bug — fail loudly, never compare less.
     /// Any engine-side error or a stall beyond `RECV_TIMEOUT` is a loud fail.
-    fn collect(mut self) -> Vec<u32> {
+    fn collect(mut self) -> Vec<(u32, TokenLogprob)> {
         let mut tokens = Vec::new();
         let deadline = Instant::now() + RECV_TIMEOUT;
         loop {
             match self.rx.try_recv() {
-                Ok(TokenEvent::Token { id, .. }) => tokens.push(id),
+                Ok(TokenEvent::Token { id, logprob }) => {
+                    let logprob = logprob.unwrap_or_else(|| {
+                        panic!(
+                            "[{}] token {id} arrived without a logprob — the \
+                             engine dropped a requested logprob",
+                            self.label
+                        )
+                    });
+                    tokens.push((id, logprob));
+                }
                 Ok(TokenEvent::Finished { .. }) => return tokens,
                 Ok(TokenEvent::Error { message, .. }) => {
                     panic!("[{}] engine error: {message}", self.label)
@@ -341,18 +383,43 @@ impl PendingRequest {
 struct RegretStats {
     positions: usize,
     exact_matches: usize,
-    flips: Vec<f32>, // regret of in-bound disagreements
+    flips: Vec<f32>,       // regret of in-bound disagreements
+    deltas: Vec<f32>,      // |Δlogprob| at exact-match positions (asserted)
+    flip_deltas: Vec<f32>, // |Δlogprob| of scored flip picks (printed only)
     violations: Vec<String>,
 }
 
 /// Fold pegainfer's pick at one position into the stats, applying the
-/// flatness-scaled regret rule.
-fn check_pick(stats: &mut RegretStats, seq: &Seq, pos: usize, pick: u32) {
+/// flatness-scaled regret rule and accumulating the two-sided |Δlogprob|.
+fn check_pick(stats: &mut RegretStats, seq: &Seq, pos: usize, pick: u32, pick_lp: &TokenLogprob) {
     stats.positions += 1;
+
+    // Internal consistency: the engine's pick is its own argmax, so its
+    // logprob must equal the head of its own top-K (ties aside). A gap means
+    // the GPU argmax and the host log-softmax saw different logits.
+    let own_top = pick_lp
+        .top_logprobs
+        .first()
+        .map_or(f32::NEG_INFINITY, |&(_, lp)| lp);
+    if pick_lp.logprob < own_top - 1e-5 {
+        stats.violations.push(format!(
+            "{} pos {pos}: pick {pick} logprob {:.4} sits below pegainfer's \
+             own top-1 {:.4} — argmax and log-softmax disagree on the same logits",
+            seq.name, pick_lp.logprob, own_top,
+        ));
+    }
+
     let (vllm_top1, vllm_top1_lp) = seq.vllm_top1(pos);
     if pick == vllm_top1 {
         stats.exact_matches += 1;
+        // Two-sided drift on the agreed token — pure numerics, asserted.
+        stats.deltas.push((pick_lp.logprob - vllm_top1_lp).abs());
         return;
+    }
+    // Flip pick scored by both engines — observability only; the regret
+    // rule below owns flip positions.
+    if let Some(vllm_lp) = seq.vllm_logprob(pos, pick) {
+        stats.flip_deltas.push((pick_lp.logprob - vllm_lp).abs());
     }
     match seq.vllm_logprob(pos, pick) {
         None => stats.violations.push(format!(
@@ -385,15 +452,31 @@ fn report(label: &str, stats: &RegretStats, failures: &mut Vec<String>) {
     let mut flips = stats.flips.clone();
     flips.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let exact_rate = stats.exact_matches as f64 / stats.positions as f64;
+
+    let mut deltas = stats.deltas.clone();
+    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let delta_mean = deltas.iter().map(|&d| f64::from(d)).sum::<f64>() / deltas.len().max(1) as f64;
+    let delta_p99 = if deltas.is_empty() {
+        0.0
+    } else {
+        deltas[((deltas.len() as f64 * 0.99).ceil() as usize).min(deltas.len()) - 1]
+    };
+    let delta_max = deltas.last().copied().unwrap_or(0.0);
+
+    let flip_delta_max = stats.flip_deltas.iter().copied().fold(0.0f32, f32::max);
     eprintln!(
         "vllm_golden_gate [{label}]: {} positions — {} exact ({:.1}%), \
-         {} in-bound flips (max regret {:.4}), {} violations",
+         {} in-bound flips (max regret {:.4}), {} violations; \
+         |Δlogprob| over {} exact-match picks: mean {delta_mean:.4}, \
+         p99 {delta_p99:.4}, max {delta_max:.4}; \
+         flip-pick |Δlogprob| max {flip_delta_max:.4} (not asserted)",
         stats.positions,
         stats.exact_matches,
         exact_rate * 100.0,
         flips.len(),
         flips.last().copied().unwrap_or(0.0),
         stats.violations.len(),
+        deltas.len(),
     );
     for v in &stats.violations {
         failures.push(format!("[{label}] {v}"));
@@ -403,6 +486,19 @@ fn report(label: &str, stats: &RegretStats, failures: &mut Vec<String>) {
             "[{label}] exact-match rate {exact_rate:.3} is below the \
              {EXACT_FLOOR} floor — many small flips is systematic drift \
              even when every one is in-bound",
+        ));
+    }
+    if delta_mean > LOGPROB_DELTA_MEAN_TOL {
+        failures.push(format!(
+            "[{label}] |Δlogprob| mean {delta_mean:.4} exceeds \
+             {LOGPROB_DELTA_MEAN_TOL} — systematic numerical drift between \
+             the engines even where the tokens agree",
+        ));
+    }
+    if delta_p99 > LOGPROB_DELTA_P99_TOL {
+        failures.push(format!(
+            "[{label}] |Δlogprob| p99 {delta_p99:.4} exceeds \
+             {LOGPROB_DELTA_P99_TOL} — the drift tail is too heavy",
         ));
     }
 }
@@ -418,7 +514,13 @@ fn teacher_forced_sweep(engine: &EngineHandle, fixture: &Fixture) -> RegretStats
             .map(|i| {
                 let mut prompt = seq.prompt_token_ids.clone();
                 prompt.extend_from_slice(&seq.tail_token_ids[..i]);
-                submit(engine, format!("tf:{}:{i}", seq.name), &prompt, 1)
+                submit(
+                    engine,
+                    format!("tf:{}:{i}", seq.name),
+                    &prompt,
+                    1,
+                    fixture.meta.top_k,
+                )
             })
             .collect();
         for (i, req) in pending.into_iter().enumerate() {
@@ -430,7 +532,7 @@ fn teacher_forced_sweep(engine: &EngineHandle, fixture: &Fixture) -> RegretStats
                 seq.name,
                 tokens.len()
             );
-            check_pick(&mut stats, seq, i, tokens[0]);
+            check_pick(&mut stats, seq, i, tokens[0].0, &tokens[0].1);
         }
     }
     stats
@@ -446,7 +548,7 @@ fn greedy_parity(
     let mut stats = RegretStats::default();
     let mut compared = 0usize;
 
-    let outputs: Vec<(usize, Vec<u32>)> = if concurrent {
+    let outputs: Vec<(usize, Vec<(u32, TokenLogprob)>)> = if concurrent {
         let pending: Vec<PendingRequest> = fixture
             .seqs
             .iter()
@@ -456,6 +558,7 @@ fn greedy_parity(
                     format!("greedy:{}", seq.name),
                     &seq.prompt_token_ids,
                     fixture.meta.decode_tokens,
+                    fixture.meta.top_k,
                 )
             })
             .collect();
@@ -475,6 +578,7 @@ fn greedy_parity(
                     format!("greedy:{}", seq.name),
                     &seq.prompt_token_ids,
                     fixture.meta.decode_tokens,
+                    fixture.meta.top_k,
                 );
                 (i, req.collect())
             })
@@ -491,8 +595,9 @@ fn greedy_parity(
             tokens.len(),
             fixture.meta.decode_tokens
         );
-        for (pos, &tok) in tokens.iter().enumerate() {
-            check_pick(&mut stats, seq, pos, tok);
+        for (pos, (tok, lp)) in tokens.iter().enumerate() {
+            let tok = *tok;
+            check_pick(&mut stats, seq, pos, tok, lp);
             compared += 1;
             if tok != seq.tail_token_ids[pos] {
                 // The engines now sit in different contexts; later positions
@@ -554,15 +659,16 @@ fn kimi_greedy_matches_vllm_golden() {
         }
     }
 
-    // Determinism: identical input must reproduce identical tokens. Catches
-    // nondeterministic kernels and uninitialised scratch independently of the
-    // vLLM reference.
+    // Determinism: identical input must reproduce identical tokens AND
+    // bit-identical logprobs. Catches nondeterministic kernels and
+    // uninitialised scratch independently of the vLLM reference.
     let seq = &fixture.seqs[0];
     let a = submit(
         &engine,
         format!("det:{}:a", seq.name),
         &seq.prompt_token_ids,
         fixture.meta.decode_tokens,
+        fixture.meta.top_k,
     )
     .collect();
     let b = submit(
@@ -570,11 +676,12 @@ fn kimi_greedy_matches_vllm_golden() {
         format!("det:{}:b", seq.name),
         &seq.prompt_token_ids,
         fixture.meta.decode_tokens,
+        fixture.meta.top_k,
     )
     .collect();
     if a != b {
         failures.push(format!(
-            "det:{}: identical inputs produced different token streams",
+            "det:{}: identical inputs produced different token/logprob streams",
             seq.name
         ));
     }

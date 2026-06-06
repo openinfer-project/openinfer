@@ -49,7 +49,7 @@ pub struct ModelInfo {
     pub max_model_len: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TokenLogprob {
     pub logprob: f32,
     pub top_logprobs: Vec<(u32, f32)>,

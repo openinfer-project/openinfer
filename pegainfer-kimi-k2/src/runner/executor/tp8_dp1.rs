@@ -25,10 +25,12 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         slot: usize,
         decode_batch_size: usize,
         _ep_max_seq_len: usize,
+        logprobs: usize,
     ) -> Result<KimiOneTokenForwardReport> {
         if self.workers.is_empty() {
             bail!("Kimi TP8 executor has no rank workers");
         }
+        ensure_no_logprobs_tp8(logprobs > 0)?;
         let responses = self
             .workers
             .iter()
@@ -37,6 +39,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                     input_ids.to_vec(),
                     slot,
                     decode_batch_size,
+                    0,
                     0,
                 )
             })
@@ -71,6 +74,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         append_positions: &[usize],
         slots: &[usize],
         decode_batch_size: usize,
+        logprobs: &[usize],
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
         if self.workers.is_empty() {
             bail!("Kimi TP8 executor has no rank workers");
@@ -86,6 +90,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                 slots.len()
             );
         }
+        ensure_no_logprobs_tp8(logprobs.iter().any(|&k| k > 0))?;
         let responses = self
             .workers
             .iter()
@@ -95,6 +100,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                     append_positions.to_vec(),
                     slots.to_vec(),
                     decode_batch_size,
+                    vec![0; token_ids.len()],
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -178,6 +184,16 @@ impl Drop for Tp8Dp1ForwardExecutor {
             let _ = worker.shutdown();
         }
     }
+}
+
+fn ensure_no_logprobs_tp8(requested: bool) -> Result<()> {
+    ensure!(
+        !requested,
+        "Kimi TP8 path does not support logprobs yet: each rank holds a vocab \
+         shard and a shard-local logsumexp is not the global one — needs a \
+         cross-rank merge (#236)"
+    );
+    Ok(())
 }
 
 fn validate_one_token_report(
