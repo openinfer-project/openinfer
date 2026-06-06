@@ -38,9 +38,11 @@
 //!     mismatch beyond the regret bound fails the gate. An
 //!     aggregate coverage floor keeps mass early divergence from passing
 //!     silently. Runs sequentially (bs=1), concurrently (DP8 routing +
-//!     batched decode), and twice on one sequence (determinism: identical
-//!     inputs must reproduce identical tokens; logprobs within the paged-KV
-//!     ULP wobble, see `DET_TOP1_TOLERANCE` and #293).
+//!     batched decode), and twice on one sequence (determinism + warm-vs-cold
+//!     prefix cache #230: identical inputs must reproduce identical tokens;
+//!     logprobs within the paged-KV ULP wobble, see `DET_TOP1_TOLERANCE` and
+//!     #293). Repeated prompts across passes also hit the prefix cache, so
+//!     every bound in this gate exercises the cached-prefill path too.
 //!
 //! Requires 8 GPUs and Kimi-K2.6 weights. `PEGAINFER_TEST_MODEL_PATH` must
 //! point at the weights and the fixture must exist — both fail loudly when
@@ -667,13 +669,17 @@ fn kimi_greedy_matches_vllm_golden() {
         }
     }
 
-    // Determinism: identical input must reproduce the identical token stream,
-    // with picked-token logprobs equal within DET_TOP1_TOLERANCE. Bitwise
-    // logprob equality is NOT asserted: dynamic page allocation hands the two
-    // runs different physical KV pages, and that alone wobbles decode logits
-    // by 1-2 bf16 ULP (top-1 |Δ| mean ≈0.03, max 0.12 nat measured) even when
-    // page content is provably identical — an address/timing-sensitive
-    // accumulation order somewhere in the decode path, not yet isolated (#293).
+    // Determinism + prefix cache: identical input must reproduce the identical
+    // token stream, with picked-token logprobs equal within DET_TOP1_TOLERANCE.
+    // Run A prefills cold and registers its prompt blocks; run B hits the
+    // prefix cache (#230) and prefills only the block-unaligned tail, so this
+    // doubles as the warm-vs-cold accuracy A/B for the cached prefill path
+    // (latent gather + kv_b decompression). Bitwise logprob equality is NOT
+    // asserted: dynamic page allocation hands the two runs different physical
+    // KV pages, and that alone wobbles decode logits by 1-2 bf16 ULP (top-1
+    // |Δ| mean ≈0.03, max 0.12 nat measured) even when page content is
+    // provably identical — an address/timing-sensitive accumulation order
+    // somewhere in the decode path, not yet isolated (#293).
     let seq = &fixture.seqs[0];
     let a = submit(
         &engine,

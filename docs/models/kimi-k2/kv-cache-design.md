@@ -1,6 +1,6 @@
 # Kimi-K2 KV cache: adopting the qwen3 paged stack (#239 → #230/#231)
 
-**TL;DR**: Kimi's KV is *already paged* at the kernel level (FlashInfer-style page tables, paged MLA append/decode kernels) — the "fixed 2048-token arena" was only a static Rust-side slot→pages mapping. The qwen3 stack landed in **one PR with zero kernel changes**: a kvbm-managed `BlockPool` per rank replaces the static mapping, admission uses full-lifetime reservation (the qwen3 #85 pattern), over-cap requests get an explicit `Rejected` instead of poisoning the batch mid-decode, and the per-request cap rises 2048 → 8192 tokens (DP prompts stay ≤ 2048 — a PPLX fabric-buffer constraint, see below). This is the substrate for prefix cache (#230) and long context (#231). Landed on `feat/kimi-kv-pool`, 2026-06-06. 8×H200 verification caught a DP8 decode deadlock (kvbm's eager generation block vs the worker's exact page-count check — fixed via `step_page_indices`, see below); golden-gate parity is green; run-to-run bitwise logprob determinism is lost by design under dynamic paging (address-sensitive accumulation order, #293) — the det check now gates token-stream equality + a 0.25-nat top-1 tolerance.
+**TL;DR**: Kimi's KV is *already paged* at the kernel level (FlashInfer-style page tables, paged MLA append/decode kernels) — the "fixed 2048-token arena" was only a static Rust-side slot→pages mapping. The qwen3 stack landed in **one PR with zero kernel changes**: a kvbm-managed `BlockPool` per rank replaces the static mapping, admission uses full-lifetime reservation (the qwen3 #85 pattern), over-cap requests get an explicit `Rejected` instead of poisoning the batch mid-decode, and the per-request cap rises 2048 → 8192 tokens (DP prompts stay ≤ 2048 — a PPLX fabric-buffer constraint, see below). Prefix caching (#230) now rides this substrate: kvbm full-block matching at admission + suffix-only prefill via latent gather → kv_b decompression → cached k/v assembly (see below); long context (#231) remains open. Landed on `feat/kimi-kv-pool`, 2026-06-06/07. 8×H200 verification caught a DP8 decode deadlock (kvbm's eager generation block vs the worker's exact page-count check — fixed via `step_page_indices`, see below); golden-gate parity is green; run-to-run bitwise logprob determinism is lost by design under dynamic paging (address-sensitive accumulation order, #293) — the det check now gates token-stream equality + a 0.25-nat top-1 tolerance.
 
 Last touched: 2026-06
 
@@ -158,10 +158,40 @@ pool's.
 Pool buffers are allocated eagerly at weight load (crash early on OOM); the
 stable base pointers keep captured CUDA graphs valid.
 
-### Explicitly out of scope
+### Prefix caching (#230, landed on this branch)
 
-Prefix matching (#230): flip on kvbm matching + nonzero-position suffix
-prefill with a cached-replay logits A/B, after this substrate lands.
+Default on, no flag. Admission calls `match_and_add_prefix` (full-block
+matching, ≥1 token always left uncached) and prefills only the suffix.
+
+The interesting part is MLA-specific: kimi prefill attention never reads
+the paged pool — it materializes contiguous k/v from the latent via the
+kv_b GEMM and runs `single_prefill`. So a cache hit cannot just point the
+page table at cached pages; it must rebuild the k/v rows the suffix
+attends over:
+
+1. **Gather** the cached ckv pages into a contiguous `[cached][512]`
+   latent buffer (`gather_cached_ckv_kernel` — pure page-table scatter).
+2. **Decompress** through the *same* `kv_b_proj` GEMM the cold path uses
+   (same weights, same math — only the GEMM's M dimension differs).
+3. **Assemble** k/v rows `0..cached` from the decompressed latent plus
+   the pooled kpe pages (`assemble_cached_kv_kernel`). Pool kpe is stored
+   post-RoPE: it is broadcast per head **verbatim** — re-rotating it would
+   corrupt positions (the bug class the qwen3 prefix cache hit with its
+   RoPE scalar path).
+4. The suffix assembles at absolute positions `cached..cached+seq` (RoPE
+   table sized to `kv_len`), and FlashInfer's bottom-right causal
+   alignment makes `qo_len < kv_len` exactly the suffix causal mask.
+
+DP plumbing: the owning rank forwards only the suffix; padding ranks and
+PPLX prefill scratch size against the suffix (`ep_max_seq_len`), so a
+warm hit also shrinks the EP collective, not just the GEMMs. The worker
+page table covers `cached + suffix` tokens and the append positions start
+at `cached` — the kernel-side append needed zero changes.
+
+Accuracy: the golden gate's repeated prompts now exercise the cached
+path under every bound (teacher-forced sweep requests share block-aligned
+prefixes), and the det check doubles as the warm-vs-cold A/B: run A cold,
+run B cache-hit, same tokens + top-1 |Δ| ≤ 0.25 nat.
 
 ## Run-to-run determinism under dynamic paging (#293)
 
@@ -187,8 +217,10 @@ What the 8×H200 investigation established (two nodes, 3/3 repro):
 
 ## Next step
 
-8×H200 verification, remaining items: over-cap request → explicit
-rejection (not batch poison); `prompt + max_tokens` boundary; >2048-token
-prompt e2e on TP8 (4K–8K); DP prompt-cap rejection at 2049; greedy bs64
-TPOT p50 unchanged (~30 ms). Golden-gate parity already green at main's
-level; det green under the #293 tolerance contract.
+8×H200 verification, remaining items: golden gate on the prefix-cache
+branch state (now covers warm path under all bounds); over-cap request →
+explicit rejection (not batch poison); `prompt + max_tokens` boundary;
+>2048-token prompt e2e on TP8 (4K–8K); DP prompt-cap rejection at 2049;
+greedy bs64 TPOT p50 unchanged (~30 ms); warm-vs-cold TTFT p50/p99.
+Golden-gate parity green pre-#230; det green under the #293 tolerance
+contract.
