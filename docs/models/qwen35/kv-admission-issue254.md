@@ -69,8 +69,8 @@
 - Remote validation host:
   - GPU: NVIDIA GeForce RTX 5090, driver `580.105.08`, 32607 MiB.
   - CUDA toolkit: `/usr/local/cuda-12.8`, `PEGAINFER_CUDA_SM=120`.
-  - Triton AOT Python: `/root/autodl-tmp/vllm-omni-issue4176/venv/bin/python`.
-  - Model: `/root/autodl-tmp/pegainfer-issue254/repo/models/Qwen3.5-4B`, HF revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
+  - Triton AOT Python: validation venv with Triton 3.6 for `sm_120`.
+  - Model: `models/Qwen3.5-4B`, HF revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 - Remote dependency fixes needed before validation:
   - vendored crates.io dependencies for offline cargo;
   - removed AppleDouble `._*` files from the uploaded tar/vendor tree;
@@ -86,7 +86,7 @@
 
 ### Step 5: Real Qwen3.5 e2e
 - Command:
-  - `PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/pegainfer-issue254/repo/models/Qwen3.5-4B cargo test --offline --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --offline --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture`
 - Result before the extra release-assert hardening:
   - `test_e2e_qwen35_scheduler ... ok`
   - `1 passed`, finished in `12.95s`.
