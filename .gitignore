@@ -6,3 +6,5 @@ __pycache__/
 *.py[cod]
 /bench_results/
 /docs/private/
+/profile/
+.claude/scheduled_tasks.lock

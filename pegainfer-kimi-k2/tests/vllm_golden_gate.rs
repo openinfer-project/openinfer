@@ -699,6 +699,14 @@ fn kimi_greedy_matches_vllm_golden() {
     .collect();
     let tokens_a: Vec<u32> = a.iter().map(|&(t, _)| t).collect();
     let tokens_b: Vec<u32> = b.iter().map(|&(t, _)| t).collect();
+    // Self-guard: `tokens_a == tokens_b` is vacuously true on empty streams,
+    // which would let the det block pass without comparing anything.
+    assert_eq!(
+        tokens_a.len(),
+        fixture.meta.decode_tokens,
+        "det:{}: run produced no/short token stream",
+        seq.name
+    );
     if tokens_a == tokens_b {
         for (pos, ((_, lp_a), (_, lp_b))) in a.iter().zip(&b).enumerate() {
             let delta = (lp_a.logprob - lp_b.logprob).abs();
