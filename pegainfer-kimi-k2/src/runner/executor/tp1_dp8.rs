@@ -2,7 +2,9 @@ use anyhow::{Result, bail, ensure};
 
 use crate::{
     config::KIMI_K2_VOCAB,
-    runner::worker::{KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker},
+    runner::worker::{
+        KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker, KimiRowOptions,
+    },
 };
 
 use super::{DP_MAX_BATCH_PER_RANK, ForwardExecutor};
@@ -27,14 +29,16 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         slot: usize,
         decode_batch_size: usize,
         ep_max_seq_len: usize,
-        logprobs: usize,
+        row: KimiRowOptions,
+        seed: u64,
     ) -> Result<KimiOneTokenForwardReport> {
         let response = self.worker.forward_prompt_next_token_async(
             input_ids.to_vec(),
             slot,
             decode_batch_size,
             ep_max_seq_len,
-            logprobs,
+            row,
+            seed,
         )?;
         let report = response
             .recv()
@@ -49,7 +53,8 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         append_positions: &[usize],
         slots: &[usize],
         decode_batch_size: usize,
-        logprobs: &[usize],
+        rows: &[KimiRowOptions],
+        seed: u64,
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
         if token_ids.is_empty() {
             bail!("Kimi TP1 batch decode requires at least one token");
@@ -67,7 +72,8 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
             append_positions.to_vec(),
             slots.to_vec(),
             decode_batch_size,
-            logprobs.to_vec(),
+            rows.to_vec(),
+            seed,
         )?;
         let reports = response
             .recv()

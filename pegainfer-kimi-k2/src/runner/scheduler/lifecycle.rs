@@ -50,7 +50,37 @@ fn finish_unschedulable(req: &GenerateRequest) -> bool {
         });
         return true;
     }
+    if let Err(message) = validate_sampling_params(req) {
+        let _ = req.token_tx.send(TokenEvent::Rejected {
+            message,
+            prompt_tokens: req.prompt_tokens.len(),
+            completion_tokens: 0,
+        });
+        return true;
+    }
     false
+}
+
+/// Honor-or-reject (#237): a request whose sampling parameters cannot be
+/// honored exactly is rejected here, before any forward work.
+fn validate_sampling_params(req: &GenerateRequest) -> Result<(), String> {
+    let p = &req.params;
+    if !p.temperature.is_finite() || p.temperature < 0.0 {
+        return Err(format!(
+            "temperature must be finite and >= 0, got {}",
+            p.temperature
+        ));
+    }
+    if !p.top_p.is_finite() || p.top_p <= 0.0 || p.top_p > 1.0 {
+        return Err(format!("top_p must be in (0, 1], got {}", p.top_p));
+    }
+    if p.top_k < -1 || p.top_k == 0 {
+        return Err(format!(
+            "top_k must be -1 (disabled) or >= 1, got {}",
+            p.top_k
+        ));
+    }
+    Ok(())
 }
 
 fn unix_now_s() -> f64 {

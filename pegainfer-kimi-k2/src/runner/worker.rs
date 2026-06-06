@@ -89,6 +89,15 @@ pub(super) struct KimiRankWeightLoadReport {
     pub expert_kernel_weights_packaged: bool,
 }
 
+/// Per-row token-selection options carried through a forward call: how the
+/// next token is picked (greedy argmax vs temperature/top-k/top-p sampling)
+/// and how many logprobs to report for it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct KimiRowOptions {
+    pub(crate) logprobs: usize,
+    pub(crate) sampling: pegainfer_core::sampler::SamplingParams,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct KimiOneTokenForwardReport {
     pub rank: usize,
@@ -127,7 +136,8 @@ enum KimiRankCommand {
         decode_batch_size: usize,
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
-        logprobs: usize,
+        row: KimiRowOptions,
+        seed: u64,
         resp: Sender<Result<KimiOneTokenForwardReport>>,
     },
     ForwardDecodeBatchNextTokens {
@@ -135,7 +145,8 @@ enum KimiRankCommand {
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        logprobs: Vec<usize>,
+        rows: Vec<KimiRowOptions>,
+        seed: u64,
         resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     EnablePplx {
@@ -268,7 +279,8 @@ impl KimiRankWorker {
         slot: usize,
         decode_batch_size: usize,
         ep_max_seq_len: usize,
-        logprobs: usize,
+        row: KimiRowOptions,
+        seed: u64,
     ) -> Result<Receiver<Result<KimiOneTokenForwardReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -277,7 +289,8 @@ impl KimiRankWorker {
                 decode_batch_size,
                 input_ids,
                 ep_max_seq_len,
-                logprobs,
+                row,
+                seed,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
@@ -290,7 +303,8 @@ impl KimiRankWorker {
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        logprobs: Vec<usize>,
+        rows: Vec<KimiRowOptions>,
+        seed: u64,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -299,7 +313,8 @@ impl KimiRankWorker {
                 append_positions,
                 slots,
                 decode_batch_size,
-                logprobs,
+                rows,
+                seed,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
@@ -619,7 +634,8 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 decode_batch_size,
                 input_ids,
                 ep_max_seq_len,
-                logprobs,
+                row,
+                seed,
                 resp,
             } => {
                 let result = state.forward_prompt_next_token(
@@ -627,7 +643,8 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                     decode_batch_size,
                     &input_ids,
                     ep_max_seq_len,
-                    logprobs,
+                    row,
+                    seed,
                 );
                 let _ = resp.send(result);
             }
@@ -636,7 +653,8 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 append_positions,
                 slots,
                 decode_batch_size,
-                logprobs,
+                rows,
+                seed,
                 resp,
             } => {
                 let result = state.forward_decode_batch_next_tokens(
@@ -644,7 +662,8 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                     &append_positions,
                     &slots,
                     decode_batch_size,
-                    &logprobs,
+                    &rows,
+                    seed,
                 );
                 let _ = resp.send(result);
             }

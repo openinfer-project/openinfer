@@ -33,6 +33,7 @@ pub use norm::{
     rms_norm_into, rms_norm_offset_into,
 };
 pub use sampling::{
-    argmax, argmax_batch_bf16_into, argmax_batch_bf16_split_partials_len,
-    flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into,
+    BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
+    argmax_batch_bf16_split_partials_len, flashinfer_top1_batch_into,
+    flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_batch_into, gpu_sample_into,
 };

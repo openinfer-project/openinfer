@@ -176,7 +176,7 @@ fn start_engine_tp1_dp8(
     )?;
     let stop_token_ids = load_stop_token_ids(model_path)?;
     let executors = build_tp1_dp8_executors(&config)?;
-    let coordinator = DpCoordinator::new(executors, stop_token_ids);
+    let coordinator = DpCoordinator::new(executors, stop_token_ids, options.seed);
     let lb = DpLoadBalancer::new(dp_world);
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();

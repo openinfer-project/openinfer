@@ -148,6 +148,11 @@ pub(crate) struct SamplingScratch {
     pub(crate) top1_out: CudaSlice<i32>,
     pub(crate) top1_partial_values: CudaSlice<f32>,
     pub(crate) top1_partial_indices: CudaSlice<i32>,
+    /// Buffers for non-greedy rows (f32 probs are batch x vocab, ~42 MB at
+    /// batch 64) — allocated on the first sampling request so greedy-only
+    /// serving pays nothing.
+    batch_sampling: Option<pegainfer_kernels::ops::BatchSamplingScratch>,
+    batch_size: usize,
 }
 
 impl SamplingScratch {
@@ -158,7 +163,26 @@ impl SamplingScratch {
             top1_out: ctx.stream.alloc_zeros(batch_size)?,
             top1_partial_values: ctx.stream.alloc_zeros(partials)?,
             top1_partial_indices: ctx.stream.alloc_zeros(partials)?,
+            batch_sampling: None,
+            batch_size,
         })
+    }
+
+    pub(crate) fn batch_sampling(
+        &mut self,
+        ctx: &DeviceContext,
+    ) -> Result<&mut pegainfer_kernels::ops::BatchSamplingScratch> {
+        if self.batch_sampling.is_none() {
+            self.batch_sampling = Some(pegainfer_kernels::ops::BatchSamplingScratch::new(
+                ctx,
+                self.batch_size,
+                KIMI_K2_VOCAB,
+            )?);
+        }
+        Ok(self
+            .batch_sampling
+            .as_mut()
+            .expect("batch sampling scratch was just initialized"))
     }
 }
 

@@ -8,6 +8,7 @@ pub(in crate::runner) mod dp;
 mod lifecycle;
 
 use crate::runner::executor::ForwardExecutor;
+use crate::runner::worker::KimiRowOptions;
 use anyhow::{Context, Result};
 use lifecycle::schedule_prefill_candidate;
 use log::error;
@@ -24,16 +25,22 @@ pub(super) struct KimiK2Scheduler {
     stop_token_ids: Vec<u32>,
 }
 
+fn row_options(req: &GenerateRequest) -> KimiRowOptions {
+    KimiRowOptions {
+        logprobs: req.logprobs,
+        sampling: req.params,
+    }
+}
+
 struct ActiveKimiRequest {
     token_tx: mpsc::UnboundedSender<TokenEvent>,
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
-    ignore_eos: bool,
     last_token: u32,
     slot: usize,
     decode_batch_size: usize,
-    logprobs: usize,
+    options: KimiRowOptions,
 }
 
 impl KimiK2Scheduler {
@@ -51,14 +58,15 @@ impl KimiK2Scheduler {
             .collect::<Vec<_>>();
         let warm_positions = vec![0; KIMI_RUNNER_MAX_BATCH];
         let warm_slots = (0..KIMI_RUNNER_MAX_BATCH).collect::<Vec<_>>();
-        let warm_logprobs = vec![0; KIMI_RUNNER_MAX_BATCH];
+        let warm_rows = vec![KimiRowOptions::default(); KIMI_RUNNER_MAX_BATCH];
         let _ = executor
             .forward_decode_batch(
                 &warm_tokens,
                 &warm_positions,
                 &warm_slots,
                 KIMI_RUNNER_MAX_BATCH,
-                &warm_logprobs,
+                &warm_rows,
+                0,
             )
             .with_context(|| {
                 format!("Kimi-K2 warm decode admission bs{KIMI_RUNNER_MAX_BATCH} before serving")
@@ -112,9 +120,24 @@ impl KimiK2Scheduler {
     fn handle_request_batch(&mut self, reqs: Vec<GenerateRequest>) {
         let mut prefill_reqs = Vec::with_capacity(reqs.len());
         for req in reqs {
-            if let Some(req) = schedule_prefill_candidate(req) {
-                prefill_reqs.push(req);
+            let Some(req) = schedule_prefill_candidate(req) else {
+                continue;
+            };
+            // Honor-or-reject (#237): this scheduler drives the TP8 path,
+            // where each rank holds a vocab shard and cannot sample the
+            // global distribution (#226). Rejecting here keeps one bad
+            // request from failing the whole decode batch in the executor.
+            if !req.params.is_greedy() {
+                let _ = req.token_tx.send(TokenEvent::Rejected {
+                    message: "Kimi TP8 path does not support sampling yet: use \
+                              TP1/DP8 or temperature=0 (#237, #226)"
+                        .to_string(),
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                continue;
             }
+            prefill_reqs.push(req);
         }
         if prefill_reqs.is_empty() {
             return;
@@ -179,13 +202,14 @@ impl KimiK2Scheduler {
                 .map(|req| req.prompt_len + req.completion_tokens - 1)
                 .collect::<Vec<_>>();
             let slots = active.iter().map(|req| req.slot).collect::<Vec<_>>();
-            let logprobs = active.iter().map(|req| req.logprobs).collect::<Vec<_>>();
+            let rows = active.iter().map(|req| req.options).collect::<Vec<_>>();
             let reports = match self.executor.forward_decode_batch(
                 &token_ids,
                 &append_positions,
                 &slots,
                 decode_batch_size,
-                &logprobs,
+                &rows,
+                0,
             ) {
                 Ok(reports) => reports,
                 Err(err) => {
@@ -212,7 +236,7 @@ impl KimiK2Scheduler {
                 req.completion_tokens += 1;
                 // EOS outranks the length limit; the stop token itself is not
                 // emitted (same contract as the Qwen schedulers).
-                if !req.ignore_eos && self.stop_token_ids.contains(&token_id) {
+                if !req.options.sampling.ignore_eos && self.stop_token_ids.contains(&token_id) {
                     let _ = req.token_tx.send(TokenEvent::Finished {
                         finish_reason: FinishReason::Stop,
                         prompt_tokens: req.prompt_len,
@@ -261,7 +285,8 @@ impl KimiK2Scheduler {
             slot,
             decode_batch_size,
             0,
-            req.logprobs,
+            row_options(&req),
+            0,
         ) {
             Ok(report) => {
                 let token_id = report.local_next_token_global_id;
@@ -308,16 +333,16 @@ impl KimiK2Scheduler {
             });
             return None;
         }
+        let options = row_options(&req);
         Some(ActiveKimiRequest {
             token_tx: req.token_tx,
             prompt_len: req.prompt_tokens.len(),
             completion_tokens,
             max_tokens: req.max_tokens,
-            ignore_eos: req.params.ignore_eos,
             last_token,
             slot,
             decode_batch_size,
-            logprobs: req.logprobs,
+            options,
         })
     }
 
@@ -333,16 +358,17 @@ impl KimiK2Scheduler {
             .collect::<Vec<_>>();
         let append_positions = vec![0; token_ids.len()];
         let slots = group.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
-        let logprobs = group
+        let rows = group
             .iter()
-            .map(|(_, req)| req.logprobs)
+            .map(|(_, req)| row_options(req))
             .collect::<Vec<_>>();
         let reports = match self.executor.forward_decode_batch(
             &token_ids,
             &append_positions,
             &slots,
             decode_batch_size,
-            &logprobs,
+            &rows,
+            0,
         ) {
             Ok(reports) => reports,
             Err(err) => {
@@ -391,16 +417,16 @@ impl KimiK2Scheduler {
                 });
                 continue;
             }
+            let options = row_options(&req);
             active.push(ActiveKimiRequest {
                 token_tx: req.token_tx,
                 prompt_len: req.prompt_tokens.len(),
                 completion_tokens,
                 max_tokens: req.max_tokens,
-                ignore_eos: req.params.ignore_eos,
                 last_token: token_id,
                 slot,
                 decode_batch_size,
-                logprobs: req.logprobs,
+                options,
             });
         }
     }
@@ -457,7 +483,8 @@ mod tests {
             slot: usize,
             decode_batch_size: usize,
             _ep_max_seq_len: usize,
-            _logprobs: usize,
+            _row: KimiRowOptions,
+            _seed: u64,
         ) -> Result<KimiOneTokenForwardReport> {
             self.calls.lock().unwrap().push(ForwardCall::Prefill {
                 input_ids: input_ids.to_vec(),
@@ -473,7 +500,8 @@ mod tests {
             append_positions: &[usize],
             slots: &[usize],
             decode_batch_size: usize,
-            _logprobs: &[usize],
+            _rows: &[KimiRowOptions],
+            _seed: u64,
         ) -> Result<Vec<KimiOneTokenForwardReport>> {
             self.calls.lock().unwrap().push(ForwardCall::Decode {
                 token_ids: token_ids.to_vec(),
@@ -566,6 +594,52 @@ mod tests {
                     decode_batch_size: 3,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn tp8_scheduler_rejects_sampling_requests_before_forward() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = RecordingExecutor::new(Arc::clone(&calls));
+        let mut scheduler = KimiK2Scheduler {
+            executor: Box::new(executor),
+            stop_token_ids: Vec::new(),
+        };
+
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        let sampling_req = GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: vec![11, 22],
+            params: SamplingParams {
+                temperature: 0.8,
+                top_k: -1,
+                top_p: 0.9,
+                ignore_eos: false,
+            },
+            max_tokens: 4,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        };
+
+        scheduler.handle_request_batch(vec![sampling_req]);
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a rejected sampling request must not reach the executor"
+        );
+        // Scheduled event precedes the rejection.
+        let Ok(TokenEvent::Scheduled { .. }) = token_rx.try_recv() else {
+            panic!("expected Scheduled event");
+        };
+        let Ok(TokenEvent::Rejected { message, .. }) = token_rx.try_recv() else {
+            panic!("expected Rejected event");
+        };
+        assert!(
+            message.contains("TP8"),
+            "rejection names the path: {message}"
         );
     }
 }

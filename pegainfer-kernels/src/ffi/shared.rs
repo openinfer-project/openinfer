@@ -103,6 +103,24 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn gpu_sample_batch_flashinfer_cuda(
+        logits: *const Half,
+        row_indices: *const i32,
+        probs_scratch: *mut f32,
+        temperature_arr: *const f32,
+        top_k_arr: *const i32,
+        top_p_arr: *const f32,
+        valid_scratch: *mut u8,
+        output: *mut i32,
+        softmax_workspace: *mut u8,
+        softmax_workspace_bytes: usize,
+        n_rows: i32,
+        vocab_size: i32,
+        seed: u64,
+        offset: u64,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn gemm_cuda(
         W: *const Half,
         X: *const Half,

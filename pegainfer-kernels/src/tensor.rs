@@ -419,6 +419,14 @@ pub struct HiddenStates {
 }
 
 impl HiddenStates {
+    pub fn as_ref(&self) -> HiddenStatesRef<'_> {
+        HiddenStatesRef {
+            data: &self.data,
+            hidden_dim: self.hidden_dim,
+            seq_len: self.seq_len,
+        }
+    }
+
     /// Create zeroed batch
     pub fn zeros(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
         let data: CudaSlice<bf16> = ctx
@@ -575,6 +583,7 @@ impl<const ELEMS: usize> GpuRawSliceI32<ELEMS> {
 }
 
 /// Non-owning reference to `HiddenStates`-shaped data (bridge to untyped ops).
+#[derive(Clone, Copy)]
 pub struct HiddenStatesRef<'a> {
     pub data: &'a CudaSlice<bf16>,
     pub hidden_dim: usize,

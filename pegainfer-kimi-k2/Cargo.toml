@@ -19,6 +19,7 @@ pegainfer-bench = { workspace = true }
 pegainfer-comm = { workspace = true, optional = true }
 pegainfer-core = { workspace = true }
 pegainfer-kernels = { workspace = true }
+rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

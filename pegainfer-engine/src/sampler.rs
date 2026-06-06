@@ -1,4 +1,4 @@
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: i32,
@@ -14,5 +14,16 @@ impl Default for SamplingParams {
             top_p: 1.0,
             ignore_eos: false,
         }
+    }
+}
+
+impl SamplingParams {
+    /// Greedy means argmax: temperature below the sampling epsilon (the
+    /// temperature -> 0 limit is argmax regardless of top_p, and 1/temperature
+    /// overflows long before that; vLLM draws the same line at 1e-5) or
+    /// top_k == 1 (a single token survives the mask). Everything else requires
+    /// a real sampling pass.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature < 1e-5 || self.top_k == 1
     }
 }

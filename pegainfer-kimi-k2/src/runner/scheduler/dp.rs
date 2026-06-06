@@ -2,15 +2,17 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use log::error;
 use pegainfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
+use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::runner::{
     executor::{DP_MAX_BATCH_PER_RANK, ForwardExecutor},
     load_balancer::DpLoadBalancer,
-    worker::KimiOneTokenForwardReport,
+    worker::{KimiOneTokenForwardReport, KimiRowOptions},
 };
 
 use super::lifecycle::{preflight_prefill_candidate, send_scheduled};
+use super::row_options;
 
 /// Stable per-rank decode arena capacity. Logical slot IDs are arena rows, so
 /// every TP1 DP8 decode/prefill command must keep this capacity stable.
@@ -28,6 +30,11 @@ pub(in crate::runner) struct DpCoordinator {
     step_txs: Vec<Sender<StepCommand>>,
     result_rxs: Vec<Receiver<StepResult>>,
     stop_token_ids: Vec<u32>,
+    /// Drives non-greedy sampling: every step command carries a fresh philox
+    /// seed per rank (rows within a rank decorrelate through the philox
+    /// subsequence; ranks must not share a seed or same-index rows across
+    /// ranks would draw the same uniform).
+    rng: StdRng,
 }
 
 pub(in crate::runner) struct DpRankState {
@@ -39,9 +46,8 @@ struct RequestState {
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
-    ignore_eos: bool,
     last_token: u32,
-    logprobs: usize,
+    options: KimiRowOptions,
 }
 
 struct DecodeAdmission {
@@ -54,7 +60,7 @@ struct DecodeInput {
     token_id: u32,
     append_position: usize,
     slot: usize,
-    logprobs: usize,
+    options: KimiRowOptions,
 }
 
 enum DecodeBatchRow {
@@ -84,10 +90,10 @@ impl DecodeBatchRow {
         }
     }
 
-    fn logprobs(&self) -> usize {
+    fn options(&self) -> KimiRowOptions {
         match self {
-            Self::Active(input) => input.logprobs,
-            Self::Admission(admission) => admission.req.logprobs,
+            Self::Active(input) => input.options,
+            Self::Admission(admission) => row_options(&admission.req),
         }
     }
 }
@@ -98,14 +104,16 @@ enum StepCommand {
         positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
-        logprobs: Vec<usize>,
+        rows: Vec<KimiRowOptions>,
+        seed: u64,
     },
     Prefill {
         input_ids: Vec<u32>,
         slot: usize,
         decode_batch_size: usize,
         ep_max_seq_len: usize,
-        logprobs: usize,
+        row: KimiRowOptions,
+        seed: u64,
     },
     Shutdown,
 }
@@ -119,6 +127,7 @@ impl DpCoordinator {
     pub(in crate::runner) fn new(
         executors: Vec<Box<dyn ForwardExecutor + Send>>,
         stop_token_ids: Vec<u32>,
+        seed: u64,
     ) -> Self {
         let dp_world = executors.len();
         let mut ranks = Vec::with_capacity(dp_world);
@@ -135,7 +144,12 @@ impl DpCoordinator {
             step_txs: Vec::new(),
             result_rxs: Vec::new(),
             stop_token_ids,
+            rng: rand::SeedableRng::seed_from_u64(seed),
         }
+    }
+
+    fn next_step_seed(&mut self) -> u64 {
+        rand::RngExt::random(&mut self.rng)
     }
 
     /// Spawn per-rank forward threads and run the coordinated decode loop.
@@ -384,20 +398,21 @@ impl DpCoordinator {
             return;
         }
 
+        let options = row_options(&req);
         self.ranks[dp_rank].slots[slot] = Some(RequestState {
             token_tx: req.token_tx,
             prompt_len,
             completion_tokens,
             max_tokens: req.max_tokens,
-            ignore_eos: req.params.ignore_eos,
             last_token,
-            logprobs: req.logprobs,
+            options,
         });
     }
 
     fn synchronized_decode_admissions(&mut self, batch: Vec<Vec<DecodeAdmission>>) {
         let mut rows_by_rank = Vec::with_capacity(self.dp_world);
         for (dp_rank, rank_batch) in batch.into_iter().enumerate() {
+            let seed = self.next_step_seed();
             let mut rows = self.ranks[dp_rank]
                 .active_decode_inputs()
                 .into_iter()
@@ -413,16 +428,16 @@ impl DpCoordinator {
                     &self.step_txs[dp_rank],
                     dp_rank,
                     "decode admission overflow padding",
-                    build_padding_decode_command(),
+                    build_padding_decode_command(seed),
                 );
                 rows_by_rank.push(Vec::new());
                 continue;
             }
 
             let cmd = if rows.is_empty() {
-                build_padding_decode_command()
+                build_padding_decode_command(seed)
             } else {
-                build_decode_command_from_rows(&rows)
+                build_decode_command_from_rows(&rows, seed)
             };
             send_step_command(&self.step_txs[dp_rank], dp_rank, "decode admission", cmd);
             rows_by_rank.push(rows);
@@ -517,14 +532,14 @@ impl DpCoordinator {
             return;
         }
 
+        let options = row_options(&admission.req);
         self.ranks[dp_rank].slots[admission.slot] = Some(RequestState {
             token_tx: admission.req.token_tx,
             prompt_len: admission.req.prompt_tokens.len(),
             completion_tokens,
             max_tokens: admission.req.max_tokens,
-            ignore_eos: admission.req.params.ignore_eos,
             last_token: token_id,
-            logprobs: admission.req.logprobs,
+            options,
         });
     }
 
@@ -550,7 +565,7 @@ impl DpCoordinator {
     }
 
     fn synchronized_prefill(
-        &self,
+        &mut self,
         owning_rank: usize,
         prefill_slots: &[usize],
         req: &GenerateRequest,
@@ -563,13 +578,15 @@ impl DpCoordinator {
             .enumerate()
             .take(self.dp_world)
         {
+            let seed = self.next_step_seed();
             let cmd = if dp_rank == owning_rank {
                 StepCommand::Prefill {
                     input_ids: req.prompt_tokens.clone(),
                     slot,
                     decode_batch_size: MAX_BATCH_PER_DP,
                     ep_max_seq_len,
-                    logprobs: req.logprobs,
+                    row: row_options(req),
+                    seed,
                 }
             } else {
                 // All ranks run prefill so they traverse layers at the same
@@ -579,7 +596,8 @@ impl DpCoordinator {
                     slot,
                     decode_batch_size: MAX_BATCH_PER_DP,
                     ep_max_seq_len,
-                    logprobs: 0,
+                    row: KimiRowOptions::default(),
+                    seed,
                 }
             };
             send_step_command(&self.step_txs[dp_rank], dp_rank, "prefill", cmd);
@@ -589,7 +607,8 @@ impl DpCoordinator {
     fn synchronized_decode_step(&mut self) {
         // Build per-rank decode commands
         for dp_rank in 0..self.dp_world {
-            let cmd = self.ranks[dp_rank].build_decode_command();
+            let seed = self.next_step_seed();
+            let cmd = self.ranks[dp_rank].build_decode_command(seed);
             send_step_command(&self.step_txs[dp_rank], dp_rank, "decode", cmd);
         }
 
@@ -643,13 +662,13 @@ impl DpRankState {
             .collect()
     }
 
-    fn build_decode_command(&self) -> StepCommand {
+    fn build_decode_command(&self, seed: u64) -> StepCommand {
         let inputs = self.active_decode_inputs();
         if inputs.is_empty() {
-            return build_padding_decode_command();
+            return build_padding_decode_command(seed);
         }
 
-        build_decode_command_from_inputs(&inputs)
+        build_decode_command_from_inputs(&inputs, seed)
     }
 
     fn active_decode_inputs(&self) -> Vec<DecodeInput> {
@@ -661,7 +680,7 @@ impl DpRankState {
                     token_id: req.last_token,
                     append_position: req.prompt_len + req.completion_tokens - 1,
                     slot,
-                    logprobs: req.logprobs,
+                    options: req.options,
                 })
             })
             .collect()
@@ -703,7 +722,7 @@ impl DpRankState {
 
         // EOS outranks the length limit; the stop token itself is not emitted
         // (same contract as the Qwen schedulers).
-        if !req.ignore_eos && stop_token_ids.contains(&token_id) {
+        if !req.options.sampling.ignore_eos && stop_token_ids.contains(&token_id) {
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: req.prompt_len,
@@ -753,33 +772,36 @@ impl DpRankState {
 
 /// Padding command for idle ranks: 1 dummy token so the rank participates
 /// in EP collectives without producing real output.
-fn build_padding_decode_command() -> StepCommand {
+fn build_padding_decode_command(seed: u64) -> StepCommand {
     StepCommand::Decode {
         token_ids: vec![0],
         positions: vec![0],
         slots: vec![0],
         decode_batch_size: MAX_BATCH_PER_DP,
-        logprobs: vec![0],
+        rows: vec![KimiRowOptions::default()],
+        seed,
     }
 }
 
-fn build_decode_command_from_rows(rows: &[DecodeBatchRow]) -> StepCommand {
+fn build_decode_command_from_rows(rows: &[DecodeBatchRow], seed: u64) -> StepCommand {
     StepCommand::Decode {
         token_ids: rows.iter().map(DecodeBatchRow::token_id).collect(),
         positions: rows.iter().map(DecodeBatchRow::append_position).collect(),
         slots: rows.iter().map(DecodeBatchRow::slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
-        logprobs: rows.iter().map(DecodeBatchRow::logprobs).collect(),
+        rows: rows.iter().map(DecodeBatchRow::options).collect(),
+        seed,
     }
 }
 
-fn build_decode_command_from_inputs(inputs: &[DecodeInput]) -> StepCommand {
+fn build_decode_command_from_inputs(inputs: &[DecodeInput], seed: u64) -> StepCommand {
     StepCommand::Decode {
         token_ids: inputs.iter().map(|input| input.token_id).collect(),
         positions: inputs.iter().map(|input| input.append_position).collect(),
         slots: inputs.iter().map(|input| input.slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
-        logprobs: inputs.iter().map(|input| input.logprobs).collect(),
+        rows: inputs.iter().map(|input| input.options).collect(),
+        seed,
     }
 }
 
@@ -807,14 +829,16 @@ fn rank_forward_loop(
                 positions,
                 slots,
                 decode_batch_size,
-                logprobs,
+                rows,
+                seed,
             } => {
                 let result = executor.forward_decode_batch(
                     &token_ids,
                     &positions,
                     &slots,
                     decode_batch_size,
-                    &logprobs,
+                    &rows,
+                    seed,
                 );
                 let _ = res_tx.send(StepResult::Decode(result));
             }
@@ -823,14 +847,16 @@ fn rank_forward_loop(
                 slot,
                 decode_batch_size,
                 ep_max_seq_len,
-                logprobs,
+                row,
+                seed,
             } => {
                 let result = executor.forward_prefill(
                     &input_ids,
                     slot,
                     decode_batch_size,
                     ep_max_seq_len,
-                    logprobs,
+                    row,
+                    seed,
                 );
                 let _ = res_tx.send(StepResult::Prefill(result));
             }
@@ -879,9 +905,8 @@ mod tests {
             prompt_len,
             completion_tokens,
             max_tokens: 16,
-            ignore_eos: false,
             last_token,
-            logprobs: 0,
+            options: KimiRowOptions::default(),
         }
     }
 
@@ -913,6 +938,7 @@ mod tests {
             step_txs: Vec::new(),
             result_rxs: Vec::new(),
             stop_token_ids: Vec::new(),
+            rng: rand::SeedableRng::seed_from_u64(0),
         }
     }
 
@@ -928,8 +954,9 @@ mod tests {
             positions,
             slots,
             decode_batch_size,
-            logprobs,
-        } = rank.build_decode_command()
+            rows,
+            seed,
+        } = rank.build_decode_command(7)
         else {
             panic!("decode command expected");
         };
@@ -938,21 +965,29 @@ mod tests {
         assert_eq!(token_ids, vec![123]);
         assert_eq!(positions, vec![6]);
         assert_eq!(slots, vec![MAX_BATCH_PER_DP - 1]);
-        assert_eq!(logprobs, vec![0]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].logprobs, 0);
+        assert_eq!(seed, 7);
     }
 
     #[test]
     fn decode_rows_merge_active_decode_and_new_admission() {
-        let rows = vec![
+        let mut sampling_req = dummy_request(vec![99], 8);
+        sampling_req.params.temperature = 0.8;
+        sampling_req.params.top_p = 0.9;
+        let batch_rows = vec![
             DecodeBatchRow::Active(DecodeInput {
                 token_id: 11,
                 append_position: 5,
                 slot: 3,
-                logprobs: 4,
+                options: KimiRowOptions {
+                    logprobs: 4,
+                    sampling: SamplingParams::default(),
+                },
             }),
             DecodeBatchRow::Admission(DecodeAdmission {
                 slot: 7,
-                req: dummy_request(vec![99], 8),
+                req: sampling_req,
             }),
         ];
 
@@ -961,8 +996,9 @@ mod tests {
             positions,
             slots,
             decode_batch_size,
-            logprobs,
-        } = build_decode_command_from_rows(&rows)
+            rows,
+            seed,
+        } = build_decode_command_from_rows(&batch_rows, 42)
         else {
             panic!("decode command expected");
         };
@@ -971,7 +1007,12 @@ mod tests {
         assert_eq!(token_ids, vec![11, 99]);
         assert_eq!(positions, vec![5, 0]);
         assert_eq!(slots, vec![3, 7]);
-        assert_eq!(logprobs, vec![4, 0]);
+        assert_eq!(rows[0].logprobs, 4);
+        assert!(rows[0].sampling.is_greedy());
+        assert_eq!(rows[1].logprobs, 0);
+        assert!(!rows[1].sampling.is_greedy());
+        assert!((rows[1].sampling.temperature - 0.8).abs() < f32::EPSILON);
+        assert_eq!(seed, 42);
     }
 
     #[test]
@@ -981,8 +1022,9 @@ mod tests {
             positions,
             slots,
             decode_batch_size,
-            logprobs,
-        } = build_padding_decode_command()
+            rows,
+            seed: _,
+        } = build_padding_decode_command(1)
         else {
             panic!("decode command expected");
         };
@@ -991,7 +1033,8 @@ mod tests {
         assert_eq!(token_ids, vec![0]);
         assert_eq!(positions, vec![0]);
         assert_eq!(slots, vec![0]);
-        assert_eq!(logprobs, vec![0]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].sampling.is_greedy());
     }
 
     #[test]
@@ -1005,9 +1048,8 @@ mod tests {
             prompt_len: 4,
             completion_tokens: 1,
             max_tokens: 16,
-            ignore_eos: false,
             last_token: 7,
-            logprobs: 0,
+            options: KimiRowOptions::default(),
         });
 
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586]);
@@ -1038,9 +1080,14 @@ mod tests {
             prompt_len: 4,
             completion_tokens: 1,
             max_tokens: 16,
-            ignore_eos: true,
             last_token: 7,
-            logprobs: 0,
+            options: KimiRowOptions {
+                logprobs: 0,
+                sampling: SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+            },
         });
 
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586]);
