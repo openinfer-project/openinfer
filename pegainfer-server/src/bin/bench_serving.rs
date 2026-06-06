@@ -44,8 +44,15 @@ const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
 const SNAPSHOT_DECODE_PROMPT_LEN: usize = 1024;
 const SNAPSHOT_DECODE_OUTPUT_LEN: usize = 256;
 
-fn snapshot_prefill_prompt_len(_model_type: ModelType) -> usize {
-    10_000
+fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
+    match model_type {
+        // Kimi serves TP1/DP8, where the PPLX fabric buffers cap prompts at
+        // 2048 tokens (full-lifetime KV cap is 8192) — probe the largest
+        // prompt the serving shape admits.
+        #[cfg(feature = "kimi-k2")]
+        ModelType::KimiK2 => 2_048,
+        _ => 10_000,
+    }
 }
 const REGRESSION_TPOT_PCT: f64 = 2.0;
 const REGRESSION_TTFT_PCT: f64 = 3.0;
@@ -359,6 +366,10 @@ struct SnapshotReport {
     date: String,
     model: String,
     gpu: String,
+    /// Parallel layout the snapshot was measured under (e.g. "tp1-dp8-pplx").
+    /// Absent in snapshots that predate multi-GPU model lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parallel: Option<String>,
     prefill_heavy: SnapshotProfile,
     decode_heavy: SnapshotProfile,
 }
@@ -1830,11 +1841,22 @@ fn run_snapshot(
 
     let model_name = model_display_name(&cli.model_path);
     let gpu = gpu_name();
+    let parallel = match model_type {
+        #[cfg(feature = "kimi-k2")]
+        ModelType::KimiK2 => Some(format!(
+            "tp{}-dp{}-{}",
+            cli.tp_size,
+            cli.dp_size,
+            format!("{:?}", cli.ep_backend).to_lowercase()
+        )),
+        _ => None,
+    };
     let report = SnapshotReport {
         commit: git_short_commit(),
         date: today_date(),
         model: model_name.clone(),
         gpu: gpu.clone(),
+        parallel,
         prefill_heavy: SnapshotProfile {
             prompt_len: prefill_prompt_len,
             output_len: SNAPSHOT_PREFILL_OUTPUT_LEN,
@@ -1863,6 +1885,9 @@ fn render_snapshot_text(report: &SnapshotReport, path: &Path) -> String {
     let _ = writeln!(out, "bench_serving snapshot\n");
     let _ = writeln!(out, "model:  {}", report.model);
     let _ = writeln!(out, "gpu:    {}", report.gpu);
+    if let Some(parallel) = &report.parallel {
+        let _ = writeln!(out, "shape:  {parallel}");
+    }
     let _ = writeln!(out, "commit: {}\n", report.commit);
     let _ = writeln!(
         out,
