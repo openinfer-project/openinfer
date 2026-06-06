@@ -369,8 +369,8 @@ fn verify_dispatch_weights(
                 ));
             }
         }
-        got.sort_by(|a, b| a.total_cmp(b));
-        expected[expert].sort_by(|a, b| a.total_cmp(b));
+        got.sort_by(f32::total_cmp);
+        expected[expert].sort_by(f32::total_cmp);
         if got != expected[expert] {
             return Err(format!(
                 "rank {rank} expert {expert}: dispatch weights mismatch: got {:?}, expected {:?}",

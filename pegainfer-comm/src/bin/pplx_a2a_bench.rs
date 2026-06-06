@@ -14,6 +14,8 @@ use pegainfer_comm::bootstrap::{
     EpModelShape, PplxBootstrapParams, build_intra_node_backends_for_devices,
 };
 
+// CLI flags: each bool is an independent --flag, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long, default_value_t = 256)]
@@ -73,6 +75,8 @@ struct BenchConfig {
     canonicalize_duplicate_sources: bool,
 }
 
+// The `us` postfix is the unit, not noise.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Copy, Debug, Default)]
 struct IterTimes {
     dispatch_send_us: f64,
@@ -295,13 +299,12 @@ fn run_config(config: &BenchConfig) -> Result<Vec<Vec<IterTimes>>> {
     let (backends, _resources) =
         build_intra_node_backends_for_devices(config.shape, &devices, params)?;
 
-    let barrier = Arc::new(Barrier::new(config.world_size));
+    let barrier = Barrier::new(config.world_size);
     let mut rank_results: Vec<Vec<IterTimes>> = Vec::with_capacity(config.world_size);
     thread::scope(|scope| -> Result<()> {
         let mut handles = Vec::with_capacity(config.world_size);
         for (rank, backend) in backends.into_iter().enumerate() {
-            let barrier = Arc::clone(&barrier);
-            let config = config;
+            let barrier = &barrier;
             handles.push(scope.spawn(move || {
                 run_rank(rank, backend, config, barrier)
                     .with_context(|| format!("rank {rank}"))
@@ -320,7 +323,7 @@ fn run_rank(
     rank: usize,
     mut backend: pegainfer_comm::EpBackend,
     config: &BenchConfig,
-    barrier: Arc<Barrier>,
+    barrier: &Barrier,
 ) -> Result<Vec<IterTimes>> {
     let gpu = GpuContext::new(rank)?;
 
@@ -367,9 +370,8 @@ fn run_rank(
     barrier.wait();
     for iter in 0..total_iters {
         let record = iter >= config.warmup;
-        let mut times = IterTimes::default();
 
-        times.dispatch_send_us = time_stage(&gpu, record, || {
+        let dispatch_send_us = time_stage(&gpu, record, || {
             if config.dispatch_send_route_only {
                 dispatch_send_route_only(
                     &mut backend,
@@ -392,7 +394,7 @@ fn run_rank(
                 )
             }
         })?;
-        times.dispatch_recv_us = time_stage(&gpu, record, || {
+        let dispatch_recv_us = time_stage(&gpu, record, || {
             if config.dispatch_recv_counts_only {
                 dispatch_recv_counts_only(
                     &mut backend,
@@ -409,10 +411,10 @@ fn run_rank(
                 )
             }
         })?;
-        times.combine_send_us = time_stage(&gpu, record, || {
+        let combine_send_us = time_stage(&gpu, record, || {
             combine_send(&mut backend, hidden, &expert_y, &gpu)
         })?;
-        times.combine_recv_us = time_stage(&gpu, record, || {
+        let combine_recv_us = time_stage(&gpu, record, || {
             combine_recv(
                 &mut backend,
                 config.max_num_tokens,
@@ -426,7 +428,12 @@ fn run_rank(
         })?;
 
         if record {
-            measured.push(times);
+            measured.push(IterTimes {
+                dispatch_send_us,
+                dispatch_recv_us,
+                combine_send_us,
+                combine_recv_us,
+            });
         }
     }
     gpu.sync()?;
@@ -690,7 +697,7 @@ fn print_stats(name: &str, values: &[f64]) {
 
 fn stats(values: &[f64]) -> Stats {
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.sort_by(f64::total_cmp);
     let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
     Stats {
         mean,

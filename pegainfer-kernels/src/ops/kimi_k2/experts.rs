@@ -2405,10 +2405,8 @@ mod tests {
             let mut routes = topk_host
                 .iter()
                 .enumerate()
-                .filter_map(|(route_offset, &expert)| {
-                    (usize::try_from(expert).ok() == Some(global_expert))
-                        .then(|| i32::try_from(route_offset).expect("route offset"))
-                })
+                .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
+                .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
                 .collect::<Vec<_>>();
             if routes.is_empty() {
                 continue;

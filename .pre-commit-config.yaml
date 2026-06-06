@@ -32,3 +32,19 @@ repos:
         types: [rust]
         files: ^pegainfer-kimi-k2/
         pass_filenames: false
+      # The kimi-k2 hook above is --no-deps, so the kimi code living in
+      # pegainfer-kernels (ops/kimi_k2 + csrc) is never linted by it.
+      - id: clippy-kernels-kimi
+        name: clippy (kernels w/ kimi-k2, -D warnings)
+        entry: cargo clippy -p pegainfer-kernels --no-deps --release --features kimi-k2 --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        files: ^pegainfer-kernels/
+        pass_filenames: false
+      - id: clippy-comm
+        name: clippy (pegainfer-comm, -D warnings)
+        entry: cargo clippy -p pegainfer-comm --no-deps --release --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        files: ^pegainfer-comm/
+        pass_filenames: false
