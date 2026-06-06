@@ -476,7 +476,11 @@ impl DeepSeekV2LiteEp2Generator {
         ops::argmax_batch_bf16_into(&self.rank0.ctx, &logits, &mut values, &mut out)?;
 
         let out_host = self.rank0.ctx.stream.clone_dtoh(&out)?;
-        self.rank0.ctx.sync()?;
+        self.rank0
+            .ctx
+            .stream
+            .synchronize()
+            .context("sync sampled token D2H stream")?;
 
         out_host
             .into_iter()
