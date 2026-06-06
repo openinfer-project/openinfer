@@ -72,14 +72,13 @@ struct Qwen35SchedulerDriver {
     model: Qwen35Model,
     graph_state: BatchDecodeGraphState,
     sample_scratch: SampleScratch,
-    max_batch: usize,
 }
 
 impl SchedulerDriver for Qwen35SchedulerDriver {
     type Active = ActiveRequest35;
 
     fn max_batch(&self) -> usize {
-        self.max_batch
+        self.graph_state.slot_states.len()
     }
 
     fn page_size(&self) -> usize {
@@ -185,7 +184,6 @@ pub fn start_with_capacity(
                     model,
                     graph_state,
                     sample_scratch,
-                    max_batch,
                 };
                 scheduler_loop(driver, submit_rx, seed);
             }

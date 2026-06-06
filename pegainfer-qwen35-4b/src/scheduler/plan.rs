@@ -102,7 +102,7 @@ fn active_future_pages(active: &[ActiveKvBudget], page_size: usize) -> usize {
         .map(|req| {
             let max_pages = pages_needed(max_kv_tokens(req.prompt_len, req.max_tokens), page_size);
             let current_pages = pages_needed(current_active_tokens(*req), page_size);
-            assert!(
+            debug_assert!(
                 current_pages <= max_pages,
                 "active Qwen3.5 request exceeded its admitted KV lifetime budget"
             );
