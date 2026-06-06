@@ -58,12 +58,14 @@ pub fn trace_decode_kernel_calls(
     let dummy_prompt_len = if kv_len > 1 { kv_len - 1 } else { 1 };
     let mut rkvs = (0..batch_size)
         .map(|_| {
-            let mut rkv = kv_mgr.new_request(vec![0; dummy_prompt_len], 1, None);
-            rkv.schedule_prefill(dummy_prompt_len, &kv_mgr)
+            let mut rkv = kv_mgr
+                .pool()
+                .new_request(vec![0; dummy_prompt_len], 1, None);
+            rkv.schedule_prefill(dummy_prompt_len, kv_mgr.pool())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            rkv.apply_prefill(0, &kv_mgr)?;
+            rkv.apply_prefill(0, kv_mgr.pool())?;
             // Now kv_position == dummy_prompt_len. Schedule one decode step.
-            rkv.schedule_decode(&kv_mgr)
+            rkv.schedule_decode(kv_mgr.pool())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(rkv)
         })
@@ -77,8 +79,8 @@ pub fn trace_decode_kernel_calls(
         model.local_intermediate_size(),
         model.config().vocab_size,
         batch_size,
-        kv_mgr.total_blocks(),
-        kv_mgr.padding_block_id(),
+        kv_mgr.pool().total_blocks(),
+        kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
     )?;
     let token_ids = vec![0_u32; batch_size];

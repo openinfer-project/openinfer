@@ -468,8 +468,8 @@ impl Qwen3Executor {
             config: model.config().clone(),
         };
         let kv_buffer = kv_mgr.buffer().clone();
-        let total_blocks = kv_mgr.total_blocks();
-        let padding_block_id = kv_mgr.padding_block_id();
+        let total_blocks = kv_mgr.pool().total_blocks();
+        let padding_block_id = kv_mgr.pool().padding_block_id();
         Ok(Self {
             metadata,
             kv_mgr,
@@ -561,8 +561,8 @@ impl Qwen3Executor {
             model.attach_tp_comm(comm);
         }
 
-        let total_blocks = kv_mgr.total_blocks();
-        let padding_block_id = kv_mgr.padding_block_id();
+        let total_blocks = kv_mgr.pool().total_blocks();
+        let padding_block_id = kv_mgr.pool().padding_block_id();
 
         // Primary rank gets the KvBuffer from the centralized manager.
         let primary_buffer = kv_mgr.buffer().clone();
@@ -718,11 +718,11 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn max_request_blocks(&self) -> usize {
-        self.kv_mgr.max_request_blocks()
+        self.kv_mgr.pool().max_request_blocks()
     }
 
     fn available_blocks(&self) -> usize {
-        self.kv_mgr.available_blocks()
+        self.kv_mgr.pool().available_blocks()
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -740,7 +740,7 @@ impl ModelExecutor for Qwen3Executor {
         // 1. Create RequestKvs, reuse cached prefix blocks, schedule the rest
         let mut requests = plan.requests.to_vec();
         for req in &mut requests {
-            let mut rkv = self.kv_mgr.new_request(
+            let mut rkv = self.kv_mgr.pool().new_request(
                 req.prompt_tokens.clone(),
                 req.max_output_tokens,
                 self.active_lora_adapter.as_deref(),
@@ -748,9 +748,9 @@ impl ModelExecutor for Qwen3Executor {
             // Echo needs logits for every prompt position; cached positions
             // are never forwarded, so echo requests prefill from scratch.
             if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(&self.kv_mgr)?;
+                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
-            rkv.schedule_prefill(req.suffix_len(), &self.kv_mgr)
+            rkv.schedule_prefill(req.suffix_len(), self.kv_mgr.pool())
                 .map_err(|e| {
                     anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
                 })?;
@@ -786,7 +786,7 @@ impl ModelExecutor for Qwen3Executor {
                 .request_kvs
                 .get_mut(&req_result.request_id)
                 .expect("request must exist after prefill");
-            rkv.apply_prefill(req_result.first_token, &self.kv_mgr)?;
+            rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
         }
 
         Ok(result)
@@ -799,7 +799,7 @@ impl ModelExecutor for Qwen3Executor {
                 .request_kvs
                 .get_mut(&req.request_id)
                 .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
-            rkv.schedule_decode(&self.kv_mgr).map_err(|e| {
+            rkv.schedule_decode(self.kv_mgr.pool()).map_err(|e| {
                 anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
             })?;
         }
@@ -833,7 +833,7 @@ impl ModelExecutor for Qwen3Executor {
                 .request_kvs
                 .get_mut(&req_result.request_id)
                 .expect("request must exist after decode");
-            rkv.apply_decode(req_result.token, &self.kv_mgr)?;
+            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
         }
 
         Ok(result)
@@ -844,15 +844,15 @@ impl ModelExecutor for Qwen3Executor {
         // blocks, and schedule the rest
         let mut prefill_requests = plan.prefill_requests.to_vec();
         for req in &mut prefill_requests {
-            let mut rkv = self.kv_mgr.new_request(
+            let mut rkv = self.kv_mgr.pool().new_request(
                 req.prompt_tokens.clone(),
                 req.max_output_tokens,
                 self.active_lora_adapter.as_deref(),
             );
             if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(&self.kv_mgr)?;
+                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
-            rkv.schedule_prefill(req.suffix_len(), &self.kv_mgr)
+            rkv.schedule_prefill(req.suffix_len(), self.kv_mgr.pool())
                 .map_err(|e| {
                     anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
                 })?;
@@ -865,7 +865,7 @@ impl ModelExecutor for Qwen3Executor {
                 .request_kvs
                 .get_mut(&req.request_id)
                 .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
-            rkv.schedule_decode(&self.kv_mgr).map_err(|e| {
+            rkv.schedule_decode(self.kv_mgr.pool()).map_err(|e| {
                 anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
             })?;
         }
@@ -905,14 +905,14 @@ impl ModelExecutor for Qwen3Executor {
                 .request_kvs
                 .get_mut(&req_result.request_id)
                 .expect("request must exist after unified prefill");
-            rkv.apply_prefill(req_result.first_token, &self.kv_mgr)?;
+            rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
         }
         for req_result in &result.decode_requests {
             let rkv = self
                 .request_kvs
                 .get_mut(&req_result.request_id)
                 .expect("request must exist after unified decode");
-            rkv.apply_decode(req_result.token, &self.kv_mgr)?;
+            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
         }
 
         Ok(result)

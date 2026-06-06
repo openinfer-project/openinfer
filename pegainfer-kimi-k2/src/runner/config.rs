@@ -18,4 +18,8 @@ pub(crate) struct KimiK2RunnerConfig {
     pub(crate) pplx_thread_placement: pegainfer_core::cpu_topology::RankThreadPlacementPlan,
     pub enable_cuda_graph: bool,
     pub ep_backend: EpBackend,
+    /// KV pool size in pages per rank. Both the per-rank physical MLA pool
+    /// and the scheduler's logical `BlockPool` are sized from this, so the
+    /// block accounting and the GPU buffers can never disagree.
+    pub kv_pool_pages: usize,
 }

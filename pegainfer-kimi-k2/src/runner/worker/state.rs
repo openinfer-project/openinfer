@@ -61,8 +61,31 @@ impl KimiRankThreadState {
             "kimi-k2: rank {rank} one-token forward cache build cost {:.2}s",
             cache_started.elapsed().as_secs_f64()
         );
-        let decode_arenas =
-            KimiWorkerDecodeArenas::new(one_token_cache.vocab_rows, &self.local_dims);
+        // Allocate the shared KV pool eagerly: an OOM should kill bringup,
+        // not the first request that fills the pool.
+        let kv_pool_started = Instant::now();
+        let kv_pool = KimiWorkerKvPool::new(
+            &self.ctx.as_device_context(),
+            KIMI_K2_LAYERS,
+            self.kv_pool_pages,
+        )
+        .with_context(|| {
+            format!(
+                "failed to allocate Kimi rank {rank} KV pool ({} pages)",
+                self.kv_pool_pages
+            )
+        })?;
+        debug!(
+            "kimi-k2: rank {rank} KV pool ({} pages, {} tokens) alloc cost {:.2}s",
+            self.kv_pool_pages,
+            self.kv_pool_pages * KIMI_KV_PAGE_SIZE,
+            kv_pool_started.elapsed().as_secs_f64()
+        );
+        let decode_arenas = KimiWorkerDecodeArenas::new(
+            one_token_cache.vocab_rows,
+            &self.local_dims,
+            self.kv_pool_pages,
+        );
         let report = KimiRankWeightLoadReport::from_loaded_weights(
             tensor_count,
             total_bytes,
@@ -72,6 +95,7 @@ impl KimiRankThreadState {
             gpu: weights,
             expert_kernels: expert_kernel_weights,
             one_token_cache,
+            kv_pool,
             decode_arenas,
         };
         ensure!(
@@ -97,12 +121,14 @@ impl KimiRankThreadState {
         Ok(report)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_prompt_next_token(
         &mut self,
         slot: usize,
         decode_batch_size: usize,
         input_ids: &[u32],
         ep_max_seq_len: usize,
+        kv_pages: &KimiKvStepPages,
         row: KimiRowOptions,
         seed: u64,
     ) -> Result<KimiOneTokenForwardReport> {
@@ -111,6 +137,7 @@ impl KimiRankThreadState {
             decode_batch_size,
             input_ids,
             ep_max_seq_len,
+            kv_pages,
             row,
             seed,
         )
@@ -139,12 +166,14 @@ impl KimiRankThreadState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_decode_batch_next_tokens(
         &mut self,
         token_ids: &[u32],
         append_positions: &[usize],
         slots: &[usize],
         decode_batch_size: usize,
+        kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],
         seed: u64,
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
@@ -177,6 +206,7 @@ impl KimiRankThreadState {
             gpu,
             expert_kernels,
             one_token_cache: cache,
+            kv_pool,
             decode_arenas,
         } = loaded;
         let rank = gpu.rank;
@@ -207,7 +237,7 @@ impl KimiRankThreadState {
             }
         }
         decode_arena
-            .configure_batch_decode(&device_ctx, slots, append_positions)
+            .configure_batch_decode(&device_ctx, slots, append_positions, kv_pages)
             .with_context(|| format!("Kimi rank {rank} configure batch decode KV page table"))?;
         decode_arena
             .upload_batch_tokens(&device_ctx, token_ids)
@@ -229,6 +259,7 @@ impl KimiRankThreadState {
                         tp_comm_ref,
                         cache,
                         expert_kernels,
+                        kv_pool,
                         decode_arena,
                         active_len,
                         local_heads,
@@ -262,6 +293,7 @@ impl KimiRankThreadState {
                 tp_comm_ref,
                 cache,
                 expert_kernels,
+                kv_pool,
                 decode_arena,
                 active_len,
                 local_heads,
@@ -359,12 +391,14 @@ impl KimiRankThreadState {
         Ok(reports)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_prompt_next_token_inner(
         &mut self,
         slot: usize,
         decode_batch_size: usize,
         input_ids: &[u32],
         ep_max_seq_len: usize,
+        kv_pages: &KimiKvStepPages,
         row: KimiRowOptions,
         seed: u64,
     ) -> Result<KimiOneTokenForwardReport> {
@@ -380,6 +414,7 @@ impl KimiRankThreadState {
             gpu,
             expert_kernels,
             one_token_cache: cache,
+            kv_pool,
             decode_arenas,
         } = loaded;
         let rank = gpu.rank;
@@ -389,7 +424,7 @@ impl KimiRankThreadState {
             .ok_or_else(|| anyhow::anyhow!("Kimi prompt ids unexpectedly empty"))?;
         let decode_arena = decode_arenas.get_mut(&device_ctx, decode_batch_size)?;
         decode_arena
-            .configure_slot_prefill(&device_ctx, slot, seq_len)
+            .configure_slot_prefill(&device_ctx, slot, seq_len, kv_pages)
             .with_context(|| {
                 format!("Kimi rank {rank} configure slot {slot} prefill KV page table")
             })?;
@@ -450,6 +485,7 @@ impl KimiRankThreadState {
                 &layer.attention,
                 &cos,
                 &sin,
+                kv_pool,
                 decode_arena,
                 &mut hidden,
                 &mut normed,
@@ -589,6 +625,7 @@ impl KimiRankThreadState {
         Ok(report)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_mla_prefill(
         ctx: &DeviceContext,
         comm: Option<&Comm>,
@@ -596,6 +633,7 @@ impl KimiRankThreadState {
         attention: &KimiAttentionForwardCache,
         cos: &CudaSlice<half::bf16>,
         sin: &CudaSlice<half::bf16>,
+        kv_pool: &mut KimiWorkerKvPool,
         decode_arena: &mut KimiWorkerDecodeArena,
         hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
         normed: &mut GpuTensor<KIMI_K2_HIDDEN>,
@@ -637,7 +675,13 @@ impl KimiRankThreadState {
             &decode_arena.positions_d,
             &mut append_kpe,
         )?;
-        decode_arena.append_prefill_layer_kv(ctx, layer_idx, &compressed_normed, &append_kpe)?;
+        decode_arena.append_prefill_layer_kv(
+            ctx,
+            kv_pool,
+            layer_idx,
+            &compressed_normed,
+            &append_kpe,
+        )?;
         let mut kv_b = HiddenStates::zeros(ctx, kv_b_out, seq_len)?;
         typed_ops::gemm_dm_typed_to_hs(ctx, &attention.kv_b_proj, &compressed_normed, &mut kv_b)?;
 

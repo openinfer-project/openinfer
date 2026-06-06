@@ -54,6 +54,14 @@ use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT
 
 pub(super) const PPLX_EXPERT_PADDING: usize = 8;
 
+/// Hard cap on tokens one PPLX dispatch can carry, fixed at bootstrap
+/// (`PplxBootstrapParams::max_num_tokens` sizes the fabric buffers from it —
+/// recv capacity grows superlinearly, ~13 GB/rank extra at 8K). On the DP
+/// path every prefill dispatches its whole prompt through PPLX, so this is
+/// the DP per-request *prompt* cap; decode dispatches only batch-many tokens
+/// and total sequence length is not bound by it.
+pub(super) const PPLX_MAX_DISPATCH_TOKENS: usize = 2048;
+
 pub(super) struct KimiMoePplxScratch {
     pub(super) max_local_output_tokens: usize,
     pub(super) expert_padding: usize,

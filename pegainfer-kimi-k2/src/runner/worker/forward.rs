@@ -1,11 +1,13 @@
 use super::{runtime::*, *};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn forward_decode_batch_next_token_kernels(
     device_ctx: &DeviceContext,
     decode_aux_ctx: &DeviceContext,
     comm: Option<&Comm>,
     cache: &KimiOneTokenForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
+    kv_pool: &mut KimiWorkerKvPool,
     decode_arena: &mut KimiWorkerDecodeArena,
     active_len: usize,
     local_heads: usize,
@@ -29,6 +31,7 @@ pub(super) fn forward_decode_batch_next_token_kernels(
         forward_mla_decode_layer_into(
             device_ctx,
             &layer.attention,
+            kv_pool,
             decode_arena,
             layer.layer_idx,
             local_heads,
@@ -124,6 +127,7 @@ pub(super) fn forward_decode_batch_next_token_kernels(
 fn forward_mla_decode_layer_into(
     ctx: &DeviceContext,
     attention: &KimiAttentionForwardCache,
+    kv_pool: &mut KimiWorkerKvPool,
     arena: &mut KimiWorkerDecodeArena,
     layer_idx: usize,
     local_heads: usize,
@@ -140,13 +144,10 @@ fn forward_mla_decode_layer_into(
         kv_chunk_size_d,
         cos_d,
         sin_d,
-        layer_caches,
         scratch,
         ..
     } = arena;
-    let layer_cache = layer_caches
-        .get_mut(layer_idx)
-        .ok_or_else(|| anyhow::anyhow!("Kimi decode layer cache {layer_idx} out of range"))?;
+    let layer_cache = kv_pool.layer_mut(layer_idx)?;
 
     typed_ops::rms_norm_into(
         ctx,

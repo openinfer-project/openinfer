@@ -2,15 +2,64 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pegainfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
 
-pub(in crate::runner) fn schedule_prefill_candidate(
-    req: GenerateRequest,
-) -> Option<GenerateRequest> {
-    send_scheduled(&req);
-    if finish_unschedulable(&req) {
-        None
-    } else {
-        Some(req)
+use crate::runner::worker::KIMI_MAX_REQUEST_TOKENS;
+
+/// KV tokens a request can write over its lifetime. The final generated
+/// token is returned but never fed back, so its KV is never written (the
+/// same dangling-token contract as the qwen3 admission).
+pub(in crate::runner) fn request_max_kv_tokens(req: &GenerateRequest) -> usize {
+    req.prompt_tokens.len() + req.max_tokens.saturating_sub(1)
+}
+
+/// Pool blocks a request may draw over its lifetime. One token more than
+/// `request_max_kv_tokens`: kvbm appends the final generated token to the
+/// sequence and provisions its block even though its KV is never written,
+/// so at boundary alignments the peak draw is `ceil((prompt + max) / bs)`.
+pub(in crate::runner) fn request_lifetime_blocks(
+    req: &GenerateRequest,
+    block_size: usize,
+) -> usize {
+    (req.prompt_tokens.len() + req.max_tokens)
+        .div_ceil(block_size)
+        .max(1)
+}
+
+/// Honor-or-reject (#239): a request that can never fit — per-request KV
+/// capacity, pool size, or a path-specific prompt cap — is rejected at
+/// admission with the limit spelled out, instead of poisoning the batch
+/// mid-decode when the KV write finally lands out of bounds.
+pub(in crate::runner) fn validate_kv_capacity(
+    req: &GenerateRequest,
+    block_size: usize,
+    max_request_blocks: usize,
+    max_prompt_tokens: Option<usize>,
+) -> Result<(), String> {
+    if let Some(max_prompt) = max_prompt_tokens
+        && req.prompt_tokens.len() > max_prompt
+    {
+        return Err(format!(
+            "prompt of {} tokens exceeds the per-request prompt cap of {max_prompt} \
+             tokens on this serving path",
+            req.prompt_tokens.len()
+        ));
     }
+    let max_kv_tokens = request_max_kv_tokens(req);
+    if max_kv_tokens > KIMI_MAX_REQUEST_TOKENS {
+        return Err(format!(
+            "prompt_tokens ({}) + max_tokens ({}) needs {max_kv_tokens} KV tokens, \
+             exceeding the per-request capacity of {KIMI_MAX_REQUEST_TOKENS} tokens",
+            req.prompt_tokens.len(),
+            req.max_tokens
+        ));
+    }
+    let blocks = request_lifetime_blocks(req, block_size);
+    if blocks > max_request_blocks {
+        return Err(format!(
+            "request needs {blocks} KV blocks ({max_kv_tokens} KV tokens), exceeding \
+             the pool capacity of {max_request_blocks} blocks"
+        ));
+    }
+    Ok(())
 }
 
 pub(in crate::runner) fn preflight_prefill_candidate(

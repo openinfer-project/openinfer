@@ -57,9 +57,67 @@ pub(super) use crate::typed_scratch::{KimiWorkerDecodeScratch, MARLIN_W13_OUT_DI
 const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
 const KIMI_DECODE_MAX_BATCH: usize = 64;
 const KIMI_DECODE_BATCH_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, KIMI_DECODE_MAX_BATCH];
-const KIMI_DECODE_PAGE_SIZE: usize = 16;
-const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
-const KIMI_DECODE_ROPE_CACHE_TOKENS: usize = KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST;
+/// KV page granularity shared by the worker page tables and the scheduler's
+/// logical `BlockPool` (one kvbm block = one physical page).
+pub(crate) const KIMI_KV_PAGE_SIZE: usize = 16;
+/// Per-request KV capacity: prompt + generated tokens. Sets the decode RoPE
+/// table length; the scheduler rejects requests over this at admission.
+pub(crate) const KIMI_MAX_REQUEST_TOKENS: usize = 8192;
+
+/// Physical KV page assignments for one forward step.
+///
+/// `pages`/`indptr` form a row-major CSR over the step's rows (prefill: one
+/// row for the target slot; decode: one row per active request, same order
+/// as `slots`). Page IDs index the rank's shared KV pool. `padding_page`
+/// backs idle slots and CUDA-graph padding rows — those rows write/read
+/// garbage on a page no live request owns, which is benign by construction.
+#[derive(Clone, Debug)]
+pub(crate) struct KimiKvStepPages {
+    pub(crate) pages: Vec<i32>,
+    pub(crate) indptr: Vec<i32>,
+    pub(crate) padding_page: i32,
+}
+
+impl KimiKvStepPages {
+    pub(crate) fn new(rows: Vec<Vec<i32>>, padding_page: i32) -> Self {
+        let mut pages = Vec::with_capacity(rows.iter().map(Vec::len).sum());
+        let mut indptr = Vec::with_capacity(rows.len() + 1);
+        indptr.push(0i32);
+        for row in rows {
+            pages.extend_from_slice(&row);
+            indptr.push(pages.len() as i32);
+        }
+        Self {
+            pages,
+            indptr,
+            padding_page,
+        }
+    }
+
+    pub(crate) fn single(row: Vec<i32>, padding_page: i32) -> Self {
+        Self::new(vec![row], padding_page)
+    }
+
+    pub(super) fn rows(&self) -> usize {
+        self.indptr.len().saturating_sub(1)
+    }
+
+    pub(super) fn row(&self, row: usize) -> Result<&[i32]> {
+        ensure!(
+            row + 1 < self.indptr.len(),
+            "Kimi KV step pages row {row} out of range ({} rows)",
+            self.rows()
+        );
+        let start = self.indptr[row] as usize;
+        let end = self.indptr[row + 1] as usize;
+        ensure!(
+            start <= end && end <= self.pages.len(),
+            "Kimi KV step pages row {row} CSR is corrupt: start={start}, end={end}, pages={}",
+            self.pages.len()
+        );
+        Ok(&self.pages[start..end])
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KimiK2RankPlacement {
@@ -136,6 +194,7 @@ enum KimiRankCommand {
         decode_batch_size: usize,
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
+        kv_pages: KimiKvStepPages,
         row: KimiRowOptions,
         seed: u64,
         resp: Sender<Result<KimiOneTokenForwardReport>>,
@@ -145,6 +204,7 @@ enum KimiRankCommand {
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
+        kv_pages: KimiKvStepPages,
         rows: Vec<KimiRowOptions>,
         seed: u64,
         resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
@@ -163,6 +223,7 @@ pub(super) struct KimiRankWorker {
 }
 
 impl KimiRankWorker {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn(
         placement: KimiK2RankPlacement,
         weight_names: KimiRankWeightNames,
@@ -172,6 +233,7 @@ impl KimiRankWorker {
         ctx: KimiRankGpuContext,
         collective_barrier: Arc<Barrier>,
         enable_cuda_graph: bool,
+        kv_pool_pages: usize,
     ) -> Result<Self> {
         ensure!(
             weight_names.rank == placement.rank,
@@ -204,6 +266,7 @@ impl KimiRankWorker {
                     local_dims,
                     collective_barrier,
                     enable_cuda_graph,
+                    kv_pool_pages,
                 ) {
                     Ok(state) => {
                         let _ = startup_tx.send(Ok(()));
@@ -273,12 +336,14 @@ impl KimiRankWorker {
         Ok(resp_rx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_prompt_next_token_async(
         &self,
         input_ids: Vec<u32>,
         slot: usize,
         decode_batch_size: usize,
         ep_max_seq_len: usize,
+        kv_pages: KimiKvStepPages,
         row: KimiRowOptions,
         seed: u64,
     ) -> Result<Receiver<Result<KimiOneTokenForwardReport>>> {
@@ -289,6 +354,7 @@ impl KimiRankWorker {
                 decode_batch_size,
                 input_ids,
                 ep_max_seq_len,
+                kv_pages,
                 row,
                 seed,
                 resp: resp_tx,
@@ -297,12 +363,14 @@ impl KimiRankWorker {
         Ok(resp_rx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_decode_batch_next_tokens_async(
         &self,
         token_ids: Vec<u32>,
         append_positions: Vec<usize>,
         slots: Vec<usize>,
         decode_batch_size: usize,
+        kv_pages: KimiKvStepPages,
         rows: Vec<KimiRowOptions>,
         seed: u64,
     ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
@@ -313,6 +381,7 @@ impl KimiRankWorker {
                 append_positions,
                 slots,
                 decode_batch_size,
+                kv_pages,
                 rows,
                 seed,
                 resp: resp_tx,
@@ -366,6 +435,7 @@ struct KimiRankThreadState {
     local_dims: crate::config::KimiLocalDims,
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
+    kv_pool_pages: usize,
     loaded: Option<KimiRankLoadedWeights>,
     ep_backend: Option<pegainfer_comm::EpBackend>,
     moe_pplx_scratch: Option<super::moe_pplx::KimiMoePplxScratch>,
@@ -387,6 +457,7 @@ struct KimiRankLoadedWeights {
     gpu: KimiRankGpuWeights,
     expert_kernels: KimiRankExpertMarlinWeights,
     one_token_cache: KimiOneTokenForwardCache,
+    kv_pool: KimiWorkerKvPool,
     decode_arenas: KimiWorkerDecodeArenas,
 }
 
@@ -394,15 +465,17 @@ struct KimiWorkerDecodeArenas {
     arenas: Vec<Option<KimiWorkerDecodeArena>>,
     vocab_rows: usize,
     dims: crate::config::KimiLocalDims,
+    kv_pool_pages: usize,
 }
 
 impl KimiWorkerDecodeArenas {
-    fn new(vocab_rows: usize, dims: &crate::config::KimiLocalDims) -> Self {
+    fn new(vocab_rows: usize, dims: &crate::config::KimiLocalDims, kv_pool_pages: usize) -> Self {
         let arenas = KIMI_DECODE_BATCH_BUCKETS.iter().map(|_| None).collect();
         Self {
             arenas,
             vocab_rows,
             dims: *dims,
+            kv_pool_pages,
         }
     }
 
@@ -420,9 +493,8 @@ impl KimiWorkerDecodeArenas {
             self.arenas[idx] = Some(
                 KimiWorkerDecodeArena::new(
                     ctx,
-                    KIMI_K2_LAYERS,
                     arena_batch_size,
-                    KIMI_DECODE_PAGE_SIZE,
+                    self.kv_pool_pages,
                     self.vocab_rows,
                     &self.dims,
                 )
@@ -498,10 +570,15 @@ pub(super) struct KimiMoeForwardCache {
     pub(super) shared_down_proj: DeviceMatrix,
 }
 
+/// Per-bucket decode metadata + scratch. KV data itself lives in the rank's
+/// shared [`KimiWorkerKvPool`]; the arena only carries the page-table device
+/// buffers (fixed addresses, contents re-uploaded each step — CUDA Graph
+/// replays stay valid) plus per-bucket compute scratch.
 struct KimiWorkerDecodeArena {
     batch_size: usize,
     page_size: usize,
-    max_pages: usize,
+    pool_pages: usize,
+    page_table_capacity: usize,
     append_capacity: usize,
     layout: KimiMlaPagedKvLayout,
     page_indices_d: CudaSlice<i32>,
@@ -515,10 +592,17 @@ struct KimiWorkerDecodeArena {
     token_ids_d: CudaSlice<u32>,
     cos_d: CudaSlice<half::bf16>,
     sin_d: CudaSlice<half::bf16>,
-    layer_caches: Vec<KimiWorkerMlaLayerCache>,
     scratch: KimiWorkerDecodeScratch,
     logits: HiddenStates,
     graph: CudaGraphState,
+}
+
+/// Rank-wide paged KV storage shared by every decode bucket and the prefill
+/// path: one ckv + kpe buffer pair per layer, indexed by pool page IDs the
+/// scheduler assigns. Allocated once at weight load (crash early on OOM);
+/// the stable base pointers are what keep captured CUDA graphs valid.
+pub(super) struct KimiWorkerKvPool {
+    layers: Vec<KimiWorkerMlaLayerCache>,
 }
 
 struct KimiWorkerMlaLayerCache {
@@ -546,6 +630,7 @@ fn bind_rank_thread(
     local_dims: crate::config::KimiLocalDims,
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
+    kv_pool_pages: usize,
 ) -> Result<KimiRankThreadState> {
     ctx.set_current()?;
     let decode_aux_ctx = ctx.auxiliary_device_context("decode aux")?;
@@ -597,6 +682,7 @@ fn bind_rank_thread(
         local_dims,
         collective_barrier,
         enable_cuda_graph,
+        kv_pool_pages,
         loaded: None,
         ep_backend: None,
         moe_pplx_scratch: None,
@@ -634,6 +720,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 decode_batch_size,
                 input_ids,
                 ep_max_seq_len,
+                kv_pages,
                 row,
                 seed,
                 resp,
@@ -643,6 +730,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                     decode_batch_size,
                     &input_ids,
                     ep_max_seq_len,
+                    &kv_pages,
                     row,
                     seed,
                 );
@@ -653,6 +741,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 append_positions,
                 slots,
                 decode_batch_size,
+                kv_pages,
                 rows,
                 seed,
                 resp,
@@ -662,6 +751,7 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                     &append_positions,
                     &slots,
                     decode_batch_size,
+                    &kv_pages,
                     &rows,
                     seed,
                 );
@@ -726,8 +816,8 @@ pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2Ra
 
 #[cfg(test)]
 mod tests {
-    use super::cache::build_decode_append_page_metadata;
-    use super::decode_batch_bucket;
+    use super::cache::build_slot_page_table;
+    use super::{KimiKvStepPages, decode_batch_bucket};
 
     #[test]
     fn decode_batch_bucket_rounds_up_to_power_of_two_buckets() {
@@ -753,16 +843,43 @@ mod tests {
     }
 
     #[test]
-    fn decode_page_metadata_uses_multiple_pages_per_request() {
+    fn slot_page_table_scatters_rows_and_pads_idle_slots() {
+        // Row 0 → slot 2 with 26 KV tokens (2 pool pages); row 1 → slot 0
+        // with 1 token. Slots 1 and 3 are idle → padding page 7.
+        let kv_pages = KimiKvStepPages::new(vec![vec![40, 41], vec![9]], 7);
         let (page_indices, page_indptr, last_page_len) =
-            build_decode_append_page_metadata(4, 16, 128, &[26, 0, 0, 0]).unwrap();
-        assert_eq!(page_indptr, vec![0, 2, 3, 4, 5]);
-        assert_eq!(&page_indices[..5], &[0, 1, 128, 256, 384]);
-        assert_eq!(last_page_len, vec![11, 1, 1, 1]);
+            build_slot_page_table(4, 16, &kv_pages, &[2, 0], &[26, 1]).unwrap();
+        assert_eq!(page_indices, vec![9, 7, 40, 41, 7]);
+        assert_eq!(page_indptr, vec![0, 1, 2, 4, 5]);
+        assert_eq!(last_page_len, vec![1, 1, 10, 1]);
+    }
 
-        let (_, page_indptr, last_page_len) =
-            build_decode_append_page_metadata(4, 16, 128, &[27, 0, 0, 0]).unwrap();
-        assert_eq!(page_indptr, vec![0, 2, 3, 4, 5]);
-        assert_eq!(last_page_len[0], 12);
+    #[test]
+    fn slot_page_table_last_page_len_tracks_page_boundary() {
+        // 16 tokens fill one page exactly; 17 spill one token into a second.
+        let full = KimiKvStepPages::single(vec![3], 0);
+        let (_, _, last_page_len) = build_slot_page_table(1, 16, &full, &[0], &[16]).unwrap();
+        assert_eq!(last_page_len, vec![16]);
+
+        let spill = KimiKvStepPages::single(vec![3, 4], 0);
+        let (_, _, last_page_len) = build_slot_page_table(1, 16, &spill, &[0], &[17]).unwrap();
+        assert_eq!(last_page_len, vec![1]);
+    }
+
+    #[test]
+    fn slot_page_table_rejects_page_count_mismatch() {
+        // 26 tokens need 2 pages; offering 1 or 3 must fail loudly — the
+        // scheduler's block accounting and the kernel view must agree.
+        let short = KimiKvStepPages::single(vec![40], 0);
+        assert!(build_slot_page_table(2, 16, &short, &[0], &[26]).is_err());
+        let long = KimiKvStepPages::single(vec![40, 41, 42], 0);
+        assert!(build_slot_page_table(2, 16, &long, &[0], &[26]).is_err());
+    }
+
+    #[test]
+    fn slot_page_table_rejects_out_of_range_slot_and_row_mismatch() {
+        let kv_pages = KimiKvStepPages::single(vec![1], 0);
+        assert!(build_slot_page_table(2, 16, &kv_pages, &[2], &[1]).is_err());
+        assert!(build_slot_page_table(2, 16, &kv_pages, &[0, 1], &[1, 1]).is_err());
     }
 }

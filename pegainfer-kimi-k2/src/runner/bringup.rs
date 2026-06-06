@@ -24,10 +24,20 @@ use crate::{
         executor::{ForwardExecutor, Tp1Dp8ForwardExecutor, Tp8Dp1ForwardExecutor},
         load_balancer::DpLoadBalancer,
         scheduler::{KimiK2Scheduler, dp::DpCoordinator},
-        worker::{KimiRankWeightLoadReport, KimiRankWorker, build_placements},
+        worker::{KIMI_KV_PAGE_SIZE, KimiRankWeightLoadReport, KimiRankWorker, build_placements},
     },
     weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
 };
+use pegainfer_kv_cache::BlockPool;
+
+/// TP8 replicates the KV pool on every rank: 8192 pages × 16 tokens ×
+/// (576 ckv + 64 kpe) bf16 ≈ 9.2 GiB per rank — the same footprint as the
+/// old static bs64 arena, now shared across requests instead of sliced
+/// into fixed 2048-token slots.
+const KIMI_TP8_KV_POOL_PAGES: usize = 8192;
+/// DP shards requests across ranks, so each rank only backs its own slots:
+/// 1024 pages ≈ 1.15 GiB per rank (the old per-rank arena footprint).
+const KIMI_DP_KV_POOL_PAGES_PER_RANK: usize = 1024;
 
 pub(crate) fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
     let parallel = resolve_parallel_config(options);
@@ -70,6 +80,7 @@ fn build_runner_config(
     options: &EngineLoadOptions,
     parallel: ParallelConfig,
     shape: KimiK2ParallelShape,
+    kv_pool_pages: usize,
 ) -> Result<KimiK2RunnerConfig> {
     let started = Instant::now();
     info!("kimi-k2: start build runner config");
@@ -99,6 +110,7 @@ fn build_runner_config(
         pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
         ep_backend: options.ep_backend,
+        kv_pool_pages,
     };
     info!(
         "kimi-k2: build runner config cost {:.2}s: ranks={}",
@@ -127,9 +139,11 @@ fn start_engine_tp8_dp1(
         options,
         parallel,
         KimiK2ParallelShape::tp8_ep8(),
+        KIMI_TP8_KV_POOL_PAGES,
     )?;
     let stop_token_ids = load_stop_token_ids(model_path)?;
     let executor = build_tp8_dp1_executor(&config)?;
+    let pool = BlockPool::new(KIMI_KV_PAGE_SIZE, config.kv_pool_pages)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
     let (init_tx, init_rx) = bounded::<Result<()>>(1);
@@ -137,7 +151,7 @@ fn start_engine_tp8_dp1(
         .name("kimi-k2-scheduler".into())
         .spawn(move || {
             pin_scheduler_thread(&config.thread_placement);
-            let mut scheduler = match KimiK2Scheduler::new(executor, stop_token_ids) {
+            let mut scheduler = match KimiK2Scheduler::new(executor, stop_token_ids, pool) {
                 Ok(scheduler) => scheduler,
                 Err(err) => {
                     let _ = init_tx.send(Err(err));
@@ -173,10 +187,14 @@ fn start_engine_tp1_dp8(
         options,
         parallel,
         KimiK2ParallelShape::tp1_dp8(),
+        KIMI_DP_KV_POOL_PAGES_PER_RANK,
     )?;
     let stop_token_ids = load_stop_token_ids(model_path)?;
     let executors = build_tp1_dp8_executors(&config)?;
-    let coordinator = DpCoordinator::new(executors, stop_token_ids, options.seed);
+    let pools = (0..dp_world)
+        .map(|_| BlockPool::new(KIMI_KV_PAGE_SIZE, config.kv_pool_pages))
+        .collect::<Result<Vec<_>>>()?;
+    let coordinator = DpCoordinator::new(executors, stop_token_ids, options.seed, pools);
     let lb = DpLoadBalancer::new(dp_world);
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
@@ -324,6 +342,7 @@ fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
             ctx,
             Arc::clone(&collective_barrier),
             config.enable_cuda_graph,
+            config.kv_pool_pages,
         )?;
         debug_assert_eq!(worker.placement(), placement);
         workers.push(worker);
@@ -377,7 +396,7 @@ fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]
     };
     let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
     let pplx_params = pegainfer_comm::bootstrap::PplxBootstrapParams {
-        max_num_tokens: 2048,
+        max_num_tokens: crate::runner::moe_pplx::PPLX_MAX_DISPATCH_TOKENS,
         expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
         out_dtype: pegainfer_comm::ScalarType::F32,
         canonicalize_duplicate_sources: config.parallel.tp_world() > 1
