@@ -8,13 +8,13 @@
 
 - **Read**:
   - `docs/index.md` - routed this task to the kernels subsystem with Kimi-K2 as the first consumer.
-  - `docs/models/kimi-k2/operator-todo.md` - showed the Kimi decode/prefill hot paths and the CUDA Graph boundary constraints that the macro must preserve.
+  - `docs/models/kimi-k2/bringup-history.md` - showed the Kimi decode/prefill hot paths and the CUDA Graph boundary constraints that the macro must preserve.
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed reusable kernel/runtime helpers belong in `pegainfer-kernels`, while model-specific execution remains in model crates.
   - `pegainfer-kernels/src/forward_pass.rs` - found the existing `typed_forward_pass!` DSL covering a subset of typed ops.
   - `pegainfer-kernels/src/typed_ops.rs` - confirmed the typed op surface available to the macro.
   - `pegainfer-kimi-k2/src/runner/worker.rs` - identified repeated typed op chains in MLA, dense MLP, and MoE paths.
 - **Relevant history**:
-  - `docs/models/kimi-k2/operator-todo.md` records that decode graph capture requires stable pointers and no decode-step allocation; macro expansion must not hide allocations inside decode paths.
+  - `docs/models/kimi-k2/bringup-history.md` records that decode graph capture requires stable pointers and no decode-step allocation; macro expansion must not hide allocations inside decode paths.
 - **Plan**:
   1. Extend `pegainfer-kernels/src/forward_pass.rs` into a generic typed pipeline macro with explicit `ctx`, `eps`, optional `seq_len`, and configurable GEMM mode.
   2. Support reusable statements for typed tensor allocation, `rms_norm`, `gemm`, `silu_mul`, `add`, `swap`, bf16/f32 conversion, and escape hatches for arbitrary calls that return `Result`.
