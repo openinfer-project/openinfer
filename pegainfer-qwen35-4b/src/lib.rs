@@ -1,3 +1,5 @@
+pub mod kernel_plan;
+
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
@@ -17,6 +19,8 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
+
+pub use kernel_plan::kernel_plan;
 
 /// Low-level Qwen3.5 execution interface.
 ///
