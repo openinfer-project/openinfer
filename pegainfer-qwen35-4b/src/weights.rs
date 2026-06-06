@@ -327,7 +327,7 @@ impl Qwen35Model {
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
-        let max_prefill_len = super::prefill::MAX_SEQ;
+        let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
         let scratch_reserve =
             super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
         let available = free_bytes.saturating_sub(scratch_reserve);

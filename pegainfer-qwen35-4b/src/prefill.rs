@@ -1,8 +1,11 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-/// Maximum prefill sequence length for Qwen3.5 full-attention paged kernels.
-pub(crate) const MAX_SEQ: usize = 20_000;
+/// Sequence length used for conservative prefill scratch reservation.
+///
+/// This is not an admission cap. Actual prompt admission is governed by the
+/// paged KV pool, RoPE cache coverage, and allocation success.
+pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 const HEAD_DIM: usize = 256;
 
 use super::prefill_buffers::GdrChunkwiseScratch35;
@@ -26,9 +29,8 @@ fn checked_prefill_end_pos(
         anyhow::anyhow!("Qwen3.5 prefill position overflow: base_pos={base_pos}, seq_len={seq_len}")
     })?;
     anyhow::ensure!(
-        end_pos <= MAX_SEQ,
-        "Qwen3.5 prefill HND staging supports end_pos <= {MAX_SEQ}, requested end_pos={end_pos}; max_position_embeddings={}",
-        max_position_embeddings
+        end_pos <= max_position_embeddings,
+        "Qwen3.5 prefill requested end_pos={end_pos}, beyond max_position_embeddings={max_position_embeddings}"
     );
     Ok(end_pos)
 }
@@ -423,27 +425,27 @@ impl Qwen35Model {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SEQ, checked_prefill_end_pos};
+    use super::checked_prefill_end_pos;
 
     #[test]
-    fn checked_prefill_end_pos_accepts_staging_cap() {
+    fn checked_prefill_end_pos_accepts_config_limit() {
         assert_eq!(
-            checked_prefill_end_pos(0, MAX_SEQ, 262_144).unwrap(),
-            MAX_SEQ
+            checked_prefill_end_pos(0, 262_144, 262_144).unwrap(),
+            262_144
         );
         assert_eq!(
-            checked_prefill_end_pos(MAX_SEQ - 1, 1, 262_144).unwrap(),
-            MAX_SEQ
+            checked_prefill_end_pos(262_143, 1, 262_144).unwrap(),
+            262_144
         );
     }
 
     #[test]
-    fn checked_prefill_end_pos_rejects_past_staging_cap() {
-        let err = checked_prefill_end_pos(0, MAX_SEQ + 1, 262_144)
+    fn checked_prefill_end_pos_rejects_past_config_limit() {
+        let err = checked_prefill_end_pos(0, 262_145, 262_144)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("end_pos <= 20000"));
-        assert!(err.contains("requested end_pos=20001"));
+        assert!(err.contains("beyond max_position_embeddings=262144"));
+        assert!(err.contains("requested end_pos=262145"));
     }
 
     #[test]

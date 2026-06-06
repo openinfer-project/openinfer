@@ -183,7 +183,7 @@ mod tests {
             let mut rec_a = RecurrentState::new(&model.ctx, &model.config).unwrap();
             let mut rec_b = RecurrentState::new(&model.ctx, &model.config).unwrap();
 
-            // Prefill both prompts (drop HND staging buffers between prefills to save memory)
+            // Prefill both prompts with separate request-local sequence trackers.
             let first_logits_a = {
                 let mut kv_cache = KVCache::new(
                     model.config.num_full_attention_layers(),
