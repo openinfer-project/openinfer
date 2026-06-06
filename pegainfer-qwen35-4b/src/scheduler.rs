@@ -30,7 +30,8 @@ use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::DeviceVec;
 
 use self::plan::{
-    ExecutionPlan, admit_pending_requests, compaction_after_retire, slot_for_new_request,
+    ActiveKvBudget, ExecutionPlan, admit_pending_requests, compaction_after_retire, max_kv_tokens,
+    slot_for_new_request,
 };
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -49,6 +50,88 @@ struct ActiveRequest35 {
     params: SamplingParams,
     /// Number of top logprobs to return (0 = disabled).
     logprobs: usize,
+}
+
+trait SchedulerDriver {
+    type Active;
+
+    fn max_batch(&self) -> usize;
+    fn page_size(&self) -> usize;
+    fn available_pages(&self) -> usize;
+    fn max_request_pages(&self) -> usize;
+    fn active_budget(&self, req: &Self::Active) -> ActiveKvBudget;
+    fn execute_plan(
+        &mut self,
+        active: &mut Vec<Self::Active>,
+        plan: ExecutionPlan<SchedulerRequest>,
+        rng: &mut StdRng,
+    );
+}
+
+struct Qwen35SchedulerDriver {
+    model: Qwen35Model,
+    graph_state: BatchDecodeGraphState,
+    sample_scratch: SampleScratch,
+    max_batch: usize,
+}
+
+impl SchedulerDriver for Qwen35SchedulerDriver {
+    type Active = ActiveRequest35;
+
+    fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
+    fn page_size(&self) -> usize {
+        self.model.kv_pool().layout().page_size
+    }
+
+    fn available_pages(&self) -> usize {
+        self.model.kv_pool().available_pages()
+    }
+
+    fn max_request_pages(&self) -> usize {
+        // KvPool capacity includes the CUDA Graph padding page reserved at
+        // construction, so a real request can use at most the remaining pages.
+        self.model.kv_pool().capacity_pages().saturating_sub(1)
+    }
+
+    fn active_budget(&self, req: &Self::Active) -> ActiveKvBudget {
+        ActiveKvBudget {
+            prompt_len: req.prompt_len,
+            generated_count: req.generated_count,
+            max_tokens: req.max_tokens,
+        }
+    }
+
+    fn execute_plan(
+        &mut self,
+        active: &mut Vec<Self::Active>,
+        plan: ExecutionPlan<SchedulerRequest>,
+        rng: &mut StdRng,
+    ) {
+        match plan {
+            ExecutionPlan::Unified { pending } => unified_step_sched(
+                &self.model,
+                active,
+                pending,
+                &mut self.graph_state,
+                &mut self.sample_scratch,
+                rng,
+            ),
+            ExecutionPlan::Prefill { pending } => prefill_batch(
+                &self.model,
+                active,
+                pending,
+                &mut self.graph_state,
+                &mut self.sample_scratch,
+                rng,
+            ),
+            ExecutionPlan::Decode => {
+                decode_step(&self.model, active, &mut self.graph_state, rng);
+            }
+        }
+    }
 }
 
 /// Scratch buffers for GPU sampling (reused across prefill sampling).
@@ -98,14 +181,13 @@ pub fn start_with_capacity(
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                scheduler_loop(
+                let driver = Qwen35SchedulerDriver {
                     model,
-                    submit_rx,
                     graph_state,
                     sample_scratch,
-                    seed,
                     max_batch,
-                );
+                };
+                scheduler_loop(driver, submit_rx, seed);
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -153,19 +235,18 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 // ── Main loop ───────────────────────────────────────────────────────────
 
 #[allow(clippy::needless_pass_by_value)]
-fn scheduler_loop(
-    model: Qwen35Model,
+fn scheduler_loop<D>(
+    mut driver: D,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
-    mut graph_state: BatchDecodeGraphState,
-    mut sample_scratch: SampleScratch,
     seed: u64,
-    max_batch: usize,
-) {
+) where
+    D: SchedulerDriver,
+{
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut active: Vec<ActiveRequest35> = Vec::new();
+    let mut active: Vec<D::Active> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
 
-    info!("Qwen3.5 scheduler ready (max_batch={})", max_batch);
+    info!("Qwen3.5 scheduler ready (max_batch={})", driver.max_batch());
 
     loop {
         // 1. Drain all pending requests (deferred from last iteration + channel)
@@ -187,40 +268,41 @@ fn scheduler_loop(
             }
         }
 
+        let active_budget: Vec<ActiveKvBudget> =
+            active.iter().map(|req| driver.active_budget(req)).collect();
         let admission = admit_pending_requests(
             pending,
-            active.len(),
-            graph_state.slot_states.len(),
-            model.kv_pool().layout().page_size,
-            model.kv_pool().available_pages(),
+            &active_budget,
+            driver.max_batch(),
+            driver.page_size(),
+            driver.available_pages(),
+            driver.max_request_pages(),
             |req| req.prompt_tokens.len(),
+            |req| req.max_tokens,
         );
+        for rejected in &admission.rejected {
+            send_rejection(rejected);
+        }
         let pending = admission.pending;
         deferred = admission.deferred;
 
-        match plan::build_next_plan(!active.is_empty(), pending) {
-            Some(ExecutionPlan::Unified { pending }) => unified_step_sched(
-                &model,
-                &mut active,
-                pending,
-                &mut graph_state,
-                &mut sample_scratch,
-                &mut rng,
-            ),
-            Some(ExecutionPlan::Prefill { pending }) => prefill_batch(
-                &model,
-                &mut active,
-                pending,
-                &mut graph_state,
-                &mut sample_scratch,
-                &mut rng,
-            ),
-            Some(ExecutionPlan::Decode) => {
-                decode_step(&model, &mut active, &mut graph_state, &mut rng)
-            }
-            None => {}
+        if let Some(plan) = plan::build_next_plan(!active.is_empty(), pending) {
+            driver.execute_plan(&mut active, plan, &mut rng);
         }
     }
+}
+
+fn send_rejection(req: &SchedulerRequest) {
+    let max_context_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message: format!(
+            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
+            req.prompt_tokens.len(),
+            max_context_tokens
+        ),
+        prompt_tokens: req.prompt_tokens.len(),
+        completion_tokens: 0,
+    });
 }
 
 // ── Batch prefill ───────────────────────────────────────────────────────
@@ -246,9 +328,10 @@ fn prefill_batch(
         Ok(v) => v,
         Err(e) => {
             warn!("Qwen3.5 batch prefill failed: {e}");
+            let message = e.to_string();
             for req in pending {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_tokens.len(),
                     completion_tokens: 0,
                 });
@@ -265,6 +348,11 @@ fn prefill_batch(
             Ok(t) => t,
             Err(e) => {
                 warn!("First token sampling failed for request {i}: {e}");
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: e.to_string(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: 0,
+                });
                 continue;
             }
         };
@@ -371,18 +459,19 @@ fn unified_step_sched(
         Ok(v) => v,
         Err(e) => {
             warn!("Qwen3.5 unified step failed: {e}");
+            let message = e.to_string();
             // Notify all pending requests
             for req in pending {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_tokens.len(),
                     completion_tokens: 0,
                 });
             }
             // Notify all active decode requests
             for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_len,
                     completion_tokens: req.generated_count,
                 });
@@ -403,6 +492,11 @@ fn unified_step_sched(
                 Ok(t) => t,
                 Err(e) => {
                     warn!("First token sampling failed for request {i}: {e}");
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: e.to_string(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: 0,
+                    });
                     continue;
                 }
             };
@@ -485,9 +579,10 @@ fn decode_step(
 
     if let Err(e) = model.batch_decode_graph(&token_ids, &mut kv_refs, graph_state) {
         warn!("Qwen3.5 batch_decode_graph error: {e}");
+        let message = e.to_string();
         for req in active.drain(..) {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message: message.clone(),
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
@@ -519,9 +614,10 @@ fn decode_step(
         Ok(t) => t,
         Err(e) => {
             warn!("Qwen3.5 sampling error: {e}");
+            let message = e.to_string();
             for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_len,
                     completion_tokens: req.generated_count,
                 });
@@ -567,9 +663,10 @@ fn process_decode_logits(
             }
             Err(e) => {
                 warn!("decode sampling error: {e}");
+                let message = e.to_string();
                 for req in active.drain(..) {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Stop,
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
                         prompt_tokens: req.prompt_len,
                         completion_tokens: req.generated_count,
                     });
@@ -756,4 +853,316 @@ fn compute_logprobs_from_cpu(
         logprob: sampled_logprob,
         top_logprobs: top,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeActive {
+        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        prompt_len: usize,
+        generated_count: usize,
+        max_tokens: usize,
+    }
+
+    struct FakeSchedulerDriver {
+        max_batch: usize,
+        page_size: usize,
+        available_pages: usize,
+        max_request_pages: usize,
+        fail_next_execution: Option<&'static str>,
+    }
+
+    impl FakeSchedulerDriver {
+        fn new(
+            max_batch: usize,
+            page_size: usize,
+            available_pages: usize,
+            max_request_pages: usize,
+        ) -> Self {
+            Self {
+                max_batch,
+                page_size,
+                available_pages,
+                max_request_pages,
+                fail_next_execution: None,
+            }
+        }
+
+        fn with_next_execution_failure(mut self, message: &'static str) -> Self {
+            self.fail_next_execution = Some(message);
+            self
+        }
+    }
+
+    impl SchedulerDriver for FakeSchedulerDriver {
+        type Active = FakeActive;
+
+        fn max_batch(&self) -> usize {
+            self.max_batch
+        }
+
+        fn page_size(&self) -> usize {
+            self.page_size
+        }
+
+        fn available_pages(&self) -> usize {
+            self.available_pages
+        }
+
+        fn max_request_pages(&self) -> usize {
+            self.max_request_pages
+        }
+
+        fn active_budget(&self, req: &Self::Active) -> ActiveKvBudget {
+            ActiveKvBudget {
+                prompt_len: req.prompt_len,
+                generated_count: req.generated_count,
+                max_tokens: req.max_tokens,
+            }
+        }
+
+        fn execute_plan(
+            &mut self,
+            active: &mut Vec<Self::Active>,
+            plan: ExecutionPlan<SchedulerRequest>,
+            _rng: &mut StdRng,
+        ) {
+            if let Some(message) = self.fail_next_execution.take() {
+                fail_fake_plan(active, plan, message);
+                return;
+            }
+
+            match plan {
+                ExecutionPlan::Prefill { pending } => {
+                    for req in pending {
+                        fake_prefill_success(active, req);
+                    }
+                }
+                ExecutionPlan::Unified { pending } => {
+                    fake_decode_success(active);
+                    for req in pending {
+                        fake_prefill_success(active, req);
+                    }
+                }
+                ExecutionPlan::Decode => fake_decode_success(active),
+            }
+        }
+    }
+
+    fn fail_fake_plan(
+        active: &mut Vec<FakeActive>,
+        plan: ExecutionPlan<SchedulerRequest>,
+        message: &str,
+    ) {
+        match plan {
+            ExecutionPlan::Prefill { pending } | ExecutionPlan::Unified { pending } => {
+                for req in pending {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.to_string(),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+            }
+            ExecutionPlan::Decode => {}
+        }
+        for req in active.drain(..) {
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message: message.to_string(),
+                prompt_tokens: req.prompt_len,
+                completion_tokens: req.generated_count,
+            });
+        }
+    }
+
+    fn fake_prefill_success(active: &mut Vec<FakeActive>, req: SchedulerRequest) {
+        let prompt_len = req.prompt_tokens.len();
+        if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: 11,
+                logprob: None,
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        if req.max_tokens <= 1 {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: prompt_len,
+                completion_tokens: 1,
+            });
+            return;
+        }
+
+        active.push(FakeActive {
+            token_tx: req.token_tx,
+            prompt_len,
+            generated_count: 1,
+            max_tokens: req.max_tokens,
+        });
+    }
+
+    fn fake_decode_success(active: &mut Vec<FakeActive>) {
+        for mut req in active.drain(..) {
+            req.generated_count += 1;
+            let _ = req.token_tx.send(TokenEvent::Token {
+                id: 12,
+                logprob: None,
+            });
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: req.prompt_len,
+                completion_tokens: req.generated_count,
+            });
+        }
+    }
+
+    fn start_fake_scheduler(driver: FakeSchedulerDriver) -> SchedulerHandle {
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let join_handle = thread::Builder::new()
+            .name("scheduler-qwen35-fake".into())
+            .spawn(move || scheduler_loop(driver, submit_rx, 0))
+            .expect("spawn fake scheduler");
+        SchedulerHandle::new_with_join_handle(submit_tx, join_handle)
+    }
+
+    fn fake_request(
+        prompt_len: usize,
+        max_tokens: usize,
+    ) -> (SchedulerRequest, mpsc::UnboundedReceiver<TokenEvent>) {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        (
+            SchedulerRequest {
+                request_id: None,
+                queued_at_unix_s: None,
+                prompt_tokens: vec![1; prompt_len],
+                params: SamplingParams::default(),
+                max_tokens,
+                lora_adapter: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            },
+            token_rx,
+        )
+    }
+
+    fn recv_event(rx: &mut mpsc::UnboundedReceiver<TokenEvent>) -> TokenEvent {
+        rx.blocking_recv().expect("token event")
+    }
+
+    #[test]
+    fn send_rejection_reports_kv_lifetime_context() {
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        let req = SchedulerRequest {
+            request_id: Some("too-large".to_string()),
+            queued_at_unix_s: None,
+            prompt_tokens: vec![1; 16],
+            params: SamplingParams::default(),
+            max_tokens: 65,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        };
+
+        send_rejection(&req);
+
+        match token_rx.blocking_recv() {
+            Some(TokenEvent::Rejected {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            }) => {
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 0);
+                assert!(
+                    message.contains("max_context_tokens=80"),
+                    "rejection should report the full lifetime KV context"
+                );
+            }
+            _ => panic!("expected rejection event"),
+        }
+    }
+
+    #[test]
+    fn scheduler_loop_rejects_impossible_request_without_blocking_later_fit() {
+        let handle = start_fake_scheduler(FakeSchedulerDriver::new(1, 16, 4, 4));
+        let (too_large, mut too_large_rx) = fake_request(16, 65);
+        let (fits, mut fits_rx) = fake_request(16, 1);
+
+        handle.submit(too_large).expect("submit too-large request");
+        handle.submit(fits).expect("submit fitting request");
+
+        match recv_event(&mut too_large_rx) {
+            TokenEvent::Rejected {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 0);
+                assert!(message.contains("max_context_tokens=80"));
+            }
+            _ => panic!("expected rejection for impossible request"),
+        }
+
+        assert!(matches!(
+            recv_event(&mut fits_rx),
+            TokenEvent::Token { id: 11, .. }
+        ));
+        assert!(matches!(
+            recv_event(&mut fits_rx),
+            TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 16,
+                completion_tokens: 1,
+            }
+        ));
+        drop(handle);
+    }
+
+    #[test]
+    fn scheduler_loop_reports_execution_error_and_accepts_next_request() {
+        let handle = start_fake_scheduler(
+            FakeSchedulerDriver::new(1, 16, 4, 4)
+                .with_next_execution_failure("fake prefill failed"),
+        );
+        let (first, mut first_rx) = fake_request(16, 1);
+        let (second, mut second_rx) = fake_request(16, 1);
+
+        handle.submit(first).expect("submit first request");
+        match recv_event(&mut first_rx) {
+            TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                assert_eq!(message, "fake prefill failed");
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 0);
+            }
+            _ => panic!("expected execution error"),
+        }
+
+        handle.submit(second).expect("submit second request");
+        assert!(matches!(
+            recv_event(&mut second_rx),
+            TokenEvent::Token { id: 11, .. }
+        ));
+        assert!(matches!(
+            recv_event(&mut second_rx),
+            TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 16,
+                completion_tokens: 1,
+            }
+        ));
+        drop(handle);
+    }
 }
