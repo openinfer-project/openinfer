@@ -15,7 +15,7 @@
 //! use pegainfer_qwen35_4b::kernel_plan;
 //! for phase in kernel_plan().phases {
 //!     for op in phase.ops {
-//!         println!("{phase}::{op.id} -> {op.backend}");
+//!         println!("[{}] {} -> {}", phase.name, op.id, op.backend);
 //!     }
 //! }
 //! ```
@@ -60,25 +60,25 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 KernelOp {
                     id: "qk_norm_partial_rope_prefill",
                     rust: "prefill::prefill_full_attention -> ffi::prefill_attention_hd256_prep_cuda",
-                    backend: "CUDA (csrc/prefill_attention_hd256_prep.cu)",
+                    backend: "CUDA (csrc/qwen35/prefill_attention_hd256.cu)",
                     notes: "Q/K RMSNorm + partial RoPE; head_dim=256",
                 },
                 KernelOp {
                     id: "paged_kv_scatter_prefill",
                     rust: "prefill::prefill_full_attention -> ffi::paged_kv_scatter_cuda",
-                    backend: "CUDA (csrc/paged_kv_scatter.cu)",
+                    backend: "CUDA (csrc/shared/paged_attention.cu)",
                     notes: "scatter processed K/V from HND staging buffer into paged pool",
                 },
                 KernelOp {
                     id: "paged_prefill_attention",
                     rust: "prefill::prefill_full_attention -> ffi::batch_prefill_paged_cuda_hd256",
-                    backend: "CUDA (csrc/batch_prefill_paged.cu)",
-                    notes: "FlashInfer-style paged prefill attention, head_dim=256",
+                    backend: "CUDA (csrc/shared/paged_attention.cu)",
+                    notes: "custom paged prefill attention, head_dim=256 (NOT FlashInfer)",
                 },
                 KernelOp {
                     id: "attention_gate_prefill",
                     rust: "prefill::prefill_full_attention -> ffi::attention_gate_batch_hd256_cuda",
-                    backend: "CUDA",
+                    backend: "CUDA (csrc/qwen35/prefill_attention_hd256.cu)",
                     notes: "Q-gated attention output scaling",
                 },
                 KernelOp {
@@ -177,19 +177,19 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 KernelOp {
                     id: "qk_norm_partial_rope_decode",
                     rust: "batch_decode::batch_decode_full_attention -> ops::qk_norm_partial_rope_batched_decode_hd256_into",
-                    backend: "CUDA (csrc/qk_norm_partial_rope_batched_decode_hd256.cu)",
+                    backend: "CUDA (csrc/qwen35/prefill_attention_hd256.cu)",
                     notes: "Q/K RMSNorm + partial RoPE, head_dim=256",
                 },
                 KernelOp {
                     id: "paged_decode_attention",
                     rust: "batch_decode::batch_decode_full_attention -> ops::paged_attention_batch_decode_hd256_into",
-                    backend: "FlashInfer",
-                    notes: "paged KV read with per-request CSR metadata",
+                    backend: "CUDA (csrc/shared/paged_attention.cu)",
+                    notes: "wraps paged_kv_scatter + paged_attention_decode (both in shared/paged_attention.cu) — NOT FlashInfer; custom kernels only",
                 },
                 KernelOp {
                     id: "attention_gate_decode",
                     rust: "batch_decode::batch_decode_full_attention -> ffi::attention_gate_batch_hd256_cuda",
-                    backend: "CUDA",
+                    backend: "CUDA (csrc/qwen35/prefill_attention_hd256.cu)",
                     notes: "Q-gated attention output scaling",
                 },
                 KernelOp {
