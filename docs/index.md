@@ -64,6 +64,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 model status and benchmark ledger: HF/host-staged/NCCL are exact for the narrow greedy gate; direct same-prompt batch and manual vLLM snapshots are diagnostic evidence, not production serving parity. |
 | `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150: HF incremental greedy, host-staged EP2, and NCCL EP2 are token/text exact for `Hello`, output_len=16. |
 | `models/deepseek-v2-lite/decode-attribution-gate.md` | DeepSeek-V2-Lite EP2 decode attribution gate for `Hello`/16-token batch sizes 1/4/8: structured JSON with accuracy hashes, CPU-side timing, selected CUDA event/NVTX attribution, host-staged/NCCL EP counts, and explicit no-throughput claim boundary. |
+| `models/deepseek-v2-lite/source-layout.md` | DeepSeek-V2-Lite runtime layout refactor: `runtime.rs` split by responsibility, HF/host-staged/NCCL EP2 E2E exact on 2x RTX 5090; NCCL CUDA Graph smoke remains a diagnostic blocker on that host, independent of the passed correctness gate. |
 
 ## models / kimi-k2
 
