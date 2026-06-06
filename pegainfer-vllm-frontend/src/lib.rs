@@ -398,10 +398,12 @@ impl LocalEngineBridge {
             ..
         } = request;
         let Some(prompt_tokens) = prompt_token_ids else {
+            warn!("request {request_id} dropped: missing prompt_token_ids");
             send_terminal_output(output_tx, request_id, EngineCoreFinishReason::Error, None)?;
             return Ok(());
         };
         let Some(sampling_params) = sampling_params else {
+            warn!("request {request_id} dropped: missing sampling_params");
             send_terminal_output(output_tx, request_id, EngineCoreFinishReason::Error, None)?;
             return Ok(());
         };
@@ -815,6 +817,7 @@ async fn run_request_stream(
                 return;
             }
             TokenEvent::Error { message, .. } => {
+                warn!("request {request_id} failed: {message}");
                 let _ = send_terminal_output(
                     &output_tx,
                     request_id,
@@ -825,6 +828,7 @@ async fn run_request_stream(
             }
             TokenEvent::Rejected { message, .. } => {
                 // Rejected means the request could not be admitted, not that it completed cleanly.
+                warn!("request {request_id} rejected: {message}");
                 let _ = send_terminal_output(
                     &output_tx,
                     request_id,
