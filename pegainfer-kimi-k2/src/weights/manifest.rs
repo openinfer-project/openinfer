@@ -46,7 +46,6 @@ pub(crate) struct KimiSharedExpertManifest {
 pub(crate) struct KimiInt4ProjectionManifest {
     pub weight_packed: KimiTensorEntry,
     pub weight_scale: KimiTensorEntry,
-    pub weight_shape: KimiTensorEntry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,7 +140,6 @@ pub(crate) struct KimiSharedExpertWeightNames {
 pub(crate) struct KimiInt4ProjectionWeightNames {
     pub weight_packed: String,
     pub weight_scale: String,
-    pub weight_shape: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -522,7 +520,6 @@ impl KimiInt4ProjectionWeightNames {
         Self {
             weight_packed: manifest.weight_packed.name.clone(),
             weight_scale: manifest.weight_scale.name.clone(),
-            weight_shape: manifest.weight_shape.name.clone(),
         }
     }
 }
@@ -602,7 +599,6 @@ fn push_int4_projection_load_specs(
 ) {
     push_load_spec(out, &projection.weight_packed, KimiTensorLoadSlice::Full);
     push_load_spec(out, &projection.weight_scale, KimiTensorLoadSlice::Full);
-    push_load_spec(out, &projection.weight_shape, KimiTensorLoadSlice::Full);
 }
 
 fn rank_shard_rows(total_rows: usize, rank: usize, world: usize) -> KimiTensorLoadSlice {
@@ -708,7 +704,6 @@ fn int4_projection_manifest(
     Ok(KimiInt4ProjectionManifest {
         weight_packed: layer_tensor(tensors, layer_idx, &format!("{prefix}.weight_packed"))?,
         weight_scale: layer_tensor(tensors, layer_idx, &format!("{prefix}.weight_scale"))?,
-        weight_shape: layer_tensor(tensors, layer_idx, &format!("{prefix}.weight_shape"))?,
     })
 }
 
@@ -757,5 +752,4 @@ fn push_int4_projection<'a>(
 ) {
     out.push(&projection.weight_packed);
     out.push(&projection.weight_scale);
-    out.push(&projection.weight_shape);
 }

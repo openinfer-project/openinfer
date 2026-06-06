@@ -64,26 +64,21 @@ symbols directly through `pegainfer_kernels::ffi`.
 
 ## Kimi-K2 Text TP8/EP8 Path
 
-Kimi-K2 uses the `pegainfer-kimi-k2` model crate. The first kernel-crate surface
+Kimi-K2 uses the `pegainfer-kimi-k2` model crate. The kernel-crate surface
 is text-only and targets TP8/EP8 with bs > 1 from the start. Shared BF16 ops
 reuse existing PegaInfer wrappers. Kimi-specific MoE router and routed INT4
 expert entry points live under model-specific ops modules. Kimi router uses the
-existing graph-safe GEMM path plus a device-side top8 selector. The current
-CUTLASS example69 INT4 launcher is retained only as a launch/limitation probe:
-H20 focused tests show it cannot express Kimi `group_size=32` BF16 scale
-semantics, even though its signed nibble conversion is correct. Kimi routed
-expert correctness requires a replacement W4A16 backend before full-model
-parity claims. Scale metadata now separates checkpoint `[expert,out,group]`,
-CUTLASS example69 group-major `[expert,group,out]`, and vLLM Marlin
-group-major+perm64 `[expert,group,out]`; packed-weight metadata likewise separates
-checkpoint offset-binary, CUTLASS signed reordered, and Marlin uint4b8
-no-actorder. The final Marlin runtime package is fused W13 (`gate_then_up`)
-plus W2: W13 uses `[expert,K/16,4096*2]` packed weight and
-`[expert,K/32,4096]` scale, both in vLLM layout. `kimi_marlin_int4_reorder_weight_cuda`,
-`kimi_marlin_int4_reorder_scale_cuda`, and `kimi_marlin_int4_fuse_w13_cuda`
-implement the vLLM Marlin package layouts for the future WNA16 backend.
-Kimi EP dispatch/combine is planned for
-pplx-garden EP rather than NCCL AG/RS.
+existing graph-safe GEMM path plus a device-side top8 selector. Routed experts
+run on the vLLM Marlin WNA16 backend; the earlier CUTLASS example69
+expert-major INT4 path (probe launcher, expert-major route/expand/reduce
+kernels, and the `weight_shape` metadata tensor) was retired and removed
+(#234). Scale metadata separates checkpoint `[expert,out,group]` and vLLM
+Marlin group-major+perm64 `[expert,group,out]`; packed-weight metadata likewise
+separates checkpoint offset-binary and Marlin uint4b8 no-actorder. The Marlin
+runtime package is fused W13 (`gate_then_up`) plus W2: W13 uses
+`[expert,K/16,4096*2]` packed weight and `[expert,K/32,4096]` scale, both in
+vLLM layout. Kimi EP dispatch/combine uses pplx-garden EP rather than NCCL
+AG/RS.
 
 | op_id | Runtime owner | Rust wrapper | FFI symbols | Source | Backend | Shape / layout notes |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -99,15 +94,9 @@ pplx-garden EP rather than NCCL AG/RS.
 | `kimi_k2.attn.mla_decode_paged` | `pegainfer-kimi-k2` | `ops::kimi_flashinfer_batch_decode_mla` | `kimi_flashinfer_batch_decode_mla_cuda` | `csrc/kimi_k2/kimi_mla.cu` | FlashInfer BatchDecode MLA | Consumes absorbed `q_abs_nope [B,8,512]`, `q_pe [B,8,64]`, paged compressed KV, and decode plan arrays; writes latent attention output `[B,8,512]`. `W_UK_T [H,128,512]` absorption and `W_UV [H,512,128]` v-up stay model-side. |
 | `kimi_k2.attn.mla_v_up` | `pegainfer-kimi-k2` | `ops::kimi_mla_v_up` | `kimi_mla_v_up_cuda` | `csrc/kimi_k2/kimi_mla.cu` | graph-safe cuBLAS strided-batched GEMM | Uses the `W_UV` slice inside `kv_b_proj [8,256,512]` directly: FlashInfer latent `[B,8,512] -> attn_out [B,8,128]`, one cuBLAS batch per local head, no D2H. |
 | `kimi_k2.moe.router_noaux_tc` | `pegainfer-kimi-k2` | `ops::kimi_router_noaux_tc_launch` | `kimi_k2_router_noaux_tc_cuda` | `csrc/kimi_k2/kimi_router.cu` | graph-safe GEMM + CUDA selector | BF16 hidden `[padded_tokens,7168]`, gate `[384,7168]`, correction bias `[384]`, output top8 route weights/indices for active tokens; logits projection uses library GEMM, selection stays device-resident. H20 rank0 gate covers real K2.5 layer1 gate/bias. |
-| `kimi_k2.moe.expert_major_route` | `pegainfer-kimi-k2` | `ops::kimi_moe_build_expert_major_route` | `kimi_moe_expert_major_route_cuda` | `csrc/kimi_k2/kimi_experts.cu` | CUDA routing metadata | Device-resident `topk_idx[active_tokens,8]` to local expert-major `u32 expert_indptr[49]`, `pos_to_token`, `token_topk_to_pos`, and `local_count`; no host route readback in the hot path. |
 | `kimi_k2.moe.marlin_align_block_size` | `pegainfer-kimi-k2` | `ops::kimi_moe_marlin_align_block_size` | `kimi_moe_marlin_align_block_size_cuda` | `csrc/kimi_k2/kimi_experts.cu` | CUDA routing metadata | Device-resident vLLM Marlin/WNA16 alignment: `sorted_token_ids`, `expert_ids`, and `num_tokens_post_padded` for local EP experts. It ignores non-local experts like vLLM `ignore_invalid_experts=True`, pads each local expert to block size `8/16/32/48/64`, uses sentinel `active_tokens * topk`, and performs no D2H or allocation in the decode step. |
-| `kimi_k2.moe.expert_major_expand` | `pegainfer-kimi-k2` | `ops::kimi_moe_expand_to_expert_major` | `kimi_moe_expand_to_expert_major_cuda` | `csrc/kimi_k2/kimi_experts.cu` | CUDA copy/scatter | BF16 token-major hidden `[active_tokens,7168]` to expert-major activation scratch `[routed_capacity,7168]` using device `pos_to_token`. |
-| `kimi_k2.moe.expert_major_reduce_f32` | `pegainfer-kimi-k2` | `ops::kimi_moe_reduce_expert_major_f32` | `kimi_moe_reduce_expert_major_f32_cuda` | `csrc/kimi_k2/kimi_experts.cu` | CUDA weighted reduce | BF16 expert-major output + f32 `topk_weight` + device `token_topk_to_pos` to f32 token-major routed output `[active_tokens,7168]`. |
-| `kimi_k2.moe.int4_metadata` | `pegainfer-kimi-k2` | `ops::kimi_int4_metadata_probe` | `kimi_int4_expert_metadata_probe_cuda` | `csrc/kimi_k2/kimi_experts.cu` | CUDA metadata stub | Shape contract for compressed-tensors `weight_packed` U8 `[48,out,in/2]`, checkpoint `weight_scale` BF16 `[48,out,in/32]`, and `weight_shape` I32 `[96]`; Rust manifest records signed symmetric INT4, low-then-high nibble order, and separate checkpoint/CUTLASS/Marlin group-major+perm64 scale layout specs. |
-| `kimi_k2.moe.int4_marlin_package` | `pegainfer-kimi-k2` | `ops::kimi_marlin_int4_reorder_weight`, `ops::kimi_marlin_int4_reorder_scale`, `ops::kimi_marlin_int4_fuse_w13` | `kimi_marlin_int4_reorder_weight_cuda`, `kimi_marlin_int4_reorder_scale_cuda`, `kimi_marlin_int4_fuse_w13_cuda` | `csrc/kimi_k2/kimi_marlin_int4.cu`, `csrc/kimi_k2/kimi_cutlass_int4_sm90a.cu` | CUDA load-time package helpers | Weight package preserves vLLM `uint4b8` bias=8 nibbles. Single projections repack checkpoint `[expert,out,K/8] int32` into Marlin no-actorder `[expert,K/16,N*2] int32`; scale package converts checkpoint `[expert,out,K/32]` into vLLM Marlin group-major+perm64 `[expert,K/32,out]`. Final runtime package fuses gate/up into W13 `[expert,K/16,4096*2]` and W13 scale `[expert,K/32,4096]`; W2 remains `[expert,2048/16,7168*2]` and `[expert,2048/32,7168]`. These are load/package helpers, not decode hot-path kernels. |
-| `kimi_k2.moe.int4_grouped_w1_w3` | `pegainfer-kimi-k2` | `ops::kimi_int4_grouped_w1_w3` | `kimi_int4_grouped_w1_w3_cuda`, `kimi_cutlass_int4_grouped_w1_w3_sm90a_cuda` | `csrc/kimi_k2/kimi_experts.cu`, `csrc/kimi_k2/kimi_cutlass_int4_sm90a.cu` | CUTLASS example69 limitation probe; backend replacement required | Expert-major BF16 input `[routed_tokens,7168]`, local experts `48`, topk `8`, group size `32`; W1/W3 fuse into one N=4096 grouped GEMM. Example69 launch can run on H20 but does not implement Kimi per32 BF16 scale semantics. |
+| `kimi_k2.moe.int4_marlin_package` | `pegainfer-kimi-k2` | `ops::kimi_marlin_int4_reorder_weight`, `ops::kimi_marlin_int4_reorder_scale`, `ops::kimi_marlin_int4_fuse_w13` | `kimi_marlin_int4_reorder_weight_cuda`, `kimi_marlin_int4_reorder_scale_cuda`, `kimi_marlin_int4_fuse_w13_cuda` | `csrc/kimi_k2/kimi_marlin_int4.cu` | CUDA load-time package helpers | Weight package preserves vLLM `uint4b8` bias=8 nibbles. Single projections repack checkpoint `[expert,out,K/8] int32` into Marlin no-actorder `[expert,K/16,N*2] int32`; scale package converts checkpoint `[expert,out,K/32]` into vLLM Marlin group-major+perm64 `[expert,K/32,out]`. Final runtime package fuses gate/up into W13 `[expert,K/16,4096*2]` and W13 scale `[expert,K/32,4096]`; W2 remains `[expert,2048/16,7168*2]` and `[expert,2048/32,7168]`. These are load/package helpers, not decode hot-path kernels. |
 | `kimi_k2.moe.swiglu` | `pegainfer-kimi-k2` | `ops::kimi_swiglu_silu_mul` | `silu_mul_triton_aot_cuda` | Triton AOT elementwise wrapper | Triton AOT | External `silu(gate) * up` BF16 scratch between W1/W3 and W2; keeps W2 as a plain CUTLASS grouped GEMM. |
-| `kimi_k2.moe.int4_grouped_w2` | `pegainfer-kimi-k2` | `ops::kimi_int4_grouped_w2_swiglu` | `kimi_int4_grouped_w2_swiglu_cuda`, `kimi_cutlass_int4_grouped_w2_sm90a_cuda` | `csrc/kimi_k2/kimi_experts.cu`, `csrc/kimi_k2/kimi_cutlass_int4_sm90a.cu` | CUTLASS example69 limitation probe; backend replacement required | Expert-major BF16 activated input `[routed_tokens,2048]` plus INT4 W2 to BF16 output `[routed_tokens,7168]`; bs > 1 remains explicit through `batch_size`, `active_tokens`, `routed_tokens`, and `expert_indptr[49]`. Example69 launch can run on H20 but does not implement Kimi per32 BF16 scale semantics. |
 
 ## Non-Qwen3 Compatibility
 
