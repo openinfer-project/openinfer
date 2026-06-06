@@ -204,6 +204,8 @@ impl RequestKv {
     }
 
     /// Physical page IDs assigned to this request, in sequence order.
+    /// Includes every block the request currently holds — which can be one
+    /// more than the KV tokens need (see `step_page_indices`).
     pub fn page_indices(&self) -> Vec<i32> {
         self.seq
             .inner()
@@ -211,5 +213,64 @@ impl RequestKv {
             .all_block_ids()
             .map(|&id| id as i32)
             .collect()
+    }
+
+    /// Page IDs covering exactly the KV tokens present after this step
+    /// appends `new_tokens` (`kv_position + new_tokens`). `page_indices()`
+    /// can hold one block more: kvbm's `schedule_decode` eagerly allocates
+    /// the next generation block whenever this step's token fills the last
+    /// slot of the current block. Page tables built from the raw list make
+    /// the kernel see a longer sequence than exists — use this for any
+    /// per-step page row handed to a forward pass.
+    pub fn step_page_indices(&self, new_tokens: usize) -> Vec<i32> {
+        assert!(new_tokens > 0, "a forward step appends at least one token");
+        let kv_tokens = self.seq.kv_position() + new_tokens;
+        let mut pages = self.page_indices();
+        pages.truncate(kv_tokens.div_ceil(self.seq.block_size()));
+        pages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// kvbm's `schedule_decode` allocates the next generation block when the
+    /// appended token fills the current block (`need = pending + 1`), so the
+    /// raw `page_indices()` exceeds `ceil(kv_tokens / block_size)` at every
+    /// block boundary. `step_page_indices` must hand the forward pass an
+    /// exact page row at every step — this deadlocked Kimi DP8 on H200 when
+    /// the raw list reached the worker's exact-match page-table check.
+    #[test]
+    fn step_page_indices_exact_at_block_boundaries() {
+        let mut raw_overshoots = 0usize;
+        for prompt_len in [1usize, 15, 16, 17, 31, 32, 33, 40, 47, 48] {
+            let pool = BlockPool::new(16, 256).unwrap();
+            let mut kv =
+                pool.new_request((0..prompt_len as u32).map(|i| 100 + i).collect(), 24, None);
+            kv.schedule_prefill(prompt_len, &pool).unwrap();
+            assert_eq!(
+                kv.step_page_indices(prompt_len).len(),
+                prompt_len.div_ceil(16),
+                "prefill page row P={prompt_len}"
+            );
+            kv.apply_prefill(1000, &pool).unwrap();
+            for step in 0..23u32 {
+                kv.schedule_decode(&pool).unwrap();
+                let need = (kv.kv_position() + 1).div_ceil(16);
+                assert_eq!(
+                    kv.step_page_indices(1).len(),
+                    need,
+                    "decode page row P={prompt_len} step={step}"
+                );
+                raw_overshoots += usize::from(kv.page_indices().len() > need);
+                kv.apply_decode(2000 + step, &pool).unwrap();
+            }
+        }
+        assert!(
+            raw_overshoots > 0,
+            "kvbm no longer over-allocates the generation block; \
+             step_page_indices and this test can be retired"
+        );
     }
 }

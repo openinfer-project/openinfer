@@ -259,7 +259,7 @@ impl KimiK2Scheduler {
                     schedule_err = Some(err);
                     break;
                 }
-                kv_rows.push(req.kv.page_indices());
+                kv_rows.push(req.kv.step_page_indices(1));
             }
             if let Some(err) = schedule_err {
                 let message = format!(
@@ -389,7 +389,10 @@ impl KimiK2Scheduler {
     ) -> Option<ActiveKimiRequest> {
         let completion_tokens = 0usize;
         let mut kv = self.schedule_request_kv(&req, req.prompt_tokens.len())?;
-        let kv_pages = KimiKvStepPages::single(kv.page_indices(), self.pool.padding_block_id());
+        let kv_pages = KimiKvStepPages::single(
+            kv.step_page_indices(req.prompt_tokens.len()),
+            self.pool.padding_block_id(),
+        );
         let last_token = match self.executor.forward_prefill(
             &req.prompt_tokens,
             slot,
@@ -502,7 +505,7 @@ impl KimiK2Scheduler {
         let kv_pages = KimiKvStepPages::new(
             group_kv
                 .iter()
-                .map(|(_, _, kv)| kv.page_indices())
+                .map(|(_, _, kv)| kv.step_page_indices(1))
                 .collect(),
             self.pool.padding_block_id(),
         );

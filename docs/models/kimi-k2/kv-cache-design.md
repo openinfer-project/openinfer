@@ -1,6 +1,6 @@
 # Kimi-K2 KV cache: adopting the qwen3 paged stack (#239 → #230/#231)
 
-**TL;DR**: Kimi's KV is *already paged* at the kernel level (FlashInfer-style page tables, paged MLA append/decode kernels) — the "fixed 2048-token arena" was only a static Rust-side slot→pages mapping. The qwen3 stack landed in **one PR with zero kernel changes**: a kvbm-managed `BlockPool` per rank replaces the static mapping, admission uses full-lifetime reservation (the qwen3 #85 pattern), over-cap requests get an explicit `Rejected` instead of poisoning the batch mid-decode, and the per-request cap rises 2048 → 8192 tokens (DP prompts stay ≤ 2048 — a PPLX fabric-buffer constraint, see below). This is the substrate for prefix cache (#230) and long context (#231). Landed on `feat/kimi-kv-pool`, 2026-06-06; 8×H200 verification pending.
+**TL;DR**: Kimi's KV is *already paged* at the kernel level (FlashInfer-style page tables, paged MLA append/decode kernels) — the "fixed 2048-token arena" was only a static Rust-side slot→pages mapping. The qwen3 stack landed in **one PR with zero kernel changes**: a kvbm-managed `BlockPool` per rank replaces the static mapping, admission uses full-lifetime reservation (the qwen3 #85 pattern), over-cap requests get an explicit `Rejected` instead of poisoning the batch mid-decode, and the per-request cap rises 2048 → 8192 tokens (DP prompts stay ≤ 2048 — a PPLX fabric-buffer constraint, see below). This is the substrate for prefix cache (#230) and long context (#231). Landed on `feat/kimi-kv-pool`, 2026-06-06. 8×H200 verification caught a DP8 decode deadlock (kvbm's eager generation block vs the worker's exact page-count check — fixed via `step_page_indices`, see below); golden-gate parity is green, run-to-run logprob determinism still under investigation.
 
 Last touched: 2026-06
 
@@ -75,6 +75,29 @@ Page counts are matched **exactly** (`pages == ceil(kv_tokens/16)`) — any
 drift between scheduler accounting and the kernel's view crashes the step
 instead of silently truncating attention.
 
+**The `step_page_indices` contract** (found as a DP8 decode deadlock on
+8×H200): kvbm's `schedule_decode` eagerly allocates the *next* generation
+block whenever this step's token will fill the current block's last slot, so
+the raw `RequestKv::page_indices()` holds one block more than the KV tokens
+need at **every** block boundary (`kv_tokens ≡ 0 mod 16` — any request hits
+it within 16 decode steps). Handing that raw list to the worker trips the
+exact-match check above. Every page row given to a forward pass must come
+from `RequestKv::step_page_indices(new_tokens)`, which trims to
+`ceil((kv_position + new_tokens)/16)`; a regression test in
+`pegainfer-kv-cache/src/pool.rs` sweeps prompt lengths × decode steps and
+self-retires if kvbm stops over-allocating.
+
+Why it surfaced as a *hang*, not an error: on DP the owning rank's
+`forward_decode_batch` failed **before entering the PPLX collective**, the
+other 7 ranks parked in `GdrFlag::wait` forever, and the coordinator blocked
+collecting results in rank order — 600 s silent timeout, error invisible.
+The coordinator is now hardened: in DP lock-step, any rank-level step `Err`
+is unrecoverable by construction (peers are already inside EP collectives),
+so `abort_poisoned_step` crashes the process loudly instead of logging and
+continuing into a deadlock. Local single-GPU tests can never exercise this —
+DP8 decode is the first code path where scheduler page rows meet the
+exact-match check with a generation block pending.
+
 ### Admission: full-lifetime reservation, honor-or-reject
 
 Two distinct per-request quantities — conflating them was a real bug caught
@@ -142,7 +165,14 @@ prefill with a cached-replay logits A/B, after this substrate lands.
 
 ## Next step
 
-8×H200 verification: over-cap request → explicit rejection (not batch
-poison); `prompt + max_tokens` boundary; >2048-token prompt e2e on TP8
-(4K–8K); DP prompt-cap rejection at 2049; `vllm_golden_gate` green; greedy
-bs64 TPOT p50 unchanged (~30 ms).
+8×H200 verification, remaining items: run-to-run determinism — the gate's
+det check fails on this branch (identical inputs → identical tokens, but
+logprobs differ by ≤1 bf16 logit ULP starting at the first decode token;
+prefill logprobs bit-identical; main is bit-stable because static slot→pages
+gives identical physical pages run-to-run). Garbage-tail leak and rank
+assignment are ruled out; next experiments bisect padding-row coupling vs
+page-value sensitivity in the MLA decode path. Then: over-cap request →
+explicit rejection (not batch poison); `prompt + max_tokens` boundary;
+>2048-token prompt e2e on TP8 (4K–8K); DP prompt-cap rejection at 2049;
+greedy bs64 TPOT p50 unchanged (~30 ms). Golden-gate parity already green
+at main's level.

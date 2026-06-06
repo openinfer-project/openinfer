@@ -130,7 +130,7 @@ impl DecodeBatchRow {
     fn pages(&self) -> Vec<i32> {
         match self {
             Self::Active(input) => input.pages.clone(),
-            Self::Admission(admission) => admission.kv.page_indices(),
+            Self::Admission(admission) => admission.kv.step_page_indices(1),
         }
     }
 }
@@ -435,8 +435,10 @@ impl DpCoordinator {
             });
             return;
         }
-        let kv_pages =
-            KimiKvStepPages::single(kv.page_indices(), self.pools[dp_rank].padding_block_id());
+        let kv_pages = KimiKvStepPages::single(
+            kv.step_page_indices(req.prompt_tokens.len()),
+            self.pools[dp_rank].padding_block_id(),
+        );
 
         // Prefill: all ranks run prefill in lock-step so PPLX collectives
         // align. Owning rank processes real tokens; padding ranks process a
@@ -445,61 +447,35 @@ impl DpCoordinator {
 
         let prompt_len = req.prompt_tokens.len();
 
-        let owner_result = self.result_rxs[dp_rank].recv();
-        let mut padding_errors = Vec::new();
-        for r in 0..self.dp_world {
-            if r != dp_rank {
-                match self.result_rxs[r].recv() {
-                    Ok(StepResult::Prefill(Ok(_))) => {}
-                    Ok(StepResult::Prefill(Err(err))) => {
-                        padding_errors.push(format!(
-                            "Kimi-K2 DP rank {r} padding prefill failed: {err:#}"
-                        ));
-                    }
-                    Ok(StepResult::Decode(_)) => {
-                        padding_errors.push(format!(
-                            "Kimi-K2 DP rank {r} returned decode result during prefill"
-                        ));
-                    }
-                    Err(_) => abort_dropped_result_channel(r, "prefill"),
-                }
-            }
-        }
-
-        let owner_report = match owner_result {
+        // Owner first: it processes the real tokens, so it is the realistic
+        // fast-fail (padding ranks run a fixed dummy input). Any rank error
+        // poisons the lock-step — see abort_poisoned_step.
+        let owner_report = match self.result_rxs[dp_rank].recv() {
             Ok(StepResult::Prefill(Ok(report))) => report,
             Ok(StepResult::Prefill(Err(err))) => {
-                error!("kimi-k2: DP rank {dp_rank} prefill failed: {err:#}");
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: format!("Kimi-K2 DP rank {dp_rank} prefill failed: {err:#}"),
-                    prompt_tokens: prompt_len,
-                    completion_tokens: 0,
-                });
-                return;
+                abort_poisoned_step(dp_rank, "prefill", &format!("{err:#}"))
             }
             Ok(StepResult::Decode(_)) => {
-                let message =
-                    format!("Kimi-K2 DP rank {dp_rank} returned decode result during prefill");
-                error!("kimi-k2: {message}");
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message,
-                    prompt_tokens: prompt_len,
-                    completion_tokens: 0,
-                });
-                return;
+                abort_poisoned_step(dp_rank, "prefill", "returned decode result during prefill")
             }
             Err(_) => abort_dropped_result_channel(dp_rank, "prefill"),
         };
-
-        if !padding_errors.is_empty() {
-            let message = padding_errors.join("; ");
-            error!("kimi-k2: {message}");
-            let _ = req.token_tx.send(TokenEvent::Error {
-                message,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
-            });
-            return;
+        for r in 0..self.dp_world {
+            if r == dp_rank {
+                continue;
+            }
+            match self.result_rxs[r].recv() {
+                Ok(StepResult::Prefill(Ok(_))) => {}
+                Ok(StepResult::Prefill(Err(err))) => {
+                    abort_poisoned_step(r, "padding prefill", &format!("{err:#}"))
+                }
+                Ok(StepResult::Decode(_)) => abort_poisoned_step(
+                    r,
+                    "padding prefill",
+                    "returned decode result during prefill",
+                ),
+                Err(_) => abort_dropped_result_channel(r, "prefill"),
+            }
         }
 
         let last_token = owner_report.local_next_token_global_id;
@@ -594,34 +570,17 @@ impl DpCoordinator {
         }
 
         for (dp_rank, rows) in rows_by_rank.into_iter().enumerate() {
-            let result = match self.result_rxs[dp_rank].recv() {
-                Ok(StepResult::Decode(result)) => result,
-                Ok(StepResult::Prefill(_)) => {
-                    let message = format!(
-                        "Kimi-K2 DP rank {dp_rank} returned prefill result during decode admission"
-                    );
-                    error!("kimi-k2: {message}");
-                    self.fail_decode_rows(dp_rank, rows, &message);
-                    continue;
+            let reports = match self.result_rxs[dp_rank].recv() {
+                Ok(StepResult::Decode(Ok(reports))) => reports,
+                Ok(StepResult::Decode(Err(err))) => {
+                    abort_poisoned_step(dp_rank, "decode admission", &format!("{err:#}"))
                 }
+                Ok(StepResult::Prefill(_)) => abort_poisoned_step(
+                    dp_rank,
+                    "decode admission",
+                    "returned prefill result during decode admission",
+                ),
                 Err(_) => abort_dropped_result_channel(dp_rank, "decode admission"),
-            };
-
-            let reports = match result {
-                Ok(reports) => reports,
-                Err(err) if rows.is_empty() => {
-                    error!(
-                        "kimi-k2: fatal: DP rank {dp_rank} padding decode failed during decode admission: {err:#}"
-                    );
-                    std::process::abort();
-                }
-                Err(err) => {
-                    error!("kimi-k2: DP rank {dp_rank} decode admission failed: {err:#}");
-                    let message =
-                        format!("Kimi-K2 DP rank {dp_rank} decode admission failed: {err:#}");
-                    self.fail_decode_rows(dp_rank, rows, &message);
-                    continue;
-                }
             };
 
             if rows.is_empty() {
@@ -780,22 +739,19 @@ impl DpCoordinator {
             send_step_command(&self.step_txs[dp_rank], dp_rank, "decode", cmd);
         }
 
-        // Collect results from all ranks
+        // Collect results from all ranks. A rank-level error means that rank
+        // bailed without completing the step's EP collectives while the other
+        // ranks are parked inside them — there is no recovery, only a silent
+        // engine-wide hang. Crash loudly instead (#239 verification found
+        // exactly this deadlock).
         for dp_rank in 0..self.dp_world {
             let result = match self.result_rxs[dp_rank].recv() {
                 Ok(StepResult::Decode(Ok(reports))) => reports,
                 Ok(StepResult::Decode(Err(err))) => {
-                    error!("kimi-k2: DP rank {dp_rank} decode failed: {err:#}");
-                    self.ranks[dp_rank].fail_all_active(&err);
-                    continue;
+                    abort_poisoned_step(dp_rank, "decode", &format!("{err:#}"))
                 }
                 Ok(StepResult::Prefill(_)) => {
-                    let err = anyhow::anyhow!(
-                        "Kimi-K2 DP rank {dp_rank} returned prefill result during decode"
-                    );
-                    error!("kimi-k2: {err:#}");
-                    self.ranks[dp_rank].fail_all_active(&err);
-                    continue;
+                    abort_poisoned_step(dp_rank, "decode", "returned prefill result during decode")
                 }
                 Err(_) => abort_dropped_result_channel(dp_rank, "decode"),
             };
@@ -868,7 +824,7 @@ impl DpRankState {
                 append_position: state.prompt_len + state.completion_tokens - 1,
                 slot,
                 options: state.options,
-                pages: state.kv.page_indices(),
+                pages: state.kv.step_page_indices(1),
             });
         }
         inputs
@@ -1034,6 +990,19 @@ fn send_step_command(tx: &Sender<StepCommand>, dp_rank: usize, phase: &str, comm
 
 fn abort_dropped_result_channel(dp_rank: usize, phase: &str) -> ! {
     error!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped during {phase}");
+    std::process::abort();
+}
+
+/// A rank failed (or broke protocol) mid lock-step: it never completed the
+/// step's EP collectives, so the remaining ranks are parked inside them.
+/// There is no recovery path — only a silent engine-wide hang (#239's H200
+/// verification hit exactly this). Crash loudly instead. The message also
+/// goes to stderr directly so it survives processes without a tracing
+/// subscriber (tests).
+fn abort_poisoned_step(dp_rank: usize, phase: &str, detail: &str) -> ! {
+    let message = format!("kimi-k2: fatal: DP rank {dp_rank} poisoned the {phase} step: {detail}");
+    error!("{message}");
+    eprintln!("{message}");
     std::process::abort();
 }
 
