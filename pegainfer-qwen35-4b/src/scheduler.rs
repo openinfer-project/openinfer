@@ -7,6 +7,8 @@
 //! Prefill allocates temporary `RecurrentState`s, then D2D-copies them into
 //! graph slots. On request retirement, swap-remove compaction keeps slots dense.
 
+mod plan;
+
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -26,6 +28,10 @@ use pegainfer_core::engine::{
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::DeviceVec;
+
+use self::plan::{
+    ExecutionPlan, admit_pending_requests, compaction_after_retire, slot_for_new_request,
+};
 
 // ── Internal types ──────────────────────────────────────────────────────
 
@@ -186,60 +192,38 @@ fn scheduler_loop(
             }
         }
 
-        // Admission control: cap by slot capacity AND KV page budget.
-        // Reserve one page per active decode request for its next step.
-        let page_size = model.kv_pool().layout().page_size;
-        let decode_reserve = active.len();
-        let mut page_budget = model
-            .kv_pool()
-            .available_pages()
-            .saturating_sub(decode_reserve);
-        let slot_budget = max_batch.saturating_sub(active.len());
-        let mut admitted = 0;
-        for req in &pending {
-            if admitted >= slot_budget {
-                break;
-            }
-            let needed = req.prompt_tokens.len().div_ceil(page_size);
-            if needed > page_budget {
-                break;
-            }
-            page_budget -= needed;
-            admitted += 1;
-        }
-        if admitted < pending.len() {
-            deferred = pending.split_off(admitted);
-        }
+        let admission = admit_pending_requests(
+            pending,
+            active.len(),
+            graph_state.slot_states.len(),
+            model.kv_pool().layout().page_size,
+            model.kv_pool().available_pages(),
+            |req| req.prompt_tokens.len(),
+        );
+        let pending = admission.pending;
+        deferred = admission.deferred;
 
-        let have_pending = !pending.is_empty();
-
-        if have_pending && !active.is_empty() {
-            unified_step_sched(
+        match plan::build_next_plan(!active.is_empty(), pending) {
+            Some(ExecutionPlan::Unified { pending }) => unified_step_sched(
                 &model,
                 &mut active,
                 pending,
                 &mut graph_state,
                 &mut sample_scratch,
                 &mut rng,
-            );
-        } else if have_pending {
-            prefill_batch(
+            ),
+            Some(ExecutionPlan::Prefill { pending }) => prefill_batch(
                 &model,
                 &mut active,
                 pending,
                 &mut graph_state,
                 &mut sample_scratch,
                 &mut rng,
-            );
-        }
-
-        if active.is_empty() {
-            continue;
-        }
-
-        // Pure decode step — only when no pending arrived (unified_step already did one decode).
-        if !have_pending {
-            decode_step(&model, &mut active, &mut graph_state, &mut rng);
+            ),
+            Some(ExecutionPlan::Decode) => {
+                decode_step(&model, &mut active, &mut graph_state, &mut rng)
+            }
+            None => {}
         }
     }
 }
@@ -334,7 +318,8 @@ fn prefill_batch(
         }
 
         // Assign a graph slot and copy recurrent state into it
-        let slot_idx = active.len();
+        let slot_idx = slot_for_new_request(active.len(), graph_state.slot_states.len())
+            .expect("admission must reserve a graph slot");
         graph_state
             .copy_state_to_slot(model.device_ctx(), &rec_states[i], slot_idx)
             .expect("copy recurrent state to slot failed");
@@ -471,7 +456,8 @@ fn unified_step_sched(
         }
 
         // Assign graph slot and copy recurrent state
-        let slot_idx = active.len();
+        let slot_idx = slot_for_new_request(active.len(), graph_state.slot_states.len())
+            .expect("admission must reserve a graph slot");
         graph_state
             .copy_state_to_slot(model.device_ctx(), &rec_states[i], slot_idx)
             .expect("copy recurrent state to slot failed");
@@ -667,26 +653,26 @@ fn compact_slot(
     graph_state: &mut BatchDecodeGraphState,
     idx: usize,
 ) {
-    let last = active.len() - 1;
+    let compaction = compaction_after_retire(active.len(), idx);
     active.swap_remove(idx);
 
-    if idx < active.len() {
+    if let Some(compaction) = compaction {
         // The element that was at `last` is now at `idx`.
         // Copy its recurrent state from slot `last` to slot `idx`.
         let src_slot = active[idx].graph_slot_idx;
-        debug_assert_eq!(src_slot, last);
+        debug_assert_eq!(src_slot, compaction.moved_from);
 
-        // D2D copy: graph_state.slot_states[last] → graph_state.slot_states[idx]
+        // D2D copy: graph_state.slot_states[src] -> graph_state.slot_states[dst]
         // We can't borrow two slots mutably at once, so use raw index copy.
         let ctx = model.device_ctx();
-        let src = &graph_state.slot_states[last];
+        let src = &graph_state.slot_states[compaction.moved_from];
         // Copy layer by layer using the public fields
         for layer_idx in 0..src.layers.len() {
-            let (src_part, dst_part) = if idx < last {
-                let (left, right) = graph_state.slot_states.split_at_mut(last);
+            let (src_part, dst_part) = if compaction.moved_to < compaction.moved_from {
+                let (left, right) = graph_state.slot_states.split_at_mut(compaction.moved_from);
                 (
                     &right[0].layers[layer_idx],
-                    &mut left[idx].layers[layer_idx],
+                    &mut left[compaction.moved_to].layers[layer_idx],
                 )
             } else {
                 unreachable!("idx < active.len() <= last");
@@ -699,9 +685,10 @@ fn compact_slot(
                 .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)
                 .expect("compact slot conv_state copy failed");
         }
-        graph_state.slot_states[idx].seq_len = graph_state.slot_states[last].seq_len;
+        graph_state.slot_states[compaction.moved_to].seq_len =
+            graph_state.slot_states[compaction.moved_from].seq_len;
 
-        active[idx].graph_slot_idx = idx;
+        active[compaction.moved_to].graph_slot_idx = compaction.moved_to;
     }
 }
 

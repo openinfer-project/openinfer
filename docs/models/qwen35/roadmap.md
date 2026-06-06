@@ -1,6 +1,6 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is fast and decode-correct — GDR kernels optimized, CUDA-graph decode, TTFT/TPOT at vLLM parity, current bench snapshots — and now has a long-prompt logits gate over the old 4096-position RoPE cache boundary. The current #250 slice fixes the Qwen3.5 RoPE cache to use `max_position_embeddings`, adds fail-closed cache coverage checks, verifies 4097/8192-token HF bf16 logits replay, and recovers full GSM8K 8-shot within 0.15 percentage points of the HF baseline (`strict-match` 79.38%, `flexible-extract` 79.30% vs HF 79.45%). Remaining structural items: monolithic HND prefill staging (~640MB transient per request, now fail-closed at the hard 20k-token cap), prompt-only admission with no `Rejected` event path, and zero CPU-testable scheduler logic. Findings originally verified 2026-06-04 against `6ee9247`; #186 gate status updated 2026-06-05, #250 long-prompt and GSM8K status updated 2026-06-05.
+> **TL;DR:** Qwen3.5-4B is fast and decode-correct — GDR kernels optimized, CUDA-graph decode, TTFT/TPOT at vLLM parity, current bench snapshots — and now has a long-prompt logits gate over the old 4096-position RoPE cache boundary. The current #250 slice fixes the Qwen3.5 RoPE cache to use `max_position_embeddings`, adds fail-closed cache coverage checks, verifies 4097/8192-token HF bf16 logits replay, and recovers full GSM8K 8-shot within 0.15 percentage points of the HF baseline (`strict-match` 79.38%, `flexible-extract` 79.30% vs HF 79.45%). Remaining structural items: monolithic HND prefill staging (~640MB transient per request, now fail-closed at the hard 20k-token cap) and prompt-only admission with no `Rejected` event path; the current admission/slot/compaction scheduler decisions are now covered by CPU-level lib tests. Findings originally verified 2026-06-04 against `6ee9247`; #186 gate status updated 2026-06-05, #250 long-prompt and GSM8K status updated 2026-06-05, #255 scheduler seam updated 2026-06-06.
 >
 > **Last touched:** 2026-06
 
@@ -18,7 +18,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | Prefill memory | ✗ monolithic HND staging ≈640MB transient per request; `MAX_SEQ = 20000` hard cap | `prefill.rs` |
 | Long context | Partial: current #250 slice sizes the RoPE cache from `max_position_embeddings`; decode checks the cache before use, and prefill now fails closed at the active `MAX_SEQ = 20000` HND staging cap | `config.rs`, `weights.rs`, `prefill.rs`, `batch_decode.rs` |
 | Admission | ✗ prompt-only KV sizing, no `Rejected` event, KV exhaustion mid-decode aborts the whole batch — pre-#85-fix semantics | `scheduler.rs` |
-| Scheduler tests | ✗ zero CPU-level tests; all logic behind GPU-coupled paths | — |
+| Scheduler tests | Partial: current plan selection, prompt-only admission, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
 | TP | ✗ absent (single GPU only) | — |
 | Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
 
@@ -32,9 +32,9 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 ### Next
 
-4. **Admission overhaul.** Three coupled defects, fixed together as the qwen35 analog of the #85 work: size admission on full lifetime (prompt + max_tokens), add the `Rejected` event path the engine contract already defines, and on KV exhaustion fail the offending request — not the batch. CPU-testable once 6 lands.
+4. **Admission overhaul.** Three coupled defects, fixed together as the qwen35 analog of the #85 work: size admission on full lifetime (prompt + max_tokens), add the `Rejected` event path the engine contract already defines, and on KV exhaustion fail the offending request — not the batch. The #255 scheduler seam gives this work a CPU-testable policy surface.
 5. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient, the `MAX_SEQ=20000` cap, and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → (3) RoPE cache → opens the door to 7.
-6. **Scheduler logic seam.** Extract admission/eviction/slot decisions behind a GPU-free boundary and put CPU tests on them, mirroring qwen3's scheduler-test layout. Prerequisite for testing 4 without a GPU.
+6. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. When 4 lands, keep the new lifetime-admission and rejection behavior in that seam instead of re-embedding it in GPU execution.
 7. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 5.
 8. **kernel_plan port.** qwen3's `kernel_plan.rs` (runtime kernel selection + plan dump) has no qwen35 counterpart; decode kernel picks are hardwired. Mechanical port, community-friendly.
 
