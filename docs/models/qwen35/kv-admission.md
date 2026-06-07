@@ -1,7 +1,7 @@
-# Qwen3.5 KV Admission Issue 254
+# Qwen3.5 KV Admission
 
 **Created**: 2026-06-06
-**Status**: complete
+**Status**: complete for issue #254
 
 **TL;DR**: Issue #254 is implemented and RTX 5090-validated. Qwen3.5 admission now reserves each admitted request's full KV lifetime budget (`prompt_len + max_tokens - 1`), reserves only future page growth for active requests, keeps temporarily over-budget requests deferred in FCFS order, rejects requests that can never fit this model instance, and reports execution failures as explicit request errors. A narrow fake scheduler driver now covers `scheduler_loop` rejection and execution-error recovery. Real Qwen3.5 e2e passed, an HTTP over-capacity lifetime-reservation pressure run completed `100/100` admissible requests with a healthy post-pressure completion, and a direct in-process impossible request hit the new rejection path.
 
