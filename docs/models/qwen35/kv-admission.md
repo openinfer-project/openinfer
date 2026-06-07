@@ -3,7 +3,7 @@
 **Created**: 2026-06-06
 **Status**: complete for issue #254
 
-**TL;DR**: Issue #254 is implemented and RTX 5090-validated. Qwen3.5 admission now reserves each admitted request's full KV lifetime budget (`prompt_len + max_tokens - 1`), reserves only future page growth for active requests, keeps temporarily over-budget requests deferred in FCFS order, rejects requests that can never fit this model instance, and reports execution failures as explicit request errors. A narrow fake scheduler driver now covers `scheduler_loop` rejection and execution-error recovery. Real Qwen3.5 e2e passed, an HTTP over-capacity lifetime-reservation pressure run completed `100/100` admissible requests with a healthy post-pressure completion, and a direct in-process impossible request hit the new rejection path.
+**TL;DR**: Issue #254 is implemented and RTX 5090-validated. Qwen3.5 admission now reserves each admitted request's full KV lifetime budget (`prompt_len + max_tokens - 1`), reserves only future page growth for active requests, keeps temporarily over-budget requests deferred in FCFS order, rejects requests that can never fit this model instance, and reports execution failures as explicit request errors. Real Qwen3.5 e2e passed, an HTTP over-capacity lifetime-reservation pressure run completed `100/100` admissible requests with a healthy post-pressure completion, and a direct in-process impossible request hit the new rejection path.
 
 ## Preparation
 
@@ -29,7 +29,6 @@
   5. Run local narrow tests and diff hygiene.
   6. Sync to the authorized remote GPU host and run Qwen3.5 e2e plus issue-shaped HTTP pressure and post-pressure completion.
 - **Risks / open questions**:
-  - The Qwen3.5 fake scheduler driver is intentionally narrow. It covers `scheduler_loop` rejection and recovery semantics, while real GPU prefill/unified/decode execution remains covered by release e2e and HTTP pressure validation.
   - `batch_decode_graph` returns a batch-level error without an offending request id. Full-lifetime admission should prevent KV exhaustion there; if another batch-level error appears, the scheduler can only report errors to all touched active requests.
 
 ## Execution Log
@@ -43,8 +42,8 @@
 ### Step 2: Scheduler event semantics
 - Updated `pegainfer-qwen35-4b/src/scheduler.rs` to build active budgets, pass the usable single-request cap (`capacity_pages - 1`, excluding the CUDA Graph padding page), and emit `TokenEvent::Rejected` for impossible requests.
 - Converted Qwen3.5 execution/sampling failure paths from fake `Finished(Stop)` to `TokenEvent::Error`, so request failures surface as errors instead of clean stops.
-- Rejection message includes the prompt length and full lifetime context:
-  - `request requires more KV pages than this model instance can provide: prompt_tokens=..., max_context_tokens=...`
+- Rejection message includes the prompt length and full lifetime request demand:
+  - `request requires more KV pages than this model instance can provide: prompt_tokens=..., max_request_tokens=...`
 
 ### Step 3: Tests and review hardening
 - Added and updated CPU tests for:
@@ -55,10 +54,7 @@
   - impossible request rejection without blocking a later fitting request;
   - one-token completion at a page boundary;
   - direct `send_rejection` event shape.
-- Added a private `SchedulerDriver` seam in `pegainfer-qwen35-4b/src/scheduler.rs`. Production uses `Qwen35SchedulerDriver`, which delegates to the original `Qwen35Model`/graph/scratch paths. Tests use `FakeSchedulerDriver` to run the real `scheduler_loop` without a GPU model.
-- Added fake scheduler-loop tests for:
-  - impossible-request rejection without blocking a later fitting request;
-  - execution error reporting followed by accepting the next request.
+- After PR review, removed the fake scheduler-loop seam and fake loop tests. The loop remains concrete; pure admission policy stays in `scheduler/plan.rs`, and runtime shell behavior is covered by e2e plus the direct bench rejection gate.
 - Kept the frontend bridge test proving `TokenEvent::Rejected` maps to an error finish:
   - `cargo test --offline --release -p pegainfer-vllm-frontend rejected_request_is_reported_as_error --lib -- --nocapture` passed, `1 passed`.
 - Ran read-only DeepSeek diff reviews. Useful findings were handled by adding the active future-page direct test, a release assertion, the padding-page comment, and direct rejection-event coverage. Two findings were rejected after source checks:
@@ -78,11 +74,16 @@
 - Commands passed:
   - `cargo fmt --check`
   - `cargo test --offline --release -p pegainfer-qwen35-4b --lib scheduler::plan -- --nocapture` - `14 passed`.
-  - `cargo test --offline --release -p pegainfer-qwen35-4b scheduler_loop_ --lib -- --nocapture` - `2 passed`.
-  - `cargo test --offline --release -p pegainfer-qwen35-4b --lib -- --nocapture` - `22 passed`.
-  - `cargo test --offline --release -p pegainfer-qwen35-4b send_rejection_reports_kv_lifetime_context --lib -- --nocapture` - `1 passed`.
+  - `cargo test --offline --release -p pegainfer-qwen35-4b --lib -- --nocapture` - `22 passed` before the fake-loop test deletion.
+  - `cargo test --offline --release -p pegainfer-qwen35-4b send_rejection_reports_kv_lifetime_context --lib -- --nocapture` - `1 passed` before the rejection label rename and test rename.
   - `cargo test --offline --release -p pegainfer-vllm-frontend rejected_request_is_reported_as_error --lib -- --nocapture` - `1 passed`.
   - `cargo build --offline --release -p pegainfer-server` - passed with existing unused-import warnings in `pegainfer-server`.
+- Review-fix validation on the H20 host after deleting the fake seam and renaming the rejection label:
+  - `cargo fmt --check` passed with nightly Rust.
+  - `cargo test --offline --release -p pegainfer-qwen35-4b send_rejection_reports_kv_lifetime_request_tokens --lib -- --nocapture` passed, `1 passed`.
+  - `cargo test --offline --release -p pegainfer-qwen35-4b --lib -- --nocapture` passed, `20 passed`.
+  - H20 real-model e2e was not rerun because the host had no `models/Qwen3.5-4B/config.json`, and downloading `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` failed with `Network is unreachable`.
+  - `cargo test --offline --release -p pegainfer-vllm-frontend rejected_request_is_reported_as_error --lib -- --nocapture` was blocked by the local vendored vLLM `proto/vllm_grpc.proto` path, so the prior frontend bridge pass and GitHub CPU check remain the evidence for that surface.
 
 ### Step 5: Real Qwen3.5 e2e
 - Command:
@@ -93,10 +94,6 @@
 - Result after the release-assert hardening:
   - `test_e2e_qwen35_scheduler ... ok`
   - `1 passed`, finished in `11.04s`.
-- Result after adding the fake scheduler driver seam:
-  - `test_e2e_qwen35_scheduler ... ok`
-  - `1 passed`, finished in `11.07s`.
-
 ### Step 6: HTTP pressure validation
 - Started the real OpenAI-compatible server:
   - `./target/release/pegainfer --model-path models/Qwen3.5-4B --served-model-name issue254-qwen35 --port 18082`
@@ -127,12 +124,13 @@
   - `./target/release/bench_serving --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 600000 --warmup 0 --iters 1`
 - Expected result:
   - command exited non-zero through `bench_serving`'s panic-on-generation-failure path;
-  - rejection was explicit: `scheduler request rejected: request requires more KV pages than this model instance can provide: prompt_tokens=1, max_context_tokens=600000`.
+  - rejection was explicit and included both `prompt_tokens=1` and the full lifetime request demand.
+  - PR review later named that lifetime-demand field `max_request_tokens` to avoid confusing it with the model window.
 - GPU was free after the command.
 
 ## Debrief
 
-- **Outcome**: Issue #254's core scheduler failure class is fixed for Qwen3.5. Admission now uses full-lifetime KV accounting, temporarily over-budget work waits instead of being admitted into later KV exhaustion, impossible scheduler requests are rejected with a clear event, execution failures no longer masquerade as clean stops, and the scheduler loop has a fake-driver regression seam for rejection/recovery behavior.
+- **Outcome**: Issue #254's core scheduler failure class is fixed for Qwen3.5. Admission now uses full-lifetime KV accounting, temporarily over-budget work waits instead of being admitted into later KV exhaustion, impossible scheduler requests are rejected with a clear event, and execution failures no longer masquerade as clean stops.
 - **Pitfalls encountered**:
   - A long-prompt HTTP workload can hit Qwen3.5 prefill scratch allocation before it meaningfully tests KV admission. The valid pressure shape for this issue used high `max_tokens` with early stop to stress lifetime reservation while keeping real generation short.
   - On a 32GB 5090, Qwen3.5's usable KV pool is larger than the frontend `max_model_len`, so ordinary HTTP requests may be frontend-clamped or stop before exposing the raw scheduler impossible-request cap. The in-process bench path is the cleaner rejection gate.
@@ -142,5 +140,4 @@
   - Rejection evidence should include both the pure admission unit policy and a runtime path that actually reaches `TokenEvent::Rejected`; HTTP may be too high-level when frontend constraints are lower than raw KV capacity.
   - Error paths that drain `ActiveRequest35` rely on `KvState` RAII for page return. That is worth remembering when reviewing future Qwen3.5 recovery code.
 - **Follow-ups**:
-  - The fake driver currently stops at scheduler-loop control flow and event semantics. A broader fake GPU-logits executor would be a separate refactor if future tests need per-step sampling/compaction behavior without e2e.
   - Prefill scratch pressure from very large batched prompts is a separate robustness topic; it should not be folded into issue #254 unless the desired policy expands beyond KV admission.

@@ -52,87 +52,6 @@ struct ActiveRequest35 {
     logprobs: usize,
 }
 
-trait SchedulerDriver {
-    type Active;
-
-    fn max_batch(&self) -> usize;
-    fn page_size(&self) -> usize;
-    fn available_pages(&self) -> usize;
-    fn max_request_pages(&self) -> usize;
-    fn active_budget(&self, req: &Self::Active) -> ActiveKvBudget;
-    fn execute_plan(
-        &mut self,
-        active: &mut Vec<Self::Active>,
-        plan: ExecutionPlan<SchedulerRequest>,
-        rng: &mut StdRng,
-    );
-}
-
-struct Qwen35SchedulerDriver {
-    model: Qwen35Model,
-    graph_state: BatchDecodeGraphState,
-    sample_scratch: SampleScratch,
-}
-
-impl SchedulerDriver for Qwen35SchedulerDriver {
-    type Active = ActiveRequest35;
-
-    fn max_batch(&self) -> usize {
-        self.graph_state.slot_states.len()
-    }
-
-    fn page_size(&self) -> usize {
-        self.model.kv_pool().layout().page_size
-    }
-
-    fn available_pages(&self) -> usize {
-        self.model.kv_pool().available_pages()
-    }
-
-    fn max_request_pages(&self) -> usize {
-        // KvPool capacity includes the CUDA Graph padding page reserved at
-        // construction, so a real request can use at most the remaining pages.
-        self.model.kv_pool().capacity_pages().saturating_sub(1)
-    }
-
-    fn active_budget(&self, req: &Self::Active) -> ActiveKvBudget {
-        ActiveKvBudget {
-            prompt_len: req.prompt_len,
-            generated_count: req.generated_count,
-            max_tokens: req.max_tokens,
-        }
-    }
-
-    fn execute_plan(
-        &mut self,
-        active: &mut Vec<Self::Active>,
-        plan: ExecutionPlan<SchedulerRequest>,
-        rng: &mut StdRng,
-    ) {
-        match plan {
-            ExecutionPlan::Unified { pending } => unified_step_sched(
-                &self.model,
-                active,
-                pending,
-                &mut self.graph_state,
-                &mut self.sample_scratch,
-                rng,
-            ),
-            ExecutionPlan::Prefill { pending } => prefill_batch(
-                &self.model,
-                active,
-                pending,
-                &mut self.graph_state,
-                &mut self.sample_scratch,
-                rng,
-            ),
-            ExecutionPlan::Decode => {
-                decode_step(&self.model, active, &mut self.graph_state, rng);
-            }
-        }
-    }
-}
-
 /// Scratch buffers for GPU sampling (reused across prefill sampling).
 struct SampleScratch {
     probs: cudarc::driver::CudaSlice<f32>,
@@ -180,12 +99,7 @@ pub fn start_with_capacity(
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                let driver = Qwen35SchedulerDriver {
-                    model,
-                    graph_state,
-                    sample_scratch,
-                };
-                scheduler_loop(driver, submit_rx, seed);
+                scheduler_loop(model, graph_state, sample_scratch, submit_rx, seed);
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -233,18 +147,19 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 // ── Main loop ───────────────────────────────────────────────────────────
 
 #[allow(clippy::needless_pass_by_value)]
-fn scheduler_loop<D>(
-    mut driver: D,
+fn scheduler_loop(
+    model: Qwen35Model,
+    mut graph_state: BatchDecodeGraphState,
+    mut sample_scratch: SampleScratch,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
-) where
-    D: SchedulerDriver,
-{
+) {
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut active: Vec<D::Active> = Vec::new();
+    let mut active: Vec<ActiveRequest35> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
+    let max_batch = graph_state.slot_states.len();
 
-    info!("Qwen3.5 scheduler ready (max_batch={})", driver.max_batch());
+    info!("Qwen3.5 scheduler ready (max_batch={})", max_batch);
 
     loop {
         // 1. Drain all pending requests (deferred from last iteration + channel)
@@ -266,15 +181,23 @@ fn scheduler_loop<D>(
             }
         }
 
-        let active_budget: Vec<ActiveKvBudget> =
-            active.iter().map(|req| driver.active_budget(req)).collect();
+        let active_budget: Vec<ActiveKvBudget> = active
+            .iter()
+            .map(|req| ActiveKvBudget {
+                prompt_len: req.prompt_len,
+                generated_count: req.generated_count,
+                max_tokens: req.max_tokens,
+            })
+            .collect();
         let admission = admit_pending_requests(
             pending,
             &active_budget,
-            driver.max_batch(),
-            driver.page_size(),
-            driver.available_pages(),
-            driver.max_request_pages(),
+            max_batch,
+            model.kv_pool().layout().page_size,
+            model.kv_pool().available_pages(),
+            // KvPool capacity includes the CUDA Graph padding page reserved at
+            // construction, so a real request can use at most the remaining pages.
+            model.kv_pool().capacity_pages().saturating_sub(1),
             |req| req.prompt_tokens.len(),
             |req| req.max_tokens,
         );
@@ -285,18 +208,38 @@ fn scheduler_loop<D>(
         deferred = admission.deferred;
 
         if let Some(plan) = plan::build_next_plan(!active.is_empty(), pending) {
-            driver.execute_plan(&mut active, plan, &mut rng);
+            match plan {
+                ExecutionPlan::Unified { pending } => unified_step_sched(
+                    &model,
+                    &mut active,
+                    pending,
+                    &mut graph_state,
+                    &mut sample_scratch,
+                    &mut rng,
+                ),
+                ExecutionPlan::Prefill { pending } => prefill_batch(
+                    &model,
+                    &mut active,
+                    pending,
+                    &mut graph_state,
+                    &mut sample_scratch,
+                    &mut rng,
+                ),
+                ExecutionPlan::Decode => {
+                    decode_step(&model, &mut active, &mut graph_state, &mut rng);
+                }
+            }
         }
     }
 }
 
 fn send_rejection(req: &SchedulerRequest) {
-    let max_context_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+    let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
     let _ = req.token_tx.send(TokenEvent::Rejected {
         message: format!(
-            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
+            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
             req.prompt_tokens.len(),
-            max_context_tokens
+            max_request_tokens
         ),
         prompt_tokens: req.prompt_tokens.len(),
         completion_tokens: 0,
