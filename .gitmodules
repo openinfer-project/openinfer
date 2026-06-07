@@ -1,3 +1,6 @@
 [submodule "pegainfer-kernels/third_party/flashinfer"]
 	path = pegainfer-kernels/third_party/flashinfer
 	url = https://github.com/flashinfer-ai/flashinfer
+[submodule "pegainfer-kernels/third_party/DeepEP"]
+	path = pegainfer-kernels/third_party/DeepEP
+	url = https://github.com/deepseek-ai/DeepEP
