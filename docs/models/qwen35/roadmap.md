@@ -45,7 +45,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 ## Cleanup ledger
 
-- **Dead code:** ✓ qwen35 `probe_model()`+`ModelInfo` and the `start_with_model` entry point removed (#258); the same dead pair still exists in qwen3 (owned there).
+- **Dead code:** ✓ qwen35 `probe_model()`+`ModelInfo` and the `start_with_model` entry point removed (#258); qwen3's matching pair removed in #248.
 - **Docs:** ✓ qwen35 docs cleaned (#258): `Status:` enum headers dropped, obsolete `crates/` paths corrected to top-level, parity numbers reconciled to one ledger (234ms/11.77ms), and the e2e-gibberish story lifted to `docs/lessons/exact-match-gate-thread-cublas.md`. #186 then added the HF logits gate and retired the exact-text baseline.
 - **Shared with qwen3 (owned there):** batched greedy decode sampling (`batch_decode.rs` has the same per-row pattern), non-greedy sampling correctness coverage, frontend usage accounting (#78).
 

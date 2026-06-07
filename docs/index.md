@@ -25,12 +25,10 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `models/qwen3/roadmap.md` | Qwen3-4B roadmap (2026-06 review): line is the maturity bar; open set is #220 RoPE OOB, per-row batch sampling, zero TP coverage, zero-adapter-only LoRA gate, dropped prefix-cache observability, stale docs. Sequenced Now/Next/Later + cleanup ledger. |
-| `models/qwen3/model-crate.md` | `pegainfer-qwen3-4b` owns Qwen3 config/weights/executor/scheduler/tests/kernel plan; root sees generic `EngineHandle`; split-K retuned to `256/64`, with 4k/64 serving TPOT p50 at `6.46ms` on RTX 5090. |
+| `models/qwen3/crate-layout.md` | `pegainfer-qwen3-4b` owns Qwen3 config/weights/executor/scheduler/tests/kernel plan; kernel surface and build live in `pegainfer-kernels`; server sees only `start_engine() -> EngineHandle`. Records the split-K decode gate (`256/64`, `padded_bs<=2 && seq>=1024`) and CUPTI/bench gotchas. |
 | `models/qwen3/prefix-cache.md` | Prefix caching on by default for Qwen3-4B: full-block kvbm radix matching at the executor, suffix-only prefill. Repeated ~1900-token prompt TTFT 141.8 → 16.3ms p50 (8.7×); warm TTFT ≈ TPOT + ~5ms setup. Includes the RoPE scalar-path corruption fix and the drain-the-stream TTFT measurement pitfall. |
 | `models/qwen3/accuracy-gate.md` | Qwen3-4B instance of the logits golden gate (`tests/hf_golden_gate.rs`): 48 teacher-forced sequences / 816 positions vs a stored HF bf16 golden, replayed over bs=1 / batched eager / CUDA-graph. Strict guards: regret check + mean ≤ 0.06 + p99 ≤ 0.20; absolute max printed but not asserted (coverage-unstable). Methodology in `subsystems/correctness/`. |
-| `models/qwen3/kernels-crate.md` | Phase 1 split implemented and 5090-verified: Qwen3-4B kernel surface lives in `pegainfer-kernels`; release build, test-target compile, accuracy gate, and bench snapshot pass. |
-| `models/qwen3/tp-design.md` | Qwen3 tensor-parallel design: `TP=2` milestone scope plus the controller/worker broadcast execution model, request identity, and coarse-grained step protocol for future TP/MoE work. |
-| `models/qwen3/kv-pressure-hang.md` | Issue #85 Qwen3-4B KV pressure hang fixed by full-lifetime scheduler KV admission, waiting-queue deferral, cleanup on disconnect/error, impossible-request errors, scheduler/bridge gates, and real `vllm bench serve` QPS=2 `500/500` pass with post-pressure completion healthy. |
+| `models/qwen3/tp-design.md` | Qwen3 TP runtime as implemented: controller/worker broadcast execution (`RankWorker` per rank, coarse `StepCommand`, barrier per step), plan/resolve/effects scheduler boundaries, TP=2 partitioning spec. Open: TP correctness coverage, vocab-parallel embedding/lm_head, TP CUDA-graph. |
 
 ## models / qwen35
 
@@ -134,6 +132,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `lessons/moe-dplb-decode-imbalance.md` | DPLB lesson for future PegaFlow/WiDeep MoE+EP serving: decode-side DP imbalance is a sticky KV-state problem; engines should emit raw progress while external router/proxy derive load and routing. |
 | `lessons/moe-zero-prefill-long-prefill.md` | ZeRO-Prefill lesson for future long-prefill MoE serving: once a router selects long-P work, maximize batch throughput by preserving compute-bound execution, hiding expert-weight movement, respecting KV handoff boundaries, and measuring bottlenecks before committing to an AsyncEP-style backend. |
 | `lessons/exact-match-gate-thread-cublas.md` | Two durable lessons from a Qwen3.5 e2e gibberish bug: worker threads that run a model must rebind the CUDA context and init thread-local cuBLAS handles, and exact-match greedy gates are sensitive to equal-logit top1 choices (keep a single FlashInfer selector). |
+| `lessons/kv-full-lifetime-reservation.md` | Schedulers without preemption must admit on full-lifetime KV budget (not prefill footprint), reject never-fits requests explicitly, release KV on every exit path, and prove recovery with a post-pressure request. From qwen3 issue #85; reused for kimi-k2 #239. |
 | `lessons/kimi-bringup-numerics.md` | Three MoE+TP greedy-parity / reporting lessons from Kimi-K2 bring-up, reusable on any MoE+TP decode engine gated on token-id parity: reduce hidden states in F32 not BF16 (BF16 bulk all-reduce silently breaks greedy); don't merge shared+routed expert reduce into one collective (breaks cold-batch greedy); always report p50+p99, never just mean (tail dominates on barrier-synced MoE+EP decode). |
 
 ## benchmarks

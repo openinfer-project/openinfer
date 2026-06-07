@@ -1,6 +1,6 @@
 # Qwen3-4B Roadmap
 
-> **TL;DR:** Qwen3-4B is the maturity bar of the project — continuous batching, TP=2, default-on prefix cache (#216), and the HF logits golden gate are all live — so its roadmap is sharpening, not bring-up. The verified open set: one real correctness bug (#220 RoPE cache 4096 vs 40960 admitted, silent OOB), per-row batch-decode sampling (O(batch) launches + syncs per step despite a production-proven batched primitive in-tree), zero TP correctness coverage, LoRA built but gated only by a zero-adapter smoke, prefix-cache observability dropped at the scheduler boundary, and a docs layer that describes deleted tooling. Findings verified 2026-06-04 against `6ee9247`.
+> **TL;DR:** Qwen3-4B is the maturity bar of the project — continuous batching, TP=2, default-on prefix cache (#216), and the HF logits golden gate are all live — so its roadmap is sharpening, not bring-up. The verified open set: one real correctness bug (#220 RoPE cache 4096 vs 40960 admitted, silent OOB), per-row batch-decode sampling (O(batch) launches + syncs per step despite a production-proven batched primitive in-tree), zero TP correctness coverage, LoRA built but gated only by a zero-adapter smoke, and prefix-cache observability dropped at the scheduler boundary. Findings verified 2026-06-04 against `6ee9247`; the docs/dead-code ledger (#248) was cleared 2026-06-07.
 >
 > **Last touched:** 2026-06
 
@@ -46,9 +46,9 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 ## Cleanup ledger
 
 - **Issue hygiene:** #188 references a test target deleted in #194 — close as superseded by the golden gate. #203 §1 still claims qwen3 has no prefix reuse — stale since #216.
-- **Dead code:** `batch_decode_trace.rs` `HIDDEN_SIZE`/`INTERMEDIATE_SIZE` consts (pub, zero readers); qwen3 `probe_model()`+`ModelInfo` remain uncalled (server inlines its own detection — qwen35's matching dead pair was removed in #258).
 - **File size:** `executor.rs` (1435), `scheduler.rs` (1420, ~826 of them inline tests), `kernel_bench.rs` (1112) breach the 1k-line redline.
-- **Docs:** `model-crate.md` TL;DR advertises a deleted `qwen3_kernel_snapshot` bench and, with `kernels-crate.md`, uses the obsolete `crates/` layout in every command — collapse both into one slim layout doc. `tp-design.md` describes the implemented controller/worker runtime as future direction — rewrite to past tense, promote the 3 real open items. `kv-pressure-hang.md` — lift the KV-lifetime-reservation lessons to `docs/lessons/`, then delete. `execution.md` Done list predates #216.
+- **Docs:** `execution.md` Done list predates #216.
+- ~~Dead code + stale qwen3 docs~~ — cleared by #248: `HIDDEN_SIZE`/`INTERMEDIATE_SIZE` consts and `probe_model()`+`ModelInfo` removed; `model-crate.md`+`kernels-crate.md` collapsed into `crate-layout.md`; `tp-design.md` rewritten around the implemented runtime; `kv-pressure-hang.md` lifted to `lessons/kv-full-lifetime-reservation.md` and deleted.
 
 ## Done criteria
 
