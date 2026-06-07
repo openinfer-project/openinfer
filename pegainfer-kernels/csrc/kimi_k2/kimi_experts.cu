@@ -356,6 +356,19 @@ CUresult kimi_residual_add_scaled_bf16_cuda(
 //   count_i = psum[i] - start_i
 // The expanded recv buffer is already expert-major and aligned, so
 // sorted_token_ids is identity over real rows and sentinel over pad rows.
+//
+// All capacity-sized writes are spread across the whole block: every slot
+// binary-searches the shared segment table instead of one thread owning one
+// expert's segment (skewed routing) or the tail (serial writes dominated the
+// decode profile at 8528-slot capacity).
+//
+// The expert_ids lookup maps m-block -> owning expert via the slot at the
+// block's start, which is only well-defined when alignment == block_size
+// (segment boundaries land on block boundaries); the Rust wrapper enforces
+// that equality.
+constexpr int kRoutingBuilderThreads = 1024;
+constexpr int kRoutingBuilderMaxExperts = 64;
+
 __global__ void kimi_deepep_build_marlin_routing_kernel(
     const int32_t* __restrict__ psum_expert,
     int32_t* __restrict__ sorted_token_ids,
@@ -366,13 +379,11 @@ __global__ void kimi_deepep_build_marlin_routing_kernel(
     int block_size,
     int max_padded_tokens,
     int max_m_blocks) {
-  int tid = threadIdx.x;
-  for (int block = tid; block < max_m_blocks; block += blockDim.x) {
-    expert_ids[block] = 0;
-  }
-  __syncthreads();
+  __shared__ int s_start[kRoutingBuilderMaxExperts];
+  __shared__ int s_count[kRoutingBuilderMaxExperts];
+  __shared__ int s_total;
 
-  int sentinel = max_padded_tokens;
+  int tid = threadIdx.x;
   if (tid < num_local_experts) {
     int start = 0;
     if (tid > 0) {
@@ -380,26 +391,45 @@ __global__ void kimi_deepep_build_marlin_routing_kernel(
       start = ((prev + alignment - 1) / alignment) * alignment;
     }
     int count = psum_expert[tid] - start;
-    if (count < 0) count = 0;
-    int padded = ((count + alignment - 1) / alignment) * alignment;
-    for (int j = 0; j < padded; j++) {
-      int idx = start + j;
-      if (idx < max_padded_tokens)
-        sorted_token_ids[idx] = (j < count) ? idx : sentinel;
+    s_start[tid] = start;
+    s_count[tid] = count < 0 ? 0 : count;
+  }
+  if (tid == 0) s_total = psum_expert[num_local_experts];
+  __syncthreads();
+
+  int total = s_total;
+  int sentinel = max_padded_tokens;
+
+  // Segment lookup: largest expert e with s_start[e] <= idx. Aligned starts
+  // are non-decreasing, so a binary search over the shared table suffices.
+  for (int idx = tid; idx < max_padded_tokens; idx += blockDim.x) {
+    int value = sentinel;
+    if (idx < total) {
+      int lo = 0, hi = num_local_experts - 1;
+      while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (s_start[mid] <= idx) lo = mid; else hi = mid - 1;
+      }
+      if (idx - s_start[lo] < s_count[lo]) value = idx;
     }
-    int block_start = start / block_size;
-    int block_end = (start + padded) / block_size;
-    for (int b = block_start; b < block_end && b < max_m_blocks; b++)
-      expert_ids[b] = tid;
+    sorted_token_ids[idx] = value;
   }
 
-  __syncthreads();
-  if (tid == 0) {
-    int total = psum_expert[num_local_experts];
-    for (int j = total; j < max_padded_tokens; j++)
-      sorted_token_ids[j] = sentinel;
-    num_tokens_post_padded[0] = total;
+  for (int b = tid; b < max_m_blocks; b += blockDim.x) {
+    int slot = b * block_size;
+    int expert = 0;
+    if (slot < total) {
+      int lo = 0, hi = num_local_experts - 1;
+      while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (s_start[mid] <= slot) lo = mid; else hi = mid - 1;
+      }
+      expert = lo;
+    }
+    expert_ids[b] = expert;
   }
+
+  if (tid == 0) num_tokens_post_padded[0] = total;
 }
 
 CUresult kimi_deepep_build_marlin_routing_on_stream(
@@ -413,7 +443,8 @@ CUresult kimi_deepep_build_marlin_routing_on_stream(
     int max_padded_tokens,
     int max_m_blocks,
     cudaStream_t stream) {
-  kimi_deepep_build_marlin_routing_kernel<<<1, 64, 0, stream>>>(
+  if (num_local_experts > kRoutingBuilderMaxExperts) return CUDA_ERROR_INVALID_VALUE;
+  kimi_deepep_build_marlin_routing_kernel<<<1, kRoutingBuilderThreads, 0, stream>>>(
       psum_expert,
       sorted_token_ids,
       expert_ids,

@@ -1270,8 +1270,9 @@ pub fn kimi_marlin_w13_swiglu<const INTER2: usize, const INTER: usize>(
     Ok(())
 }
 
-/// SwiGLU over the DeepEP expanded layout: grid launched at `max_rows` but actual work
-/// limited by `num_tokens_post_padded[0]` read on-device — no D2H needed.
+/// SwiGLU over the DeepEP expanded layout: fixed occupancy-sized grid that
+/// grid-strides up to `num_tokens_post_padded[0]` read on-device — cost tracks
+/// the actual expanded rows, not the worst-case capacity, and no D2H is needed.
 pub fn kimi_marlin_w13_swiglu_expanded<const INTER2: usize, const INTER: usize>(
     ctx: &DeviceContext,
     w13: &GpuTensor<INTER2>,
@@ -1304,6 +1305,7 @@ pub fn kimi_marlin_w13_swiglu_expanded<const INTER2: usize, const INTER: usize>(
             ntp_ptr as *const i32,
             w13.seq_len as i32,
             INTER as i32,
+            0,
             ctx.stream.cu_stream(),
         )
     };

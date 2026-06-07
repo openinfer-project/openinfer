@@ -360,24 +360,33 @@ __global__ void swiglu_w13_kernel(
   out[idx] = __float2bfloat16(silu_bf16 * up);
 }
 
+// Grid-stride over the device-resident row count: the launch grid is fixed
+// (occupancy-sized), so cost tracks the actual expanded rows instead of the
+// worst-case capacity. A capacity-sized grid spent more time draining empty
+// blocks than computing at decode shapes (68k blocks for ~512 live rows).
 __global__ void swiglu_w13_expanded_kernel(
     const __nv_bfloat16* __restrict__ w13,
     __nv_bfloat16* __restrict__ out,
     const int32_t* __restrict__ num_tokens_post_padded,
+    int max_rows,
     int intermediate_dim) {
   int actual_rows = num_tokens_post_padded[0];
   if (actual_rows <= 0) return;
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  // The routing builder guarantees actual_rows <= capacity == max_rows; the
+  // clamp keeps a broken device-side count from writing out of bounds.
+  if (actual_rows > max_rows) actual_rows = max_rows;
   int total = actual_rows * intermediate_dim;
-  if (idx >= total) return;
-  int row = idx / intermediate_dim;
-  int col = idx - row * intermediate_dim;
-  const __nv_bfloat16* row_ptr = w13 + row * (2 * intermediate_dim);
-  float gate = __bfloat162float(row_ptr[col]);
-  float up = __bfloat162float(row_ptr[intermediate_dim + col]);
-  float silu = gate / (1.0f + expf(-gate));
-  float silu_bf16 = __bfloat162float(__float2bfloat16(silu));
-  out[idx] = __float2bfloat16(silu_bf16 * up);
+  int stride = gridDim.x * blockDim.x;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+    int row = idx / intermediate_dim;
+    int col = idx - row * intermediate_dim;
+    const __nv_bfloat16* row_ptr = w13 + row * (2 * intermediate_dim);
+    float gate = __bfloat162float(row_ptr[col]);
+    float up = __bfloat162float(row_ptr[intermediate_dim + col]);
+    float silu = gate / (1.0f + expf(-gate));
+    float silu_bf16 = __bfloat162float(__float2bfloat16(silu));
+    out[idx] = __float2bfloat16(silu_bf16 * up);
+  }
 }
 
 __global__ void sum_topk_rows_kernel(
@@ -456,17 +465,30 @@ CUresult kimi_marlin_w13_swiglu_expanded_cuda(
     const int32_t* num_tokens_post_padded,
     int max_rows,
     int intermediate_dim,
+    int sm_count,
     cudaStream_t stream) {
   if (w13 == nullptr || out == nullptr || num_tokens_post_padded == nullptr ||
       max_rows < 0 || intermediate_dim <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (max_rows == 0) return CUDA_SUCCESS;
+  // Same convention as the Marlin GEMM launcher: sm_count <= 0 resolves the
+  // current device's multiprocessor count.
+  if (sm_count <= 0) {
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+    err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess || sm_count <= 0) return CUDA_ERROR_INVALID_VALUE;
+  }
   constexpr int threads = 256;
-  int total = max_rows * intermediate_dim;
-  int blocks = (total + threads - 1) / threads;
+  // Fixed occupancy-sized grid; the kernel grid-strides up to the actual
+  // device-side row count (<= max_rows by the recv buffer contract).
+  int max_blocks = (max_rows * intermediate_dim + threads - 1) / threads;
+  int blocks = sm_count * 8;
+  if (blocks > max_blocks) blocks = max_blocks;
   pegainfer_kimi_marlin_moe_wna16::swiglu_w13_expanded_kernel<<<blocks, threads, 0, stream>>>(
-      w13, out, num_tokens_post_padded, intermediate_dim);
+      w13, out, num_tokens_post_padded, max_rows, intermediate_dim);
   return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
 }
 

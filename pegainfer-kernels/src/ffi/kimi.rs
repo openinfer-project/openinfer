@@ -122,6 +122,7 @@ unsafe extern "C" {
         num_tokens_post_padded: *const i32,
         max_rows: i32,
         intermediate_dim: i32,
+        sm_count: i32,
         stream: CUstream,
     ) -> CUresult;
 

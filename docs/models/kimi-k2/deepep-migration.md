@@ -1,6 +1,6 @@
 # Kimi-K2 MoE EP: PPLX → DeepEP migration
 
-> **TL;DR:** Implemented — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `pegainfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → CUDA-graph-capturable in principle (#227, capture still disabled). Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Toxic-reviewed READY; numerics gates (vllm_golden_gate + det contract) and serving bench still pending on 8×H200.
+> **TL;DR:** Implemented and 8×H200-verified — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `pegainfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → CUDA-graph-capturable in principle (#227, capture still disabled). Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Same-node A/B vs PPLX on hth200-29: **bs64 TPOT p50 29.61 vs 29.79 ms (parity), comm itself 7µs/layer faster**; golden gate equivalent to main (free-greedy near-tie reds on both backends, teacher-forced 0 violations both). The initial port was +14% TPOT slower until two capacity-proportional adapter kernels were fixed (see the lesson below).
 >
 > **Last touched:** 2026-06
 
@@ -76,17 +76,80 @@ enqueue everything GPU-side (shared expert, router on aux joined via event,
 (≤ 8 distinct local experts per token, ≤ 7 pad per expert); counts are `ensure!`d
 against capacity before recv (crash early).
 
+## Lesson: capacity-proportional adapter kernels ate the comm win
+
+The first hardware run was **+4.1 ms TPOT (+14%) slower** than PPLX at bs64 —
+yet the nsys A/B showed DeepEP's comm chain (dispatch + combine, all kernels)
+was 7.3 µs/layer *faster* than PPLX's send/recv pairs. The entire regression
+was two adapter kernels whose cost scaled with the worst-case capacity
+(8528 expanded rows) instead of the actual rows (~512 at bs64); PPLX's
+capacity was ~1100 rows so the same patterns never showed there:
+
+| per layer per step | PPLX | DeepEP (first port) | DeepEP (fixed) |
+| --- | ---: | ---: | ---: |
+| comm total | 150.5 µs | 143.2 µs | 143.2 µs |
+| Marlin routing builder | 5.1 µs | **34.0 µs** | ~5 µs |
+| swiglu (expanded) | 5.5 µs | **42.4 µs** | ~5 µs |
+
+- **Routing builder**: one thread per expert wrote its segment serially, and
+  tid 0 wrote the `[total, capacity)` tail sentinels alone — ~8000 serial
+  writes when actual ≪ capacity. Fix: `<<<1,1024>>>`, shared segment table,
+  every thread grid-strides the full range with a binary search per slot.
+- **Swiglu**: the kernel always early-exited past the device-side row count,
+  but the *grid* was capacity-sized — 68k blocks draining for ~512 live rows
+  cost more than the math. Fix: fixed occupancy-sized grid (`sm_count*8`)
+  that grid-strides up to the device count.
+
+Moral (same family as the #204 small-N lesson): with `cpu_sync=false` the
+host never knows the real size, so **every** launch dimension derived from
+capacity must be re-derived from the device count or made size-independent —
+audit each adapter kernel for capacity-proportional cost, don't wait for the
+bench.
+
 ## Known costs / next levers
 
 - Prefill allocates ~5 device buffers per MoE layer (carried verbatim from the
-  PPLX prefill) — obvious TTFT cleanup, not a regression.
-- Decode swiglu/W13 launch at worst-case grid (8528 rows) and early-exit past
-  `num_tokens_post_padded[0]` — same as PPLX; revisit only if it shows in a profile.
+  PPLX prefill); TTFT is 62.2 vs PPLX 60.2 ms p50 after the kernel fixes —
+  this alloc churn plus the per-layer host spin is the remaining 2 ms.
+- combine_impl med ≈ 91 µs vs ≈ 37 µs NVLink theoretical for the bs64 payload —
+  same magnitude as PPLX's combine_recv (85 µs), so not a migration cost;
+  it is the natural #228 overlap/tuning target.
 
-## Pending hardware gates (8×H200, jzh200-42)
+## 8×H200 verification (hth200-29, 2026-06-07)
 
-1. `vllm_golden_gate` accuracy + det contract (token-exact + 0.25 nat) — the bf16
-   combine rounding is the one numerics change to watch.
-2. Serving bench vs the PPLX baseline (bs64 TPOT p50 ~30 ms on jzh200-15);
-   dispatch+combine µs at decode shapes.
-3. #227: prototype graph capture of dispatch→GEMM→combine on H200.
+Same-node A/B, main `d0a0276` (PPLX) vs `feat/kimi-deepep` + kernel fixes,
+in-process `bench_serving`, prompt 1 / output 128 / concurrency 64:
+
+| bs64 | PPLX | DeepEP |
+| --- | ---: | ---: |
+| steady TPOT p50 / p99 | 29.79 / 31.14 ms | **29.61 / 31.74 ms** |
+| TTFT p50 | 60.2 ms | 62.2 ms |
+
+`vllm_golden_gate`: teacher-forced 384 positions **0 violations both backends**
+(DeepEP exact 97.9–98.2%, |Δlogprob| mean 0.030, p99 0.21); free-greedy is red
+on **both** backends on this node at 2 near-tie positions each (DeepEP: json
+pos5 + translation pos31; PPLX: long-zh pos20 + long-en pos31, 4.25 nat) — the
+known #286 marginal class, not a migration regression. Det contract green.
+
+Node env facts (also apply to other hth200 nodes until proven otherwise):
+
+- `NCCL_NVLS_ENABLE=0` required: NVLS multicast bind fails with CUDA error 401
+  (fabric manager runs, NVSwitch multicast state broken; driver 590/CUDA 13.1
+  vs NCCL cuda13.2 build). Without it `ncclCommInitRank` → "unhandled cuda
+  error".
+- `EP_DISABLE_GIN=1` required (and correct for single-node): the GDAKI GIN
+  plugin loads but deeper init fails without DOCA GPUNetIO; intranode traffic
+  is NVLink windows, GIN is inter-node-only.
+- System NCCL is exactly 2.30.4 (`/usr/include` + `/usr/lib/x86_64-linux-gnu`);
+  `PEGAINFER_NCCL_ROOT` wants the `include/`+`lib/` layout — a symlink tree at
+  `/data/opt/nccl-2.30.4` bridges it.
+- The bastion swallows ssh exit codes — poll remote jobs with output markers,
+  never `$?`. `pkill -f <pattern>` self-matches the ssh wrapper command line —
+  kill by PID or match on `/proc/<pid>/cwd`.
+
+## Next
+
+1. #227: prototype graph capture of dispatch→GEMM→combine (decode path is
+   host-quiet; capture closure still needs EP state threaded through).
+2. Prefill alloc/spin cleanup (the +2 ms TTFT).
+3. #228 overlap: combine_impl tuning (91 µs vs 37 µs theory).
