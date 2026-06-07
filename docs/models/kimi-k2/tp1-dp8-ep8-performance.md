@@ -2,7 +2,7 @@
 
 > TL;DR: This ledger tracks pegainfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. The vLLM sustained bs64 `~106ms` TPOT is now explained by a DPLB/CUDA-graph bucket cliff: an uneven DP distribution such as `9,8,8,8,8,8,8,7` pads every rank from graph bucket 8 to 16 and doubles TPOT. O2 landed five production decode-kernel picks (cuBLASLt fixed-shape shared_gate_up / o_proj / MLA strided-batch, split-vocab argmax, fused router selector); accuracy held at the bf16 ULP floor by a base-vs-opt prefill logits A/B, and the PPLX Marlin small-N tile was identified as the messy branch's real accuracy break (`-inf` logits + SIGSEGV at small per-rank N) and rejected. bs64 TPOT is unchanged within noise (p50 `40.58 -> 40.09ms`): the per-kernel wins do not resolve above the ±1ms band at this shape. Every pegainfer optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
 >
-> Last touched: 2026-06-04
+> Last touched: 2026-06-07
 
 ## Target
 
@@ -197,12 +197,12 @@ NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
-PEGAINFER_KIMI_PARALLEL=tp1dp8 \
 nsys profile --force-overwrite=true --trace=cuda,nvtx \
   --cuda-graph-trace=node --export=sqlite \
   -o "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}" \
   target/release/bench_serving \
     --model-path "$MODEL_DIR" \
+    --tp-size 1 --dp-size 8 --ep-backend pplx \
     --cuda-graph false \
     --cuda-profiler-capture \
     --format json \
@@ -260,8 +260,9 @@ Microbench:
 - Smoke command:
 
 ```bash
-PEGAINFER_KIMI_PARALLEL=tp1dp8 target/release/bench_serving \
+target/release/bench_serving \
   --model-path $MODEL_DIR \
+  --tp-size 1 --dp-size 8 --ep-backend pplx \
   --cuda-graph false \
   --format json \
   --out $RESULT_ROOT/kimi-tp1dp8/tp1dp8_bs64_o5_64192bb_smoke.json \

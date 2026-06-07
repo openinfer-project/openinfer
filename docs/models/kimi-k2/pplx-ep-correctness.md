@@ -1,11 +1,14 @@
 # Kimi-K2 PPLX EP Correctness
 
-> **Status:** TP8/DP1 PPLX decode is token-trace exact against the TP8/DP1
-> NCCL path under the same bs64 active-decode schedule on `H20 node`.
+> **TL;DR:** TP8/DP1 PPLX decode is token-trace exact against the TP8/DP1 NCCL
+> path under the same bs64 active-decode schedule on an 8×H200 node. Historical
+> TP8/DP1 correctness baseline; the active serving line is now TP1/DP8/EP8 PPLX.
 >
 > **Ground truth rule:** compare PPLX against TP8 NCCL with the same scheduler
 > shape. A single historical hash is not enough once admission changes make the
 > decode batch truly active at 64 rows.
+>
+> **Last touched:** 2026-06
 
 ## Scope
 
@@ -13,11 +16,16 @@ Target comparison:
 
 | Item | Value |
 | --- | --- |
-| Machine | `H20 node`, 8x H20 |
+| Machine | 8×H200 node |
 | Model | `$MODEL_DIR` |
-| Reference path | `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2` |
-| PPLX path | `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2-pplx-ep` |
+| Reference path | `--tp-size 8 --dp-size 1 --ep-backend nccl`, feature `kimi-k2` |
+| PPLX path | `--tp-size 8 --dp-size 1 --ep-backend pplx`, feature `kimi-k2` |
 | Probe | `bench_serving request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1 --cuda-graph false` |
+
+> CLI note: the parallel shape and EP backend are selected by the
+> `--tp-size/--dp-size/--ep-backend` flags. The old `kimi-k2-pplx-ep` cargo
+> feature and `PEGAINFER_KIMI_PARALLEL` env (used in the original 2026-05-25 run)
+> have been removed; the feature is now just `kimi-k2`.
 
 TP1/DP8 PPLX is intentionally not the baseline for this document. The current
 repair first makes TP8/DP1 PPLX match TP8/DP1 NCCL.
@@ -26,8 +34,8 @@ repair first makes TP8/DP1 PPLX match TP8/DP1 NCCL.
 
 | Date | Path | Output | Result |
 | --- | --- | --- | --- |
-| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving` | clean build on `H20 node` | Pass |
-| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` | clean build on `H20 node` | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` (PPLX selected via `--ep-backend pplx`) | clean build on 8×H200 node | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` | clean build on 8×H200 node | Pass |
 | 2026-05-25 | `cargo test --release -p pegainfer-comm --test pplx_roundtrip -- --nocapture` | 8 ranks dispatch+combine roundtrip, each rank received 512 tokens | Pass |
 | 2026-05-25 | TP8 PPLX bs4, output 5, iters 3 | `$RESULT_ROOT/kimi_pplx_tp8_bs4_o5_final.json`: 12/12 traces hash `7c4c5d83355198fd` | Pass |
 | 2026-05-25 | TP8 NCCL bs64 active decode | `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `97.53ms` | Reference |
@@ -49,25 +57,26 @@ export NVCC=/usr/local/cuda/bin/nvcc
 export LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export PEGAINFER_CUDA_SM=90a
 export PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python
-export PEGAINFER_KIMI_PARALLEL=tp8dp1
 ```
 
-NCCL reference:
+NCCL reference (TP8/DP1):
 
 ```bash
 cargo run --quiet --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
   --model-path $MODEL_DIR \
+  --tp-size 8 --dp-size 1 --ep-backend nccl \
   --cuda-graph false \
   --format json \
   --out $RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
-PPLX path:
+PPLX path (TP8/DP1):
 
 ```bash
-cargo run --quiet --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+cargo run --quiet --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
   --model-path $MODEL_DIR \
+  --tp-size 8 --dp-size 1 --ep-backend pplx \
   --cuda-graph false \
   --format json \
   --out $RESULT_ROOT/kimi_pplx_tp8_active64_o5_after_review.json \
@@ -162,7 +171,7 @@ the expert row is already weighted.
 
 ### No Silent Fallback
 
-The `kimi-k2-pplx-ep` feature must fail startup if PPLX bootstrap fails. A
+`--ep-backend pplx` must fail startup if PPLX bootstrap fails. A
 silent fallback to NCCL would make correctness probes pass for the wrong path.
 The runtime log should include:
 

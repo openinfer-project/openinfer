@@ -1,33 +1,37 @@
 # Kimi-K2 Optimization
 
-> **TL;DR:** Kimi-K2.5/2.6 text-only on H20 ×8。**两条并行路径**：(1) TP8+EP8 NCCL（CUDA Graph）bs4 TPOT `14.39ms`（≈278 tok/s）；(2) **TP1+DP8+EP8 PPLX EP**（no CUDA Graph）bs1 TPOT `17.94ms`，已超过 NCCL no-graph baseline `18.52ms`（详见 [pplx-ep-decode.md](pplx-ep-decode.md)）。PPLX 路径从 37ms 优化到 17.94ms（−52%），根因是 expert_padding=64 导致 Marlin 98% 计算浪费。下一步：PPLX + CUDA Graph 兼容、bs>1 throughput、DP8 scheduler。
+> **TL;DR:** Kimi-K2 model card + 当前 decode 优化主线。**Active mainline 是 TP1+DP8+EP8 PPLX serving**：decode batch cap 64（buckets `[1,2,4,8,16,32,64]`），bs64 service output `1336 tok/s` / TPOT p50 `47.3ms`，beats vLLM 0.19.0 同硬件 baseline。CLI 用 `--tp-size 1 --dp-size 8 --ep-backend pplx` 选 parallel shape（详细 perf ledger 见 [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md)）。下半篇的 **TP8+EP8 NCCL bs4 graph 路径（bs4 TPOT `14.39ms`）是历史 bring-up 记录**，是当时的 keep/revert gate，不是当前 perf 主线——保留是因为它解释了 MLA/MoE/collective 的 kernel 结构和优化推理。重点仍是 decode；prefill/TTFT 优先级低。
 >
-> **Last touched:** 2026-05
+> **Last touched:** 2026-06
 
 ## Goal
 
 PegaInfer Kimi-K2 端到端延迟和吞吐在同 H20 ×8 配置上达到或超过 vLLM 0.19.0 baseline，并保留 greedy token-id parity 作为 keep/revert 硬 gate。**当前重点是 decode 性能**，prefill 与 decode 主线并行改，但不优先。
 
-阶段路线：
+阶段路线（前两步已落地，TP1+DP8+EP8 是当前 active line）：
 
-1. 当前 TP8 + EP8 形态下把 bs4 decode 推到 `> 300 tok/s`（剩余空间集中在 collective fanout / shared 通信 overlap）。
-2. 迁到 **TP1 + DP8 + EP8**（PPLX dispatch/combine），消除 MLA / dense / shared expert 的跨 rank TP all-reduce，throughput 拿 DP 乘数。这是结构改动，需要重新过 greedy parity gate。
-3. vLLM `bench serve` H20 ×8 baseline 采集后填齐 dashboard，做横向 keep/revert 判断。
+1. ✓ 历史：TP8 + EP8 形态下把 bs4 decode 推到 ~278 tok/s（fused qkv_a + shared/dense gate-up fusion + routed scaled-add + 整段 decode CUDA Graph）。剩余的 collective fanout / shared 通信 overlap 留在 TP8 path 上没有继续做，因为下一步直接迁到 TP1+DP8。
+2. ✓ 已落地：迁到 **TP1 + DP8 + EP8**（PPLX dispatch/combine），消除 MLA / dense / shared expert 的跨 rank TP all-reduce，throughput 拿 DP 乘数。这是当前 active serving 形态，decode batch cap 已升到 64（bucketed）。perf ledger 见 [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md)。
+3. ✓ 已完成：vLLM `bench serve` H20 ×8 baseline 采集，dashboard 已填，做横向 keep/revert 判断（见 [vllm-h20-baseline.md](vllm-h20-baseline.md)）。
 
-## Status
+## Status（TP8+EP8 NCCL bring-up 历史快照）
+
+> 下表是 TP8+EP8 NCCL graph 路径的 bring-up 状态，时间戳为 2026-05。当前 active serving 形态是 TP1+DP8+EP8 PPLX；其状态见 [roadmap.md](roadmap.md) 的 capability contract 和 [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md)。
 
 | 区域 | 当前状态 |
 | --- | --- |
-| Correctness | ✓ vLLM K2.5 fixture prompt（27 tok）`max_tokens=1/2/8/16` 四并发 greedy token ids 全对；多 prompt vLLM gate 4/4 argmax match，top-20 id overlap 最低 `19/20`。 |
+| Correctness | ✓ vLLM K2.5 fixture prompt（27 tok）`max_tokens=1/2/8/16` 四并发 greedy token ids 全对；多 prompt vLLM gate 4/4 argmax match，top-20 id overlap 最低 `19/20`。当前 active line 的 accuracy gate 已 git 化（#223），见 [accuracy-gate.md](accuracy-gate.md)。 |
 | Decode TPOT (bs4) | ✓ Graph mode synthetic output64 steady avg `14.39ms` / p99 `14.83ms`，真实 fixture output16 steady avg `14.13ms` / p99 `14.26ms`。 |
 | Prefill TTFT | ⚠ 优先级低。短 prompt（~30 tok）streaming chat 实测 `1995.5ms`，无稳定 perf gate；per-layer allocation、首个 collective stream drain、host-visible top1 待收敛。不影响 decode 主线。 |
 | TP / EP collectives | ⚠ 当前是 NCCL bridge：TP hidden 走 BF16→F32→BF16 桥，MoE routed combine 走 `repeat_f32 + reduce_scatter`。Greedy parity-driven，不是 PPLX EP。下一阶段迁到 TP1 + DP8 + EP8 + PPLX。 |
 | CUDA Graph | ✓ 整段 decode 已 capture/replay；prompt prefill 路径还未 graph 化。 |
 | Routed expert backend | ✓ vLLM Marlin WNA16（INT4 + BF16 scale），bit-parity 单层 W13 + SwiGLU + W2 + topk sum 对 vLLM reference 0-diff。CUTLASS example69 INT4 probe 已下线。 |
 
-## E2E Dashboard
+## E2E Dashboard（TP8+EP8 历史 bring-up 口径）
 
-GPU: 8× NVIDIA H20。Model: Kimi-K2.5 (Kimi-K2.6 同架构权重待发，K2.5 是当前 H20 验证路径)。vLLM: 0.19.0。Concurrency 默认 bs4（参见 [operator-todo.md](operator-todo.md) `KIMI_RUNNER_MAX_BATCH` 硬上限契约）。**vLLM 是 TP1+DP8+EP8 形态**，跟 pegainfer 当前 TP8+EP8 形态不同——这不是 apples-to-apples，是两条不同 sharding 路线在同硬件下的 baseline 对照（参见 [vllm-h20-baseline.md](vllm-h20-baseline.md)）。
+> 这一节是 TP8+EP8 NCCL graph 路径的历史 dashboard，concurrency 锁在 bs4。它记录的是 bring-up 阶段的 keep/revert gate，不是当前 serving cap。**当前 active line（TP1+DP8+EP8）decode batch cap 是 64**，bucketed `[1,2,4,8,16,32,64]`（`KIMI_RUNNER_MAX_BATCH = 64`，`pegainfer-kimi-k2/src/runner/scheduler.rs`），bs64 service 数据见 [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) / [roadmap.md](roadmap.md)。
+
+GPU: 8× NVIDIA H20。Model: Kimi-K2.5 (Kimi-K2.6 同架构权重，K2.5 是当时 H20 验证路径)。vLLM: 0.19.0。**vLLM 是 TP1+DP8+EP8 形态**，跟当时 pegainfer 的 TP8+EP8 形态不同——这不是 apples-to-apples，是两条不同 sharding 路线在同硬件下的 baseline 对照（参见 [vllm-h20-baseline.md](vllm-h20-baseline.md)）。
 
 In-process bench（pegainfer 自带 `bench_serving request`）：
 
@@ -251,7 +255,7 @@ Marlin 数字是 synthetic all-local route 假设，不是真实 EP8 全局 rout
 
 **Approach:** 沿用 Qwen 的 `CudaGraphState` 模板，把 Kimi decode GPU body 拆成 graph-内 launch 区段和 graph-外 top1 D2H 区段。第一次尝试在 `max_tokens=2` 四并发 hang，原因是 Kimi 8 rank worker 独立 begin/end/launch，NCCL graph capture 缺少跨 rank 阶段对齐。新增 `kimi_graph_probe` 验证 local kernel / cuBLAS / NCCL all-reduce / NCCL reduce-scatter 各自都能 capture/replay；`CudaGraphState` 加同步 phase hook 后，rank worker 在 graph begin/enqueue/end/launch 周围插 rank barrier 对齐。
 
-**Result:** `bench_serving --cuda-graph true --concurrency 4 --prompt-len 27 --output-len 64` steady TPOT `16.70ms / p99 17.11ms`，`cuGraphLaunch count = 8 ranks × 63 decode steps`，证明 measured iteration 走 graph replay。HTTP `max_tokens=128` 四并发 warm `20.64ms/token/wave`、`193.8 tok/s`，prefix/tail 一致。`kimi_graph_probe` 完成验证使命后已 retire（参见 [changelog](changelog.md)）。
+**Result:** `bench_serving --cuda-graph true --concurrency 4 --prompt-len 27 --output-len 64` steady TPOT `16.70ms / p99 17.11ms`，`cuGraphLaunch count = 8 ranks × 63 decode steps`，证明 measured iteration 走 graph replay。HTTP `max_tokens=128` 四并发 warm `20.64ms/token/wave`、`193.8 tok/s`，prefix/tail 一致。`kimi_graph_probe` 完成验证使命后已 retire（参见 [bringup-history](bringup-history.md)）。
 
 ### #2 Decode 诊断负担清理 + routed RS bridge（2026-05-22）
 
@@ -285,22 +289,19 @@ Marlin 数字是 synthetic all-local route 假设，不是真实 EP8 全局 rout
 - MLA：full prefill + decode wrapper（FlashInfer MLA decode），paged ckv/kpe cache worker 持有。
 - MoE router：`kimi_router_noaux_tc_launch`（sigmoid + group top-k，匹配 DeepSeekV3 noaux_tc 语义）。
 - TP collectives：BF16-via-F32 bridge（直接 BF16 NCCL 在 greedy parity 上回退，需要 F32 桥）。
-- Scheduler：`KIMI_RUNNER_MAX_BATCH = 4` bs4 wave，prompt prefill 走 slot-local path，第 2 token 起调用真实 bs4 decode body。
+- Scheduler（历史值）：当时 `KIMI_RUNNER_MAX_BATCH = 4` bs4 wave，prompt prefill 走 slot-local path，第 2 token 起调用真实 bs4 decode body。该 const 现在是 `64`（bucketed），见本文档顶部 dashboard 说明。
 
 **Verdict:** correctness OK。Decode strong-sync 口径 bs4 step `~35ms / 114 tok/s`，主热点 = MoE shared/reduce/router/align + TP/EP collectives；MLA + Marlin 单独都不是 bottleneck，graph fanout 和 collective cadence 是。
 
 ## Open
 
-**重点是 decode 性能。Prefill 优先级低。** 按优先级排：
+**重点是 decode 性能。Prefill 优先级低。** 当前 active line（TP1+DP8+EP8）的 open 项以 [roadmap.md](roadmap.md) 为权威；这里只保留与本 optimization log 直接相关的几条：
 
-1. **`decode(bs4) > 300 tok/s`（当前主线）**：当前 `~278 tok/s`（`4 / 0.01439s/step`）。剩余空间集中在 collective fanout（123 logical all-reduce + 60 RS bridge）、shared/EP 通信 overlap，以及下一项的 TP1 + DP8 + EP8 重排。
-2. **TP1 + DP8 + EP8 迁移（下一阶段）**：当前 TP8 + EP8 的 single-token MLA 每 token 都要做跨 8 rank TP all-reduce（123 次/step），collective cadence 是 graph-replay 下剩余 tail 的主要来源之一。改成 TP1（每 rank 自己跑 MLA / dense / shared expert，不再跨 rank reduce）+ DP8（8 路独立请求并行）+ EP8（MoE token routing 仍跨 rank，但走 PPLX dispatch/combine 而不是 NCCL bridge）后：
-   - MLA / dense / shared expert 的 `all_reduce=123` 中绝大部分消失，只剩 MoE 段需要跨 rank。
-   - Single-request TPOT 是否变好取决于 PPLX dispatch/combine 的实测；throughput 上能直接拿 8 并发的乘数。
-   - 需要 scheduler / weights / KV cache 全部按 DP rank-local 切，PPLX EP backend 替换当前 NCCL RS bridge，并重新过 greedy parity gate。结构改动，独立 milestone。
-3. **vLLM baseline 完整采集**：✓ 已完成。H20 ×8 vLLM 0.19.0 TP1+DP8+EP8 bs 1..256 扫描见 [vllm-h20-baseline.md](vllm-h20-baseline.md)；bs=8 是 vLLM 拐点（aggregate `308 tok/s`，TPOT med `26.4ms`），bs=256 峰值 `1131 tok/s`。Dashboard 的 vLLM 列已填，留作 TP1+DP8+EP8 milestone 的硬上限。
-4. **HTTP / frontend overhead 排查**：同硬件、同 bs=4，pegainfer HTTP 口径 TPOT `19.13ms` vs in-process `14.39ms`，差 `4.74ms / token` (~33%)。streaming JSON / `vllm-frontend` bridge / scheduler dispatch 三选一是主导，需要拆解。pegainfer 单请求 TPOT 比 vLLM 低 23% 的窗口正在被这块 overhead 吃掉一部分，影响真实业务感知。优先级介于 #1 和 #5 之间。
-5. **PPLX EP dispatch/combine**：✓ 已完成 decode 路径接入和性能优化。bs=1 TPOT `17.94ms`，超过 NCCL no-graph `18.52ms`。详见 [pplx-ep-decode.md](pplx-ep-decode.md)。剩余：CUDA Graph 兼容性、bs>1 throughput 验证、DP8 scheduler 集成。
-6. **Prefill 性能优化（优先级低）**：short-prompt streaming TTFT `1995.5ms` 偏高，HTTP bench p99 TTFT 飙到 `4240ms` 也是这里的体现（first NCCL collective stream drain + scheduler warmup）。先量 short-prompt prefill 拆解（embedding / MLA prefill / MoE prefill / sampling），再决定是 scratch allocator 还是首个 collective stream drain 主导。Long prompt（128+ synthetic）已经过 1k tok/s，主要痛点是 short prompt + first-call 路径。不影响 decode 主线。
+1. ✓ **`decode(bs4) > 300 tok/s`（历史 TP8 目标）**：TP8 path 最终 `~278 tok/s`（`4 / 0.01439s/step`），未达到 300；继续的空间（collective fanout 123 logical all-reduce + 60 RS bridge、shared/EP 通信 overlap）没有在 TP8 上做完，因为直接迁到了 TP1+DP8。该目标随 TP8 path 退为历史。
+2. ✓ **TP1 + DP8 + EP8 迁移**：已落地，是当前 active serving 形态。TP8+EP8 的 single-token MLA 每 token 跨 8 rank TP all-reduce（123 次/step）的 collective cadence 在 TP1 下绝大部分消失（每 rank 自己跑 MLA/dense/shared expert），只剩 MoE 段跨 rank 走 PPLX dispatch/combine；throughput 拿 DP8 乘数。scheduler/weights/KV cache 已按 DP rank-local 切，accuracy gate git 化（#223）。
+3. ✓ **vLLM baseline 完整采集**：H20 ×8 vLLM 0.19.0 TP1+DP8+EP8 bs 1..256 扫描见 [vllm-h20-baseline.md](vllm-h20-baseline.md)；bs=8 是 vLLM 拐点（aggregate `308 tok/s`，TPOT med `26.4ms`），bs=256 峰值 `1131 tok/s`。
+4. **HTTP / frontend overhead 排查（仍 open）**：bring-up 阶段记录 TP8 HTTP TPOT `19.13ms` vs in-process `14.39ms`（~33%）。这条 frontend/streaming overhead 在 roadmap 仍 open（TTFT/HTTP-overhead milestone），用 qwen3 已知的三个原因交叉验证（TCP_NODELAY/Nagle、frontend bridge、zombie decode）。
+5. ✓ **PPLX EP dispatch/combine**：已完成 decode 路径接入和性能优化。历史 bs=1 TPOT `17.94ms`，超过 NCCL no-graph `18.52ms`（详见 [pplx-ep-decode.md](pplx-ep-decode.md)）；现已作为 active line 的底座，剩余优化（PPLX graph capturability、MoE layer pipelining、DP8 routing quality）在 roadmap §10-12。
+6. **Prefill 性能优化（优先级低，仍 open）**：short-prompt streaming TTFT `1995.5ms` 偏高，HTTP bench p99 TTFT 飙到 `4240ms`（first NCCL collective stream drain + scheduler warmup）。先量 short-prompt prefill 拆解（embedding / MLA prefill / MoE prefill / sampling），再决定主导项。Long prompt（128+ synthetic）已过 1k tok/s。这是 roadmap 的 TTFT milestone。
 
-详细推进点参见 [operator-todo.md](operator-todo.md)。历史实验和 reject 路径参见 [changelog.md](changelog.md)。Decode 路径与 vLLM 算子的逐项对照参见 [vllm-path-comparison.md](vllm-path-comparison.md)。
+历史 bring-up 实验、reject 路径和算子日志已合并进 [bringup-history.md](bringup-history.md)。Decode 路径与 vLLM 算子的逐项对照参见 [vllm-path-comparison.md](vllm-path-comparison.md)。

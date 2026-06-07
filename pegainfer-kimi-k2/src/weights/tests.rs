@@ -56,7 +56,9 @@ fn rank_sliced_load_plan_applies_tp8_ep8_slices() {
     let manifest = tiny_manifest();
     let load_plan = manifest.rank_sliced_load_plan(3).unwrap();
     assert_eq!(load_plan.rank, 3);
-    assert_eq!(load_plan.tensor_count, 26_775);
+    // 8,640 fewer than the checkpoint carries: weight_shape (60 MoE layers ×
+    // 48 local experts × 3 projections) is never read by any kernel (#234).
+    assert_eq!(load_plan.tensor_count, 18_135);
 
     assert_eq!(
         find_load_spec(&load_plan, "language_model.model.embed_tokens.weight").slice,
@@ -150,10 +152,18 @@ fn rank_sliced_load_plan_applies_tp8_ep8_slices() {
     assert_eq!(
         find_load_spec(
             &load_plan,
-            "language_model.model.layers.1.mlp.experts.191.down_proj.weight_shape"
+            "language_model.model.layers.1.mlp.experts.191.down_proj.weight_scale"
         )
         .slice,
         KimiTensorLoadSlice::Full
+    );
+    // weight_shape is never read by any kernel (#234): it must not be loaded.
+    assert!(
+        find_load_spec_opt(
+            &load_plan,
+            "language_model.model.layers.1.mlp.experts.191.down_proj.weight_shape"
+        )
+        .is_none()
     );
     assert!(
         find_load_spec_opt(
@@ -270,7 +280,6 @@ fn fake_int4(layer_idx: usize, expert_idx: usize, projection: &str) -> KimiInt4P
     KimiInt4ProjectionManifest {
         weight_packed: top(&format!("{prefix}.weight_packed")),
         weight_scale: top(&format!("{prefix}.weight_scale")),
-        weight_shape: top(&format!("{prefix}.weight_shape")),
     }
 }
 

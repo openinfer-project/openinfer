@@ -1,5 +1,3 @@
-#![allow(dead_code, unreachable_pub)]
-
 use anyhow::{Result, bail, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
@@ -185,7 +183,6 @@ pub struct KimiInt4WeightManifest {
     pub logical_shape: KimiInt4LogicalShape,
     pub packed_shape: KimiInt4TensorShape,
     pub scale_shape: KimiInt4TensorShape,
-    pub weight_shape_entries: usize,
     pub group_size: usize,
     pub nibble_order: KimiInt4NibbleOrder,
     pub encoding: KimiInt4Encoding,
@@ -216,7 +213,6 @@ impl KimiInt4WeightManifest {
                 rows: logical_shape.out_dim,
                 cols: logical_shape.in_dim / KIMI_K2_INT4_GROUP_SIZE,
             },
-            weight_shape_entries: KIMI_K2_LOCAL_EXPERTS * 2,
             group_size: KIMI_K2_INT4_GROUP_SIZE,
             nibble_order,
             encoding: KimiInt4Encoding::SignedSymmetric,
@@ -287,13 +283,6 @@ impl KimiInt4WeightManifest {
             self.role.label(),
             expected_scale,
             self.scale_shape
-        );
-        ensure!(
-            self.weight_shape_entries == self.local_experts * 2,
-            "{} weight_shape must carry [out_dim, in_dim] for each local expert: expected {} i32 entries, got {}",
-            self.role.label(),
-            self.local_experts * 2,
-            self.weight_shape_entries
         );
         ensure!(
             self.encoding == KimiInt4Encoding::SignedSymmetric,
@@ -369,85 +358,6 @@ impl KimiInt4WeightManifest {
                 AxisSpec::named("out", self.scale_shape.rows),
             ],
         )
-    }
-
-    #[must_use]
-    pub fn weight_shape_spec(&self) -> TensorSpec {
-        TensorSpec::named(
-            "i32",
-            "expert_major_shape",
-            [AxisSpec::named("shape_entry", self.weight_shape_entries)],
-        )
-    }
-}
-
-pub struct KimiInt4Weight<'a> {
-    pub manifest: KimiInt4WeightManifest,
-    pub weight_packed: &'a CudaSlice<u8>,
-    pub weight_scale: &'a CudaSlice<bf16>,
-    pub weight_shape: &'a CudaSlice<i32>,
-}
-
-impl KimiInt4Weight<'_> {
-    pub fn validate(&self) -> Result<()> {
-        self.manifest.validate()?;
-        ensure!(
-            self.weight_packed.len() == self.manifest.packed_shape.elements(),
-            "{} weight_packed len must be {}, got {}",
-            self.manifest.role.label(),
-            self.manifest.packed_shape.elements(),
-            self.weight_packed.len()
-        );
-        ensure!(
-            self.weight_scale.len() == self.manifest.scale_shape.elements(),
-            "{} weight_scale len must be {}, got {}",
-            self.manifest.role.label(),
-            self.manifest.scale_shape.elements(),
-            self.weight_scale.len()
-        );
-        ensure!(
-            self.weight_shape.len() == self.manifest.weight_shape_entries,
-            "{} weight_shape len must be {}, got {}",
-            self.manifest.role.label(),
-            self.manifest.weight_shape_entries,
-            self.weight_shape.len()
-        );
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn dequant_bf16_elements(&self) -> usize {
-        self.manifest.local_experts
-            * self.manifest.logical_shape.out_dim
-            * self.manifest.logical_shape.in_dim
-    }
-}
-
-pub struct KimiInt4ExpertWeights<'a> {
-    pub w1_gate: KimiInt4Weight<'a>,
-    pub w3_up: KimiInt4Weight<'a>,
-    pub w2_down: KimiInt4Weight<'a>,
-}
-
-impl KimiInt4ExpertWeights<'_> {
-    pub fn validate(&self) -> Result<()> {
-        self.w1_gate.validate()?;
-        self.w3_up.validate()?;
-        self.w2_down.validate()?;
-        ensure_role(&self.w1_gate, KimiInt4ExpertRole::W1Gate)?;
-        ensure_role(&self.w3_up, KimiInt4ExpertRole::W3Up)?;
-        ensure_role(&self.w2_down, KimiInt4ExpertRole::W2Down)?;
-
-        let offset = self.w1_gate.manifest.local_expert_offset;
-        for weight in [&self.w3_up, &self.w2_down] {
-            ensure!(
-                weight.manifest.local_expert_offset == offset,
-                "{} local expert offset must match W1 offset {offset}, got {}",
-                weight.manifest.role.label(),
-                weight.manifest.local_expert_offset
-            );
-        }
-        Ok(())
     }
 }
 
@@ -661,148 +571,6 @@ impl KimiExpertMajorRoute<'_> {
                 KIMI_K2_LOCAL_EXPERTS + 1,
             )],
         )
-    }
-}
-
-pub struct KimiExpertMajorRouteWorkspace {
-    pub pos_to_token: CudaSlice<i32>,
-    pub token_topk_to_pos: CudaSlice<i32>,
-    pub expert_indptr: CudaSlice<u32>,
-    pub expert_cursor: CudaSlice<u32>,
-    pub local_count: CudaSlice<u32>,
-    pub max_active_tokens: usize,
-    pub topk: usize,
-    pub local_experts: usize,
-}
-
-impl KimiExpertMajorRouteWorkspace {
-    pub fn new(ctx: &DeviceContext, max_active_tokens: usize) -> Result<Self> {
-        ensure!(
-            max_active_tokens > 0,
-            "Kimi expert-major max_active_tokens must be positive"
-        );
-        let route_capacity = max_active_tokens * KIMI_K2_TOPK;
-        Ok(Self {
-            pos_to_token: ctx.stream.alloc_zeros(route_capacity)?,
-            token_topk_to_pos: ctx.stream.alloc_zeros(route_capacity)?,
-            expert_indptr: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS)?,
-            local_count: ctx.stream.alloc_zeros(1)?,
-            max_active_tokens,
-            topk: KIMI_K2_TOPK,
-            local_experts: KIMI_K2_LOCAL_EXPERTS,
-        })
-    }
-
-    pub fn validate_for(&self, active_tokens: usize) -> Result<()> {
-        ensure!(
-            active_tokens > 0,
-            "Kimi expert-major active_tokens must be positive"
-        );
-        ensure!(
-            active_tokens <= self.max_active_tokens,
-            "active_tokens {} exceeds Kimi expert-major workspace capacity {}",
-            active_tokens,
-            self.max_active_tokens
-        );
-        let route_capacity = active_tokens * KIMI_K2_TOPK;
-        ensure!(
-            self.pos_to_token.len() >= route_capacity,
-            "pos_to_token scratch too small: have {}, need {}",
-            self.pos_to_token.len(),
-            route_capacity
-        );
-        ensure!(
-            self.token_topk_to_pos.len() >= route_capacity,
-            "token_topk_to_pos scratch too small: have {}, need {}",
-            self.token_topk_to_pos.len(),
-            route_capacity
-        );
-        ensure!(
-            self.expert_indptr.len() == KIMI_K2_LOCAL_EXPERTS + 1,
-            "expert_indptr len must be {}, got {}",
-            KIMI_K2_LOCAL_EXPERTS + 1,
-            self.expert_indptr.len()
-        );
-        ensure!(
-            self.expert_cursor.len() == KIMI_K2_LOCAL_EXPERTS,
-            "expert_cursor len must be {}, got {}",
-            KIMI_K2_LOCAL_EXPERTS,
-            self.expert_cursor.len()
-        );
-        ensure!(
-            self.local_count.len() == 1,
-            "local_count len must be 1, got {}",
-            self.local_count.len()
-        );
-        ensure!(
-            self.topk == KIMI_K2_TOPK && self.local_experts == KIMI_K2_LOCAL_EXPERTS,
-            "Kimi expert-major workspace constants must be topk={} local_experts={}",
-            KIMI_K2_TOPK,
-            KIMI_K2_LOCAL_EXPERTS
-        );
-        Ok(())
-    }
-
-    #[must_use]
-    pub const fn route_capacity(active_tokens: usize) -> usize {
-        active_tokens * KIMI_K2_TOPK
-    }
-}
-
-pub struct KimiExpertMajorRouting<'a> {
-    pub route: KimiExpertMajorRoute<'a>,
-    pub pos_to_token: &'a CudaSlice<i32>,
-    pub token_topk_to_pos: &'a CudaSlice<i32>,
-    pub local_count: &'a CudaSlice<u32>,
-    pub global_expert_start: usize,
-}
-
-impl KimiExpertMajorRouting<'_> {
-    #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.expert_major_route",
-            "Kimi-K2 device-resident topk route to expert-major layout",
-        )
-        .output(
-            "expert_indptr",
-            TensorSpec::named(
-                "u32",
-                "expert_major",
-                [AxisSpec::named(
-                    "local_expert_plus_one",
-                    KIMI_K2_LOCAL_EXPERTS + 1,
-                )],
-            ),
-        )
-        .output(
-            "pos_to_token",
-            TensorSpec::named(
-                "i32",
-                "expert_major",
-                [AxisSpec::named("routed_capacity", self.route.routed_tokens)],
-            ),
-        )
-        .output(
-            "token_topk_to_pos",
-            TensorSpec::named(
-                "i32",
-                "token_topk",
-                [AxisSpec::named(
-                    "route_entry",
-                    self.route.active_tokens * KIMI_K2_TOPK,
-                )],
-            ),
-        )
-        .attr("batch_size", self.route.batch_size.to_string())
-        .attr("active_tokens", self.route.active_tokens.to_string())
-        .attr("topk", KIMI_K2_TOPK.to_string())
-        .attr("local_experts", KIMI_K2_LOCAL_EXPERTS.to_string())
-        .attr("global_expert_start", self.global_expert_start.to_string())
-        .attr("device_resident_metadata", "true".to_string())
-        .attr("decode_step_allocation", "forbidden".to_string())
-        .attr("decode_step_d2h", "forbidden".to_string())
     }
 }
 
@@ -1058,24 +826,6 @@ impl KimiMarlinRouting<'_> {
         .attr("decode_step_allocation", "forbidden".to_string())
         .attr("decode_step_d2h", "forbidden".to_string())
     }
-}
-
-pub fn kimi_int4_metadata_probe(ctx: &DeviceContext, weight: &KimiInt4Weight<'_>) -> Result<()> {
-    weight.validate()?;
-    let (shape_ptr, _shape_guard) = weight.weight_shape.device_ptr(&ctx.stream);
-    let result = unsafe {
-        ffi::kimi_int4_expert_metadata_probe_cuda(
-            shape_ptr as *const i32,
-            weight.manifest.weight_shape_entries,
-            weight.manifest.local_experts as i32,
-            weight.manifest.logical_shape.in_dim as i32,
-            weight.manifest.logical_shape.out_dim as i32,
-            weight.manifest.group_size as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
 }
 
 pub fn kimi_moe_marlin_align_block_size<'a>(
@@ -1821,179 +1571,6 @@ fn launch_marlin_wna16_gemm(
     Ok(())
 }
 
-pub fn kimi_moe_build_expert_major_route<'a>(
-    ctx: &DeviceContext,
-    batch_size: usize,
-    active_tokens: usize,
-    global_expert_start: usize,
-    topk_idx: &CudaSlice<i32>,
-    workspace: &'a mut KimiExpertMajorRouteWorkspace,
-) -> Result<KimiExpertMajorRouting<'a>> {
-    ensure!(
-        batch_size > 0,
-        "Kimi expert-major route batch_size must be positive"
-    );
-    ensure!(
-        active_tokens >= batch_size,
-        "active_tokens {} must cover batch_size {}",
-        active_tokens,
-        batch_size
-    );
-    ensure!(
-        global_expert_start + KIMI_K2_LOCAL_EXPERTS <= KIMI_K2_ROUTED_EXPERTS,
-        "global expert range [{}..{}) exceeds {} experts",
-        global_expert_start,
-        global_expert_start + KIMI_K2_LOCAL_EXPERTS,
-        KIMI_K2_ROUTED_EXPERTS
-    );
-    workspace.validate_for(active_tokens)?;
-    let route_capacity = KimiExpertMajorRouteWorkspace::route_capacity(active_tokens);
-    ensure!(
-        topk_idx.len() >= route_capacity,
-        "topk_idx too small: have {}, need {}",
-        topk_idx.len(),
-        route_capacity
-    );
-
-    {
-        let (topk_idx_ptr, _topk_idx_guard) = topk_idx.device_ptr(&ctx.stream);
-        let (pos_to_token_ptr, _pos_to_token_guard) =
-            workspace.pos_to_token.device_ptr_mut(&ctx.stream);
-        let (token_topk_to_pos_ptr, _token_topk_to_pos_guard) =
-            workspace.token_topk_to_pos.device_ptr_mut(&ctx.stream);
-        let (expert_indptr_ptr, _expert_indptr_guard) =
-            workspace.expert_indptr.device_ptr_mut(&ctx.stream);
-        let (expert_cursor_ptr, _expert_cursor_guard) =
-            workspace.expert_cursor.device_ptr_mut(&ctx.stream);
-        let (local_count_ptr, _local_count_guard) =
-            workspace.local_count.device_ptr_mut(&ctx.stream);
-
-        let result = unsafe {
-            ffi::kimi_moe_expert_major_route_cuda(
-                topk_idx_ptr as *const i32,
-                pos_to_token_ptr as *mut i32,
-                token_topk_to_pos_ptr as *mut i32,
-                expert_indptr_ptr as *mut u32,
-                expert_cursor_ptr as *mut u32,
-                local_count_ptr as *mut u32,
-                active_tokens as i32,
-                KIMI_K2_TOPK as i32,
-                global_expert_start as i32,
-                KIMI_K2_LOCAL_EXPERTS as i32,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-
-    let route = KimiExpertMajorRoute {
-        batch_size,
-        active_tokens,
-        routed_tokens: route_capacity,
-        expert_indptr: &workspace.expert_indptr,
-    };
-    route.validate()?;
-    Ok(KimiExpertMajorRouting {
-        route,
-        pos_to_token: &workspace.pos_to_token,
-        token_topk_to_pos: &workspace.token_topk_to_pos,
-        local_count: &workspace.local_count,
-        global_expert_start,
-    })
-}
-
-pub fn kimi_moe_expand_to_expert_major(
-    ctx: &DeviceContext,
-    hidden: &HiddenStates,
-    routing: &KimiExpertMajorRouting<'_>,
-    expert_major_hidden: &mut HiddenStates,
-) -> Result<()> {
-    routing.route.validate()?;
-    ensure!(
-        hidden.seq_len >= routing.route.active_tokens,
-        "hidden seq_len {} must cover active_tokens {}",
-        hidden.seq_len,
-        routing.route.active_tokens
-    );
-    validate_hidden_states(
-        "expert_major_expand.input",
-        hidden,
-        hidden.hidden_dim,
-        hidden.seq_len,
-    )?;
-    validate_hidden_states(
-        "expert_major_expand.output",
-        expert_major_hidden,
-        hidden.hidden_dim,
-        routing.route.routed_tokens,
-    )?;
-    let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
-    let (pos_ptr, _pos_guard) = routing.pos_to_token.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = expert_major_hidden.data.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::kimi_moe_expand_to_expert_major_cuda(
-            hidden_ptr as *const ffi::Half,
-            pos_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            hidden.hidden_dim as i32,
-            routing.route.routed_tokens as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
-pub fn kimi_moe_reduce_expert_major_f32(
-    ctx: &DeviceContext,
-    expert_major_output: &HiddenStates,
-    topk_weight: &CudaSlice<f32>,
-    routing: &KimiExpertMajorRouting<'_>,
-    out: &mut CudaSlice<f32>,
-) -> Result<()> {
-    routing.route.validate()?;
-    validate_hidden_states(
-        "expert_major_reduce.input",
-        expert_major_output,
-        expert_major_output.hidden_dim,
-        routing.route.routed_tokens,
-    )?;
-    let route_entries = routing.route.active_tokens * KIMI_K2_TOPK;
-    ensure!(
-        topk_weight.len() >= route_entries,
-        "topk_weight too small: have {}, need {}",
-        topk_weight.len(),
-        route_entries
-    );
-    let output_elems = routing.route.active_tokens * expert_major_output.hidden_dim;
-    ensure!(
-        out.len() >= output_elems,
-        "Kimi expert-major reduce output too small: have {}, need {}",
-        out.len(),
-        output_elems
-    );
-
-    let (expert_output_ptr, _expert_output_guard) =
-        expert_major_output.data.device_ptr(&ctx.stream);
-    let (topk_weight_ptr, _topk_weight_guard) = topk_weight.device_ptr(&ctx.stream);
-    let (map_ptr, _map_guard) = routing.token_topk_to_pos.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::kimi_moe_reduce_expert_major_f32_cuda(
-            expert_output_ptr as *const ffi::Half,
-            topk_weight_ptr as *const f32,
-            map_ptr as *const i32,
-            out_ptr as *mut f32,
-            routing.route.active_tokens as i32,
-            expert_major_output.hidden_dim as i32,
-            KIMI_K2_TOPK as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
 #[must_use]
 pub const fn packed_int4_cols(cols: usize) -> usize {
     cols.div_ceil(2)
@@ -2030,16 +1607,6 @@ fn marlin_padded_route_capacity(active_tokens: usize, block_size: usize) -> Resu
     route_elems
         .checked_add(max_padding)
         .ok_or_else(|| anyhow::anyhow!("Marlin padded route capacity overflow"))
-}
-
-fn ensure_role(weight: &KimiInt4Weight<'_>, expected: KimiInt4ExpertRole) -> Result<()> {
-    ensure!(
-        weight.manifest.role == expected,
-        "expert role must be {:?}, got {:?}",
-        expected,
-        weight.manifest.role
-    );
-    Ok(())
 }
 
 fn validate_hidden_states(
@@ -2198,7 +1765,6 @@ mod tests {
         assert_eq!(manifest.local_expert_offset, 144);
         assert_eq!(manifest.packed_shape.elements(), 48 * 2048 * (7168 / 2));
         assert_eq!(manifest.scale_shape.elements(), 48 * 2048 * (7168 / 32));
-        assert_eq!(manifest.weight_shape_entries, 96);
     }
 
     #[test]
@@ -2405,10 +1971,8 @@ mod tests {
             let mut routes = topk_host
                 .iter()
                 .enumerate()
-                .filter_map(|(route_offset, &expert)| {
-                    (usize::try_from(expert).ok() == Some(global_expert))
-                        .then(|| i32::try_from(route_offset).expect("route offset"))
-                })
+                .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
+                .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
                 .collect::<Vec<_>>();
             if routes.is_empty() {
                 continue;

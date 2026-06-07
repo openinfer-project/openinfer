@@ -5344,6 +5344,7 @@ dependencies = [
  "pegainfer-comm",
  "pegainfer-core",
  "pegainfer-kernels",
+ "pegainfer-kv-cache",
  "rand 0.10.1",
  "safetensors",
  "serde",

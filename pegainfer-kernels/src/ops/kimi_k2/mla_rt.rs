@@ -6,7 +6,9 @@ use crate::{
     tensor::{DeviceContext, DeviceMatrix, GpuTensor, HiddenStates},
 };
 
-use super::mla::{KIMI_K2_MLA_ROPE_DIM, KimiMlaPagedKvLayout, validate_paged_layout};
+use super::mla::{
+    KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_ROPE_DIM, KimiMlaPagedKvLayout, validate_paged_layout,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_mla_rope_split_decode_rt(
@@ -161,6 +163,10 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
     Ok(())
 }
 
+/// Assemble the suffix rows of prefill attention inputs. `start_pos` is the
+/// cached-prefix length (0 for a cold prefill): q covers the suffix tokens,
+/// k/v rows land at `start_pos..start_pos + seq_len` inside caches sized for
+/// `start_pos + seq_len` tokens, and RoPE positions are absolute.
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_mla_rope_assemble_prefill_rt(
     ctx: &DeviceContext,
@@ -172,9 +178,11 @@ pub fn kimi_mla_rope_assemble_prefill_rt(
     q_attn: &mut HiddenStates,
     k_cache: &mut CudaSlice<half::bf16>,
     v_cache: &mut CudaSlice<half::bf16>,
+    start_pos: usize,
     local_heads: usize,
 ) -> Result<()> {
     let seq_len = q_proj.seq_len;
+    let kv_len = start_pos + seq_len;
     let (q_ptr, _g0) = q_proj.data.device_ptr(&ctx.stream);
     let (kr_ptr, _g1) = k_rope.data.device_ptr(&ctx.stream);
     let (kv_ptr, _g2) = kv_b.data.device_ptr(&ctx.stream);
@@ -194,6 +202,8 @@ pub fn kimi_mla_rope_assemble_prefill_rt(
             kc_ptr as *mut ffi::Half,
             vc_ptr as *mut ffi::Half,
             seq_len as i32,
+            start_pos as i32,
+            kv_len as i32,
             local_heads as i32,
             ctx.stream.cu_stream(),
         )
@@ -202,6 +212,85 @@ pub fn kimi_mla_rope_assemble_prefill_rt(
     Ok(())
 }
 
+/// Scatter pooled latent ckv pages into a contiguous token-major buffer so
+/// the kv_b decompression GEMM can run over a cached prefix. `pages_offset`
+/// is the slot's start inside the uploaded page-index array (FlashInfer CSR).
+pub fn kimi_mla_gather_cached_ckv_rt(
+    ctx: &DeviceContext,
+    ckv_cache: &CudaSlice<half::bf16>,
+    page_indices_d: &CudaSlice<i32>,
+    pages_offset: usize,
+    layout: &KimiMlaPagedKvLayout,
+    ckv_out: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+) -> Result<()> {
+    let cached_len = ckv_out.seq_len;
+    let (cache_ptr, _g0) = ckv_cache.device_ptr(&ctx.stream);
+    let (pages_ptr, _g1) = page_indices_d.device_ptr(&ctx.stream);
+    let (out_ptr, _g2) = ckv_out.data.device_ptr_mut(&ctx.stream);
+    let slot_pages_ptr = (pages_ptr as *const i32).wrapping_add(pages_offset);
+    let result = unsafe {
+        ffi::kimi_mla_gather_cached_ckv_cuda(
+            cache_ptr as *const ffi::Half,
+            slot_pages_ptr,
+            out_ptr as *mut ffi::Half,
+            cached_len as i32,
+            layout.page_size as i32,
+            layout.ckv_stride_page as i64,
+            layout.ckv_stride_n as i64,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+/// Build k/v cache rows `0..cached_len` from the decompressed latent prefix
+/// (`kv_b`, the GEMM output over the gathered ckv) plus the pooled kpe pages.
+/// Pool kpe is post-RoPE, so it is broadcast per head without re-rotation.
+#[allow(clippy::too_many_arguments)]
+pub fn kimi_mla_assemble_cached_kv_rt(
+    ctx: &DeviceContext,
+    kv_b: &HiddenStates,
+    kpe_cache: &CudaSlice<half::bf16>,
+    page_indices_d: &CudaSlice<i32>,
+    pages_offset: usize,
+    layout: &KimiMlaPagedKvLayout,
+    k_cache: &mut CudaSlice<half::bf16>,
+    v_cache: &mut CudaSlice<half::bf16>,
+    kv_len: usize,
+    local_heads: usize,
+) -> Result<()> {
+    let cached_len = kv_b.seq_len;
+    let (kv_ptr, _g0) = kv_b.data.device_ptr(&ctx.stream);
+    let (kpe_ptr, _g1) = kpe_cache.device_ptr(&ctx.stream);
+    let (pages_ptr, _g2) = page_indices_d.device_ptr(&ctx.stream);
+    let (kc_ptr, _g3) = k_cache.device_ptr_mut(&ctx.stream);
+    let (vc_ptr, _g4) = v_cache.device_ptr_mut(&ctx.stream);
+    let slot_pages_ptr = (pages_ptr as *const i32).wrapping_add(pages_offset);
+    let result = unsafe {
+        ffi::kimi_mla_assemble_cached_kv_cuda(
+            kv_ptr as *const ffi::Half,
+            kpe_ptr as *const ffi::Half,
+            slot_pages_ptr,
+            kc_ptr as *mut ffi::Half,
+            vc_ptr as *mut ffi::Half,
+            cached_len as i32,
+            kv_len as i32,
+            local_heads as i32,
+            layout.page_size as i32,
+            layout.kpe_stride_page as i64,
+            layout.kpe_stride_n as i64,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+/// Suffix-aware single prefill: q covers `seq_len` suffix tokens, k/v cover
+/// `kv_len = cached + seq_len` tokens. FlashInfer's causal mask aligns
+/// bottom-right, which is exactly the absolute-position causal mask for a
+/// suffix starting at `kv_len - seq_len`.
 pub fn kimi_flashinfer_single_prefill_mla_rt(
     ctx: &DeviceContext,
     q_attn: &HiddenStates,
@@ -209,6 +298,7 @@ pub fn kimi_flashinfer_single_prefill_mla_rt(
     v_cache: &CudaSlice<half::bf16>,
     output: &mut HiddenStates,
     sm_scale: f32,
+    kv_len: usize,
     local_heads: usize,
 ) -> Result<()> {
     let seq_len = q_attn.seq_len;
@@ -224,6 +314,7 @@ pub fn kimi_flashinfer_single_prefill_mla_rt(
             v_ptr as *const ffi::Half,
             local_heads as i32,
             seq_len as i32,
+            kv_len as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )

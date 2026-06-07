@@ -3,7 +3,8 @@ use anyhow::{Result, bail, ensure};
 use crate::{
     config::KIMI_K2_VOCAB,
     runner::worker::{
-        KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker, KimiRowOptions,
+        KimiKvStepPages, KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker,
+        KimiRowOptions,
     },
 };
 
@@ -28,7 +29,9 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         input_ids: &[u32],
         slot: usize,
         decode_batch_size: usize,
+        cached_tokens: usize,
         ep_max_seq_len: usize,
+        kv_pages: &KimiKvStepPages,
         row: KimiRowOptions,
         seed: u64,
     ) -> Result<KimiOneTokenForwardReport> {
@@ -36,7 +39,9 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
             input_ids.to_vec(),
             slot,
             decode_batch_size,
+            cached_tokens,
             ep_max_seq_len,
+            kv_pages.clone(),
             row,
             seed,
         )?;
@@ -53,6 +58,7 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         append_positions: &[usize],
         slots: &[usize],
         decode_batch_size: usize,
+        kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],
         seed: u64,
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
@@ -72,6 +78,7 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
             append_positions.to_vec(),
             slots.to_vec(),
             decode_batch_size,
+            kv_pages.clone(),
             rows.to_vec(),
             seed,
         )?;

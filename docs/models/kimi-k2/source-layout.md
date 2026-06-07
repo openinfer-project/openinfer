@@ -8,12 +8,12 @@
 
 - **Read**:
   - `docs/index.md` - routed the cleanup to the Kimi-K2 model docs.
-  - `docs/models/kimi-k2/operator-todo.md` - confirmed `worker.rs` owns decode arena, forward, routing, and sampling paths.
+  - `docs/models/kimi-k2/bringup-history.md` - confirmed `worker.rs` owns decode arena, forward, routing, and sampling paths.
   - `pegainfer-kimi-k2/src/layers/attention.rs` - found tensor-view wrappers and validation helpers mixed into the attention header API.
   - `pegainfer-kimi-k2/src/layers/experts.rs` - found tests embedded at the end of the expert header API.
   - `pegainfer-kimi-k2/src/runner/worker.rs` - found rank worker ownership, state command handling, arena/cache logic, forward kernels, load helpers, runtime helpers, and tests in one file.
 - **Relevant history**:
-  - `docs/models/kimi-k2/operator-todo.md` records CUDA Graph and decode arena constraints; splits must preserve pointer-stable decode behavior and not change allocation sites.
+  - `docs/models/kimi-k2/bringup-history.md` records CUDA Graph and decode arena constraints; splits must preserve pointer-stable decode behavior and not change allocation sites.
 - **Plan**:
   1. List Rust files under `pegainfer-kimi-k2/src` over 1k lines.
   2. Split low-risk header/API files first: attention tensor wrappers/validation helpers and expert tests.

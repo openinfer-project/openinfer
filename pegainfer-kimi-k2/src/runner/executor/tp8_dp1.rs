@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::{
     config::{KIMI_K2_DENSE_LAYERS, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_VOCAB},
     runner::worker::{
-        KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker, KimiRowOptions,
+        KimiKvStepPages, KimiOneTokenForwardReport, KimiRankWeightLoadReport, KimiRankWorker,
+        KimiRowOptions,
     },
 };
 
@@ -26,7 +27,9 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         input_ids: &[u32],
         slot: usize,
         decode_batch_size: usize,
+        cached_tokens: usize,
         _ep_max_seq_len: usize,
+        kv_pages: &KimiKvStepPages,
         row: KimiRowOptions,
         _seed: u64,
     ) -> Result<KimiOneTokenForwardReport> {
@@ -35,6 +38,8 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         }
         ensure_no_logprobs_tp8(row.logprobs > 0)?;
         ensure_greedy_tp8(&row.sampling)?;
+        // Every rank replicates the KV pool with identical geometry, so the
+        // same page assignment is broadcast to all eight workers.
         let responses = self
             .workers
             .iter()
@@ -43,7 +48,9 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                     input_ids.to_vec(),
                     slot,
                     decode_batch_size,
+                    cached_tokens,
                     0,
+                    kv_pages.clone(),
                     KimiRowOptions::default(),
                     0,
                 )
@@ -79,6 +86,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         append_positions: &[usize],
         slots: &[usize],
         decode_batch_size: usize,
+        kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],
         _seed: u64,
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
@@ -109,6 +117,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                     append_positions.to_vec(),
                     slots.to_vec(),
                     decode_batch_size,
+                    kv_pages.clone(),
                     vec![KimiRowOptions::default(); token_ids.len()],
                     0,
                 )

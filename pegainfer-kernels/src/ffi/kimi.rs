@@ -42,19 +42,10 @@ unsafe extern "C" {
         v_cache: *const Half,
         local_heads: i32,
         seq_len: i32,
+        kv_len: i32,
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;
-
-    pub fn kimi_int4_expert_metadata_probe_cuda(
-        weight_shape: *const i32,
-        weight_shape_entries: usize,
-        local_experts: i32,
-        in_dim: i32,
-        out_dim: i32,
-        group_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn kimi_k2_router_noaux_tc_cuda(
         hidden: *const Half,
@@ -208,7 +199,35 @@ unsafe extern "C" {
         k_cache: *mut Half,
         v_cache: *mut Half,
         seq_len: i32,
+        start_pos: i32,
+        kv_len: i32,
         local_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_gather_cached_ckv_cuda(
+        ckv_cache: *const Half,
+        page_indices: *const i32,
+        ckv_out: *mut Half,
+        cached_len: i32,
+        page_size: i32,
+        ckv_stride_page: i64,
+        ckv_stride_n: i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn kimi_mla_assemble_cached_kv_cuda(
+        kv_b: *const Half,
+        kpe_cache: *const Half,
+        page_indices: *const i32,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        cached_len: i32,
+        kv_len: i32,
+        local_heads: i32,
+        page_size: i32,
+        kpe_stride_page: i64,
+        kpe_stride_n: i64,
         stream: CUstream,
     ) -> CUresult;
 
@@ -256,29 +275,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub fn kimi_moe_expand_to_expert_major_cuda(
-        hidden: *const Half,
-        pos_to_token: *const i32,
-        expert_major_hidden: *mut Half,
-        hidden_dim: i32,
-        routed_capacity: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_moe_expert_major_route_cuda(
-        topk_idx: *const i32,
-        pos_to_token: *mut i32,
-        token_topk_to_pos: *mut i32,
-        expert_indptr: *mut u32,
-        expert_cursor: *mut u32,
-        local_count: *mut u32,
-        active_tokens: i32,
-        topk: i32,
-        global_start: i32,
-        local_experts: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn kimi_moe_marlin_align_block_size_cuda(
         topk_idx: *const i32,
         sorted_token_ids: *mut i32,
@@ -293,17 +289,6 @@ unsafe extern "C" {
         block_size: i32,
         max_padded_tokens: i32,
         max_m_blocks: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn kimi_moe_reduce_expert_major_f32_cuda(
-        expert_major_output: *const Half,
-        topk_weight: *const f32,
-        token_topk_to_pos: *const i32,
-        out: *mut f32,
-        active_tokens: i32,
-        hidden_dim: i32,
-        topk: i32,
         stream: CUstream,
     ) -> CUresult;
 

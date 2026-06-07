@@ -34,7 +34,6 @@ pub(crate) struct KimiRouterDeviceWeights {
 struct KimiInt4ProjectionGpuWeights<'a> {
     pub weight_packed: &'a KimiGpuRawTensor,
     pub weight_scale: &'a KimiGpuRawTensor,
-    pub weight_shape: &'a KimiGpuRawTensor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,7 +224,6 @@ impl KimiRankGpuWeights {
         Ok(KimiInt4ProjectionGpuWeights {
             weight_packed: self.expect_tensor(&projection.weight_packed, Dtype::I32)?,
             weight_scale: self.expect_tensor(&projection.weight_scale, Dtype::BF16)?,
-            weight_shape: self.expect_tensor(&projection.weight_shape, Dtype::I32)?,
         })
     }
 
@@ -412,7 +410,6 @@ fn has_int4_projection_raw(
 ) -> bool {
     tensors.contains_key(&projection.weight_packed)
         && tensors.contains_key(&projection.weight_scale)
-        && tensors.contains_key(&projection.weight_shape)
 }
 
 impl KimiRouterGpuWeights<'_> {
@@ -459,7 +456,6 @@ fn validate_expert_major_projection<'a>(
     let (out_dim, in_dim) = role.dims();
     let packed_i32_shape = [out_dim, in_dim / 8];
     let scale_bf16_shape = [out_dim, in_dim / KIMI_K2_INT4_GROUP_SIZE];
-    let shape_i32_shape = [2];
     let mut packed_bytes = 0usize;
     let mut scale_bytes = 0usize;
     for projection in &projections {
@@ -474,12 +470,6 @@ fn validate_expert_major_projection<'a>(
             Dtype::BF16,
             &scale_bf16_shape,
             "weight_scale",
-        )?;
-        validate_raw_tensor(
-            projection.weight_shape,
-            Dtype::I32,
-            &shape_i32_shape,
-            "weight_shape",
         )?;
         packed_bytes += projection.weight_packed.bytes;
         scale_bytes += projection.weight_scale.bytes;
@@ -770,7 +760,6 @@ fn push_int4_projection_raw_tensor_names(
 ) {
     out.push(projection.weight_packed.clone());
     out.push(projection.weight_scale.clone());
-    out.push(projection.weight_shape.clone());
 }
 
 fn validate_raw_tensor(
