@@ -96,9 +96,6 @@ fn build_runner_config(
     let rank_sliced_load_plans = (0..placements.len())
         .map(|rank| weight_manifest.rank_sliced_load_plan(rank))
         .collect::<Result<Vec<_>>>()?;
-    let pplx_thread_placement = pegainfer_core::cpu_topology::RankThreadPlacementPlan::for_devices(
-        &options.device_ordinals,
-    )?;
     let config = KimiK2RunnerConfig {
         model_path: model_path.to_path_buf(),
         parallel,
@@ -107,9 +104,7 @@ fn build_runner_config(
         rank_sliced_load_plans,
         placements,
         thread_placement,
-        pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
-        ep_backend: options.ep_backend,
         kv_pool_pages,
     };
     info!(
@@ -134,6 +129,11 @@ fn start_engine_tp8_dp1(
     parallel: ParallelConfig,
 ) -> Result<EngineHandle> {
     info!("kimi-k2: starting TP8/DP1 engine");
+    ensure!(
+        options.ep_backend == EpBackend::Nccl,
+        "Kimi-K2 TP8/DP1 routes MoE through the NCCL backend; --ep-backend={:?} has no TP8 path",
+        options.ep_backend
+    );
     let config = build_runner_config(
         model_path,
         options,
@@ -178,8 +178,8 @@ fn start_engine_tp1_dp8(
 ) -> Result<EngineHandle> {
     info!("kimi-k2: starting TP1/DP8 engine");
     ensure!(
-        options.ep_backend == EpBackend::Pplx,
-        "Kimi-K2 TP1/DP8 requires --ep-backend=pplx"
+        options.ep_backend == EpBackend::DeepEp,
+        "Kimi-K2 TP1/DP8 requires --ep-backend=deepep"
     );
     let dp_world = parallel.dp_world();
     let config = build_runner_config(
@@ -221,13 +221,6 @@ fn build_tp8_dp1_executor(config: &KimiK2RunnerConfig) -> Result<Box<dyn Forward
     let weight_reports =
         maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
     init_tp_nccl(&workers)?;
-    if config.ep_backend == EpBackend::Pplx {
-        install_pplx_backends(config, &workers)?;
-        debug!(
-            "kimi-k2: pplx EP backends installed on all {} ranks",
-            workers.len()
-        );
-    }
     let executor: Box<dyn ForwardExecutor + Send> = Box::new(Tp8Dp1ForwardExecutor {
         workers,
         weight_reports,
@@ -247,7 +240,7 @@ fn build_tp1_dp8_executors(
     let workers = spawn_workers(config)?;
     let weight_reports =
         maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
-    install_pplx_backends(config, &workers)?;
+    install_deepep_backends(&workers)?;
 
     let mut executors: Vec<Box<dyn ForwardExecutor + Send>> =
         Vec::with_capacity(config.parallel.dp_world());
@@ -378,66 +371,31 @@ fn init_tp_nccl(workers: &[KimiRankWorker]) -> Result<()> {
     Ok(())
 }
 
-fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]) -> Result<()> {
+/// Collective DeepEP bootstrap: rank 0's unique id fans out to every rank
+/// worker, which all enter the NCCL communicator + symmetric-window create
+/// together. Send to all ranks before waiting on any response — each worker
+/// blocks inside the collective until the last rank joins.
+fn install_deepep_backends(workers: &[KimiRankWorker]) -> Result<()> {
     let started = Instant::now();
     info!(
-        "kimi-k2: start install PPLX EP backend: ranks={}",
+        "kimi-k2: start install DeepEP EP backend: ranks={}",
         workers.len()
     );
-    let build_started = Instant::now();
-    debug!(
-        "kimi-k2: start build PPLX EP backends: ranks={}",
-        workers.len()
-    );
-    let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
-        n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
-        n_activated_experts: crate::config::KIMI_K2_TOPK,
-        hidden_dim: crate::config::KIMI_K2_HIDDEN,
-    };
-    let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
-    let pplx_params = pegainfer_comm::bootstrap::PplxBootstrapParams {
-        max_num_tokens: crate::runner::moe_pplx::PPLX_MAX_DISPATCH_TOKENS,
-        expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
-        out_dtype: pegainfer_comm::ScalarType::F32,
-        canonicalize_duplicate_sources: config.parallel.tp_world() > 1
-            && config.parallel.dp_world() == 1,
-        ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
-    };
-    let (backends, resources) = pegainfer_comm::bootstrap::build_intra_node_backends(
-        ep_shape,
-        &devices,
-        &config.pplx_thread_placement,
-        pplx_params,
-    )?;
-    std::mem::forget(resources);
-    debug!(
-        "kimi-k2: build PPLX EP backends cost {:.2}s",
-        build_started.elapsed().as_secs_f64()
-    );
-    let enable_started = Instant::now();
-    debug!(
-        "kimi-k2: start enable PPLX EP backends: ranks={}",
-        workers.len()
-    );
-    let pplx_receivers = workers
+    let unique_id = pegainfer_kernels::ops::deepep_unique_id()?;
+    let receivers = workers
         .iter()
-        .zip(backends)
-        .map(|(worker, backend)| worker.enable_pplx_async(backend))
+        .map(|worker| worker.enable_deepep_async(unique_id, workers.len()))
         .collect::<Result<Vec<_>>>()?;
-    for (rank, receiver) in pplx_receivers.into_iter().enumerate() {
+    for (rank, receiver) in receivers.into_iter().enumerate() {
         receiver
             .recv()
-            .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped PPLX enable response"))?
-            .with_context(|| format!("Kimi rank {rank} PPLX EP backend enable"))?;
+            .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped DeepEP enable response"))?
+            .with_context(|| format!("Kimi rank {rank} DeepEP enable"))?;
     }
-    debug!(
-        "kimi-k2: enable PPLX EP backends cost {:.2}s: ranks={}",
-        enable_started.elapsed().as_secs_f64(),
-        workers.len()
-    );
     info!(
-        "kimi-k2: PPLX EP backend install cost {:.2}s",
-        started.elapsed().as_secs_f64()
+        "kimi-k2: DeepEP EP backend install cost {:.2}s: ranks={}",
+        started.elapsed().as_secs_f64(),
+        workers.len()
     );
     Ok(())
 }

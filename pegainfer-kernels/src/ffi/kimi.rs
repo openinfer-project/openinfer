@@ -116,7 +116,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_marlin_w13_swiglu_pplx_cuda(
+    pub fn kimi_marlin_w13_swiglu_expanded_cuda(
         w13: *const Half,
         out: *mut Half,
         num_tokens_post_padded: *const i32,
@@ -292,13 +292,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_pplx_build_marlin_routing_on_stream(
-        recv_tokens_per_expert: *const i32,
+    pub fn kimi_deepep_build_marlin_routing_on_stream(
+        psum_expert: *const i32,
         sorted_token_ids: *mut i32,
         expert_ids: *mut i32,
         num_tokens_post_padded: *mut i32,
         num_local_experts: i32,
-        expert_padding: i32,
+        alignment: i32,
         block_size: i32,
         max_padded_tokens: i32,
         max_m_blocks: i32,
@@ -315,14 +315,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn kimi_scatter_marlin_routes_to_compact_cuda(
-        global_routes: *const Half,
-        compact_routes: *mut Half,
-        sorted_token_ids: *const i32,
-        num_tokens_post_padded: *const i32,
-        route_elems: i32,
-        compact_rows: i32,
-        hidden_dim: i32,
+    pub fn kimi_residual_add_scaled_bf16_cuda(
+        hidden: *const Half,
+        projected: *const Half,
+        routed: *const Half,
+        scale: f32,
+        out: *mut Half,
+        n: i32,
         stream: CUstream,
     ) -> CUresult;
 

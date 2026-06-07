@@ -1,20 +1,20 @@
 //! NCCL all-gather / reduce-scatter MoE backend (the TP-replicated path).
 //!
-//! Sibling of [`super::moe_pplx`]: both implement the same Kimi-K2 MoE layer
+//! Sibling of [`super::moe_deepep`]: both implement the same Kimi-K2 MoE layer
 //! (shared expert + router + routed Marlin experts + scaled residual add). They
 //! differ in how routed tokens cross ranks — which in turn dictates the routing
 //! layout and on-rank buffer format:
 //!
-//! | Stage              | NCCL backend (this file)                     | PPLX backend ([`super::moe_pplx`]) |
+//! | Stage              | NCCL backend (this file)                     | DeepEP backend ([`super::moe_deepep`]) |
 //! |--------------------|----------------------------------------------|------------------------------------|
 //! | Routing layout     | every rank routes the *replicated* hidden    | `dispatch` ships tokens expert-major |
 //! | Local experts      | Marlin GEMM over all routed slots on-rank    | Marlin GEMM over received slots      |
-//! | Cross-rank combine | NCCL `reduce_scatter` / `all_reduce` of F32  | `combine_send` / `combine_recv`      |
+//! | Cross-rank combine | NCCL `reduce_scatter` / `all_reduce` of F32  | `dispatch` / `combine` collectives   |
 //!
 //! Because the hidden state is TP-replicated, every rank computes the *same*
 //! routed contribution and the collective sums duplicates away. This requires a
 //! TP `Comm` (`comm.is_some()`); the TP1 / expert-parallel case must use the
-//! PPLX path instead — the routed entry points here `ensure!` a `Comm`.
+//! DeepEP path instead — the routed entry points here `ensure!` a `Comm`.
 //!
 //! Two entry points, mirroring the call paths in [`super::worker`]:
 //! - [`forward_moe_layer_decode_normed_into`] — CUDA-graph-safe batch decode,
@@ -210,7 +210,7 @@ fn forward_moe_layer_decode_normed_after_event_into(
         .wait(&routed_local_done)
         .with_context(|| format!("Kimi MoE layer {layer_idx} main wait routed_local_done"))?;
     let nccl_comm = comm.ok_or_else(|| {
-        anyhow::anyhow!("NCCL MoE routed path requires TP comm (use PPLX for TP1)")
+        anyhow::anyhow!("NCCL MoE routed path requires TP comm (use DeepEP for TP1)")
     })?;
     reduce_scatter_f32_hidden_into(
         &scratch.comm.routed_reduce_scatter_send_f32,
@@ -356,7 +356,7 @@ pub(super) fn forward_moe_layer_batch_into(
     let mut routed_out_f32 = ctx.stream.alloc_zeros(seq_len * KIMI_K2_HIDDEN)?;
     kimi_marlin_sum_topk_rows_f32(ctx, &expert_output, seq_len, &mut routed_out_f32)?;
     let nccl_comm = comm.ok_or_else(|| {
-        anyhow::anyhow!("NCCL MoE batch routed path requires TP comm (use PPLX for TP1)")
+        anyhow::anyhow!("NCCL MoE batch routed path requires TP comm (use DeepEP for TP1)")
     })?;
     all_reduce_f32_in_place(&mut routed_out_f32, nccl_comm)?;
     scale_f32_in_place(

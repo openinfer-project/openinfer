@@ -92,6 +92,50 @@ pub fn kimi_residual_add_scaled_f32<const DIM: usize>(
     Ok(())
 }
 
+/// `out = bf16(hidden + projected) + scale * routed` with a bf16 routed
+/// contribution (the DeepEP combine output dtype).
+pub fn kimi_residual_add_scaled_bf16<const DIM: usize>(
+    ctx: &DeviceContext,
+    hidden: &GpuTensor<DIM>,
+    projected: &GpuTensor<DIM>,
+    routed: &GpuTensor<DIM>,
+    scale: f32,
+    out: &mut GpuTensor<DIM>,
+) -> Result<()> {
+    let elems = DIM * hidden.seq_len;
+    ensure!(
+        projected.seq_len == hidden.seq_len && out.seq_len == hidden.seq_len,
+        "Kimi residual_add_scaled_bf16 seq_len mismatch: hidden={}, projected={}, out={}",
+        hidden.seq_len,
+        projected.seq_len,
+        out.seq_len
+    );
+    ensure!(
+        routed.seq_len >= hidden.seq_len,
+        "Kimi residual_add_scaled_bf16 routed too small: have {}, need {}",
+        routed.seq_len,
+        hidden.seq_len
+    );
+
+    let (hidden_ptr, _g0) = hidden.data.device_ptr(&ctx.stream);
+    let (projected_ptr, _g1) = projected.data.device_ptr(&ctx.stream);
+    let (routed_ptr, _g2) = routed.data.device_ptr(&ctx.stream);
+    let (out_ptr, _g3) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::kimi_residual_add_scaled_bf16_cuda(
+            hidden_ptr as *const ffi::Half,
+            projected_ptr as *const ffi::Half,
+            routed_ptr as *const ffi::Half,
+            scale,
+            out_ptr as *mut ffi::Half,
+            elems as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KimiInt4ExpertRole {
     W1Gate,
@@ -1226,9 +1270,9 @@ pub fn kimi_marlin_w13_swiglu<const INTER2: usize, const INTER: usize>(
     Ok(())
 }
 
-/// SwiGLU for PPLX path: grid launched at `max_rows` but actual work
+/// SwiGLU over the DeepEP expanded layout: grid launched at `max_rows` but actual work
 /// limited by `num_tokens_post_padded[0]` read on-device — no D2H needed.
-pub fn kimi_marlin_w13_swiglu_pplx<const INTER2: usize, const INTER: usize>(
+pub fn kimi_marlin_w13_swiglu_expanded<const INTER2: usize, const INTER: usize>(
     ctx: &DeviceContext,
     w13: &GpuTensor<INTER2>,
     num_tokens_post_padded: &CudaSlice<i32>,
@@ -1236,13 +1280,13 @@ pub fn kimi_marlin_w13_swiglu_pplx<const INTER2: usize, const INTER: usize>(
 ) -> Result<()> {
     ensure!(
         INTER2 == 2 * INTER,
-        "Kimi PPLX Marlin SwiGLU dim mismatch: input={}, output={}",
+        "Kimi expanded Marlin SwiGLU dim mismatch: input={}, output={}",
         INTER2,
         INTER
     );
     ensure!(
         w13.seq_len == output.seq_len,
-        "Kimi PPLX Marlin SwiGLU seq_len mismatch: input={}, output={}",
+        "Kimi expanded Marlin SwiGLU seq_len mismatch: input={}, output={}",
         w13.seq_len,
         output.seq_len
     );
@@ -1254,7 +1298,7 @@ pub fn kimi_marlin_w13_swiglu_pplx<const INTER2: usize, const INTER: usize>(
     let (out_ptr, _out_guard) = output.data.device_ptr_mut(&ctx.stream);
     let (ntp_ptr, _ntp_guard) = num_tokens_post_padded.device_ptr(&ctx.stream);
     let result = unsafe {
-        ffi::kimi_marlin_w13_swiglu_pplx_cuda(
+        ffi::kimi_marlin_w13_swiglu_expanded_cuda(
             w13_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             ntp_ptr as *const i32,
@@ -1301,103 +1345,66 @@ pub fn kimi_marlin_sum_topk_rows_f32<const DIM: usize>(
     Ok(())
 }
 
-pub fn kimi_scatter_marlin_routes_to_compact<const DIM: usize>(
-    ctx: &DeviceContext,
-    global_routes: &GpuTensor<DIM>,
-    routing: &KimiMarlinRouting<'_>,
-    compact_routes: &mut GpuTensor<DIM>,
-) -> Result<()> {
-    ensure!(
-        global_routes.seq_len == routing.route_elems,
-        "global route output seq_len must be {}, got {}",
-        routing.route_elems,
-        global_routes.seq_len
-    );
-    ensure!(
-        compact_routes.data.len() >= routing.max_padded_tokens * DIM,
-        "compact route output too small: have {}, need {}",
-        compact_routes.data.len(),
-        routing.max_padded_tokens * DIM
-    );
-    let (global_ptr, _global_guard) = global_routes.data.device_ptr(&ctx.stream);
-    let (compact_ptr, _compact_guard) = compact_routes.data.device_ptr_mut(&ctx.stream);
-    let (sorted_ptr, _sorted_guard) = routing.sorted_token_ids.device_ptr(&ctx.stream);
-    let (ntp_ptr, _ntp_guard) = routing.num_tokens_post_padded.device_ptr(&ctx.stream);
-    let result = unsafe {
-        ffi::kimi_scatter_marlin_routes_to_compact_cuda(
-            global_ptr as *const ffi::Half,
-            compact_ptr as *mut ffi::Half,
-            sorted_ptr as *const i32,
-            ntp_ptr as *const i32,
-            routing.route_elems as i32,
-            routing.max_padded_tokens as i32,
-            DIM as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
-/// Build Marlin routing metadata on-stream from PPLX recv counts.
+/// Build Marlin routing metadata on-stream from a DeepEP post-epilogue
+/// expert prefix sum (`psum_expert`, `num_local_experts + 1` entries).
 ///
-/// Launches a <<<1,1>>> CUDA kernel that reads `recv_tokens_per_expert`,
-/// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
-/// and `num_tokens_post_padded` directly on the GPU — zero D2H.
-///
-/// PPLX can receive a skewed set of routes from every EP rank, so the host-side
-/// bound uses the full receive capacity. The CUDA kernel writes the actual
-/// padded total to `num_tokens_post_padded[0]`; Marlin and `swiglu_w13_pplx`
-/// read it on-device to skip sentinel rows within that capacity.
-pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
+/// The DeepEP expanded recv buffer is already expert-major with each expert
+/// segment aligned to `expert_alignment`, so `sorted_token_ids` is identity
+/// over real rows and sentinel over pad rows. A `<<<1,64>>>` kernel fills the
+/// metadata and writes the actual padded total to `num_tokens_post_padded[0]`
+/// — zero D2H; Marlin and `swiglu_w13_expanded` read it on-device.
+pub fn kimi_deepep_build_marlin_routing_on_stream<'a>(
     ctx: &DeviceContext,
     workspace: &'a mut KimiMarlinRouteWorkspace,
-    recv_tokens_per_expert: &CudaSlice<i32>,
-    expert_padding: usize,
-    pplx_recv_capacity: usize,
+    psum_expert: &CudaSlice<i32>,
+    expert_alignment: usize,
+    expanded_capacity: usize,
 ) -> Result<KimiMarlinRouting<'a>> {
-    ensure!(expert_padding > 0, "pplx expert_padding must be positive");
     ensure!(
-        expert_padding.is_multiple_of(workspace.block_size),
-        "pplx expert_padding {} must be a multiple of Marlin block_size {}",
-        expert_padding,
+        expert_alignment > 0,
+        "deepep expert_alignment must be positive"
+    );
+    ensure!(
+        expert_alignment.is_multiple_of(workspace.block_size),
+        "deepep expert_alignment {} must be a multiple of Marlin block_size {}",
+        expert_alignment,
         workspace.block_size
     );
     ensure!(
-        recv_tokens_per_expert.len() >= KIMI_K2_LOCAL_EXPERTS,
-        "recv_tokens_per_expert len must be >= {}, got {}",
-        KIMI_K2_LOCAL_EXPERTS,
-        recv_tokens_per_expert.len()
+        psum_expert.len() > KIMI_K2_LOCAL_EXPERTS,
+        "psum_expert len must be >= {}, got {}",
+        KIMI_K2_LOCAL_EXPERTS + 1,
+        psum_expert.len()
     );
     ensure!(
-        pplx_recv_capacity <= workspace.max_padded_tokens,
-        "pplx_recv_capacity {} exceeds workspace max_padded_tokens {}",
-        pplx_recv_capacity,
+        expanded_capacity <= workspace.max_padded_tokens,
+        "deepep expanded_capacity {} exceeds workspace max_padded_tokens {}",
+        expanded_capacity,
         workspace.max_padded_tokens
     );
 
     let block_size = workspace.block_size;
 
-    // Use full recv capacity: PPLX receives tokens from ALL ranks, so any
-    // expert can get many tokens. The GPU kernel writes the actual count to
+    // Use the full expanded capacity: any expert can receive tokens from
+    // every EP rank. The GPU kernel writes the actual padded total to
     // num_tokens_post_padded[0]; Marlin skips sentinel-filled blocks.
-    let tight_max = pplx_recv_capacity;
+    let tight_max = expanded_capacity;
     let tight_m_blocks = tight_max.div_ceil(block_size);
 
     {
-        let (counts_ptr, _g0) = recv_tokens_per_expert.device_ptr(&ctx.stream);
+        let (psum_ptr, _g0) = psum_expert.device_ptr(&ctx.stream);
         let (sorted_ptr, _g1) = workspace.sorted_token_ids.device_ptr_mut(&ctx.stream);
         let (expert_ptr, _g2) = workspace.expert_ids.device_ptr_mut(&ctx.stream);
         let (ntp_ptr, _g3) = workspace.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
 
         let result = unsafe {
-            ffi::kimi_pplx_build_marlin_routing_on_stream(
-                counts_ptr as *const i32,
+            ffi::kimi_deepep_build_marlin_routing_on_stream(
+                psum_ptr as *const i32,
                 sorted_ptr as *mut i32,
                 expert_ptr as *mut i32,
                 ntp_ptr as *mut i32,
                 KIMI_K2_LOCAL_EXPERTS as i32,
-                expert_padding as i32,
+                expert_alignment as i32,
                 block_size as i32,
                 tight_max as i32,
                 tight_m_blocks as i32,
@@ -1405,7 +1412,7 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
             )
         };
         if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            anyhow::bail!("kimi_pplx_build_marlin_routing_on_stream failed: {result:?}");
+            anyhow::bail!("kimi_deepep_build_marlin_routing_on_stream failed: {result:?}");
         }
     }
 
@@ -1423,8 +1430,8 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     })
 }
 
-/// W13 (gate+up) GEMM for PPLX path: top_k=1, no weight scaling.
-pub fn kimi_marlin_wna16_pplx_w13_gemm<const IN: usize, const OUT: usize>(
+/// W13 (gate+up) GEMM over the DeepEP expanded layout: top_k=1, no weight scaling.
+pub fn kimi_marlin_wna16_expanded_w13_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,
@@ -1458,9 +1465,9 @@ pub fn kimi_marlin_wna16_pplx_w13_gemm<const IN: usize, const OUT: usize>(
     )
 }
 
-/// W2 (down) GEMM for PPLX path: top_k=1 with one top-k weight per
+/// W2 (down) GEMM over the DeepEP expanded layout: top_k=1 with one top-k weight per
 /// expert-major row. This matches the NCCL path's BF16 rounding boundary.
-pub fn kimi_marlin_wna16_pplx_w2_gemm<const IN: usize, const OUT: usize>(
+pub fn kimi_marlin_wna16_expanded_w2_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
     routing: &KimiMarlinRouting<'_>,

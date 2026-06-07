@@ -299,6 +299,83 @@ fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
     })
 }
 
+/// DeepEP elastic shim (csrc/deepep/): Kimi-K2's EP all-to-all backend.
+/// Compiled only with the `kimi-k2` feature; needs NCCL >= 2.30.4 headers/lib.
+fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
+    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
+        relative
+            .components()
+            .any(|part| part.as_os_str() == "deepep")
+    })
+}
+
+/// NCCL >= 2.30.4 root (include/nccl.h + lib/libnccl.so.2) for the DeepEP
+/// shim's device API (ncclDevComm / windows / GIN). cudarc dlopens whatever
+/// libnccl.so.2 it finds at runtime, so build and runtime must point at the
+/// same install: set PEGAINFER_NCCL_ROOT and put `$PEGAINFER_NCCL_ROOT/lib`
+/// on LD_LIBRARY_PATH. The nvidia-nccl-cu13 wheel layout works directly:
+///   pip download 'nvidia-nccl-cu13>=2.30.4' --no-deps -d /tmp/nccl \
+///     && unzip /tmp/nccl/*.whl 'nvidia/nccl/*' -d /tmp/nccl \
+///     && export PEGAINFER_NCCL_ROOT=/tmp/nccl/nvidia/nccl
+fn deepep_nccl_root() -> PathBuf {
+    let Ok(root) = std::env::var("PEGAINFER_NCCL_ROOT").map(PathBuf::from) else {
+        panic!(
+            "The kimi-k2 feature builds the DeepEP shim, which needs NCCL >= 2.30.4. \
+             Set PEGAINFER_NCCL_ROOT to an install with include/nccl.h and lib/libnccl.so.2 \
+             (e.g. the unpacked nvidia-nccl-cu13 wheel)."
+        )
+    };
+
+    let header = root.join("include/nccl.h");
+    let contents = fs::read_to_string(&header).unwrap_or_else(|err| {
+        panic!(
+            "PEGAINFER_NCCL_ROOT: cannot read {}: {err}",
+            header.display()
+        )
+    });
+    let version_component = |name: &str| -> u32 {
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("#define {name} ")))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{} does not define {name}", header.display()))
+    };
+    let version = version_component("NCCL_MAJOR") * 10000
+        + version_component("NCCL_MINOR") * 100
+        + version_component("NCCL_PATCH");
+    assert!(
+        version >= 23004,
+        "PEGAINFER_NCCL_ROOT points at NCCL {version} (< 2.30.4); the DeepEP shim needs the \
+         NCCL device API"
+    );
+
+    let lib = root.join("lib/libnccl.so.2");
+    assert!(
+        lib.is_file(),
+        "PEGAINFER_NCCL_ROOT: {} not found",
+        lib.display()
+    );
+    root
+}
+
+/// The wheel ships only libnccl.so.2; give the linker the unversioned name it
+/// wants via a symlink in OUT_DIR (already on the link search path). The
+/// resulting DT_NEEDED is the soname (libnccl.so.2), resolved at runtime from
+/// LD_LIBRARY_PATH.
+fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
+    let link_name = out_dir.join("libnccl.so");
+    let target = nccl_root.join("lib/libnccl.so.2");
+    match fs::read_link(&link_name) {
+        Ok(existing) if existing == target => {}
+        _ => {
+            let _ = fs::remove_file(&link_name);
+            std::os::unix::fs::symlink(&target, &link_name)
+                .unwrap_or_else(|err| panic!("Failed to symlink {}: {err}", link_name.display()));
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=nccl");
+}
+
 fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
     let Some(relative) = cu_file.strip_prefix(csrc_dir).ok() else {
         return format!("{}_cuda.o", cu_file.file_stem().unwrap().to_string_lossy());
@@ -1108,7 +1185,9 @@ fn main() {
             if !deepseek_enabled && is_deepseek_v4_source(&csrc_dir, path) {
                 return None;
             }
-            if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
+            if !kimi_k2_enabled
+                && (is_kimi_k2_source(&csrc_dir, path) || is_deepep_source(&csrc_dir, path))
+            {
                 return None;
             }
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
@@ -1146,6 +1225,8 @@ fn main() {
         "cargo:warning=Using FlashInfer include dir: {}",
         flashinfer.include.display()
     );
+
+    let deepep_nccl = kimi_k2_enabled.then(deepep_nccl_root);
 
     let mut nvcc_tasks = Vec::new();
     for cu_file in &cu_files {
@@ -1203,6 +1284,34 @@ fn main() {
                 "-DFLASHINFER_ENABLE_FP8_E8M0".to_string(),
                 "-DFLASHINFER_ENABLE_FP4_E2M1".to_string(),
                 "-DCUTLASS_ENABLE_GDC_FOR_SM100=1".to_string(),
+            ]);
+        }
+
+        // DeepEP elastic shim: mirrors the upstream JIT compile flags
+        // (DeepEP csrc/jit/compiler.hpp) minus the cubin plumbing.
+        if is_deepep_source(&csrc_dir, cu_file) {
+            let nccl_root = deepep_nccl
+                .as_ref()
+                .expect("deepep sources are collected only with the kimi-k2 feature");
+            nvcc_args.extend(
+                [
+                    "--std=c++20",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--diag-suppress=39,68,161,174,177,186,940,3012",
+                    "-Xptxas",
+                    "--register-usage-level=10",
+                    "-DEP_NUM_TOPK_IDX_BITS=32",
+                ]
+                .map(str::to_string),
+            );
+            nvcc_args.extend([
+                "-I".to_string(),
+                root.join("third_party/DeepEP/deep_ep/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                nccl_root.join("include").to_string_lossy().to_string(),
             ]);
         }
 
@@ -1403,6 +1512,9 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");
+    if let Some(nccl_root) = &deepep_nccl {
+        link_deepep_nccl(nccl_root, &out_dir);
+    }
     if !cutedsl_runtime_lib_dirs.is_empty() {
         println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
     }
@@ -1419,4 +1531,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PEGAINFER_FLASHINFER_INCLUDE");
     println!("cargo:rerun-if-env-changed=PEGAINFER_BUILD_TIMING");
     println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_JOBS");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_NCCL_ROOT");
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("third_party/DeepEP/deep_ep/include").display()
+    );
 }

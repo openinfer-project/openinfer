@@ -360,7 +360,7 @@ __global__ void swiglu_w13_kernel(
   out[idx] = __float2bfloat16(silu_bf16 * up);
 }
 
-__global__ void swiglu_w13_pplx_kernel(
+__global__ void swiglu_w13_expanded_kernel(
     const __nv_bfloat16* __restrict__ w13,
     __nv_bfloat16* __restrict__ out,
     const int32_t* __restrict__ num_tokens_post_padded,
@@ -450,7 +450,7 @@ CUresult kimi_marlin_w13_swiglu_cuda(
   return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
 }
 
-CUresult kimi_marlin_w13_swiglu_pplx_cuda(
+CUresult kimi_marlin_w13_swiglu_expanded_cuda(
     const __nv_bfloat16* w13,
     __nv_bfloat16* out,
     const int32_t* num_tokens_post_padded,
@@ -465,7 +465,7 @@ CUresult kimi_marlin_w13_swiglu_pplx_cuda(
   constexpr int threads = 256;
   int total = max_rows * intermediate_dim;
   int blocks = (total + threads - 1) / threads;
-  pegainfer_kimi_marlin_moe_wna16::swiglu_w13_pplx_kernel<<<blocks, threads, 0, stream>>>(
+  pegainfer_kimi_marlin_moe_wna16::swiglu_w13_expanded_kernel<<<blocks, threads, 0, stream>>>(
       w13, out, num_tokens_post_padded, intermediate_dim);
   return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
 }

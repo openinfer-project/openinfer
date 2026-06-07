@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::runner::{
     executor::{DP_MAX_BATCH_PER_RANK, ForwardExecutor},
     load_balancer::DpLoadBalancer,
-    moe_pplx::PPLX_MAX_DISPATCH_TOKENS,
+    moe_deepep::DEEPEP_MAX_DISPATCH_TOKENS,
     worker::{KimiKvStepPages, KimiOneTokenForwardReport, KimiRowOptions},
 };
 
@@ -25,7 +25,7 @@ const MAX_BATCH_PER_DP: usize = DP_MAX_BATCH_PER_RANK;
 /// Coordinated DP engine: one coordinator thread drives all DP ranks in
 /// lock-step. Every decode step, ALL ranks execute forward simultaneously
 /// (active ranks with real tokens, idle ranks with padding). This satisfies
-/// the PPLX EP contract that requires all ranks to participate in every
+/// the DeepEP contract that requires all ranks to participate in every
 /// MoE layer's dispatch/combine collective.
 pub(in crate::runner) struct DpCoordinator {
     dp_world: usize,
@@ -304,7 +304,7 @@ impl DpCoordinator {
                 &req,
                 self.pools[0].block_size(),
                 self.pools[0].max_request_blocks(),
-                Some(PPLX_MAX_DISPATCH_TOKENS),
+                Some(DEEPEP_MAX_DISPATCH_TOKENS),
             ) {
                 send_scheduled(&req);
                 let _ = req.token_tx.send(TokenEvent::Rejected {
@@ -455,7 +455,7 @@ impl DpCoordinator {
             self.pools[dp_rank].padding_block_id(),
         );
 
-        // Prefill: all ranks run prefill in lock-step so PPLX collectives
+        // Prefill: all ranks run prefill in lock-step so DeepEP collectives
         // align. Owning rank processes the uncached suffix; padding ranks
         // process a single dummy token into a free slot (output discarded).
         self.synchronized_prefill(dp_rank, prefill_slots, &req, cached_tokens, &kv_pages);
@@ -735,7 +735,7 @@ impl DpCoordinator {
                 }
             } else {
                 // All ranks run prefill so they traverse layers at the same
-                // pace, making exactly 1 PPLX dispatch/combine per MoE layer.
+                // pace, making exactly 1 DeepEP dispatch/combine per MoE layer.
                 // The dummy token's KV write lands on the rank's padding page.
                 let padding_page = self.pools[dp_rank].padding_block_id();
                 StepCommand::Prefill {

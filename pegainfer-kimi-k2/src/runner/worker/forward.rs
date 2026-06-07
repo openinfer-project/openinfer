@@ -11,7 +11,7 @@ pub(super) fn forward_decode_batch_next_token_kernels(
     decode_arena: &mut KimiWorkerDecodeArena,
     active_len: usize,
     local_heads: usize,
-    mut pplx: Option<&mut PplxDecodeContext<'_>>,
+    mut deepep: Option<&mut crate::runner::moe_deepep::KimiMoeDeepEpState>,
 ) -> Result<()> {
     typed_ops::embedding_vocab_shard_into(
         device_ctx,
@@ -64,24 +64,23 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                 })?;
             }
             KimiLayerForwardKindCache::Moe(moe) => {
-                if let Some(pplx_ctx) = pplx.as_mut() {
+                if let Some(dp) = deepep.as_mut() {
                     let arena_seq_len = decode_arena.scratch.mla.hidden.seq_len;
                     decode_arena.scratch.set_moe_seq_len(active_len)?;
-                    let pplx_result = crate::runner::moe_pplx::forward_moe_layer_decode_pplx_normed(
-                        device_ctx,
-                        decode_aux_ctx,
-                        comm,
-                        pplx_ctx.ep,
-                        layer.layer_idx,
-                        moe,
-                        expert_kernels,
-                        &mut decode_arena.scratch,
-                        pplx_ctx.scratch,
-                    );
+                    let deepep_result =
+                        crate::runner::moe_deepep::forward_moe_layer_decode_deepep_normed(
+                            device_ctx,
+                            decode_aux_ctx,
+                            layer.layer_idx,
+                            moe,
+                            expert_kernels,
+                            &mut decode_arena.scratch,
+                            dp,
+                        );
                     let restore_result = decode_arena.scratch.set_moe_seq_len(arena_seq_len);
                     restore_result?;
-                    pplx_result.with_context(|| {
-                        format!("Kimi MoE PPLX batch decode layer {}", layer.layer_idx)
+                    deepep_result.with_context(|| {
+                        format!("Kimi MoE DeepEP batch decode layer {}", layer.layer_idx)
                     })?;
                 } else {
                     crate::runner::moe_nccl::forward_moe_layer_decode_normed_into(

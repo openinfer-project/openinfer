@@ -3,8 +3,8 @@ mod bringup;
 mod config;
 mod executor;
 mod load_balancer;
+mod moe_deepep;
 mod moe_nccl;
-mod moe_pplx;
 mod scheduler;
 mod worker;
 

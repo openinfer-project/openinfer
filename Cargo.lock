@@ -5341,7 +5341,6 @@ dependencies = [
  "log",
  "memmap2",
  "pegainfer-bench",
- "pegainfer-comm",
  "pegainfer-core",
  "pegainfer-kernels",
  "pegainfer-kv-cache",

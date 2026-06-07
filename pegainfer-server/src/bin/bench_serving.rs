@@ -105,14 +105,15 @@ enum OutputFormat {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliEpBackend {
     Nccl,
-    Pplx,
+    #[value(name = "deepep")]
+    DeepEp,
 }
 
 impl From<CliEpBackend> for EpBackend {
     fn from(value: CliEpBackend) -> Self {
         match value {
             CliEpBackend::Nccl => Self::Nccl,
-            CliEpBackend::Pplx => Self::Pplx,
+            CliEpBackend::DeepEp => Self::DeepEp,
         }
     }
 }
@@ -175,8 +176,8 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     dp_size: usize,
 
-    /// Expert-parallel backend for Kimi-K2
-    #[arg(long, default_value = "pplx")]
+    /// Expert-parallel backend for Kimi-K2 (TP1/DP8 requires deepep; TP8/DP1 requires nccl)
+    #[arg(long, default_value = "deepep")]
     ep_backend: CliEpBackend,
 
     #[command(subcommand)]
@@ -366,7 +367,7 @@ struct SnapshotReport {
     date: String,
     model: String,
     gpu: String,
-    /// Parallel layout the snapshot was measured under (e.g. "tp1-dp8-pplx").
+    /// Parallel layout the snapshot was measured under (e.g. "tp1-dp8-deepep").
     /// Absent in snapshots that predate multi-GPU model lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parallel: Option<String>,

@@ -210,8 +210,9 @@ enum KimiRankCommand {
         seed: u64,
         resp: Sender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
-    EnablePplx {
-        ep_backend: pegainfer_comm::EpBackend,
+    EnableDeepEp {
+        unique_id: [u8; 128],
+        num_ranks: usize,
         resp: Sender<Result<()>>,
     },
     Shutdown,
@@ -393,14 +394,19 @@ impl KimiRankWorker {
         Ok(resp_rx)
     }
 
-    pub(super) fn enable_pplx_async(
+    /// Collective DeepEP context creation: send to every rank first, then
+    /// wait — each worker thread blocks inside the NCCL init until all ranks
+    /// have joined.
+    pub(super) fn enable_deepep_async(
         &self,
-        ep_backend: pegainfer_comm::EpBackend,
+        unique_id: [u8; 128],
+        num_ranks: usize,
     ) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
-            .send(KimiRankCommand::EnablePplx {
-                ep_backend,
+            .send(KimiRankCommand::EnableDeepEp {
+                unique_id,
+                num_ranks,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
@@ -440,8 +446,7 @@ struct KimiRankThreadState {
     enable_cuda_graph: bool,
     kv_pool_pages: usize,
     loaded: Option<KimiRankLoadedWeights>,
-    ep_backend: Option<pegainfer_comm::EpBackend>,
-    moe_pplx_scratch: Option<super::moe_pplx::KimiMoePplxScratch>,
+    deepep: Option<super::moe_deepep::KimiMoeDeepEpState>,
 }
 
 struct OwnedRankComm(Comm);
@@ -687,8 +692,7 @@ fn bind_rank_thread(
         enable_cuda_graph,
         kv_pool_pages,
         loaded: None,
-        ep_backend: None,
-        moe_pplx_scratch: None,
+        deepep: None,
     })
 }
 
@@ -762,8 +766,12 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 );
                 let _ = resp.send(result);
             }
-            KimiRankCommand::EnablePplx { ep_backend, resp } => {
-                let result = state.enable_pplx(ep_backend);
+            KimiRankCommand::EnableDeepEp {
+                unique_id,
+                num_ranks,
+                resp,
+            } => {
+                let result = state.enable_deepep(&unique_id, num_ranks);
                 let _ = resp.send(result);
             }
             KimiRankCommand::Shutdown => break,
@@ -779,13 +787,8 @@ pub(super) use runtime::{
     all_reduce_f32_in_place, kimi_marlin_block_size, maybe_all_reduce_hidden_via_f32_in_place,
     reduce_scatter_f32_hidden_into,
 };
-mod state;
-struct PplxDecodeContext<'a> {
-    ep: &'a mut pegainfer_comm::EpBackend,
-    scratch: &'a mut super::moe_pplx::KimiMoePplxScratch,
-}
-
 mod forward;
+mod state;
 
 impl KimiRankWeightLoadReport {
     fn from_loaded_weights(

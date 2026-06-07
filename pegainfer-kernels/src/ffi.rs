@@ -4,11 +4,15 @@
 // Half type (16-bit float) - same layout as CUDA half. Shared ABI type used by all submodules.
 pub type Half = u16;
 
+#[cfg(feature = "kimi-k2")]
+mod deepep;
 mod deepseek;
 #[cfg(feature = "kimi-k2")]
 mod kimi;
 mod qwen35;
 mod shared;
+#[cfg(feature = "kimi-k2")]
+pub use deepep::*;
 pub use deepseek::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi::*;

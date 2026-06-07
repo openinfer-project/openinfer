@@ -38,7 +38,7 @@ impl Default for EngineLoadOptions {
 pub enum EpBackend {
     #[default]
     Nccl,
-    Pplx,
+    DeepEp,
 }
 
 #[derive(Clone, Debug)]

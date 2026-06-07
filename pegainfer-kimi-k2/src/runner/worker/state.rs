@@ -2,9 +2,32 @@ use super::{forward::*, runtime::*, *};
 use crate::config::KIMI_K2_VOCAB;
 
 impl KimiRankThreadState {
-    pub(super) fn enable_pplx(&mut self, ep_backend: pegainfer_comm::EpBackend) -> Result<()> {
+    /// Collective: every rank's worker thread must execute this concurrently
+    /// (the DeepEP context create blocks until all ranks join the NCCL
+    /// communicator and register the symmetric window).
+    pub(super) fn enable_deepep(&mut self, unique_id: &[u8; 128], num_ranks: usize) -> Result<()> {
+        ensure!(
+            self.deepep.is_none(),
+            "Kimi rank {} DeepEP already enabled",
+            self.sliced_load_plan.rank
+        );
+        ensure!(
+            self.tp_comm.is_none(),
+            "Kimi rank {} DeepEP is the TP1/DP8 EP path; TP8 uses the NCCL MoE backend",
+            self.sliced_load_plan.rank
+        );
         self.ctx.set_current()?;
-        self.ep_backend = Some(ep_backend);
+        let rank = self.sliced_load_plan.rank;
+        self.deepep = Some(crate::runner::moe_deepep::KimiMoeDeepEpState::new(
+            &self.ctx.as_device_context(),
+            unique_id,
+            num_ranks,
+            rank,
+        )?);
+        // The DeepEP decode path is host-quiet and graph-capturable, but the
+        // decode graph capture closure does not thread the EP state through
+        // yet — capturing without it would silently fall back to the NCCL
+        // MoE path and compute local experts only (#227).
         self.enable_cuda_graph = false;
         Ok(())
     }
@@ -148,23 +171,12 @@ impl KimiRankThreadState {
     pub(super) fn ensure_decode_arena(&mut self, decode_batch_size: usize) -> Result<()> {
         self.ctx.set_current()?;
         let device_ctx = self.ctx.as_device_context();
-        let (rank, arena_batch_size) = {
-            let loaded = self.loaded.as_mut().ok_or_else(|| {
-                anyhow::anyhow!("Kimi rank weights must be loaded before decode arena allocation")
-            })?;
-            let arena = loaded
-                .decode_arenas
-                .get_mut(&device_ctx, decode_batch_size)?;
-            (loaded.gpu.rank, arena.batch_size)
-        };
-        if self.ep_backend.is_some() {
-            ensure_pplx_decode_scratch(
-                &device_ctx,
-                rank,
-                &mut self.moe_pplx_scratch,
-                arena_batch_size,
-            )?;
-        }
+        let loaded = self.loaded.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Kimi rank weights must be loaded before decode arena allocation")
+        })?;
+        loaded
+            .decode_arenas
+            .get_mut(&device_ctx, decode_batch_size)?;
         Ok(())
     }
 
@@ -272,23 +284,6 @@ impl KimiRankThreadState {
             decode_arena.graph = graph;
             result
         } else {
-            if self.ep_backend.is_some() {
-                ensure_pplx_decode_scratch(
-                    &device_ctx,
-                    rank,
-                    &mut self.moe_pplx_scratch,
-                    decode_arena.batch_size,
-                )?;
-            }
-            let mut pplx_ctx = match self.ep_backend.as_mut() {
-                Some(ep) => {
-                    let scratch = self.moe_pplx_scratch.as_mut().ok_or_else(|| {
-                        anyhow::anyhow!("Kimi rank {rank} PPLX decode scratch is missing")
-                    })?;
-                    Some(PplxDecodeContext { ep, scratch })
-                }
-                None => None,
-            };
             forward_decode_batch_next_token_kernels(
                 &device_ctx,
                 &decode_aux_ctx,
@@ -299,7 +294,7 @@ impl KimiRankThreadState {
                 decode_arena,
                 active_len,
                 local_heads,
-                pplx_ctx.as_mut(),
+                self.deepep.as_mut(),
             )
         };
         forward_result?;
@@ -464,15 +459,12 @@ impl KimiRankThreadState {
             stream: Arc::clone(&self.decode_aux_ctx.stream),
             device_ordinal: self.decode_aux_ctx.device_ordinal,
         };
-        let mut pplx_prefill_scratch = if tp_comm_ref.is_none() && ep_max_seq_len > 0 {
+        let mut deepep_prefill = if tp_comm_ref.is_none() && ep_max_seq_len > 0 {
             Some(
-                crate::runner::moe_pplx::KimiMoePplxScratch::new_prefill(
-                    &device_ctx,
-                    ep_max_seq_len,
-                )
-                .with_context(|| {
+                crate::runner::moe_deepep::KimiMoeDeepEpPrefill::new(&device_ctx, ep_max_seq_len)
+                    .with_context(|| {
                     format!(
-                        "Kimi rank {rank} PPLX prefill scratch (ep_max_seq_len={ep_max_seq_len})"
+                        "Kimi rank {rank} DeepEP prefill buffers (ep_max_seq_len={ep_max_seq_len})"
                     )
                 })?,
             )
@@ -515,11 +507,18 @@ impl KimiRankThreadState {
                     dense_layers_executed += 1;
                 }
                 KimiLayerForwardKindCache::Moe(moe) => {
-                    if let Some(pplx_scratch) = pplx_prefill_scratch.as_mut() {
-                        crate::runner::moe_pplx::forward_moe_layer_prefill_pplx(
+                    if let Some(prefill) = deepep_prefill.as_mut() {
+                        let ep = self
+                            .deepep
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Kimi rank {rank} TP1 prefill requires DeepEP")
+                            })?
+                            .ep();
+                        crate::runner::moe_deepep::forward_moe_layer_prefill_deepep(
                             &device_ctx,
                             &decode_aux_ctx,
-                            self.ep_backend.as_mut().expect("TP1 requires PPLX"),
+                            ep,
                             layer.layer_idx,
                             moe,
                             &layer.attention.post_attention_norm,
@@ -527,10 +526,10 @@ impl KimiRankThreadState {
                             &mut hidden,
                             &mut normed,
                             &mut next_hidden,
-                            pplx_scratch,
+                            prefill,
                         )
                         .with_context(|| {
-                            format!("Kimi MoE PPLX prefill layer {}", layer.layer_idx)
+                            format!("Kimi MoE DeepEP prefill layer {}", layer.layer_idx)
                         })?;
                     } else {
                         Self::forward_moe_layer(
@@ -821,23 +820,4 @@ impl KimiRankThreadState {
             next_hidden,
         )
     }
-}
-fn ensure_pplx_decode_scratch(
-    ctx: &DeviceContext,
-    rank: usize,
-    scratch: &mut Option<crate::runner::moe_pplx::KimiMoePplxScratch>,
-    batch_size: usize,
-) -> Result<()> {
-    let needs_alloc = match scratch.as_ref() {
-        Some(scratch) => scratch.max_local_output_tokens < batch_size,
-        None => true,
-    };
-    if needs_alloc {
-        *scratch = Some(
-            crate::runner::moe_pplx::KimiMoePplxScratch::new_decode(ctx, batch_size).with_context(
-                || format!("Kimi rank {rank} PPLX decode scratch allocation bs{batch_size}"),
-            )?,
-        );
-    }
-    Ok(())
 }

@@ -1,77 +1,92 @@
-# Kimi-K2 MoE EP: PPLX → DeepEP migration research
+# Kimi-K2 MoE EP: PPLX → DeepEP migration
 
-> **TL;DR:** DeepEP is vendored as a submodule (`pegainfer-kernels/third_party/DeepEP`, commit `d4f41e4`, 2026-05-26). The integration target is the new **elastic** API (`deep_ep/buffers/elastic.py` — `legacy.py` is the old LL/HT split). For the decode path the right call shape is **fresh dispatch per step with `do_expand=True` + `do_cpu_sync=False`**: fixed worst-case output shapes (CUDA-graph-capturable, no D2H stall) and per-expert aligned contiguous segments that feed a grouped GEMM directly. The Marlin side is an **adapter, not a rewrite** — the PPLX campaign already moved Marlin to GPU-resident counts (sentinel routing + device-read `num_tokens_post_padded`), and DeepEP's psum layout translates into that format with one small kernel. The real integration risks are the host layer, not the math: `at::cuda::CUDAStream` in every launch signature, mandatory NVRTC JIT (we need AOT instantiation), and NVSHMEM as a build-time link dependency even for single-node.
+> **TL;DR:** Implemented — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `pegainfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → CUDA-graph-capturable in principle (#227, capture still disabled). Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Toxic-reviewed READY; numerics gates (vllm_golden_gate + det contract) and serving bench still pending on 8×H200.
 >
 > **Last touched:** 2026-06
 
-## Why DeepEP (what PPLX cannot give us)
-
-- **CUDA Graph (#227):** the PPLX path architecturally cannot be captured — it relies on a fabric worker thread per rank (`enable_pplx()` force-disables graphs, `runner/worker/state.rs:5-10`). DeepEP elastic dispatch/combine are stream-ordered kernels over the NCCL device API (`ncclDevComm_t`/`ncclWindow_t` in the kernel signatures, `csrc/.../dispatch.hpp:214-238`); with `do_cpu_sync=False` all shapes are static, so the whole MoE section becomes capturable in principle (needs an H200 prototype to confirm GIN ops capture cleanly).
-- **Overlap (#228):** elastic API has first-class event plumbing (`previous_event`, `previous_event_before_epilogue`, `async_with_compute_stream`) designed for comm/compute overlap.
-- **Determinism:** `ElasticBuffer(deterministic=...)` exists and `tests/elastic/test_ep.py:460-463` asserts combine output is **bitwise-identical** to an NCCL reference — directly supports our token-exact det contract.
-- After the #204 kernel-pick campaign, collectives/MoE is the only structural decode lever left (bs64 TPOT unchanged within ±1ms after five GEMM picks).
-
-## Elastic API facts that drive the design (all verified in source)
-
-Dispatch (`elastic.py:708-855`):
-
-- `do_expand=True` → "one slot per (expert, token)" layout. Per-local-expert segments are contiguous and **aligned to `expert_alignment`**; `psum_num_recv_tokens_per_expert` (GPU, `[num_local_experts]`) encodes both real counts and offsets: `psum[i] − align(psum[i−1], A)` = expert *i*'s real count, `align(psum[i], A)` = expert *i+1*'s start (`elastic.py:41-47`). Set `expert_alignment` = Marlin block size and the layout is exactly what the grouped GEMM wants.
-- `do_cpu_sync=False` → no D2H sync; CPU never learns counts; `recv_x` is allocated at fixed worst-case capacity (exact formula lives in csrc buffer sizing — verify before sizing memory). Default is `True`, so this must be passed explicitly.
-- In expand mode `recv_topk_idx` is `None` but **`recv_topk_weights` is returned per-slot** (`test_ep.py:151-155, 384-393` indexes it with slot indices) — the expert rank has router weights available, so the current "W2 GEMM applies topk weight" design maps 1:1.
-- Cached `EPHandle` re-dispatch is for *unchanged routing* (`topk_idx` must be `None`, reused from handle) — not applicable to decode, where every step has fresh router output. Decode = fresh dispatch each step.
-- FP8 dispatch is available (`x` as `(fp8_e4m3, scales)` tuple, per-128-element scales); bf16 is the simple first target.
-
-Combine (`elastic.py:868-928`):
-
-- Takes bf16 `[tokens, hidden]` + handle. **Never multiplies router weights into `x`** in either mode — `combined_topk_weights` is just routed back and asserted equal to the originals (`test_ep.py:464-465`). Weighting is always the caller's job, applied to expert outputs *before* combine. Expand-mode combine ("reduced combine") sums the slots of each source token.
-- `bias` (up to 2 tensors) is added in the epilogue — a free fusion point for the shared-expert path if we ever want it.
-
-Answering the design question directly: **`do_expand=True`, `do_cpu_sync=False` is correct for decode.** Expand's cost (token duplicated per selected expert → topk× traffic into the GEMM) is noise at decode batch sizes; what it buys is contiguous aligned per-expert segments with GPU-only counts and fixed shapes — the exact preconditions for grouped GEMM + CUDA graph. `do_cpu_sync=True` would reintroduce a per-layer D2H sync (the thing that makes a step ~unGraphable and stalls the pipeline 61 times per token).
-
-## Marlin interface: adapter, not rewrite
-
-Current PPLX decode flow (`runner/moe_pplx.rs:256-465`):
+## Architecture as built
 
 ```
-dispatch_recv → recv_tokens_per_expert (GPU, i32/expert)
-  → kimi_pplx_build_marlin_routing_on_stream  (<<<1,64>>> prefix sum, kimi_experts.cu:308-364)
-  → sorted_token_ids (+sentinel for padding) / expert_ids / num_tokens_post_padded[0]  (all GPU)
-  → Marlin W13 (reads M from device, marlin_template.h:307) → SwiGLU → Marlin W2 (applies topk weights)
-  → combine_send/recv (F32 out) → ×KIMI_K2_ROUTER_SCALE → residual
+pegainfer-kernels/
+  third_party/DeepEP            # submodule d4f41e4 (2026-05-26)
+  csrc/deepep/deepep_shim.cu    # AOT template instantiation (Kimi config baked:
+                                #   384 experts / 48 local, topk 8, hidden 7168, 8 ranks)
+                                # + torch-free host launch over cudaLaunchKernelExC
+  src/ffi/deepep.rs             # repr(C) DeepEpInfo + extern decls
+  src/ops/deepep.rs             # DeepEp wrapper: decode_dispatch/decode_combine (no sync),
+                                #   prefill_dispatch_send/wait_counts/recv + prefill_combine
+pegainfer-kimi-k2/
+  src/runner/moe_deepep.rs      # the MoE layer:
+                                #   forward_moe_layer_decode_deepep_normed  (host-quiet)
+                                #   forward_moe_layer_prefill_deepep       (cpu-sync)
 ```
 
-Marlin already consumes GPU-resident M and guards invalid rows in the epilogue (`block_num_valid_tokens`, `marlin_template.h:509-514, 1640, 1697`). DeepEP expand mode produces the same shape of problem: aligned per-expert segments with garbage padding rows between real count and aligned end — *isomorphic to PPLX's padded expert-major layout once you know per-expert counts*.
+Build needs `PEGAINFER_NCCL_ROOT` pointing at NCCL ≥ 2.30 (device API: `ncclDevComm`,
+windows, GIN). The binary links `libnccl.so.2` via `LD_LIBRARY_PATH` at runtime.
+Local dev: `PEGAINFER_NCCL_ROOT=/data/opt/nccl-2.30.4`.
 
-Required changes, scoped:
+Backend selection: TP1/DP8 **requires** `--ep-backend=deepep` (default), TP8/DP1
+requires `nccl` — both enforced with `ensure!` in `runner/bringup.rs`. There is no
+PPLX fallback by design ("我们并不是很喜欢 pplx ep"). `pegainfer-comm`/PPLX survive
+only for the deepseek crates, which use their own `pegainfer_comm::EpBackend` type.
 
-1. **Routing adapter kernel** (small): translate DeepEP's `psum_num_recv_tokens_per_expert` → the existing `sorted_token_ids`/`expert_ids`/`num_tokens_post_padded` triple. Same job as `kimi_pplx_build_marlin_routing_on_stream` does for PPLX counts; with `expert_alignment = 8` (current PPLX expert padding) offsets are already aligned and the prefix sum is already done — the adapter mostly emits sentinels for the pad rows. Marlin core untouched.
-2. **Per-slot weights plumbing:** W2 currently reads `pplx_recv_topk_weight`; switch the source to DeepEP's expanded `recv_topk_weights` (already per-slot, same indexing space as the activation rows).
-3. **Combine-side rework** (the genuinely new part): DeepEP combine takes **bf16** and returns bf16; PPLX `combine_recv` returns F32 and the router scale is applied post-combine (`KIMI_K2_ROUTER_SCALE`, `moe_pplx.rs:457-465`). Options: fold the router scale into the W2 epilogue (per-slot weight × 0.0625 pre-scale), or accept a bf16 combine and upconvert for the residual add. Numerics must be re-gated either way (det contract + vllm_golden_gate).
-4. **SwiGLU:** already launches at worst-case rows and tolerates garbage rows that the next GEMM's epilogue masks — unchanged, but re-verify the garbage-row tolerance claim under DeepEP's padding pattern (the #204 lesson: small-N corruption only shows at decode shapes).
+## The contracts the integration stands on (verified in upstream source)
 
-What does *not* change: INT4 weight/scale layout (expert-major wna16, group 32, perm64), the W13→SwiGLU→W2 structure, the sentinel mechanism.
+**psum_expert post-epilogue semantics** (`dispatch.cuh:209,251-254`,
+`dispatch_copy_epilogue.cuh:117`): dispatch writes the *exclusive* prefix sum of
+*aligned* per-local-expert counts (49 entries); the copy epilogue then `atomicAdd`s
++1 per real slot, so afterwards `psum[i] = aligned_start_i + real_count_i` and
+`psum[48]` = total aligned expanded rows, untouched. The Marlin routing kernel
+(`kimi_deepep_build_marlin_routing_kernel`, `<<<1,64>>>`) reconstructs
+`start_i = round_up(psum[i-1], 8)`, `count_i = psum[i] − start_i`, and reads
+`num_tokens_post_padded` straight from `psum[48]` — no counts-conversion kernel.
 
-## Host-layer integration (the actual hard part)
+**Marlin in-place consumption**: DeepEP `expert_alignment=8` equals Marlin's block
+size, so the expanded recv buffer (expert-major, per-expert 8-aligned segments) *is*
+Marlin's "sorted+padded" format. Routing = identity `sorted_token_ids` with sentinel
+(=capacity) on pad rows + per-block `expert_ids` + device-resident
+`num_tokens_post_padded`. Pad rows compute garbage that combine never reads
+(row-independent GEMMs, sentinel-guarded epilogue). Marlin core untouched.
 
-The kernels are torch-free (raw pointers + NCCL device API; no torch includes in `*.cuh`). Everything above them is not:
+**Weights/scale flow**: dispatch carries per-slot f32 router weights
+(`recv_topk_weight`, same row space as `recv_x`); W2 applies them
+(`mul_topk_weights=true, top_k=1`); combine sums **unweighted**
+(`topk_weights=nullptr`, asserted upstream); `KIMI_K2_ROUTER_SCALE` is applied at
+the residual via `kimi_residual_add_scaled_bf16` — same convention as the NCCL
+backend. Net numerics delta vs PPLX: combine output is bf16 where PPLX returned
+f32, i.e. the routed sum rounds to bf16 one step earlier. Must be re-gated on
+hardware (vllm_golden_gate + det contract), expected within the bf16 ULP floor.
 
-- **`at::cuda::CUDAStream` in every launch signature** (20+ functions, `dispatch.hpp:61,238`, `combine.hpp:132`, `jit/launch_runtime.hpp:50-52`) plus `at::cuda::setCurrentCUDAStream` thread-local games in `buffer.hpp:496-555`. Rust FFI needs a thin C++ shim that accepts `cudaStream_t` and constructs the launch context without ATen — or we port the (modest) host orchestration logic into pegainfer-comm and call the kernel stubs directly.
-- **NVRTC JIT is mandatory today**: template params (`num_experts`, `hidden`, `num_topk`, `num_qps`, rank counts) are baked per specialization (`jit/compiler.hpp:111-160`). For us they are all static per model config (Kimi-K2: 384 experts / 48 local, topk 8, hidden 7168, 8 ranks) → AOT-instantiate the needed specializations in `pegainfer-kernels/build.rs`, same pattern as the Triton AOT flow.
-- **NVSHMEM is a build-time `REQUIRED` link dep** (`CMakeLists.txt:26`) even though single-node runtime traffic goes over the NCCL device path (GIN + symmetric windows, `nccl.cu:94-147`); upstream `setup.py:93` has "TODO: make NVSHMEM and legacy optional". Either carry the dep or patch it out for intranode-only builds.
-- **NCCL version floor:** the device API (`ncclDevComm`, windows, GIN) needs a recent NCCL — pin and verify on the H200 image before anything else.
-- **Bootstrap:** symmetric memory via `ncclCommWindowRegister` + CUDA IPC fd exchange (`symmetric.hpp`) — pegainfer-comm's existing single-process 8-rank bootstrap can drive this; no torch.distributed anywhere in that layer.
+**Decode is host-quiet**: all buffers persistent and worst-case-sized at
+`enable_deepep` (8528 expanded rows ≈ 350 MB/rank); per step there are zero
+allocations, zero D2H syncs, zero `seq_len` mutations. `decode_combine` passes the
+worst-case 1024 as `num_reduced_tokens` — that is the upstream *sentinel*
+(`combine.cuh:43-44`): the kernel reloads the actual count from `psum_rank` on
+device. Graph capture stays disabled for now because the capture closure doesn't
+thread EP state — enabling it would silently fall back to NCCL-MoE local-experts
+(#227 tracks capture).
 
-## Open questions (verify on hardware, in rough order)
+**Prefill lock-step**: all 8 DP ranks call the layer fn simultaneously
+(synchronized prefill pads idle ranks with 1 dummy token). Order per layer:
+enqueue everything GPU-side (shared expert, router on aux joined via event,
+`prefill_dispatch_send`) **before** the host spins on pinned counters
+(`prefill_wait_counts`, 120 s throwing timeout). Capacity:
+`recv_capacity = ep_max_seq_len + 7` (only the owner sends real tokens; 7 dummies),
+`expanded_capacity = (recv_capacity·8 + 48·7).next_multiple_of(8)` — tight bound
+(≤ 8 distinct local experts per token, ≤ 7 pad per expert); counts are `ensure!`d
+against capacity before recv (crash early).
 
-1. Exact worst-case `recv_x` capacity formula with `do_cpu_sync=False` (read csrc buffer sizing; matters little at decode shapes — order 10⁴ slots × 14KB — but must be right).
-2. Empty-rank semantics: all 8 DP ranks must call dispatch/combine each step even with 0 tokens (PPLX supports this today); confirm elastic does.
-3. CUDA-graph capture of GIN/symmetric-window kernels on H200 — the entire #227 thesis rests on this; prototype before any Rust work.
-4. Decode-shape latency: dispatch+combine µs at bs64/topk8/hidden7168 vs PPLX dispatch_send/recv+combine_send/recv pair (Python-side microbench is enough for go/no-go).
-5. `deterministic=True` cost at decode shapes.
+## Known costs / next levers
 
-## Next steps
+- Prefill allocates ~5 device buffers per MoE layer (carried verbatim from the
+  PPLX prefill) — obvious TTFT cleanup, not a regression.
+- Decode swiglu/W13 launch at worst-case grid (8528 rows) and early-exit past
+  `num_tokens_post_padded[0]` — same as PPLX; revisit only if it shows in a profile.
 
-1. H200 prototype (Python, no Rust): build DeepEP, run `tests/elastic/test_ep.py` single-node 8-GPU, microbench decode shapes incl. graph capture of a dispatch→dummy-GEMM→combine step. Go/no-go on items 3-4 above.
-2. AOT spike: instantiate the elastic dispatch/combine specializations for the Kimi config without NVRTC; measure build cost in `pegainfer-kernels/build.rs`.
-3. C++ shim for `cudaStream_t`-based launch + Rust FFI in pegainfer-comm behind an `ep_backend` variant (keep PPLX as the fallback during bring-up).
-4. Marlin routing adapter kernel + combine-side rework; gate with vllm_golden_gate + det contract before any perf claims.
+## Pending hardware gates (8×H200, jzh200-42)
+
+1. `vllm_golden_gate` accuracy + det contract (token-exact + 0.25 nat) — the bf16
+   combine rounding is the one numerics change to watch.
+2. Serving bench vs the PPLX baseline (bs64 TPOT p50 ~30 ms on jzh200-15);
+   dispatch+combine µs at decode shapes.
+3. #227: prototype graph capture of dispatch→GEMM→combine on H200.

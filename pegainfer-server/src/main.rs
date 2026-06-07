@@ -59,8 +59,8 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     dp_size: usize,
 
-    /// Expert-parallel backend for Kimi-K2
-    #[arg(long, default_value = "pplx")]
+    /// Expert-parallel backend for Kimi-K2 (TP1/DP8 requires deepep; TP8/DP1 requires nccl)
+    #[arg(long, default_value = "deepep")]
     ep_backend: CliEpBackend,
 
     /// Emit synchronized DeepSeek V4 prefill phase timing records.
@@ -71,14 +71,15 @@ struct Args {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliEpBackend {
     Nccl,
-    Pplx,
+    #[value(name = "deepep")]
+    DeepEp,
 }
 
 impl From<CliEpBackend> for EpBackend {
     fn from(value: CliEpBackend) -> Self {
         match value {
             CliEpBackend::Nccl => Self::Nccl,
-            CliEpBackend::Pplx => Self::Pplx,
+            CliEpBackend::DeepEp => Self::DeepEp,
         }
     }
 }
