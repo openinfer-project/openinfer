@@ -127,9 +127,9 @@ pub fn lora_decode_fused_delta_group3_into(
     }) else {
         return Ok(());
     };
-    validate_group_projection(&p0, input, max_loras, max_rank);
-    validate_group_projection(&p1, input, max_loras, max_rank);
-    validate_group_projection(&p2, input, max_loras, max_rank);
+    validate_group_projection(p0.as_ref(), input, max_loras, max_rank);
+    validate_group_projection(p1.as_ref(), input, max_loras, max_rank);
+    validate_group_projection(p2.as_ref(), input, max_loras, max_rank);
 
     let (slots_ptr, _gslot) = token_slots.device_ptr(&ctx.stream);
     let (input_ptr, _gi) = input.data.device_ptr(&ctx.stream);
@@ -241,24 +241,24 @@ pub fn lora_decode_fused_delta_group3_into(
 
     let result = unsafe {
         ffi::lora_decode_fused_delta_group3_cuda(
-            p0_a as *const ffi::Half,
-            p0_b as *const ffi::Half,
+            p0_a.cast::<ffi::Half>(),
+            p0_b.cast::<ffi::Half>(),
             p0_scales,
-            p0_out as *mut ffi::Half,
+            p0_out.cast::<ffi::Half>(),
             p0_rank,
             p0_out_dim,
             p0_out_hidden_dim,
-            p1_a as *const ffi::Half,
-            p1_b as *const ffi::Half,
+            p1_a.cast::<ffi::Half>(),
+            p1_b.cast::<ffi::Half>(),
             p1_scales,
-            p1_out as *mut ffi::Half,
+            p1_out.cast::<ffi::Half>(),
             p1_rank,
             p1_out_dim,
             p1_out_hidden_dim,
-            p2_a as *const ffi::Half,
-            p2_b as *const ffi::Half,
+            p2_a.cast::<ffi::Half>(),
+            p2_b.cast::<ffi::Half>(),
             p2_scales,
-            p2_out as *mut ffi::Half,
+            p2_out.cast::<ffi::Half>(),
             p2_rank,
             p2_out_dim,
             p2_out_hidden_dim,
@@ -277,7 +277,7 @@ pub fn lora_decode_fused_delta_group3_into(
 }
 
 fn validate_group_projection(
-    projection: &Option<LoraDecodeGroupedProjection<'_>>,
+    projection: Option<&LoraDecodeGroupedProjection<'_>>,
     input: &HiddenStates,
     max_loras: usize,
     max_rank: usize,
