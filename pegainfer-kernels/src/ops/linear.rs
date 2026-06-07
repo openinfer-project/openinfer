@@ -121,6 +121,49 @@ pub fn gemm_into_checked(
     gemm_into_with_policy(ctx, weight, x, out, x.seq_len == 1)
 }
 
+/// GEMM for a contiguous token range in `x` into a compact output buffer.
+pub fn gemm_token_range_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    token_offset: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(
+        weight.cols, x.hidden_dim,
+        "weight cols {} != hidden_dim {}",
+        weight.cols, x.hidden_dim
+    );
+    assert_eq!(
+        out.hidden_dim, weight.rows,
+        "out hidden_dim {} != weight rows {}",
+        out.hidden_dim, weight.rows
+    );
+    assert!(
+        token_offset + out.seq_len <= x.seq_len,
+        "token range [{}..{}) exceeds input seq_len {}",
+        token_offset,
+        token_offset + out.seq_len,
+        x.seq_len
+    );
+
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_base, _gx) = x.data.device_ptr(&ctx.stream);
+    let x_ptr = x_base + (token_offset * x.hidden_dim * std::mem::size_of::<half::bf16>()) as u64;
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    launch_gemm(
+        w_ptr as *const ffi::Half,
+        x_ptr as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        weight.rows,
+        out.seq_len,
+        weight.cols,
+        out.seq_len == 1,
+        ctx,
+    )
+}
+
 /// Checked GEMM that always uses the workspace-free cuBLAS handle. Kimi decode
 /// uses this for active-batch sizes 1..=4 so graph-readiness is not tied to a
 /// bs1-only condition.

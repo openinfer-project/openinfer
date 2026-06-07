@@ -86,6 +86,149 @@ pub fn scaled_add_rows_into(
     Ok(())
 }
 
+/// In-place scaled add into a row range of a contiguous token range in `out`.
+pub fn scaled_add_rows_token_range_into(
+    ctx: &DeviceContext,
+    delta: &HiddenStates,
+    scale: f32,
+    out: &mut HiddenStates,
+    row_offset: usize,
+    token_offset: usize,
+) -> Result<()> {
+    assert!(
+        scale.is_finite(),
+        "scaled_add_rows_token_range_into scale must be finite"
+    );
+    assert!(
+        row_offset + delta.hidden_dim <= out.hidden_dim,
+        "row range [{}..{}) exceeds out hidden_dim {}",
+        row_offset,
+        row_offset + delta.hidden_dim,
+        out.hidden_dim
+    );
+    assert!(
+        token_offset + delta.seq_len <= out.seq_len,
+        "token range [{}..{}) exceeds out seq_len {}",
+        token_offset,
+        token_offset + delta.seq_len,
+        out.seq_len
+    );
+
+    let (delta_ptr, _gd) = delta.data.device_ptr(&ctx.stream);
+    let (out_base, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let out_ptr =
+        out_base + (token_offset * out.hidden_dim * std::mem::size_of::<half::bf16>()) as u64;
+    let result = unsafe {
+        ffi::scaled_add_rows_cuda(
+            delta_ptr as *const ffi::Half,
+            scale,
+            out_ptr as *mut ffi::Half,
+            out.hidden_dim as i32,
+            row_offset as i32,
+            delta.hidden_dim as i32,
+            delta.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
+pub fn gather_hidden_tokens_into(
+    ctx: &DeviceContext,
+    input: &HiddenStates,
+    token_indices: &CudaSlice<i32>,
+    token_count: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(
+        out.hidden_dim, input.hidden_dim,
+        "gather output hidden_dim {} != input hidden_dim {}",
+        out.hidden_dim, input.hidden_dim
+    );
+    assert_eq!(
+        out.seq_len, token_count,
+        "gather output seq_len {} != token_count {}",
+        out.seq_len, token_count
+    );
+    assert!(
+        token_count <= token_indices.len(),
+        "token_count {} exceeds indices len {}",
+        token_count,
+        token_indices.len()
+    );
+    let (input_ptr, _gi) = input.data.device_ptr(&ctx.stream);
+    let (indices_ptr, _gidx) = token_indices.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::gather_hidden_tokens_cuda(
+            input_ptr as *const ffi::Half,
+            indices_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            input.hidden_dim as i32,
+            token_count as i32,
+            input.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+pub fn scaled_add_rows_indexed_into(
+    ctx: &DeviceContext,
+    delta: &HiddenStates,
+    scale: f32,
+    token_indices: &CudaSlice<i32>,
+    token_count: usize,
+    out: &mut HiddenStates,
+    row_offset: usize,
+) -> Result<()> {
+    assert!(
+        scale.is_finite(),
+        "scaled_add_rows_indexed_into scale must be finite"
+    );
+    assert_eq!(
+        delta.seq_len, token_count,
+        "delta seq_len {} != token_count {}",
+        delta.seq_len, token_count
+    );
+    assert!(
+        token_count <= token_indices.len(),
+        "token_count {} exceeds indices len {}",
+        token_count,
+        token_indices.len()
+    );
+    assert!(
+        row_offset + delta.hidden_dim <= out.hidden_dim,
+        "row range [{}..{}) exceeds out hidden_dim {}",
+        row_offset,
+        row_offset + delta.hidden_dim,
+        out.hidden_dim
+    );
+
+    let (delta_ptr, _gd) = delta.data.device_ptr(&ctx.stream);
+    let (indices_ptr, _gidx) = token_indices.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::scaled_add_rows_indexed_cuda(
+            delta_ptr as *const ffi::Half,
+            scale,
+            indices_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            out.hidden_dim as i32,
+            row_offset as i32,
+            delta.hidden_dim as i32,
+            token_count as i32,
+            out.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// In-place scaled add for tensors with identical shape.
 pub fn scaled_add_batch_into(
     ctx: &DeviceContext,

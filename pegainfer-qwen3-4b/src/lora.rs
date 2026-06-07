@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+use cudarc::driver::CudaSlice;
 use half::{bf16, f16};
 use pegainfer_core::ops;
 use pegainfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
@@ -80,6 +81,158 @@ pub(crate) struct DeviceLoraProjection {
     pub(crate) b: DeviceMatrix,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoraProjectionKind {
+    Q,
+    K,
+    V,
+    O,
+    Gate,
+    Up,
+    Down,
+}
+
+impl LoraProjectionKind {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Q,
+        Self::K,
+        Self::V,
+        Self::O,
+        Self::Gate,
+        Self::Up,
+        Self::Down,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Q => 0,
+            Self::K => 1,
+            Self::V => 2,
+            Self::O => 3,
+            Self::Gate => 4,
+            Self::Up => 5,
+            Self::Down => 6,
+        }
+    }
+}
+
+impl DeviceLoraLayer {
+    pub(crate) fn projection(&self, kind: LoraProjectionKind) -> Option<&DeviceLoraProjection> {
+        match kind {
+            LoraProjectionKind::Q => self.q_proj.as_ref(),
+            LoraProjectionKind::K => self.k_proj.as_ref(),
+            LoraProjectionKind::V => self.v_proj.as_ref(),
+            LoraProjectionKind::O => self.o_proj.as_ref(),
+            LoraProjectionKind::Gate => self.gate_proj.as_ref(),
+            LoraProjectionKind::Up => self.up_proj.as_ref(),
+            LoraProjectionKind::Down => self.down_proj.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LoraTokenRange<'a> {
+    pub(crate) adapter: &'a str,
+    pub(crate) token_offset: usize,
+    pub(crate) token_len: usize,
+}
+
+pub(crate) struct LoraTokenGroup<'a> {
+    pub(crate) adapter: &'a str,
+    pub(crate) ranges: Vec<&'a LoraTokenRange<'a>>,
+    pub(crate) token_count: usize,
+}
+
+pub(crate) struct DeviceLoraTokenGroup<'a> {
+    pub(crate) adapter: &'a str,
+    pub(crate) ranges: Vec<&'a LoraTokenRange<'a>>,
+    pub(crate) token_count: usize,
+    pub(crate) token_indices_d: Option<CudaSlice<i32>>,
+}
+
+pub(crate) fn build_lora_token_ranges<'a>(
+    seq_lens: impl IntoIterator<Item = usize>,
+    adapters: impl IntoIterator<Item = Option<&'a str>>,
+) -> Vec<LoraTokenRange<'a>> {
+    let mut ranges: Vec<LoraTokenRange<'a>> = Vec::new();
+    let mut token_offset = 0usize;
+    for (seq_len, adapter) in seq_lens.into_iter().zip(adapters) {
+        if let Some(adapter) = adapter
+            && seq_len > 0
+        {
+            if let Some(prev) = ranges.last_mut()
+                && prev.adapter == adapter
+                && prev.token_offset + prev.token_len == token_offset
+            {
+                prev.token_len += seq_len;
+            } else {
+                ranges.push(LoraTokenRange {
+                    adapter,
+                    token_offset,
+                    token_len: seq_len,
+                });
+            }
+        }
+        token_offset += seq_len;
+    }
+    ranges
+}
+
+pub(crate) fn group_lora_token_ranges<'a>(
+    ranges: &'a [LoraTokenRange<'a>],
+) -> Vec<LoraTokenGroup<'a>> {
+    let mut groups: Vec<LoraTokenGroup<'a>> = Vec::new();
+    for range in ranges {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.adapter == range.adapter)
+        {
+            group.token_count += range.token_len;
+            group.ranges.push(range);
+        } else {
+            groups.push(LoraTokenGroup {
+                adapter: range.adapter,
+                ranges: vec![range],
+                token_count: range.token_len,
+            });
+        }
+    }
+    groups
+}
+
+pub(crate) fn prepare_lora_token_groups<'a>(
+    ctx: &DeviceContext,
+    ranges: &'a [LoraTokenRange<'a>],
+) -> Result<Vec<DeviceLoraTokenGroup<'a>>> {
+    let mut prepared = Vec::new();
+    for group in group_lora_token_ranges(ranges) {
+        let token_indices_d = if group.ranges.len() == 1 {
+            None
+        } else {
+            let mut token_indices = Vec::with_capacity(group.token_count);
+            for grouped_range in &group.ranges {
+                token_indices.extend(
+                    (grouped_range.token_offset
+                        ..grouped_range.token_offset + grouped_range.token_len)
+                        .map(|idx| idx as i32),
+                );
+            }
+            Some(
+                ctx.stream
+                    .clone_htod(&token_indices)
+                    .map_err(|e| anyhow::anyhow!("LoRA indexed token copy failed: {e}"))?,
+            )
+        };
+        prepared.push(DeviceLoraTokenGroup {
+            adapter: group.adapter,
+            ranges: group.ranges,
+            token_count: group.token_count,
+            token_indices_d,
+        });
+    }
+    Ok(prepared)
+}
+
 #[derive(Debug, Deserialize)]
 struct PeftAdapterConfig {
     #[serde(alias = "r")]
@@ -151,8 +304,12 @@ impl LoraAdapter {
     }
 }
 
-pub(crate) fn load_lora_adapter(path: &Path, config: &Config) -> Result<LoraAdapter> {
-    let (manifest, raw_weights) = inspect_lora_adapter(path, config)?;
+pub(crate) fn load_lora_adapter(
+    path: &Path,
+    config: &Config,
+    max_lora_rank: usize,
+) -> Result<LoraAdapter> {
+    let (manifest, raw_weights) = inspect_lora_adapter(path, config, max_lora_rank)?;
     let tensors = SafeTensors::deserialize(&raw_weights).with_context(|| {
         format!(
             "failed to parse {}",
@@ -214,26 +371,70 @@ pub(crate) fn load_device_lora_adapter(
     })
 }
 
-pub(crate) fn apply_lora_projection_delta(
+pub(crate) fn apply_lora_projection_delta_range(
     ctx: &DeviceContext,
     projection: &DeviceLoraProjection,
     input: &HiddenStates,
     out: &mut HiddenStates,
     row_offset: usize,
+    token_offset: usize,
+    token_len: usize,
     scale: f32,
 ) -> Result<()> {
-    let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, input.seq_len)?;
-    ops::gemm_into(ctx, &projection.a, input, &mut rank_out);
-    let mut delta = HiddenStates::zeros(ctx, projection.b.rows, input.seq_len)?;
+    if token_len == 0 {
+        return Ok(());
+    }
+    let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_len)?;
+    ops::gemm_token_range_into_checked(ctx, &projection.a, input, token_offset, &mut rank_out)?;
+    let mut delta = HiddenStates::zeros(ctx, projection.b.rows, token_len)?;
     ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
-    ops::scaled_add_rows_into(ctx, &delta, scale, out, row_offset)
+    ops::scaled_add_rows_token_range_into(ctx, &delta, scale, out, row_offset, token_offset)
 }
 
-fn inspect_lora_adapter(path: &Path, config: &Config) -> Result<(LoraAdapterManifest, Vec<u8>)> {
+pub(crate) fn apply_lora_projection_delta_indexed(
+    ctx: &DeviceContext,
+    projection: &DeviceLoraProjection,
+    input: &HiddenStates,
+    out: &mut HiddenStates,
+    row_offset: usize,
+    token_indices_d: &CudaSlice<i32>,
+    token_count: usize,
+    scale: f32,
+) -> Result<()> {
+    if token_count == 0 {
+        return Ok(());
+    }
+    let mut compact_input = HiddenStates::zeros(ctx, input.hidden_dim, token_count)?;
+    ops::gather_hidden_tokens_into(ctx, input, token_indices_d, token_count, &mut compact_input)?;
+
+    let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_count)?;
+    ops::gemm_into_checked(ctx, &projection.a, &compact_input, &mut rank_out)?;
+    let mut delta = HiddenStates::zeros(ctx, projection.b.rows, token_count)?;
+    ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
+    ops::scaled_add_rows_indexed_into(
+        ctx,
+        &delta,
+        scale,
+        token_indices_d,
+        token_count,
+        out,
+        row_offset,
+    )
+}
+
+fn inspect_lora_adapter(
+    path: &Path,
+    config: &Config,
+    max_lora_rank: usize,
+) -> Result<(LoraAdapterManifest, Vec<u8>)> {
     let adapter_config = load_adapter_config(path)?;
     let rank = adapter_config.lora_rank;
     let alpha = adapter_config.alpha;
     ensure!(rank > 0, "LoRA rank must be > 0");
+    ensure!(
+        rank <= max_lora_rank,
+        "LoRA rank {rank} exceeds max_lora_rank {max_lora_rank}"
+    );
     ensure!(alpha > 0, "LoRA alpha must be > 0");
     if let Some(peft_type) = &adapter_config.peft_type {
         ensure!(
@@ -701,9 +902,13 @@ mod tests {
         write_adapter_config(&path, targets, 2);
         write_adapter_weights(&path, &config, targets, 2);
 
-        let manifest = load_lora_adapter(&path, &config)
-            .expect("load adapter")
-            .manifest;
+        let manifest = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter")
+        .manifest;
 
         assert_eq!(manifest.rank, 2);
         assert_eq!(manifest.alpha, 16);
@@ -721,7 +926,12 @@ mod tests {
         write_adapter_config(&path, &["q_proj", "down_proj"], 2);
         write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
 
-        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let adapter = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter");
 
         assert_eq!(adapter.manifest.rank, 2);
         assert_eq!(adapter.layers.len(), config.num_hidden_layers);
@@ -769,7 +979,12 @@ mod tests {
         safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
             .expect("write safetensors");
 
-        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let adapter = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter");
         let q_proj = adapter.layers[0].projections.get("q_proj").expect("q_proj");
 
         assert_eq!(q_proj.a.data[0].to_f32(), bf16::from_f32(1.5).to_f32());
@@ -783,9 +998,84 @@ mod tests {
         write_adapter_config(&path, &["q_proj", "embed_tokens"], 2);
         write_adapter_weights(&path, &config, &["q_proj"], 2);
 
-        let error = load_lora_adapter(&path, &config).expect_err("unsupported target");
+        let error = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect_err("unsupported target");
 
         assert!(error.to_string().contains("unsupported Qwen3 LoRA target"));
+    }
+
+    #[test]
+    fn rejects_lora_rank_above_configured_limit() {
+        let config = tiny_config();
+        let path = temp_adapter_dir("rank-limit");
+        write_adapter_config(&path, &["q_proj"], 2);
+        write_adapter_weights(&path, &config, &["q_proj"], 2);
+
+        let error = load_lora_adapter(&path, &config, 1)
+            .expect_err("rank above max_lora_rank should fail")
+            .to_string();
+
+        assert!(error.contains("LoRA rank 2 exceeds max_lora_rank 1"));
+    }
+
+    #[test]
+    fn groups_non_contiguous_lora_ranges_by_adapter() {
+        let ranges = build_lora_token_ranges(
+            [2usize, 3, 1, 4],
+            [
+                Some("adapter-a"),
+                Some("adapter-b"),
+                Some("adapter-a"),
+                None,
+            ],
+        );
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].adapter, "adapter-a");
+        assert_eq!((ranges[0].token_offset, ranges[0].token_len), (0, 2));
+        assert_eq!(ranges[1].adapter, "adapter-b");
+        assert_eq!((ranges[1].token_offset, ranges[1].token_len), (2, 3));
+        assert_eq!(ranges[2].adapter, "adapter-a");
+        assert_eq!((ranges[2].token_offset, ranges[2].token_len), (5, 1));
+
+        let groups = group_lora_token_ranges(&ranges);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].adapter, "adapter-a");
+        assert_eq!(groups[0].token_count, 3);
+        assert_eq!(groups[0].ranges.len(), 2);
+        assert_eq!(groups[1].adapter, "adapter-b");
+        assert_eq!(groups[1].token_count, 3);
+        assert_eq!(groups[1].ranges.len(), 1);
+    }
+
+    #[test]
+    fn prepares_indexed_lora_ranges_once_per_adapter_group() {
+        let Ok(ctx) = DeviceContext::new() else {
+            eprintln!("skipping CUDA test");
+            return;
+        };
+        let ranges = build_lora_token_ranges(
+            [2usize, 3, 1, 4],
+            [
+                Some("adapter-a"),
+                Some("adapter-b"),
+                Some("adapter-a"),
+                None,
+            ],
+        );
+
+        let groups = prepare_lora_token_groups(&ctx, &ranges).expect("prepare LoRA token groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].adapter, "adapter-a");
+        assert_eq!(groups[0].token_count, 3);
+        assert!(groups[0].token_indices_d.is_some());
+        assert_eq!(groups[1].adapter, "adapter-b");
+        assert_eq!(groups[1].token_count, 3);
+        assert!(groups[1].token_indices_d.is_none());
     }
 
     #[test]
@@ -814,7 +1104,12 @@ mod tests {
         safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
             .expect("write safetensors");
 
-        let error = load_lora_adapter(&path, &config).expect_err("bad tensor shape");
+        let error = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect_err("bad tensor shape");
 
         assert!(error.to_string().contains("shape mismatch"));
     }
@@ -867,7 +1162,12 @@ mod tests {
         let path = temp_adapter_dir("tp-shard");
         write_adapter_config(&path, &["q_proj", "down_proj"], 2);
         write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
-        let adapter = load_lora_adapter(&path, &config).expect("load adapter");
+        let adapter = load_lora_adapter(
+            &path,
+            &config,
+            crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+        )
+        .expect("load adapter");
 
         let sharded = adapter
             .shard_for_tensor_parallel(

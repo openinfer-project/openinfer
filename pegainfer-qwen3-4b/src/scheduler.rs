@@ -18,6 +18,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
+use crate::Qwen3LoraOptions;
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use pegainfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, TokenEvent,
@@ -87,8 +88,14 @@ pub(crate) fn start_qwen3_with_lora_control(
     enable_cuda_graph: bool,
     device_ordinals: &[usize],
     seed: u64,
+    lora_options: Qwen3LoraOptions,
 ) -> Result<EngineHandle> {
-    let executor = Qwen3Executor::from_runtime(model_path, enable_cuda_graph, device_ordinals)?;
+    let executor = Qwen3Executor::from_runtime_with_lora_options(
+        model_path,
+        enable_cuda_graph,
+        device_ordinals,
+        lora_options,
+    )?;
     Ok(start_with_executor_with_lora_control(executor, seed))
 }
 
@@ -185,6 +192,7 @@ fn scheduler_loop<E>(
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
+            executor.max_decode_batch_size(),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -291,6 +299,7 @@ fn scheduler_loop_with_lora_control<E>(
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
+            executor.max_decode_batch_size(),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -493,8 +502,10 @@ fn admit_deferred_requests(
     available_blocks: usize,
     max_request_blocks: usize,
     max_context_tokens: usize,
+    max_decode_batch_size: usize,
 ) -> AdmissionOutcome {
     let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
+    let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -517,8 +528,9 @@ fn admit_deferred_requests(
             continue;
         }
 
-        if max_needed <= budget {
+        if max_needed <= budget && decode_slots > 0 {
             budget -= max_needed;
+            decode_slots -= 1;
             pending.push(req);
         } else {
             still_deferred.push(req);
@@ -649,11 +661,11 @@ mod tests {
         fail_decode_once: bool,
         decode_delay: Duration,
         loaded_lora_adapters: HashSet<String>,
-        active_lora_adapter: Option<String>,
-        lora_activations: Arc<Mutex<Vec<Option<String>>>>,
         dropped: Arc<Mutex<Vec<u64>>>,
         prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
         decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
+        prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
+        decode_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
     }
 
     impl FakeExecutor {
@@ -667,11 +679,11 @@ mod tests {
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
                 loaded_lora_adapters: HashSet::new(),
-                active_lora_adapter: None,
-                lora_activations: Arc::new(Mutex::new(Vec::new())),
                 dropped,
                 prefill_batches: Arc::new(Mutex::new(Vec::new())),
                 decode_batches: Arc::new(Mutex::new(Vec::new())),
+                prefill_lora_batches: Arc::new(Mutex::new(Vec::new())),
+                decode_lora_batches: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -690,13 +702,8 @@ mod tests {
             self
         }
 
-        fn with_lora_adapters(
-            mut self,
-            names: &[&str],
-            activations: Arc<Mutex<Vec<Option<String>>>>,
-        ) -> Self {
+        fn with_lora_adapters(mut self, names: &[&str]) -> Self {
             self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
-            self.lora_activations = activations;
             self
         }
 
@@ -707,6 +714,16 @@ mod tests {
         ) -> Self {
             self.prefill_batches = prefill_batches;
             self.decode_batches = decode_batches;
+            self
+        }
+
+        fn with_lora_batch_records(
+            mut self,
+            prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
+            decode_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
+        ) -> Self {
+            self.prefill_lora_batches = prefill_lora_batches;
+            self.decode_lora_batches = decode_lora_batches;
             self
         }
 
@@ -741,6 +758,10 @@ mod tests {
             self.max_context_tokens
         }
 
+        fn max_decode_batch_size(&self) -> usize {
+            64
+        }
+
         fn available_blocks(&self) -> usize {
             self.available_blocks
         }
@@ -757,20 +778,6 @@ mod tests {
             Ok(())
         }
 
-        fn activate_lora_adapter(&mut self, adapter: Option<&str>) -> Result<()> {
-            if let Some(adapter) = adapter {
-                if !self.loaded_lora_adapters.contains(adapter) {
-                    anyhow::bail!("LoRA adapter is not loaded: {adapter}");
-                }
-            }
-            self.active_lora_adapter = adapter.map(ToString::to_string);
-            self.lora_activations
-                .lock()
-                .unwrap()
-                .push(self.active_lora_adapter.clone());
-            Ok(())
-        }
-
         fn list_lora_adapters(&self) -> Vec<String> {
             let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
             names.sort();
@@ -783,9 +790,6 @@ mod tests {
                 "LoRA adapter is not loaded: {}",
                 request.lora_name
             );
-            if self.active_lora_adapter.as_deref() == Some(request.lora_name.as_str()) {
-                self.active_lora_adapter = None;
-            }
             Ok(())
         }
 
@@ -794,6 +798,12 @@ mod tests {
                 plan.requests
                     .iter()
                     .map(|request| request.request_id)
+                    .collect(),
+            );
+            self.prefill_lora_batches.lock().unwrap().push(
+                plan.requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
                     .collect(),
             );
             for req in plan.requests {
@@ -832,6 +842,12 @@ mod tests {
                     .map(|request| request.request_id)
                     .collect(),
             );
+            self.decode_lora_batches.lock().unwrap().push(
+                plan.requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
+                    .collect(),
+            );
             for req in plan.requests {
                 let current_tokens = self
                     .held_tokens
@@ -861,10 +877,22 @@ mod tests {
                     .map(|request| request.request_id)
                     .collect(),
             );
+            self.prefill_lora_batches.lock().unwrap().push(
+                plan.prefill_requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
+                    .collect(),
+            );
             self.decode_batches.lock().unwrap().push(
                 plan.decode_requests
                     .iter()
                     .map(|request| request.request_id)
+                    .collect(),
+            );
+            self.decode_lora_batches.lock().unwrap().push(
+                plan.decode_requests
+                    .iter()
+                    .map(|request| request.lora_adapter.clone())
                     .collect(),
             );
             for req in plan.prefill_requests {
@@ -971,7 +999,7 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1010,7 +1038,7 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64);
 
         let pending_ids = outcome
             .pending
@@ -1035,6 +1063,40 @@ mod tests {
                 "rejected on the context window, not the KV budget"
             );
         }
+    }
+
+    #[test]
+    fn admission_respects_decode_batch_capacity() {
+        let mut active = Vec::new();
+        for id in 0..64 {
+            let (token_tx, _rx) = mpsc::unbounded_channel();
+            active.push(ActiveRequestState {
+                request_id: RequestId(id),
+                lora_adapter: None,
+                token_tx,
+                last_token: 1,
+                generated_count: 1,
+                max_tokens: 2,
+                prompt_len: 16,
+                params: SamplingParams::default(),
+                logprobs: 0,
+            });
+        }
+        let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
+
+        let outcome =
+            admit_deferred_requests(vec![pending], &active, 16, 1024, 1024, usize::MAX, 64);
+
+        assert!(
+            outcome.pending.is_empty(),
+            "new request must not be admitted past decode scratch capacity"
+        );
+        assert_eq!(
+            outcome.deferred[0].request_id,
+            RequestId(64),
+            "capacity-starved request should stay deferred"
+        );
+        assert!(outcome.rejected.is_empty());
     }
 
     #[test]
@@ -1212,14 +1274,19 @@ mod tests {
     }
 
     #[test]
-    fn mixed_lora_prefill_requests_run_in_adapter_groups() {
+    fn mixed_lora_prefill_requests_run_in_one_batch() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let activations = Arc::new(Mutex::new(Vec::new()));
         let prefill_batches = Arc::new(Mutex::new(Vec::new()));
         let decode_batches = Arc::new(Mutex::new(Vec::new()));
+        let prefill_lora_batches = Arc::new(Mutex::new(Vec::new()));
+        let decode_lora_batches = Arc::new(Mutex::new(Vec::new()));
         let mut executor = FakeExecutor::new(4, Arc::clone(&dropped))
-            .with_lora_adapters(&["adapter-a", "adapter-b"], Arc::clone(&activations))
-            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches));
+            .with_lora_adapters(&["adapter-a", "adapter-b"])
+            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches))
+            .with_lora_batch_records(
+                Arc::clone(&prefill_lora_batches),
+                Arc::clone(&decode_lora_batches),
+            );
         let mut rng = StdRng::seed_from_u64(42);
         let mut active = Vec::new();
 
@@ -1238,7 +1305,7 @@ mod tests {
             plan::ExecutionPlan::Prefill { pending },
             &mut rng,
         )
-        .expect("execute grouped prefill");
+        .expect("execute mixed-LoRA prefill");
         let plan::ExecutionArtifacts::Prefill { result, .. } = artifacts else {
             panic!("expected prefill artifacts");
         };
@@ -1252,21 +1319,26 @@ mod tests {
             vec![RequestId(0), RequestId(1), RequestId(2)]
         );
         assert_eq!(
-            *activations.lock().unwrap(),
-            vec![
-                None,
-                Some("adapter-a".to_string()),
-                Some("adapter-b".to_string())
-            ]
+            *prefill_batches.lock().unwrap(),
+            vec![vec![RequestId(0), RequestId(1), RequestId(2)]],
+            "one execution plan should run as one mixed-LoRA prefill batch"
         );
         assert_eq!(
-            *prefill_batches.lock().unwrap(),
-            vec![vec![RequestId(1)], vec![RequestId(2)], vec![RequestId(0)]],
-            "one execution plan should be split into base, adapter-a, and adapter-b groups"
+            *prefill_lora_batches.lock().unwrap(),
+            vec![vec![
+                Some("adapter-b".to_string()),
+                None,
+                Some("adapter-a".to_string())
+            ]],
+            "mixed-LoRA batch should preserve per-request adapter metadata"
         );
         assert!(
             decode_batches.lock().unwrap().is_empty(),
             "prefill-only plan should not execute decode batches"
+        );
+        assert!(
+            decode_lora_batches.lock().unwrap().is_empty(),
+            "prefill-only plan should not record decode LoRA metadata"
         );
     }
 
@@ -1478,8 +1550,8 @@ mod tests {
     #[test]
     fn lora_control_unloads_adapter_when_idle() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped))
-            .with_lora_adapters(&["adapter-a"], Arc::new(Mutex::new(Vec::new())));
+        let executor =
+            FakeExecutor::new(4, Arc::clone(&dropped)).with_lora_adapters(&["adapter-a"]);
         let handle = start_with_executor_with_lora_control(executor, 42);
 
         let runtime = tokio::runtime::Builder::new_current_thread()

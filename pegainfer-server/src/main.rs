@@ -7,10 +7,10 @@ use log::info;
 use pegainfer::logging;
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer::vllm_frontend::LoraModule;
-use pegainfer_core::{
-    engine::{EngineLoadOptions, EpBackend},
-    parallel::ParallelConfig,
-};
+use pegainfer_core::engine::{EngineLoadOptions, EpBackend};
+#[cfg(feature = "kimi-k2")]
+use pegainfer_core::parallel::ParallelConfig;
+use pegainfer_qwen3_4b::Qwen3LoraOptions;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -46,6 +46,14 @@ struct Args {
     /// object, or JSON list object entries with `name` and `path`.
     #[arg(long = "lora-modules", value_parser = parse_lora_modules_arg)]
     lora_modules: Vec<LoraModule>,
+
+    /// Maximum number of resident LoRA adapters in Qwen3 LoRA mode.
+    #[arg(long = "max-loras", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORAS)]
+    max_loras: usize,
+
+    /// Maximum supported LoRA rank in Qwen3 LoRA mode.
+    #[arg(long = "max-lora-rank", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK, value_parser = parse_max_lora_rank_arg)]
+    max_lora_rank: usize,
 
     /// CUDA device ordinal for single-GPU Qwen3 loads
     #[arg(long, default_value_t = 0)]
@@ -116,11 +124,13 @@ async fn main() -> anyhow::Result<()> {
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, device_ordinal={}, tp_size={}, dp_size={}, ep_backend={:?}",
+        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, max_loras={}, max_lora_rank={}, device_ordinal={}, tp_size={}, dp_size={}, ep_backend={:?}",
         args.model_path.display(),
         args.cuda_graph,
         effective_cuda_graph,
         args.enable_lora,
+        args.max_loras,
+        args.max_lora_rank,
         args.device_ordinal,
         args.tp_size,
         args.dp_size,
@@ -200,8 +210,19 @@ async fn main() -> anyhow::Result<()> {
                 seed: 42,
             };
             let handle = if args.enable_lora {
-                info!("Starting Qwen3 engine with LoRA control; CUDA Graph is disabled");
-                pegainfer_qwen3_4b::start_engine_with_lora_control(&args.model_path, options)
+                let lora_options = Qwen3LoraOptions {
+                    max_loras: args.max_loras,
+                    max_lora_rank: args.max_lora_rank,
+                };
+                info!(
+                    "Starting Qwen3 engine with LoRA control; CUDA Graph is disabled; max_loras={}, max_lora_rank={}",
+                    lora_options.max_loras, lora_options.max_lora_rank
+                );
+                pegainfer_qwen3_4b::start_engine_with_lora_control(
+                    &args.model_path,
+                    options,
+                    lora_options,
+                )
             } else {
                 pegainfer_qwen3_4b::start_engine(&args.model_path, options)
             }
@@ -321,6 +342,20 @@ fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> {
     }
 }
 
+fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
+    let rank = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid --max-lora-rank: {error}"))?;
+    if Qwen3LoraOptions::is_supported_max_lora_rank(rank) {
+        Ok(rank)
+    } else {
+        Err(format!(
+            "--max-lora-rank must be one of: {}",
+            Qwen3LoraOptions::supported_max_lora_ranks_display()
+        ))
+    }
+}
+
 fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String> {
     if name.is_empty() {
         return Err("--lora-modules name must not be empty".to_string());
@@ -371,5 +406,24 @@ mod tests {
                 path: PathBuf::from("/tmp/adapter-a"),
             }
         );
+    }
+
+    #[test]
+    fn parses_supported_max_lora_rank() {
+        assert_eq!(parse_max_lora_rank_arg("16").expect("parse rank"), 16);
+        assert_eq!(parse_max_lora_rank_arg("320").expect("parse rank"), 320);
+    }
+
+    #[test]
+    fn qwen3_lora_default_rank_is_64() {
+        assert_eq!(Qwen3LoraOptions::default().max_lora_rank, 64);
+    }
+
+    #[test]
+    fn rejects_unsupported_max_lora_rank() {
+        let error = parse_max_lora_rank_arg("7").expect_err("rank should be unsupported");
+
+        assert!(error.contains("--max-lora-rank must be one of"));
+        assert!(error.contains("16"));
     }
 }

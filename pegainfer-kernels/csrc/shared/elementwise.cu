@@ -42,6 +42,56 @@ __global__ void scaled_add_rows_kernel(
   }
 }
 
+__global__ void gather_hidden_tokens_kernel(
+    const __nv_bfloat16 *__restrict__ input,
+    const int *__restrict__ token_indices,
+    __nv_bfloat16 *__restrict__ out,
+    int hidden_dim,
+    int token_count,
+    int input_seq_len) {
+  int total = hidden_dim * token_count;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int token = idx / hidden_dim;
+    int row = idx % hidden_dim;
+    int src_token = token_indices[token];
+    if (src_token < 0 || src_token >= input_seq_len) {
+      continue;
+    }
+    out[idx] = input[(size_t)src_token * hidden_dim + row];
+  }
+}
+
+__global__ void scaled_add_rows_indexed_kernel(
+    const __nv_bfloat16 *__restrict__ delta,
+    float scale,
+    const int *__restrict__ token_indices,
+    __nv_bfloat16 *__restrict__ out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int token_count,
+    int out_seq_len) {
+  for (int token = blockIdx.y * blockDim.y + threadIdx.y;
+       token < token_count;
+       token += gridDim.y * blockDim.y) {
+    int out_token = token_indices[token];
+    if (out_token < 0 || out_token >= out_seq_len) {
+      continue;
+    }
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < rows;
+         row += gridDim.x * blockDim.x) {
+      int delta_idx = token * rows + row;
+      int out_idx = out_token * out_hidden_dim + row_offset + row;
+      float base = __bfloat162float(out[out_idx]);
+      float add = __bfloat162float(delta[delta_idx]) * scale;
+      out[out_idx] = __float2bfloat16(base + add);
+    }
+  }
+}
+
 // ============================================================================
 // Type conversion helpers for deterministic decode collectives.
 // ============================================================================
@@ -214,6 +264,55 @@ CUresult scaled_add_rows_cuda(
   dim3 grid(grid_x, grid_y);
   scaled_add_rows_kernel<<<grid, block, 0, stream>>>(
       delta, scale, out, out_hidden_dim, row_offset, rows, seq_len);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult gather_hidden_tokens_cuda(
+    const __nv_bfloat16 *input,
+    const int *token_indices,
+    __nv_bfloat16 *out,
+    int hidden_dim,
+    int token_count,
+    int input_seq_len,
+    cudaStream_t stream) {
+  if (input == nullptr || token_indices == nullptr || out == nullptr ||
+      hidden_dim <= 0 || token_count <= 0 || input_seq_len <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = hidden_dim * token_count;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  gather_hidden_tokens_kernel<<<grid, block, 0, stream>>>(
+      input, token_indices, out, hidden_dim, token_count, input_seq_len);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult scaled_add_rows_indexed_cuda(
+    const __nv_bfloat16 *delta,
+    float scale,
+    const int *token_indices,
+    __nv_bfloat16 *out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int token_count,
+    int out_seq_len,
+    cudaStream_t stream) {
+  if (delta == nullptr || token_indices == nullptr || out == nullptr ||
+      out_hidden_dim <= 0 || row_offset < 0 || rows <= 0 ||
+      token_count <= 0 || out_seq_len <= 0 ||
+      row_offset + rows > out_hidden_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dim3 block(32, 8);
+  int grid_x = (rows + block.x - 1) / block.x;
+  int grid_y = (token_count + block.y - 1) / block.y;
+  grid_x = grid_x > 65535 ? 65535 : grid_x;
+  grid_y = grid_y > 65535 ? 65535 : grid_y;
+  dim3 grid(grid_x, grid_y);
+  scaled_add_rows_indexed_kernel<<<grid, block, 0, stream>>>(
+      delta, scale, token_indices, out, out_hidden_dim, row_offset, rows,
+      token_count, out_seq_len);
   return (CUresult)cudaGetLastError();
 }
 

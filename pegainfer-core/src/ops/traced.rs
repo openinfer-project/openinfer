@@ -86,6 +86,25 @@ pub fn gemm_into(
     pegainfer_kernels::ops::gemm_into(ctx, weight, x, out);
 }
 
+pub fn gemm_token_range_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    token_offset: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("gemm_token_range");
+        call_trace::record_call(gemm_call::<OutDim, InDim>(
+            label,
+            weight.rows,
+            weight.cols,
+            out.seq_len,
+        ));
+    }
+    pegainfer_kernels::ops::gemm_token_range_into_checked(ctx, weight, x, token_offset, out)
+}
+
 pub fn qk_norm_rope_batch_decode_into(
     ctx: &DeviceContext,
     q: &mut HiddenStates,

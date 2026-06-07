@@ -475,6 +475,29 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn gather_hidden_tokens_cuda(
+        input: *const Half,
+        token_indices: *const i32,
+        out: *mut Half,
+        hidden_dim: i32,
+        token_count: i32,
+        input_seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn scaled_add_rows_indexed_cuda(
+        delta: *const Half,
+        scale: f32,
+        token_indices: *const i32,
+        out: *mut Half,
+        out_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        token_count: i32,
+        out_seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
 
 }
