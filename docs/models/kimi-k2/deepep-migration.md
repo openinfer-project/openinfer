@@ -1,6 +1,6 @@
 # Kimi-K2 MoE EP: PPLX → DeepEP migration
 
-> **TL;DR:** Implemented and 8×H200-verified — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `pegainfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → CUDA-graph-capturable in principle (#227, capture still disabled). Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Same-node A/B vs PPLX on hth200-29: **bs64 TPOT p50 29.61 vs 29.79 ms (parity), comm itself 7µs/layer faster**; golden gate equivalent to main (free-greedy near-tie reds on both backends, teacher-forced 0 violations both). The initial port was +14% TPOT slower until two capacity-proportional adapter kernels were fixed (see the lesson below).
+> **TL;DR:** Implemented and 8×H200-verified — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `pegainfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → **CUDA graph capture enabled (#227): bs64 steady TPOT p50 26.03 ms vs 29.61 eager (−12%), replay only at full bucket occupancy**. Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Same-node A/B vs PPLX on hth200-29: **eager bs64 TPOT p50 29.61 vs 29.79 ms (parity), comm itself 7µs/layer faster**; golden gate equivalent to main (free-greedy near-tie reds on both backends, teacher-forced 0 violations both). The initial port was +14% TPOT slower until two capacity-proportional adapter kernels were fixed (see the lesson below).
 >
 > **Last touched:** 2026-06
 
@@ -62,9 +62,23 @@ hardware (vllm_golden_gate + det contract), expected within the bf16 ULP floor.
 allocations, zero D2H syncs, zero `seq_len` mutations. `decode_combine` passes the
 worst-case 1024 as `num_reduced_tokens` — that is the upstream *sentinel*
 (`combine.cuh:43-44`): the kernel reloads the actual count from `psum_rank` on
-device. Graph capture stays disabled for now because the capture closure doesn't
-thread EP state — enabling it would silently fall back to NCCL-MoE local-experts
-(#227 tracks capture).
+device.
+
+**CUDA graph capture (#227)**: enabled for the DeepEP decode arm, replay
+**only at full bucket occupancy** (`active_len == decode_batch_size`, always 8
+under the DP scheduler) — the captured graph bakes the row count, so partial
+buckets run eager. No cross-rank barrier (unlike the TP8/NCCL arm): DeepEP
+decode has no host-side collectives, and DP ranks reach full occupancy on
+*different* steps — a shared barrier would deadlock. While one rank captures,
+peers' device-side dispatch spins simply wait until its first graph launch;
+the safety margin for that pause is the DeepEP device timeout
+(`kTimeoutCycles` ≈ 100 s, traps on the *peer* rank) vs a capture window of
+tens of ms — keep captures far below that ceiling. Replay numerics are
+device-driven by construction (positions/page tables/tokens are uploaded into
+persistent buffers *before* the graph region): 56/64 bench traces were
+byte-identical to the eager runs' dominant trace families. Cooperative,
+PDL, and cluster launches (the shim's full attribute set) all capture and
+replay cleanly on CUDA 12.9 / driver 590.
 
 **Prefill lock-step**: all 8 DP ranks call the layer fn simultaneously
 (synchronized prefill pads idle ranks with 1 dummy token). Order per layer:
@@ -120,10 +134,16 @@ bench.
 Same-node A/B, main `d0a0276` (PPLX) vs `feat/kimi-deepep` + kernel fixes,
 in-process `bench_serving`, prompt 1 / output 128 / concurrency 64:
 
-| bs64 | PPLX | DeepEP |
-| --- | ---: | ---: |
-| steady TPOT p50 / p99 | 29.79 / 31.14 ms | **29.61 / 31.74 ms** |
-| TTFT p50 | 60.2 ms | 62.2 ms |
+| bs64 | PPLX eager | DeepEP eager | DeepEP + graph |
+| --- | ---: | ---: | ---: |
+| steady TPOT p50 / p99 | 29.79 / 31.14 ms | 29.61 / 31.74 ms | **26.03 / 30.18 ms** |
+| TTFT p50 | 60.2 ms | 62.2 ms | 59.0 ms |
+| decode tok/s | 33.6 | 33.7 | **38.25** |
+
+Graph run: all 64 requests generated the full 128 tokens; trace hash
+distribution matches the eager runs' dominant families (30+26 of 64
+byte-identical) — per-step positions and page tables are device-driven, not
+baked into the capture.
 
 `vllm_golden_gate`: teacher-forced 384 positions **0 violations both backends**
 (DeepEP exact 97.9–98.2%, |Δlogprob| mean 0.030, p99 0.21); free-greedy is red
@@ -149,7 +169,9 @@ Node env facts (also apply to other hth200 nodes until proven otherwise):
 
 ## Next
 
-1. #227: prototype graph capture of dispatch→GEMM→combine (decode path is
-   host-quiet; capture closure still needs EP state threaded through).
-2. Prefill alloc/spin cleanup (the +2 ms TTFT).
-3. #228 overlap: combine_impl tuning (91 µs vs 37 µs theory).
+1. Prefill alloc/spin cleanup (the +2 ms TTFT).
+2. #228 overlap: combine_impl tuning (91 µs vs 37 µs theory).
+3. Gate coverage gap: `vllm_golden_gate` runs with `enable_cuda_graph: false`
+   and its concurrent pass peaks at ~2 active/rank — the graph replay path has
+   no dedicated numerics gate beyond the trace-hash evidence above. A
+   full-bucket graph-vs-eager comparison is the missing test (#227 follow-up).
