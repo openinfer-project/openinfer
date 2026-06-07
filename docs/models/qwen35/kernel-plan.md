@@ -16,9 +16,9 @@ The refactor (issue #256) adds a qwen35 counterpart: a `src/kernel_plan.rs` modu
 
 Three phases, matching the qwen3 layout:
 
-- **prefill** — embedding, full-attention prefill (Q/K/V gemm, QK-norm+RoPE, paged-kv scatter, paged prefill attention, attention gate, O proj), linear-attention prefill (5-way in-proj, conv1d, GDR chunkwise, gated RMSNorm, out-proj), shared MLP/norm/residual, final norm, LM head.
-- **decode** — embedding, RMSNorm, full-attention decode (Q/K/V gemm, QK-norm+RoPE, paged decode attention, attention gate, O proj), linear-attention decode (5-way in-proj, conv1d, GDR per-slot, gated RMSNorm, out-proj), shared MLP/norm/residual, final norm, LM head, sampling.
-- **unified** — `unified_step` (mixed prefill+decode) and per-request logit extraction.
+- **prefill** — embedding, full-attention prefill (Q/K/V gemm, QK-norm+RoPE, paged-kv scatter, paged prefill attention, attention gate, O proj), linear-attention prefill (4 GEMMs: in_proj_qkv fused q+k+v + z + b + a, conv1d, GDR chunkwise Triton AOT, gated RMSNorm, out-proj), shared MLP/norm/residual (RMSNorm via FlashInfer GemmaRMSNorm), final norm (FlashInfer), LM head.
+- **decode** — embedding, RMSNorm (FlashInfer GemmaRMSNorm), full-attention decode (Q/K/V gemm, QK-norm+RoPE, paged decode attention, attention gate, O proj), linear-attention decode (4 GEMMs: in_proj_qkv fused q+k+v + z + b + a, conv1d, GDR per-slot, gated RMSNorm, out-proj), shared MLP/norm/residual, final norm (FlashInfer), LM head, sampling (FlashInfer stochastic / CUDA argmax greedy).
+- **unified** — `unified_step` (mixed prefill+decode) and per-request logit extraction (D2D memcpy, not a kernel launch).
 
 Each `KernelOp` records the Rust call site (path through the crate), the runtime backend (CUDA, cuBLAS, FlashInfer, Triton AOT, …), and a free-form note explaining why that kernel.
 
