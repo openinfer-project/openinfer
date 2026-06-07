@@ -9,6 +9,7 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header::CONTENT_LENGTH};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use log::{info, warn};
@@ -47,6 +48,7 @@ use pegainfer_engine::sampler::SamplingParams;
 
 const ENGINE_INDEX: u32 = 0;
 const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
+const COMPLETION_ROUTE_BODY_LIMIT: usize = 2 * 1024 * 1024;
 const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
 #[derive(Clone)]
@@ -238,6 +240,34 @@ fn bad_request(message: impl Into<String>) -> Response {
         }),
     )
         .into_response()
+}
+
+/// Rejects `max_tokens` over the cap. A too-long prompt may still 500.
+async fn enforce_capacity(State(servable): State<u32>, request: Request, next: Next) -> Response {
+    #[derive(Deserialize)]
+    struct Probe {
+        max_tokens: Option<u64>,
+    }
+    let path = request.uri().path();
+    if path != "/v1/completions" && path != "/v1/chat/completions" {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = to_bytes(body, COMPLETION_ROUTE_BODY_LIMIT).await else {
+        return bad_request("failed to read request body");
+    };
+    let over = serde_json::from_slice::<Probe>(&bytes)
+        .ok()
+        .and_then(|probe| probe.max_tokens)
+        .filter(|&max_tokens| max_tokens > u64::from(servable));
+    if let Some(max_tokens) = over {
+        warn!("rejecting request: max_tokens {max_tokens} exceeds servable cap {servable}");
+        return bad_request(format!(
+            "max_tokens ({max_tokens}) exceeds the model's maximum context length of {servable} tokens"
+        ));
+    }
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -589,6 +619,8 @@ where
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
 
+    let servable_len = handle.servable_len();
+    let max_model_len = servable_len.map_or(max_model_len, |cap| max_model_len.min(cap));
     let bridge = LocalEngineBridge {
         input_address: input_address.clone(),
         output_address: output_address.clone(),
@@ -626,6 +658,13 @@ where
         shutdown_timeout: Duration::from_secs(10),
     };
 
+    let extend_router = move |router: Router| {
+        let router = extend_router(router);
+        match servable_len {
+            Some(cap) => router.layer(from_fn_with_state(cap, enforce_capacity)),
+            None => router,
+        }
+    };
     let result = vllm_server::serve_with_router_extension(config, shutdown, extend_router).await;
     bridge_task.abort();
     let _ = std::fs::remove_dir_all(namespace);

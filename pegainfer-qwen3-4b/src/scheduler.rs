@@ -99,10 +99,22 @@ pub(crate) fn start_qwen3_with_lora_control(
     Ok(start_with_executor_with_lora_control(executor, seed))
 }
 
+fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32 {
+    max_context
+        .min(max_blocks.saturating_mul(block_size))
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
 pub(crate) fn start_with_executor<E>(executor: E, seed: u64) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
+    let servable = servable_len(
+        executor.max_context_tokens(),
+        executor.max_request_blocks(),
+        executor.block_size(),
+    );
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -112,13 +124,18 @@ where
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new(submit_tx)
+    EngineHandle::new(submit_tx).with_servable_len(servable)
 }
 
 pub(crate) fn start_with_executor_with_lora_control<E>(executor: E, seed: u64) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
+    let servable = servable_len(
+        executor.max_context_tokens(),
+        executor.max_request_blocks(),
+        executor.block_size(),
+    );
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -128,7 +145,7 @@ where
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new_with_command_channel(command_tx)
+    EngineHandle::new_with_command_channel(command_tx).with_servable_len(servable)
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────
