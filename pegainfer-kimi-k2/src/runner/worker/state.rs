@@ -24,11 +24,10 @@ impl KimiRankThreadState {
             num_ranks,
             rank,
         )?);
-        // The DeepEP decode path is host-quiet and graph-capturable, but the
-        // decode graph capture closure does not thread the EP state through
-        // yet — capturing without it would silently fall back to the NCCL
-        // MoE path and compute local experts only (#227).
-        self.enable_cuda_graph = false;
+        // The DeepEP decode path is host-quiet (no allocs, no D2H, no seq_len
+        // mutations; persistent worst-case buffers), so it is graph-capturable
+        // (#227): the decode step threads the EP state into the capture
+        // closure and replays only at full arena occupancy.
         Ok(())
     }
 
@@ -258,7 +257,55 @@ impl KimiRankThreadState {
             .with_context(|| format!("Kimi rank {rank} upload batch decode tokens"))?;
 
         let local_heads = self.local_dims.local_heads;
-        let forward_result = if self.enable_cuda_graph {
+        let deepep = self.deepep.as_mut();
+        let forward_result = if self.enable_cuda_graph && deepep.is_some() {
+            if active_len == decode_batch_size {
+                // Full arena occupancy: the captured shape matches exactly, so
+                // replay is safe. No cross-rank barrier — DeepEP decode has no
+                // host-side collectives, and DP ranks reach full occupancy on
+                // different steps (a shared barrier would deadlock). During one
+                // rank's capture the others' device-side spins resolve as soon
+                // as its first graph launch executes the captured step. The
+                // safety margin for that pause is the DeepEP device timeout
+                // (`kTimeoutCycles` ≈ 100 s): a peer already spinning in
+                // dispatch traps on the PEER rank if our capture+instantiate
+                // ever exceeds it. Today the window is tens of ms — keep it
+                // far below that ceiling.
+                let mut graph = std::mem::take(&mut decode_arena.graph);
+                let result = graph.run_or_capture(&device_ctx, || {
+                    forward_decode_batch_next_token_kernels(
+                        &device_ctx,
+                        &decode_aux_ctx,
+                        tp_comm_ref,
+                        cache,
+                        expert_kernels,
+                        kv_pool,
+                        decode_arena,
+                        active_len,
+                        local_heads,
+                        deepep,
+                    )
+                });
+                decode_arena.graph = graph;
+                result
+            } else {
+                // Partial bucket: run eager — a graph captured at this
+                // active_len would bake the row count and silently compute
+                // the wrong rows on replay.
+                forward_decode_batch_next_token_kernels(
+                    &device_ctx,
+                    &decode_aux_ctx,
+                    tp_comm_ref,
+                    cache,
+                    expert_kernels,
+                    kv_pool,
+                    decode_arena,
+                    active_len,
+                    local_heads,
+                    deepep,
+                )
+            }
+        } else if self.enable_cuda_graph {
             let mut graph = std::mem::take(&mut decode_arena.graph);
             let graph_barrier = Arc::clone(&self.collective_barrier);
             let result = graph.run_or_capture_synchronized(
@@ -294,7 +341,7 @@ impl KimiRankThreadState {
                 decode_arena,
                 active_len,
                 local_heads,
-                self.deepep.as_mut(),
+                deepep,
             )
         };
         forward_result?;
