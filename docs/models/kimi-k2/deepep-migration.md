@@ -171,7 +171,7 @@ Node env facts (also apply to other hth200 nodes until proven otherwise):
 
 1. Prefill alloc/spin cleanup (the +2 ms TTFT).
 2. #228 overlap: combine_impl tuning (91 µs vs 37 µs theory).
-3. Gate coverage gap: `vllm_golden_gate` runs with `enable_cuda_graph: false`
-   and its concurrent pass peaks at ~2 active/rank — the graph replay path has
-   no dedicated numerics gate beyond the trace-hash evidence above. A
-   full-bucket graph-vs-eager comparison is the missing test (#227 follow-up).
+3. #300 — gate coverage gap: `vllm_golden_gate` runs with
+   `enable_cuda_graph: false` and its concurrent pass peaks at ~2 active/rank —
+   the graph replay path has no dedicated numerics gate beyond the trace-hash
+   evidence above. A full-bucket graph-vs-eager comparison is the missing test.
