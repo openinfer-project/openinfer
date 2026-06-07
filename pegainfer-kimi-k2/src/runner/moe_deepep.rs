@@ -30,11 +30,11 @@ use pegainfer_kernels::{
         DeepEp, DeepEpDispatchScratch, KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS,
         KIMI_K2_ROUTER_SCALE, KIMI_K2_SHARED_GATE_UP, KimiMarlinInt4ExpertWeights,
         KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch, KimiRouterConfig,
-        KimiRouterOutput, KimiRouterScratch, deepep_info,
-        kimi_deepep_build_marlin_routing_on_stream, kimi_marlin_w13_swiglu_expanded,
-        kimi_marlin_wna16_expanded_w2_gemm, kimi_marlin_wna16_expanded_w13_gemm,
-        kimi_residual_add_scaled_bf16, kimi_router_noaux_tc_launch,
-        kimi_shared_gate_up_cublaslt_into, kimi_shared_gate_up_cublaslt_supports_batch_size,
+        KimiRouterOutput, deepep_info, kimi_deepep_build_marlin_routing_on_stream,
+        kimi_marlin_w13_swiglu_expanded, kimi_marlin_wna16_expanded_w2_gemm,
+        kimi_marlin_wna16_expanded_w13_gemm, kimi_residual_add_scaled_bf16,
+        kimi_router_noaux_tc_launch, kimi_shared_gate_up_cublaslt_into,
+        kimi_shared_gate_up_cublaslt_supports_batch_size,
     },
     tensor::{DeviceContext, GpuTensor, HiddenStates, NormWeight},
     typed_ops,
@@ -157,7 +157,6 @@ pub(super) struct KimiMoeDeepEpPrefill {
     recv_x: GpuTensor<KIMI_K2_HIDDEN>,
     recv_topk_weight: CudaSlice<f32>,
     recv_src_metadata: CudaSlice<i32>,
-    num_recv_per_expert: Vec<i32>,
     w13_out: GpuTensor<MARLIN_W13_OUT_DIM>,
     activated: GpuTensor<KIMI_K2_EXPERT_INTERMEDIATE>,
     expert_output: GpuTensor<KIMI_K2_HIDDEN>,
@@ -194,7 +193,6 @@ impl KimiMoeDeepEpPrefill {
             recv_x: GpuTensor::zeros(ctx, expanded_capacity)?,
             recv_topk_weight: ctx.stream.alloc_zeros(expanded_capacity)?,
             recv_src_metadata: ctx.stream.alloc_zeros(recv_capacity * (KIMI_K2_TOPK + 2))?,
-            num_recv_per_expert: vec![0i32; KIMI_K2_LOCAL_EXPERTS],
             w13_out: GpuTensor::zeros(ctx, expanded_capacity)?,
             activated: GpuTensor::zeros(ctx, expanded_capacity)?,
             expert_output: GpuTensor::zeros(ctx, expanded_capacity)?,
@@ -245,11 +243,6 @@ pub(super) fn forward_moe_layer_decode_deepep_normed(
         .wait(&norm_ready)
         .with_context(|| format!("Kimi MoE DeepEP layer {layer_idx} aux wait norm_ready"))?;
     {
-        let mut router_scratch = KimiRouterScratch {
-            logits: &mut scratch.router.router_logits.data,
-            scores: &mut scratch.router.router_scores.data,
-            choice_scores: &mut scratch.router.router_choice_scores.data,
-        };
         let mut router_output = KimiRouterOutput {
             topk_weight: &mut scratch.router.router_topk_weight.data,
             topk_idx: &mut scratch.router.router_topk_idx.data,
@@ -265,7 +258,7 @@ pub(super) fn forward_moe_layer_decode_deepep_normed(
             &scratch.mla.normed,
             &moe.router.gate_weight,
             &moe.router.e_score_correction_bias,
-            &mut router_scratch,
+            &mut scratch.router.router_logits.data,
             &mut router_output,
         )?;
     }
@@ -431,21 +424,10 @@ pub(super) fn forward_moe_layer_prefill_deepep(
     let mut router_logits: CudaSlice<f32> = aux_ctx
         .stream
         .alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
-    let mut router_scores: CudaSlice<f32> = aux_ctx
-        .stream
-        .alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
-    let mut router_choice_scores: CudaSlice<f32> = aux_ctx
-        .stream
-        .alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
     let mut router_topk_weight: CudaSlice<f32> =
         aux_ctx.stream.alloc_zeros(seq_len * KIMI_K2_TOPK)?;
     let mut router_topk_idx: CudaSlice<i32> = aux_ctx.stream.alloc_zeros(seq_len * KIMI_K2_TOPK)?;
     {
-        let mut router_scratch = KimiRouterScratch {
-            logits: &mut router_logits,
-            scores: &mut router_scores,
-            choice_scores: &mut router_choice_scores,
-        };
         let mut output = KimiRouterOutput {
             topk_weight: &mut router_topk_weight,
             topk_idx: &mut router_topk_idx,
@@ -461,7 +443,7 @@ pub(super) fn forward_moe_layer_prefill_deepep(
             normed,
             &moe.router.gate_weight,
             &moe.router.e_score_correction_bias,
-            &mut router_scratch,
+            &mut router_logits,
             &mut output,
         )?;
     }
@@ -486,7 +468,7 @@ pub(super) fn forward_moe_layer_prefill_deepep(
     // CPU spin on the dispatch counts (the GPU keeps draining the stream);
     // crash early if a skewed routing exceeds the prompt-sized buffers.
     let counts = ep
-        .prefill_wait_counts(&mut pf.num_recv_per_expert)
+        .prefill_wait_counts()
         .with_context(|| format!("deepep prefill wait_counts layer {layer_idx}"))?;
     ensure!(
         counts.num_recv_tokens <= pf.recv_capacity

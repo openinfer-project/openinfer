@@ -52,8 +52,6 @@ unsafe extern "C" {
         gate_weight: *const Half,
         e_score_correction_bias: *const f32,
         logits: *mut f32,
-        scores: *mut f32,
-        choice_scores: *mut f32,
         topk_weight: *mut f32,
         topk_idx: *mut i32,
         active_tokens: i32,

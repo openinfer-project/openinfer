@@ -567,12 +567,6 @@ int deepep_ctx_destroy(DeepEpCtx* ctx) {
     SHIM_API_END
 }
 
-int deepep_barrier(DeepEpCtx* ctx, void* stream) {
-    SHIM_API_BEGIN
-    launch_barrier_on(ctx, static_cast<cudaStream_t>(stream));
-    SHIM_API_END
-}
-
 int deepep_decode_dispatch(DeepEpCtx* ctx, void* stream, const void* x,
                            const int32_t* topk_idx, const float* topk_weights,
                            int32_t num_tokens, int32_t* rank_count_scratch,
@@ -623,7 +617,7 @@ int deepep_prefill_dispatch_send(DeepEpCtx* ctx, void* stream, const void* x,
 }
 
 int deepep_prefill_wait_counts(DeepEpCtx* ctx, int32_t* num_recv_tokens,
-                               int32_t* num_expanded_tokens, int32_t* num_recv_per_expert) {
+                               int32_t* num_expanded_tokens) {
     SHIM_API_BEGIN
     const auto host_layout = host_workspace_layout(ctx);
     const volatile int64_t* rank_counts = host_layout.get_scaleup_rank_count_ptr<false>();
@@ -645,7 +639,6 @@ int deepep_prefill_wait_counts(DeepEpCtx* ctx, int32_t* num_recv_tokens,
             // Already aligned to kExpertAlignment by the dispatch kernel.
             const auto count = math::encode_decode_positive(expert_counts[expert_i]);
             if ((ready = math::is_decoded_positive_ready(count))) {
-                num_recv_per_expert[expert_i] = static_cast<int32_t>(count);
                 expanded += count;
                 ++expert_i;
             }

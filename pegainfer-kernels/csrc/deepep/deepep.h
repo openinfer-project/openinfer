@@ -69,9 +69,6 @@ int deepep_ctx_create(const uint8_t unique_id[128], int32_t num_ranks, int32_t r
 // everything including the NCCL communicator.
 int deepep_ctx_destroy(DeepEpCtx* ctx);
 
-// Stream-ordered GPU barrier across all ranks.
-int deepep_barrier(DeepEpCtx* ctx, void* stream);
-
 // ---------------------------------------------------------------------------
 // Decode: deterministic prologue + dispatch + copy epilogue, one call.
 // All outputs caller-allocated at the worst-case sizes from DeepEpInfo.
@@ -125,12 +122,11 @@ int deepep_prefill_dispatch_send(
 
 // Blocks the CPU until this rank's receive counts arrive (pinned-memory spin,
 // ~100 s timeout). num_expanded_tokens is already segment-aligned: it is the
-// exact recv_x row count. num_recv_per_expert entries are aligned counts too.
+// exact recv_x row count.
 int deepep_prefill_wait_counts(
     DeepEpCtx* ctx,
-    int32_t* num_recv_tokens,       // out
-    int32_t* num_expanded_tokens,   // out
-    int32_t* num_recv_per_expert);  // out [num_local_experts]
+    int32_t* num_recv_tokens,        // out
+    int32_t* num_expanded_tokens);   // out
 
 int deepep_prefill_dispatch_recv(
     DeepEpCtx* ctx, void* stream,

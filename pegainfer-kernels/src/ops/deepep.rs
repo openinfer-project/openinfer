@@ -130,19 +130,6 @@ impl DeepEp {
         })
     }
 
-    pub fn info(&self) -> &DeepEpInfo {
-        &self.info
-    }
-
-    /// Stream-ordered GPU barrier across all ranks (collective).
-    pub fn barrier(&self, ctx: &DeviceContext) -> Result<()> {
-        // Safety: context and stream are live.
-        shim_call!("deepep_barrier", unsafe {
-            ffi::deepep_barrier(self.ctx.as_ptr(), ctx.stream.cu_stream().cast())
-        });
-        Ok(())
-    }
-
     /// Decode dispatch: deterministic prologue + dispatch + copy epilogue in
     /// one stream-ordered call, fixed worst-case output shapes. The recv
     /// buffers must be sized at the published worst case
@@ -309,25 +296,16 @@ impl DeepEp {
     }
 
     /// Blocks the CPU on pinned counters until this rank's receive counts
-    /// arrive. `num_recv_per_expert` must hold `num_local_experts` entries.
-    pub fn prefill_wait_counts(
-        &self,
-        num_recv_per_expert: &mut [i32],
-    ) -> Result<DeepEpPrefillCounts> {
-        ensure!(
-            num_recv_per_expert.len() == self.info.num_local_experts as usize,
-            "prefill wait: expert count buffer must have {} entries",
-            self.info.num_local_experts
-        );
+    /// arrive.
+    pub fn prefill_wait_counts(&self) -> Result<DeepEpPrefillCounts> {
         let mut num_recv_tokens = 0i32;
         let mut num_expanded_tokens = 0i32;
-        // Safety: out pointers are valid; slice length checked above.
+        // Safety: out pointers are valid.
         shim_call!("deepep_prefill_wait_counts", unsafe {
             ffi::deepep_prefill_wait_counts(
                 self.ctx.as_ptr(),
                 &raw mut num_recv_tokens,
                 &raw mut num_expanded_tokens,
-                num_recv_per_expert.as_mut_ptr(),
             )
         });
         Ok(DeepEpPrefillCounts {

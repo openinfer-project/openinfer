@@ -27,11 +27,10 @@ use cudarc::nccl::{ReduceOp, safe::Comm};
 use pegainfer_kernels::{
     ops::{
         KIMI_K2_EP_WORLD, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
-        KimiRouterBatch, KimiRouterConfig, KimiRouterOutput, KimiRouterScratch,
-        kimi_add_f32_bf16_to_bf16, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
-        kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_moe_marlin_align_block_size,
-        kimi_residual_add_scaled_f32, kimi_router_noaux_tc_launch,
-        repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
+        KimiRouterBatch, KimiRouterConfig, KimiRouterOutput, kimi_add_f32_bf16_to_bf16,
+        kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm,
+        kimi_marlin_wna16_w13_gemm, kimi_moe_marlin_align_block_size, kimi_residual_add_scaled_f32,
+        kimi_router_noaux_tc_launch, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
     },
     tensor::{DeviceContext, GpuTensor, HiddenStates, NormWeight},
     typed_ops,
@@ -118,11 +117,6 @@ fn forward_moe_layer_decode_normed_after_event_into(
 
     // Router + routed experts (aux stream)
     {
-        let mut router_scratch = KimiRouterScratch {
-            logits: &mut scratch.router.router_logits.data,
-            scores: &mut scratch.router.router_scores.data,
-            choice_scores: &mut scratch.router.router_choice_scores.data,
-        };
         let mut router_output = KimiRouterOutput {
             topk_weight: &mut scratch.router.router_topk_weight.data,
             topk_idx: &mut scratch.router.router_topk_idx.data,
@@ -138,7 +132,7 @@ fn forward_moe_layer_decode_normed_after_event_into(
             &scratch.mla.normed,
             &moe.router.gate_weight,
             &moe.router.e_score_correction_bias,
-            &mut router_scratch,
+            &mut scratch.router.router_logits.data,
             &mut router_output,
         )?;
     }
@@ -275,16 +269,9 @@ pub(super) fn forward_moe_layer_batch_into(
     }
 
     let mut router_logits = ctx.stream.alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
-    let mut router_scores = ctx.stream.alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
-    let mut router_choice_scores = ctx.stream.alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
     let mut router_topk_weight = ctx.stream.alloc_zeros(seq_len * KIMI_K2_TOPK)?;
     let mut router_topk_idx = ctx.stream.alloc_zeros(seq_len * KIMI_K2_TOPK)?;
     {
-        let mut scratch = KimiRouterScratch {
-            logits: &mut router_logits,
-            scores: &mut router_scores,
-            choice_scores: &mut router_choice_scores,
-        };
         let mut output = KimiRouterOutput {
             topk_weight: &mut router_topk_weight,
             topk_idx: &mut router_topk_idx,
@@ -300,7 +287,7 @@ pub(super) fn forward_moe_layer_batch_into(
             normed,
             &moe.router.gate_weight,
             &moe.router.e_score_correction_bias,
-            &mut scratch,
+            &mut router_logits,
             &mut output,
         )?;
     }

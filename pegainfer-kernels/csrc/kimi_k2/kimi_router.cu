@@ -20,8 +20,6 @@ __device__ __forceinline__ bool better_router_choice(float value, int expert, fl
 __global__ void router_scores_topk_normalize_kernel(
     const float *__restrict__ logits,
     const float *__restrict__ e_score_correction_bias,
-    float *__restrict__ scores_out,
-    float *__restrict__ choice_scores_out,
     float *__restrict__ topk_weight,
     int *__restrict__ topk_idx,
     int active_tokens,
@@ -40,14 +38,11 @@ __global__ void router_scores_topk_normalize_kernel(
   int *reduce_indices = reinterpret_cast<int *>(reduce_values + blockDim.x);
   float *selected_scores = reinterpret_cast<float *>(reduce_indices + blockDim.x);
 
-  const int row_base = token * n_experts;
   const int expert = tid;
   if (expert < n_experts) {
-    float score = 1.0f / (1.0f + expf(-logits[row_base + expert]));
+    float score = 1.0f / (1.0f + expf(-logits[token * n_experts + expert]));
     scores[tid] = score;
     choice_scores[tid] = score + e_score_correction_bias[expert];
-    scores_out[row_base + expert] = scores[tid];
-    choice_scores_out[row_base + expert] = choice_scores[tid];
   } else {
     scores[tid] = 0.0f;
     choice_scores[tid] = -CUDART_INF_F;
@@ -82,7 +77,6 @@ __global__ void router_scores_topk_normalize_kernel(
       selected_sum += route_score;
       if (best_idx < n_experts) {
         choice_scores[best_idx] = -CUDART_INF_F;
-        choice_scores_out[row_base + best_idx] = -CUDART_INF_F;
       }
     }
     __syncthreads();
@@ -156,8 +150,6 @@ CUresult kimi_k2_router_noaux_tc_cuda(
     const __nv_bfloat16 *gate_weight,
     const float *e_score_correction_bias,
     float *logits,
-    float *scores,
-    float *choice_scores,
     float *topk_weight,
     int *topk_idx,
     int active_tokens,
@@ -169,8 +161,7 @@ CUresult kimi_k2_router_noaux_tc_cuda(
     cudaStream_t stream) {
   (void)stream;
   if (hidden == nullptr || gate_weight == nullptr || e_score_correction_bias == nullptr ||
-      logits == nullptr || scores == nullptr || choice_scores == nullptr ||
-      topk_weight == nullptr || topk_idx == nullptr) {
+      logits == nullptr || topk_weight == nullptr || topk_idx == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (active_tokens <= 0 || padded_tokens <= 0 || active_tokens > padded_tokens ||
@@ -187,7 +178,7 @@ CUresult kimi_k2_router_noaux_tc_cuda(
       static_cast<size_t>(kRouterSelectThreads) * (3 * sizeof(float) + sizeof(int)) +
       static_cast<size_t>(topk) * sizeof(float);
   router_scores_topk_normalize_kernel<<<padded_tokens, kRouterSelectThreads, select_smem, stream>>>(
-      logits, e_score_correction_bias, scores, choice_scores, topk_weight, topk_idx, active_tokens,
+      logits, e_score_correction_bias, topk_weight, topk_idx, active_tokens,
       padded_tokens, n_experts, topk, route_scale);
   result = consume_last_cuda_error();
   if (result != CUDA_SUCCESS) return result;
