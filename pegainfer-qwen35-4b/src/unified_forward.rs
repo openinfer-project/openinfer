@@ -14,7 +14,6 @@ use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
 use crate::ops;
-use pegainfer_core::kv_cache::KVCache;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceVec;
 
@@ -39,17 +38,7 @@ impl Qwen35Model {
 
         let mut logits = Vec::with_capacity(n);
         for i in 0..n {
-            // Each request needs its own KVCache staging buffer for the HND→paged scatter.
-            let mut kv_cache = KVCache::new(
-                self.config.num_full_attention_layers(),
-                self.config.num_key_value_heads,
-            );
-            let logit = self.prefill_forward(
-                prompts[i],
-                &mut kv_cache,
-                &mut kv_states[i],
-                recurrent_states[i],
-            )?;
+            let logit = self.prefill_forward(prompts[i], &mut kv_states[i], recurrent_states[i])?;
             logits.push(logit);
         }
         Ok(logits)
@@ -184,24 +173,12 @@ mod tests {
             let mut rec_b = RecurrentState::new(&model.ctx, &model.config).unwrap();
 
             // Prefill both prompts with separate request-local sequence trackers.
-            let first_logits_a = {
-                let mut kv_cache = KVCache::new(
-                    model.config.num_full_attention_layers(),
-                    model.config.num_key_value_heads,
-                );
-                model
-                    .prefill_forward(&prompt_a, &mut kv_cache, &mut kv_a, &mut rec_a)
-                    .unwrap()
-            };
-            let first_logits_b = {
-                let mut kv_cache = KVCache::new(
-                    model.config.num_full_attention_layers(),
-                    model.config.num_key_value_heads,
-                );
-                model
-                    .prefill_forward(&prompt_b, &mut kv_cache, &mut kv_b, &mut rec_b)
-                    .unwrap()
-            };
+            let first_logits_a = model
+                .prefill_forward(&prompt_a, &mut kv_a, &mut rec_a)
+                .unwrap();
+            let first_logits_b = model
+                .prefill_forward(&prompt_b, &mut kv_b, &mut rec_b)
+                .unwrap();
 
             let mut rng = StdRng::seed_from_u64(seed);
             let first_a = greedy_sample(&model, &first_logits_a, &mut rng);

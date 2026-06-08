@@ -16,7 +16,6 @@ use super::weights::{
 use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
-use pegainfer_core::kv_cache::KVCache;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::{DeviceVec, HiddenStates};
 
@@ -39,7 +38,6 @@ impl Qwen35Model {
     pub(super) fn prefill_forward(
         &self,
         token_ids: &[u32],
-        kv_cache: &mut KVCache,
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
     ) -> Result<DeviceVec> {
@@ -93,21 +91,15 @@ impl Qwen35Model {
                 &mut gdr_chunkwise_scratch,
                 &mut linear_idx,
                 &mut full_idx,
-                kv_cache,
                 kv_state,
                 &prefill_plan,
                 recurrent,
             )?;
         }
 
-        // All layers processed. Advance write-buffer seq_len for next prefill call.
-        kv_cache.advance_seq_len(seq_len);
+        // All layers processed. Advance recurrent seq_len for the next call;
+        // the paged KV position is tracked by `kv_state` (advanced above).
         recurrent.seq_len += seq_len;
-        debug_assert_eq!(
-            kv_cache.len(),
-            kv_state.seq_len(),
-            "kv_cache and kv_state seq_len diverged"
-        );
 
         // Extract last token's hidden state
         let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, seq_len - 1)?;
@@ -139,7 +131,6 @@ impl Qwen35Model {
         gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
         linear_idx: &mut usize,
         full_idx: &mut usize,
-        kv_cache: &mut KVCache,
         kv_state: &KvState,
         prefill_plan: &PrefillPagedPlan,
         recurrent: &mut RecurrentState,
@@ -166,7 +157,6 @@ impl Qwen35Model {
                 attn,
                 &normed_batch,
                 full_idx,
-                kv_cache,
                 kv_state,
                 prefill_plan,
                 attn_out_dim,
@@ -205,7 +195,6 @@ impl Qwen35Model {
         attn: &FullAttentionLayer,
         normed_batch: &HiddenStates,
         full_idx: &mut usize,
-        kv_cache: &mut KVCache,
         kv_state: &KvState,
         prefill_plan: &PrefillPagedPlan,
         _attn_out_dim: usize,
@@ -219,7 +208,9 @@ impl Qwen35Model {
         let v_batch = ops::gemm(&self.ctx, &attn.v_proj, normed_batch)?;
         let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
 
-        let base_pos = kv_cache.len();
+        // `kv_state` was advanced by `seq_len` before the layer loop, so the
+        // base write position for this prefill is `seq_len()` minus this batch.
+        let base_pos = kv_state.seq_len() - seq_len;
         let mut q_prepped = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
         let start_pos_cpu: CudaSlice<i32> = self
             .ctx

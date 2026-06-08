@@ -58,9 +58,11 @@ __global__ void prefill_qk_norm_rope_hd256_paged_kernel(
     int page_size,
     int64_t stride_page
 ) {
+    // seq_len is mapped onto grid.x (limit ~2^31) and the head index onto
+    // grid.y so prompts longer than the 65535 grid.y limit still launch.
     int start_pos = *start_pos_ptr;
-    int head_global = blockIdx.x;
-    int token = blockIdx.y;
+    int token = blockIdx.x;
+    int head_global = blockIdx.y;
     int d = threadIdx.x;
 
     bool is_q = head_global < num_q_heads;
@@ -150,9 +152,10 @@ __global__ void prefill_v_cache_write_hd256_paged_kernel(
     int page_size,
     int64_t stride_page
 ) {
+    // seq_len on grid.x, kv-head on grid.y (see prep kernel note).
     int start_pos = *start_pos_ptr;
-    int kv_head = blockIdx.x;
-    int token = blockIdx.y;
+    int token = blockIdx.x;
+    int kv_head = blockIdx.y;
     int d = threadIdx.x;
 
     int pos = start_pos + token;
@@ -345,7 +348,7 @@ void prefill_attention_hd256_prep_paged_cuda(
     int64_t stride_page,
     cudaStream_t stream
 ) {
-    dim3 prep_grid(num_q_heads + num_kv_heads, seq_len);
+    dim3 prep_grid(seq_len, num_q_heads + num_kv_heads);
     prefill_qk_norm_rope_hd256_paged_kernel<<<prep_grid, THREADS_HD256, 0, stream>>>(
         q_full_batch,
         k_batch,
@@ -367,7 +370,7 @@ void prefill_attention_hd256_prep_paged_cuda(
         stride_page
     );
 
-    dim3 v_grid(num_kv_heads, seq_len);
+    dim3 v_grid(seq_len, num_kv_heads);
     prefill_v_cache_write_hd256_paged_kernel<<<v_grid, THREADS_HD256, 0, stream>>>(
         v_batch,
         kv_data,
