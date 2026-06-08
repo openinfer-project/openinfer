@@ -832,10 +832,12 @@ const SYNTHETIC_TOKEN_LO: u32 = 100;
 const SYNTHETIC_TOKEN_HI: u32 = 100_000;
 
 /// One synthetic prompt of `len` random tokens, seeded per request so the
-/// concurrent decode streams diverge. Identical concurrent prompts collapse a
-/// MoE router onto a single expert cluster and under-measure decode TPOT by
-/// ~30% (the bench trap behind the false #225 "+51% HTTP" attribution);
-/// distinct prompts exercise the real expert all-to-all.
+/// concurrent decode streams diverge. Identical concurrent prompts route a MoE
+/// batch onto a narrow expert set, packing the Marlin expert GEMM into fat
+/// tiles and under-measuring decode TPOT by ~7–15% (measured on Kimi-K2 via a
+/// `--distinct-prompts` sweep; the bench trap behind the misread #225 "+51%
+/// HTTP" gap). Distinct prompts exercise realistic broad expert routing. See
+/// docs/lessons/moe-bench-prompt-diversity.md.
 fn synthetic_random_prompt(len: usize, seed: u64, request_idx: usize) -> Vec<u32> {
     let mut rng =
         StdRng::seed_from_u64(seed ^ (request_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
