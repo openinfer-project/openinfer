@@ -619,8 +619,8 @@ where
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
 
-    let servable_len = handle.servable_len();
-    let max_model_len = servable_len.map_or(max_model_len, |cap| max_model_len.min(cap));
+    let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
+    let max_model_len = servable_limit.unwrap_or(max_model_len);
     let bridge = LocalEngineBridge {
         input_address: input_address.clone(),
         output_address: output_address.clone(),
@@ -660,8 +660,8 @@ where
 
     let extend_router = move |router: Router| {
         let router = extend_router(router);
-        match servable_len {
-            Some(cap) => router.layer(from_fn_with_state(cap, enforce_capacity)),
+        match servable_limit {
+            Some(limit) => router.layer(from_fn_with_state(limit, enforce_capacity)),
             None => router,
         }
     };
