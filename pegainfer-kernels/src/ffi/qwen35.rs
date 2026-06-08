@@ -4,28 +4,6 @@ use cudarc::driver::sys::{CUresult, CUstream};
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu; the *_hd256 paged variants live in csrc/shared/paged_attention.cu.
 unsafe extern "C" {
-    // Qwen3.5 full-attention prefill prep: Q/K norm + partial RoPE + KV cache write.
-    pub fn prefill_attention_hd256_prep_cuda(
-        q_full_batch: *const Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        start_pos_ptr: *const i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        max_seq_len: i32,
-        stream: CUstream,
-    );
-
     // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
     pub fn prefill_attention_hd256_prep_paged_cuda(
         q_full_batch: *const Half,
