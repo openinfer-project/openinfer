@@ -84,7 +84,18 @@ Results:
 - Token SHA256: `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`.
 - Text SHA256: `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 - Candidate NCCL attribution: `gpu_timing.sample_count=8384`, `failure_count=0`.
-- Final review cleanup gate: package `--bins --tests` clippy passed with only three explicit allows for pre-existing unrelated lints (`pegainfer-core::logging` `option_option`, and two `host_ops` test lints).
+- Initial remote cleanup gate: package `--bins --tests` clippy passed with only three explicit allows for then-existing lints (`pegainfer-core::logging` `option_option`, and two `host_ops` test lints).
+
+Follow-up review gate on 2026-06-09 after fixing those lints:
+
+```bash
+cargo fmt --all --check
+
+cargo clippy --release -p pegainfer-deepseek-v2-lite \
+  --features deepseek-v2-lite --bins --tests -- -D warnings
+```
+
+Both commands passed on the same remote source copy after syncing the follow-up `host_ops.rs` and `logging.rs` fixes. The clippy command ran without `clippy::manual_midpoint`, `clippy::needless_range_loop`, or `clippy::option_option` allows.
 
 Before/after readiness comparison for the same model snapshot and diagnostic shape:
 
