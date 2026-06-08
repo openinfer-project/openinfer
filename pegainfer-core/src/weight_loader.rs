@@ -8,7 +8,6 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs;
-use std::time::Instant;
 
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -55,7 +54,6 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
 /// let shards = deserialize_shards(&mmaps)?;
 /// ```
 pub fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
-    let t0 = Instant::now();
     let mmaps: Vec<Mmap> = shard_paths
         .iter()
         .map(|p| {
@@ -68,10 +66,9 @@ pub fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
 
     let total_bytes: usize = mmaps.iter().map(|m| m.len()).sum();
     info!(
-        "Memory-mapped {} shard(s) ({:.1} MB) in {:.0}ms",
+        "Memory-mapped {} shard(s) ({:.1} MB)",
         mmaps.len(),
-        total_bytes as f64 / 1e6,
-        t0.elapsed().as_secs_f64() * 1e3
+        total_bytes as f64 / 1e6
     );
     Ok(mmaps)
 }

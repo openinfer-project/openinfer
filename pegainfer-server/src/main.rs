@@ -121,11 +121,11 @@ async fn main() -> anyhow::Result<()> {
         ModelType::Qwen3 | ModelType::Qwen35 => args.cuda_graph,
     };
 
-    info!("=== Rust LLM Server - {} (GPU) ===", model_type);
+    info!("=== pegainfer - {} (GPU) ===", model_type);
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, max_loras={}, max_lora_rank={}, device_ordinal={}, tp_size={}, dp_size={}, ep_backend={:?}",
+        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, max_loras={}, max_lora_rank={}, device_ordinal={}, tp_size={}",
         args.model_path.display(),
         args.cuda_graph,
         effective_cuda_graph,
@@ -134,8 +134,6 @@ async fn main() -> anyhow::Result<()> {
         args.max_lora_rank,
         args.device_ordinal,
         args.tp_size,
-        args.dp_size,
-        args.ep_backend
     );
 
     let handle = match model_type {
@@ -154,8 +152,6 @@ async fn main() -> anyhow::Result<()> {
             )
             .context("failed to start DeepSeek V4 engine")?;
 
-            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
-
             handle
         }
         #[cfg(feature = "deepseek-v2-lite")]
@@ -172,13 +168,15 @@ async fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
-
             handle
         }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {
             let parallel = kimi_parallel_config(args.tp_size, args.dp_size)?;
+            info!(
+                "EP options: dp_size={}, ep_backend={:?}",
+                args.dp_size, args.ep_backend
+            );
             let handle = pegainfer_kimi_k2::start_engine(
                 &args.model_path,
                 EngineLoadOptions {
@@ -191,8 +189,6 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .context("failed to start Kimi-K2.6 text engine")?;
-
-            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
             handle
         }
@@ -229,8 +225,6 @@ async fn main() -> anyhow::Result<()> {
             }
             .context("failed to start Qwen3 engine")?;
 
-            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
-
             handle
         }
         ModelType::Qwen35 => {
@@ -247,11 +241,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .context("failed to start Qwen3.5 engine")?;
 
-            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
-
             handle
         }
     };
+
+    info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
     if args.enable_lora {
         let max_model_len =

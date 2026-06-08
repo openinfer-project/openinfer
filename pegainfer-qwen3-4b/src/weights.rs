@@ -530,10 +530,9 @@ impl Qwen3Model {
 
         ctx.sync()?;
         info!(
-            "GPU transfer complete in {:.0}ms",
+            "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
-        info!("GPU model loaded successfully");
 
         let num_hidden_layers = config.num_hidden_layers;
         let model = Self {

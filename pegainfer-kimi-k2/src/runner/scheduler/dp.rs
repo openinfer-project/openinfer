@@ -340,7 +340,7 @@ impl DpCoordinator {
                     let message = format!(
                         "Kimi-K2 admission KV block accounting violated full-lifetime reservation: {err}"
                     );
-                    error!("kimi-k2: {message}");
+                    error!("{message}");
                     send_scheduled(&req);
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message,
@@ -428,7 +428,7 @@ impl DpCoordinator {
             Ok(cached) => cached,
             Err(err) => {
                 let message = format!("Kimi-K2 prefix cache matching failed: {err:#}");
-                error!("kimi-k2: {message}");
+                error!("{message}");
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message,
                     prompt_tokens: req.prompt_tokens.len(),
@@ -442,7 +442,7 @@ impl DpCoordinator {
             let message = format!(
                 "Kimi-K2 prefill KV block accounting violated full-lifetime reservation: {err}"
             );
-            error!("kimi-k2: {message}");
+            error!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {
                 message,
                 prompt_tokens: req.prompt_tokens.len(),
@@ -496,7 +496,7 @@ impl DpCoordinator {
         let last_token = owner_report.local_next_token_global_id;
         if let Err(err) = kv.apply_prefill(last_token, &self.pools[dp_rank]) {
             let message = format!("Kimi-K2 prefill KV bookkeeping failed: {err:#}");
-            error!("kimi-k2: {message}");
+            error!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {
                 message,
                 prompt_tokens: prompt_len,
@@ -631,7 +631,7 @@ impl DpCoordinator {
         let token_id = report.local_next_token_global_id;
         if let Err(err) = kv.apply_prefill(token_id, &self.pools[dp_rank]) {
             let message = format!("Kimi-K2 admission KV bookkeeping failed: {err:#}");
-            error!("kimi-k2: {message}");
+            error!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {
                 message,
                 prompt_tokens: req.prompt_tokens.len(),
@@ -832,7 +832,7 @@ impl DpRankState {
                 let message = format!(
                     "Kimi-K2 decode KV block accounting violated full-lifetime reservation: {err}"
                 );
-                error!("kimi-k2: {message}");
+                error!("{message}");
                 let _ = state.token_tx.send(TokenEvent::Error {
                     message,
                     prompt_tokens: state.prompt_len,
@@ -890,7 +890,7 @@ impl DpRankState {
 
         if let Err(err) = req.kv.apply_decode(token_id, pool) {
             let message = format!("Kimi-K2 decode KV bookkeeping failed: {err:#}");
-            error!("kimi-k2: {message}");
+            error!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {
                 message,
                 prompt_tokens: req.prompt_len,
@@ -1005,13 +1005,13 @@ fn build_decode_command_from_inputs(
 
 fn send_step_command(tx: &Sender<StepCommand>, dp_rank: usize, phase: &str, command: StepCommand) {
     if tx.send(command).is_err() {
-        error!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped before {phase}");
+        error!("fatal: DP rank {dp_rank} forward thread dropped before {phase}");
         std::process::abort();
     }
 }
 
 fn abort_dropped_result_channel(dp_rank: usize, phase: &str) -> ! {
-    error!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped during {phase}");
+    error!("fatal: DP rank {dp_rank} forward thread dropped during {phase}");
     std::process::abort();
 }
 

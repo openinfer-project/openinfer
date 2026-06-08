@@ -1075,7 +1075,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         );
     }
     if options.enable_cuda_graph {
-        warn!("DeepSeek V4 direct engine does not use CUDA graph yet");
+        warn!("direct engine does not use CUDA graph yet");
     }
     let model_path = model_path.to_path_buf();
     let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
@@ -1124,7 +1124,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
                 }
             }
             let _ = init_tx.send(Ok(()));
-            info!("DeepSeek V4 scheduler ready");
+            info!("scheduler ready");
             while let Some(req) = submit_rx.blocking_recv() {
                 let mut wave = collect_request_wave(&mut submit_rx, req);
                 if wave.len() == 1 {
@@ -1137,7 +1137,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
                     handle_request_wave(&mut generator, wave);
                 }
             }
-            info!("DeepSeek V4 scheduler exiting");
+            info!("scheduler exiting");
         })
         .expect("failed to spawn DeepSeek V4 scheduler thread");
     init_rx

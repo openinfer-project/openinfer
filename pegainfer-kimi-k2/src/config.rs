@@ -250,7 +250,7 @@ pub fn probe_config_json(json: &Value) -> Result<()> {
 /// of letting every request silently run to `max_tokens`.
 pub(crate) fn load_stop_token_ids(model_path: &Path) -> Result<Vec<u32>> {
     let stop_token_ids = read_stop_token_ids(model_path)?;
-    log::info!("kimi-k2: stop tokens: {stop_token_ids:?}");
+    log::info!("stop tokens: {stop_token_ids:?}");
     Ok(stop_token_ids)
 }
 

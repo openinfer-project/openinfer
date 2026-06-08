@@ -96,7 +96,7 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
     let mut expert_layers = Vec::with_capacity(KIMI_K2_MOE_LAYERS);
     let load_started = Instant::now();
     debug!(
-        "kimi-k2: rank {} start weight load: tensors={}, shards={}",
+        "rank {} start weight load: tensors={}, shards={}",
         load_plan.rank,
         load_plan.tensor_count,
         load_plan.shards.len()
@@ -176,7 +176,7 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
         layers: expert_layers,
         total_bytes: expert_kernel_total_bytes,
     };
-    debug!("kimi-k2: rank {} start weight copy sync", load_plan.rank);
+    debug!("rank {} start weight copy sync", load_plan.rank);
     let sync_started = Instant::now();
     ctx.sync().with_context(|| {
         format!(
@@ -185,13 +185,13 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
         )
     })?;
     debug!(
-        "kimi-k2: rank {} weight copy sync cost {:.2}s",
+        "rank {} weight copy sync cost {:.2}s",
         load_plan.rank,
         sync_started.elapsed().as_secs_f64()
     );
     let (slowest_shard, slowest_secs) = slowest_shard.unwrap_or_else(|| ("none".to_owned(), 0.0));
     debug!(
-        "kimi-k2: rank {} weight load cost {:.2}s: loaded_tensors={}, loaded_bytes={}, resident_raw_bytes={}, expert_package_bytes={}, packed_moe_layers={}, slowest_shard={} {:.2}s",
+        "rank {} weight load cost {:.2}s: loaded_tensors={}, loaded_bytes={}, resident_raw_bytes={}, expert_package_bytes={}, packed_moe_layers={}, slowest_shard={} {:.2}s",
         load_plan.rank,
         load_started.elapsed().as_secs_f64(),
         loaded_tensor_count,

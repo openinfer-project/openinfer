@@ -52,7 +52,7 @@ impl KimiRankThreadState {
     ) -> Result<KimiRankWeightLoadReport> {
         let started = Instant::now();
         let rank = self.sliced_load_plan.rank;
-        debug!("kimi-k2: rank {rank} start rank weight init");
+        debug!("rank {rank} start rank weight init");
         let load_output = load_rank_sliced_weights_to_gpu(
             &self.ctx,
             model_path,
@@ -69,7 +69,7 @@ impl KimiRankThreadState {
         let expert_kernel_weights = load_output.expert_kernel_weights;
         let tensor_count = load_output.loaded_tensor_count;
         let total_bytes = load_output.loaded_total_bytes;
-        debug!("kimi-k2: rank {rank} start one-token forward cache build");
+        debug!("rank {rank} start one-token forward cache build");
         let cache_started = Instant::now();
         let one_token_cache =
             KimiOneTokenForwardCache::from_gpu_weights(&self.ctx, &weights, &self.weight_names)
@@ -80,7 +80,7 @@ impl KimiRankThreadState {
                     )
                 })?;
         debug!(
-            "kimi-k2: rank {rank} one-token forward cache build cost {:.2}s",
+            "rank {rank} one-token forward cache build cost {:.2}s",
             cache_started.elapsed().as_secs_f64()
         );
         // Allocate the shared KV pool eagerly: an OOM should kill bringup,
@@ -98,7 +98,7 @@ impl KimiRankThreadState {
             )
         })?;
         debug!(
-            "kimi-k2: rank {rank} KV pool ({} pages, {} tokens) alloc cost {:.2}s",
+            "rank {rank} KV pool ({} pages, {} tokens) alloc cost {:.2}s",
             self.kv_pool_pages,
             self.kv_pool_pages * KIMI_KV_PAGE_SIZE,
             kv_pool_started.elapsed().as_secs_f64()
@@ -134,7 +134,7 @@ impl KimiRankThreadState {
         );
         self.loaded = Some(loaded);
         debug!(
-            "kimi-k2: rank {rank} rank weight init cost {:.2}s: tensors={}, bytes={}, expert_layers={}",
+            "rank {rank} rank weight init cost {:.2}s: tensors={}, bytes={}, expert_layers={}",
             started.elapsed().as_secs_f64(),
             tensor_count,
             ByteSize(total_bytes as u64),
