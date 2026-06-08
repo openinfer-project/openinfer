@@ -228,6 +228,14 @@ struct RequestArgs {
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
 
+    /// Number of *distinct* synthetic prompts to tile across the concurrent
+    /// batch (0 = one per request, fully diverse). `1` makes every concurrent
+    /// request identical, which collapses MoE routing onto a narrow expert set
+    /// and under-measures decode TPOT — sweep this to quantify the
+    /// routing-diversity → TPOT curve (see the MoE bench-diversity lesson).
+    #[arg(long, default_value_t = 0)]
+    distinct_prompts: usize,
+
     #[command(flatten)]
     run: RunArgs,
 }
@@ -1487,12 +1495,19 @@ fn bench_request(
     // default text) is the caller's chosen prompt and is replicated as-is.
     let synthetic = args.prompt_input.prompt_len.is_some();
     let prompts: Vec<Vec<u32>> = if synthetic {
+        // 0 = one distinct prompt per request (fully diverse). Otherwise tile
+        // `distinct` unique prompts across the batch: idx → idx % distinct.
+        let distinct = if args.distinct_prompts == 0 {
+            args.concurrency
+        } else {
+            args.distinct_prompts.min(args.concurrency)
+        };
         prompt.descriptor.source = format!(
-            "synthetic-random[{SYNTHETIC_TOKEN_LO}..{SYNTHETIC_TOKEN_HI}) seed={} per-request",
-            args.run.seed
+            "synthetic-random[{SYNTHETIC_TOKEN_LO}..{SYNTHETIC_TOKEN_HI}) seed={} distinct={distinct}/{}",
+            args.run.seed, args.concurrency
         );
         (0..args.concurrency)
-            .map(|idx| synthetic_random_prompt(prompt.tokens.len(), args.run.seed, idx))
+            .map(|idx| synthetic_random_prompt(prompt.tokens.len(), args.run.seed, idx % distinct))
             .collect()
     } else {
         vec![prompt.tokens.clone(); args.concurrency]
