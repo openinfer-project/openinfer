@@ -33,6 +33,7 @@ use pegainfer_core::{
     parallel::ParallelConfig,
 };
 use pegainfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
@@ -816,6 +817,25 @@ fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
     (0..len).map(|i| ((i % 1000) + 100) as u32).collect()
 }
 
+/// Token-id bounds for synthetic concurrent prompts: above the low special
+/// tokens and well under the smallest supported vocab (DeepSeek-V2-Lite ≈
+/// 102 400), so every drawn id is an ordinary token on any model line.
+const SYNTHETIC_TOKEN_LO: u32 = 100;
+const SYNTHETIC_TOKEN_HI: u32 = 100_000;
+
+/// One synthetic prompt of `len` random tokens, seeded per request so the
+/// concurrent decode streams diverge. Identical concurrent prompts collapse a
+/// MoE router onto a single expert cluster and under-measure decode TPOT by
+/// ~30% (the bench trap behind the false #225 "+51% HTTP" attribution);
+/// distinct prompts exercise the real expert all-to-all.
+fn synthetic_random_prompt(len: usize, seed: u64, request_idx: usize) -> Vec<u32> {
+    let mut rng =
+        StdRng::seed_from_u64(seed ^ (request_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (0..len)
+        .map(|_| rng.random_range(SYNTHETIC_TOKEN_LO..SYNTHETIC_TOKEN_HI))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct PromptSpec {
     descriptor: PromptDescriptor,
@@ -913,16 +933,19 @@ trait BenchModel {
         rng: &mut StdRng,
     ) -> GenTimings;
 
+    /// Run one request per prompt; the slice length is the concurrency. Each
+    /// prompt is independent, so MoE models must be handed *distinct* prompts
+    /// to exercise realistic expert routing (see `synthetic_random_prompt`).
     fn timed_generation_batch(
         &mut self,
-        prompt_tokens: &[u32],
+        prompts: &[Vec<u32>],
         max_new_tokens: usize,
         sampling: &SamplingParams,
         rng: &mut StdRng,
-        concurrency: usize,
     ) -> Vec<GenTimings> {
-        (0..concurrency)
-            .map(|_| self.timed_generation(prompt_tokens, max_new_tokens, sampling, rng))
+        prompts
+            .iter()
+            .map(|prompt| self.timed_generation(prompt, max_new_tokens, sampling, rng))
             .collect()
     }
 }
@@ -1025,17 +1048,16 @@ impl BenchModel for SchedulerBenchModel {
 
     fn timed_generation_batch(
         &mut self,
-        prompt_tokens: &[u32],
+        prompts: &[Vec<u32>],
         max_new_tokens: usize,
         sampling: &SamplingParams,
         _rng: &mut StdRng,
-        concurrency: usize,
     ) -> Vec<GenTimings> {
-        let mut workers = Vec::with_capacity(concurrency);
-        for idx in 0..concurrency {
+        let mut workers = Vec::with_capacity(prompts.len());
+        for (idx, prompt) in prompts.iter().enumerate() {
             let handle = self.handle.clone();
-            let prompt_tokens = prompt_tokens.to_vec();
-            let sampling = sampling.clone();
+            let prompt_tokens = prompt.clone();
+            let sampling = *sampling;
             workers.push(thread::spawn(move || {
                 run_timed(&prompt_tokens, max_new_tokens, |toks, n, cb| {
                     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
@@ -1129,22 +1151,24 @@ impl BenchModel for DeepSeekV2LiteBenchModel {
 
     fn timed_generation_batch(
         &mut self,
-        prompt_tokens: &[u32],
+        prompts: &[Vec<u32>],
         max_new_tokens: usize,
         sampling: &SamplingParams,
         _rng: &mut StdRng,
-        concurrency: usize,
     ) -> Vec<GenTimings> {
         assert_dsv2_lite_sampling_contract(sampling);
-        if concurrency == 1 {
-            return vec![self.timed_generation(prompt_tokens, max_new_tokens, sampling, _rng)];
+        if prompts.len() == 1 {
+            return vec![self.timed_generation(&prompts[0], max_new_tokens, sampling, _rng)];
         }
 
+        // This generator drives a narrow same-prompt batched decode kernel:
+        // every row shares `prompts[0]`. Distinct per-request prompts are a
+        // scheduler-path concern; this microbench takes one prompt by design.
         let result = self
             .generator
             .generate_greedy_batch_same_prompt_with_timings(
-                prompt_tokens,
-                concurrency,
+                &prompts[0],
+                prompts.len(),
                 max_new_tokens,
                 sampling.ignore_eos,
             )
@@ -1333,14 +1357,14 @@ fn validate_run_args(args: &RunArgs) -> Result<()> {
 
 fn measure_timings(
     model: &mut dyn BenchModel,
-    prompt_tokens: &[u32],
+    prompts: &[Vec<u32>],
     output_len: usize,
     run: &RunArgs,
     cuda_profiler_capture: bool,
-    concurrency: usize,
 ) -> Result<Vec<GenTimings>> {
     ensure!(output_len > 0, "--output-len must be > 0");
-    model.validate_concurrency(concurrency)?;
+    ensure!(!prompts.is_empty(), "concurrency must be > 0");
+    model.validate_concurrency(prompts.len())?;
     validate_run_args(run)?;
 
     let sampling = SamplingParams {
@@ -1350,13 +1374,7 @@ fn measure_timings(
     let mut rng = StdRng::seed_from_u64(run.seed);
 
     for _ in 0..run.warmup {
-        let _ = model.timed_generation_batch(
-            prompt_tokens,
-            output_len,
-            &sampling,
-            &mut rng,
-            concurrency,
-        );
+        let _ = model.timed_generation_batch(prompts, output_len, &sampling, &mut rng);
     }
 
     let profiler = if cuda_profiler_capture {
@@ -1370,15 +1388,9 @@ fn measure_timings(
         None
     };
 
-    let mut timings = Vec::with_capacity(run.iters * concurrency);
+    let mut timings = Vec::with_capacity(run.iters * prompts.len());
     for _ in 0..run.iters {
-        timings.extend(model.timed_generation_batch(
-            prompt_tokens,
-            output_len,
-            &sampling,
-            &mut rng,
-            concurrency,
-        ));
+        timings.extend(model.timed_generation_batch(prompts, output_len, &sampling, &mut rng));
     }
     drop(profiler);
     Ok(timings)
@@ -1463,28 +1475,44 @@ fn bench_request(
     cuda_graph: bool,
     args: &RequestArgs,
 ) -> Result<BenchReport> {
-    let prompt = resolve_prompt_input(
+    let mut prompt = resolve_prompt_input(
         &args.prompt_input,
         tokenizer,
         Some(DEFAULT_REQUEST_PROMPT),
         None,
     )?;
+    // A `--prompt-len` workload is synthetic: give every concurrent request a
+    // distinct seeded-random prompt so the decode streams diverge and MoE
+    // routing is realistic. An explicit `--prompt`/`--prompt-file` (or the
+    // default text) is the caller's chosen prompt and is replicated as-is.
+    let synthetic = args.prompt_input.prompt_len.is_some();
+    let prompts: Vec<Vec<u32>> = if synthetic {
+        prompt.descriptor.source = format!(
+            "synthetic-random[{SYNTHETIC_TOKEN_LO}..{SYNTHETIC_TOKEN_HI}) seed={} per-request",
+            args.run.seed
+        );
+        (0..args.concurrency)
+            .map(|idx| synthetic_random_prompt(prompt.tokens.len(), args.run.seed, idx))
+            .collect()
+    } else {
+        vec![prompt.tokens.clone(); args.concurrency]
+    };
     info!(
-        "Starting request benchmark: prompt_tokens={} output_len={} concurrency={} warmup={} iters={} seed={}",
+        "Starting request benchmark: prompt_tokens={} output_len={} concurrency={} warmup={} iters={} seed={} source={}",
         prompt.descriptor.prompt_tokens,
         args.output_len,
         args.concurrency,
         args.run.warmup,
         args.run.iters,
-        args.run.seed
+        args.run.seed,
+        prompt.descriptor.source,
     );
     let timings = measure_timings(
         model,
-        &prompt.tokens,
+        &prompts,
         args.output_len,
         &args.run,
         cli.cuda_profiler_capture,
-        args.concurrency,
     )?;
     Ok(BenchReport::Request(Box::new(RequestReport {
         run: run_info(cli, "request", model_type, load_ms, cuda_graph),
@@ -1527,11 +1555,10 @@ fn bench_matrix(
             );
             let timings = measure_timings(
                 model,
-                &prompt_tokens,
+                std::slice::from_ref(&prompt_tokens),
                 output_len,
                 &args.run,
                 cli.cuda_profiler_capture,
-                1,
             )?;
             let metrics = build_request_metrics(&timings);
             cells.push(MatrixCell {
@@ -1591,11 +1618,10 @@ fn bench_curve(
     );
     let timings = measure_timings(
         model,
-        &prompt.tokens,
+        std::slice::from_ref(&prompt.tokens),
         args.output_len,
         &args.run,
         cli.cuda_profiler_capture,
-        1,
     )?;
 
     let mut tbt_by_pos: Vec<Vec<Duration>> = Vec::new();
@@ -1820,11 +1846,10 @@ fn run_snapshot(
     let prefill_tokens = synthetic_prompt_tokens(prefill_prompt_len);
     let prefill_timings = measure_timings(
         model,
-        &prefill_tokens,
+        std::slice::from_ref(&prefill_tokens),
         SNAPSHOT_PREFILL_OUTPUT_LEN,
         &args.run,
         cli.cuda_profiler_capture,
-        1,
     )?;
     let prefill_metrics = build_request_metrics(&prefill_timings);
 
@@ -1832,11 +1857,10 @@ fn run_snapshot(
     let decode_tokens = synthetic_prompt_tokens(SNAPSHOT_DECODE_PROMPT_LEN);
     let decode_timings = measure_timings(
         model,
-        &decode_tokens,
+        std::slice::from_ref(&decode_tokens),
         SNAPSHOT_DECODE_OUTPUT_LEN,
         &args.run,
         cli.cuda_profiler_capture,
-        1,
     )?;
     let decode_metrics = build_request_metrics(&decode_timings);
 
