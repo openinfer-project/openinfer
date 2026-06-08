@@ -18,7 +18,7 @@ Fixes # (issue number)
 
 \## Checklist
 
-\- \[ ] My code follows the style guidelines of this project (see `docs/areas/coding-style.md`).
+\- \[ ] My code follows the style guidelines of this project (see `docs/conventions/coding-style.md`).
 
 \- \[ ] I have performed a self-review of my own code.
 

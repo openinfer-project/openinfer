@@ -100,8 +100,6 @@ impl SharedExpertDecodeScratch {
 gpu_buffers! {
     pub(crate) struct RouterScratch {
         pub(crate) router_logits:        GpuRawSlice<{ KIMI_K2_ROUTED_EXPERTS }>,
-        pub(crate) router_scores:        GpuRawSlice<{ KIMI_K2_ROUTED_EXPERTS }>,
-        pub(crate) router_choice_scores: GpuRawSlice<{ KIMI_K2_ROUTED_EXPERTS }>,
         pub(crate) router_topk_weight:   GpuRawSlice<{ KIMI_K2_TOPK }>,
         pub(crate) router_topk_idx:      GpuRawSliceI32<{ KIMI_K2_TOPK }>,
     }

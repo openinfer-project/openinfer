@@ -3,7 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{AxisSpec, DeviceContext, GpuTensor, HiddenStates, KernelCall, TensorSpec};
+use crate::tensor::{AxisSpec, DeviceContext, GpuTensor, KernelCall, TensorSpec};
 
 pub const KIMI_K2_HIDDEN: usize = 7168;
 pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
@@ -565,56 +565,6 @@ impl KimiMarlinInt4ExpertWeights<'_> {
             self.w2_down.manifest.role
         );
         Ok(())
-    }
-}
-
-pub struct KimiExpertMajorRoute<'a> {
-    pub batch_size: usize,
-    pub active_tokens: usize,
-    pub routed_tokens: usize,
-    pub expert_indptr: &'a CudaSlice<u32>,
-}
-
-impl KimiExpertMajorRoute<'_> {
-    #[must_use]
-    pub const fn max_routed_tokens(active_tokens: usize) -> usize {
-        active_tokens * KIMI_K2_TOPK
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        ensure!(self.batch_size > 0, "batch_size must be > 0");
-        ensure!(self.active_tokens > 0, "active_tokens must be > 0");
-        ensure!(
-            self.active_tokens >= self.batch_size,
-            "active_tokens {} must cover batch_size {} for bs>1 expert-major routing",
-            self.active_tokens,
-            self.batch_size
-        );
-        ensure!(
-            self.routed_tokens <= Self::max_routed_tokens(self.active_tokens),
-            "routed_tokens {} exceeds active_tokens * topk {}",
-            self.routed_tokens,
-            Self::max_routed_tokens(self.active_tokens)
-        );
-        ensure!(
-            self.expert_indptr.len() == KIMI_K2_LOCAL_EXPERTS + 1,
-            "expert_indptr len must be exactly {}, got {}",
-            KIMI_K2_LOCAL_EXPERTS + 1,
-            self.expert_indptr.len()
-        );
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn expert_indptr_spec(&self) -> TensorSpec {
-        TensorSpec::named(
-            "u32",
-            "expert_major",
-            [AxisSpec::named(
-                "local_expert_plus_one",
-                KIMI_K2_LOCAL_EXPERTS + 1,
-            )],
-        )
     }
 }
 
@@ -1618,133 +1568,6 @@ fn marlin_padded_route_capacity(active_tokens: usize, block_size: usize) -> Resu
         .ok_or_else(|| anyhow::anyhow!("Marlin padded route capacity overflow"))
 }
 
-fn validate_hidden_states(
-    name: &str,
-    states: &HiddenStates,
-    hidden_dim: usize,
-    seq_len: usize,
-) -> Result<()> {
-    ensure!(
-        states.hidden_dim == hidden_dim,
-        "{name} hidden_dim must be {hidden_dim}, got {}",
-        states.hidden_dim
-    );
-    ensure!(
-        states.seq_len == seq_len,
-        "{name} seq_len must be {seq_len}, got {}",
-        states.seq_len
-    );
-    ensure!(
-        states.data.len() >= hidden_dim * seq_len,
-        "{name} storage len must cover {}, got {}",
-        hidden_dim * seq_len,
-        states.data.len()
-    );
-    Ok(())
-}
-
-fn hidden_spec(hidden_dim: usize, tokens: usize) -> TensorSpec {
-    TensorSpec::named(
-        "bf16",
-        "expert_major",
-        [
-            AxisSpec::named("routed_token", tokens),
-            AxisSpec::named("hidden", hidden_dim),
-        ],
-    )
-}
-
-pub struct KimiSwiGluPlan<'a> {
-    pub route: KimiExpertMajorRoute<'a>,
-    pub gate: &'a HiddenStates,
-    pub up: &'a HiddenStates,
-    pub activated: &'a mut HiddenStates,
-}
-
-impl KimiSwiGluPlan<'_> {
-    pub fn validate(&self) -> Result<()> {
-        self.route.validate()?;
-        validate_hidden_states(
-            "swiglu.gate",
-            self.gate,
-            KIMI_K2_EXPERT_INTERMEDIATE,
-            self.route.routed_tokens,
-        )?;
-        validate_hidden_states(
-            "swiglu.up",
-            self.up,
-            KIMI_K2_EXPERT_INTERMEDIATE,
-            self.route.routed_tokens,
-        )?;
-        validate_hidden_states(
-            "swiglu.activated",
-            self.activated,
-            KIMI_K2_EXPERT_INTERMEDIATE,
-            self.route.routed_tokens,
-        )
-    }
-
-    #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.swiglu_silu_mul",
-            "Kimi-K2 expert SwiGLU activation between W1/W3 and W2",
-        )
-        .input(
-            "gate",
-            hidden_spec(KIMI_K2_EXPERT_INTERMEDIATE, self.route.routed_tokens),
-        )
-        .input(
-            "up",
-            hidden_spec(KIMI_K2_EXPERT_INTERMEDIATE, self.route.routed_tokens),
-        )
-        .output(
-            "activated",
-            hidden_spec(KIMI_K2_EXPERT_INTERMEDIATE, self.route.routed_tokens),
-        )
-        .attr("local_experts", KIMI_K2_LOCAL_EXPERTS.to_string())
-        .attr("topk", KIMI_K2_TOPK.to_string())
-        .attr("batch_size", self.route.batch_size.to_string())
-        .attr("active_tokens", self.route.active_tokens.to_string())
-        .attr("routed_tokens", self.route.routed_tokens.to_string())
-        .attr("layout", "expert_major_routed_tokens".to_string())
-        .attr("activation", "silu_gate_mul_up".to_string())
-        .attr("dtype", "bf16".to_string())
-        .attr("accumulator_dtype", "f32".to_string())
-        .attr("cuda_graph_ready", "yes".to_string())
-        .attr("kernel", "elementwise.silu_mul_triton_aot_cuda".to_string())
-    }
-}
-
-/// SwiGLU activation between INT4 grouped W1/W3 and W2 for Kimi-K2 routed experts.
-///
-/// Computes `activated[i] = silu(gate[i]) * up[i]` element-wise over expert-major
-/// `[routed_tokens, KIMI_K2_EXPERT_INTERMEDIATE]` BF16 buffers, reusing the shared
-/// `silu_mul_triton_aot_cuda` kernel. Output is layer-resident scratch so the
-/// follow-on W2 grouped INT4 GEMM consumes BF16 activations without copies.
-pub fn kimi_swiglu_silu_mul(ctx: &DeviceContext, plan: &mut KimiSwiGluPlan<'_>) -> Result<()> {
-    plan.validate()?;
-    let n = KIMI_K2_EXPERT_INTERMEDIATE * plan.route.routed_tokens;
-    if n == 0 {
-        return Ok(());
-    }
-    let (gate_ptr, _gate_guard) = plan.gate.data.device_ptr(&ctx.stream);
-    let (up_ptr, _up_guard) = plan.up.data.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = plan.activated.data.device_ptr_mut(&ctx.stream);
-
-    let result = unsafe {
-        ffi::silu_mul_triton_aot_cuda(
-            gate_ptr as *const ffi::Half,
-            up_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            n as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
 pub fn validate_ep_rank(ep_rank: usize) -> Result<()> {
     if ep_rank < KIMI_K2_EP_WORLD {
         Ok(())
@@ -1875,11 +1698,6 @@ mod tests {
     }
 
     #[test]
-    fn route_layout_accepts_multi_batch_active_tokens() {
-        assert_eq!(KimiExpertMajorRoute::max_routed_tokens(5), 40);
-    }
-
-    #[test]
     fn marlin_route_capacity_matches_vllm_ignore_invalid_bound() {
         let active_tokens = 7;
         let block_size = 8;
@@ -1890,40 +1708,6 @@ mod tests {
             route_elems + KIMI_K2_LOCAL_EXPERTS * (block_size - 1)
         );
         assert_eq!(capacity.div_ceil(block_size), 49);
-    }
-
-    #[test]
-    fn swiglu_manifest_call_carries_expert_major_layout() {
-        let indptr = std::iter::repeat_n(0u32, KIMI_K2_LOCAL_EXPERTS + 1).collect::<Vec<_>>();
-        let ctx = crate::tensor::DeviceContext::new().expect("CUDA context");
-        let indptr_dev = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
-        let gate = crate::tensor::HiddenStates::zeros(&ctx, KIMI_K2_EXPERT_INTERMEDIATE, 0)
-            .expect("gate buffer");
-        let up = crate::tensor::HiddenStates::zeros(&ctx, KIMI_K2_EXPERT_INTERMEDIATE, 0)
-            .expect("up buffer");
-        let mut activated =
-            crate::tensor::HiddenStates::zeros(&ctx, KIMI_K2_EXPERT_INTERMEDIATE, 0)
-                .expect("out buffer");
-        let plan = KimiSwiGluPlan {
-            route: KimiExpertMajorRoute {
-                batch_size: 1,
-                active_tokens: 1,
-                routed_tokens: 0,
-                expert_indptr: &indptr_dev,
-            },
-            gate: &gate,
-            up: &up,
-            activated: &mut activated,
-        };
-        let call = plan.manifest_call();
-        let attrs: std::collections::HashMap<&str, &str> = call
-            .attrs
-            .iter()
-            .map(|a| (a.name.as_str(), a.value.as_str()))
-            .collect();
-        assert_eq!(attrs.get("activation"), Some(&"silu_gate_mul_up"));
-        assert_eq!(attrs.get("layout"), Some(&"expert_major_routed_tokens"));
-        assert_eq!(attrs.get("dtype"), Some(&"bf16"));
     }
 
     #[test]
@@ -2011,72 +1795,6 @@ mod tests {
         assert_eq!(attrs.get("device_resident_metadata"), Some(&"true"));
         assert_eq!(attrs.get("decode_step_d2h"), Some(&"forbidden"));
         assert_eq!(attrs.get("sentinel_token_id"), Some(&"56"));
-    }
-
-    #[test]
-    fn swiglu_gpu_kernel_matches_silu_mul_reference() {
-        use half::bf16;
-        let ctx = crate::tensor::DeviceContext::new().expect("CUDA context");
-
-        let routed_tokens = 4usize;
-        let intermediate = KIMI_K2_EXPERT_INTERMEDIATE;
-        let n = routed_tokens * intermediate;
-
-        let mut gate_host = Vec::with_capacity(n);
-        let mut up_host = Vec::with_capacity(n);
-        for i in 0..n {
-            let g = ((i as f32) * 0.013).sin();
-            let u = ((i as f32) * 0.017).cos();
-            gate_host.push(bf16::from_f32(g));
-            up_host.push(bf16::from_f32(u));
-        }
-
-        let mut gate = crate::tensor::HiddenStates::zeros(&ctx, intermediate, routed_tokens)
-            .expect("gate alloc");
-        let mut up = crate::tensor::HiddenStates::zeros(&ctx, intermediate, routed_tokens)
-            .expect("up alloc");
-        let mut activated = crate::tensor::HiddenStates::zeros(&ctx, intermediate, routed_tokens)
-            .expect("out alloc");
-        ctx.stream
-            .memcpy_htod(&gate_host, &mut gate.data)
-            .expect("gate H2D");
-        ctx.stream
-            .memcpy_htod(&up_host, &mut up.data)
-            .expect("up H2D");
-
-        let indptr = std::iter::repeat_n(0u32, KIMI_K2_LOCAL_EXPERTS + 1).collect::<Vec<_>>();
-        let indptr_dev = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
-
-        {
-            let mut plan = KimiSwiGluPlan {
-                route: KimiExpertMajorRoute {
-                    batch_size: 1,
-                    active_tokens: routed_tokens,
-                    routed_tokens,
-                    expert_indptr: &indptr_dev,
-                },
-                gate: &gate,
-                up: &up,
-                activated: &mut activated,
-            };
-            kimi_swiglu_silu_mul(&ctx, &mut plan).expect("swiglu launch");
-        }
-        ctx.sync().expect("sync");
-
-        let out_host: Vec<bf16> = ctx.stream.clone_dtoh(&activated.data).expect("D2H");
-        ctx.sync().expect("sync");
-
-        for i in 0..n {
-            let g = gate_host[i].to_f32();
-            let u = up_host[i].to_f32();
-            let silu_g = g / (1.0 + (-g).exp());
-            let expected = bf16::from_f32(bf16::from_f32(silu_g).to_f32() * u).to_f32();
-            let actual = out_host[i].to_f32();
-            assert!(
-                (actual - expected).abs() <= 1e-3,
-                "i={i} actual={actual} expected={expected}"
-            );
-        }
     }
 
     #[test]

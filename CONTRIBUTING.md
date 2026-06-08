@@ -15,11 +15,11 @@ If you have questions, need help, or want to discuss a feature, please reach out
 
 We keep our detailed technical documentation close to the code. Please refer to these guides:
 
-\* \*\*First-time Setup:\*\* See \[Developer Onboarding](docs/resources/developer-onboarding.md) to set up your toolchain.
+\* \*\*First-time Setup:\*\* See \[Developer Onboarding](docs/playbooks/developer-onboarding.md) to set up your toolchain.
 
 \* \*\*Building \& Running Tests:\*\* Check \[CLAUDE.md](./CLAUDE.md) for quick commands on building and running the test suite.
 
-\* \*\*Coding Style \& Principles:\*\* Read our \[Coding Style Guide](docs/areas/coding-style.md).
+\* \*\*Coding Style \& Principles:\*\* Read our \[Coding Style Guide](docs/conventions/coding-style.md).
 
 
 

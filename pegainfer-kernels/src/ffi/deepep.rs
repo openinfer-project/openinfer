@@ -46,8 +46,6 @@ unsafe extern "C" {
 
     pub fn deepep_ctx_destroy(ctx: *mut DeepEpCtx) -> c_int;
 
-    pub fn deepep_barrier(ctx: *mut DeepEpCtx, stream: *mut c_void) -> c_int;
-
     pub fn deepep_decode_dispatch(
         ctx: *mut DeepEpCtx,
         stream: *mut c_void,
@@ -92,7 +90,6 @@ unsafe extern "C" {
         ctx: *mut DeepEpCtx,
         num_recv_tokens: *mut i32,
         num_expanded_tokens: *mut i32,
-        num_recv_per_expert: *mut i32,
     ) -> c_int;
 
     pub fn deepep_prefill_dispatch_recv(

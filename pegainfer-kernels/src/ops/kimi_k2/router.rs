@@ -94,12 +94,6 @@ impl KimiRouterBatch {
     }
 }
 
-pub struct KimiRouterScratch<'a> {
-    pub logits: &'a mut CudaSlice<f32>,
-    pub scores: &'a mut CudaSlice<f32>,
-    pub choice_scores: &'a mut CudaSlice<f32>,
-}
-
 pub struct KimiRouterOutput<'a> {
     pub topk_weight: &'a mut CudaSlice<f32>,
     pub topk_idx: &'a mut CudaSlice<i32>,
@@ -111,7 +105,7 @@ pub fn validate_kimi_router_shapes<const DIM: usize>(
     hidden: &GpuTensor<DIM>,
     _gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
     e_score_correction_bias: &CudaSlice<f32>,
-    scratch: &KimiRouterScratch<'_>,
+    logits: &CudaSlice<f32>,
     output: &KimiRouterOutput<'_>,
 ) -> Result<()> {
     config.validate()?;
@@ -145,21 +139,9 @@ pub fn validate_kimi_router_shapes<const DIM: usize>(
         config.n_experts
     );
     ensure!(
-        scratch.logits.len() >= score_elems,
+        logits.len() >= score_elems,
         "Kimi router logits scratch too small: have {}, need {}",
-        scratch.logits.len(),
-        score_elems
-    );
-    ensure!(
-        scratch.scores.len() >= score_elems,
-        "Kimi router scores scratch too small: have {}, need {}",
-        scratch.scores.len(),
-        score_elems
-    );
-    ensure!(
-        scratch.choice_scores.len() >= score_elems,
-        "Kimi router choice_scores scratch too small: have {}, need {}",
-        scratch.choice_scores.len(),
+        logits.len(),
         score_elems
     );
 
@@ -198,7 +180,7 @@ pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
     hidden: &GpuTensor<DIM>,
     gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
     e_score_correction_bias: &CudaSlice<f32>,
-    scratch: &mut KimiRouterScratch<'_>,
+    logits: &mut CudaSlice<f32>,
     output: &mut KimiRouterOutput<'_>,
 ) -> Result<()> {
     validate_kimi_router_shapes(
@@ -207,16 +189,14 @@ pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
         hidden,
         gate_weight,
         e_score_correction_bias,
-        scratch,
+        logits,
         output,
     )?;
 
     let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
     let (gate_ptr, _gate_guard) = gate_weight.data.device_ptr(&ctx.stream);
     let (bias_ptr, _bias_guard) = e_score_correction_bias.device_ptr(&ctx.stream);
-    let (logits_ptr, _logits_guard) = scratch.logits.device_ptr_mut(&ctx.stream);
-    let (scores_ptr, _scores_guard) = scratch.scores.device_ptr_mut(&ctx.stream);
-    let (choice_ptr, _choice_guard) = scratch.choice_scores.device_ptr_mut(&ctx.stream);
+    let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);
     let (weight_ptr, _weight_guard) = output.topk_weight.device_ptr_mut(&ctx.stream);
     let (idx_ptr, _idx_guard) = output.topk_idx.device_ptr_mut(&ctx.stream);
 
@@ -226,8 +206,6 @@ pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
             gate_ptr as *const ffi::Half,
             bias_ptr as *const f32,
             logits_ptr as *mut f32,
-            scores_ptr as *mut f32,
-            choice_ptr as *mut f32,
             weight_ptr as *mut f32,
             idx_ptr as *mut i32,
             batch.active_tokens as i32,

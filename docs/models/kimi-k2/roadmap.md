@@ -1,105 +1,116 @@
 # Kimi-K2 Roadmap
 
-> **TL;DR:** Kimi-K2 decode performance is ahead of vLLM on the same H20 ×8 hardware (TP1+DP8+EP8 service bs64: output `1336 tok/s` vs vLLM `594 tok/s`, TPOT p50 `47.3ms` vs `107.2ms`), but the crate is far behind Qwen3-4B on the serving contract and correctness surface: every request runs greedy regardless of sampling params, prompts over 2048 tokens overrun the KV arena unchecked, and no accuracy gate is reproducible from a fresh clone. EOS/stop-token handling landed (issue #238): both scheduler paths stop at EOS and honor `ignore_eos`. The roadmap sequence is: serving-contract correctness + a git-versioned accuracy gate first, then the TTFT/prefill and HTTP-overhead perf gaps, then the continuous-batching→KV-lifecycle→prefix-cache chain and the PPLX/decode-throughput chain. Findings verified 2026-06-04 against `6ee9247`.
+> **TL;DR:** Kimi-K2 decode leads vLLM on the same 8×H200 hardware (active TP1+DP8+EP8 **DeepEP** line, bs64 in-process graph TPOT **26.30 ms** p50 / **30.50 ms** p99 — the −12% win from the #227 CUDA-graph capture). The M1 serving-contract wave has landed — sampling honor-or-reject (#237), EOS (#238), KV admission (#239), prefix cache (#230) — and the git-versioned accuracy gate (#223) is green teacher-forced. The live frontier is **serving performance**: the apparent "+51% HTTP" gap (#225) was a **bench/metric artifact**, settled by measurement — a `--distinct-prompts` sweep shows identical-prompt batches under-measure decode by only **~7–15%** (the rest of the original gap was comparing identical first-decode-step against diverse steady-TPOT), with transport ≈0; an nsys kernel diff pins the whole diversity delta to the **Marlin expert GEMM** (per-launch ~2×), not the all-to-all. Decode floor ~34 ms; the serial MoE a2a (~30% of GPU time, #228) is the floor lever, orthogonal to the diversity gap. Short-prompt TTFT is still 4.5×/31× behind vLLM (#224). See **Measured serving profile** below for first-hand numbers. Re-verified 2026-06-08 on 8×H200.
 >
 > **Last touched:** 2026-06
 
-Status ledgers: [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) (active perf line), [optimization.md](optimization.md) (model card + TP8 history). This doc owns the cross-cutting plan: what's missing, what blocks what, and in which order.
+Status ledgers: [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) (active perf line), [deepep-migration.md](deepep-migration.md) (DeepEP backend + A/B), [accuracy-gate.md](accuracy-gate.md) (the committed gate), [optimization.md](optimization.md) (model card + TP8 history). This doc owns the cross-cutting plan: what's missing, what blocks what, and in which order.
 
-## Capability contract (Qwen3-4B as the maturity bar)
+## Measured serving profile (2026-06-08, 8×H200, DeepEP graph path)
 
-| Capability | Qwen3-4B | Kimi-K2 | Evidence |
-| --- | --- | --- | --- |
-| EOS / stop-token detection | ✓ per-step `is_stop_token` | ✓ per-step on both paths, honors `ignore_eos` (issue #238) | `config.rs::load_stop_token_ids`; checks in `runner/scheduler.rs` + `runner/scheduler/dp.rs`; e2e `scripts/e2e_eos_stop.py` |
-| Sampling params | ✓ FlashInfer greedy + non-greedy | ✗ `req.params` never read — temperature/top_k/top_p **silently ignored**, always argmax | `runner/worker/forward.rs:113` top1 only |
-| Prompt-length guard | ✓ KV-budget admission rejects impossible requests | ✗ 2048-token arena cap (`worker.rs:60-61`), `append_position` unchecked → silent overrun | `runner/scheduler.rs:148-151` |
-| KV admission control | ✓ full-lifetime budget, deferral, rejection (issue #85 fix) | ✗ slot-count only on both paths | qwen3 `scheduler.rs:478-510` |
-| Continuous batching | ✓ | TP1/DP8: ✓ (`DpCoordinator` per-step admission, waiting queue); TP8/DP1: ✗ strict batch-then-drain | `runner/scheduler/dp.rs:168,189-236` vs `runner/scheduler.rs:140-207` |
-| Prefix cache | ✓ kvbm full-block matching (PR #216) | ✗ fixed per-slot arena, no block table / free pool | `runner/worker/cache.rs:391-396` |
-| Accuracy gate in git | ✓ `tests/hf_golden_gate.rs` + committed golden | ✗ no `tests/` dir (only model crate without one); fixtures + A/B harness live off-repo | see Accuracy section |
-| logprobs / echo | ✓ | ✗ `logprob: None` always, `PromptTokens` never emitted | `runner/scheduler/dp.rs:345` |
-| Bench-regression snapshot | ✓ `bench_snapshots/*/qwen3-4b.json` | ✗ no kimi snapshot, no h20 dir | `docs/conventions/bench-regression.md` |
-| CUDA Graph state | shared `pegainfer-core` type | ✓ same shared type + multi-rank synchronized capture | `runner/worker.rs:17` |
-| LoRA | ✓ | intentionally N/A, server rejects cleanly | `pegainfer-server/src/main.rs:101-103` |
+First-hand bs64 decode profile on the active TP1+DP8+EP8 DeepEP line (`--cuda-graph true`, prompt 1 / output 128 / concurrency 64). Confirms the published graph numbers and sharpens three open issues.
+
+**Decode TPOT (in-process `bench_serving`, full-bucket graph replay):** p50 **26.30 ms** / p95 27.40 / p99 **30.50 ms**; in-process TTFT p50 56.4 ms. Matches the published 26.03 ms graph figure — the −12% graph win over eager (29.6 ms) holds.
+
+**nsys decode composition** (graph-replay, 8-rank aggregate; `--cuda-graph-trace=node`, so read *proportions*, not absolute times):
+
+| Kernel family | % GPU | median | note |
+| --- | ---: | ---: | --- |
+| `combine_impl` (DeepEP combine a2a) | 18.7% | 87.9 µs | **#228 target** — 87.9 µs vs ~37 µs NVLink theory (2.4×); systematic tail p99/p50 2.7× |
+| `gemmSN_TN` (dense GEMV) | 18.4% | 91.9 µs | rock-steady (σ 0.7 µs) |
+| `Marlin` (INT4 expert GEMM, ×2/layer) | 18.2% | 39.7 µs | route-imbalance tail p99/p50 3.2× |
+| `nvjet_*` cuBLASLt GEMMs (MLA/proj) | ~22% | — | the #204 skinny-GEMM picks |
+| `dispatch_impl` (DeepEP dispatch a2a) | 9.1% | 14.7 µs | rank-skew tail: p99 311 µs, **max 15 ms** one-off (p99/p50 21×) |
+| `BatchDecode…MLA` (attention) | 3.5% | 16.5 µs | small at 2k ctx; grows with KV (#231) |
+
+**Host side is clean:** `cuStreamSynchronize` 65% + `cuGraphLaunch` 34%, `cudaLaunchKernel` < 0.5%. Decode is **GPU-bound — the per-step host enqueue overhead is already eliminated by the #227 graph capture.** The remaining decode lever is GPU kernel time: the MoE all-to-all (**dispatch + combine ≈ 28% of GPU time, run strictly serial dispatch→Marlin→combine with no overlap → #228**), not host work.
+
+**HTTP vs in-process "overhead" (#225) — RESOLVED by measurement: a bench/metric artifact, not a transport cost.** The original "+51%" compared two *different* metrics on two *different* workloads — identical-prompt **first-decode-step** (26 ms) vs diverse-prompt **steady-TPOT** (34 ms). A controlled in-process `--distinct-prompts K` sweep (transport held constant, 8×H200, bs64 DeepEP graph) gives the honest same-metric splits:
+
+| metric (K=1 identical → K=64 diverse) | K=1 | K=64 | Δ |
+| --- | ---: | ---: | ---: |
+| first-decode-step p50 (isolates routing) | 26.1 ms | 28.1 ms | **+7%** |
+| steady-TPOT p50 (incl. ctx growth) | 28.7 ms | 32.6 ms | **+14%** |
+
+So routing diversity is worth **~7–15%** of decode TPOT, non-linear in K (flat below K≈16). Transport is ≈0: like-for-like diverse-steady in-process **32.6 ms** vs HTTP **33.9 ms** (+4%, diversity-richness margin); the coordinator clock put host at **0.1 ms/step**, ranks balanced **8/8** — bridge and scheduler exonerated by direct measurement, not Nagle (`TCP_NODELAY` already set, `lib.rs:153`). **Mechanism, from an nsys K=1-vs-K=64 kernel diff: the entire +15.6% GPU delta is the Marlin expert GEMM** (same 32 640 launches, per-launch 45.7 → 89.0 µs — narrow routing packs fat tiles, broad routing scatters thin weight-load-bound tiles). The DeepEP **all-to-all does not grow** (dispatch flat, combine −14%). So the diversity lever is **grouped-expert GEMM tile efficiency, not a2a overlap (#228)** — #228 still cuts the absolute floor but is orthogonal to this gap. Bench fixed (seeded distinct prompts) + `--distinct-prompts` sweep knob in **PR #308**; full evidence in [moe-bench-prompt-diversity.md](../../lessons/moe-bench-prompt-diversity.md) and the profiling-discipline postmortem [profile-diff-before-blaming-transport.md](../../lessons/profile-diff-before-blaming-transport.md).
+
+**Correctness re-run (#223 gate, current DeepEP + graph checkout):** teacher-forced sweep **0 violations** (384 positions, 375 exact = 97.7%, |Δlogprob| mean 0.032 / p99 0.324) — the authoritative claim holds. bs=1 greedy parity **0 violations**. Concurrent free-greedy: **1 violation at `translation` pos 31** (picked a token vLLM scores 1.375 nat below argmax) — the known **#286** final-position concurrent-batch near-tie, reproduced identically to the migration record, not a regression. Det contract (#293) green. Net: the strict gate is green; the only red is the tracked #286 concurrent marginal.
+
+## Capability contract (current state)
+
+| Capability | State | Evidence / PR |
+| --- | --- | --- |
+| EOS / stop-token | ✓ both paths, honors `ignore_eos` | #238; `runner/scheduler{,/dp}.rs` |
+| Sampling (temp/top_k/top_p) | ✓ honor-or-reject, batched FlashInfer (TP1/DP8); TP8 rejects non-greedy | #237/#285 |
+| Prompt-length guard | ✓ admission rejects `prompt+max_tokens−1 > 8192` | #239/#292; `worker.rs:65` |
+| KV admission | ✓ full-lifetime paged `BlockPool` budget | #239/#292 |
+| Prefix cache | ✓ gather ckv→decompress, kpe post-RoPE; warm TTFT 4.8× | #230/#292 |
+| Continuous batching | ✓ TP1/DP8 (`DpCoordinator`); TP8/DP1 still batch-then-drain | `runner/scheduler/dp.rs` |
+| Accuracy gate in git | ✓ teacher-forced golden + committed K2.6 fixture; green 2026-06-08 | #223/#269; `tests/vllm_golden_gate.rs` |
+| logprobs | ✓ exact on TP1/DP8; ✗ TP8 (sharded vocab) | #236; `worker/state.rs:410` |
+| echo | rejected before forward (honor-or-reject) | #236; `scheduler/lifecycle.rs:125` |
+| CUDA graph decode | ✓ DeepEP full-bucket capture, −12% TPOT | #227/#298 |
+| Bench-regression snapshot | ✓ `bench_snapshots/h200/kimi-k2.6.json` | #232 |
+| Lint gate (kernels + comm) | ✓ scoped `-D warnings` hook | #233 |
+| LoRA | N/A — server rejects cleanly | `pegainfer-server/src/main.rs` |
 
 ## Claim boundaries
 
-- **TP1+DP8+EP8 PPLX (active line):** service bs64 `256/256` success, output `1336 tok/s`, TPOT p50/p99 `47.3/47.7ms` — beats the vLLM out-of-box sustained baseline (`594 tok/s` / `107.2ms`, itself depressed by vLLM's DPLB/CUDA-graph bucket cliff; vLLM's balanced pinned capability is ~`48-50ms`). Greedy-only; token parity vs a reference trace is **not yet a gate** on this shape.
-- **TP8+EP8 NCCL (graph path):** bs4 TPOT `14.39ms` synthetic. Wave-batched, reference/history path.
-- **TTFT is the open perf gap:** HTTP decode-heavy bs4 TTFT p50 `313ms` / p99 `4240ms` vs vLLM `69.6/135.4ms` (4.5×/31× worse). Short-prompt streaming TTFT ~`2.0s`.
-- **HTTP vs in-process:** `19.13ms` vs `14.39ms` TPOT at bs4 — ~33% serving overhead, unattributed.
-- No claim of: non-greedy sampling, >2048-token prompts, long-context decode correctness, prefix reuse, multi-node.
+- **TP1+DP8+EP8 DeepEP (active line):** bs64 in-process graph TPOT p50/p99 `26.30/30.50 ms` (eager `29.6 ms`), measured 2026-06-08 on 8×H200. Service-level H20 history (`1336 tok/s`, `47.3 ms`) lives in [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md). Greedy parity is gated teacher-forced (#223); free-greedy concurrent has the tracked #286 marginal.
+- **TP8+EP8 NCCL:** reference/history. The backend is now a hard architectural split — `bringup.rs` enforces TP8→NCCL and TP1/DP8→DeepEP; there is no PPLX fallback (PPLX deleted in #298/#301).
+- **HTTP serving:** no transport overhead (#225 resolved by measurement). The "+51%" was a metric mismatch; same-metric, identical-prompt batches under-measure decode only ~7–15% (the Marlin expert GEMM), and in-process-diverse (32.6 ms) ≈ HTTP-diverse (33.9 ms). TTFT has no HTTP penalty.
+- **TTFT:** short-prompt still ~4.5×/31× behind vLLM p50/p99 (#224).
+- **KV ceiling:** `prompt + max_tokens − 1 ≤ 8192` (`worker.rs:65`). No claim of long-context decode correctness (>8k), TP8 non-greedy / logprobs, or multi-node.
 
 ## Sequencing — what blocks what
 
 ```
-Correctness milestone (M1) ──┬─→ any further kernel/decode opt (needs regression gate)
-Accuracy gate in git (M2) ───┘    K2.6 weight swap validation
-Lint-gate fix ───→ dead-code removal (cleanup ledger)
-TP8 continuous batching ─→ shared block table + free pool ─→ MLA physical backend
-                                ─→ nonzero-position prefill ─→ prefix cache ─→ DP prefix-affinity routing
-PPLX graph capturability / MoE pipelining ─→ TP1+DP8 decode throughput targets
+M1 (serving contract) + M2 (accuracy gate) ── DONE → unblock all decode/serving opt + K2.6 (now the active model)
+#286 concurrent-decode corruption ─→ trustworthy free-greedy gate ─→ #300 graph-replay numerics gate
+#225 HTTP overhead ─ RESOLVED (bench artifact; real floor is #228)
+#228 MoE a2a overlap ─→ TP1/DP8 decode TPOT
+shared block table (done #292) ─→ MLA split-KV (#231 long-context) ─→ DP prefix-affinity routing (#229)
 ```
 
 ## Roadmap
 
-### Now — M1: serving-contract correctness
+### Shipped — M1 serving contract + M2 accuracy gate (2026-06)
 
-The engine is fast but does not honor the OpenAI contract it serves. All items are crash-early-or-honor, none are perf work:
+Closed: sampling honor-or-reject (#237/#285), EOS/stop (#238), KV admission + paged pool (#239/#292), prefix cache (#230/#292), accuracy gate in git (#223/#269), CUDA-graph decode on DeepEP (#227/#298), bench snapshot (#232), lint gate (#233), dead-code + doc sweeps (#234/#235). The PPLX→DeepEP migration (#298/#301) replaced the MoE EP backend underneath all of this. **K2.6 is now the live model** — the gate fixture is K2.6-vLLM-golden, so the old "#16 K2.6 readiness" is effectively satisfied.
 
-1. **EOS/stop-token handling.** ✓ Done (issue #238): `config.rs::load_stop_token_ids` (generation_config.json with config.json fallback), per-step checks on both scheduler paths, `ignore_eos` honored end-to-end (also fixed the frontend `convert_sampling` derivation that voided it), `FinishReason::Stop` emitted. Verified on both shapes with `scripts/e2e_eos_stop.py`.
-2. **Sampling params: honor or reject.** `req.params` is never read. Either route non-greedy rows through the shared FlashInfer sampling ops, or reject non-greedy requests explicitly. Audit the full OpenAI param surface (temperature/top_k/top_p, n, seed, penalties, stop strings) — each one: honored / rejected / documented-ignored. Silent-wrong is the only forbidden state.
-3. **Prompt-length guard.** Reject prompts whose `prompt + max_tokens` exceeds the 2048-token per-slot arena instead of overrunning KV pages.
-4. **KV admission + abort-on-disconnect.** Port the qwen3 admission pattern (budget, deferral, rejection) to both paths; wire disconnect-abort when the server-wide #215 lands.
-5. **`tests/` directory.** Scheduler-robustness ITs (CPU-runnable: admission, coalesce, slot-lifecycle edges) so the above gets regression coverage. Kimi-K2 is the only model crate without integration tests.
+### Open — correctness debt (finish what M1/M2 started)
 
-### Now — M2: accuracy gate in git
-
-Today no accuracy claim is reproducible from a fresh clone: the vLLM top-20 fixture gate's reference *and* candidate fixtures live only on the H20 box, the PegaInfer-side candidate dumper was retired in PR #158, and the prefill-logits A/B harness that gated PR #204's kernel picks was never committed. The HF-loading recipe for K2.5 (trust_remote_code + vision-tower stub) is already solved in `pegainfer-kernels/tools/kimi_k2/hf_logits_reference.py`.
-
-1. Define the gate invariant per `docs/subsystems/correctness/logits-golden-gate.md`: teacher-forced per-position logprob delta vs a committed golden — not top-20 membership.
-2. Commit the reference fixture (top-K logprobs over a few sequences — small) under `test_data/`, plus a maintained candidate-dump entry point in the crate.
-3. The gate must replay **bs>1 and CUDA-graph** surfaces — every historical kimi accuracy bug was batch/row-state, exactly what one-shot bs1 runs miss.
-4. 8×H20-only model ⇒ the gate is a committed script run manually pre-release, with thresholds encoded in the script. It cannot live in CPU CI; it must still live in git.
-5. Commit the base-vs-opt prefill-logits A/B harness so future kernel picks repeat the PR #204 validation instead of re-inventing it.
-
-This milestone gates: further decode-kernel opts, the K2.6 weight swap, and any TP1/DP8 parity claim.
+- **#222 `tests/` surface.** `vllm_golden_gate.rs` now exists (teacher-forced sweep + bs1/concurrent parity + det + prefix-cache), but the M1 features it should protect have **no engine-through IT**: EOS (#238), sampling (#237), admission (#239) are guarded only by in-src unit tests. No CPU/single-GPU scheduler-robustness test like qwen3's. Stale `PPLX` strings linger at lines 19/35/309/519.
+- **#236 logprobs / echo.** ~85% done — exact logprobs on TP1/DP8 (`eb4255c`), echo rejected before forward (`28f3749`). Remaining: TP8 logprobs (sharded-vocab logsumexp) and echo-via-prefill-logits (prefill runs last-token-only `lm_head`).
+- **#286 concurrent-decode corruption.** The real bug behind the "near-tie" title: teacher-forced + bs1 are clean, but concurrent free-greedy mispicks at final positions (`translation` pos 31, 1.4–7.4 nat below argmax, reproduced 2026-06-08), on **both** backends. Split into the cheap near-tie exemption in `check_pick()` and the actual corruption hunt (MLA reduction / combine arrival order / final-step batch recompose).
+- **#300 graph-replay numerics gate.** The prod graph path (full-bucket replay) has **no** numerics gate — `vllm_golden_gate` runs `enable_cuda_graph: false` and peaks at ~2 active/rank. Add a graph-enabled, concurrent, full-bucket variant comparing replay vs eager to the bf16 ULP floor.
+- **#293 det wobble.** Tolerance gate landed (`b51a53b`, 0.25 nat); per-layer same-page-vs-different-page root-cause isolation still open. Lowest of the band — formalize or fix.
 
 ### Next — serving performance
 
-6. **Prefill / TTFT milestone.** The largest user-visible gap vs vLLM (p50 4.5×, p99 31×). Decompose short-prompt TTFT (~2s): embedding / MLA prefill / MoE prefill / first-collective stream drain / per-layer scratch allocation; then fix the dominant term and add a TTFT gate. Target: vLLM's `69.6/135.4ms` class.
-7. **HTTP-overhead isolation.** ~33% (4.74ms/token) between in-process and HTTP at bs4. Cross-check the three causes already found on qwen3: TCP_NODELAY/Nagle on SSE, frontend bridge, zombie decode from missing abort.
-8. **TP8 continuous batching** (if TP8 stays a supported shape): running/waiting split as in dp.rs; recompute batch shape from live rows so retired rows stop paying collective width.
-9. **Bench-regression snapshot.** `bench_snapshots/h20/kimi-k2.json` via the existing `bench_serving` wiring, plugged into the convention's compare gate.
-10. **PPLX + CUDA Graph.** The EP all-to-all progresses via a host worker thread — non-capturable; graphs are hard-disabled on the PPLX path, leaving ~3ms/token of host enqueue on the table. Either device-side signaling to make a2a stream-capturable, or capture rank-local compute segments around it.
-11. **MoE layer pipelining on PPLX.** dispatch→Marlin→combine runs strictly serial per layer (~1.6ms/token structural bubble); the EpBackend already exposes the four phases separately for overlap.
-12. **DP8 routing quality.** `DpLoadBalancer::pick_rank` is greedy free-slot-count (duplicated in dp.rs); needs load- and (later) prefix-affinity-aware routing.
+- **#225 HTTP overhead — RESOLVED by measurement, no work left.** The "+51%" was a metric mismatch (identical first-decode-step 26 ms vs diverse steady-TPOT 34 ms). A `--distinct-prompts` sweep + nsys kernel diff: routing diversity costs only ~7–15% of decode, entirely the Marlin expert GEMM (per-launch ~2×), all-to-all flat; host/bridge 0.1 ms/step, ranks balanced. Bench fixed + sweep knob (PR #308). Lessons: [moe-bench-prompt-diversity.md](../../lessons/moe-bench-prompt-diversity.md), [profile-diff-before-blaming-transport.md](../../lessons/profile-diff-before-blaming-transport.md).
+- **#224 TTFT.** Decompose short-prompt ~2 s (4.5×/31× vs vLLM): embedding / MLA prefill / MoE prefill / first-collective drain / per-layer scratch alloc. Prime suspects from [deepep-migration.md](deepep-migration.md): ~5 prefill buffers/layer + per-layer host spins. Add a TTFT bench snapshot.
+- **#228 MoE a2a overlap.** dispatch + combine = ~28% of GPU time, strictly serial; combine `87.9 µs` vs `~37 µs` NVLink theory. Double-buffer layer N+1 dispatch against layer N combine (recv/combined buffers are persistent and worst-case-sized). ⚠️ Issue body still says "PPLX path" — reframe to DeepEP.
+- **#229 DP8 routing.** Greedy free-slot pick, duplicated single-/multi-token; unify into `DpLoadBalancer` with length-skew + (later) prefix-affinity awareness; evaluate on mixed-arrival.
 
 ### Later — structural
 
-13. **Prefix cache chain.** (a) shared block table + global free pool replacing the fixed per-slot arena; (b) MLA physical backend for kvbm — the logical layer (sequence hashing, block matching) is layout-agnostic and reusable, but `KvLayout`/`KvBuffer` are FullAttention-only and can't express the dual `ckv[512]+kpe[64]` segments; (c) nonzero-position suffix prefill — `configure_slot_prefill` hardcodes positions `0..seq_len`, and kpe is stored RoPE-applied, so cache-hit suffix prefill would reproduce qwen3's start-position drift bug unless positions are threaded through; gate with a cached-replay logits A/B; (d) DP8 prefix-affinity routing.
-14. **MLA split-KV decode.** `partition_kv=false`, one CTA scans the full KV serially per row — fine at 2k context, cannot saturate the GPU at long context. Prerequisite: a long-context decode harness (long-context correctness is currently not claimed at all).
-15. **TP8 cuBLASLt parity or formal demotion.** PR #204's cuBLASLt GEMM picks are shape-gated to TP1 (`local_heads==64`, `o_proj cols==8192`); TP8 silently falls back to the old GEMMs. Either add TP8-shaped plans or declare TP8 reference-only and stop maintaining two backends.
-16. **K2.6 readiness.** Same-architecture weights pending. Confirm drop-in swap (no manifest/config/kernel changes), and re-run the accuracy gate against K2.6 — impossible until M2 exists.
-17. **Multi-node DP/EP** per [dp-design.md](dp-design.md) §10.
+- **#226 TP8 decision.** Already architecturally NCCL-only (`bringup.rs` enforces it). Just *formalize* supported-vs-reference in docs, and close the two gaps: TP8 is not exercised by the accuracy gate, and #204's cuBLASLt picks are TP1-shaped only (TP8 falls back to old GEMMs).
+- **#231 long-context.** Ceiling is now 8192 (#292), but no correctness harness at 4K/32K/128K and `partition_kv=false` (one CTA scans full KV serially, `kimi_mla.cu`). Harness first (correctness gate), then MLA split-KV.
+- **Multi-node DP/EP** per [dp-design.md](dp-design.md) §10.
 
 ## Cleanup ledger
 
-Order matters: fix the lint gate first, or the dead code regrows.
-
-1. **Lint-gate hole.** The global clippy hook lints only `default-members` (pegainfer-server); the kimi hook is `--no-deps` scoped to `^pegainfer-kimi-k2/`. Net: `pegainfer-kernels/src/ops/kimi_k2/*`, kimi csrc, and `pegainfer-comm` are never `-D warnings` checked. Add a scoped hook for the kernels kimi slice (and comm).
-2. ✓ **Dead expert-major/CUTLASS-era cluster — done (#234).** The retired expert-major INT4 / CUTLASS example69 API and the compiled-but-uncalled CUDA launchers in `kimi_experts.cu` are deleted; the file-level dead-code allow is dropped. `KimiExpertMajorRoute` + `KimiExpertMajorProjectionPlan` remain live (EP route layout, not the dead CUTLASS kernel). Marlin WNA16 is the only runtime INT4 path.
-3. ✓ **`weight_shape` tensor — done (#234).** No longer loaded to GPU; removing it drops 8,640 tensors (60 MoE layers × 384 experts × 3 projections × `weight_shape`) from the load set (asserted in `weights/tests.rs`). The checkpoint still carries it on disk.
-4. **`KERNELS.md` stale rows.** References a deleted `.cu` file and two ops with zero code references.
-5. ✓ **Doc refresh — done 2026-06-07 (#235).** Batch-cap claims corrected (code: `KIMI_RUNNER_MAX_BATCH = 64`, buckets `[1,2,4,8,16,32,64]`); repro commands using the removed `kimi-k2-pplx-ep` feature / `PEGAINFER_KIMI_PARALLEL` env fixed to `--tp-size/--dp-size/--ep-backend` (`vllm-h20-baseline.md`, `pplx-ep-correctness.md`); `optimization.md` re-framed so TP1+DP8+EP8 is the active mainline and the TP8 bs4 path is labelled historical.
-6. ✓ **Doc consolidation — done 2026-06-07 (#235).** `dp1-tp8-ep8-performance.md` deleted (superseded by `tp1-dp8-ep8-performance.md`; TP8/DP1 is reference-only). The bring-up trio (`support-analysis.md` / `changelog.md` / `operator-todo.md`) collapsed into [bringup-history.md](bringup-history.md). Three numeric lessons lifted to [docs/lessons/kimi-bringup-numerics.md](../../lessons/kimi-bringup-numerics.md): BF16 bulk all-reduce breaks greedy (keep the F32 bridge), merging shared+routed reduce breaks cold-batch greedy, and full-percentile reporting discipline.
+- ✓ Done: lint gate (#233), dead expert-major/CUTLASS cluster + `weight_shape` tensor (#234), doc refresh + consolidation (#235, lessons lifted to [kimi-bringup-numerics.md](../../lessons/kimi-bringup-numerics.md)).
+- Open: `KERNELS.md` stale rows (references a deleted `.cu` + two zero-reference ops); stale `PPLX` strings in `tests/vllm_golden_gate.rs` (lines 19/35/309/519) and the #228 issue body.
 
 ## Done criteria
 
 This roadmap is healthy when:
 
-- a temperature/top_p request is either correctly sampled or explicitly rejected — never silently greedy; generation stops at EOS;
-- a fresh clone + an 8×H20 node can re-run the accuracy gate from committed code and fixtures alone;
-- TTFT p50/p99 has a measured decomposition, a gate, and is within striking distance of the vLLM class;
-- prefix-cache work consumes the shared KV roadmap (#203 §1) rather than a kimi one-off;
+- ✓ a temperature/top_p request is sampled or explicitly rejected, never silently greedy; generation stops at EOS (#237/#238).
+- ✓ a fresh clone + an 8×H200 node re-runs the accuracy gate from committed code and the K2.6 fixture alone (#223).
+- TTFT p50/p99 has a measured decomposition, a gate, and is within striking distance of the vLLM class (#224, open).
+- ✓ the HTTP path's per-token cost is attributed (#225 resolved by measurement: no transport overhead — the gap was a metric mismatch, routing diversity costs ~7–15% via the Marlin expert GEMM, floor ~34 ms separately gated by #228).
+- the free-greedy gate is trustworthy at full concurrent batch — #286 fixed-or-formally-bounded and the graph-replay path gated (#300).
 - `docs/models/kimi-k2/` describes the engine that exists, not the bring-up that happened.
