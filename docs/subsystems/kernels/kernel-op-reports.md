@@ -9,17 +9,17 @@
 
 - **Read**:
   - `docs/index.md` - located the active benchmarking, CUPTI, kernel-boundary, and Qwen3 model-crate docs.
-  - `docs/models/qwen3/model-crate.md` - confirmed `qwen3_kernel_snapshot` was the current Qwen3 kernel snapshot runner and already captured warm/cold-L2 latency plus default CUPTI counters.
+  - `docs/models/qwen3/crate-layout.md` (at the time `model-crate.md`) - confirmed `qwen3_kernel_snapshot` was then the Qwen3 kernel snapshot runner and already captured warm/cold-L2 latency plus default CUPTI counters.
   - `docs/conventions/bench-regression.md` - clarified that the existing serving benchmark remains the model-level regression artifact; this task should not mix per-op reports with E2E snapshots.
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed kernels should become first-class measurable assets and model DAG manifests should live with model crates.
-  - `docs/models/qwen3/kernels-crate.md` - confirmed kernel source/build ownership now lives in `pegainfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
+  - `docs/models/qwen3/crate-layout.md` (at the time `kernels-crate.md`) - confirmed kernel source/build ownership lives in `pegainfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
   - `docs/playbooks/profiling-guide.md` - confirmed the diagnostic split between kernel composition/proportions and benchmark-grade latency.
 - **Relevant history**:
-  - `docs/models/qwen3/model-crate.md` showed the current single-op snapshot already found the low-batch long-context decode-attention bottleneck.
+  - The Qwen3 crate records (now `docs/models/qwen3/crate-layout.md`) showed the single-op snapshot already found the low-batch long-context decode-attention bottleneck.
 - **Plan**:
   1. Add direct Qwen3 crate dev-dependencies for generic infrastructure (`clap` derive for CLI and `toml` for manifest parsing) instead of extending the hand-written parser.
   2. Add a model-local TOML manifest for Qwen3-4B kernel reports, initially covering only op names, phases, shape sweeps, and variants.
-  3. Replace `crates/pegainfer-qwen3-4b/benches/qwen3_kernel_snapshot.rs` with a manifest-driven `qwen3_kernel_report` bin; do not keep a bench wrapper.
+  3. Replace the `qwen3_kernel_snapshot` bench with a manifest-driven `qwen3_kernel_report` bin; do not keep a bench wrapper.
   4. Add a composition command that reads per-op case results and emits a decode phase report by joining the manifest's op repeat rules with measured per-op reports.
   5. Run formatting and the strongest local compile checks available; GPU execution may still require the CUDA validation host because this machine lacks local CUDA tooling.
 - **Risks / open questions**:
@@ -29,13 +29,13 @@
 ## Execution Log
 
 ### Step 1: Move from bench target to bin
-- Removed the `qwen3_kernel_snapshot` bench target from `crates/pegainfer-qwen3-4b/Cargo.toml`.
-- Moved the report runner to `crates/pegainfer-qwen3-4b/src/bin/qwen3_kernel_report.rs`.
+- Removed the `qwen3_kernel_snapshot` bench target from `pegainfer-qwen3-4b/Cargo.toml`.
+- Moved the report runner to `pegainfer-qwen3-4b/src/bin/qwen3_kernel_report.rs`.
 - Added a `kernel-report` feature for generic tool dependencies (`clap`, `toml`, `sha2`, `hex`) and `pegainfer-cupti`; the bin requires that feature so normal Qwen3 library/server builds do not pull CUPTI into the default dependency graph.
 - Removed the temporary `cargo bench` compatibility argument handling after the tool became a normal binary.
 
 ### Step 2: Add model-local manifest
-- Added `crates/pegainfer-qwen3-4b/kernel_manifests/qwen3-4b.toml`.
+- Added `pegainfer-qwen3-4b/kernel_manifests/qwen3-4b.toml`.
 - The first manifest now stays deliberately thin: `model`, `[[ops]]`, `phase`, per-op shape sweep fields, and variant labels. Provider-owned facts such as dtype, head counts, head dimension, page size, thresholds, and composition policy stay in Rust.
 
 ### Step 3: Refactor report schema and commands
@@ -46,11 +46,11 @@
 ### Step 4: Local validation
 - `cargo fmt --all --check` passed.
 - `cargo metadata --no-deps --format-version 1` passed.
-- Local `cargo check --release -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot` previously failed before Rust type checking because this local host lacks a usable `nvcc`; GPU validation moved to the CUDA validation host.
+- Local compile checks of the report bin fail before Rust type checking because this local host lacks a usable `nvcc`; GPU validation moved to the CUDA validation host (build/run commands in Step 5).
 
 ### Step 5: GPU minimal validation
 - Rebuilt the disposable validation worktree at `<validation-worktree>` from local `HEAD` commit `612850f`, then rsynced the current working tree changes over it.
-- Copied initialized FlashInfer headers from `<validation-checkout>/third_party/flashinfer` into the clean worktree's `crates/pegainfer-kernels/third_party/flashinfer` directory.
+- Copied initialized FlashInfer headers from `<validation-checkout>/third_party/flashinfer` into the clean worktree's `pegainfer-kernels/third_party/flashinfer` directory.
 - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
 - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --no-cupti --iters 1 --contexts 1024 --batch-sizes 1 --variants non_partition --out $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed.
 - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_op_report_min.json --new $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed with `warnings=0 failures=0`.
@@ -242,10 +242,10 @@
 
 ### Step 16: Inspect local FlashInfer prefill implementation
 - Initialized the local FlashInfer submodule:
-  - `git submodule update --init crates/pegainfer-kernels/third_party/flashinfer`
+  - `git submodule update --init pegainfer-kernels/third_party/flashinfer`
   - Checked out `779c24d1c9e6fcc51aa2359884696fbf4ac69b3b`.
 - Confirmed the current PegaInfer wrapper calls FlashInfer's FA2 paged prefill path:
-  - `crates/pegainfer-kernels/csrc/paged_attention.cu` computes `cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim)` and dispatches `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, 128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, ...>`.
+  - `pegainfer-kernels/csrc/paged_attention.cu` computes `cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim)` and dispatches `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, 128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, ...>`.
   - For Qwen3 `seq_len=10000`, `packed_qo_len = seq_len * (num_qo_heads / num_kv_heads) = 40000`, and FlashInfer's `FA2DetermineCtaTileQ` selects `CTA_TILE_Q=128`.
   - Rust prefill planning also calls `batch_prefill_cta_tile_q`, so any `CTA_TILE_Q` override must be plumbed into both the plan metadata and the kernel launch.
 - Matched the NCU kernel traits to FlashInfer source:

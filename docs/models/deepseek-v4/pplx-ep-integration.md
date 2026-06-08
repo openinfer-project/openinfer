@@ -41,7 +41,7 @@
 - `SendBuf / RecvBuf`：裸 device pointer + elem_count + elem_size + 可选 scale pointer；调用方持有底层 allocation 的所有权。
 - `RdmaBackend`（`src/backend/rdma.rs`）：私有类型，四个 trait 方法全是 `todo!()`，构造函数当前只存了 `EpTopology`，没拿 `AllToAllContext`。
 
-### pplx wrapper（`crates/pegainfer-comm-p2p-all-to-all/`）
+### pplx wrapper（`pegainfer-comm/crates/pegainfer-comm-p2p-all-to-all/`）
 
 - `AllToAllContext::new(...)`：21 个参数，需要外部传入 `TransferEngine`、`rank_handles`、预注册的 send/recv buffer + MR、host pointer arrays（sync/send/recv），构造时启动一个 `"p2p_all_to_all Worker"` 后台线程，固定 CPU 亲和性。
 - 调用形态是 **四步**（不是 trait 现在写的两步）：

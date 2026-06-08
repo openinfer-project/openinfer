@@ -9,7 +9,7 @@
   - `docs/index.md` - showed DeepSeek V4 support, kernel boundary, and Qwen3 kernel extraction as the relevant prior work.
   - `docs/models/deepseek-v4/support.md` - confirmed DeepSeek V4 currently has native MP8 runtime, TileLang build-time kernels, exact E2E coverage, and a documented CUDA split by subsystem.
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed kernels belong in the shared kernels crate, while model DAG/runtime policy stays in the model crate.
-  - `docs/models/qwen3/kernels-crate.md` - established the existing crate-first split and the role of `pegainfer-kernels/KERNELS.md`.
+  - `docs/models/qwen3/crate-layout.md` (at the time `kernels-crate.md`) - records kernel ownership in `pegainfer-kernels` and the role of `pegainfer-kernels/KERNELS.md`.
   - `docs/conventions/coding-style.md` - reminded that GPU kernels deserve targeted tests, while broad behavior is better covered by integration/E2E.
   - `pegainfer-kernels/build.rs` - showed DeepSeek kernels are feature-gated by filename prefix in a flat `csrc/` scan, and TileLang generation was hard-coded to the old flat `tools/tilelang/gen_deepseek_v4_tilelang.py` path.
   - `pegainfer-kernels/KERNELS.md` - currently indexes Qwen3 and only mentions DeepSeek as compatibility symbols, so DSV4 has no routing table.
@@ -17,7 +17,7 @@
   - `pegainfer-deepseek-v4/src/runtime/*` - confirmed runtime calls reach DeepSeek symbols through `pegainfer_kernels::ffi`, so path cleanup should not require runtime API changes.
 - **Relevant history**:
   - `docs/models/deepseek-v4/support.md` records that the current DeepSeek CUDA glue is intentionally split by subsystem; this cleanup should preserve that split instead of merging files.
-  - `docs/models/qwen3/kernels-crate.md` moved kernel ownership into `pegainfer-kernels`; the same pattern supports moving model-specific source into a clearer subdirectory without changing model runtime ownership.
+  - The Qwen3 kernels-crate split (recorded today in `docs/models/qwen3/crate-layout.md`) moved kernel ownership into `pegainfer-kernels`; the same pattern supports moving model-specific source into a clearer subdirectory without changing model runtime ownership.
 - **Plan**:
   1. First slice: move DeepSeek V4 CUDA sources from `pegainfer-kernels/csrc/deepseek_*.cu` and `deepseek_common.cuh` into `pegainfer-kernels/csrc/deepseek_v4/`, then update `pegainfer-kernels/build.rs` to discover CUDA files recursively and feature-gate DeepSeek by path instead of flat filename prefix.
   2. Keep object file names stable or explicitly namespace them so `ar` input names remain collision-free when sources live in subdirectories.

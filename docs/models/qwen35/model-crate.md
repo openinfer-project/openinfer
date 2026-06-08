@@ -8,13 +8,13 @@
 
 - **Read**:
   - `docs/index.md` - identified the existing core split, Qwen3 model crate split, and Qwen3.5 accuracy/optimization docs.
-  - `docs/models/qwen3/model-crate.md` - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
+  - `docs/models/qwen3/crate-layout.md` (at the time `model-crate.md`) - Qwen3 already owns its scheduler, executor/runtime API, tests, benches, and root-facing `EngineHandle` entry.
   - `docs/models/qwen35/accuracy.md` - at the time of this migration, Qwen3.5 e2e tests were regression guards against `test_data/Qwen3.5-4B.json`; current accuracy coverage is the HF logits gate recorded there.
   - `docs/models/qwen35/optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
   - GitHub issue #79 - acceptance criteria require `pegainfer-qwen35-4b`, removal of root `pegainfer::model::Qwen35Model` and `pegainfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
   - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `pegainfer-qwen3-4b/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
 - **Relevant history**:
-  - `docs/models/qwen3/model-crate.md` - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
+  - `docs/models/qwen3/crate-layout.md` (at the time `model-crate.md`) - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
 - **Plan**:
   1. Add `pegainfer-qwen35-4b` to the workspace with dependencies mirroring the Qwen3 crate plus the root dependencies Qwen3.5 currently uses.
   2. Move `src/model/qwen35.rs`, `src/model/qwen35/*`, `src/scheduler_qwen35.rs`, and Qwen3.5 recurrent op wrappers into the new crate, keeping CUDA/Triton kernel sources and FFI in `pegainfer-kernels`.
