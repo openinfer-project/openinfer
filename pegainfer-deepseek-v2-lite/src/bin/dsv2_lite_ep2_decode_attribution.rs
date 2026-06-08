@@ -34,7 +34,9 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    let cli = parse_cli()?;
+    let Some(cli) = parse_cli()? else {
+        return Ok(());
+    };
     let model_path = resolve_model_path(&cli.model_path);
     ensure!(
         model_path.join("config.json").exists(),
@@ -72,9 +74,9 @@ fn main() -> Result<()> {
         single_report(
             &tokenizer,
             &prompt_tokens,
-            result,
-            attribution,
-            graph_readiness,
+            &result,
+            &attribution,
+            &graph_readiness,
         )?
     } else {
         let (result, attribution) = generator.generate_greedy_batch_same_prompt_with_attribution(
@@ -91,9 +93,9 @@ fn main() -> Result<()> {
         batch_report(
             &tokenizer,
             &prompt_tokens,
-            result,
-            attribution,
-            graph_readiness,
+            &result,
+            &attribution,
+            &graph_readiness,
         )?
     };
 
@@ -114,9 +116,9 @@ fn main() -> Result<()> {
 fn single_report(
     tokenizer: &HuggingFaceTokenizer,
     prompt_tokens: &[u32],
-    result: pegainfer_deepseek_v2_lite::GenerationResult,
-    attribution: pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
-    graph_readiness: DecodeGraphReadinessReport,
+    result: &pegainfer_deepseek_v2_lite::GenerationResult,
+    attribution: &pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+    graph_readiness: &DecodeGraphReadinessReport,
 ) -> Result<Value> {
     let generated_text = tokenizer
         .decode(&result.tokens, false)
@@ -177,7 +179,7 @@ fn single_report(
             "failure_count": attribution.gpu_timing_failure_count(),
             "nvtx_enabled": attribution.nvtx_enabled(),
             "nvtx_range_count": attribution.nvtx_range_count(),
-            "scope": "selected GPU/NCCL sections only; host routing, host accumulation, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+            "scope": "selected GPU/NCCL sections only; host routing, host-directed route iteration, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
         },
         "schedule_source": "fixed DeepSeek-V2-Lite EP2 greedy gate: prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
         "by_section": by_section,
@@ -185,7 +187,7 @@ fn single_report(
         "by_call_site": attribution.by_call_site(),
         "by_gpu_section": by_gpu_section,
         "by_gpu_call_site": by_gpu_call_site,
-        "coverage": coverage_rows(&result.stats.ep_backend, 1, &attribution, &graph_readiness),
+        "coverage": coverage_rows(&result.stats.ep_backend, 1, attribution, graph_readiness),
         "ep": ep_report(&result.stats),
         "cuda_graph_readiness": graph_readiness,
         "claim_boundary": "Attribution only for the covered EP2 Hello/16 decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
@@ -195,9 +197,9 @@ fn single_report(
 fn batch_report(
     tokenizer: &HuggingFaceTokenizer,
     prompt_tokens: &[u32],
-    result: pegainfer_deepseek_v2_lite::BatchedGenerationResult,
-    attribution: pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
-    graph_readiness: DecodeGraphReadinessReport,
+    result: &pegainfer_deepseek_v2_lite::BatchedGenerationResult,
+    attribution: &pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+    graph_readiness: &DecodeGraphReadinessReport,
 ) -> Result<Value> {
     ensure!(
         result.per_token_decode_us == attribution.per_token_decode_us(),
@@ -279,7 +281,7 @@ fn batch_report(
             "failure_count": attribution.gpu_timing_failure_count(),
             "nvtx_enabled": attribution.nvtx_enabled(),
             "nvtx_range_count": attribution.nvtx_range_count(),
-            "scope": "selected GPU/NCCL sections only; host routing, host accumulation, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+            "scope": "selected GPU/NCCL sections only; host routing, host-directed route iteration, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
         },
         "schedule_source": format!(
             "fixed DeepSeek-V2-Lite EP2 greedy gate: batch_size={}, prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
@@ -290,14 +292,14 @@ fn batch_report(
         "by_call_site": attribution.by_call_site(),
         "by_gpu_section": by_gpu_section,
         "by_gpu_call_site": by_gpu_call_site,
-        "coverage": coverage_rows(&result.stats.ep_backend, result.tokens.len(), &attribution, &graph_readiness),
+        "coverage": coverage_rows(&result.stats.ep_backend, result.tokens.len(), attribution, graph_readiness),
         "ep": ep_report(&result.stats),
         "cuda_graph_readiness": graph_readiness,
         "claim_boundary": "Attribution only for the covered EP2 Hello/16 same-prompt batched decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
     }))
 }
 
-fn parse_cli() -> Result<Cli> {
+fn parse_cli() -> Result<Option<Cli>> {
     let mut model_path = "models/DeepSeek-V2-Lite".to_string();
     let mut batch_size = 1;
     let mut nccl_graph_smoke = false;
@@ -333,19 +335,19 @@ fn parse_cli() -> Result<Cli> {
                 println!(
                     "DeepSeek-V2-Lite EP2 decode attribution gate\n\nUSAGE:\n  dsv2_lite_ep2_decode_attribution [--model-path PATH] [--batch-size N] [--nccl-graph-smoke] [--out PATH]\n\nThe gate is intentionally fixed to prompt=Hello, output_len=16, with batch-size in 1..=8. Select NCCL with PEGAINFER_DSV2_LITE_EP_BACKEND=nccl. Use --nccl-graph-smoke to run a preallocated f32 NCCL all-reduce CUDA Graph capture/replay smoke after attribution."
                 );
-                std::process::exit(0);
+                return Ok(None);
             }
             other => bail!(
                 "unsupported argument `{other}`; supported flags: --model-path PATH, --batch-size N, --nccl-graph-smoke, --out PATH"
             ),
         }
     }
-    Ok(Cli {
+    Ok(Some(Cli {
         model_path,
         batch_size,
         nccl_graph_smoke,
         out,
-    })
+    }))
 }
 
 fn ep_report(stats: &pegainfer_deepseek_v2_lite::GenerationStats) -> Value {

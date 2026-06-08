@@ -1,7 +1,7 @@
 use std::{
     ffi::{CStr, c_char, c_int, c_void},
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -17,7 +17,10 @@ use cudarc::{
 };
 use half::bf16;
 use libloading::Library;
-use pegainfer_core::tensor::{DeviceContext, HiddenStates};
+use pegainfer_core::{
+    ops,
+    tensor::{DeviceContext, HiddenStates},
+};
 use serde::Serialize;
 
 use crate::device::activate;
@@ -42,8 +45,10 @@ type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 pub(crate) struct NaiveNcclEp2Backend {
     lib: Arc<RawNcclLib>,
     comms: Vec<ncclComm_t>,
+    combine_scratch: Mutex<DeviceCombineScratch>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct NcclGraphSmokeReport {
     attempted: bool,
@@ -100,6 +105,108 @@ struct RawNcclLib {
     get_error_string: NcclGetErrorString,
 }
 
+#[derive(Default)]
+struct DeviceCombineScratch {
+    hidden_dim: usize,
+    seq_len: usize,
+    rank0_send: Option<CudaSlice<f32>>,
+    rank0_recv: Option<CudaSlice<f32>>,
+    rank1_send: Option<CudaSlice<f32>>,
+    rank1_recv: Option<CudaSlice<f32>>,
+}
+
+impl DeviceCombineScratch {
+    fn ensure(
+        &mut self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let elems = combine_elems(hidden_dim, seq_len)?;
+        if self.hidden_dim == hidden_dim
+            && self.seq_len == seq_len
+            && self
+                .rank0_send
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+            && self
+                .rank0_recv
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+            && self
+                .rank1_send
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+            && self
+                .rank1_recv
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+        {
+            return Ok(());
+        }
+
+        activate(rank0)?;
+        drop(self.rank0_send.take());
+        drop(self.rank0_recv.take());
+        let rank0_send = rank0.stream.alloc_zeros::<f32>(elems)?;
+        let rank0_recv = rank0.stream.alloc_zeros::<f32>(elems)?;
+        activate(rank1)?;
+        drop(self.rank1_send.take());
+        drop(self.rank1_recv.take());
+        let rank1_send = rank1.stream.alloc_zeros::<f32>(elems)?;
+        let rank1_recv = rank1.stream.alloc_zeros::<f32>(elems)?;
+
+        self.hidden_dim = hidden_dim;
+        self.seq_len = seq_len;
+        self.rank0_send = Some(rank0_send);
+        self.rank0_recv = Some(rank0_recv);
+        self.rank1_send = Some(rank1_send);
+        self.rank1_recv = Some(rank1_recv);
+        Ok(())
+    }
+
+    fn ensure_shape(&self, hidden_dim: usize, seq_len: usize) -> Result<usize> {
+        let elems = combine_elems(hidden_dim, seq_len)?;
+        ensure!(
+            self.hidden_dim == hidden_dim && self.seq_len == seq_len,
+            "DeepSeek-V2-Lite NCCL device combine scratch shape mismatch: scratch=[{}, {}], requested=[{}, {}]",
+            self.hidden_dim,
+            self.seq_len,
+            hidden_dim,
+            seq_len
+        );
+        ensure!(
+            self.rank0_send
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+                && self
+                    .rank0_recv
+                    .as_ref()
+                    .is_some_and(|buf| buf.len() >= elems)
+                && self
+                    .rank1_send
+                    .as_ref()
+                    .is_some_and(|buf| buf.len() >= elems)
+                && self
+                    .rank1_recv
+                    .as_ref()
+                    .is_some_and(|buf| buf.len() >= elems),
+            "DeepSeek-V2-Lite NCCL device combine scratch is not initialized for {elems} elements"
+        );
+        Ok(elems)
+    }
+
+    fn send_mut(&mut self, rank: usize) -> Result<&mut CudaSlice<f32>> {
+        match rank {
+            0 => self.rank0_send.as_mut(),
+            1 => self.rank1_send.as_mut(),
+            other => bail!("DeepSeek-V2-Lite NCCL device combine unsupported EP rank {other}"),
+        }
+        .context("DeepSeek-V2-Lite NCCL device combine send scratch is missing")
+    }
+}
+
 impl NaiveNcclEp2Backend {
     pub(crate) fn new(rank0: &DeviceContext, rank1: &DeviceContext) -> Result<Self> {
         ensure!(
@@ -123,7 +230,11 @@ impl NaiveNcclEp2Backend {
             comms.iter().all(|comm| !comm.is_null()),
             "DeepSeek-V2-Lite NCCL EP=2 communicator initialization returned a null communicator"
         );
-        let backend = Self { lib, comms };
+        let backend = Self {
+            lib,
+            comms,
+            combine_scratch: Mutex::new(DeviceCombineScratch::default()),
+        };
         backend.validate_communicators(&ordinals)?;
         backend.smoke_all_reduce_f32(rank0, rank1)?;
         Ok(backend)
@@ -175,57 +286,117 @@ impl NaiveNcclEp2Backend {
         Ok(rank1_recv)
     }
 
-    pub(crate) fn combine_f32_contributions_to_rank0(
+    pub(crate) fn clear_device_combine(
         &self,
         rank0: &DeviceContext,
         rank1: &DeviceContext,
-        rank0_contrib: &[f32],
-        rank1_contrib: &[f32],
-    ) -> Result<Vec<f32>> {
-        ensure!(
-            !rank0_contrib.is_empty(),
-            "DeepSeek-V2-Lite NCCL combine requires non-empty rank0 contribution"
-        );
-        ensure!(
-            rank0_contrib.len() == rank1_contrib.len(),
-            "DeepSeek-V2-Lite NCCL combine contribution length mismatch: rank0={}, rank1={}",
-            rank0_contrib.len(),
-            rank1_contrib.len()
-        );
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let mut scratch = self.combine_scratch()?;
+        let elems = combine_elems(hidden_dim, seq_len)?;
+        scratch.ensure(rank0, rank1, hidden_dim, seq_len)?;
         activate(rank0)?;
-        let rank0_send = rank0.stream.clone_htod(rank0_contrib)?;
-        let mut rank0_recv = rank0.stream.alloc_zeros::<f32>(rank0_contrib.len())?;
+        rank0
+            .stream
+            .memset_zeros(scratch.send_mut(0)?)
+            .context("clear DeepSeek-V2-Lite NCCL rank0 combine send scratch")?;
         activate(rank1)?;
-        let rank1_send = rank1.stream.clone_htod(rank1_contrib)?;
-        let mut rank1_recv = rank1.stream.alloc_zeros::<f32>(rank1_contrib.len())?;
+        rank1
+            .stream
+            .memset_zeros(scratch.send_mut(1)?)
+            .context("clear DeepSeek-V2-Lite NCCL rank1 combine send scratch")?;
+        scratch.ensure_shape(hidden_dim, seq_len)?;
+        ensure!(
+            elems > 0,
+            "DeepSeek-V2-Lite NCCL device combine requires non-empty scratch"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn accumulate_device_contribution(
+        &self,
+        rank: usize,
+        ctx: &DeviceContext,
+        expert_output: &HiddenStates,
+        token_idx: usize,
+        seq_len: usize,
+        weight: f32,
+    ) -> Result<()> {
+        ensure!(
+            expert_output.seq_len == 1,
+            "DeepSeek-V2-Lite NCCL device combine expects one-token expert output, got seq_len={}",
+            expert_output.seq_len
+        );
+        let mut scratch = self.combine_scratch()?;
+        scratch.ensure_shape(expert_output.hidden_dim, seq_len)?;
+        activate(ctx)?;
+        ops::accumulate_bf16_token_scaled_to_f32_into(
+            ctx,
+            expert_output,
+            weight,
+            token_idx,
+            seq_len,
+            scratch.send_mut(rank)?,
+        )
+    }
+
+    pub(crate) fn combine_device_contributions_to_rank0(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<HiddenStates> {
+        let mut scratch = self.combine_scratch()?;
+        let elems = scratch.ensure_shape(hidden_dim, seq_len)?;
+
+        let DeviceCombineScratch {
+            rank0_send,
+            rank0_recv,
+            rank1_send,
+            rank1_recv,
+            ..
+        } = &mut *scratch;
+        let rank0_send = rank0_send
+            .as_ref()
+            .context("DeepSeek-V2-Lite NCCL rank0 combine send scratch is missing")?;
+        let rank0_recv = rank0_recv
+            .as_mut()
+            .context("DeepSeek-V2-Lite NCCL rank0 combine recv scratch is missing")?;
+        let rank1_send = rank1_send
+            .as_ref()
+            .context("DeepSeek-V2-Lite NCCL rank1 combine send scratch is missing")?;
+        let rank1_recv = rank1_recv
+            .as_mut()
+            .context("DeepSeek-V2-Lite NCCL rank1 combine recv scratch is missing")?;
 
         self.grouped("DeepSeek-V2-Lite NCCL combine all-reduce", || {
             activate(rank0)?;
             self.all_reduce_f32(
                 0,
-                &rank0_send,
-                &mut rank0_recv,
-                rank0_contrib.len(),
+                rank0_send,
+                rank0_recv,
+                elems,
                 rank0.stream.cu_stream(),
                 "DeepSeek-V2-Lite NCCL combine rank0 all-reduce",
             )?;
             activate(rank1)?;
             self.all_reduce_f32(
                 1,
-                &rank1_send,
-                &mut rank1_recv,
-                rank1_contrib.len(),
+                rank1_send,
+                rank1_recv,
+                elems,
                 rank1.stream.cu_stream(),
                 "DeepSeek-V2-Lite NCCL combine rank1 all-reduce",
             )?;
             Ok(())
         })?;
-        rank0.sync()?;
-        rank1.sync()?;
 
-        let combined = rank0.stream.clone_dtoh(&rank0_recv)?;
-        rank0.sync()?;
-        Ok(combined)
+        activate(rank0)?;
+        let mut routed = HiddenStates::zeros(rank0, hidden_dim, seq_len)?;
+        ops::f32_to_bf16_hidden_into(rank0, rank0_recv, &mut routed)?;
+        Ok(routed)
     }
 
     fn smoke_all_reduce_f32(&self, rank0: &DeviceContext, rank1: &DeviceContext) -> Result<()> {
@@ -562,6 +733,12 @@ impl NaiveNcclEp2Backend {
         Ok(comm)
     }
 
+    fn combine_scratch(&self) -> Result<MutexGuard<'_, DeviceCombineScratch>> {
+        self.combine_scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DeepSeek-V2-Lite NCCL device combine scratch poisoned"))
+    }
+
     fn grouped(&self, context: &str, f: impl FnOnce() -> Result<()>) -> Result<()> {
         let start = unsafe {
             // SAFETY: NCCL group state is process-global and entered/exited on
@@ -578,6 +755,18 @@ impl NaiveNcclEp2Backend {
         op_result?;
         end_result
     }
+}
+
+fn combine_elems(hidden_dim: usize, seq_len: usize) -> Result<usize> {
+    ensure!(
+        hidden_dim > 0 && seq_len > 0,
+        "DeepSeek-V2-Lite NCCL device combine requires non-empty shape, got hidden_dim={hidden_dim}, seq_len={seq_len}"
+    );
+    hidden_dim.checked_mul(seq_len).with_context(|| {
+        format!(
+            "DeepSeek-V2-Lite NCCL device combine shape overflow: hidden_dim={hidden_dim}, seq_len={seq_len}"
+        )
+    })
 }
 
 fn cleanup_capture(ctx: &DeviceContext, capture_started: bool) {
@@ -597,7 +786,7 @@ impl CapturedCudaGraph {
         let status = unsafe {
             // SAFETY: `graph` was returned by `cuStreamEndCapture` and is
             // still owned by this captured graph wrapper.
-            cudarc::driver::sys::cuGraphInstantiateWithFlags(&mut exec, self.graph, 0)
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(&raw mut exec, self.graph, 0)
         };
         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS || exec.is_null() {
             bail!("instantiate CUDA Graph on {rank_label} stream failed with {status:?}");
@@ -680,7 +869,7 @@ fn end_capture(stream: CUstream, rank_label: &str) -> Result<CapturedCudaGraph> 
     let mut graph = ptr::null_mut();
     let status = unsafe {
         // SAFETY: Matches `begin_capture` on the same live rank stream.
-        cudarc::driver::sys::cuStreamEndCapture(stream, &mut graph)
+        cudarc::driver::sys::cuStreamEndCapture(stream, &raw mut graph)
     };
     ensure!(
         status == cudarc::driver::sys::CUresult::CUDA_SUCCESS && !graph.is_null(),
@@ -709,13 +898,12 @@ impl RawNcclLib {
         let mut tried = Vec::new();
         for candidate in ["libnccl.so.2", "libnccl.so"] {
             tried.push(candidate);
-            let library = match unsafe {
+            let Ok(library) = (unsafe {
                 // SAFETY: Loading NCCL is required to create the selected
                 // runtime backend. All symbols are validated immediately below.
                 Library::new(candidate)
-            } {
-                Ok(library) => library,
-                Err(_) => continue,
+            }) else {
+                continue;
             };
             return unsafe {
                 // SAFETY: The library is kept alive inside `RawNcclLib`; copied
@@ -766,7 +954,7 @@ impl RawNcclLib {
         let status = unsafe {
             // SAFETY: `count` is a valid out pointer and `comm` was validated
             // by the caller as a non-null communicator handle.
-            (self.comm_count)(comm, &mut count)
+            (self.comm_count)(comm, &raw mut count)
         };
         self.check(status, context)?;
         Ok(count)
@@ -777,7 +965,7 @@ impl RawNcclLib {
         let status = unsafe {
             // SAFETY: `device` is a valid out pointer and `comm` was validated
             // by the caller as a non-null communicator handle.
-            (self.comm_cu_device)(comm, &mut device)
+            (self.comm_cu_device)(comm, &raw mut device)
         };
         self.check(status, context)?;
         Ok(device)

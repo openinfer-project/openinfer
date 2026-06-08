@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. HF, host-staged, and NCCL match for the narrow greedy gate; current batch and vLLM data are diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. HF, host-staged, and NCCL match for the narrow greedy gate; NCCL decode combine now uses reusable device-resident f32 scratch, while dense exchange and host-directed routing still block full decode graph capture. Current batch and vLLM data remain diagnostic and do not claim production serving parity.
 
 Last touched: 2026-06
 
@@ -13,6 +13,7 @@ Last touched: 2026-06
 | HF token/text/hash gate | Available | PR #154 establishes the HF / host-staged / NCCL comparison; PR #176 refreshes it to Transformers `generate(..., use_cache=true)`. |
 | Decode attribution | Available | PR #162 and PR #169 add CPU/GPU attribution, route counts, NCCL counters, CUDA event timing, and optional NVTX correlation. |
 | Direct same-prompt diagnostic batch | Available | PR #184 and PR #196 cover batch sizes `1`, `4`, and `8` for the fixed same-prompt direct path. |
+| Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
 | NCCL CUDA Graph readiness | Diagnostic only | The attribution binary now emits `cuda_graph_readiness`. Current NCCL full decode capture is blocked; the optional preallocated f32 NCCL graph smoke captures, replays, and verifies. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
 | vLLM production parity | Not claimed | The manual vLLM snapshot below is for understanding the gap requested in issue #170. |
@@ -55,7 +56,7 @@ Current retained direct snapshot from PR #184:
 | 8 | host-staged | 394.753 | 411.348 | 19.423 |
 | 8 | NCCL | 522.917 | 539.643 | 14.874 |
 
-PR #196 extends attribution for the same direct diagnostic shapes. The latest A800 attribution gate keeps `batch-size=1/4/8`, `prompt="Hello"`, `output_len=16`, host-staged, and NCCL exact against the same-host HF gate.
+PR #196 extends attribution for the same direct diagnostic shapes. The retained A800 attribution gate keeps `batch-size=1/4/8`, `prompt="Hello"`, `output_len=16`, host-staged, and NCCL exact against the same-host HF gate.
 
 ### Manual vLLM Snapshot
 
@@ -99,14 +100,15 @@ Do not claim:
 
 Issue #205 records the model roadmap. Maintainer feedback there calls out NCCL plus CUDA Graph as the likely best decode direction, with host staging possibly deprecated later. Treat that as a future direction, not as current evidence.
 
-The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. A basic preallocated f32 NCCL all-reduce smoke now captures, replays, and verifies on the latest A800 run, but that proves only the collective smoke shape. It is not full decode CUDA Graph coverage. HF, host-staged, and NCCL remain token/text exact for the narrow greedy gate.
+The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers from the retained 2x RTX 5090 attribution gate, but dense exchange allocation/sync and host-directed routing remain. A basic preallocated f32 NCCL all-reduce smoke captures, replays, and verifies on the retained A800 run, but that proves only the collective smoke shape. It is not full decode CUDA Graph coverage. HF, host-staged, and NCCL remain token/text exact for the narrow greedy gate.
 
 The next implementation should be chosen from measured evidence:
 
-1. Move NCCL decode toward CUDA Graph coverage.
+1. Move the remaining NCCL decode path toward CUDA Graph coverage.
    - keep HF / host-staged / NCCL exact before and after;
    - keep host-staged as the correctness baseline while it exists;
    - preserve attribution before and after the change;
+   - attack dense exchange allocation/sync and host route iteration next;
    - avoid broad generic EP or multi-node work;
    - judge issue #170 by whether it reduces NCCL decode overhead and makes the path more graph-friendly.
 

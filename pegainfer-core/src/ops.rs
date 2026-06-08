@@ -15,14 +15,15 @@ pub use attention::{
 };
 pub use paged_plan::PrefillPagedPlan;
 pub use pegainfer_kernels::ops::{
-    LoraDecodeGroupedProjection, add_batch, add_batch_into, embedding_decode_into, extract_vec,
-    extract_vec_into, fused_add_rms_norm_into, gather_hidden_tokens_into, gemm, gemm_into_checked,
-    gemm_per_token, gemv, linear, lora_decode_fused_delta_group3_into,
+    LoraDecodeGroupedProjection, accumulate_bf16_token_scaled_to_f32_into, add_batch,
+    add_batch_into, bf16_hidden_to_f32_into, embedding_decode_into, extract_vec, extract_vec_into,
+    f32_to_bf16_hidden_into, fused_add_rms_norm_into, gather_hidden_tokens_into, gemm,
+    gemm_into_checked, gemm_per_token, gemv, linear, lora_decode_fused_delta_group3_into,
     lora_decode_fused_delta_into, pack_lora_b_rows_into,
     qk_norm_partial_rope_batched_decode_hd256_into, rms_norm, rms_norm_batch_offset_into,
-    rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into, scaled_add_batch_into,
-    scaled_add_rows_indexed_into, scaled_add_rows_into, scaled_add_rows_token_range_into,
-    silu_mul_batch, silu_mul_batch_into, write_vec_into,
+    rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into, scale_f32_in_place,
+    scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
+    scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into, write_vec_into,
 };
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::{
