@@ -16,7 +16,7 @@
 //! comparison the gate bounds a two-sided |Δlogprob| distribution: pegainfer's
 //! own logprob of its pick against vLLM's logprob of the same token. Two
 //! passes through the *real serving path*
-//! (EngineHandle → DP coordinator → PPLX EP → MLA kernels, TP1/DP8/EP8):
+//! (EngineHandle → DP coordinator → DeepEP → MLA kernels, TP1/DP8/EP8):
 //!
 //!   * teacher-forced argmax sweep — for every position i, prefill
 //!     `prompt + tail[..i]` with max_tokens=1. pegainfer's pick must satisfy
@@ -32,7 +32,7 @@
 //!     covers prefill numerics position-by-position.
 //!   * free-greedy decode parity — generate the tail end-to-end and compare
 //!     token-by-token. This is the only public way to exercise the *decode*
-//!     kernels (MLA decode, batched PPLX MoE), at the cost that comparison
+//!     kernels (MLA decode, batched DeepEP MoE), at the cost that comparison
 //!     stops at the first benign divergence: an in-bound mismatch ends that
 //!     sequence's comparison (the engines walked into different contexts); a
 //!     mismatch beyond the regret bound fails the gate. An
@@ -305,7 +305,7 @@ fn start_engine(path: &str) -> EngineHandle {
             seed: 42,
         },
     )
-    .expect("start kimi-k2 TP1/DP8/EP8 PPLX engine")
+    .expect("start kimi-k2 TP1/DP8/EP8 DeepEP engine")
 }
 
 struct PendingRequest {
@@ -516,7 +516,7 @@ fn report(label: &str, stats: &RegretStats, failures: &mut Vec<String>) {
 /// Pass A: teacher-forced argmax sweep. One wave per sequence: D concurrent
 /// single-token requests at prompt lengths `len(prompt) .. len(prompt)+D-1`.
 /// Mixed-length concurrent prefill is exactly the DP-coordinator admission
-/// shape the PPLX path must handle (uneven per-rank rows, empty ranks).
+/// shape the DeepEP path must handle (uneven per-rank rows, empty ranks).
 fn teacher_forced_sweep(engine: &EngineHandle, fixture: &Fixture) -> RegretStats {
     let mut stats = RegretStats::default();
     for seq in &fixture.seqs {
