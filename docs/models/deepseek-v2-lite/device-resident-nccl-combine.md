@@ -1,11 +1,8 @@
 # DeepSeek-V2-Lite Device-Resident NCCL Combine
 
-**Created**: 2026-06-08
-**Status**: validated on 2x RTX 5090
+> **TL;DR:** Issue #275 moves the NCCL decode combine path to reusable device-resident f32 scratch buffers. The retained `Hello` / 16-token gate stays HF / host-staged / NCCL exact, and the readiness report no longer lists the old combine H2D/D2H/allocation/sync blockers. Full decode capture is still blocked by dense exchange allocation/sync and host-directed routing.
 
-## TL;DR
-
-Issue #275 moves the NCCL decode combine path to reusable device-resident f32 scratch buffers. The retained `Hello` / 16-token gate stays HF / host-staged / NCCL exact, and the readiness report no longer lists the old combine H2D/D2H/allocation/sync blockers. Full decode capture is still blocked by dense exchange allocation/sync and host-directed routing.
+Last touched: 2026-06
 
 ## Preparation
 

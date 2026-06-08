@@ -254,6 +254,8 @@ impl DeepSeekV2LiteEp2Generator {
         )?;
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
+        let mut live_expert_outputs =
+            Vec::with_capacity(input.seq_len * self.config.num_experts_per_token);
 
         for (token, token_routes) in routes.iter().enumerate() {
             for &(global_expert, weight) in token_routes {
@@ -312,6 +314,7 @@ impl DeepSeekV2LiteEp2Generator {
                         )
                     },
                 )?;
+                live_expert_outputs.push(out);
             }
         }
 
@@ -332,6 +335,7 @@ impl DeepSeekV2LiteEp2Generator {
                 )
             },
         )?;
+        drop(live_expert_outputs);
         activate(&self.rank0.ctx)?;
         let hidden = attribution.record_gpu_result(
             &self.rank0.ctx,
