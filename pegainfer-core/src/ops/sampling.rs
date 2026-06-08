@@ -90,6 +90,14 @@ pub fn select_batch_tokens_into(
 
     if !greedy_rows.is_empty() {
         // Batch sampling for greedy rows.
+        if row_indices_scratch.len() < greedy_rows.len() {
+            return Err(anyhow!(
+                "row_indices_scratch too small: have {}, need {}",
+                row_indices_scratch.len(),
+                greedy_rows.len()
+            ));
+        }
+
         ctx.stream
             .memcpy_htod(&greedy_rows, row_indices_scratch)
             .map_err(|e| anyhow!("H2D indexed argmax rows failed: {}", e))?;
