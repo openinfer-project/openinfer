@@ -18,26 +18,19 @@ impl Qwen35Model {
         params: &[&pegainfer_core::sampler::SamplingParams],
         rng: &mut rand::rngs::StdRng,
     ) -> Result<Vec<u32>> {
-        let batch_size = params.len();
-
-        let mut tokens = Vec::with_capacity(batch_size);
-        for (i, params_i) in params.iter().enumerate().take(batch_size) {
-            let logits_i = ops::extract_vec(&self.ctx, &bufs.logits, i)?;
-            let random_val: f32 = rand::RngExt::random(rng);
-            let token = ops::gpu_sample_into(
-                &self.ctx,
-                &logits_i,
-                &mut bufs.sample_probs,
-                &mut bufs.sample_top1_value,
-                &mut bufs.sample_row_states,
-                &mut bufs.sample_valid,
-                &mut bufs.sample_out,
-                params_i,
-                random_val,
-            )?;
-            tokens.push(token);
-        }
-        Ok(tokens)
+        let random_vals: Vec<f32> = params.iter().map(|_| rand::RngExt::random(rng)).collect();
+        ops::select_batch_tokens_into(
+            &self.ctx,
+            &bufs.logits,
+            params,
+            &random_vals,
+            &mut bufs.sample_row_indices,
+            &mut bufs.sample_probs,
+            &mut bufs.sample_top1_value,
+            &mut bufs.sample_row_states,
+            &mut bufs.sample_valid,
+            &mut bufs.sample_out,
+        )
     }
 
     fn batch_decode_full_attention(

@@ -32,7 +32,8 @@ pub use pegainfer_kernels::ops::{
     silu_mul_fused_batch_into,
 };
 pub use sampling::{
-    argmax, argmax_batch_bf16_into, flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into,
+    argmax, argmax_batch_bf16_indexed_into, argmax_batch_bf16_into,
+    flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into, select_batch_tokens_into,
 };
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::{

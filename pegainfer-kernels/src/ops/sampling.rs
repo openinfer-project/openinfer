@@ -273,6 +273,59 @@ pub fn argmax_batch_bf16_into(
     Ok(())
 }
 
+pub fn argmax_batch_bf16_indexed_into(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    row_indices: &CudaSlice<i32>,
+    rows: usize,
+    values: &mut CudaSlice<half::bf16>,
+    out: &mut CudaSlice<i32>,
+) -> Result<()> {
+    if rows == 0 {
+        return Err(anyhow!("argmax indexed batch requires at least one row"));
+    }
+    if row_indices.len() < rows {
+        return Err(anyhow!(
+            "argmax indexed row scratch too small: have {}, need {}",
+            row_indices.len(),
+            rows
+        ));
+    }
+    if values.len() < rows {
+        return Err(anyhow!(
+            "argmax indexed values scratch too small: have {}, need {}",
+            values.len(),
+            rows
+        ));
+    }
+    if out.len() < rows {
+        return Err(anyhow!(
+            "argmax indexed output too small: have {}, need {}",
+            out.len(),
+            rows
+        ));
+    }
+
+    let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (row_indices_ptr, _gr) = row_indices.device_ptr(&ctx.stream);
+    let (values_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::argmax_batch_bf16_indexed_cuda(
+            logits_ptr as *const ffi::Half,
+            row_indices_ptr as *const i32,
+            values_ptr as *mut ffi::Half,
+            out_ptr as *mut i32,
+            rows as i32,
+            logits.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize {
     const TILE_ELEMS: usize = 4096;
     rows * vocab.div_ceil(TILE_ELEMS)

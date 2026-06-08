@@ -42,7 +42,7 @@ fn handle_request(generator: &mut DeepSeekV2LiteEp2Generator, req: &GenerateRequ
             logprobs: vec![None; prompt_tokens],
         });
     }
-    if !is_greedy(req.params) {
+    if !req.params.is_greedy() {
         reject_request(
             req,
             prompt_tokens,
@@ -108,10 +108,6 @@ fn emit_generation_result(
         prompt_tokens,
         completion_tokens: result.tokens.len(),
     });
-}
-
-fn is_greedy(params: SamplingParams) -> bool {
-    (params.temperature <= 0.0 || params.top_k == 1) && params.top_p >= 1.0
 }
 
 fn unix_time_secs() -> f64 {

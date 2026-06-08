@@ -183,6 +183,43 @@ fn build_decode_request_results(
     Ok(outputs)
 }
 
+fn build_batch_decode_request_results(
+    lane: &mut LocalQwen3Lane,
+    requests: &[DecodeStepItem],
+) -> Result<Vec<DecodeRequestResult>> {
+    let params: Vec<&SamplingParams> = requests.iter().map(|req| &req.params).collect();
+    let random_vals: Vec<f32> = requests.iter().map(|req| req.random_val).collect();
+    let tokens = pegainfer_core::ops::select_batch_tokens_into(
+        lane.model.device_ctx(),
+        &lane.bufs.logits,
+        &params,
+        &random_vals,
+        &mut lane.sample_scratch.row_indices,
+        &mut lane.sample_scratch.probs,
+        &mut lane.sample_scratch.top1_values,
+        &mut lane.sample_scratch.row_states,
+        &mut lane.sample_scratch.valid,
+        &mut lane.sample_scratch.out,
+    )?;
+
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (i, req) in requests.iter().enumerate() {
+        let token = tokens[i];
+        let logprob = if req.logprobs > 0 {
+            let logits_i = ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i)?;
+            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
+        } else {
+            None
+        };
+        outputs.push(DecodeRequestResult {
+            request_id: req.request_id,
+            token,
+            logprob,
+        });
+    }
+    Ok(outputs)
+}
+
 fn execute_step_on_lane(
     lane: &mut LocalQwen3Lane,
     step: &StepCommand,
@@ -223,11 +260,8 @@ fn execute_step_on_lane(
                 .collect();
             lane.execute_decode(&token_ids, kv_views, &lora_adapters)?;
             if collect_result {
-                let logits: Vec<DeviceVec> = (0..requests.len())
-                    .map(|i| ops::extract_vec(lane.model.device_ctx(), &lane.bufs.logits, i))
-                    .collect::<Result<Vec<_>>>()?;
                 Ok(WorkerStepOutcome::Decode(DecodeResult {
-                    requests: build_decode_request_results(lane, requests, &logits)?,
+                    requests: build_batch_decode_request_results(lane, requests)?,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -293,23 +327,25 @@ impl Drop for CublasThreadGuard {
 }
 
 struct SamplingScratch {
+    row_indices: cudarc::driver::CudaSlice<i32>,
     probs: cudarc::driver::CudaSlice<f32>,
-    top1_value: cudarc::driver::CudaSlice<half::bf16>,
+    top1_values: cudarc::driver::CudaSlice<half::bf16>,
     row_states: cudarc::driver::CudaSlice<u8>,
     valid: cudarc::driver::CudaSlice<u8>,
     out: cudarc::driver::CudaSlice<i32>,
 }
 
 impl SamplingScratch {
-    fn new(ctx: &DeviceContext, vocab_size: usize) -> Result<Self> {
+    fn new(ctx: &DeviceContext, vocab_size: usize, max_batch_bucket: usize) -> Result<Self> {
         Ok(Self {
+            row_indices: ctx.stream.alloc_zeros(max_batch_bucket)?,
             probs: ctx.stream.alloc_zeros(vocab_size)?,
-            top1_value: ctx.stream.alloc_zeros(1)?,
+            top1_values: ctx.stream.alloc_zeros(max_batch_bucket)?,
             row_states: ctx
                 .stream
                 .alloc_zeros(pegainfer_core::ops::flashinfer_topk_row_states_bytes())?,
             valid: ctx.stream.alloc_zeros(1)?,
-            out: ctx.stream.alloc_zeros(1)?,
+            out: ctx.stream.alloc_zeros(max_batch_bucket)?,
         })
     }
 }
@@ -1216,7 +1252,8 @@ impl LocalQwen3Lane {
             padding_block_id,
             model.local_num_attention_heads(),
         )?;
-        let sample_scratch = SamplingScratch::new(model.device_ctx(), model.config().vocab_size)?;
+        let sample_scratch =
+            SamplingScratch::new(model.device_ctx(), model.config().vocab_size, max_bucket)?;
         Ok(Self {
             model,
             kv_buffer,
@@ -1241,7 +1278,7 @@ impl LocalQwen3Lane {
             self.model.device_ctx(),
             logits,
             &mut self.sample_scratch.probs,
-            &mut self.sample_scratch.top1_value,
+            &mut self.sample_scratch.top1_values,
             &mut self.sample_scratch.row_states,
             &mut self.sample_scratch.valid,
             &mut self.sample_scratch.out,
