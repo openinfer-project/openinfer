@@ -225,11 +225,6 @@ impl DeepSeekV2LiteEp2Generator {
                 }
             },
         )?;
-        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
-        let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
-        // NCCL covers only the dense hidden exchange and final contribution
-        // sum in this first gate. Route iteration and expert-output
-        // accumulation stay host-side so host-staged remains a simple oracle.
         let rank1_input = attribution.record_gpu_pair_result(
             &self.rank0.ctx,
             &self.rank1.ctx,
@@ -240,77 +235,90 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input),
         )?;
+        attribution.record_gpu_pair_result(
+            &self.rank0.ctx,
+            &self.rank1.ctx,
+            phase,
+            "nccl_combine_clear",
+            || format!("layer.{layer_idx}.nccl.combine_clear"),
+            Some(layer_idx),
+            token_index,
+            || {
+                nccl.clear_device_combine(
+                    &self.rank0.ctx,
+                    &self.rank1.ctx,
+                    input.hidden_dim,
+                    input.seq_len,
+                )
+            },
+        )?;
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
+        let mut live_expert_outputs =
+            Vec::with_capacity(input.seq_len * self.config.num_experts_per_token);
 
         for (token, token_routes) in routes.iter().enumerate() {
             for &(global_expert, weight) in token_routes {
                 let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
-                let (out, dst) = match owner_rank {
+                let out = match owner_rank {
                     0 => {
                         local_routes += 1;
                         let expert = self.rank0.routed_expert(layer_idx, global_expert)?;
-                        (
-                            attribution.record_gpu_result(
-                                &self.rank0.ctx,
-                                phase,
-                                "nccl_local_expert",
-                                || format!("layer.{layer_idx}.nccl.local_expert"),
-                                Some(layer_idx),
-                                token_index,
-                                || expert_forward_device(&self.rank0.ctx, expert, input, token),
-                            )?,
-                            &mut rank0_contrib,
-                        )
+                        attribution.record_gpu_result(
+                            &self.rank0.ctx,
+                            phase,
+                            "nccl_local_expert",
+                            || format!("layer.{layer_idx}.nccl.local_expert"),
+                            Some(layer_idx),
+                            token_index,
+                            || expert_forward_device(&self.rank0.ctx, expert, input, token),
+                        )?
                     }
                     1 => {
                         remote_routes += 1;
                         let expert = self.rank1.routed_expert(layer_idx, global_expert)?;
-                        (
-                            attribution.record_gpu_result(
-                                &self.rank1.ctx,
-                                phase,
-                                "nccl_remote_expert",
-                                || format!("layer.{layer_idx}.nccl.remote_expert"),
-                                Some(layer_idx),
-                                token_index,
-                                || {
-                                    expert_forward_device(
-                                        &self.rank1.ctx,
-                                        expert,
-                                        &rank1_input,
-                                        token,
-                                    )
-                                },
-                            )?,
-                            &mut rank1_contrib,
-                        )
+                        attribution.record_gpu_result(
+                            &self.rank1.ctx,
+                            phase,
+                            "nccl_remote_expert",
+                            || format!("layer.{layer_idx}.nccl.remote_expert"),
+                            Some(layer_idx),
+                            token_index,
+                            || expert_forward_device(&self.rank1.ctx, expert, &rank1_input, token),
+                        )?
                     }
                     other => {
                         bail!("routed expert {global_expert} maps to unsupported EP rank {other}")
                     }
                 };
-                let offset = token * self.config.hidden_size;
-                attribution.record_result(
+                let expert_ctx = if owner_rank == 0 {
+                    &self.rank0.ctx
+                } else {
+                    &self.rank1.ctx
+                };
+                attribution.record_gpu_result(
+                    expert_ctx,
                     phase,
-                    "nccl_contribution_accumulate",
-                    || format!("layer.{layer_idx}.nccl.contribution_accumulate"),
+                    "nccl_contribution_accumulate_device",
+                    || format!("layer.{layer_idx}.nccl.contribution_accumulate_device"),
                     Some(layer_idx),
                     token_index,
                     || {
-                        for (dst, value) in dst[offset..offset + self.config.hidden_size]
-                            .iter_mut()
-                            .zip(out)
-                        {
-                            *dst += weight * value;
-                        }
-                        Ok(())
+                        nccl.accumulate_device_contribution(
+                            owner_rank,
+                            expert_ctx,
+                            &out,
+                            token,
+                            input.seq_len,
+                            weight,
+                        )
                     },
                 )?;
+                live_expert_outputs.push(out);
             }
         }
 
-        let combined = attribution.record_gpu_pair_result(
+        let routed = attribution.record_gpu_pair_result(
             &self.rank0.ctx,
             &self.rank1.ctx,
             phase,
@@ -319,30 +327,15 @@ impl DeepSeekV2LiteEp2Generator {
             Some(layer_idx),
             token_index,
             || {
-                nccl.combine_f32_contributions_to_rank0(
+                nccl.combine_device_contributions_to_rank0(
                     &self.rank0.ctx,
                     &self.rank1.ctx,
-                    &rank0_contrib,
-                    &rank1_contrib,
-                )
-            },
-        )?;
-        let routed = attribution.record_gpu_result(
-            &self.rank0.ctx,
-            phase,
-            "nccl_combine_to_device",
-            || format!("layer.{layer_idx}.nccl.combine_to_device"),
-            Some(layer_idx),
-            token_index,
-            || {
-                hidden_from_f32_host(
-                    &self.rank0.ctx,
-                    &combined,
-                    self.config.hidden_size,
+                    input.hidden_dim,
                     input.seq_len,
                 )
             },
         )?;
+        drop(live_expert_outputs);
         activate(&self.rank0.ctx)?;
         let hidden = attribution.record_gpu_result(
             &self.rank0.ctx,
@@ -386,7 +379,7 @@ fn expert_forward_device(
     expert: &ExpertMlp,
     input: &HiddenStates,
     token_idx: usize,
-) -> Result<Vec<f32>> {
+) -> Result<HiddenStates> {
     activate(ctx)?;
     let token = ops::extract_vec(ctx, input, token_idx)?;
     let token_hidden = HiddenStates {
@@ -394,6 +387,5 @@ fn expert_forward_device(
         seq_len: 1,
         data: token.data,
     };
-    let out = dense_mlp_forward(ctx, &expert.dense, &token_hidden)?;
-    hidden_to_f32(ctx, &out)
+    dense_mlp_forward(ctx, &expert.dense, &token_hidden)
 }

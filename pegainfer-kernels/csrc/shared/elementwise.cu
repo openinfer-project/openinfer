@@ -126,6 +126,24 @@ __global__ void scale_f32_kernel(float *__restrict__ values, float scale, int n)
   }
 }
 
+__global__ void accumulate_bf16_token_scaled_to_f32_kernel(
+    const __nv_bfloat16 *__restrict__ token,
+    float scale,
+    float *__restrict__ out,
+    int hidden_dim,
+    int token_idx,
+    int seq_len) {
+  if (token_idx < 0 || token_idx >= seq_len) {
+    return;
+  }
+  int base = token_idx * hidden_dim;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < hidden_dim;
+       idx += gridDim.x * blockDim.x) {
+    out[base + idx] += __bfloat162float(token[idx]) * scale;
+  }
+}
+
 __global__ void repeat_f32_rows_for_reduce_scatter_kernel(
     const float *__restrict__ local,
     float *__restrict__ repeated,
@@ -336,6 +354,25 @@ CUresult scale_f32_cuda(float *values, float scale, int n, cudaStream_t stream) 
   int block = 256;
   int grid = (n + block - 1) / block;
   scale_f32_kernel<<<grid, block, 0, stream>>>(values, scale, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult accumulate_bf16_token_scaled_to_f32_cuda(
+    const __nv_bfloat16 *token,
+    float scale,
+    float *out,
+    int hidden_dim,
+    int token_idx,
+    int seq_len,
+    cudaStream_t stream) {
+  if (token == nullptr || out == nullptr || hidden_dim <= 0 || seq_len <= 0 ||
+      token_idx < 0 || token_idx >= seq_len) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int block = 256;
+  int grid = (hidden_dim + block - 1) / block;
+  accumulate_bf16_token_scaled_to_f32_kernel<<<grid, block, 0, stream>>>(
+      token, scale, out, hidden_dim, token_idx, seq_len);
   return (CUresult)cudaGetLastError();
 }
 

@@ -30,7 +30,7 @@ impl EpBackendKind {
 
 pub(super) enum EpBackendRuntime {
     HostStaged,
-    Nccl(NaiveNcclEp2Backend),
+    Nccl(Box<NaiveNcclEp2Backend>),
 }
 
 impl EpBackendRuntime {
@@ -41,7 +41,9 @@ impl EpBackendRuntime {
     ) -> Result<Self> {
         match kind {
             EpBackendKind::HostStaged => Ok(Self::HostStaged),
-            EpBackendKind::Nccl => Ok(Self::Nccl(NaiveNcclEp2Backend::new(rank0, rank1)?)),
+            EpBackendKind::Nccl => Ok(Self::Nccl(Box::new(NaiveNcclEp2Backend::new(
+                rank0, rank1,
+            )?))),
         }
     }
 

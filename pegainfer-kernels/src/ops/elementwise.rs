@@ -316,6 +316,53 @@ pub fn scale_f32_in_place(
     Ok(())
 }
 
+pub fn accumulate_bf16_token_scaled_to_f32_into(
+    ctx: &DeviceContext,
+    token: &HiddenStates,
+    scale: f32,
+    token_idx: usize,
+    seq_len: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    assert!(
+        scale.is_finite(),
+        "accumulate_bf16_token_scaled_to_f32_into scale must be finite"
+    );
+    assert_eq!(
+        token.seq_len, 1,
+        "accumulate_bf16_token_scaled_to_f32_into expects one token, got seq_len={}",
+        token.seq_len
+    );
+    assert!(
+        token_idx < seq_len,
+        "accumulate token_idx {} exceeds seq_len {}",
+        token_idx,
+        seq_len
+    );
+    assert!(
+        out.len() >= token.hidden_dim * seq_len,
+        "f32 output len {} < hidden_dim {} * seq_len {}",
+        out.len(),
+        token.hidden_dim,
+        seq_len
+    );
+    let (token_ptr, _gt) = token.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::accumulate_bf16_token_scaled_to_f32_cuda(
+            token_ptr as *const ffi::Half,
+            scale,
+            out_ptr as *mut f32,
+            token.hidden_dim as i32,
+            token_idx as i32,
+            seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 pub fn repeat_f32_for_reduce_scatter_into(
     ctx: &DeviceContext,
     local: &CudaSlice<f32>,

@@ -500,6 +500,16 @@ unsafe extern "C" {
 
     pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
 
+    pub fn accumulate_bf16_token_scaled_to_f32_cuda(
+        token: *const Half,
+        scale: f32,
+        out: *mut f32,
+        hidden_dim: i32,
+        token_idx: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }
 
 // Added during rebase: split argmax variant.

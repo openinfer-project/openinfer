@@ -106,29 +106,9 @@ fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
                 reason: "expert routing and per-route loop decisions stay on the host",
             },
             DecodeGraphBlocker {
-                id: "nccl_contribution_accumulation_on_host",
+                id: "nccl_expert_accumulation_host_directed",
                 source: "runtime/moe.rs::moe_forward_nccl",
-                reason: "local and remote expert outputs are copied back and accumulated in host vectors",
-            },
-            DecodeGraphBlocker {
-                id: "nccl_combine_h2d_contribution_copy",
-                source: "nccl_backend.rs::combine_f32_contributions_to_rank0",
-                reason: "rank contributions are copied from host to device for each combine call",
-            },
-            DecodeGraphBlocker {
-                id: "nccl_combine_allocates_per_call",
-                source: "nccl_backend.rs::combine_f32_contributions_to_rank0",
-                reason: "send and receive buffers are allocated inside each combine call",
-            },
-            DecodeGraphBlocker {
-                id: "nccl_combine_syncs_rank_streams",
-                source: "nccl_backend.rs::combine_f32_contributions_to_rank0",
-                reason: "both rank streams are synchronized after every combine collective",
-            },
-            DecodeGraphBlocker {
-                id: "nccl_combine_d2h_result_copy",
-                source: "nccl_backend.rs::combine_f32_contributions_to_rank0",
-                reason: "the combined rank0 result is copied back to host before being uploaded again",
+                reason: "expert launches and device-side scratch accumulation are still driven by the host route loop",
             },
         ],
     }

@@ -33,6 +33,11 @@ const DEFAULT_NOISY_MODULE_LEVELS: [(&str, &str); 5] = [
     ("tower", "warn"),
 ];
 
+enum BareGlobalLevel {
+    Off,
+    Level(Level),
+}
+
 fn apply_default_module_levels(mut filter: String) -> String {
     for (module, level) in DEFAULT_NOISY_MODULE_LEVELS {
         let module_pattern = format!("{module}=");
@@ -48,7 +53,7 @@ fn apply_default_module_levels(mut filter: String) -> String {
     filter
 }
 
-fn bare_global_level(filter: &str) -> Option<Option<Level>> {
+fn bare_global_level(filter: &str) -> Option<BareGlobalLevel> {
     let mut global_level = None;
 
     for directive in filter
@@ -61,9 +66,9 @@ fn bare_global_level(filter: &str) -> Option<Option<Level>> {
         }
 
         if directive.eq_ignore_ascii_case("off") {
-            global_level = Some(None);
+            global_level = Some(BareGlobalLevel::Off);
         } else if let Ok(level) = Level::from_str(directive) {
-            global_level = Some(Some(level));
+            global_level = Some(BareGlobalLevel::Level(level));
         }
     }
 
@@ -71,7 +76,7 @@ fn bare_global_level(filter: &str) -> Option<Option<Level>> {
 }
 
 fn should_apply_default_module_levels(filter: &str) -> bool {
-    matches!(bare_global_level(filter), Some(Some(level)) if level < Level::Warn)
+    matches!(bare_global_level(filter), Some(BareGlobalLevel::Level(level)) if level < Level::Warn)
 }
 
 fn resolved_filter_string(level: String, rust_log: Option<String>) -> String {

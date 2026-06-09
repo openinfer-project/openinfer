@@ -458,7 +458,8 @@ mod tests {
 
         rms_norm_host(&input, &weight, eps, &mut out);
 
-        let inv_rms = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt().recip();
+        let mean_square = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
+        let inv_rms = mean_square.sqrt().recip();
         let expected0 = bf16::from_f32(bf16::from_f32(3.0 * inv_rms).to_f32() * 3.0);
         let expected1 = bf16::from_f32(bf16::from_f32(4.0 * inv_rms).to_f32() * 0.5);
         assert_eq!(out, [expected0, expected1]);
@@ -530,7 +531,7 @@ mod tests {
         let mut kv_a_decode = Vec::new();
         let mut kv_b_decode = Vec::new();
         let mut expected = Vec::new();
-        for row in 0..batch_size {
+        for (row, cache) in single_caches.iter_mut().enumerate() {
             let q_host = patterned(row + 30, config.q_proj_rows(), 0.04);
             let kv_a_host = patterned(row + 40, config.kv_a_proj_rows(), 0.05);
             let kv_b_host = patterned(row + 50, config.kv_b_proj_rows(), 0.06);
@@ -547,14 +548,10 @@ mod tests {
                 position,
                 1,
                 &mut queries,
-                &mut single_caches[row],
+                cache,
             );
             expected.extend(compute_attention_host(
-                &config,
-                &queries,
-                &single_caches[row],
-                position,
-                1,
+                &config, &queries, cache, position, 1,
             ));
         }
 
