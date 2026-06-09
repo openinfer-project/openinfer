@@ -37,7 +37,7 @@ Current evidence:
 | Requirement | Evidence | Status |
 | --- | --- | --- |
 | Main objective: stable sub-`25ms/token` DeepSeek V4 decode without bs=1 or seq_len=1 specialization | Best retained repeats reached the `26.28-27.31ms/token` band; fresh 5-run stability sweep after the latest rejected act_quant probe is `28.29-28.91ms` aggregate steady TPOT while another CPU load was running | Not achieved. Keep the goal active. |
-| Fixed bench stable sub-30 with hash `6346f03343d75a65` | `$RESULT_ROOT/dsv4_stability_after_act_quant_revert_{1..5}.json` records 5 consecutive fixed bench runs, aggregate steady TPOT avg `28.291-28.912ms`, and all 15 per-iteration hashes `6346f03343d75a65`; reviewer rerun `$RESULT_ROOT/pegainfer_dev_pr101_bench_{1..5}.json` observed aggregate steady TPOT avg `27.552965-29.755957ms`, again with all 15 hashes `6346f03343d75a65` | Achieved for the retained tree. |
+| Fixed bench stable sub-30 with hash `6346f03343d75a65` | `$RESULT_ROOT/dsv4_stability_after_act_quant_revert_{1..5}.json` records 5 consecutive fixed bench runs, aggregate steady TPOT avg `28.291-28.912ms`, and all 15 per-iteration hashes `6346f03343d75a65`; reviewer rerun `$RESULT_ROOT/openinfer_dev_pr101_bench_{1..5}.json` observed aggregate steady TPOT avg `27.552965-29.755957ms`, again with all 15 hashes `6346f03343d75a65` | Achieved for the retained tree. |
 | Exact E2E remains `20/20` | `$RESULT_ROOT/dsv4_fresh_e2e_after_w2_reduce_doc.log` records `All 20 DeepSeek V4 exact cases passed` | Achieved for the retained tree. |
 | Public vLLM/SGLang MoE decomposition is replicated first | Runtime uses routed FP4 `W13 grouped GEMM -> fused SwiGLU + W2 activation quant -> W2 grouped GEMM`; old split W1/W3/SwiGLU/W2 public and FFI paths are removed | Achieved. |
 | Deeper W13 accumulator -> SwiGLU -> W2-quant path is explored only after microbench/fuzz | TileLang W13 accumulator prototype was compiled after lowering fixes but failed the first active-expert fuzz shape, so it was removed before runtime integration | Explored and rejected; still open as a future true tensor-core epilogue project. |
@@ -50,14 +50,14 @@ Audit conclusion: the goal is not complete because stable sub-`25ms/token` has n
 
 The goal is to copy the mature decomposition and validation discipline, not the framework surface. This table is the current "homework ledger" for DeepSeek V4 decode MoE:
 
-| Source idea | vLLM/SGLang anchor | PegaInfer status | Decision |
+| Source idea | vLLM/SGLang anchor | OpenInfer status | Decision |
 | --- | --- | --- | --- |
 | Experts core decomposition: `W13 grouped GEMM -> activation/quant -> W2 grouped GEMM` | vLLM `docs/design/fused_moe_modular_kernel.md`; vLLM `fused_moe/modular_kernel.py`; SGLang `srt/layers/moe/moe_runner/triton.py` | Retained as routed FP4 W13 grouped launch plus fused SwiGLU+W2 activation quant plus W2 grouped FP4 launch | Adopted. This is the baseline decomposition and the old split W1/W3/SwiGLU/W2 public path is removed. |
-| Prepare/finalize can be separate from experts | vLLM `FusedMoEPrepareAndFinalizeModular`; SGLang EP MoE dispatcher/finalizer split | Our AG/RS, route mapping, local experts, partial combine, and reduce-scatter are explicit stages | Adopted selectively. We keep the simpler PegaInfer scheduler/worker structure rather than importing generic dispatch classes. |
+| Prepare/finalize can be separate from experts | vLLM `FusedMoEPrepareAndFinalizeModular`; SGLang EP MoE dispatcher/finalizer split | Our AG/RS, route mapping, local experts, partial combine, and reduce-scatter are explicit stages | Adopted selectively. We keep the simpler OpenInfer scheduler/worker structure rather than importing generic dispatch classes. |
 | Async prepare/finalize enables shared expert overlap | vLLM `prepare_no_receive`; vLLM modular-kernel doc notes shared expert overlap during communication | MoE hidden/token all-gather and reduce-scatter run on a MoE NCCL stream while shared expert runs on the main compute stream | Adopted. Full shared-compute-stream overlap changed token hash and was rejected. |
 | `TopKWeightAndReduce` may live inside experts | vLLM `topk_weight_and_reduce.py`; vLLM `FusedMoEExpertsModular::finalize_weight_and_reduce_impl` | Atomic epilogue-shaped microbench was slower than current deterministic reduce | Rejected for current layout. This needs a token-major or deterministic W2 scheduler, not atomics bolted onto expert-major TileLang W2. |
 | W13 layout should match fused SwiGLU convention | vLLM `oracle/mxfp4.py`; vLLM `quantization/utils/flashinfer_utils.py`; SGLang `moe_runner/flashinfer_cutedsl.py` | Pair-interleaved `[up, gate]` standalone SwiGLU+quant was byte-identical but mostly flat and tiny | Rejected as standalone. Keep the note for a true W13 epilogue fusion. |
-| FlashInfer/TRTLLM/CuteDSL FP4 MoE backends use specialized weight/scale reorder | vLLM `experts/trtllm_mxfp4_moe.py`; vLLM `oracle/mxfp4.py`; SGLang `quantization/mxfp4.py`; SGLang `moe_runner/flashinfer_trtllm.py` | Not integrated. Current PegaInfer weights are per-expert tensors and TileLang grouped GEMM takes pointer arrays; FlashInfer routes expect different packed/reordered layouts and runner-level metadata | Candidate, but only after a standalone grouped-GEMM microbench proves a real W13/W2 win on our exact shapes. Do not import the framework runner. |
+| FlashInfer/TRTLLM/CuteDSL FP4 MoE backends use specialized weight/scale reorder | vLLM `experts/trtllm_mxfp4_moe.py`; vLLM `oracle/mxfp4.py`; SGLang `quantization/mxfp4.py`; SGLang `moe_runner/flashinfer_trtllm.py` | Not integrated. Current OpenInfer weights are per-expert tensors and TileLang grouped GEMM takes pointer arrays; FlashInfer routes expect different packed/reordered layouts and runner-level metadata | Candidate, but only after a standalone grouped-GEMM microbench proves a real W13/W2 win on our exact shapes. Do not import the framework runner. |
 | DeepGEMM-style deeper epilogue fusion | vLLM `experts/deep_gemm_moe.py`; SGLang DeepGEMM benchmarks under `benchmark/kernels/deepseek` | Scalar upper-bound microbench shows exact feasibility but absolute standalone delta is tiny | Candidate only as true tensor-core W13 epilogue work. Standalone SwiGLU/quant substitutions are no longer enough. |
 | FP4 quant before communication for high-throughput all-gather | SGLang `srt/layers/moe/utils.py::should_use_flashinfer_cutlass_moe_fp4_allgather` | Not adopted. Our current AG gathers BF16 hidden before routing; changing this means routing/dispatch protocol changes, not a local kernel swap | Future architecture work. Needs correctness design because router consumes hidden before expert dispatch. |
 | High-throughput bs>100 packed MoE layout | vLLM/SGLang packed FP4/MXFP4 backends and dispatcher/finalizer layouts | Not part of the current sub-25 latency patch. Current per-expert tensors are good for low-latency iteration but probably not the final throughput layout | Future architecture work. Design W13/W2 weight layout, FP4 scale layout, dispatch row layout, and combine/finalize together; keep conversion offline/load-time and avoid two production hot paths. |
@@ -261,7 +261,7 @@ The later retained path uses the same MoE NCCL stream for the earlier hidden/tok
 4. main stream waits on all-gather completion before router, local experts, and routed combine.
 5. routed reduce-scatter still uses the MoE NCCL stream and the final add waits on its completion event.
 
-This does not change route math, grouped GEMM shape, or batch/expert generality. It is not copied directly from vLLM/SGLang operator code; it is a PegaInfer scheduling step that becomes available once the vLLM/SGLang-style local expert path is exact and stable. The first reduce-scatter-only fixed bench run moved to `26.77-26.80ms/token`; two repeats landed in the `27.64-27.99ms/token` band; the post full-overlap revert calibration landed at `28.38-28.54ms/token`. Moving MoE all-gather to the same NCCL stream and overlapping shared expert with all-gather produced fresh repeated fixed benches at `26.28-27.31ms/token`, still with token hash `6346f03343d75a65`. Keep decision: retain. This is safer than the rejected full shared-expert overlap because shared expert stays on the main compute stream; only MoE collectives move to the MoE NCCL stream.
+This does not change route math, grouped GEMM shape, or batch/expert generality. It is not copied directly from vLLM/SGLang operator code; it is a OpenInfer scheduling step that becomes available once the vLLM/SGLang-style local expert path is exact and stable. The first reduce-scatter-only fixed bench run moved to `26.77-26.80ms/token`; two repeats landed in the `27.64-27.99ms/token` band; the post full-overlap revert calibration landed at `28.38-28.54ms/token`. Moving MoE all-gather to the same NCCL stream and overlapping shared expert with all-gather produced fresh repeated fixed benches at `26.28-27.31ms/token`, still with token hash `6346f03343d75a65`. Keep decision: retain. This is safer than the rejected full shared-expert overlap because shared expert stays on the main compute stream; only MoE collectives move to the MoE NCCL stream.
 
 ### Fused Q/KV RoPE projection
 
@@ -366,7 +366,7 @@ Validation on 5090:
 | Check | Result |
 | --- | --- |
 | `cargo fmt --check` | passed |
-| `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench run 1 | steady TPOT avg `33.330ms`, p50 `32.858ms`, p95 `35.274ms`, hash `6346f03343d75a65` |
 | fixed bench run 2 | steady TPOT avg `34.289ms`, p50 `33.979ms`, p95 `36.852ms`, hash `6346f03343d75a65` |
@@ -388,7 +388,7 @@ blockIdx.x 0..15   -> W1 pointer arrays -> gate output
 blockIdx.x 16..31  -> W3 pointer arrays -> up output
 ```
 
-The C++ tool `pegainfer-kernels/tools/deepseek_v4/w13_grouped_fp4_bench.cu` links the generated TileLang object directly and compares:
+The C++ tool `openinfer-kernels/tools/deepseek_v4/w13_grouped_fp4_bench.cu` links the generated TileLang object directly and compares:
 
 ```text
 baseline: grouped_gemm(W1) + grouped_gemm(W3)
@@ -400,10 +400,10 @@ Fuzz uses BF16 random input, TileLang `act_quant_k4096`, random FP4 bytes and bo
 Verified compile command shape:
 
 ```bash
-OUT_DIR=$(find target/release/build/pegainfer-kernels-* -maxdepth 1 -type d -name out -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+OUT_DIR=$(find target/release/build/openinfer-kernels-* -maxdepth 1 -type d -name out -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
 /usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_120 \
   -I/usr/local/cuda/include \
-  pegainfer-kernels/tools/deepseek_v4/w13_grouped_fp4_bench.cu \
+  openinfer-kernels/tools/deepseek_v4/w13_grouped_fp4_bench.cu \
   "$OUT_DIR/libkernels_cuda.a" \
   -lcudart \
   -o $RESULT_ROOT/w13_grouped_fp4_bench
@@ -441,7 +441,7 @@ Runtime validation on 5090:
 | Check | Result |
 | --- | --- |
 | `cargo fmt --check` | passed |
-| `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench text run | steady TPOT avg `34.22ms`, p50 `33.77ms`, p95 `36.53ms`, first decode avg `32.94ms` |
 | fixed bench JSON run | steady TPOT avg `31.986ms`, p50 `31.458ms`, p95 `34.052ms`, first decode avg `30.544ms`, hash `6346f03343d75a65` |
@@ -461,11 +461,11 @@ Reference source positions:
 | SGLang | `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | `grouped_gemm_nt_f8f8bf16_masked` writes `gateup_output`, then `sglang_per_token_group_quant_8bit(..., fuse_silu_and_mul=True)`, then W2 grouped GEMM. |
 | SGLang C++ quant | `$LOCAL_WORKSPACE/sglang/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu` | The `fuse_silu_and_mul` path fuses activation with group quant, including masked expert layout. |
 
-The next reusable lesson is their problem-size representation. vLLM builds `expert_offsets`, `blockscale_offsets`, `problem_sizes1`, and `problem_sizes2` before CUTLASS grouped GEMM. SGLang's masked path passes `masked_m` and `expected_m` into DeepGEMM. Both make the GEMM scheduler aware of per-expert logical M. PegaInfer currently has `expert_indptr`, but the TileLang grouped launch still uses `dim3 grid(out_tiles, ceil(rows / 32), local_experts)` and returns inside the kernel when `blockIdx.y * 32 >= expert_m`. That is correct and GPU-resident, but it still launches empty CTAs for short or empty experts.
+The next reusable lesson is their problem-size representation. vLLM builds `expert_offsets`, `blockscale_offsets`, `problem_sizes1`, and `problem_sizes2` before CUTLASS grouped GEMM. SGLang's masked path passes `masked_m` and `expected_m` into DeepGEMM. Both make the GEMM scheduler aware of per-expert logical M. OpenInfer currently has `expert_indptr`, but the TileLang grouped launch still uses `dim3 grid(out_tiles, ceil(rows / 32), local_experts)` and returns inside the kernel when `blockIdx.y * 32 >= expert_m`. That is correct and GPU-resident, but it still launches empty CTAs for short or empty experts.
 
 The first active-tile design check found a launch-side constraint: a GPU-generated active tile list cannot by itself shrink the next CUDA launch because grid dimensions are chosen on the host. Using a device-side `active_tile_count` would require a D2H count, CUDA dynamic parallelism, or launching the original capacity grid and returning on `tile >= active_count`. The last option preserves correctness but not the desired launch reduction. A better target is the existing `local_count`: decode route mapping already computes the actual number of local routes on GPU, while runtime still carries `num_expanded = routed.seq_len * topk` (`8 * 6 = 48` for MP8 decode) through expand, activation quant, and grouped GEMM. The hard part is exploiting `local_count` without reintroducing route metadata D2H.
 
-Historical PegaInfer path before the retained fused W2 activation-quant work:
+Historical OpenInfer path before the retained fused W2 activation-quant work:
 
 ```text
 act_quant(expanded_input)
@@ -520,7 +520,7 @@ Runtime validation on 5090:
 | Check | Result |
 | --- | --- |
 | `cargo fmt --check` | passed |
-| `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON run 1 | steady TPOT avg `33.416ms`, p50 `32.884ms`, p95 `35.510ms`, first decode avg `31.885ms`, hash `6346f03343d75a65` |
 | fixed bench JSON run 2 | steady TPOT avg `31.180ms`, p50 `30.675ms`, p95 `33.151ms`, first decode avg `30.020ms`, hash `6346f03343d75a65` |
@@ -559,9 +559,9 @@ Implementation notes:
 | Check | Result |
 | --- | --- |
 | local `cargo fmt --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | 5090 `cargo fmt --check` | passed |
-| 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON run 1 | steady TPOT avg `29.764ms`, p50 `29.296ms`, p95 `31.766ms`, first decode avg `28.575ms`, hash `6346f03343d75a65` |
 | fixed bench JSON run 2 | steady TPOT avg `31.592ms`, p50 `31.082ms`, p95 `33.699ms`, first decode avg `30.019ms`, hash `6346f03343d75a65` |
@@ -600,7 +600,7 @@ These clears are semantic initialization, not removable allocation noise, but th
 | Check | Result |
 | --- | --- |
 | local `cargo fmt --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON | `29.862ms`, `29.969ms`, `29.874ms`, all hash `6346f03343d75a65` |
 | short nsys kernel summary | old `deepseek_moe_clear_i32_kernel` gone; `deepseek_moe_clear_mapping_kernel` appears once per mapping call |
@@ -625,7 +625,7 @@ For MP8 decode, `route_elems = global_batch * topk`; with the fixed single-reque
 | Check | Result |
 | --- | --- |
 | local `cargo fmt --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON run 1 | `27.608ms`, `27.662ms`, `27.826ms`, all hash `6346f03343d75a65` |
 | fixed bench JSON run 2 | `27.698ms`, `27.693ms`, `27.644ms`, all hash `6346f03343d75a65` |
@@ -656,7 +656,7 @@ This was exact-safe but not performance-safe. The route W13 kernel launched one 
 | --- | --- |
 | local `cargo fmt --check` | passed |
 | local `git diff --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | 5090 release build for `bench_serving` and `deepseek_v4_e2e` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON | aggregate steady TPOT avg `33.217ms`, p50 `33.003ms`, p95 `34.584ms`, decode throughput `30.115 tok/s` |
@@ -695,7 +695,7 @@ Runtime validation:
 | --- | --- |
 | local `cargo fmt --check` | passed |
 | local `git diff --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | 5090 release build for `bench_serving` and `deepseek_v4_e2e` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench run 1 | aggregate steady TPOT avg `27.807ms`; iterations `28.080ms`, `28.143ms`, `27.198ms`; all hash `6346f03343d75a65` |
@@ -725,7 +725,7 @@ This preserved the no-D2H rule and kept W2 grouped GEMM semantics unchanged. It 
 | --- | --- |
 | local `cargo fmt --check` | passed |
 | local `git diff --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | 5090 release build for `bench_serving` and `deepseek_v4_e2e` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON | aggregate steady TPOT avg `31.270ms`, p50 `30.660ms`, p95 `33.575ms` |
@@ -735,7 +735,7 @@ Drop decision: do not retain. Skipping empty rows inside a tiny regular kernel i
 
 ### Rejected: shrink grouped GEMM row-tile launch by seq_len
 
-vLLM's CUTLASS path passes logical per-expert `problem_sizes`, while PegaInfer's TileLang grouped FP4 launch uses a host grid of:
+vLLM's CUTLASS path passes logical per-expert `problem_sizes`, while OpenInfer's TileLang grouped FP4 launch uses a host grid of:
 
 ```text
 grid.x = output tiles
@@ -767,8 +767,8 @@ Runtime validation on 5090:
 | --- | --- |
 | local `cargo fmt --check` | passed |
 | local `git diff --check` | passed |
-| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
-| 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` | passed |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench JSON | per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65` |
 
@@ -945,7 +945,7 @@ Additional `32768` probes stayed bitwise:
 | active `8`, rows/active `8` | `0.122960ms -> 0.108667ms` | `0.063493ms -> 0.057330ms` |
 | active `16`, rows/active `4` | `0.315041ms -> 0.283986ms` | `0.122991ms -> 0.082393ms` |
 
-Runtime change: grouped FP4 W13 and W2 wrappers generated by `pegainfer-kernels/tools/tilelang/deepseek_v4/generate.py` now request `32768` dynamic shared bytes. Dense FP4/FP8 wrappers keep their existing requests.
+Runtime change: grouped FP4 W13 and W2 wrappers generated by `openinfer-kernels/tools/tilelang/deepseek_v4/generate.py` now request `32768` dynamic shared bytes. Dense FP4/FP8 wrappers keep their existing requests.
 
 5090 validation:
 
@@ -1040,7 +1040,7 @@ Full-runtime validation:
 
 | Check | Result |
 | --- | --- |
-| release `cargo check -p pegainfer-deepseek-v4 --features deepseek-v4` | passed locally and on 5090 |
+| release `cargo check -p openinfer-deepseek-v4 --features deepseek-v4` | passed locally and on 5090 |
 | release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
 | fixed bench run 1 | aggregate steady TPOT avg `28.971ms`; per-iteration `28.727ms`, `28.963ms`, `29.224ms`; all hash `6346f03343d75a65` |
 | fixed bench repeat | aggregate steady TPOT avg `29.797ms`; per-iteration `29.913ms`, `29.764ms`, `29.713ms`; all hash `6346f03343d75a65` |
@@ -1135,7 +1135,7 @@ Implementation notes:
 
 | Check | Result |
 | --- | --- |
-| release `cargo check -p pegainfer-deepseek-v4 --features deepseek-v4` | passed locally and on 5090 after generator fixes |
+| release `cargo check -p openinfer-deepseek-v4 --features deepseek-v4` | passed locally and on 5090 after generator fixes |
 | microbench first fuzz shape | active `1`, rows/active `8`, experts `32` |
 | fuzz result | FAIL: FP8 activation and E8M0 scale bytes differed from the current baseline |
 | log | `$RESULT_ROOT/dsv4_w13_swiglu_quant_bench.log` |
@@ -1145,7 +1145,7 @@ Drop decision: do not retain. The generator can express the rough shape, but it 
 Evidence required for each adoption step:
 
 - vLLM/SGLang source location and whether we copied the decomposition, the kernel shape, or only the validation idea.
-- standalone microbench with fuzz against the current PegaInfer baseline.
+- standalone microbench with fuzz against the current OpenInfer baseline.
 - exact E2E `20/20`.
 - fixed JSON bench with token hash `6346f03343d75a65`.
 - repeated TPOT range, not a single fast run.
@@ -1168,7 +1168,7 @@ Earlier exploratory runs of the same BF16 direct shape landed at `26.194ms`, `30
 
 Rejected variant: caching score-gate weights as F32 preserved exact E2E and token hash, but the fixed bench regressed to aggregate steady TPOT avg `29.148ms` with per-iteration `29.152ms`, `29.139ms`, and `29.155ms`. The extra F32 memory footprint and F32 math path were not worth keeping.
 
-Rejected variant: direct CUDA BF16 router projection. SGLang has a `fused_moe_router_cudacore` route in `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/router.py`, and TileKernels has warp-level top-k/scoring kernels under `$LOCAL_WORKSPACE/TileKernels/tile_kernels/moe/`. We tested the analogous PegaInfer idea with a temporary standalone bench: keep the existing select/normalization semantics, but replace the cuBLAS BF16 projection with a direct CUDA dot-product kernel over `(seq_len, n_experts, hidden_dim)`. The bench source was deleted after rejection so it cannot be accidentally wired into runtime.
+Rejected variant: direct CUDA BF16 router projection. SGLang has a `fused_moe_router_cudacore` route in `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/router.py`, and TileKernels has warp-level top-k/scoring kernels under `$LOCAL_WORKSPACE/TileKernels/tile_kernels/moe/`. We tested the analogous OpenInfer idea with a temporary standalone bench: keep the existing select/normalization semantics, but replace the cuBLAS BF16 projection with a direct CUDA dot-product kernel over `(seq_len, n_experts, hidden_dim)`. The bench source was deleted after rejection so it cannot be accidentally wired into runtime.
 
 5090 microbench:
 
@@ -1715,7 +1715,7 @@ Standalone tool:
   -O3 \
   -std=c++17 \
   -arch=sm_120 \
-  pegainfer-kernels/tools/deepseek_v4/score_select_bench.cu \
+  openinfer-kernels/tools/deepseek_v4/score_select_bench.cu \
   -o $RESULT_ROOT/dsv4_score_select_bench
 
 $RESULT_ROOT/dsv4_score_select_bench
@@ -1823,8 +1823,8 @@ Verified command set for this PR:
 
 ```bash
 cargo fmt --check
-cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
-cargo check --release -p pegainfer-server --features deepseek-v4
+cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4
+cargo check --release -p openinfer-server --features deepseek-v4
 gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cuda_api_counter.c -ldl
 ```
 
@@ -1833,8 +1833,8 @@ gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cu
 Local:
 
 - `cargo fmt --check`
-- `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`
-- `cargo check --release -p pegainfer-server --features deepseek-v4`
+- `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4`
+- `cargo check --release -p openinfer-server --features deepseek-v4`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D $RESULT_ROOT/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 - `git diff --check`
@@ -1843,8 +1843,8 @@ Local:
 5090:
 
 - `cargo fmt --check`
-- `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`
-- `cargo check --release -p pegainfer-server --features deepseek-v4`
+- `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4`
+- `cargo check --release -p openinfer-server --features deepseek-v4`
 - release `deepseek_v4_e2e`: `All 20 DeepSeek V4 exact cases passed`
 - release fixed bench log `$RESULT_ROOT/dsv4_pr_driver_numa_bench.log`: steady TPOT avg `35.253ms`, p50 `34.800ms`, p95 `37.335ms`, first decode avg `33.743ms`, hash `6346f03343d75a65`
 - current clean fixed bench log `$RESULT_ROOT/dsv4_clean_tpot_now.log`: per-iteration steady TPOT avg `29.944ms`, `29.907ms`, `29.896ms`, all hash `6346f03343d75a65`
@@ -1889,7 +1889,7 @@ Local:
 - post-revert hand act_quant exact E2E log `$RESULT_ROOT/dsv4_act_quant_restored_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - post-revert hand act_quant fixed bench logs `$RESULT_ROOT/dsv4_act_quant_restored_bench.json` and `$RESULT_ROOT/dsv4_act_quant_restored_bench_repeat.json`: first run aggregate steady TPOT avg `28.249ms` but one iteration hash changed to `a278a8140c25b812`; repeat aggregate steady TPOT avg `29.277ms`, per-iteration `29.265ms`, `29.272ms`, `29.293ms`, with all hashes restored to `6346f03343d75a65`
 - post-revert hand act_quant 5-run stability logs `$RESULT_ROOT/dsv4_stability_after_act_quant_revert_{1..5}.json`: aggregate steady TPOT avg `28.912ms`, `28.867ms`, `28.291ms`, `28.375ms`, and `28.715ms`; all 15 per-iteration hashes were `6346f03343d75a65`. Another CPU load was running during this sweep, so the result is a conservative sub-30 stability check rather than a clean machine best-band.
-- reviewer 5090 5-run stability rerun `$RESULT_ROOT/pegainfer_dev_pr101_bench_{1..5}.json`: aggregate steady TPOT avg `28.505793ms`, `28.087102ms`, `29.755957ms`, `27.552965ms`, and `29.371630ms`; all 15 per-iteration hashes were `6346f03343d75a65`. One run wrote the complete JSON report and logged scheduler exit, then segfaulted in NCCL shutdown; treat that as the existing shutdown cleanup issue, not decode TPOT or token-correctness evidence.
+- reviewer 5090 5-run stability rerun `$RESULT_ROOT/openinfer_dev_pr101_bench_{1..5}.json`: aggregate steady TPOT avg `28.505793ms`, `28.087102ms`, `29.755957ms`, `27.552965ms`, and `29.371630ms`; all 15 per-iteration hashes were `6346f03343d75a65`. One run wrote the complete JSON report and logged scheduler exit, then segfaulted in NCCL shutdown; treat that as the existing shutdown cleanup issue, not decode TPOT or token-correctness evidence.
 - fused Q/KV RoPE exact E2E log `$RESULT_ROOT/dsv4_qkv_rope_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - fused Q/KV RoPE fixed bench logs `$RESULT_ROOT/dsv4_qkv_rope_bench.log` and `$RESULT_ROOT/dsv4_qkv_rope_bench_repeat.log`: per-iteration steady TPOT avg `28.215ms`, `28.256ms`, `28.236ms`, then `27.096ms`, `28.565ms`, `28.349ms`; all hash `6346f03343d75a65`
 - fused Q/KV RoPE short profile `$RESULT_ROOT/dsv4_qkv_rope_short.nsys-rep` and `$RESULT_ROOT/dsv4_qkv_rope_short_kernels_cuda_gpu_kern_sum.csv`: `deepseek_apply_rope_q_kv_kernel` appears in the kernel summary; residual hidden-RoPE kernels are from non-projection paths.
@@ -1898,7 +1898,7 @@ Local:
 - rejected ratio-4 top-k concat removal exact E2E log `$RESULT_ROOT/dsv4_topk_no_concat_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - rejected ratio-4 top-k concat removal fixed bench log `$RESULT_ROOT/dsv4_topk_no_concat_bench.log`: aggregate steady TPOT avg `29.541ms`, per-iteration `29.551ms`, `29.539ms`, `29.532ms`; all hash `6346f03343d75a65`
 - post-revert ratio-4 top-k fixed bench log `$RESULT_ROOT/dsv4_revert_topk_bench.log`: aggregate steady TPOT avg `28.333ms`, per-iteration `28.316ms`, `28.336ms`, `28.346ms`; all hash `6346f03343d75a65`
-- old split MoE/SwiGLU cleanup: local `cargo fmt --check`, local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`, local `git diff --check`, 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`, and 5090 release builds for `bench_serving` and `deepseek_v4_e2e` passed after removing stale public/FFI exports.
+- old split MoE/SwiGLU cleanup: local `cargo fmt --check`, local `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4`, local `git diff --check`, 5090 `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4`, and 5090 release builds for `bench_serving` and `deepseek_v4_e2e` passed after removing stale public/FFI exports.
 - old split MoE/SwiGLU cleanup exact E2E log `$RESULT_ROOT/dsv4_fused_cleanup_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - old split MoE/SwiGLU cleanup fixed bench log `$RESULT_ROOT/dsv4_fused_cleanup_bench.log`: aggregate steady TPOT avg `27.860ms`, per-iteration `27.863ms`, `27.845ms`, `27.872ms`; all hash `6346f03343d75a65`
 - MoE reduce-scatter/shared overlap exact E2E log `$RESULT_ROOT/dsv4_moe_rs_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
@@ -1939,7 +1939,7 @@ Local:
 - rejected naive grouped FP4 `block_M=16` logs `$RESULT_ROOT/dsv4_w13_block_m16_bench.log` and `$RESULT_ROOT/dsv4_w13_block_m16_large_rows_bench.log`: decode-like small rows sped up, but rows/active `32` failed fuzz because grouped transforms/wrappers still have hard-coded `32`-row assumptions; not retained.
 - rejected parameterized grouped FP4 `block_M=16` logs `$RESULT_ROOT/dsv4_w13_block_m16_param_fuzz.log`, `$RESULT_ROOT/dsv4_grouped_block_m16_e2e.log`, `$RESULT_ROOT/dsv4_grouped_block_m16_bench.log`, and `$RESULT_ROOT/dsv4_grouped_block_m16_bench_repeat.log`: broad fuzz and exact E2E passed, token hash stayed `6346f03343d75a65`, but fixed bench regressed to aggregate steady TPOT avg `28.971ms` then `29.797ms`; local and 5090 were restored to grouped FP4 `block_M=32`.
 - post-restore grouped FP4 fixed bench log `$RESULT_ROOT/dsv4_grouped_block_m16_restored_bench.log`: aggregate steady TPOT avg `28.736ms`, per-iteration `28.445ms`, `28.998ms`, `28.763ms`; all hash `6346f03343d75a65`.
-- completion audit and cleanup: local `git diff --check`, `cargo fmt --check`, and `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed after documenting the sub-25 gap and deleting untracked rejected bench sources. The retained tool sources are `score_select_bench.cu`, `swiglu_quant_bench.cu`, and `w13_grouped_fp4_bench.cu`.
+- completion audit and cleanup: local `git diff --check`, `cargo fmt --check`, and `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` passed after documenting the sub-25 gap and deleting untracked rejected bench sources. The retained tool sources are `score_select_bench.cu`, `swiglu_quant_bench.cu`, and `w13_grouped_fp4_bench.cu`.
 - vLLM/SGLang large-batch gap audit: source inspection confirmed the mature FP4 MoE throughput path combines static W13/W2 weight reorder, FP4 scale interleave, packed routed top-k, and problem-size-aware grouped backends. This supports keeping packed MoE layout as a separate bs>100 architecture project rather than mixing it into the current sub-25 latency patch.
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D $RESULT_ROOT/cuda_api_counter.so` confirmed base and `_ptsz` wrappers

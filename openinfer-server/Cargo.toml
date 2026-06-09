@@ -1,0 +1,70 @@
+[package]
+autobenches = false
+name = "openinfer-server"
+default-run = "openinfer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "openinfer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openinfer"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench_serving"
+path = "src/bin/bench_serving.rs"
+
+[dependencies]
+openinfer-core = { workspace = true }
+openinfer-deepseek-v2-lite = { workspace = true, optional = true }
+openinfer-deepseek-v4 = { workspace = true, optional = true }
+openinfer-kimi-k2 = { workspace = true, optional = true }
+openinfer-qwen3-4b = { workspace = true }
+openinfer-qwen35-4b = { workspace = true }
+openinfer-vllm-frontend = { workspace = true }
+openinfer-vllm-support = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
+comfy-table = { workspace = true }
+cudarc = { workspace = true }
+fastrace = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+vllm-text = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[features]
+default = []
+deepseek-v4 = ["dep:openinfer-deepseek-v4", "openinfer-deepseek-v4/deepseek-v4"]
+deepseek-v2-lite = ["dep:openinfer-deepseek-v2-lite", "openinfer-deepseek-v2-lite/deepseek-v2-lite"]
+kimi-k2 = ["dep:openinfer-kimi-k2", "openinfer-kimi-k2/kimi-k2"]
+pplx-ep = ["deepseek-v4", "openinfer-deepseek-v4/pplx-ep"]
+deepseek-v4-cutedsl-diagnostic = [
+    "deepseek-v4",
+    "openinfer-deepseek-v4/deepseek-v4-cutedsl-diagnostic",
+]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "ops_bench"
+harness = false
+
+[[bench]]
+name = "nccl_bench"
+harness = false

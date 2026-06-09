@@ -31,7 +31,7 @@ them.
 
 ### Direct KV Ownership
 
-`code-fact`: `pegainfer-deepseek-v4/src/direct/scheduler.rs` owns
+`code-fact`: `openinfer-deepseek-v4/src/direct/scheduler.rs` owns
 `DirectKvCacheManager` and `DirectKvCacheLease`.
 
 Current lifecycle:
@@ -78,7 +78,7 @@ P-D handoff, or transport-level handles.
 
 ### Communication Boundary
 
-`code-fact`: `pegainfer-comm` currently provides EP all-to-all public surface and
+`code-fact`: `openinfer-comm` currently provides EP all-to-all public surface and
 opaque operation handles. It does not yet provide KV transfer or ownership
 handoff primitives.
 
@@ -375,7 +375,7 @@ field names.
 `derivation`: P-D handoff requires ownership handles, not transport objects. The
 handle describes who owns cleanup and which observable signal proves transfer
 completion or cancellation. It does not choose RDMA, IPC, serialization, or a
-specific `pegainfer-comm` operation.
+specific `openinfer-comm` operation.
 
 ### Export Side
 
@@ -520,7 +520,7 @@ Out of scope:
 - prefix eviction performance tuning;
 - production prefix cache policy;
 - changing HTTP benchmark semantics;
-- replacing `pegainfer-comm` or adding KV transfer to it.
+- replacing `openinfer-comm` or adding KV transfer to it.
 
 Merge criteria:
 
@@ -536,5 +536,5 @@ Merge criteria:
   deliberately does not commit to a value.
 - Decide whether prefix entries are rank-local only in v1 or require a
   multi-rank consistency object.
-- Define a future `pegainfer-comm` KV-transfer extension only after allocator
+- Define a future `openinfer-comm` KV-transfer extension only after allocator
   handles and cleanup semantics are proven locally.

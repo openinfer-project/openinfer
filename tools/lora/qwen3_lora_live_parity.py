@@ -3,7 +3,7 @@
 
 The script creates a deterministic PEFT-style adapter, obtains the greedy
 reference text from transformers+peft, loads the same adapter through
-PegaInfer's live /v1/load_lora_adapter route, and compares /v1/completions.
+OpenInfer's live /v1/load_lora_adapter route, and compares /v1/completions.
 """
 
 from __future__ import annotations
@@ -167,41 +167,41 @@ def encode_generated_text(model_path: Path, text: str) -> list[int]:
 
 def first_token_mismatch(
     hf_token_ids: list[int],
-    pegainfer_token_ids: list[int],
+    openinfer_token_ids: list[int],
     model_path: Path,
 ) -> dict | None:
-    if hf_token_ids == pegainfer_token_ids:
+    if hf_token_ids == openinfer_token_ids:
         return None
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    for index, (hf_token_id, pegainfer_token_id) in enumerate(
-        zip(hf_token_ids, pegainfer_token_ids),
+    for index, (hf_token_id, openinfer_token_id) in enumerate(
+        zip(hf_token_ids, openinfer_token_ids),
         start=1,
     ):
-        if hf_token_id != pegainfer_token_id:
+        if hf_token_id != openinfer_token_id:
             return {
                 "index_1based": index,
                 "hf_token_id": hf_token_id,
-                "pegainfer_token_id": pegainfer_token_id,
+                "openinfer_token_id": openinfer_token_id,
                 "hf_piece": tokenizer.decode([hf_token_id]),
-                "pegainfer_piece": tokenizer.decode([pegainfer_token_id]),
+                "openinfer_piece": tokenizer.decode([openinfer_token_id]),
             }
 
     return {
-        "index_1based": min(len(hf_token_ids), len(pegainfer_token_ids)) + 1,
-        "hf_token_id": hf_token_ids[len(pegainfer_token_ids)]
-        if len(hf_token_ids) > len(pegainfer_token_ids)
+        "index_1based": min(len(hf_token_ids), len(openinfer_token_ids)) + 1,
+        "hf_token_id": hf_token_ids[len(openinfer_token_ids)]
+        if len(hf_token_ids) > len(openinfer_token_ids)
         else None,
-        "pegainfer_token_id": pegainfer_token_ids[len(hf_token_ids)]
-        if len(pegainfer_token_ids) > len(hf_token_ids)
+        "openinfer_token_id": openinfer_token_ids[len(hf_token_ids)]
+        if len(openinfer_token_ids) > len(hf_token_ids)
         else None,
-        "hf_piece": tokenizer.decode([hf_token_ids[len(pegainfer_token_ids)]])
-        if len(hf_token_ids) > len(pegainfer_token_ids)
+        "hf_piece": tokenizer.decode([hf_token_ids[len(openinfer_token_ids)]])
+        if len(hf_token_ids) > len(openinfer_token_ids)
         else None,
-        "pegainfer_piece": tokenizer.decode([pegainfer_token_ids[len(hf_token_ids)]])
-        if len(pegainfer_token_ids) > len(hf_token_ids)
+        "openinfer_piece": tokenizer.decode([openinfer_token_ids[len(hf_token_ids)]])
+        if len(openinfer_token_ids) > len(hf_token_ids)
         else None,
     }
 
@@ -243,7 +243,7 @@ def wait_for_health(server_url: str, timeout_s: float, process: subprocess.Popen
 
 def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
     env = os.environ.copy()
-    env.setdefault("PEGAINFER_CUDA_SM", "80")
+    env.setdefault("OPENINFER_CUDA_SM", "80")
     compat = "/usr/local/cuda-12.9/compat"
     if Path(compat).exists():
         old = env.get("LD_LIBRARY_PATH")
@@ -253,7 +253,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         "run",
         "--release",
         "-p",
-        "pegainfer-server",
+        "openinfer-server",
         "--",
         "--model-path",
         args.model_path,
@@ -264,7 +264,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         str(args.port),
     ]
     log = tempfile.NamedTemporaryFile(
-        prefix="pegainfer-qwen3-lora-server-",
+        prefix="openinfer-qwen3-lora-server-",
         suffix=".log",
         mode="w+",
         delete=False,
@@ -278,7 +278,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         text=True,
         start_new_session=True,
     )
-    process.pegainfer_log_path = log.name  # type: ignore[attr-defined]
+    process.openinfer_log_path = log.name  # type: ignore[attr-defined]
     print(f"server_log={log.name}", file=sys.stderr)
     log.close()
     return process
@@ -298,7 +298,7 @@ def stop_server(process: subprocess.Popen | None) -> None:
 def tail_server_output(process: subprocess.Popen | None) -> str:
     if process is None:
         return ""
-    log_path = getattr(process, "pegainfer_log_path", None)
+    log_path = getattr(process, "openinfer_log_path", None)
     if not log_path:
         return ""
     with contextlib.suppress(Exception):
@@ -306,7 +306,7 @@ def tail_server_output(process: subprocess.Popen | None) -> str:
     return ""
 
 
-def pegainfer_completion(
+def openinfer_completion(
     server_url: str,
     model_name: str,
     prompt: str,
@@ -335,7 +335,7 @@ def main() -> int:
         adapter_path.mkdir(parents=True, exist_ok=True)
         cleanup = contextlib.nullcontext(adapter_path)
     else:
-        cleanup = tempfile.TemporaryDirectory(prefix="pegainfer-qwen3-lora-parity-")
+        cleanup = tempfile.TemporaryDirectory(prefix="openinfer-qwen3-lora-parity-")
 
     process = None
     with cleanup as adapter_dir:
@@ -359,7 +359,7 @@ def main() -> int:
                 f"{server_url}/v1/load_lora_adapter",
                 {"lora_name": args.lora_name, "lora_path": str(adapter_path)},
             )
-            completion = pegainfer_completion(
+            completion = openinfer_completion(
                 server_url,
                 model_name=args.lora_name,
                 prompt=args.prompt,
@@ -374,9 +374,9 @@ def main() -> int:
     choices = completion.get("choices", [])
     if not choices:
         raise RuntimeError(f"completion response has no choices: {completion}")
-    pegainfer_text = choices[0].get("text", "")
-    pegainfer_token_ids = encode_generated_text(model_path, pegainfer_text)
-    mismatch = first_token_mismatch(hf["token_ids"], pegainfer_token_ids, model_path)
+    openinfer_text = choices[0].get("text", "")
+    openinfer_token_ids = encode_generated_text(model_path, openinfer_text)
+    mismatch = first_token_mismatch(hf["token_ids"], openinfer_token_ids, model_path)
     summary = {
         "adapter_path": str(adapter_path),
         "hf_text": hf["text"],
@@ -384,14 +384,14 @@ def main() -> int:
         "hf_logit_max_abs_diff_vs_base": hf["logit_max_abs_diff_vs_base"],
         "peft_autocast_adapter_dtype": peft_autocast_adapter_dtype,
         "load_response": load_response,
-        "pegainfer_text": pegainfer_text,
-        "pegainfer_token_ids": pegainfer_token_ids,
+        "openinfer_text": openinfer_text,
+        "openinfer_token_ids": openinfer_token_ids,
         "first_token_mismatch": mismatch,
-        "match": pegainfer_text == hf["text"],
+        "match": openinfer_text == hf["text"],
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
-    if pegainfer_text != hf["text"]:
+    if openinfer_text != hf["text"]:
         print(tail_server_output(process), file=sys.stderr)
         return 1
     if hf["logit_max_abs_diff_vs_base"] == 0.0:

@@ -1,0 +1,13 @@
+[package]
+name = "openinfer-vllm-support"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+once_cell = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+vllm-text = { workspace = true }
+vllm-tokenizer = { workspace = true }
+
+[lints]
+workspace = true

@@ -136,12 +136,12 @@ Nsight Systems 10k direct, sorted by CUDA kernel total time:
 | Decode MoE | `dispatch_decode_moe_step` accepts `input.seq_len`; local routing and grouped GEMM operate over seq length. | not first candidate until active-set path proves MoE is a top online bucket. |
 | Prefill request batching | prefill starts one request into one KV slot; no multi-request prefill active set. | input throughput is mostly long-seq single-request kernel efficiency today; true batch prefill needs a larger scheduler/runtime shape change. |
 | Prefill attention/compressor | prefill kernels are sequence-parallel for one request; no native multi-request DSV4 prefill stack. | Pacer prefill replacements should target high-share single-request buckets first, especially non-overlap compressor, while preserving the chosen quality policy. |
-| CUDA Graph | `pegainfer-server` passes `enable_cuda_graph=false` for DeepSeek V4; direct engine warns that DSV4 does not use CUDA Graph yet. | graph work starts after active-set shapes stabilize; blockers are dynamic seq/compressed lengths, collectives, stream/event ownership, allocator/scratch lifetimes, and batch capacity. |
+| CUDA Graph | `openinfer-server` passes `enable_cuda_graph=false` for DeepSeek V4; direct engine warns that DSV4 does not use CUDA Graph yet. | graph work starts after active-set shapes stabilize; blockers are dynamic seq/compressed lengths, collectives, stream/event ownership, allocator/scratch lifetimes, and batch capacity. |
 
 ## Next Work Selection
 
 | Task | Owner | Entry |
 | --- | --- | --- |
-| task #45 HTTP active-set batching + CUDA Graph serving gate | @PegaInfer-Dev | Make serving trace show active set size > 1 under c2/c4/c8, then measure output tok/s/TPOT against this baseline. |
+| task #45 HTTP active-set batching + CUDA Graph serving gate | @OpenInfer-Dev | Make serving trace show active set size > 1 under c2/c4/c8, then measure output tok/s/TPOT against this baseline. |
 | task #46 decode operator replacement | @Pacer | Prefer decode compressor `_batch_` path from task #44 coverage; fallback is decode indexer top-k batch if compressor exactness blocks. |
 | task #46 prefill operator replacement | @Pacer | Prefer non-overlap compressor only when local microbench/correctness and precision review show meaningful input-throughput gain; skip low-yield patches. |

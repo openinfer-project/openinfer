@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible HTTP serving benchmark for pegainfer.
+"""OpenAI-compatible HTTP serving benchmark for openinfer.
 
 The harness intentionally talks to /v1/completions over HTTP instead of using
 the in-process bench_serving binary. It records streaming TTFT/ITL/TPOT,
@@ -113,7 +113,7 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         if isinstance(result.server_trace.get("decode_batch_size_max"), int)
     ]
     return {
-        "source": "server log lines matching `pegainfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
+        "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
         "missing_traces": [result.request_id for result in measured if result.server_trace is None],
         "phases_ms": phase_summary,
@@ -364,7 +364,7 @@ def failed_result(
     )
 
 
-TRACE_RE = re.compile(r"pegainfer_http_trace\s+(\{.*\})")
+TRACE_RE = re.compile(r"openinfer_http_trace\s+(\{.*\})")
 STREAM_ERROR_RE = re.compile(r'request failed .*self\.request_id="([^"]+)"')
 
 
@@ -475,7 +475,7 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
             pool.submit(
                 request_once,
                 idx,
-                f"pegainfer-bench-{label}-{offset + idx}",
+                f"openinfer-bench-{label}-{offset + idx}",
                 url,
                 args.model,
                 prompt_words,
@@ -596,7 +596,7 @@ def main() -> None:
     parser.add_argument(
         "--server-log",
         type=Path,
-        help="Optional pegainfer server log containing pegainfer_http_trace lines for TTFT phase attribution.",
+        help="Optional openinfer server log containing openinfer_http_trace lines for TTFT phase attribution.",
     )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()

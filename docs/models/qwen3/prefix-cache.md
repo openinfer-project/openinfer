@@ -53,12 +53,12 @@ Negative result: registering 40 extra unique ~1900-token prompts did not move wa
 
 ## Tests
 
-- `pegainfer-qwen3-4b/tests/prefix_cache.rs` — behavioral contract: exact cached-token counts (3-block hit + tail recompute, extension match, full-block cap edge), mixed cold+warm batch in one plan, unified prefill+decode path, warm-vs-cold logit bounds (regret + mean, golden-gate methodology).
-- `pegainfer-qwen3-4b/tests/hf_golden_gate.rs` — cached-replay surfaces (sequential bs=1 eager, batched eager, batched cuda-graph) vs the HF golden: warm mean 0.0316 / p99 0.1215 vs cold floor 0.0317 / 0.1196.
+- `openinfer-qwen3-4b/tests/prefix_cache.rs` — behavioral contract: exact cached-token counts (3-block hit + tail recompute, extension match, full-block cap edge), mixed cold+warm batch in one plan, unified prefill+decode path, warm-vs-cold logit bounds (regret + mean, golden-gate methodology).
+- `openinfer-qwen3-4b/tests/hf_golden_gate.rs` — cached-replay surfaces (sequential bs=1 eager, batched eager, batched cuda-graph) vs the HF golden: warm mean 0.0316 / p99 0.1215 vs cold floor 0.0317 / 0.1196.
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test prefix_cache
-PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test prefix_cache
+OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
 ```
 
 ## Next

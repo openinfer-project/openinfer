@@ -1,40 +1,40 @@
 [workspace]
 resolver = "3"
-default-members = ["pegainfer-server"]
+default-members = ["openinfer-server"]
 members = [
-    "pegainfer-engine",
-    "pegainfer-vllm-frontend",
-    "pegainfer-sim",
-    "pegainfer-vllm-support",
-    "pegainfer-server",
-    "pegainfer-core",
-    "pegainfer-cupti",
-    "pegainfer-kernels",
-    "pegainfer-bench",
-    "pegainfer-deepseek-v4",
-    "pegainfer-deepseek-v2-lite",
-    "pegainfer-kimi-k2",
-    "pegainfer-qwen3-4b",
-    "pegainfer-qwen35-4b",
-    "pegainfer-kv-cache",
-    "pegainfer-kv-offload",
-    # ---- pegainfer-comm (EP all-to-all) ----
-    "pegainfer-comm",
-    "pegainfer-comm/crates/pegainfer-comm-build-utils",
-    "pegainfer-comm/crates/pegainfer-comm-cuda-sys",
-    "pegainfer-comm/crates/pegainfer-comm-cudart-sys",
-    "pegainfer-comm/crates/pegainfer-comm-gdrapi-sys",
-    "pegainfer-comm/crates/pegainfer-comm-libibverbs-sys",
-    "pegainfer-comm/crates/pegainfer-comm-cuda-lib",
-    "pegainfer-comm/crates/pegainfer-comm-thread-lib",
-    "pegainfer-comm/crates/pegainfer-comm-proc-lib",
-    "pegainfer-comm/crates/pegainfer-comm-logging-lib",
-    "pegainfer-comm/crates/pegainfer-comm-torch-lib",
-    "pegainfer-comm/crates/pegainfer-comm-fabric-lib",
-    "pegainfer-comm/crates/pegainfer-comm-fabric-debug",
-    "pegainfer-comm/crates/pegainfer-comm-a2a-kernels",
-    "pegainfer-comm/crates/pegainfer-comm-p2p-all-to-all",
-    "pegainfer-comm/crates/pegainfer-comm-python-ext",
+    "openinfer-engine",
+    "openinfer-vllm-frontend",
+    "openinfer-sim",
+    "openinfer-vllm-support",
+    "openinfer-server",
+    "openinfer-core",
+    "openinfer-cupti",
+    "openinfer-kernels",
+    "openinfer-bench",
+    "openinfer-deepseek-v4",
+    "openinfer-deepseek-v2-lite",
+    "openinfer-kimi-k2",
+    "openinfer-qwen3-4b",
+    "openinfer-qwen35-4b",
+    "openinfer-kv-cache",
+    "openinfer-kv-offload",
+    # ---- openinfer-comm (EP all-to-all) ----
+    "openinfer-comm",
+    "openinfer-comm/crates/openinfer-comm-build-utils",
+    "openinfer-comm/crates/openinfer-comm-cuda-sys",
+    "openinfer-comm/crates/openinfer-comm-cudart-sys",
+    "openinfer-comm/crates/openinfer-comm-gdrapi-sys",
+    "openinfer-comm/crates/openinfer-comm-libibverbs-sys",
+    "openinfer-comm/crates/openinfer-comm-cuda-lib",
+    "openinfer-comm/crates/openinfer-comm-thread-lib",
+    "openinfer-comm/crates/openinfer-comm-proc-lib",
+    "openinfer-comm/crates/openinfer-comm-logging-lib",
+    "openinfer-comm/crates/openinfer-comm-torch-lib",
+    "openinfer-comm/crates/openinfer-comm-fabric-lib",
+    "openinfer-comm/crates/openinfer-comm-fabric-debug",
+    "openinfer-comm/crates/openinfer-comm-a2a-kernels",
+    "openinfer-comm/crates/openinfer-comm-p2p-all-to-all",
+    "openinfer-comm/crates/openinfer-comm-python-ext",
     # ---- dynamo kvbm (ported, Apache-2.0) ----
     "kvbm/dynamo-tokens",
     "kvbm/dynamo-memory",
@@ -126,21 +126,21 @@ opentelemetry_sdk = { version = "0.31.0", features = ["trace", "logs", "rt-tokio
 ordered-float = "4"
 oneshot = "0.1.11"
 parking_lot = "0.12.5"
-pegainfer-bench = { path = "pegainfer-bench" }
-pegainfer-core = { path = "pegainfer-core" }
-pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
-pegainfer-kv-offload = { path = "pegainfer-kv-offload" }
-pegainfer-cupti = { path = "pegainfer-cupti" }
-pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
-pegainfer-engine = { path = "pegainfer-engine" }
-pegainfer-kernels = { path = "pegainfer-kernels" }
-pegainfer-kimi-k2 = { path = "pegainfer-kimi-k2" }
-pegainfer-qwen3-4b = { path = "pegainfer-qwen3-4b" }
-pegainfer-qwen35-4b = { path = "pegainfer-qwen35-4b" }
-pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }
-pegainfer-vllm-frontend = { path = "pegainfer-vllm-frontend" }
-pegainfer-vllm-support = { path = "pegainfer-vllm-support" }
-pegainfer-comm = { path = "pegainfer-comm" }
+openinfer-bench = { path = "openinfer-bench" }
+openinfer-core = { path = "openinfer-core" }
+openinfer-kv-cache = { path = "openinfer-kv-cache" }
+openinfer-kv-offload = { path = "openinfer-kv-offload" }
+openinfer-cupti = { path = "openinfer-cupti" }
+openinfer-deepseek-v4 = { path = "openinfer-deepseek-v4" }
+openinfer-engine = { path = "openinfer-engine" }
+openinfer-kernels = { path = "openinfer-kernels" }
+openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
+openinfer-qwen3-4b = { path = "openinfer-qwen3-4b" }
+openinfer-qwen35-4b = { path = "openinfer-qwen35-4b" }
+openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
+openinfer-vllm-frontend = { path = "openinfer-vllm-frontend" }
+openinfer-vllm-support = { path = "openinfer-vllm-support" }
+openinfer-comm = { path = "openinfer-comm" }
 pkg-config = "0.3.32"
 prometheus = "0.14"
 postcard = { version = "1.1.3", features = ["alloc", "use-std"] }

@@ -10,16 +10,16 @@ This gate deliberately stays model-specific and shape-specific:
 
 - Model: DeepSeek-V2-Lite.
 - Shape: batch size `1`, `4`, or `8`, prompt `Hello`, prompt token ids `[17464]`, output length `16`.
-- Backends: default host-staged EP2 and `PEGAINFER_DSV2_LITE_EP_BACKEND=nccl`.
+- Backends: default host-staged EP2 and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
 - Accuracy oracle: the same generated token/text/hash gate used by `hf-accuracy-gate.md`.
 - Attribution source: `DeepSeekV2LiteEp2Generator::generate_greedy_with_attribution` for `batch-size=1`, and `DeepSeekV2LiteEp2Generator::generate_greedy_batch_same_prompt_with_attribution` for `batch-size>1`.
 - GPU attribution source: CUDA events around selected stream sections in the explicit attribution path.
-- NVTX source: set `PEGAINFER_DSV2_LITE_NVTX=1` to emit matching ranges for those selected sections during a profiler run.
+- NVTX source: set `OPENINFER_DSV2_LITE_NVTX=1` to emit matching ranges for those selected sections during a profiler run.
 
 Out of scope:
 
 - sparse dispatch;
-- pegainfer-comm / NVLink backend;
+- openinfer-comm / NVLink backend;
 - multi-node or generic EP topology;
 - production continuous batching or broader prompts;
 - performance improvement or throughput claims.
@@ -54,14 +54,14 @@ python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
   --output-len 16 \
   --out target/accuracy/dsv2-lite-ep2/hf.json
 
-PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
-PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
-  cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
+  cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
-PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
-PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
-PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
-  cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
+OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
+  cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --hf target/accuracy/dsv2-lite-ep2/hf.json \
@@ -71,18 +71,18 @@ python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --require-all-exact
 ```
 
-Then collect attribution for the same two pegainfer backends. Use `--batch-size 1` for the original single-row gate, and `--batch-size 4` / `--batch-size 8` for the true-batch benchmark attribution shape:
+Then collect attribution for the same two openinfer backends. Use `--batch-size 1` for the original single-row gate, and `--batch-size 4` / `--batch-size 8` for the true-batch benchmark attribution shape:
 
 ```bash
-cargo run --release -p pegainfer-deepseek-v2-lite \
+cargo run --release -p openinfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path models/DeepSeek-V2-Lite \
   --batch-size 1 \
   --out target/accuracy/dsv2-lite-ep2/host-staged-attribution.json
 
-PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
-  cargo run --release -p pegainfer-deepseek-v2-lite \
+OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --release -p openinfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path models/DeepSeek-V2-Lite \
@@ -90,15 +90,15 @@ PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
   --out target/accuracy/dsv2-lite-ep2/nccl-attribution.json
 
 for batch in 4 8; do
-  cargo run --release -p pegainfer-deepseek-v2-lite \
+  cargo run --release -p openinfer-deepseek-v2-lite \
     --features deepseek-v2-lite \
     --bin dsv2_lite_ep2_decode_attribution \
     -- --model-path models/DeepSeek-V2-Lite \
     --batch-size "$batch" \
     --out "target/accuracy/dsv2-lite-ep2/host-staged-batch${batch}-attribution.json"
 
-  PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
-    cargo run --release -p pegainfer-deepseek-v2-lite \
+  OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
+    cargo run --release -p openinfer-deepseek-v2-lite \
     --features deepseek-v2-lite \
     --bin dsv2_lite_ep2_decode_attribution \
     -- --model-path models/DeepSeek-V2-Lite \
@@ -107,13 +107,13 @@ for batch in 4 8; do
 done
 ```
 
-For an Nsight Systems pass, run the same attribution command under the profiler and set `PEGAINFER_DSV2_LITE_NVTX=1`; the JSON `coverage` row then records `nvtx_ranges=emitted`. The NVTX labels are correlation markers for the selected GPU/NCCL sections, not timing evidence by themselves. Their wall-clock span can include CPU-side wrapper work, event setup, and synchronization around the section, so compare JSON `by_gpu_*` rows only with CUDA event timing, not with raw NVTX range duration.
+For an Nsight Systems pass, run the same attribution command under the profiler and set `OPENINFER_DSV2_LITE_NVTX=1`; the JSON `coverage` row then records `nvtx_ranges=emitted`. The NVTX labels are correlation markers for the selected GPU/NCCL sections, not timing evidence by themselves. Their wall-clock span can include CPU-side wrapper work, event setup, and synchronization around the section, so compare JSON `by_gpu_*` rows only with CUDA event timing, not with raw NVTX range duration.
 
 To inspect the CUDA Graph readiness boundary for the current NCCL backend, run the attribution binary with the optional smoke flag:
 
 ```bash
-PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
-  cargo run --release -p pegainfer-deepseek-v2-lite \
+OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --release -p openinfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path models/DeepSeek-V2-Lite \

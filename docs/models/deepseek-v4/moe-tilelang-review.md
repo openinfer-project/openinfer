@@ -20,13 +20,13 @@
 - **Read**:
   - `docs/index.md` - identified DeepSeek V4 support, DeepSeek kernel paths, and kernel technology reference as the relevant routing docs.
   - `docs/models/deepseek-v4/support.md` - confirmed the current DeepSeek V4 path has native MP8 runtime, TileLang build-time kernels, and a handwritten CUDA MoE path; it also notes MoE route-index D2H synchronization as a higher-risk remaining target.
-  - `docs/models/deepseek-v4/kernel-paths.md` - confirmed DeepSeek CUDA sources now live under `pegainfer-kernels/csrc/deepseek_v4/` and TileLang generators live under `pegainfer-kernels/tools/tilelang/deepseek_v4/`.
+  - `docs/models/deepseek-v4/kernel-paths.md` - confirmed DeepSeek CUDA sources now live under `openinfer-kernels/csrc/deepseek_v4/` and TileLang generators live under `openinfer-kernels/tools/tilelang/deepseek_v4/`.
 - **Relevant history**:
   - `docs/models/deepseek-v4/support.md` records that the current local TileLang generator emits quantized linear, sparse attention, and HC kernels, while `deepseek_moe.cu` owns routing, SwiGLU, and expert accumulation.
   - `docs/models/deepseek-v4/kernel-paths.md` records that the DeepSeek kernel routing table was recently organized, so this review should compare against those paths instead of rediscovering ownership from scratch.
 - **Plan**:
   1. Inspect the official DeepSeek TileKernels `tile_kernels/moe` directory from `https://github.com/deepseek-ai/TileKernels/tree/main/tile_kernels/moe`, including file names, exported kernels, and expected tensor layouts.
-  2. Inspect local MoE code paths: `pegainfer-kernels/csrc/deepseek_v4/deepseek_moe.cu`, related FFI declarations, and `pegainfer-deepseek-v4/src/runtime/` callers.
+  2. Inspect local MoE code paths: `openinfer-kernels/csrc/deepseek_v4/deepseek_moe.cu`, related FFI declarations, and `openinfer-deepseek-v4/src/runtime/` callers.
   3. Compare official kernels against local behavior along routing layout, expert grouping, quantization format, activation, accumulation dtype, and dispatch/combine boundaries.
   4. Summarize what official TileLang operators exist, what they appear to solve, and which local MoE issue they most likely explain or do not explain.
   5. If the gap is clear and small, propose the first implementation slice; otherwise stop with a focused diagnostic checklist.
@@ -68,13 +68,13 @@
 Result: official MoE TileLang is primarily a routing, mapping, packing, and reduction toolkit. It does not appear to provide a single fused FP4 expert MLP kernel in `tile_kernels/moe/`; the fused expert GEMM path is implied by the expert-major layout and the quantized helpers used around it.
 
 ### Step 2: Compare local MoE implementation
-- Local score routing in `pegainfer-kernels/csrc/deepseek_v4/deepseek_moe.cu` broadly matches the model config's simple scoring semantics:
+- Local score routing in `openinfer-kernels/csrc/deepseek_v4/deepseek_moe.cu` broadly matches the model config's simple scoring semantics:
   - BF16 gate scores are converted to F32 and multiplied through cuBLAS;
   - selection score is `sqrt(softplus(dot)) + gate_bias`;
   - route weight is the original `sqrt(softplus(dot))`;
   - selected weights are normalized and multiplied by `routed_scaling_factor`.
 - Local execution differs substantially from the official fused-layout path:
-  - `pegainfer-deepseek-v4/src/runtime/moe.rs` copies `routed.indices` from device to host and synchronizes in both `routed_local_experts_forward_bf16_hidden` and `routed_local_experts_forward_f32_hidden`.
+  - `openinfer-deepseek-v4/src/runtime/moe.rs` copies `routed.indices` from device to host and synchronizes in both `routed_local_experts_forward_bf16_hidden` and `routed_local_experts_forward_f32_hidden`.
   - The CPU then builds `active_local` and loops over local experts.
   - For each active local expert, `local_expert_forward_*` runs W1, W3, SwiGLU, and W2 over the full input batch, then masks/weights the result by route index.
   - Official TileKernels instead keeps routing metadata on GPU, creates expert-major packed token ranges, expands inputs once, executes expert work over packed ranges, then reduces back with `token_topk_to_pos`.
@@ -129,7 +129,7 @@ Result: the most likely MoE problem is not the `sqrtsoftplus` math itself for no
 - Non-nsys synthetic decode-heavy command:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- \
   --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
@@ -221,13 +221,13 @@ nsys profile --stats=false --force-overwrite=true \
 - Validation:
 
 ```bash
-cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
+cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4
 ```
 
   - Passed with the existing unreachable-pub warnings in `runtime/core.rs` and `runtime/state.rs`.
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- \
   --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
@@ -241,7 +241,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - e2e: `3.69s`
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
   --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --offset 0 --limit 1 --max-new-tokens 64
@@ -251,7 +251,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Full exact validation required before commit:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
   --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --max-new-tokens 64
@@ -300,13 +300,13 @@ nsys profile --stats=false --force-overwrite=true \
 - Validation:
 
 ```bash
-cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
+cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4
 ```
 
   - Passed with the existing unreachable-pub warnings in `runtime/core.rs` and `runtime/state.rs`.
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- \
   --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
@@ -320,7 +320,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - e2e: `3.11s`
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
   --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --max-new-tokens 64
@@ -406,13 +406,13 @@ nsys profile --stats=false --force-overwrite=true \
   - Interpretation: MoE EP8 route imbalance creates some phase skew, but the 100ms-scale TPOT comes from many small phase skews being paid at every barrier. Attention and indexer collectives also pay large skew despite nearly equal active GPU work, which points at CPU runtime, allocation/free, launch gaps, and host-controlled loops as the amplification mechanism.
   - Next experiments should measure or reduce runtime churn and host-controlled MoE decode scheduling before assuming expert compute or raw NCCL bandwidth is the limiting factor.
 - Temporary NVTX proof trace:
-  - Added a temporary profiling-only NVTX loader using runtime `dlopen`/`dlsym` for `nvtxRangePushA`, `nvtxRangePop`, and `nvtxMarkA`, gated by `PEGAINFER_DSV4_NVTX=1`. The instrumentation marked rank worker decode stages (`attn_local`, `indexer_ar`, `attention_ar`, `moe_route`, `moe_plan`, `moe_experts`, `moe_reduce`, `shared_expert`, `moe_ar`) plus active local expert counts and per-local-expert ranges. The temporary code was removed after the trace, so it is not part of the hot path.
+  - Added a temporary profiling-only NVTX loader using runtime `dlopen`/`dlsym` for `nvtxRangePushA`, `nvtxRangePop`, and `nvtxMarkA`, gated by `OPENINFER_DSV4_NVTX=1`. The instrumentation marked rank worker decode stages (`attn_local`, `indexer_ar`, `attention_ar`, `moe_route`, `moe_plan`, `moe_experts`, `moe_reduce`, `shared_expert`, `moe_ar`) plus active local expert counts and per-local-expert ranges. The temporary code was removed after the trace, so it is not part of the hot path.
   - Build and trace commands:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo build --release -p pegainfer-server --bin bench_serving --features deepseek-v4
+OPENINFER_NVCC_JOBS=8 cargo build --release -p openinfer-server --bin bench_serving --features deepseek-v4
 
-PEGAINFER_DSV4_NVTX=1 nsys profile --stats=false --force-overwrite=true \
+OPENINFER_DSV4_NVTX=1 nsys profile --stats=false --force-overwrite=true \
   --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
   --delay=34 --duration=12 \
   -o target/profiling/dsv4_rank_stage_proof \
@@ -460,13 +460,13 @@ nsys export --type sqlite --force-overwrite=true \
   - Validation:
 
 ```bash
-cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
+cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4
 
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- \
   --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
   --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --max-new-tokens 64

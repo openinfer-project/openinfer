@@ -3897,6 +3897,469 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "openinfer-kernels",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "openinfer-comm"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cudarc",
+ "half",
+ "log",
+ "openinfer-comm-cuda-lib",
+ "openinfer-comm-fabric-lib",
+ "openinfer-comm-p2p-all-to-all",
+ "openinfer-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "openinfer-comm-a2a-kernels"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "cxx",
+ "cxx-build",
+ "openinfer-comm-build-utils",
+]
+
+[[package]]
+name = "openinfer-comm-build-utils"
+version = "0.0.0"
+
+[[package]]
+name = "openinfer-comm-cuda-lib"
+version = "0.0.0"
+dependencies = [
+ "bincode 2.0.1",
+ "libc",
+ "openinfer-comm-cuda-sys",
+ "openinfer-comm-cudart-sys",
+ "openinfer-comm-gdrapi-sys",
+ "openinfer-comm-proc-lib",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "openinfer-comm-cuda-sys"
+version = "0.0.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "openinfer-comm-build-utils",
+]
+
+[[package]]
+name = "openinfer-comm-cudart-sys"
+version = "0.0.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "openinfer-comm-build-utils",
+]
+
+[[package]]
+name = "openinfer-comm-fabric-debug"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "openinfer-comm-cuda-lib",
+ "openinfer-comm-fabric-lib",
+ "openinfer-comm-logging-lib",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "openinfer-comm-fabric-lib"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "crossbeam-channel",
+ "dashmap",
+ "libc",
+ "mockall",
+ "once_cell",
+ "oneshot",
+ "openinfer-comm-cuda-lib",
+ "openinfer-comm-libibverbs-sys",
+ "openinfer-comm-thread-lib",
+ "parking_lot",
+ "postcard",
+ "serde",
+ "smallvec",
+ "syscalls",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "openinfer-comm-gdrapi-sys"
+version = "0.0.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "openinfer-comm-build-utils",
+]
+
+[[package]]
+name = "openinfer-comm-libibverbs-sys"
+version = "0.0.0"
+dependencies = [
+ "bindgen 0.72.1",
+ "cc",
+ "openinfer-comm-build-utils",
+]
+
+[[package]]
+name = "openinfer-comm-logging-lib"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "is-terminal",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "openinfer-comm-p2p-all-to-all"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "nvtx",
+ "oneshot",
+ "openinfer-comm-a2a-kernels",
+ "openinfer-comm-cuda-lib",
+ "openinfer-comm-fabric-lib",
+ "openinfer-comm-thread-lib",
+ "tracing",
+]
+
+[[package]]
+name = "openinfer-comm-proc-lib"
+version = "0.0.0"
+dependencies = [
+ "openinfer-comm-cudart-sys",
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "openinfer-comm-python-ext"
+version = "0.0.0"
+dependencies = [
+ "bincode 2.0.1",
+ "bytes",
+ "openinfer-comm-cuda-lib",
+ "openinfer-comm-fabric-lib",
+ "openinfer-comm-logging-lib",
+ "openinfer-comm-p2p-all-to-all",
+ "openinfer-comm-thread-lib",
+ "openinfer-comm-torch-lib",
+ "parking_lot",
+ "postcard",
+ "pyo3",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "openinfer-comm-thread-lib"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "syscalls",
+ "tracing",
+]
+
+[[package]]
+name = "openinfer-comm-torch-lib"
+version = "0.0.0"
+dependencies = [
+ "cxx",
+ "cxx-build",
+ "openinfer-comm-cuda-lib",
+ "pkg-config",
+ "pyo3",
+]
+
+[[package]]
+name = "openinfer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "colored",
+ "cudarc",
+ "half",
+ "libc",
+ "log",
+ "logforth",
+ "memmap2",
+ "openinfer-engine",
+ "openinfer-kernels",
+ "parking_lot",
+ "safetensors",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "openinfer-cupti"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "openinfer-deepseek-v2-lite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "hex",
+ "libloading 0.9.0",
+ "memmap2",
+ "nvtx",
+ "openinfer-core",
+ "openinfer-engine",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
+name = "openinfer-deepseek-v4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "cudarc",
+ "half",
+ "libc",
+ "log",
+ "memmap2",
+ "openinfer-comm",
+ "openinfer-core",
+ "openinfer-kernels",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
+name = "openinfer-engine"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "openinfer-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cudarc",
+ "half",
+ "serde",
+]
+
+[[package]]
+name = "openinfer-kimi-k2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "clap",
+ "crossbeam-channel",
+ "cudarc",
+ "half",
+ "log",
+ "memmap2",
+ "openinfer-bench",
+ "openinfer-core",
+ "openinfer-kernels",
+ "openinfer-kv-cache",
+ "rand 0.10.1",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "openinfer-kv-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "dynamo-kv-hashing",
+ "half",
+ "kvbm-logical",
+ "openinfer-kernels",
+]
+
+[[package]]
+name = "openinfer-kv-offload"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "log",
+ "openinfer-kv-cache",
+ "pegaflow-core",
+ "tokio",
+]
+
+[[package]]
+name = "openinfer-qwen3-4b"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comfy-table",
+ "crossbeam-channel",
+ "cudarc",
+ "fastrace",
+ "half",
+ "hex",
+ "log",
+ "openinfer-bench",
+ "openinfer-core",
+ "openinfer-cupti",
+ "openinfer-kernels",
+ "openinfer-kv-cache",
+ "openinfer-kv-offload",
+ "openinfer-vllm-support",
+ "rand 0.10.1",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "vllm-text",
+]
+
+[[package]]
+name = "openinfer-qwen35-4b"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion 0.8.2",
+ "cudarc",
+ "fastrace",
+ "half",
+ "log",
+ "openinfer-core",
+ "openinfer-kernels",
+ "openinfer-vllm-support",
+ "rand 0.10.1",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
+name = "openinfer-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "comfy-table",
+ "criterion 0.8.2",
+ "cudarc",
+ "fastrace",
+ "half",
+ "log",
+ "logforth",
+ "openinfer-core",
+ "openinfer-deepseek-v2-lite",
+ "openinfer-deepseek-v4",
+ "openinfer-kimi-k2",
+ "openinfer-qwen3-4b",
+ "openinfer-qwen35-4b",
+ "openinfer-vllm-frontend",
+ "openinfer-vllm-support",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tikv-jemallocator",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
+name = "openinfer-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "openinfer-engine",
+ "openinfer-vllm-frontend",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "openinfer-vllm-frontend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "log",
+ "openinfer-engine",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "uuid",
+ "vllm-engine-core-client",
+ "vllm-server",
+ "zeromq",
+]
+
+[[package]]
+name = "openinfer-vllm-support"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "tokio",
+ "vllm-text",
+ "vllm-tokenizer",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4106,469 +4569,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
-]
-
-[[package]]
-name = "pegainfer-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "pegainfer-kernels",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pegainfer-comm"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "cudarc",
- "half",
- "log",
- "pegainfer-comm-cuda-lib",
- "pegainfer-comm-fabric-lib",
- "pegainfer-comm-p2p-all-to-all",
- "pegainfer-core",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "pegainfer-comm-a2a-kernels"
-version = "0.0.0"
-dependencies = [
- "cc",
- "cxx",
- "cxx-build",
- "pegainfer-comm-build-utils",
-]
-
-[[package]]
-name = "pegainfer-comm-build-utils"
-version = "0.0.0"
-
-[[package]]
-name = "pegainfer-comm-cuda-lib"
-version = "0.0.0"
-dependencies = [
- "bincode 2.0.1",
- "libc",
- "pegainfer-comm-cuda-sys",
- "pegainfer-comm-cudart-sys",
- "pegainfer-comm-gdrapi-sys",
- "pegainfer-comm-proc-lib",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "pegainfer-comm-cuda-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "pegainfer-comm-build-utils",
-]
-
-[[package]]
-name = "pegainfer-comm-cudart-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "pegainfer-comm-build-utils",
-]
-
-[[package]]
-name = "pegainfer-comm-fabric-debug"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "bytes",
- "pegainfer-comm-cuda-lib",
- "pegainfer-comm-fabric-lib",
- "pegainfer-comm-logging-lib",
- "postcard",
- "serde",
-]
-
-[[package]]
-name = "pegainfer-comm-fabric-lib"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "bytes",
- "crossbeam-channel",
- "dashmap",
- "libc",
- "mockall",
- "once_cell",
- "oneshot",
- "parking_lot",
- "pegainfer-comm-cuda-lib",
- "pegainfer-comm-libibverbs-sys",
- "pegainfer-comm-thread-lib",
- "postcard",
- "serde",
- "smallvec",
- "syscalls",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "pegainfer-comm-gdrapi-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "pegainfer-comm-build-utils",
-]
-
-[[package]]
-name = "pegainfer-comm-libibverbs-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen 0.72.1",
- "cc",
- "pegainfer-comm-build-utils",
-]
-
-[[package]]
-name = "pegainfer-comm-logging-lib"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "is-terminal",
- "tracing",
- "tracing-core",
- "tracing-log",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "pegainfer-comm-p2p-all-to-all"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "nvtx",
- "oneshot",
- "pegainfer-comm-a2a-kernels",
- "pegainfer-comm-cuda-lib",
- "pegainfer-comm-fabric-lib",
- "pegainfer-comm-thread-lib",
- "tracing",
-]
-
-[[package]]
-name = "pegainfer-comm-proc-lib"
-version = "0.0.0"
-dependencies = [
- "pegainfer-comm-cudart-sys",
- "proc-macro2",
- "quote",
-]
-
-[[package]]
-name = "pegainfer-comm-python-ext"
-version = "0.0.0"
-dependencies = [
- "bincode 2.0.1",
- "bytes",
- "parking_lot",
- "pegainfer-comm-cuda-lib",
- "pegainfer-comm-fabric-lib",
- "pegainfer-comm-logging-lib",
- "pegainfer-comm-p2p-all-to-all",
- "pegainfer-comm-thread-lib",
- "pegainfer-comm-torch-lib",
- "postcard",
- "pyo3",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "pegainfer-comm-thread-lib"
-version = "0.0.0"
-dependencies = [
- "libc",
- "syscalls",
- "tracing",
-]
-
-[[package]]
-name = "pegainfer-comm-torch-lib"
-version = "0.0.0"
-dependencies = [
- "cxx",
- "cxx-build",
- "pegainfer-comm-cuda-lib",
- "pkg-config",
- "pyo3",
-]
-
-[[package]]
-name = "pegainfer-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "colored",
- "cudarc",
- "half",
- "libc",
- "log",
- "logforth",
- "memmap2",
- "parking_lot",
- "pegainfer-engine",
- "pegainfer-kernels",
- "safetensors",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "pegainfer-cupti"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "pegainfer-deepseek-v2-lite"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "hex",
- "libloading 0.9.0",
- "memmap2",
- "nvtx",
- "pegainfer-core",
- "pegainfer-engine",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "vllm-text",
-]
-
-[[package]]
-name = "pegainfer-deepseek-v4"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "cudarc",
- "half",
- "libc",
- "log",
- "memmap2",
- "pegainfer-comm",
- "pegainfer-core",
- "pegainfer-kernels",
- "safetensors",
- "serde",
- "serde_json",
- "tokio",
- "vllm-text",
-]
-
-[[package]]
-name = "pegainfer-engine"
-version = "0.1.0"
-dependencies = [
- "tokio",
-]
-
-[[package]]
-name = "pegainfer-kernels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "cudarc",
- "half",
- "serde",
-]
-
-[[package]]
-name = "pegainfer-kimi-k2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytesize",
- "clap",
- "crossbeam-channel",
- "cudarc",
- "half",
- "log",
- "memmap2",
- "pegainfer-bench",
- "pegainfer-core",
- "pegainfer-kernels",
- "pegainfer-kv-cache",
- "rand 0.10.1",
- "safetensors",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "pegainfer-kv-cache"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "dynamo-kv-hashing",
- "half",
- "kvbm-logical",
- "pegainfer-kernels",
-]
-
-[[package]]
-name = "pegainfer-kv-offload"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "half",
- "log",
- "pegaflow-core",
- "pegainfer-kv-cache",
- "tokio",
-]
-
-[[package]]
-name = "pegainfer-qwen3-4b"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "comfy-table",
- "crossbeam-channel",
- "cudarc",
- "fastrace",
- "half",
- "hex",
- "log",
- "pegainfer-bench",
- "pegainfer-core",
- "pegainfer-cupti",
- "pegainfer-kernels",
- "pegainfer-kv-cache",
- "pegainfer-kv-offload",
- "pegainfer-vllm-support",
- "rand 0.10.1",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "toml 1.1.2+spec-1.1.0",
- "vllm-text",
-]
-
-[[package]]
-name = "pegainfer-qwen35-4b"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "criterion 0.8.2",
- "cudarc",
- "fastrace",
- "half",
- "log",
- "pegainfer-core",
- "pegainfer-kernels",
- "pegainfer-vllm-support",
- "rand 0.10.1",
- "safetensors",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "vllm-text",
-]
-
-[[package]]
-name = "pegainfer-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "colored",
- "comfy-table",
- "criterion 0.8.2",
- "cudarc",
- "fastrace",
- "half",
- "log",
- "logforth",
- "pegainfer-core",
- "pegainfer-deepseek-v2-lite",
- "pegainfer-deepseek-v4",
- "pegainfer-kimi-k2",
- "pegainfer-qwen3-4b",
- "pegainfer-qwen35-4b",
- "pegainfer-vllm-frontend",
- "pegainfer-vllm-support",
- "rand 0.10.1",
- "serde",
- "serde_json",
- "tikv-jemallocator",
- "tokio",
- "vllm-text",
-]
-
-[[package]]
-name = "pegainfer-sim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "pegainfer-engine",
- "pegainfer-vllm-frontend",
- "reqwest",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "pegainfer-vllm-frontend"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "log",
- "pegainfer-engine",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
- "uuid",
- "vllm-engine-core-client",
- "vllm-server",
- "zeromq",
-]
-
-[[package]]
-name = "pegainfer-vllm-support"
-version = "0.1.0"
-dependencies = [
- "once_cell",
- "tokio",
- "vllm-text",
- "vllm-tokenizer",
 ]
 
 [[package]]
