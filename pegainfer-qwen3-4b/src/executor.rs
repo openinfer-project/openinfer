@@ -4,16 +4,19 @@ use std::thread;
 use anyhow::Result;
 use crossbeam_channel as channel;
 
-use crate::Qwen3LoraOptions;
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
+use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use pegainfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest};
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
-use pegainfer_kv_cache::{KvBuffer, KvCacheManager, KvView};
+use pegainfer_kv_cache::{
+    KvBlockGuard, KvBuffer, KvCacheManager, KvView, LoadReservation, PrefixProbe,
+};
+use pegainfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) u64);
@@ -449,6 +452,32 @@ pub(crate) trait ModelExecutor: Send {
     fn list_lora_adapters(&self) -> Vec<String> {
         Vec::new()
     }
+
+    // ── KV-offload prefetch hooks (no-op unless offload is enabled) ─────
+
+    /// Offer a freshly-submitted request for async CPU-tier KV prefetch.
+    /// Returns `true` if a load is now in flight and the scheduler must park
+    /// the request until [`Self::drain_ready_prefetch`] reports it ready.
+    fn begin_kv_prefetch(
+        &mut self,
+        _request_id: RequestId,
+        _prompt_tokens: &[u32],
+        _lora_adapter: Option<&str>,
+    ) -> bool {
+        false
+    }
+
+    /// Non-blocking sweep: request ids whose prefetch just settled (now
+    /// prefill-eligible).
+    fn drain_ready_prefetch(&mut self) -> Vec<RequestId> {
+        Vec::new()
+    }
+
+    /// Block until at least one in-flight prefetch settles (idle-only), then
+    /// sweep the rest.
+    fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
+        Vec::new()
+    }
 }
 
 struct Qwen3ExecutorMetadata {
@@ -466,10 +495,34 @@ pub struct Qwen3Executor {
     loaded_lora_adapters: HashSet<String>,
     prefix_cache_enabled: bool,
     lora_options: Qwen3LoraOptions,
+    /// pegaflow KV-offload bridge; `None` unless offload is opted in on the
+    /// single-GPU path. Drives both the SAVE hook and the async LOAD prefetch.
+    offload: Option<OffloadEngine>,
+    /// Per-request count of sealed blocks already saved to the host tier, so
+    /// each step only saves blocks that newly sealed. Initialized to the
+    /// GPU-hit prefix (already resident) on first save.
+    saved_cursor: HashMap<RequestId, usize>,
+    /// In-flight CPU→GPU prefetches keyed by request, parked until their load
+    /// settles and the blocks register into the prefix cache.
+    prefetch: HashMap<RequestId, PrefetchState>,
+}
+
+/// One request's in-flight CPU-tier KV prefetch.
+///
+/// Holds the destination blocks (via `probe`/`reservation`) and the load handle
+/// so the scheduler can poll completion non-blockingly. Once the load settles,
+/// the reservation is committed (blocks staged + registered) and only `probe`
+/// remains, holding the GPU+CPU prefix resident until the request prefills.
+struct PrefetchState {
+    probe: PrefixProbe,
+    /// `Some` until the load lands and the blocks are committed.
+    reservation: Option<LoadReservation>,
+    /// `Some` while the DMA is in flight; `None` once it has settled.
+    handle: Option<LoadHandle>,
 }
 
 impl Qwen3Executor {
-    pub(crate) fn single(model: Qwen3Model) -> Result<Self> {
+    pub(crate) fn single(model: Qwen3Model, offload_opts: &Qwen3OffloadOptions) -> Result<Self> {
         let budget = model.kv_budget();
         let kv_mgr = KvCacheManager::new(
             &model.device_ctx().stream,
@@ -485,6 +538,9 @@ impl Qwen3Executor {
             config: model.config().clone(),
         };
         let kv_buffer = kv_mgr.buffer().clone();
+        // Build the offload engine while the model's stream is still in hand
+        // (it moves into the RankWorker below). Registers the fused KV buffer.
+        let offload = build_offload(offload_opts, &kv_mgr, model.device_ctx())?;
         let total_blocks = kv_mgr.pool().total_blocks();
         let padding_block_id = kv_mgr.pool().padding_block_id();
         Ok(Self {
@@ -499,6 +555,9 @@ impl Qwen3Executor {
             loaded_lora_adapters: HashSet::new(),
             prefix_cache_enabled: true,
             lora_options: Qwen3LoraOptions::default(),
+            offload,
+            saved_cursor: HashMap::new(),
+            prefetch: HashMap::new(),
         })
     }
 
@@ -512,6 +571,7 @@ impl Qwen3Executor {
             enable_cuda_graph,
             device_ordinals,
             Qwen3LoraOptions::default(),
+            Qwen3OffloadOptions::disabled(),
         )
     }
 
@@ -520,11 +580,18 @@ impl Qwen3Executor {
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
         lora_options: Qwen3LoraOptions,
+        offload_options: Qwen3OffloadOptions,
     ) -> Result<Self> {
         let lora_options = lora_options.validate()?;
         anyhow::ensure!(
             !device_ordinals.is_empty(),
             "Qwen3 executor requires at least one device"
+        );
+        anyhow::ensure!(
+            !offload_options.enabled || device_ordinals.len() == 1,
+            "KV offload is only supported on the single-GPU path (tensor parallel \
+             shards KV per rank); got {} devices",
+            device_ordinals.len()
         );
         if device_ordinals.len() == 1 {
             let model = Qwen3Model::from_safetensors_with_runtime(
@@ -537,7 +604,7 @@ impl Qwen3Executor {
                     max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
-            let mut executor = Self::single(model)?;
+            let mut executor = Self::single(model, &offload_options)?;
             executor.lora_options = lora_options;
             return Ok(executor);
         }
@@ -635,6 +702,10 @@ impl Qwen3Executor {
             loaded_lora_adapters: HashSet::new(),
             prefix_cache_enabled: true,
             lora_options,
+            // Offload is single-GPU only (asserted above); never built here.
+            offload: None,
+            saved_cursor: HashMap::new(),
+            prefetch: HashMap::new(),
         })
     }
 
@@ -677,6 +748,124 @@ impl Qwen3Executor {
         self.prefix_cache_enabled = enabled;
     }
 
+    /// Whether KV offload is active on this executor.
+    pub fn offload_enabled(&self) -> bool {
+        self.offload.is_some()
+    }
+
+    /// Flush pending offload saves into the host read cache so a following
+    /// query can see them. A persistence barrier for handoff and tests; no-op
+    /// without offload.
+    pub fn flush_offload_saves(&self) {
+        if let Some(offload) = &self.offload {
+            offload.flush_saves();
+        }
+    }
+
+    /// Drop every cached-but-unused GPU prefix block. With offload on, this
+    /// forces a cold prefix to be restored from the host tier on its next
+    /// request (rather than served from HBM).
+    pub fn evict_cached_blocks(&self) {
+        self.kv_mgr.pool().evict_inactive();
+    }
+
+    /// Begin an async CPU-tier KV prefetch for `request_id`; see the
+    /// [`ModelExecutor`] hook. Public so admission drivers and tests can park a
+    /// request on its load. Returns `true` when a load is in flight.
+    pub fn begin_kv_prefetch(
+        &mut self,
+        request_id: RequestId,
+        prompt_tokens: &[u32],
+        lora_adapter: Option<&str>,
+    ) -> bool {
+        <Self as ModelExecutor>::begin_kv_prefetch(self, request_id, prompt_tokens, lora_adapter)
+    }
+
+    /// Block until at least one in-flight prefetch settles, then sweep the
+    /// rest; returns the settled request ids (now prefill-eligible).
+    pub fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
+        <Self as ModelExecutor>::wait_ready_prefetch(self)
+    }
+
+    // ── KV-offload SAVE ────────────────────────────────────────────────
+
+    /// Save every block that sealed since this request's last save to the host
+    /// tier (fire-and-forget). Safe to call right after `apply_prefill`/
+    /// `apply_decode`: the producing step's token read-back has already
+    /// synchronized the compute stream, so the sealed KV is fully written.
+    fn save_sealed_blocks(&mut self, request_id: RequestId) {
+        if self.offload.is_none() {
+            return;
+        }
+        let Some(rkv) = self.request_kvs.get(&request_id) else {
+            return;
+        };
+        // `assigned_block_hashes` lists only sealed (registered) blocks; the
+        // partial tail block has no hash and never appears here.
+        let assigned = rkv.assigned_block_hashes();
+        let prefix_matched = rkv.prefix_matched_blocks();
+        let cursor = self
+            .saved_cursor
+            .entry(request_id)
+            .or_insert(prefix_matched);
+        if assigned.len() <= *cursor {
+            return;
+        }
+        let fresh = &assigned[*cursor..];
+        let block_ids: Vec<i32> = fresh.iter().map(|(id, _)| *id).collect();
+        let block_hashes: Vec<Vec<u8>> = fresh.iter().map(|(_, h)| h.to_vec()).collect();
+        // Pin exactly the blocks being saved (aligned 1:1 with `assigned`) for
+        // the duration of the async D2H, so a finished request can't hand the
+        // slot to a new request that overwrites it before the copy lands.
+        let pins: Vec<KvBlockGuard> = rkv
+            .assigned_block_guards()
+            .into_iter()
+            .skip(*cursor)
+            .collect();
+        *cursor = assigned.len();
+        self.offload
+            .as_ref()
+            .expect("offload present")
+            .save(&block_ids, &block_hashes, pins);
+    }
+
+    // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
+    // The trait-facing prefetch hooks (`begin_kv_prefetch`,
+    // `drain_ready_prefetch`, `wait_ready_prefetch`, `has_pending_prefetch`)
+    // live in the `ModelExecutor` impl below; `settle_prefetch` is their shared
+    // helper.
+
+    /// Finalize one prefetch whose load returned `result`. On success the
+    /// reserved blocks are staged + registered (held by the probe until the
+    /// request prefills); on failure the state is dropped so the request
+    /// prefills from scratch.
+    fn settle_prefetch(
+        &mut self,
+        id: RequestId,
+        result: Result<(), pegainfer_kv_offload::EngineError>,
+    ) {
+        if let Some(st) = self.prefetch.get_mut(&id) {
+            st.handle = None;
+        }
+        match result {
+            Ok(()) => {
+                let reservation = self
+                    .prefetch
+                    .get_mut(&id)
+                    .and_then(|st| st.reservation.take())
+                    .expect("reservation present until commit");
+                let st = self.prefetch.get_mut(&id).expect("prefetch present");
+                self.kv_mgr
+                    .pool()
+                    .commit_loaded_blocks(&mut st.probe, reservation);
+            }
+            Err(e) => {
+                log::warn!("KV offload load failed for {id:?} (prefill from scratch): {e}");
+                self.prefetch.remove(&id);
+            }
+        }
+    }
+
     fn wait_for_step_ack(
         pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
         op_name: &'static str,
@@ -710,6 +899,33 @@ impl Qwen3Executor {
         Self::wait_for_step_ack(pending, step.kind())?;
         Ok(primary_result)
     }
+}
+
+/// Build the KV-offload engine for the single-GPU path, or `None` when offload
+/// is disabled. Registers the fused KV buffer with pegaflow against the model's
+/// device/stream — must be called while that stream is still owned by the model
+/// (before it moves into the `RankWorker`).
+fn build_offload(
+    opts: &Qwen3OffloadOptions,
+    kv_mgr: &KvCacheManager,
+    ctx: &DeviceContext,
+) -> Result<Option<OffloadEngine>> {
+    if !opts.enabled {
+        return Ok(None);
+    }
+    let device_id = ctx.device_ordinal as i32;
+    let config = OffloadConfig::new(
+        format!("qwen3-4b-dev{device_id}"),
+        device_id,
+        opts.pinned_pool_bytes,
+    );
+    let engine = OffloadEngine::new(config, kv_mgr.buffer(), &ctx.stream)
+        .map_err(|e| anyhow::anyhow!("KV offload engine init failed: {e}"))?;
+    log::info!(
+        "KV offload enabled on device {device_id} ({} MiB host tier)",
+        opts.pinned_pool_bytes >> 20
+    );
+    Ok(Some(engine))
 }
 
 fn ensure_lora_capacity(
@@ -762,9 +978,116 @@ impl ModelExecutor for Qwen3Executor {
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         // Remove and drop — RAII on SchedulableSequence's block guards
-        // returns all allocated blocks regardless of lifecycle state.
+        // returns all allocated blocks regardless of lifecycle state. The same
+        // RAII frees any parked prefetch's reserved/held blocks.
         self.request_kvs.remove(&request_id);
+        self.prefetch.remove(&request_id);
+        self.saved_cursor.remove(&request_id);
         Ok(())
+    }
+
+    fn begin_kv_prefetch(
+        &mut self,
+        request_id: RequestId,
+        prompt_tokens: &[u32],
+        lora_adapter: Option<&str>,
+    ) -> bool {
+        let Some(offload) = self.offload.as_ref() else {
+            return false;
+        };
+        if !self.prefix_cache_enabled {
+            return false;
+        }
+        let probe = self
+            .kv_mgr
+            .pool()
+            .probe_prefix(prompt_tokens.to_vec(), lora_adapter);
+        let query_hashes = probe.cpu_query_hashes();
+        if query_hashes.is_empty() {
+            return false;
+        }
+        let hit = match offload.query(&request_id.0.to_string(), &query_hashes) {
+            Ok(hit) => hit,
+            Err(e) => {
+                log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");
+                return false;
+            }
+        };
+        let (Some(lease), num_blocks) = (hit.lease, hit.num_blocks) else {
+            return false; // miss
+        };
+        let Some(reservation) = self.kv_mgr.pool().reserve_loaded_blocks(num_blocks) else {
+            // Block pressure: release the lease so its pinned host blocks aren't
+            // held for the full lease TTL, and prefill from scratch rather than
+            // stall.
+            offload.release_query_lease(lease);
+            return false;
+        };
+        let page_ids = reservation.page_ids();
+        let handle = match offload.load(lease, page_ids) {
+            Ok(handle) => handle,
+            Err(e) => {
+                log::warn!("KV offload load submit failed for {request_id:?} (skipping): {e}");
+                // `load` consumes the lease only past its early validation; a
+                // submit error may leave it pinned, so release it (no-op if it
+                // was already consumed).
+                offload.release_query_lease(lease);
+                return false;
+            }
+        };
+        self.prefetch.insert(
+            request_id,
+            PrefetchState {
+                probe,
+                reservation: Some(reservation),
+                handle: Some(handle),
+            },
+        );
+        true
+    }
+
+    fn drain_ready_prefetch(&mut self) -> Vec<RequestId> {
+        let ids: Vec<RequestId> = self.prefetch.keys().copied().collect();
+        let mut done = Vec::new();
+        for id in ids {
+            let poll = match self.prefetch.get_mut(&id).and_then(|st| st.handle.as_mut()) {
+                Some(handle) => handle.poll(),
+                None => continue, // already settled, awaiting prefill
+            };
+            if let Some(result) = poll {
+                self.settle_prefetch(id, result);
+                done.push(id);
+            }
+        }
+        done
+    }
+
+    fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
+        let mut done = Vec::new();
+        if let Some(id) = self
+            .prefetch
+            .iter()
+            .find(|(_, st)| st.handle.is_some())
+            .map(|(id, _)| *id)
+        {
+            let handle = self
+                .prefetch
+                .get_mut(&id)
+                .and_then(|st| st.handle.take())
+                .expect("in-flight handle present");
+            let result = handle.wait();
+            self.settle_prefetch(id, result);
+            // `settle_prefetch` clears the handle, so the drain below skips it;
+            // record it here as the one we blocked on.
+            done.push(id);
+        }
+        // Sweep any others that completed concurrently.
+        for id in self.drain_ready_prefetch() {
+            if !done.contains(&id) {
+                done.push(id);
+            }
+        }
+        done
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -786,6 +1109,10 @@ impl ModelExecutor for Qwen3Executor {
                     anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
                 })?;
             self.request_kvs.insert(req.request_id, rkv);
+            // match_and_add_prefix above already absorbed any CPU-prefetched
+            // blocks (now held by the request's sequence), so release the
+            // prefetch's separate hold.
+            self.prefetch.remove(&req.request_id);
         }
 
         // 2. Build KvViews (seq_len = cached prefix + new suffix)
@@ -818,6 +1145,10 @@ impl ModelExecutor for Qwen3Executor {
                 .get_mut(&req_result.request_id)
                 .expect("request must exist after prefill");
             rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
+        }
+        // 5. Offload the blocks this prefill just sealed (post-step-sync).
+        for req_result in &result.requests {
+            self.save_sealed_blocks(req_result.request_id);
         }
 
         Ok(result)
@@ -866,6 +1197,10 @@ impl ModelExecutor for Qwen3Executor {
                 .expect("request must exist after decode");
             rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
         }
+        // 5. Offload any block this decode step just sealed (post-step-sync).
+        for req_result in &result.requests {
+            self.save_sealed_blocks(req_result.request_id);
+        }
 
         Ok(result)
     }
@@ -888,6 +1223,7 @@ impl ModelExecutor for Qwen3Executor {
                     anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
                 })?;
             self.request_kvs.insert(req.request_id, rkv);
+            self.prefetch.remove(&req.request_id);
         }
 
         // Schedule decode for active requests
@@ -944,6 +1280,13 @@ impl ModelExecutor for Qwen3Executor {
                 .get_mut(&req_result.request_id)
                 .expect("request must exist after unified decode");
             rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+        }
+        // 5. Offload sealed blocks from both halves (post-step-sync).
+        for req_result in &result.prefill_requests {
+            self.save_sealed_blocks(req_result.request_id);
+        }
+        for req_result in &result.decode_requests {
+            self.save_sealed_blocks(req_result.request_id);
         }
 
         Ok(result)

@@ -156,6 +156,7 @@ mod tests {
             token_tx,
             logprobs: 0,
             echo: false,
+            prefetch_offered: false,
         }
     }
 

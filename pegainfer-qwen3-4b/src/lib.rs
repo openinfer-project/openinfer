@@ -63,6 +63,45 @@ impl Default for Qwen3LoraOptions {
     }
 }
 
+/// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
+///
+/// Disabled by default — the existing GPU-only prefix cache is unchanged.
+/// When enabled, the executor saves sealed KV blocks to pegaflow's host tier
+/// and prefetches CPU-resident prefixes back into HBM before prefill, so a
+/// prompt that has fallen out of the GPU cache still skips recompute. Only the
+/// single-GPU topology is supported (tensor parallel shards KV per rank).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen3OffloadOptions {
+    pub enabled: bool,
+    /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
+    pub pinned_pool_bytes: usize,
+}
+
+impl Qwen3OffloadOptions {
+    /// 8 GiB host tier — a few thousand dense Qwen3-4B blocks.
+    pub const DEFAULT_PINNED_POOL_BYTES: usize = 8 << 30;
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            pinned_pool_bytes: 0,
+        }
+    }
+
+    pub fn enabled(pinned_pool_bytes: usize) -> Self {
+        Self {
+            enabled: true,
+            pinned_pool_bytes,
+        }
+    }
+}
+
+impl Default for Qwen3OffloadOptions {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// Low-level Qwen3 execution interface.
 ///
 /// This is the production phase boundary used by the Qwen3 scheduler and by
@@ -99,6 +138,17 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
+    start_engine_with_offload(model_path, options, Qwen3OffloadOptions::disabled())
+}
+
+/// Like [`start_engine`] but with pegaflow KV offload (single-GPU only). The
+/// host tier persists sealed KV blocks and serves CPU-resident prefixes back
+/// into HBM before prefill.
+pub fn start_engine_with_offload(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    offload_options: Qwen3OffloadOptions,
+) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -108,7 +158,13 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    scheduler::start_qwen3(model_path, enable_cuda_graph, &device_ordinals, seed)
+    scheduler::start_qwen3(
+        model_path,
+        enable_cuda_graph,
+        &device_ordinals,
+        seed,
+        offload_options,
+    )
 }
 
 pub fn start_engine_with_lora_control(
@@ -131,5 +187,6 @@ pub fn start_engine_with_lora_control(
         &device_ordinals,
         seed,
         lora_options.validate()?,
+        Qwen3OffloadOptions::disabled(),
     )
 }
