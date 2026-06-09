@@ -4,6 +4,11 @@
 whole pipeline is gated behind the `qwen35-4b` feature of `openinfer-kernels` —
 a default build (Qwen3 only) never runs Triton and needs no Python.
 
+`openinfer-kernels` can also expose selected generated CUBIN launchers through
+TVM FFI under `openinfer_kernels::triton_cubin` when the
+`tvm-ffi-triton-cubin` feature is enabled. This is the DSL-facing wrapper layer;
+the generated C stubs remain the low-level CUDA launch owner.
+
 ## What this covers
 
 - Build-time generation of Triton AOT cubins for `gated_delta_rule_chunkwise_kernels.py` (with `--features qwen35-4b`)
@@ -16,6 +21,10 @@ a default build (Qwen3 only) never runs Triton and needs no Python.
 export CUDA_HOME=/usr/local/cuda
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 ```
+
+The TVM FFI bridge is optional. Only install the TVM FFI runtime when building
+with `--features tvm-ffi-triton-cubin`; in that mode `tvm-ffi-config` must be on
+`PATH` and `libtvm_ffi` must be discoverable during build and runtime.
 
 Bootstrap a repo-local Triton Python once:
 
@@ -64,6 +73,17 @@ Generated Triton artifacts are written to Cargo `OUT_DIR`, typically under:
 ```text
 target/release/build/openinfer-kernels-*/out/triton_aot/
 ```
+
+## TVM FFI wrapper example
+
+```bash
+cargo run --release -p openinfer-kernels --features tvm-ffi-triton-cubin --example triton_cubin_tvm_ffi
+```
+
+The registered names use the `openinfer.triton_cubin.qwen35.*` prefix. Pointer
+and stream arguments are packed as TVM integers or opaque pointers; scalar launch
+arguments use TVM integers. The wrapper returns `()` on CUDA success and a TVM
+`RuntimeError` if the underlying CUBIN launcher returns a non-success CUDA result.
 
 ## Validation
 
