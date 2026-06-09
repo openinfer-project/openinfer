@@ -188,6 +188,14 @@ impl PrefixProbe {
         self.gpu_hit
     }
 
+    /// Total blocks this probe holds: the GPU-hit prefix plus any committed from
+    /// a CPU-tier load. They are already out of the free pool and become the
+    /// request's cached prefix at prefill, so admission credits them against the
+    /// request's block need (avoiding a double-count against `available_blocks`).
+    pub fn held_blocks(&self) -> usize {
+        self.held.len()
+    }
+
     /// Content hashes to query the CPU tier with: the blocks past the GPU hit,
     /// capped at the reuse boundary. Empty when the GPU hit already covers
     /// every reusable block (nothing to load — prefill normally).

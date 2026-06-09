@@ -84,14 +84,16 @@ pub(crate) fn start_qwen3(
     device_ordinals: &[usize],
     seed: u64,
     offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
-    let executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
         enable_cuda_graph,
         device_ordinals,
         Qwen3LoraOptions::default(),
         offload_options,
     )?;
+    executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor(executor, seed))
 }
 
@@ -298,6 +300,7 @@ fn scheduler_loop<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -420,6 +423,7 @@ fn scheduler_loop_with_lora_control<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
@@ -629,6 +633,11 @@ fn admit_deferred_requests(
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
+    // Blocks a request already holds from a settled prefetch. These are already
+    // out of `available_blocks`, so they must be credited against the request's
+    // need or admission double-counts them and can wedge a near-budget CPU-hit
+    // request forever (never admitted, prefetch never released).
+    prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> AdmissionOutcome {
     let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
     let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
@@ -648,14 +657,19 @@ fn admit_deferred_requests(
             continue;
         }
 
-        let max_needed = blocks_needed(max_request_tokens(&req), block_size);
-        if max_needed > max_request_blocks {
+        // Full physical footprint gates the per-request cap (a request occupies
+        // all of it, prefetched or not)…
+        let footprint = blocks_needed(max_request_tokens(&req), block_size);
+        if footprint > max_request_blocks {
             rejected.push((req, RejectReason::KvBudget));
             continue;
         }
 
-        if max_needed <= budget && decode_slots > 0 {
-            budget -= max_needed;
+        // …but only the blocks not already held by this request's prefetch must
+        // come from the free-pool budget.
+        let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
+        if fresh_needed <= budget && decode_slots > 0 {
+            budget -= fresh_needed;
             decode_slots -= 1;
             pending.push(req);
         } else {
@@ -1125,7 +1139,7 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64, |_| 0);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1164,7 +1178,7 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64, |_| 0);
 
         let pending_ids = outcome
             .pending
@@ -1210,8 +1224,16 @@ mod tests {
         }
         let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
 
-        let outcome =
-            admit_deferred_requests(vec![pending], &active, 16, 1024, 1024, usize::MAX, 64);
+        let outcome = admit_deferred_requests(
+            vec![pending],
+            &active,
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            |_| 0,
+        );
 
         assert!(
             outcome.pending.is_empty(),

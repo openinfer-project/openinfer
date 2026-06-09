@@ -478,6 +478,15 @@ pub(crate) trait ModelExecutor: Send {
     fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
         Vec::new()
     }
+
+    /// Blocks `request_id` already holds via a settled prefetch (its restored
+    /// prefix). These were taken out of the free pool for this request and
+    /// become its cached prefill prefix, so admission credits them against the
+    /// request's block need to avoid double-counting. Zero unless a prefetch
+    /// has committed for `request_id`.
+    fn prefetched_blocks(&self, _request_id: RequestId) -> usize {
+        0
+    }
 }
 
 struct Qwen3ExecutorMetadata {
@@ -505,6 +514,14 @@ pub struct Qwen3Executor {
     /// In-flight CPU→GPU prefetches keyed by request, parked until their load
     /// settles and the blocks register into the prefix cache.
     prefetch: HashMap<RequestId, PrefetchState>,
+    /// Offload pure-L2 mode. When set, completed blocks are not kept for
+    /// cross-request HBM reuse: the prefetch probe drains the inactive pool
+    /// first, so every probe sees `gpu_hit == 0` and the whole cacheable prefix
+    /// is restored from the host tier. This is what `--no-prefix-cache` means
+    /// once offload is on (the L2 restore still rides on `match_and_add_prefix`,
+    /// so prefix matching itself stays enabled). Set via
+    /// [`Self::set_no_prefix_cache`].
+    l1_retention_disabled: bool,
 }
 
 /// One request's in-flight CPU-tier KV prefetch.
@@ -558,6 +575,7 @@ impl Qwen3Executor {
             offload,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
+            l1_retention_disabled: false,
         })
     }
 
@@ -706,6 +724,7 @@ impl Qwen3Executor {
             offload: None,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
+            l1_retention_disabled: false,
         })
     }
 
@@ -746,6 +765,27 @@ impl Qwen3Executor {
     /// drifts logits by bf16 ULPs).
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
         self.prefix_cache_enabled = enabled;
+    }
+
+    /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
+    /// active:
+    ///   * **No offload** — classic: disable prefix matching outright, so every
+    ///     prefill recomputes the full prompt.
+    ///   * **With offload** — pure-L2 mode: keep matching on (the host-tier
+    ///     restore registers blocks and relies on `match_and_add_prefix` to pick
+    ///     them up) but stop retaining completed blocks in HBM, so no request
+    ///     ever serves its prefix from a cross-request L1 hit. Every reuse then
+    ///     comes from the host tier, which is the point of the L2 benchmark.
+    ///
+    /// A resident HBM block and its host-tier copy share one content hash, so
+    /// the cache cannot be told to prefer L2 for a block still in HBM — the only
+    /// way to force the bytes from L2 is to not keep the HBM copy around.
+    pub fn set_no_prefix_cache(&mut self, on: bool) {
+        if self.offload.is_some() {
+            self.l1_retention_disabled = on;
+        } else {
+            self.prefix_cache_enabled = !on;
+        }
     }
 
     /// Whether KV offload is active on this executor.
@@ -976,12 +1016,30 @@ impl ModelExecutor for Qwen3Executor {
         self.metadata.stop_token_ids.contains(&token_id)
     }
 
+    fn prefetched_blocks(&self, request_id: RequestId) -> usize {
+        self.prefetch
+            .get(&request_id)
+            .map(|st| st.probe.held_blocks())
+            .unwrap_or(0)
+    }
+
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         // Remove and drop — RAII on SchedulableSequence's block guards
         // returns all allocated blocks regardless of lifecycle state. The same
         // RAII frees any parked prefetch's reserved/held blocks.
         self.request_kvs.remove(&request_id);
-        self.prefetch.remove(&request_id);
+        // A parked prefetch may still have a load in flight: pegaflow's worker
+        // is writing the reserved GPU blocks (H2D). Dropping the reservation now
+        // frees those physical pages for immediate reuse while the DMA keeps
+        // landing on them — silent KV corruption, the load-side mirror of the
+        // SAVE keep-alive pin. Block until the copy finishes before the
+        // reservation drops. The scheduler is a dedicated synchronous thread, so
+        // this brief wait costs nothing it could spend elsewhere.
+        if let Some(mut state) = self.prefetch.remove(&request_id) {
+            if let Some(handle) = state.handle.take() {
+                let _ = handle.wait();
+            }
+        }
         self.saved_cursor.remove(&request_id);
         Ok(())
     }
@@ -997,6 +1055,14 @@ impl ModelExecutor for Qwen3Executor {
         };
         if !self.prefix_cache_enabled {
             return false;
+        }
+        if self.l1_retention_disabled {
+            // Pure-L2 mode: drop any cross-request HBM retention so the probe
+            // sees gpu_hit == 0 and queries the whole cacheable prefix from the
+            // host tier. Only inactive (completed, unheld) blocks are drained —
+            // the current request holds nothing yet, and in-flight prefetches
+            // keep their reserved blocks, so this never touches live KV.
+            self.kv_mgr.pool().evict_inactive();
         }
         let probe = self
             .kv_mgr
