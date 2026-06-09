@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 serde = { workspace = true }
+tvm-ffi = { version = "0.1.0-alpha.0", optional = true }
 
 [build-dependencies]
 cc = { workspace = true }
@@ -17,6 +18,7 @@ default = []
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
 kimi-k2 = []
+tvm-ffi-interop = ["dep:tvm-ffi"]
 
 [lints]
 workspace = true
