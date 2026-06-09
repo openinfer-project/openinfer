@@ -138,16 +138,23 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    start_engine_with_offload(model_path, options, Qwen3OffloadOptions::disabled())
+    start_engine_with_offload(model_path, options, Qwen3OffloadOptions::disabled(), false)
 }
 
 /// Like [`start_engine`] but with pegaflow KV offload (single-GPU only). The
 /// host tier persists sealed KV blocks and serves CPU-resident prefixes back
 /// into HBM before prefill.
+///
+/// `no_prefix_cache` is the vLLM-style switch (see
+/// [`Qwen3Executor::set_no_prefix_cache`](runtime::Qwen3Executor::set_no_prefix_cache)):
+/// without offload it disables prefix matching outright; with offload it keeps
+/// the host tier but stops cross-request HBM reuse, so every prefix is served
+/// from L2 — the pure-L2 benchmark mode.
 pub fn start_engine_with_offload(
     model_path: &Path,
     options: EngineLoadOptions,
     offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -164,6 +171,7 @@ pub fn start_engine_with_offload(
         &device_ordinals,
         seed,
         offload_options,
+        no_prefix_cache,
     )
 }
 

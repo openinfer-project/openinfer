@@ -10,7 +10,7 @@ use pegainfer::vllm_frontend::LoraModule;
 use pegainfer_core::engine::{EngineLoadOptions, EpBackend};
 #[cfg(feature = "kimi-k2")]
 use pegainfer_core::parallel::ParallelConfig;
-use pegainfer_qwen3_4b::Qwen3LoraOptions;
+use pegainfer_qwen3_4b::{Qwen3LoraOptions, Qwen3OffloadOptions};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -74,6 +74,25 @@ struct Args {
     /// Emit synchronized DeepSeek V4 prefill phase timing records.
     #[arg(long, default_value_t = false)]
     deepseek_prefill_profile: bool,
+
+    /// Enable pegaflow KV offload (host-tier "L2" cache) on the single-GPU
+    /// Qwen3 path. Sealed KV blocks are saved to host pinned memory and
+    /// restored into HBM before prefill when a prompt's prefix has fallen out
+    /// of the GPU cache.
+    #[arg(long, default_value_t = false)]
+    kv_offload: bool,
+
+    /// Host pinned-memory pool size for the KV offload tier, in GiB. pegaflow
+    /// allocates the whole pool up front, so RSS reflects this at startup.
+    #[arg(long, default_value_t = 8.0)]
+    kv_offload_host_gib: f64,
+
+    /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
+    /// matching outright (every prefill recomputes the full prompt). With
+    /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every
+    /// prefix is restored from the host tier — for measuring the L2 TTFT win.
+    #[arg(long, default_value_t = false)]
+    no_prefix_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -225,7 +244,22 @@ async fn main() -> anyhow::Result<()> {
                     lora_options,
                 )
             } else {
-                pegainfer_qwen3_4b::start_engine(&args.model_path, options)
+                let offload = if args.kv_offload {
+                    let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
+                    info!(
+                        "Qwen3 KV offload enabled: host tier {:.1} GiB, no_prefix_cache={}",
+                        args.kv_offload_host_gib, args.no_prefix_cache
+                    );
+                    Qwen3OffloadOptions::enabled(bytes)
+                } else {
+                    Qwen3OffloadOptions::disabled()
+                };
+                pegainfer_qwen3_4b::start_engine_with_offload(
+                    &args.model_path,
+                    options,
+                    offload,
+                    args.no_prefix_cache,
+                )
             }
             .context("failed to start Qwen3 engine")?;
 
