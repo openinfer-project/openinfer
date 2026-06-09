@@ -10,6 +10,7 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 
 - **Model-owned kernel plans.** Qwen3 already carries a light `kernel_plan` mapping prefill/decode/unified phases → Rust wrappers, FFI symbols, and CUDA/Triton/cuBLAS backends. Extend the same shape to Qwen3.5 and DeepSeek V4 so each model crate is self-describing.
 - **Frontend polish.** `vllm-frontend-rs` is the default OpenAI surface, talking to openinfer via a local engine-core IPC bridge. Outstanding: logprobs / prompt-logprobs translation, usage accounting, and a deliberate decision on whether the served-model-id should decouple from the tokenizer path.
+- **KV data plane (pegaflow).** First concrete tier landed: `openinfer-kv-offload::OffloadEngine` wraps in-process `pegaflow-core` as a host-tier ("L2") KV backend (mechanism), with per-model schedulers owning the residency policy (no universal connector trait — policy/mechanism split per `direction.md`). Shipped on Qwen3-4B full-attn (#316). Next candidate: Kimi-K2 MLA (layout zero-impedance, reuses the same connector pattern). SSD/RDMA tiers and DeepSeek sparse remain unrealized scope. See `subsystems/runtime/pegaflow-offload-integration.md`.
 
 ### Next
 
@@ -56,7 +57,7 @@ Each model crate owns its own scheduler, kernels, accuracy story, and benchmarks
 
 **Goal:** stay ahead of vLLM on serving experience while expanding the parallel-strategy and scheduling surface.
 
-**Done:** single-request and continuous batching ahead of vLLM (decode TPOT wins at all concurrencies; QPS=2 within 2% throughput while leading TTFT, TPOT, and latency stability). TP=2 brought up end-to-end on one machine; TP=8 smoke-tested on 8×4090. Issue #85 KV-pressure hang at QPS=2 is fixed.
+**Done:** single-request and continuous batching ahead of vLLM (decode TPOT wins at all concurrencies; QPS=2 within 2% throughput while leading TTFT, TPOT, and latency stability). TP=2 brought up end-to-end on one machine; TP=8 smoke-tested on 8×4090. Issue #85 KV-pressure hang at QPS=2 is fixed. Batched greedy decode sampling landed (#307 — one `argmax_batch_bf16_into` launch per step, not O(batch)). **In-process pegaflow KV offload shipped (#316)** — host-tier "L2" save/restore wired into executor + scheduler, server CLI (`--kv-offload` / `--kv-offload-host-gib` / `--no-prefix-cache`) on both plain and LoRA paths; pure-L2 TTFT 195→40 ms measured. See `subsystems/runtime/pegaflow-offload-integration.md`.
 
 **Next:**
 - Explore pipeline parallelism (PP) as a complement to TP — particularly for larger model fits and multi-node layouts.

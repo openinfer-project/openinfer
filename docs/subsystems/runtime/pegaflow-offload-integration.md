@@ -1,6 +1,6 @@
 # pegaflow KV 卸载接入 Spec
 
-> **TL;DR**: 把 `pegaflow-core` 当**进程内 Rust 库**做 KV 卸载的物理后端（HBM→DRAM/SSD/RDMA），补上 kvbm 留着没写的卸载层。connector 大脑（决定 load/save 哪些 block）用 kvbm logical/physical 分层思想自建，pegaflow 退为语义无关的 raw block transfer 后端。**路线已调整为 Qwen3-4B full-attn 首发**（原计划 Kimi 首发）：page-first 单 buffer 经 pegaflow `block_stride_bytes`（PR #331）适配。**端到端已在真实 GPU 上跑通并验证**：async SAVE + async LOAD 接进 `Qwen3Executor` + scheduler，`tests/kv_offload_cpu_hit.rs` 覆盖纯 CPU-hit 与 GPU+CPU 组合 hit，恢复后 logits 与冷算一致；连接层 `OffloadEngine` + `tests/cpu_roundtrip.rs` 字节级一致。默认关（builder flag opt-in），未接 server CLI。**Qwen3.5 linear/SSM state 明确排除**；**DeepSeek sparse 暂缓**。
+> **TL;DR**: 把 `pegaflow-core` 当**进程内 Rust 库**做 KV 卸载的物理后端（HBM→DRAM/SSD/RDMA），补上 kvbm 留着没写的卸载层。connector 大脑（决定 load/save 哪些 block）用 kvbm logical/physical 分层思想自建，pegaflow 退为语义无关的 raw block transfer 后端。**路线已调整为 Qwen3-4B full-attn 首发**（原计划 Kimi 首发）：page-first 单 buffer 经 pegaflow `block_stride_bytes`（PR #331）适配。**端到端已在真实 GPU 上跑通并验证**：async SAVE + async LOAD 接进 `Qwen3Executor` + scheduler，`tests/kv_offload_cpu_hit.rs` 覆盖纯 CPU-hit 与 GPU+CPU 组合 hit，恢复后 logits 与冷算一致；连接层 `OffloadEngine` + `tests/cpu_roundtrip.rs` 字节级一致。默认关（builder flag opt-in）；**server CLI 已接**（#316：`--kv-offload` / `--kv-offload-host-gib` / `--no-prefix-cache`，plain 与 `--enable-lora` 两条启动路径都透传）。纯-L2 基准实测 Qwen3-4B mean TTFT 195→40ms（−79%，evict-before-probe → `gpu_hit=0`，全前缀从 host tier 恢复）。**Qwen3.5 linear/SSM state 明确排除**；**DeepSeek sparse 暂缓**。
 >
 > Last touched: 2026-06
 
@@ -17,7 +17,7 @@
 - **live 接线（§9，已落地）**：`Qwen3Executor` 持 `Option<OffloadEngine>`（`Qwen3OffloadOptions` opt-in，默认关）；SAVE hook（`save_sealed_blocks`，async fire-and-forget）+ 非阻塞 prefetch admission（`begin_kv_prefetch`/`drain_ready_prefetch`/`wait_ready_prefetch`，scheduler `loading` 态）。`tests/kv_offload_cpu_hit.rs` 单测序跑两幕——纯 CPU restore（`gpu_hit==0`）与 GPU+CPU 组合 hit（G=3+C=3 拼成一段连续前缀）——恢复后 first-token logits 与冷算一致（mean Δ≈0.03 nat，bf16 floor）。
 - **三处正确性加固**（toxic-review 后）：① query lease 在 `reserve_loaded_blocks` 失败 / `load` 提交失败时显式 `release_query_lease`，不再泄漏到 600s TTL；② admission 拒绝（context/KV budget/未知 LoRA）时 `drop_request` 释放已 settle 的 prefetch 状态，不再泄漏已 commit 的 block；③ async SAVE 把被保存 block 的 `ImmutableBlock` 强引用（`KvBlockGuard`）随 spawn 持到 D2H 落地才 drop——封死"请求结束→slot 重分配→D2H 抓到错 KV 写进旧 hash"的静默腐蚀窗口。
 
-未接 server CLI（仅经 `start_engine_with_offload` / 测试入口）。**依赖已从 fork 摘除**：PR #331+#333 均合入上游 master（squash 进 `07cac7e`），`third_party/pegaflow` 已删，`pegaflow-core` 改为 pin 到该 rev 的 **git 依赖**（见 §5.2），GPU 测试在 git-dep 下行为不变（delta 一致）。
+**server CLI 已接（#316）**：`--kv-offload`（bool）/ `--kv-offload-host-gib`（f64，默认 8.0，pegaflow 启动即整块 `cudaHostAlloc`，RSS 立即反映）/ `--no-prefix-cache`（vLLM 风格；不带 offload = 关前缀匹配，带 offload = 纯-L2 模式，evict-before-probe 使每个前缀从 host tier 恢复）。plain 与 `--enable-lora` 两条路径都透传 `offload_options` + `no_prefix_cache`；LoRA 下安全，因前缀 block hash 以 adapter 名加 salt（`compute_salt_hash`），恢复的 KV（HBM 或 host tier）永不跨 adapter。三处 #316 review 加固：echo 请求不 offer prefetch（其 prefill 跳过 `match_and_add_prefix`，prefetch 块用不上）、admission 按 `prefetched_blocks` 抵扣已 settle 前缀块、`drop_request` 等在途 H2D 落地再放 reservation。**依赖已从 fork 摘除**：PR #331+#333 均合入上游 master（squash 进 `07cac7e`），`third_party/pegaflow` 已删，`pegaflow-core` 改为 pin 到该 rev 的 **git 依赖**（见 §5.2），GPU 测试在 git-dep 下行为不变（delta 一致）。
 
 相关：[kv-cache-design.md](kv-cache-design.md)（logical/physical 分层，已把 pegaflow 列为设计调研）· [qwen3-kvbm-integration-spec.md](qwen3-kvbm-integration-spec.md)（kvbm-logical 已接入）· `models/kimi-k2/kv-cache-design.md`（Kimi 已用 `BlockPool`）· `models/qwen3/prefix-cache.md`（HBM 内前缀复用已落地）。
 
@@ -45,8 +45,8 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 
 | 模型 | KV 形态 | active set | 跨请求复用 | 卸载结论 |
 | --- | --- | --- | --- | --- |
-| **Kimi-K2 MLA** | paged，per-layer ckv/kpe arena，后端是 `BlockPool`；latent 68.6 KiB/token，无 per-head | 无（dense 全前缀） | 有（HBM 内 prefix cache 已落地） | **首发**：接入面最干净，layout 直接适配 pegaflow registration |
-| **Qwen3 / Qwen3.5 full-attn** | paged，page-first 单 buffer，`PagePool` | 无（dense 全前缀） | 有（前缀缓存已落地） | **次发**：page-first 与 pegaflow `stride==copy-size` ABI 冲突，需加 `block_stride`（见 §5.R1） |
+| **Qwen3 / Qwen3.5 full-attn** | paged，page-first 单 buffer，`PagePool` | 无（dense 全前缀） | 有（前缀缓存已落地） | **已首发（#316）**：page-first 与 pegaflow `stride==copy-size` ABI 冲突已由 `block_stride`（§5.R1）解掉，端到端跑通 |
+| **Kimi-K2 MLA** | paged，per-layer ckv/kpe arena，后端是 `BlockPool`；latent 68.6 KiB/token，无 per-head | 无（dense 全前缀） | 有（HBM 内 prefix cache 已落地） | **下一候选**：layout 直接适配 pegaflow registration（接入面最干净），复用 Qwen3-4B 这套 connector 模式即可 |
 | **Qwen3.5 linear（24 层）** | per-request `RecurrentState` [32,128,128] f32 2 MiB/层，非 paged、独立分配 | 无（每步读写整个 matrix） | **零**（this-request 有损摘要，非 content-addressable） | **排除**：offload 无 prefix/dedup 收益；省显存是 per-request swap-out，另一套机制 |
 | **DeepSeek-V4 sparse** | per-request per-layer dense arena [window\|compressed]，非 paged；compressor 4:1 | **显式**：`topk_idxs` = window 行 + indexer 选中 compressed 行，token/row 粒度，每步重选 | 部分 | **暂缓**：compressor 已控 footprint；indexer 信号现成但 token 粒度 ≠ block 粒度（见 §7） |
 
@@ -56,8 +56,8 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 
 ## 4. 路线
 
-1. **Kimi MLA 首发** —— pegaflow 做 `BlockPool` 下的 host/SSD tier；block evict 时 demote 到 host，前缀 query 命中时从 host restore。带宽便宜（latent 小），layout 零阻抗。
-2. **Qwen full-attn 次发** —— 先给 pegaflow 加 `block_stride_bytes`（R1），再接 page-first buffer。
+1. **Qwen full-attn 已首发（#316）** —— 给 pegaflow 加了 `block_stride_bytes`（R1）解掉 page-first ABI 冲突，async SAVE + 非阻塞 prefetch admission 接进 `Qwen3Executor` + scheduler，server CLI 已接。
+2. **Kimi MLA 下一候选** —— pegaflow 做 `BlockPool` 下的 host/SSD tier；block evict 时 demote 到 host，前缀 query 命中时从 host restore。带宽便宜（latent 小），layout 零阻抗，直接复用 Qwen3-4B 的 connector 模式。
 3. **linear 排除、sparse 暂缓**。
 
 ## 5. 可行性（对抗验证结论，附证据）
