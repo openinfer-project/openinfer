@@ -1,0 +1,27 @@
+[package]
+name = "openinfer-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openinfer-engine = { workspace = true }
+openinfer-kernels = { workspace = true }
+anyhow = { workspace = true }
+colored = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[features]
+default = []
+kernel-call-trace = []
+
+[lints]
+workspace = true

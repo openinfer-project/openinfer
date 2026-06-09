@@ -148,7 +148,7 @@ def classify(pairs: dict[str, dict[str, Any]]) -> str:
         return "all_token_text_exact"
     if not host_nccl_exact:
         return "nccl_transport_regression"
-    return "pegainfer_baseline_accuracy_gap"
+    return "openinfer_baseline_accuracy_gap"
 
 
 def short(text: str, width: int = 72) -> str:
@@ -253,8 +253,8 @@ def context_warnings(hf: Output, host: Output, nccl: Output) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf", required=True, help="HF JSON output")
-    parser.add_argument("--host-staged", required=True, help="host-staged pegainfer JSON output")
-    parser.add_argument("--nccl", required=True, help="NCCL pegainfer JSON output")
+    parser.add_argument("--host-staged", required=True, help="host-staged openinfer JSON output")
+    parser.add_argument("--nccl", required=True, help="NCCL openinfer JSON output")
     parser.add_argument("--out", help="Optional path for structured comparison JSON")
     parser.add_argument(
         "--require-all-exact",

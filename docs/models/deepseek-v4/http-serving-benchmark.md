@@ -34,21 +34,21 @@ requests:
 Build the server on the target GPU host:
 
 ```bash
-cd /path/to/pegainfer
+cd /path/to/openinfer
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-13.1
-export PEGAINFER_TILELANG_PYTHON=/path/to/venv/bin/python
-export PEGAINFER_TRITON_PYTHON=/path/to/venv/bin/python
-export PEGAINFER_NVCC_JOBS=8
-export CARGO_TARGET_DIR=/path/to/pegainfer-target
+export OPENINFER_TILELANG_PYTHON=/path/to/venv/bin/python
+export OPENINFER_TRITON_PYTHON=/path/to/venv/bin/python
+export OPENINFER_NVCC_JOBS=8
+export CARGO_TARGET_DIR=/path/to/openinfer-target
 
-cargo build --release -p pegainfer-server --features deepseek-v4 --bin pegainfer
+cargo build --release -p openinfer-server --features deepseek-v4 --bin openinfer
 ```
 
 Start the OpenAI-compatible HTTP endpoint:
 
 ```bash
-$CARGO_TARGET_DIR/release/pegainfer \
+$CARGO_TARGET_DIR/release/openinfer \
   --model-path $MODEL_DIR \
   --port 18118 2>&1 | tee $RESULT_ROOT/dsv4_http_server.log
 ```
@@ -56,7 +56,7 @@ $CARGO_TARGET_DIR/release/pegainfer \
 For prefill phase attribution, start the endpoint with profiling enabled:
 
 ```bash
-$CARGO_TARGET_DIR/release/pegainfer \
+$CARGO_TARGET_DIR/release/openinfer \
   --model-path $MODEL_DIR \
   --port 18118 \
   --deepseek-prefill-profile 2>&1 | tee $RESULT_ROOT/dsv4_http_server_profile.log
@@ -125,8 +125,8 @@ The script is intentionally model-server agnostic at the HTTP layer. It only
 requires an OpenAI-compatible `/v1/completions` endpoint that supports streaming
 responses.
 
-The server trace columns are pegainfer-specific and require a pegainfer server
-log containing `pegainfer_http_trace` lines. The sweep fails when any cell has
+The server trace columns are openinfer-specific and require a openinfer server
+log containing `openinfer_http_trace` lines. The sweep fails when any cell has
 request failures/timeouts or per-request output hashes that change across
 repeats.
 
@@ -357,7 +357,7 @@ top-k as the largest remaining indexer-side bucket:
 The equivalence gate is a GPU test against the current selector semantics:
 
 ```bash
-cargo test --release -p pegainfer-kernels \
+cargo test --release -p openinfer-kernels \
   --features deepseek-v4 \
   --test deepseek_indexer_topk -- --ignored --nocapture
 ```

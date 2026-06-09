@@ -1,0 +1,4 @@
+[package]
+edition = "2024"
+name = "openinfer-comm-build-utils"
+publish = false

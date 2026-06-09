@@ -3,18 +3,18 @@
 **Created**: 2026-05-16
 **Status**: ready for PR review
 **Last touched**: 2026-05
-**TL;DR**: `pegainfer-sim` is a CPU-only simulated model crate that serves through the existing vLLM/OpenAI frontend with configurable TTFT/TPOT and lightweight HTTP e2e coverage. It is a benchmark and frontend validation harness, not a real-model performance path.
+**TL;DR**: `openinfer-sim` is a CPU-only simulated model crate that serves through the existing vLLM/OpenAI frontend with configurable TTFT/TPOT and lightweight HTTP e2e coverage. It is a benchmark and frontend validation harness, not a real-model performance path.
 
 ## Scope
 
-Issue #125 needs a server path that can run `vllm bench serve` without GPU or model weights while still exercising the same HTTP frontend used by real pegainfer models.
+Issue #125 needs a server path that can run `vllm bench serve` without GPU or model weights while still exercising the same HTTP frontend used by real openinfer models.
 
 This PR keeps that boundary narrow:
 
-- Add `pegainfer-engine` for the lightweight `EngineHandle`, `GenerateRequest`, `TokenEvent`, and `SamplingParams` contract.
-- Re-export that contract from `pegainfer-core` so existing model crates keep their current imports.
-- Move the vLLM bridge into `pegainfer-vllm-frontend`, leaving `pegainfer-server/src/vllm_frontend.rs` as a compatibility re-export.
-- Add `pegainfer-sim` as an independently maintained model crate with a thin CLI binary.
+- Add `openinfer-engine` for the lightweight `EngineHandle`, `GenerateRequest`, `TokenEvent`, and `SamplingParams` contract.
+- Re-export that contract from `openinfer-core` so existing model crates keep their current imports.
+- Move the vLLM bridge into `openinfer-vllm-frontend`, leaving `openinfer-server/src/vllm_frontend.rs` as a compatibility re-export.
+- Add `openinfer-sim` as an independently maintained model crate with a thin CLI binary.
 
 Out of scope:
 
@@ -24,7 +24,7 @@ Out of scope:
 
 ## Behavior
 
-`pegainfer-sim` exposes CLI knobs for model id, port, max model length, base TTFT, prefill throughput, TPOT, and fallback token id.
+`openinfer-sim` exposes CLI knobs for model id, port, max model length, base TTFT, prefill throughput, TPOT, and fallback token id.
 
 The timing model is intentionally simple: TTFT is `base_ttft_ms + prompt_len / prefill_tokens_per_ms`, and TPOT is a fixed delay between generated tokens. Output token ids cycle through the prompt tokens, using the fallback id for empty prompts.
 
@@ -32,7 +32,7 @@ The frontend still needs tokenizer/model metadata, but the simulator never loads
 
 ## Frontend Metadata Contract
 
-`pegainfer-sim` does not load model weights, but serving it through the
+`openinfer-sim` does not load model weights, but serving it through the
 vLLM/OpenAI frontend still constructs the normal text/chat backend. That
 frontend path requires enough local model metadata to initialize tokenization
 and detokenization.
@@ -45,9 +45,9 @@ metadata, but no weight files are required.
 
 ## Implementation Details
 
-- `pegainfer-engine` owns the shared engine contract, while `pegainfer-core` only re-exports it for existing model crates.
-- `pegainfer-vllm-frontend` owns the bridge logic; `pegainfer-server/src/vllm_frontend.rs` stays as a compatibility re-export.
-- `pegainfer-sim` is kept as a separate model crate so future simulation changes do not have to live inside the real model crates.
+- `openinfer-engine` owns the shared engine contract, while `openinfer-core` only re-exports it for existing model crates.
+- `openinfer-vllm-frontend` owns the bridge logic; `openinfer-server/src/vllm_frontend.rs` stays as a compatibility re-export.
+- `openinfer-sim` is kept as a separate model crate so future simulation changes do not have to live inside the real model crates.
 
 ## Future Plans
 

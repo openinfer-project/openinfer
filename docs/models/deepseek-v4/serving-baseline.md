@@ -19,7 +19,7 @@ Use this document as the baseline contract before changing the DeepSeek V4 sched
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
-| DeepSeek V4 engine load behind the OpenAI HTTP facade | Available for smoke testing | `pegainfer-server --features deepseek-v4 --bin pegainfer` starts an OpenAI server for `$MODEL_DIR` on 8x RTX 5090 |
+| DeepSeek V4 engine load behind the OpenAI HTTP facade | Available for smoke testing | `openinfer-server --features deepseek-v4 --bin openinfer` starts an OpenAI server for `$MODEL_DIR` on 8x RTX 5090 |
 | `/v1/models` | Available | The returned model id is the full model path: `$MODEL_DIR` |
 | `/v1/completions` single-request greedy smoke | Available | Prompt `hello`, `max_tokens=4`, `temperature=0` returned a text completion and usage accounting |
 | Direct single-request TPOT/hash regression | Available | `bench_serving request --prompt-len 1 --output-len 160 --warmup 2 --iters 3 --seed 42` is the retained DeepSeek V4 decode gate |
@@ -34,21 +34,21 @@ Run these commands from any checkout at or after PR #101's merge commit `d6d2cee
 Build the HTTP server on the 5090 host:
 
 ```bash
-cd /path/to/pegainfer
+cd /path/to/openinfer
 export PATH=/usr/local/cuda-13.1/bin:$PWD/.venv/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-13.1
-export PEGAINFER_TILELANG_PYTHON=$PWD/.venv/bin/python
-export PEGAINFER_TRITON_PYTHON=$PWD/.venv/bin/python
-export PEGAINFER_NVCC_JOBS=8
-export CARGO_TARGET_DIR=/path/to/pegainfer-target
+export OPENINFER_TILELANG_PYTHON=$PWD/.venv/bin/python
+export OPENINFER_TRITON_PYTHON=$PWD/.venv/bin/python
+export OPENINFER_NVCC_JOBS=8
+export CARGO_TARGET_DIR=/path/to/openinfer-target
 
-cargo build --release -p pegainfer-server --features deepseek-v4 --bin pegainfer
+cargo build --release -p openinfer-server --features deepseek-v4 --bin openinfer
 ```
 
 Start the HTTP endpoint:
 
 ```bash
-$CARGO_TARGET_DIR/release/pegainfer \
+$CARGO_TARGET_DIR/release/openinfer \
   --model-path $MODEL_DIR \
   --port 18103
 ```
@@ -102,7 +102,7 @@ Observed smoke result:
 Run the direct single-request decode regression gate:
 
 ```bash
-cargo run --release -p pegainfer-server \
+cargo run --release -p openinfer-server \
   --bin bench_serving \
   --features deepseek-v4 \
   -- \

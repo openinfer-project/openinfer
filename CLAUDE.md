@@ -1,6 +1,6 @@
 This file provides guidance to Coding Agent when working with code in this repository.
 
-## What is pegainfer
+## What is openinfer
 
 Pure Rust + CUDA LLM inference engine (~83K Rust, ~11K CUDA). No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` API.
 
@@ -8,11 +8,11 @@ Pure Rust + CUDA LLM inference engine (~83K Rust, ~11K CUDA). No PyTorch, no fra
 
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
-| Qwen3-4B / 8B | `pegainfer-qwen3-4b` | always built | Full attention, TP support |
-| Qwen3.5-4B | `pegainfer-qwen35-4b` | always built | 24 linear + 8 full attention |
-| DeepSeek-V4 | `pegainfer-deepseek-v4` | `--features deepseek-v4` | MoE + compressor + indexer, 8-GPU |
-| DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
-| Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
+| Qwen3-4B / 8B | `openinfer-qwen3-4b` | always built | Full attention, TP support |
+| Qwen3.5-4B | `openinfer-qwen35-4b` | always built | 24 linear + 8 full attention |
+| DeepSeek-V4 | `openinfer-deepseek-v4` | `--features deepseek-v4` | MoE + compressor + indexer, 8-GPU |
+| DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
+| Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 
 ## Build & Run
 
@@ -28,11 +28,11 @@ cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
 ```
 
 **Key env vars:**
-- `PEGAINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
-- `PEGAINFER_TRITON_PYTHON` — Python with Triton for build-time AOT kernel generation
-- `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
-- `PEGAINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
-- `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
+- `OPENINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
+- `OPENINFER_TRITON_PYTHON` — Python with Triton for build-time AOT kernel generation
+- `OPENINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
+- `OPENINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
+- `OPENINFER_NVCC_JOBS` — override parallel nvcc job count
 
 ## Tests
 
@@ -41,9 +41,9 @@ cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
 cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test hf_golden_gate
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test hf_golden_gate
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler
+OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test e2e_scheduler
 
 # Single test
 cargo test --release embedding_variants -- --nocapture
@@ -58,13 +58,13 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
                                                │
               ┌──────────────┬─────────────────┼─────────────────┬──────────────┐
               │              │                 │                 │              │
-       pegainfer-     pegainfer-      pegainfer-       pegainfer-    pegainfer-
+       openinfer-     openinfer-      openinfer-       openinfer-    openinfer-
        qwen3-4b      qwen35-4b      deepseek-v4     deepseek-v2-   kimi-k2
      (full attn)   (linear+full)   (MoE+indexer)    lite (MoE+EP)  (MLA+MoE)
               │              │                 │                 │              │
               └──────────────┴─────────────────┼─────────────────┴──────────────┘
                                                │
-                         pegainfer-core runtime + pegainfer-kernels
+                         openinfer-core runtime + openinfer-kernels
                                                │
                               ┌────────────────┼────────────────┐
                               │                │                │
@@ -75,17 +75,17 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Key abstractions:**
 
-- **`pegainfer-core::engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates.
+- **`openinfer-core::engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates.
 - **Per-model crates** — each model owns config, weights, prefill/decode execution, scheduler, tests, and benches.
-- **`pegainfer-core::ops`** — shared GPU operator wrappers used by model crates.
-- **`pegainfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `deepseek_v4`).
-- **`pegainfer-comm`** — EP all-to-all communication (GDR, NCCL, IB verbs). Requires CUDA + RDMA hardware to compile.
+- **`openinfer-core::ops`** — shared GPU operator wrappers used by model crates.
+- **`openinfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `deepseek_v4`).
+- **`openinfer-comm`** — EP all-to-all communication (GDR, NCCL, IB verbs). Requires CUDA + RDMA hardware to compile.
 - **CUDA Graph** — decode path captured inside model executors with pre-allocated buffers to preserve pointer stability.
-- **KV state** — model schedulers own request state; shared paged-KV primitives live in `pegainfer-core`.
+- **KV state** — model schedulers own request state; shared paged-KV primitives live in `openinfer-core`.
 
-**Build system**: the virtual workspace root has no package build script. `pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
-1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py` for Qwen3.5 kernels
+**Build system**: the virtual workspace root has no package build script. `openinfer-kernels/build.rs` owns CUDA/Triton compilation:
+1. Compiles `openinfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
+2. Runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py` for Qwen3.5 kernels
 3. Feature-gated: `deepseek-v4` triggers TileLang + CuTe DSL codegen; `kimi-k2` adds MLA/MoE/Marlin CUDA
 
 ---

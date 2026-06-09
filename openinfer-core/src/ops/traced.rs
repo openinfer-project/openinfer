@@ -1,0 +1,215 @@
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+
+use crate::ops::call_spec::{
+    self, PagedDecodeCallSpec, embedding_batch_call, fused_add_rms_norm_batch_call, gemm_call,
+    gemm_rows_call, qk_norm_rope_batch_decode_call, rms_norm_batch_call, silu_mul_fused_batch_call,
+};
+use crate::ops::call_trace;
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use openinfer_kernels::tensor::{Hidden, InDim, OutDim};
+
+pub fn embedding_batch(
+    ctx: &DeviceContext,
+    embed: &DeviceMatrix,
+    token_ids_gpu: &CudaSlice<u32>,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("embedding_batch");
+        call_trace::record_call(embedding_batch_call(
+            label,
+            embed.rows,
+            embed.cols,
+            out.seq_len,
+        ));
+    }
+    openinfer_kernels::ops::embedding_batch(ctx, embed, token_ids_gpu, out)
+}
+
+pub fn rms_norm_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("rms_norm_batch");
+        call_trace::record_call(rms_norm_batch_call::<Hidden>(
+            label,
+            x.hidden_dim,
+            x.seq_len,
+            eps,
+        ));
+    }
+    openinfer_kernels::ops::rms_norm_batch_into(ctx, x, weight, eps, out);
+}
+
+pub fn gemm_rows_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    row_offset: usize,
+    num_rows: usize,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("gemm_rows");
+        call_trace::record_call(gemm_rows_call::<OutDim>(
+            label,
+            weight.rows,
+            weight.cols,
+            num_rows,
+            row_offset,
+            x.seq_len,
+        ));
+    }
+    openinfer_kernels::ops::gemm_rows_into(ctx, weight, row_offset, num_rows, x, out);
+}
+
+pub fn gemm_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("gemm");
+        call_trace::record_call(gemm_call::<OutDim, InDim>(
+            label,
+            weight.rows,
+            weight.cols,
+            x.seq_len,
+        ));
+    }
+    openinfer_kernels::ops::gemm_into(ctx, weight, x, out);
+}
+
+pub fn gemm_token_range_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    token_offset: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("gemm_token_range");
+        call_trace::record_call(gemm_call::<OutDim, InDim>(
+            label,
+            weight.rows,
+            weight.cols,
+            out.seq_len,
+        ));
+    }
+    openinfer_kernels::ops::gemm_token_range_into_checked(ctx, weight, x, token_offset, out)
+}
+
+pub fn qk_norm_rope_batch_decode_into(
+    ctx: &DeviceContext,
+    q: &mut HiddenStates,
+    k: &mut HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    positions_d: &CudaSlice<i32>,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rms_eps: f32,
+) {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("qk_norm_rope_batch_decode");
+        let rope_seq = cos_cache.len / head_dim;
+        call_trace::record_call(qk_norm_rope_batch_decode_call(
+            label,
+            q.hidden_dim,
+            k.hidden_dim,
+            q.seq_len,
+            rope_seq,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rms_eps,
+        ));
+    }
+    openinfer_kernels::ops::qk_norm_rope_batch_decode_into(
+        ctx,
+        q,
+        k,
+        q_norm_weight,
+        k_norm_weight,
+        cos_cache,
+        sin_cache,
+        positions_d,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rms_eps,
+    );
+}
+
+pub fn fused_add_rms_norm_batch_into(
+    ctx: &DeviceContext,
+    hidden: &mut HiddenStates,
+    residual: &HiddenStates,
+    weight: &DeviceVec,
+    eps: f32,
+    out: &mut HiddenStates,
+) {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("fused_add_rms_norm_batch");
+        call_trace::record_call(fused_add_rms_norm_batch_call::<Hidden>(
+            label,
+            hidden.hidden_dim,
+            hidden.seq_len,
+            eps,
+        ));
+    }
+    openinfer_kernels::ops::fused_add_rms_norm_batch_into(ctx, hidden, residual, weight, eps, out);
+}
+
+pub fn silu_mul_fused_batch_into(
+    ctx: &DeviceContext,
+    gate_up: &HiddenStates,
+    out: &mut HiddenStates,
+) {
+    if call_trace::is_enabled() {
+        let label = call_trace::current_label("silu_mul_fused_batch");
+        call_trace::record_call(silu_mul_fused_batch_call(
+            label,
+            out.hidden_dim,
+            gate_up.seq_len,
+        ));
+    }
+    openinfer_kernels::ops::silu_mul_fused_batch_into(ctx, gate_up, out);
+}
+
+pub(crate) fn paged_decode_call_spec(
+    label: String,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    kv_buffer_len: usize,
+    layout: &crate::kv_pool::KvLayout,
+    num_q_heads: usize,
+    batch_size: usize,
+    variant: &'static str,
+) -> openinfer_kernels::tensor::KernelCall {
+    call_spec::paged_decode_attention_call(
+        label,
+        PagedDecodeCallSpec {
+            batch_size,
+            total_pages: kv_buffer_len / layout.page_stride,
+            num_layers: layout.num_layers,
+            page_size: layout.page_size,
+            q_dim: q.hidden_dim,
+            kv_dim: k.hidden_dim,
+            num_q_heads,
+            num_kv_heads: layout.num_kv_heads,
+            head_dim: layout.head_dim,
+            kv_len: call_trace::decode_kv_len().unwrap_or(0),
+            variant,
+        },
+    )
+}

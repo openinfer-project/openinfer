@@ -140,7 +140,7 @@ class BenchHttpServingTests(unittest.TestCase):
             text_prefix="text",
         )
         line = (
-            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-1-generated",'
+            'INFO openinfer_http_trace {"request_id":"cmpl-bench-1-generated",'
             '"queued_at_unix_s":100.01,"scheduled_at_unix_s":100.03,'
             '"first_token_emit_unix_s":100.20,"prefill_ms":170.0,'
             '"first_decode_ms":28.0}\\n'
@@ -222,7 +222,7 @@ class BenchHttpServingTests(unittest.TestCase):
             text_prefix="text",
         )
         line = (
-            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-0-generated",'
+            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-generated",'
             '"completion_tokens":0}\\n'
         )
         with tempfile.TemporaryDirectory() as tmp:

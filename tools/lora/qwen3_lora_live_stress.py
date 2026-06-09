@@ -155,7 +155,7 @@ def wait_for_health(server_url: str, timeout_s: float, process: subprocess.Popen
 def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
     assert_port_available(args.port)
     env = os.environ.copy()
-    env.setdefault("PEGAINFER_CUDA_SM", "80")
+    env.setdefault("OPENINFER_CUDA_SM", "80")
     compat = "/usr/local/cuda-12.9/compat"
     if Path(compat).exists():
         old = env.get("LD_LIBRARY_PATH")
@@ -165,7 +165,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         "run",
         "--release",
         "-p",
-        "pegainfer-server",
+        "openinfer-server",
         "--",
         "--model-path",
         args.model_path,
@@ -180,7 +180,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         str(args.port),
     ]
     log = tempfile.NamedTemporaryFile(
-        prefix="pegainfer-qwen3-lora-stress-server-",
+        prefix="openinfer-qwen3-lora-stress-server-",
         suffix=".log",
         mode="w+",
         delete=False,
@@ -194,7 +194,7 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
         text=True,
         start_new_session=True,
     )
-    process.pegainfer_log_path = log.name  # type: ignore[attr-defined]
+    process.openinfer_log_path = log.name  # type: ignore[attr-defined]
     print(f"server_log={log.name}", file=sys.stderr)
     log.close()
     return process
@@ -223,7 +223,7 @@ def stop_server(process: subprocess.Popen | None) -> None:
 def tail_server_output(process: subprocess.Popen | None) -> str:
     if process is None:
         return ""
-    log_path = getattr(process, "pegainfer_log_path", None)
+    log_path = getattr(process, "openinfer_log_path", None)
     if not log_path:
         return ""
     with contextlib.suppress(Exception):
@@ -289,7 +289,7 @@ def main() -> int:
     server_url = args.server_url or f"http://127.0.0.1:{args.port}"
     process = None
 
-    with tempfile.TemporaryDirectory(prefix="pegainfer-qwen3-lora-stress-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="openinfer-qwen3-lora-stress-") as tmp:
         root = Path(tmp)
         adapters = {
             "stress-a": root / "stress-a",

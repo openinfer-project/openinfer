@@ -9,7 +9,7 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 ### In progress
 
 - **Model-owned kernel plans.** Qwen3 already carries a light `kernel_plan` mapping prefill/decode/unified phases → Rust wrappers, FFI symbols, and CUDA/Triton/cuBLAS backends. Extend the same shape to Qwen3.5 and DeepSeek V4 so each model crate is self-describing.
-- **Frontend polish.** `vllm-frontend-rs` is the default OpenAI surface, talking to pegainfer via a local engine-core IPC bridge. Outstanding: logprobs / prompt-logprobs translation, usage accounting, and a deliberate decision on whether the served-model-id should decouple from the tokenizer path.
+- **Frontend polish.** `vllm-frontend-rs` is the default OpenAI surface, talking to openinfer via a local engine-core IPC bridge. Outstanding: logprobs / prompt-logprobs translation, usage accounting, and a deliberate decision on whether the served-model-id should decouple from the tokenizer path.
 
 ### Next
 
@@ -23,7 +23,7 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 
 ## Models
 
-Each model crate owns its own scheduler, kernels, accuracy story, and benchmarks. The boundary with shared infrastructure is `pegainfer-core` (runtime contract) + `pegainfer-kernels` (op layer).
+Each model crate owns its own scheduler, kernels, accuracy story, and benchmarks. The boundary with shared infrastructure is `openinfer-core` (runtime contract) + `openinfer-kernels` (op layer).
 
 ### DeepSeek V4
 

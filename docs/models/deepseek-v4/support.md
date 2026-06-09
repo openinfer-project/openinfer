@@ -9,8 +9,8 @@ This document is the single project record for the initial DeepSeek V4 PR. It re
 
 The PR scope is:
 
-- add `pegainfer-deepseek-v4` as the model crate for the DeepSeek V4 Flash MP8 checkpoint;
-- wire DeepSeek V4 into `pegainfer-server` model detection and `bench_serving`;
+- add `openinfer-deepseek-v4` as the model crate for the DeepSeek V4 Flash MP8 checkpoint;
+- wire DeepSeek V4 into `openinfer-server` model detection and `bench_serving`;
 - build official-style DeepSeek V4 TileLang kernels at compile time;
 - keep runtime Python-free;
 - provide exact text, operator, and HTTP service validation;
@@ -23,7 +23,7 @@ DeepSeek V4 currently requires the `deepseek-v4` Cargo feature and TileLang at b
 
 The kernels build script probes:
 
-- `PEGAINFER_TILELANG_PYTHON`, if set;
+- `OPENINFER_TILELANG_PYTHON`, if set;
 - `../.venv/bin/python`;
 - `.venv/bin/python`;
 - `python3`;
@@ -40,28 +40,28 @@ Minimal setup:
 uv venv && source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 uv pip install "tilelang==0.1.9"
-export PEGAINFER_TILELANG_PYTHON=.venv/bin/python
+export OPENINFER_TILELANG_PYTHON=.venv/bin/python
 ```
 
-The generated CUDA is linked into `pegainfer-kernels` when the feature is enabled; Python is not needed at runtime.
+The generated CUDA is linked into `openinfer-kernels` when the feature is enabled; Python is not needed at runtime.
 
 ## Implementation Summary
 
 ### Model Crate
 
-`pegainfer-deepseek-v4` owns:
+`openinfer-deepseek-v4` owns:
 
 - config parsing for DeepSeek V4 MP8;
 - per-rank weight manifests and GPU loading;
 - runtime ops for block prefill/decode, HC, sparse attention, routing, compressor state, and final logits;
 - direct `EngineHandle` integration used by server and tests;
-- exact E2E tests driven by `test_data/deepseek-v4-ground-truth.json`, with `PEGAINFER_DEEPSEEK_GT_PATH` available for regenerations.
+- exact E2E tests driven by `test_data/deepseek-v4-ground-truth.json`, with `OPENINFER_DEEPSEEK_GT_PATH` available for regenerations.
 
 The direct engine seeds decode cache from prompt prefill instead of replaying prompt tokens through decode. This made exact validation practical enough for PR use.
 
 ### TileLang Kernels
 
-`pegainfer-kernels/tools/tilelang/deepseek_v4/generate.py` generates CUDA sources for official-style DeepSeek V4 kernels:
+`openinfer-kernels/tools/tilelang/deepseek_v4/generate.py` generates CUDA sources for official-style DeepSeek V4 kernels:
 
 - `act_quant_kernel`
 - `fp8_gemm_kernel`
@@ -104,11 +104,11 @@ All 20 ground-truth cases pass exact text validation as four 5-case slices with 
 Command shape:
 
 ```bash
-PEGAINFER_DEEPSEEK_GT_OFFSET=<offset> \
-PEGAINFER_DEEPSEEK_GT_LIMIT=5 \
-PEGAINFER_DEEPSEEK_GT_MAX_NEW_TOKENS=64 \
-PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash \
-cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test e2e -- --nocapture --exact test_e2e_deepseek_v4_generation
+OPENINFER_DEEPSEEK_GT_OFFSET=<offset> \
+OPENINFER_DEEPSEEK_GT_LIMIT=5 \
+OPENINFER_DEEPSEEK_GT_MAX_NEW_TOKENS=64 \
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash \
+cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test e2e -- --nocapture --exact test_e2e_deepseek_v4_generation
 ```
 
 ### Operator Guards
@@ -116,9 +116,9 @@ cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test e2e 
 The full DeepSeek V4 `mp8_manifest` release test passes:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=$MODEL_DIR \
-PEGAINFER_NVCC_JOBS=8 \
-cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture
+OPENINFER_TEST_MODEL_PATH=$MODEL_DIR \
+OPENINFER_NVCC_JOBS=8 \
+cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture
 ```
 
 Result: `23 passed`, `0 failed`.
@@ -127,14 +127,14 @@ Coverage includes MP8 layout accessors, RoPE formula checks, TileLang FP8/FP4 li
 
 ### HTTP Service
 
-With `--features deepseek-v4`, `pegainfer-server` detects `model_type="deepseek_v4"` and starts DeepSeek V4 with eight devices and CUDA graph disabled.
+With `--features deepseek-v4`, `openinfer-server` detects `model_type="deepseek_v4"` and starts DeepSeek V4 with eight devices and CUDA graph disabled.
 
 The initial service path is intentionally greedy-only. Requests that ask for sampling or logprobs are rejected before generation and surfaced through `stop_reason` instead of being silently coerced to greedy. This is a temporary compatibility choice in the vLLM frontend path; a later API cleanup should reject unsupported DeepSeek V4 request parameters during request validation instead of representing them as a completed generation.
 
 Server command used for HTTP validation:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --features deepseek-v4 -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --features deepseek-v4 -- \
   --model-path $MODEL_DIR --port 18080
 ```
 
@@ -197,7 +197,7 @@ Earlier exact-request profiling removed the large synchronous `cudaMalloc/cudaFr
 The current synthetic decode-heavy baseline on 5090-dev is:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- \
   --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
@@ -219,12 +219,12 @@ The remaining TPOT problem is structural: decode still launches hundreds of thou
 
 ## Workspace Isolation
 
-DeepSeek V4 is a workspace member, but its DeepSeek-specific bins, integration tests, and `pegainfer-kernels/deepseek-v4` dependency are gated behind the `deepseek-v4` feature. This keeps default Qwen-oriented workspace checks from requiring TileLang.
+DeepSeek V4 is a workspace member, but its DeepSeek-specific bins, integration tests, and `openinfer-kernels/deepseek-v4` dependency are gated behind the `deepseek-v4` feature. This keeps default Qwen-oriented workspace checks from requiring TileLang.
 
 Verified:
 
-- `PEGAINFER_NVCC_JOBS=8 cargo check --release --workspace` passed with DeepSeek TileLang disabled in `pegainfer-kernels`.
-- `cargo test --release --workspace --lib` passed with DeepSeek TileLang disabled in `pegainfer-kernels`. Qwen model-loading lib tests now skip only when `PEGAINFER_TEST_MODEL_PATH` is unset and the default local model directory is absent; explicitly provided model paths still run normally and fail normally if invalid.
+- `OPENINFER_NVCC_JOBS=8 cargo check --release --workspace` passed with DeepSeek TileLang disabled in `openinfer-kernels`.
+- `cargo test --release --workspace --lib` passed with DeepSeek TileLang disabled in `openinfer-kernels`. Qwen model-loading lib tests now skip only when `OPENINFER_TEST_MODEL_PATH` is unset and the default local model directory is absent; explicitly provided model paths still run normally and fail normally if invalid.
 
 ## Known Follow-ups
 
@@ -235,7 +235,7 @@ These are intentionally out of the initial PR scope:
 - add arbitrary-value per-shape TileLang FP8/FP4 parity tests beyond the current power-of-two guards;
 - profile final logits only if nsys shows it matters;
 - profile NCCL all-reduce and TileLang FP4 GEMM after the initial PR lands;
-- narrow the current public diagnostic surface in `pegainfer-deepseek-v4` after bring-up bins/tests are either retired or moved behind a dedicated test-helper boundary;
+- narrow the current public diagnostic surface in `openinfer-deepseek-v4` after bring-up bins/tests are either retired or moved behind a dedicated test-helper boundary;
 - move unsupported DeepSeek V4 request handling from generation-time `stop_reason` compatibility into frontend request validation;
 - add an explicit non-panicking shutdown path for NCCL communicator teardown.
 
@@ -243,21 +243,21 @@ These are intentionally out of the initial PR scope:
 
 Before opening the PR, keep the required gate focused:
 
-- `cargo fmt --check -p pegainfer-deepseek-v4`
-- `cargo check --release -p pegainfer-server`
-- `PEGAINFER_NVCC_JOBS=8 cargo check --release -p pegainfer-server --features deepseek-v4`
-- `PEGAINFER_TEST_MODEL_PATH=$MODEL_DIR PEGAINFER_NVCC_JOBS=8 cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture`
+- `cargo fmt --check -p openinfer-deepseek-v4`
+- `cargo check --release -p openinfer-server`
+- `OPENINFER_NVCC_JOBS=8 cargo check --release -p openinfer-server --features deepseek-v4`
+- `OPENINFER_TEST_MODEL_PATH=$MODEL_DIR OPENINFER_NVCC_JOBS=8 cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture`
 - four exact E2E slices over `test_data/deepseek-v4-ground-truth.json`, using:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=$MODEL_DIR \
-PEGAINFER_DEEPSEEK_GT_OFFSET=<0|5|10|15> \
-PEGAINFER_DEEPSEEK_GT_LIMIT=5 \
-PEGAINFER_DEEPSEEK_GT_MAX_NEW_TOKENS=64 \
-PEGAINFER_NVCC_JOBS=8 \
-cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test e2e -- --nocapture --exact test_e2e_deepseek_v4_generation
+OPENINFER_TEST_MODEL_PATH=$MODEL_DIR \
+OPENINFER_DEEPSEEK_GT_OFFSET=<0|5|10|15> \
+OPENINFER_DEEPSEEK_GT_LIMIT=5 \
+OPENINFER_DEEPSEEK_GT_MAX_NEW_TOKENS=64 \
+OPENINFER_NVCC_JOBS=8 \
+cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test e2e -- --nocapture --exact test_e2e_deepseek_v4_generation
 ```
 
-- one `/v1/completions` or `/v1/chat/completions` validation through `pegainfer-server`, plus one unsupported-parameter request checking `stop_reason`.
+- one `/v1/completions` or `/v1/chat/completions` validation through `openinfer-server`, plus one unsupported-parameter request checking `stop_reason`.
 
 Broader workspace checks are valuable, but failures outside the DeepSeek V4 diff should be separated from this initial support PR.

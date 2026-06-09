@@ -1,4 +1,4 @@
-# Developer Onboarding: Setting Up the pegainfer Dev Environment from Scratch
+# Developer Onboarding: Setting Up the openinfer Dev Environment from Scratch
 
 **Status**: Complete
 **TL;DR**: Full new-developer onboarding — toolchain check, unified venv, build, tests, benchmark smoke test.
@@ -23,7 +23,7 @@ uv --version      # Python package manager
 The project uses a single `.venv` for everything: triton (build dependency) and torch/transformers (reference scripts).
 
 ```bash
-cd pegainfer/
+cd openinfer/
 uv venv
 uv pip install triton torch transformers accelerate pytest
 ```
@@ -35,7 +35,7 @@ Verify:
 .venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-> build.rs auto-detects `.venv/bin/python` for Triton AOT compilation. Override with `PEGAINFER_TRITON_PYTHON` if needed.
+> build.rs auto-detects `.venv/bin/python` for Triton AOT compilation. Override with `OPENINFER_TRITON_PYTHON` if needed.
 
 ## 3. Build
 
@@ -43,13 +43,13 @@ Verify:
 cargo build --release
 ```
 
-First build takes ~30s. Compiles CUDA kernels (`pegainfer-kernels/csrc/*.cu`) and Triton AOT kernels (`pegainfer-kernels/tools/triton/*.py`).
+First build takes ~30s. Compiles CUDA kernels (`openinfer-kernels/csrc/*.cu`) and Triton AOT kernels (`openinfer-kernels/tools/triton/*.py`).
 
 ## 4. Run Tests
 
 ```bash
 cargo test -r --workspace --lib   # unit tests (~9s)
-cargo test -r -p pegainfer-qwen3-4b --test hf_golden_gate   # Qwen3-4B logits vs HF golden (~7s, needs GPU + model)
+cargo test -r -p openinfer-qwen3-4b --test hf_golden_gate   # Qwen3-4B logits vs HF golden (~7s, needs GPU + model)
 ```
 
 > **Always use `--release`**. Debug builds are extremely slow for GPU code and will timeout.
@@ -112,14 +112,14 @@ cargo run -r --bin bench_serving -- --model-path models/Qwen3.5-4B request
 Accuracy tests live in each model crate:
 
 ```bash
-cargo test -r -p pegainfer-qwen3-4b  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p pegainfer-qwen35-4b --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p pegainfer-qwen35-4b --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
+cargo test -r -p openinfer-qwen3-4b  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
+cargo test -r -p openinfer-qwen35-4b --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
+cargo test -r -p openinfer-qwen35-4b --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
 ```
 
-Qwen3-4B no longer pins exact greedy text: a bit-wise baseline false-positives across GPUs (per-card bf16 GEMM drifts the low bits). `hf_golden_gate` instead teacher-forces a fixed set of sequences and asserts pegainfer's logprobs land within the bf16 noise floor of a stored HuggingFace reference — across bs=1, batched, and the CUDA-graph path. The reasoning and tolerances are in `docs/models/qwen3/accuracy-gate.md`.
+Qwen3-4B no longer pins exact greedy text: a bit-wise baseline false-positives across GPUs (per-card bf16 GEMM drifts the low bits). `hf_golden_gate` instead teacher-forces a fixed set of sequences and asserts openinfer's logprobs land within the bf16 noise floor of a stored HuggingFace reference — across bs=1, batched, and the CUDA-graph path. The reasoning and tolerances are in `docs/models/qwen3/accuracy-gate.md`.
 
-Qwen3.5-4B follows the same HF-golden rule with one model-specific caveat: its fixture is produced through HF `use_cache=True` / `past_key_values`, and its replay surface is sequential graph plus bucket-straddling batched graph plus slot compaction because Qwen3.5 does not currently have an eager batched decode path. A broader PegaInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
+Qwen3.5-4B follows the same HF-golden rule with one model-specific caveat: its fixture is produced through HF `use_cache=True` / `past_key_values`, and its replay surface is sequential graph plus bucket-straddling batched graph plus slot compaction because Qwen3.5 does not currently have an eager batched decode path. A broader OpenInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
 
 ### Regenerating Reference Data
 

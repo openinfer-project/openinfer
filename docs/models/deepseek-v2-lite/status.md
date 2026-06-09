@@ -28,7 +28,7 @@ The retained correctness gate is deliberately narrow:
 - prompt token ids: `[17464]`;
 - output length: `16`;
 - generation mode: greedy;
-- backends: host-staged and `PEGAINFER_DSV2_LITE_EP_BACKEND=nccl`.
+- backends: host-staged and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
 
 The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact. Host-staged remains the baseline oracle for NCCL transport changes.
 
@@ -62,12 +62,12 @@ PR #196 extends attribution for the same direct diagnostic shapes. The retained 
 
 In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, a manual same-model snapshot was collected with `vllm bench serve` concurrency pressure `1`, `4`, and `8`.
 
-This table is retained only to document the current gap. It is not evidence of a complete, fair production-serving parity comparison, and `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal PegaInfer batch size.
+This table is retained only to document the current gap. It is not evidence of a complete, fair production-serving parity comparison, and `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal OpenInfer batch size.
 
 | Engine | Mode | conc=1 TPOT ms | conc=4 TPOT ms | conc=8 TPOT ms | Output tok/s at 1/4/8 |
 | --- | --- | ---: | ---: | ---: | --- |
-| PegaInfer | host-staged | 49.95 | 51.30 | 51.22 | 19.84 / 19.53 / 19.56 |
-| PegaInfer | NCCL | 178.31 | 173.22 | 174.46 | 5.59 / 5.77 / 5.73 |
+| OpenInfer | host-staged | 49.95 | 51.30 | 51.22 | 19.84 / 19.53 / 19.56 |
+| OpenInfer | NCCL | 178.31 | 173.22 | 174.46 | 5.59 / 5.77 / 5.73 |
 | vLLM | TP2 default | 35.61 | 36.43 | 36.37 | 27.54 / 97.72 / 195.28 |
 | vLLM | TP2+EP2 default | 34.15 | 34.97 | 34.88 | 28.87 / 101.52 / 204.08 |
 
@@ -75,7 +75,7 @@ Interpretation:
 
 - at single-concurrency TPOT, host-staged is closer to vLLM than the current NCCL backend;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
-- PegaInfer HTTP throughput did not scale with concurrency in this snapshot, so serving batching remains open;
+- OpenInfer HTTP throughput did not scale with concurrency in this snapshot, so serving batching remains open;
 - vLLM TP2+EP2 worked in this environment and should stay in future comparison matrices.
 
 ## Claim Boundaries
@@ -86,7 +86,7 @@ Use these labels consistently:
 | --- | --- | --- |
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
-| `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True PegaInfer batch size unless the engine path proves it. |
+| `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
 
 Do not claim:
 
@@ -113,8 +113,8 @@ The next implementation should be chosen from measured evidence:
    - judge issue #170 by whether it reduces NCCL decode overhead and makes the path more graph-friendly.
 
 2. Keep a fair serving benchmark contract around future performance work.
-   - PegaInfer host-staged.
-   - PegaInfer NCCL.
+   - OpenInfer host-staged.
+   - OpenInfer NCCL.
    - vLLM TP2.
    - vLLM TP2+EP2 when supported.
    - default vLLM configuration plus a controlled configuration with cache/flag choices recorded.

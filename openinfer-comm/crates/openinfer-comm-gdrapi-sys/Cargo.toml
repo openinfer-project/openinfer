@@ -1,0 +1,15 @@
+[package]
+edition = "2024"
+links = "gdrapi"
+name = "openinfer-comm-gdrapi-sys"
+publish = false
+
+[features]
+# Internal sys-crate feature. See `openinfer-comm-cuda-sys/Cargo.toml` for the rationale.
+default = []
+system-bindings = []
+
+[build-dependencies]
+build-utils = { path = "../openinfer-comm-build-utils", package = "openinfer-comm-build-utils" }
+
+bindgen = { workspace = true }

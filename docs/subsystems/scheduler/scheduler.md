@@ -50,7 +50,7 @@ The bridge to FlashInfer's `paged_kv_t` (which expects separate `k_data`/`v_data
 
 ### QPS=2 head-to-head vs vLLM 0.18.x
 
-| Metric | pegainfer | vLLM | Delta |
+| Metric | openinfer | vLLM | Delta |
 |---|---|---|---|
 | TTFT median | 301ms | 359ms | **−16%** |
 | TTFT p99 | 951ms | 1245ms | **−24%** |
@@ -60,11 +60,11 @@ The bridge to FlashInfer's `paged_kv_t` (which expects separate `k_data`/`v_data
 | failed | 9 | **0** | — |
 | ITL p99 | 291ms | **211ms** | +38% |
 
-pegainfer wins 17/20 metrics. Std lower across the board (TTFT −20%, TPOT −22%). vLLM wins on robustness (zero failed) and ITL tail.
+openinfer wins 17/20 metrics. Std lower across the board (TTFT −20%, TPOT −22%). vLLM wins on robustness (zero failed) and ITL tail.
 
 ### Decode TPOT scaling (in=1, out=128)
 
-| Concurrency | pegainfer | vLLM |
+| Concurrency | openinfer | vLLM |
 |---|---|---|
 | 1 | 10.75ms | 11.31ms |
 | 4 | 10.96ms | 11.52ms |

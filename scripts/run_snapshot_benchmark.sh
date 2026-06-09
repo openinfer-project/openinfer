@@ -61,7 +61,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
-if [[ -f .gitmodules ]] && [[ ! -f pegainfer-kernels/third_party/flashinfer/include/flashinfer/norm.cuh ]]; then
+if [[ -f .gitmodules ]] && [[ ! -f openinfer-kernels/third_party/flashinfer/include/flashinfer/norm.cuh ]]; then
   git submodule update --init --recursive
 fi
 
@@ -80,10 +80,10 @@ fi
 
 export CUDA_HOME
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export PEGAINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
-if [[ -z "${PEGAINFER_CUDA_SM:-}" ]]; then
-  PEGAINFER_CUDA_SM="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
-  export PEGAINFER_CUDA_SM
+export OPENINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
+if [[ -z "${OPENINFER_CUDA_SM:-}" ]]; then
+  OPENINFER_CUDA_SM="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')"
+  export OPENINFER_CUDA_SM
 fi
 
 cargo build --release --bin bench_serving

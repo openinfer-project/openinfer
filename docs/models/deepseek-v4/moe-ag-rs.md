@@ -20,17 +20,17 @@ Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter fl
   1. Keep production prefill group helpers, because `prefill_logits_and_decode_cache_group_bf16_hidden` is still called by the direct runtime.
   2. Remove decode-only group entry points that support single-thread multi-rank decode: `block_decode_group_bf16_hidden`, `block_decode_group_rank_threads_bf16_hidden`, and their now-unused attention/MoE group helpers.
   3. Remove public re-exports and mp8 manifest tests that only exercise the deleted decode group path.
-  4. Run `cargo fmt --check` and `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`.
+  4. Run `cargo fmt --check` and `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4`.
 - **Risks / open questions**:
   - Some tests currently use group decode as a small two-rank smoke path; deleting them narrows coverage to production rank-lane decode plus prefill group tests.
 
 ### Eliminate central single-thread direct runtime paths
 
 - **Read**:
-  - `pegainfer-deepseek-v4/src/direct.rs` - confirmed decode already uses persistent rank workers, but cache ownership is still moved through central runtime every token and prefill still uses central group helpers.
-  - `pegainfer-deepseek-v4/src/runtime/block.rs` - identified rank-local decode structure and central prefill group cache seeding path.
-  - `pegainfer-deepseek-v4/src/runtime/attention.rs` - identified ratio-4 prefill indexer all-reduce as the non-trivial collective that needs a rank-lane version.
-  - `pegainfer-deepseek-v4/src/runtime/moe.rs` - identified prefill MoE routed all-reduce as another group-only collective to move into rank lanes.
+  - `openinfer-deepseek-v4/src/direct.rs` - confirmed decode already uses persistent rank workers, but cache ownership is still moved through central runtime every token and prefill still uses central group helpers.
+  - `openinfer-deepseek-v4/src/runtime/block.rs` - identified rank-local decode structure and central prefill group cache seeding path.
+  - `openinfer-deepseek-v4/src/runtime/attention.rs` - identified ratio-4 prefill indexer all-reduce as the non-trivial collective that needs a rank-lane version.
+  - `openinfer-deepseek-v4/src/runtime/moe.rs` - identified prefill MoE routed all-reduce as another group-only collective to move into rank lanes.
 - **Relevant history**:
   - Step 6 removed decode group entry points, but prefill/cache ownership still left a central multi-rank path that future changes could accidentally follow.
 - **Plan**:
@@ -49,9 +49,9 @@ Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter fl
 - **Relevant history**:
   - `docs/models/deepseek-v4/moe-tilelang-review.md` records that replacing local expert execution is a larger cutover; this task intentionally only adds the regular collective exchange primitives.
 - **Plan**:
-  1. Add `all_gather_bf16_hidden_group` and `reduce_scatter_f32_hidden_group` in `pegainfer-deepseek-v4/src/runtime/collectives.rs` with explicit shape checks.
-  2. Export the new collectives from `pegainfer-deepseek-v4/src/lib.rs`.
-  3. Add a focused NCCL pair test in `pegainfer-deepseek-v4/tests/mp8_manifest.rs` that validates `[B_local,H] -> [world*B_local,H]` allgather and `[world*B_local,H] -> [B_local,H]` f32 reduce-scatter.
+  1. Add `all_gather_bf16_hidden_group` and `reduce_scatter_f32_hidden_group` in `openinfer-deepseek-v4/src/runtime/collectives.rs` with explicit shape checks.
+  2. Export the new collectives from `openinfer-deepseek-v4/src/lib.rs`.
+  3. Add a focused NCCL pair test in `openinfer-deepseek-v4/tests/mp8_manifest.rs` that validates `[B_local,H] -> [world*B_local,H]` allgather and `[world*B_local,H] -> [B_local,H]` f32 reduce-scatter.
   4. Run the targeted test or compile check with release settings.
 - **Risks / open questions**:
   - The pair test requires two GPUs and a loadable NCCL runtime; it should skip cleanly when NCCL is unavailable, matching the existing all-reduce test.
@@ -59,30 +59,30 @@ Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter fl
 ## Execution Log
 
 ### Step 6: Remove legacy decode group path
-- Removed decode-only single-thread/multi-rank entry points from `pegainfer-deepseek-v4/src/runtime/block.rs`:
+- Removed decode-only single-thread/multi-rank entry points from `openinfer-deepseek-v4/src/runtime/block.rs`:
   - `block_decode_group_bf16_hidden`
   - `block_decode_group_rank_threads_bf16_hidden`
 - Removed decode group helpers that only existed for those entry points:
-  - attention decode group wrappers in `pegainfer-deepseek-v4/src/runtime/attention.rs`
-  - `decode_moe_ag_rs_group_bf16_hidden` in `pegainfer-deepseek-v4/src/runtime/moe.rs`
+  - attention decode group wrappers in `openinfer-deepseek-v4/src/runtime/attention.rs`
+  - `decode_moe_ag_rs_group_bf16_hidden` in `openinfer-deepseek-v4/src/runtime/moe.rs`
   - AG/RS group collectives `all_gather_bf16_hidden_group`, `all_gather_u32_group`, and `reduce_scatter_f32_hidden_group`
 - Removed public re-exports and mp8 manifest tests that referenced the deleted decode group path.
 - Kept production prefill group helpers, because direct prefill still calls `prefill_logits_and_decode_cache_group_bf16_hidden`.
 - Verification:
   - `cargo fmt`
   - `cargo fmt --check` passed
-  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
-  - `rg -n "block_decode_group|group_rank_threads|attention_decode_group|decode_moe_ag_rs_group|all_gather_bf16_hidden_group|reduce_scatter_f32_hidden_group|all_gather_u32_group" pegainfer-deepseek-v4/src pegainfer-deepseek-v4/tests` returned no matches
+  - `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` passed
+  - `rg -n "block_decode_group|group_rank_threads|attention_decode_group|decode_moe_ag_rs_group|all_gather_bf16_hidden_group|reduce_scatter_f32_hidden_group|all_gather_u32_group" openinfer-deepseek-v4/src openinfer-deepseek-v4/tests` returned no matches
 
 ### Step 7: Remote exact E2E after cleanup
-- Synced the cleanup files back to `5090:$PEGAINFER_DIR`.
+- Synced the cleanup files back to `5090:$OPENINFER_DIR`.
 - Verified model path on 5090: `$MODEL_DIR`.
 - Ran on 5090:
 
 ```bash
 source ~/.cargo/env 2>/dev/null || true
-cd $PEGAINFER_DIR
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
+cd $OPENINFER_DIR
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
 ```
 
 - Result:
@@ -105,23 +105,23 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - mp8 tests that exercised the deleted group path
 - Verification:
   - `cargo fmt` passed locally
-  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed locally and on 5090
-  - `cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest --no-run` passed locally
-  - `rg -n "group_start|group_end|all_reduce_hidden_group|all_gather_logits_group|embedding_vocab_parallel_group|final_logits_group_bf16_hidden|hash_routed_moe_group_bf16_hidden|moe_group_bf16_hidden|attention_prefill_.*group|block_prefill_group|prefill_logits_group|prefill_logits_and_decode_cache_group|deepseek_mp8_check|contexts: Vec<RankGpuContext>" pegainfer-deepseek-v4/src pegainfer-deepseek-v4/tests pegainfer-deepseek-v4/Cargo.toml` returned no matches locally
+  - `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` passed locally and on 5090
+  - `cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest --no-run` passed locally
+  - `rg -n "group_start|group_end|all_reduce_hidden_group|all_gather_logits_group|embedding_vocab_parallel_group|final_logits_group_bf16_hidden|hash_routed_moe_group_bf16_hidden|moe_group_bf16_hidden|attention_prefill_.*group|block_prefill_group|prefill_logits_group|prefill_logits_and_decode_cache_group|deepseek_mp8_check|contexts: Vec<RankGpuContext>" openinfer-deepseek-v4/src openinfer-deepseek-v4/tests openinfer-deepseek-v4/Cargo.toml` returned no matches locally
   - 5090 exact E2E with `$MODEL_DIR` passed: `All 20 DeepSeek V4 exact cases passed`
 
 ### Step 9: Split direct scheduler and worker files
-- Split the former monolithic `pegainfer-deepseek-v4/src/direct.rs` into:
-  - `pegainfer-deepseek-v4/src/direct.rs` as a thin module/re-export facade.
-  - `pegainfer-deepseek-v4/src/direct/scheduler.rs` for request validation, the single-request greedy scheduler loop, token event emission, and sampling.
-  - `pegainfer-deepseek-v4/src/direct/worker.rs` for rank worker commands, rank resource ownership, cache/RoPE management, per-rank prefill/decode execution, and rank-0 logits collection.
+- Split the former monolithic `openinfer-deepseek-v4/src/direct.rs` into:
+  - `openinfer-deepseek-v4/src/direct.rs` as a thin module/re-export facade.
+  - `openinfer-deepseek-v4/src/direct/scheduler.rs` for request validation, the single-request greedy scheduler loop, token event emission, and sampling.
+  - `openinfer-deepseek-v4/src/direct/worker.rs` for rank worker commands, rank resource ownership, cache/RoPE management, per-rank prefill/decode execution, and rank-0 logits collection.
 - Renamed the request/scheduler thread from `deepseek-v4-direct` to `deepseek-v4-scheduler`. Rank worker thread names remain `deepseek-v4-rank-{rank}`.
 - Kept behavior unchanged; this is only a responsibility-boundary cleanup.
 - Follow-up naming debt:
   - The module and public type names still use `direct`; that name is legacy and should eventually become `engine` or `executor` in a dedicated rename pass.
 - Verification:
   - `cargo fmt` passed
-  - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed
+  - `cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4` passed
 
 ### Step 3: Expand scope to decode backend replacement
 - User goal changed from adding standalone AG/RS collectives to completing the MoE all-to-all backend replacement and passing DeepSeek V4 E2E.
@@ -146,7 +146,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Exact E2E command run:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
 ```
 
 - Result: `19 / 20` exact cases passed.
@@ -155,7 +155,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Performance sanity command run:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path $MODEL_DIR --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- --model-path $MODEL_DIR --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
 - Result:
@@ -180,9 +180,9 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 - Validation commands:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path $MODEL_DIR --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+OPENINFER_NVCC_JOBS=8 cargo check --release -p openinfer-deepseek-v4 --features deepseek-v4
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
+OPENINFER_NVCC_JOBS=8 cargo run --release -p openinfer-server --bin bench_serving --features deepseek-v4 -- --model-path $MODEL_DIR --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
 - Results:
@@ -192,22 +192,22 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
   - Earlier row-routed scalar path measured around `223.30ms`, so grouped TileLang cuts the local expert bottleneck roughly in half.
 
 ### Step 1: Add AG/RS collectives
-- Added `all_gather_bf16_hidden_group` in `pegainfer-deepseek-v4/src/runtime/collectives.rs`.
+- Added `all_gather_bf16_hidden_group` in `openinfer-deepseek-v4/src/runtime/collectives.rs`.
   - Contract: every rank contributes `bf16 [B_local,H]`.
   - Output on each rank: `bf16 [world*B_local,H]`.
   - Uses NCCL `Comm::all_gather` on device buffers; no runtime D2H metadata.
-- Added `reduce_scatter_f32_hidden_group` in `pegainfer-deepseek-v4/src/runtime/collectives.rs`.
+- Added `reduce_scatter_f32_hidden_group` in `openinfer-deepseek-v4/src/runtime/collectives.rs`.
   - Contract: every rank contributes `f32 [world*B_local,H]`.
   - Output on each rank: `f32 [B_local,H]`.
   - Uses NCCL `Comm::reduce_scatter(..., ReduceOp::Sum)` on device buffers.
-- Exported both helpers from `pegainfer-deepseek-v4/src/lib.rs`.
+- Exported both helpers from `openinfer-deepseek-v4/src/lib.rs`.
 
 ### Step 2: Validate
-- Added `nccl_hidden_all_gather_and_reduce_scatter_pair` in `pegainfer-deepseek-v4/tests/mp8_manifest.rs`.
+- Added `nccl_hidden_all_gather_and_reduce_scatter_pair` in `openinfer-deepseek-v4/tests/mp8_manifest.rs`.
 - Ran:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest nccl_hidden_all_gather_and_reduce_scatter_pair -- --nocapture
+OPENINFER_NVCC_JOBS=8 cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest nccl_hidden_all_gather_and_reduce_scatter_pair -- --nocapture
 ```
 
 - Result: passed, `1 passed; 0 failed; 23 filtered out`.

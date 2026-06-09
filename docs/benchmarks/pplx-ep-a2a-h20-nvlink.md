@@ -17,7 +17,7 @@ Last touched: 2026-05
 
 ## Benchmark
 
-Binary: `pplx_a2a_bench --sweep` (in `pegainfer-comm`).
+Binary: `pplx_a2a_bench --sweep` (in `openinfer-comm`).
 
 Each config bootstraps a fresh pplx-garden EP backend (CUMem + fabric MR + NVLink peer-map), runs 20 warmup + 100 measured iterations of the full dispatch_send → dispatch_recv → combine_send → combine_recv cycle, and reports `max_rank_split_sum_us` — the per-iteration maximum across all 8 ranks of the four-stage sum.
 

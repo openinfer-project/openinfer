@@ -1,0 +1,9 @@
+[package]
+edition = "2024"
+name = "openinfer-comm-thread-lib"
+publish = false
+
+[dependencies]
+libc = { workspace = true }
+syscalls = { workspace = true }
+tracing = { workspace = true }

@@ -1,6 +1,6 @@
-# DeepEP V2 vs PegaInfer PPLX EP on H20 x8
+# DeepEP V2 vs OpenInfer PPLX EP on H20 x8
 
-> **TL;DR** On an 8x H20 node, DeepEP V2 ElasticBuffer/NCCL Gin is clearly ahead of the current PegaInfer PPLX EP microbenchmark on the tested MoE exchange shapes. In the paired run here, the directional dispatch+combine ratio is about 2.5x to 5.3x; against the earlier PPLX snapshot, it is about 2.4x to 4.5x. This is a backend direction check, not a dtype-identical replacement gate.
+> **TL;DR** On an 8x H20 node, DeepEP V2 ElasticBuffer/NCCL Gin is clearly ahead of the current OpenInfer PPLX EP microbenchmark on the tested MoE exchange shapes. In the paired run here, the directional dispatch+combine ratio is about 2.5x to 5.3x; against the earlier PPLX snapshot, it is about 2.4x to 4.5x. This is a backend direction check, not a dtype-identical replacement gate.
 
 Last touched: 2026-05-25
 
@@ -8,8 +8,8 @@ Last touched: 2026-05-25
 
 | Component | Revision |
 | --- | --- |
-| PegaInfer paired run | `f071baa` |
-| PegaInfer historical PPLX snapshot | `ec514ef` |
+| OpenInfer paired run | `f071baa` |
+| OpenInfer historical PPLX snapshot | `ec514ef` |
 | DeepEP | `723716f` |
 
 ## Hardware And Software
@@ -23,10 +23,10 @@ Last touched: 2026-05-25
 
 ## Method
 
-PegaInfer paired-run command:
+OpenInfer paired-run command:
 
 ```bash
-cargo run -r -p pegainfer-comm --bin pplx_a2a_bench -- --sweep --warmup 20 --repeats 100
+cargo run -r -p openinfer-comm --bin pplx_a2a_bench -- --sweep --warmup 20 --repeats 100
 ```
 
 DeepEP V2 command template:
@@ -51,11 +51,11 @@ Sweep inputs:
 
 DeepEP was run with `--test-first-only`, so the measured case is the first elastic EP case: copy enabled, expert alignment 128, FP8 dispatch enabled, BF16 combine, no previous event, synchronous path. Correctness checks were skipped with `--skip-check`; this run is latency-only.
 
-PegaInfer reports event-timed `max_rank_split_sum_us` for the full dispatch_send -> dispatch_recv -> combine_send -> combine_recv cycle. DeepEP reports profiler averages for ordinary dispatch and ordinary combine. For comparison, this note takes the ordinary dispatch line and ordinary combine line, sums dispatch+combine by rank, and reports both the worst rank and the mean rank. Because these are not identical timing harnesses, all ratios below are directional.
+OpenInfer reports event-timed `max_rank_split_sum_us` for the full dispatch_send -> dispatch_recv -> combine_send -> combine_recv cycle. DeepEP reports profiler averages for ordinary dispatch and ordinary combine. For comparison, this note takes the ordinary dispatch line and ordinary combine line, sums dispatch+combine by rank, and reports both the worst rank and the mean rank. Because these are not identical timing harnesses, all ratios below are directional.
 
 ## Results
 
-| Config | PegaInfer paired p50 us | PegaInfer paired mean us | DeepEP V2 worst-rank sum us | DeepEP V2 mean-rank sum us | Directional ratio vs PegaInfer p50 |
+| Config | OpenInfer paired p50 us | OpenInfer paired mean us | DeepEP V2 worst-rank sum us | DeepEP V2 mean-rank sum us | Directional ratio vs OpenInfer p50 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | dsv4/tok=1 | 87.5 | 91.0 | 23.815 | 23.632 | 3.7x |
 | dsv4/tok=4 | 95.9 | 97.4 | 24.094 | 23.801 | 4.0x |
@@ -87,9 +87,9 @@ PegaInfer reports event-timed `max_rank_split_sum_us` for the full dispatch_send
 | kimi-k2/tok=128 | 32.042 | 42.672 | 74.572 |
 | kimi-k2/tok=256 | 50.735 | 71.921 | 122.617 |
 
-## PegaInfer Baseline Drift
+## OpenInfer Baseline Drift
 
-The table above uses the PegaInfer run taken in the same benchmarking session as the DeepEP run. The earlier PPLX benchmark snapshot in `docs/benchmarks/pplx-ep-a2a-h20-nvlink.md` was captured at `ec514ef`. Those two PegaInfer snapshots differ enough that the comparison should not pretend to be a precise speedup gate.
+The table above uses the OpenInfer run taken in the same benchmarking session as the DeepEP run. The earlier PPLX benchmark snapshot in `docs/benchmarks/pplx-ep-a2a-h20-nvlink.md` was captured at `ec514ef`. Those two OpenInfer snapshots differ enough that the comparison should not pretend to be a precise speedup gate.
 
 Positive delta means the paired run here is slower than the historical snapshot.
 
@@ -113,13 +113,13 @@ Using the historical PPLX p50s instead of the paired run gives a directional rat
 ## Interpretation Guardrails
 
 - DeepEP V2 was measured through the elastic EP path: ElasticBuffer with the NCCL Gin backend. The repository still builds legacy NVSHMEM pieces, but this V2 path is the one relevant to the current comparison.
-- The measured DeepEP V2 case uses FP8 dispatch and BF16 combine. PegaInfer PPLX currently benchmarks a BF16 payload. Treat the table as a backend signal, not an exact dtype-to-dtype gate.
-- DeepEP correctness checks were skipped in this latency run. A replacement decision needs a correctness run in the integrated PegaInfer path.
-- DeepEP `num_tokens` is a max-per-rank input; the test uses slightly different actual token counts across ranks. PegaInfer uses the fixed max token count per rank.
-- DeepEP numbers are profiler kernel averages. PegaInfer numbers are CUDA event timings around the benchmark cycle. The delta is large enough to be actionable, but integration work should add one apples-to-apples harness before replacing backend policy.
+- The measured DeepEP V2 case uses FP8 dispatch and BF16 combine. OpenInfer PPLX currently benchmarks a BF16 payload. Treat the table as a backend signal, not an exact dtype-to-dtype gate.
+- DeepEP correctness checks were skipped in this latency run. A replacement decision needs a correctness run in the integrated OpenInfer path.
+- DeepEP `num_tokens` is a max-per-rank input; the test uses slightly different actual token counts across ranks. OpenInfer uses the fixed max token count per rank.
+- DeepEP numbers are profiler kernel averages. OpenInfer numbers are CUDA event timings around the benchmark cycle. The delta is large enough to be actionable, but integration work should add one apples-to-apples harness before replacing backend policy.
 
 ## Read
 
-DeepEP V2 is especially strong at low token counts: the tested DSV4 and Kimi-K2 shapes sit around 24-34 us for tok <= 32, while the paired PegaInfer PPLX path is roughly 96-147 us. At larger payloads, DeepEP still holds about a 2.5x to 3.1x directional advantage in the paired run.
+DeepEP V2 is especially strong at low token counts: the tested DSV4 and Kimi-K2 shapes sit around 24-34 us for tok <= 32, while the paired OpenInfer PPLX path is roughly 96-147 us. At larger payloads, DeepEP still holds about a 2.5x to 3.1x directional advantage in the paired run.
 
-The next useful gate is a strict integration benchmark with the same payload dtype, token distribution, correctness checks, and PegaInfer scheduler-facing API cost included.
+The next useful gate is a strict integration benchmark with the same payload dtype, token distribution, correctness checks, and OpenInfer scheduler-facing API cost included.

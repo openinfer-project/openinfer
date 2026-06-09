@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Generate the HuggingFace bf16 logprob golden for the Qwen3-4B logits gate.
 
-The gate (`pegainfer-qwen3-4b/tests/hf_golden_gate.rs`) compares pegainfer's
+The gate (`openinfer-qwen3-4b/tests/hf_golden_gate.rs`) compares openinfer's
 logprobs against HF *without* running HF at test time and *without* binding to
 one GPU's exact bit pattern. So we precompute, once, on the GPU:
 
   * a seed-pinned set of fixed token sequences (`prompt + teacher-forced tail`),
   * HF's top-K next-token logprobs at every evaluated position.
 
-The Rust gate replays the *same fixed sequences* through pegainfer (prefill +
+The Rust gate replays the *same fixed sequences* through openinfer (prefill +
 teacher-forced decode) and asserts its logprobs land within a bf16 tolerance of
 this golden — argmax must match HF wherever HF has a clear (> a few ULP) winner,
 logprobs within the bf16 noise floor.
 
-bf16 (not fp32) on purpose: it is the same precision regime as pegainfer, so the
+bf16 (not fp32) on purpose: it is the same precision regime as openinfer, so the
 comparison is apples-to-apples, and it runs on the GPU — `device_map=auto` scales
 the same script to the large models. fp32 only mattered for the one-time tie
 *adjudication* (compare_qwen3_4b_hf_logprobs.py --dtype float32); the gate's
