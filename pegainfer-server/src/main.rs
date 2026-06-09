@@ -229,6 +229,16 @@ async fn main() -> anyhow::Result<()> {
                 ep_backend: EpBackend::Nccl,
                 seed: 42,
             };
+            let offload = if args.kv_offload {
+                let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
+                info!(
+                    "Qwen3 KV offload enabled: host tier {:.1} GiB, no_prefix_cache={}",
+                    args.kv_offload_host_gib, args.no_prefix_cache
+                );
+                Qwen3OffloadOptions::enabled(bytes)
+            } else {
+                Qwen3OffloadOptions::disabled()
+            };
             let handle = if args.enable_lora {
                 let lora_options = Qwen3LoraOptions {
                     max_loras: args.max_loras,
@@ -242,18 +252,10 @@ async fn main() -> anyhow::Result<()> {
                     &args.model_path,
                     options,
                     lora_options,
+                    offload,
+                    args.no_prefix_cache,
                 )
             } else {
-                let offload = if args.kv_offload {
-                    let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
-                    info!(
-                        "Qwen3 KV offload enabled: host tier {:.1} GiB, no_prefix_cache={}",
-                        args.kv_offload_host_gib, args.no_prefix_cache
-                    );
-                    Qwen3OffloadOptions::enabled(bytes)
-                } else {
-                    Qwen3OffloadOptions::disabled()
-                };
                 pegainfer_qwen3_4b::start_engine_with_offload(
                     &args.model_path,
                     options,

@@ -104,14 +104,16 @@ pub(crate) fn start_qwen3_with_lora_control(
     seed: u64,
     lora_options: Qwen3LoraOptions,
     offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
-    let executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
         enable_cuda_graph,
         device_ordinals,
         lora_options,
         offload_options,
     )?;
+    executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor_with_lora_control(executor, seed))
 }
 

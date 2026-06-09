@@ -179,6 +179,8 @@ pub fn start_engine_with_lora_control(
     model_path: &Path,
     options: EngineLoadOptions,
     lora_options: Qwen3LoraOptions,
+    offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -195,6 +197,7 @@ pub fn start_engine_with_lora_control(
         &device_ordinals,
         seed,
         lora_options.validate()?,
-        Qwen3OffloadOptions::disabled(),
+        offload_options,
+        no_prefix_cache,
     )
 }

@@ -228,6 +228,8 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
             ..EngineLoadOptions::default()
         },
         pegainfer_qwen3_4b::Qwen3LoraOptions::default(),
+        pegainfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
+        false,
     )
     .expect("start LoRA-capable Qwen3 engine");
 
