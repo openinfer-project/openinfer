@@ -163,6 +163,13 @@ fn reclaim_ready_prefetch<E: ModelExecutor>(
 /// moving the ones that start loading out of `deferred` into `loading`. A
 /// request that doesn't start a load (pure GPU hit, miss, or block pressure)
 /// stays in `deferred`, flagged so it isn't re-probed next tick.
+///
+/// Echo requests are never offered: their prefill forwards the whole prompt to
+/// recover prompt logprobs and so skips `match_and_add_prefix` (see
+/// `execute_prefill`). Prefetched blocks would never be matched/reused — they
+/// would only park restored KV that admission credits but prefill can't spend,
+/// starving the request under tight budgets. Leaving `prefetch_offered` unset
+/// for echo is harmless: the `!req.echo` guard keeps them from being probed.
 fn offer_prefetch<E: ModelExecutor>(
     executor: &mut E,
     deferred: &mut Vec<PendingRequest>,
@@ -170,7 +177,7 @@ fn offer_prefetch<E: ModelExecutor>(
 ) {
     let mut keep = Vec::with_capacity(deferred.len());
     for mut req in deferred.drain(..) {
-        if !req.prefetch_offered {
+        if !req.prefetch_offered && !req.echo {
             req.prefetch_offered = true;
             if executor.begin_kv_prefetch(
                 req.request_id,
@@ -802,6 +809,7 @@ mod tests {
         decode_delay: Duration,
         loaded_lora_adapters: HashSet<String>,
         dropped: Arc<Mutex<Vec<u64>>>,
+        prefetch_offers: Arc<Mutex<Vec<u64>>>,
         prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
         decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
         prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
@@ -820,6 +828,7 @@ mod tests {
                 decode_delay: Duration::ZERO,
                 loaded_lora_adapters: HashSet::new(),
                 dropped,
+                prefetch_offers: Arc::new(Mutex::new(Vec::new())),
                 prefill_batches: Arc::new(Mutex::new(Vec::new())),
                 decode_batches: Arc::new(Mutex::new(Vec::new())),
                 prefill_lora_batches: Arc::new(Mutex::new(Vec::new())),
@@ -916,6 +925,16 @@ mod tests {
             }
             self.dropped.lock().unwrap().push(request_id.get());
             Ok(())
+        }
+
+        fn begin_kv_prefetch(
+            &mut self,
+            request_id: RequestId,
+            _prompt_tokens: &[u32],
+            _lora_adapter: Option<&str>,
+        ) -> bool {
+            self.prefetch_offers.lock().unwrap().push(request_id.get());
+            false
         }
 
         fn list_lora_adapters(&self) -> Vec<String> {
@@ -1302,6 +1321,43 @@ mod tests {
         assert!(
             matches!(wait_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
             "waiting request should finish after admission"
+        );
+    }
+
+    fn pending(request_id: u64, echo: bool) -> PendingRequest {
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        PendingRequest {
+            request_id: RequestId::new(request_id),
+            lora_adapter: None,
+            prompt_tokens: vec![1; 32],
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            token_tx,
+            logprobs: 0,
+            echo,
+            prefetch_offered: false,
+        }
+    }
+
+    #[test]
+    fn echo_requests_are_never_offered_to_prefetch() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, dropped);
+        let offers = Arc::clone(&executor.prefetch_offers);
+
+        let mut deferred = vec![pending(1, true), pending(2, false)];
+        let mut loading = Vec::new();
+        offer_prefetch(&mut executor, &mut deferred, &mut loading);
+
+        // The plain request is probed; the echo request is skipped entirely, so
+        // its prefill forwards the whole prompt without parking unspendable KV.
+        assert_eq!(*offers.lock().unwrap(), vec![2]);
+        let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
+        assert!(!echo.prefetch_offered, "echo request must stay un-probed");
+        let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
+        assert!(
+            plain.prefetch_offered,
+            "plain request must be marked probed"
         );
     }
 
