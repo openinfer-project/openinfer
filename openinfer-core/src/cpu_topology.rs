@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    ffi::CStr,
+    ffi::{CStr, c_char},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -146,7 +146,7 @@ pub fn pin_current_thread_to_cpu(cpu: CpuId) -> Result<()> {
 }
 
 pub fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
-    let mut buf = [0i8; 32];
+    let mut buf = [c_char::default(); 32];
     cuda_driver_result::init().map_err(|err| anyhow::anyhow!("{err:?}"))?;
     let device = cuda_driver_result::device::get(device_ordinal as i32)
         .map_err(|err| anyhow::anyhow!("{err:?}"))?;
