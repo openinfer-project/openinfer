@@ -197,7 +197,7 @@ impl KimiK2Scheduler {
                 self.executor.gpu_weight_ready_count(),
                 self.executor.worker_count()
             );
-            error!("kimi-k2: {message}");
+            error!("{message}");
             for req in prefill_reqs {
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message: message.clone(),
@@ -265,7 +265,7 @@ impl KimiK2Scheduler {
                 let message = format!(
                     "Kimi-K2 decode KV block accounting violated full-lifetime reservation: {err}"
                 );
-                error!("kimi-k2: {message}");
+                error!("{message}");
                 for req in active.drain(..) {
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message: message.clone(),
@@ -292,7 +292,7 @@ impl KimiK2Scheduler {
                         self.executor.gpu_weight_ready_count(),
                         self.executor.worker_count()
                     );
-                    error!("kimi-k2: {message}");
+                    error!("{message}");
                     for req in active.drain(..) {
                         let _ = req.token_tx.send(TokenEvent::Error {
                             message: message.clone(),
@@ -310,7 +310,7 @@ impl KimiK2Scheduler {
                 req.completion_tokens += 1;
                 if let Err(err) = req.kv.apply_decode(token_id, &self.pool) {
                     let message = format!("Kimi-K2 decode KV bookkeeping failed: {err:#}");
-                    error!("kimi-k2: {message}");
+                    error!("{message}");
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message,
                         prompt_tokens: req.prompt_len,
@@ -372,7 +372,7 @@ impl KimiK2Scheduler {
             Ok(cached) => cached,
             Err(err) => {
                 let message = format!("Kimi-K2 prefix cache matching failed: {err:#}");
-                error!("kimi-k2: {message}");
+                error!("{message}");
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message,
                     prompt_tokens: req.prompt_tokens.len(),
@@ -386,7 +386,7 @@ impl KimiK2Scheduler {
             let message = format!(
                 "Kimi-K2 prefill KV block accounting violated full-lifetime reservation: {err}"
             );
-            error!("kimi-k2: {message}");
+            error!("{message}");
             let _ = req.token_tx.send(TokenEvent::Error {
                 message,
                 prompt_tokens: req.prompt_tokens.len(),
@@ -424,7 +424,7 @@ impl KimiK2Scheduler {
                 let token_id = report.local_next_token_global_id;
                 if let Err(err) = kv.apply_prefill(token_id, &self.pool) {
                     let message = format!("Kimi-K2 prefill KV bookkeeping failed: {err:#}");
-                    error!("kimi-k2: {message}");
+                    error!("{message}");
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message,
                         prompt_tokens: req.prompt_tokens.len(),
@@ -544,7 +544,7 @@ impl KimiK2Scheduler {
                     self.executor.gpu_weight_ready_count(),
                     self.executor.worker_count()
                 );
-                error!("kimi-k2: {message}");
+                error!("{message}");
                 for (_, req, _) in group_kv {
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message: message.clone(),
@@ -559,7 +559,7 @@ impl KimiK2Scheduler {
             let token_id = report.local_next_token_global_id;
             if let Err(err) = kv.apply_prefill(token_id, &self.pool) {
                 let message = format!("Kimi-K2 admission KV bookkeeping failed: {err:#}");
-                error!("kimi-k2: {message}");
+                error!("{message}");
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message,
                     prompt_tokens: req.prompt_tokens.len(),

@@ -4,7 +4,7 @@ pub(super) use pegainfer_core::cpu_topology::{
 
 pub(super) fn pin_scheduler_thread(placement: &RankThreadPlacementPlan) {
     let Some(cpu) = placement.scheduler_cpu() else {
-        log::warn!("DeepSeek V4 scheduler CPU1 is not in the current affinity mask");
+        log::warn!("scheduler CPU1 is not in the current affinity mask");
         return;
     };
     pin_current_thread_to_cpu(cpu)

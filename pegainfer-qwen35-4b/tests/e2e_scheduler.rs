@@ -133,7 +133,7 @@ fn test_e2e_qwen35_scheduler() {
     // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
     let handle = pegainfer_qwen35_4b::runtime::start_with_capacity(model, 42, 8)
         .expect("Failed to start Qwen3.5 scheduler");
-    info!("Qwen3.5 scheduler loaded in {:.2?}", start.elapsed());
+    info!("scheduler loaded in {:.2?}", start.elapsed());
 
     // ── 1. Sequential scheduler requests ────────────────────────────────
     info!("=== Phase 1: Qwen3.5 sequential scheduler requests ===");

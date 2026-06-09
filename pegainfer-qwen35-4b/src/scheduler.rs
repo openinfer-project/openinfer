@@ -159,7 +159,7 @@ fn scheduler_loop(
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
     let max_batch = graph_state.slot_states.len();
 
-    info!("Qwen3.5 scheduler ready (max_batch={})", max_batch);
+    info!("scheduler ready (max_batch={})", max_batch);
 
     loop {
         // 1. Drain all pending requests (deferred from last iteration + channel)
@@ -173,7 +173,7 @@ fn scheduler_loop(
             if let Some(req) = submit_rx.blocking_recv() {
                 pending.push(req);
             } else {
-                info!("Qwen3.5 scheduler: all handles dropped, exiting");
+                info!("scheduler: all handles dropped, exiting");
                 return;
             }
             while let Ok(req) = submit_rx.try_recv() {
@@ -268,7 +268,7 @@ fn prefill_batch(
     let logits_vec = match model.batch_prefill(&prompts, &mut kv_states, &mut rec_refs) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Qwen3.5 batch prefill failed: {e}");
+            warn!("batch prefill failed: {e}");
             let message = e.to_string();
             for req in pending {
                 let _ = req.token_tx.send(TokenEvent::Error {
@@ -399,7 +399,7 @@ fn unified_step_sched(
     ) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Qwen3.5 unified step failed: {e}");
+            warn!("unified step failed: {e}");
             let message = e.to_string();
             // Notify all pending requests
             for req in pending {
@@ -519,7 +519,7 @@ fn decode_step(
     let mut kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
 
     if let Err(e) = model.batch_decode_graph(&token_ids, &mut kv_refs, graph_state) {
-        warn!("Qwen3.5 batch_decode_graph error: {e}");
+        warn!("batch_decode_graph error: {e}");
         let message = e.to_string();
         for req in active.drain(..) {
             let _ = req.token_tx.send(TokenEvent::Error {
@@ -554,7 +554,7 @@ fn decode_step(
     {
         Ok(t) => t,
         Err(e) => {
-            warn!("Qwen3.5 sampling error: {e}");
+            warn!("sampling error: {e}");
             let message = e.to_string();
             for req in active.drain(..) {
                 let _ = req.token_tx.send(TokenEvent::Error {
