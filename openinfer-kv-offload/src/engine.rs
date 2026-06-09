@@ -10,10 +10,10 @@
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::CudaStream;
+use openinfer_kv_cache::KvBuffer;
 use pegaflow_core::{
     EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId, StorageConfig,
 };
-use openinfer_kv_cache::KvBuffer;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;

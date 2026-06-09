@@ -13,7 +13,6 @@ pub use attention::{
     paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
     paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
 };
-pub use paged_plan::PrefillPagedPlan;
 pub use openinfer_kernels::ops::{
     LoraDecodeGroupedProjection, accumulate_bf16_token_scaled_to_f32_into, add_batch,
     add_batch_into, bf16_hidden_to_f32_into, embedding_decode_into, extract_vec, extract_vec_into,
@@ -31,6 +30,7 @@ pub use openinfer_kernels::ops::{
     gemm_token_range_into_checked, qk_norm_rope_batch_decode_into, rms_norm_batch_into,
     silu_mul_fused_batch_into,
 };
+pub use paged_plan::PrefillPagedPlan;
 pub use sampling::{
     argmax, argmax_batch_bf16_indexed_into, argmax_batch_bf16_into,
     flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into, select_batch_tokens_into,
