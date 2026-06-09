@@ -52,7 +52,7 @@ __global__ void prefill_qk_norm_rope_hd256_paged_kernel(
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
-    const int* __restrict__ start_pos_ptr,           // GPU-resident for CUDA Graph safety
+    const int* __restrict__ start_pos_ptr,           // device pointer to this prefill's base position
     int rotary_dim,
     float rms_eps,
     int page_size,
@@ -148,7 +148,7 @@ __global__ void prefill_v_cache_write_hd256_paged_kernel(
     const int* __restrict__ page_indices,       // request page list
     int num_kv_heads,
     int seq_len,
-    const int* __restrict__ start_pos_ptr,      // GPU-resident
+    const int* __restrict__ start_pos_ptr,      // device pointer to this prefill's base position
     int page_size,
     int64_t stride_page
 ) {
