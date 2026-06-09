@@ -4,9 +4,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use pegainfer_engine::{
-    engine::{EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent},
-    sampler::SamplingParams,
+use pegainfer_engine::engine::{
+    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent,
 };
 use tokio::sync::mpsc;
 

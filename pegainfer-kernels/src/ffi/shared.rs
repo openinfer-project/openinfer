@@ -411,6 +411,16 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn argmax_batch_bf16_indexed_cuda(
+        x: *const Half,
+        row_indices: *const i32,
+        values: *mut Half,
+        indices: *mut i32,
+        rows: i32,
+        n: i32,
+        stream: CUstream,
+    );
+
     pub fn bf16_to_f32_cuda(
         input: *const Half,
         output: *mut f32,
