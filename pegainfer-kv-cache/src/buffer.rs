@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use half::bf16;
 
 use crate::KvLayout;
@@ -49,6 +49,18 @@ impl KvBuffer {
 
     pub fn buffer(&self) -> &CudaSlice<bf16> {
         &self.inner.buffer
+    }
+
+    /// Base device address of the fused KV buffer.
+    ///
+    /// Stable for the buffer's lifetime — cudarc allocations don't move — so
+    /// the KV-offload connector registers this once with pegaflow and the
+    /// page-first [`KvLayout`] strides reach every (layer, block, K/V) segment
+    /// from it. The returned address outlives the transient stream-ordering
+    /// guard precisely because the `Arc<Inner>` keeps the slice alive.
+    pub fn device_ptr(&self, stream: &CudaStream) -> u64 {
+        let (ptr, _guard) = self.inner.buffer.device_ptr(stream);
+        ptr
     }
 
     pub fn num_blocks(&self) -> usize {

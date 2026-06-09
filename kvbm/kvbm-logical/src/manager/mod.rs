@@ -89,6 +89,16 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         Ok(())
     }
 
+    /// Evict every cached-but-unused block: drain the inactive pool back to the
+    /// reset pool. Active blocks (held by a request or an external strong ref,
+    /// e.g. a leaked padding reservation) are untouched. Unlike
+    /// [`reset_inactive_pool`](Self::reset_inactive_pool) this makes no
+    /// assertion about the resulting free count, so it is safe to call on a
+    /// pool that still has pinned blocks — a cold-cache flush, not a reset.
+    pub fn evict_inactive(&self) {
+        drop(self.store.drain_inactive_to_mutable());
+    }
+
     /// Register a batch of completed blocks.
     pub fn register_blocks(&self, blocks: Vec<CompleteBlock<T>>) -> Vec<ImmutableBlock<T>> {
         blocks

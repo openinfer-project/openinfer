@@ -17,6 +17,7 @@ members = [
     "pegainfer-qwen3-4b",
     "pegainfer-qwen35-4b",
     "pegainfer-kv-cache",
+    "pegainfer-kv-offload",
     # ---- pegainfer-comm (EP all-to-all) ----
     "pegainfer-comm",
     "pegainfer-comm/crates/pegainfer-comm-build-utils",
@@ -40,12 +41,9 @@ members = [
     "kvbm/dynamo-kv-hashing",
     "kvbm/dynamo-kv-router",
     "kvbm/kvbm-common",
-    "kvbm/kvbm-config",
     "kvbm/kvbm-consolidator",
-    "kvbm/kvbm-engine",
     "kvbm/kvbm-kernels",
     "kvbm/kvbm-logical",
-    "kvbm/kvbm-physical",
 ]
 
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
@@ -66,12 +64,9 @@ dynamo-memory = { path = "kvbm/dynamo-memory" }
 dynamo-kv-hashing = { path = "kvbm/dynamo-kv-hashing" }
 dynamo-kv-router = { path = "kvbm/dynamo-kv-router", features = ["metrics"] }
 kvbm-common = { path = "kvbm/kvbm-common" }
-kvbm-config = { path = "kvbm/kvbm-config" }
 kvbm-consolidator = { path = "kvbm/kvbm-consolidator" }
-kvbm-engine = { path = "kvbm/kvbm-engine" }
 kvbm-kernels = { path = "kvbm/kvbm-kernels" }
 kvbm-logical = { path = "kvbm/kvbm-logical" }
-kvbm-physical = { path = "kvbm/kvbm-physical" }
 # ---- third-party ----
 anyhow = "1.0"
 async-nats = { version = "0.45.0", features = ["service"] }
@@ -96,6 +91,11 @@ cudarc = { version = "0.19.7", features = [
     "cublas",
     "f16",
     "nccl",
+    # nvrtc: embedded pegaflow-core's transfer/kernel.rs references the nvrtc
+    # bindings unconditionally (its KernelBackend JIT-compiles the copy kernel).
+    # Lazy per-symbol loading (0.19.5+) keeps this off the runtime driver floor,
+    # so it stays compatible with the cuda-12090 binding level (issue #263).
+    "nvrtc",
 ] }
 cxx = "1.0.187"
 cxx-build = "1.0.187"
@@ -129,6 +129,7 @@ parking_lot = "0.12.5"
 pegainfer-bench = { path = "pegainfer-bench" }
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
+pegainfer-kv-offload = { path = "pegainfer-kv-offload" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v4 = { path = "pegainfer-deepseek-v4" }
 pegainfer-engine = { path = "pegainfer-engine" }
