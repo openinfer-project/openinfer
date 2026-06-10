@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
@@ -39,6 +39,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
+mod cli;
+use cli::*;
+
 const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench_snapshots");
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
 const SNAPSHOT_DECODE_PROMPT_LEN: usize = 1024;
@@ -57,234 +60,9 @@ fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
 const REGRESSION_TPOT_PCT: f64 = 2.0;
 const REGRESSION_TTFT_PCT: f64 = 3.0;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DEFAULT_REQUEST_PROMPT: &str = "Tell me a story";
 const DEFAULT_CURVE_PROMPT_LEN: usize = 512;
 const SYNTHETIC_PATTERN: &str = "token_id = 100 + (idx % 1000)";
-const TOP_LEVEL_EXAMPLES: &str = "\
-Examples:
-  cargo run -r --bin bench_serving -- request
-  cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
-  cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64
-  cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512,2048 --output-lens 32,128,256
-  cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
-  cargo run -r --bin bench_serving -- --format json --out bench.json request --prompt-len 512 --output-len 64
-  cargo run -r --bin bench_serving -- snapshot
-  cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json";
-const REQUEST_EXAMPLES: &str = "\
-Examples:
-  cargo run -r --bin bench_serving -- request
-  cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
-  cargo run -r --bin bench_serving -- request --prompt-file prompts/story.txt --output-len 128
-  cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64 --warmup 3 --iters 10";
-const MATRIX_EXAMPLES: &str = "\
-Examples:
-  cargo run -r --bin bench_serving -- matrix
-  cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512,2048 --output-lens 32,128,256
-  cargo run -r --bin bench_serving -- --format json --out matrix.json matrix --prompt-lens 128,512 --output-lens 64,256";
-const CURVE_EXAMPLES: &str = "\
-Examples:
-  cargo run -r --bin bench_serving -- curve
-  cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
-  cargo run -r --bin bench_serving -- curve --prompt \"Summarize KV cache behavior\" --output-len 128 --window 16";
-const SNAPSHOT_EXAMPLES: &str = "\
-Examples:
-  cargo run -r --bin bench_serving -- snapshot
-  cargo run -r --bin bench_serving -- snapshot --warmup 3 --iters 10";
-const COMPARE_EXAMPLES: &str = "\
-Examples:
-  cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json
-  cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline HEAD~3";
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliEpBackend {
-    Nccl,
-    #[value(name = "deepep")]
-    DeepEp,
-}
-
-impl From<CliEpBackend> for EpBackend {
-    fn from(value: CliEpBackend) -> Self {
-        match value {
-            CliEpBackend::Nccl => Self::Nccl,
-            CliEpBackend::DeepEp => Self::DeepEp,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Measure one request shape end-to-end.
-    #[command(after_help = REQUEST_EXAMPLES)]
-    Request(RequestArgs),
-    /// Sweep prompt_len x output_len and summarize each cell.
-    #[command(after_help = MATRIX_EXAMPLES)]
-    Matrix(MatrixArgs),
-    /// Measure TPOT as context grows during decode.
-    #[command(after_help = CURVE_EXAMPLES)]
-    Curve(CurveArgs),
-    /// Run standard profiles and write a regression-trackable snapshot.
-    #[command(after_help = SNAPSHOT_EXAMPLES)]
-    Snapshot(SnapshotArgs),
-    /// Compare a snapshot against its git baseline.
-    #[command(after_help = COMPARE_EXAMPLES)]
-    Compare(CompareArgs),
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "bench_serving",
-    about = "openinfer in-process inference benchmark",
-    after_help = TOP_LEVEL_EXAMPLES
-)]
-struct Cli {
-    /// Model directory (contains config.json, tokenizer, safetensors)
-    #[arg(long, default_value = DEFAULT_MODEL_PATH)]
-    model_path: String,
-
-    /// Enable CUDA graph on decode path
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    cuda_graph: bool,
-
-    /// Render result to terminal as text or structured JSON
-    #[arg(long, default_value = "text")]
-    format: OutputFormat,
-
-    /// Optional label to tag this benchmark run
-    #[arg(long)]
-    label: Option<String>,
-
-    /// Optional output path for the rendered report
-    #[arg(long)]
-    out: Option<String>,
-
-    /// Capture only measured iterations for nsys `-c cudaProfilerApi`
-    #[arg(long, default_value_t = false)]
-    cuda_profiler_capture: bool,
-
-    /// Tensor-parallel world size for Kimi-K2
-    #[arg(long, default_value_t = 1)]
-    tp_size: usize,
-
-    /// Data-parallel world size for Kimi-K2
-    #[arg(long, default_value_t = 8)]
-    dp_size: usize,
-
-    /// Expert-parallel backend for Kimi-K2 (TP1/DP8 requires deepep; TP8/DP1 requires nccl)
-    #[arg(long, default_value = "deepep")]
-    ep_backend: CliEpBackend,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Clone, ClapArgs)]
-struct PromptInputArgs {
-    /// Inline prompt text
-    #[arg(long, conflicts_with_all = ["prompt_file", "prompt_len"])]
-    prompt: Option<String>,
-
-    /// Read prompt text from file
-    #[arg(long, conflicts_with_all = ["prompt", "prompt_len"])]
-    prompt_file: Option<String>,
-
-    /// Use a synthetic prompt with exactly this many token ids
-    #[arg(long, conflicts_with_all = ["prompt", "prompt_file"])]
-    prompt_len: Option<usize>,
-}
-
-#[derive(Debug, Clone, ClapArgs)]
-struct RunArgs {
-    /// Warmup iterations
-    #[arg(long, default_value_t = 5)]
-    warmup: usize,
-
-    /// Measured iterations
-    #[arg(long, default_value_t = 20)]
-    iters: usize,
-
-    /// RNG seed (matters once sampling becomes non-greedy)
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
-}
-
-#[derive(Debug, ClapArgs)]
-struct RequestArgs {
-    #[command(flatten)]
-    prompt_input: PromptInputArgs,
-
-    /// Max generated tokens
-    #[arg(long, default_value_t = 64)]
-    output_len: usize,
-
-    /// Number of concurrent requests per measured iteration
-    #[arg(long, default_value_t = 1)]
-    concurrency: usize,
-
-    /// Number of *distinct* synthetic prompts to tile across the concurrent
-    /// batch (0 = one per request, fully diverse). `1` makes every concurrent
-    /// request identical, which collapses MoE routing onto a narrow expert set
-    /// and under-measures decode TPOT — sweep this to quantify the
-    /// routing-diversity → TPOT curve (see the MoE bench-diversity lesson).
-    #[arg(long, default_value_t = 0)]
-    distinct_prompts: usize,
-
-    #[command(flatten)]
-    run: RunArgs,
-}
-
-#[derive(Debug, ClapArgs)]
-struct MatrixArgs {
-    /// Synthetic prompt lengths to sweep
-    #[arg(long, value_delimiter = ',', default_value = "32,128,512,2048")]
-    prompt_lens: Vec<usize>,
-
-    /// Output lengths to sweep
-    #[arg(long, value_delimiter = ',', default_value = "32,128,256")]
-    output_lens: Vec<usize>,
-
-    #[command(flatten)]
-    run: RunArgs,
-}
-
-#[derive(Debug, ClapArgs)]
-struct CurveArgs {
-    #[command(flatten)]
-    prompt_input: PromptInputArgs,
-
-    /// Max generated tokens
-    #[arg(long, default_value_t = 256)]
-    output_len: usize,
-
-    /// Group decode positions into windows of this size
-    #[arg(long, default_value_t = 32)]
-    window: usize,
-
-    #[command(flatten)]
-    run: RunArgs,
-}
-
-#[derive(Debug, ClapArgs)]
-struct SnapshotArgs {
-    #[command(flatten)]
-    run: RunArgs,
-}
-
-#[derive(Debug, ClapArgs)]
-struct CompareArgs {
-    /// Path to snapshot JSON file
-    path: String,
-
-    /// Git ref to compare against
-    #[arg(long, default_value = "HEAD")]
-    baseline: String,
-}
 
 #[derive(Debug, Clone, Serialize)]
 struct RunInfo {

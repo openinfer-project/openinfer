@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "bench_serving"
-path = "src/bin/bench_serving.rs"
+path = "src/bin/bench_serving/main.rs"
 
 [dependencies]
 openinfer-core = { workspace = true }
