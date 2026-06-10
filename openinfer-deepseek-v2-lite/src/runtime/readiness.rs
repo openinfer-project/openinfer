@@ -91,16 +91,6 @@ fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
         ],
         EpBackendKind::Nccl => vec![
             DecodeGraphBlocker {
-                id: "nccl_dense_exchange_allocates_per_call",
-                source: "nccl_backend.rs::dense_all_reduce_rank0_hidden_to_rank1",
-                reason: "rank0/rank1 receive and zero-send buffers are allocated inside each dense exchange",
-            },
-            DecodeGraphBlocker {
-                id: "nccl_dense_exchange_syncs_rank_streams",
-                source: "nccl_backend.rs::dense_all_reduce_rank0_hidden_to_rank1",
-                reason: "both rank streams are synchronized after every dense exchange",
-            },
-            DecodeGraphBlocker {
                 id: "nccl_route_iteration_on_host",
                 source: "runtime/moe.rs::moe_forward_nccl",
                 reason: "expert routing and per-route loop decisions stay on the host",
@@ -111,5 +101,24 @@ fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
                 reason: "expert launches and device-side scratch accumulation are still driven by the host route loop",
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nccl_readiness_reports_only_remaining_graph_blockers() {
+        let blockers = decode_graph_blockers(EpBackendKind::Nccl);
+        let ids: Vec<_> = blockers.iter().map(|blocker| blocker.id).collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "nccl_route_iteration_on_host",
+                "nccl_expert_accumulation_host_directed",
+            ]
+        );
     }
 }

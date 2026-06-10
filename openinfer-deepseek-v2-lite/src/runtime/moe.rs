@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
 use half::bf16;
-use openinfer_core::{ops, tensor::HiddenStates};
+use openinfer_core::{
+    ops,
+    tensor::{HiddenStates, HiddenStatesRef},
+};
 
 use super::{DeepSeekV2LiteEp2Generator, backend::EpBackendRuntime};
 use crate::{
@@ -235,6 +238,7 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input),
         )?;
+        let rank1_hidden = rank1_input.rank1_hidden()?;
         attribution.record_gpu_pair_result(
             &self.rank0.ctx,
             &self.rank1.ctx,
@@ -271,7 +275,14 @@ impl DeepSeekV2LiteEp2Generator {
                             || format!("layer.{layer_idx}.nccl.local_expert"),
                             Some(layer_idx),
                             token_index,
-                            || expert_forward_device(&self.rank0.ctx, expert, input, token),
+                            || {
+                                expert_forward_device(
+                                    &self.rank0.ctx,
+                                    expert,
+                                    input.as_ref(),
+                                    token,
+                                )
+                            },
                         )?
                     }
                     1 => {
@@ -284,7 +295,7 @@ impl DeepSeekV2LiteEp2Generator {
                             || format!("layer.{layer_idx}.nccl.remote_expert"),
                             Some(layer_idx),
                             token_index,
-                            || expert_forward_device(&self.rank1.ctx, expert, &rank1_input, token),
+                            || expert_forward_device(&self.rank1.ctx, expert, rank1_hidden, token),
                         )?
                     }
                     other => {
@@ -377,11 +388,11 @@ impl DeepSeekV2LiteEp2Generator {
 fn expert_forward_device(
     ctx: &openinfer_core::tensor::DeviceContext,
     expert: &ExpertMlp,
-    input: &HiddenStates,
+    input: HiddenStatesRef<'_>,
     token_idx: usize,
 ) -> Result<HiddenStates> {
     activate(ctx)?;
-    let token = ops::extract_vec(ctx, input, token_idx)?;
+    let token = ops::extract_vec_ref(ctx, input, token_idx)?;
     let token_hidden = HiddenStates {
         hidden_dim: token.len,
         seq_len: 1,

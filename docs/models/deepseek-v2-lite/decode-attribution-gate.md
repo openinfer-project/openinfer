@@ -133,13 +133,13 @@ ncclMaxSharedMem 82240 exceeds device/fn maxSharedMem 79856
 NCCL WARN Cuda failure 1 'invalid argument'
 ```
 
-Use a newer NCCL runtime through the normal library path if the system runtime fails this way. The project code path should not change just to work around local NCCL installation age.
+The NCCL loader now tries explicit overrides first (`OPENINFER_NCCL_LIB`, then `OPENINFER_NCCL_LIB_DIR` / `OPENINFER_NCCL_LIBRARY_PATH`), then Python wheel NCCL directories discoverable from `OPENINFER_NCCL_PYTHON`, `OPENINFER_TRITON_PYTHON`, `VIRTUAL_ENV`, or `CONDA_PREFIX`, and finally the system `libnccl.so.2` / `libnccl.so`. This keeps the code path unchanged while avoiding a stale system NCCL when the validation environment already has a newer CUDA wheel runtime.
 
 The HF oracle needs a Python environment that can load DeepSeek-V2-Lite with `trust_remote_code=True`. The helper script tolerates the model file's optional `flash_attn` import check when FlashAttention is not installed, but the HF environment remains separate from the Rust runtime claim: it is only the truth-source generator for the comparison JSON.
 
 ## Latest Validation
 
-The issue #275 refresh was rerun on 2026-06-08 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. HF, host-staged, and NCCL were dumped from the same model directory and compared with `--require-all-exact`.
+The issue #276 refresh was rerun on 2026-06-10 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. HF, host-staged, and NCCL were dumped from the same model directory and compared with `--require-all-exact`. The Rust path loaded NCCL `2.30.7+cuda12.9` from the Python CUDA wheel path because the system NCCL `2.25.1+cuda12.8` failed the init smoke on this Blackwell host before model-level validation.
 
 - HF / host-staged / NCCL comparison: `all_token_text_exact`.
 - Token SHA256: `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`.
@@ -147,7 +147,15 @@ The issue #275 refresh was rerun on 2026-06-08 with DeepSeek-V2-Lite snapshot `6
 - Generated text: `, I am a 19 year old girl from the UK. I am`.
 - Candidate NCCL attribution: `gpu_timing.sample_count=8384`, `failure_count=0`.
 
-The candidate readiness report still has `full_decode_capture_ready=false`. Compared with the same-host baseline attribution, it removed `nccl_contribution_accumulation_on_host`, `nccl_combine_h2d_contribution_copy`, `nccl_combine_allocates_per_call`, `nccl_combine_syncs_rank_streams`, and `nccl_combine_d2h_result_copy`. The remaining blockers are `nccl_dense_exchange_allocates_per_call`, `nccl_dense_exchange_syncs_rank_streams`, `nccl_route_iteration_on_host`, and `nccl_expert_accumulation_host_directed`.
+The candidate readiness report still has `full_decode_capture_ready=false`. Compared with the issue #275 candidate, it removes the dense-exchange allocation/sync blockers. The remaining blockers are `nccl_route_iteration_on_host` and `nccl_expert_accumulation_host_directed`.
+
+Current NCCL attribution for the issue #276 gate:
+
+| Batch | GPU event samples | GPU failures | NCCL exchange/combine calls | Route counters | Readiness blockers |
+| ---: | ---: | ---: | --- | --- | --- |
+| 1 | 8384 | 0 | `416 / 416` | `local=1284`, `remote=1212`, `combine=2496` | `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
+| 4 | 23996 | 0 | `494 / 494` | `local=5136`, `remote=4848`, `combine=9984` | `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
+| 8 | 44812 | 0 | `598 / 598` | `local=10272`, `remote=9696`, `combine=19968` | `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
 
 The previous A800 strict same-host accuracy gate was rerun on 2026-06-04 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x A800-SXM4-80GB. The token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model directory as the Rust E2E gate.
 
@@ -158,7 +166,7 @@ The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for thi
 - Text SHA256: `4aaafbe4b3a46bc5b9ab5ea8d09d5fad71225006c2e234e87a928e3265b387c6`.
 - Generated text: `, I am a 20 year old female and I have been having a`.
 
-The graph-readiness diagnostic was rerun on 2026-06-04 on the same model snapshot and 2x A800-SXM4-80GB:
+The historical graph-readiness diagnostic before the #275/#276 device-scratch work was rerun on 2026-06-04 on the same model snapshot and 2x A800-SXM4-80GB:
 
 - `full_decode_capture_ready=false`;
 - `status=blocked_full_decode_path`;

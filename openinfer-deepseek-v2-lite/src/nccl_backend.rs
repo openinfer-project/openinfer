@@ -1,5 +1,9 @@
 use std::{
+    collections::HashSet,
+    env,
     ffi::{CStr, c_char, c_int, c_void},
+    fs,
+    path::{Path, PathBuf},
     ptr,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -19,7 +23,7 @@ use half::bf16;
 use libloading::Library;
 use openinfer_core::{
     ops,
-    tensor::{DeviceContext, HiddenStates},
+    tensor::{DeviceContext, HiddenStates, HiddenStatesRef},
 };
 use serde::Serialize;
 
@@ -45,6 +49,7 @@ type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 pub(crate) struct NaiveNcclEp2Backend {
     lib: Arc<RawNcclLib>,
     comms: Vec<ncclComm_t>,
+    dense_exchange_scratch: Mutex<DeviceDenseExchangeScratch>,
     combine_scratch: Mutex<DeviceCombineScratch>,
 }
 
@@ -95,6 +100,7 @@ impl NcclGraphSmokeReport {
 
 struct RawNcclLib {
     _library: Library,
+    source: String,
     comm_init_all: NcclCommInitAll,
     comm_count: NcclCommCount,
     comm_cu_device: NcclCommCuDevice,
@@ -103,6 +109,108 @@ struct RawNcclLib {
     group_end: NcclGroupEnd,
     all_reduce: NcclAllReduce,
     get_error_string: NcclGetErrorString,
+}
+
+#[derive(Default)]
+struct DeviceDenseExchangeScratch {
+    hidden_dim: usize,
+    seq_len: usize,
+    rank0_recv: Option<CudaSlice<bf16>>,
+    rank1_send_zero: Option<CudaSlice<bf16>>,
+    rank1_recv: Option<CudaSlice<bf16>>,
+}
+
+impl DeviceDenseExchangeScratch {
+    fn ensure(
+        &mut self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let elems = dense_exchange_elems(hidden_dim, seq_len)?;
+        if self.hidden_dim == hidden_dim
+            && self.seq_len == seq_len
+            && self
+                .rank0_recv
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+            && self
+                .rank1_send_zero
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+            && self
+                .rank1_recv
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+        {
+            return Ok(());
+        }
+
+        activate(rank0)?;
+        drop(self.rank0_recv.take());
+        let rank0_recv = rank0.stream.alloc_zeros::<bf16>(elems)?;
+        activate(rank1)?;
+        drop(self.rank1_send_zero.take());
+        drop(self.rank1_recv.take());
+        let rank1_send_zero = rank1.stream.alloc_zeros::<bf16>(elems)?;
+        let rank1_recv = rank1.stream.alloc_zeros::<bf16>(elems)?;
+
+        self.hidden_dim = hidden_dim;
+        self.seq_len = seq_len;
+        self.rank0_recv = Some(rank0_recv);
+        self.rank1_send_zero = Some(rank1_send_zero);
+        self.rank1_recv = Some(rank1_recv);
+        Ok(())
+    }
+
+    fn ensure_shape(&self, hidden_dim: usize, seq_len: usize) -> Result<usize> {
+        let elems = dense_exchange_elems(hidden_dim, seq_len)?;
+        ensure!(
+            self.hidden_dim == hidden_dim && self.seq_len == seq_len,
+            "DeepSeek-V2-Lite NCCL dense exchange scratch shape mismatch: scratch=[{}, {}], requested=[{}, {}]",
+            self.hidden_dim,
+            self.seq_len,
+            hidden_dim,
+            seq_len
+        );
+        ensure!(
+            self.rank0_recv
+                .as_ref()
+                .is_some_and(|buf| buf.len() >= elems)
+                && self
+                    .rank1_send_zero
+                    .as_ref()
+                    .is_some_and(|buf| buf.len() >= elems)
+                && self
+                    .rank1_recv
+                    .as_ref()
+                    .is_some_and(|buf| buf.len() >= elems),
+            "DeepSeek-V2-Lite NCCL dense exchange scratch is not initialized for {elems} elements"
+        );
+        Ok(elems)
+    }
+
+    fn rank1_hidden_ref(&self) -> Result<HiddenStatesRef<'_>> {
+        Ok(HiddenStatesRef {
+            data: self
+                .rank1_recv
+                .as_ref()
+                .context("DeepSeek-V2-Lite NCCL rank1 dense exchange recv scratch is missing")?,
+            hidden_dim: self.hidden_dim,
+            seq_len: self.seq_len,
+        })
+    }
+}
+
+pub(crate) struct DenseExchangeOutput<'a> {
+    scratch: MutexGuard<'a, DeviceDenseExchangeScratch>,
+}
+
+impl DenseExchangeOutput<'_> {
+    pub(crate) fn rank1_hidden(&self) -> Result<HiddenStatesRef<'_>> {
+        self.scratch.rank1_hidden_ref()
+    }
 }
 
 #[derive(Default)]
@@ -233,6 +341,7 @@ impl NaiveNcclEp2Backend {
         let backend = Self {
             lib,
             comms,
+            dense_exchange_scratch: Mutex::new(DeviceDenseExchangeScratch::default()),
             combine_scratch: Mutex::new(DeviceCombineScratch::default()),
         };
         backend.validate_communicators(&ordinals)?;
@@ -245,45 +354,64 @@ impl NaiveNcclEp2Backend {
         rank0: &DeviceContext,
         rank1: &DeviceContext,
         input: &HiddenStates,
-    ) -> Result<HiddenStates> {
+    ) -> Result<DenseExchangeOutput<'_>> {
         ensure!(
             input.hidden_dim > 0 && input.seq_len > 0,
             "DeepSeek-V2-Lite NCCL dense hidden exchange requires non-empty hidden states"
         );
-        activate(rank0)?;
-        let mut rank0_recv = HiddenStates::zeros(rank0, input.hidden_dim, input.seq_len)?;
+        let mut scratch = self.dense_exchange_scratch()?;
+        let elems = dense_exchange_elems(input.hidden_dim, input.seq_len)?;
+        scratch.ensure(rank0, rank1, input.hidden_dim, input.seq_len)?;
         activate(rank1)?;
-        let rank1_send = HiddenStates::zeros(rank1, input.hidden_dim, input.seq_len)?;
-        let mut rank1_recv = HiddenStates::zeros(rank1, input.hidden_dim, input.seq_len)?;
+        rank1
+            .stream
+            .memset_zeros(scratch.rank1_send_zero.as_mut().context(
+                "DeepSeek-V2-Lite NCCL rank1 dense exchange zero-send scratch is missing",
+            )?)
+            .context("clear DeepSeek-V2-Lite NCCL rank1 dense exchange zero-send scratch")?;
+        scratch.ensure_shape(input.hidden_dim, input.seq_len)?;
+
+        let DeviceDenseExchangeScratch {
+            rank0_recv,
+            rank1_send_zero,
+            rank1_recv,
+            ..
+        } = &mut *scratch;
+        let rank0_recv = rank0_recv
+            .as_mut()
+            .context("DeepSeek-V2-Lite NCCL rank0 dense exchange recv scratch is missing")?;
+        let rank1_send_zero = rank1_send_zero
+            .as_ref()
+            .context("DeepSeek-V2-Lite NCCL rank1 dense exchange zero-send scratch is missing")?;
+        let rank1_recv = rank1_recv
+            .as_mut()
+            .context("DeepSeek-V2-Lite NCCL rank1 dense exchange recv scratch is missing")?;
 
         // Correctness-first dense exchange: rank0 contributes the hidden state
         // and rank1 contributes zeros. This makes rank0 hidden visible on rank1
         // without pretending to be sparse routed dispatch.
-        let count = input.hidden_dim * input.seq_len;
         self.grouped("DeepSeek-V2-Lite NCCL dense hidden all-reduce", || {
             activate(rank0)?;
             self.all_reduce_bf16(
                 0,
                 &input.data,
-                &mut rank0_recv.data,
-                count,
+                rank0_recv,
+                elems,
                 rank0.stream.cu_stream(),
                 "DeepSeek-V2-Lite NCCL dense hidden rank0 all-reduce",
             )?;
             activate(rank1)?;
             self.all_reduce_bf16(
                 1,
-                &rank1_send.data,
-                &mut rank1_recv.data,
-                count,
+                rank1_send_zero,
+                rank1_recv,
+                elems,
                 rank1.stream.cu_stream(),
                 "DeepSeek-V2-Lite NCCL dense hidden rank1 all-reduce",
             )?;
             Ok(())
         })?;
-        rank0.sync()?;
-        rank1.sync()?;
-        Ok(rank1_recv)
+        Ok(DenseExchangeOutput { scratch })
     }
 
     pub(crate) fn clear_device_combine(
@@ -739,6 +867,12 @@ impl NaiveNcclEp2Backend {
             .map_err(|_| anyhow::anyhow!("DeepSeek-V2-Lite NCCL device combine scratch poisoned"))
     }
 
+    fn dense_exchange_scratch(&self) -> Result<MutexGuard<'_, DeviceDenseExchangeScratch>> {
+        self.dense_exchange_scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DeepSeek-V2-Lite NCCL dense exchange scratch poisoned"))
+    }
+
     fn grouped(&self, context: &str, f: impl FnOnce() -> Result<()>) -> Result<()> {
         let start = unsafe {
             // SAFETY: NCCL group state is process-global and entered/exited on
@@ -765,6 +899,18 @@ fn combine_elems(hidden_dim: usize, seq_len: usize) -> Result<usize> {
     hidden_dim.checked_mul(seq_len).with_context(|| {
         format!(
             "DeepSeek-V2-Lite NCCL device combine shape overflow: hidden_dim={hidden_dim}, seq_len={seq_len}"
+        )
+    })
+}
+
+fn dense_exchange_elems(hidden_dim: usize, seq_len: usize) -> Result<usize> {
+    ensure!(
+        hidden_dim > 0 && seq_len > 0,
+        "DeepSeek-V2-Lite NCCL dense exchange requires non-empty shape, got hidden_dim={hidden_dim}, seq_len={seq_len}"
+    );
+    hidden_dim.checked_mul(seq_len).with_context(|| {
+        format!(
+            "DeepSeek-V2-Lite NCCL dense exchange shape overflow: hidden_dim={hidden_dim}, seq_len={seq_len}"
         )
     })
 }
@@ -896,19 +1042,19 @@ impl Drop for NaiveNcclEp2Backend {
 impl RawNcclLib {
     fn load() -> Result<Self> {
         let mut tried = Vec::new();
-        for candidate in ["libnccl.so.2", "libnccl.so"] {
-            tried.push(candidate);
+        for candidate in nccl_library_candidates() {
+            tried.push(candidate.clone());
             let Ok(library) = (unsafe {
                 // SAFETY: Loading NCCL is required to create the selected
                 // runtime backend. All symbols are validated immediately below.
-                Library::new(candidate)
+                Library::new(&candidate)
             }) else {
                 continue;
             };
             return unsafe {
                 // SAFETY: The library is kept alive inside `RawNcclLib`; copied
                 // function pointers do not outlive it.
-                Self::from_library(library)
+                Self::from_library(library, candidate.clone())
             }
             .with_context(|| format!("load DeepSeek-V2-Lite NCCL backend from {candidate}"));
         }
@@ -918,7 +1064,7 @@ impl RawNcclLib {
         )
     }
 
-    unsafe fn from_library(library: Library) -> Result<Self> {
+    unsafe fn from_library(library: Library, source: String) -> Result<Self> {
         Ok(Self {
             comm_init_all: unsafe { load_symbol(&library, b"ncclCommInitAll\0")? },
             comm_count: unsafe { load_symbol(&library, b"ncclCommCount\0")? },
@@ -928,6 +1074,7 @@ impl RawNcclLib {
             group_end: unsafe { load_symbol(&library, b"ncclGroupEnd\0")? },
             all_reduce: unsafe { load_symbol(&library, b"ncclAllReduce\0")? },
             get_error_string: unsafe { load_symbol(&library, b"ncclGetErrorString\0")? },
+            source,
             _library: library,
         })
     }
@@ -946,7 +1093,10 @@ impl RawNcclLib {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        bail!("{context} failed: {message} ({status:?})")
+        bail!(
+            "{context} failed with NCCL library {}: {message} ({status:?})",
+            self.source
+        )
     }
 
     fn query_comm_count(&self, comm: ncclComm_t, context: &str) -> Result<c_int> {
@@ -972,6 +1122,142 @@ impl RawNcclLib {
     }
 }
 
+fn nccl_library_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    add_env_file_candidates(&mut candidates, &mut seen, "OPENINFER_NCCL_LIB");
+    add_env_dir_candidates(&mut candidates, &mut seen, "OPENINFER_NCCL_LIB_DIR");
+    add_env_dir_candidates(&mut candidates, &mut seen, "OPENINFER_NCCL_LIBRARY_PATH");
+    for lib_dir in nccl_python_wheel_lib_dirs() {
+        add_nccl_dir_candidates(&mut candidates, &mut seen, &lib_dir);
+    }
+
+    add_candidate(&mut candidates, &mut seen, "libnccl.so.2".to_string());
+    add_candidate(&mut candidates, &mut seen, "libnccl.so".to_string());
+    candidates
+}
+
+fn add_env_file_candidates(candidates: &mut Vec<String>, seen: &mut HashSet<String>, key: &str) {
+    let Ok(value) = env::var(key) else {
+        return;
+    };
+    for path in env::split_paths(&value) {
+        add_candidate(candidates, seen, path.to_string_lossy().into_owned());
+    }
+}
+
+fn add_env_dir_candidates(candidates: &mut Vec<String>, seen: &mut HashSet<String>, key: &str) {
+    let Ok(value) = env::var(key) else {
+        return;
+    };
+    for dir in env::split_paths(&value) {
+        add_nccl_dir_candidates(candidates, seen, &dir);
+    }
+}
+
+fn add_nccl_dir_candidates(candidates: &mut Vec<String>, seen: &mut HashSet<String>, dir: &Path) {
+    add_candidate(
+        candidates,
+        seen,
+        dir.join("libnccl.so.2").to_string_lossy().into_owned(),
+    );
+    add_candidate(
+        candidates,
+        seen,
+        dir.join("libnccl.so").to_string_lossy().into_owned(),
+    );
+}
+
+fn add_candidate(candidates: &mut Vec<String>, seen: &mut HashSet<String>, candidate: String) {
+    if !candidate.is_empty() && seen.insert(candidate.clone()) {
+        candidates.push(candidate);
+    }
+}
+
+fn nccl_python_wheel_lib_dirs() -> Vec<PathBuf> {
+    python_env_roots()
+        .into_iter()
+        .flat_map(|root| nccl_python_wheel_lib_dirs_from_root(&root))
+        .collect()
+}
+
+fn python_env_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    for key in ["OPENINFER_NCCL_PYTHON", "OPENINFER_TRITON_PYTHON"] {
+        if let Ok(value) = env::var(key) {
+            add_python_env_root(&mut roots, &mut seen, Path::new(&value));
+        }
+    }
+    for key in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
+        if let Ok(value) = env::var(key) {
+            add_pathbuf_once(&mut roots, &mut seen, PathBuf::from(value));
+        }
+    }
+    roots
+}
+
+fn add_python_env_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, python: &Path) {
+    if python.is_dir() {
+        add_pathbuf_once(roots, seen, python.to_path_buf());
+        return;
+    }
+    if let Some(parent) = python.parent()
+        && parent.file_name().is_some_and(|name| name == "bin")
+        && let Some(root) = parent.parent()
+    {
+        add_pathbuf_once(roots, seen, root.to_path_buf());
+    }
+}
+
+fn add_pathbuf_once(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if !path.as_os_str().is_empty() && seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+fn nccl_python_wheel_lib_dirs_from_root(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    add_python_wheel_lib_dir(
+        &mut dirs,
+        &mut seen,
+        root.join("site-packages/nvidia/nccl/lib"),
+    );
+
+    let lib_root = root.join("lib");
+    if let Ok(entries) = fs::read_dir(&lib_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with("python") {
+                add_python_wheel_lib_dir(
+                    &mut dirs,
+                    &mut seen,
+                    path.join("site-packages/nvidia/nccl/lib"),
+                );
+            }
+        }
+    }
+
+    add_python_wheel_lib_dir(
+        &mut dirs,
+        &mut seen,
+        root.join("Lib/site-packages/nvidia/nccl/lib"),
+    );
+    dirs
+}
+
+fn add_python_wheel_lib_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
+    if dir.join("libnccl.so.2").exists() && seen.insert(dir.clone()) {
+        dirs.push(dir);
+    }
+}
+
 unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static [u8]) -> Result<T> {
     unsafe { library.get::<T>(symbol) }
         .map(|symbol| *symbol)
@@ -981,4 +1267,40 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static [u8]) -> Resu
                 String::from_utf8_lossy(symbol).trim_end_matches('\0')
             )
         })
+}
+
+#[cfg(test)]
+mod nccl_loader_tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    #[test]
+    fn finds_nccl_python_wheel_lib_dir_from_python_executable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "openinfer-nccl-wheel-test-{}-{unique}",
+            std::process::id()
+        ));
+        let python_dir = root.join("bin");
+        let wheel_dir = root.join("lib/python3.11/site-packages/nvidia/nccl/lib");
+        fs::create_dir_all(&python_dir).expect("create python bin dir");
+        fs::create_dir_all(&wheel_dir).expect("create NCCL wheel dir");
+        fs::write(wheel_dir.join("libnccl.so.2"), []).expect("create fake NCCL lib marker");
+
+        let mut roots = Vec::new();
+        let mut seen = HashSet::new();
+        add_python_env_root(&mut roots, &mut seen, &python_dir.join("python"));
+
+        assert_eq!(roots, vec![root.clone()]);
+        assert_eq!(nccl_python_wheel_lib_dirs_from_root(&root), vec![wheel_dir]);
+
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
 }

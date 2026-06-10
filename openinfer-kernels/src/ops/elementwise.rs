@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {
@@ -478,9 +478,18 @@ pub fn extract_vec(
     batch: &HiddenStates,
     token_idx: usize,
 ) -> Result<DeviceVec> {
+    extract_vec_ref(ctx, batch.as_ref(), token_idx)
+}
+
+/// Extract a single token's vector from a borrowed HiddenStates batch.
+pub fn extract_vec_ref(
+    ctx: &DeviceContext,
+    batch: HiddenStatesRef<'_>,
+    token_idx: usize,
+) -> Result<DeviceVec> {
     let len = batch.hidden_dim;
     let mut out = DeviceVec::zeros(ctx, len)?;
-    extract_vec_into(ctx, batch, token_idx, &mut out)?;
+    extract_vec_ref_into(ctx, batch, token_idx, &mut out)?;
     Ok(out)
 }
 
@@ -488,6 +497,16 @@ pub fn extract_vec(
 pub fn extract_vec_into(
     ctx: &DeviceContext,
     batch: &HiddenStates,
+    token_idx: usize,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    extract_vec_ref_into(ctx, batch.as_ref(), token_idx, out)
+}
+
+/// Copy one column from a borrowed `batch` into a pre-allocated `out`.
+pub fn extract_vec_ref_into(
+    ctx: &DeviceContext,
+    batch: HiddenStatesRef<'_>,
     token_idx: usize,
     out: &mut DeviceVec,
 ) -> Result<()> {
