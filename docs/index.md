@@ -147,6 +147,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `benchmarks/qwen3-4b-serving-vllm-rtx5090.md` | Qwen3-4B TP1 vs vLLM 0.22.1 on RTX 5090, README source (#327): Poisson QPS sweep (openinfer wins low-load TTFT, vLLM wins TPOT +11→27% and knees later, ~QPS 12 vs ~10) + warm prefix-cache-hit TTFT sweep (openinfer leads all lengths, 3× at 16k: 30.3 vs 90.8 ms). Seeded, reproducible via `tools/bench/`. |
 | `benchmarks/bs1-4k64-vllm-openinfer.md` | RTX 5090 single-concurrency probe: `input_len=4096`, `output_len=64`, no vLLM prefix cache. OpenInfer TTFT median `177ms` vs vLLM `198ms`; TPOT median `6.47ms` vs `6.36ms`; corrected output throughput `+6%` for OpenInfer. |
 | `benchmarks/accuracy-eval-results.md` | Phase 1 GSM8K: Qwen3-4B PASS (openinfer 85.37% vs HF 85.82%, delta -0.45 pp). Qwen3.5-4B historical FAIL recovered by #250 (strict 79.38%, flexible 79.30% vs HF 79.45%). |
 | `benchmarks/pplx-ep-a2a-h20-nvlink.md` | pplx EP all-to-all latency on 8× H20 NV18 NVLink: DSV4 & Kimi-K2 shapes, tok=1..256. tok=1 p50 ~82μs, tok=256 p50 ~204/303μs. |

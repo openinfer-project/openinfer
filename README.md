@@ -24,20 +24,39 @@ The goal is to understand every layer of the inference stack by building it from
 
 ## Performance
 
-Measured on **RTX 5070 Ti** (16 GB), BF16, CUDA Graph enabled, single request:
+**Qwen3-4B vs vLLM 0.22.1** — measured 2026-06-10 on one **RTX 5090** (32 GB), BF16, TP1,
+both engines driven by `vllm bench serve` (random 1024-token prompts, 128-token outputs,
+Poisson arrivals, fixed seed). Full data, commands, and caveats:
+[`docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md`](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md).
 
-| Metric | Qwen3-4B | Qwen3.5-4B |
-|--------|----------|-------------|
-| TTFT (short prompt) | ~14 ms | ~22 ms |
-| TPOT (decode) | ~11 ms/tok | ~11.8 ms/tok |
-| Throughput | **~91 tok/s** | **~85 tok/s** |
+Serving load sweep (**openinfer** / vLLM):
+
+| QPS | TTFT p50 (ms) | TPOT p50 (ms) | Output tok/s |
+|-----|---------------|----------------|--------------|
+| 1 | **50.7** / 57.8 | 7.36 / **6.65** | 126 / 126 |
+| 4 | **57.3** / 61.8 | 11.09 / **8.57** | 502 / 504 |
+| 8 | 69.5 / **68.1** | 14.98 / **11.82** | 1005 / 1008 |
+| 12 (overload) | 1754 / **120** | 44.2 / **19.4** | 1415 / 1501 |
+
+Warm TTFT with a GPU prefix-cache hit (identical prompt re-sent, output = 1 token):
+
+| Input length | openinfer warm p50 | vLLM warm p50 |
+|--------------|--------------------|---------------|
+| 1k tokens | **10.5 ms** | 16.1 ms |
+| 4k tokens | **14.5 ms** | 27.3 ms |
+| 16k tokens | **30.3 ms** | 90.8 ms |
+
+openinfer wins single-stream TTFT and prefix-cache-hit TTFT (3× at 16k tokens);
+vLLM wins batched decode TPOT and saturates later (knee ~QPS 12 vs ~QPS 10).
+Qwen3.5-4B single-stream numbers are at parity with vLLM — see
+[`docs/models/qwen35/optimization.md`](docs/models/qwen35/optimization.md).
 
 <details>
 <summary>What do these metrics mean?</summary>
 
 - **TTFT** (Time To First Token): latency from receiving the prompt to generating the first output token. Includes tokenization, embedding, and the full prefill pass.
 - **TPOT** (Time Per Output Token): average time to generate each subsequent token during the decode phase.
-- **Throughput**: 1000 / TPOT, i.e. tokens generated per second during decode.
+- **Warm TTFT**: TTFT when the prompt's KV is already resident in the GPU prefix cache, so only cache lookup + suffix prefill + sampling remain.
 
 </details>
 
