@@ -1055,8 +1055,7 @@ impl ModelExecutor for Qwen3Executor {
     fn prefetched_blocks(&self, request_id: RequestId) -> usize {
         self.prefetch
             .get(&request_id)
-            .map(|st| st.probe.held_blocks())
-            .unwrap_or(0)
+            .map_or(0, |st| st.probe.held_blocks())
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
@@ -1493,14 +1492,14 @@ impl ModelExecutor for Qwen3Executor {
                     Ok(response) => match response.recv() {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
-                            cleanup_errors.push(format!("rank {rank} cleanup: {err:#}"))
+                            cleanup_errors.push(format!("rank {rank} cleanup: {err:#}"));
                         }
                         Err(_) => cleanup_errors.push(format!(
                             "rank {rank} cleanup: dropped LoRA discard response"
                         )),
                     },
                     Err(err) => {
-                        cleanup_errors.push(format!("rank {rank} cleanup dispatch: {err:#}"))
+                        cleanup_errors.push(format!("rank {rank} cleanup dispatch: {err:#}"));
                     }
                 }
             }

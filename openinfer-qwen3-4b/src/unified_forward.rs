@@ -150,7 +150,10 @@ impl Qwen3Model {
             .iter()
             .map(|v| v.page_indices().to_vec())
             .collect();
-        let last_page_lens: Vec<usize> = prefill_views.iter().map(|v| v.last_page_len()).collect();
+        let last_page_lens: Vec<usize> = prefill_views
+            .iter()
+            .map(openinfer_kv_cache::KvView::last_page_len)
+            .collect();
         let prefill_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,
             &page_indices,

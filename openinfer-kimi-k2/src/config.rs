@@ -1,5 +1,9 @@
 //! Kimi-K2.6 text-only constants, config probing, and derived shapes.
 
+// Most consumers live behind the kimi-k2 feature; the constants and shape
+// helpers are intentionally kept compiling in feature-off builds.
+#![cfg_attr(not(feature = "kimi-k2"), allow(dead_code))]
+
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};

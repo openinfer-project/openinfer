@@ -65,6 +65,8 @@ pub(crate) struct DeviceLoraAdapter {
     pub(crate) layers: Vec<DeviceLoraLayer>,
 }
 
+// Field names mirror the adapter safetensors tensor names.
+#[allow(clippy::struct_field_names)]
 #[derive(Default)]
 pub(crate) struct DeviceLoraLayer {
     pub(crate) q_proj: Option<DeviceLoraProjection>,
@@ -779,9 +781,9 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
             max_position_embeddings: 40960,
-            eos_token_id: 151645,
+            eos_token_id: 151_645,
             tie_word_embeddings: false,
-            stop_token_ids: vec![151645],
+            stop_token_ids: vec![151_645],
         }
     }
 
@@ -987,8 +989,8 @@ mod tests {
         .expect("load adapter");
         let q_proj = adapter.layers[0].projections.get("q_proj").expect("q_proj");
 
-        assert_eq!(q_proj.a.data[0].to_f32(), bf16::from_f32(1.5).to_f32());
-        assert_eq!(q_proj.b.data[0].to_f32(), bf16::from_f32(2.25).to_f32());
+        assert_eq!(q_proj.a.data[0], bf16::from_f32(1.5));
+        assert_eq!(q_proj.b.data[0], bf16::from_f32(2.25));
     }
 
     #[test]

@@ -163,7 +163,7 @@ impl PackedLoraProjection {
         )
         .map_err(|e| anyhow::anyhow!("packed LoRA B copy failed: {e}"))?;
 
-        let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
+        let mut scale_slot = self.scales.slice_mut(slot..=slot);
         ctx.stream
             .memcpy_htod(&[scale], &mut scale_slot)
             .map_err(|e| anyhow::anyhow!("packed LoRA scale copy failed: {e}"))?;
@@ -193,7 +193,7 @@ impl PackedLoraProjection {
             .memcpy_htod(&zero_b, &mut b_dst)
             .map_err(|e| anyhow::anyhow!("packed LoRA B clear failed: {e}"))?;
 
-        let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
+        let mut scale_slot = self.scales.slice_mut(slot..=slot);
         ctx.stream
             .memcpy_htod(&[0.0f32], &mut scale_slot)
             .map_err(|e| anyhow::anyhow!("packed LoRA scale clear failed: {e}"))?;
