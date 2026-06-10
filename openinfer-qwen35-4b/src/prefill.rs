@@ -79,8 +79,7 @@ impl Qwen35Model {
         let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
 
         // Last-token logic runs once, on the final chunk's output.
-        let last_hidden =
-            ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)?;
+        let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)?;
 
         // Final norm (1+weight offset)
         let normed = {
