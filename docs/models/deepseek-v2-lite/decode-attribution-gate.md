@@ -71,7 +71,7 @@ python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --require-all-exact
 ```
 
-Then collect attribution for the same two openinfer backends. Use `--batch-size 1` for the original single-row gate, and `--batch-size 4` / `--batch-size 8` for the true-batch benchmark attribution shape:
+Then collect attribution for the same two openinfer backends. Use `--batch-size 1` for the original single-row gate, and `--batch-size 4` / `--batch-size 8` for the true-batch benchmark attribution shape. If the NCCL runtime should come from a Python CUDA wheel rather than the system install, set `OPENINFER_NCCL_PYTHON` or `OPENINFER_TRITON_PYTHON` to that environment's Python for the attribution command too.
 
 ```bash
 cargo run --release -p openinfer-deepseek-v2-lite \

@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Device-Resident NCCL Combine
 
-> **TL;DR:** Issue #275 moves the NCCL decode combine path to reusable device-resident f32 scratch buffers. The retained `Hello` / 16-token gate stays HF / host-staged / NCCL exact, and the readiness report no longer lists the old combine H2D/D2H/allocation/sync blockers. Issue #276 later removes the dense-exchange allocation/sync blockers; full decode capture is still blocked by host-directed routing/expert accumulation.
+> **TL;DR:** Issue #275 moves the NCCL decode combine path to reusable device-resident f32 scratch buffers. The retained `Hello` / 16-token gate stays HF / host-staged / NCCL exact, and the readiness report no longer lists the old combine H2D/D2H/allocation/sync blockers. Current NCCL graph-readiness blockers live in `status.md`.
 
 Last touched: 2026-06
 
@@ -23,11 +23,11 @@ Last touched: 2026-06
   1. Add a shared CUDA helper that accumulates a bf16 single-token expert output into a f32 device contribution buffer at a selected token row.
   2. Re-export that helper through `openinfer-core::ops`.
   3. Add reusable NCCL combine scratch buffers inside `NaiveNcclEp2Backend`, clear the f32 send scratch per MoE call, accumulate local/remote expert outputs on the owning device, all-reduce device buffers, and cast rank0 f32 result to bf16 on device.
-  4. Update graph-readiness blockers and attribution wording so removed combine H2D/D2H/allocation/sync blockers are no longer claimed, while the then-remaining host routing and dense-exchange blockers stay explicit.
+  4. Update graph-readiness blockers and attribution wording so removed combine H2D/D2H/allocation/sync blockers are no longer claimed, while the remaining host routing and dense-exchange blockers stay explicit.
   5. Run formatting and local compile gates, then use the provided remote GPU host for the DeepSeek-V2-Lite EP2 exactness and attribution gates.
 - **Risks / open questions**:
   - Device f32 accumulation must preserve the existing expert-id accumulation order before the final bf16 cast.
-  - At the time of issue #275, dense exchange and host route selection still blocked full decode CUDA Graph capture; issue #276 later removed the dense-exchange allocation/sync blockers, but `full_decode_capture_ready` should remain false while host-directed routing/expert accumulation remain.
+  - Dense exchange and host route selection still blocked full decode CUDA Graph capture at the time of issue #275; keep the current blocker list in `status.md`.
   - The provided SSH credential should stay local to the validation session and must not be echoed into docs or final output.
 
 ## Execution Log
@@ -104,8 +104,6 @@ Before/after readiness comparison for the same model snapshot and diagnostic sha
 | Baseline NCCL attribution | `nccl_dense_exchange_allocates_per_call`, `nccl_dense_exchange_syncs_rank_streams`, `nccl_route_iteration_on_host`, `nccl_contribution_accumulation_on_host`, `nccl_combine_h2d_contribution_copy`, `nccl_combine_allocates_per_call`, `nccl_combine_syncs_rank_streams`, `nccl_combine_d2h_result_copy` |
 | Candidate NCCL attribution | `nccl_dense_exchange_allocates_per_call`, `nccl_dense_exchange_syncs_rank_streams`, `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
 
-Current issue #276 readiness removes the dense-exchange allocation/sync blockers as well. The retained NCCL blockers are `nccl_route_iteration_on_host` and `nccl_expert_accumulation_host_directed`.
-
 Removed blockers:
 
 - `nccl_contribution_accumulation_on_host`
@@ -120,4 +118,4 @@ The candidate report replaces the old `nccl_contribution_accumulate` and `nccl_c
 
 The implementation keeps host-staged unchanged as the correctness oracle. The NCCL backend now owns reusable rank0/rank1 f32 send/recv scratch buffers behind `DeviceCombineScratch`; each MoE call clears the f32 send scratch on device, accumulates one-token expert outputs into the owning rank's send scratch with a CUDA helper, runs the f32 NCCL all-reduce, and casts rank0's f32 result back to bf16 on device.
 
-The final bf16 `HiddenStates` returned to the model is still allocated per combine call. That allocation is outside the removed NCCL contribution/result round trip, so issue #275 did not claim full CUDA Graph readiness. Issue #276 then moved dense exchange to reusable bf16 scratch; the remaining host-directed readiness blockers are still real and should drive the next slice.
+The final bf16 `HiddenStates` returned to the model is still allocated per combine call. That allocation is outside the removed NCCL contribution/result round trip, so issue #275 did not claim full CUDA Graph readiness. The current blocker list should stay in `status.md`.

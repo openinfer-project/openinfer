@@ -14,7 +14,7 @@ Last touched: 2026-06
 | Decode attribution | Available | PR #162 and PR #169 add CPU/GPU attribution, route counts, NCCL counters, CUDA event timing, and optional NVTX correlation. |
 | Direct same-prompt diagnostic batch | Available | PR #184 and PR #196 cover batch sizes `1`, `4`, and `8` for the fixed same-prompt direct path. |
 | Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
-| Device-resident NCCL dense exchange | Available | Issue #276 keeps dense-exchange rank recv/zero-send buffers on reusable backend-owned bf16 scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
+| Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL CUDA Graph readiness | Diagnostic only | The attribution binary emits `cuda_graph_readiness`. Current NCCL full decode capture remains blocked by host route iteration and host-directed expert accumulation; the removed dense-exchange allocation/sync blockers should stay absent. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
 | vLLM production parity | Not claimed | The manual vLLM snapshot below is for understanding the gap requested in issue #170. |
@@ -101,7 +101,7 @@ Do not claim:
 
 Issue #205 records the model roadmap. Maintainer feedback there calls out NCCL plus CUDA Graph as the likely best decode direction, with host staging possibly deprecated later. Treat that as a future direction, not as current evidence.
 
-The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, and issue #276 removed the dense-exchange allocation/sync blockers from the retained 2x RTX 5090 attribution gate. The remaining NCCL blockers are host route iteration and host-directed expert accumulation. The optional f32 NCCL graph smoke is a separate collective-only diagnostic and is not #276 evidence. HF, host-staged, and NCCL remain token/text exact for the narrow greedy gate.
+The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, and issue #276 removed the dense-exchange allocation/sync blockers from the retained 2x RTX 5090 attribution gate. Those removed dense-exchange blockers are absent from the current readiness report. The remaining NCCL blockers are host route iteration and host-directed expert accumulation. The optional f32 NCCL graph smoke is a separate collective-only diagnostic and is not #276 evidence. HF, host-staged, and NCCL remain token/text exact for the narrow greedy gate.
 
 The next implementation should be chosen from measured evidence:
 

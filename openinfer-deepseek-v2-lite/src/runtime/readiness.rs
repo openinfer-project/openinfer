@@ -9,6 +9,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+mod tests;
+
 impl DeepSeekV2LiteEp2Generator {
     pub fn decode_graph_readiness_report(
         &self,
@@ -101,24 +104,5 @@ fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
                 reason: "expert launches and device-side scratch accumulation are still driven by the host route loop",
             },
         ],
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nccl_readiness_reports_only_remaining_graph_blockers() {
-        let blockers = decode_graph_blockers(EpBackendKind::Nccl);
-        let ids: Vec<_> = blockers.iter().map(|blocker| blocker.id).collect();
-
-        assert_eq!(
-            ids,
-            vec![
-                "nccl_route_iteration_on_host",
-                "nccl_expert_accumulation_host_directed",
-            ]
-        );
     }
 }

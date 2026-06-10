@@ -29,6 +29,9 @@ use serde::Serialize;
 
 use crate::device::activate;
 
+#[cfg(test)]
+mod tests;
+
 type NcclCommInitAll = unsafe extern "C" fn(*mut ncclComm_t, c_int, *const c_int) -> ncclResult_t;
 type NcclCommCount = unsafe extern "C" fn(ncclComm_t, *mut c_int) -> ncclResult_t;
 type NcclCommCuDevice = unsafe extern "C" fn(ncclComm_t, *mut c_int) -> ncclResult_t;
@@ -127,7 +130,7 @@ impl DeviceDenseExchangeScratch {
         rank1: &DeviceContext,
         hidden_dim: usize,
         seq_len: usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let elems = dense_exchange_elems(hidden_dim, seq_len)?;
         if self.hidden_dim == hidden_dim
             && self.seq_len == seq_len
@@ -144,7 +147,7 @@ impl DeviceDenseExchangeScratch {
                 .as_ref()
                 .is_some_and(|buf| buf.len() >= elems)
         {
-            return Ok(());
+            return Ok(elems);
         }
 
         activate(rank0)?;
@@ -161,33 +164,6 @@ impl DeviceDenseExchangeScratch {
         self.rank0_recv = Some(rank0_recv);
         self.rank1_send_zero = Some(rank1_send_zero);
         self.rank1_recv = Some(rank1_recv);
-        Ok(())
-    }
-
-    fn ensure_shape(&self, hidden_dim: usize, seq_len: usize) -> Result<usize> {
-        let elems = dense_exchange_elems(hidden_dim, seq_len)?;
-        ensure!(
-            self.hidden_dim == hidden_dim && self.seq_len == seq_len,
-            "DeepSeek-V2-Lite NCCL dense exchange scratch shape mismatch: scratch=[{}, {}], requested=[{}, {}]",
-            self.hidden_dim,
-            self.seq_len,
-            hidden_dim,
-            seq_len
-        );
-        ensure!(
-            self.rank0_recv
-                .as_ref()
-                .is_some_and(|buf| buf.len() >= elems)
-                && self
-                    .rank1_send_zero
-                    .as_ref()
-                    .is_some_and(|buf| buf.len() >= elems)
-                && self
-                    .rank1_recv
-                    .as_ref()
-                    .is_some_and(|buf| buf.len() >= elems),
-            "DeepSeek-V2-Lite NCCL dense exchange scratch is not initialized for {elems} elements"
-        );
         Ok(elems)
     }
 
@@ -360,8 +336,7 @@ impl NaiveNcclEp2Backend {
             "DeepSeek-V2-Lite NCCL dense hidden exchange requires non-empty hidden states"
         );
         let mut scratch = self.dense_exchange_scratch()?;
-        let elems = dense_exchange_elems(input.hidden_dim, input.seq_len)?;
-        scratch.ensure(rank0, rank1, input.hidden_dim, input.seq_len)?;
+        let elems = scratch.ensure(rank0, rank1, input.hidden_dim, input.seq_len)?;
         activate(rank1)?;
         rank1
             .stream
@@ -369,7 +344,6 @@ impl NaiveNcclEp2Backend {
                 "DeepSeek-V2-Lite NCCL rank1 dense exchange zero-send scratch is missing",
             )?)
             .context("clear DeepSeek-V2-Lite NCCL rank1 dense exchange zero-send scratch")?;
-        scratch.ensure_shape(input.hidden_dim, input.seq_len)?;
 
         let DeviceDenseExchangeScratch {
             rank0_recv,
@@ -1267,40 +1241,4 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static [u8]) -> Resu
                 String::from_utf8_lossy(symbol).trim_end_matches('\0')
             )
         })
-}
-
-#[cfg(test)]
-mod nccl_loader_tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use super::*;
-
-    #[test]
-    fn finds_nccl_python_wheel_lib_dir_from_python_executable() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_nanos();
-        let root = env::temp_dir().join(format!(
-            "openinfer-nccl-wheel-test-{}-{unique}",
-            std::process::id()
-        ));
-        let python_dir = root.join("bin");
-        let wheel_dir = root.join("lib/python3.11/site-packages/nvidia/nccl/lib");
-        fs::create_dir_all(&python_dir).expect("create python bin dir");
-        fs::create_dir_all(&wheel_dir).expect("create NCCL wheel dir");
-        fs::write(wheel_dir.join("libnccl.so.2"), []).expect("create fake NCCL lib marker");
-
-        let mut roots = Vec::new();
-        let mut seen = HashSet::new();
-        add_python_env_root(&mut roots, &mut seen, &python_dir.join("python"));
-
-        assert_eq!(roots, vec![root.clone()]);
-        assert_eq!(nccl_python_wheel_lib_dirs_from_root(&root), vec![wheel_dir]);
-
-        fs::remove_dir_all(root).expect("remove temp root");
-    }
 }
