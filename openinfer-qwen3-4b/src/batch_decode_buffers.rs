@@ -9,7 +9,13 @@ use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
-pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+/// Mirrors vLLM's cudagraph capture list ([1,2,4,8] then every 8) up to 256; graphs
+/// are captured lazily per bucket, and activation buffers are shared (sized once at
+/// the largest bucket), so extra buckets cost capture time on first hit, not memory.
+pub(crate) const BATCH_BUCKETS: &[usize] = &[
+    1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
+    168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
+];
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 const SPLIT_KV_CHUNK_TOKENS: usize = 256;
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
