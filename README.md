@@ -29,26 +29,32 @@ both engines driven by `vllm bench serve` (random 1024-token prompts, 128-token 
 Poisson arrivals, fixed seed). Full data, commands, and caveats:
 [`docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md`](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md).
 
-Serving load sweep (**openinfer** / vLLM):
+**Warm TTFT on a GPU prefix-cache hit** (identical prompt re-sent, output = 1 token,
+20 samples per length — the agent / multi-turn-chat hot path). openinfer leads at
+every length and the gap widens with context: **3× faster at 16k tokens**.
+
+| Input length | openinfer p50 / p99 | vLLM p50 / p99 |
+|--------------|---------------------|----------------|
+| 256 | **9.5 / 10.5 ms** | 13.3 / 14.2 ms |
+| 512 | **9.9 / 10.1 ms** | 14.3 / 14.5 ms |
+| 1k | **10.5 / 10.7 ms** | 16.1 / 16.4 ms |
+| 2k | **11.9 / 12.4 ms** | 19.8 / 20.5 ms |
+| 4k | **14.5 / 15.1 ms** | 27.3 / 28.3 ms |
+| 8k | **24.6 / 25.6 ms** | 46.9 / 49.3 ms |
+| 16k | **30.3 / 31.4 ms** | 90.8 / 100.2 ms |
+
+**Serving load sweep** (Poisson arrivals, **openinfer** / vLLM):
 
 | QPS | TTFT p50 (ms) | TPOT p50 (ms) | Output tok/s |
 |-----|---------------|----------------|--------------|
 | 1 | **50.7** / 57.8 | 7.36 / **6.65** | 126 / 126 |
 | 4 | **57.3** / 61.8 | 11.09 / **8.57** | 502 / 504 |
 | 8 | 69.5 / **68.1** | 14.98 / **11.82** | 1005 / 1008 |
-| 12 (overload) | 1754 / **120** | 44.2 / **19.4** | 1415 / 1501 |
 
-Warm TTFT with a GPU prefix-cache hit (identical prompt re-sent, output = 1 token):
-
-| Input length | openinfer warm p50 | vLLM warm p50 |
-|--------------|--------------------|---------------|
-| 1k tokens | **10.5 ms** | 16.1 ms |
-| 4k tokens | **14.5 ms** | 27.3 ms |
-| 16k tokens | **30.3 ms** | 90.8 ms |
-
-openinfer wins single-stream TTFT and prefix-cache-hit TTFT (3× at 16k tokens);
-vLLM wins batched decode TPOT and saturates later (knee ~QPS 12 vs ~QPS 10).
-Qwen3.5-4B single-stream numbers are at parity with vLLM — see
+openinfer wins single-stream and low-load TTFT; vLLM wins batched decode TPOT and
+holds higher load before saturating (knee ~QPS 12 vs ~QPS 10 on this GPU — the full
+sweep through overload is in the snapshot doc). Qwen3.5-4B single-stream numbers are
+at parity with vLLM — see
 [`docs/models/qwen35/optimization.md`](docs/models/qwen35/optimization.md).
 
 <details>
