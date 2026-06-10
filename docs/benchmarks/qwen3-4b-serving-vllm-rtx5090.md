@@ -88,6 +88,13 @@ VLLM=.venv/bin/vllm tools/bench/qps_sweep.sh
   openinfer's queue diverges (TTFT p50 1.75 s) while vLLM still serves at 119.5 ms.
   Both are overloaded at QPS 16; vLLM's saturated throughput is ~12% higher
   (1690 vs 1511 out tok/s).
+- **openinfer's saturated throughput is pinned by the bs=64 decode cap** (largest
+  CUDA-graph bucket, `BATCH_BUCKETS` ends at 64). Implied decode concurrency
+  (`out_tok/s × TPOT`) sits at 62 in both overloaded openinfer runs — exactly the
+  cap — giving a hard ceiling of `64 / TPOT(bs64) ≈ 64/42 ms ≈ 1520 tok/s`, which
+  matches the measured 1511. vLLM keeps admitting past 64 (implied concurrency ~129
+  at QPS 16) and converts that into its +12%. The low-load TPOT gap is unrelated to
+  the cap (implied concurrency ≤ 16 at QPS ≤ 8).
 - ITL p99 is consistently worse for openinfer under load (97.7 vs 46.7 ms at QPS 8) —
   scheduling jitter, same tail issue noted in `subsystems/scheduler/scheduler.md`.
 
