@@ -1227,9 +1227,13 @@ fn nccl_python_wheel_lib_dirs_from_root(root: &Path) -> Vec<PathBuf> {
 }
 
 fn add_python_wheel_lib_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
-    if dir.join("libnccl.so.2").exists() && seen.insert(dir.clone()) {
+    if nccl_lib_dir_exists(&dir) && seen.insert(dir.clone()) {
         dirs.push(dir);
     }
+}
+
+fn nccl_lib_dir_exists(dir: &Path) -> bool {
+    dir.join("libnccl.so.2").exists() || dir.join("libnccl.so").exists()
 }
 
 unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static [u8]) -> Result<T> {

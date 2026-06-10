@@ -31,3 +31,22 @@ fn finds_nccl_python_wheel_lib_dir_from_python_executable() {
 
     fs::remove_dir_all(root).expect("remove temp root");
 }
+
+#[test]
+fn finds_nccl_python_wheel_lib_dir_with_unversioned_soname() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "openinfer-nccl-wheel-unversioned-test-{}-{unique}",
+        std::process::id()
+    ));
+    let wheel_dir = root.join("lib/python3.11/site-packages/nvidia/nccl/lib");
+    fs::create_dir_all(&wheel_dir).expect("create NCCL wheel dir");
+    fs::write(wheel_dir.join("libnccl.so"), []).expect("create fake NCCL lib marker");
+
+    assert_eq!(nccl_python_wheel_lib_dirs_from_root(&root), vec![wheel_dir]);
+
+    fs::remove_dir_all(root).expect("remove temp root");
+}

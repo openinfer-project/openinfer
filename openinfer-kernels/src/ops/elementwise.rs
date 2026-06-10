@@ -510,9 +510,14 @@ pub fn extract_vec_ref_into(
     token_idx: usize,
     out: &mut DeviceVec,
 ) -> Result<()> {
-    let offset = token_idx * batch.hidden_dim;
     let len = batch.hidden_dim;
     anyhow::ensure!(out.len == len, "extract_vec_into len mismatch");
+    anyhow::ensure!(
+        token_idx < batch.seq_len,
+        "extract_vec_into token index {token_idx} out of bounds for seq_len {}",
+        batch.seq_len
+    );
+    let offset = token_idx * batch.hidden_dim;
     let src_view = batch.data.slice(offset..offset + len);
     ctx.stream
         .memcpy_dtod(&src_view, &mut out.data)
@@ -604,6 +609,21 @@ mod tests {
                 "fused/split silu_mul mismatch at index {idx}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn extract_vec_ref_rejects_out_of_bounds_token() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden = hidden_from_host(&ctx, &[bf16::from_f32(1.0), bf16::from_f32(2.0)], 2, 1)?;
+        let mut out = DeviceVec::zeros(&ctx, 2)?;
+
+        let err = extract_vec_ref_into(&ctx, hidden.as_ref(), 1, &mut out).unwrap_err();
+
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 }
