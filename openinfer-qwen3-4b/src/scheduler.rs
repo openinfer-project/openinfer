@@ -672,6 +672,14 @@ fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usi
         .sum()
 }
 
+/// Prefill tokens admitted into a single step. Prefill activation scratch
+/// scales with the step's total prompt tokens (~22 KB/token measured on
+/// Qwen3-4B), so an unbounded prefill batch can eat the post-KV-pool VRAM
+/// headroom and OOM mid-serving under a request burst. A single request is
+/// always admitted regardless of its prompt length — only batching beyond one
+/// request is capped.
+const PREFILL_STEP_TOKEN_BUDGET: usize = 8192;
+
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
@@ -688,6 +696,7 @@ fn admit_deferred_requests(
 ) -> AdmissionOutcome {
     let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
     let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
+    let mut step_prefill_tokens = 0usize;
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -715,9 +724,13 @@ fn admit_deferred_requests(
         // …but only the blocks not already held by this request's prefetch must
         // come from the free-pool budget.
         let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
-        if fresh_needed <= budget && decode_slots > 0 {
+        let prompt_len = req.prompt_tokens.len();
+        let within_token_budget =
+            pending.is_empty() || step_prefill_tokens + prompt_len <= PREFILL_STEP_TOKEN_BUDGET;
+        if fresh_needed <= budget && decode_slots > 0 && within_token_budget {
             budget -= fresh_needed;
             decode_slots -= 1;
+            step_prefill_tokens += prompt_len;
             pending.push(req);
         } else {
             still_deferred.push(req);
