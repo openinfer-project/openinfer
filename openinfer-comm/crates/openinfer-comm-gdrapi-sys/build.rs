@@ -6,11 +6,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let gdrapi_home = build_utils::find_package(
+    let (gdrapi_home, _) = openinfer_build::find_package(
         "gdrapi-sys",
         "GDRAPI_HOME",
         &["/usr"],
-        "include/gdrapi.h",
+        &["include/gdrapi.h"],
     );
     let bindings = bindgen::Builder::default()
         .header_contents("wrapper.h", "#include <gdrapi.h>")
@@ -35,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("gdrapi-sys build error: cannot write gdrapi-bindings.rs: {}", e)
     })?;
 
-    // Dynamic link dependencies
     println!("cargo:rustc-link-lib=gdrapi");
     println!("cargo:rustc-link-search=native={}/lib", gdrapi_home.display());
 

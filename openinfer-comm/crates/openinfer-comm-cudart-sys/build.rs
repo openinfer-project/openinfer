@@ -23,15 +23,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cuda_home = build_utils::find_package(
+    let headers = openinfer_build::cuda_headers("cuda.h");
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (cuda_home, cuda_h) = openinfer_build::find_package(
         "cudart-sys",
         "CUDA_HOME",
         &["/usr/local/cuda"],
-        "include/cuda.h",
+        &headers,
     );
+    let cuda_include = cuda_h.parent().expect("cuda.h has a parent directory");
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_arg(format!("-I{}/include", cuda_home.display()))
+        .clang_arg(format!("-I{}", cuda_include.display()))
         .parse_callbacks(Box::new(RenameCallback))
         .prepend_enum_name(false)
         .allowlist_item(r"cuda.*")
@@ -51,8 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("cudart-sys build error: cannot write cudart-bindings.rs: {}", e)
     })?;
 
-    // Dynamic link dependencies
-    println!("cargo:rustc-link-search=native={}/lib64", cuda_home.display());
+    openinfer_build::link_cuda(&cuda_home, None);
     println!("cargo:rustc-link-lib=cudart");
 
     Ok(())

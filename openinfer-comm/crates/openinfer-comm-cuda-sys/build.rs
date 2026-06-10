@@ -10,14 +10,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cuda_home = build_utils::find_package(
+    let headers = openinfer_build::cuda_headers("cuda.h");
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (cuda_home, cuda_h) = openinfer_build::find_package(
         "cuda-sys",
         "CUDA_HOME",
         &["/usr/local/cuda"],
-        "include/cuda.h",
+        &headers,
     );
     let bindings = bindgen::Builder::default()
-        .header(cuda_home.join("include/cuda.h").to_string_lossy())
+        .header(cuda_h.to_string_lossy())
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .prepend_enum_name(false)
         .allowlist_item(r"(cu|CU).*")
@@ -37,8 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("cuda-sys build error: cannot write cuda-bindings.rs: {}", e)
     })?;
 
-    // Dynamic link dependencies
-    println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_home.display());
+    openinfer_build::link_cuda(&cuda_home, Some("stubs"));
     println!("cargo:rustc-link-lib=cuda");
 
     Ok(())

@@ -6,15 +6,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let libibverbs_home = build_utils::find_package(
+    let (libibverbs_home, _) = openinfer_build::find_package(
         "libibverbs-sys",
         "LIBIBVERBS_HOME",
         &["/usr"],
-        "include/infiniband/verbs.h",
+        &["include/infiniband/verbs.h"],
     );
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Generate bindings
     // https://rust-lang.github.io/rust-bindgen/tutorial-3.html
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
@@ -48,14 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
-    // Compile wrap_static_fns.c
     cc::Build::new()
         .file(out_dir.join("wrap_static_fns.c"))
         .include(libibverbs_home.join("include"))
         .include(env!("CARGO_MANIFEST_DIR"))
         .compile("wrap_static_fns");
 
-    // Dynamic link dependencies
     println!("cargo:rustc-link-search=native={}/lib", libibverbs_home.display());
     println!("cargo:rustc-link-lib=ibverbs");
 

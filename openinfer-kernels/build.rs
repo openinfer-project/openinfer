@@ -1478,7 +1478,7 @@ fn main() {
     if cfg!(target_os = "windows") {
         println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
     } else {
-        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+        openinfer_build::link_cuda(Path::new(&cuda_path), None);
     }
     for dir in &cutedsl_runtime_lib_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());

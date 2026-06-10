@@ -11,7 +11,6 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // Generate bindings
     cxx_build::bridge("src/hw_cuda_impl.rs")
         .debug(false)
         .cuda(true)
@@ -27,7 +26,7 @@ fn main() {
         .file("src/a2a/a2a_dispatch_send.cu")
         .compile("liba2a_kernels.a");
 
-    build_utils::emit_rerun_if_changed_files("src", &["cu", "cuh", "h"]);
+    openinfer_build::emit_rerun_if_changed_files("src", &["cu", "cuh", "h"]);
 
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
     println!("cargo:rustc-link-lib=cudart");

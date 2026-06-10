@@ -1,5 +1,5 @@
 [package]
 edition = "2024"
-name = "openinfer-comm-build-utils"
+name = "openinfer-build"
 license = "Apache-2.0"
 publish = false
