@@ -10,6 +10,7 @@ use openinfer::vllm_frontend::LoraModule;
 use openinfer_core::engine::{EngineLoadOptions, EpBackend};
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
+#[cfg(feature = "qwen3-4b")]
 use openinfer_qwen3_4b::{Qwen3LoraOptions, Qwen3OffloadOptions};
 
 #[cfg(not(target_env = "msvc"))]
@@ -20,6 +21,7 @@ const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models
 
 #[derive(Parser)]
 #[command(name = "openinfer", about = "Qwen3/3.5 GPU inference server")]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
 struct Args {
     /// Model directory containing config, tokenizer, and safetensor shards
     #[arg(long, default_value = DEFAULT_MODEL_PATH)]
@@ -48,10 +50,12 @@ struct Args {
     lora_modules: Vec<LoraModule>,
 
     /// Maximum number of resident LoRA adapters in Qwen3 LoRA mode.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long = "max-loras", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORAS)]
     max_loras: usize,
 
     /// Maximum supported LoRA rank in Qwen3 LoRA mode.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long = "max-lora-rank", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK, value_parser = parse_max_lora_rank_arg)]
     max_lora_rank: usize,
 
@@ -126,7 +130,11 @@ async fn main() -> anyhow::Result<()> {
     if !args.enable_lora && !args.lora_modules.is_empty() {
         bail!("--lora-modules requires --enable-lora");
     }
-    if args.enable_lora && !matches!(model_type, ModelType::Qwen3) {
+    #[cfg(feature = "qwen3-4b")]
+    let lora_capable = matches!(model_type, ModelType::Qwen3);
+    #[cfg(not(feature = "qwen3-4b"))]
+    let lora_capable = false;
+    if args.enable_lora && !lora_capable {
         bail!("--enable-lora is currently supported only for Qwen3");
     }
     let effective_cuda_graph = match model_type {
@@ -136,21 +144,23 @@ async fn main() -> anyhow::Result<()> {
         ModelType::DeepSeekV4 => false,
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => args.cuda_graph,
+        #[cfg(feature = "qwen3-4b")]
         ModelType::Qwen3 if args.enable_lora => false,
-        ModelType::Qwen3 | ModelType::Qwen35 => args.cuda_graph,
+        #[cfg(feature = "qwen3-4b")]
+        ModelType::Qwen3 => args.cuda_graph,
+        #[cfg(feature = "qwen35-4b")]
+        ModelType::Qwen35 => args.cuda_graph,
     };
 
     info!("=== openinfer - {} (GPU) ===", model_type);
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, max_loras={}, max_lora_rank={}, device_ordinal={}, tp_size={}",
+        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, enable_lora={}, device_ordinal={}, tp_size={}",
         args.model_path.display(),
         args.cuda_graph,
         effective_cuda_graph,
         args.enable_lora,
-        args.max_loras,
-        args.max_lora_rank,
         args.device_ordinal,
         args.tp_size,
     );
@@ -211,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
 
             handle
         }
+        #[cfg(feature = "qwen3-4b")]
         ModelType::Qwen3 => {
             let device_ordinals: Vec<usize> = if args.tp_size == 1 {
                 vec![args.device_ordinal]
@@ -235,7 +246,8 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 Qwen3OffloadOptions::disabled()
             };
-            let handle = if args.enable_lora {
+
+            if args.enable_lora {
                 let lora_options = Qwen3LoraOptions {
                     max_loras: args.max_loras,
                     max_lora_rank: args.max_lora_rank,
@@ -259,26 +271,21 @@ async fn main() -> anyhow::Result<()> {
                     args.no_prefix_cache,
                 )
             }
-            .context("failed to start Qwen3 engine")?;
-
-            handle
+            .context("failed to start Qwen3 engine")?
         }
-        ModelType::Qwen35 => {
-            let handle = openinfer_qwen35_4b::start_engine(
-                &args.model_path,
-                EngineLoadOptions {
-                    enable_cuda_graph: args.cuda_graph,
-                    enable_prefill_profile: false,
-                    device_ordinals: vec![args.device_ordinal],
-                    parallel_config: None,
-                    ep_backend: EpBackend::Nccl,
-                    seed: 42,
-                },
-            )
-            .context("failed to start Qwen3.5 engine")?;
-
-            handle
-        }
+        #[cfg(feature = "qwen35-4b")]
+        ModelType::Qwen35 => openinfer_qwen35_4b::start_engine(
+            &args.model_path,
+            EngineLoadOptions {
+                enable_cuda_graph: args.cuda_graph,
+                enable_prefill_profile: false,
+                device_ordinals: vec![args.device_ordinal],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+        )
+        .context("failed to start Qwen3.5 engine")?,
     };
 
     info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
@@ -373,6 +380,7 @@ fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> {
     }
 }
 
+#[cfg(feature = "qwen3-4b")]
 fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
     let rank = value
         .parse::<usize>()
@@ -439,17 +447,20 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qwen3-4b")]
     #[test]
     fn parses_supported_max_lora_rank() {
         assert_eq!(parse_max_lora_rank_arg("16").expect("parse rank"), 16);
         assert_eq!(parse_max_lora_rank_arg("320").expect("parse rank"), 320);
     }
 
+    #[cfg(feature = "qwen3-4b")]
     #[test]
     fn qwen3_lora_default_rank_is_64() {
         assert_eq!(Qwen3LoraOptions::default().max_lora_rank, 64);
     }
 
+    #[cfg(feature = "qwen3-4b")]
     #[test]
     fn rejects_unsupported_max_lora_rank() {
         let error = parse_max_lora_rank_arg("7").expect_err("rank should be unsupported");

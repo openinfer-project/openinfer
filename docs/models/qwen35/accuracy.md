@@ -21,13 +21,9 @@
 - A broader OpenInfer-owned rand/hash corpus was considered for issue #186, but checked-in exact token/hash data may drift across GPU architectures (`sm_80`, `sm_90`, `sm_120`). Keep that as follow-up design work until the cross-architecture stability policy is explicit.
 - `docs/models/qwen35/optimization.md` records historical exact-text baseline churn. New accuracy work should use the HF logits gate before interpreting prompt-level text drift.
 - The #250 GSM8K 8-shot recovery run now closes the task-score side of the old long-prompt divergence: openinfer scored `strict-match` 79.38% and `flexible-extract` 79.30% vs the HF 79.45% baseline.
-- Existing low-level tests already narrow the search space:
-  - `src/ops/tests.rs`: `test_flash_attention_prefill_hd256_matches_cpu_reference`
-  - `src/ops/tests.rs`: `test_prefill_attention_hd256_batch_matches_cpu_reference`
-  - `src/ops/tests.rs`: `test_gated_delta_rule_prefill_chunkwise_matches_decode_reference`
-  - `src/ops/tests.rs`: `test_conv1d_prefill_handoff_matches_single_prefill`
-  - `src/ops/tests.rs`: `test_conv1d_prefill_seq1_matches_decode`
-  - `src/ops/tests.rs`: `test_argmax_tie_prefers_smallest_index`
+- Most of the historical op-level CPU-reference tests were retired along with
+  the kernels they covered; the surviving low-level guard is
+  `openinfer-qwen35-4b/src/recurrent.rs`: `conv1d_prefill_handoff_matches_single_prefill`.
   - `src/ops/tests.rs`: `test_argmax_tie_prefers_smallest_index_across_thread_strides`
 - Historical accuracy tooling was recorded for layer `0` prefill, but these paths are not present in the current tree after the model-crate split:
   - `src/bin/qwen35_dump_layer0.rs` dumps openinfer layer-0 checkpoints to JSON

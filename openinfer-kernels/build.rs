@@ -900,35 +900,13 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     let mut generated_sources = Vec::new();
     let root = crate_root();
     let chunkwise_kernel_path = root.join("tools/triton/gated_delta_rule_chunkwise_kernels.py");
-
-    let flash_attn_prefill_hd256_spec = TritonKernelSpec {
-        artifact_dir: "flash_attention_prefill_hd256",
-        kernel_path: "tools/triton/flash_attention_prefill_hd256_kernel.py",
-        kernel_name: "flash_attention_prefill_hd256_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,*i32,i32,64,64,256",
-        grid: "(seq_len + 63) / 64,num_q_heads,1",
-        out_name: "triton_flash_attention_prefill_hd256",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (flash_attn_hd256_func, flash_attn_hd256_c) = generate_triton_artifacts(
-        &python,
-        out_dir,
-        &triton_target,
-        &flash_attn_prefill_hd256_spec,
+    assert!(
+        chunkwise_kernel_path.exists(),
+        "Qwen3.5 GDR Triton kernel source is missing: {}",
+        chunkwise_kernel_path.display()
     );
-    let flash_attn_hd256_wrapper = write_wrapper(
-        &flash_attn_hd256_c,
-        "triton_flash_attention_prefill_hd256_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t q_dim);\n\nCUresult flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, q_dim);\n}}\n",
-            func = flash_attn_hd256_func
-        ),
-    );
-    generated_sources.push(flash_attn_hd256_c);
-    generated_sources.push(flash_attn_hd256_wrapper);
 
-    if chunkwise_kernel_path.exists() {
+    {
         let gdr_prepare_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_prepare",
             kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
@@ -1089,11 +1067,6 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         );
         generated_sources.push(gdr_chunk_o_c);
         generated_sources.push(gdr_chunk_o_wrapper);
-    } else {
-        println!(
-            "cargo:warning=Skipping chunk-wise GDR Triton AOT scaffolding because {} is not present yet.",
-            chunkwise_kernel_path.display()
-        );
     }
 
     let mut build = cc::Build::new();
@@ -1111,12 +1084,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Using Triton AOT for Qwen3.5 HD256 FlashAttention prefill and GDR chunkwise; basic ops (add, silu_mul, embedding) use native CUDA"
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("tools/triton/flash_attention_prefill_hd256_kernel.py")
-            .display()
+        "cargo:warning=Using Triton AOT for Qwen3.5 GDR chunkwise prefill; basic ops (add, silu_mul, embedding) use native CUDA"
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -1143,6 +1111,7 @@ fn main() {
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
+    let qwen35_enabled = cfg!(feature = "qwen35-4b");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
         Some(generate_deepseek_tilelang_artifacts(&out_dir))
@@ -1497,7 +1466,13 @@ fn main() {
 
     assert!(status.success(), "ar failed");
 
-    compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+    if qwen35_enabled {
+        compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+    } else {
+        println!(
+            "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35-4b` feature to build them (needs Python + Triton at build time)"
+        );
+    }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     if cfg!(target_os = "windows") {

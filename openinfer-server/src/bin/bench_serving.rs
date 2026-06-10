@@ -28,10 +28,9 @@ use openinfer::logging;
 use openinfer::sampler::SamplingParams;
 use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
 use openinfer::server_engine::{ModelType, detect_model_type};
-use openinfer_core::{
-    engine::{EngineLoadOptions, EpBackend},
-    parallel::ParallelConfig,
-};
+use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+#[cfg(feature = "kimi-k2")]
+use openinfer_core::parallel::ParallelConfig;
 use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
 use rand::RngExt;
 use rand::SeedableRng;
@@ -2227,6 +2226,7 @@ fn main() -> Result<()> {
                 &tokenizer,
             )
         }
+        #[cfg(feature = "qwen3-4b")]
         ModelType::Qwen3 => {
             let handle = openinfer_qwen3_4b::start_engine(
                 Path::new(&cli.model_path),
@@ -2251,6 +2251,7 @@ fn main() -> Result<()> {
                 &tokenizer,
             )
         }
+        #[cfg(feature = "qwen35-4b")]
         ModelType::Qwen35 => {
             let handle = openinfer_qwen35_4b::start_engine_with_capacity(
                 Path::new(&cli.model_path),
