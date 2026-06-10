@@ -621,16 +621,16 @@ fn blocks_needed(token_count: usize, block_size: usize) -> usize {
     token_count.div_ceil(block_size)
 }
 
-// Prefill samples the first output token but does not append it to KV. A
-// generated token occupies KV only when it is fed as the next decode input.
-// Therefore N returned completion tokens occupy at most N - 1 generated-token
-// KV slots.
+// Prefill samples the first output token but does not write its KV. A generated
+// token's KV is written only when it is fed as the next decode input. Therefore
+// N returned completion tokens occupy at most N - 1 generated-token KV slots.
 fn max_request_tokens(req: &PendingRequest) -> usize {
     req.prompt_tokens
         .len()
         .saturating_add(req.max_tokens.saturating_sub(1))
 }
 
+#[cfg(test)]
 fn max_active_tokens(req: &ActiveRequestState) -> usize {
     req.prompt_len
         .saturating_add(req.max_tokens.saturating_sub(1))
@@ -641,11 +641,30 @@ fn current_active_tokens(req: &ActiveRequestState) -> usize {
         .saturating_add(req.generated_count.saturating_sub(1))
 }
 
+// Pool blocks a request can draw over its lifetime. kvbm's schedule_decode
+// provisions the final dangling token's block even though that token's KV is
+// never written, so admission must reserve prompt + max_tokens, not just the
+// written-KV token count.
+fn request_lifetime_blocks(prompt_len: usize, max_tokens: usize, block_size: usize) -> usize {
+    prompt_len
+        .saturating_add(max_tokens)
+        .div_ceil(block_size)
+        .max(1)
+}
+
+fn pending_lifetime_blocks(req: &PendingRequest, block_size: usize) -> usize {
+    request_lifetime_blocks(req.prompt_tokens.len(), req.max_tokens, block_size)
+}
+
+fn active_lifetime_blocks(req: &ActiveRequestState, block_size: usize) -> usize {
+    request_lifetime_blocks(req.prompt_len, req.max_tokens, block_size)
+}
+
 fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usize {
     active
         .iter()
         .map(|req| {
-            blocks_needed(max_active_tokens(req), block_size)
+            active_lifetime_blocks(req, block_size)
                 .saturating_sub(blocks_needed(current_active_tokens(req), block_size))
         })
         .sum()
@@ -685,7 +704,7 @@ fn admit_deferred_requests(
 
         // Full physical footprint gates the per-request cap (a request occupies
         // all of it, prefetched or not)…
-        let footprint = blocks_needed(max_request_tokens(&req), block_size);
+        let footprint = pending_lifetime_blocks(&req, block_size);
         if footprint > max_request_blocks {
             rejected.push((req, RejectReason::KvBudget));
             continue;
@@ -811,6 +830,7 @@ mod tests {
     use openinfer_core::engine::{
         EngineControlError, LoadLoraAdapterRequest, UnloadLoraAdapterRequest,
     };
+    use openinfer_kv_cache::BlockPool;
 
     use super::*;
     use crate::executor::{
@@ -1111,11 +1131,12 @@ mod tests {
     }
 
     #[test]
-    fn kv_budget_counts_only_tokens_written_to_cache() {
+    fn kv_budget_distinguishes_written_tokens_from_lifetime_blocks() {
         let (pending_req, _pending_rx) = request(16, 1);
         let pending = PendingRequest::from_scheduler_request(RequestId(7), pending_req);
         assert_eq!(max_request_tokens(&pending), 16);
         assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 1);
+        assert_eq!(pending_lifetime_blocks(&pending, 16), 2);
 
         let (token_tx, _token_rx) = mpsc::unbounded_channel();
         let after_prefill = ActiveRequestState {
@@ -1124,13 +1145,14 @@ mod tests {
             token_tx,
             last_token: 100,
             generated_count: 1,
-            max_tokens: 3,
+            max_tokens: 17,
             prompt_len: 16,
             params: SamplingParams::default(),
             logprobs: 0,
         };
         assert_eq!(current_active_tokens(&after_prefill), 16);
-        assert_eq!(max_active_tokens(&after_prefill), 18);
+        assert_eq!(max_active_tokens(&after_prefill), 32);
+        assert_eq!(active_lifetime_blocks(&after_prefill, 16), 3);
 
         let (token_tx, _token_rx) = mpsc::unbounded_channel();
         let after_one_decode = ActiveRequestState {
@@ -1139,13 +1161,14 @@ mod tests {
             token_tx,
             last_token: 200,
             generated_count: 2,
-            max_tokens: 3,
+            max_tokens: 17,
             prompt_len: 16,
             params: SamplingParams::default(),
             logprobs: 0,
         };
         assert_eq!(current_active_tokens(&after_one_decode), 17);
-        assert_eq!(max_active_tokens(&after_one_decode), 18);
+        assert_eq!(max_active_tokens(&after_one_decode), 32);
+        assert_eq!(active_lifetime_blocks(&after_one_decode, 16), 3);
     }
 
     #[test]
@@ -1160,7 +1183,7 @@ mod tests {
             token_tx,
             last_token: 1,
             generated_count: 1, // current tokens = prompt_len (16) -> 1 block
-            max_tokens: 18,     // max tokens = 16 + 17 = 33 -> 3 blocks; future growth = 2
+            max_tokens: 18,     // lifetime tokens = 16 + 18 = 34 -> 3 blocks; future growth = 2
             prompt_len: 16,
             params: SamplingParams::default(),
             logprobs: 0,
@@ -1170,10 +1193,10 @@ mod tests {
             PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
         };
         let deferred = vec![
-            mk(1, 16, 1), // 16 tokens -> 1 block: admitted
-            mk(2, 16, 1), // 1 block: admitted, budget now 0
-            mk(3, 16, 1), // 1 block: no budget left -> stays deferred
-            mk(4, 80, 1), // 80 tokens -> 5 blocks > cap of 4 -> rejected outright
+            mk(1, 15, 1), // 15 prompt + 1 max -> 1 block: admitted
+            mk(2, 15, 1), // 1 block: admitted, budget now 0
+            mk(3, 15, 1), // 1 block: no budget left -> stays deferred
+            mk(4, 80, 1), // 80 prompt + 1 max -> 6 blocks > cap of 4 -> rejected outright
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
@@ -1211,7 +1234,7 @@ mod tests {
         };
 
         let deferred = vec![
-            mk(1, 16, 16), // reqest 1: 16 prompt + 16 max = 32 total: admitted
+            mk(1, 16, 16), // request 1: 16 prompt + 16 max = 32 total: admitted
             mk(2, 16, 17), // request 2: 16 prompt + 17 max = 33 total: overflows by 1 token → rejected
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
@@ -1286,25 +1309,128 @@ mod tests {
     }
 
     #[test]
-    fn one_token_completion_on_page_boundary_fits_one_page() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(1, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
+    fn page_boundary_lifetime_blocks_gate_admission() {
+        let active: [ActiveRequestState; 0] = [];
+        let mk = |id: u64, prompt_len, max_tokens| {
+            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        };
 
-        let (fits_exactly, mut rx) = request(16, 1);
-        handle.submit(fits_exactly).expect("submit fits_exactly");
-        assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
-            "prefill should emit the sampled token"
+        let under_reserved = admit_deferred_requests(
+            vec![mk(1, 16, 17)],
+            &active,
+            16,
+            2,
+            2,
+            usize::MAX,
+            64,
+            |_| 0,
         );
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "one-token completion should finish without a decode KV page"
+            under_reserved.pending.is_empty(),
+            "old prompt + max_tokens - 1 arithmetic would admit this request with 2 blocks"
         );
+        assert_eq!(under_reserved.rejected.len(), 1);
         assert!(
-            dropped.lock().unwrap().contains(&0),
-            "finished request should release its one prompt page"
+            matches!(under_reserved.rejected[0].1, RejectReason::KvBudget),
+            "request needs 3 lifetime blocks: ceil((16 + 17) / 16)"
         );
+
+        let exactly_reserved = admit_deferred_requests(
+            vec![mk(2, 16, 17)],
+            &active,
+            16,
+            3,
+            3,
+            usize::MAX,
+            64,
+            |_| 0,
+        );
+        assert_eq!(
+            exactly_reserved.pending[0].request_id,
+            RequestId(2),
+            "ceil((prompt + max_tokens) / block_size) admits the request"
+        );
+        assert!(exactly_reserved.rejected.is_empty());
+    }
+
+    fn kvbm_peak_draw(prompt_len: usize, max_tokens: usize, block_size: usize) -> usize {
+        let pool = BlockPool::new(block_size, 512).expect("test block pool");
+        let base = pool.available_blocks();
+        let mut peak = 0usize;
+        let mut kv = pool.new_request(vec![1; prompt_len], max_tokens, None);
+
+        kv.schedule_prefill(prompt_len, &pool)
+            .expect("schedule prefill");
+        peak = peak.max(base - pool.available_blocks());
+        kv.apply_prefill(100, &pool).expect("apply prefill");
+        peak = peak.max(base - pool.available_blocks());
+
+        for step in 1..max_tokens {
+            kv.schedule_decode(&pool).expect("schedule decode");
+            peak = peak.max(base - pool.available_blocks());
+            kv.apply_decode(100 + step as u32, &pool)
+                .expect("apply decode");
+            peak = peak.max(base - pool.available_blocks());
+        }
+
+        kv.release().expect("release request kv");
+        assert_eq!(
+            pool.available_blocks(),
+            base,
+            "probe must release every block it draws"
+        );
+        peak
+    }
+
+    #[test]
+    fn lifetime_blocks_match_kvbm_peak_draw_at_issue_boundaries() {
+        let block_size = 16;
+        for (prompt_len, max_tokens) in [(16usize, 17usize), (1, 16), (17, 16)] {
+            let reserved = request_lifetime_blocks(prompt_len, max_tokens, block_size);
+            let peak = kvbm_peak_draw(prompt_len, max_tokens, block_size);
+            let old = blocks_needed(
+                prompt_len.saturating_add(max_tokens.saturating_sub(1)),
+                block_size,
+            );
+            assert_eq!(
+                peak, reserved,
+                "prompt={prompt_len} max_tokens={max_tokens}"
+            );
+            assert_eq!(
+                old + 1,
+                peak,
+                "old prompt + max_tokens - 1 arithmetic under-reserved by one block"
+            );
+        }
+
+        let prompt_len = 33usize;
+        let max_tokens = 100usize;
+        let reserved = request_lifetime_blocks(prompt_len, max_tokens, block_size);
+        let peak = kvbm_peak_draw(prompt_len, max_tokens, block_size);
+        let old = blocks_needed(
+            prompt_len.saturating_add(max_tokens.saturating_sub(1)),
+            block_size,
+        );
+        assert_eq!(peak, reserved);
+        assert_eq!(
+            old, reserved,
+            "non-boundary case should not reserve more than the old arithmetic"
+        );
+    }
+
+    #[test]
+    fn lifetime_blocks_never_under_reserve_kvbm_peak_draw() {
+        let block_size = 16;
+        for prompt_len in 1usize..=64 {
+            for max_tokens in 1usize..=64 {
+                let reserved = request_lifetime_blocks(prompt_len, max_tokens, block_size);
+                let peak = kvbm_peak_draw(prompt_len, max_tokens, block_size);
+                assert!(
+                    peak <= reserved,
+                    "prompt={prompt_len} max_tokens={max_tokens}: peak={peak}, reserved={reserved}"
+                );
+            }
+        }
     }
 
     #[test]
