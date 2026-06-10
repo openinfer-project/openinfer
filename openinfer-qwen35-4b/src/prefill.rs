@@ -4,8 +4,18 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 /// Sequence length used for conservative prefill scratch reservation.
 ///
 /// This is not an admission cap. Actual prompt admission is governed by the
-/// paged KV pool, RoPE cache coverage, and allocation success.
+/// paged KV pool, RoPE cache coverage, and allocation success. Prompts longer
+/// than this are handled by chunking prefill at `PREFILL_CHUNK_LEN` rather than
+/// being rejected (see `prefill_forward`).
 pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
+
+/// Maximum number of tokens processed in a single prefill forward pass.
+///
+/// Prefill is chunked at this granularity so the per-pass GDR scratch
+/// (`GdrChunkwiseScratch35`, which scales linearly with the pass length) never
+/// exceeds the memory reserved at startup. Kept equal to `SCRATCH_ESTIMATE_SEQ`
+/// so the reservation in `weights.rs` covers exactly one chunk.
+pub(crate) const PREFILL_CHUNK_LEN: usize = SCRATCH_ESTIMATE_SEQ;
 const HEAD_DIM: usize = 256;
 
 use super::prefill_buffers::GdrChunkwiseScratch35;
@@ -44,65 +54,32 @@ impl Qwen35Model {
         let seq_len = token_ids.len();
         anyhow::ensure!(seq_len > 0, "prefill_forward requires at least one token");
         let c = &self.config;
+        let hidden_dim = c.hidden_size;
+
+        // Validate the full target range up front (position overflow + RoPE cache
+        // coverage) so an out-of-range prompt is rejected before any chunk mutates
+        // the KV / recurrent state, rather than failing partway through.
         let base_pos = kv_state.seq_len();
         let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
         self.ensure_rope_cache_covers(end_pos)?;
 
-        // Get embeddings for all tokens
-        let token_ids_gpu = self
-            .ctx
-            .stream
-            .clone_htod(token_ids)
-            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
-
-        let hidden_dim = c.hidden_size;
-        let mut hidden_batch = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
-        ops::embedding_batch(
-            &self.ctx,
-            &self.embed_tokens,
-            &token_ids_gpu,
-            &mut hidden_batch,
-        )?;
-
-        // Advance paged KV state and build prefill plan (shared across all layers).
-        kv_state.ensure_capacity(end_pos)?;
-        kv_state.advance(seq_len);
-        let kv_desc = kv_state.desc();
-        let prefill_plan = PrefillPagedPlan::new(
-            &self.ctx,
-            &kv_desc,
-            base_pos,
-            seq_len,
-            c.num_attention_heads,
-            c.num_key_value_heads,
-            c.head_dim,
-        )?;
-
-        // Process layers
-        let mut linear_idx = 0usize;
-        let mut full_idx = 0usize;
-        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden_batch = self.prefill_layer(
-                layer_idx,
-                layer,
-                &hidden_batch,
-                &mut gdr_chunkwise_scratch,
-                &mut linear_idx,
-                &mut full_idx,
-                kv_state,
-                &prefill_plan,
-                recurrent,
-            )?;
+        // Run prefill in serial chunks of at most `PREFILL_CHUNK_LEN` tokens. Each
+        // chunk advances the paged KV and linear-attention recurrent/conv state in
+        // place, so the next chunk continues from the previous one. This caps the
+        // per-pass GDR scratch (which grows with the pass length) at the budget
+        // reserved at startup, so prompts longer than one chunk prefill without OOM.
+        let mut hidden_batch: Option<HiddenStates> = None;
+        for chunk in token_ids.chunks(PREFILL_CHUNK_LEN) {
+            // Free the previous chunk's hidden states before allocating the next
+            // chunk's scratch so peak memory stays within one chunk's reservation.
+            drop(hidden_batch.take());
+            hidden_batch = Some(self.prefill_chunk_forward(chunk, kv_state, recurrent)?);
         }
+        // `seq_len > 0` guarantees at least one chunk produced hidden states.
+        let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
 
-        // All layers processed. Advance recurrent seq_len for the next call;
-        // the paged KV position is tracked by `kv_state` (advanced above).
-        recurrent.seq_len += seq_len;
-
-        // Extract last token's hidden state
-        let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, seq_len - 1)?;
+        // Last-token logic runs once, on the final chunk's output.
+        let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)?;
 
         // Final norm (1+weight offset)
         let normed = {
@@ -119,6 +96,88 @@ impl Qwen35Model {
 
         // LM head (tied embeddings)
         ops::linear(&self.ctx, &normed, &self.embed_tokens)
+    }
+
+    /// Forward one prefill chunk through all layers, advancing the paged KV state
+    /// and the linear-attention recurrent/conv state in place.
+    ///
+    /// `token_ids.len()` must be in `1..=PREFILL_CHUNK_LEN` so the per-chunk GDR
+    /// scratch stays within the startup reservation. Returns the chunk's hidden
+    /// states for every token; only the final chunk's last token feeds the LM head.
+    fn prefill_chunk_forward(
+        &self,
+        token_ids: &[u32],
+        kv_state: &mut KvState,
+        recurrent: &mut RecurrentState,
+    ) -> Result<HiddenStates> {
+        let seq_len = token_ids.len();
+        debug_assert!(
+            seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
+            "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
+        );
+        let c = &self.config;
+        let base_pos = kv_state.seq_len();
+        let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
+        self.ensure_rope_cache_covers(end_pos)?;
+
+        // Embeddings for this chunk.
+        let token_ids_gpu = self
+            .ctx
+            .stream
+            .clone_htod(token_ids)
+            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
+
+        let hidden_dim = c.hidden_size;
+        let mut hidden_batch = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &token_ids_gpu,
+            &mut hidden_batch,
+        )?;
+
+        // Allocate the chunk scratch before advancing the KV state. It is the
+        // largest, most allocation-prone buffer here, so failing first leaves
+        // `kv_state` untouched and the request can be rejected cleanly.
+        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
+
+        // Advance paged KV state and build this chunk's prefill plan.
+        kv_state.ensure_capacity(end_pos)?;
+        kv_state.advance(seq_len);
+        let kv_desc = kv_state.desc();
+        let prefill_plan = PrefillPagedPlan::new(
+            &self.ctx,
+            &kv_desc,
+            base_pos,
+            seq_len,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+            c.head_dim,
+        )?;
+
+        // Process layers
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden_batch = self.prefill_layer(
+                layer_idx,
+                layer,
+                &hidden_batch,
+                &mut gdr_chunkwise_scratch,
+                &mut linear_idx,
+                &mut full_idx,
+                kv_state,
+                &prefill_plan,
+                recurrent,
+            )?;
+        }
+
+        // Advance recurrent token count for the next chunk / decode step; the
+        // paged KV position is tracked by `kv_state` (advanced above).
+        recurrent.seq_len += seq_len;
+
+        Ok(hidden_batch)
     }
 
     /// Process one layer during prefill. Returns updated hidden_batch.
