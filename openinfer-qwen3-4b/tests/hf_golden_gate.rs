@@ -43,8 +43,13 @@
 //!     bugs) surface. Run the bucket straddles (9→16, 5→8) that maximise the
 //!     padding-slot count.
 //!
+//! On a machine with ≥2 CUDA devices the eager replays additionally run under
+//! TP=2 (`device_ordinals = [0, 1]`) against the same golden and tolerances —
+//! sharding must not move logits beyond the single-GPU bf16 noise floor.
+//!
 //! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when the model is
-//! absent (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it).
+//! absent (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it). The
+//! TP pass skips on single-GPU hosts.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -436,6 +441,69 @@ fn report_and_assert(label: &str, stats: &Stats) {
     let _ = max; // reported above, but not asserted: the worst single delta grows with coverage
 }
 
+/// Number of visible CUDA devices; 0 when the driver cannot be queried.
+fn cuda_device_count() -> usize {
+    cudarc::driver::CudaContext::device_count().map_or(0, |n| n.max(0) as usize)
+}
+
+/// The eager replay suite — bs=1 sequential (plus the bit-identical
+/// determinism rerun), batched eager isolation, and the prefix-cached replays
+/// — over a given device set, with `label` prefixing every report line.
+fn run_eager_suite(golden: &Golden, model_path: &str, devices: &[usize], label: &str) {
+    let all: Vec<usize> = (0..golden.num_seqs).collect();
+    let mut ex = Qwen3Executor::from_runtime(model_path, false, devices)
+        .unwrap_or_else(|e| panic!("build eager executor on {devices:?}: {e:#}"));
+    // The determinism and isolation passes need bit-replayable prefill: a
+    // prefix-cache hit shrinks the prefill GEMM to the uncached suffix,
+    // which drifts logits by bf16 ULPs. Caching gets its own pass below.
+    ex.set_prefix_cache_enabled(false);
+
+    // bs=1 sequential over *every* golden sequence — this is the breadth of
+    // the prompt/length coverage (one request's KV at a time, so it scales to
+    // long prompts cheaply). Also the determinism anchor: a second identical
+    // run must reproduce every logprob bit-for-bit. A nondeterministic kernel
+    // or uninitialised decode scratch would not.
+    let (stats, fp1) = run(golden, &mut ex, &all, false);
+    report_and_assert(&format!("{label}sequential bs=1 eager"), &stats);
+    let (_, fp2) = run(golden, &mut ex, &all, false);
+    assert_eq!(
+        fp1, fp2,
+        "{label}sequential bs=1 eager: identical inputs must reproduce identical logprobs"
+    );
+
+    // A batch advanced together (eager runs at the exact width — no padding).
+    // This is the cross-request isolation check: requests of differing
+    // lengths/page layouts share each kernel launch, so KV mixing or a
+    // per-request indexing bug corrupts a neighbour's logits. It replaces the
+    // old exact batch==sequential check, which mistook the batched decode
+    // path's benign reduction-order noise (within tolerance here) for a bug.
+    // Breadth is the bs=1 pass's job; this just needs enough concurrent reqs.
+    let n = BUCKET_STRADDLES[0];
+    let (batched, _) = run(golden, &mut ex, &all[..n], true);
+    report_and_assert(&format!("{label}batched eager ({n}, no pad)"), &batched);
+
+    // Prefix-cached replay. Every block is already registered (the runs
+    // above register blocks even with matching disabled), so these rerun
+    // with warm caches: prefill skips the cached prefix and attention spans
+    // cached KV + recomputed suffix (kv_len > q_len). Same HF tolerances —
+    // a wrong RoPE offset, mask, or stale page would blow far past them.
+    ex.set_prefix_cache_enabled(true);
+    let (cached, _) = run(golden, &mut ex, &all, false);
+    assert!(
+        cached.cached_tokens > 0,
+        "{label}cached replay matched no prefix blocks — the cache path was not exercised"
+    );
+    report_and_assert(
+        &format!("{label}sequential bs=1 eager cached replay"),
+        &cached,
+    );
+    let (cached_batched, _) = run(golden, &mut ex, &all[..n], true);
+    report_and_assert(
+        &format!("{label}batched eager cached replay ({n})"),
+        &cached_batched,
+    );
+}
+
 #[test]
 fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     let Some(model_path) = model_path_or_skip() else {
@@ -444,58 +512,25 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     let golden = Golden::load();
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    // Each executor owns its GPU memory; scope them so only one model is resident
-    // at a time (drop frees it before the next load).
-    {
-        let mut ex =
-            Qwen3Executor::from_runtime(&model_path, false, &[0]).expect("build eager executor");
-        // The determinism and isolation passes need bit-replayable prefill: a
-        // prefix-cache hit shrinks the prefill GEMM to the uncached suffix,
-        // which drifts logits by bf16 ULPs. Caching gets its own pass below.
-        ex.set_prefix_cache_enabled(false);
-
-        // bs=1 sequential over *every* golden sequence — this is the breadth of
-        // the prompt/length coverage (one request's KV at a time, so it scales to
-        // long prompts cheaply). Also the determinism anchor: a second identical
-        // run must reproduce every logprob bit-for-bit. A nondeterministic kernel
-        // or uninitialised decode scratch would not.
-        let (stats, fp1) = run(&golden, &mut ex, &all, false);
-        report_and_assert("sequential bs=1 eager", &stats);
-        let (_, fp2) = run(&golden, &mut ex, &all, false);
-        assert_eq!(
-            fp1, fp2,
-            "sequential bs=1 eager: identical inputs must reproduce identical logprobs"
-        );
-
-        // A batch advanced together (eager runs at the exact width — no padding).
-        // This is the cross-request isolation check: requests of differing
-        // lengths/page layouts share each kernel launch, so KV mixing or a
-        // per-request indexing bug corrupts a neighbour's logits. It replaces the
-        // old exact batch==sequential check, which mistook the batched decode
-        // path's benign reduction-order noise (within tolerance here) for a bug.
-        // Breadth is the bs=1 pass's job; this just needs enough concurrent reqs.
-        let n = BUCKET_STRADDLES[0];
-        let (batched, _) = run(&golden, &mut ex, &all[..n], true);
-        report_and_assert(&format!("batched eager ({n}, no pad)"), &batched);
-
-        // Prefix-cached replay. Every block is already registered (the runs
-        // above register blocks even with matching disabled), so these rerun
-        // with warm caches: prefill skips the cached prefix and attention spans
-        // cached KV + recomputed suffix (kv_len > q_len). Same HF tolerances —
-        // a wrong RoPE offset, mask, or stale page would blow far past them.
-        ex.set_prefix_cache_enabled(true);
-        let (cached, _) = run(&golden, &mut ex, &all, false);
+    // Debug knob: skip the single-GPU passes and run only the TP=2 suite.
+    // The full gate builds TP executors after single-GPU executors in the
+    // same process; running with this set isolates the TP pass from any
+    // state they leave behind.
+    if std::env::var("OPENINFER_GOLDEN_TP_ONLY").is_ok() {
+        let gpus = cuda_device_count();
         assert!(
-            cached.cached_tokens > 0,
-            "cached replay matched no prefix blocks — the cache path was not exercised"
+            gpus >= 2,
+            "OPENINFER_GOLDEN_TP_ONLY needs >=2 GPUs, have {gpus}"
         );
-        report_and_assert("sequential bs=1 eager cached replay", &cached);
-        let (cached_batched, _) = run(&golden, &mut ex, &all[..n], true);
-        report_and_assert(
-            &format!("batched eager cached replay ({n})"),
-            &cached_batched,
-        );
+        run_eager_suite(&golden, &model_path, &[0, 1], "tp2 ");
+        return;
     }
+
+    // Each executor owns its GPU memory; scope them so only one model is
+    // resident at a time (drop frees it before the next load). Everything
+    // stays in one #[test] for the same reason: two parallel tests would both
+    // budget 85% of free VRAM for KV.
+    run_eager_suite(&golden, &model_path, &[0], "");
 
     // CUDA-graph decode is captured per bucket and pads the batch up to it, so
     // this path is where padding-slot leaks (and graph pointer/buffer bugs)
@@ -520,4 +555,15 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
         );
         report_and_assert(&format!("batched cuda-graph cached replay ({n})"), &cached);
     }
+
+    // TP=2: the same eager suite sharded over two GPUs. Same golden, same
+    // tolerances — a reduction-order, shard-offset, or all-reduce bug drifts
+    // logits far past the bf16 noise floor. Eager-only: TP CUDA-graph support
+    // is deferred follow-up work (docs/models/qwen3/tp-design.md).
+    let gpus = cuda_device_count();
+    if gpus < 2 {
+        eprintln!("skipping hf_golden_gate TP=2 pass: {gpus} CUDA device(s) visible, need 2");
+        return;
+    }
+    run_eager_suite(&golden, &model_path, &[0, 1], "tp2 ");
 }
