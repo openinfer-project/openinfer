@@ -999,6 +999,54 @@ where
     }
 }
 
+/// Submit a single request to the scheduler and drain its token stream,
+/// invoking `on_token` for each generated token id. Returns when the request
+/// finishes, `on_token` returns false (early stop), or an error/closed event
+/// arrives. Owns its args and borrows the handle so it composes inside a
+/// `thread::spawn(move)` worker with a cloned `SchedulerHandle`.
+fn run_scheduler_stream(
+    handle: &SchedulerHandle,
+    request_id: Option<String>,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    max_tokens: usize,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<()> {
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    handle
+        .submit(SchedulerRequest {
+            request_id,
+            queued_at_unix_s: None,
+            prompt_tokens,
+            params,
+            max_tokens,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
+
+    loop {
+        match token_rx.blocking_recv() {
+            Some(TokenEvent::Token { id, .. }) => {
+                if !on_token(id) {
+                    return Ok(());
+                }
+            }
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(TokenEvent::Finished { .. }) => return Ok(()),
+            Some(TokenEvent::Error { message, .. }) => {
+                anyhow::bail!("scheduler request failed: {message}");
+            }
+            Some(TokenEvent::Rejected { message, .. }) => {
+                anyhow::bail!("scheduler request rejected: {message}");
+            }
+            None => anyhow::bail!("scheduler channel closed"),
+        }
+    }
+}
+
 struct SchedulerBenchModel {
     handle: SchedulerHandle,
 }
@@ -1012,45 +1060,7 @@ impl BenchModel for SchedulerBenchModel {
         _rng: &mut StdRng,
     ) -> GenTimings {
         run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
-            let (token_tx, mut token_rx) = mpsc::unbounded_channel();
-            self.handle
-                .submit(SchedulerRequest {
-                    request_id: None,
-                    queued_at_unix_s: None,
-                    prompt_tokens: toks.to_vec(),
-                    params: SamplingParams {
-                        temperature: sampling.temperature,
-                        top_k: sampling.top_k,
-                        top_p: sampling.top_p,
-                        ignore_eos: sampling.ignore_eos,
-                    },
-                    max_tokens: n,
-                    lora_adapter: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
-
-            loop {
-                match token_rx.blocking_recv() {
-                    Some(TokenEvent::Token { id, .. }) => {
-                        if !cb(id) {
-                            break;
-                        }
-                    }
-                    Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
-                    Some(TokenEvent::Finished { .. }) => break,
-                    Some(TokenEvent::Error { message, .. }) => {
-                        anyhow::bail!("scheduler request failed: {message}");
-                    }
-                    Some(TokenEvent::Rejected { message, .. }) => {
-                        anyhow::bail!("scheduler request rejected: {message}");
-                    }
-                    None => anyhow::bail!("scheduler channel closed"),
-                }
-            }
-
+            run_scheduler_stream(&self.handle, None, toks.to_vec(), *sampling, n, |id| cb(id))?;
             Ok(())
         })
     }
@@ -1069,47 +1079,14 @@ impl BenchModel for SchedulerBenchModel {
             let sampling = *sampling;
             workers.push(thread::spawn(move || {
                 run_timed(&prompt_tokens, max_new_tokens, |toks, n, cb| {
-                    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
-                    handle
-                        .submit(SchedulerRequest {
-                            request_id: Some(format!("bench-serving-{idx}")),
-                            queued_at_unix_s: None,
-                            prompt_tokens: toks.to_vec(),
-                            params: SamplingParams {
-                                temperature: sampling.temperature,
-                                top_k: sampling.top_k,
-                                top_p: sampling.top_p,
-                                ignore_eos: sampling.ignore_eos,
-                            },
-                            max_tokens: n,
-                            lora_adapter: None,
-                            token_tx,
-                            logprobs: 0,
-                            echo: false,
-                        })
-                        .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
-
-                    loop {
-                        match token_rx.blocking_recv() {
-                            Some(TokenEvent::Token { id, .. }) => {
-                                if !cb(id) {
-                                    break;
-                                }
-                            }
-                            Some(
-                                TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. },
-                            ) => {}
-                            Some(TokenEvent::Finished { .. }) => break,
-                            Some(TokenEvent::Error { message, .. }) => {
-                                anyhow::bail!("scheduler request failed: {message}");
-                            }
-                            Some(TokenEvent::Rejected { message, .. }) => {
-                                anyhow::bail!("scheduler request rejected: {message}");
-                            }
-                            None => anyhow::bail!("scheduler channel closed"),
-                        }
-                    }
-
+                    run_scheduler_stream(
+                        &handle,
+                        Some(format!("bench-serving-{idx}")),
+                        toks.to_vec(),
+                        sampling,
+                        n,
+                        |id| cb(id),
+                    )?;
                     Ok(())
                 })
             }));
@@ -2163,9 +2140,22 @@ fn main() -> Result<()> {
     debug!("Detected model type: {:?}", model_type);
     let load_start = Instant::now();
 
+    // Shared tail for every scheduler-backed model: load the tokenizer, stamp
+    // the elapsed load time, wrap the handle, and dispatch. The per-model arms
+    // below differ only in how they construct the engine handle.
+    let finish = |handle: SchedulerHandle, cuda_graph: bool| -> Result<()> {
+        let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
+        let load_ms = dur_ms(load_start.elapsed());
+        let mut bench = SchedulerBenchModel { handle };
+        dispatch(
+            &cli, model_type, load_ms, cuda_graph, &mut bench, &tokenizer,
+        )
+    };
+
     match model_type {
         #[cfg(feature = "deepseek-v2-lite")]
         ModelType::DeepSeekV2Lite => {
+            // Distinct bench type (not scheduler-backed), so it keeps its own tail.
             let generator = openinfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator::load(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
@@ -2195,10 +2185,7 @@ fn main() -> Result<()> {
                     seed: command_seed(&cli),
                 },
             )?;
-            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
-            let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = SchedulerBenchModel { handle };
-            dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
+            finish(handle, false)
         }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {
@@ -2214,17 +2201,7 @@ fn main() -> Result<()> {
                     seed: command_seed(&cli),
                 },
             )?;
-            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
-            let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = SchedulerBenchModel { handle };
-            dispatch(
-                &cli,
-                model_type,
-                load_ms,
-                cli.cuda_graph,
-                &mut bench,
-                &tokenizer,
-            )
+            finish(handle, cli.cuda_graph)
         }
         #[cfg(feature = "qwen3-4b")]
         ModelType::Qwen3 => {
@@ -2239,17 +2216,7 @@ fn main() -> Result<()> {
                     seed: command_seed(&cli),
                 },
             )?;
-            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
-            let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = SchedulerBenchModel { handle };
-            dispatch(
-                &cli,
-                model_type,
-                load_ms,
-                cli.cuda_graph,
-                &mut bench,
-                &tokenizer,
-            )
+            finish(handle, cli.cuda_graph)
         }
         #[cfg(feature = "qwen35-4b")]
         ModelType::Qwen35 => {
@@ -2265,17 +2232,7 @@ fn main() -> Result<()> {
                 },
                 4,
             )?;
-            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
-            let load_ms = dur_ms(load_start.elapsed());
-            let mut bench = SchedulerBenchModel { handle };
-            dispatch(
-                &cli,
-                model_type,
-                load_ms,
-                cli.cuda_graph,
-                &mut bench,
-                &tokenizer,
-            )
+            finish(handle, cli.cuda_graph)
         }
     }
 }
