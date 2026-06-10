@@ -1,0 +1,295 @@
+//! comfy_table renderers for the text report format.
+
+use std::io::{IsTerminal, stdout};
+
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
+use comfy_table::{Cell, CellAlignment, Table};
+
+use crate::report::{CurveReport, DurationStats, MatrixReport, RequestReport, RunInfo};
+
+pub(crate) fn new_table() -> Table {
+    let mut table = Table::new();
+    if stdout().is_terminal() {
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.apply_modifier(UTF8_ROUND_CORNERS);
+    } else {
+        table.load_preset(ASCII_FULL_CONDENSED);
+    }
+    table
+}
+
+pub(crate) fn key_cell(label: impl Into<String>) -> Cell {
+    Cell::new(label.into())
+}
+
+pub(crate) fn value_cell(value: impl Into<String>) -> Cell {
+    Cell::new(value.into())
+}
+
+pub(crate) fn numeric_cell(value: impl Into<String>) -> Cell {
+    Cell::new(value.into()).set_alignment(CellAlignment::Right)
+}
+
+pub(crate) fn format_rate(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"))
+}
+
+pub(crate) fn format_duration_ms(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+pub(crate) fn format_count_avg(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+pub(crate) fn push_table(out: &mut String, table: &Table) {
+    out.push_str(&table.to_string());
+    out.push('\n');
+}
+
+pub(crate) fn render_run_summary(report: &RunInfo) -> Table {
+    let mut table = new_table();
+    table.add_row(vec![
+        key_cell("model"),
+        value_cell(format!("{} ({})", report.model_path, report.model_type)),
+    ]);
+    table.add_row(vec![
+        key_cell("cuda_graph"),
+        value_cell(report.cuda_graph.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("load_ms"),
+        numeric_cell(format_duration_ms(report.load_ms)),
+    ]);
+    if let Some(label) = &report.label {
+        table.add_row(vec![key_cell("label"), value_cell(label.clone())]);
+    }
+    table
+}
+
+pub(crate) fn render_request_meta(report: &RequestReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_source"),
+        value_cell(report.workload.prompt.source.clone()),
+    ]);
+    table.add_row(vec![
+        key_cell("prompt_tokens"),
+        numeric_cell(report.workload.prompt.prompt_tokens.to_string()),
+    ]);
+    if let Some(preview) = &report.workload.prompt.prompt_preview {
+        table.add_row(vec![
+            key_cell("prompt"),
+            value_cell(format!("\"{preview}\"")),
+        ]);
+    }
+    table.add_row(vec![
+        key_cell("output_len"),
+        numeric_cell(report.workload.output_len.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+pub(crate) fn render_duration_table(rows: Vec<(String, DurationStats)>) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("metric"),
+        Cell::new("avg_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p50_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p95_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p99_ms").set_alignment(CellAlignment::Right),
+        Cell::new("max_ms").set_alignment(CellAlignment::Right),
+        Cell::new("samples").set_alignment(CellAlignment::Right),
+    ]);
+    for (label, stats) in rows {
+        table.add_row(vec![
+            key_cell(label),
+            numeric_cell(format_duration_ms(stats.avg_ms)),
+            numeric_cell(format_duration_ms(stats.p50_ms)),
+            numeric_cell(format_duration_ms(stats.p95_ms)),
+            numeric_cell(format_duration_ms(stats.p99_ms)),
+            numeric_cell(format_duration_ms(stats.max_ms)),
+            numeric_cell(stats.samples.to_string()),
+        ]);
+    }
+    table
+}
+
+pub(crate) fn render_request_summary(report: &RequestReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("metric"),
+        Cell::new("value").set_alignment(CellAlignment::Right),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_tokens_avg"),
+        numeric_cell(format_count_avg(report.metrics.generated_tokens.avg)),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_tokens_min"),
+        numeric_cell(report.metrics.generated_tokens.min.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_tokens_max"),
+        numeric_cell(report.metrics.generated_tokens.max.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("generated_token_runs"),
+        numeric_cell(report.metrics.generated_tokens.samples.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("request_tok_s"),
+        numeric_cell(format_rate(report.metrics.request_tok_s)),
+    ]);
+    table.add_row(vec![
+        key_cell("decode_tok_s"),
+        numeric_cell(format_rate(report.metrics.decode_tok_s)),
+    ]);
+    table
+}
+
+pub(crate) fn render_matrix_meta(report: &MatrixReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_lens"),
+        value_cell(
+            report
+                .workload
+                .prompt_lens
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    ]);
+    table.add_row(vec![
+        key_cell("output_lens"),
+        value_cell(
+            report
+                .workload
+                .output_lens
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    ]);
+    table.add_row(vec![
+        key_cell("synthetic_pattern"),
+        value_cell(report.workload.synthetic_pattern),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+pub(crate) fn render_matrix_table(report: &MatrixReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("prompt_tok").set_alignment(CellAlignment::Right),
+        Cell::new("output_tok").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_avg").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_p95").set_alignment(CellAlignment::Right),
+        Cell::new("e2e_avg").set_alignment(CellAlignment::Right),
+        Cell::new("req_tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("decode_tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("gen_avg").set_alignment(CellAlignment::Right),
+    ]);
+    for cell in &report.cells {
+        table.add_row(vec![
+            numeric_cell(cell.prompt_len.to_string()),
+            numeric_cell(cell.output_len.to_string()),
+            numeric_cell(format_duration_ms(cell.ttft_ms.avg_ms)),
+            numeric_cell(format_duration_ms(cell.ttft_ms.p95_ms)),
+            numeric_cell(format_duration_ms(cell.e2e_ms.avg_ms)),
+            numeric_cell(format_rate(cell.request_tok_s)),
+            numeric_cell(format_rate(cell.decode_tok_s)),
+            numeric_cell(format_count_avg(cell.generated_tokens.avg)),
+        ]);
+    }
+    table
+}
+
+pub(crate) fn render_curve_meta(report: &CurveReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_source"),
+        value_cell(report.workload.prompt.source.clone()),
+    ]);
+    table.add_row(vec![
+        key_cell("prompt_tokens"),
+        numeric_cell(report.workload.prompt.prompt_tokens.to_string()),
+    ]);
+    if let Some(preview) = &report.workload.prompt.prompt_preview {
+        table.add_row(vec![
+            key_cell("prompt"),
+            value_cell(format!("\"{preview}\"")),
+        ]);
+    }
+    table.add_row(vec![
+        key_cell("output_len"),
+        numeric_cell(report.workload.output_len.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("window"),
+        numeric_cell(report.workload.window.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+pub(crate) fn render_curve_table(report: &CurveReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("ctx_range"),
+        Cell::new("avg_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p50_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p95_ms").set_alignment(CellAlignment::Right),
+        Cell::new("p99_ms").set_alignment(CellAlignment::Right),
+        Cell::new("tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("samples").set_alignment(CellAlignment::Right),
+    ]);
+    for window in &report.windows {
+        table.add_row(vec![
+            value_cell(format!("{}-{}", window.ctx_start, window.ctx_end)),
+            numeric_cell(format_duration_ms(window.tpot_ms.avg_ms)),
+            numeric_cell(format_duration_ms(window.tpot_ms.p50_ms)),
+            numeric_cell(format_duration_ms(window.tpot_ms.p95_ms)),
+            numeric_cell(format_duration_ms(window.tpot_ms.p99_ms)),
+            numeric_cell(format_rate(window.decode_tok_s)),
+            numeric_cell(window.tpot_ms.samples.to_string()),
+        ]);
+    }
+    table
+}
