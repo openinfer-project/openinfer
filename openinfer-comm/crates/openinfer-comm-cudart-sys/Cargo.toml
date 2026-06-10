@@ -2,6 +2,7 @@
 edition = "2024"
 links = "cudart"
 name = "openinfer-comm-cudart-sys"
+license = "Apache-2.0"
 publish = false
 
 [features]

@@ -2,6 +2,7 @@
 edition = "2024"
 links = "torch-lib"
 name = "openinfer-comm-torch-lib"
+license = "Apache-2.0"
 publish = false
 
 [features]

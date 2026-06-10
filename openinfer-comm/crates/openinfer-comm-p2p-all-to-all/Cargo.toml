@@ -1,6 +1,7 @@
 [package]
 edition = "2024"
 name = "openinfer-comm-p2p-all-to-all"
+license = "Apache-2.0"
 publish = false
 
 [features]

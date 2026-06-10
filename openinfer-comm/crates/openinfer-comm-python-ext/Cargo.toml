@@ -1,6 +1,7 @@
 [package]
 edition = "2024"
 name = "openinfer-comm-python-ext"
+license = "Apache-2.0"
 publish = false
 
 [lib]

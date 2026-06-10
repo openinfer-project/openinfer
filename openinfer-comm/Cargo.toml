@@ -1,5 +1,6 @@
 [package]
 name = "openinfer-comm"
+license = "Apache-2.0"
 edition = "2024"
 publish = false
 description = "OpenInfer comm-backend public surface (EP all-to-all first; future data-movement surfaces later). Requires CUDA, RDMA Verbs, and GDRCopy on the host."

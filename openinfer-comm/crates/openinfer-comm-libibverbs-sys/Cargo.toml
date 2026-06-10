@@ -2,6 +2,7 @@
 edition = "2024"
 links = "ibverbs"
 name = "openinfer-comm-libibverbs-sys"
+license = "Apache-2.0"
 publish = false
 
 [features]

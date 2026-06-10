@@ -2,6 +2,7 @@
 edition = "2024"
 links = "a2a_kernels"
 name = "openinfer-comm-a2a-kernels"
+license = "Apache-2.0"
 publish = false
 
 [features]

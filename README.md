@@ -259,4 +259,6 @@ openinfer-qwen35-4b/               # Qwen3.5-4B model-owned engine crate
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported from
+NVIDIA Dynamo (the `kvbm/` crates) retain their original Apache-2.0 headers; see
+[NOTICE_DYNAMO](NOTICE_DYNAMO).
