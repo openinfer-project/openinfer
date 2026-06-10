@@ -81,8 +81,9 @@ VLLM=.venv/bin/vllm tools/bench/qps_sweep.sh
 
 - **Low load (QPS ≤ 8): TTFT favors openinfer (~10% lower p50), TPOT favors vLLM.**
   The TPOT gap grows with concurrency: +11% at QPS 1 (7.36 vs 6.65 ms) to +27% at
-  QPS 8 (14.98 vs 11.82 ms). openinfer's batched decode is the known weak spot
-  (per-row sampling, `models/qwen3/roadmap.md`).
+  QPS 8 (14.98 vs 11.82 ms). The growth pattern points at batched decode step cost,
+  not sampling — greedy token selection is already batched (#307, in this build);
+  isolating the kernel-level cause needs an nsys diff at fixed batch size.
 - **Saturation: openinfer knees at ~QPS 10, vLLM holds to ~QPS 12.** At QPS 12
   openinfer's queue diverges (TTFT p50 1.75 s) while vLLM still serves at 119.5 ms.
   Both are overloaded at QPS 16; vLLM's saturated throughput is ~12% higher
