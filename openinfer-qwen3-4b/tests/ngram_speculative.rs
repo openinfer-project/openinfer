@@ -28,7 +28,9 @@ const MAX_OUTPUT: usize = N_GENERATE + 8;
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => Some(MODEL_PATH.to_string()),
+        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
+            Some(MODEL_PATH.to_string())
+        }
         Err(_) => {
             eprintln!(
                 "skipping qwen3 ngram_speculative: {MODEL_PATH}/config.json missing; set OPENINFER_TEST_MODEL_PATH to run it"

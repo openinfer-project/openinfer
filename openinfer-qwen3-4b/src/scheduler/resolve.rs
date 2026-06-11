@@ -71,6 +71,8 @@ fn resolve_prefill_outputs(
             continue;
         }
 
+        let mut token_history = req.prompt_tokens.clone();
+        token_history.push(result.first_token);
         effects.pending.push(PendingEffect::Promote {
             state: ActiveRequestState {
                 request_id: req.request_id,
@@ -82,6 +84,7 @@ fn resolve_prefill_outputs(
                 prompt_len,
                 params: req.params,
                 logprobs: req.logprobs,
+                token_history,
             },
             first_token: result.first_token,
             logprob: result.first_token_logprob,

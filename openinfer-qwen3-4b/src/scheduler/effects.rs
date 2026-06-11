@@ -149,6 +149,7 @@ pub(super) fn apply_effects(
                 } else {
                     req.last_token = token;
                     req.generated_count = completion_tokens;
+                    req.token_history.push(token);
                 }
             }
         }
