@@ -10,6 +10,12 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let toolkit = openinfer_build::CudaToolkit::discover();
+
+    if env::var_os("NVCC").is_none() {
+        // SAFETY: build scripts run single-threaded before any thread spawns.
+        unsafe { env::set_var("NVCC", &toolkit.nvcc) };
+    }
 
     cxx_build::bridge("src/hw_cuda_impl.rs")
         .debug(false)
@@ -28,6 +34,6 @@ fn main() {
 
     openinfer_build::emit_rerun_if_changed_files("src", &["cu", "cuh", "h"]);
 
-    println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+    toolkit.link_search();
     println!("cargo:rustc-link-lib=cudart");
 }

@@ -62,58 +62,114 @@ fn target_dirs() -> Vec<String> {
     }
 }
 
-/// Relative candidate paths for a CUDA header across the layouts of
-/// [`cuda_libs`].
-pub fn cuda_headers(header: &str) -> Vec<String> {
-    let mut headers = vec![format!("include/{header}")];
-    for target in target_dirs() {
-        headers.push(format!("targets/{target}/include/{header}"));
-    }
-    headers
+/// One build-time CUDA toolkit resolution covering the classic, conda, and
+/// NVIDIA HPC SDK layouts; runtime loading (`LD_LIBRARY_PATH`, rpath) is out of scope.
+pub struct CudaToolkit {
+    pub root: PathBuf,
+    /// `{root}/bin/nvcc` when present, otherwise bare `nvcc` from `$PATH`.
+    pub nvcc: PathBuf,
+    pub include_dirs: Vec<PathBuf>,
+    pub lib_dirs: Vec<PathBuf>,
 }
 
-/// Emits `cargo:rustc-link-search` for [`cuda_libs`], warning when nothing
-/// matched so a failing link points back at the probed root.
-pub fn link_cuda(root: &Path, suffix: Option<&str>) {
-    let dirs = cuda_libs(root, suffix);
-    if dirs.is_empty() {
-        println!(
-            "cargo:warning=no CUDA library dir found under {} (suffix: {})",
-            root.display(),
-            suffix.unwrap_or("none"),
-        );
+impl CudaToolkit {
+    /// The root is not validated; a missing toolkit surfaces at the consuming probe or link step.
+    pub fn discover() -> Self {
+        println!("cargo:rerun-if-env-changed=CUDA_HOME");
+        println!("cargo:rerun-if-env-changed=CUDA_PATH");
+        let root = env::var("CUDA_HOME")
+            .or_else(|_| env::var("CUDA_PATH"))
+            .map_or_else(|_| PathBuf::from("/usr/local/cuda"), PathBuf::from);
+        Self::from_root(root)
     }
+
+    pub fn from_root(root: PathBuf) -> Self {
+        let nvcc = root.join("bin/nvcc");
+        let nvcc = if nvcc.is_file() {
+            nvcc
+        } else {
+            PathBuf::from("nvcc")
+        };
+
+        let mut include_dirs = vec![root.join("include")];
+        let mut lib_dirs = vec![root.join("lib64"), root.join("lib")];
+        for target in target_dirs() {
+            include_dirs.push(root.join(format!("targets/{target}/include")));
+            lib_dirs.push(root.join(format!("targets/{target}/lib")));
+        }
+        // HPC SDK roots look like .../hpc_sdk/<os>/<release>/cuda/<ver>; the
+        // math libraries live in the <release>/math_libs/<ver> sibling tree.
+        if let (Some(version), Some(release)) =
+            (root.file_name(), root.parent().and_then(Path::parent))
+        {
+            let math = release.join("math_libs").join(version);
+            lib_dirs.push(math.join("lib64"));
+            lib_dirs.push(math.join("lib"));
+        }
+
+        Self {
+            nvcc,
+            include_dirs: existing_deduped(include_dirs),
+            lib_dirs: existing_deduped(lib_dirs),
+            root,
+        }
+    }
+
+    /// The include dir that actually contains `header` — host-compiler `-I`
+    /// flags need this; on conda `include/` exists but lacks the CUDA headers.
+    pub fn header_dir(&self, header: &str) -> Option<PathBuf> {
+        self.include_dirs
+            .iter()
+            .find(|dir| dir.join(header).is_file())
+            .cloned()
+    }
+
+    pub fn link_search(&self) {
+        if self.lib_dirs.is_empty() {
+            println!(
+                "cargo:warning=no CUDA library dir found under {}",
+                self.root.display()
+            );
+        }
+        for dir in &self.lib_dirs {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+
+    /// Driver-stub variant, for linking `libcuda` without a GPU driver.
+    pub fn link_search_stubs(&self) {
+        let dirs: Vec<PathBuf> = self
+            .lib_dirs
+            .iter()
+            .map(|dir| dir.join("stubs"))
+            .filter(|dir| dir.is_dir())
+            .collect();
+        if dirs.is_empty() {
+            println!(
+                "cargo:warning=no CUDA stub dir found under {}",
+                self.root.display()
+            );
+        }
+        for dir in dirs {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+}
+
+fn existing_deduped(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
     for dir in dirs {
-        println!("cargo:rustc-link-search=native={}", dir.display());
+        if !dir.is_dir() {
+            continue;
+        }
+        let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !seen.contains(&canon) {
+            seen.push(canon);
+            out.push(dir);
+        }
     }
-}
-
-/// The existing CUDA library dirs under `root`: `lib64` (classic), `lib`
-/// (conda), `targets/<arch>/lib`, and the NVIDIA HPC SDK `math_libs/<ver>`
-/// sibling tree, where cuBLAS lives outside the cuda dir. `suffix` narrows
-/// each candidate, e.g. `Some("stubs")` for driver stubs. Kept free of cargo
-/// output so layout coverage is unit-testable on synthetic trees.
-pub fn cuda_libs(root: &Path, suffix: Option<&str>) -> Vec<PathBuf> {
-    let mut subdirs = vec!["lib64".to_string(), "lib".to_string()];
-    for target in target_dirs() {
-        subdirs.push(format!("targets/{target}/lib"));
-    }
-    let mut dirs: Vec<PathBuf> = subdirs.iter().map(|sub| root.join(sub)).collect();
-    // HPC SDK roots look like .../hpc_sdk/<os>/<release>/cuda/<ver>; the math
-    // libraries live in the <release>/math_libs/<ver> sibling tree.
-    if let (Some(version), Some(release)) = (root.file_name(), root.parent().and_then(Path::parent))
-    {
-        let math = release.join("math_libs").join(version);
-        dirs.push(math.join("lib64"));
-        dirs.push(math.join("lib"));
-    }
-    dirs.into_iter()
-        .map(|dir| match suffix {
-            Some(suffix) => dir.join(suffix),
-            None => dir,
-        })
-        .filter(|dir| dir.is_dir())
-        .collect()
+    out
 }
 
 /// Recursively emits `cargo:rerun-if-changed` for all files under `src_dir`
@@ -184,68 +240,81 @@ mod tests {
     }
 
     #[test]
-    fn classic_layout_finds_header_and_lib64() {
+    fn classic_layout() {
         let tree = TempTree::new("classic");
         tree.touch("include/cuda.h");
+        tree.touch("bin/nvcc");
         let lib64 = tree.mkdirs("lib64");
         tree.mkdirs("lib64/stubs");
 
-        let candidates = cuda_headers("cuda.h");
-        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
-        let root_str = tree.0.to_str().unwrap().to_string();
-        let (root, header) = find_package(
-            "test",
-            "OPENINFER_TEST_UNSET_ENV",
-            &[&root_str],
-            &candidates,
-        );
-        assert_eq!(root, tree.0);
-        assert_eq!(header, tree.0.join("include/cuda.h"));
-
-        assert_eq!(cuda_libs(&tree.0, None), vec![lib64.clone()]);
-        assert_eq!(cuda_libs(&tree.0, Some("stubs")), vec![lib64.join("stubs")]);
+        let tk = CudaToolkit::from_root(tree.0.clone());
+        assert_eq!(tk.nvcc, tree.0.join("bin/nvcc"));
+        assert_eq!(tk.header_dir("cuda.h"), Some(tree.0.join("include")));
+        assert_eq!(tk.lib_dirs, vec![lib64.clone()]);
+        assert!(lib64.join("stubs").is_dir());
     }
 
     #[test]
-    fn conda_layout_finds_targets_header_and_lib() {
+    fn conda_layout() {
         let tree = TempTree::new("conda");
         let target = target_dir();
+        tree.mkdirs("include");
         tree.touch(&format!("targets/{target}/include/cuda.h"));
         let lib = tree.mkdirs("lib");
         let targets_lib = tree.mkdirs(&format!("targets/{target}/lib"));
 
-        let candidates = cuda_headers("cuda.h");
-        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
-        let root_str = tree.0.to_str().unwrap().to_string();
-        let (_, header) = find_package(
-            "test",
-            "OPENINFER_TEST_UNSET_ENV",
-            &[&root_str],
-            &candidates,
-        );
+        let tk = CudaToolkit::from_root(tree.0.clone());
+        assert_eq!(tk.nvcc, PathBuf::from("nvcc"));
         assert_eq!(
-            header,
-            tree.0.join(format!("targets/{target}/include/cuda.h"))
+            tk.header_dir("cuda.h"),
+            Some(tree.0.join(format!("targets/{target}/include")))
         );
-
-        assert_eq!(cuda_libs(&tree.0, None), vec![lib, targets_lib]);
+        assert_eq!(tk.lib_dirs, vec![lib, targets_lib]);
     }
 
     #[test]
     fn hpc_sdk_layout_adds_math_libs_sibling() {
         let tree = TempTree::new("hpcsdk");
-        let cuda_root = tree.mkdirs("release/cuda/12.6");
-        let cuda_lib64 = tree.mkdirs("release/cuda/12.6/lib64");
-        let math_lib64 = tree.mkdirs("release/math_libs/12.6/lib64");
+        let root = tree.mkdirs("release/cuda/12.6");
+        let lib64 = tree.mkdirs("release/cuda/12.6/lib64");
+        let math = tree.mkdirs("release/math_libs/12.6/lib64");
 
-        assert_eq!(cuda_libs(&cuda_root, None), vec![cuda_lib64, math_lib64]);
+        assert_eq!(CudaToolkit::from_root(root).lib_dirs, vec![lib64, math]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dirs_dedupe() {
+        let tree = TempTree::new("symlink");
+        let target = target_dir();
+        tree.touch(&format!("targets/{target}/include/cuda.h"));
+        tree.mkdirs(&format!("targets/{target}/lib"));
+        std::os::unix::fs::symlink(
+            tree.0.join(format!("targets/{target}/include")),
+            tree.0.join("include"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            tree.0.join(format!("targets/{target}/lib")),
+            tree.0.join("lib"),
+        )
+        .unwrap();
+
+        let tk = CudaToolkit::from_root(tree.0.clone());
+        assert_eq!(tk.include_dirs.len(), 1);
+        assert_eq!(tk.lib_dirs.len(), 1);
+        assert_eq!(tk.header_dir("cuda.h"), Some(tree.0.join("include")));
     }
 
     #[test]
-    fn unknown_layout_yields_no_dirs() {
+    fn unknown_layout_yields_nothing() {
         let tree = TempTree::new("unknown");
         tree.mkdirs("weird/place");
-        assert!(cuda_libs(&tree.0, None).is_empty());
+
+        let tk = CudaToolkit::from_root(tree.0.clone());
+        assert!(tk.lib_dirs.is_empty());
+        assert!(tk.include_dirs.is_empty());
+        assert_eq!(tk.header_dir("cuda.h"), None);
     }
 
     #[test]
