@@ -895,6 +895,12 @@ fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> Pa
 }
 
 fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &[String]) {
+    // Host cc compiles the wrappers below; unlike nvcc it won't find cuda.h itself.
+    assert!(
+        cuda_include.join("cuda.h").is_file(),
+        "cuda.h not found in {}; set CUDA_HOME to a CUDA toolkit root",
+        cuda_include.display()
+    );
     let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
     let triton_target = triton_target(sm_targets);
     let mut generated_sources = Vec::new();

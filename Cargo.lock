@@ -3532,6 +3532,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-build"
+version = "0.0.0"
+
+[[package]]
 name = "openinfer-comm"
 version = "0.0.0"
 dependencies = [
@@ -3554,12 +3558,8 @@ dependencies = [
  "cc",
  "cxx",
  "cxx-build",
- "openinfer-comm-build-utils",
+ "openinfer-build",
 ]
-
-[[package]]
-name = "openinfer-comm-build-utils"
-version = "0.0.0"
 
 [[package]]
 name = "openinfer-comm-cuda-lib"
@@ -3579,7 +3579,7 @@ name = "openinfer-comm-cuda-sys"
 version = "0.0.0"
 dependencies = [
  "bindgen",
- "openinfer-comm-build-utils",
+ "openinfer-build",
 ]
 
 [[package]]
@@ -3587,7 +3587,7 @@ name = "openinfer-comm-cudart-sys"
 version = "0.0.0"
 dependencies = [
  "bindgen",
- "openinfer-comm-build-utils",
+ "openinfer-build",
 ]
 
 [[package]]
@@ -3633,7 +3633,7 @@ name = "openinfer-comm-gdrapi-sys"
 version = "0.0.0"
 dependencies = [
  "bindgen",
- "openinfer-comm-build-utils",
+ "openinfer-build",
 ]
 
 [[package]]
@@ -3642,7 +3642,7 @@ version = "0.0.0"
 dependencies = [
  "bindgen",
  "cc",
- "openinfer-comm-build-utils",
+ "openinfer-build",
 ]
 
 [[package]]
@@ -3715,6 +3715,7 @@ version = "0.0.0"
 dependencies = [
  "cxx",
  "cxx-build",
+ "openinfer-build",
  "openinfer-comm-cuda-lib",
  "pkg-config",
  "pyo3",
@@ -3745,6 +3746,7 @@ name = "openinfer-cupti"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "openinfer-build",
 ]
 
 [[package]]
@@ -3805,6 +3807,7 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+ "openinfer-build",
  "serde",
  "tvm-ffi",
 ]

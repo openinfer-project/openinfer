@@ -73,13 +73,18 @@ pub struct CudaToolkit {
 }
 
 impl CudaToolkit {
-    /// The root is not validated; a missing toolkit surfaces at the consuming probe or link step.
     pub fn discover() -> Self {
         println!("cargo:rerun-if-env-changed=CUDA_HOME");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
-        let root = env::var("CUDA_HOME")
+        let env_root = env::var("CUDA_HOME")
             .or_else(|_| env::var("CUDA_PATH"))
-            .map_or_else(|_| PathBuf::from("/usr/local/cuda"), PathBuf::from);
+            .ok();
+        if let Some(root) = env_root.as_deref().filter(|root| !Path::new(root).is_dir()) {
+            println!(
+                "cargo:warning=CUDA root {root} (from CUDA_HOME/CUDA_PATH) is not a directory"
+            );
+        }
+        let root = env_root.map_or_else(|| PathBuf::from("/usr/local/cuda"), PathBuf::from);
         Self::from_root(root)
     }
 
@@ -315,6 +320,22 @@ mod tests {
         assert!(tk.lib_dirs.is_empty());
         assert!(tk.include_dirs.is_empty());
         assert_eq!(tk.header_dir("cuda.h"), None);
+    }
+
+    #[test]
+    fn find_package_returns_matching_root_and_check_file() {
+        let tree = TempTree::new("findpkg");
+        tree.touch("include/gdrapi.h");
+        let root_str = tree.0.to_str().unwrap().to_string();
+
+        let (root, header) = find_package(
+            "test",
+            "OPENINFER_TEST_UNSET_ENV",
+            &[&root_str],
+            &["targets/missing/include/gdrapi.h", "include/gdrapi.h"],
+        );
+        assert_eq!(root, tree.0);
+        assert_eq!(header, tree.0.join("include/gdrapi.h"));
     }
 
     #[test]
