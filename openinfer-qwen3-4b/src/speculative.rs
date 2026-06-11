@@ -7,19 +7,51 @@
 //! this live in the decode path and are intentionally not part of this module,
 //! so the acceptance rule stays pure and unit-tested.
 
-use crate::ngram::NgramConfig;
+use crate::ngram::{NgramConfig, NgramProposer};
+
+/// A draft-token source for speculative decoding.
+///
+/// This is the single axis of variation between speculative methods: n-gram /
+/// prompt-lookup today, draft-model or EAGLE/Medusa later. Everything around it
+/// — the verify forward, KV reserve/rollback, greedy acceptance, and the
+/// scheduler step that streams committed tokens — is method-agnostic and is
+/// reused unchanged.
+///
+/// The context is the request's full token sequence so far (prompt + generated
+/// tokens). Returning an empty `Vec` means "no draft this step", and the decode
+/// path falls back to a single-token decode. A token-only context fits n-gram
+/// and draft-model proposers; hidden-state proposers (EAGLE/Medusa) will need a
+/// richer context (request id + hidden states), which is a deliberate future
+/// extension rather than something modelled speculatively here.
+pub trait SpeculativeProposer: Send + Sync {
+    /// Propose up to `K` continuation tokens for `context`.
+    fn propose(&self, context: &[u32]) -> Vec<u32>;
+}
+
+/// Which proposer to build. Add a variant per new speculative method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpeculativeMethod {
+    /// N-gram / prompt-lookup (no draft model).
+    Ngram(NgramConfig),
+}
+
+impl Default for SpeculativeMethod {
+    fn default() -> Self {
+        Self::Ngram(NgramConfig::default())
+    }
+}
 
 /// Speculative-decoding configuration.
 ///
-/// `Default` is disabled with the default n-gram settings (`enabled: false`),
-/// so the decode path runs the normal one-token step until explicitly turned on.
+/// `Default` is disabled with the default method (`enabled: false`), so the
+/// decode path runs the normal one-token step until explicitly turned on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct SpeculativeConfig {
     /// Master switch. When `false` the decode path runs the normal one-token
-    /// step and never calls the proposer.
+    /// step and never builds a proposer.
     pub enabled: bool,
-    /// N-gram proposer settings (ignored when `enabled` is `false`).
-    pub ngram: NgramConfig,
+    /// Which proposer to use (ignored when `enabled` is `false`).
+    pub method: SpeculativeMethod,
 }
 
 impl SpeculativeConfig {
@@ -41,11 +73,31 @@ impl SpeculativeConfig {
             env_usize("OPENINFER_QWEN3_NGRAM_SPEC_MAX_NGRAM").unwrap_or(defaults.max_ngram);
         Self {
             enabled,
-            ngram: NgramConfig {
+            method: SpeculativeMethod::Ngram(NgramConfig {
                 max_ngram,
                 min_ngram: defaults.min_ngram,
                 num_speculative,
-            },
+            }),
+        }
+    }
+
+    /// Construct the proposer described by [`Self::method`]. The scheduler calls
+    /// this once at startup and reuses the boxed proposer across all requests.
+    #[must_use]
+    pub fn build_proposer(&self) -> Box<dyn SpeculativeProposer> {
+        match self.method {
+            SpeculativeMethod::Ngram(cfg) => Box::new(NgramProposer::new(cfg)),
+        }
+    }
+
+    /// Human-readable one-liner for startup logging.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self.method {
+            SpeculativeMethod::Ngram(cfg) => format!(
+                "n-gram (K={}, max_ngram={})",
+                cfg.num_speculative, cfg.max_ngram
+            ),
         }
     }
 }

@@ -278,12 +278,9 @@ fn scheduler_loop<E>(
     // single-token decode.
     let spec_config = crate::speculative::SpeculativeConfig::from_env();
     if spec_config.enabled {
-        info!(
-            "n-gram speculative decode enabled (K={}, max_ngram={})",
-            spec_config.ngram.num_speculative, spec_config.ngram.max_ngram
-        );
+        info!("speculative decode enabled: {}", spec_config.describe());
     }
-    let ngram_proposer = crate::ngram::NgramProposer::new(spec_config.ngram);
+    let spec_proposer = spec_config.build_proposer();
 
     info!("Scheduler ready");
 
@@ -358,7 +355,11 @@ fn scheduler_loop<E>(
         // Speculative decode replaces the batched single-token decode on
         // pure-decode ticks (no new prefill this step). Lossless under greedy.
         if spec_config.enabled && matches!(plan, self::plan::ExecutionPlan::Decode) {
-            self::speculative::speculative_decode_step(&mut executor, &mut active, &ngram_proposer);
+            self::speculative::speculative_decode_step(
+                &mut executor,
+                &mut active,
+                spec_proposer.as_ref(),
+            );
             continue;
         }
         let failure_targets = failure_targets_for(&active, &plan);

@@ -15,16 +15,18 @@ use log::warn;
 use openinfer_core::engine::FinishReason;
 
 use crate::executor::{DecodePlan, DecodeStepItem, ModelExecutor, SpeculativeStepItem};
-use crate::ngram::NgramProposer;
+use crate::speculative::SpeculativeProposer;
 
 use super::{ActiveRequestState, TokenEvent};
 
 /// Advance every active request by one speculative step. Finished requests are
-/// dropped from `active`.
+/// dropped from `active`. The proposer is method-agnostic ([`SpeculativeProposer`]);
+/// everything below it (verify, KV rollback, acceptance, streaming) is reused
+/// unchanged regardless of which proposer is plugged in.
 pub(super) fn speculative_decode_step(
     executor: &mut impl ModelExecutor,
     active: &mut Vec<ActiveRequestState>,
-    proposer: &NgramProposer,
+    proposer: &dyn SpeculativeProposer,
 ) {
     let mut to_retire = Vec::new();
     for idx in 0..active.len() {
