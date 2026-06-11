@@ -93,6 +93,13 @@ struct Args {
     /// prefix is restored from the host tier — for measuring the L2 TTFT win.
     #[arg(long, default_value_t = false)]
     no_prefix_cache: bool,
+
+    /// Cap on total prompt tokens batch-prefilled in one Qwen3 scheduler step.
+    /// Prefill activation scratch scales with the step's prompt tokens, so this
+    /// bounds peak VRAM under request bursts. A single request longer than the
+    /// cap is still admitted alone.
+    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
+    max_prefill_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -250,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                     lora_options,
                     offload,
                     args.no_prefix_cache,
+                    args.max_prefill_tokens,
                 )
             } else {
                 openinfer_qwen3_4b::start_engine_with_offload(
@@ -257,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
                     options,
                     offload,
                     args.no_prefix_cache,
+                    args.max_prefill_tokens,
                 )
             }
             .context("failed to start Qwen3 engine")?;

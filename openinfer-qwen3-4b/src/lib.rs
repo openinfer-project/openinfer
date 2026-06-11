@@ -19,6 +19,7 @@ use anyhow::Result;
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, ModelInfo};
 
 pub use kernel_plan::kernel_plan;
+pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3LoraOptions {
@@ -138,7 +139,13 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    start_engine_with_offload(model_path, options, Qwen3OffloadOptions::disabled(), false)
+    start_engine_with_offload(
+        model_path,
+        options,
+        Qwen3OffloadOptions::disabled(),
+        false,
+        DEFAULT_MAX_PREFILL_TOKENS,
+    )
 }
 
 /// Like [`start_engine`] but with pegaflow KV offload (single-GPU only). The
@@ -150,11 +157,15 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
 /// without offload it disables prefix matching outright; with offload it keeps
 /// the host tier but stops cross-request HBM reuse, so every prefix is served
 /// from L2 — the pure-L2 benchmark mode.
+///
+/// `max_prefill_tokens` caps the total prompt tokens batch-prefilled in one
+/// scheduler step (see [`DEFAULT_MAX_PREFILL_TOKENS`]).
 pub fn start_engine_with_offload(
     model_path: &Path,
     options: EngineLoadOptions,
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
+    max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -172,6 +183,7 @@ pub fn start_engine_with_offload(
         seed,
         offload_options,
         no_prefix_cache,
+        max_prefill_tokens,
     )
 }
 
@@ -181,6 +193,7 @@ pub fn start_engine_with_lora_control(
     lora_options: Qwen3LoraOptions,
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
+    max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -199,5 +212,6 @@ pub fn start_engine_with_lora_control(
         lora_options.validate()?,
         offload_options,
         no_prefix_cache,
+        max_prefill_tokens,
     )
 }

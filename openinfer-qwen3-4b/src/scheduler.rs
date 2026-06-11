@@ -85,6 +85,7 @@ pub(crate) fn start_qwen3(
     seed: u64,
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
+    max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -94,7 +95,7 @@ pub(crate) fn start_qwen3(
         offload_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-    Ok(start_with_executor(executor, seed))
+    Ok(start_with_executor(executor, seed, max_prefill_tokens))
 }
 
 pub(crate) fn start_qwen3_with_lora_control(
@@ -105,6 +106,7 @@ pub(crate) fn start_qwen3_with_lora_control(
     lora_options: Qwen3LoraOptions,
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
+    max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -114,7 +116,11 @@ pub(crate) fn start_qwen3_with_lora_control(
         offload_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-    Ok(start_with_executor_with_lora_control(executor, seed))
+    Ok(start_with_executor_with_lora_control(
+        executor,
+        seed,
+        max_prefill_tokens,
+    ))
 }
 
 fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32 {
@@ -124,7 +130,11 @@ fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32
         .unwrap_or(u32::MAX)
 }
 
-pub(crate) fn start_with_executor<E>(executor: E, seed: u64) -> EngineHandle
+pub(crate) fn start_with_executor<E>(
+    executor: E,
+    seed: u64,
+    max_prefill_tokens: usize,
+) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
@@ -138,14 +148,18 @@ where
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop(executor, submit_rx, seed);
+            scheduler_loop(executor, submit_rx, seed, max_prefill_tokens);
         })
         .expect("failed to spawn scheduler thread");
 
     EngineHandle::new(submit_tx).with_servable_len(servable)
 }
 
-pub(crate) fn start_with_executor_with_lora_control<E>(executor: E, seed: u64) -> EngineHandle
+pub(crate) fn start_with_executor_with_lora_control<E>(
+    executor: E,
+    seed: u64,
+    max_prefill_tokens: usize,
+) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
@@ -159,7 +173,7 @@ where
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop_with_lora_control(executor, command_rx, seed);
+            scheduler_loop_with_lora_control(executor, command_rx, seed, max_prefill_tokens);
         })
         .expect("failed to spawn scheduler thread");
 
@@ -256,6 +270,7 @@ fn scheduler_loop<E>(
     mut executor: E,
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     seed: u64,
+    max_prefill_tokens: usize,
 ) where
     E: ModelExecutor,
 {
@@ -326,6 +341,7 @@ fn scheduler_loop<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
@@ -356,6 +372,7 @@ fn scheduler_loop_with_lora_control<E>(
     mut executor: E,
     mut command_rx: mpsc::UnboundedReceiver<EngineCommand>,
     seed: u64,
+    max_prefill_tokens: usize,
 ) where
     E: ModelExecutor,
 {
@@ -449,6 +466,7 @@ fn scheduler_loop_with_lora_control<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
@@ -672,13 +690,13 @@ fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usi
         .sum()
 }
 
-/// Prefill tokens admitted into a single step. Prefill activation scratch
-/// scales with the step's total prompt tokens (~22 KB/token measured on
-/// Qwen3-4B), so an unbounded prefill batch can eat the post-KV-pool VRAM
-/// headroom and OOM mid-serving under a request burst. A single request is
-/// always admitted regardless of its prompt length — only batching beyond one
-/// request is capped.
-const PREFILL_STEP_TOKEN_BUDGET: usize = 8192;
+/// Default for `max_prefill_tokens`: prefill tokens admitted into a single
+/// step. Prefill activation scratch scales with the step's total prompt tokens
+/// (~22 KB/token measured on Qwen3-4B), so an unbounded prefill batch can eat
+/// the post-KV-pool VRAM headroom and OOM mid-serving under a request burst. A
+/// single request is always admitted regardless of its prompt length — only
+/// batching beyond one request is capped.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 8192;
 
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
@@ -688,6 +706,7 @@ fn admit_deferred_requests(
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
+    max_prefill_tokens: usize,
     // Blocks a request already holds from a settled prefetch. These are already
     // out of `available_blocks`, so they must be credited against the request's
     // need or admission double-counts them and can wedge a near-budget CPU-hit
@@ -726,7 +745,7 @@ fn admit_deferred_requests(
         let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
         let prompt_len = req.prompt_tokens.len();
         let within_token_budget =
-            pending.is_empty() || step_prefill_tokens + prompt_len <= PREFILL_STEP_TOKEN_BUDGET;
+            pending.is_empty() || step_prefill_tokens + prompt_len <= max_prefill_tokens;
         if fresh_needed <= budget && decode_slots > 0 && within_token_budget {
             budget -= fresh_needed;
             decode_slots -= 1;
@@ -1221,7 +1240,17 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64, |_| 0);
+        let outcome = admit_deferred_requests(
+            deferred,
+            &active,
+            16,
+            4,
+            4,
+            usize::MAX,
+            64,
+            DEFAULT_MAX_PREFILL_TOKENS,
+            |_| 0,
+        );
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1260,7 +1289,17 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64, |_| 0);
+        let outcome = admit_deferred_requests(
+            deferred,
+            &active,
+            16,
+            1000,
+            1000,
+            32,
+            64,
+            DEFAULT_MAX_PREFILL_TOKENS,
+            |_| 0,
+        );
 
         let pending_ids = outcome
             .pending
@@ -1314,6 +1353,7 @@ mod tests {
             1024,
             usize::MAX,
             64,
+            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
 
@@ -1330,10 +1370,59 @@ mod tests {
     }
 
     #[test]
+    fn prefill_token_budget_caps_batching_but_never_starves_one_request() {
+        let active: [ActiveRequestState; 0] = [];
+        let mk = |id: u64, prompt_len, max_tokens| {
+            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        };
+
+        // A first request larger than the whole budget is still admitted alone —
+        // otherwise it would be deferred forever.
+        let oversized = admit_deferred_requests(
+            vec![mk(1, 64, 1), mk(2, 16, 1)],
+            &active,
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            32,
+            |_| 0,
+        );
+        assert_eq!(oversized.pending.len(), 1);
+        assert_eq!(
+            oversized.deferred[0].request_id,
+            RequestId(2),
+            "follow-up waits for the next step once the budget is blown"
+        );
+
+        // Requests batch until the budget is filled exactly; overflow defers,
+        // never rejects.
+        let batched = admit_deferred_requests(
+            vec![mk(3, 16, 1), mk(4, 16, 1), mk(5, 16, 1)],
+            &active,
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            32,
+            |_| 0,
+        );
+        assert_eq!(
+            batched.pending.len(),
+            2,
+            "16 + 16 fills the 32-token budget"
+        );
+        assert_eq!(batched.deferred[0].request_id, RequestId(5));
+        assert!(batched.rejected.is_empty());
+    }
+
+    #[test]
     fn one_token_completion_on_page_boundary_fits_one_page() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(1, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (fits_exactly, mut rx) = request(16, 1);
         handle.submit(fits_exactly).expect("submit fits_exactly");
@@ -1366,6 +1455,7 @@ mod tests {
             2,
             usize::MAX,
             64,
+            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
         assert!(
@@ -1386,6 +1476,7 @@ mod tests {
             3,
             usize::MAX,
             64,
+            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
         assert_eq!(
@@ -1480,7 +1571,7 @@ mod tests {
     fn request_waits_for_full_kv_budget_before_prefill() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (long_running, mut long_rx) = request(16, 18);
         handle.submit(long_running).expect("submit long_running");
@@ -1595,7 +1686,7 @@ mod tests {
     fn impossible_request_is_rejected_without_blocking_later_work() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(2, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (too_large, mut too_large_rx) = request(16, 34);
         handle.submit(too_large).expect("submit too_large");
@@ -1631,7 +1722,7 @@ mod tests {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         // max_positional_encoding_tokens = 32
         let executor = FakeExecutor::new(1000, Arc::clone(&dropped)).with_max_context_tokens(32);
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         // prompt=16, max_new=100
         let (too_long, mut too_long_rx) = request(16, 100);
@@ -1738,7 +1829,7 @@ mod tests {
     fn unknown_lora_request_is_rejected_without_blocking_base_request() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (unknown, mut unknown_rx) = request_with_lora(16, 1, Some("missing-adapter"));
         let (base, mut base_rx) = request_with_lora(16, 1, None);
@@ -1775,7 +1866,7 @@ mod tests {
     fn decode_error_drops_request_state_and_scheduler_recovers() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_failure();
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (will_fail, mut fail_rx) = request(16, 2);
         handle.submit(will_fail).expect("submit will_fail");
@@ -1825,7 +1916,7 @@ mod tests {
     fn active_receiver_drop_releases_request_state() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (will_disconnect, mut token_rx) = request(16, 3);
         handle
@@ -1918,7 +2009,8 @@ mod tests {
     fn lora_control_reports_unimplemented_when_idle() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor_with_lora_control(executor, 42);
+        let handle =
+            start_with_executor_with_lora_control(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let error = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1944,7 +2036,8 @@ mod tests {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor =
             FakeExecutor::new(4, Arc::clone(&dropped)).with_lora_adapters(&["adapter-a"]);
-        let handle = start_with_executor_with_lora_control(executor, 42);
+        let handle =
+            start_with_executor_with_lora_control(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1968,7 +2061,8 @@ mod tests {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor =
             FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_delay(Duration::from_millis(80));
-        let handle = start_with_executor_with_lora_control(executor, 42);
+        let handle =
+            start_with_executor_with_lora_control(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
 
         let (long_running, mut token_rx) = request(16, 3);
         handle.submit(long_running).expect("submit long_running");
