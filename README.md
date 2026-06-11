@@ -18,53 +18,44 @@
 
 ---
 
-openinfer is a from-scratch LLM inference engine written in **~9.6K lines of Rust**, **~2.6K lines of CUDA**, and **~1.4K lines of Triton GPU kernels**. No PyTorch, no ONNX, no model framework runtime — just Rust plus CUDA, Triton AOT, and generated compatibility kernels.
+openinfer is a from-scratch LLM inference engine written in **~95K lines of Rust** and **~14K lines of CUDA**, plus Triton AOT kernels. No PyTorch, no ONNX, no model framework runtime — just Rust plus CUDA, Triton AOT, and generated compatibility kernels.
 
 The goal is to understand every layer of the inference stack by building it from the ground up, and to explore what a Rust-native inference engine can look like.
 
 ## Performance
 
-**Qwen3-4B vs vLLM 0.22.1** — measured 2026-06-10 on one **RTX 5090** (32 GB), BF16, TP1,
-both engines driven by `vllm bench serve` (random 1024-token prompts, 128-token outputs,
-Poisson arrivals, fixed seed). Full data, commands, and caveats:
-[`docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md`](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md).
+Head-to-head with **vLLM 0.22.1** on one **RTX 5090** (32 GB) — Qwen3-4B, BF16, TP1,
+both engines measured by the same `vllm bench serve` client with identical seeds.
 
-**Warm TTFT on a GPU prefix-cache hit** (identical prompt re-sent, output = 1 token,
-20 samples per length — the agent / multi-turn-chat hot path). openinfer leads at
-every length and the gap widens with context: **3× faster at 16k tokens**.
+**On a prefix-cache hit — the multi-turn chat / agent hot path — openinfer returns
+the first token up to 3× faster, and the lead grows with context:**
 
-| Input length | openinfer p50 / p99 | vLLM p50 / p99 |
-|--------------|---------------------|----------------|
-| 256 | **9.5 / 10.5 ms** | 13.3 / 14.2 ms |
-| 512 | **9.9 / 10.1 ms** | 14.3 / 14.5 ms |
-| 1k | **10.5 / 10.7 ms** | 16.1 / 16.4 ms |
-| 2k | **11.9 / 12.4 ms** | 19.8 / 20.5 ms |
-| 4k | **14.5 / 15.1 ms** | 27.3 / 28.3 ms |
-| 8k | **24.6 / 25.6 ms** | 46.9 / 49.3 ms |
-| 16k | **30.3 / 31.4 ms** | 90.8 / 100.2 ms |
+| Cached prompt | openinfer | vLLM 0.22.1 | speedup |
+|--------------:|----------:|------------:|--------:|
+| 1k tokens | 10.5 ms | 16.1 ms | 1.5× |
+| 4k tokens | 14.5 ms | 27.3 ms | 1.9× |
+| 8k tokens | 24.6 ms | 46.9 ms | 1.9× |
+| 16k tokens | 30.3 ms | 90.8 ms | **3.0×** |
 
-**Serving load sweep** (Poisson arrivals, **openinfer** / vLLM):
+<sub>Warm TTFT, p50 of 20 samples per length. The tail behaves the same way:
+openinfer's p99 stays within ~1 ms of its p50 at every length, while vLLM's reaches
+100 ms at 16k. From 256 → 16k tokens, vLLM's warm TTFT grows ~7×; openinfer's grows ~3×.</sub>
 
-| QPS | TTFT p50 (ms) | TPOT p50 (ms) | Output tok/s |
-|-----|---------------|----------------|--------------|
-| 1 | **50.7** / 57.8 | 7.36 / **6.65** | 126 / 126 |
-| 4 | **57.3** / 61.8 | 11.09 / **8.57** | 502 / 504 |
-| 8 | 69.5 / **68.1** | 14.98 / **11.82** | 1005 / 1008 |
+Under serving load (Poisson arrivals, 1k-token prompts, 128-token outputs), openinfer
+delivers lower TTFT at low load (50.7 vs 57.8 ms p50 at QPS 1, converging by QPS 8)
+at identical output throughput, and cold prefill is at parity up to 16k context
+(1.00 vs 1.11 s). vLLM is ahead on batched decode TPOT (7.36 vs 6.65 ms at QPS 1,
+widening to 27% at QPS 8) and sustains ~12% more throughput past saturation —
+openinfer's current ceiling is its largest CUDA-graph batch bucket (64 sequences),
+which caps saturated decode at ~1.5k tok/s. Closing the batched-decode gap is active
+work.
 
-openinfer wins single-stream and low-load TTFT; vLLM wins batched decode TPOT and
-holds higher load before saturating (knee ~QPS 12 vs ~QPS 10 on this GPU — the full
-sweep through overload is in the snapshot doc). Qwen3.5-4B single-stream numbers are
-at parity with vLLM — see
+Full tables (p50/p99 at every QPS level, the saturation sweep, exact commands, and
+caveats) are in
+[`docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md`](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md)
+(measured 2026-06-10, openinfer `6901965`, vLLM 0.22.1 from PyPI). Qwen3.5-4B
+single-stream latency is at parity with vLLM — see
 [`docs/models/qwen35/optimization.md`](docs/models/qwen35/optimization.md).
-
-<details>
-<summary>What do these metrics mean?</summary>
-
-- **TTFT** (Time To First Token): latency from receiving the prompt to generating the first output token. Includes tokenization, embedding, and the full prefill pass.
-- **TPOT** (Time Per Output Token): average time to generate each subsequent token during the decode phase.
-- **Warm TTFT**: TTFT when the prompt's KV is already resident in the GPU prefix cache, so only cache lookup + suffix prefill + sampling remain.
-
-</details>
 
 ## Quickstart
 
