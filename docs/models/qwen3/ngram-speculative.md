@@ -9,11 +9,12 @@ fewer forward passes on repetitive / structured text (code, quoting, JSON).
 The KV layer (kvbm) already supports speculative scheduling natively, so
 rejected drafts need no manual rollback.
 
-Last touched: 2026-06 · Status: **proposer, acceptance, KV speculative
-pass-throughs, and the executor verify forward (`execute_speculative`) landed,
-and GPU-validated lossless on real Qwen3-4B (`tests/ngram_speculative.rs`:
-greedy spec-on == spec-off, token-identical). Only the scheduler wiring
-(proposer over token history in the serving loop) remains.**
+Last touched: 2026-06 · Status: **end-to-end implemented and gated behind a
+(default-off) `SpeculativeConfig`: proposer, greedy acceptance, KV speculative
+pass-throughs, the executor verify forward (`execute_speculative`,
+GPU-validated lossless), and the scheduler serving-loop wiring
+(`speculative_decode_step`, mock-tested). Remaining: a public config knob to
+turn it on, and a speedup measurement.**
 
 ## Why this is cheap to add here
 
@@ -88,15 +89,29 @@ same prompt under greedy params.
   (proposer → schedule_speculative → verify forward → accept_greedy →
   apply_speculative) end-to-end.
 
+## Landed: scheduler serving-loop wiring
+
+- `ActiveRequestState` carries `token_history` (prompt + generated), maintained
+  on promote and each committed decode token.
+- `scheduler/speculative.rs::speculative_decode_step` proposes per active
+  request, runs `execute_speculative` (or a single decode when no draft), and
+  streams the committed tokens with stop / max-token handling — isolated from
+  the one-token-per-step plan/resolve/effects pipeline. `scheduler_loop` routes
+  pure-decode ticks through it when `SpeculativeConfig.enabled`.
+- Mock-tested (`FakeExecutor::execute_speculative`): streams every committed
+  token + advances state; commits past `max_tokens` truncate, finish, retire.
+
 ## Remaining work
 
-1. **Scheduler wiring**: invoke the proposer over per-request token history when
-   `SpeculativeConfig.enabled`; the commit loop applies stop / max-token
-   handling to each committed token. (vLLM proposes the *next* step's drafts
-   right after a forward and stores them on the request for pipelining; the
-   first cut may propose at step start for simplicity.)
+1. **Public config knob**: `SpeculativeConfig` is currently constructed
+   default-off inside `scheduler_loop`; thread a knob through `start_qwen3*` /
+   `start_engine*` (and a server flag) to turn it on. Single-request greedy
+   first; the unified prefill+decode tick still uses plain decode.
 2. **Speedup measurement**: acceptance-rate / TPOT on repetitive prompts (the
-   feature's actual payoff, distinct from the correctness oracle above).
+   payoff, distinct from the lossless correctness oracle).
+3. **Batched / vLLM-style verify** (perf): fold the verify tokens into the
+   unified batched forward (FlashInfer varlen) with a GPU rejection step,
+   instead of the current per-request `batch_prefill`-based verify.
 
 ## Scope / deferred
 
