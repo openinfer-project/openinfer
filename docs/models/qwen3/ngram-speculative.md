@@ -9,8 +9,10 @@ fewer forward passes on repetitive / structured text (code, quoting, JSON).
 The KV layer (kvbm) already supports speculative scheduling natively, so
 rejected drafts need no manual rollback.
 
-Last touched: 2026-06 · Status: **design + building blocks landed; GPU verify
-forward + executor/scheduler wiring pending.**
+Last touched: 2026-06 · Status: **proposer, acceptance, KV speculative
+pass-throughs, and the executor verify forward (`execute_speculative`) landed
+and compile; scheduler wiring (proposer over token history) and GPU validation
+of the lossless `spec-on == spec-off` property pending.**
 
 ## Why this is cheap to add here
 
@@ -65,23 +67,28 @@ to what plain greedy decode would have produced one token at a time. This gives
 a free correctness oracle: **speculative-on must equal speculative-off** for the
 same prompt under greedy params.
 
-## Remaining work (the GPU verify forward + wiring)
+## Landed: GPU verify forward + executor step
 
-1. **`verify_forward(verify_tokens, kv_view) -> Vec<u32>`** on `Qwen3Model` — a
-   standalone method (kept separate so it does not pollute `batch_prefill` /
-   `batch_decode`). Internally reuses the paged-prefill attention + the existing
-   all-position-logits path, then takes a per-position argmax on the GPU via the
-   existing batch sampler (`select_batch_tokens_into` with greedy params over
-   the `K + 1` positions). Only the `K + 1` token ids are copied to host — never
-   the `[vocab, K + 1]` logits — mirroring vLLM's GPU-side rejection sampler.
-2. **`StepCommand::SpeculativeVerify` + `execute_speculative`** in the executor:
-   `schedule_speculative` → `prefill_view(1 + K)` → run verify step → argmax →
-   `accept_greedy` → `apply_speculative` → return committed tokens.
-3. **Scheduler wiring**: invoke the proposer over per-request history when
-   `SpeculativeConfig.enabled`; commit loop applies stop / max-token handling to
-   each committed token. (vLLM proposes the *next* step's drafts right after a
-   forward and stores them on the request for pipelining; the first cut may
-   propose at step start for simplicity.)
+- **`LocalQwen3Lane::execute_verify(verify_tokens, kv_view, lora)`** — reuses
+  `batch_prefill(echo = true)` for per-position logits over the existing paged
+  KV, then a GPU argmax (`argmax_batch_bf16_into`) returns one token per verify
+  position. Only the position ids cross to host, never the `[vocab, n]` logits
+  (vLLM-style). Kept additive: `batch_prefill` / `batch_decode` are untouched.
+- **`StepCommand::SpeculativeVerify` + `Qwen3Executor::execute_speculative`** —
+  `schedule_speculative(K + 1)` → `prefill_view(1 + K)` → verify step → argmax →
+  `accept_greedy` → `apply_speculative`, returning the committed tokens. The
+  rank-worker channel carries it (TP-safe).
+
+## Remaining work
+
+1. **Scheduler wiring**: invoke the proposer over per-request token history when
+   `SpeculativeConfig.enabled`; the commit loop applies stop / max-token
+   handling to each committed token. (vLLM proposes the *next* step's drafts
+   right after a forward and stores them on the request for pipelining; the
+   first cut may propose at step start for simplicity.)
+2. **GPU validation**: assert the lossless `spec-on == spec-off` property on a
+   real Qwen3-4B run, plus an acceptance-rate / speedup measurement on
+   repetitive prompts.
 
 ## Scope / deferred
 
