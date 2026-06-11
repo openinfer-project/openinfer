@@ -9,7 +9,7 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header::CONTENT_LENGTH};
-use axum::middleware::{Next, from_fn_with_state};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use log::{info, warn};
@@ -45,6 +45,9 @@ use openinfer_engine::engine::{
     TokenEvent, TokenLogprob, UnloadLoraAdapterRequest,
 };
 use openinfer_engine::sampler::SamplingParams;
+
+mod sampling_guard;
+use sampling_guard::reject_unsupported_sampling;
 
 const ENGINE_INDEX: u32 = 0;
 const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
@@ -678,7 +681,7 @@ where
     };
 
     let extend_router = move |router: Router| {
-        let router = extend_router(router);
+        let router = extend_router(router).layer(from_fn(reject_unsupported_sampling));
         match servable_limit {
             Some(limit) => router.layer(from_fn_with_state(limit, enforce_capacity)),
             None => router,
