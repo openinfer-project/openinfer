@@ -1,12 +1,18 @@
 //! comfy_table renderers for the text report format.
 
+use std::fmt::Write as _;
 use std::io::{IsTerminal, stdout};
+use std::time::Duration;
 
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, CellAlignment, Table};
 
-use crate::report::{CurveReport, DurationStats, MatrixReport, RequestReport, RunInfo};
+use crate::metrics::summarize_durations;
+use crate::report::{
+    CurveReport, DurationStats, MatrixReport, MixedLoadReport, RequestReport, RunInfo,
+};
+use crate::snapshot::format_delta;
 
 pub(crate) fn new_table() -> Table {
     let mut table = Table::new();
@@ -292,4 +298,130 @@ pub(crate) fn render_curve_table(report: &CurveReport) -> Table {
         ]);
     }
     table
+}
+
+pub(crate) fn render_mixed_text(report: &MixedLoadReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "bench_serving mixed-load ITL\n");
+
+    let cfg = &report.config;
+    let mut meta = render_run_summary(&report.run);
+    meta.add_row(vec![
+        key_cell("commit / gpu"),
+        value_cell(format!("{} / {}", report.commit, report.gpu)),
+    ]);
+    meta.add_row(vec![
+        key_cell("bg (prompt,conc,out)"),
+        value_cell(format!(
+            "({},{},{})",
+            cfg.bg_prompt_len, cfg.bg_concurrency, cfg.bg_output_len
+        )),
+    ]);
+    meta.add_row(vec![
+        key_cell("injection (prompt,out)"),
+        value_cell(format!(
+            "({},{})  warm_frac={}",
+            cfg.inj_prompt_len, cfg.inj_output_len, cfg.inj_warm_frac
+        )),
+    ]);
+    meta.add_row(vec![
+        key_cell("qps / num_injections"),
+        value_cell(format!("{} / {}", cfg.qps, cfg.num_injections)),
+    ]);
+    meta.add_row(vec![
+        key_cell("warmup / seed"),
+        value_cell(format!("{} / {}", cfg.warmup, cfg.seed)),
+    ]);
+    push_table(&mut out, &meta);
+    out.push('\n');
+
+    let mut rows = Vec::new();
+    if let Some(baseline) = &report.baseline_itl {
+        rows.push(("baseline_itl".to_string(), baseline.clone()));
+    }
+    rows.push(("mixed_itl_all".to_string(), report.mixed_itl.all.clone()));
+    if let Some(steady) = &report.mixed_itl.steady {
+        rows.push(("mixed_itl_steady".to_string(), steady.clone()));
+    }
+    if let Some(stall) = &report.mixed_itl.stall {
+        rows.push(("mixed_itl_stall".to_string(), stall.clone()));
+    }
+    push_table(&mut out, &render_duration_table(rows));
+    out.push('\n');
+
+    let total = report.mixed_itl.total_gap_count;
+    let stalled = report.mixed_itl.stall_gap_count;
+    let stall_pct = if total > 0 {
+        100.0 * stalled as f64 / total as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(out, "stall gaps: {stalled}/{total} ({stall_pct:.1}%)");
+
+    let dur = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+    let prefill_line = |label: &str, ms: &[Duration]| {
+        if ms.is_empty() {
+            return String::new();
+        }
+        let s = summarize_durations(ms);
+        format!(
+            "{label}: p50={:.2}ms  p99={:.2}ms  max={:.2}ms (n={})\n",
+            s.p50_ms,
+            s.p99_ms,
+            s.max_ms,
+            ms.len()
+        )
+    };
+    if !report.injections.is_empty() {
+        let cold: Vec<Duration> = report
+            .injections
+            .iter()
+            .filter(|r| !r.warm)
+            .map(|r| dur(r.prefill_ms))
+            .collect();
+        let warm: Vec<Duration> = report
+            .injections
+            .iter()
+            .filter(|r| r.warm)
+            .map(|r| dur(r.prefill_ms))
+            .collect();
+        out.push_str(&prefill_line("injected prefill (cold)", &cold));
+        out.push_str(&prefill_line("injected prefill (warm)", &warm));
+    }
+
+    let d = &report.decision_inputs;
+    match (
+        d.baseline_p50_ms,
+        d.baseline_p99_ms,
+        d.p99_delta_pct,
+        d.p99_delta_ms,
+    ) {
+        (Some(bp50), Some(bp99), Some(dpct), Some(dms)) => {
+            let _ = writeln!(
+                out,
+                "\nITL p50: baseline {:.2}ms → mixed {:.2}ms",
+                bp50, d.mixed_p50_ms
+            );
+            let _ = writeln!(
+                out,
+                "ITL p99: baseline {:.2}ms → mixed {:.2}ms ({}, {:+.2}ms)",
+                bp99,
+                d.mixed_p99_ms,
+                format_delta(dpct),
+                dms
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "\nITL (mixed, no baseline): p50={:.2}ms  p99={:.2}ms",
+                d.mixed_p50_ms, d.mixed_p99_ms
+            );
+        }
+    }
+
+    for warning in &report.warnings {
+        let _ = writeln!(out, "warning: {warning}");
+    }
+    out
 }

@@ -27,6 +27,11 @@ pub(crate) trait BenchModel {
         Ok(())
     }
 
+    /// Scheduler handle for open-loop mixed-load benchmarking.
+    fn scheduler_handle(&self) -> Option<SchedulerHandle> {
+        None
+    }
+
     fn timed_generation(
         &mut self,
         prompt_tokens: &[u32],
@@ -96,6 +101,13 @@ where
     }
 }
 
+/// Outcome of draining a scheduler request's token stream.
+pub(crate) struct StreamOutcome {
+    /// True if the stream ended on `TokenEvent::Finished`; false if `on_token`
+    /// requested an early stop by returning false.
+    pub(crate) finished: bool,
+}
+
 /// Submit a single request to the scheduler and drain its token stream,
 /// invoking `on_token` for each generated token id. Returns when the request
 /// finishes, `on_token` returns false (early stop), or an error/closed event
@@ -108,7 +120,7 @@ pub(crate) fn run_scheduler_stream(
     params: SamplingParams,
     max_tokens: usize,
     mut on_token: impl FnMut(u32) -> bool,
-) -> Result<()> {
+) -> Result<StreamOutcome> {
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
     handle
         .submit(SchedulerRequest {
@@ -128,11 +140,11 @@ pub(crate) fn run_scheduler_stream(
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => {
                 if !on_token(id) {
-                    return Ok(());
+                    return Ok(StreamOutcome { finished: false });
                 }
             }
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
-            Some(TokenEvent::Finished { .. }) => return Ok(()),
+            Some(TokenEvent::Finished { .. }) => return Ok(StreamOutcome { finished: true }),
             Some(TokenEvent::Error { message, .. }) => {
                 anyhow::bail!("scheduler request failed: {message}");
             }
@@ -149,6 +161,10 @@ pub(crate) struct SchedulerBenchModel {
 }
 
 impl BenchModel for SchedulerBenchModel {
+    fn scheduler_handle(&self) -> Option<SchedulerHandle> {
+        Some(self.handle.clone())
+    }
+
     fn timed_generation(
         &mut self,
         prompt_tokens: &[u32],

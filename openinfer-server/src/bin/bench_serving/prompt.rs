@@ -29,6 +29,16 @@ pub(crate) fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
     (0..len).map(|i| ((i % 1000) + 100) as u32).collect()
 }
 
+/// Like `synthetic_prompt_tokens`, but offset by `salt` so each prompt of the
+/// same prompt length gets a different token sequence and so misses the prefix
+/// cache when intended (e.g. `--inj-warm-frac 0.0`).
+pub(crate) fn synthetic_prompt_tokens_salted(len: usize, salt: usize) -> Vec<u32> {
+    let shift = salt.wrapping_mul(7919);
+    (0..len)
+        .map(|i| (((i + shift) % 1000) + 100) as u32)
+        .collect()
+}
+
 /// Token-id bounds for synthetic concurrent prompts: above the low special
 /// tokens and well under the smallest supported vocab (DeepSeek-V2-Lite ≈
 /// 102 400), so every drawn id is an ordinary token on any model line.

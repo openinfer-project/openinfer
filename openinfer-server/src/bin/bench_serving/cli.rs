@@ -39,6 +39,13 @@ pub(crate) const COMPARE_EXAMPLES: &str = "\
 Examples:
   cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json
   cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline HEAD~3";
+pub(crate) const MIXED_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- mixed
+  cargo run -r --bin bench_serving -- mixed --bg-concurrency 8 --qps 0.5 --num-injections 10
+  cargo run -r --bin bench_serving -- mixed --bg-concurrency 2 --bg-output-len 512 \\
+    --inj-prompt-len 4000 --qps 1.0 --num-injections 3 --warmup 2
+  cargo run -r --bin bench_serving -- --format json --out mixed.json mixed --skip-baseline";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum OutputFormat {
@@ -79,6 +86,9 @@ pub(crate) enum Command {
     /// Compare a snapshot against its git baseline.
     #[command(after_help = COMPARE_EXAMPLES)]
     Compare(CompareArgs),
+    /// Measure decode ITL while long prompts arrive at low QPS (mixed load).
+    #[command(after_help = MIXED_EXAMPLES)]
+    Mixed(MixedArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -228,4 +238,54 @@ pub(crate) struct CompareArgs {
     /// Git ref to compare against
     #[arg(long, default_value = "HEAD")]
     pub(crate) baseline: String,
+}
+
+#[derive(Debug, ClapArgs)]
+pub(crate) struct MixedArgs {
+    /// Prompt length of each background decode stream (decode-heavy steady state)
+    #[arg(long, default_value_t = 1024)]
+    pub(crate) bg_prompt_len: usize,
+
+    /// Number of long-lived background decode streams kept active for the run
+    #[arg(long, default_value_t = 8)]
+    pub(crate) bg_concurrency: usize,
+
+    /// Max generated tokens per background stream (size to outlast the whole run)
+    #[arg(long, default_value_t = 8192)]
+    pub(crate) bg_output_len: usize,
+
+    /// Prompt length of each injected long prompt (the prefill that stalls decode)
+    #[arg(long, default_value_t = 10_000)]
+    pub(crate) inj_prompt_len: usize,
+
+    /// Max generated tokens per injected prompt (1 = prefill-dominated)
+    #[arg(long, default_value_t = 1)]
+    pub(crate) inj_output_len: usize,
+
+    /// Arrival rate of injected long prompts, in requests per second
+    #[arg(long, default_value_t = 0.5)]
+    pub(crate) qps: f64,
+
+    /// Number of long prompts to inject; bounds the run length
+    #[arg(long, default_value_t = 10)]
+    pub(crate) num_injections: usize,
+
+    /// Skip the decode-only baseline control (only measure the mixed run)
+    #[arg(long, default_value_t = false)]
+    pub(crate) skip_baseline: bool,
+
+    /// Fraction of injections that reuse a shared prompt and so hit the prefix
+    /// cache (warm prefill, ~no stall); the rest get distinct prompts (cold,
+    /// worst-case stall). 0.0 = all cold (default), 1.0 = all warm, 0.5 = half.
+    /// Warm/cold are interleaved evenly across the run.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) inj_warm_frac: f64,
+
+    /// Background tokens each stream must emit before injection starts (head-start)
+    #[arg(long, default_value_t = 8)]
+    pub(crate) head_start_tokens: usize,
+
+    /// `--iters` is ignored by `mixed`; `--warmup`/`--seed` apply.
+    #[command(flatten)]
+    pub(crate) run: RunArgs,
 }

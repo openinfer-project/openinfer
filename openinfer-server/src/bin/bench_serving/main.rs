@@ -27,6 +27,7 @@ use vllm_text::tokenizer::DynTokenizer;
 mod cli;
 mod exec;
 mod metrics;
+mod mixed;
 mod prompt;
 mod render;
 mod report;
@@ -45,6 +46,7 @@ fn command_seed(cli: &Cli) -> u64 {
         Command::Curve(args) => args.run.seed,
         Command::Snapshot(args) => args.run.seed,
         Command::Compare(_) => 42,
+        Command::Mixed(args) => args.run.seed,
     }
 }
 
@@ -89,6 +91,7 @@ fn main() -> Result<()> {
             Command::Curve(_) => "curve",
             Command::Snapshot(_) => "snapshot",
             Command::Compare(_) => "compare",
+            Command::Mixed(_) => "mixed",
         },
         cli.model_path,
         cli.cuda_graph,

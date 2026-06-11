@@ -408,6 +408,7 @@ pub(crate) fn render_text(report: &BenchReport) -> String {
             out.push('\n');
             push_table(&mut out, &render_curve_table(report));
         }
+        BenchReport::Mixed(report) => out.push_str(&render_mixed_text(report)),
     }
     out
 }
@@ -442,6 +443,9 @@ pub(crate) fn run_command(
         Command::Matrix(args) => bench_matrix(model, cli, model_type, load_ms, cuda_graph, args),
         Command::Curve(args) => {
             bench_curve(model, tokenizer, cli, model_type, load_ms, cuda_graph, args)
+        }
+        Command::Mixed(args) => {
+            crate::mixed::run_mixed_load(model, cli, model_type, load_ms, cuda_graph, args)
         }
         Command::Snapshot(_) | Command::Compare(_) => unreachable!(),
     }
