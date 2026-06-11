@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use crate::executor::RequestId;
 use openinfer_core::engine::{FinishReason, TokenLogprob};
 
-use super::{ActiveRequestState, TokenEvent};
+use super::{ActiveRequestState, PendingRequest, TokenEvent};
 
 pub(super) struct PromptEchoEffect {
     pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
@@ -33,6 +33,9 @@ pub(super) enum PendingEffect {
         first_token: u32,
         logprob: Option<TokenLogprob>,
     },
+    /// A non-final prefill chunk ran; the request goes back to the front of
+    /// the prefilling queue with its progress updated.
+    ContinuePrefill { req: PendingRequest },
 }
 
 pub(super) enum DecodeEffect {
@@ -75,6 +78,7 @@ impl StepEffects {
 pub(super) fn apply_effects(
     executor: &mut impl crate::executor::ModelExecutor,
     active: &mut Vec<ActiveRequestState>,
+    prefilling: &mut Vec<PendingRequest>,
     effects: StepEffects,
 ) {
     for echo in effects.prompt_echoes {
@@ -159,8 +163,20 @@ pub(super) fn apply_effects(
         active.swap_remove(i);
     }
 
+    // Requests that ran a non-final chunk this step came off the front of the
+    // prefilling queue; splicing them back at the front (in step order, which
+    // is request-id order) keeps the queue FIFO so chunked prompts finish
+    // before newer arrivals start.
+    let mut continued: Vec<PendingRequest> = Vec::new();
     for effect in effects.pending {
         match effect {
+            PendingEffect::ContinuePrefill { req } => {
+                if req.token_tx.is_closed() {
+                    let _ = executor.drop_request(req.request_id);
+                } else {
+                    continued.push(req);
+                }
+            }
             PendingEffect::Finish {
                 request_id,
                 token_tx,
@@ -216,4 +232,5 @@ pub(super) fn apply_effects(
             }
         }
     }
+    prefilling.splice(0..0, continued);
 }

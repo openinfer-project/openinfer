@@ -171,7 +171,7 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     ex.evict_cached_blocks();
 
     // ── A GPU miss now: the prefetch must restore P from the CPU tier. ──
-    let hit = ex.begin_kv_prefetch(RequestId::new(2), &p, None);
+    let hit = ex.begin_kv_prefetch(RequestId::new(2), &p, None, 0);
     assert!(hit, "P must hit the CPU tier after GPU eviction");
     let ready = ex.wait_ready_prefetch();
     assert!(
@@ -241,7 +241,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
 
     // ── Prefetch `full`: GPU hits blocks 0..3, the host tier must supply the
     // continuation 3..6. A pure GPU hit would not start a load. ──
-    let hit = ex.begin_kv_prefetch(RequestId::new(3), &full, None);
+    let hit = ex.begin_kv_prefetch(RequestId::new(3), &full, None, 0);
     assert!(
         hit,
         "blocks 3..6 must be fetched from the CPU tier beyond the GPU hit"

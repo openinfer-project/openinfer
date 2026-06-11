@@ -104,7 +104,10 @@ fn build_prefill_items(
                 echo: r.echo,
                 lora_adapter: r.lora_adapter.clone(),
                 random_val: rand::RngExt::random(rng),
-                cached_tokens: 0,
+                cached_tokens: r.cached_tokens,
+                chunk_budget: r.step_chunk,
+                chunk_start: 0,
+                chunk_tokens: 0,
             }
         })
         .collect()
@@ -157,6 +160,9 @@ mod tests {
             logprobs: 0,
             echo: false,
             prefetch_offered: false,
+            prefill_pos: 0,
+            step_chunk: 3,
+            cached_tokens: 0,
         }
     }
 

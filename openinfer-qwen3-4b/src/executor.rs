@@ -45,6 +45,15 @@ pub struct PrefillStepItem {
     /// Set by the executor after matching; the forward pass only computes
     /// the remaining suffix.
     pub(crate) cached_tokens: usize,
+    /// Scheduler-set cap on prompt tokens forwarded this step (chunked
+    /// prefill). The executor clamps it to the tokens actually remaining.
+    pub(crate) chunk_budget: usize,
+    /// First prompt position forwarded this step. Set by the executor from
+    /// the request's KV position (covers both prefix-cache hits and chunks
+    /// applied in earlier steps).
+    pub(crate) chunk_start: usize,
+    /// Prompt tokens forwarded this step. Set by the executor.
+    pub(crate) chunk_tokens: usize,
 }
 
 impl PrefillStepItem {
@@ -57,6 +66,7 @@ impl PrefillStepItem {
         echo: bool,
         random_val: f32,
     ) -> Self {
+        let chunk_tokens = prompt_tokens.len();
         Self {
             request_id,
             prompt_tokens,
@@ -67,16 +77,21 @@ impl PrefillStepItem {
             lora_adapter: None,
             random_val,
             cached_tokens: 0,
+            chunk_budget: usize::MAX,
+            chunk_start: 0,
+            chunk_tokens,
         }
     }
 
-    /// Prompt tokens that still need prefill (cached prefix excluded).
+    /// Prompt tokens forwarded this step.
     fn as_slice(&self) -> &[u32] {
-        &self.prompt_tokens[self.cached_tokens..]
+        &self.prompt_tokens[self.chunk_start..self.chunk_start + self.chunk_tokens]
     }
 
-    fn suffix_len(&self) -> usize {
-        self.prompt_tokens.len() - self.cached_tokens
+    /// Whether this step's chunk reaches the end of the prompt (and so
+    /// produces the first generated token).
+    fn is_final_chunk(&self) -> bool {
+        self.chunk_start + self.chunk_tokens == self.prompt_tokens.len()
     }
 }
 
@@ -120,8 +135,9 @@ fn build_prefill_request_results(
     let mut token_offset = 0usize;
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
+        let completed = req.is_final_chunk();
         let first_token = tokens[i];
-        let first_token_logprob = if req.logprobs > 0 {
+        let first_token_logprob = if completed && req.logprobs > 0 {
             let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, i)?;
             Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs)?)
         } else {
@@ -154,13 +170,15 @@ fn build_prefill_request_results(
         } else {
             None
         };
-        token_offset += req.suffix_len();
+        token_offset += req.chunk_tokens;
         outputs.push(PrefillRequestResult {
             request_id: req.request_id,
             first_token,
             first_token_logprob,
             prompt_logprobs,
             cached_tokens: req.cached_tokens,
+            completed,
+            prefill_pos: req.chunk_start + req.chunk_tokens,
         });
     }
     Ok(outputs)
@@ -459,6 +477,12 @@ pub struct PrefillRequestResult {
     pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
     pub cached_tokens: usize,
+    /// Whether the prompt is fully prefilled. When false this step ran a
+    /// non-final chunk and `first_token` is meaningless.
+    pub completed: bool,
+    /// Prompt tokens with KV computed after this step (authoritative —
+    /// includes prefix-cache hits the scheduler can't see).
+    pub prefill_pos: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -518,11 +542,17 @@ pub(crate) trait ModelExecutor: Send {
     /// Offer a freshly-submitted request for async CPU-tier KV prefetch.
     /// Returns `true` if a load is now in flight and the scheduler must park
     /// the request until [`Self::drain_ready_prefetch`] reports it ready.
+    ///
+    /// `reserve_floor` is the number of free blocks already promised to
+    /// admitted requests (active decode growth + remaining prefill chunks);
+    /// the prefetch must not reserve into it, or a mid-prefill request's next
+    /// chunk fails allocation and the whole step errors out.
     fn begin_kv_prefetch(
         &mut self,
         _request_id: RequestId,
         _prompt_tokens: &[u32],
         _lora_adapter: Option<&str>,
+        _reserve_floor: usize,
     ) -> bool {
         false
     }
@@ -877,8 +907,15 @@ impl Qwen3Executor {
         request_id: RequestId,
         prompt_tokens: &[u32],
         lora_adapter: Option<&str>,
+        reserve_floor: usize,
     ) -> bool {
-        <Self as ModelExecutor>::begin_kv_prefetch(self, request_id, prompt_tokens, lora_adapter)
+        <Self as ModelExecutor>::begin_kv_prefetch(
+            self,
+            request_id,
+            prompt_tokens,
+            lora_adapter,
+            reserve_floor,
+        )
     }
 
     /// Block until at least one in-flight prefetch settles, then sweep the
@@ -927,6 +964,68 @@ impl Qwen3Executor {
             .as_ref()
             .expect("offload present")
             .save(&block_ids, &block_hashes, pins);
+    }
+
+    // ── Chunked prefill ────────────────────────────────────────────────
+
+    /// Prepare one prefill step for `req`: create its `RequestKv` on the
+    /// first chunk (matching the prefix cache), then clamp the scheduler's
+    /// chunk budget to the prompt tokens actually remaining and allocate KV
+    /// for them. Sets `chunk_start`/`chunk_tokens` on the item.
+    fn schedule_prefill_chunk(&mut self, req: &mut PrefillStepItem) -> Result<()> {
+        if !self.request_kvs.contains_key(&req.request_id) {
+            let mut rkv = self.kv_mgr.pool().new_request(
+                req.prompt_tokens.clone(),
+                req.max_output_tokens,
+                req.lora_adapter.as_deref(),
+            );
+            // Echo needs logits for every prompt position; cached positions
+            // are never forwarded, so echo requests prefill from scratch.
+            if self.prefix_cache_enabled && !req.echo {
+                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+            }
+            self.request_kvs.insert(req.request_id, rkv);
+            // match_and_add_prefix above already absorbed any CPU-prefetched
+            // blocks (now held by the request's sequence), so release the
+            // prefetch's separate hold.
+            self.prefetch.remove(&req.request_id);
+        }
+        let rkv = self
+            .request_kvs
+            .get_mut(&req.request_id)
+            .expect("inserted above");
+        req.chunk_start = rkv.kv_position();
+        let remaining = req.prompt_tokens.len() - req.chunk_start;
+        // Echo must produce all-position logits in a single forward, so it is
+        // exempt from chunking (the scheduler never splits echo requests).
+        req.chunk_tokens = if req.echo {
+            remaining
+        } else {
+            remaining.min(req.chunk_budget)
+        };
+        assert!(
+            req.chunk_tokens > 0,
+            "zero-token prefill chunk for {:?} (budget {})",
+            req.request_id,
+            req.chunk_budget
+        );
+        rkv.schedule_prefill(req.chunk_tokens, self.kv_mgr.pool())
+            .map_err(|e| anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id))
+    }
+
+    /// Register a finished prefill step on the request's KV: the final chunk
+    /// carries the first generated token, non-final chunks only advance the
+    /// KV position.
+    fn apply_prefill_result(&mut self, result: &PrefillRequestResult) -> Result<()> {
+        let rkv = self
+            .request_kvs
+            .get_mut(&result.request_id)
+            .expect("request must exist after prefill");
+        if result.completed {
+            rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
+        } else {
+            rkv.apply_prefill_chunk(self.kv_mgr.pool())
+        }
     }
 
     // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
@@ -1108,6 +1207,7 @@ impl ModelExecutor for Qwen3Executor {
         request_id: RequestId,
         prompt_tokens: &[u32],
         lora_adapter: Option<&str>,
+        reserve_floor: usize,
     ) -> bool {
         let Some(offload) = self.offload.as_ref() else {
             return false;
@@ -1141,6 +1241,18 @@ impl ModelExecutor for Qwen3Executor {
         let (Some(lease), num_blocks) = (hit.lease, hit.num_blocks) else {
             return false; // miss
         };
+        // Blocks promised to admitted requests are off-limits: reserving into
+        // them makes a later prefill chunk or decode growth fail allocation.
+        if self
+            .kv_mgr
+            .pool()
+            .available_blocks()
+            .saturating_sub(reserve_floor)
+            < num_blocks
+        {
+            offload.release_query_lease(lease);
+            return false;
+        }
         let Some(reservation) = self.kv_mgr.pool().reserve_loaded_blocks(num_blocks) else {
             // Block pressure: release the lease so its pinned host blocks aren't
             // held for the full lease TTL, and prefill from scratch rather than
@@ -1216,34 +1328,17 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        // 1. Create RequestKvs, reuse cached prefix blocks, schedule the rest
+        // 1. Create RequestKvs (first chunk only), clamp chunk budgets,
+        // schedule KV for this step's tokens
         let mut requests = plan.requests.to_vec();
         for req in &mut requests {
-            let mut rkv = self.kv_mgr.pool().new_request(
-                req.prompt_tokens.clone(),
-                req.max_output_tokens,
-                req.lora_adapter.as_deref(),
-            );
-            // Echo needs logits for every prompt position; cached positions
-            // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
-            }
-            rkv.schedule_prefill(req.suffix_len(), self.kv_mgr.pool())
-                .map_err(|e| {
-                    anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
-                })?;
-            self.request_kvs.insert(req.request_id, rkv);
-            // match_and_add_prefix above already absorbed any CPU-prefetched
-            // blocks (now held by the request's sequence), so release the
-            // prefetch's separate hold.
-            self.prefetch.remove(&req.request_id);
+            self.schedule_prefill_chunk(req)?;
         }
 
-        // 2. Build KvViews (seq_len = cached prefix + new suffix)
+        // 2. Build KvViews (seq_len = chunk_start + this chunk)
         let kv_views: Vec<KvView> = requests
             .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.suffix_len()))
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.chunk_tokens))
             .collect();
 
         // 3. Execute forward
@@ -1265,11 +1360,7 @@ impl ModelExecutor for Qwen3Executor {
             }
         };
         for req_result in &result.requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after prefill");
-            rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
+            self.apply_prefill_result(req_result)?;
         }
         // 5. Offload the blocks this prefill just sealed (post-step-sync).
         for req_result in &result.requests {
@@ -1331,24 +1422,11 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        // 1. Create RequestKvs for prefill requests, reuse cached prefix
-        // blocks, and schedule the rest
+        // 1. Create RequestKvs for prefill requests (first chunk only), clamp
+        // chunk budgets, schedule KV for this step's tokens
         let mut prefill_requests = plan.prefill_requests.to_vec();
         for req in &mut prefill_requests {
-            let mut rkv = self.kv_mgr.pool().new_request(
-                req.prompt_tokens.clone(),
-                req.max_output_tokens,
-                req.lora_adapter.as_deref(),
-            );
-            if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
-            }
-            rkv.schedule_prefill(req.suffix_len(), self.kv_mgr.pool())
-                .map_err(|e| {
-                    anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
-                })?;
-            self.request_kvs.insert(req.request_id, rkv);
-            self.prefetch.remove(&req.request_id);
+            self.schedule_prefill_chunk(req)?;
         }
 
         // Schedule decode for active requests
@@ -1365,7 +1443,7 @@ impl ModelExecutor for Qwen3Executor {
         // 2. Build KvViews
         let prefill_kv_views: Vec<KvView> = prefill_requests
             .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.suffix_len()))
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.chunk_tokens))
             .collect();
         let decode_kv_views: Vec<KvView> = plan
             .decode_requests
@@ -1393,11 +1471,7 @@ impl ModelExecutor for Qwen3Executor {
             }
         };
         for req_result in &result.prefill_requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after unified prefill");
-            rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
+            self.apply_prefill_result(req_result)?;
         }
         for req_result in &result.decode_requests {
             let rkv = self
@@ -1727,25 +1801,6 @@ impl LocalQwen3Lane {
             &mut self.sample_scratch.row_states,
             &mut self.sample_scratch.valid,
             &mut self.sample_scratch.out,
-        )
-    }
-
-    fn sample_from_logits(
-        &mut self,
-        logits: &DeviceVec,
-        params: &SamplingParams,
-        random_val: f32,
-    ) -> Result<u32> {
-        openinfer_core::ops::gpu_sample_into(
-            self.model.device_ctx(),
-            logits,
-            &mut self.sample_scratch.probs,
-            &mut self.sample_scratch.top1_values,
-            &mut self.sample_scratch.row_states,
-            &mut self.sample_scratch.valid,
-            &mut self.sample_scratch.out,
-            params,
-            random_val,
         )
     }
 

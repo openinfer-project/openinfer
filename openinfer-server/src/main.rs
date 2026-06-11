@@ -98,10 +98,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_prefix_cache: bool,
 
-    /// Cap on total prompt tokens batch-prefilled in one Qwen3 scheduler step.
-    /// Prefill activation scratch scales with the step's prompt tokens, so this
-    /// bounds peak VRAM under request bursts. A single request longer than the
-    /// cap is still admitted alone.
+    /// Cap on total prompt tokens forwarded in one Qwen3 scheduler step
+    /// (chunked prefill). Prefill activation scratch scales with the step's
+    /// prompt tokens, so this bounds peak VRAM under request bursts; prompts
+    /// longer than the cap are split across steps so running decodes keep
+    /// ticking. Echo requests are never split. Must be positive.
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
     max_prefill_tokens: usize,
 }

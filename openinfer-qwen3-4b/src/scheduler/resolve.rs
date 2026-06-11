@@ -33,9 +33,21 @@ fn resolve_prefill_outputs(
     request_results: Vec<PrefillRequestResult>,
 ) -> StepEffects {
     let mut effects = StepEffects::empty();
-    for (req, result) in pending.into_iter().zip(request_results) {
-        debug_assert_eq!(req.request_id, result.request_id);
+    for (mut req, result) in pending.into_iter().zip(request_results) {
+        // Results are matched to requests positionally; a misalignment here
+        // would deliver request A's tokens to request B, so fail loudly in
+        // release builds too.
+        assert_eq!(req.request_id, result.request_id);
         let prompt_len = req.prompt_tokens.len();
+
+        if !result.completed {
+            req.prefill_pos = result.prefill_pos;
+            req.cached_tokens = req.cached_tokens.max(result.cached_tokens);
+            effects
+                .pending
+                .push(PendingEffect::ContinuePrefill { req });
+            continue;
+        }
 
         if req.echo {
             effects.prompt_echoes.push(PromptEchoEffect {
