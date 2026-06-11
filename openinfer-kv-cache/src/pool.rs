@@ -284,6 +284,21 @@ impl RequestKv {
         self.seq.schedule_decode(&pool.block_manager)
     }
 
+    /// Schedule a speculative decode that may commit up to `max_commit_tokens`
+    /// tokens this step — the accepted prefix of the proposed continuation plus
+    /// the model's bonus/correction token. Pre-allocates for the worst case;
+    /// [`Self::apply_speculative`] releases any blocks the accepted count does
+    /// not use. The verify forward's `KvView` is built with
+    /// `prefill_view(1 + num_draft_tokens)` (the dangling token plus drafts).
+    pub fn schedule_speculative(
+        &mut self,
+        max_commit_tokens: usize,
+        pool: &BlockPool,
+    ) -> Result<(), ScheduleError> {
+        self.seq
+            .schedule_speculative(max_commit_tokens, &pool.block_manager)
+    }
+
     // ── Views (for forward pass) ───────────────────────────────────────
 
     /// Build an immutable `KvView` for prefill.
@@ -314,6 +329,22 @@ impl RequestKv {
         self.seq
             .apply_decode(token, &pool.block_manager)
             .map_err(|e| anyhow::anyhow!("apply_decode: {e}"))
+    }
+
+    /// Commit the accepted tokens of a scheduled speculative step. `accepted`
+    /// is the verified continuation (accepted draft prefix plus the model's
+    /// bonus token); its length must be in `1..=max_commit_tokens`. Excess
+    /// blocks pre-allocated for rejected drafts are released (LIFO) by kvbm.
+    /// `kv_position` advances by `accepted.len()` and the last token becomes
+    /// the new dangling token for the next step.
+    pub fn apply_speculative(
+        &mut self,
+        accepted: &[u32],
+        pool: &BlockPool,
+    ) -> anyhow::Result<DecodeOutcome> {
+        self.seq
+            .apply_speculative(accepted, &pool.block_manager)
+            .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
     pub fn release(&mut self) -> anyhow::Result<()> {
@@ -507,5 +538,39 @@ mod tests {
             "kvbm no longer over-allocates the generation block; \
              step_page_indices and this test can be retired"
         );
+    }
+
+    /// A speculative step commits the accepted prefix and advances
+    /// `kv_position` by exactly `accepted.len()`; the rejected drafts'
+    /// pre-allocated blocks are released by kvbm without manual rollback.
+    #[test]
+    fn speculative_commits_accepted_prefix() {
+        let pool = BlockPool::new(16, 256).unwrap();
+        let mut kv = pool.new_request((0..8u32).collect(), 32, None);
+        kv.schedule_prefill(8, &pool).unwrap();
+        kv.apply_prefill(1000, &pool).unwrap();
+        assert_eq!(kv.kv_position(), 8);
+
+        // Schedule room for 4, accept only 2 (prefix + bonus).
+        kv.schedule_speculative(4, &pool).unwrap();
+        kv.apply_speculative(&[100, 101], &pool).unwrap();
+        assert_eq!(kv.kv_position(), 10, "advances by accepted.len()");
+        assert_eq!(kv.generated_tokens(), 3, "1 from prefill + 2 committed");
+    }
+
+    /// Committing more tokens than were scheduled is rejected (the verify
+    /// forward must never accept past the pre-allocated draft budget).
+    #[test]
+    fn speculative_rejects_overcommit() {
+        let pool = BlockPool::new(16, 256).unwrap();
+        let mut kv = pool.new_request((0..8u32).collect(), 32, None);
+        kv.schedule_prefill(8, &pool).unwrap();
+        kv.apply_prefill(1000, &pool).unwrap();
+
+        kv.schedule_speculative(2, &pool).unwrap();
+        let err = kv
+            .apply_speculative(&[100, 101, 102], &pool)
+            .expect_err("committing 3 of scheduled 2 must fail");
+        assert!(err.to_string().contains("apply_speculative"));
     }
 }
