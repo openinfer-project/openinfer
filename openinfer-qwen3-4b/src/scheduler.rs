@@ -272,11 +272,17 @@ fn scheduler_loop<E>(
     // Requests parked while their async CPU-tier KV prefetch loads.
     let mut loading: Vec<PendingRequest> = Vec::new();
 
-    // N-gram speculative decode. Disabled by default; enabling it is a follow-up
-    // (a server/config knob is not wired yet). When on, pure-decode ticks route
+    // N-gram speculative decode. Off unless OPENINFER_QWEN3_NGRAM_SPEC is set
+    // (see SpeculativeConfig::from_env). When on, pure-decode ticks route
     // through `speculative::speculative_decode_step` instead of the batched
     // single-token decode.
-    let spec_config = crate::speculative::SpeculativeConfig::default();
+    let spec_config = crate::speculative::SpeculativeConfig::from_env();
+    if spec_config.enabled {
+        info!(
+            "n-gram speculative decode enabled (K={}, max_ngram={})",
+            spec_config.ngram.num_speculative, spec_config.ngram.max_ngram
+        );
+    }
     let ngram_proposer = crate::ngram::NgramProposer::new(spec_config.ngram);
 
     info!("Scheduler ready");

@@ -101,12 +101,23 @@ same prompt under greedy params.
 - Mock-tested (`FakeExecutor::execute_speculative`): streams every committed
   token + advances state; commits past `max_tokens` truncate, finish, retire.
 
+## Enabling it
+
+`scheduler_loop` builds the config via `SpeculativeConfig::from_env()`
+(default-off). Operational switch:
+
+- `OPENINFER_QWEN3_NGRAM_SPEC=1` — turn it on.
+- `OPENINFER_QWEN3_NGRAM_SPEC_TOKENS=K` — draft count (default 4).
+- `OPENINFER_QWEN3_NGRAM_SPEC_MAX_NGRAM=N` — longest matched suffix (default 3).
+
+Only the non-LoRA `scheduler_loop` reads it; the unified prefill+decode tick
+still uses plain decode.
+
 ## Remaining work
 
-1. **Public config knob**: `SpeculativeConfig` is currently constructed
-   default-off inside `scheduler_loop`; thread a knob through `start_qwen3*` /
-   `start_engine*` (and a server flag) to turn it on. Single-request greedy
-   first; the unified prefill+decode tick still uses plain decode.
+1. **First-class config knob**: env var is the current switch; thread a typed
+   knob through `start_qwen3*` / `start_engine*` (and a server flag) so it shows
+   up in the engine config rather than the environment.
 2. **Speedup measurement**: acceptance-rate / TPOT on repetitive prompts (the
    payoff, distinct from the lossless correctness oracle).
 3. **Batched / vLLM-style verify** (perf): fold the verify tokens into the
