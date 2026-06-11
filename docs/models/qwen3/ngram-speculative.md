@@ -10,9 +10,10 @@ The KV layer (kvbm) already supports speculative scheduling natively, so
 rejected drafts need no manual rollback.
 
 Last touched: 2026-06 · Status: **proposer, acceptance, KV speculative
-pass-throughs, and the executor verify forward (`execute_speculative`) landed
-and compile; scheduler wiring (proposer over token history) and GPU validation
-of the lossless `spec-on == spec-off` property pending.**
+pass-throughs, and the executor verify forward (`execute_speculative`) landed,
+and GPU-validated lossless on real Qwen3-4B (`tests/ngram_speculative.rs`:
+greedy spec-on == spec-off, token-identical). Only the scheduler wiring
+(proposer over token history in the serving loop) remains.**
 
 ## Why this is cheap to add here
 
@@ -79,6 +80,14 @@ same prompt under greedy params.
   `accept_greedy` → `apply_speculative`, returning the committed tokens. The
   rank-worker channel carries it (TP-safe).
 
+## Validated
+
+- **Lossless on GPU** — `tests/ngram_speculative.rs` runs real Qwen3-4B and
+  asserts greedy n-gram speculative decode is token-identical to plain greedy
+  decode (prefix cache off; repetitive prompt). Confirms the full pipeline
+  (proposer → schedule_speculative → verify forward → accept_greedy →
+  apply_speculative) end-to-end.
+
 ## Remaining work
 
 1. **Scheduler wiring**: invoke the proposer over per-request token history when
@@ -86,9 +95,8 @@ same prompt under greedy params.
    handling to each committed token. (vLLM proposes the *next* step's drafts
    right after a forward and stores them on the request for pipelining; the
    first cut may propose at step start for simplicity.)
-2. **GPU validation**: assert the lossless `spec-on == spec-off` property on a
-   real Qwen3-4B run, plus an acceptance-rate / speedup measurement on
-   repetitive prompts.
+2. **Speedup measurement**: acceptance-rate / TPOT on repetitive prompts (the
+   feature's actual payoff, distinct from the correctness oracle above).
 
 ## Scope / deferred
 
