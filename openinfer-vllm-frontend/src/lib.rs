@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -265,6 +265,25 @@ struct LocalEngineBridge {
     max_model_len: u32,
 }
 
+enum EngineHandleSource {
+    Ready(EngineHandle),
+    Deferred(oneshot::Receiver<EngineHandle>),
+}
+
+impl EngineHandleSource {
+    async fn recv(self, shutdown: &CancellationToken) -> Result<Option<EngineHandle>> {
+        match self {
+            Self::Ready(handle) => Ok(Some(handle)),
+            Self::Deferred(handle_rx) => tokio::select! {
+                result = handle_rx => result
+                    .map(Some)
+                    .context("engine handle sender dropped before local vLLM bridge startup"),
+                () = shutdown.cancelled() => Ok(None),
+            },
+        }
+    }
+}
+
 impl LocalEngineBridge {
     async fn run(self, shutdown: CancellationToken) -> Result<()> {
         wait_for_ipc_endpoint(&self.input_address, &shutdown).await?;
@@ -455,14 +474,8 @@ impl LocalEngineBridge {
     }
 }
 
-pub async fn serve(
-    handle: EngineHandle,
-    model_path: &Path,
-    served_model_name: Option<&str>,
-    port: u16,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let max_model_len = load_max_model_len(model_path).unwrap_or_else(|| {
+fn load_max_model_len_or_fallback(model_path: &Path) -> u32 {
+    load_max_model_len(model_path).unwrap_or_else(|| {
         const FALLBACK_MAX_MODEL_LEN: u32 = 4096;
         warn!(
             "max_position_embeddings not found in {}/config.json; capping max_model_len at {FALLBACK_MAX_MODEL_LEN}. \
@@ -470,7 +483,17 @@ pub async fn serve(
             model_path.display()
         );
         FALLBACK_MAX_MODEL_LEN
-    });
+    })
+}
+
+pub async fn serve(
+    handle: EngineHandle,
+    model_path: &Path,
+    served_model_name: Option<&str>,
+    port: u16,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let max_model_len = load_max_model_len_or_fallback(model_path);
     serve_model(
         handle,
         model_path.to_string_lossy().into_owned(),
@@ -478,6 +501,25 @@ pub async fn serve(
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect(),
+        port,
+        max_model_len,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_with_deferred_handle(
+    handle_rx: oneshot::Receiver<EngineHandle>,
+    model_path: PathBuf,
+    served_model_name: Option<String>,
+    port: u16,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let max_model_len = load_max_model_len_or_fallback(&model_path);
+    serve_model_with_deferred_handle(
+        handle_rx,
+        model_path.to_string_lossy().into_owned(),
+        served_model_name.into_iter().collect(),
         port,
         max_model_len,
         shutdown,
@@ -502,6 +544,28 @@ pub async fn serve_model(
         port,
         max_model_len,
         shutdown,
+    )
+    .await
+}
+
+pub async fn serve_model_with_deferred_handle(
+    handle_rx: oneshot::Receiver<EngineHandle>,
+    model_id: impl Into<String>,
+    served_model_name: Vec<String>,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let model_id = model_id.into();
+    serve_model_on_host_with_handle_source_and_router_extension(
+        EngineHandleSource::Deferred(handle_rx),
+        model_id,
+        served_model_name,
+        "0.0.0.0".to_string(),
+        port,
+        max_model_len,
+        shutdown,
+        |router| router,
     )
     .await
 }
@@ -604,23 +668,58 @@ async fn serve_model_on_host_with_router_extension<F>(
 where
     F: FnOnce(Router) -> Router,
 {
+    serve_model_on_host_with_handle_source_and_router_extension(
+        EngineHandleSource::Ready(handle),
+        model_id,
+        served_model_name,
+        host,
+        port,
+        max_model_len,
+        shutdown,
+        extend_router,
+    )
+    .await
+}
+
+async fn serve_model_on_host_with_handle_source_and_router_extension<F>(
+    handle_source: EngineHandleSource,
+    model_id: String,
+    served_model_name: Vec<String>,
+    host: String,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+    extend_router: F,
+) -> Result<()>
+where
+    F: FnOnce(Router) -> Router,
+{
     let namespace = local_ipc_namespace()?;
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
 
-    let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
-    let max_model_len = servable_limit.unwrap_or(max_model_len);
-    let bridge = LocalEngineBridge {
-        input_address: input_address.clone(),
-        output_address: output_address.clone(),
-        handle,
-        max_model_len,
-    };
+    let servable_limit = Arc::new(OnceLock::new());
     let bridge_shutdown = shutdown.child_token();
+    let bridge_servable_limit = Arc::clone(&servable_limit);
+    let bridge_input_address = input_address.clone();
+    let bridge_output_address = output_address.clone();
     let bridge_task = tokio::spawn(async move {
+        let Some(handle) = handle_source.recv(&bridge_shutdown).await? else {
+            return Ok::<(), anyhow::Error>(());
+        };
+        let effective_servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
+        let bridge_max_model_len = effective_servable_limit.unwrap_or(max_model_len);
+        let _ = bridge_servable_limit.set(effective_servable_limit);
+        let bridge = LocalEngineBridge {
+            input_address: bridge_input_address,
+            output_address: bridge_output_address,
+            handle,
+            max_model_len: bridge_max_model_len,
+        };
         if let Err(error) = bridge.run(bridge_shutdown).await {
             warn!("local vLLM engine bridge exited: {error:#}");
         }
+        Ok(())
     });
 
     let config = Config {
@@ -653,7 +752,11 @@ where
     };
 
     let extend_router = move |router: Router| {
-        extend_router(router).layer(from_fn_with_state(servable_limit, guard_generation_request))
+        let router = extend_router(router);
+        let servable_limit = *servable_limit
+            .get()
+            .expect("local vLLM bridge must publish servable limit before router setup");
+        router.layer(from_fn_with_state(servable_limit, guard_generation_request))
     };
     let result = vllm_server::serve_with_router_extension(config, shutdown, extend_router).await;
     bridge_task.abort();

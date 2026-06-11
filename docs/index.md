@@ -107,6 +107,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `openinfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
+| `subsystems/frontend/startup-latency.md` | Qwen3-4B default serving overlaps vLLM tokenizer/text/chat metadata loading with engine startup; local `/v1/models` readiness improved from 3.09s external poll / 2.90s bind to about 1.9-2.1s, with completion smoke passing. |
 
 ## subsystems / correctness
 

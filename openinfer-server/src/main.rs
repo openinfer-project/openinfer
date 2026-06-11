@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use log::info;
 use openinfer::logging;
@@ -172,6 +172,28 @@ async fn main() -> anyhow::Result<()> {
         args.tp_size,
     );
 
+    let shutdown = openinfer::vllm_frontend::shutdown_token_from_ctrl_c();
+    let frontend = if args.enable_lora {
+        None
+    } else {
+        let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
+        let model_path = args.model_path.clone();
+        let served_model_name = args.served_model_name.clone();
+        let port = args.port;
+        let frontend_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            openinfer::vllm_frontend::serve_with_deferred_handle(
+                handle_rx,
+                model_path,
+                served_model_name,
+                port,
+                frontend_shutdown,
+            )
+            .await
+        });
+        Some((handle_tx, task))
+    };
+
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => {
@@ -309,18 +331,19 @@ async fn main() -> anyhow::Result<()> {
             args.lora_modules,
             args.port,
             max_model_len,
-            openinfer::vllm_frontend::shutdown_token_from_ctrl_c(),
+            shutdown,
         )
         .await
     } else {
-        openinfer::vllm_frontend::serve(
-            handle,
-            &args.model_path,
-            args.served_model_name.as_deref(),
-            args.port,
-            openinfer::vllm_frontend::shutdown_token_from_ctrl_c(),
-        )
-        .await
+        let Some((handle_tx, frontend_task)) = frontend else {
+            unreachable!("non-LoRA frontend task should be started before engine load");
+        };
+        handle_tx
+            .send(handle)
+            .map_err(|_| anyhow!("vLLM frontend exited before engine was ready"))?;
+        frontend_task
+            .await
+            .context("vLLM frontend task failed to join")?
     }
     .context("vLLM frontend server failed")?;
 
