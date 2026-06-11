@@ -62,7 +62,7 @@ pub fn trace_decode_kernel_calls(
     // step needs one more. With max_output_tokens = 1 the sequence is already
     // complete after prefill, so `schedule_decode` fails with GenerationComplete.
     let dummy_prompt_len = if kv_len > 1 { kv_len - 1 } else { 1 };
-    let mut rkvs = (0..batch_size)
+    let rkvs = (0..batch_size)
         .map(|_| {
             let mut rkv = kv_mgr
                 .pool()
