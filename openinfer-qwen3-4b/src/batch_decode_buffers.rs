@@ -9,11 +9,17 @@ use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
-/// Mirrors vLLM's cudagraph capture list ([1,2,4,8] then every 8) up to 256; graphs
-/// are captured lazily per bucket, and activation buffers are shared (sized once at
-/// the largest bucket), so extra buckets cost capture time on first hit, not memory.
+/// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
+/// bucket, and activation buffers are shared (sized once at the largest bucket), so
+/// extra buckets cost capture time on first hit, not memory.
+///
+/// There is deliberately no bucket in [5, 19]: cuBLAS's heuristic skips split-K
+/// for GEMMs with batch in [8, 16], leaving ~20 CTAs on 170 SMs — measured on
+/// RTX 5090 (ctx1024), a bs8/bs16 step took 9.4/9.5ms while bs20 took 8.5ms.
+/// Padding those batches up to 20 buys the split-K configs and is strictly
+/// faster than running them at their own size.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[
-    1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
+    1, 2, 4, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
     168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
