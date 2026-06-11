@@ -7,7 +7,7 @@ use log::info;
 use openinfer::logging;
 use openinfer::server_engine::{ModelType, detect_model_type};
 use openinfer::vllm_frontend::LoraModule;
-use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
 #[cfg(feature = "qwen3-4b")]
@@ -172,6 +172,72 @@ async fn main() -> anyhow::Result<()> {
         args.tp_size,
     );
 
+    // Engine load (weights → GPU) runs on a blocking thread so the HTTP
+    // frontend (tokenizer, chat templates) loads concurrently. The frontend
+    // binds only after the engine registers, so readiness is unchanged.
+    let model_path = args.model_path.clone();
+    let served_model_name = args.served_model_name.clone();
+    let lora_modules = args.lora_modules.clone();
+    let enable_lora = args.enable_lora;
+    let port = args.port;
+    let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<EngineHandle> {
+        load_engine(&args, model_type, effective_cuda_graph)
+    });
+
+    if enable_lora {
+        // LoRA routes need the engine handle when the router is built, so this
+        // path stays sequential.
+        let handle = engine_load
+            .await
+            .context("engine loader thread panicked")??;
+        info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+        let max_model_len =
+            openinfer::vllm_frontend::load_max_model_len(&model_path).unwrap_or(4096);
+        openinfer::vllm_frontend::serve_model_with_lora_routes(
+            handle,
+            model_path.to_string_lossy().into_owned(),
+            served_model_name.into_iter().collect(),
+            lora_modules,
+            port,
+            max_model_len,
+            openinfer::vllm_frontend::shutdown_token_from_ctrl_c(),
+        )
+        .await
+    } else {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let engine = {
+            let shutdown = shutdown.clone();
+            async move {
+                let handle = engine_load
+                    .await
+                    .context("engine loader thread panicked")??;
+                info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+                // The blocking load can't be cancelled, so SIGINT keeps its
+                // default kill behavior until the engine is up; only then
+                // switch to graceful shutdown.
+                openinfer::vllm_frontend::cancel_token_on_ctrl_c(&shutdown);
+                anyhow::Ok(handle)
+            }
+        };
+        openinfer::vllm_frontend::serve(
+            engine,
+            &model_path,
+            served_model_name.as_deref(),
+            port,
+            shutdown,
+        )
+        .await
+    }
+    .context("vLLM frontend server failed")?;
+
+    Ok(())
+}
+
+fn load_engine(
+    args: &Args,
+    model_type: ModelType,
+    effective_cuda_graph: bool,
+) -> anyhow::Result<EngineHandle> {
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => {
@@ -297,34 +363,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to start Qwen3.5 engine")?,
     };
 
-    info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
-
-    if args.enable_lora {
-        let max_model_len =
-            openinfer::vllm_frontend::load_max_model_len(&args.model_path).unwrap_or(4096);
-        openinfer::vllm_frontend::serve_model_with_lora_routes(
-            handle,
-            args.model_path.to_string_lossy().into_owned(),
-            args.served_model_name.into_iter().collect(),
-            args.lora_modules,
-            args.port,
-            max_model_len,
-            openinfer::vllm_frontend::shutdown_token_from_ctrl_c(),
-        )
-        .await
-    } else {
-        openinfer::vllm_frontend::serve(
-            handle,
-            &args.model_path,
-            args.served_model_name.as_deref(),
-            args.port,
-            openinfer::vllm_frontend::shutdown_token_from_ctrl_c(),
-        )
-        .await
-    }
-    .context("vLLM frontend server failed")?;
-
-    Ok(())
+    Ok(handle)
 }
 
 #[cfg(feature = "kimi-k2")]

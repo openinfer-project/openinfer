@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,7 +48,7 @@ use openinfer_engine::engine::{
 use openinfer_engine::sampler::SamplingParams;
 
 mod sampling_guard;
-use sampling_guard::guard_generation_request;
+use sampling_guard::{ServableCap, guard_generation_request};
 
 const ENGINE_INDEX: u32 = 0;
 const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
@@ -455,8 +456,12 @@ impl LocalEngineBridge {
     }
 }
 
+/// Serve while the engine is still loading: the HTTP frontend (tokenizer,
+/// chat templates) starts immediately and the engine bridge attaches once
+/// `engine` resolves. HTTP binds only after the bridge registers, so a
+/// reachable port still means the engine is ready.
 pub async fn serve(
-    handle: EngineHandle,
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
     model_path: &Path,
     served_model_name: Option<&str>,
     port: u16,
@@ -471,13 +476,14 @@ pub async fn serve(
         );
         FALLBACK_MAX_MODEL_LEN
     });
-    serve_model(
-        handle,
+    serve_model_on_host(
+        engine,
         model_path.to_string_lossy().into_owned(),
         served_model_name
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect(),
+        "0.0.0.0".to_string(),
         port,
         max_model_len,
         shutdown,
@@ -495,7 +501,7 @@ pub async fn serve_model(
 ) -> Result<()> {
     let model_id = model_id.into();
     serve_model_on_host(
-        handle,
+        std::future::ready(Ok(handle)),
         model_id,
         served_model_name,
         "0.0.0.0".to_string(),
@@ -523,7 +529,7 @@ pub async fn serve_model_with_lora_routes(
         .cloned()
         .unwrap_or_else(|| model_id.clone());
     serve_model_on_host_with_router_extension(
-        handle.clone(),
+        std::future::ready(Ok(handle.clone())),
         model_id,
         served_model_name.clone(),
         "0.0.0.0".to_string(),
@@ -570,7 +576,7 @@ async fn load_startup_lora_modules(
 }
 
 async fn serve_model_on_host(
-    handle: EngineHandle,
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
     host: String,
@@ -579,7 +585,7 @@ async fn serve_model_on_host(
     shutdown: CancellationToken,
 ) -> Result<()> {
     serve_model_on_host_with_router_extension(
-        handle,
+        engine,
         model_id,
         served_model_name,
         host,
@@ -592,7 +598,7 @@ async fn serve_model_on_host(
 }
 
 async fn serve_model_on_host_with_router_extension<F>(
-    handle: EngineHandle,
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
     host: String,
@@ -608,18 +614,41 @@ where
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
 
-    let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
-    let max_model_len = servable_limit.unwrap_or(max_model_len);
-    let bridge = LocalEngineBridge {
-        input_address: input_address.clone(),
-        output_address: output_address.clone(),
-        handle,
-        max_model_len,
-    };
+    // The HTTP server runs concurrently with the engine load: vllm-server
+    // spends ~1s loading the tokenizer and chat templates before it waits for
+    // an engine to register, so neither waits on the other. This task attaches
+    // the bridge once the engine resolves and runs it to completion; on engine
+    // failure it cancels the server so the error surfaces instead of hanging
+    // in the registration wait.
+    let servable_cap = ServableCap::default();
+    let server_shutdown = shutdown.child_token();
     let bridge_shutdown = shutdown.child_token();
-    let bridge_task = tokio::spawn(async move {
-        if let Err(error) = bridge.run(bridge_shutdown).await {
-            warn!("local vLLM engine bridge exited: {error:#}");
+    let engine_task = tokio::spawn({
+        let servable_cap = servable_cap.clone();
+        let server_shutdown = server_shutdown.clone();
+        let bridge_shutdown = bridge_shutdown.clone();
+        let input_address = input_address.clone();
+        let output_address = output_address.clone();
+        async move {
+            let handle = match engine.await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    server_shutdown.cancel();
+                    return Err(error);
+                }
+            };
+            let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
+            servable_cap.set(servable_limit);
+            let bridge = LocalEngineBridge {
+                input_address,
+                output_address,
+                handle,
+                max_model_len: servable_limit.unwrap_or(max_model_len),
+            };
+            if let Err(error) = bridge.run(bridge_shutdown).await {
+                warn!("local vLLM engine bridge exited: {error:#}");
+            }
+            Ok(())
         }
     });
 
@@ -628,7 +657,11 @@ where
             input_address,
             output_address,
             engine_count: 1,
-            ready_timeout: Duration::from_secs(30),
+            // The in-process bridge registers once the engine future resolves,
+            // so this bounds the whole engine load (multi-GPU MoE models take
+            // minutes, cold starts longer). Load *failure* already cancels the
+            // server via the engine task; this only catches a truly hung load.
+            ready_timeout: Duration::from_mins(30),
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
@@ -653,10 +686,26 @@ where
     };
 
     let extend_router = move |router: Router| {
-        extend_router(router).layer(from_fn_with_state(servable_limit, guard_generation_request))
+        extend_router(router).layer(from_fn_with_state(servable_cap, guard_generation_request))
     };
-    let result = vllm_server::serve_with_router_extension(config, shutdown, extend_router).await;
-    bridge_task.abort();
+    let result =
+        vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
+    // Stop the bridge (no-op if the caller's shutdown already cancelled it),
+    // then collect the engine task. If the server failed while the engine is
+    // still loading, the uncancellable blocking load must finish first.
+    bridge_shutdown.cancel();
+    if result.is_err() && !engine_task.is_finished() {
+        warn!("HTTP server failed; waiting for the in-flight engine load to finish before exit");
+    }
+    let result = match engine_task.await {
+        Ok(Ok(())) => result,
+        // Engine failed: the server saw a cancel and returned Ok — the engine
+        // error is the one worth reporting.
+        Ok(Err(engine_error)) => result.and(Err(engine_error)),
+        Err(join_error) => result.and(Err(anyhow::anyhow!(
+            "engine startup task panicked: {join_error}"
+        ))),
+    };
     let _ = std::fs::remove_dir_all(namespace);
     result
 }
@@ -1203,8 +1252,11 @@ pub fn load_max_model_len(model_path: &Path) -> Option<u32> {
         .max_model_len()
 }
 
-pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
-    let token = CancellationToken::new();
+/// Cancel `token` on the first CTRL+C. Installing the handler replaces the
+/// default SIGINT kill behavior — only call this once whatever the token
+/// guards can actually wind down (e.g. after an uncancellable blocking engine
+/// load has finished), otherwise CTRL+C turns into a no-op wait.
+pub fn cancel_token_on_ctrl_c(token: &CancellationToken) {
     let shutdown = token.clone();
     tokio::spawn(async move {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -1212,6 +1264,11 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
         }
         shutdown.cancel();
     });
+}
+
+pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
+    let token = CancellationToken::new();
+    cancel_token_on_ctrl_c(&token);
     token
 }
 

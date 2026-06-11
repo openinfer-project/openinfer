@@ -4,6 +4,8 @@
 //! covers both checks on all three generation endpoints (`/v1/completions`,
 //! `/v1/chat/completions`, `/inference/v1/generate`).
 
+use std::sync::{Arc, OnceLock};
+
 use axum::Json;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
@@ -14,6 +16,30 @@ use log::warn;
 use serde::Deserialize;
 
 use super::{COMPLETION_ROUTE_BODY_LIMIT, bad_request};
+
+/// Engine-derived cap on a request's generated tokens (`None` = no cap),
+/// shared with the guard before the engine finishes loading so the HTTP
+/// frontend can start concurrently with the engine. vllm-server builds the
+/// router (and this guard) only after the engine bridge registers, which
+/// happens after [`ServableCap::set`] — so generation requests always observe
+/// the final value. An unset read means that invariant broke; reject loudly
+/// instead of serving with a missing cap.
+#[derive(Clone, Default)]
+pub(crate) struct ServableCap(Arc<OnceLock<Option<u32>>>);
+
+impl ServableCap {
+    pub(crate) fn set(&self, cap: Option<u32>) {
+        self.0
+            .set(cap)
+            .expect("servable cap must be set exactly once");
+    }
+
+    /// Outer `None` = engine still loading; inner = the engine's cap.
+    #[allow(clippy::option_option)]
+    fn get(&self) -> Option<Option<u32>> {
+        self.0.get().copied()
+    }
+}
 
 /// OpenAI-style invalid-request error, byte-compatible with vllm-server's
 /// `ErrorDetail` wire shape (that type is not exported, so mirror it here).
@@ -225,7 +251,7 @@ struct GenerateProbe {
 /// those pass. The same parse rejects `max_tokens` over the servable cap;
 /// a too-long prompt is rejected later by the upstream tokenized-length check.
 pub(crate) async fn guard_generation_request(
-    State(servable): State<Option<u32>>,
+    State(cap): State<ServableCap>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -233,6 +259,21 @@ pub(crate) async fn guard_generation_request(
         "/v1/completions" | "/v1/chat/completions" => false,
         "/inference/v1/generate" => true,
         _ => return next.run(request).await,
+    };
+    let Some(servable) = cap.get() else {
+        warn!("generation request arrived before the engine finished loading");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "the engine is still loading",
+                    "type": "service_unavailable_error",
+                    "param": null,
+                    "code": "service_unavailable_error",
+                }
+            })),
+        )
+            .into_response();
     };
     let (parts, body) = request.into_parts();
     let Ok(bytes) = to_bytes(body, COMPLETION_ROUTE_BODY_LIMIT).await else {
@@ -276,12 +317,29 @@ mod tests {
     use super::*;
 
     fn guarded_router(servable: Option<u32>) -> Router {
+        let cap = ServableCap::default();
+        cap.set(servable);
+        unset_cap_router(cap)
+    }
+
+    fn unset_cap_router(cap: ServableCap) -> Router {
         Router::new()
             .route("/v1/completions", post(|| async { "ok" }))
             .route("/v1/chat/completions", post(|| async { "ok" }))
             .route("/inference/v1/generate", post(|| async { "ok" }))
             .route("/v1/models", get(|| async { "models" }))
-            .layer(from_fn_with_state(servable, guard_generation_request))
+            .layer(from_fn_with_state(cap, guard_generation_request))
+    }
+
+    #[tokio::test]
+    async fn generation_before_engine_ready_is_rejected_not_passed_through() {
+        let (status, _) = send_json(
+            unset_cap_router(ServableCap::default()),
+            "/v1/completions",
+            r#"{"max_tokens": 1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     async fn send_json(router: Router, path: &str, body: &str) -> (StatusCode, serde_json::Value) {

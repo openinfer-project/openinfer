@@ -4298,6 +4298,7 @@ dependencies = [
  "half",
  "hex",
  "log",
+ "memmap2",
  "openinfer-bench",
  "openinfer-core",
  "openinfer-cupti",
@@ -4364,6 +4365,7 @@ dependencies = [
  "serde_json",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "vllm-text",
 ]
 
