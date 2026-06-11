@@ -112,16 +112,18 @@ impl DecodeStepItem {
 fn build_prefill_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[PrefillStepItem],
-    logits_vec: &[DeviceVec],
+    logits: &HiddenStates,
+    tokens: &[u32],
     all_position_logits: Option<&HiddenStates>,
     compute_prompt_logprobs: bool,
 ) -> Result<Vec<PrefillRequestResult>> {
     let mut token_offset = 0usize;
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
-        let first_token = lane.sample_from_logits(&logits_vec[i], &req.params, req.random_val)?;
+        let first_token = tokens[i];
         let first_token_logprob = if req.logprobs > 0 {
-            Some(lane.extract_logprobs(&logits_vec[i], first_token, req.logprobs)?)
+            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, i)?;
+            Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs)?)
         } else {
             None
         };
@@ -167,13 +169,16 @@ fn build_prefill_request_results(
 fn build_decode_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[DecodeStepItem],
-    logits: &[DeviceVec],
+    logits: &HiddenStates,
+    row_offset: usize,
+    tokens: &[u32],
 ) -> Result<Vec<DecodeRequestResult>> {
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
-        let token = lane.sample_from_logits(&logits[i], &req.params, req.random_val)?;
+        let token = tokens[row_offset + i];
         let logprob = if req.logprobs > 0 {
-            Some(lane.extract_logprobs(&logits[i], token, req.logprobs)?)
+            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, row_offset + i)?;
+            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
         } else {
             None
         };
@@ -242,11 +247,15 @@ fn execute_step_on_lane(
             let (logits, all_position_logits) =
                 lane.execute_prefill(&prompts, kv_views, &lora_adapters, *echo)?;
             if collect_result {
+                let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
+                let random_vals: Vec<f32> = requests.iter().map(|r| r.random_val).collect();
+                let tokens = lane.select_step_tokens(&logits, &params, &random_vals)?;
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
                         lane,
                         requests,
                         &logits,
+                        &tokens,
                         all_position_logits.as_ref(),
                         *echo,
                     )?,
@@ -289,7 +298,7 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            let (prefill_logits, decode_logits) = lane.execute_unified(
+            let logits = lane.execute_unified(
                 &prefill_prompts,
                 prefill_kv_views,
                 &prefill_lora_adapters,
@@ -298,18 +307,33 @@ fn execute_step_on_lane(
                 &decode_lora_adapters,
             )?;
             if collect_result {
+                // Logits columns: prefill requests first, then decode rows.
+                let params: Vec<&SamplingParams> = prefill_requests
+                    .iter()
+                    .map(|r| &r.params)
+                    .chain(decode_requests.iter().map(|r| &r.params))
+                    .collect();
+                let random_vals: Vec<f32> = prefill_requests
+                    .iter()
+                    .map(|r| r.random_val)
+                    .chain(decode_requests.iter().map(|r| r.random_val))
+                    .collect();
+                let tokens = lane.select_step_tokens(&logits, &params, &random_vals)?;
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
                     prefill_requests: build_prefill_request_results(
                         lane,
                         prefill_requests,
-                        &prefill_logits,
+                        &logits,
+                        &tokens,
                         None,
                         false,
                     )?,
                     decode_requests: build_decode_request_results(
                         lane,
                         decode_requests,
-                        &decode_logits,
+                        &logits,
+                        prefill_requests.len(),
+                        &tokens,
                     )?,
                 }))
             } else {
@@ -1676,6 +1700,36 @@ impl LocalQwen3Lane {
         Ok(CublasThreadGuard)
     }
 
+    /// Pick one token per logits column (batched argmax for greedy rows,
+    /// per-row sampler otherwise). Grows the sampling scratch when a step
+    /// is wider than the decode bucket it was sized for.
+    fn select_step_tokens(
+        &mut self,
+        logits: &HiddenStates,
+        params: &[&SamplingParams],
+        random_vals: &[f32],
+    ) -> Result<Vec<u32>> {
+        if params.len() > self.sample_scratch.row_indices.len() {
+            self.sample_scratch = SamplingScratch::new(
+                self.model.device_ctx(),
+                self.model.config().vocab_size,
+                params.len(),
+            )?;
+        }
+        openinfer_core::ops::select_batch_tokens_into(
+            self.model.device_ctx(),
+            logits,
+            params,
+            random_vals,
+            &mut self.sample_scratch.row_indices,
+            &mut self.sample_scratch.probs,
+            &mut self.sample_scratch.top1_values,
+            &mut self.sample_scratch.row_states,
+            &mut self.sample_scratch.valid,
+            &mut self.sample_scratch.out,
+        )
+    }
+
     fn sample_from_logits(
         &mut self,
         logits: &DeviceVec,
@@ -1727,7 +1781,7 @@ impl LocalQwen3Lane {
         kv_views: &[KvView],
         lora_adapters: &[Option<&str>],
         echo: bool,
-    ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
         self.model.batch_prefill(
             prompts,
             kv_views,
@@ -1762,7 +1816,7 @@ impl LocalQwen3Lane {
         decode_tokens: &[u32],
         decode_views: &[KvView],
         decode_lora_adapters: &[Option<&str>],
-    ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
+    ) -> Result<HiddenStates> {
         self.model.unified_step(
             prefill_prompts,
             prefill_views,

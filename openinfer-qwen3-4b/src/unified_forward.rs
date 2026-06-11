@@ -16,7 +16,7 @@ use openinfer_core::ffi;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::KvView;
 
 /// Decode attention metadata (allocated per unified step, not CUDA-graph safe).
@@ -75,7 +75,8 @@ fn col_byte_offset(hidden_dim: usize, col: usize) -> u64 {
 impl Qwen3Model {
     /// Unified step: prefill + decode in one forward pass.
     ///
-    /// Returns `(prefill_logits, decode_logits)` — one `DeviceVec` per request.
+    /// Returns batched last-token logits `[vocab_size, n_prefill + n_decode]`:
+    /// prefill request columns first (in request order), then decode columns.
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
@@ -86,7 +87,7 @@ impl Qwen3Model {
         decode_lora_adapters: &[Option<&str>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
-    ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
+    ) -> Result<HiddenStates> {
         let num_prefill_reqs = prefill_prompts.len();
         let num_decode_reqs = decode_tokens.len();
         assert_eq!(num_prefill_reqs, prefill_views.len());
@@ -185,39 +186,18 @@ impl Qwen3Model {
         )?;
 
         // ── 5. Extract logits ─────────────────────────────────────────
-        // Prefill: last token of each sequence
-        let mut prefill_logits = Vec::with_capacity(num_prefill_reqs);
-        let mut offset = 0;
+        // Last token of each prefill sequence, then every decode token —
+        // one gather + one batched lm_head GEMM for the whole step.
+        let mut last_indices = Vec::with_capacity(num_prefill_reqs + num_decode_reqs);
+        let mut offset = 0usize;
         for &seq_len in &prefill_seq_lens {
-            let last_idx = offset + seq_len - 1;
-            let last_hidden = ops::extract_vec(&self.ctx, &hidden, last_idx)?;
-            let normed = ops::rms_norm(
-                &self.ctx,
-                &last_hidden,
-                &self.norm,
-                self.config.rms_norm_eps,
-            )?;
-            let logits = ops::linear(&self.ctx, &normed, self.output_projection())?;
-            prefill_logits.push(logits);
+            last_indices.push((offset + seq_len - 1) as i32);
             offset += seq_len;
         }
-
-        // Decode: all decode tokens
-        let mut decode_logits = Vec::with_capacity(num_decode_reqs);
         for i in 0..num_decode_reqs {
-            let idx = total_prefill + i;
-            let last_hidden = ops::extract_vec(&self.ctx, &hidden, idx)?;
-            let normed = ops::rms_norm(
-                &self.ctx,
-                &last_hidden,
-                &self.norm,
-                self.config.rms_norm_eps,
-            )?;
-            let logits = ops::linear(&self.ctx, &normed, self.output_projection())?;
-            decode_logits.push(logits);
+            last_indices.push((total_prefill + i) as i32);
         }
-
-        Ok((prefill_logits, decode_logits))
+        self.batch_token_logits(&hidden, &last_indices)
     }
 
     fn unified_layers(

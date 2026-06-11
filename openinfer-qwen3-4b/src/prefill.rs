@@ -8,7 +8,7 @@ use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_to
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::KvView;
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -283,9 +283,33 @@ impl Qwen3Model {
         ops::gemm(&self.ctx, self.output_projection(), &normed)
     }
 
+    /// Batched last-token logits: gather the given token columns out of
+    /// `hidden`, then apply final RMSNorm and lm_head as single batched ops.
+    /// Returns `HiddenStates [vocab_size, n]`, one column per index.
+    pub(crate) fn batch_token_logits(
+        &self,
+        hidden: &HiddenStates,
+        token_indices: &[i32],
+    ) -> Result<HiddenStates> {
+        let n = token_indices.len();
+        let indices_d = self.ctx.stream.clone_htod(token_indices)?;
+        let mut gathered = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
+        ops::gather_hidden_tokens_into(&self.ctx, hidden, &indices_d, n, &mut gathered)?;
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
+        ops::rms_norm_batch_into(
+            &self.ctx,
+            &gathered,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        );
+        ops::gemm(&self.ctx, self.output_projection(), &normed)
+    }
+
     /// Concatenates all prompts' tokens, runs one GEMM per layer for the
     /// entire batch, and uses FlashInfer's multi-request causal attention.
-    /// Returns per-request logits (last token of each prompt).
+    /// Returns batched last-token logits `[vocab_size, batch]`, one column
+    /// per request.
     ///
     /// If `echo` is true, also returns all-position logits as a
     /// `HiddenStates [vocab_size, total_tokens]` for prompt logprobs.
@@ -297,7 +321,7 @@ impl Qwen3Model {
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
         echo: bool,
-    ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
         let batch_size = prompts.len();
         assert_eq!(batch_size, kv_views.len());
         assert_eq!(batch_size, lora_adapters.len());
@@ -346,24 +370,16 @@ impl Qwen3Model {
             None
         };
 
-        // Extract per-request last-token logits
-        let mut logits_vec = Vec::with_capacity(batch_size);
-        let mut offset = 0;
+        // Batched last-token logits (one lm_head GEMM for the whole batch)
+        let mut last_indices = Vec::with_capacity(batch_size);
+        let mut offset = 0usize;
         for &seq_len in &seq_lens {
-            let last_idx = offset + seq_len - 1;
-            let last_hidden = ops::extract_vec(&self.ctx, &hidden, last_idx)?;
-            let normed = ops::rms_norm(
-                &self.ctx,
-                &last_hidden,
-                &self.norm,
-                self.config.rms_norm_eps,
-            )?;
-            let logits = ops::linear(&self.ctx, &normed, self.output_projection())?;
-            logits_vec.push(logits);
+            last_indices.push((offset + seq_len - 1) as i32);
             offset += seq_len;
         }
+        let logits = self.batch_token_logits(&hidden, &last_indices)?;
 
-        Ok((logits_vec, all_logits))
+        Ok((logits, all_logits))
     }
 
     fn process_all_layers_batch_multi(

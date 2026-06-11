@@ -41,12 +41,13 @@ struct Args {
     profile_steps: usize,
     capture_range: bool,
     enable_cuda_graph: bool,
+    batch_size: usize,
 }
 
 fn usage() -> &'static str {
     "usage: qwen3_decode_context [--mode measure|profile] [--model-path PATH] \
      [--contexts 128,512,...] [--iters N] [--profile-steps N] \
-     [--capture-range] [--disable-cuda-graph]"
+     [--batch-size N] [--capture-range] [--disable-cuda-graph]"
 }
 
 fn parse_contexts(raw: &str) -> Result<Vec<usize>> {
@@ -83,6 +84,7 @@ fn parse_args() -> Result<ParsedArgs> {
     let mut profile_steps = DEFAULT_PROFILE_STEPS;
     let mut capture_range = false;
     let mut enable_cuda_graph = true;
+    let mut batch_size = 1usize;
 
     let mut raw = std::env::args().skip(1);
     while let Some(arg) = raw.next() {
@@ -119,6 +121,12 @@ fn parse_args() -> Result<ParsedArgs> {
                     .ok_or_else(|| anyhow!("--profile-steps needs a value"))?;
                 profile_steps = parse_usize("--profile-steps", &value)?;
             }
+            "--batch-size" => {
+                let value = raw
+                    .next()
+                    .ok_or_else(|| anyhow!("--batch-size needs a value"))?;
+                batch_size = parse_usize("--batch-size", &value)?;
+            }
             "--capture-range" => {
                 capture_range = true;
             }
@@ -144,6 +152,7 @@ fn parse_args() -> Result<ParsedArgs> {
         profile_steps,
         capture_range,
         enable_cuda_graph,
+        batch_size,
     }))
 }
 
@@ -210,6 +219,56 @@ fn decode_one_step(
     Ok(elapsed)
 }
 
+/// Prefill `batch_size` independent requests of `context_len` tokens each and
+/// return their (request_id, last_token) pairs, ready for batched decode.
+fn setup_batch(
+    executor: &mut Qwen3Executor,
+    context_len: usize,
+    batch_size: usize,
+    params: SamplingParams,
+    next_id: &mut u64,
+    rng: &mut StdRng,
+) -> Result<Vec<(RequestId, u32)>> {
+    let prompt = synthetic_prompt(context_len);
+    (0..batch_size)
+        .map(|_| {
+            let request_id = next_request_id(next_id);
+            let token = prefill_one(executor, request_id, &prompt, params, rng)?;
+            Ok((request_id, token))
+        })
+        .collect()
+}
+
+fn decode_batch_step(
+    executor: &mut Qwen3Executor,
+    batch: &mut [(RequestId, u32)],
+    params: SamplingParams,
+    rng: &mut StdRng,
+) -> Result<Duration> {
+    let requests: Vec<DecodeStepItem> = batch
+        .iter()
+        .map(|&(request_id, token)| {
+            DecodeStepItem::new(request_id, token, params, 0, rng.random())
+        })
+        .collect();
+    let start = Instant::now();
+    let result = executor.execute_decode(DecodePlan {
+        requests: &requests,
+    })?;
+    let elapsed = start.elapsed();
+    for (slot, req_result) in batch.iter_mut().zip(&result.requests) {
+        slot.1 = req_result.token;
+    }
+    Ok(elapsed)
+}
+
+fn drop_batch(executor: &mut Qwen3Executor, batch: &[(RequestId, u32)]) -> Result<()> {
+    for &(request_id, _) in batch {
+        executor.drop_request(request_id)?;
+    }
+    Ok(())
+}
+
 fn warm_decode_graph(
     executor: &mut Qwen3Executor,
     context_len: usize,
@@ -243,10 +302,12 @@ fn duration_ms(duration: Duration) -> f64 {
 
 fn print_measurement_header(args: &Args) {
     println!(
-        "mode=measure model_path={} cuda_graph={} iters={} contexts={:?}",
-        args.model_path, args.enable_cuda_graph, args.iters, args.contexts
+        "mode=measure model_path={} cuda_graph={} iters={} batch_size={} contexts={:?}",
+        args.model_path, args.enable_cuda_graph, args.iters, args.batch_size, args.contexts
     );
-    println!("prompt_context,kv_len_during_decode,iters,avg_ms,p50_ms,p90_ms,min_ms,max_ms");
+    println!(
+        "prompt_context,kv_len_during_decode,batch_size,iters,avg_ms,p50_ms,p90_ms,min_ms,max_ms"
+    );
 }
 
 fn measure_contexts(args: &Args) -> Result<()> {
@@ -255,35 +316,40 @@ fn measure_contexts(args: &Args) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(42);
     let mut next_id = 0u64;
 
-    if args.enable_cuda_graph {
-        warm_decode_graph(&mut executor, 1, params, &mut next_id, &mut rng)?;
-    }
-
     print_measurement_header(args);
     for &context_len in &args.contexts {
-        let prompt = synthetic_prompt(context_len);
+        let mut batch = setup_batch(
+            &mut executor,
+            context_len,
+            args.batch_size,
+            params,
+            &mut next_id,
+            &mut rng,
+        )?;
+        // First batched step captures the CUDA graph for this bucket; warm it
+        // out of the measurement.
+        let _ = decode_batch_step(&mut executor, &mut batch, params, &mut rng)?;
+
         let mut samples = Vec::with_capacity(args.iters);
         for _ in 0..args.iters {
-            let request_id = next_request_id(&mut next_id);
-            let mut token = prefill_one(&mut executor, request_id, &prompt, params, &mut rng)?;
-            samples.push(decode_one_step(
+            samples.push(decode_batch_step(
                 &mut executor,
-                request_id,
-                &mut token,
+                &mut batch,
                 params,
                 &mut rng,
             )?);
-            black_box(token);
-            executor.drop_request(request_id)?;
         }
+        black_box(&batch);
+        drop_batch(&mut executor, &batch)?;
 
         let sorted = sorted_durations(&samples);
         let total: Duration = samples.iter().sum();
         let avg = total / samples.len() as u32;
         println!(
-            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
             context_len,
             context_len + 1,
+            args.batch_size,
             samples.len(),
             duration_ms(avg),
             duration_ms(percentile(&sorted, 0.50)),
@@ -319,16 +385,24 @@ fn profile_context(args: &Args) -> Result<()> {
         warm_decode_graph(&mut executor, context_len, params, &mut next_id, &mut rng)?;
     }
 
-    let prompt = synthetic_prompt(context_len);
-    let request_id = next_request_id(&mut next_id);
-    let mut token = prefill_one(&mut executor, request_id, &prompt, params, &mut rng)?;
+    let mut batch = setup_batch(
+        &mut executor,
+        context_len,
+        args.batch_size,
+        params,
+        &mut next_id,
+        &mut rng,
+    )?;
+    // Capture the CUDA graph for this bucket outside the profiled range.
+    let _ = decode_batch_step(&mut executor, &mut batch, params, &mut rng)?;
 
     println!(
-        "mode=profile model_path={} cuda_graph={} prompt_context={} initial_kv_len_during_decode={} profile_steps={} capture_range={}",
+        "mode=profile model_path={} cuda_graph={} prompt_context={} initial_kv_len_during_decode={} batch_size={} profile_steps={} capture_range={}",
         args.model_path,
         args.enable_cuda_graph,
         context_len,
         context_len + 1,
+        args.batch_size,
         args.profile_steps,
         args.capture_range
     );
@@ -339,9 +413,8 @@ fn profile_context(args: &Args) -> Result<()> {
 
     let start = Instant::now();
     for _ in 0..args.profile_steps {
-        let elapsed = decode_one_step(&mut executor, request_id, &mut token, params, &mut rng)?;
+        let elapsed = decode_batch_step(&mut executor, &mut batch, params, &mut rng)?;
         black_box(elapsed);
-        black_box(token);
     }
     let elapsed = start.elapsed();
 
@@ -349,7 +422,7 @@ fn profile_context(args: &Args) -> Result<()> {
         profiler_stop()?;
     }
 
-    executor.drop_request(request_id)?;
+    drop_batch(&mut executor, &batch)?;
     println!(
         "profile_total_ms={:.4} profile_avg_tpot_ms={:.4}",
         duration_ms(elapsed),
