@@ -359,6 +359,7 @@ fn scheduler_loop<E>(
                 &mut executor,
                 &mut active,
                 spec_proposer.as_ref(),
+                &mut rng,
             );
             continue;
         }
@@ -1940,8 +1941,9 @@ mod tests {
         // FakeExecutor commits drafts + bonus 300 -> [6,5,300].
         let (state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
         let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
 
-        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2());
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
 
         assert_eq!(drain_tokens(&mut rx), vec![6, 5, 300]);
         assert_eq!(active.len(), 1, "request continues");
@@ -1963,11 +1965,56 @@ mod tests {
         executor.ensure_request_tokens(RequestId(0), 3).unwrap();
         let (state, mut rx) = spec_active(RequestId(0), 3, vec![5, 6, 5]);
         let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
 
-        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2());
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
 
         assert_eq!(drain_tokens(&mut rx), vec![6, 300]);
         assert!(active.is_empty(), "request retired at length limit");
         assert_eq!(dropped.lock().unwrap().clone(), vec![0]);
+    }
+
+    // A non-greedy (sampled) request must NOT use the speculative path even when
+    // speculation is enabled: it takes a normal single-token decode (FakeExecutor
+    // -> 200 + id), so its sampling is preserved instead of being forced to argmax.
+    #[test]
+    fn sampled_request_bypasses_speculation() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
+        let (mut state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
+        state.params.temperature = 1.0; // non-greedy -> not spec-eligible
+        let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
+
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
+
+        // One token from the normal decode path, not the multi-token spec commit.
+        assert_eq!(drain_tokens(&mut rx), vec![200]);
+        assert_eq!(active.len(), 1, "request continues");
+        assert_eq!(active[0].generated_count, 2, "1 + 1 decoded");
+        assert_eq!(active[0].last_token, 200);
+        assert_eq!(active[0].token_history, vec![5, 6, 5, 200]);
+        assert!(dropped.lock().unwrap().is_empty());
+    }
+
+    // A request that asked for decode logprobs is likewise not spec-eligible
+    // (speculation drops per-token logprobs), so it takes the normal decode path.
+    #[test]
+    fn logprobs_request_bypasses_speculation() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
+        let (mut state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
+        state.logprobs = 1; // requested decode logprobs -> not spec-eligible
+        let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
+
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
+
+        assert_eq!(drain_tokens(&mut rx), vec![200]);
+        assert_eq!(active.len(), 1, "request continues");
+        assert_eq!(active[0].last_token, 200);
+        assert!(dropped.lock().unwrap().is_empty());
     }
 }

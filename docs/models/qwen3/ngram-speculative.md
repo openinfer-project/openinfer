@@ -141,6 +141,15 @@ parses its own knobs (`NgramConfig::from_env`):
 Only the non-LoRA `scheduler_loop` reads it; the unified prefill+decode tick
 still uses plain decode.
 
+**Per-request eligibility.** Even with the switch on, only requests that are
+greedy (`SamplingParams::is_greedy()`) **and** ask for no decode logprobs
+(`logprobs == 0`) take the speculative path. Speculation verifies with argmax
+and emits no per-token logprobs, so a sampled request would otherwise be forced
+to argmax and a logprobs request would silently lose them. Any ineligible
+request takes a normal sampled single-token decode (its own params, logprobs,
+and a fresh `random_val`) on that tick, so enabling speculation never changes a
+sampled request's output or strips requested logprobs.
+
 ## Remaining work
 
 1. **First-class config knob**: env var is the current switch; thread a typed
