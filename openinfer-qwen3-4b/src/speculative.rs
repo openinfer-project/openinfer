@@ -1,34 +1,43 @@
-//! Method-agnostic core of speculative decoding for Qwen3.
+//! Core of **greedy** speculative decoding for Qwen3.
 //!
-//! Three pieces live here, none tied to a specific proposer:
-//! * [`SpeculativeProposer`] — the draft-token source (the one axis that varies
-//!   between methods; [`crate::ngram::NgramProposer`] is the first impl).
-//! * [`SpeculativeConfig`] / [`SpeculativeMethod`] — what to run and how to
-//!   build the proposer ([`SpeculativeConfig::build_proposer`]).
-//! * [`accept_greedy`] — greedy acceptance: given the `K` drafts and the target
-//!   model's greedy token at each of the `K + 1` verify positions, return the
-//!   tokens to commit.
+//! Three pieces live here:
+//! * [`SpeculativeProposer`] — the draft-token source. This is the one piece
+//!   meant to vary between methods; [`crate::ngram::NgramProposer`] is the only
+//!   impl today and the trait is sized for it (see its docs).
+//! * [`SpeculativeConfig`] / [`SpeculativeMethod`] — a *closed set* of methods
+//!   selected by enum dispatch, plus how to build the proposer.
+//! * [`accept_greedy`] — greedy acceptance over the target model's per-position
+//!   argmax.
 //!
-//! The GPU verify forward and KV reserve/rollback that feed `accept_greedy`
-//! live in the decode path (executor) and are intentionally not part of this
-//! module, so the acceptance rule stays pure and unit-tested.
+//! What is **not** generic yet (don't mistake this for a method-agnostic core):
+//! the verify forward in the executor returns argmax, which is part of the
+//! *greedy* acceptance rule — sampling acceptance would need distributions; and
+//! the scheduler step assumes a *stateless* proposer (no per-request
+//! create/drop). Adding a stateful, model-based proposer therefore touches the
+//! trait, the scheduler step, and the verify path, not just this module.
+
+use std::fmt;
 
 use crate::ngram::{NgramConfig, NgramProposer};
 
 /// A draft-token source for speculative decoding.
 ///
-/// This is the single axis of variation between speculative methods: n-gram /
-/// prompt-lookup today, draft-model or EAGLE/Medusa later. Everything around it
-/// — the verify forward, KV reserve/rollback, greedy acceptance, and the
-/// scheduler step that streams committed tokens — is method-agnostic and is
-/// reused unchanged.
-///
 /// The context is the request's full token sequence so far (prompt + generated
-/// tokens). Returning an empty `Vec` means "no draft this step", and the decode
-/// path falls back to a single-token decode. A token-only context fits n-gram
-/// and draft-model proposers; hidden-state proposers (EAGLE/Medusa) will need a
-/// richer context (request id + hidden states), which is a deliberate future
-/// extension rather than something modelled speculatively here.
+/// tokens); returning an empty `Vec` means "no draft this step" and the decode
+/// path falls back to a single-token decode.
+///
+/// Scope: this signature fits n-gram / prompt-lookup proposers, which are
+/// stateless (they rescan the context each step) and emit plain tokens. It is
+/// deliberately **not** a general proposer abstraction — a draft-model or
+/// EAGLE/Medusa proposer needs more than this trait can express:
+/// * `&mut self` / interior mutability plus a per-request create/drop lifecycle
+///   (a draft model keeps its own KV cache per request),
+/// * the request id, to key that per-request state,
+/// * returning draft *probabilities* alongside tokens, for rejection sampling.
+///
+/// Growing the trait to cover those is left until such a proposer actually
+/// lands, so the shape is validated against a real second implementation rather
+/// than guessed at now.
 pub trait SpeculativeProposer: Send + Sync {
     /// Propose up to `K` continuation tokens for `context`.
     fn propose(&self, context: &[u32]) -> Vec<u32>;
@@ -44,6 +53,16 @@ pub enum SpeculativeMethod {
 impl Default for SpeculativeMethod {
     fn default() -> Self {
         Self::Ngram(NgramConfig::default())
+    }
+}
+
+impl fmt::Display for SpeculativeMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Each method formats its own fields (e.g. `NgramConfig: Display`),
+            // so adding a method does not touch this arm beyond the name.
+            Self::Ngram(cfg) => write!(f, "n-gram ({cfg})"),
+        }
     }
 }
 
@@ -88,17 +107,6 @@ impl SpeculativeConfig {
             SpeculativeMethod::Ngram(cfg) => Box::new(NgramProposer::new(cfg)),
         }
     }
-
-    /// Human-readable one-liner for startup logging.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        match self.method {
-            SpeculativeMethod::Ngram(cfg) => format!(
-                "n-gram (K={}, max_ngram={})",
-                cfg.num_speculative, cfg.max_ngram
-            ),
-        }
-    }
 }
 
 /// Greedy speculative acceptance.
@@ -125,24 +133,21 @@ pub fn accept_greedy(proposed: &[u32], target_argmax: &[u32]) -> Vec<u32> {
         proposed.len() + 1,
         "verify must produce one greedy token per candidate plus a bonus"
     );
-    let mut committed = Vec::with_capacity(proposed.len() + 1);
-    let mut i = 0;
-    while i < proposed.len() && proposed[i] == target_argmax[i] {
-        committed.push(proposed[i]);
-        i += 1;
-    }
+    let n = num_accepted(proposed, target_argmax);
+    let mut committed = Vec::with_capacity(n + 1);
+    committed.extend_from_slice(&proposed[..n]);
     // The model's own token at the first divergence (or the bonus continuation
-    // when the whole run was accepted). `i <= proposed.len() < target_argmax.len()`
+    // when the whole run was accepted). `n <= proposed.len() < target_argmax.len()`
     // so this index is always valid.
-    committed.push(target_argmax[i]);
+    committed.push(target_argmax[n]);
     committed
 }
 
-/// Number of candidate tokens accepted before the committed bonus token, i.e.
-/// `accept_greedy(..).len() - 1`. Useful for KV rollback bookkeeping (how many
-/// of the speculatively written candidate positions to keep).
-#[must_use]
-pub fn num_accepted(proposed: &[u32], target_argmax: &[u32]) -> usize {
+/// Number of leading drafts whose token matches the model's argmax — the length
+/// of the accepted prefix. Internal helper for [`accept_greedy`] (which appends
+/// one model token on top); KV rollback in the executor uses the committed
+/// length directly, so this is not part of the public surface.
+fn num_accepted(proposed: &[u32], target_argmax: &[u32]) -> usize {
     let mut i = 0;
     while i < proposed.len() && proposed[i] == target_argmax[i] {
         i += 1;

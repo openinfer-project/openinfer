@@ -278,7 +278,7 @@ fn scheduler_loop<E>(
     // single-token decode.
     let spec_config = crate::speculative::SpeculativeConfig::from_env();
     if spec_config.enabled {
-        info!("speculative decode enabled: {}", spec_config.describe());
+        info!("speculative decode enabled: {}", spec_config.method);
     }
     let spec_proposer = spec_config.build_proposer();
 

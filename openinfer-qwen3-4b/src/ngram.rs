@@ -36,6 +36,16 @@ impl Default for NgramConfig {
     }
 }
 
+impl std::fmt::Display for NgramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "K={}, max_ngram={}",
+            self.num_speculative, self.max_ngram
+        )
+    }
+}
+
 impl NgramConfig {
     /// Read the n-gram-specific knobs from the environment, falling back to
     /// [`Default`] for anything unset. The generic on/off switch lives in

@@ -101,26 +101,32 @@ same prompt under greedy params.
 - Mock-tested (`FakeExecutor::execute_speculative`): streams every committed
   token + advances state; commits past `max_tokens` truncate, finish, retire.
 
-## Pluggable proposer
+## Proposer seam (closed-set, n-gram-sized)
 
-The proposer is the one axis that varies between speculative methods; everything
-below it is method-agnostic and reused unchanged:
+The proposer is factored out as the one piece meant to vary between methods:
 
 - `speculative::SpeculativeProposer` — `fn propose(&self, context: &[u32]) -> Vec<u32>`.
-  `NgramProposer` implements it; a draft-model proposer slots in the same way.
-- `SpeculativeConfig.method: SpeculativeMethod` (enum, one variant per method) +
-  `build_proposer()` factory. `scheduler_loop` builds one boxed
-  `dyn SpeculativeProposer` at startup and `speculative_decode_step` takes
-  `&dyn SpeculativeProposer`.
-- Reused regardless of method: verify forward (`SpeculativeVerify`), KV
-  reserve/rollback (`schedule/apply_speculative`), `accept_greedy`, and the
-  scheduler step that streams committed tokens.
+- `SpeculativeConfig.method: SpeculativeMethod` (a *closed* enum, one variant per
+  method) + `build_proposer()` factory. `scheduler_loop` builds one boxed
+  `dyn SpeculativeProposer` at startup; `speculative_decode_step` takes
+  `&dyn SpeculativeProposer`. This is closed-set enum dispatch, not an open
+  plugin system — the idiomatic Rust choice for a small known set.
 
-Two seams are intentionally **not** abstracted yet (no second implementation to
-test against): **acceptance** (`accept_greedy` is greedy-only; sampling/rejection
-needs verify to return distributions, not just argmax) and the proposer
-**context** (token-only `&[u32]` fits n-gram and draft-model; EAGLE/Medusa will
-need request id + hidden states).
+This is a good **n-gram** seam, not yet a general proposer abstraction. The
+trait fits stateless, token-emitting proposers; a draft-model / EAGLE proposer
+would need a wider trait (`&mut self` + per-request create/drop lifecycle, the
+request id, and returning draft probabilities for rejection sampling) **and**
+changes to the scheduler step and verify path. Concretely, the parts below the
+proposer are **greedy-specific**, not method-agnostic:
+
+- the verify forward returns argmax (part of the greedy acceptance rule; sampling
+  acceptance needs distributions),
+- `accept_greedy` is greedy-only,
+- `speculative_decode_step` assumes a stateless proposer (no per-request
+  create/drop).
+
+Widening these is deferred until a second proposer actually lands, so the shapes
+are validated against a real implementation rather than guessed at now.
 
 ## Enabling it
 
