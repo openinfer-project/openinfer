@@ -9,7 +9,7 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header::CONTENT_LENGTH};
-use axum::middleware::{Next, from_fn, from_fn_with_state};
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use log::{info, warn};
@@ -47,7 +47,7 @@ use openinfer_engine::engine::{
 use openinfer_engine::sampler::SamplingParams;
 
 mod sampling_guard;
-use sampling_guard::reject_unsupported_sampling;
+use sampling_guard::guard_generation_request;
 
 const ENGINE_INDEX: u32 = 0;
 const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
@@ -243,34 +243,6 @@ fn bad_request(message: impl Into<String>) -> Response {
         }),
     )
         .into_response()
-}
-
-/// Rejects `max_tokens` over the cap. A too-long prompt may still 500.
-async fn enforce_capacity(State(servable): State<u32>, request: Request, next: Next) -> Response {
-    #[derive(Deserialize)]
-    struct Probe {
-        max_tokens: Option<u64>,
-    }
-    let path = request.uri().path();
-    if path != "/v1/completions" && path != "/v1/chat/completions" {
-        return next.run(request).await;
-    }
-    let (parts, body) = request.into_parts();
-    let Ok(bytes) = to_bytes(body, COMPLETION_ROUTE_BODY_LIMIT).await else {
-        return bad_request("failed to read request body");
-    };
-    let over = serde_json::from_slice::<Probe>(&bytes)
-        .ok()
-        .and_then(|probe| probe.max_tokens)
-        .filter(|&max_tokens| max_tokens > u64::from(servable));
-    if let Some(max_tokens) = over {
-        warn!("rejecting request: max_tokens {max_tokens} exceeds servable cap {servable}");
-        return bad_request(format!(
-            "max_tokens ({max_tokens}) exceeds the model's maximum context length of {servable} tokens"
-        ));
-    }
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,11 +653,7 @@ where
     };
 
     let extend_router = move |router: Router| {
-        let router = extend_router(router).layer(from_fn(reject_unsupported_sampling));
-        match servable_limit {
-            Some(limit) => router.layer(from_fn_with_state(limit, enforce_capacity)),
-            None => router,
-        }
+        extend_router(router).layer(from_fn_with_state(servable_limit, guard_generation_request))
     };
     let result = vllm_server::serve_with_router_extension(config, shutdown, extend_router).await;
     bridge_task.abort();

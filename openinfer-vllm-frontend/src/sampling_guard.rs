@@ -1,8 +1,12 @@
-//! Rejects sampling params the engine would otherwise silently drop (#243).
+//! Rejects requests the engine would otherwise degrade silently (#243, #355):
+//! sampling params that evaporate between the wire protocol and
+//! `SamplingParams`, and `max_tokens` beyond the servable cap. One body parse
+//! covers both checks on all three generation endpoints (`/v1/completions`,
+//! `/v1/chat/completions`, `/inference/v1/generate`).
 
 use axum::Json;
 use axum::body::{Body, to_bytes};
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -28,155 +32,235 @@ fn invalid_request_error(param: &'static str, message: String) -> Response {
         .into_response()
 }
 
-/// The engine honors `temperature` / `top_p` / `top_k` / `ignore_eos`; every
-/// other sampling or output-shaping knob the OpenAI surface accepts would be
-/// dropped on the floor between the wire protocol and `SamplingParams`.
-/// Silently ignoring a requested seed, penalty, or JSON schema returns output
-/// the client explicitly asked us not to produce, so reject non-neutral
-/// values up front (#243). Neutral values (penalty 0, repetition 1, empty
-/// logit_bias, `response_format: {"type": "text"}`) are no-ops that common
-/// client SDKs send by default — those pass.
-pub(crate) async fn reject_unsupported_sampling(request: Request, next: Next) -> Response {
-    // `use_beam_search` (both endpoints) and `length_penalty` (completions
-    // only) are also rejected by the upstream validators; they stay in the
-    // probe so chat gets the same coverage and every unsupported param fails
-    // with one consistent message.
-    #[derive(Deserialize)]
-    struct Probe {
-        seed: Option<serde_json::Value>,
-        presence_penalty: Option<f64>,
-        frequency_penalty: Option<f64>,
-        repetition_penalty: Option<f64>,
-        min_p: Option<f64>,
-        min_tokens: Option<u64>,
-        length_penalty: Option<f64>,
-        #[serde(default)]
-        use_beam_search: bool,
-        logit_bias: Option<serde_json::Map<String, serde_json::Value>>,
-        response_format: Option<serde_json::Value>,
-        structured_outputs: Option<serde_json::Value>,
-        stop_token_ids: Option<Vec<i64>>,
-        allowed_token_ids: Option<Vec<i64>>,
-        prompt_logprobs: Option<i64>,
-    }
+/// Sampling-adjacent fields shared by the OpenAI request types (top level) and
+/// `/inference/v1/generate` (nested under `sampling_params`). Field names match
+/// both wire formats; fields one surface lacks simply stay `None`.
+///
+/// `use_beam_search` (both OpenAI endpoints) and `length_penalty` (completions
+/// only) are also rejected by the upstream validators; they stay in the probe
+/// so chat gets the same coverage and every unsupported param fails with one
+/// consistent message.
+#[derive(Default, Deserialize)]
+struct Probe {
+    seed: Option<serde_json::Value>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    repetition_penalty: Option<f64>,
+    min_p: Option<f64>,
+    min_tokens: Option<u64>,
+    length_penalty: Option<f64>,
+    #[serde(default)]
+    use_beam_search: bool,
+    logit_bias: Option<serde_json::Map<String, serde_json::Value>>,
+    response_format: Option<serde_json::Value>,
+    structured_outputs: Option<serde_json::Value>,
+    stop_token_ids: Option<Vec<i64>>,
+    allowed_token_ids: Option<Vec<i64>>,
+    prompt_logprobs: Option<i64>,
+    // `/inference/v1/generate` extras the OpenAI lowering never sets.
+    bad_words: Option<Vec<serde_json::Value>>,
+    logprob_token_ids: Option<Vec<i64>>,
+    skip_reading_prefix_cache: Option<bool>,
+    max_tokens: Option<u64>,
+    // Chat's current spelling; upstream reads it over the deprecated
+    // `max_tokens` when both are present.
+    max_completion_tokens: Option<u64>,
+}
 
-    impl Probe {
-        fn first_unsupported(&self) -> Option<(&'static str, String)> {
-            if self.seed.as_ref().is_some_and(|seed| !seed.is_null()) {
-                return Some((
-                    "seed",
-                    "per-request seed is not supported by this engine".to_string(),
-                ));
-            }
-            for (param, value, neutral) in [
-                ("presence_penalty", self.presence_penalty, 0.0),
-                ("frequency_penalty", self.frequency_penalty, 0.0),
-                ("repetition_penalty", self.repetition_penalty, 1.0),
-                ("min_p", self.min_p, 0.0),
-                ("length_penalty", self.length_penalty, 1.0),
-            ] {
-                if let Some(value) = value
-                    && value != neutral
-                {
-                    return Some((
-                        param,
-                        format!("{param} ({value}) is not supported by this engine"),
-                    ));
-                }
-            }
-            if self.min_tokens.is_some_and(|min_tokens| min_tokens > 0) {
-                return Some((
-                    "min_tokens",
-                    "min_tokens is not supported by this engine".to_string(),
-                ));
-            }
-            if self.use_beam_search {
-                return Some((
-                    "use_beam_search",
-                    "beam search is not supported by this engine".to_string(),
-                ));
-            }
-            if self
-                .logit_bias
-                .as_ref()
-                .is_some_and(|bias| !bias.is_empty())
-            {
-                return Some((
-                    "logit_bias",
-                    "logit_bias is not supported by this engine".to_string(),
-                ));
-            }
-            // `{"type": "text"}` is the OpenAI default and a no-op; any other
-            // shape (json_object / json_schema / structural_tag) would
-            // silently produce unconstrained text.
-            if self.response_format.as_ref().is_some_and(|format| {
-                !format.is_null() && format.get("type").and_then(|t| t.as_str()) != Some("text")
-            }) {
-                return Some((
-                    "response_format",
-                    "structured output (response_format) is not supported by this engine"
-                        .to_string(),
-                ));
-            }
-            if self
-                .structured_outputs
-                .as_ref()
-                .is_some_and(|value| !value.is_null())
-            {
-                return Some((
-                    "structured_outputs",
-                    "structured_outputs is not supported by this engine".to_string(),
-                ));
-            }
-            // The engine only stops on the model EOS; custom stop token ids
-            // would be crossed without stopping.
-            if self
-                .stop_token_ids
-                .as_ref()
-                .is_some_and(|ids| !ids.is_empty())
-            {
-                return Some((
-                    "stop_token_ids",
-                    "stop_token_ids is not supported by this engine (only stop strings and the model EOS)"
-                        .to_string(),
-                ));
-            }
-            if self
-                .allowed_token_ids
-                .as_ref()
-                .is_some_and(|ids| !ids.is_empty())
-            {
-                return Some((
-                    "allowed_token_ids",
-                    "allowed_token_ids is not supported by this engine".to_string(),
-                ));
-            }
-            // The bridge drops prompt logprobs (TokenEvent::PromptTokens), so
-            // an explicit request would return a response without them.
-            if self.prompt_logprobs.is_some() {
-                return Some((
-                    "prompt_logprobs",
-                    "prompt_logprobs is not supported by this engine".to_string(),
-                ));
-            }
-            None
+impl Probe {
+    fn first_unsupported(&self) -> Option<(&'static str, String)> {
+        if self.seed.as_ref().is_some_and(|seed| !seed.is_null()) {
+            return Some((
+                "seed",
+                "per-request seed is not supported by this engine".to_string(),
+            ));
         }
+        for (param, value, neutral) in [
+            ("presence_penalty", self.presence_penalty, 0.0),
+            ("frequency_penalty", self.frequency_penalty, 0.0),
+            ("repetition_penalty", self.repetition_penalty, 1.0),
+            ("min_p", self.min_p, 0.0),
+            ("length_penalty", self.length_penalty, 1.0),
+        ] {
+            if let Some(value) = value
+                && value != neutral
+            {
+                return Some((
+                    param,
+                    format!("{param} ({value}) is not supported by this engine"),
+                ));
+            }
+        }
+        if self.min_tokens.is_some_and(|min_tokens| min_tokens > 0) {
+            return Some((
+                "min_tokens",
+                "min_tokens is not supported by this engine".to_string(),
+            ));
+        }
+        if self.use_beam_search {
+            return Some((
+                "use_beam_search",
+                "beam search is not supported by this engine".to_string(),
+            ));
+        }
+        if self
+            .logit_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty())
+        {
+            return Some((
+                "logit_bias",
+                "logit_bias is not supported by this engine".to_string(),
+            ));
+        }
+        // `{"type": "text"}` is the OpenAI default and a no-op; any other
+        // shape (json_object / json_schema / structural_tag) would silently
+        // produce unconstrained text.
+        if self.response_format.as_ref().is_some_and(|format| {
+            !format.is_null() && format.get("type").and_then(|t| t.as_str()) != Some("text")
+        }) {
+            return Some((
+                "response_format",
+                "structured output (response_format) is not supported by this engine".to_string(),
+            ));
+        }
+        if self
+            .structured_outputs
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+        {
+            return Some((
+                "structured_outputs",
+                "structured_outputs is not supported by this engine".to_string(),
+            ));
+        }
+        // The engine only stops on the model EOS; custom stop token ids would
+        // be crossed without stopping.
+        if self
+            .stop_token_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Some((
+                "stop_token_ids",
+                "stop_token_ids is not supported by this engine (only stop strings and the model EOS)"
+                    .to_string(),
+            ));
+        }
+        if self
+            .allowed_token_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Some((
+                "allowed_token_ids",
+                "allowed_token_ids is not supported by this engine".to_string(),
+            ));
+        }
+        // The bridge drops prompt logprobs (TokenEvent::PromptTokens), so an
+        // explicit request would return a response without them.
+        if self.prompt_logprobs.is_some() {
+            return Some((
+                "prompt_logprobs",
+                "prompt_logprobs is not supported by this engine".to_string(),
+            ));
+        }
+        if self
+            .bad_words
+            .as_ref()
+            .is_some_and(|words| !words.is_empty())
+        {
+            return Some((
+                "bad_words",
+                "bad_words is not supported by this engine".to_string(),
+            ));
+        }
+        if self
+            .logprob_token_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Some((
+                "logprob_token_ids",
+                "logprob_token_ids is not supported by this engine".to_string(),
+            ));
+        }
+        // The engine always reads the prefix cache; an explicit opt-out would
+        // be silently ignored.
+        if self.skip_reading_prefix_cache == Some(true) {
+            return Some((
+                "skip_reading_prefix_cache",
+                "skip_reading_prefix_cache is not supported by this engine".to_string(),
+            ));
+        }
+        None
     }
 
-    let path = request.uri().path();
-    if path != "/v1/completions" && path != "/v1/chat/completions" {
-        return next.run(request).await;
+    fn over_capacity(&self, servable: Option<u32>) -> Option<(&'static str, u64, u32)> {
+        let servable = servable?;
+        // Mirror upstream's migration: `max_completion_tokens` wins over the
+        // deprecated `max_tokens` when both are present.
+        let (param, requested) = match (self.max_completion_tokens, self.max_tokens) {
+            (Some(requested), _) => ("max_completion_tokens", requested),
+            (None, Some(requested)) => ("max_tokens", requested),
+            (None, None) => return None,
+        };
+        (requested > u64::from(servable)).then_some((param, requested, servable))
     }
+}
+
+/// `/inference/v1/generate` nests its sampling fields.
+#[derive(Deserialize)]
+struct GenerateProbe {
+    sampling_params: Option<Probe>,
+}
+
+/// The engine honors `temperature` / `top_p` / `top_k` / `ignore_eos`; every
+/// other sampling or output-shaping knob would be dropped on the floor between
+/// the wire protocol and `SamplingParams`. Silently ignoring a requested seed,
+/// penalty, or JSON schema returns output the client explicitly asked us not
+/// to produce, so reject non-neutral values up front (#243, #355). Neutral
+/// values (penalty 0, repetition 1, empty logit_bias, `response_format:
+/// {"type": "text"}`) are no-ops that common client SDKs send by default —
+/// those pass. The same parse rejects `max_tokens` over the servable cap;
+/// a too-long prompt is rejected later by the upstream tokenized-length check.
+pub(crate) async fn guard_generation_request(
+    State(servable): State<Option<u32>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let nested = match request.uri().path() {
+        "/v1/completions" | "/v1/chat/completions" => false,
+        "/inference/v1/generate" => true,
+        _ => return next.run(request).await,
+    };
     let (parts, body) = request.into_parts();
     let Ok(bytes) = to_bytes(body, COMPLETION_ROUTE_BODY_LIMIT).await else {
         return bad_request("failed to read request body");
     };
     // Malformed JSON falls through to the server's own JsonParseError path.
-    if let Ok(probe) = serde_json::from_slice::<Probe>(&bytes)
-        && let Some((param, message)) = probe.first_unsupported()
-    {
-        warn!("rejecting request: {message}");
-        return invalid_request_error(param, message);
+    let probe = if nested {
+        serde_json::from_slice::<GenerateProbe>(&bytes)
+            .ok()
+            .map(|generate| generate.sampling_params.unwrap_or_default())
+    } else {
+        serde_json::from_slice::<Probe>(&bytes).ok()
+    };
+    if probe.is_none() {
+        warn!("sampling guard could not parse the request body; deferring to server validation");
+    }
+    if let Some(probe) = probe {
+        if let Some((param, message)) = probe.first_unsupported() {
+            warn!("rejecting request: {message}");
+            return invalid_request_error(param, message);
+        }
+        if let Some((param, requested, servable)) = probe.over_capacity(servable) {
+            let message = format!(
+                "{param} ({requested}) exceeds the model's maximum context length of {servable} tokens"
+            );
+            warn!("rejecting request: {message}");
+            return invalid_request_error(param, message);
+        }
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
@@ -185,18 +269,19 @@ pub(crate) async fn reject_unsupported_sampling(request: Request, next: Next) ->
 #[cfg(test)]
 mod tests {
     use axum::Router;
-    use axum::middleware::from_fn;
+    use axum::middleware::from_fn_with_state;
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
     use super::*;
 
-    fn sampling_guard_router() -> Router {
+    fn guarded_router(servable: Option<u32>) -> Router {
         Router::new()
             .route("/v1/completions", post(|| async { "ok" }))
             .route("/v1/chat/completions", post(|| async { "ok" }))
+            .route("/inference/v1/generate", post(|| async { "ok" }))
             .route("/v1/models", get(|| async { "models" }))
-            .layer(from_fn(reject_unsupported_sampling))
+            .layer(from_fn_with_state(servable, guard_generation_request))
     }
 
     async fn send_json(router: Router, path: &str, body: &str) -> (StatusCode, serde_json::Value) {
@@ -249,7 +334,7 @@ mod tests {
         ];
         for (body, param) in cases {
             for path in ["/v1/completions", "/v1/chat/completions"] {
-                let (status, error) = send_json(sampling_guard_router(), path, body).await;
+                let (status, error) = send_json(guarded_router(None), path, body).await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
                 assert_eq!(error["error"]["param"], param, "{body}");
                 assert_eq!(error["error"]["type"], "invalid_request_error", "{body}");
@@ -260,6 +345,115 @@ mod tests {
                     "{body}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_endpoint_rejects_nested_unsupported_params() {
+        let cases = [
+            (
+                r#"{"token_ids": [1], "sampling_params": {"seed": 42}}"#,
+                "seed",
+            ),
+            (
+                r#"{"token_ids": [1], "sampling_params": {"min_p": 0.1}}"#,
+                "min_p",
+            ),
+            (
+                r#"{"token_ids": [1], "sampling_params": {"bad_words": ["foo"]}}"#,
+                "bad_words",
+            ),
+            (
+                r#"{"token_ids": [1], "sampling_params": {"logprob_token_ids": [5]}}"#,
+                "logprob_token_ids",
+            ),
+            (
+                r#"{"token_ids": [1], "sampling_params": {"structured_outputs": {"json": {}}}}"#,
+                "structured_outputs",
+            ),
+        ];
+        for (body, param) in cases {
+            let (status, error) =
+                send_json(guarded_router(None), "/inference/v1/generate", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(error["error"]["param"], param, "{body}");
+            assert_eq!(error["error"]["type"], "invalid_request_error", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_wins_over_deprecated_max_tokens() {
+        // Upstream lowers max_completion_tokens when present; a small
+        // max_tokens next to a huge max_completion_tokens must not mask it.
+        let (status, error) = send_json(
+            guarded_router(Some(100)),
+            "/v1/chat/completions",
+            r#"{"max_tokens": 10, "max_completion_tokens": 999999}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["param"], "max_completion_tokens");
+
+        let (status, _) = send_json(
+            guarded_router(Some(100)),
+            "/v1/chat/completions",
+            r#"{"max_tokens": 999999, "max_completion_tokens": 10}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn skip_reading_prefix_cache_opt_out_is_rejected() {
+        let (status, error) = send_json(
+            guarded_router(None),
+            "/inference/v1/generate",
+            r#"{"token_ids": [1], "sampling_params": {"skip_reading_prefix_cache": true}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["param"], "skip_reading_prefix_cache");
+
+        let (status, _) = send_json(
+            guarded_router(None),
+            "/inference/v1/generate",
+            r#"{"token_ids": [1], "sampling_params": {"skip_reading_prefix_cache": false}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn max_tokens_over_servable_cap_is_rejected_on_all_endpoints() {
+        let cases = [
+            ("/v1/completions", r#"{"max_tokens": 101}"#, "max_tokens"),
+            (
+                "/v1/chat/completions",
+                r#"{"max_tokens": 101}"#,
+                "max_tokens",
+            ),
+            (
+                "/v1/chat/completions",
+                r#"{"max_completion_tokens": 101}"#,
+                "max_completion_tokens",
+            ),
+            (
+                "/inference/v1/generate",
+                r#"{"token_ids": [1], "sampling_params": {"max_tokens": 101}}"#,
+                "max_tokens",
+            ),
+        ];
+        for (path, body, param) in cases {
+            let (status, error) = send_json(guarded_router(Some(100)), path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(error["error"]["param"], param, "{path}");
+
+            // At or under the cap — or with no cap configured — it passes.
+            let (status, _) =
+                send_json(guarded_router(Some(101)), path, &body.replace("101", "100")).await;
+            assert_eq!(status, StatusCode::OK, "{path} under cap");
+            let (status, _) = send_json(guarded_router(None), path, body).await;
+            assert_eq!(status, StatusCode::OK, "{path} uncapped");
         }
     }
 
@@ -281,18 +475,30 @@ mod tests {
             r#"{"temperature": 0.7, "top_p": 0.9, "top_k": 40}"#,
         ];
         for body in bodies {
-            let (status, _) = send_json(sampling_guard_router(), "/v1/completions", body).await;
+            let (status, _) = send_json(guarded_router(Some(100)), "/v1/completions", body).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        // Missing sampling_params: the guard passes it through; the real
+        // server's typed parse rejects it (the field is required upstream) —
+        // the stub handler's 200 only asserts the guard stays out of the way.
+        for body in [
+            r#"{"token_ids": [1]}"#,
+            r#"{"token_ids": [1], "sampling_params": {"temperature": 0.7, "max_tokens": 50, "ignore_eos": true}}"#,
+        ] {
+            let (status, _) =
+                send_json(guarded_router(Some(100)), "/inference/v1/generate", body).await;
             assert_eq!(status, StatusCode::OK, "{body}");
         }
     }
 
     #[tokio::test]
-    async fn sampling_guard_ignores_other_routes_and_malformed_json() {
+    async fn guard_ignores_other_routes_and_malformed_json() {
         // Malformed JSON must fall through to the server's own parse error.
-        let (status, _) = send_json(sampling_guard_router(), "/v1/completions", "{not json").await;
+        let (status, _) =
+            send_json(guarded_router(Some(100)), "/v1/completions", "{not json").await;
         assert_eq!(status, StatusCode::OK);
 
-        let response = sampling_guard_router()
+        let response = guarded_router(None)
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/v1/models")
