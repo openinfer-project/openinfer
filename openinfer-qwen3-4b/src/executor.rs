@@ -865,6 +865,36 @@ impl Qwen3Executor {
                 anyhow::anyhow!("schedule_speculative failed for {:?}: {e}", item.request_id)
             })?;
 
+        // schedule_speculative pre-allocated KV blocks and moved the sequence
+        // into the SpeculativeScheduled state. The verify + apply below must
+        // either complete (apply_speculative) or revert that reservation, so a
+        // mid-step failure leaves the sequence idle for the next step rather
+        // than stranded half-scheduled.
+        let result = self.verify_and_commit(item);
+        if result.is_err() {
+            if let Some(rkv) = self.request_kvs.get_mut(&item.request_id) {
+                if let Err(revert_err) = rkv.revert_schedule() {
+                    log::warn!(
+                        "failed to revert speculative schedule for {:?}: {revert_err}",
+                        item.request_id
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// The fallible body of [`Self::execute_speculative`]: build the verify
+    /// input, run the verify forward, greedily accept, and commit. Factored out
+    /// so `execute_speculative` can revert the schedule reservation on any
+    /// error here. Assumes `schedule_speculative` already succeeded.
+    fn verify_and_commit(&mut self, item: &SpeculativeStepItem) -> Result<Vec<u32>> {
+        let k = item.drafts.len();
+        let rkv = self
+            .request_kvs
+            .get_mut(&item.request_id)
+            .expect("request must exist; schedule_speculative just succeeded");
+
         let mut verify_tokens = Vec::with_capacity(k + 1);
         verify_tokens.push(item.token_id);
         verify_tokens.extend_from_slice(&item.drafts);

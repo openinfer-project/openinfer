@@ -31,7 +31,20 @@ pub(super) fn speculative_decode_step(
     let mut to_retire = Vec::new();
     for idx in 0..active.len() {
         let request_id = active[idx].request_id;
-        let drafts = proposer.propose(&active[idx].token_history);
+        let mut drafts = proposer.propose(&active[idx].token_history);
+
+        // A verify step commits at most `drafts.len() + 1` tokens. Cap the
+        // draft count to the request's remaining token budget so the commit can
+        // never exceed it — otherwise the executor's `schedule_speculative`
+        // clamps to the budget and the larger accepted run is rejected. Tokens
+        // past the budget would be truncated by `apply_committed` anyway.
+        let remaining = active[idx]
+            .max_tokens
+            .saturating_sub(active[idx].generated_count);
+        let max_drafts = remaining.saturating_sub(1);
+        if drafts.len() > max_drafts {
+            drafts.truncate(max_drafts);
+        }
 
         let committed = match commit_tokens(executor, &active[idx], drafts) {
             Ok(tokens) => tokens,

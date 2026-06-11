@@ -347,6 +347,17 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
+    /// Revert a scheduled-but-not-applied step, returning the sequence to its
+    /// pre-schedule (idle) state and LIFO-releasing the pre-allocated blocks.
+    /// Used to keep [`Self::schedule_speculative`] transactional: if the verify
+    /// forward fails before [`Self::apply_speculative`], the reservation is
+    /// undone instead of stranding the sequence in a half-scheduled state.
+    pub fn revert_schedule(&mut self) -> anyhow::Result<()> {
+        self.seq
+            .revert_schedule()
+            .map_err(|e| anyhow::anyhow!("revert_schedule: {e}"))
+    }
+
     pub fn release(&mut self) -> anyhow::Result<()> {
         self.seq
             .release()

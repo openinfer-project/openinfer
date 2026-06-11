@@ -272,7 +272,7 @@ fn scheduler_loop<E>(
     // Requests parked while their async CPU-tier KV prefetch loads.
     let mut loading: Vec<PendingRequest> = Vec::new();
 
-    // N-gram speculative decode. Off unless OPENINFER_QWEN3_NGRAM_SPEC is set
+    // N-gram speculative decode. Off unless OPENINFER_QWEN3_SPEC is set
     // (see SpeculativeConfig::from_env). When on, pure-decode ticks route
     // through `speculative::speculative_decode_step` instead of the batched
     // single-token decode.
@@ -1951,21 +1951,22 @@ mod tests {
         assert!(dropped.lock().unwrap().is_empty());
     }
 
-    // Committed tokens past max_tokens are truncated: the step stops emitting at
-    // the limit, finishes the request, and retires it.
+    // A request near its max_tokens budget caps the draft count so the commit
+    // lands exactly on the limit instead of over-committing. max_tokens 3,
+    // generated 1 -> only 2 tokens of budget, so drafts [6,5] are capped to [6]
+    // (1 draft); commit [6,300] -> emit 6 (gen 2), 300 (gen 3 == limit ->
+    // Length), then finish + retire.
     #[test]
-    fn speculative_step_truncates_at_max_tokens() {
+    fn speculative_step_caps_drafts_at_max_tokens() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
         executor.ensure_request_tokens(RequestId(0), 3).unwrap();
-        // max_tokens 3, generated 1: commit [6,5,300] -> emit 6 (gen 2), 5 (gen 3
-        // == limit -> Length), 300 never emitted.
         let (state, mut rx) = spec_active(RequestId(0), 3, vec![5, 6, 5]);
         let mut active = vec![state];
 
         speculative::speculative_decode_step(&mut executor, &mut active, &ngram2());
 
-        assert_eq!(drain_tokens(&mut rx), vec![6, 5]);
+        assert_eq!(drain_tokens(&mut rx), vec![6, 300]);
         assert!(active.is_empty(), "request retired at length limit");
         assert_eq!(dropped.lock().unwrap().clone(), vec![0]);
     }

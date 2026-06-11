@@ -22,7 +22,7 @@ Three of the four pieces already exist or are trivial:
 
 - **Proposer** — `openinfer-qwen3-4b/src/ngram.rs` (`NgramProposer`). Done, unit-tested.
 - **Acceptance** — `openinfer-qwen3-4b/src/speculative.rs` (`accept_greedy`,
-  `num_accepted`, `SpeculativeConfig`). Done, unit-tested.
+  `SpeculativeConfig`). Done, unit-tested.
 - **KV scheduling / rollback** — kvbm's `SchedulableSequence` already implements
   `schedule_speculative` / `apply_speculative` with **automatic LIFO release of
   the blocks pre-allocated for rejected drafts**. Exposed on `RequestKv`
