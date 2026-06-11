@@ -18,9 +18,11 @@ uv --version      # Python package manager
 /usr/local/cuda/bin/nvcc --version  # CUDA compiler
 ```
 
-## 2. Create Unified Python venv
+## 2. Create Unified Python venv (optional for the default build)
 
-The project uses a single `.venv` for everything: triton (build dependency) and torch/transformers (reference scripts).
+The default build (Qwen3 only) is pure Rust + CUDA and needs no Python. Set up
+`.venv` when you build feature-gated model lines (`qwen35-4b` needs triton) or
+run the HF reference scripts (torch/transformers).
 
 ```bash
 cd openinfer/
@@ -40,10 +42,11 @@ Verify:
 ## 3. Build
 
 ```bash
-cargo build --release
+cargo build --release                          # Qwen3 only, no Python
+cargo build --release --features qwen35-4b     # adds Qwen3.5 (Triton AOT at build time)
 ```
 
-First build takes ~30s. Compiles CUDA kernels (`openinfer-kernels/csrc/*.cu`) and Triton AOT kernels (`openinfer-kernels/tools/triton/*.py`).
+First build takes ~30s. Compiles CUDA kernels (`openinfer-kernels/csrc/*.cu`); with `--features qwen35-4b` it also generates the Triton AOT kernels (`openinfer-kernels/tools/triton/*.py`).
 
 ## 4. Run Tests
 

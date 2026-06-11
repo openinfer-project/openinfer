@@ -14,20 +14,26 @@ pub enum ModelType {
     DeepSeekV4,
     #[cfg(feature = "kimi-k2")]
     KimiK2,
+    #[cfg(feature = "qwen3-4b")]
     Qwen3,
+    #[cfg(feature = "qwen35-4b")]
     Qwen35,
 }
 
 impl fmt::Display for ModelType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        // By-value match so the no-model-features build (empty enum) still
+        // type-checks: an empty match is only exhaustive for owned values.
+        match *self {
             #[cfg(feature = "deepseek-v2-lite")]
             Self::DeepSeekV2Lite => write!(f, "DeepSeek-V2-Lite"),
             #[cfg(feature = "deepseek-v4")]
             Self::DeepSeekV4 => write!(f, "DeepSeek V4"),
             #[cfg(feature = "kimi-k2")]
             Self::KimiK2 => write!(f, "Kimi-K2.6"),
+            #[cfg(feature = "qwen3-4b")]
             Self::Qwen3 => write!(f, "Qwen3"),
+            #[cfg(feature = "qwen35-4b")]
             Self::Qwen35 => write!(f, "Qwen3.5"),
         }
     }
@@ -94,8 +100,18 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
     }
 
     if json.get("text_config").is_some() {
+        #[cfg(feature = "qwen35-4b")]
         return Ok(ModelType::Qwen35);
+        #[cfg(not(feature = "qwen35-4b"))]
+        anyhow::bail!(
+            "Qwen3.5 support is feature-gated; rebuild openinfer-server with --features qwen35-4b"
+        );
     }
 
-    Ok(ModelType::Qwen3)
+    #[cfg(feature = "qwen3-4b")]
+    return Ok(ModelType::Qwen3);
+    #[cfg(not(feature = "qwen3-4b"))]
+    anyhow::bail!(
+        "Qwen3 support is feature-gated; rebuild openinfer-server with --features qwen3-4b"
+    );
 }

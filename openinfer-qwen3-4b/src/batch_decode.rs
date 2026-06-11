@@ -163,12 +163,23 @@ impl Qwen3Model {
             } else {
                 &self.norm
             };
+            // Without kernel-call-trace, dag_label! expands to `()` and the
+            // branches collapse into identical unit blocks.
+            #[cfg_attr(
+                not(feature = "kernel-call-trace"),
+                allow(
+                    clippy::if_same_then_else,
+                    clippy::let_unit_value,
+                    clippy::semicolon_if_nothing_returned
+                )
+            )]
+            let label = if layer_idx + 1 < num_layers {
+                dag_label!(format!("L{layer_idx}.mlp.fused_add_rms_norm"))
+            } else {
+                dag_label!("final.rms_norm")
+            };
             dag.fused_add_rms_norm(
-                if layer_idx + 1 < num_layers {
-                    dag_label!(format!("L{layer_idx}.mlp.fused_add_rms_norm"))
-                } else {
-                    dag_label!("final.rms_norm")
-                },
+                label,
                 &mut bufs.hidden,
                 &bufs.mlp_out,
                 next_weight,
@@ -712,7 +723,10 @@ mod tests {
             for rkv in &mut rkvs {
                 rkv.schedule_decode(mgr.pool()).unwrap();
             }
-            let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
+            let views: Vec<_> = rkvs
+                .iter()
+                .map(openinfer_kv_cache::RequestKv::decode_view)
+                .collect();
             model
                 .batch_decode(
                     &token_ids,

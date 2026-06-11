@@ -106,8 +106,7 @@ fn generate_tokens(
     loop {
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::Scheduled { .. }) => {}
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
@@ -141,7 +140,7 @@ fn test_e2e_qwen35_scheduler() {
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
         let (tokens, finish_reason) =
-            generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
+            generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
         let elapsed = start.elapsed();
 
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
@@ -166,7 +165,7 @@ fn test_e2e_qwen35_scheduler() {
     // ── 2. Multi-request (scheduler state reuse) ────────────────────────
     info!("=== Phase 2: Multi-request ===");
     for case in CASES {
-        let (tokens, _) = generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
+        let (tokens, _) = generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
             !text.is_empty(),
@@ -183,9 +182,7 @@ fn test_e2e_qwen35_scheduler() {
 
         // Submit all cases concurrently
         for case in CASES {
-            let prompt_tokens = tokenizer
-                .encode(&case.prompt, false)
-                .expect("encode failed");
+            let prompt_tokens = tokenizer.encode(case.prompt, false).expect("encode failed");
             let (token_tx, token_rx) = mpsc::unbounded_channel();
             handle
                 .submit(GenerateRequest {
@@ -209,8 +206,7 @@ fn test_e2e_qwen35_scheduler() {
             loop {
                 match rx.blocking_recv() {
                     Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::PromptTokens { .. }) => {}
-                    Some(TokenEvent::Scheduled { .. }) => {}
+                    Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     Some(TokenEvent::Error { message, .. }) => {
                         panic!("generation failed: {message}")

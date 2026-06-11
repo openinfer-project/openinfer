@@ -225,7 +225,7 @@ fn prefix_cache_behavior() {
     assert_eq!(pr.requests[1].cached_tokens, 3 * BLOCK, "A is warm");
     let d_mixed = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
     let a_mixed = vec![top_logprobs(pr.requests[1].first_token_logprob.as_ref())];
-    assert_close("A in mixed batch", &a_cold[..1].to_vec(), &a_mixed);
+    assert_close("A in mixed batch", &a_cold[..1], &a_mixed);
     ex.drop_request(RequestId::new(21)).expect("drop");
     ex.drop_request(RequestId::new(22)).expect("drop");
 
@@ -266,7 +266,7 @@ fn prefix_cache_behavior() {
     let a_unified = vec![top_logprobs(
         ur.prefill_requests[0].first_token_logprob.as_ref(),
     )];
-    assert_close("A in unified plan", &a_cold[..1].to_vec(), &a_unified);
+    assert_close("A in unified plan", &a_cold[..1], &a_unified);
     ex.drop_request(RequestId::new(41)).expect("drop");
     ex.drop_request(RequestId::new(42)).expect("drop");
 }

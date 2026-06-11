@@ -1969,7 +1969,7 @@ mod tests {
 
         let load_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let load_done_thread = Arc::clone(&load_done);
-        let load_handle = handle.clone();
+        let load_handle = handle;
         let load_thread = thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
                 .build()

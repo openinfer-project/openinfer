@@ -121,6 +121,11 @@ impl<'a> BatchDecodeDag<'a> {
         )
     }
 
+    // `Out` labels the kernel-call-trace record; unused without the feature.
+    #[cfg_attr(
+        not(feature = "kernel-call-trace"),
+        allow(clippy::extra_unused_type_parameters)
+    )]
     pub(crate) fn gemm_rows<Out: AxisTag>(
         &self,
         label: DagLabel,
@@ -142,6 +147,11 @@ impl<'a> BatchDecodeDag<'a> {
         openinfer_kernels::ops::gemm_rows_into(&self.model.ctx, weight, row_offset, rows, x, out);
     }
 
+    // `Out`/`In` label the kernel-call-trace record; unused without the feature.
+    #[cfg_attr(
+        not(feature = "kernel-call-trace"),
+        allow(clippy::extra_unused_type_parameters)
+    )]
     pub(crate) fn gemm<Out: AxisTag, In: AxisTag>(
         &self,
         label: DagLabel,

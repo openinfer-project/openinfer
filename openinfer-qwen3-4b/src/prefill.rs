@@ -319,7 +319,10 @@ impl Qwen3Model {
         // Build batch plan from views
         let page_indices: Vec<Vec<i32>> =
             kv_views.iter().map(|v| v.page_indices().to_vec()).collect();
-        let last_page_lens: Vec<usize> = kv_views.iter().map(|v| v.last_page_len()).collect();
+        let last_page_lens: Vec<usize> = kv_views
+            .iter()
+            .map(openinfer_kv_cache::KvView::last_page_len)
+            .collect();
         let plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,
             &page_indices,

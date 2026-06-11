@@ -63,23 +63,19 @@ single-stream latency is at parity with vLLM — see
 
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
 - NVIDIA driver R535 (CUDA 12.2) or newer; driver symbols resolve lazily at call time, so the `cuda-12090` cudarc feature does not raise the driver floor
-- Python 3 + Triton (build-time only — no Python at runtime)
+- The default build (Qwen3-4B / 8B) is pure Rust + CUDA — no Python at all
+- Python 3 + Triton for `qwen35-4b` feature builds (build-time only — no Python at runtime)
 - TileLang for `deepseek-v4` feature builds (build-time only)
 - `deepseek-v4` / `kimi-k2` EP paths additionally need NCCL ≥ 2.27 at runtime (`ncclAlltoAll`)
 
 ### Build & Run
 
 ```bash
-# One-time Python setup (for Triton AOT kernel compilation)
-uv venv && source .venv/bin/activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-
 # Download a model
 huggingface-cli download Qwen/Qwen3-4B --local-dir models/Qwen3-4B
 
-# Build & start server on port 8000
+# Build & start server on port 8000 — no Python needed for the default Qwen3 build
 export CUDA_HOME=/usr/local/cuda
-export OPENINFER_TRITON_PYTHON=.venv/bin/python
 cargo run --release
 ```
 
@@ -103,8 +99,10 @@ curl -N http://localhost:8000/v1/completions \
 <summary>More options</summary>
 
 ```bash
-# Different model
-cargo run --release -- --model-path models/Qwen3.5-4B
+# Qwen3.5 requires the feature-gated Triton AOT kernels (Python + Triton at build time)
+uv venv && uv pip install triton
+export OPENINFER_TRITON_PYTHON=.venv/bin/python
+cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 
 # DeepSeek V4 Flash requires the feature-gated MP8 path and TileLang at build time
 uv pip install "tilelang==0.1.9"
@@ -120,7 +118,7 @@ cargo run --release -- --cuda-graph=false
 | Variable | Description |
 |----------|-------------|
 | `CUDA_HOME` | CUDA Toolkit path (default: `/usr/local/cuda`) |
-| `OPENINFER_TRITON_PYTHON` | Python with Triton for build-time AOT compilation |
+| `OPENINFER_TRITON_PYTHON` | Python with Triton for `qwen35-4b` build-time AOT compilation |
 | `OPENINFER_TILELANG_PYTHON` | Python with TileLang for `deepseek-v4` build-time kernel generation |
 | `OPENINFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
 
@@ -131,12 +129,16 @@ cargo run --release -- --cuda-graph=false
 
 ```powershell
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x"
+
+# Default Qwen3 build needs no Python
+cargo build --release
+cargo run --release -p openinfer-server -- --model-path models/Qwen3-4B
+
+# Qwen3.5 additionally needs Triton for the feature-gated AOT kernels
 uv venv .venv --python 3.12
 uv pip install "triton-windows<3.7"
 $env:OPENINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
-
-cargo build --release
-cargo run --release -p openinfer-server -- --model-path models/Qwen3-4B
+cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 ```
 
 </details>
@@ -145,14 +147,14 @@ cargo run --release -p openinfer-server -- --model-path models/Qwen3-4B
 
 | Model | Architecture | Params | Status |
 |-------|-------------|--------|--------|
-| [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | Greedy + sampling |
-| [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling |
-| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling |
+| [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | Greedy + sampling, default feature, pure Rust + CUDA build |
+| [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling, default feature, pure Rust + CUDA build |
+| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling, feature-gated, `--features qwen35-4b` (build-time Triton) |
 | [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU path |
 | [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention, MP8 checkpoint | 671B total / 37B active | Initial greedy, feature-gated, 8-GPU MP8 |
 | [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
 
-Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Feature-gated model lines require rebuilding `openinfer-server` with the matching `--features ...` flag before launch.
+Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Every model line is controlled by a cargo feature; only `qwen3-4b` is on by default, so the stock build serves Qwen3 with zero Python. Other lines require rebuilding `openinfer-server` with the matching `--features ...` flag before launch.
 
 DeepSeek V4 support is intentionally narrower than the Qwen paths in the initial PR: it requires `--features deepseek-v4`, uses CUDA devices `0..7`, serves greedy requests only, terminates unsupported logprobs and non-greedy sampling requests with an explicit `stop_reason`, and does not use CUDA Graph yet.
 
@@ -217,14 +219,14 @@ cargo test --release --workspace --lib
 
 # Accuracy and integration tests (need GPU + model weights)
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test e2e_scheduler
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test e2e
 ```
 
 ### Triton AOT
 
-Triton compiles the Qwen3.5 compatibility AOT kernels at build time. Qwen3-4B dense full-attention kernels are CUDA/cuBLAS/FlashInfer C++ wrappers. Runtime has no Python dependency — Triton is build-time only.
+Triton compiles the Qwen3.5 GDR chunkwise prefill kernels at build time, gated behind the `qwen35-4b` feature — the default Qwen3 build never invokes Python. Qwen3-4B dense full-attention kernels are CUDA/cuBLAS/FlashInfer C++ wrappers. Runtime has no Python dependency — Triton is build-time only.
 
 See `openinfer-kernels/tools/triton/README.md` for setup and troubleshooting.
 

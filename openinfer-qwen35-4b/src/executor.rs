@@ -62,10 +62,12 @@ impl DecodeStepItem {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
 }
 
+#[derive(Clone, Copy)]
 pub struct DecodePlan<'a> {
     pub requests: &'a [DecodeStepItem],
 }
@@ -188,7 +190,7 @@ impl Qwen35Executor {
             .batch_prefill(&prompts, &mut kv_states, &mut recurrent_refs)?;
 
         let mut results = Vec::with_capacity(plan.requests.len());
-        for (i, (req, kv)) in plan.requests.iter().zip(kv_states.into_iter()).enumerate() {
+        for (i, (req, kv)) in plan.requests.iter().zip(kv_states).enumerate() {
             let (first_token, first_token_logprob) =
                 self.token_and_logprob(&logits[i], req.logprobs)?;
             let slot_idx = self.active.len();
@@ -326,10 +328,10 @@ impl Qwen35Executor {
     }
 }
 
-fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    top_k: usize,
-) -> Option<(u32, f32, Vec<(u32, f32)>)> {
+/// (sampled token, its logprob, top-k `(token, logprob)` pairs).
+type CpuLogprobs = (u32, f32, Vec<(u32, f32)>);
+
+fn compute_logprobs_from_cpu(logits_f32: &[f32], top_k: usize) -> Option<CpuLogprobs> {
     if logits_f32.is_empty() {
         return None;
     }

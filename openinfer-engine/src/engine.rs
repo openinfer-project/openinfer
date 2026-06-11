@@ -400,10 +400,10 @@ mod tests {
                 assert_eq!(actual, request);
                 response_tx.send(Ok(())).expect("send load result");
             }
-            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter { .. }) => {
-                panic!("expected LoRA load command")
-            }
-            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+            EngineCommand::Control(
+                EngineControlRequest::UnloadLoraAdapter { .. }
+                | EngineControlRequest::ListLoraAdapters { .. },
+            ) => {
                 panic!("expected LoRA load command")
             }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),
@@ -429,10 +429,10 @@ mod tests {
                     .send(Ok(vec!["adapter-a".to_string()]))
                     .expect("send list result");
             }
-            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
-                panic!("expected LoRA list command")
-            }
-            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter { .. }) => {
+            EngineCommand::Control(
+                EngineControlRequest::LoadLoraAdapter { .. }
+                | EngineControlRequest::UnloadLoraAdapter { .. },
+            ) => {
                 panic!("expected LoRA list command")
             }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),
@@ -486,10 +486,10 @@ mod tests {
                 assert_eq!(actual, request);
                 response_tx.send(Ok(())).expect("send unload result");
             }
-            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
-                panic!("expected LoRA unload command")
-            }
-            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+            EngineCommand::Control(
+                EngineControlRequest::LoadLoraAdapter { .. }
+                | EngineControlRequest::ListLoraAdapters { .. },
+            ) => {
                 panic!("expected LoRA unload command")
             }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),

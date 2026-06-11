@@ -487,7 +487,7 @@ pub async fn serve(
         model_path.to_string_lossy().into_owned(),
         served_model_name
             .into_iter()
-            .map(|name| name.to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
         port,
         max_model_len,
@@ -1045,14 +1045,14 @@ fn collect_ready_token_batch(
             Ok(other) => {
                 return (
                     token_ids,
-                    has_logprobs.then(|| MaybeWireLogprobs::Direct(Logprobs { positions })),
+                    has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions })),
                     Some(other),
                 );
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
                 return (
                     token_ids,
-                    has_logprobs.then(|| MaybeWireLogprobs::Direct(Logprobs { positions })),
+                    has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions })),
                     None,
                 );
             }
@@ -1394,11 +1394,11 @@ mod tests {
         // ignore_eos=true lowering: _eos_token_id=None while
         // _all_stop_token_ids still carries the model EOS set.
         let mut params = EngineCoreSamplingParams::for_test();
-        params.all_stop_token_ids = BTreeSet::from([163586]);
+        params.all_stop_token_ids = BTreeSet::from([163_586]);
         assert!(convert_sampling(&params).ignore_eos);
 
         // Normal request: _eos_token_id present.
-        params.eos_token_id = Some(163586);
+        params.eos_token_id = Some(163_586);
         assert!(!convert_sampling(&params).ignore_eos);
 
         // Explicit client stop tokens keep EOS detection on even when the
