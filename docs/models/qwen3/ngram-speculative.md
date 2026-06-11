@@ -125,11 +125,12 @@ need request id + hidden states).
 ## Enabling it
 
 `scheduler_loop` builds the config via `SpeculativeConfig::from_env()`
-(default-off). Operational switch:
+(default-off). The generic switch lives on `SpeculativeConfig`; each method
+parses its own knobs (`NgramConfig::from_env`):
 
-- `OPENINFER_QWEN3_NGRAM_SPEC=1` — turn it on.
-- `OPENINFER_QWEN3_NGRAM_SPEC_TOKENS=K` — draft count (default 4).
-- `OPENINFER_QWEN3_NGRAM_SPEC_MAX_NGRAM=N` — longest matched suffix (default 3).
+- `OPENINFER_QWEN3_SPEC=1` — turn speculation on (generic).
+- `OPENINFER_QWEN3_NGRAM_TOKENS=K` — draft count (n-gram, default 4).
+- `OPENINFER_QWEN3_NGRAM_MAX_NGRAM=N` — longest matched suffix (n-gram, default 3).
 
 Only the non-LoRA `scheduler_loop` reads it; the unified prefill+decode tick
 still uses plain decode.

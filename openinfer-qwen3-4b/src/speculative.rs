@@ -61,29 +61,22 @@ pub struct SpeculativeConfig {
 }
 
 impl SpeculativeConfig {
-    /// Read the config from environment variables (the operational switch until
-    /// a first-class server/config knob is wired):
+    /// Read the config from the environment (the operational switch until a
+    /// first-class server/config knob is wired). This owns only the generic
+    /// switch; each method parses its own knobs (see [`NgramConfig::from_env`]):
     ///
-    /// * `OPENINFER_QWEN3_NGRAM_SPEC` = `1`/`true` enables it (default off).
-    /// * `OPENINFER_QWEN3_NGRAM_SPEC_TOKENS` = draft count `K` (default 4).
-    /// * `OPENINFER_QWEN3_NGRAM_SPEC_MAX_NGRAM` = longest suffix to match (default 3).
+    /// * `OPENINFER_QWEN3_SPEC` = `1`/`true` enables speculation (default off).
+    ///
+    /// The method defaults to n-gram; add a `OPENINFER_QWEN3_SPEC_METHOD`
+    /// dispatch here when a second proposer lands.
     #[must_use]
     pub fn from_env() -> Self {
-        let defaults = NgramConfig::default();
-        let enabled = std::env::var("OPENINFER_QWEN3_NGRAM_SPEC")
+        let enabled = std::env::var("OPENINFER_QWEN3_SPEC")
             .ok()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let num_speculative =
-            env_usize("OPENINFER_QWEN3_NGRAM_SPEC_TOKENS").unwrap_or(defaults.num_speculative);
-        let max_ngram =
-            env_usize("OPENINFER_QWEN3_NGRAM_SPEC_MAX_NGRAM").unwrap_or(defaults.max_ngram);
         Self {
             enabled,
-            method: SpeculativeMethod::Ngram(NgramConfig {
-                max_ngram,
-                min_ngram: defaults.min_ngram,
-                num_speculative,
-            }),
+            method: SpeculativeMethod::Ngram(NgramConfig::from_env()),
         }
     }
 
@@ -106,10 +99,6 @@ impl SpeculativeConfig {
             ),
         }
     }
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 /// Greedy speculative acceptance.

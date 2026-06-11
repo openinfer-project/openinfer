@@ -36,6 +36,30 @@ impl Default for NgramConfig {
     }
 }
 
+impl NgramConfig {
+    /// Read the n-gram-specific knobs from the environment, falling back to
+    /// [`Default`] for anything unset. The generic on/off switch lives in
+    /// [`crate::speculative::SpeculativeConfig::from_env`]; this only owns the
+    /// proposer's own parameters:
+    ///
+    /// * `OPENINFER_QWEN3_NGRAM_TOKENS` = draft count `K`.
+    /// * `OPENINFER_QWEN3_NGRAM_MAX_NGRAM` = longest suffix to match.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            max_ngram: env_usize("OPENINFER_QWEN3_NGRAM_MAX_NGRAM").unwrap_or(defaults.max_ngram),
+            min_ngram: defaults.min_ngram,
+            num_speculative: env_usize("OPENINFER_QWEN3_NGRAM_TOKENS")
+                .unwrap_or(defaults.num_speculative),
+        }
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
 /// Stateless n-gram / prompt-lookup proposer.
 ///
 /// The proposer keeps no history of its own; each call scans the supplied
