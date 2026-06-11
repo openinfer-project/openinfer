@@ -11,6 +11,18 @@ pub(super) struct PromptEchoEffect {
     pub(super) logprobs: Vec<Option<TokenLogprob>>,
 }
 
+/// Emitted once per request when its prefill result lands — carries the
+/// prefix-cache hit count the frontend reports in usage (#246). The
+/// scheduled timestamp was stamped when the batch was formed, not when the
+/// event is sent, so queue-time metrics exclude prefill execution.
+pub(super) struct ScheduledEffect {
+    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) queued_at_unix_s: Option<f64>,
+    pub(super) scheduled_at_unix_s: f64,
+    pub(super) prompt_tokens: usize,
+    pub(super) cached_tokens: usize,
+}
+
 pub(super) enum PendingEffect {
     Finish {
         request_id: RequestId,
@@ -57,6 +69,7 @@ pub(super) enum DecodeEffect {
 }
 
 pub(super) struct StepEffects {
+    pub(super) scheduled: Vec<ScheduledEffect>,
     pub(super) prompt_echoes: Vec<PromptEchoEffect>,
     pub(super) pending: Vec<PendingEffect>,
     pub(super) decode: Vec<DecodeEffect>,
@@ -65,6 +78,7 @@ pub(super) struct StepEffects {
 impl StepEffects {
     pub(super) fn empty() -> Self {
         Self {
+            scheduled: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: Vec::new(),
@@ -77,6 +91,17 @@ pub(super) fn apply_effects(
     active: &mut Vec<ActiveRequestState>,
     effects: StepEffects,
 ) {
+    for scheduled in effects.scheduled {
+        let _ = scheduled.token_tx.send(TokenEvent::Scheduled {
+            queued_at_unix_s: scheduled
+                .queued_at_unix_s
+                .unwrap_or(scheduled.scheduled_at_unix_s),
+            scheduled_at_unix_s: scheduled.scheduled_at_unix_s,
+            prompt_tokens: scheduled.prompt_tokens,
+            cached_tokens: scheduled.cached_tokens,
+        });
+    }
+
     for echo in effects.prompt_echoes {
         let _ = echo.token_tx.send(TokenEvent::PromptTokens {
             ids: echo.ids,

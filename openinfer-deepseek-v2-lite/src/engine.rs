@@ -34,6 +34,7 @@ fn handle_request(generator: &mut DeepSeekV2LiteEp2Generator, req: &GenerateRequ
         queued_at_unix_s: req.queued_at_unix_s.unwrap_or(now),
         scheduled_at_unix_s: now,
         prompt_tokens,
+        cached_tokens: 0,
     });
     if req.echo {
         let _ = req.token_tx.send(TokenEvent::PromptTokens {

@@ -33,8 +33,8 @@ use vllm_engine_core_client::protocol::{
 };
 use vllm_engine_core_client::{EngineId, TransportMode};
 use vllm_server::{
-    ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode, ParserSelection,
-    RendererSelection,
+    ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode,
+    ParserSelection, RendererSelection,
 };
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
@@ -429,12 +429,26 @@ impl LocalEngineBridge {
         } = request;
         let Some(prompt_tokens) = prompt_token_ids else {
             warn!("request {request_id} dropped: missing prompt_token_ids");
-            send_terminal_output(output_tx, request_id, EngineCoreFinishReason::Error, None)?;
+            send_terminal_output(
+                output_tx,
+                request_id,
+                EngineCoreFinishReason::Error,
+                None,
+                None,
+                None,
+            )?;
             return Ok(());
         };
         let Some(sampling_params) = sampling_params else {
             warn!("request {request_id} dropped: missing sampling_params");
-            send_terminal_output(output_tx, request_id, EngineCoreFinishReason::Error, None)?;
+            send_terminal_output(
+                output_tx,
+                request_id,
+                EngineCoreFinishReason::Error,
+                None,
+                None,
+                None,
+            )?;
             return Ok(());
         };
 
@@ -651,8 +665,13 @@ where
         chat_template: None,
         default_chat_template_kwargs: None,
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
-        enable_log_requests: true,
-        enable_request_id_headers: false,
+        language_model_only: true,
+        api_keys: Vec::new(),
+        api_server_options: ApiServerOptions {
+            enable_log_requests: true,
+            enable_prompt_tokens_details: true,
+            enable_request_id_headers: false,
+        },
         disable_log_stats: true,
         grpc_port: None,
         shutdown_timeout: Duration::from_secs(10),
@@ -807,6 +826,7 @@ async fn run_request_stream(
                 queued_at_unix_s,
                 scheduled_at_unix_s,
                 prompt_tokens,
+                cached_tokens,
             } => {
                 first_token_events = Some(vec![
                     EngineCoreEvent {
@@ -818,11 +838,14 @@ async fn run_request_stream(
                         timestamp: scheduled_at_unix_s,
                     },
                 ]);
+                // Upstream invariant: computed (actual prefill work) +
+                // cached (prefix-cache hit) == prompt; double-counting skews
+                // the per-source prompt token metrics.
                 first_token_prefill_stats = Some(PrefillStats {
                     num_prompt_tokens: prompt_tokens as u32,
-                    num_computed_tokens: prompt_tokens as u32,
-                    num_cached_tokens: 0,
-                    num_local_cached_tokens: 0,
+                    num_computed_tokens: prompt_tokens.saturating_sub(cached_tokens) as u32,
+                    num_cached_tokens: cached_tokens as u32,
+                    num_local_cached_tokens: cached_tokens as u32,
                     num_external_cached_tokens: 0,
                 });
             }
@@ -855,11 +878,16 @@ async fn run_request_stream(
                 // Prompt logprobs are intentionally deferred for this bridge.
             }
             TokenEvent::Finished { finish_reason, .. } => {
+                // A request can finish without emitting a token (EOS sampled
+                // on prefill) — flush the pending scheduled events and prefill
+                // stats with the terminal output or they are lost.
                 let _ = send_terminal_output(
                     &output_tx,
                     request_id,
                     convert_finish_reason(finish_reason),
                     None,
+                    first_token_events.take(),
+                    first_token_prefill_stats.take(),
                 );
                 return;
             }
@@ -870,6 +898,8 @@ async fn run_request_stream(
                     request_id,
                     EngineCoreFinishReason::Error,
                     Some(StopReason::Text(message)),
+                    None,
+                    None,
                 );
                 return;
             }
@@ -881,6 +911,8 @@ async fn run_request_stream(
                     request_id,
                     EngineCoreFinishReason::Error,
                     Some(StopReason::Text(message)),
+                    None,
+                    None,
                 );
                 return;
             }
@@ -933,6 +965,8 @@ fn send_terminal_output(
     request_id: String,
     finish_reason: EngineCoreFinishReason,
     stop_reason: Option<StopReason>,
+    events: Option<Vec<EngineCoreEvent>>,
+    prefill_stats: Option<PrefillStats>,
 ) -> Result<()> {
     send_outputs(
         output_tx,
@@ -944,8 +978,8 @@ fn send_terminal_output(
                 None,
                 Some(finish_reason),
                 stop_reason,
-                None,
-                None,
+                events,
+                prefill_stats,
             )],
             finished_requests: Some(BTreeSet::from([request_id])),
             timestamp: now_secs_f64(),
@@ -960,7 +994,7 @@ fn send_utility_response(
     method_name: &str,
 ) -> Result<()> {
     let result = match method_name {
-        "is_sleeping" | "reset_prefix_cache" => rmpv::ext::to_value(false)?,
+        "is_sleeping" | "is_paused" | "reset_prefix_cache" => rmpv::ext::to_value(false)?,
         "sleep" | "wake_up" | "reset_mm_cache" | "reset_encoder_cache" | "collective_rpc" => {
             rmpv::Value::Nil
         }
@@ -1469,6 +1503,7 @@ mod tests {
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 16,
+                cached_tokens: 0,
             })
             .expect("send scheduled");
         token_tx
@@ -1544,6 +1579,7 @@ mod tests {
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 8,
+                cached_tokens: 5,
             })
             .expect("send scheduled");
         token_tx
@@ -1573,9 +1609,62 @@ mod tests {
         assert_eq!(first_batch.outputs[0].new_token_ids, vec![1]);
         assert_eq!(second_batch.outputs[0].new_token_ids, vec![2]);
         assert!(first_batch.outputs[0].events.is_some());
-        assert!(first_batch.outputs[0].prefill_stats.is_some());
+        let stats = first_batch.outputs[0]
+            .prefill_stats
+            .as_ref()
+            .expect("first batch carries prefill stats");
+        assert_eq!(stats.num_prompt_tokens, 8);
+        assert_eq!(stats.num_cached_tokens, 5);
+        assert_eq!(stats.num_local_cached_tokens, 5);
+        assert_eq!(
+            stats.num_computed_tokens, 3,
+            "computed must be prompt minus cached, not the full prompt"
+        );
         assert!(second_batch.outputs[0].events.is_none());
         assert!(second_batch.outputs[0].prefill_stats.is_none());
+        assert!(output_rx.recv().await.is_none());
+    }
+
+    /// A request that stops on its first sampled token never emits `Token`
+    /// — the terminal output must still deliver the scheduled events and
+    /// prefill stats or cached_tokens silently vanishes from usage.
+    #[tokio::test]
+    async fn stop_on_prefill_terminal_output_carries_prefill_stats() {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        token_tx
+            .send(TokenEvent::Scheduled {
+                queued_at_unix_s: 1.0,
+                scheduled_at_unix_s: 2.0,
+                prompt_tokens: 16,
+                cached_tokens: 4,
+            })
+            .expect("send scheduled");
+        token_tx
+            .send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 16,
+                completion_tokens: 0,
+            })
+            .expect("send finished");
+        drop(token_tx);
+
+        run_request_stream("req-stop".to_string(), token_rx, output_tx).await;
+
+        let terminal = output_rx.recv().await.expect("terminal output");
+        let output = &terminal.outputs[0];
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert!(
+            output.events.is_some(),
+            "queued/scheduled events must flush"
+        );
+        let stats = output
+            .prefill_stats
+            .as_ref()
+            .expect("terminal output must flush prefill stats");
+        assert_eq!(stats.num_cached_tokens, 4);
+        assert_eq!(stats.num_computed_tokens, 12);
         assert!(output_rx.recv().await.is_none());
     }
 

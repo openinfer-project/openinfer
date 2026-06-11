@@ -134,6 +134,9 @@ pub enum TokenEvent {
         queued_at_unix_s: f64,
         scheduled_at_unix_s: f64,
         prompt_tokens: usize,
+        /// Prompt tokens served from the prefix cache (0 when the engine has
+        /// no prefix cache or the value is not known at emit time).
+        cached_tokens: usize,
     },
     Token {
         id: u32,
@@ -158,6 +161,15 @@ pub enum TokenEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+}
+
+/// Seconds since `UNIX_EPOCH` as `f64` — the clock base for `TokenEvent`
+/// timestamps.
+pub fn unix_now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before UNIX_EPOCH")
+        .as_secs_f64()
 }
 
 #[derive(Clone)]

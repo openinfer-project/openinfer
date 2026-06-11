@@ -1,6 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 
 use crate::runner::worker::KIMI_MAX_REQUEST_TOKENS;
 
@@ -95,6 +93,10 @@ pub(in crate::runner) fn send_scheduled(req: &GenerateRequest) {
         queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at),
         scheduled_at_unix_s: scheduled_at,
         prompt_tokens: req.prompt_tokens.len(),
+        // Emitted at admission, before the KV prefix match runs — the real
+        // hit count is not known yet (kimi prefix-cache usage reporting is a
+        // follow-up).
+        cached_tokens: 0,
     });
 }
 
@@ -149,11 +151,4 @@ fn validate_sampling_params(req: &GenerateRequest) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn unix_now_s() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before UNIX_EPOCH")
-        .as_secs_f64()
 }

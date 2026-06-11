@@ -83,6 +83,7 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
             queued_at_unix_s,
             scheduled_at_unix_s: now_secs_f64(),
             prompt_tokens: prompt_len,
+            cached_tokens: 0,
         })
         .is_err()
     {

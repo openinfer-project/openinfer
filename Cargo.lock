@@ -1620,6 +1620,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8072bec12b909b65aec01fa6518f387cfbf3427d4475409ad622898cd347522c"
 
 [[package]]
+name = "educe"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7bc049e1bd8cdeb31b68bbd586a9464ecf9f3944af3958a7a9d0f8b9799417"
+dependencies = [
+ "enum-ordinalize",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1659,6 +1671,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0359ee92f81184d7985519e474bda2a5738476334edd3746c9b1265c067afe70"
 dependencies = [
  "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "enum-ordinalize"
+version = "4.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a1091a7bb1f8f2c4b28f1fe2cef4980ca2d410a3d727d67ecc3178c9b0800f0"
+dependencies = [
+ "enum-ordinalize-derive",
+]
+
+[[package]]
+name = "enum-ordinalize-derive"
+version = "4.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ca9601fb2d62598ee17836250842873a413586e5d7ed88b356e38ddbb0ec631"
+dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4976,7 +5008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -4997,7 +5029,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7551,13 +7583,14 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
  "easy-ext",
  "futures",
  "half",
+ "indexmap 2.14.0",
  "itertools 0.14.0",
  "llm-multimodal",
  "minijinja",
@@ -7586,7 +7619,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -7620,7 +7653,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -7639,7 +7672,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "prometheus-client",
 ]
@@ -7647,7 +7680,7 @@ dependencies = [
 [[package]]
 name = "vllm-reasoning-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "thiserror 2.0.18",
  "vllm-tokenizer",
@@ -7656,11 +7689,12 @@ dependencies = [
 [[package]]
 name = "vllm-server"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
  "axum",
+ "educe",
  "futures",
  "http-body",
  "itertools 0.14.0",
@@ -7672,7 +7706,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sha2 0.10.9",
  "socket2",
+ "subtle",
  "thiserror-ext",
  "tokio",
  "tokio-stream",
@@ -7696,7 +7732,7 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7720,7 +7756,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -7739,7 +7775,7 @@ dependencies = [
 [[package]]
 name = "vllm-tool-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=4aaed4ca225a3745aa1e18864dad0599d3ac7626#4aaed4ca225a3745aa1e18864dad0599d3ac7626"
+source = "git+https://github.com/vllm-project/vllm.git?rev=5d5591d99bb7b2ba695766a992dc328ca5867a4c#5d5591d99bb7b2ba695766a992dc328ca5867a4c"
 dependencies = [
  "easy-ext",
  "serde",

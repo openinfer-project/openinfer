@@ -18,6 +18,10 @@ pub(super) enum ExecutionArtifacts {
     Prefill {
         pending: Vec<PendingRequest>,
         result: PrefillResult,
+        /// Stamped before the forward pass ran — downstream metrics split
+        /// queue time (queued→scheduled) from prefill time (scheduled→first
+        /// token), so stamping after execution would fold prefill into queue.
+        scheduled_at_unix_s: f64,
     },
     Decode {
         result: DecodeResult,
@@ -25,6 +29,7 @@ pub(super) enum ExecutionArtifacts {
     Unified {
         pending: Vec<PendingRequest>,
         result: UnifiedResult,
+        scheduled_at_unix_s: f64,
     },
 }
 
@@ -51,6 +56,7 @@ pub(super) fn execute_plan(
 ) -> Result<ExecutionArtifacts> {
     match plan {
         ExecutionPlan::Prefill { pending } => {
+            let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
             let requests = build_prefill_items(&pending, &indices, rng);
             let any_echo = pending.iter().any(|req| req.echo);
@@ -59,7 +65,11 @@ pub(super) fn execute_plan(
                 echo: any_echo,
             })?;
             sort_prefill_results(&mut result.requests);
-            Ok(ExecutionArtifacts::Prefill { pending, result })
+            Ok(ExecutionArtifacts::Prefill {
+                pending,
+                result,
+                scheduled_at_unix_s,
+            })
         }
         ExecutionPlan::Decode => {
             let indices: Vec<usize> = (0..active.len()).collect();
@@ -71,6 +81,7 @@ pub(super) fn execute_plan(
             Ok(ExecutionArtifacts::Decode { result })
         }
         ExecutionPlan::Unified { pending } => {
+            let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
             let active_indices: Vec<usize> = (0..active.len()).collect();
             let prefill_requests = build_prefill_items(&pending, &pending_indices, rng);
@@ -81,7 +92,11 @@ pub(super) fn execute_plan(
             })?;
             sort_prefill_results(&mut result.prefill_requests);
             sort_decode_results(&mut result.decode_requests);
-            Ok(ExecutionArtifacts::Unified { pending, result })
+            Ok(ExecutionArtifacts::Unified {
+                pending,
+                result,
+                scheduled_at_unix_s,
+            })
         }
     }
 }
@@ -156,6 +171,7 @@ mod tests {
             token_tx,
             logprobs: 0,
             echo: false,
+            queued_at_unix_s: None,
             prefetch_offered: false,
         }
     }

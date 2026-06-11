@@ -1,7 +1,7 @@
 use crate::executor::{DecodeRequestResult, ModelExecutor, PrefillRequestResult};
 use openinfer_core::engine::FinishReason;
 
-use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, StepEffects};
+use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, ScheduledEffect, StepEffects};
 use super::plan::ExecutionArtifacts;
 use super::{ActiveRequestState, PendingRequest};
 
@@ -11,16 +11,28 @@ pub(super) fn resolve_step(
     artifacts: ExecutionArtifacts,
 ) -> StepEffects {
     match artifacts {
-        ExecutionArtifacts::Prefill { pending, result } => {
-            resolve_prefill_outputs(executor, pending, result.requests)
-        }
+        ExecutionArtifacts::Prefill {
+            pending,
+            result,
+            scheduled_at_unix_s,
+        } => resolve_prefill_outputs(executor, pending, result.requests, scheduled_at_unix_s),
         ExecutionArtifacts::Decode { result } => StepEffects {
+            scheduled: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
         },
-        ExecutionArtifacts::Unified { pending, result } => {
-            let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
+        ExecutionArtifacts::Unified {
+            pending,
+            result,
+            scheduled_at_unix_s,
+        } => {
+            let mut effects = resolve_prefill_outputs(
+                executor,
+                pending,
+                result.prefill_requests,
+                scheduled_at_unix_s,
+            );
             effects.decode = resolve_decode_outputs(executor, active, &result.decode_requests);
             effects
         }
@@ -31,11 +43,20 @@ fn resolve_prefill_outputs(
     executor: &impl ModelExecutor,
     pending: Vec<PendingRequest>,
     request_results: Vec<PrefillRequestResult>,
+    scheduled_at_unix_s: f64,
 ) -> StepEffects {
     let mut effects = StepEffects::empty();
     for (req, result) in pending.into_iter().zip(request_results) {
         debug_assert_eq!(req.request_id, result.request_id);
         let prompt_len = req.prompt_tokens.len();
+
+        effects.scheduled.push(ScheduledEffect {
+            token_tx: req.token_tx.clone(),
+            queued_at_unix_s: req.queued_at_unix_s,
+            scheduled_at_unix_s,
+            prompt_tokens: prompt_len,
+            cached_tokens: result.cached_tokens,
+        });
 
         if req.echo {
             effects.prompt_echoes.push(PromptEchoEffect {

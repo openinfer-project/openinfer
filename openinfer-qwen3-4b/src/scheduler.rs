@@ -54,6 +54,7 @@ pub(super) struct PendingRequest {
     pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
     pub(super) logprobs: usize,
     pub(super) echo: bool,
+    pub(super) queued_at_unix_s: Option<f64>,
     /// Whether this request has already been offered to async KV prefetch.
     /// Offered at most once; a no-hit offer leaves the request in the normal
     /// admission flow with this set so it isn't re-probed every tick.
@@ -71,6 +72,7 @@ impl PendingRequest {
             token_tx: req.token_tx,
             logprobs: req.logprobs,
             echo: req.echo,
+            queued_at_unix_s: req.queued_at_unix_s,
             prefetch_offered: false,
         }
     }
@@ -874,6 +876,7 @@ mod tests {
 
     struct FakeExecutor {
         block_size: usize,
+        cached_tokens: usize,
         max_request_blocks: usize,
         max_context_tokens: usize,
         available_blocks: usize,
@@ -893,6 +896,7 @@ mod tests {
         fn new(max_request_blocks: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
             Self {
                 block_size: 16,
+                cached_tokens: 0,
                 max_request_blocks,
                 max_context_tokens: usize::MAX,
                 available_blocks: max_request_blocks,
@@ -907,6 +911,11 @@ mod tests {
                 prefill_lora_batches: Arc::new(Mutex::new(Vec::new())),
                 decode_lora_batches: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_cached_tokens(mut self, cached_tokens: usize) -> Self {
+            self.cached_tokens = cached_tokens;
+            self
         }
 
         fn with_decode_failure(mut self) -> Self {
@@ -1050,7 +1059,7 @@ mod tests {
                         first_token: 100 + req.request_id.get() as u32,
                         first_token_logprob: None,
                         prompt_logprobs: None,
-                        cached_tokens: 0,
+                        cached_tokens: self.cached_tokens,
                     })
                     .collect(),
             })
@@ -1148,7 +1157,7 @@ mod tests {
                         first_token: 100 + req.request_id.get() as u32,
                         first_token_logprob: None,
                         prompt_logprobs: None,
-                        cached_tokens: 0,
+                        cached_tokens: self.cached_tokens,
                     })
                     .collect(),
                 decode_requests: plan
@@ -1427,17 +1436,61 @@ mod tests {
         let (fits_exactly, mut rx) = request(16, 1);
         handle.submit(fits_exactly).expect("submit fits_exactly");
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
+            matches!(
+                recv_skipping_scheduled(&mut rx),
+                Some(TokenEvent::Token { id: 100, .. })
+            ),
             "prefill should emit the sampled token"
         );
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "one-token completion should finish without a decode KV page"
         );
         assert!(
             dropped.lock().unwrap().contains(&0),
             "finished request should release its one prompt page"
         );
+    }
+
+    /// The engine stream opens with exactly one `Scheduled` event carrying
+    /// the executor-reported prefix-cache hit count (#246) — before any
+    /// token, and never again.
+    #[test]
+    fn scheduled_event_reports_cached_tokens_exactly_once() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_cached_tokens(7);
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+
+        let (req, mut rx) = request(32, 2);
+        handle.submit(req).expect("submit");
+
+        match rx.blocking_recv() {
+            Some(TokenEvent::Scheduled {
+                prompt_tokens,
+                cached_tokens,
+                queued_at_unix_s,
+                scheduled_at_unix_s,
+            }) => {
+                assert_eq!(prompt_tokens, 32);
+                assert_eq!(cached_tokens, 7);
+                assert!(queued_at_unix_s <= scheduled_at_unix_s);
+            }
+            _ => panic!("first event must be Scheduled"),
+        }
+
+        loop {
+            match rx.blocking_recv() {
+                Some(TokenEvent::Scheduled { .. }) => {
+                    panic!("Scheduled must be emitted exactly once")
+                }
+                Some(TokenEvent::Finished { .. }) => break,
+                Some(_) => {}
+                None => panic!("stream closed without Finished"),
+            }
+        }
     }
 
     #[test]
@@ -1577,7 +1630,7 @@ mod tests {
         handle.submit(long_running).expect("submit long_running");
         assert!(
             matches!(
-                long_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut long_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "first request should prefill"
@@ -1588,7 +1641,7 @@ mod tests {
 
         assert!(
             matches!(
-                wait_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut wait_rx),
                 Some(TokenEvent::Token { id: 101, .. })
             ),
             "waiting request should start once the active request releases its full KV budget"
@@ -1598,9 +1651,23 @@ mod tests {
             "second request was admitted before the first request released KV"
         );
         assert!(
-            matches!(wait_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut wait_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "waiting request should finish after admission"
         );
+    }
+
+    /// Engine streams now open with `TokenEvent::Scheduled` (#246); these
+    /// tests assert on the token/terminal events, so skip past it.
+    fn recv_skipping_scheduled(rx: &mut mpsc::UnboundedReceiver<TokenEvent>) -> Option<TokenEvent> {
+        loop {
+            match rx.blocking_recv() {
+                Some(TokenEvent::Scheduled { .. }) => {}
+                other => return other,
+            }
+        }
     }
 
     fn pending(request_id: u64, echo: bool) -> PendingRequest {
@@ -1614,6 +1681,7 @@ mod tests {
             token_tx,
             logprobs: 0,
             echo,
+            queued_at_unix_s: None,
             prefetch_offered: false,
         }
     }
@@ -1705,12 +1773,15 @@ mod tests {
 
         let (fits, mut fits_rx) = request(16, 1);
         handle.submit(fits).expect("submit fits");
-        match fits_rx.blocking_recv() {
+        match recv_skipping_scheduled(&mut fits_rx) {
             Some(TokenEvent::Token { id, .. }) => assert_eq!(id, 101),
             _ => panic!("later fitting request should emit a token"),
         }
         assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut fits_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "later fitting request should finish"
         );
     }
@@ -1747,11 +1818,17 @@ mod tests {
         let (fits, mut fits_rx) = request(16, 1);
         handle.submit(fits).expect("submit fits");
         assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Token { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut fits_rx),
+                Some(TokenEvent::Token { .. })
+            ),
             "later fitting request should emit a token"
         );
         assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut fits_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "later fitting request should finish"
         );
     }
@@ -1851,13 +1928,16 @@ mod tests {
 
         assert!(
             matches!(
-                base_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut base_rx),
                 Some(TokenEvent::Token { id: 101, .. })
             ),
             "base request should still run after unknown adapter rejection"
         );
         assert!(
-            matches!(base_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut base_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "base request should finish"
         );
     }
@@ -1872,12 +1952,12 @@ mod tests {
         handle.submit(will_fail).expect("submit will_fail");
         assert!(
             matches!(
-                fail_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut fail_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "first token should be emitted before decode failure"
         );
-        match fail_rx.blocking_recv() {
+        match recv_skipping_scheduled(&mut fail_rx) {
             Some(TokenEvent::Error {
                 message,
                 prompt_tokens,
@@ -1901,13 +1981,16 @@ mod tests {
         handle.submit(after_failure).expect("submit after_failure");
         assert!(
             matches!(
-                after_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut after_rx),
                 Some(TokenEvent::Token { id: 101, .. })
             ),
             "scheduler should accept new work after a decode error"
         );
         assert!(
-            matches!(after_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                recv_skipping_scheduled(&mut after_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "request after failure should finish"
         );
     }
@@ -1924,7 +2007,7 @@ mod tests {
             .expect("submit will_disconnect");
         assert!(
             matches!(
-                token_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut token_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "prefill should emit the first token"
@@ -1968,6 +2051,7 @@ mod tests {
             &mut executor,
             &mut active,
             effects::StepEffects {
+                scheduled: Vec::new(),
                 prompt_echoes: Vec::new(),
                 pending: Vec::new(),
                 decode: vec![
@@ -2068,7 +2152,7 @@ mod tests {
         handle.submit(long_running).expect("submit long_running");
         assert!(
             matches!(
-                token_rx.blocking_recv(),
+                recv_skipping_scheduled(&mut token_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "first token should be emitted before decode"
@@ -2096,7 +2180,10 @@ mod tests {
             "load_lora_adapter should wait while generation is active"
         );
 
-        while !matches!(token_rx.blocking_recv(), Some(TokenEvent::Finished { .. })) {}
+        while !matches!(
+            recv_skipping_scheduled(&mut token_rx),
+            Some(TokenEvent::Finished { .. })
+        ) {}
 
         let error = load_thread
             .join()
