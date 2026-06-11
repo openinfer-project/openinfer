@@ -175,19 +175,68 @@ Sampling and logprob support is model-dependent. Qwen models support the samplin
 
 ## Architecture
 
-```
-HTTP / vLLM frontend → EngineHandle → per-model engine crate
-                                  │
-          ┌───────────────────────┼───────────────────────┐
-          │                       │                       │
-openinfer-qwen3-4b      openinfer-qwen35-4b     openinfer-deepseek-v4
-  (full attention)      (24 linear + 8 full)    (MP8 MoE + sparse attn)
-          │                       │                       │
-          └───────────────────────┼───────────────────────┘
-                                  │
-                  openinfer-core runtime + openinfer-kernels
-                                  │
-                  CUDA / cuBLAS / Triton / TileLang / FlashInfer
+```mermaid
+flowchart TB
+    api["HTTP / OpenAI-compatible /v1/completions"]
+    frontend["openinfer-server<br/>openinfer-vllm-frontend"]
+    runtime["EngineHandle<br/>openinfer-core shared runtime"]
+
+    api --> frontend
+    frontend --> runtime
+
+    subgraph engines["Per-model engine crates"]
+        direction LR
+        qwen3["openinfer-qwen3-4b<br/>full attention"]
+        qwen35["openinfer-qwen35-4b<br/>24 linear + 8 full attention"]
+        dsv2["openinfer-deepseek-v2-lite<br/>MoE + EP"]
+        dsv4["openinfer-deepseek-v4<br/>MoE + compressor + indexer"]
+        kimi["openinfer-kimi-k2<br/>MLA + MoE + Marlin INT4"]
+    end
+
+    runtime --> qwen3
+    runtime --> qwen35
+    runtime --> dsv2
+    runtime --> dsv4
+    runtime --> kimi
+
+    subgraph shared["Shared kernels and KV management"]
+        direction LR
+        kernels["openinfer-kernels"]
+        kvbm["kvbm/*<br/>dynamo-memory / kvbm-logical / kvbm-kernels"]
+    end
+
+    qwen3 --> kernels
+    qwen35 --> kernels
+    dsv2 --> kernels
+    dsv4 --> kernels
+    kimi --> kernels
+
+    qwen3 --> kvbm
+    qwen35 --> kvbm
+    dsv2 --> kvbm
+    dsv4 --> kvbm
+    kimi --> kvbm
+
+    subgraph backends["Backend libraries and communication"]
+        direction LR
+        cuda["CUDA"]
+        cublas["cuBLAS"]
+        triton["Triton AOT"]
+        tilelang["TileLang"]
+        flashinfer["FlashInfer"]
+        nccl["NCCL"]
+        comm["openinfer-comm<br/>PPLX all-to-all"]
+    end
+
+    kernels --> cuda
+    kernels --> cublas
+    kernels --> triton
+    kernels --> tilelang
+    kernels --> flashinfer
+    dsv2 --> comm
+    dsv4 --> comm
+    kimi --> comm
+    comm --> nccl
 ```
 
 **Key design decisions:**
