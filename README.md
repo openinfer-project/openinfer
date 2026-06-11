@@ -212,9 +212,6 @@ flowchart TB
     kimi --> kernels
 
     qwen3 --> kvbm
-    qwen35 --> kvbm
-    dsv2 --> kvbm
-    dsv4 --> kvbm
     kimi --> kvbm
 
     subgraph backends["Backend libraries and communication"]
@@ -225,7 +222,8 @@ flowchart TB
         tilelang["TileLang"]
         flashinfer["FlashInfer"]
         nccl["NCCL"]
-        comm["openinfer-comm<br/>PPLX all-to-all"]
+        deepep["DeepEP shim<br/>NCCL"]
+        comm["openinfer-comm<br/>optional pplx-ep PPLX all-to-all"]
     end
 
     kernels --> cuda
@@ -233,9 +231,11 @@ flowchart TB
     kernels --> triton
     kernels --> tilelang
     kernels --> flashinfer
-    dsv2 --> comm
-    dsv4 --> comm
-    kimi --> comm
+    dsv2 --> nccl
+    dsv4 --> nccl
+    kimi --> deepep
+    deepep --> nccl
+    dsv4 -.-> comm
     comm --> nccl
 ```
 
