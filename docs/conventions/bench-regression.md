@@ -20,6 +20,8 @@ Regressions are only meaningful when comparing the **same GPU** across commits. 
 | decode_heavy | 1024 | 256 | TPOT (steady, excluding first decode step) | yes |
 | mixed_itl | 4096 inj / 512 bg | 1 inj / 1024 bg | background decode ITL p50/p99 | **no** |
 
+The `mixed_itl` row carries two values per column because the profile runs two request kinds at once: `inj` is the injected long prompt that triggers the stall, `bg` is each of the background decode streams it stalls. So `4096 inj / 512 bg` = a 4096-token injection over 512-token background prompts, and `1 inj / 1024 bg` = the injection emits 1 token (prefill-only) while each background stream decodes up to 1024.
+
 Prefill prompt length is model-dependent: Qwen3 uses 10000 tokens, Qwen3.5 uses 4000 (HD256 attention needs ~4x working memory vs HD128, OOMs at 10k on 16 GB GPUs). `compare` checks shape consistency within the same model — if you change the constants, it will error until you re-baseline.
 
 `prefill_heavy` with `output_len=1` produces no steady decode steps: `steady_tpot_ms` is `null` in the JSON. This is expected.
