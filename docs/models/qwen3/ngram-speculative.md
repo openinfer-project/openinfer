@@ -118,11 +118,31 @@ still uses plain decode.
 1. **First-class config knob**: env var is the current switch; thread a typed
    knob through `start_qwen3*` / `start_engine*` (and a server flag) so it shows
    up in the engine config rather than the environment.
-2. **Speedup measurement**: acceptance-rate / TPOT on repetitive prompts (the
-   payoff, distinct from the lossless correctness oracle).
+2. **Speedup measurement** (initial numbers below — generalize to realistic
+   prompts and the scheduler loop).
 3. **Batched / vLLM-style verify** (perf): fold the verify tokens into the
    unified batched forward (FlashInfer varlen) with a GPU rejection step,
    instead of the current per-request `batch_prefill`-based verify.
+
+## Measured speedup (best case)
+
+`tests/ngram_speculative.rs::ngram_speculative_speedup` (ignored; needs GPU +
+weights) times greedy vs. speculative on Qwen3-4B (eager, single request, 192
+tokens). On the perfectly periodic synthetic prompt:
+
+| metric            | greedy   | speculative |
+| ----------------- | -------- | ----------- |
+| forward passes    | 191      | 39          |
+| ms / token        | 9.99     | 2.52        |
+| accepted / verify | —        | 5.00 (max with K=4) |
+| wall-clock        | 1908 ms  | 481 ms (**3.96x**) |
+
+This is the ceiling: the prompt is exactly periodic so every draft is accepted.
+Real prompts accept a fraction of drafts, so expect smaller wins; the benchmark
+exists to track acceptance-rate / TPOT as the proposer and verify path evolve.
+Run: `cargo test -p openinfer-qwen3-4b --release --test ngram_speculative \
+ngram_speculative_speedup -- --ignored --nocapture` (`OPENINFER_BENCH_TOKENS`
+overrides the 192-token default).
 
 ## Scope / deferred
 

@@ -51,10 +51,14 @@ fn repetitive_prompt() -> Vec<u32> {
 }
 
 fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
+    prefill_item_max(id, prompt, MAX_OUTPUT)
+}
+
+fn prefill_item_max(id: u64, prompt: &[u32], max_output: usize) -> PrefillStepItem {
     PrefillStepItem::new(
         RequestId::new(id),
         prompt.to_vec(),
-        MAX_OUTPUT,
+        max_output,
         SamplingParams::default(),
         0,
         false,
@@ -157,5 +161,179 @@ fn ngram_speculative_is_lossless_vs_greedy() {
     assert_eq!(
         reference, speculative,
         "greedy speculative decode must be token-identical to plain greedy decode"
+    );
+}
+
+/// Counters for the speculative run: how many forward passes (verify + fallback
+/// single decodes) it took and how many tokens those passes committed.
+struct SpecStats {
+    tokens: usize,
+    forwards: usize,
+    drafted_forwards: usize,
+    drafted_tokens: usize,
+}
+
+/// Greedy speculative decode that also tallies forward passes / acceptance.
+fn speculative_decode_timed(
+    ex: &mut Qwen3Executor,
+    id: u64,
+    prompt: &[u32],
+    n_generate: usize,
+) -> (Vec<u32>, SpecStats) {
+    let proposer = NgramProposer::new(NgramConfig {
+        max_ngram: 3,
+        min_ngram: 1,
+        num_speculative: 4,
+    });
+    let pr = ex
+        .execute_prefill(PrefillPlan {
+            requests: &[prefill_item_max(id, prompt, n_generate + 8)],
+            echo: false,
+        })
+        .expect("prefill");
+    let first = pr.requests[0].first_token;
+    let mut history = prompt.to_vec();
+    history.push(first);
+    let mut out = vec![first];
+    let mut stats = SpecStats {
+        tokens: 0,
+        forwards: 0,
+        drafted_forwards: 0,
+        drafted_tokens: 0,
+    };
+
+    while out.len() < n_generate {
+        let last = *out.last().unwrap();
+        let drafts = proposer.propose(&history);
+        if drafts.is_empty() {
+            let dr = ex
+                .execute_decode(DecodePlan {
+                    requests: &[DecodeStepItem::new(
+                        RequestId::new(id),
+                        last,
+                        SamplingParams::default(),
+                        0,
+                        0.0,
+                    )],
+                })
+                .expect("decode");
+            let t = dr.requests[0].token;
+            history.push(t);
+            out.push(t);
+            stats.forwards += 1;
+        } else {
+            let committed = ex
+                .execute_speculative(&SpeculativeStepItem::new(RequestId::new(id), last, drafts))
+                .expect("speculative");
+            stats.forwards += 1;
+            stats.drafted_forwards += 1;
+            stats.drafted_tokens += committed.len();
+            for t in committed {
+                history.push(t);
+                out.push(t);
+            }
+        }
+    }
+    out.truncate(n_generate);
+    stats.tokens = n_generate;
+    (out, stats)
+}
+
+/// Wall-clock + acceptance benchmark; ignored by default (needs a GPU + weights
+/// and is timing-sensitive). Run with:
+/// `cargo test -p openinfer-qwen3-4b --release --test ngram_speculative \
+///   ngram_speculative_speedup -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn ngram_speculative_speedup() {
+    use std::time::Instant;
+
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let n_generate = std::env::var("OPENINFER_BENCH_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(192usize);
+
+    let mut ex =
+        Qwen3Executor::from_runtime(&model_path, false, &[0]).expect("build eager executor");
+    ex.set_prefix_cache_enabled(false);
+    let prompt = repetitive_prompt();
+
+    // Warm up CUDA/cuBLAS so the first run's lazy init doesn't skew timings.
+    let _ = greedy_decode(&mut ex, 100, &prompt);
+
+    let t0 = Instant::now();
+    let baseline = {
+        // Inline greedy decode for `n_generate` tokens (greedy_decode is fixed at
+        // N_GENERATE), counting decode forwards.
+        let pr = ex
+            .execute_prefill(PrefillPlan {
+                requests: &[prefill_item_max(1, &prompt, n_generate + 8)],
+                echo: false,
+            })
+            .expect("prefill");
+        let mut last = pr.requests[0].first_token;
+        let mut out = vec![last];
+        while out.len() < n_generate {
+            let dr = ex
+                .execute_decode(DecodePlan {
+                    requests: &[DecodeStepItem::new(
+                        RequestId::new(1),
+                        last,
+                        SamplingParams::default(),
+                        0,
+                        0.0,
+                    )],
+                })
+                .expect("decode");
+            last = dr.requests[0].token;
+            out.push(last);
+        }
+        out
+    };
+    let baseline_dt = t0.elapsed();
+    let baseline_forwards = baseline.len() - 1; // one decode forward per token after prefill
+
+    let t1 = Instant::now();
+    let (spec_out, stats) = speculative_decode_timed(&mut ex, 2, &prompt, n_generate);
+    let spec_dt = t1.elapsed();
+
+    assert_eq!(
+        baseline, spec_out,
+        "speculative output must stay token-identical to greedy"
+    );
+
+    let baseline_tpot = baseline_dt.as_secs_f64() / baseline_forwards as f64 * 1e3;
+    let spec_tpot = spec_dt.as_secs_f64() / (stats.tokens - 1) as f64 * 1e3;
+    let accept_per_verify = stats.drafted_tokens as f64 / stats.drafted_forwards.max(1) as f64;
+
+    eprintln!("=== n-gram speculative decode benchmark ===");
+    eprintln!("tokens generated   : {}", stats.tokens);
+    eprintln!(
+        "baseline (greedy)  : {:>7.1} ms, {} forwards, {:.3} ms/token",
+        baseline_dt.as_secs_f64() * 1e3,
+        baseline_forwards,
+        baseline_tpot
+    );
+    eprintln!(
+        "speculative        : {:>7.1} ms, {} forwards ({} verify), {:.3} ms/token",
+        spec_dt.as_secs_f64() * 1e3,
+        stats.forwards,
+        stats.drafted_forwards,
+        spec_tpot
+    );
+    eprintln!(
+        "accepted/verify    : {:.2} tokens (K=4, so up to 5 per verify)",
+        accept_per_verify
+    );
+    eprintln!(
+        "forward-pass saving: {:.1}% fewer model calls",
+        (1.0 - stats.forwards as f64 / baseline_forwards as f64) * 100.0
+    );
+    eprintln!(
+        "wall-clock speedup : {:.2}x",
+        baseline_dt.as_secs_f64() / spec_dt.as_secs_f64()
     );
 }
