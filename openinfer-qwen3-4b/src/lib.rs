@@ -8,6 +8,7 @@ mod config;
 mod executor;
 pub mod kernel_bench;
 mod lora;
+pub mod ngram;
 mod prefill;
 mod scheduler;
 mod unified_forward;
