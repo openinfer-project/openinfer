@@ -576,6 +576,16 @@ mod tests {
         .unwrap()
     }
 
+    /// Split batched `[vocab, n]` logits into one `DeviceVec` per column.
+    fn split_logits_columns(
+        model: &Qwen3Model,
+        logits: &openinfer_core::tensor::HiddenStates,
+    ) -> Vec<DeviceVec> {
+        (0..logits.seq_len)
+            .map(|i| ops::extract_vec(&model.ctx, logits, i).unwrap())
+            .collect()
+    }
+
     fn prefill_one(
         model: &Qwen3Model,
         mgr: &KvCacheManager,
@@ -588,7 +598,7 @@ mod tests {
         rkv.schedule_prefill(prompt_tokens.len(), mgr.pool())
             .unwrap();
         let view = rkv.prefill_view(prompt_tokens.len());
-        let (logits_vec, _) = model
+        let (logits, _) = model
             .batch_prefill(
                 &[prompt_tokens],
                 &[view],
@@ -598,6 +608,7 @@ mod tests {
                 false,
             )
             .unwrap();
+        let logits_vec = split_logits_columns(model, &logits);
         let first_token = sample_logits(model, &logits_vec[0], params, rng);
         rkv.apply_prefill(first_token, mgr.pool()).unwrap();
         (rkv, first_token)
@@ -679,7 +690,7 @@ mod tests {
             .zip(prompts.iter())
             .map(|(r, p)| r.prefill_view(p.len()))
             .collect();
-        let (logits_vec, _) = model
+        let (logits, _) = model
             .batch_prefill(
                 prompts,
                 &views,
@@ -689,7 +700,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let first_tokens: Vec<u32> = logits_vec
+        let first_tokens: Vec<u32> = split_logits_columns(model, &logits)
             .iter()
             .map(|logits| sample_logits(model, logits, &params, &mut rng))
             .collect();
@@ -817,7 +828,7 @@ mod tests {
                 .unwrap();
 
             let mut batch_first_tokens = Vec::new();
-            for (i, logits) in logits_vec.iter().enumerate() {
+            for (i, logits) in split_logits_columns(&model, &logits_vec).iter().enumerate() {
                 let mut rng = StdRng::seed_from_u64(seed);
                 let token = sample_logits(&model, logits, &params, &mut rng);
                 rkvs[i].apply_prefill(token, mgr.pool()).unwrap();
