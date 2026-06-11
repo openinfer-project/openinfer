@@ -109,6 +109,29 @@ impl DecodeStepItem {
     }
 }
 
+/// One request's speculative-decode step input: the last committed token
+/// (`token_id`, the dangling `d0`) plus the proposer's draft continuation.
+/// The verify forward runs the model on `[token_id, drafts..]` and the
+/// executor commits the greedy-accepted prefix plus one model token.
+#[derive(Clone)]
+pub struct SpeculativeStepItem {
+    pub request_id: RequestId,
+    pub token_id: u32,
+    pub drafts: Vec<u32>,
+    pub lora_adapter: Option<String>,
+}
+
+impl SpeculativeStepItem {
+    pub fn new(request_id: RequestId, token_id: u32, drafts: Vec<u32>) -> Self {
+        Self {
+            request_id,
+            token_id,
+            drafts,
+            lora_adapter: None,
+        }
+    }
+}
+
 fn build_prefill_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[PrefillStepItem],
@@ -312,6 +335,18 @@ fn execute_step_on_lane(
                         &decode_logits,
                     )?,
                 }))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::SpeculativeVerify {
+            verify_tokens,
+            kv_view,
+            lora_adapter,
+        } => {
+            let argmax = lane.execute_verify(verify_tokens, kv_view, lora_adapter.as_deref())?;
+            if collect_result {
+                Ok(WorkerStepOutcome::Speculative(argmax))
             } else {
                 Ok(WorkerStepOutcome::Ack)
             }
@@ -794,6 +829,63 @@ impl Qwen3Executor {
 
     pub fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
         <Self as ModelExecutor>::execute_unified(self, plan)
+    }
+
+    /// Run one n-gram speculative decode step for a single request and return
+    /// the committed tokens (the greedy-accepted draft prefix plus one model
+    /// token; always >= 1). The verify forward runs the model on
+    /// `[dangling, drafts..]` over the request's existing KV; kvbm releases the
+    /// blocks pre-allocated for rejected drafts. Greedy verification is
+    /// lossless: the committed tokens equal plain greedy decode.
+    ///
+    /// The proposer that produces `item.drafts` lives in the scheduler layer
+    /// (it owns the request's token history); this method only verifies and
+    /// commits. Speculative decode is disabled by default
+    /// ([`crate::speculative::SpeculativeConfig`]); the scheduler calls this
+    /// only when it is enabled and the proposer returned a non-empty draft.
+    pub fn execute_speculative(&mut self, item: &SpeculativeStepItem) -> Result<Vec<u32>> {
+        anyhow::ensure!(!item.drafts.is_empty(), "speculative step needs >= 1 draft");
+        let k = item.drafts.len();
+
+        let rkv = self
+            .request_kvs
+            .get_mut(&item.request_id)
+            .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", item.request_id))?;
+        // Reserve room for every draft plus the model's bonus/correction token.
+        rkv.schedule_speculative(k + 1, self.kv_mgr.pool())
+            .map_err(|e| {
+                anyhow::anyhow!("schedule_speculative failed for {:?}: {e}", item.request_id)
+            })?;
+
+        let mut verify_tokens = Vec::with_capacity(k + 1);
+        verify_tokens.push(item.token_id);
+        verify_tokens.extend_from_slice(&item.drafts);
+        let kv_view = rkv.prefill_view(verify_tokens.len());
+
+        let step = StepCommand::SpeculativeVerify {
+            verify_tokens,
+            kv_view,
+            lora_adapter: item.lora_adapter.clone(),
+        };
+        let outcome = self.run_step(&step)?;
+        let argmax = match outcome {
+            WorkerStepOutcome::Speculative(argmax) => argmax,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "speculative returned unexpected: {}",
+                    other.kind()
+                ));
+            }
+        };
+
+        let committed = crate::speculative::accept_greedy(&item.drafts, &argmax);
+        let rkv = self
+            .request_kvs
+            .get_mut(&item.request_id)
+            .expect("request must exist after speculative verify");
+        rkv.apply_speculative(&committed, self.kv_mgr.pool())?;
+        self.save_sealed_blocks(item.request_id);
+        Ok(committed)
     }
 
     /// Prefix caching is on by default; tests that assert bit-identical
@@ -1755,6 +1847,45 @@ impl LocalQwen3Lane {
         )
     }
 
+    /// Speculative verify forward: run the model on `verify_tokens`
+    /// (`[dangling, drafts..]`) over the request's existing paged KV and return
+    /// the greedy token at each of the `verify_tokens.len()` positions.
+    ///
+    /// Structurally a prefill of `verify_tokens` at the current position
+    /// (`kv_view = prefill_view(verify_tokens.len())`), so it reuses
+    /// `batch_prefill(echo = true)` for the per-position logits and takes the
+    /// argmax on the GPU — only the position token ids are copied to host,
+    /// never the `[vocab, n]` logits.
+    fn execute_verify(
+        &mut self,
+        verify_tokens: &[u32],
+        kv_view: &KvView,
+        lora_adapter: Option<&str>,
+    ) -> Result<Vec<u32>> {
+        let (_last_logits, all_logits) = self.model.batch_prefill(
+            &[verify_tokens],
+            std::slice::from_ref(kv_view),
+            &[lora_adapter],
+            self.kv_buffer.buffer(),
+            &self.layout,
+            true,
+        )?;
+        let all_logits = all_logits
+            .ok_or_else(|| anyhow::anyhow!("verify forward must return all-position logits"))?;
+
+        let rows = verify_tokens.len();
+        let ctx = self.model.device_ctx();
+        let mut values: cudarc::driver::CudaSlice<half::bf16> = ctx.stream.alloc_zeros(rows)?;
+        let mut indices: cudarc::driver::CudaSlice<i32> = ctx.stream.alloc_zeros(rows)?;
+        openinfer_core::ops::argmax_batch_bf16_into(ctx, &all_logits, &mut values, &mut indices)?;
+        let host = ctx
+            .stream
+            .clone_dtoh(&indices)
+            .map_err(|e| anyhow::anyhow!("verify argmax D2H failed: {e}"))?;
+        ctx.sync()?;
+        Ok(host.into_iter().map(|i| i as u32).collect())
+    }
+
     fn execute_unified(
         &mut self,
         prefill_prompts: &[&[u32]],
@@ -1814,6 +1945,11 @@ enum StepCommand {
         decode_requests: Vec<DecodeStepItem>,
         decode_kv_views: Vec<KvView>,
     },
+    SpeculativeVerify {
+        verify_tokens: Vec<u32>,
+        kv_view: KvView,
+        lora_adapter: Option<String>,
+    },
 }
 
 impl StepCommand {
@@ -1822,6 +1958,7 @@ impl StepCommand {
             Self::Prefill { .. } => "prefill",
             Self::Decode { .. } => "decode",
             Self::Unified { .. } => "unified",
+            Self::SpeculativeVerify { .. } => "speculative_verify",
         }
     }
 }
@@ -1854,6 +1991,9 @@ enum WorkerStepOutcome {
     Prefill(PrefillResult),
     Decode(DecodeResult),
     Unified(UnifiedResult),
+    /// Per-position greedy argmax (one token per verify input) from a
+    /// speculative verify forward.
+    Speculative(Vec<u32>),
 }
 
 impl WorkerStepOutcome {
@@ -1863,6 +2003,7 @@ impl WorkerStepOutcome {
             Self::Prefill(_) => "prefill",
             Self::Decode(_) => "decode",
             Self::Unified(_) => "unified",
+            Self::Speculative(_) => "speculative",
         }
     }
 }

@@ -112,7 +112,7 @@ pub mod runtime {
     pub use crate::executor::{
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
         PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,
-        UnifiedPlan, UnifiedResult,
+        SpeculativeStepItem, UnifiedPlan, UnifiedResult,
     };
 }
 

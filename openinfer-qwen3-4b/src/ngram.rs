@@ -101,9 +101,7 @@ fn latest_earlier_match(context: &[u32], suffix: &[u32]) -> Option<usize> {
     // Candidate starts run from `len - n - 1` (immediately before the trailing
     // suffix) down to 0; the trailing occurrence itself (start `len - n`) is
     // excluded so we never "predict" from the suffix we are matching.
-    (0..=len - n - 1)
-        .rev()
-        .find(|&i| &context[i..i + n] == suffix)
+    (0..len - n).rev().find(|&i| &context[i..i + n] == suffix)
 }
 
 #[cfg(test)]

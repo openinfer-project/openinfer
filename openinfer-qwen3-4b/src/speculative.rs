@@ -10,22 +10,16 @@
 use crate::ngram::NgramConfig;
 
 /// Speculative-decoding configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// `Default` is disabled with the default n-gram settings (`enabled: false`),
+/// so the decode path runs the normal one-token step until explicitly turned on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct SpeculativeConfig {
     /// Master switch. When `false` the decode path runs the normal one-token
     /// step and never calls the proposer.
     pub enabled: bool,
     /// N-gram proposer settings (ignored when `enabled` is `false`).
     pub ngram: NgramConfig,
-}
-
-impl Default for SpeculativeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ngram: NgramConfig::default(),
-        }
-    }
 }
 
 /// Greedy speculative acceptance.
