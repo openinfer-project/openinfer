@@ -120,19 +120,21 @@ fn sampling_params_steer_the_sampler() {
     );
     assert_eq!(top_k_one, greedy, "top_k=1 must collapse to greedy");
 
-    // A tiny nucleus always contains exactly the top token (the largest
-    // probability alone satisfies any threshold at or below itself), so
-    // top_p -> 0 collapses to greedy as well.
+    // The nucleus is the smallest descending-probability prefix whose mass
+    // reaches top_p. The largest probability is always >= 1/vocab (~6.6e-6
+    // for Qwen3), so with top_p below that bound the nucleus is exactly the
+    // argmax for ANY distribution — the identity holds even on high-entropy
+    // steps where the top token carries little mass.
     let top_p_tiny = generate(
         &handle,
         prompt_tokens.clone(),
         SamplingParams {
             temperature: 1.0,
-            top_p: 0.01,
+            top_p: 1e-6,
             ..SamplingParams::default()
         },
     );
-    assert_eq!(top_p_tiny, greedy, "top_p=0.01 must collapse to greedy");
+    assert_eq!(top_p_tiny, greedy, "top_p=1e-6 must collapse to greedy");
 
     // Unrestricted high-temperature sampling must actually sample: four runs
     // of 32 tokens collapsing to one sequence means the params were dropped
