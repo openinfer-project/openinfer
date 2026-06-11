@@ -505,6 +505,14 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 
+    /// Run one n-gram speculative decode step for a single request, returning
+    /// the committed tokens (accepted draft prefix + one model token; >= 1).
+    /// Default: unsupported. Implemented by `Qwen3Executor`; the scheduler only
+    /// calls it when speculative decode is enabled.
+    fn execute_speculative(&mut self, _item: &SpeculativeStepItem) -> Result<Vec<u32>> {
+        anyhow::bail!("speculative decode is not supported by this executor")
+    }
+
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         anyhow::bail!(
             "Qwen3 LoRA adapter loading is not implemented yet: name={}, path={}",
@@ -1397,6 +1405,12 @@ impl ModelExecutor for Qwen3Executor {
         }
 
         Ok(result)
+    }
+
+    fn execute_speculative(&mut self, item: &SpeculativeStepItem) -> Result<Vec<u32>> {
+        // Inherent method holds the body (and is the public surface used by
+        // tests); the trait method delegates so generic schedulers can call it.
+        Qwen3Executor::execute_speculative(self, item)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
