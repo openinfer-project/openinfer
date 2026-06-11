@@ -83,6 +83,12 @@ impl PrefillStepItem {
         }
     }
 
+    #[must_use]
+    pub fn with_lora_adapter(mut self, lora_adapter: Option<String>) -> Self {
+        self.lora_adapter = lora_adapter;
+        self
+    }
+
     /// Prompt tokens forwarded this step.
     fn as_slice(&self) -> &[u32] {
         &self.prompt_tokens[self.chunk_start..self.chunk_start + self.chunk_tokens]
@@ -121,6 +127,12 @@ impl DecodeStepItem {
             lora_adapter: None,
             random_val,
         }
+    }
+
+    #[must_use]
+    pub fn with_lora_adapter(mut self, lora_adapter: Option<String>) -> Self {
+        self.lora_adapter = lora_adapter;
+        self
     }
 }
 
@@ -899,6 +911,10 @@ impl Qwen3Executor {
 
     pub fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
         <Self as ModelExecutor>::execute_unified(self, plan)
+    }
+
+    pub fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
+        <Self as ModelExecutor>::load_lora_adapter(self, request)
     }
 
     /// Prefix caching is on by default; tests that assert bit-identical
