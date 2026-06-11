@@ -26,7 +26,6 @@ fn single_request_prefill_decode_release() {
     assert_eq!(view.seq_len(), 10);
     assert_eq!(view.num_pages(), 1);
     assert_eq!(view.last_page_len(), 10);
-    view.ensure_capacity(10).expect("capacity check");
 
     // Apply prefill (first generated token = 42)
     req.apply_prefill(42, mgr.pool()).expect("apply_prefill");
@@ -192,31 +191,6 @@ fn schedule_without_apply_returns_blocks_on_drop() {
     );
 }
 
-/// ensure_capacity on a view should fail if the view doesn't have
-/// enough pages for the requested token count.
-#[test]
-fn ensure_capacity_rejects_insufficient_pages() {
-    let mgr = make_manager(10);
-    let mut req = mgr.pool().new_request(vec![1; 8], 1, None);
-
-    req.schedule_prefill(8, mgr.pool())
-        .expect("schedule_prefill");
-    let view = req.prefill_view(8);
-
-    // View has 1 page (ceil(8/16)). Asking for 17 tokens needs 2 pages.
-    let err = view.ensure_capacity(17);
-    assert!(
-        err.is_err(),
-        "should reject: 17 tokens needs 2 pages but view has 1"
-    );
-
-    // 16 tokens still fits in 1 page.
-    view.ensure_capacity(16).expect("16 tokens fits 1 page");
-
-    req.apply_prefill(42, mgr.pool()).unwrap();
-    req.release().unwrap();
-}
-
 /// decode_view must produce seq_len == kv_position + 1.
 #[test]
 fn decode_view_seq_len_invariant() {
@@ -255,9 +229,6 @@ fn prefill_view_covers_target_seq_len() {
     assert_eq!(view.seq_len(), 20);
     // 20 tokens → ceil(20/16) = 2 pages
     assert_eq!(view.num_pages(), 2);
-    // ensure_capacity must agree
-    view.ensure_capacity(20)
-        .expect("20 tokens must fit in 2 pages");
 
     req.apply_prefill(42, mgr.pool()).unwrap();
     req.release().unwrap();

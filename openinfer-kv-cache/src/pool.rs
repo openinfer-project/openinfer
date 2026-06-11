@@ -290,16 +290,26 @@ impl RequestKv {
     ///
     /// `prompt_len` tokens will be appended starting at `kv_position()`.
     /// The view's seq_len = kv_position + prompt_len (post-advance state
-    /// that FlashInfer attention metadata expects).
+    /// that FlashInfer attention metadata expects). The page row is exact
+    /// (`step_page_indices`), never the raw block holdings — the raw list
+    /// can carry an eagerly-allocated next block the kernel must not see.
     pub fn prefill_view(&self, prompt_len: usize) -> KvView {
         let target_seq_len = self.seq.kv_position() + prompt_len;
-        KvView::new(self.page_indices(), target_seq_len, self.seq.block_size())
+        KvView::new(
+            self.step_page_indices(prompt_len),
+            target_seq_len,
+            self.seq.block_size(),
+        )
     }
 
-    /// Build an immutable `KvView` for decode (one new token).
+    /// Build an immutable `KvView` for decode (one new token). Same exact
+    /// page-row contract as `prefill_view`.
     pub fn decode_view(&self) -> KvView {
-        let target_seq_len = self.seq.kv_position() + 1;
-        KvView::new(self.page_indices(), target_seq_len, self.seq.block_size())
+        KvView::new(
+            self.step_page_indices(1),
+            self.seq.kv_position() + 1,
+            self.seq.block_size(),
+        )
     }
 
     // ── Apply (register blocks, advance position) ──────────────────────
@@ -475,7 +485,10 @@ mod tests {
     /// raw `page_indices()` exceeds `ceil(kv_tokens / block_size)` at every
     /// block boundary. `step_page_indices` must hand the forward pass an
     /// exact page row at every step — this deadlocked Kimi DP8 on H200 when
-    /// the raw list reached the worker's exact-match page-table check.
+    /// the raw list reached the worker's exact-match page-table check, and
+    /// made qwen3's FlashInfer metadata read one garbage page past the
+    /// sequence at every block boundary (#291). `prefill_view`/`decode_view`
+    /// must carry the same exact row.
     #[test]
     fn step_page_indices_exact_at_block_boundaries() {
         let mut raw_overshoots = 0usize;
@@ -489,6 +502,11 @@ mod tests {
                 prompt_len.div_ceil(16),
                 "prefill page row P={prompt_len}"
             );
+            assert_eq!(
+                kv.prefill_view(prompt_len).num_pages(),
+                prompt_len.div_ceil(16),
+                "prefill view P={prompt_len}"
+            );
             kv.apply_prefill(1000, &pool).unwrap();
             for step in 0..23u32 {
                 kv.schedule_decode(&pool).unwrap();
@@ -497,6 +515,17 @@ mod tests {
                     kv.step_page_indices(1).len(),
                     need,
                     "decode page row P={prompt_len} step={step}"
+                );
+                let view = kv.decode_view();
+                assert_eq!(
+                    view.num_pages(),
+                    need,
+                    "decode view P={prompt_len} step={step}"
+                );
+                assert_eq!(
+                    (view.num_pages() - 1) * 16 + view.last_page_len(),
+                    kv.kv_position() + 1,
+                    "kernel-derived length P={prompt_len} step={step}"
                 );
                 raw_overshoots += usize::from(kv.page_indices().len() > need);
                 kv.apply_decode(2000 + step, &pool).unwrap();
