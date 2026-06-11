@@ -30,8 +30,8 @@ use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::DeviceVec;
 
 use self::plan::{
-    ActiveKvBudget, ExecutionPlan, admit_pending_requests, compaction_after_retire, max_kv_tokens,
-    slot_for_new_request,
+    ActiveKvBudget, ExecutionPlan, RejectReason, admit_pending_requests, compaction_after_retire,
+    max_kv_tokens, slot_for_new_request,
 };
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -88,6 +88,13 @@ pub fn start_with_capacity(
     seed: u64,
     max_batch: usize,
 ) -> Result<SchedulerHandle> {
+    // Static instance cap for the vLLM bridge's max_model_len. Live admission
+    // still uses the current page budget inside the scheduler loop.
+    let servable = servable_len(
+        model.config().max_position_embeddings,
+        model.kv_pool().capacity_pages().saturating_sub(1),
+        model.kv_pool().layout().page_size,
+    );
     let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
     let sample_scratch = SampleScratch::new(&model)?;
 
@@ -110,7 +117,14 @@ pub fn start_with_capacity(
     startup_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("Qwen3.5 scheduler exited during startup"))??;
-    Ok(SchedulerHandle::new(submit_tx))
+    Ok(SchedulerHandle::new(submit_tx).with_servable_len(servable))
+}
+
+fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {
+    max_context
+        .min(max_pages.saturating_mul(page_size))
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 struct CublasThreadGuard;
@@ -198,11 +212,12 @@ fn scheduler_loop(
             // KvPool capacity includes the CUDA Graph padding page reserved at
             // construction, so a real request can use at most the remaining pages.
             model.kv_pool().capacity_pages().saturating_sub(1),
+            model.config().max_position_embeddings,
             |req| req.prompt_tokens.len(),
             |req| req.max_tokens,
         );
-        for rejected in &admission.rejected {
-            send_rejection(rejected);
+        for (rejected, reason) in &admission.rejected {
+            send_rejection(rejected, *reason);
         }
         let pending = admission.pending;
         deferred = admission.deferred;
@@ -233,14 +248,24 @@ fn scheduler_loop(
     }
 }
 
-fn send_rejection(req: &SchedulerRequest) {
-    let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
-    let _ = req.token_tx.send(TokenEvent::Rejected {
-        message: format!(
-            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
+fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
+    let message = match reason {
+        RejectReason::ContextLength { limit } => format!(
+            "request exceeds this model's maximum context length of {limit} tokens: requested {} (prompt={} + max_tokens={})",
+            req.prompt_tokens.len().saturating_add(req.max_tokens),
             req.prompt_tokens.len(),
-            max_request_tokens
+            req.max_tokens
         ),
+        RejectReason::KvBudget => {
+            let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+            format!(
+                "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={max_request_tokens}",
+                req.prompt_tokens.len()
+            )
+        }
+    };
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message,
         prompt_tokens: req.prompt_tokens.len(),
         completion_tokens: 0,
     });
