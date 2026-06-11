@@ -802,7 +802,10 @@ fn prefilling_future_blocks(
 /// Exception: echo requests need all-position logits in one forward and run
 /// whole regardless of the budget — an oversized echo prompt still spikes
 /// activation memory.
-pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 8192;
+///
+/// 2048 matches vLLM's `max_num_batched_tokens` default and trades a few
+/// percent of overload throughput for half the ITL p99 tail.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 2048;
 
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
