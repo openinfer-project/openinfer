@@ -97,26 +97,18 @@ pub(crate) struct SnapshotReport {
     pub(crate) parallel: Option<String>,
     pub(crate) prefill_heavy: SnapshotProfile,
     pub(crate) decode_heavy: SnapshotProfile,
-    /// Long cold prompt arriving into a decode-heavy steady state (#244's
-    /// unified-step stall). Absent for non-scheduler-backed models and in
-    /// snapshots that predate this profile. Reported by `compare` but **not**
-    /// regression-gated — the stall tail is thermally and run-to-run noisy.
+    /// Long cold prompt arriving into a decode-heavy steady state
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mixed_itl: Option<SnapshotMixedItl>,
 }
 
-/// Mixed-load ITL profile baked into a snapshot: the canonical cell from
-/// docs/benchmarks/mixed-load-itl.md (4k cold prompt @ 0.5 req/s into a 4-way
-/// decode-heavy steady state), refreshed alongside the prefill/decode profiles.
+/// Mixed-load ITL profile baked into a snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SnapshotMixedItl {
     pub(crate) config: MixedLoadConfig,
-    /// Decode-only control over the same wall-clock (None if it was skipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) baseline_itl: Option<DurationStats>,
-    /// Background decode inter-token latency under the mixed load.
     pub(crate) itl: MixedLoadItl,
-    /// Non-fatal measurement caveats (early-finished stream, QPS overrun, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) warnings: Vec<String>,
 }
@@ -216,9 +208,7 @@ pub(crate) struct InjectionRecord {
     pub(crate) index: usize,
     /// Whether this injection reused the shared prompt (intended prefix-cache hit).
     pub(crate) warm: bool,
-    /// Wall time from submit to last token of the injected prompt (≈ prefill time).
     pub(crate) prefill_ms: f64,
-    /// Offset of this injection's submit from the first injection's submit.
     pub(crate) arrival_offset_ms: f64,
 }
 
@@ -239,7 +229,6 @@ pub(crate) struct MixedLoadReport {
     pub(crate) gpu: String,
     pub(crate) run: RunInfo,
     pub(crate) config: MixedLoadConfig,
-    /// Decode-only control (None when --skip-baseline).
     pub(crate) baseline_itl: Option<DurationStats>,
     pub(crate) mixed_itl: MixedLoadItl,
     pub(crate) injections: Vec<InjectionRecord>,

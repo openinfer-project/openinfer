@@ -1,37 +1,19 @@
 # Mixed-Load ITL — long prompts arriving into steady-state decode (Qwen3-4B)
 
 **Created**: 2026-06-08
+
 **TL;DR**: A long prompt admitted mid-decode freezes **every** active decode for
 the whole prefill (the stalled inter-token gap ≈ prefill wall-time: 4k ≈490ms,
 8k ≈1180ms, 12k ≈2230ms); gaps with no prefill in flight stay at baseline TPOT
 (~14ms). Whether that reaches headline **ITL p99** is a *frequency* question — it
 only does once stalls exceed ~1% of decode gaps, a fraction that grows with both
-**QPS and prompt length**. Swept qps×warm×prompt on RTX 5070 Ti: low QPS +
-moderate prompt keeps p99 at baseline (~15ms); ≥8k prompts or ≥1 req/s blow it to
-0.5–3.8s; **any** prefix-reuse (warm) collapses it back to baseline.
-**Decision: chunked prefill is a conditional no-go** — justify only behind a hard
-ITL-p99 SLA in a sustained-arrival or long-prompt, cold-prefix regime.
+**QPS and prompt length**. 
 
-The canonical (0.5 req/s, 4k, cold) point is a tracked profile in the Qwen3-4B
-snapshot — `bench_snapshots/{gpu}/qwen3-4b.json` under `mixed_itl`, refreshed by
-`bench_serving snapshot` alongside the prefill/decode profiles (reported by
-`compare`, but not regression-gated — see below). The minimal sweep that maps the
-rest of the cube is inlined under [Reproduce](#reproduce).
+## Motivation
 
-## Why this measurement exists
-
-[Issue #244](https://github.com/xiaguan/openinfer/issues/244). Qwen3-4B's
-scheduler admits a pending prefill into a **unified step** when decodes are active
-(`pending && active → Unified{pending}`,
-[plan.rs:55-68](../../openinfer-qwen3-4b/src/scheduler/plan.rs#L55-L68)) with no
-per-step token budget: the long prefill and all active decode rows run in one
-forward pass, so that step's wall-time balloons to ~the prefill time and every
-decoding request stalls for that one inter-token gap. The scheduler doc carried
-an anecdotal "+38% ITL p99 tail vs vLLM (291 vs 211ms)"
-([scheduler.md](../subsystems/scheduler/scheduler.md)) from a single QPS=2
-random-length run; the maintainer stance is **chunked prefill is not automatically
-the fix — measure first**. This characterises the tail across the QPS × prompt-length
-× prefix-reuse space. Chunked prefill itself is out of scope for #244.
+- [Issue #244](https://github.com/xiaguan/openinfer/issues/244). Qwen3-4B's
+scheduler admits a pending prefill into a **unified step** when decodes are active, thus the long prefill and all active decode rows run in one forward pass, so that step's wall-time balloons to ~the prefill time and every decoding request stalls for that one inter-token gap.
+- Current test in [scheduler.md](../subsystems/scheduler/scheduler.md) is a single QPS=2 random-length run; the maintainer stance is **chunked prefill is not automatically the fix — measure first**. This characterises the tail across the QPS × prompt-length × prefix-reuse space.
 
 ## Method
 
@@ -59,7 +41,7 @@ baseline covers every cell and 4k/8k/12k all fit.
 
 **Thermal.** A 10k+ prefill is a heavy compute burst; a back-to-back sweep
 throttles the GPU and *fabricates* saturation (12k prefill inflated 2235→4400ms).
-The sweep script inserts inter-cell cooldowns — the throttle-check table below
+The sweep script inserts inter-cell cooldowns(`sleep`) — the throttle-check table below
 (cold prefill ≈ constant across QPS) confirms the numbers are clock-clean.
 
 ## Results — sweep (RTX 5070 Ti, Qwen3-4B, greedy, 4-way background)
@@ -98,13 +80,12 @@ injection's one-time cold cache-fill — the rest are hits, so p99 is clean.)
 | 8k  | 1213 | 1170 | 1167 |
 | 12k | 2192 | 2180 | 2304 |
 
-## Reading the cube
+## Explaination
 
 Two independent knobs explain every cell:
 
 1. **Severity = the prefill wall-time** (throttle-check row): the one stalled gap ≈
    the entire prefill. Scales ~linearly with prompt (4k→8k→12k ≈ 0.5→1.2→2.2s).
-   `steady` gaps and **p50 stay at baseline in every cell** — purely a tail effect.
 
 2. **Frequency decides if it reaches p99** = stall-gap fraction
    `≈ qps / (qps + (1−qps·prefill_s)/TPOT)`. It rises with *both* QPS and prompt
@@ -126,23 +107,22 @@ Two independent knobs explain every cell:
    wall, not just a tail — chunked prefill can't add prefill FLOPs; needs
    rate-limit / bigger card.
 
-## Decision — chunked prefill: conditional no-go
+## Decision for chunked prefill
 
-**Don't implement it for #244's profile.** Moderate prompts at genuinely low QPS
-into a decode-heavy batch (the green cells: all of qps 0.25, 4k@0.5, plus any
-warm) keep ITL p99 at **baseline order (~15ms)**; the documented stall lives only
-at p99.9/max, tolerable for most decode SLAs. The "varied-length workloads break
-the waves naturally" stance holds at p99.
+Depends on the workload. The stall is a pure **tail** effect — `p50`/`steady` stay
+at baseline in every cell — so it only matters under a hard ITL-**p99** SLA, and
+only in the cold-prefix / high-QPS / long-prompt corner. Chunked prefill itself is
+out of scope for #244; this measurement only records the go/no-go.
 
-**Implement it only** behind a **hard ITL-p99 SLA** *and* a regime in the **bold
-cells** — sustained arrival (≥1 req/s) **or** routinely long, **cold** prompts
-(≥8k), where p99 is **0.5–3.8s (30–250× baseline)** and no per-token SLA survives.
-Chunked prefill (bounding per-step prefill tokens so decode rows are serviced
-between chunks) is the right fix there. In the saturated cells it's necessary but
-not sufficient (also rate-limit).
+| Your workload | Chunked prefill? |
+|---------------|------------------|
+| Moderate prompts at low QPS, **or** prompts that share a prefix (warm) | **No** — ITL p99 already at baseline (~15ms) |
+| Hard ITL-p99 SLA **and** sustained arrival (≥1 req/s) **or** routinely long cold prompts (≥8k) | **Yes** — this is the right fix |
+| …and the cell is already saturated (`qps·prefill_s ≳ 1`) | **Yes, but** necessary-not-sufficient — also rate-limit / bigger card |
 
-This replaces the single-point anecdote with a severity-vs-frequency model and the
-p50/p99/max numbers #244's acceptance boundary requires.
+The trigger lives in the deployment's SLA and arrival pattern, not the engine: with
+no hard per-token SLA, or long prompts that share prefixes, leave it unbuilt.
+
 
 ## Reproduce
 
@@ -153,12 +133,6 @@ CUDA_HOME=/opt/cuda NVCC_PREPEND_FLAGS="-ccbin g++-13" \
   OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=/abs/.venv/bin/python \
   cargo build -r -p openinfer-server --bin bench_serving
 
-# Minimal severity × frequency sweep (cold prompts into 4-way decode), prints
-# background-decode ITL p99 per cell. The `sleep 25` is load-bearing: a tight
-# back-to-back loop throttles the GPU and fabricates saturation (see Thermal) —
-# without it 4k@0.5 reads ~570ms instead of ~15ms.
-# Extend to the full cube by widening the loops (add 12288 — OOMs run-to-run on
-# 16 GB — and an --inj-warm-frac axis) and aggregating the JSON yourself.
 BIN=./target/release/bench_serving; M=models/Qwen3-4B
 BG="--bg-prompt-len 512 --bg-concurrency 4 --bg-output-len 1024"
 for p in 4096 8192; do for q in 0.5 1.0; do
@@ -168,13 +142,9 @@ for p in 4096 8192; do for q in 0.5 1.0; do
     --num-injections 5 --warmup 5 --inj-warm-frac 0.0 --skip-baseline >/dev/null 2>&1
   echo "p=$p q=$q  p99=$(python3 -c "import json;print(f\"{json.load(open('/tmp/itl.json'))['mixed_itl']['all']['p99_ms']:.0f}\")")ms"
 done; done
-# → p=4096 q=0.5 p99≈15ms   q=1.0 p99≈500ms
-#   p=8192 q=0.5 p99≈1600ms q=1.0 p99 saturated (multi-second)
 
-# Canonical cell — refreshed into the tracked snapshot alongside prefill/decode:
 CUDA_HOME=/opt/cuda LIBRARY_PATH=/usr/lib/wsl/lib:/opt/cuda/lib64 \
   ./target/release/bench_serving --model-path models/Qwen3-4B snapshot --warmup 5 --iters 20
-# → writes bench_snapshots/{gpu}/qwen3-4b.json (mixed_itl = 4k cold @ 0.5 req/s, 4-way bg)
 ```
 
 The canonical cell is folded into the `snapshot` subcommand as the `mixed_itl`
@@ -182,20 +152,8 @@ profile, so it refreshes with the prefill/decode profiles and its history lives 
 git ([bench-regression.md](../conventions/bench-regression.md)). The wider
 qps×warm×prompt sweep stays an **ad-hoc diagnostic** — the minimal loop above is
 the whole of it; widen the loops for more cells. It's deliberately not a tracked
-script: too noisy/expensive for the regression set. `compare` prints the ITL delta
-for context but does **not** gate on it: the stall tail is thermally and
-run-to-run noisy (see Caveats).
+script: too noisy/expensive for the regression set.
 
-### Caveats
-- **16k+ prompts OOM** on 16 GB (prefill activation scratch); 12k is the ceiling.
-- **Knee cells are run-to-run noisy**: where stall-fraction sits right at ~1%
-  (e.g. 4k@0.5, 4k@1.0) p99 wobbles ~15–19ms or catches/misses a stall. Trends are
-  solid; borderline single p99s aren't.
-- **Cooldowns are mandatory** for a sweep — without them heavy prefills self-throttle
-  and fabricate saturation (see Thermal).
-- **Cold prompts are the worst case**; if your real long prompts share prefixes the
-  tail is milder (warm column). The harness salts cold prompts so the cache can't
-  hide the stall.
 
 ## Next
 

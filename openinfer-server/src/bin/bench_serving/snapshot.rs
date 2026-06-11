@@ -165,9 +165,6 @@ pub(crate) fn run_snapshot(
     )?;
     let decode_metrics = build_request_metrics(&decode_timings);
 
-    // Mixed-load ITL: the #244 stall profile. Scheduler-backed models only —
-    // it needs continuous batching; the deepseek generator path exposes no
-    // handle, so the profile is simply absent there.
     let mixed_itl = if model.scheduler_handle().is_some() {
         let margs = snapshot_mixed_args();
         info!(
@@ -268,7 +265,11 @@ pub(crate) fn render_snapshot_text(report: &SnapshotReport, path: &Path) -> Stri
             m.config.inj_prompt_len, m.config.qps, m.config.bg_concurrency
         );
         if let Some(b) = &m.baseline_itl {
-            let _ = writeln!(out, "  baseline  p50={:.2}ms  p99={:.2}ms", b.p50_ms, b.p99_ms);
+            let _ = writeln!(
+                out,
+                "  baseline  p50={:.2}ms  p99={:.2}ms",
+                b.p50_ms, b.p99_ms
+            );
         }
         let _ = writeln!(
             out,
@@ -402,8 +403,6 @@ pub(crate) fn render_comparison(
         }
     }
 
-    // Mixed-load ITL: shown for context only (not gated — see note below).
-    // Only meaningful cell-to-cell, so require the injection shape to match.
     if let (Some(cm), Some(bm)) = (&current.mixed_itl, &baseline.mixed_itl) {
         if cm.config.inj_prompt_len == bm.config.inj_prompt_len && cm.config.qps == bm.config.qps {
             let ml = format!("(inj {}@{})", cm.config.inj_prompt_len, cm.config.qps);
