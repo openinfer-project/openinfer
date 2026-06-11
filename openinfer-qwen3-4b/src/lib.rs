@@ -11,6 +11,7 @@ mod lora;
 pub mod ngram;
 mod prefill;
 mod scheduler;
+pub mod speculative;
 mod unified_forward;
 mod weights;
 
