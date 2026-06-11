@@ -1,11 +1,17 @@
-//! Speculative-decoding glue for Qwen3: config and greedy acceptance.
+//! Method-agnostic core of speculative decoding for Qwen3.
 //!
-//! The proposer ([`crate::ngram`]) suggests `K` candidate tokens; the target
-//! model is then run once on `[last_confirmed, c_0, .., c_{K-1}]` to produce a
-//! greedy token at each of the `K + 1` positions. [`accept_greedy`] turns those
-//! into the tokens to commit. The GPU verify forward and KV rollback that feed
-//! this live in the decode path and are intentionally not part of this module,
-//! so the acceptance rule stays pure and unit-tested.
+//! Three pieces live here, none tied to a specific proposer:
+//! * [`SpeculativeProposer`] — the draft-token source (the one axis that varies
+//!   between methods; [`crate::ngram::NgramProposer`] is the first impl).
+//! * [`SpeculativeConfig`] / [`SpeculativeMethod`] — what to run and how to
+//!   build the proposer ([`SpeculativeConfig::build_proposer`]).
+//! * [`accept_greedy`] — greedy acceptance: given the `K` drafts and the target
+//!   model's greedy token at each of the `K + 1` verify positions, return the
+//!   tokens to commit.
+//!
+//! The GPU verify forward and KV reserve/rollback that feed `accept_greedy`
+//! live in the decode path (executor) and are intentionally not part of this
+//! module, so the acceptance rule stays pure and unit-tested.
 
 use crate::ngram::{NgramConfig, NgramProposer};
 
