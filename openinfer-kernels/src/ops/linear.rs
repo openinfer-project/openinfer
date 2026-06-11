@@ -4,6 +4,63 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
+/// GEMMs at or below this N consult the cublasLt plan cache.
+pub const GEMM_LT_MAX_N: usize = 4;
+
+/// Mirrors GEMM_LT_UNTUNED in csrc/shared/linear.cu.
+const GEMM_LT_UNTUNED: i32 = -1;
+
+/// Select the fastest cublasLt algo for a (num_rows, n, cols) GEMM and cache
+/// it for this thread's subsequent decode GEMMs of that shape.
+///
+/// `samples` are (weight, row_offset) pairs of identically shaped slices.
+/// Passing several layers' weights keeps the timing loop out of L2, so the
+/// ranking matches steady-state decode where weights stream from DRAM. Must
+/// run on the executor thread before CUDA Graph capture.
+pub fn gemm_lt_tune(
+    ctx: &DeviceContext,
+    samples: &[(&DeviceMatrix, usize)],
+    num_rows: usize,
+    n: usize,
+) -> Result<()> {
+    let (first, _) = samples
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("gemm_lt_tune requires at least one weight sample"))?;
+    let cols = first.cols;
+    let mut guards = Vec::with_capacity(samples.len());
+    let mut ptrs: Vec<*const ffi::Half> = Vec::with_capacity(samples.len());
+    for (weight, row_offset) in samples {
+        assert_eq!(weight.cols, cols);
+        assert!(row_offset + num_rows <= weight.rows);
+        let (w_ptr, guard) = weight.data.device_ptr(&ctx.stream);
+        ptrs.push(
+            (w_ptr + (row_offset * cols * std::mem::size_of::<half::bf16>()) as u64)
+                as *const ffi::Half,
+        );
+        guards.push(guard);
+    }
+    let status = unsafe {
+        ffi::gemm_lt_tune_cuda(
+            ptrs.as_ptr(),
+            ptrs.len() as i32,
+            num_rows as i32,
+            n as i32,
+            cols as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    if status != 0 {
+        bail!(
+            "cublasLt GEMM tuning failed: status={}, m={}, n={}, k={}",
+            status,
+            num_rows,
+            n,
+            cols
+        );
+    }
+    Ok(())
+}
+
 /// GEMM on a row sub-range of a weight matrix: Y = W[row_offset..row_offset+M, :] @ X
 pub fn gemm_rows_into(
     ctx: &DeviceContext,
@@ -284,8 +341,11 @@ fn launch_gemm(
     ctx: &DeviceContext,
 ) -> Result<()> {
     unsafe {
-        let status = if graphsafe {
-            ffi::gemm_graphsafe_cuda(
+        // Small-N projections run the cublasLt algo selected by gemm_lt_tune.
+        // Shapes this thread never tuned report GEMM_LT_UNTUNED and keep their
+        // existing cublasGemmEx path (and its capture behavior) unchanged.
+        let mut status = if n <= GEMM_LT_MAX_N {
+            ffi::gemm_lt_cuda(
                 w_ptr,
                 x_ptr,
                 y_ptr,
@@ -295,16 +355,31 @@ fn launch_gemm(
                 ctx.stream.cu_stream(),
             )
         } else {
-            ffi::gemm_cuda(
-                w_ptr,
-                x_ptr,
-                y_ptr,
-                m as i32,
-                n as i32,
-                k as i32,
-                ctx.stream.cu_stream(),
-            )
+            GEMM_LT_UNTUNED
         };
+        if status == GEMM_LT_UNTUNED {
+            status = if graphsafe {
+                ffi::gemm_graphsafe_cuda(
+                    w_ptr,
+                    x_ptr,
+                    y_ptr,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    ctx.stream.cu_stream(),
+                )
+            } else {
+                ffi::gemm_cuda(
+                    w_ptr,
+                    x_ptr,
+                    y_ptr,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    ctx.stream.cu_stream(),
+                )
+            };
+        }
         if status != 0 {
             if status >= 100_000 {
                 bail!(

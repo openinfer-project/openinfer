@@ -93,57 +93,9 @@ __global__ void argmax_batch_bf16_kernel(
   }
 }
 
-__global__ void argmax_batch_bf16_indexed_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const int* __restrict__ row_indices,
-    __nv_bfloat16* __restrict__ values,
-    int* __restrict__ indices,
-    int rows,
-    int n) {
-  extern __shared__ char shared_mem[];
-  float* shared_vals = reinterpret_cast<float*>(shared_mem);
-  int* shared_idxs =
-      reinterpret_cast<int*>(shared_mem + blockDim.x * sizeof(float));
-
-  int row = blockIdx.x;
-  if (row >= rows) return;
-  int source_row = row_indices[row];
-  const __nv_bfloat16* row_x = x + static_cast<size_t>(source_row) * n;
-  int tid = threadIdx.x;
-
-  float local_max = -INFINITY;
-  int local_idx = 0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    float val = __bfloat162float(row_x[i]);
-    if (argmax_better(val, i, local_max, local_idx)) {
-      local_max = val;
-      local_idx = i;
-    }
-  }
-  shared_vals[tid] = local_max;
-  shared_idxs[tid] = local_idx;
-  __syncthreads();
-
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) {
-      float rhs_val = shared_vals[tid + s];
-      int rhs_idx = shared_idxs[tid + s];
-      if (argmax_better(rhs_val, rhs_idx, shared_vals[tid], shared_idxs[tid])) {
-        shared_vals[tid] = rhs_val;
-        shared_idxs[tid] = rhs_idx;
-      }
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    indices[row] = shared_idxs[0];
-    values[row] = __float2bfloat16(shared_vals[0]);
-  }
-}
-
 __global__ void argmax_batch_bf16_partial_kernel(
     const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ row_indices,  // nullptr → row maps to itself
     float* __restrict__ partial_values,
     int* __restrict__ partial_indices,
     int rows,
@@ -161,7 +113,8 @@ __global__ void argmax_batch_bf16_partial_kernel(
   int start = tile * ARGMAX_BATCH_TILE_ELEMS;
   int end = start + ARGMAX_BATCH_TILE_ELEMS;
   if (end > n) end = n;
-  const __nv_bfloat16* row_x = x + static_cast<size_t>(row) * n;
+  int source_row = row_indices ? row_indices[row] : row;
+  const __nv_bfloat16* row_x = x + static_cast<size_t>(source_row) * n;
   int tid = threadIdx.x;
 
   float local_max = -INFINITY;
@@ -257,16 +210,6 @@ void argmax_batch_bf16_cuda(const __nv_bfloat16* x, __nv_bfloat16* values,
                              stream>>>(x, values, indices, rows, n);
 }
 
-void argmax_batch_bf16_indexed_cuda(const __nv_bfloat16* x,
-                                    const int* row_indices,
-                                    __nv_bfloat16* values, int* indices,
-                                    int rows, int n,
-                                    cudaStream_t stream) {
-  argmax_batch_bf16_indexed_kernel<<<rows, SAMPLE_BLOCK,
-                                     SAMPLE_BLOCK * (sizeof(float) + sizeof(int)),
-                                     stream>>>(x, row_indices, values, indices, rows, n);
-}
-
 void argmax_batch_bf16_split_cuda(const __nv_bfloat16* x, __nv_bfloat16* values,
                                   int* indices, float* partial_values,
                                   int* partial_indices, int rows, int n,
@@ -274,7 +217,21 @@ void argmax_batch_bf16_split_cuda(const __nv_bfloat16* x, __nv_bfloat16* values,
   int tiles_per_row = (n + ARGMAX_BATCH_TILE_ELEMS - 1) / ARGMAX_BATCH_TILE_ELEMS;
   size_t smem = SAMPLE_BLOCK * (sizeof(float) + sizeof(int));
   argmax_batch_bf16_partial_kernel<<<dim3(tiles_per_row, rows), SAMPLE_BLOCK, smem, stream>>>(
-      x, partial_values, partial_indices, rows, n, tiles_per_row);
+      x, nullptr, partial_values, partial_indices, rows, n, tiles_per_row);
+  argmax_batch_bf16_finalize_kernel<<<rows, SAMPLE_BLOCK, smem, stream>>>(
+      partial_values, partial_indices, values, indices, rows, tiles_per_row);
+}
+
+void argmax_batch_bf16_split_indexed_cuda(const __nv_bfloat16* x,
+                                          const int* row_indices,
+                                          __nv_bfloat16* values, int* indices,
+                                          float* partial_values,
+                                          int* partial_indices, int rows, int n,
+                                          cudaStream_t stream) {
+  int tiles_per_row = (n + ARGMAX_BATCH_TILE_ELEMS - 1) / ARGMAX_BATCH_TILE_ELEMS;
+  size_t smem = SAMPLE_BLOCK * (sizeof(float) + sizeof(int));
+  argmax_batch_bf16_partial_kernel<<<dim3(tiles_per_row, rows), SAMPLE_BLOCK, smem, stream>>>(
+      x, row_indices, partial_values, partial_indices, rows, n, tiles_per_row);
   argmax_batch_bf16_finalize_kernel<<<rows, SAMPLE_BLOCK, smem, stream>>>(
       partial_values, partial_indices, values, indices, rows, tiles_per_row);
 }

@@ -33,8 +33,8 @@ pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_deco
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{
-    gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_per_token,
-    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
+    GEMM_LT_MAX_N, gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_lt_tune,
+    gemm_per_token, gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
     gemm_token_range_into_checked, gemv, linear,
 };
 pub use lora::{
@@ -47,7 +47,8 @@ pub use norm::{
     rms_norm_into, rms_norm_offset_into,
 };
 pub use sampling::{
-    BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_indexed_into,
-    argmax_batch_bf16_into, argmax_batch_bf16_split_partials_len, flashinfer_top1_batch_into,
-    flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_batch_into, gpu_sample_into,
+    BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
+    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
+    flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes, gpu_sample,
+    gpu_sample_batch_into, gpu_sample_into,
 };

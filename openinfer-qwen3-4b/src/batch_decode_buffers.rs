@@ -15,17 +15,21 @@ use openinfer_kv_cache::KvView;
 ///
 /// There is deliberately no bucket in [5, 19]: cuBLAS's heuristic skips split-K
 /// for GEMMs with batch in [8, 16], leaving ~20 CTAs on 170 SMs — measured on
-/// RTX 5090 (ctx1024), a bs8/bs16 step took 9.4/9.5ms while bs20 took 8.5ms.
-/// Padding those batches up to 20 buys the split-K configs and is strictly
-/// faster than running them at their own size.
+/// RTX 5090 (ctx1024, cuBLAS 12.9 and 13.2 alike), a bs8/bs16 step took
+/// 9.2/9.3ms while bs20 took 7.9ms. Padding those batches up to 20 buys the
+/// split-K configs and is strictly faster than running them at their own size.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[
     1, 2, 4, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
     168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
-const SPLIT_KV_CHUNK_TOKENS: usize = 256;
+// Split-KV decode attention: at bs <= 4 the non-partitioned kernel leaves most
+// SMs idle (one CTA per request x head). 64-token chunks measured fastest on
+// RTX 5090 at ctx1024 (128 and 256 are 1-7% slower, 32 is past the merge
+// overhead knee); beyond bs4 the non-partitioned kernel has enough CTAs.
+const SPLIT_KV_CHUNK_TOKENS: usize = 64;
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
-const SPLIT_KV_MAX_BATCH_SIZE: usize = 2;
+const SPLIT_KV_MAX_BATCH_SIZE: usize = 4;
 const SPLIT_KV_MIN_SEQ_LEN: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
