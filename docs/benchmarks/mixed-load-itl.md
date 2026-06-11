@@ -12,8 +12,11 @@ moderate prompt keeps p99 at baseline (~15ms); ≥8k prompts or ≥1 req/s blow 
 **Decision: chunked prefill is a conditional no-go** — justify only behind a hard
 ITL-p99 SLA in a sustained-arrival or long-prompt, cold-prefix regime.
 
-Reproduce the full cube with [`scripts/sweep_mixed_itl.sh`](../../scripts/sweep_mixed_itl.sh);
-the canonical (0.5 req/s, 4k, cold) point is committed as `mixed-load-itl.qwen3-4b.json`.
+Reproduce the full cube with [`scripts/sweep_mixed_itl.sh`](../../scripts/sweep_mixed_itl.sh).
+The canonical (0.5 req/s, 4k, cold) point is a tracked profile in the Qwen3-4B
+snapshot — `bench_snapshots/{gpu}/qwen3-4b.json` under `mixed_itl`, refreshed by
+`bench_serving snapshot` alongside the prefill/decode profiles (reported by
+`compare`, but not regression-gated — see below).
 
 ## Why this measurement exists
 
@@ -167,16 +170,18 @@ done
 # Full qps × warm × prompt cube (with cooldowns + throttle-check):
 bash scripts/sweep_mixed_itl.sh
 
-# Single canonical cell (writes the committed JSON):
+# Canonical cell — refreshed into the tracked snapshot alongside prefill/decode:
 CUDA_HOME=/opt/cuda LIBRARY_PATH=/usr/lib/wsl/lib:/opt/cuda/lib64 \
-  ./target/release/bench_serving --model-path models/Qwen3-4B \
-  --format json --out docs/benchmarks/mixed-load-itl.qwen3-4b.json \
-  mixed --bg-prompt-len 512 --bg-concurrency 4 --bg-output-len 1024 \
-        --inj-prompt-len 4096 --inj-output-len 1 --qps 0.5 --num-injections 5 --warmup 5
+  ./target/release/bench_serving --model-path models/Qwen3-4B snapshot --warmup 5 --iters 20
+# → writes bench_snapshots/{gpu}/qwen3-4b.json (mixed_itl = 4k cold @ 0.5 req/s, 4-way bg)
 ```
 
-`mixed` is a **standalone diagnostic**, not part of the shape-guarded snapshot
-regression set ([bench-regression.md](../conventions/bench-regression.md)).
+The canonical cell is folded into the `snapshot` subcommand as the `mixed_itl`
+profile, so it refreshes with the prefill/decode profiles and its history lives in
+git ([bench-regression.md](../conventions/bench-regression.md)). The full
+qps×warm×prompt sweep above stays a **standalone diagnostic** — too noisy/expensive
+for the tracked set. `compare` prints the ITL delta for context but does **not**
+gate on it: the stall tail is thermally and run-to-run noisy (see Caveats).
 
 ### Caveats
 - **16k+ prompts OOM** on 16 GB (prefill activation scratch); 12k is the ceiling.

@@ -35,6 +35,32 @@ pub(crate) fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
 pub(crate) const REGRESSION_TPOT_PCT: f64 = 2.0;
 pub(crate) const REGRESSION_TTFT_PCT: f64 = 3.0;
 
+/// Canonical mixed-load cell folded into the snapshot: 4 background decode
+/// streams (512-prompt / 1024-out) with a 4k **cold** prompt arriving at
+/// 0.5 req/s. This is the committed reference point from
+/// docs/benchmarks/mixed-load-itl.md; it fits the 16 GB KV budget so it runs on
+/// every supported card. Pinned (not driven by `--warmup`/`--seed`) so the
+/// tracked profile stays shape-stable across refreshes.
+fn snapshot_mixed_args() -> MixedArgs {
+    MixedArgs {
+        bg_prompt_len: 512,
+        bg_concurrency: 4,
+        bg_output_len: 1024,
+        inj_prompt_len: 4096,
+        inj_output_len: 1,
+        qps: 0.5,
+        num_injections: 5,
+        skip_baseline: false,
+        inj_warm_frac: 0.0,
+        head_start_tokens: 8,
+        run: RunArgs {
+            warmup: 5,
+            iters: 20,
+            seed: 42,
+        },
+    }
+}
+
 pub(crate) fn shell_output(program: &str, args: &[&str]) -> Option<String> {
     std::process::Command::new(program)
         .args(args)
@@ -139,6 +165,29 @@ pub(crate) fn run_snapshot(
     )?;
     let decode_metrics = build_request_metrics(&decode_timings);
 
+    // Mixed-load ITL: the #244 stall profile. Scheduler-backed models only —
+    // it needs continuous batching; the deepseek generator path exposes no
+    // handle, so the profile is simply absent there.
+    let mixed_itl = if model.scheduler_handle().is_some() {
+        let margs = snapshot_mixed_args();
+        info!(
+            "Running mixed-load ITL (inj {} cold @ {} req/s into {}-way decode)",
+            margs.inj_prompt_len, margs.qps, margs.bg_concurrency
+        );
+        match crate::mixed::run_mixed_load(model, cli, model_type, 0.0, cli.cuda_graph, &margs)? {
+            BenchReport::Mixed(report) => Some(SnapshotMixedItl {
+                config: report.config,
+                baseline_itl: report.baseline_itl,
+                itl: report.mixed_itl,
+                warnings: report.warnings,
+            }),
+            _ => None,
+        }
+    } else {
+        info!("snapshot: model exposes no scheduler handle; skipping mixed-load ITL profile");
+        None
+    };
+
     let model_name = model_display_name(&cli.model_path);
     let gpu = gpu_name();
     let parallel = match model_type {
@@ -167,6 +216,7 @@ pub(crate) fn run_snapshot(
             output_len: SNAPSHOT_DECODE_OUTPUT_LEN,
             metrics: decode_metrics,
         },
+        mixed_itl,
     };
 
     let dir = Path::new(SNAPSHOT_DIR).join(gpu_slug_from(&gpu));
@@ -209,6 +259,21 @@ pub(crate) fn render_snapshot_text(report: &SnapshotReport, path: &Path) -> Stri
             out,
             "  TPOT  p50={:.2}ms  p99={:.2}ms",
             tpot.p50_ms, tpot.p99_ms
+        );
+    }
+    if let Some(m) = &report.mixed_itl {
+        let _ = writeln!(
+            out,
+            "\nmixed_itl (inj {} cold @ {} req/s, {}-way bg):",
+            m.config.inj_prompt_len, m.config.qps, m.config.bg_concurrency
+        );
+        if let Some(b) = &m.baseline_itl {
+            let _ = writeln!(out, "  baseline  p50={:.2}ms  p99={:.2}ms", b.p50_ms, b.p99_ms);
+        }
+        let _ = writeln!(
+            out,
+            "  mixed     p50={:.2}ms  p99={:.2}ms",
+            m.itl.all.p50_ms, m.itl.all.p99_ms
         );
     }
     let _ = writeln!(out, "\nwritten to {}", path.display());
@@ -337,6 +402,25 @@ pub(crate) fn render_comparison(
         }
     }
 
+    // Mixed-load ITL: shown for context only (not gated — see note below).
+    // Only meaningful cell-to-cell, so require the injection shape to match.
+    if let (Some(cm), Some(bm)) = (&current.mixed_itl, &baseline.mixed_itl) {
+        if cm.config.inj_prompt_len == bm.config.inj_prompt_len && cm.config.qps == bm.config.qps {
+            let ml = format!("(inj {}@{})", cm.config.inj_prompt_len, cm.config.qps);
+            for (stat, cur, base) in [
+                ("p50", cm.itl.all.p50_ms, bm.itl.all.p50_ms),
+                ("p99", cm.itl.all.p99_ms, bm.itl.all.p99_ms),
+            ] {
+                table.add_row(vec![
+                    key_cell(format!("ITL {stat} {ml}")),
+                    numeric_cell(format!("{cur:.2}ms")),
+                    numeric_cell(format!("{base:.2}ms")),
+                    numeric_cell(format_delta(delta_pct(cur, base))),
+                ]);
+            }
+        }
+    }
+
     push_table(&mut out, &table);
 
     // Regression check
@@ -373,6 +457,12 @@ pub(crate) fn render_comparison(
         for r in &regressions {
             let _ = writeln!(out, "  {r}");
         }
+    }
+    if current.mixed_itl.is_some() && baseline.mixed_itl.is_some() {
+        let _ = writeln!(
+            out,
+            "(mixed-load ITL shown for context only — not gated; the stall tail is thermally/run-to-run noisy)"
+        );
     }
 
     out
