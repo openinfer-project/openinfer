@@ -59,6 +59,16 @@ pub(super) struct PendingRequest {
     /// Offered at most once; a no-hit offer leaves the request in the normal
     /// admission flow with this set so it isn't re-probed every tick.
     pub(super) prefetch_offered: bool,
+    /// Prompt tokens whose KV is already computed (prefix-cache hits plus
+    /// chunks applied in earlier steps). Updated from the executor's
+    /// authoritative position after every chunk.
+    pub(super) prefill_pos: usize,
+    /// Prompt tokens to forward in the upcoming step. Set by
+    /// `take_prefill_chunks` when the request is packed into a step.
+    pub(super) step_chunk: usize,
+    /// Prefix-cache hits reported by the first chunk, carried across later
+    /// chunks so the final result still reports them truthfully.
+    pub(super) cached_tokens: usize,
 }
 
 impl PendingRequest {
@@ -74,8 +84,50 @@ impl PendingRequest {
             echo: req.echo,
             queued_at_unix_s: req.queued_at_unix_s,
             prefetch_offered: false,
+            prefill_pos: 0,
+            step_chunk: 0,
+            cached_tokens: 0,
         }
     }
+
+    fn remaining_prompt_tokens(&self) -> usize {
+        self.prompt_tokens.len() - self.prefill_pos
+    }
+}
+
+/// Pull the next prefill step set off the front of `prefilling`, capping the
+/// step's total forwarded tokens at `max_prefill_tokens`. Each taken request
+/// gets its per-step chunk recorded in `step_chunk`. Echo requests need
+/// logits for every prompt position in one forward, so they only run when
+/// their whole remainder fits — or alone at the head of an empty step, which
+/// also guarantees the queue always makes progress.
+fn take_prefill_chunks(
+    prefilling: &mut Vec<PendingRequest>,
+    max_prefill_tokens: usize,
+) -> Vec<PendingRequest> {
+    let mut budget = max_prefill_tokens;
+    let mut taken: Vec<PendingRequest> = Vec::new();
+    let mut i = 0;
+    while i < prefilling.len() && budget > 0 {
+        let remaining = prefilling[i].remaining_prompt_tokens();
+        let chunk = if prefilling[i].echo {
+            if remaining > budget && !taken.is_empty() {
+                i += 1;
+                continue;
+            }
+            remaining
+        } else {
+            remaining.min(budget)
+        };
+        let mut req = prefilling.remove(i);
+        req.step_chunk = chunk;
+        budget = budget.saturating_sub(chunk);
+        taken.push(req);
+    }
+    // Echo skips can take items out of arrival order; results come back
+    // sorted by request id, so the step set must be too.
+    taken.sort_by_key(|req| req.request_id);
+    taken
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -140,6 +192,10 @@ pub(crate) fn start_with_executor<E>(
 where
     E: ModelExecutor + 'static,
 {
+    assert!(
+        max_prefill_tokens > 0,
+        "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
+    );
     let servable = servable_len(
         executor.max_context_tokens(),
         executor.max_request_blocks(),
@@ -165,6 +221,10 @@ pub(crate) fn start_with_executor_with_lora_control<E>(
 where
     E: ModelExecutor + 'static,
 {
+    assert!(
+        max_prefill_tokens > 0,
+        "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
+    );
     let servable = servable_len(
         executor.max_context_tokens(),
         executor.max_request_blocks(),
@@ -209,6 +269,9 @@ fn offer_prefetch<E: ModelExecutor>(
     executor: &mut E,
     deferred: &mut Vec<PendingRequest>,
     loading: &mut Vec<PendingRequest>,
+    // Free blocks already promised to admitted requests; the prefetch must
+    // leave them untouched (see `ModelExecutor::begin_kv_prefetch`).
+    reserve_floor: usize,
 ) {
     let mut keep = Vec::with_capacity(deferred.len());
     for mut req in deferred.drain(..) {
@@ -218,6 +281,7 @@ fn offer_prefetch<E: ModelExecutor>(
                 req.request_id,
                 &req.prompt_tokens,
                 req.lora_adapter.as_deref(),
+                reserve_floor,
             ) {
                 loading.push(req);
                 continue;
@@ -284,6 +348,9 @@ fn scheduler_loop<E>(
     let mut deferred: Vec<PendingRequest> = Vec::new();
     // Requests parked while their async CPU-tier KV prefetch loads.
     let mut loading: Vec<PendingRequest> = Vec::new();
+    // Admitted requests whose prompts are not fully prefilled yet (chunked
+    // prefill). FIFO by request id; each step takes chunks off the front.
+    let mut prefilling: Vec<PendingRequest> = Vec::new();
 
     info!("Scheduler ready");
 
@@ -299,12 +366,13 @@ fn scheduler_loop<E>(
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
         reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
-        offer_prefetch(&mut executor, &mut deferred, &mut loading);
+        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+        offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
 
         // 3. Nothing active and nothing admittable → block. Prefer blocking on
         // an in-flight load (so its request prefills next) over a new submit;
         // only truly idle (no loads either) do we block on the channel.
-        if active.is_empty() && deferred.is_empty() {
+        if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             if !loading.is_empty() {
                 block_on_loading(&mut executor, &mut deferred, &mut loading);
                 continue;
@@ -338,20 +406,21 @@ fn scheduler_loop<E>(
         let admission = admit_deferred_requests(
             lora_validation.accepted,
             &active,
+            &prefilling,
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
-            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
             release_rejected(&mut executor, rejected);
         }
-        let pending = admission.pending;
+        prefilling.extend(admission.pending);
         deferred = admission.deferred;
+        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
 
         let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
             continue;
@@ -366,7 +435,7 @@ fn scheduler_loop<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, effects);
+        apply_effects(&mut executor, &mut active, &mut prefilling, effects);
     }
 }
 
@@ -383,6 +452,7 @@ fn scheduler_loop_with_lora_control<E>(
     let mut next_request_id = 0u64;
     let mut deferred: Vec<PendingRequest> = Vec::new();
     let mut loading: Vec<PendingRequest> = Vec::new();
+    let mut prefilling: Vec<PendingRequest> = Vec::new();
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
 
@@ -406,12 +476,13 @@ fn scheduler_loop_with_lora_control<E>(
         // (a prefetch must not race ahead of an adapter load it depends on).
         reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
         if pending_control.is_empty() {
-            offer_prefetch(&mut executor, &mut deferred, &mut loading);
+            let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+            offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         }
 
         // 2. Once idle, apply pending control commands before admitting newer
         // generation requests that arrived behind them.
-        if active.is_empty() && deferred.is_empty() {
+        if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             drain_idle_control(&mut executor, &mut pending_control);
             if pending_control.is_empty() && !post_control_deferred.is_empty() {
                 deferred.append(&mut post_control_deferred);
@@ -420,7 +491,7 @@ fn scheduler_loop_with_lora_control<E>(
 
         // 3. Nothing active and no deferred generation → block. An in-flight
         // load takes priority over waiting on a new command.
-        if active.is_empty() && deferred.is_empty() {
+        if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             if !loading.is_empty() {
                 block_on_loading(&mut executor, &mut deferred, &mut loading);
                 continue;
@@ -463,20 +534,21 @@ fn scheduler_loop_with_lora_control<E>(
         let admission = admit_deferred_requests(
             lora_validation.accepted,
             &active,
+            &prefilling,
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
-            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
             release_rejected(&mut executor, rejected);
         }
-        let pending = admission.pending;
+        prefilling.extend(admission.pending);
         deferred = admission.deferred;
+        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
 
         if active.is_empty() && pending.is_empty() {
             // A parked load must still be polled to completion before we block.
@@ -512,7 +584,7 @@ fn scheduler_loop_with_lora_control<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, effects);
+        apply_effects(&mut executor, &mut active, &mut prefilling, effects);
     }
 }
 
@@ -692,32 +764,82 @@ fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usi
         .sum()
 }
 
-/// Default for `max_prefill_tokens`: prefill tokens admitted into a single
-/// step. Prefill activation scratch scales with the step's total prompt tokens
-/// (~22 KB/token measured on Qwen3-4B), so an unbounded prefill batch can eat
-/// the post-KV-pool VRAM headroom and OOM mid-serving under a request burst. A
-/// single request is always admitted regardless of its prompt length — only
-/// batching beyond one request is capped.
-pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 8192;
+/// Free blocks already promised to admitted requests (active decode growth +
+/// remaining prefill chunks). A KV prefetch reservation must stay out of this
+/// floor or a later chunk/decode fails allocation and kills the whole step.
+fn admitted_future_blocks<E: ModelExecutor>(
+    executor: &E,
+    active: &[ActiveRequestState],
+    prefilling: &[PendingRequest],
+) -> usize {
+    let block_size = executor.block_size();
+    active_future_blocks(active, block_size)
+        + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+}
+
+fn prefilling_future_blocks(
+    prefilling: &[PendingRequest],
+    block_size: usize,
+    // Blocks a request already holds via a settled prefetch (zero once its
+    // first chunk absorbs them). They are out of the free pool, so counting
+    // them as future need would double-charge the budget.
+    prefetch_credit: impl Fn(RequestId) -> usize,
+) -> usize {
+    prefilling
+        .iter()
+        .map(|req| {
+            pending_lifetime_blocks(req, block_size)
+                .saturating_sub(blocks_needed(req.prefill_pos, block_size))
+                .saturating_sub(prefetch_credit(req.request_id))
+        })
+        .sum()
+}
+
+/// Default for `max_prefill_tokens`: prompt tokens forwarded in a single step
+/// (chunked prefill). Prefill activation scratch scales with the step's total
+/// prompt tokens (~22 KB/token measured on Qwen3-4B), so an unbounded prefill
+/// batch can eat the post-KV-pool VRAM headroom and OOM mid-serving under a
+/// request burst. Prompts longer than the budget are split across steps, so
+/// long prompts can't monopolize a step and starve running decodes.
+/// Exception: echo requests need all-position logits in one forward and run
+/// whole regardless of the budget — an oversized echo prompt still spikes
+/// activation memory.
+///
+/// A unified step's duration scales with its prefill tokens, and every decode
+/// request in the batch stalls for the whole step — the budget bounds that
+/// stall. 1024 halves ITL p99 vs 2048 at mid-load with the same mean TPOT;
+/// 512 chunks no longer amortize the per-step fixed cost, so prefill falls
+/// behind arrivals and TTFT queues up.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
+    // Admitted requests still mid-prefill: they hold KV for their applied
+    // chunks and will take a decode slot when they promote, so admission
+    // must reserve both or completing chunks can overshoot capacity.
+    prefilling: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
-    max_prefill_tokens: usize,
     // Blocks a request already holds from a settled prefetch. These are already
     // out of `available_blocks`, so they must be credited against the request's
     // need or admission double-counts them and can wedge a near-budget CPU-hit
     // request forever (never admitted, prefetch never released).
     prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> AdmissionOutcome {
-    let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
-    let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
-    let mut step_prefill_tokens = 0usize;
+    let mut budget = available_blocks
+        .saturating_sub(active_future_blocks(active, block_size))
+        .saturating_sub(prefilling_future_blocks(
+            prefilling,
+            block_size,
+            &prefetch_credit,
+        ));
+    let mut decode_slots = max_decode_batch_size
+        .saturating_sub(active.len())
+        .saturating_sub(prefilling.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -745,13 +867,9 @@ fn admit_deferred_requests(
         // …but only the blocks not already held by this request's prefetch must
         // come from the free-pool budget.
         let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
-        let prompt_len = req.prompt_tokens.len();
-        let within_token_budget =
-            pending.is_empty() || step_prefill_tokens + prompt_len <= max_prefill_tokens;
-        if fresh_needed <= budget && decode_slots > 0 && within_token_budget {
+        if fresh_needed <= budget && decode_slots > 0 {
             budget -= fresh_needed;
             decode_slots -= 1;
-            step_prefill_tokens += prompt_len;
             pending.push(req);
         } else {
             still_deferred.push(req);
@@ -871,7 +989,7 @@ mod tests {
     use super::*;
     use crate::executor::{
         DecodePlan, DecodeRequestResult, PrefillPlan, PrefillRequestResult, PrefillResult,
-        UnifiedPlan, UnifiedResult,
+        PrefillStepItem, UnifiedPlan, UnifiedResult,
     };
 
     struct FakeExecutor {
@@ -881,6 +999,9 @@ mod tests {
         max_context_tokens: usize,
         available_blocks: usize,
         held_tokens: HashMap<RequestId, usize>,
+        // Prompt progress of requests mid-chunked-prefill (mirrors the real
+        // executor's kv_position so multi-chunk scheduling is exercised).
+        prefill_positions: HashMap<RequestId, usize>,
         fail_decode_once: bool,
         decode_delay: Duration,
         loaded_lora_adapters: HashSet<String>,
@@ -901,6 +1022,7 @@ mod tests {
                 max_context_tokens: usize::MAX,
                 available_blocks: max_request_blocks,
                 held_tokens: HashMap::new(),
+                prefill_positions: HashMap::new(),
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
                 loaded_lora_adapters: HashSet::new(),
@@ -958,6 +1080,34 @@ mod tests {
             self
         }
 
+        /// Advance a request's prompt by one chunk, mirroring the real
+        /// executor: clamp the scheduler's budget to the tokens remaining
+        /// and report the new authoritative position.
+        fn fake_prefill_result(&mut self, req: &PrefillStepItem) -> PrefillRequestResult {
+            let start = self
+                .prefill_positions
+                .get(&req.request_id)
+                .copied()
+                .unwrap_or(0);
+            let chunk = (req.prompt_tokens.len() - start).min(req.chunk_budget);
+            let prefill_pos = start + chunk;
+            let completed = prefill_pos == req.prompt_tokens.len();
+            if completed {
+                self.prefill_positions.remove(&req.request_id);
+            } else {
+                self.prefill_positions.insert(req.request_id, prefill_pos);
+            }
+            PrefillRequestResult {
+                request_id: req.request_id,
+                first_token: 100 + req.request_id.get() as u32,
+                first_token_logprob: None,
+                prompt_logprobs: None,
+                cached_tokens: self.cached_tokens,
+                completed,
+                prefill_pos,
+            }
+        }
+
         fn ensure_request_tokens(
             &mut self,
             request_id: RequestId,
@@ -1005,6 +1155,7 @@ mod tests {
             if let Some(tokens) = self.held_tokens.remove(&request_id) {
                 self.available_blocks += blocks_needed(tokens, self.block_size);
             }
+            self.prefill_positions.remove(&request_id);
             self.dropped.lock().unwrap().push(request_id.get());
             Ok(())
         }
@@ -1014,6 +1165,7 @@ mod tests {
             request_id: RequestId,
             _prompt_tokens: &[u32],
             _lora_adapter: Option<&str>,
+            _reserve_floor: usize,
         ) -> bool {
             self.prefetch_offers.lock().unwrap().push(request_id.get());
             false
@@ -1054,13 +1206,7 @@ mod tests {
                 requests: plan
                     .requests
                     .iter()
-                    .map(|req| PrefillRequestResult {
-                        request_id: req.request_id,
-                        first_token: 100 + req.request_id.get() as u32,
-                        first_token_logprob: None,
-                        prompt_logprobs: None,
-                        cached_tokens: self.cached_tokens,
-                    })
+                    .map(|req| self.fake_prefill_result(req))
                     .collect(),
             })
         }
@@ -1152,13 +1298,7 @@ mod tests {
                 prefill_requests: plan
                     .prefill_requests
                     .iter()
-                    .map(|req| PrefillRequestResult {
-                        request_id: req.request_id,
-                        first_token: 100 + req.request_id.get() as u32,
-                        first_token_logprob: None,
-                        prompt_logprobs: None,
-                        cached_tokens: self.cached_tokens,
-                    })
+                    .map(|req| self.fake_prefill_result(req))
                     .collect(),
                 decode_requests: plan
                     .decode_requests
@@ -1252,12 +1392,12 @@ mod tests {
         let outcome = admit_deferred_requests(
             deferred,
             &active,
+            &[],
             16,
             4,
             4,
             usize::MAX,
             64,
-            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
 
@@ -1301,12 +1441,12 @@ mod tests {
         let outcome = admit_deferred_requests(
             deferred,
             &active,
+            &[],
             16,
             1000,
             1000,
             32,
             64,
-            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
 
@@ -1357,12 +1497,12 @@ mod tests {
         let outcome = admit_deferred_requests(
             vec![pending],
             &active,
+            &[],
             16,
             1024,
             1024,
             usize::MAX,
             64,
-            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
 
@@ -1379,52 +1519,147 @@ mod tests {
     }
 
     #[test]
-    fn prefill_token_budget_caps_batching_but_never_starves_one_request() {
-        let active: [ActiveRequestState; 0] = [];
+    fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
         let mk = |id: u64, prompt_len, max_tokens| {
             PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
         };
 
-        // A first request larger than the whole budget is still admitted alone —
-        // otherwise it would be deferred forever.
-        let oversized = admit_deferred_requests(
-            vec![mk(1, 64, 1), mk(2, 16, 1)],
-            &active,
-            16,
-            1024,
-            1024,
-            usize::MAX,
-            64,
-            32,
-            |_| 0,
-        );
-        assert_eq!(oversized.pending.len(), 1);
+        // A prompt larger than the budget is split: the head request gets a
+        // budget-sized chunk and everyone behind it waits.
+        let mut prefilling = vec![mk(1, 64, 1), mk(2, 16, 1)];
+        let taken = take_prefill_chunks(&mut prefilling, 32);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].request_id, RequestId(1));
+        assert_eq!(taken[0].step_chunk, 32, "chunk is capped at the budget");
         assert_eq!(
-            oversized.deferred[0].request_id,
+            prefilling[0].request_id,
             RequestId(2),
-            "follow-up waits for the next step once the budget is blown"
+            "follow-up waits for the next step once the budget is spent"
         );
 
-        // Requests batch until the budget is filled exactly; overflow defers,
-        // never rejects.
-        let batched = admit_deferred_requests(
-            vec![mk(3, 16, 1), mk(4, 16, 1), mk(5, 16, 1)],
-            &active,
-            16,
-            1024,
-            1024,
-            usize::MAX,
-            64,
-            32,
-            |_| 0,
-        );
+        // Requests pack until the budget is filled exactly; the overflow stays
+        // queued in arrival order.
+        let mut prefilling = vec![mk(3, 16, 1), mk(4, 16, 1), mk(5, 16, 1)];
+        let taken = take_prefill_chunks(&mut prefilling, 32);
         assert_eq!(
-            batched.pending.len(),
-            2,
+            taken.iter().map(|r| r.step_chunk).collect::<Vec<_>>(),
+            vec![16, 16],
             "16 + 16 fills the 32-token budget"
         );
-        assert_eq!(batched.deferred[0].request_id, RequestId(5));
-        assert!(batched.rejected.is_empty());
+        assert_eq!(prefilling[0].request_id, RequestId(5));
+
+        // A partially-prefilled head request only consumes its remainder.
+        let mut head = mk(6, 64, 1);
+        head.prefill_pos = 48;
+        let mut prefilling = vec![head, mk(7, 16, 1)];
+        let taken = take_prefill_chunks(&mut prefilling, 32);
+        assert_eq!(
+            taken.iter().map(|r| r.step_chunk).collect::<Vec<_>>(),
+            vec![16, 16],
+            "remainder of the chunked head + the next request share the step"
+        );
+        assert!(prefilling.is_empty());
+    }
+
+    #[test]
+    fn echo_requests_never_split_but_run_alone_when_oversized() {
+        let mk_echo = |id: u64, prompt_len| {
+            let (req, _rx) = request(prompt_len, 1);
+            let mut pending = PendingRequest::from_scheduler_request(RequestId(id), req);
+            pending.echo = true;
+            pending
+        };
+        let mk = |id: u64, prompt_len| {
+            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
+        };
+
+        // Oversized echo at the head of an empty step runs whole — chunking it
+        // would lose the all-position logits echo needs.
+        let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
+        let taken = take_prefill_chunks(&mut prefilling, 32);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].step_chunk, 64, "echo takes its full prompt");
+        assert_eq!(prefilling[0].request_id, RequestId(2));
+
+        // An echo that doesn't fit behind earlier work is skipped, not split;
+        // later requests may still fill the leftover budget, and the step set
+        // stays sorted by request id.
+        let mut prefilling = vec![mk(3, 24), mk_echo(4, 16), mk(5, 8)];
+        let taken = take_prefill_chunks(&mut prefilling, 32);
+        assert_eq!(
+            taken
+                .iter()
+                .map(|r| (r.request_id.get(), r.step_chunk))
+                .collect::<Vec<_>>(),
+            vec![(3, 24), (5, 8)],
+            "echo skipped, leftover budget goes to the next non-echo request"
+        );
+        assert_eq!(prefilling[0].request_id, RequestId(4));
+    }
+
+    #[test]
+    fn long_prompt_chunks_across_steps_and_still_completes() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let prefill_batches = Arc::new(Mutex::new(Vec::new()));
+        let decode_batches = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(64, Arc::clone(&dropped)).with_batch_records(
+            Arc::clone(&prefill_batches),
+            Arc::clone(&decode_batches),
+        );
+        // 8-token chunk budget: a 32-token prompt needs 4 prefill steps.
+        let handle = start_with_executor(executor, 42, 8);
+
+        let (req, mut rx) = request(32, 2);
+        handle.submit(req).expect("submit chunked request");
+        match rx.blocking_recv() {
+            Some(TokenEvent::Scheduled { prompt_tokens, .. }) => {
+                assert_eq!(prompt_tokens, 32, "Scheduled fires once, on the first chunk");
+            }
+            _ => panic!("stream opens with Scheduled"),
+        }
+        assert!(
+            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
+            "first token arrives only after the final chunk, with no duplicate Scheduled"
+        );
+        assert!(
+            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 200, .. })),
+            "decode continues normally after promotion"
+        );
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(TokenEvent::Finished { .. })
+        ));
+
+        let batches = prefill_batches.lock().unwrap();
+        assert_eq!(
+            batches.len(),
+            4,
+            "32-token prompt under an 8-token budget takes exactly 4 chunk steps"
+        );
+        assert!(
+            batches.iter().all(|b| b == &vec![RequestId(0)]),
+            "every chunk step carries the same request"
+        );
+    }
+
+    #[test]
+    fn disconnect_mid_chunk_drops_the_request() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        let handle = start_with_executor(executor, 42, 8);
+
+        let (req, rx) = request(32, 2);
+        handle.submit(req).expect("submit chunked request");
+        drop(rx); // client goes away while chunks are still in flight
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if dropped.lock().unwrap().contains(&0) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("request KV was not dropped after a mid-prefill disconnect");
     }
 
     #[test]
@@ -1503,12 +1738,12 @@ mod tests {
         let under_reserved = admit_deferred_requests(
             vec![mk(1, 16, 17)],
             &active,
+            &[],
             16,
             2,
             2,
             usize::MAX,
             64,
-            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
         assert!(
@@ -1524,12 +1759,12 @@ mod tests {
         let exactly_reserved = admit_deferred_requests(
             vec![mk(2, 16, 17)],
             &active,
+            &[],
             16,
             3,
             3,
             usize::MAX,
             64,
-            DEFAULT_MAX_PREFILL_TOKENS,
             |_| 0,
         );
         assert_eq!(
@@ -1683,6 +1918,9 @@ mod tests {
             echo,
             queued_at_unix_s: None,
             prefetch_offered: false,
+            prefill_pos: 0,
+            step_chunk: 0,
+            cached_tokens: 0,
         }
     }
 
@@ -1694,7 +1932,7 @@ mod tests {
 
         let mut deferred = vec![pending(1, true), pending(2, false)];
         let mut loading = Vec::new();
-        offer_prefetch(&mut executor, &mut deferred, &mut loading);
+        offer_prefetch(&mut executor, &mut deferred, &mut loading, 0);
 
         // The plain request is probed; the echo request is skipped entirely, so
         // its prefill forwards the whole prompt without parking unspendable KV.
@@ -2050,6 +2288,7 @@ mod tests {
         apply_effects(
             &mut executor,
             &mut active,
+            &mut Vec::new(),
             effects::StepEffects {
                 scheduled: Vec::new(),
                 prompt_echoes: Vec::new(),

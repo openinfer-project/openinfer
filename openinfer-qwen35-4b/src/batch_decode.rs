@@ -25,6 +25,8 @@ impl Qwen35Model {
             params,
             &random_vals,
             &mut bufs.sample_row_indices,
+            &mut bufs.sample_argmax_partial_values,
+            &mut bufs.sample_argmax_partial_indices,
             &mut bufs.sample_probs,
             &mut bufs.sample_top1_value,
             &mut bufs.sample_row_states,

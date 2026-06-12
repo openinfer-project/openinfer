@@ -320,6 +320,15 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_prefill: {e}"))
     }
 
+    /// Apply a non-final prefill chunk: registers the chunk's blocks and
+    /// advances `kv_position` without emitting a generated token. The final
+    /// chunk must go through [`Self::apply_prefill`] instead.
+    pub fn apply_prefill_chunk(&mut self, pool: &BlockPool) -> anyhow::Result<()> {
+        self.seq
+            .apply_prefill(None, &pool.block_manager)
+            .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
+    }
+
     pub fn apply_decode(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<DecodeOutcome> {
         self.seq
             .apply_decode(token, &pool.block_manager)

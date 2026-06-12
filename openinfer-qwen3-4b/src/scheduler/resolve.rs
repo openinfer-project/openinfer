@@ -46,17 +46,34 @@ fn resolve_prefill_outputs(
     scheduled_at_unix_s: f64,
 ) -> StepEffects {
     let mut effects = StepEffects::empty();
-    for (req, result) in pending.into_iter().zip(request_results) {
-        debug_assert_eq!(req.request_id, result.request_id);
+    for (mut req, result) in pending.into_iter().zip(request_results) {
+        // Results are matched to requests positionally; a misalignment here
+        // would deliver request A's tokens to request B, so fail loudly in
+        // release builds too.
+        assert_eq!(req.request_id, result.request_id);
         let prompt_len = req.prompt_tokens.len();
 
-        effects.scheduled.push(ScheduledEffect {
-            token_tx: req.token_tx.clone(),
-            queued_at_unix_s: req.queued_at_unix_s,
-            scheduled_at_unix_s,
-            prompt_tokens: prompt_len,
-            cached_tokens: result.cached_tokens,
-        });
+        // Fire Scheduled on the request's first chunk only: queue time ends
+        // when prompt work first reaches the GPU, and the prefix-cache hit
+        // count is determined there. Later chunks must not re-send the event.
+        if req.prefill_pos == 0 {
+            effects.scheduled.push(ScheduledEffect {
+                token_tx: req.token_tx.clone(),
+                queued_at_unix_s: req.queued_at_unix_s,
+                scheduled_at_unix_s,
+                prompt_tokens: prompt_len,
+                cached_tokens: result.cached_tokens,
+            });
+        }
+
+        if !result.completed {
+            req.prefill_pos = result.prefill_pos;
+            req.cached_tokens = req.cached_tokens.max(result.cached_tokens);
+            effects
+                .pending
+                .push(PendingEffect::ContinuePrefill { req });
+            continue;
+        }
 
         if req.echo {
             effects.prompt_echoes.push(PromptEchoEffect {

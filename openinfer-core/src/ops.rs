@@ -14,10 +14,10 @@ pub use attention::{
     paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
 };
 pub use openinfer_kernels::ops::{
-    LoraDecodeGroupedProjection, accumulate_bf16_token_scaled_to_f32_into, add_batch,
+    GEMM_LT_MAX_N, LoraDecodeGroupedProjection, accumulate_bf16_token_scaled_to_f32_into, add_batch,
     add_batch_into, bf16_hidden_to_f32_into, embedding_decode_into, extract_vec, extract_vec_into,
     extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into, fused_add_rms_norm_into,
-    gather_hidden_tokens_into, gemm, gemm_into_checked, gemm_per_token, gemv, linear,
+    gather_hidden_tokens_into, gemm, gemm_into_checked, gemm_lt_tune, gemm_per_token, gemv, linear,
     lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into, pack_lora_b_rows_into,
     qk_norm_partial_rope_batched_decode_hd256_into, rms_norm, rms_norm_batch_offset_into,
     rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into, scale_f32_in_place,
@@ -32,8 +32,9 @@ pub use openinfer_kernels::ops::{
 };
 pub use paged_plan::PrefillPagedPlan;
 pub use sampling::{
-    argmax, argmax_batch_bf16_indexed_into, argmax_batch_bf16_into,
-    flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into, select_batch_tokens_into,
+    argmax, argmax_batch_bf16_into, argmax_batch_bf16_split_indexed_into,
+    argmax_batch_bf16_split_partials_len, flashinfer_topk_row_states_bytes, gpu_sample,
+    gpu_sample_into, select_batch_tokens_into,
 };
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::{
