@@ -35,14 +35,7 @@ members = [
     "openinfer-comm/crates/openinfer-comm-a2a-kernels",
     "openinfer-comm/crates/openinfer-comm-p2p-all-to-all",
     "openinfer-comm/crates/openinfer-comm-python-ext",
-    # ---- dynamo kvbm (ported, Apache-2.0) ----
-    "kvbm/dynamo-tokens",
-    "kvbm/dynamo-memory",
-    "kvbm/dynamo-kv-hashing",
-    "kvbm/dynamo-kv-router",
-    "kvbm/kvbm-common",
-    "kvbm/kvbm-consolidator",
-    "kvbm/kvbm-kernels",
+    # ---- dynamo kvbm (forked from upstream, Apache-2.0) ----
     "kvbm/kvbm-logical",
 ]
 
@@ -58,14 +51,12 @@ repository = "https://github.com/ai-dynamo/dynamo.git"
 keywords = ["llm", "genai", "inference", "nvidia", "distributed"]
 
 [workspace.dependencies]
-# ---- dynamo kvbm internal crates ----
-dynamo-tokens = { path = "kvbm/dynamo-tokens" }
-dynamo-memory = { path = "kvbm/dynamo-memory" }
-dynamo-kv-hashing = { path = "kvbm/dynamo-kv-hashing" }
-dynamo-kv-router = { path = "kvbm/dynamo-kv-router", features = ["metrics"] }
-kvbm-common = { path = "kvbm/kvbm-common" }
-kvbm-consolidator = { path = "kvbm/kvbm-consolidator" }
-kvbm-kernels = { path = "kvbm/kvbm-kernels" }
+# ---- dynamo (upstream via git; kvbm-logical is a local fork) ----
+# Keep every ai-dynamo/dynamo dep on the SAME rev: crates from the same git
+# checkout unify their shared internal deps (dynamo-tokens), mixing revs would
+# split type identity.
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
+dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
 kvbm-logical = { path = "kvbm/kvbm-logical" }
 # ---- third-party ----
 anyhow = "1.0"
