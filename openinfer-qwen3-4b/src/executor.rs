@@ -463,8 +463,9 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
     Ok(())
 }
 
-/// Pick the fastest cublasLt algo for every decode GEMM shape (N <= 4) before
-/// the first step, so CUDA-Graph capture bakes in the tuned kernels. Every
+/// Pick the fastest cublasLt algo for every decode GEMM shape (buckets up to
+/// `GEMM_LT_MAX_N`) before the first step, so CUDA-Graph capture bakes in the
+/// tuned kernels; adds a few seconds of startup per model thread. Every
 /// layer's weights enter the timing rotation to keep the loop L2-cold, the
 /// regime steady-state decode runs in.
 fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {

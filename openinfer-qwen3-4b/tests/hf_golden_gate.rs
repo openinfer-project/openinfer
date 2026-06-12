@@ -102,7 +102,8 @@ const P99_TOL: f32 = 0.20;
 const HEAD_K: usize = 8;
 
 /// Batch sizes for the batched passes, chosen against the CUDA-graph decode
-/// buckets `[1, 2, 4, 8, 16, 32, 64]` (`bucket_for` in `batch_decode.rs`). A
+/// buckets `[1, 2, 4, 8, 16, 20, ...]` (`BATCH_BUCKETS` in
+/// `batch_decode_buffers.rs`). A
 /// batch pads up to the next bucket, and padding-slot isolation is stressed
 /// hardest just *past* a boundary, where almost a whole bucket is padding: 9
 /// pads to 16 (7 pad slots) and 5 pads to 8 (3 pad slots). Both are well within
