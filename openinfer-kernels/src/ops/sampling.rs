@@ -293,7 +293,9 @@ pub fn argmax_batch_bf16_split_indexed_into(
     out: &mut CudaSlice<i32>,
 ) -> Result<()> {
     if rows == 0 {
-        return Err(anyhow!("argmax split indexed batch requires at least one row"));
+        return Err(anyhow!(
+            "argmax split indexed batch requires at least one row"
+        ));
     }
     if row_indices.len() < rows {
         return Err(anyhow!(
