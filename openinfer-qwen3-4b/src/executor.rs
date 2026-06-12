@@ -490,7 +490,12 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
     let o_samples: Vec<_> = layers.iter().map(|l| (&l.attention.o_proj, 0)).collect();
     let gate_up_samples: Vec<_> = layers
         .iter()
-        .flat_map(|l| [(&l.mlp.gate_up_proj, 0), (&l.mlp.gate_up_proj, intermediate)])
+        .flat_map(|l| {
+            [
+                (&l.mlp.gate_up_proj, 0),
+                (&l.mlp.gate_up_proj, intermediate),
+            ]
+        })
         .collect();
     let down_samples: Vec<_> = layers.iter().map(|l| (&l.mlp.down_proj, 0)).collect();
     let lm_head_samples = [(model.output_projection(), 0)];

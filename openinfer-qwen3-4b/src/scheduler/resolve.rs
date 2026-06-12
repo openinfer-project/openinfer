@@ -69,9 +69,7 @@ fn resolve_prefill_outputs(
         if !result.completed {
             req.prefill_pos = result.prefill_pos;
             req.cached_tokens = req.cached_tokens.max(result.cached_tokens);
-            effects
-                .pending
-                .push(PendingEffect::ContinuePrefill { req });
+            effects.pending.push(PendingEffect::ContinuePrefill { req });
             continue;
         }
 
