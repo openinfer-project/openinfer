@@ -5,8 +5,8 @@ use crate::sampler::SamplingParams;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 pub use openinfer_kernels::ops::{
-    argmax, argmax_batch_bf16_indexed_into, argmax_batch_bf16_into,
-    flashinfer_topk_row_states_bytes,
+    argmax, argmax_batch_bf16_into, argmax_batch_bf16_split_indexed_into,
+    argmax_batch_bf16_split_partials_len, flashinfer_topk_row_states_bytes,
 };
 
 /// GPU sampling: temperature -> softmax -> top-k -> top-p -> multinomial.
@@ -74,6 +74,8 @@ pub fn select_batch_tokens_into(
     params: &[&SamplingParams],
     random_vals: &[f32],
     row_indices_scratch: &mut CudaSlice<i32>,
+    argmax_partial_values_scratch: &mut CudaSlice<f32>,
+    argmax_partial_indices_scratch: &mut CudaSlice<i32>,
     probs_scratch: &mut CudaSlice<f32>,
     top1_value_scratch: &mut CudaSlice<half::bf16>,
     row_states_scratch: &mut CudaSlice<u8>,
@@ -102,11 +104,13 @@ pub fn select_batch_tokens_into(
             .memcpy_htod(&greedy_rows, row_indices_scratch)
             .map_err(|e| anyhow!("H2D indexed argmax rows failed: {}", e))?;
 
-        argmax_batch_bf16_indexed_into(
+        argmax_batch_bf16_split_indexed_into(
             ctx,
             logits,
             row_indices_scratch,
             greedy_rows.len(),
+            argmax_partial_values_scratch,
+            argmax_partial_indices_scratch,
             top1_value_scratch,
             out,
         )?;

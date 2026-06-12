@@ -141,6 +141,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn gemm_lt_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gemm_lt_tune_cuda(
+        Ws: *const *const Half,
+        num_ws: i32,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(
         embed: *const Half,
@@ -411,11 +430,13 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub fn argmax_batch_bf16_indexed_cuda(
+    pub fn argmax_batch_bf16_split_indexed_cuda(
         x: *const Half,
         row_indices: *const i32,
         values: *mut Half,
         indices: *mut i32,
+        partial_values: *mut f32,
+        partial_indices: *mut i32,
         rows: i32,
         n: i32,
         stream: CUstream,

@@ -221,6 +221,8 @@ fn build_batch_decode_request_results(
         &params,
         &random_vals,
         &mut lane.sample_scratch.row_indices,
+        &mut lane.sample_scratch.argmax_partial_values,
+        &mut lane.sample_scratch.argmax_partial_indices,
         &mut lane.sample_scratch.probs,
         &mut lane.sample_scratch.top1_values,
         &mut lane.sample_scratch.row_states,
@@ -373,6 +375,8 @@ impl Drop for CublasThreadGuard {
 
 struct SamplingScratch {
     row_indices: cudarc::driver::CudaSlice<i32>,
+    argmax_partial_values: cudarc::driver::CudaSlice<f32>,
+    argmax_partial_indices: cudarc::driver::CudaSlice<i32>,
     probs: cudarc::driver::CudaSlice<f32>,
     top1_values: cudarc::driver::CudaSlice<half::bf16>,
     row_states: cudarc::driver::CudaSlice<u8>,
@@ -382,8 +386,12 @@ struct SamplingScratch {
 
 impl SamplingScratch {
     fn new(ctx: &DeviceContext, vocab_size: usize, max_batch_bucket: usize) -> Result<Self> {
+        let partials =
+            openinfer_core::ops::argmax_batch_bf16_split_partials_len(max_batch_bucket, vocab_size);
         Ok(Self {
             row_indices: ctx.stream.alloc_zeros(max_batch_bucket)?,
+            argmax_partial_values: ctx.stream.alloc_zeros(partials)?,
+            argmax_partial_indices: ctx.stream.alloc_zeros(partials)?,
             probs: ctx.stream.alloc_zeros(vocab_size)?,
             top1_values: ctx.stream.alloc_zeros(max_batch_bucket)?,
             row_states: ctx
@@ -451,6 +459,49 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to bind CUDA context to thread: {e}"))?;
     unsafe {
         openinfer_core::ffi::cublas_init();
+    }
+    Ok(())
+}
+
+/// Pick the fastest cublasLt algo for every decode GEMM shape (buckets up to
+/// `GEMM_LT_MAX_N`) before the first step, so CUDA-Graph capture bakes in the
+/// tuned kernels; adds a few seconds of startup per model thread. Every
+/// layer's weights enter the timing rotation to keep the loop L2-cold, the
+/// regime steady-state decode runs in.
+fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
+    let ctx = model.device_ctx();
+    let hidden = model.config().hidden_size;
+    let vocab = model.config().vocab_size;
+    let q_dim = model.local_q_dim();
+    let kv_dim = model.local_kv_dim();
+    let intermediate = model.local_intermediate_size();
+    let layers = &model.layers;
+
+    let q_samples: Vec<_> = layers.iter().map(|l| (&l.attention.qkv_proj, 0)).collect();
+    let kv_samples: Vec<_> = layers
+        .iter()
+        .flat_map(|l| {
+            [
+                (&l.attention.qkv_proj, q_dim),
+                (&l.attention.qkv_proj, q_dim + kv_dim),
+            ]
+        })
+        .collect();
+    let o_samples: Vec<_> = layers.iter().map(|l| (&l.attention.o_proj, 0)).collect();
+    let gate_up_samples: Vec<_> = layers
+        .iter()
+        .flat_map(|l| [(&l.mlp.gate_up_proj, 0), (&l.mlp.gate_up_proj, intermediate)])
+        .collect();
+    let down_samples: Vec<_> = layers.iter().map(|l| (&l.mlp.down_proj, 0)).collect();
+    let lm_head_samples = [(model.output_projection(), 0)];
+
+    for &n in BATCH_BUCKETS.iter().filter(|&&b| b <= ops::GEMM_LT_MAX_N) {
+        ops::gemm_lt_tune(ctx, &q_samples, q_dim, n)?;
+        ops::gemm_lt_tune(ctx, &kv_samples, kv_dim, n)?;
+        ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
+        ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
+        ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
+        ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
     }
     Ok(())
 }
@@ -1771,6 +1822,7 @@ impl LocalQwen3Lane {
 
     fn bind(&self) -> Result<CublasThreadGuard> {
         bind_model_thread(&self.model)?;
+        tune_decode_gemm_algos(&self.model)?;
         Ok(CublasThreadGuard)
     }
 
@@ -1796,6 +1848,8 @@ impl LocalQwen3Lane {
             params,
             random_vals,
             &mut self.sample_scratch.row_indices,
+            &mut self.sample_scratch.argmax_partial_values,
+            &mut self.sample_scratch.argmax_partial_indices,
             &mut self.sample_scratch.probs,
             &mut self.sample_scratch.top1_values,
             &mut self.sample_scratch.row_states,

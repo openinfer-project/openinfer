@@ -803,9 +803,12 @@ fn prefilling_future_blocks(
 /// whole regardless of the budget — an oversized echo prompt still spikes
 /// activation memory.
 ///
-/// 2048 matches vLLM's `max_num_batched_tokens` default and trades a few
-/// percent of overload throughput for half the ITL p99 tail.
-pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 2048;
+/// A unified step's duration scales with its prefill tokens, and every decode
+/// request in the batch stalls for the whole step — the budget bounds that
+/// stall. 1024 halves ITL p99 vs 2048 at mid-load with the same mean TPOT;
+/// 512 chunks no longer amortize the per-step fixed cost, so prefill falls
+/// behind arrivals and TTFT queues up.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
