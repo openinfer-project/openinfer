@@ -247,9 +247,7 @@ fn decode_batch_step(
 ) -> Result<Duration> {
     let requests: Vec<DecodeStepItem> = batch
         .iter()
-        .map(|&(request_id, token)| {
-            DecodeStepItem::new(request_id, token, params, 0, rng.random())
-        })
+        .map(|&(request_id, token)| DecodeStepItem::new(request_id, token, params, 0, rng.random()))
         .collect();
     let start = Instant::now();
     let result = executor.execute_decode(DecodePlan {

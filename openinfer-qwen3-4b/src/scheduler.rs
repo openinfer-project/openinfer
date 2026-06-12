@@ -1389,17 +1389,8 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(
-            deferred,
-            &active,
-            &[],
-            16,
-            4,
-            4,
-            usize::MAX,
-            64,
-            |_| 0,
-        );
+        let outcome =
+            admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, |_| 0);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1438,17 +1429,8 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome = admit_deferred_requests(
-            deferred,
-            &active,
-            &[],
-            16,
-            1000,
-            1000,
-            32,
-            64,
-            |_| 0,
-        );
+        let outcome =
+            admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, |_| 0);
 
         let pending_ids = outcome
             .pending
@@ -1602,10 +1584,8 @@ mod tests {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let prefill_batches = Arc::new(Mutex::new(Vec::new()));
         let decode_batches = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(64, Arc::clone(&dropped)).with_batch_records(
-            Arc::clone(&prefill_batches),
-            Arc::clone(&decode_batches),
-        );
+        let executor = FakeExecutor::new(64, Arc::clone(&dropped))
+            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches));
         // 8-token chunk budget: a 32-token prompt needs 4 prefill steps.
         let handle = start_with_executor(executor, 42, 8);
 
@@ -1613,7 +1593,10 @@ mod tests {
         handle.submit(req).expect("submit chunked request");
         match rx.blocking_recv() {
             Some(TokenEvent::Scheduled { prompt_tokens, .. }) => {
-                assert_eq!(prompt_tokens, 32, "Scheduled fires once, on the first chunk");
+                assert_eq!(
+                    prompt_tokens, 32,
+                    "Scheduled fires once, on the first chunk"
+                );
             }
             _ => panic!("stream opens with Scheduled"),
         }
