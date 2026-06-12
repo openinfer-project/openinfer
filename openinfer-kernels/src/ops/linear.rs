@@ -4,8 +4,11 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
-/// GEMMs at or below this N consult the cublasLt plan cache.
-pub const GEMM_LT_MAX_N: usize = 4;
+/// GEMMs at or below this N consult the cublasLt plan cache. 32 covers the
+/// decode buckets where cuBLAS's GemmEx heuristic picks badly (worst at
+/// N in [8, 16], where it skips split-K entirely); above that the GEMMs are
+/// wide enough that the default selection is fine.
+pub const GEMM_LT_MAX_N: usize = 32;
 
 /// Mirrors GEMM_LT_UNTUNED in csrc/shared/linear.cu.
 const GEMM_LT_UNTUNED: i32 = -1;

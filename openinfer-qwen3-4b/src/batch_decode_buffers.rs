@@ -13,23 +13,23 @@ use openinfer_kv_cache::KvView;
 /// bucket, and activation buffers are shared (sized once at the largest bucket), so
 /// extra buckets cost capture time on first hit, not memory.
 ///
-/// There is deliberately no bucket in [5, 19]: cuBLAS's heuristic skips split-K
-/// for GEMMs with batch in [8, 16], leaving ~20 CTAs on 170 SMs — measured on
-/// RTX 5090 (ctx1024, cuBLAS 12.9 and 13.2 alike), a bs8/bs16 step took
-/// 9.2/9.3ms while bs20 took 7.9ms. Padding those batches up to 20 buys the
-/// split-K configs and is strictly faster than running them at their own size.
+/// Buckets 8/16 are viable only because decode GEMMs at N <= GEMM_LT_MAX_N run
+/// tuned cublasLt algos: cuBLAS's GemmEx heuristic skips split-K for batch in
+/// [8, 16] (RTX 5090 ctx1024: 9.2/9.3ms steps vs 7.9ms at bs20), while the Lt
+/// heuristic list has full-speed candidates at every small N.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[
-    1, 2, 4, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160,
-    168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
+    1, 2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152,
+    160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
-// Split-KV decode attention: at bs <= 4 the non-partitioned kernel leaves most
-// SMs idle (one CTA per request x head). 64-token chunks measured fastest on
-// RTX 5090 at ctx1024 (128 and 256 are 1-7% slower, 32 is past the merge
-// overhead knee); beyond bs4 the non-partitioned kernel has enough CTAs.
+// Split-KV decode attention: the non-partitioned kernel runs one CTA per
+// request x head, starving SMs at small batch. 64-token chunks measured
+// fastest on RTX 5090 at ctx1024 (128/256 are 1-7% slower, 32 is past the
+// merge-overhead knee). Wins shrink with batch (bs8 -1.0ms, bs32 -0.4ms) and
+// reach noise level past bs40, where 320+ CTAs already fill the GPU.
 const SPLIT_KV_CHUNK_TOKENS: usize = 64;
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
-const SPLIT_KV_MAX_BATCH_SIZE: usize = 4;
+const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 const SPLIT_KV_MIN_SEQ_LEN: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +130,10 @@ impl BatchDecodeBuffers {
         num_qo_heads: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
-        let max_split_slots = bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
+        // The split-KV path is gated on padded_bs <= SPLIT_KV_MAX_BATCH_SIZE,
+        // so its workspace only needs slots for that many requests (~16 MiB
+        // instead of ~128 MiB at bucket 256).
+        let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
 
         Ok(Self {
             max_batch_size: bs,
@@ -253,6 +256,11 @@ impl BatchDecodeBuffers {
         kv_views: &[&KvView],
         padded_bs: usize,
     ) -> Result<()> {
+        // Past the batch cap the step always takes the non-partitioned path
+        // (see attention_path), and the workspace has no slots for it anyway.
+        if padded_bs > SPLIT_KV_MAX_BATCH_SIZE {
+            return Ok(());
+        }
         let split_chunk_size =
             SPLIT_KV_CHUNK_TOKENS.max(self.max_seq_len.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST));
         let split_padded_slots = padded_bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
