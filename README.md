@@ -260,6 +260,24 @@ flowchart TB
 
 ## Development
 
+### Fresh-box dev setup
+
+`scripts/setup_dev.sh` bootstraps a build environment on any fresh NVIDIA Ubuntu
+host: apt build deps + `protobuf-compiler`, uv, the rustup nightly pinned by
+`rust-toolchain.toml`, the vendored `flashinfer/3rdparty/cccl` submodule, then
+`cargo build --release`. CUDA is a prerequisite — it detects `nvcc` and fails
+loudly rather than installing a toolkit, so boot a CUDA image.
+
+```bash
+bash scripts/setup_dev.sh
+# on a GPU whose arch the kernels don't target (e.g. V100 sm_70), compile for another:
+OPENINFER_CUDA_SM=90 bash scripts/setup_dev.sh
+```
+
+To get the box itself, `scripts/prime_devbox.sh` provisions the cheapest match on
+[Prime Intellect](https://www.primeintellect.ai/), has the box git-clone this
+repo over HTTPS, and runs `setup_dev.sh` — see the script header for one-time setup.
+
 ### Tests
 
 ```bash
