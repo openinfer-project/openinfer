@@ -396,6 +396,18 @@ pub(crate) fn render_text(report: &BenchReport) -> String {
             out.push('\n');
             push_table(&mut out, &render_request_summary(report));
         }
+        BenchReport::Prefill(report) => {
+            let _ = writeln!(out, "bench_serving prefill\n");
+            push_table(&mut out, &render_prefill_meta(report));
+            out.push('\n');
+            push_table(&mut out, &render_prefill_table(report));
+        }
+        BenchReport::Decode(report) => {
+            let _ = writeln!(out, "bench_serving decode\n");
+            push_table(&mut out, &render_decode_meta(report));
+            out.push('\n');
+            push_table(&mut out, &render_decode_table(report));
+        }
         BenchReport::Matrix(report) => {
             let _ = writeln!(out, "bench_serving matrix\n");
             push_table(&mut out, &render_matrix_meta(report));
@@ -439,6 +451,12 @@ pub(crate) fn run_command(
     match &cli.command {
         Command::Request(args) => {
             bench_request(model, tokenizer, cli, model_type, load_ms, cuda_graph, args)
+        }
+        Command::Prefill(args) => {
+            crate::prefill::run_prefill(model, cli, model_type, load_ms, cuda_graph, args)
+        }
+        Command::Decode(args) => {
+            crate::decode::run_decode(model, cli, model_type, load_ms, cuda_graph, args)
         }
         Command::Matrix(args) => bench_matrix(model, cli, model_type, load_ms, cuda_graph, args),
         Command::Curve(args) => {

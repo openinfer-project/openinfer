@@ -172,10 +172,42 @@ pub fn unix_now_s() -> f64 {
         .as_secs_f64()
 }
 
+/// KV pool capacity as the scheduler actually allocates it: whole blocks of
+/// `block_size` tokens. A request of `L` tokens occupies `⌈L / block_size⌉`
+/// blocks no matter how `L` divides, so a fit check must round per request —
+/// summing raw token counts under-counts and can admit a batch that the
+/// scheduler then has to defer. Lets a caller (e.g. the prefill/decode bench)
+/// decide up front whether a batch fits without computing per-token KV by hand.
+#[derive(Clone, Copy, Debug)]
+pub struct KvCapacity {
+    /// Blocks available for requests when the pool is empty.
+    pub total_blocks: usize,
+    /// Tokens per block.
+    pub block_size: usize,
+}
+
+impl KvCapacity {
+    /// Total tokens the pool can hold (`total_blocks × block_size`).
+    #[must_use]
+    pub fn total_tokens(self) -> usize {
+        self.total_blocks.saturating_mul(self.block_size)
+    }
+
+    /// Blocks a single request of `tokens` tokens occupies — whole-block
+    /// allocation rounds up.
+    #[must_use]
+    pub fn blocks_for(self, tokens: usize) -> usize {
+        tokens.div_ceil(self.block_size.max(1))
+    }
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<EngineInner>,
     servable_len: Option<u32>,
+    /// KV pool capacity in blocks + block size, or `None` if the engine did not
+    /// report it. See [`KvCapacity`].
+    kv_capacity: Option<KvCapacity>,
 }
 
 struct EngineInner {
@@ -224,6 +256,7 @@ impl EngineHandle {
                 join_handle,
             }),
             servable_len: None,
+            kv_capacity: None,
         }
     }
 
@@ -235,6 +268,19 @@ impl EngineHandle {
 
     pub fn servable_len(&self) -> Option<u32> {
         self.servable_len
+    }
+
+    #[must_use]
+    pub fn with_kv_capacity(mut self, kv_capacity: KvCapacity) -> Self {
+        self.kv_capacity = Some(kv_capacity);
+        self
+    }
+
+    /// KV pool capacity, if the engine reported it. A batch whose per-request
+    /// block footprint exceeds [`KvCapacity::total_blocks`] cannot be resident
+    /// at once.
+    pub fn kv_capacity(&self) -> Option<KvCapacity> {
+        self.kv_capacity
     }
 
     #[allow(clippy::result_large_err)]

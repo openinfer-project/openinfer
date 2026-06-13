@@ -10,7 +10,8 @@ use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::metrics::summarize_durations;
 use crate::report::{
-    CurveReport, DurationStats, MatrixReport, MixedLoadReport, RequestReport, RunInfo,
+    CurveReport, DecodeReport, DurationStats, MatrixReport, MixedLoadReport, PrefillReport,
+    RequestReport, RunInfo,
 };
 use crate::snapshot::format_delta;
 
@@ -163,6 +164,145 @@ pub(crate) fn render_request_summary(report: &RequestReport) -> Table {
         key_cell("decode_tok_s"),
         numeric_cell(format_rate(report.metrics.decode_tok_s)),
     ]);
+    table
+}
+
+fn join_csv(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(crate) fn render_prefill_meta(report: &PrefillReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("prompt_lens"),
+        value_cell(join_csv(&report.workload.prompt_lens)),
+    ]);
+    table.add_row(vec![
+        key_cell("batches"),
+        value_cell(join_csv(&report.workload.batches)),
+    ]);
+    table.add_row(vec![
+        key_cell("kv_capacity_tokens"),
+        value_cell(
+            report
+                .workload
+                .kv_capacity_tokens
+                .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
+        ),
+    ]);
+    table.add_row(vec![
+        key_cell("distinct_prompts"),
+        numeric_cell(report.workload.distinct_prompts.to_string()),
+    ]);
+    table.add_row(vec![
+        key_cell("warmup / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.warmup, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+pub(crate) fn render_prefill_table(report: &PrefillReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("prompt_tok").set_alignment(CellAlignment::Right),
+        Cell::new("batch").set_alignment(CellAlignment::Right),
+        Cell::new("total_tok").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_p50").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_p99").set_alignment(CellAlignment::Right),
+        Cell::new("ttft_max").set_alignment(CellAlignment::Right),
+        Cell::new("prefill_tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("samples").set_alignment(CellAlignment::Right),
+    ]);
+    for cell in &report.cells {
+        table.add_row(vec![
+            numeric_cell(cell.prompt_len.to_string()),
+            numeric_cell(cell.batch.to_string()),
+            numeric_cell(cell.total_tokens.to_string()),
+            numeric_cell(format_duration_ms(cell.ttft_ms.p50_ms)),
+            numeric_cell(format_duration_ms(cell.ttft_ms.p99_ms)),
+            numeric_cell(format_duration_ms(cell.ttft_ms.max_ms)),
+            numeric_cell(format_rate(cell.prefill_tok_s)),
+            numeric_cell(cell.ttft_ms.samples.to_string()),
+        ]);
+    }
+    table
+}
+
+pub(crate) fn render_decode_meta(report: &DecodeReport) -> Table {
+    let mut table = render_run_summary(&report.run);
+    table.add_row(vec![
+        key_cell("ctxs"),
+        value_cell(join_csv(&report.workload.ctxs)),
+    ]);
+    table.add_row(vec![
+        key_cell("batches"),
+        value_cell(join_csv(&report.workload.batches)),
+    ]);
+    table.add_row(vec![
+        key_cell("kv_capacity_tokens"),
+        value_cell(
+            report
+                .workload
+                .kv_capacity_tokens
+                .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
+        ),
+    ]);
+    table.add_row(vec![
+        key_cell("decode_steps / warmup_steps"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.decode_steps, report.workload.warmup_steps
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("distinct_prompts / iters"),
+        value_cell(format!(
+            "{} / {}",
+            report.workload.distinct_prompts, report.workload.iters
+        )),
+    ]);
+    table.add_row(vec![
+        key_cell("seed"),
+        numeric_cell(report.workload.seed.to_string()),
+    ]);
+    table
+}
+
+pub(crate) fn render_decode_table(report: &DecodeReport) -> Table {
+    let mut table = new_table();
+    table.set_header(vec![
+        Cell::new("ctx").set_alignment(CellAlignment::Right),
+        Cell::new("batch").set_alignment(CellAlignment::Right),
+        Cell::new("peak_tok").set_alignment(CellAlignment::Right),
+        Cell::new("tpot_p50").set_alignment(CellAlignment::Right),
+        Cell::new("tpot_p99").set_alignment(CellAlignment::Right),
+        Cell::new("tpot_max").set_alignment(CellAlignment::Right),
+        Cell::new("decode_tok/s").set_alignment(CellAlignment::Right),
+        Cell::new("samples").set_alignment(CellAlignment::Right),
+    ]);
+    for cell in &report.cells {
+        table.add_row(vec![
+            numeric_cell(cell.ctx.to_string()),
+            numeric_cell(cell.batch.to_string()),
+            numeric_cell(cell.peak_tokens.to_string()),
+            numeric_cell(format_duration_ms(cell.tpot_ms.p50_ms)),
+            numeric_cell(format_duration_ms(cell.tpot_ms.p99_ms)),
+            numeric_cell(format_duration_ms(cell.tpot_ms.max_ms)),
+            numeric_cell(format_rate(cell.decode_tok_s)),
+            numeric_cell(cell.tpot_ms.samples.to_string()),
+        ]);
+    }
     table
 }
 

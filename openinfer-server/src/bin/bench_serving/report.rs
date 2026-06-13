@@ -122,6 +122,72 @@ pub(crate) struct RequestReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct PrefillWorkload {
+    pub(crate) prompt_lens: Vec<usize>,
+    pub(crate) batches: Vec<usize>,
+    pub(crate) distinct_prompts: usize,
+    pub(crate) warmup: usize,
+    pub(crate) iters: usize,
+    pub(crate) seed: u64,
+    /// Total KV pool capacity in tokens the sweep was checked against (`None`
+    /// if the model did not report it, in which case no capacity guard ran).
+    pub(crate) kv_capacity_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PrefillCell {
+    pub(crate) prompt_len: usize,
+    pub(crate) batch: usize,
+    /// `prompt_len × batch` — the KV the batch holds resident during prefill.
+    pub(crate) total_tokens: usize,
+    pub(crate) ttft_ms: DurationStats,
+    /// Batch prefill throughput: `total_tokens / ttft.p50`.
+    pub(crate) prefill_tok_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PrefillReport {
+    pub(crate) run: RunInfo,
+    pub(crate) workload: PrefillWorkload,
+    pub(crate) cells: Vec<PrefillCell>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DecodeWorkload {
+    pub(crate) ctxs: Vec<usize>,
+    pub(crate) batches: Vec<usize>,
+    pub(crate) decode_steps: usize,
+    pub(crate) warmup_steps: usize,
+    pub(crate) distinct_prompts: usize,
+    pub(crate) iters: usize,
+    pub(crate) seed: u64,
+    /// Total KV pool capacity in tokens the sweep was checked against (`None`
+    /// if the model did not report it, in which case no capacity guard ran).
+    pub(crate) kv_capacity_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DecodeCell {
+    pub(crate) ctx: usize,
+    pub(crate) batch: usize,
+    pub(crate) decode_steps: usize,
+    /// `batch × (ctx + decode_steps)` — peak resident KV during the decode.
+    pub(crate) peak_tokens: usize,
+    /// Steady-state per-token decode latency (prefill served from cache, so it
+    /// is excluded; the leading `warmup_steps` are dropped).
+    pub(crate) tpot_ms: DurationStats,
+    /// Aggregate decode throughput: `batch / tpot.p50`.
+    pub(crate) decode_tok_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DecodeReport {
+    pub(crate) run: RunInfo,
+    pub(crate) workload: DecodeWorkload,
+    pub(crate) cells: Vec<DecodeCell>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct MatrixWorkload {
     pub(crate) prompt_lens: Vec<usize>,
     pub(crate) output_lens: Vec<usize>,
@@ -241,6 +307,8 @@ pub(crate) struct MixedLoadReport {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum BenchReport {
     Request(Box<RequestReport>),
+    Prefill(PrefillReport),
+    Decode(DecodeReport),
     Matrix(MatrixReport),
     Curve(CurveReport),
     Mixed(Box<MixedLoadReport>),
