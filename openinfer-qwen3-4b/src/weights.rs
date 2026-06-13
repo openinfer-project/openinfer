@@ -296,13 +296,6 @@ pub(crate) struct Qwen3Model {
     pub(super) packed_lora: PackedLoraRegistry,
     pub(super) max_loras: usize,
     pub(super) max_lora_rank: usize,
-    /// Source safetensors mmaps, kept for the model's lifetime. munmap of the
-    /// ~8GB touched mapping costs ~0.4s of kernel page-table teardown under
-    /// the process mmap lock, stalling whatever cudaMalloc/cuBLAS init runs
-    /// next (KV cache, decode buffers, first-decode graph capture) — while
-    /// keeping it is free: the pages are clean file-backed page cache the
-    /// kernel can reclaim under pressure.
-    _weight_source: Vec<memmap2::Mmap>,
 }
 
 // SAFETY: Each model instance is pinned to a single CUDA device and is only
@@ -541,6 +534,7 @@ impl Qwen3Model {
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
         drop(shards);
+        drop(mmaps);
 
         let num_hidden_layers = config.num_hidden_layers;
         let model = Self {
@@ -559,7 +553,6 @@ impl Qwen3Model {
             packed_lora: PackedLoraRegistry::empty(runtime.max_loras, num_hidden_layers),
             max_loras: runtime.max_loras,
             max_lora_rank: runtime.max_lora_rank,
-            _weight_source: mmaps,
         };
 
         if model.enable_cuda_graph {
