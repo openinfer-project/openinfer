@@ -150,13 +150,16 @@ cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | Greedy + sampling, default feature, pure Rust + CUDA build |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling, default feature, pure Rust + CUDA build |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling, feature-gated, `--features qwen35-4b` (build-time Triton) |
-| [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU path |
-| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention, MP8 checkpoint | 671B total / 37B active | Initial greedy, feature-gated, 8-GPU MP8 |
+| [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU EP2 correctness path |
+| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention, MP8 checkpoint | 671B total / 37B active | Feature-gated, `--features deepseek-v4`, 8-GPU MP8, TileLang build-time kernels, greedy-only |
 | [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
 
 Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Every model line is controlled by a cargo feature; only `qwen3-4b` is on by default, so the stock build serves Qwen3 with zero Python. Other lines require rebuilding `openinfer-server` with the matching `--features ...` flag before launch.
 
-DeepSeek V4 support is intentionally narrower than the Qwen paths in the initial PR: it requires `--features deepseek-v4`, uses CUDA devices `0..7`, serves greedy requests only, terminates unsupported logprobs and non-greedy sampling requests with an explicit `stop_reason`, and does not use CUDA Graph yet.
+DeepSeek support is intentionally narrower than the Qwen paths:
+
+- **DeepSeek-V4-Flash** requires `--features deepseek-v4`, the 8-GPU MP8 checkpoint, and TileLang at build time. The current OpenAI-compatible path is a single-request greedy smoke/direct regression path: unsupported logprobs and non-greedy sampling requests terminate with an explicit `stop_reason`; bs>1 serving, continuous batching, service-level KV management, and CUDA Graph remain follow-up. Evidence: [`support.md`](docs/models/deepseek-v4/support.md), [`serving-baseline.md`](docs/models/deepseek-v4/serving-baseline.md), and [`decode-performance.md`](docs/models/deepseek-v4/decode-performance.md).
+- **DeepSeek-V2-Lite** requires `--features deepseek-v2-lite` and the 2-GPU EP2 path. Its current gate is correctness and attribution only: HF, host-staged, and NCCL are token/text exact for the narrow `Hello`/16-token greedy contract; same-prompt batch and HTTP/vLLM data are diagnostic and do not claim production continuous batching or serving parity. Evidence: [`status.md`](docs/models/deepseek-v2-lite/status.md) and [`hf-accuracy-gate.md`](docs/models/deepseek-v2-lite/hf-accuracy-gate.md).
 
 ## API
 
@@ -252,7 +255,8 @@ flowchart TB
 
 - **Qwen3**: 32 Q heads, 8 KV heads (GQA 4:1), head_dim=128
 - **Qwen3.5**: hybrid — 24 linear attention layers (Gated Delta Rule) + 8 full attention layers, head_dim=256
-- **DeepSeek V4 Flash**: feature-gated 8-way MP8 checkpoint with MoE routing, sparse attention, FP8/FP4 TileLang kernels, and OpenAI-compatible greedy serving
+- **DeepSeek V2-Lite**: feature-gated 2-GPU EP2 correctness/attribution path for the HF/host-staged/NCCL narrow greedy gate
+- **DeepSeek V4 Flash**: feature-gated 8-way MP8 checkpoint with MoE routing, sparse attention, FP8/FP4 TileLang kernels, and single-request OpenAI-compatible greedy smoke/direct regression path
 
 ### What's not (yet) implemented
 
