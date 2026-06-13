@@ -73,6 +73,20 @@ fn get_model_path() -> String {
     std::env::var("OPENINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
 }
 
+fn max_position_embeddings(model_path: &str) -> usize {
+    let config_path = std::path::Path::new(model_path).join("config.json");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display())),
+    )
+    .expect("config.json must be valid JSON");
+    config
+        .pointer("/text_config/max_position_embeddings")
+        .or_else(|| config.pointer("/max_position_embeddings"))
+        .and_then(serde_json::Value::as_u64)
+        .expect("Qwen3.5 config must expose max_position_embeddings") as usize
+}
+
 struct TestCase {
     name: &'static str,
     prompt: &'static str,
@@ -117,11 +131,51 @@ fn generate_tokens(
     }
 }
 
+fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: usize) {
+    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+
+    handle
+        .submit(GenerateRequest {
+            request_id: Some("over-context-window".to_string()),
+            queued_at_unix_s: None,
+            prompt_tokens: vec![1; max_context_tokens],
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .expect("submit over-context request");
+
+    match token_rx.blocking_recv() {
+        Some(TokenEvent::Rejected {
+            message,
+            prompt_tokens,
+            completion_tokens,
+        }) => {
+            assert_eq!(prompt_tokens, max_context_tokens);
+            assert_eq!(completion_tokens, 0);
+            assert!(
+                message.contains("maximum context length"),
+                "expected context-window rejection, got: {message}"
+            );
+            assert!(
+                message.contains(&(max_context_tokens + 1).to_string()),
+                "rejection should report prompt + max_tokens, got: {message}"
+            );
+        }
+        Some(_) => panic!("expected context-window rejection"),
+        None => panic!("scheduler channel closed without rejection"),
+    }
+}
+
 #[test]
 fn test_e2e_qwen35_scheduler() {
     // logging intentionally left to the test harness
 
     let model_path = get_model_path();
+    let max_context_tokens = max_position_embeddings(&model_path);
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
@@ -133,6 +187,11 @@ fn test_e2e_qwen35_scheduler() {
     let handle = openinfer_qwen35_4b::runtime::start_with_capacity(model, 42, 8)
         .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
+
+    // ── 0. Static context-window rejection ─────────────────────────────
+    info!("=== Phase 0: Context-window rejection ===");
+    expect_context_window_rejection(&handle, max_context_tokens);
+    info!("  PASS: over-context request rejected before prefill");
 
     // ── 1. Sequential scheduler requests ────────────────────────────────
     info!("=== Phase 1: Qwen3.5 sequential scheduler requests ===");

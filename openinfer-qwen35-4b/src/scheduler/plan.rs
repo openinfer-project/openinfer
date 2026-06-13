@@ -7,7 +7,7 @@ pub(super) enum ExecutionPlan<T> {
 pub(super) struct AdmissionOutcome<T> {
     pub(super) pending: Vec<T>,
     pub(super) deferred: Vec<T>,
-    pub(super) rejected: Vec<T>,
+    pub(super) rejected: Vec<(T, RejectReason)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +21,12 @@ pub(super) struct ActiveKvBudget {
 pub(super) struct SlotCompaction {
     pub(super) moved_from: usize,
     pub(super) moved_to: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RejectReason {
+    ContextLength { limit: usize },
+    KvBudget,
 }
 
 pub(super) fn build_next_plan<T>(have_active: bool, pending: Vec<T>) -> Option<ExecutionPlan<T>> {
@@ -42,6 +48,7 @@ pub(super) fn admit_pending_requests<T>(
     page_size: usize,
     available_pages: usize,
     max_request_pages: usize,
+    max_context_tokens: usize,
     mut prompt_len: impl FnMut(&T) -> usize,
     mut max_tokens: impl FnMut(&T) -> usize,
 ) -> AdmissionOutcome<T> {
@@ -55,10 +62,21 @@ pub(super) fn admit_pending_requests<T>(
     let mut blocked = false;
 
     for req in pending {
-        let request_pages =
-            pages_needed(max_kv_tokens(prompt_len(&req), max_tokens(&req)), page_size);
+        let prompt_len = prompt_len(&req);
+        let max_tokens = max_tokens(&req);
+        if prompt_len.saturating_add(max_tokens) > max_context_tokens {
+            rejected.push((
+                req,
+                RejectReason::ContextLength {
+                    limit: max_context_tokens,
+                },
+            ));
+            continue;
+        }
+
+        let request_pages = pages_needed(max_kv_tokens(prompt_len, max_tokens), page_size);
         if request_pages > max_request_pages {
-            rejected.push(req);
+            rejected.push((req, RejectReason::KvBudget));
             continue;
         }
 
@@ -162,6 +180,10 @@ mod tests {
         reqs.iter().map(|req| req.id).collect()
     }
 
+    fn rejected_ids(reqs: &[(Pending, RejectReason)]) -> Vec<u32> {
+        reqs.iter().map(|(req, _)| req.id).collect()
+    }
+
     #[test]
     fn plan_selection_follows_active_and_pending_state() {
         assert!(
@@ -212,6 +234,7 @@ mod tests {
             16,
             6,
             6,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -238,6 +261,7 @@ mod tests {
             16,
             3,
             8,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -260,6 +284,7 @@ mod tests {
             16,
             2,
             8,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -282,6 +307,7 @@ mod tests {
             16,
             3,
             8,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -297,6 +323,61 @@ mod tests {
             "17 tokens needs two pages and waits when only one page remains"
         );
         assert!(outcome.rejected.is_empty());
+    }
+
+    #[test]
+    fn admission_rejects_requests_past_context_window() {
+        let outcome = admit_pending_requests(
+            vec![
+                pending_with_max(1, 16, 16), // 32 context tokens: admitted.
+                pending_with_max(2, 16, 17), // 33 context tokens: rejected.
+                pending_with_max(3, 40, 1),  // prompt alone exceeds the window.
+            ],
+            &[],
+            8,
+            16,
+            1000,
+            1000,
+            32,
+            |req| req.prompt_len,
+            |req| req.max_tokens,
+        );
+
+        assert_eq!(ids(&outcome.pending), vec![1]);
+        assert!(outcome.deferred.is_empty());
+        assert_eq!(rejected_ids(&outcome.rejected), vec![2, 3]);
+        for (_, reason) in &outcome.rejected {
+            assert!(
+                matches!(reason, RejectReason::ContextLength { limit: 32 }),
+                "over-window requests must be rejected on context length"
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_rejection_takes_precedence_over_kv_budget() {
+        let outcome = admit_pending_requests(
+            vec![pending_with_max(1, 40, 40)], // exceeds both 32-token context and 1 page.
+            &[],
+            8,
+            16,
+            1000,
+            1,
+            32,
+            |req| req.prompt_len,
+            |req| req.max_tokens,
+        );
+
+        assert!(outcome.pending.is_empty());
+        assert!(outcome.deferred.is_empty());
+        assert_eq!(rejected_ids(&outcome.rejected), vec![1]);
+        assert!(
+            matches!(
+                outcome.rejected[0].1,
+                RejectReason::ContextLength { limit: 32 }
+            ),
+            "a static context-window violation should not be reported as KV pressure"
+        );
     }
 
     #[test]
@@ -329,6 +410,7 @@ mod tests {
             16,
             10,
             10,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -351,6 +433,7 @@ mod tests {
             16,
             1,
             4,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -379,6 +462,7 @@ mod tests {
             16,
             2,
             8,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -433,6 +517,7 @@ mod tests {
             16,
             4,
             8,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -458,13 +543,18 @@ mod tests {
             16,
             4,
             4,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
 
         assert_eq!(ids(&outcome.pending), vec![2]);
         assert!(outcome.deferred.is_empty());
-        assert_eq!(ids(&outcome.rejected), vec![1]);
+        assert_eq!(rejected_ids(&outcome.rejected), vec![1]);
+        assert!(
+            matches!(outcome.rejected[0].1, RejectReason::KvBudget),
+            "over-budget requests should keep the existing KV rejection reason"
+        );
     }
 
     #[test]
@@ -476,6 +566,7 @@ mod tests {
             16,
             4,
             4,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
@@ -495,6 +586,7 @@ mod tests {
             16,
             1,
             1,
+            usize::MAX,
             |req| req.prompt_len,
             |req| req.max_tokens,
         );
