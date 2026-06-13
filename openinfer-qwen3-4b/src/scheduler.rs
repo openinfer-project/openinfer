@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
-    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, TokenEvent,
+    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
 };
 use openinfer_core::sampler::SamplingParams;
 
@@ -204,9 +204,10 @@ where
     // Executor just built: the only committed block is the leaked CUDA-graph
     // padding slot, so available_blocks() is total − 1. Conservative by one
     // block, which is the right side to err on for a capacity ceiling.
-    let kv_capacity = executor
-        .available_blocks()
-        .saturating_mul(executor.block_size());
+    let kv_capacity = KvCapacity {
+        total_blocks: executor.available_blocks(),
+        block_size: executor.block_size(),
+    };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -218,7 +219,7 @@ where
 
     EngineHandle::new(submit_tx)
         .with_servable_len(servable)
-        .with_kv_capacity_tokens(kv_capacity)
+        .with_kv_capacity(kv_capacity)
 }
 
 pub(crate) fn start_with_executor_with_lora_control<E>(
@@ -241,9 +242,10 @@ where
     // Executor just built: the only committed block is the leaked CUDA-graph
     // padding slot, so available_blocks() is total − 1. Conservative by one
     // block, which is the right side to err on for a capacity ceiling.
-    let kv_capacity = executor
-        .available_blocks()
-        .saturating_mul(executor.block_size());
+    let kv_capacity = KvCapacity {
+        total_blocks: executor.available_blocks(),
+        block_size: executor.block_size(),
+    };
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -255,7 +257,7 @@ where
 
     EngineHandle::new_with_command_channel(command_tx)
         .with_servable_len(servable)
-        .with_kv_capacity_tokens(kv_capacity)
+        .with_kv_capacity(kv_capacity)
 }
 
 // ── KV-offload prefetch admission helpers ────────────────────────────────

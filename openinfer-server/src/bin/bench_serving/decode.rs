@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use log::{info, warn};
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
+use openinfer::scheduler::{KvCapacity, SchedulerHandle, SchedulerRequest, TokenEvent};
 use openinfer::server_engine::ModelType;
 use tokio::sync::mpsc;
 
@@ -59,7 +59,7 @@ pub(crate) fn run_decode(
     let handle = model.scheduler_handle().context(
         "decode requires a scheduler-backed model; deepseek-v2-lite is generator-based — use `request`",
     )?;
-    let capacity = handle.kv_capacity_tokens();
+    let capacity = handle.kv_capacity();
     guard_capacity(capacity, &ctxs, &batches, args.decode_steps)?;
 
     let sampling = SamplingParams {
@@ -92,16 +92,19 @@ pub(crate) fn run_decode(
             distinct_prompts: args.distinct_prompts,
             iters: args.iters,
             seed: args.seed,
-            kv_capacity_tokens: capacity,
+            kv_capacity_tokens: capacity.map(KvCapacity::total_tokens),
         },
         cells,
     }))
 }
 
-/// Refuse the sweep if any cell's peak resident KV (`batch × (ctx +
-/// decode_steps)`) exceeds the pool. `None` capacity downgrades to a warning.
+/// Refuse the sweep if any cell's peak resident KV exceeds the pool. Each of the
+/// `batch` requests grows to `ctx + decode_steps` tokens and the scheduler
+/// allocates whole blocks, so a cell needs `batch × ⌈(ctx + decode_steps) /
+/// block_size⌉` blocks — summing raw tokens would under-count. `None` capacity
+/// downgrades to a warning.
 fn guard_capacity(
-    capacity: Option<usize>,
+    capacity: Option<KvCapacity>,
     ctxs: &[usize],
     batches: &[usize],
     decode_steps: usize,
@@ -114,22 +117,29 @@ fn guard_capacity(
         return Ok(());
     };
 
+    let blocks = |c: usize, b: usize| b.saturating_mul(cap.blocks_for(c + decode_steps));
     let over: Vec<String> = ctxs
         .iter()
         .flat_map(|&c| batches.iter().map(move |&b| (c, b)))
-        .filter(|&(c, b)| b.saturating_mul(c + decode_steps) > cap)
-        .map(|(c, b)| format!("ctx{c}×bs{b} ({} tok)", b * (c + decode_steps)))
+        .filter(|&(c, b)| blocks(c, b) > cap.total_blocks)
+        .map(|(c, b)| format!("ctx{c}×bs{b} ({} blocks)", blocks(c, b)))
         .collect();
 
     if !over.is_empty() {
         bail!(
-            "KV pool holds {cap} tokens; these decode cells exceed it \
-             (batch × (ctx + decode_steps)): {}. Lower --ctxs/--batches/--decode-steps.",
+            "KV pool holds {} blocks ({} tokens); these decode cells exceed it \
+             (batch × ⌈(ctx + decode_steps)/{}⌉ blocks): {}. \
+             Lower --ctxs/--batches/--decode-steps.",
+            cap.total_blocks,
+            cap.total_tokens(),
+            cap.block_size,
             over.join(", ")
         );
     }
     info!(
-        "KV capacity {cap} tokens; all {} decode cells fit",
+        "KV capacity {} blocks ({} tokens); all {} decode cells fit",
+        cap.total_blocks,
+        cap.total_tokens(),
         ctxs.len() * batches.len()
     );
     Ok(())
@@ -163,11 +173,19 @@ fn measure_decode_cell(
                 stream.emitted,
                 args.decode_steps
             );
+            // A real hit covers all of the prompt bar the final partial block.
+            // cached_tokens == 0 means nothing matched — and some lines never
+            // emit a real count (Kimi reports 0 until prefix-usage lands;
+            // Qwen3.5 emits no Scheduled at all), in which case the slack would
+            // let small ctx masquerade as a hit and report a prefill-polluted
+            // TPOT. Require a positive, near-full hit so those lines fail loudly
+            // instead.
             ensure!(
-                stream.cached_tokens + CACHE_HIT_SLACK >= ctx,
+                stream.cached_tokens > 0 && stream.cached_tokens + CACHE_HIT_SLACK >= ctx,
                 "decode cell ctx{ctx}×bs{batch}: prefill was not served from cache \
                  (cached {} of {ctx} tokens) — decode TPOT would include prefill. \
-                 Prefix caching must be enabled.",
+                 This needs a scheduler with prefix caching that reports \
+                 Scheduled.cached_tokens (qwen3 does; kimi/qwen3.5 do not yet).",
                 stream.cached_tokens
             );
             tbts.extend(stream.tbt.iter().skip(args.warmup_steps).copied());

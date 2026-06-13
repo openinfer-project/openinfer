@@ -1,17 +1,18 @@
 //! Prefill sweep: cold-prefill TTFT across prompt_len × batch.
 //!
-//! The KV a prefill batch holds resident is `prompt_len × batch` tokens, so a
-//! big enough cell will not fit the pool. The engine already knows its pool
-//! size (`EngineHandle::kv_capacity_tokens`), so the sweep checks every
-//! requested cell up front and refuses the whole run if any exceeds capacity —
-//! the user never computes per-token KV by hand, and the run never silently
-//! under-batches or OOMs mid-sweep.
+//! A prefill batch holds `batch` requests resident, each occupying
+//! `⌈prompt_len / block_size⌉` KV blocks, so a big enough cell will not fit the
+//! pool. The engine already knows its pool size (`EngineHandle::kv_capacity`),
+//! so the sweep checks every requested cell up front and refuses the whole run
+//! if any exceeds capacity — the user never computes per-token KV by hand, and
+//! the run never silently under-batches or OOMs mid-sweep.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 use openinfer::sampler::SamplingParams;
+use openinfer::scheduler::KvCapacity;
 use openinfer::server_engine::ModelType;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -38,7 +39,7 @@ pub(crate) fn run_prefill(
     let handle = model.scheduler_handle().context(
         "prefill requires a scheduler-backed model; deepseek-v2-lite is generator-based — use `request`",
     )?;
-    let capacity = handle.kv_capacity_tokens();
+    let capacity = handle.kv_capacity();
     guard_capacity(capacity, &prompt_lens, &batches)?;
 
     let sampling = SamplingParams {
@@ -72,16 +73,23 @@ pub(crate) fn run_prefill(
             warmup: args.run.warmup,
             iters: args.run.iters,
             seed: args.run.seed,
-            kv_capacity_tokens: capacity,
+            kv_capacity_tokens: capacity.map(KvCapacity::total_tokens),
         },
         cells,
     }))
 }
 
 /// Refuse the whole sweep if any requested cell's resident KV exceeds the pool.
+/// The scheduler allocates whole blocks per request, so a cell needs
+/// `batch × ⌈prompt_len / block_size⌉` blocks — summing raw tokens would
+/// under-count and admit a cell the scheduler then defers, contaminating TTFT.
 /// A `None` capacity (model did not report it) downgrades to a warning: we
 /// cannot pre-check, so a too-large cell would surface as a mid-run rejection.
-fn guard_capacity(capacity: Option<usize>, prompt_lens: &[usize], batches: &[usize]) -> Result<()> {
+fn guard_capacity(
+    capacity: Option<KvCapacity>,
+    prompt_lens: &[usize],
+    batches: &[usize],
+) -> Result<()> {
     let Some(cap) = capacity else {
         warn!(
             "model did not report KV capacity; skipping the prefill capacity guard \
@@ -90,22 +98,28 @@ fn guard_capacity(capacity: Option<usize>, prompt_lens: &[usize], batches: &[usi
         return Ok(());
     };
 
+    let blocks = |l: usize, b: usize| b.saturating_mul(cap.blocks_for(l));
     let over: Vec<String> = prompt_lens
         .iter()
         .flat_map(|&l| batches.iter().map(move |&b| (l, b)))
-        .filter(|&(l, b)| l.saturating_mul(b) > cap)
-        .map(|(l, b)| format!("{l}×{b} ({} tok)", l.saturating_mul(b)))
+        .filter(|&(l, b)| blocks(l, b) > cap.total_blocks)
+        .map(|(l, b)| format!("{l}×{b} ({} blocks)", blocks(l, b)))
         .collect();
 
     if !over.is_empty() {
         bail!(
-            "KV pool holds {cap} tokens; these cells exceed it: {}. \
-             Drop them or lower --prompt-lens/--batches so prompt_len × batch ≤ {cap}.",
+            "KV pool holds {} blocks ({} tokens); these cells exceed it \
+             (batch × ⌈prompt_len/{}⌉ blocks): {}. Lower --prompt-lens/--batches.",
+            cap.total_blocks,
+            cap.total_tokens(),
+            cap.block_size,
             over.join(", ")
         );
     }
     info!(
-        "KV capacity {cap} tokens; all {} cells fit",
+        "KV capacity {} blocks ({} tokens); all {} cells fit",
+        cap.total_blocks,
+        cap.total_tokens(),
         prompt_lens.len() * batches.len()
     );
     Ok(())
