@@ -21,6 +21,16 @@ Examples:
   cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
   cargo run -r --bin bench_serving -- request --prompt-file prompts/story.txt --output-len 128
   cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64 --warmup 3 --iters 10";
+pub(crate) const DECODE_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- decode
+  cargo run -r --bin bench_serving -- decode --ctxs 512,2048 --batches 1,4,8 --decode-steps 128
+  cargo run -r --bin bench_serving -- --format json --out decode.json decode --ctxs 2048 --batches 16";
+pub(crate) const PREFILL_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- prefill
+  cargo run -r --bin bench_serving -- prefill --prompt-lens 128,512,1024,2048,4096 --batches 1,2,4,8,16
+  cargo run -r --bin bench_serving -- --format json --out prefill.json prefill --prompt-lens 512,2048 --batches 1,8";
 pub(crate) const MATRIX_EXAMPLES: &str = "\
 Examples:
   cargo run -r --bin bench_serving -- matrix
@@ -74,6 +84,12 @@ pub(crate) enum Command {
     /// Measure one request shape end-to-end.
     #[command(after_help = REQUEST_EXAMPLES)]
     Request(RequestArgs),
+    /// Sweep prompt_len x prefill_batch and summarize cold-prefill TTFT per cell.
+    #[command(after_help = PREFILL_EXAMPLES)]
+    Prefill(PrefillArgs),
+    /// Sweep ctx x batch and summarize steady-state decode TPOT per cell.
+    #[command(after_help = DECODE_EXAMPLES)]
+    Decode(DecodeArgs),
     /// Sweep prompt_len x output_len and summarize each cell.
     #[command(after_help = MATRIX_EXAMPLES)]
     Matrix(MatrixArgs),
@@ -186,6 +202,62 @@ pub(crate) struct RequestArgs {
     /// request identical, which collapses MoE routing onto a narrow expert set
     /// and under-measures decode TPOT — sweep this to quantify the
     /// routing-diversity → TPOT curve (see the MoE bench-diversity lesson).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) distinct_prompts: usize,
+
+    #[command(flatten)]
+    pub(crate) run: RunArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+pub(crate) struct DecodeArgs {
+    /// Context lengths to sweep (each request is prefilled to this length)
+    #[arg(long, value_delimiter = ',', default_value = "128,512,1024,2048,4096")]
+    pub(crate) ctxs: Vec<usize>,
+
+    /// Decode batch sizes to sweep (requests decoding concurrently)
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16,32")]
+    pub(crate) batches: Vec<usize>,
+
+    /// Decode tokens generated per request in the measured round
+    #[arg(long, default_value_t = 128)]
+    pub(crate) decode_steps: usize,
+
+    /// Leading decode tokens dropped per request (graph capture + batch ramp)
+    #[arg(long, default_value_t = 16)]
+    pub(crate) warmup_steps: usize,
+
+    /// Distinct prompts tiled across the batch (0 = one per request). Distinct
+    /// prompts give every request its own ctx-length KV (true N-way decode).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) distinct_prompts: usize,
+
+    /// Repeat the warm+measure cycle per cell and pool the samples
+    #[arg(long, default_value_t = 1)]
+    pub(crate) iters: usize,
+
+    /// RNG seed for the synthetic prompts
+    #[arg(long, default_value_t = 42)]
+    pub(crate) seed: u64,
+}
+
+#[derive(Debug, ClapArgs)]
+pub(crate) struct PrefillArgs {
+    /// Synthetic prompt lengths to sweep (one prefill per length)
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "128,512,1024,2048,4096,8192,16384"
+    )]
+    pub(crate) prompt_lens: Vec<usize>,
+
+    /// Prefill batch sizes to sweep (concurrent requests prefilled together)
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16,32")]
+    pub(crate) batches: Vec<usize>,
+
+    /// Distinct synthetic prompts tiled across each batch (0 = one per request,
+    /// fully distinct). Distinct prompts give every request its own KV and
+    /// realistic MoE routing; only lower this to study prefix-cache reuse.
     #[arg(long, default_value_t = 0)]
     pub(crate) distinct_prompts: usize,
 

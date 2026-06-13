@@ -60,6 +60,38 @@ pub(crate) fn synthetic_random_prompt(len: usize, seed: u64, request_idx: usize)
         .collect()
 }
 
+/// Build one sweep cell's `batch` prompts of `len` tokens each.
+///
+/// Draws `distinct` unique base prompts (`distinct == 0` ⇒ all `batch` unique,
+/// otherwise clamped to `batch`) from a monotonic `salt` that the caller
+/// advances past every prompt produced so far in the sweep. No base prompt ever
+/// repeats — across cells, iterations, or rounds — so every one is cold and
+/// misses the prefix cache. This single salt-draw is the cold-prompt invariant
+/// for both the prefill and decode sweeps; keep it in one place so the two
+/// drivers cannot drift and silently measure a warm prefill. The bases are
+/// tiled round-robin to fill `batch`.
+pub(crate) fn draw_distinct_prompts(
+    distinct: usize,
+    batch: usize,
+    len: usize,
+    seed: u64,
+    salt: &mut usize,
+) -> Vec<Vec<u32>> {
+    let distinct = if distinct == 0 {
+        batch
+    } else {
+        distinct.min(batch)
+    };
+    let base: Vec<Vec<u32>> = (0..distinct)
+        .map(|_| {
+            let request_idx = *salt;
+            *salt += 1;
+            synthetic_random_prompt(len, seed, request_idx)
+        })
+        .collect();
+    (0..batch).map(|idx| base[idx % distinct].clone()).collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PromptSpec {
     pub(crate) descriptor: PromptDescriptor,

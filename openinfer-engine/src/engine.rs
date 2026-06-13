@@ -176,6 +176,11 @@ pub fn unix_now_s() -> f64 {
 pub struct EngineHandle {
     inner: Arc<EngineInner>,
     servable_len: Option<u32>,
+    /// Total KV pool capacity in tokens (`total_blocks × block_size`). Lets a
+    /// caller (e.g. the prefill bench) decide up front whether a batch fits,
+    /// instead of computing per-token KV by hand. `None` if the engine did not
+    /// report it.
+    kv_capacity_tokens: Option<usize>,
 }
 
 struct EngineInner {
@@ -224,6 +229,7 @@ impl EngineHandle {
                 join_handle,
             }),
             servable_len: None,
+            kv_capacity_tokens: None,
         }
     }
 
@@ -235,6 +241,19 @@ impl EngineHandle {
 
     pub fn servable_len(&self) -> Option<u32> {
         self.servable_len
+    }
+
+    #[must_use]
+    pub fn with_kv_capacity_tokens(mut self, kv_capacity_tokens: usize) -> Self {
+        self.kv_capacity_tokens = Some(kv_capacity_tokens);
+        self
+    }
+
+    /// Total KV pool capacity in tokens, if the engine reported it. A batch
+    /// whose summed `prompt + generated` tokens exceed this cannot be resident
+    /// at once.
+    pub fn kv_capacity_tokens(&self) -> Option<usize> {
+        self.kv_capacity_tokens
     }
 
     #[allow(clippy::result_large_err)]

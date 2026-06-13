@@ -201,6 +201,12 @@ where
         executor.max_request_blocks(),
         executor.block_size(),
     );
+    // Executor just built: the only committed block is the leaked CUDA-graph
+    // padding slot, so available_blocks() is total − 1. Conservative by one
+    // block, which is the right side to err on for a capacity ceiling.
+    let kv_capacity = executor
+        .available_blocks()
+        .saturating_mul(executor.block_size());
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -210,7 +216,9 @@ where
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new(submit_tx).with_servable_len(servable)
+    EngineHandle::new(submit_tx)
+        .with_servable_len(servable)
+        .with_kv_capacity_tokens(kv_capacity)
 }
 
 pub(crate) fn start_with_executor_with_lora_control<E>(
@@ -230,6 +238,12 @@ where
         executor.max_request_blocks(),
         executor.block_size(),
     );
+    // Executor just built: the only committed block is the leaked CUDA-graph
+    // padding slot, so available_blocks() is total − 1. Conservative by one
+    // block, which is the right side to err on for a capacity ceiling.
+    let kv_capacity = executor
+        .available_blocks()
+        .saturating_mul(executor.block_size());
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     thread::Builder::new()
@@ -239,7 +253,9 @@ where
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new_with_command_channel(command_tx).with_servable_len(servable)
+    EngineHandle::new_with_command_channel(command_tx)
+        .with_servable_len(servable)
+        .with_kv_capacity_tokens(kv_capacity)
 }
 
 // ── KV-offload prefetch admission helpers ────────────────────────────────

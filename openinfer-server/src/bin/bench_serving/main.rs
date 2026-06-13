@@ -25,9 +25,11 @@ use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod cli;
+mod decode;
 mod exec;
 mod metrics;
 mod mixed;
+mod prefill;
 mod prompt;
 mod render;
 mod report;
@@ -42,6 +44,8 @@ use snapshot::*;
 fn command_seed(cli: &Cli) -> u64 {
     match &cli.command {
         Command::Request(args) => args.run.seed,
+        Command::Prefill(args) => args.run.seed,
+        Command::Decode(args) => args.seed,
         Command::Matrix(args) => args.run.seed,
         Command::Curve(args) => args.run.seed,
         Command::Snapshot(args) => args.run.seed,
@@ -87,6 +91,8 @@ fn main() -> Result<()> {
         "bench_serving starting: command={} model_path={} cuda_graph={} format={:?}",
         match &cli.command {
             Command::Request(_) => "request",
+            Command::Prefill(_) => "prefill",
+            Command::Decode(_) => "decode",
             Command::Matrix(_) => "matrix",
             Command::Curve(_) => "curve",
             Command::Snapshot(_) => "snapshot",
