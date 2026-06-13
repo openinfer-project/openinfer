@@ -11,6 +11,7 @@ members = [
     "openinfer-cupti",
     "openinfer-kernels",
     "openinfer-bench",
+    "openinfer-build",
     "openinfer-deepseek-v4",
     "openinfer-deepseek-v2-lite",
     "openinfer-kimi-k2",
@@ -20,7 +21,6 @@ members = [
     "openinfer-kv-offload",
     # ---- openinfer-comm (EP all-to-all) ----
     "openinfer-comm",
-    "openinfer-comm/crates/openinfer-comm-build-utils",
     "openinfer-comm/crates/openinfer-comm-cuda-sys",
     "openinfer-comm/crates/openinfer-comm-cudart-sys",
     "openinfer-comm/crates/openinfer-comm-gdrapi-sys",
@@ -118,6 +118,7 @@ ordered-float = "4"
 oneshot = "0.1.11"
 parking_lot = "0.12.5"
 openinfer-bench = { path = "openinfer-bench" }
+openinfer-build = { path = "openinfer-build" }
 openinfer-core = { path = "openinfer-core" }
 openinfer-kv-cache = { path = "openinfer-kv-cache" }
 openinfer-kv-offload = { path = "openinfer-kv-offload" }

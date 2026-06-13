@@ -18,4 +18,4 @@ cxx = { workspace = true }
 [build-dependencies]
 cc = { workspace = true, features = ["parallel"] }
 cxx-build = { workspace = true }
-build-utils = { path = "../openinfer-comm-build-utils", package = "openinfer-comm-build-utils" }
+openinfer-build = { workspace = true }

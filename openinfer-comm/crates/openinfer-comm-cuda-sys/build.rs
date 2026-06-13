@@ -10,14 +10,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cuda_home = build_utils::find_package(
-        "cuda-sys",
-        "CUDA_HOME",
-        &["/usr/local/cuda"],
-        "include/cuda.h",
-    );
+    let toolkit = openinfer_build::CudaToolkit::discover();
+    let cuda_h = toolkit
+        .header_dir("cuda.h")
+        .map(|dir| dir.join("cuda.h"))
+        .unwrap_or_else(|| {
+            panic!(
+                "cuda-sys build error: cuda.h not found under {}. \
+                 Hint: install the CUDA SDK and/or set CUDA_HOME to its install root.",
+                toolkit.root.display()
+            )
+        });
     let bindings = bindgen::Builder::default()
-        .header(cuda_home.join("include/cuda.h").to_string_lossy())
+        .header(cuda_h.to_string_lossy())
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .prepend_enum_name(false)
         .allowlist_item(r"(cu|CU).*")
@@ -26,9 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| {
             format!(
                 "cuda-sys build error: failed to generate CUDA driver bindings via bindgen \
-                 (looked under CUDA_HOME={}). Underlying error: {}. \
+                 (looked under {}). Underlying error: {}. \
                  Hint: install the CUDA SDK and/or set CUDA_HOME to its install root.",
-                cuda_home.display(),
+                toolkit.root.display(),
                 e
             )
         })?;
@@ -37,8 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("cuda-sys build error: cannot write cuda-bindings.rs: {}", e)
     })?;
 
-    // Dynamic link dependencies
-    println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_home.display());
+    toolkit.link_search_stubs();
     println!("cargo:rustc-link-lib=cuda");
 
     Ok(())

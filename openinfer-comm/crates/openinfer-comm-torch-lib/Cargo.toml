@@ -19,4 +19,5 @@ cuda-lib = { path = "../openinfer-comm-cuda-lib", package = "openinfer-comm-cuda
 
 [build-dependencies]
 cxx-build = { workspace = true }
+openinfer-build = { workspace = true }
 pkg-config = { workspace = true }

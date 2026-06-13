@@ -6,6 +6,7 @@ edition = "2024"
 
 [build-dependencies]
 cc = { workspace = true }
+openinfer-build = { workspace = true }
 
 [lints]
 workspace = true

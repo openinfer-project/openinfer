@@ -894,7 +894,13 @@ fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> Pa
     wrapper_path
 }
 
-fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
+fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &[String]) {
+    // Host cc compiles the wrappers below; unlike nvcc it won't find cuda.h itself.
+    assert!(
+        cuda_include.join("cuda.h").is_file(),
+        "cuda.h not found in {}; set CUDA_HOME to a CUDA toolkit root",
+        cuda_include.display()
+    );
     let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
     let triton_target = triton_target(sm_targets);
     let mut generated_sources = Vec::new();
@@ -1072,7 +1078,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     let mut build = cc::Build::new();
     build
         .cuda(false)
-        .include(format!("{}/include", cuda_path))
+        .include(cuda_include)
         .flag("-std=c11")
         .warnings(false);
     for source in &generated_sources {
@@ -1099,12 +1105,11 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 }
 
 fn main() {
-    let cuda_path = std::env::var("CUDA_HOME")
-        .or_else(|_| std::env::var("CUDA_PATH"))
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-
-    let nvcc = format!("{}/bin/nvcc", cuda_path);
-    let cuda_include = Path::new(&cuda_path).join("include");
+    let toolkit = openinfer_build::CudaToolkit::discover();
+    let nvcc = toolkit.nvcc.to_string_lossy().into_owned();
+    let cuda_include = toolkit
+        .header_dir("cuda.h")
+        .unwrap_or_else(|| toolkit.root.join("include"));
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
     let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
@@ -1467,7 +1472,7 @@ fn main() {
     assert!(status.success(), "ar failed");
 
     if qwen35_enabled {
-        compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+        compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);
     } else {
         println!(
             "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35-4b` feature to build them (needs Python + Triton at build time)"
@@ -1476,9 +1481,12 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
+        println!(
+            "cargo:rustc-link-search=native={}/lib/x64",
+            toolkit.root.display()
+        );
     } else {
-        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+        toolkit.link_search();
     }
     for dir in &cutedsl_runtime_lib_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
@@ -1499,8 +1507,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", root.join("csrc").display());
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=OPENINFER_CUDA_SM");
     println!("cargo:rerun-if-env-changed=CUDA_SM");
     println!("cargo:rerun-if-env-changed=OPENINFER_FLASHINFER_INCLUDE");

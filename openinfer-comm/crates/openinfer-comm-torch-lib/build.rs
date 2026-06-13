@@ -11,6 +11,7 @@ fn main() {
         return;
     }
 
+    let toolkit = openinfer_build::CudaToolkit::discover();
     let cmake_prefix_path = resolve_torch_cmake_prefix_path();
     let torch_path = resolve_torch_install_root(&cmake_prefix_path);
     let torch_include = torch_path.join("include");
@@ -26,7 +27,7 @@ fn main() {
         .flag("-Wno-unused-parameter")
         .includes(config.include_paths)
         .include(torch_include)
-        .include("/usr/local/cuda/include")
+        .includes(&toolkit.include_dirs)
         .std("c++20")
         .compile("torch-lib");
 
