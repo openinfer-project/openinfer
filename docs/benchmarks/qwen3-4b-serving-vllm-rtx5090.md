@@ -1,161 +1,117 @@
 # Qwen3-4B serving: openinfer vs vLLM on RTX 5090
 
-**Created**: 2026-06-10
-**TL;DR**: TP1 Qwen3-4B on one RTX 5090, both engines driven by `vllm bench serve`
-(Poisson arrivals, seed 42). Low load (QPS ≤ 8): openinfer wins TTFT p50 by ~10%,
-vLLM wins TPOT at every level (gap grows +11% → +27% with batch size). Saturation:
-openinfer knees at ~QPS 10, vLLM at ~QPS 12–14; vLLM's overloaded peak throughput is
-~12% higher (1690 vs 1511 out tok/s). Warm prefix-cache-hit TTFT: openinfer leads at
-every input length, 3× at 16k tokens (30.3 ms vs 90.8 ms p50).
+**Created**: 2026-06-13 (supersedes the 2026-06-10 run)
 
-Source benchmark for the README performance section (issue #327).
+**TL;DR**: TP1 Qwen3-4B on one RTX 5090. openinfer's resident footprint is ~5× smaller
+(771 MB vs 3814 MB) and it reaches HTTP-ready in ~3 s vs vLLM's 70 s cold / 32.7 s warm — no
+`torch.compile`. Warm prefix-cache-hit TTFT leads at every length, 3.6× at 16k (26.3 vs
+95.6 ms). QPS sweep: low load comparable, vLLM keeps a TPOT edge at mid load (QPS 8–12), and
+openinfer now edges ahead at saturation (1794 vs 1692 out tok/s) after batched lm_head +
+sampling (#362) lifted the prior ~1511 cap. pegaflow KV-offload restores prefixes from host
+DRAM at 2.6–9.1× over cold prefill.
+
+Source benchmark for the README performance section.
 
 ## Setup
 
 | Item | Value |
 | --- | --- |
-| GPU | 1× NVIDIA GeForce RTX 5090 (32 GB), driver 590.48.01, same GPU for both engines (sequential runs) |
+| GPU | 1× NVIDIA GeForce RTX 5090 (32 GB), driver 590.48.01, CUDA 13.1 build, same GPU for both engines (sequential runs) |
 | Model | Qwen3-4B, BF16 safetensors (7.6 GB), TP1 |
-| openinfer | commit `6901965` (main, 2026-06-10), release build, CUDA Graph on (default) |
-| vLLM | 0.22.1 (PyPI), torch 2.11.0+cu130, Python 3.12, default engine config |
-| Client | `vllm bench serve` 0.22.1 on localhost (same host) |
+| openinfer | main @ `0b42ed3` (#377), release build, CUDA Graph on (default), prefix cache on |
+| vLLM | 0.22.1 (PyPI), prefix cache on (default) |
+| Client | `vllm bench serve` 0.22.1 on localhost (same host), GPU 0 |
 
-Server commands:
+Both engines: prefix cache ON, same Poisson stream (seed 42), `input_len=1024` /
+`output_len=128`. Each got an unrecorded 8-request warmup before the QPS sweep, so vLLM's
+`torch.compile` cold start does not pollute the latency sweep.
 
-```bash
-# vLLM (test 1: prefix cache off for random-prompt fairness)
-CUDA_VISIBLE_DEVICES=1 vllm serve /data/Qwen3-4B --port 8100 \
-  --max-model-len 8192 --gpu-memory-utilization 0.9 --no-enable-prefix-caching
+## Footprint (the headline)
 
-# vLLM (test 2: prefix cache on — the default; longer context for the sweep)
-CUDA_VISIBLE_DEVICES=1 vllm serve /data/Qwen3-4B --port 8100 --max-model-len 20480
-
-# openinfer (test 1: prefix cache off)
-CUDA_VISIBLE_DEVICES=1 target/release/openinfer --model-path /data/Qwen3-4B \
-  --port 8100 --no-prefix-cache
-
-# openinfer (test 2: prefix cache on — the default)
-CUDA_VISIBLE_DEVICES=1 target/release/openinfer --model-path /data/Qwen3-4B --port 8100
-```
-
-Both engines got an unrecorded 8-request warmup (`--num-prompts 8 --request-rate inf --seed 7`)
-before measurement, so vLLM torch.compile cold-start does not pollute the sweep.
-
-## Test 1 — QPS sweep, Poisson arrivals
-
-`tools/bench/qps_sweep.sh`: random dataset, `input_len=1024`, `output_len=128`,
-`--ignore-eos --temperature 0`, Poisson arrivals (`--burstiness 1.0`), `--seed 42`,
-`num_prompts = 60 × QPS` (≈60 s of arrivals per level).
-
-```bash
-MODEL=/data/Qwen3-4B PORT=8100 ENGINE=<openinfer|vllm> \
-RESULT_DIR=<dir> QPS_LIST="1 2 4 8 10 12 16" INPUT_LEN=1024 OUTPUT_LEN=128 SEED=42 \
-VLLM=.venv/bin/vllm tools/bench/qps_sweep.sh
-```
-
-### openinfer
-
-| QPS | req/s | out tok/s | TTFT p50 (ms) | TTFT p99 | TPOT p50 | TPOT p99 | ITL p99 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 0.98 | 126 | 50.7 | 69.2 | 7.36 | 9.34 | 9.5 |
-| 2 | 1.97 | 252 | 52.9 | 98.8 | 8.95 | 11.04 | 49.1 |
-| 4 | 3.92 | 502 | 57.3 | 139.2 | 11.09 | 13.34 | 52.9 |
-| 8 | 7.85 | 1005 | 69.5 | 211.6 | 14.98 | 23.65 | 97.7 |
-| 10 | 9.77 | 1251 | 109.4 | 432.2 | 22.98 | 42.99 | 148.2 |
-| 12 | 11.05 | 1415 | 1753.8 | 4199.6 | 44.17 | 44.65 | 171.0 |
-| 16 | 11.80 | 1511 | 8898.4 | 19716.1 | 41.12 | 42.01 | 252.0 |
-
-### vLLM 0.22.1
-
-| QPS | req/s | out tok/s | TTFT p50 (ms) | TTFT p99 | TPOT p50 | TPOT p99 | ITL p99 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 0.99 | 126 | 57.8 | 73.2 | 6.65 | 7.77 | 12.8 |
-| 2 | 1.97 | 252 | 58.8 | 103.7 | 7.17 | 8.92 | 35.3 |
-| 4 | 3.93 | 504 | 61.8 | 115.8 | 8.57 | 10.60 | 38.2 |
-| 8 | 7.88 | 1008 | 68.1 | 192.4 | 11.82 | 15.80 | 46.7 |
-| 10 | 9.80 | 1254 | 75.7 | 243.3 | 13.99 | 20.90 | 80.0 |
-| 12 | 11.72 | 1501 | 119.5 | 409.3 | 19.41 | 49.21 | 102.5 |
-| 16 | 13.20 | 1690 | 3933.9 | 10684.2 | 76.21 | 80.17 | 118.5 |
-
-### Reading
-
-- **Low load (QPS ≤ 8): TTFT favors openinfer (~10% lower p50), TPOT favors vLLM.**
-  The TPOT gap grows with concurrency: +11% at QPS 1 (7.36 vs 6.65 ms) to +27% at
-  QPS 8 (14.98 vs 11.82 ms). The growth pattern points at batched decode step cost,
-  not sampling — greedy token selection is already batched (#307, in this build);
-  isolating the kernel-level cause needs an nsys diff at fixed batch size.
-- **Saturation: openinfer knees at ~QPS 10, vLLM holds to ~QPS 12.** At QPS 12
-  openinfer's queue diverges (TTFT p50 1.75 s) while vLLM still serves at 119.5 ms.
-  Both are overloaded at QPS 16; vLLM's saturated throughput is ~12% higher
-  (1690 vs 1511 out tok/s).
-- **openinfer's saturated throughput is pinned by the bs=64 decode cap** (largest
-  CUDA-graph bucket, `BATCH_BUCKETS` ends at 64). Implied decode concurrency
-  (`out_tok/s × TPOT`) sits at 62 in both overloaded openinfer runs — exactly the
-  cap — giving a hard ceiling of `64 / TPOT(bs64) ≈ 64/42 ms ≈ 1520 tok/s`, which
-  matches the measured 1511. vLLM keeps admitting past 64 (implied concurrency ~129
-  at QPS 16) and converts that into its +12%. The low-load TPOT gap is unrelated to
-  the cap (implied concurrency ≤ 16 at QPS ≤ 8).
-- ITL p99 is consistently worse for openinfer under load (97.7 vs 46.7 ms at QPS 8) —
-  scheduling jitter, same tail issue noted in `subsystems/scheduler/scheduler.md`.
-
-## Test 2 — warm (prefix-cache-hit) TTFT vs input length
-
-`tools/bench/warm_ttft_sweep.py`: one fixed random-token prompt per length
-(seed 42), sent once cold to populate the GPU prefix cache, then 20 warm samples
-of the identical prompt with `max_tokens=1`. Every sample drains the SSE stream
-to `[DONE]` before the next request. Prefix cache ON for both engines.
-
-```bash
-.venv/bin/python tools/bench/warm_ttft_sweep.py \
-  --base-url http://localhost:8100 --model /data/Qwen3-4B \
-  --tokenizer /data/Qwen3-4B --lengths 256,512,1024,2048,4096,8192,16384 \
-  --samples 20 --seed 42 --output <out>.json
-```
-
-### openinfer
-
-| Input len | Cold TTFT (ms) | Warm p50 | Warm p99 |
+| metric | openinfer | vLLM | ratio |
 | --- | --- | --- | --- |
-| 256 | 34.4 | 9.5 | 10.5 |
-| 512 | 23.7 | 9.9 | 10.1 |
-| 1024 | 44.8 | 10.5 | 10.7 |
-| 2048 | 88.4 | 11.9 | 12.4 |
-| 4096 | 199.1 | 14.5 | 15.1 |
-| 8192 | 415.0 | 24.6 | 25.6 |
-| 16384 | 1003.0 | 30.3 | 31.4 |
+| RSS before stress (idle, loaded) | 771 MB | 3814 MB | 4.9× less |
+| RSS after stress | 1064 MB | 3863 MB | 3.6× less |
+| RSS peak (load transient, HWM) | 8156 MB | — | — |
+| startup to HTTP ready | 2.99 s | 70.0 s | 23× faster |
+| GPU mem (default util) | 28832 MiB | 30290 MiB | — |
 
-### vLLM 0.22.1
+- openinfer is a single process; vLLM RSS is summed over its process tree.
+- The 8156 MB peak is transient — weights are read through `mmap` during the H2D copy; the
+  mmap is dropped after load (#377), so steady-state RSS settles at 771 MB.
 
-| Input len | Cold TTFT (ms) | Warm p50 | Warm p99 |
+## QPS sweep (Poisson, in1024/out128, seed 42)
+
+| QPS | oi out tok/s | vllm out tok/s | oi TTFT p50 | vllm TTFT p50 | oi TPOT p50 | vllm TPOT p50 | oi TPOT p99 | vllm TPOT p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1  | 126.1 | 126.0 | 60.9 | 57.1 | 6.89 | 6.90 | 8.21 | 8.02 |
+| 2  | 252.3 | 252.3 | 31.1 | 39.4 | 6.87 | 7.05 | 9.07 | 9.18 |
+| 4  | 503.8 | 503.4 | 59.9 | 42.4 | 7.50 | 7.91 | 10.93 | 10.30 |
+| 8  | 1008.3 | 1007.5 | 67.7 | 69.1 | 14.61 | 12.09 | 22.16 | 16.14 |
+| 10 | 1249.6 | 1253.6 | 90.2 | 79.4 | 21.05 | 14.44 | 32.16 | 21.08 |
+| 12 | 1489.8 | 1499.9 | 134.9 | 119.5 | 33.08 | 19.75 | 61.71 | 49.10 |
+| 16 | 1794.1 | 1692.6 | 2591.1 | 3712.4 | 65.02 | 78.22 | 65.22 | 81.46 |
+
+- Low load (QPS ≤ 4) is comparable on both throughput and TTFT.
+- Mid load (QPS 8–12): vLLM wins TPOT (12.09 vs 14.61 ms at QPS 8, 19.75 vs 33.08 at QPS 12).
+- Saturation (QPS 16, both overloaded): openinfer edges ahead on throughput (1794 vs 1692 out
+  tok/s) and req/s (14.0 vs 13.2). This is the change from the 2026-06-10 run, where openinfer
+  was capped at ~1511 by the bs=64 decode bucket — batched lm_head + sampling (#362) lifted it.
+
+## Warm prefix-cache-hit TTFT (HBM hit) vs input length
+
+| len | oi cold | oi warm p50 | oi warm p99 | vllm cold | vllm warm p50 | vllm warm p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256 | 16.2 | 8.5 | 8.8 | 24.0 | 14.5 | 19.1 |
+| 512 | 24.6 | 8.6 | 8.8 | 30.5 | 16.0 | 16.4 |
+| 1024 | 44.0 | 9.2 | 9.5 | 52.5 | 18.4 | 19.0 |
+| 2048 | 92.0 | 10.4 | 10.8 | 97.8 | 23.7 | 24.4 |
+| 4096 | 211.5 | 12.7 | 13.4 | 200.4 | 34.1 | 36.2 |
+| 8192 | 460.0 | 21.6 | 22.8 | 451.9 | 58.6 | 59.9 |
+| 16384 | 1143.9 | 26.3 | 27.9 | 1115.4 | 95.6 | 98.2 |
+
+- openinfer wins warm TTFT at every length; the gap widens with length, reaching 3.6× at 16k
+  (26.3 vs 95.6 ms p50).
+- Cold (full-prefill) TTFT is near parity (16k: 1143.9 vs 1115.4 ms).
+- openinfer's warm p99 stays within ~1–2 ms of p50 at every length.
+
+## pegaflow KV offload — pure-L2 TTFT (cold full-prefill vs host-tier restore)
+
+`--kv-offload --kv-offload-host-gib 16 --no-prefix-cache` (evict-before-probe, so every prefix
+is restored from host DRAM rather than HBM).
+
+| len | cold (full prefill) | L2 warm p50 (host restore) | speedup |
 | --- | --- | --- | --- |
-| 256 | 41.5 | 13.3 | 14.2 |
-| 512 | 28.5 | 14.3 | 14.5 |
-| 1024 | 50.3 | 16.1 | 16.4 |
-| 2048 | 95.2 | 19.8 | 20.5 |
-| 4096 | 197.9 | 27.3 | 28.3 |
-| 8192 | 449.6 | 46.9 | 49.3 |
-| 16384 | 1106.8 | 90.8 | 100.2 |
+| 256 | 25.4 | 9.8 | 2.6× |
+| 512 | 25.6 | 11.6 | 2.2× |
+| 1024 | 45.3 | 15.4 | 2.9× |
+| 2048 | 92.5 | 22.9 | 4.0× |
+| 4096 | 211.1 | 37.5 | 5.6× |
+| 8192 | 461.3 | 71.4 | 6.5× |
+| 16384 | 1140.5 | 125.5 | 9.1× |
 
-### Reading
+Tiering picture at 16k: HBM hit 26 ms < host-tier L2 restore 126 ms ≪ cold prefill 1140 ms.
 
-- **openinfer wins warm TTFT at every length, and the gap widens with length:
-  1.4× at 256 tokens (9.5 vs 13.3 ms), 3× at 16k (30.3 vs 90.8 ms).** vLLM's warm
-  TTFT grows ~7× from 256 → 16k while openinfer grows ~3×.
-- Cold TTFT (full prefill) is near parity, openinfer slightly ahead at most
-  lengths (16k: 1003 vs 1107 ms).
-- p99 stays tight on both engines (single client, no contention) — the warm p99
-  column shows jitter, not load.
+## Startup: warm vs cold
+
+vLLM startup is dominated by `torch.compile`. Measured with identical env/command, only the
+cache state differs:
+
+| | openinfer | vLLM 0.22.1 |
+| --- | --- | --- |
+| cold (compile from scratch / first start) | 2.99 s | 70.0 s |
+| warm (compile cache hit, 15 GB `~/.cache/vllm`) | ~3.0 s (no compile step) | 32.7 s (warm2; warm1 37.8) |
+
+openinfer has no compilation cache to warm up — cold ≈ warm ≈ 3 s. The fair steady-state
+comparison is openinfer 3.0 s vs vLLM warm 32.7 s ≈ 11×; cold-vs-cold is 23×.
 
 ## Caveats
 
-- `vllm bench serve` is the unified client for test 1; both engines see identical
-  request streams (same seed → same prompts and same Poisson arrival schedule).
-- The historical openinfer caveat about overreported streaming
-  `usage.completion_tokens` (see `playbooks/bench-vs-vllm.md`) did **not** reproduce:
-  every openinfer run has `total_output_tokens == completed × 128` exactly, so the
-  `output_throughput` field is trusted as-is.
-- QPS levels past the knee (12, 16) measure overload behavior, not steady state:
-  `req/s < QPS` means the arrival window stretched and TTFT includes queue time.
-- Raw result JSONs (one per engine × QPS level, plus the two TTFT sweeps) live on
-  the 5090 host under `/data/xingming/bench/20260610-qwen3-5090/`; the tables
-  above are transcribed from them.
+- `vllm bench serve` is the unified client; both engines see identical request streams (same
+  seed → same prompts and the same Poisson arrival schedule).
+- QPS levels past the knee (12, 16) measure overload behavior, not steady state: `req/s < QPS`
+  means the arrival window stretched and TTFT includes queue time.
+- The README chart (`qwen3-4b-5090-perf.png`) plots the QPS-throughput and warm-TTFT columns
+  above; regenerate it from these tables if the numbers change.
+- Raw result logs (per engine × QPS level, the TTFT sweeps, and `vllm_warmstart_warm{1,2}.log`)
+  live on the 5090 host; the tables above are transcribed from them.

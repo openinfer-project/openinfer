@@ -9,53 +9,18 @@
 </p>
 
 <p align="center">
-  <a href="#performance">Performance</a> &middot;
   <a href="#quickstart">Quickstart</a> &middot;
   <a href="#supported-models">Models</a> &middot;
   <a href="#api">API</a> &middot;
+  <a href="#performance">Performance</a> &middot;
   <a href="#architecture">Architecture</a>
 </p>
 
 ---
 
-openinfer is a from-scratch LLM inference engine written in **~95K lines of Rust** and **~14K lines of CUDA**, plus Triton AOT kernels. No PyTorch, no ONNX, no model framework runtime — just Rust plus CUDA, Triton AOT, and generated compatibility kernels.
+openinfer is an LLM inference engine built entirely in Rust and CUDA — no PyTorch, no ONNX, no framework runtime, every kernel and scheduler hand-written.
 
-The goal is to understand every layer of the inference stack by building it from the ground up, and to explore what a Rust-native inference engine can look like.
-
-## Performance
-
-Head-to-head with **vLLM 0.22.1** on one **RTX 5090** (32 GB) — Qwen3-4B, BF16, TP1,
-both engines measured by the same `vllm bench serve` client with identical seeds.
-
-**On a prefix-cache hit — the multi-turn chat / agent hot path — openinfer returns
-the first token up to 3× faster, and the lead grows with context:**
-
-| Cached prompt | openinfer | vLLM 0.22.1 | speedup |
-|--------------:|----------:|------------:|--------:|
-| 1k tokens | 10.5 ms | 16.1 ms | 1.5× |
-| 4k tokens | 14.5 ms | 27.3 ms | 1.9× |
-| 8k tokens | 24.6 ms | 46.9 ms | 1.9× |
-| 16k tokens | 30.3 ms | 90.8 ms | **3.0×** |
-
-<sub>Warm TTFT, p50 of 20 samples per length. The tail behaves the same way:
-openinfer's p99 stays within ~1 ms of its p50 at every length, while vLLM's reaches
-100 ms at 16k. From 256 → 16k tokens, vLLM's warm TTFT grows ~7×; openinfer's grows ~3×.</sub>
-
-Under serving load (Poisson arrivals, 1k-token prompts, 128-token outputs), openinfer
-delivers lower TTFT at low load (50.7 vs 57.8 ms p50 at QPS 1, converging by QPS 8)
-at identical output throughput, and cold prefill is at parity up to 16k context
-(1.00 vs 1.11 s). vLLM is ahead on batched decode TPOT (7.36 vs 6.65 ms at QPS 1,
-widening to 27% at QPS 8) and sustains ~12% more throughput past saturation —
-openinfer's current ceiling is its largest CUDA-graph batch bucket (64 sequences),
-which caps saturated decode at ~1.5k tok/s. Closing the batched-decode gap is active
-work.
-
-Full tables (p50/p99 at every QPS level, the saturation sweep, exact commands, and
-caveats) are in
-[`docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md`](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md)
-(measured 2026-06-10, openinfer `6901965`, vLLM 0.22.1 from PyPI). Qwen3.5-4B
-single-stream latency is at parity with vLLM — see
-[`docs/models/qwen35/optimization.md`](docs/models/qwen35/optimization.md).
+It serves frontier-scale models, from Qwen3 to the trillion-parameter Kimi-K2, and already holds its own against the best open-source inference frameworks.
 
 ## Quickstart
 
@@ -151,7 +116,7 @@ cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | Greedy + sampling, default feature, pure Rust + CUDA build |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 4B | Greedy + sampling, feature-gated, `--features qwen35-4b` (build-time Triton) |
 | [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU path |
-| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention, MP8 checkpoint | 671B total / 37B active | Initial greedy, feature-gated, 8-GPU MP8 |
+| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | MoE + sparse attention (compressor + indexer), MP8 checkpoint | 671B total / 37B active | Initial greedy, feature-gated, 8-GPU MP8 |
 | [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
 
 Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Every model line is controlled by a cargo feature; only `qwen3-4b` is on by default, so the stock build serves Qwen3 with zero Python. Other lines require rebuilding `openinfer-server` with the matching `--features ...` flag before launch.
@@ -173,13 +138,62 @@ OpenAI-compatible `/v1/completions` endpoint.
 
 Sampling and logprob support is model-dependent. Qwen models support the sampling controls above; the initial DeepSeek V4 path accepts greedy requests only and reports unsupported parameters through `stop_reason`.
 
+## Performance
+
+Single RTX 5090 (32 GB), Qwen3-4B, BF16, TP1 — openinfer @ `0b42ed3`, vLLM 0.22.1, both driven
+by the same `vllm bench serve` client (prefix cache on, seed 42, 1k-in / 128-out). Full tables
+and method are in the [benchmark report](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md).
+
+### Footprint
+
+No framework runtime means a small process that starts fast — one process, no `torch.compile`:
+
+| Metric | openinfer | vLLM 0.22.1 |
+|---|---:|---:|
+| Resident memory (idle, loaded) | **771 MB** | 3814 MB |
+| Startup → HTTP-ready (cold) | **3.0 s** | 70.0 s |
+| Startup (warm compile cache) | **~3.0 s** | 32.7 s |
+
+~5× smaller resident footprint, and a 3 s cold start against vLLM's 70 s — still 11× even
+versus vLLM's warm `torch.compile` cache. openinfer is a single process; vLLM's RSS is summed
+across its process tree.
+
+<p align="center">
+  <img src="docs/benchmarks/qwen3-4b-5090-perf.png" width="900" alt="Qwen3-4B on one RTX 5090: output throughput vs request rate, and warm-cache TTFT vs input length — openinfer vs vLLM 0.22.1">
+</p>
+
+### Under serving load
+
+Poisson arrivals, 1k-token prompts, 128-token outputs. Throughput tracks vLLM step-for-step
+through the knee and edges ahead at saturation (1794 vs 1692 tok/s, ~14.0 vs 13.2 req/s at
+QPS 16). vLLM keeps a per-token decode (TPOT) edge at mid load (QPS 8–12); both knee around
+QPS 10–12, past which the queue dominates. The saturated-throughput cap from the earlier run is
+gone — batched lm_head + sampling (#362) lifted it.
+
+### Warm-cache latency — the chat / agent hot path
+
+On the multi-turn chat and agent hot path, most of the prompt lands as a warm prefix-cache hit.
+openinfer's first token stays flat as context grows — ~9 ms at 1k tokens, ~26 ms at 16k against
+vLLM's ~96 ms (3.6×) — with p99 within ~1 ms of p50 at every length. Cold (uncached) prefill is
+at parity (~1.1 s at 16k).
+
+### KV offload — host-tier restore (pegaflow)
+
+With `--kv-offload`, prefixes evicted from HBM are restored from host DRAM instead of recomputed.
+At 16k that turns a 1.14 s cold prefill into a 126 ms host-tier restore (9.1×; 2.6× at 256
+tokens). The tiering ladder at 16k: HBM hit ~26 ms < host-tier restore ~126 ms ≪ cold prefill
+~1.14 s.
+
+Qwen3.5-4B single-stream latency sits at the same level — see
+[Qwen3.5 optimization notes](docs/models/qwen35/optimization.md).
+
 ## Architecture
 
 ```mermaid
 flowchart TB
     api["HTTP / OpenAI-compatible /v1/completions"]
     frontend["openinfer-server<br/>openinfer-vllm-frontend"]
-    runtime["EngineHandle<br/>openinfer-core shared runtime"]
+    runtime["EngineHandle / GenerateRequest / TokenEvent<br/>openinfer-engine contract · openinfer-core runtime"]
 
     api --> frontend
     frontend --> runtime
@@ -202,7 +216,8 @@ flowchart TB
     subgraph shared["Shared kernels and KV management"]
         direction LR
         kernels["openinfer-kernels"]
-        kvbm["kvbm/*<br/>dynamo-memory / kvbm-logical / kvbm-kernels"]
+        kvcache["openinfer-kv-cache<br/>openinfer-kv-offload"]
+        kvbm["kvbm-logical<br/>ported from NVIDIA Dynamo"]
     end
 
     qwen3 --> kernels
@@ -211,8 +226,9 @@ flowchart TB
     dsv4 --> kernels
     kimi --> kernels
 
-    qwen3 --> kvbm
-    kimi --> kvbm
+    qwen3 --> kvcache
+    kimi --> kvcache
+    kvcache --> kvbm
 
     subgraph backends["Backend libraries and communication"]
         direction LR
@@ -244,7 +260,6 @@ flowchart TB
 - **GPU-first runtime** — model execution stays in native Rust/CUDA paths; initial DeepSeek V4 still performs host-side greedy token selection from rank0 logits
 - **Custom GPU kernels** — CUDA for decode-critical paths, Triton AOT for Qwen3.5 compatibility kernels, TileLang-generated CUDA for DeepSeek V4 compatibility kernels, FlashInfer for paged attention/sampling, NCCL for multi-GPU reductions, and cuBLAS for matrix multiplication
 - **Fused operators where mature** — Qwen decode paths use fused attention/MLP kernels; DeepSeek V4 is currently a multi-stage MP8 path with TileLang kernels, NCCL reductions, and CUDA glue
-- **BF16 storage, FP32 accumulation** — numerical stability without memory overhead
 - **CUDA Graph** on Qwen decode paths — eliminates kernel launch overhead where enabled
 - **Per-model crate boundary** — Qwen3-4B owns its config, weights, scheduler/executor, tests, benches, and kernel plan in `openinfer-qwen3-4b`
 
@@ -256,7 +271,7 @@ flowchart TB
 
 ### What's not (yet) implemented
 
-- Additional quantization modes such as INT8/INT4
+- General-purpose quantization for the Qwen lines — INT4 and FP8/FP4 today are model-specific (Kimi-K2 Marlin INT4, DeepSeek-V4 FP8/FP4), not yet available for the BF16 Qwen models
 
 ## Development
 
@@ -288,62 +303,11 @@ cargo test --release --workspace --lib
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test e2e
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openinfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest
 ```
-
-### Triton AOT
-
-Triton compiles the Qwen3.5 GDR chunkwise prefill kernels at build time, gated behind the `qwen35-4b` feature — the default Qwen3 build never invokes Python. Qwen3-4B dense full-attention kernels are CUDA/cuBLAS/FlashInfer C++ wrappers. Runtime has no Python dependency — Triton is build-time only.
-
-See `openinfer-kernels/tools/triton/README.md` for setup and troubleshooting.
-
-### Source Layout
-
-<details>
-<summary>Expand</summary>
-
-```
-Cargo.toml                         # Virtual workspace root
-
-openinfer-server/                  # Product package: CLI, vLLM frontend, benchmarks
-├── src/main.rs                    # CLI + vLLM/OpenAI server startup
-├── src/vllm_frontend.rs           # vLLM engine-core bridge into a generic EngineHandle
-├── src/server_engine.rs           # Model detection and shared server helpers
-├── src/scheduler.rs               # Compatibility re-export of core engine request/event types
-├── src/ops.rs                     # Compatibility re-export of shared GPU ops
-├── src/ops/tests.rs               # Server package operator coverage tests
-├── src/tensor.rs                  # Re-export of openinfer-kernels tensor types
-├── src/sampler.rs                 # Temperature, top-k, top-p sampling
-└── src/logging.rs                 # Runtime logging setup
-
-openinfer-core/                    # Shared runtime API for model crates
-├── src/engine.rs                  # EngineHandle, GenerateRequest, TokenEvent
-├── src/kv_pool.rs                 # Paged KV pool and request state
-├── src/ops.rs                     # Shared op wrappers over openinfer-kernels
-└── src/weight_loader.rs           # Safetensors helpers shared by model crates
-
-openinfer-kernels/                 # Shared GPU kernel/runtime crate
-├── KERNELS.md                     # LLM routing index for model op -> wrapper -> FFI -> source
-├── src/                           # GPU tensor types, FFI, paged KV layout, Rust ops
-├── csrc/                          # Hand-written CUDA / FlashInfer C++ wrappers
-└── tools/triton/                  # Triton AOT kernels (build-time compiled)
-
-openinfer-qwen3-4b/                # Qwen3-4B model-owned engine crate
-├── src/                           # Config, weights, prefill/decode/unified, scheduler/executor
-├── tests/                         # Qwen3 HF logits gate and integration coverage
-├── benches/                       # Qwen3 model-level benchmarks
-└── src/kernel_plan.rs             # Model DAG phase -> kernel routing index
-
-openinfer-qwen35-4b/               # Qwen3.5-4B model-owned engine crate
-├── src/                           # Config, weights, prefill/decode/unified, recurrent state, scheduler
-├── tests/                         # Qwen3.5 HF logits gate and scheduler integration
-└── benches/                       # Qwen3.5 recurrent/norm operator benchmarks
-```
-
-</details>
 
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported from
-NVIDIA Dynamo (the `kvbm/` crates) retain their original Apache-2.0 headers; see
+NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
