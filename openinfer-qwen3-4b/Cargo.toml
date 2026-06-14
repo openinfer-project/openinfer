@@ -22,6 +22,7 @@ half = { workspace = true }
 hex = { workspace = true, optional = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
+nvtx = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }

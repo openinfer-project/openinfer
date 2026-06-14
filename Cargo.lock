@@ -3872,6 +3872,7 @@ dependencies = [
  "hex",
  "log",
  "memmap2",
+ "nvtx",
  "openinfer-bench",
  "openinfer-core",
  "openinfer-cupti",

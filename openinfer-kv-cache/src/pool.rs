@@ -262,7 +262,9 @@ impl LoadReservation {
 /// Per-request KV state wrapping `SchedulableSequence`.
 ///
 /// Lifecycle: `schedule_prefill → prefill_view/pages → forward → apply_prefill`,
-/// then `schedule_decode → decode_view/pages → forward → apply_decode` in a loop.
+/// then either `schedule_decode → decode_view/pages → forward → apply_decode`
+/// or `schedule_speculative → speculative_view/pages → forward →
+/// apply_speculative` in a loop.
 pub struct RequestKv {
     seq: SchedulableSequence<()>,
 }
@@ -299,6 +301,15 @@ impl RequestKv {
         self.seq.schedule_decode(&pool.block_manager)
     }
 
+    pub fn schedule_speculative(
+        &mut self,
+        num_draft_tokens: usize,
+        pool: &BlockPool,
+    ) -> Result<(), ScheduleError> {
+        self.seq
+            .schedule_speculative(num_draft_tokens, &pool.block_manager)
+    }
+
     // ── Views (for forward pass) ───────────────────────────────────────
 
     /// Build an immutable `KvView` for prefill.
@@ -327,6 +338,20 @@ impl RequestKv {
         )
     }
 
+    /// Build an immutable `KvView` for speculative verification.
+    ///
+    /// The verifier forwards `num_draft_tokens` consecutive token positions:
+    /// the request's current dangling token followed by draft candidates. The
+    /// view covers the post-step KV extent; [`Self::apply_speculative`] later
+    /// commits only the accepted prefix and releases excess draft capacity.
+    pub fn speculative_view(&self, num_draft_tokens: usize) -> KvView {
+        KvView::new(
+            self.step_page_indices(num_draft_tokens),
+            self.seq.kv_position() + num_draft_tokens,
+            self.seq.block_size(),
+        )
+    }
+
     // ── Apply (register blocks, advance position) ──────────────────────
 
     pub fn apply_prefill(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<()> {
@@ -348,6 +373,16 @@ impl RequestKv {
         self.seq
             .apply_decode(token, &pool.block_manager)
             .map_err(|e| anyhow::anyhow!("apply_decode: {e}"))
+    }
+
+    pub fn apply_speculative(
+        &mut self,
+        accepted_tokens: &[u32],
+        pool: &BlockPool,
+    ) -> anyhow::Result<DecodeOutcome> {
+        self.seq
+            .apply_speculative(accepted_tokens, &pool.block_manager)
+            .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
     pub fn release(&mut self) -> anyhow::Result<()> {

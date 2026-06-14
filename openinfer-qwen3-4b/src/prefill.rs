@@ -75,6 +75,20 @@ impl Qwen3Model {
         Ok(out)
     }
 
+    pub(super) fn get_embeddings_batch_into(
+        &self,
+        token_ids_gpu: &cudarc::driver::CudaSlice<u32>,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            out.hidden_dim == self.config.hidden_size,
+            "embedding output hidden_dim {} does not match model hidden_size {}",
+            out.hidden_dim,
+            self.config.hidden_size
+        );
+        ops::embedding_batch(&self.ctx, &self.embed_tokens, token_ids_gpu, out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_batch_paged(
         &self,
@@ -322,6 +336,29 @@ impl Qwen3Model {
         layout: &KvLayout,
         echo: bool,
     ) -> Result<(HiddenStates, Option<HiddenStates>)> {
+        let (logits, all_logits, _) = self.batch_prefill_with_hidden_capture(
+            prompts,
+            kv_views,
+            lora_adapters,
+            kv_buffer,
+            layout,
+            echo,
+            None,
+        )?;
+        Ok((logits, all_logits))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batch_prefill_with_hidden_capture(
+        &self,
+        prompts: &[&[u32]],
+        kv_views: &[KvView],
+        lora_adapters: &[Option<&str>],
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
+        echo: bool,
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
         assert_eq!(batch_size, kv_views.len());
         assert_eq!(batch_size, lora_adapters.len());
@@ -360,8 +397,14 @@ impl Qwen3Model {
         )?;
 
         // Forward through all layers
-        let hidden =
-            self.process_all_layers_batch_multi(hidden, layout, kv_buffer, &plan, &lora_groups)?;
+        let (hidden, captured_hidden) = self.process_all_layers_batch_multi(
+            hidden,
+            layout,
+            kv_buffer,
+            &plan,
+            &lora_groups,
+            capture_layer_ids,
+        )?;
 
         // All-position logits for echo (before we extract last-token logits)
         let all_logits = if echo {
@@ -379,7 +422,7 @@ impl Qwen3Model {
         }
         let logits = self.batch_token_logits(&hidden, &last_indices)?;
 
-        Ok((logits, all_logits))
+        Ok((logits, all_logits, captured_hidden))
     }
 
     fn process_all_layers_batch_multi(
@@ -389,11 +432,33 @@ impl Qwen3Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         plan: &PrefillPagedPlan,
         lora_groups: &[DeviceLoraTokenGroup<'_>],
-    ) -> Result<HiddenStates> {
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
         let total_tokens = hidden.seq_len;
         let inter_dim = self.local_intermediate_size();
         let q_dim = self.local_q_dim();
         let kv_dim = self.local_kv_dim();
+        let capture_layer_ids = capture_layer_ids.unwrap_or(&[]);
+        anyhow::ensure!(
+            capture_layer_ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "target hidden capture layer ids must be strictly increasing"
+        );
+        anyhow::ensure!(
+            capture_layer_ids
+                .iter()
+                .all(|&layer| layer < self.layers.len()),
+            "target hidden capture layer id out of range"
+        );
+        let mut captured_hidden = if capture_layer_ids.is_empty() {
+            None
+        } else {
+            Some(HiddenStates::zeros(
+                &self.ctx,
+                self.config.hidden_size * capture_layer_ids.len(),
+                total_tokens,
+            )?)
+        };
+        let mut next_capture = 0usize;
 
         let mut bufs = PrefillBuffers::new(
             &self.ctx,
@@ -415,8 +480,20 @@ impl Qwen3Model {
                 lora_groups,
                 &mut bufs,
             )?;
+            if capture_layer_ids.get(next_capture) == Some(&layer_idx) {
+                let out = captured_hidden
+                    .as_mut()
+                    .expect("capture buffer exists when ids are non-empty");
+                ops::copy_hidden_rows_into(
+                    &self.ctx,
+                    &hidden,
+                    out,
+                    next_capture * self.config.hidden_size,
+                )?;
+                next_capture += 1;
+            }
         }
 
-        Ok(hidden)
+        Ok((hidden, captured_hidden))
     }
 }

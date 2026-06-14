@@ -833,6 +833,10 @@ impl Qwen3Model {
 
     /// KV cache geometry and budget for the executor to create a KvCacheManager.
     pub(crate) fn kv_budget(&self) -> KvBudget {
+        self.kv_budget_with_reserved_bytes(0)
+    }
+
+    pub(crate) fn kv_budget_with_reserved_bytes(&self, reserved_bytes: usize) -> KvBudget {
         let page_size = 16;
         let num_kv_heads = self.local_num_key_value_heads();
         let layout = openinfer_kv_cache::KvLayout::new(
@@ -843,14 +847,30 @@ impl Qwen3Model {
         );
         let bytes_per_block = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo failed");
-        let kv_budget_bytes = (free_bytes as f64 * 0.85) as usize;
-        let num_blocks = (kv_budget_bytes / bytes_per_block).max(64);
-        let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
-        log::info!(
-            "KV cache: {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free)",
-            kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
-            free_bytes as f64 / 1024.0 / 1024.0
+        let usable_free_bytes = free_bytes.saturating_sub(reserved_bytes);
+        let max_blocks = usable_free_bytes / bytes_per_block;
+        assert!(
+            max_blocks >= 2,
+            "not enough GPU memory for Qwen3 KV cache after reserving {} MB",
+            reserved_bytes / (1024 * 1024)
         );
+        let kv_budget_bytes = (usable_free_bytes as f64 * 0.85) as usize;
+        let num_blocks = (kv_budget_bytes / bytes_per_block).max(64).min(max_blocks);
+        let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
+        if reserved_bytes == 0 {
+            log::info!(
+                "KV cache: {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+                kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
+                free_bytes as f64 / 1024.0 / 1024.0
+            );
+        } else {
+            log::info!(
+                "KV cache: {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free after reserving {:.0} MB)",
+                kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
+                free_bytes as f64 / 1024.0 / 1024.0,
+                reserved_bytes as f64 / 1024.0 / 1024.0
+            );
+        }
         KvBudget {
             num_layers: self.config.num_hidden_layers,
             num_kv_heads,

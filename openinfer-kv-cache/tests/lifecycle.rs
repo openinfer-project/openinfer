@@ -215,6 +215,102 @@ fn decode_view_seq_len_invariant() {
     req.release().unwrap();
 }
 
+#[test]
+fn speculative_view_covers_verify_span() {
+    let mgr = make_manager(10);
+    let mut req = mgr.pool().new_request(vec![1; 10], 8, None);
+
+    req.schedule_prefill(10, mgr.pool()).unwrap();
+    req.apply_prefill(42, mgr.pool()).unwrap();
+    assert_eq!(req.kv_position(), 10);
+
+    req.schedule_speculative(4, mgr.pool()).unwrap();
+    let view = req.speculative_view(4);
+    assert_eq!(view.seq_len(), req.kv_position() + 4);
+    assert_eq!(view.num_pages(), 1);
+    assert_eq!(view.last_page_len(), 14);
+
+    req.apply_speculative(&[100, 101], mgr.pool()).unwrap();
+    assert_eq!(
+        req.kv_position(),
+        12,
+        "accepted token count advances KV while preserving one dangling token"
+    );
+    assert_eq!(req.generated_tokens(), 3);
+
+    req.release().unwrap();
+}
+
+#[test]
+fn speculative_partial_accept_releases_excess_capacity() {
+    let mgr = make_manager(5); // 4 usable blocks
+    let initial_avail = mgr.pool().available_blocks();
+
+    let mut req = mgr.pool().new_request(vec![1; 4], 64, None);
+    req.schedule_prefill(4, mgr.pool()).unwrap();
+    req.apply_prefill(42, mgr.pool()).unwrap();
+
+    req.schedule_speculative(32, mgr.pool()).unwrap();
+    let after_schedule = mgr.pool().available_blocks();
+    assert!(
+        after_schedule < initial_avail,
+        "speculative scheduling should reserve draft capacity"
+    );
+
+    req.apply_speculative(&[100], mgr.pool()).unwrap();
+    assert!(
+        mgr.pool().available_blocks() > after_schedule,
+        "partial accept should release excess draft capacity"
+    );
+    assert_eq!(req.kv_position(), 5);
+    assert_eq!(req.generated_tokens(), 2);
+
+    req.release().unwrap();
+    assert_eq!(mgr.pool().available_blocks(), initial_avail);
+}
+
+#[test]
+fn speculative_partial_accept_keeps_cross_page_tail_visible() {
+    let mgr = make_manager(16);
+    let mut req = mgr.pool().new_request(vec![1; 10], 64, None);
+
+    req.schedule_prefill(10, mgr.pool()).unwrap();
+    req.apply_prefill(42, mgr.pool()).unwrap();
+
+    let accepted_lens = [1usize, 1, 2, 1, 2, 1, 4, 2, 2, 1, 4, 1, 1];
+    let mut next_token = 100u32;
+    for accepted_len in accepted_lens {
+        req.schedule_speculative(16, mgr.pool()).unwrap();
+        let view = req.speculative_view(16);
+        assert_eq!(
+            view.num_pages(),
+            view.seq_len().div_ceil(16),
+            "verify view must exactly cover seq_len={}",
+            view.seq_len()
+        );
+        let accepted: Vec<u32> = (0..accepted_len)
+            .map(|_| {
+                let token = next_token;
+                next_token += 1;
+                token
+            })
+            .collect();
+        req.apply_speculative(&accepted, mgr.pool()).unwrap();
+    }
+
+    req.schedule_speculative(16, mgr.pool()).unwrap();
+    let view = req.speculative_view(16);
+    assert_eq!(view.seq_len(), 49);
+    assert_eq!(
+        view.num_pages(),
+        4,
+        "33 committed KV tokens + 16-token verify span must expose the fourth page"
+    );
+    req.apply_speculative(&[next_token], mgr.pool()).unwrap();
+
+    req.release().unwrap();
+}
+
 /// prefill_view seq_len == kv_position + prompt_len, page count covers
 /// that seq_len.
 #[test]

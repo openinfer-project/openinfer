@@ -278,6 +278,60 @@ pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize 
     rows * vocab.div_ceil(TILE_ELEMS)
 }
 
+/// Two-stage batched argmax for contiguous rows: tile-parallel partials then
+/// one finalize per row. Lowest index wins ties.
+pub fn argmax_batch_bf16_split_into(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+    values: &mut CudaSlice<half::bf16>,
+    out: &mut CudaSlice<i32>,
+) -> Result<()> {
+    let rows = logits.seq_len;
+    if rows == 0 {
+        return Err(anyhow!("argmax split batch requires at least one row"));
+    }
+    let needed_partials = argmax_batch_bf16_split_partials_len(rows, logits.hidden_dim);
+    if partial_values.len() < needed_partials || partial_indices.len() < needed_partials {
+        return Err(anyhow!(
+            "argmax split partials scratch too small: have {}/{}, need {}",
+            partial_values.len(),
+            partial_indices.len(),
+            needed_partials
+        ));
+    }
+    if values.len() < rows || out.len() < rows {
+        return Err(anyhow!(
+            "argmax split outputs too small: have {}/{}, need {}",
+            values.len(),
+            out.len(),
+            rows
+        ));
+    }
+
+    let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (pv_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
+    let (values_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::argmax_batch_bf16_split_cuda(
+            logits_ptr as *const ffi::Half,
+            values_ptr as *mut ffi::Half,
+            out_ptr as *mut i32,
+            pv_ptr as *mut f32,
+            pi_ptr as *mut i32,
+            rows as i32,
+            logits.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Two-stage indexed batched argmax: tile-parallel partials then a per-row
 /// finalize. Lowest index wins ties; each vocab row spreads over many CTAs
 /// instead of one.

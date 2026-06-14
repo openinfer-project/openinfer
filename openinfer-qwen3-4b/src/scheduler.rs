@@ -19,14 +19,14 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
-use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
+use crate::{Qwen3LoraOptions, Qwen3OffloadOptions, Qwen3SpeculativeOptions};
 use openinfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
 };
 use openinfer_core::sampler::SamplingParams;
 
 use self::effects::apply_effects;
-use self::plan::{build_next_plan, execute_plan};
+use self::plan::{ExecutionPlan, build_next_plan, execute_plan, should_speculative_decode};
 use self::resolve::resolve_step;
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -138,15 +138,17 @@ pub(crate) fn start_qwen3(
     device_ordinals: &[usize],
     seed: u64,
     offload_options: Qwen3OffloadOptions,
+    speculative_options: Qwen3SpeculativeOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
-    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_options(
         model_path,
         enable_cuda_graph,
         device_ordinals,
         Qwen3LoraOptions::default(),
         offload_options,
+        speculative_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor(executor, seed, max_prefill_tokens))
@@ -159,15 +161,17 @@ pub(crate) fn start_qwen3_with_lora_control(
     seed: u64,
     lora_options: Qwen3LoraOptions,
     offload_options: Qwen3OffloadOptions,
+    speculative_options: Qwen3SpeculativeOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
-    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_options(
         model_path,
         enable_cuda_graph,
         device_ordinals,
         lora_options,
         offload_options,
+        speculative_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor_with_lora_control(
@@ -438,11 +442,8 @@ fn scheduler_loop<E>(
         }
         prefilling.extend(admission.pending);
         deferred = admission.deferred;
-        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
-
-        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
-            continue;
-        };
+        let plan = build_runtime_plan(&executor, &active, &mut prefilling, max_prefill_tokens);
+        let Some(plan) = plan else { continue };
         let failure_targets = failure_targets_for(&active, &plan);
         let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
             Ok(v) => v,
@@ -566,9 +567,8 @@ fn scheduler_loop_with_lora_control<E>(
         }
         prefilling.extend(admission.pending);
         deferred = admission.deferred;
-        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
-
-        if active.is_empty() && pending.is_empty() {
+        let plan = build_runtime_plan(&executor, &active, &mut prefilling, max_prefill_tokens);
+        if plan.is_none() && active.is_empty() {
             // A parked load must still be polled to completion before we block.
             if !loading.is_empty() {
                 block_on_loading(&mut executor, &mut deferred, &mut loading);
@@ -589,9 +589,7 @@ fn scheduler_loop_with_lora_control<E>(
             continue;
         }
 
-        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
-            continue;
-        };
+        let Some(plan) = plan else { continue };
         let failure_targets = failure_targets_for(&active, &plan);
         let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
             Ok(v) => v,
@@ -603,6 +601,24 @@ fn scheduler_loop_with_lora_control<E>(
         };
         let effects = resolve_step(&executor, &active, artifacts);
         apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+    }
+}
+
+fn build_runtime_plan(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    prefilling: &mut Vec<PendingRequest>,
+    max_prefill_tokens: usize,
+) -> Option<ExecutionPlan> {
+    let pending = take_prefill_chunks(prefilling, max_prefill_tokens);
+    if should_speculative_decode(executor, active) {
+        if pending.is_empty() {
+            Some(ExecutionPlan::SpeculativeDecode)
+        } else {
+            Some(ExecutionPlan::Prefill { pending })
+        }
+    } else {
+        build_next_plan(!active.is_empty(), pending)
     }
 }
 
@@ -944,6 +960,9 @@ fn failure_targets_for(
         self::plan::ExecutionPlan::Decode => {
             targets.extend(active.iter().map(active_failure_target));
         }
+        self::plan::ExecutionPlan::SpeculativeDecode => {
+            targets.extend(active.iter().map(active_failure_target));
+        }
         self::plan::ExecutionPlan::Unified { pending } => {
             targets.extend(active.iter().map(active_failure_target));
             targets.extend(pending.iter().map(pending_failure_target));
@@ -1010,6 +1029,12 @@ mod tests {
         PrefillStepItem, UnifiedPlan, UnifiedResult,
     };
 
+    #[test]
+    fn servable_len_reports_the_tighter_context_or_kv_limit() {
+        assert_eq!(servable_len(40944, 4096, 16), 40944);
+        assert_eq!(servable_len(40944, 1027, 16), 16432);
+    }
+
     struct FakeExecutor {
         block_size: usize,
         cached_tokens: usize,
@@ -1022,6 +1047,7 @@ mod tests {
         prefill_positions: HashMap<RequestId, usize>,
         fail_decode_once: bool,
         decode_delay: Duration,
+        speculative_ready: HashSet<RequestId>,
         loaded_lora_adapters: HashSet<String>,
         dropped: Arc<Mutex<Vec<u64>>>,
         prefetch_offers: Arc<Mutex<Vec<u64>>>,
@@ -1043,6 +1069,7 @@ mod tests {
                 prefill_positions: HashMap::new(),
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
+                speculative_ready: HashSet::new(),
                 loaded_lora_adapters: HashSet::new(),
                 dropped,
                 prefetch_offers: Arc::new(Mutex::new(Vec::new())),
@@ -1070,6 +1097,11 @@ mod tests {
 
         fn with_decode_delay(mut self, delay: Duration) -> Self {
             self.decode_delay = delay;
+            self
+        }
+
+        fn with_speculative_ready(mut self, request_id: RequestId) -> Self {
+            self.speculative_ready.insert(request_id);
             self
         }
 
@@ -1195,6 +1227,14 @@ mod tests {
             names
         }
 
+        fn speculative_enabled(&self) -> bool {
+            !self.speculative_ready.is_empty()
+        }
+
+        fn speculative_request_ready(&self, request_id: RequestId) -> bool {
+            self.speculative_ready.contains(&request_id)
+        }
+
         fn unload_lora_adapter(&mut self, request: &UnloadLoraAdapterRequest) -> Result<()> {
             anyhow::ensure!(
                 self.loaded_lora_adapters.remove(&request.lora_name),
@@ -1226,6 +1266,7 @@ mod tests {
                     .iter()
                     .map(|req| self.fake_prefill_result(req))
                     .collect(),
+                dflash_context_captured: false,
             })
         }
 
@@ -1595,6 +1636,116 @@ mod tests {
             "echo skipped, leftover budget goes to the next non-echo request"
         );
         assert_eq!(prefilling[0].request_id, RequestId(4));
+    }
+
+    #[test]
+    fn dflash_ready_active_prefills_waiting_request_before_next_draft() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(64, dropped).with_speculative_ready(RequestId(7));
+        let (token_tx, _rx) = mpsc::unbounded_channel();
+        let active = vec![ActiveRequestState {
+            request_id: RequestId(7),
+            lora_adapter: None,
+            token_tx,
+            last_token: 42,
+            generated_count: 1,
+            max_tokens: 32,
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }];
+        let mut prefilling = vec![PendingRequest::from_scheduler_request(
+            RequestId(8),
+            request(16, 1).0,
+        )];
+
+        match build_runtime_plan(&executor, &active, &mut prefilling, 1024) {
+            Some(ExecutionPlan::Prefill { pending }) => {
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].request_id, RequestId(8));
+            }
+            _ => panic!("DFlash should prefill waiting requests so they become DFlash-ready"),
+        }
+        assert!(prefilling.is_empty());
+    }
+
+    #[test]
+    fn dflash_ready_active_prefills_waiting_batch_before_next_draft() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(64, dropped).with_speculative_ready(RequestId(7));
+        let (token_tx, _rx) = mpsc::unbounded_channel();
+        let active = vec![ActiveRequestState {
+            request_id: RequestId(7),
+            lora_adapter: None,
+            token_tx,
+            last_token: 42,
+            generated_count: 1,
+            max_tokens: 32,
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }];
+        let mut prefilling = vec![
+            PendingRequest::from_scheduler_request(RequestId(8), request(16, 1).0),
+            PendingRequest::from_scheduler_request(RequestId(9), request(16, 1).0),
+        ];
+
+        match build_runtime_plan(&executor, &active, &mut prefilling, 1024) {
+            Some(ExecutionPlan::Prefill { pending }) => {
+                assert_eq!(
+                    pending.iter().map(|req| req.request_id).collect::<Vec<_>>(),
+                    vec![RequestId(8), RequestId(9)]
+                );
+            }
+            _ => panic!("DFlash should prefill the waiting batch before the next draft"),
+        }
+        assert!(prefilling.is_empty());
+
+        let mut prefilling = Vec::new();
+        match build_runtime_plan(&executor, &active, &mut prefilling, 1024) {
+            Some(ExecutionPlan::SpeculativeDecode) => {}
+            _ => panic!("ready single active request should speculate once pending is drained"),
+        }
+    }
+
+    #[test]
+    fn dflash_ready_multi_active_speculates_as_one_batch() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(64, dropped)
+            .with_speculative_ready(RequestId(7))
+            .with_speculative_ready(RequestId(8));
+        let (tx0, _rx0) = mpsc::unbounded_channel();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let active = vec![
+            ActiveRequestState {
+                request_id: RequestId(7),
+                lora_adapter: None,
+                token_tx: tx0,
+                last_token: 42,
+                generated_count: 1,
+                max_tokens: 32,
+                prompt_len: 16,
+                params: SamplingParams::default(),
+                logprobs: 0,
+            },
+            ActiveRequestState {
+                request_id: RequestId(8),
+                lora_adapter: None,
+                token_tx: tx1,
+                last_token: 43,
+                generated_count: 1,
+                max_tokens: 32,
+                prompt_len: 16,
+                params: SamplingParams::default(),
+                logprobs: 0,
+            },
+        ];
+        let mut prefilling = Vec::new();
+
+        match build_runtime_plan(&executor, &active, &mut prefilling, 1024) {
+            Some(ExecutionPlan::SpeculativeDecode) => {}
+            _ => panic!("all-ready active requests should run DFlash together"),
+        }
     }
 
     #[test]
