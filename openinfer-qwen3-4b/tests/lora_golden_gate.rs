@@ -7,6 +7,11 @@
 //! Replay framework and tolerances are copied from `hf_golden_gate.rs` (tests cannot
 //! share modules); see that header for the rationale.
 //!
+//! On a host with >=2 GPUs it also replays under TP=2 against the same reference: the
+//! adapter is sharded per rank (B row-shard for q/k/v/gate/up, A col-shard for o/down),
+//! so the col-shard deltas are summed by the same all-reduce as the base output — a path
+//! single-GPU LoRA and the TP=2 base gate never exercise.
+//!
 //! Needs a CUDA GPU and Qwen3-4B weights (`OPENINFER_TEST_MODEL_PATH`); skips cleanly
 //! otherwise.
 
@@ -500,5 +505,15 @@ fn lora_logprobs_match_peft_golden_within_bf16_tolerance() {
 
     run_suite(&golden, &model_path, &adapter_dir, &[0], "");
 
+    if cuda_device_count() >= 2 {
+        run_suite(&golden, &model_path, &adapter_dir, &[0, 1], "tp2 ");
+    } else {
+        eprintln!("skipping lora_golden_gate TP=2 pass: <2 CUDA devices visible");
+    }
+
     let _ = std::fs::remove_dir_all(&adapter_dir);
+}
+
+fn cuda_device_count() -> usize {
+    cudarc::driver::CudaContext::device_count().map_or(0, |n| n.max(0) as usize)
 }
