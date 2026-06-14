@@ -49,7 +49,7 @@ pub fn gemm_lt_tune(
             num_rows as i32,
             n as i32,
             cols as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     if status != 0 {
@@ -270,7 +270,7 @@ pub fn gemm_per_token_into_checked(
             weight.rows as i32,
             x.seq_len as i32,
             weight.cols as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
             if status >= 100_000 {
@@ -355,7 +355,7 @@ fn launch_gemm(
                 m as i32,
                 n as i32,
                 k as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             )
         } else {
             GEMM_LT_UNTUNED
@@ -369,7 +369,7 @@ fn launch_gemm(
                     m as i32,
                     n as i32,
                     k as i32,
-                    ctx.stream.cu_stream(),
+                    crate::tensor::active_cu_stream(ctx),
                 )
             } else {
                 ffi::gemm_cuda(
@@ -379,7 +379,7 @@ fn launch_gemm(
                     m as i32,
                     n as i32,
                     k as i32,
-                    ctx.stream.cu_stream(),
+                    crate::tensor::active_cu_stream(ctx),
                 )
             };
         }

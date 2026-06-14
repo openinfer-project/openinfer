@@ -162,7 +162,7 @@ pub fn gpu_sample_batch_into(
                 scratch.vocab as i32,
                 seed,
                 0,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             )
         };
         ensure!(err == 0, "batch sampling kernel failed: cudaError {err}");
@@ -216,7 +216,7 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
                 x_ptr as *const ffi::Half,
                 out_ptr as *mut i32,
                 x.len as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             );
         }
     }
@@ -266,7 +266,7 @@ pub fn argmax_batch_bf16_into(
             out_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 
@@ -339,7 +339,7 @@ pub fn argmax_batch_bf16_split_indexed_into(
             pi_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 
@@ -437,7 +437,7 @@ fn gpu_sample_core(
                 l_ptr as *const ffi::Half,
                 o_ptr as *mut i32,
                 logits.len as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             );
         }
     } else {
@@ -459,7 +459,7 @@ fn gpu_sample_core(
                 top_k,
                 top_p,
                 u64::from(random_val.to_bits()),
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             );
         }
     }
@@ -519,7 +519,7 @@ pub fn flashinfer_top1_batch_into(
             o_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 

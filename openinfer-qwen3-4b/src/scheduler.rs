@@ -18,7 +18,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
-use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
+use crate::executor::{ModelExecutor, PrefillPlan, Qwen3Executor, RequestId};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
@@ -26,7 +26,7 @@ use openinfer_core::engine::{
 use openinfer_core::sampler::SamplingParams;
 
 use self::effects::apply_effects;
-use self::plan::{build_next_plan, execute_plan};
+use self::plan::{ExecutionArtifacts, ExecutionPlan, build_next_plan, execute_plan};
 use self::resolve::resolve_step;
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ pub(super) struct ActiveRequestState {
     pub(super) logprobs: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct PendingRequest {
     pub(super) request_id: RequestId,
     pub(super) lora_adapter: Option<String>,
@@ -149,6 +150,17 @@ pub(crate) fn start_qwen3(
         offload_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
+
+    // Enable Green Context SM partitioning if requested via env var.
+    // OPENINFER_SM_PARTITION=<decode_pct>  (e.g. "20" for 20% decode / 80% prefill)
+    if let Ok(val) = std::env::var("OPENINFER_SM_PARTITION") {
+        let decode_pct: u32 = val.parse().unwrap_or(20);
+        match executor.enable_sm_partition(crate::green_ctx::SmPartitionConfig { decode_pct }) {
+            Ok(()) => log::info!("SM partition enabled: decode_pct={decode_pct}"),
+            Err(e) => log::warn!("SM partition requested but failed: {e}; continuing without"),
+        }
+    }
+
     Ok(start_with_executor(executor, seed, max_prefill_tokens))
 }
 
@@ -369,10 +381,32 @@ fn scheduler_loop<E>(
     // Admitted requests whose prompts are not fully prefilled yet (chunked
     // prefill). FIFO by request id; each step takes chunks off the front.
     let mut prefilling: Vec<PendingRequest> = Vec::new();
+    // SM-partition async prefill: pending requests whose prefill is in-flight
+    // on the prefill partition stream. `None` when no async prefill is running.
+    let mut inflight_prefill_pending: Option<Vec<PendingRequest>> = None;
 
     info!("Scheduler ready");
 
     loop {
+        // 0. Poll in-flight async prefill (SM partition mode).
+        if inflight_prefill_pending.is_some() {
+            if let Some(prefill_result) = executor.poll_async_prefill() {
+                let pending = inflight_prefill_pending.take().unwrap();
+                info!(
+                    "SM-partition: async prefill completed ({} reqs)",
+                    pending.len()
+                );
+                let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
+                let artifacts = ExecutionArtifacts::Prefill {
+                    pending,
+                    result: prefill_result,
+                    scheduled_at_unix_s,
+                };
+                let effects = resolve_step(&executor, &active, artifacts);
+                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+            }
+        }
+
         // 1. Drain all incoming requests into deferred.
         while let Ok(req) = submit_rx.try_recv() {
             deferred.push(PendingRequest::from_scheduler_request(
@@ -438,11 +472,69 @@ fn scheduler_loop<E>(
         }
         prefilling.extend(admission.pending);
         deferred = admission.deferred;
-        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
+        // If there's an in-flight async prefill, skip taking new prefill chunks
+        // (only do decode until the async prefill completes).
+        let pending = if inflight_prefill_pending.is_some() {
+            Vec::new()
+        } else {
+            take_prefill_chunks(&mut prefilling, max_prefill_tokens)
+        };
 
         let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
             continue;
         };
+
+        // SM-partition path: when a Unified plan appears and SM partition is
+        // active (and no async prefill is already in-flight), execute_unified
+        // internally uses SplitConcurrent which only syncs decode and defers
+        // the prefill sync. This lets the scheduler advance decode immediately.
+        // The prefill result is polled at the top of the next iteration.
+        if executor.has_sm_partition()
+            && inflight_prefill_pending.is_none()
+            && matches!(plan, ExecutionPlan::Unified { .. })
+        {
+            if let ExecutionPlan::Unified { pending } = plan {
+                let prefill_tokens: usize = pending.iter().map(|r| r.step_chunk).sum();
+                info!(
+                    "SM-partition: unified step with async prefill ({} reqs, ~{} tokens)",
+                    pending.len(),
+                    prefill_tokens
+                );
+
+                // Save pending for later poll resolution.
+                let pending_for_poll = pending.clone();
+
+                // execute_plan(Unified) will internally SplitConcurrent:
+                // - sync decode immediately
+                // - defer prefill sync
+                // It returns Unified artifacts with empty prefill_requests.
+                let unified_plan = ExecutionPlan::Unified { pending };
+                let failure_targets = failure_targets_for(&active, &unified_plan);
+                let artifacts =
+                    match execute_plan(&mut executor, &mut active, unified_plan, &mut rng) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Execution step failed: {e}");
+                            fail_touched_requests(
+                                &mut executor,
+                                &mut active,
+                                failure_targets,
+                                &e.to_string(),
+                            );
+                            continue;
+                        }
+                    };
+
+                // Only apply decode effects from the unified result.
+                let effects = resolve_step(&executor, &active, artifacts);
+                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+
+                // Track the pending prefill for next-iteration polling.
+                inflight_prefill_pending = Some(pending_for_poll);
+                continue;
+            }
+        }
+
         let failure_targets = failure_targets_for(&active, &plan);
         let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
             Ok(v) => v,

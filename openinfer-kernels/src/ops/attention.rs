@@ -356,7 +356,7 @@ pub fn prefill_attention_paged_into(
     let (kcs_ptr, _) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
     let (tnr_ptr, _) = plan.total_num_rows_d.device_ptr(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     unsafe {
         // RoPE positions always come from the plan's per-token array — it is
@@ -492,7 +492,7 @@ pub fn qk_norm_rope_batch_decode_into(
             batch_size as i32,
             rms_eps,
             (cos_cache.data.len() / head_dim) as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 }
@@ -545,7 +545,7 @@ pub fn qk_norm_partial_rope_batched_decode_hd256_into(
             batch_size as i32,
             rotary_dim as i32,
             rms_eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 }
@@ -595,7 +595,7 @@ pub fn paged_attention_batch_decode_into(
     let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     // Step 1: Append K/V to paged cache (batched) using the same generic
     // scatter path as prefill, with explicit request indices and positions.
@@ -715,7 +715,7 @@ pub fn paged_attention_batch_decode_split_kv_into(
     let (split_tmp_v_ptr, _gstmpv) = split_tmp_v.device_ptr_mut(&ctx.stream);
     let (split_tmp_s_ptr, _gstmps) = split_tmp_s.device_ptr_mut(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     let src_stride_n = (num_kv_heads * head_dim) as i64;
     let src_stride_h = head_dim as i64;
@@ -823,7 +823,7 @@ pub fn paged_attention_batch_decode_hd256_into(
     let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     let src_stride_n = (num_kv_heads * head_dim) as i64;
     let src_stride_h = head_dim as i64;
