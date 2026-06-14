@@ -265,9 +265,17 @@ fn build_batch_decode_request_results(
     Ok(outputs)
 }
 
-fn dflash_memory_reserve_bytes(options: &Qwen3SpeculativeOptions) -> Result<usize> {
+pub(super) struct DFlashMemoryReserve {
+    total_bytes: usize,
+    request_state_budget_bytes: usize,
+}
+
+fn dflash_memory_reserve(options: &Qwen3SpeculativeOptions) -> Result<DFlashMemoryReserve> {
     let Some(dflash) = options.dflash.as_ref() else {
-        return Ok(0);
+        return Ok(DFlashMemoryReserve {
+            total_bytes: 0,
+            request_state_budget_bytes: 0,
+        });
     };
     let path = dflash
         .model_path
@@ -282,16 +290,21 @@ fn dflash_memory_reserve_bytes(options: &Qwen3SpeculativeOptions) -> Result<usiz
         Ok::<usize, anyhow::Error>(acc + len)
     })?;
     let extra_bytes = dflash_request_state_reserve_bytes(&config)?;
+    let state_budget_bytes = extra_bytes.saturating_sub(DFLASH_ALLOCATOR_MARGIN_BYTES);
     let reserved = weight_bytes
         .checked_add(extra_bytes)
         .context("DFlash memory reserve overflow")?;
     log::info!(
-        "Qwen3 DFlash memory reserve: weights={:.1} MB, extra={:.1} MB, total={:.1} MB",
+        "Qwen3 DFlash memory reserve: weights={:.1} MB, extra={:.1} MB, state_budget={:.1} MB, total={:.1} MB",
         weight_bytes as f64 / 1e6,
         extra_bytes as f64 / 1e6,
+        state_budget_bytes as f64 / 1e6,
         reserved as f64 / 1e6,
     );
-    Ok(reserved)
+    Ok(DFlashMemoryReserve {
+        total_bytes: reserved,
+        request_state_budget_bytes: state_budget_bytes,
+    })
 }
 
 fn checked_product(values: &[usize], context: &'static str) -> Result<usize> {
@@ -311,7 +324,19 @@ fn bf16_tensor_bytes(rows: usize, cols: usize, context: &'static str) -> Result<
 }
 
 fn dflash_request_state_reserve_bytes(config: &DFlashConfig) -> Result<usize> {
-    let max_tokens = config.max_position_embeddings;
+    let footprint =
+        dflash_request_state_footprint_bytes_for_len(config, config.max_position_embeddings)?;
+    let with_margin = footprint
+        .checked_add(DFLASH_ALLOCATOR_MARGIN_BYTES)
+        .context("DFlash request-state reserve overflow")?;
+    Ok(with_margin.max(DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES))
+}
+
+pub(super) fn dflash_request_state_footprint_bytes_for_len(
+    config: &DFlashConfig,
+    max_cache_len: usize,
+) -> Result<usize> {
+    let max_tokens = max_cache_len;
     let block = config.block_size;
     let hidden = config.hidden_size;
     let q_dim = checked_product(
@@ -369,7 +394,7 @@ fn dflash_request_state_reserve_bytes(config: &DFlashConfig) -> Result<usize> {
         "DFlash token-id scratch reserve overflow",
     )?;
 
-    let exact = checked_sum(
+    checked_sum(
         &[
             kv_cache,
             pending_context,
@@ -383,11 +408,9 @@ fn dflash_request_state_reserve_bytes(config: &DFlashConfig) -> Result<usize> {
             block_mlp_count,
             block_logits,
             block_token_ids,
-            DFLASH_ALLOCATOR_MARGIN_BYTES,
         ],
         "DFlash request-state reserve overflow",
-    )?;
-    Ok(exact.max(DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES))
+    )
 }
 
 fn execute_step_on_lane(
@@ -419,7 +442,7 @@ fn execute_step_on_lane(
                 *echo,
                 capture_layer_ids.as_deref(),
             )?;
-            let dflash_context_captured = lane.record_prefill_dflash_context(
+            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
                 requests,
                 capture_dflash_context,
                 _captured_hidden.as_ref(),
@@ -437,7 +460,7 @@ fn execute_step_on_lane(
                         all_position_logits.as_ref(),
                         *echo,
                     )?,
-                    dflash_context_captured,
+                    dflash_context_captured_requests,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -776,7 +799,7 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
-    pub dflash_context_captured: bool,
+    pub dflash_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -816,6 +839,12 @@ pub(crate) trait ModelExecutor: Send {
     }
     fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
         self.speculative_enabled()
+    }
+    fn speculative_state_budget_bytes(&self) -> Option<usize> {
+        None
+    }
+    fn speculative_request_state_bytes(&self, _prompt_len: usize, _max_tokens: usize) -> usize {
+        0
     }
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 
@@ -885,6 +914,8 @@ struct Qwen3ExecutorMetadata {
     stop_token_ids: Vec<u32>,
     config: Config,
     max_context_tokens: usize,
+    dflash_config: Option<DFlashConfig>,
+    dflash_state_budget_bytes: usize,
 }
 
 pub struct Qwen3Executor {
@@ -943,7 +974,10 @@ impl Drop for Qwen3Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES, dflash_request_state_reserve_bytes};
+    use super::{
+        DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES, dflash_request_state_footprint_bytes_for_len,
+        dflash_request_state_reserve_bytes,
+    };
     use crate::config::{DFlashConfig, DFlashInnerConfig};
 
     #[test]
@@ -972,6 +1006,35 @@ mod tests {
         assert!(
             reserve > DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES * 2,
             "Qwen3-4B DFlash reserve should account for long-context request state, got {reserve}"
+        );
+    }
+
+    #[test]
+    fn dflash_short_request_footprint_does_not_include_global_allocator_floor() {
+        let config = DFlashConfig {
+            hidden_size: 2560,
+            intermediate_size: 9728,
+            num_hidden_layers: 5,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_target_layers: 5,
+            head_dim: 128,
+            vocab_size: 151936,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 40960,
+            block_size: 16,
+            dflash_config: DFlashInnerConfig {
+                mask_token_id: 151669,
+                target_layer_ids: vec![1, 9, 17, 25, 33],
+            },
+        };
+
+        let footprint = dflash_request_state_footprint_bytes_for_len(&config, 80).unwrap();
+
+        assert!(
+            footprint < DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES / 8,
+            "short-request admission must charge true DFlash state footprint, not the global floor: {footprint}"
         );
     }
 }

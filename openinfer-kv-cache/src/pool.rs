@@ -385,6 +385,14 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
+    /// Undo a scheduled-but-unapplied KV operation and return any blocks
+    /// reserved by that schedule to the pool.
+    pub fn revert_schedule(&mut self) -> anyhow::Result<()> {
+        self.seq
+            .revert_schedule()
+            .map_err(|e| anyhow::anyhow!("revert_schedule: {e}"))
+    }
+
     pub fn release(&mut self) -> anyhow::Result<()> {
         self.seq
             .release()

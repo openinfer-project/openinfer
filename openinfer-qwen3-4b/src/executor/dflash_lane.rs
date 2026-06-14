@@ -14,7 +14,7 @@ use crate::speculative::{
 use openinfer_core::tensor::HiddenStates;
 
 use super::dflash_prefill::{
-    dflash_prefill_supported,
+    dflash_prefill_can_capture,
     should_capture_dflash_prefill_context as should_capture_dflash_prefill_context_with_state,
 };
 use super::worker::LocalQwen3Lane;
@@ -104,13 +104,13 @@ impl LocalQwen3Lane {
         requests: &[PrefillStepItem],
         capture_requested: bool,
         captured_hidden: Option<&HiddenStates>,
-    ) -> Result<bool> {
+    ) -> Result<Vec<RequestId>> {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::ensure!(
                 !capture_requested,
                 "DFlash prefill context capture was requested but no hidden states were returned"
             );
-            return Ok(false);
+            return Ok(Vec::new());
         };
         anyhow::ensure!(
             capture_requested,
@@ -127,9 +127,11 @@ impl LocalQwen3Lane {
             expected_tokens
         );
         let ctx = self.model.device_ctx().clone();
+        let mut captured_requests = Vec::new();
         let mut token_offset = 0usize;
         for req in requests {
-            if dflash_prefill_supported(req) {
+            let pending_exists = dflash.requests.contains_key(&req.request_id);
+            if dflash_prefill_can_capture(req, pending_exists) {
                 let max_cache_len =
                     req.prompt_tokens.len() + req.max_output_tokens + dflash.model.block_size();
                 let mut state = match dflash.requests.remove(&req.request_id) {
@@ -152,12 +154,13 @@ impl LocalQwen3Lane {
                     req.chunk_tokens,
                 )?;
                 dflash.requests.insert(req.request_id, state);
+                captured_requests.push(req.request_id);
             } else {
                 dflash.requests.remove(&req.request_id);
             }
             token_offset += req.chunk_tokens;
         }
-        Ok(true)
+        Ok(captured_requests)
     }
 
     pub(super) fn record_verify_dflash_context(

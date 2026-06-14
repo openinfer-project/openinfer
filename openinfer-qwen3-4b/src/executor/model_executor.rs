@@ -12,7 +12,7 @@ use super::worker::{StepCommand, WorkerStepOutcome};
 use super::{
     DecodePlan, DecodeResult, ModelExecutor, PrefillPlan, PrefillResult, Qwen3Executor, RequestId,
     SpeculativeDraftPlan, SpeculativeDraftResult, SpeculativeVerifyPlan, SpeculativeVerifyResult,
-    UnifiedPlan, UnifiedResult,
+    UnifiedPlan, UnifiedResult, dflash_request_state_footprint_bytes_for_len,
 };
 
 impl ModelExecutor for Qwen3Executor {
@@ -235,7 +235,10 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative_enabled {
             for (req, req_result) in scheduled_requests.iter().zip(&result.requests) {
                 assert_eq!(req.request_id, req_result.request_id);
-                match dflash_prefill_action(result.dflash_context_captured, req_result.completed) {
+                let captured = result
+                    .dflash_context_captured_requests
+                    .contains(&req.request_id);
+                match dflash_prefill_action(captured, req_result.completed) {
                     DFlashPrefillAction::MarkReady => {
                         self.dflash_ready_requests.insert(req.request_id);
                     }
@@ -335,6 +338,30 @@ impl ModelExecutor for Qwen3Executor {
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
         self.dflash_ready_requests.contains(&request_id)
+    }
+
+    fn speculative_state_budget_bytes(&self) -> Option<usize> {
+        self.speculative_enabled
+            .then_some(self.metadata.dflash_state_budget_bytes)
+    }
+
+    fn speculative_request_state_bytes(&self, prompt_len: usize, max_tokens: usize) -> usize {
+        let Some(config) = self.metadata.dflash_config.as_ref() else {
+            return 0;
+        };
+        let max_cache_len = prompt_len
+            .saturating_add(max_tokens)
+            .saturating_add(config.block_size)
+            .min(config.max_position_embeddings);
+        match dflash_request_state_footprint_bytes_for_len(config, max_cache_len) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!(
+                    "failed to estimate DFlash request-state memory for prompt_len={prompt_len} max_tokens={max_tokens}: {error}"
+                );
+                usize::MAX
+            }
+        }
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {

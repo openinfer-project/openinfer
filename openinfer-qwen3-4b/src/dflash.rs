@@ -365,6 +365,10 @@ impl DFlashDraftModel {
         self.config.block_size
     }
 
+    pub(crate) fn config(&self) -> &DFlashConfig {
+        &self.config
+    }
+
     pub(crate) fn mask_token_id(&self) -> u32 {
         self.config.dflash_config.mask_token_id
     }

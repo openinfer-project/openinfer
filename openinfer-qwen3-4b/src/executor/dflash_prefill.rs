@@ -22,7 +22,7 @@ pub(super) fn should_capture_dflash_prefill_context(
     !requests.is_empty()
         && requests
             .iter()
-            .all(|req| dflash_prefill_can_capture(req, pending_state_exists(req.request_id)))
+            .any(|req| dflash_prefill_can_capture(req, pending_state_exists(req.request_id)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +53,7 @@ mod tests {
     use openinfer_core::sampler::SamplingParams;
 
     #[test]
-    fn dflash_prefill_capture_requires_single_supported_request() {
+    fn dflash_prefill_capture_runs_when_any_request_can_capture() {
         let greedy = SamplingParams::default();
         let mut non_greedy_params = greedy;
         non_greedy_params.temperature = 0.7;
@@ -85,6 +85,10 @@ mod tests {
         cached.cached_tokens = 1;
         assert!(should_capture_dflash_prefill_context(
             &[supported.clone(), second],
+            |_| false
+        ));
+        assert!(should_capture_dflash_prefill_context(
+            &[supported.clone(), non_greedy.clone()],
             |_| false
         ));
         assert!(!should_capture_dflash_prefill_context(
@@ -126,7 +130,7 @@ mod tests {
 
         let mut mid_chunk = second;
         mid_chunk.chunk_start = 3;
-        assert!(!should_capture_dflash_prefill_context(
+        assert!(should_capture_dflash_prefill_context(
             &[supported.clone(), mid_chunk.clone()],
             |_| false
         ));

@@ -14,7 +14,7 @@ use super::{
     DecodePlan, DecodeResult, ModelExecutor, PrefillPlan, PrefillRequestResult, PrefillResult,
     PrefillStepItem, Qwen3Executor, Qwen3ExecutorMetadata, RequestId, SpeculativeDraftPlan,
     SpeculativeDraftResult, SpeculativeVerifyPlan, SpeculativeVerifyResult, UnifiedPlan,
-    UnifiedResult, dflash_memory_reserve_bytes,
+    UnifiedResult, dflash_memory_reserve,
 };
 
 impl Qwen3Executor {
@@ -23,8 +23,8 @@ impl Qwen3Executor {
         offload_opts: &Qwen3OffloadOptions,
         speculative_options: Qwen3SpeculativeOptions,
     ) -> Result<Self> {
-        let budget =
-            model.kv_budget_with_reserved_bytes(dflash_memory_reserve_bytes(&speculative_options)?);
+        let dflash_reserve = dflash_memory_reserve(&speculative_options)?;
+        let budget = model.kv_budget_with_reserved_bytes(dflash_reserve.total_bytes);
         let kv_mgr = KvCacheManager::new(
             &model.device_ctx().stream,
             budget.num_layers,
@@ -63,6 +63,8 @@ impl Qwen3Executor {
             stop_token_ids: model.config().stop_token_ids.clone(),
             config: model.config().clone(),
             max_context_tokens,
+            dflash_config: dflash.as_ref().map(|dflash| dflash.config().clone()),
+            dflash_state_budget_bytes: dflash_reserve.request_state_budget_bytes,
         };
         if speculative_enabled {
             log::info!(
@@ -197,6 +199,8 @@ impl Qwen3Executor {
             stop_token_ids: models[0].config().stop_token_ids.clone(),
             config: models[0].config().clone(),
             max_context_tokens: models[0].config().max_position_embeddings,
+            dflash_config: None,
+            dflash_state_budget_bytes: 0,
         };
 
         // Create extra KvBuffers for ranks 1+ on their respective streams.

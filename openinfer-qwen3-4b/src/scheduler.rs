@@ -434,6 +434,11 @@ fn scheduler_loop<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            executor.speculative_state_budget_bytes(),
+            |id| executor.speculative_request_ready(id),
+            |prompt_len, max_tokens| {
+                executor.speculative_request_state_bytes(prompt_len, max_tokens)
+            },
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
@@ -559,6 +564,11 @@ fn scheduler_loop_with_lora_control<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            executor.speculative_state_budget_bytes(),
+            |id| executor.speculative_request_ready(id),
+            |prompt_len, max_tokens| {
+                executor.speculative_request_state_bytes(prompt_len, max_tokens)
+            },
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
@@ -829,6 +839,41 @@ fn prefilling_future_blocks(
         .sum()
 }
 
+fn active_speculative_state_candidate(req: &ActiveRequestState) -> bool {
+    req.lora_adapter.is_none() && req.logprobs == 0 && req.params.is_greedy()
+}
+
+fn pending_speculative_state_candidate(req: &PendingRequest) -> bool {
+    req.lora_adapter.is_none()
+        && req.cached_tokens == 0
+        && req.logprobs == 0
+        && !req.echo
+        && req.params.is_greedy()
+}
+
+fn active_speculative_state_bytes(
+    active: &[ActiveRequestState],
+    state_exists: &impl Fn(RequestId) -> bool,
+    estimate: &impl Fn(usize, usize) -> usize,
+) -> usize {
+    active
+        .iter()
+        .filter(|req| active_speculative_state_candidate(req) && state_exists(req.request_id))
+        .map(|req| estimate(req.prompt_len, req.max_tokens))
+        .fold(0usize, usize::saturating_add)
+}
+
+fn prefilling_speculative_state_bytes(
+    prefilling: &[PendingRequest],
+    estimate: &impl Fn(usize, usize) -> usize,
+) -> usize {
+    prefilling
+        .iter()
+        .filter(|req| pending_speculative_state_candidate(req))
+        .map(|req| estimate(req.prompt_tokens.len(), req.max_tokens))
+        .fold(0usize, usize::saturating_add)
+}
+
 /// Default for `max_prefill_tokens`: prompt tokens forwarded in a single step
 /// (chunked prefill). Prefill activation scratch scales with the step's total
 /// prompt tokens (~22 KB/token measured on Qwen3-4B), so an unbounded prefill
@@ -858,6 +903,9 @@ fn admit_deferred_requests(
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
+    speculative_state_budget_bytes: Option<usize>,
+    active_speculative_state_exists: impl Fn(RequestId) -> bool,
+    speculative_request_state_bytes: impl Fn(usize, usize) -> usize,
     // Blocks a request already holds from a settled prefetch. These are already
     // out of `available_blocks`, so they must be credited against the request's
     // need or admission double-counts them and can wedge a near-budget CPU-hit
@@ -874,6 +922,18 @@ fn admit_deferred_requests(
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
         .saturating_sub(prefilling.len());
+    let mut speculative_state_budget = speculative_state_budget_bytes.map(|budget| {
+        budget
+            .saturating_sub(active_speculative_state_bytes(
+                active,
+                &active_speculative_state_exists,
+                &speculative_request_state_bytes,
+            ))
+            .saturating_sub(prefilling_speculative_state_bytes(
+                prefilling,
+                &speculative_request_state_bytes,
+            ))
+    });
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -901,9 +961,22 @@ fn admit_deferred_requests(
         // …but only the blocks not already held by this request's prefetch must
         // come from the free-pool budget.
         let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
+        let speculative_state_needed = if pending_speculative_state_candidate(&req) {
+            speculative_request_state_bytes(req.prompt_tokens.len(), req.max_tokens)
+        } else {
+            0
+        };
+        if speculative_state_budget.is_some_and(|budget| speculative_state_needed > budget) {
+            still_deferred.push(req);
+            continue;
+        }
         if fresh_needed <= budget && decode_slots > 0 {
             budget -= fresh_needed;
             decode_slots -= 1;
+            if let Some(speculative_state_budget) = speculative_state_budget.as_mut() {
+                *speculative_state_budget =
+                    speculative_state_budget.saturating_sub(speculative_state_needed);
+            }
             pending.push(req);
         } else {
             still_deferred.push(req);
@@ -955,6 +1028,7 @@ fn failure_targets_for(
     let mut targets = Vec::new();
     match plan {
         self::plan::ExecutionPlan::Prefill { pending } => {
+            targets.extend(active.iter().map(active_failure_target));
             targets.extend(pending.iter().map(pending_failure_target));
         }
         self::plan::ExecutionPlan::Decode => {
@@ -1266,7 +1340,7 @@ mod tests {
                     .iter()
                     .map(|req| self.fake_prefill_result(req))
                     .collect(),
-                dflash_context_captured: false,
+                dflash_context_captured_requests: Vec::new(),
             })
         }
 
@@ -1448,8 +1522,20 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome =
-            admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, |_| 0);
+        let outcome = admit_deferred_requests(
+            deferred,
+            &active,
+            &[],
+            16,
+            4,
+            4,
+            usize::MAX,
+            64,
+            None,
+            |_| false,
+            |_, _| 0,
+            |_| 0,
+        );
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1488,8 +1574,20 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome =
-            admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, |_| 0);
+        let outcome = admit_deferred_requests(
+            deferred,
+            &active,
+            &[],
+            16,
+            1000,
+            1000,
+            32,
+            64,
+            None,
+            |_| false,
+            |_, _| 0,
+            |_| 0,
+        );
 
         let pending_ids = outcome
             .pending
@@ -1544,6 +1642,9 @@ mod tests {
             1024,
             usize::MAX,
             64,
+            None,
+            |_| false,
+            |_, _| 0,
             |_| 0,
         );
 
@@ -1557,6 +1658,98 @@ mod tests {
             "capacity-starved request should stay deferred"
         );
         assert!(outcome.rejected.is_empty());
+    }
+
+    #[test]
+    fn admission_respects_speculative_state_budget_for_supported_requests() {
+        let active: [ActiveRequestState; 0] = [];
+        let mk = |id: u64| PendingRequest::from_scheduler_request(RequestId(id), request(8, 2).0);
+        let mut unsupported = mk(3);
+        unsupported.params.temperature = 0.7;
+        let deferred = vec![mk(1), mk(2), unsupported];
+
+        let outcome = admit_deferred_requests(
+            deferred,
+            &active,
+            &[],
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            Some(10),
+            |_| false,
+            |prompt_len, max_tokens| prompt_len + max_tokens,
+            |_| 0,
+        );
+
+        let ids =
+            |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&outcome.pending),
+            vec![1, 3],
+            "one supported request consumes the speculative side-state budget; unsupported fallback does not"
+        );
+        assert_eq!(
+            ids(&outcome.deferred),
+            vec![2],
+            "extra supported requests wait for DFlash state memory instead of OOMing later"
+        );
+        assert!(outcome.rejected.is_empty());
+    }
+
+    #[test]
+    fn admission_counts_only_active_requests_with_speculative_state() {
+        let (token_tx, _rx) = mpsc::unbounded_channel();
+        let active = [ActiveRequestState {
+            request_id: RequestId(1),
+            lora_adapter: None,
+            token_tx,
+            last_token: 1,
+            generated_count: 1,
+            max_tokens: 2,
+            prompt_len: 8,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }];
+        let mk_pending = || PendingRequest::from_scheduler_request(RequestId(2), request(8, 2).0);
+
+        let fallback_active = admit_deferred_requests(
+            vec![mk_pending()],
+            &active,
+            &[],
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            Some(10),
+            |_| false,
+            |prompt_len, max_tokens| prompt_len + max_tokens,
+            |_| 0,
+        );
+        assert_eq!(
+            fallback_active.pending[0].request_id,
+            RequestId(2),
+            "a greedy active request that already fell back to baseline must not consume DFlash side-state budget"
+        );
+
+        let dflash_active = admit_deferred_requests(
+            vec![mk_pending()],
+            &active,
+            &[],
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            Some(10),
+            |id| id == RequestId(1),
+            |prompt_len, max_tokens| prompt_len + max_tokens,
+            |_| 0,
+        );
+        assert!(dflash_active.pending.is_empty());
+        assert_eq!(dflash_active.deferred[0].request_id, RequestId(2));
     }
 
     #[test]
@@ -1706,6 +1899,37 @@ mod tests {
             Some(ExecutionPlan::SpeculativeDecode) => {}
             _ => panic!("ready single active request should speculate once pending is drained"),
         }
+    }
+
+    #[test]
+    fn prefill_failure_with_active_targets_active_and_pending_requests() {
+        let (active_tx, _active_rx) = mpsc::unbounded_channel();
+        let active = vec![ActiveRequestState {
+            request_id: RequestId(7),
+            lora_adapter: None,
+            token_tx: active_tx,
+            last_token: 42,
+            generated_count: 1,
+            max_tokens: 32,
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }];
+        let pending = vec![PendingRequest::from_scheduler_request(
+            RequestId(8),
+            request(16, 1).0,
+        )];
+        let plan = ExecutionPlan::Prefill { pending };
+
+        let targets = failure_targets_for(&active, &plan);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.request_id)
+                .collect::<Vec<_>>(),
+            vec![RequestId(7), RequestId(8)],
+            "a prefill step while active requests exist can dirty the shared executor step and must fail both sides"
+        );
     }
 
     #[test]
@@ -1896,6 +2120,9 @@ mod tests {
             2,
             usize::MAX,
             64,
+            None,
+            |_| false,
+            |_, _| 0,
             |_| 0,
         );
         assert!(
@@ -1917,6 +2144,9 @@ mod tests {
             3,
             usize::MAX,
             64,
+            None,
+            |_| false,
+            |_, _| 0,
             |_| 0,
         );
         assert_eq!(

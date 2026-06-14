@@ -270,6 +270,39 @@ fn speculative_partial_accept_releases_excess_capacity() {
 }
 
 #[test]
+fn speculative_revert_returns_reserved_blocks() {
+    let mgr = make_manager(5); // 4 usable blocks
+    let initial_avail = mgr.pool().available_blocks();
+
+    let mut req = mgr.pool().new_request(vec![1; 4], 64, None);
+    req.schedule_prefill(4, mgr.pool()).unwrap();
+    req.apply_prefill(42, mgr.pool()).unwrap();
+    let before_schedule = mgr.pool().available_blocks();
+
+    req.schedule_speculative(32, mgr.pool()).unwrap();
+    assert!(
+        mgr.pool().available_blocks() < before_schedule,
+        "speculative scheduling should reserve draft capacity"
+    );
+
+    req.revert_schedule().unwrap();
+    assert_eq!(
+        mgr.pool().available_blocks(),
+        before_schedule,
+        "reverting a speculative schedule should return reserved blocks"
+    );
+    assert_eq!(req.kv_position(), 4);
+    assert_eq!(req.generated_tokens(), 1);
+
+    req.schedule_decode(mgr.pool()).unwrap();
+    req.apply_decode(100, mgr.pool()).unwrap();
+    assert_eq!(req.kv_position(), 5);
+
+    req.release().unwrap();
+    assert_eq!(mgr.pool().available_blocks(), initial_avail);
+}
+
+#[test]
 fn speculative_partial_accept_keeps_cross_page_tail_visible() {
     let mgr = make_manager(16);
     let mut req = mgr.pool().new_request(vec![1; 10], 64, None);
