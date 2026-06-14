@@ -284,29 +284,32 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn is_deepseek_v4_source(csrc_dir: &Path, path: &Path) -> bool {
-    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
-        relative
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "deepseek_v4")
-    })
+            .any(|part| part.as_os_str() == "deepseek_v4"),
+        Err(_) => false,
+    }
 }
 
 fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
-    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
-        relative
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "kimi_k2")
-    })
+            .any(|part| part.as_os_str() == "kimi_k2"),
+        Err(_) => false,
+    }
 }
 
 /// DeepEP elastic shim (csrc/deepep/): Kimi-K2's EP all-to-all backend.
 /// Compiled only with the `kimi-k2` feature; needs NCCL >= 2.30.4 headers/lib.
 fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
-    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
-        relative
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "deepep")
-    })
+            .any(|part| part.as_os_str() == "deepep"),
+        Err(_) => false,
+    }
 }
 
 /// NCCL >= 2.30.4 root (include/nccl.h + lib/libnccl.so.2) for the DeepEP

@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite EP2 Decode Attribution Gate
 
-> **TL;DR:** DeepSeek-V2-Lite now has a narrow EP2 decode attribution report for the same correctness shape as the HF gate and the true-batch benchmark follow-up: `prompt="Hello"`, `output_len=16`, `batch-size=1/4/8`, host-staged backend, and NCCL backend. The report combines CPU-side attribution, selected CUDA event timing, optional NVTX ranges, route/transfer counts, and a fail-closed CUDA Graph readiness section; it is evidence for the next bottleneck decision, not a throughput or production EP claim.
+> **TL;DR:** DeepSeek-V2-Lite has a narrow EP2 decode attribution report for the retained diagnostic shape: `prompt="Hello"`, `output_len=16`, `batch-size=1/4/8`, host-staged backend, and NCCL backend. The wider HF accuracy gate now covers more cases, while this report stays focused on CPU-side attribution, selected CUDA event timing, optional NVTX ranges, route/transfer counts, and a fail-closed CUDA Graph readiness section. It is evidence for the next bottleneck decision, not a throughput or production EP claim.
 >
 > **Status:** Passing for the covered EP2 `Hello` / 16-token host-staged and NCCL attribution gate. The batch attribution mode is diagnostic and uses the same-prompt, fixed-length shape as the direct benchmark path.
 
@@ -11,7 +11,7 @@ This gate deliberately stays model-specific and shape-specific:
 - Model: DeepSeek-V2-Lite.
 - Shape: batch size `1`, `4`, or `8`, prompt `Hello`, prompt token ids `[17464]`, output length `16`.
 - Backends: default host-staged EP2 and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
-- Accuracy oracle: the same generated token/text/hash gate used by `hf-accuracy-gate.md`.
+- Accuracy oracle: the generated token/text/hash comparison from `hf-accuracy-gate.md`; attribution itself remains on the `Hello` / 16-token diagnostic shape.
 - Attribution source: `DeepSeekV2LiteEp2Generator::generate_greedy_with_attribution` for `batch-size=1`, and `DeepSeekV2LiteEp2Generator::generate_greedy_batch_same_prompt_with_attribution` for `batch-size>1`.
 - GPU attribution source: CUDA events around selected stream sections in the explicit attribution path.
 - NVTX source: set `OPENINFER_DSV2_LITE_NVTX=1` to emit matching ranges for those selected sections during a profiler run.
@@ -50,15 +50,16 @@ mkdir -p target/accuracy/dsv2-lite-ep2
 
 python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
   --model-path models/DeepSeek-V2-Lite \
-  --prompt Hello \
-  --output-len 16 \
+  --case-set-json test_data/deepseek-v2-lite-ep2-cases.json \
   --out target/accuracy/dsv2-lite-ep2/hf.json
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
   cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
 OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
   cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture

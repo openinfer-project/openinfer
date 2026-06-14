@@ -1,23 +1,33 @@
 # DeepSeek-V2-Lite EP2 HF Accuracy Gate
 
-> **TL;DR:** HF comparison gate for issue #135 after PR #149 and PR #150. The remaining correctness question was not NCCL performance; it was whether the existing DeepSeek-V2-Lite EP=2 baseline matches Hugging Face `generate(use_cache=true)` greedy decode for `prompt="Hello"`, `batch=1`, `output_len=16`.
+> **TL;DR:** HF comparison gate for DeepSeek-V2-Lite EP2. The original `Hello` / 16-token shape remains covered, and issue #274 widens the same HF / host-staged / NCCL oracle to a small committed case set with multiple prompts plus diagnostic same-prompt batch sizes `4` and `8`.
 >
-> **Status:** Passing for the covered shape. The latest run is token-exact and text-exact across HF `generate(use_cache=true)` greedy, openinfer host-staged EP2, and openinfer NCCL EP2.
+> **Status:** Passing evidence must come from a same-host comparison against `test_data/deepseek-v2-lite-ep2-cases.json`. The Rust E2E may emit OpenInfer case outputs, but the HF JSON remains the accuracy oracle.
 
 ## Scope
 
 In scope:
 
 - HF truth: `AutoTokenizer` and `AutoModelForCausalLM` with `trust_remote_code=True`, `torch_dtype=torch.bfloat16`, `model.eval()`, and `torch.no_grad()`.
-- Generation shape: batch `1`, prompt `Hello`, prompt token ids `[17464]`, output length `16`, greedy argmax only.
+- Generation shapes: the committed cases in `test_data/deepseek-v2-lite-ep2-cases.json`: `Hello` at batch `1/4/8`, plus two additional batch-1 prompts, all with `output_len=16` and greedy argmax.
 - Openinfer paths: default host-staged EP2 backend and explicit `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
-- Result comparison: generated token ids, generated text, token sha256, text sha256, and first different generated-token index.
+- Result comparison: per-case and per-row generated token ids, generated text, token sha256, text sha256, and first different generated-token index.
+
+The committed case set uses one object per case:
+
+- `id`: stable comparison key.
+- `prompt`: prompt text passed to HF and OpenInfer.
+- `output_len`: requested greedy output length.
+- `batch_size`: OpenInfer same-prompt row count for the diagnostic batch cases.
+- `ignore_eos`: when `true`, HF sets `eos_token_id=None` and OpenInfer ignores EOS so fixed-length batch rows can be compared. Batch cases must use `ignore_eos=true`; batch-1 cases may stop on EOS.
+
+The current Rust same-prompt batch helper is capped at batch size `8`, so the committed diagnostic batch cases stop at `4` and `8`.
 
 Out of scope:
 
 - Performance claims.
 - Sparse dispatch or production EP backend work.
-- Generic EP topology, multi-node support, larger prompts, or batch > 1.
+- Generic EP topology, multi-node support, serving batch, or mixed-request continuous batching.
 - Any NCCL runtime-path change when host-staged and NCCL still match each other.
 
 ## Issue #135 Coverage Map
@@ -30,7 +40,7 @@ Out of scope:
 | Unsupported backend/topology reports explicit errors. | PR #149 / #150 | Unsupported device count, duplicate devices, cuda_graph, and backend names fail closed. |
 | Minimal dispatch/combine path exists for the first correctness gate. | PR #149 | Host-staged dispatch/combine path remains the default baseline. |
 | Maintainer-requested naive NCCL backend exists before openinfer-comm/NVLink work. | PR #150 | `OPENINFER_DSV2_LITE_EP_BACKEND=nccl` path passes the same EP2 greedy E2E as host-staged. |
-| HF ground-truth accuracy comparison exists. | This gate | HF `generate(use_cache=true)` greedy, host-staged EP2, and NCCL EP2 are token/text exact for the covered shape. |
+| HF ground-truth accuracy comparison exists. | This gate | HF `generate(use_cache=true)` greedy, host-staged EP2, and NCCL EP2 are token/text exact for the covered case set. |
 
 Together with PR #149 and PR #150, this gate covers issue #135's correctness-first acceptance surface for the narrow EP=2 milestone. Follow-up work should be tracked separately for sparse/GPU dispatch, openinfer-comm/NVLink integration, performance evidence, long context, and broader prompts/batches.
 
@@ -43,15 +53,16 @@ mkdir -p target/accuracy/dsv2-lite-ep2
 
 python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
   --model-path models/DeepSeek-V2-Lite \
-  --prompt Hello \
-  --output-len 16 \
+  --case-set-json test_data/deepseek-v2-lite-ep2-cases.json \
   --out target/accuracy/dsv2-lite-ep2/hf.json
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
   cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
 OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
   cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
@@ -71,10 +82,29 @@ On Blackwell-class GPUs, make sure the selected NCCL runtime supports the device
 ## Interpretation
 
 - `all_token_text_exact`: HF, host-staged, and NCCL agree on generated token ids and generated text.
-- `openinfer_baseline_accuracy_gap`: host-staged and NCCL match each other, but both differ from HF. Treat this as a openinfer baseline accuracy problem before touching NCCL transport.
+- `openinfer_baseline_accuracy_gap`: host-staged and NCCL match each other, but both differ from HF. Treat this as an OpenInfer baseline accuracy problem before touching NCCL transport.
 - `nccl_transport_regression`: host-staged and NCCL differ. Debug the NCCL path before drawing any HF parity conclusion.
 
+For batch cases, the HF output is the expected row output, and every host-staged / NCCL same-prompt row must match it. Host-staged and NCCL must also match each other row-by-row.
+
 ## Latest Evidence
+
+2026-06-14, single-node 2x RTX 5090 validation with `test_data/deepseek-v2-lite-ep2-cases.json` on the same `models/DeepSeek-V2-Lite` snapshot for HF, host-staged, and NCCL. The HF truth source used `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` with `torch==2.7.0+cu128` and `transformers==4.40.2`. The Rust gate emitted schema-2 case-set JSON for host-staged and NCCL, including row-level outputs for the same-prompt batch cases.
+
+Review artifacts from that run were written under `target/accuracy/dsv2-lite-ep2-review/`:
+
+- `target/accuracy/dsv2-lite-ep2-review/hf.json`
+- `target/accuracy/dsv2-lite-ep2-review/host-staged.json`
+- `target/accuracy/dsv2-lite-ep2-review/nccl.json`
+- `target/accuracy/dsv2-lite-ep2-review/comparison.json`
+
+Comparison result:
+
+- `case_count=5`.
+- Classification: `all_token_text_exact`.
+- Per-case classifications: `capital_16_bs1`, `code_16_bs1`, `hello_16_bs1`, `hello_16_bs4`, and `hello_16_bs8` all reported `all_token_text_exact`.
+- Warnings: none.
+- Batch rule: HF single-row output was broadcast as the expected row output; every host-staged and NCCL row for `hello_16_bs4` and `hello_16_bs8` matched HF and matched the other backend row-by-row.
 
 2026-05-30, single-node 2 GPU validation with the same `models/DeepSeek-V2-Lite` snapshot for all three outputs. The model snapshot metadata recorded commit `604d5664dddd88a0433dbae533b7fe9472482de0`. The HF truth source used `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` with `torch==2.7.0+cu128` and `transformers==4.40.2` on 2x A800-SXM4-80GB:
 

@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use openinfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
 use openinfer_engine::engine::{EngineLoadOptions, FinishReason};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
@@ -25,6 +26,23 @@ const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
 const DSV2_LITE_HIDDEN_SIZE: usize = 2048;
 const DSV2_LITE_MOE_LAYERS: usize = 26;
 const E2E_JSON_OUT_ENV: &str = "OPENINFER_DSV2_LITE_E2E_JSON_OUT";
+const E2E_CASE_SET_ENV: &str = "OPENINFER_DSV2_LITE_E2E_CASE_SET";
+
+#[derive(Debug, Deserialize)]
+struct CaseSet {
+    cases: Vec<GateCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GateCase {
+    id: String,
+    prompt: String,
+    output_len: usize,
+    #[serde(default = "default_batch_size")]
+    batch_size: usize,
+    #[serde(default)]
+    ignore_eos: bool,
+}
 
 #[test]
 fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
@@ -65,6 +83,16 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
             tokenizer_path.display()
         )
     })?;
+    if let Some((case_set_path, cases)) = load_case_set_from_env()? {
+        return run_case_set_generation(
+            model_path_label,
+            model_path,
+            &tokenizer,
+            &case_set_path,
+            &cases,
+        );
+    }
+
     let prompt = "Hello";
     let prompt_tokens = tokenizer
         .encode(prompt, false)
@@ -246,6 +274,429 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
         EXPECTED_OUTPUT_SHA256_PAIRS
     );
     Ok(())
+}
+
+fn run_case_set_generation(
+    model_path_label: &str,
+    model_path: &Path,
+    tokenizer: &HuggingFaceTokenizer,
+    case_set_path: &Path,
+    cases: &[GateCase],
+) -> Result<()> {
+    ensure!(
+        !cases.is_empty(),
+        "DeepSeek-V2-Lite E2E case set must contain at least one case"
+    );
+    let mut generator = DeepSeekV2LiteEp2Generator::load(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            enable_prefill_profile: false,
+            device_ordinals: vec![0, 1],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+    )?;
+
+    // The generator owns loaded weights and reusable backend scratch. Each
+    // generate call below builds fresh DecodeCache and GenerationStats values,
+    // so the case set can share one model load without sharing KV state.
+    let mut case_payloads = Vec::with_capacity(cases.len());
+    for case in cases {
+        case_payloads.push(run_case_set_case(tokenizer, &mut generator, case)?);
+    }
+
+    let payload = serde_json::json!({
+        "schema": 2,
+        "report_type": "deepseek-v2-lite-ep2-rust-e2e-case-set",
+        "model_path": model_path_label,
+        "case_set_json": case_set_path.display().to_string(),
+        "gpu_count": 2,
+        "ep_size": 2,
+        "ep_backend": current_backend(),
+        "devices": [0, 1],
+        "case_count": case_payloads.len(),
+        "token_sha256_algorithm": "sha256 over generated token ids encoded as little-endian u32",
+        "text_sha256_algorithm": "sha256 over UTF-8 generated text bytes",
+        "cases": case_payloads,
+    });
+    let payload_text = serde_json::to_string_pretty(&payload)?;
+    write_payload_if_requested(&payload_text)?;
+    println!("{payload_text}");
+    Ok(())
+}
+
+fn run_case_set_case(
+    tokenizer: &HuggingFaceTokenizer,
+    generator: &mut DeepSeekV2LiteEp2Generator,
+    case: &GateCase,
+) -> Result<serde_json::Value> {
+    let prompt_tokens = tokenizer
+        .encode(&case.prompt, false)
+        .map_err(|err| anyhow::anyhow!("encode prompt for case {} failed: {err:?}", case.id))?;
+    ensure!(
+        !prompt_tokens.is_empty(),
+        "tokenizer returned empty prompt for case {}",
+        case.id
+    );
+
+    if case.batch_size == 1 {
+        let result = generator.generate_greedy(&prompt_tokens, case.output_len, case.ignore_eos)?;
+        ensure!(
+            !result.tokens.is_empty(),
+            "case {} produced no tokens",
+            case.id
+        );
+        ensure!(
+            result.tokens.len() <= case.output_len,
+            "case {} generated {} tokens, expected at most {}",
+            case.id,
+            result.tokens.len(),
+            case.output_len
+        );
+        if case.ignore_eos {
+            ensure!(
+                result.tokens.len() == case.output_len,
+                "case {} uses ignore_eos=true and must generate exactly {} tokens, got {}",
+                case.id,
+                case.output_len,
+                result.tokens.len()
+            );
+        }
+        validate_generation_stats(
+            &result.stats,
+            case,
+            prompt_tokens.len(),
+            result.tokens.len(),
+        )?;
+        let generated_text = decode_tokens(tokenizer, &result.tokens, &case.id)?;
+        let text_sha256 = sha256_text(&generated_text);
+        let matched_output_oracle =
+            matched_expected_output_oracle(&result.stats.output_token_sha256, &text_sha256);
+
+        Ok(serde_json::json!({
+            "id": &case.id,
+            "prompt": &case.prompt,
+            "prompt_token_ids": &prompt_tokens,
+            "prompt_tokens": prompt_tokens.len(),
+            "batch_size": case.batch_size,
+            "output_len": case.output_len,
+            "ignore_eos": case.ignore_eos,
+            "generated_tokens": result.tokens.len(),
+            "generated_token_ids": &result.tokens,
+            "generated_text": generated_text,
+            "output_token_sha256": result.stats.output_token_sha256,
+            "output_text_sha256": text_sha256,
+            "matched_output_oracle": matched_output_oracle,
+            "finish_reason": format!("{:?}", result.finish_reason),
+            "ep": ep_payload(&result.stats),
+        }))
+    } else {
+        ensure!(
+            case.ignore_eos,
+            "batch case {} must set ignore_eos=true so each row has the requested output length",
+            case.id
+        );
+        let result = generator.generate_greedy_batch_same_prompt_with_timings(
+            &prompt_tokens,
+            case.batch_size,
+            case.output_len,
+            case.ignore_eos,
+        )?;
+        ensure!(
+            result.tokens.len() == case.batch_size,
+            "case {} returned {} rows, expected batch_size={}",
+            case.id,
+            result.tokens.len(),
+            case.batch_size
+        );
+        ensure!(
+            result
+                .tokens
+                .iter()
+                .all(|tokens| tokens.len() == case.output_len),
+            "case {} batch rows must all generate exactly {} tokens",
+            case.id,
+            case.output_len
+        );
+        validate_generation_stats(
+            &result.stats,
+            case,
+            prompt_tokens.len(),
+            result.tokens[0].len(),
+        )?;
+
+        let mut generated_text_by_row = Vec::with_capacity(result.tokens.len());
+        let mut token_sha256_by_row = Vec::with_capacity(result.tokens.len());
+        let mut text_sha256_by_row = Vec::with_capacity(result.tokens.len());
+        for row in &result.tokens {
+            let generated_text = decode_tokens(tokenizer, row, &case.id)?;
+            token_sha256_by_row.push(token_sha256(row));
+            text_sha256_by_row.push(sha256_text(&generated_text));
+            generated_text_by_row.push(generated_text);
+        }
+        ensure!(
+            token_sha256_by_row
+                .iter()
+                .all(|hash| hash == &token_sha256_by_row[0])
+                && text_sha256_by_row
+                    .iter()
+                    .all(|hash| hash == &text_sha256_by_row[0]),
+            "case {} same-prompt batch rows are not hash-identical",
+            case.id
+        );
+        let matched_output_oracle =
+            matched_expected_output_oracle(&token_sha256_by_row[0], &text_sha256_by_row[0]);
+
+        Ok(serde_json::json!({
+            "id": &case.id,
+            "prompt": &case.prompt,
+            "prompt_token_ids": &prompt_tokens,
+            "prompt_tokens": prompt_tokens.len(),
+            "batch_size": case.batch_size,
+            "output_len": case.output_len,
+            "ignore_eos": case.ignore_eos,
+            "generated_tokens": result.tokens[0].len(),
+            "generated_tokens_total": result.stats.generated_tokens,
+            "generated_token_ids": &result.tokens[0],
+            "generated_text": &generated_text_by_row[0],
+            "output_token_sha256": &token_sha256_by_row[0],
+            "output_text_sha256": &text_sha256_by_row[0],
+            "generated_token_ids_by_row": &result.tokens,
+            "generated_text_by_row": &generated_text_by_row,
+            "token_sha256_by_row": &token_sha256_by_row,
+            "text_sha256_by_row": &text_sha256_by_row,
+            "same_prompt_rows_exact": true,
+            "matched_output_oracle": matched_output_oracle,
+            "ep": ep_payload(&result.stats),
+        }))
+    }
+}
+
+fn load_case_set_from_env() -> Result<Option<(PathBuf, Vec<GateCase>)>> {
+    let Ok(raw_path) = env::var(E2E_CASE_SET_ENV) else {
+        return Ok(None);
+    };
+    if raw_path.is_empty() {
+        return Ok(None);
+    }
+    let path = resolve_workspace_path(PathBuf::from(raw_path));
+    let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let case_set: CaseSet =
+        serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))?;
+    ensure!(
+        !case_set.cases.is_empty(),
+        "{} must contain at least one case",
+        path.display()
+    );
+    for case in &case_set.cases {
+        validate_case(case)?;
+    }
+    Ok(Some((path, case_set.cases)))
+}
+
+fn validate_case(case: &GateCase) -> Result<()> {
+    ensure!(!case.id.is_empty(), "case id must not be empty");
+    ensure!(
+        !case.prompt.is_empty(),
+        "case {} prompt must not be empty",
+        case.id
+    );
+    ensure!(
+        case.output_len > 0,
+        "case {} output_len must be positive",
+        case.id
+    );
+    ensure!(
+        (1..=8).contains(&case.batch_size),
+        "case {} batch_size must be in 1..=8, got {}",
+        case.id,
+        case.batch_size
+    );
+    if case.batch_size > 1 {
+        ensure!(
+            case.ignore_eos,
+            "case {} batch_size={} requires ignore_eos=true",
+            case.id,
+            case.batch_size
+        );
+    }
+    Ok(())
+}
+
+fn validate_generation_stats(
+    stats: &openinfer_deepseek_v2_lite::GenerationStats,
+    case: &GateCase,
+    prompt_tokens_per_row: usize,
+    generated_tokens_per_row: usize,
+) -> Result<()> {
+    ensure!(
+        stats.ep_size == 2,
+        "case {} expected ep_size=2, got {}",
+        case.id,
+        stats.ep_size
+    );
+    ensure!(
+        stats.device_ordinals == vec![0, 1],
+        "case {} expected devices [0, 1], got {:?}",
+        case.id,
+        stats.device_ordinals
+    );
+    ensure!(
+        stats.ep_backend == current_backend(),
+        "case {} backend mismatch: got {}, expected {}",
+        case.id,
+        stats.ep_backend,
+        current_backend()
+    );
+    let expected_prompt_tokens = prompt_tokens_per_row * case.batch_size;
+    ensure!(
+        stats.prompt_tokens == expected_prompt_tokens,
+        "case {} prompt token count drift: got {}, expected {}",
+        case.id,
+        stats.prompt_tokens,
+        expected_prompt_tokens
+    );
+    let expected_generated_tokens = generated_tokens_per_row * case.batch_size;
+    ensure!(
+        stats.generated_tokens == expected_generated_tokens,
+        "case {} generated token count drift: got {}, expected {}",
+        case.id,
+        stats.generated_tokens,
+        expected_generated_tokens
+    );
+
+    match stats.ep_backend.as_str() {
+        "host-staged" => {
+            ensure!(
+                stats.host_dispatch_calls > 0
+                    && stats.host_combine_calls == stats.host_dispatch_calls
+                    && stats.host_dispatch_elements > 0
+                    && stats.host_combine_elements == stats.host_dispatch_elements,
+                "case {} host-staged EP gate did not record dispatch/combine counts",
+                case.id
+            );
+            ensure!(
+                stats.host_dispatch_remote_routes > 0,
+                "case {} host-staged EP gate did not exercise any remote routed expert",
+                case.id
+            );
+            ensure!(
+                stats.host_dispatch_local_routes > 0,
+                "case {} host-staged EP gate did not exercise any local routed expert",
+                case.id
+            );
+            ensure!(
+                stats.nccl_dense_exchange_calls == 0
+                    && stats.nccl_combine_calls == 0
+                    && stats.nccl_dense_exchange_elements == 0
+                    && stats.nccl_combine_elements == 0,
+                "case {} host-staged EP gate unexpectedly recorded NCCL collectives",
+                case.id
+            );
+        }
+        "nccl" => {
+            ensure!(
+                stats.nccl_dispatch_remote_routes > 0,
+                "case {} NCCL EP gate did not exercise any remote routed expert",
+                case.id
+            );
+            ensure!(
+                stats.nccl_dispatch_local_routes > 0,
+                "case {} NCCL EP gate did not exercise any local routed expert",
+                case.id
+            );
+            ensure!(
+                stats.nccl_combine_routes
+                    == stats.nccl_dispatch_local_routes + stats.nccl_dispatch_remote_routes,
+                "case {} NCCL combine route accounting drift",
+                case.id
+            );
+            ensure!(
+                stats.nccl_dense_exchange_calls > 0
+                    && stats.nccl_combine_calls == stats.nccl_dense_exchange_calls,
+                "case {} NCCL EP gate did not record matching dense exchange/combine calls",
+                case.id,
+                stats.nccl_dense_exchange_calls,
+                stats.nccl_combine_calls
+            );
+            ensure!(
+                stats.nccl_dense_exchange_elements > 0
+                    && stats.nccl_combine_elements == stats.nccl_dense_exchange_elements,
+                "case {} NCCL EP gate did not record matching dense exchange/combine elements",
+                case.id,
+                stats.nccl_dense_exchange_elements,
+                stats.nccl_combine_elements
+            );
+        }
+        other => anyhow::bail!(
+            "case {} unexpected DeepSeek-V2-Lite EP backend in E2E: {other}",
+            case.id
+        ),
+    }
+    Ok(())
+}
+
+fn ep_payload(stats: &openinfer_deepseek_v2_lite::GenerationStats) -> serde_json::Value {
+    serde_json::json!({
+        "host_dispatch_calls": stats.host_dispatch_calls,
+        "host_dispatch_elements": stats.host_dispatch_elements,
+        "host_combine_calls": stats.host_combine_calls,
+        "host_combine_elements": stats.host_combine_elements,
+        "host_dispatch_local_routes": stats.host_dispatch_local_routes,
+        "host_dispatch_remote_routes": stats.host_dispatch_remote_routes,
+        "nccl_dispatch_local_routes": stats.nccl_dispatch_local_routes,
+        "nccl_dispatch_remote_routes": stats.nccl_dispatch_remote_routes,
+        "nccl_combine_routes": stats.nccl_combine_routes,
+        "nccl_dense_exchange_calls": stats.nccl_dense_exchange_calls,
+        "nccl_combine_calls": stats.nccl_combine_calls,
+        "nccl_dense_exchange_elements": stats.nccl_dense_exchange_elements,
+        "nccl_combine_elements": stats.nccl_combine_elements,
+    })
+}
+
+fn decode_tokens(
+    tokenizer: &HuggingFaceTokenizer,
+    tokens: &[u32],
+    case_id: &str,
+) -> Result<String> {
+    tokenizer
+        .decode(tokens, false)
+        .map_err(|err| anyhow::anyhow!("decode output for case {case_id} failed: {err:?}"))
+}
+
+fn token_sha256(tokens: &[u32]) -> String {
+    let mut hasher = Sha256::new();
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn sha256_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn write_payload_if_requested(payload_text: &str) -> Result<()> {
+    if let Ok(path) = env::var(E2E_JSON_OUT_ENV) {
+        if !path.is_empty() {
+            let path = PathBuf::from(path);
+            let path = resolve_workspace_path(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            fs::write(&path, format!("{payload_text}\n"))
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn default_batch_size() -> usize {
+    1
 }
 
 fn matched_expected_output_oracle(token_sha256: &str, text_sha256: &str) -> Option<&'static str> {

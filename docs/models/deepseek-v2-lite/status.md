@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. HF, host-staged, and NCCL match for the narrow greedy gate; NCCL decode combine and dense exchange now use reusable device scratch, while host-directed routing/expert accumulation still block full decode graph capture. Current batch and vLLM data remain diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, while host-directed routing/expert accumulation still block full decode graph capture. Current batch and vLLM data remain diagnostic and do not claim production serving parity.
 
 Last touched: 2026-06
 
@@ -11,6 +11,7 @@ Last touched: 2026-06
 | EP2 correctness bring-up | Available | PR #149 adds the model crate, EP2 expert ownership, rank1 expert-only loading, and the host-staged dispatch/combine baseline. |
 | Naive NCCL backend | Available | PR #150 adds a dense correctness-first NCCL path. Host-staged remains the transport oracle. |
 | HF token/text/hash gate | Available | PR #154 establishes the HF / host-staged / NCCL comparison; PR #176 refreshes it to Transformers `generate(..., use_cache=true)`. |
+| HF widened case set | Available | Issue #274 adds a committed case set that keeps the HF / host-staged / NCCL oracle strict while adding additional prompts and diagnostic batch sizes `4` and `8`; the 2026-06-14 2x RTX 5090 run classified all 5 cases as `all_token_text_exact`. |
 | Decode attribution | Available | PR #162 and PR #169 add CPU/GPU attribution, route counts, NCCL counters, CUDA event timing, and optional NVTX correlation. |
 | Direct same-prompt diagnostic batch | Available | PR #184 and PR #196 cover batch sizes `1`, `4`, and `8` for the fixed same-prompt direct path. |
 | Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
@@ -25,13 +26,11 @@ The retained correctness gate is deliberately narrow:
 
 - model: DeepSeek-V2-Lite;
 - devices: single-node EP2 with two local GPUs;
-- prompt: `Hello`;
-- prompt token ids: `[17464]`;
-- output length: `16`;
+- committed cases: `test_data/deepseek-v2-lite-ep2-cases.json` keeps the original `Hello` / 16-token case and widens the oracle with a few additional prompts plus batch sizes `4` and `8`;
 - generation mode: greedy;
 - backends: host-staged and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
 
-The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact. Host-staged remains the baseline oracle for NCCL transport changes.
+The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-14 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, and no comparison warnings.
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, because the same model snapshot has produced different exact greedy text on those hosts while still matching HF on each host. Do not use the static hash pair list as a substitute for the same-host HF comparison when changing accuracy-sensitive code.
 
@@ -101,11 +100,16 @@ Do not claim:
 
 Issue #205 records the model roadmap. Maintainer feedback there calls out NCCL plus CUDA Graph as the likely best decode direction, with host staging possibly deprecated later. Treat that as a future direction, not as current evidence.
 
-The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, and issue #276 removed the dense-exchange allocation/sync blockers from the retained 2x RTX 5090 attribution gate. Those removed dense-exchange blockers are absent from the current readiness report. The remaining NCCL blockers are host route iteration and host-directed expert accumulation. The optional f32 NCCL graph smoke is a separate collective-only diagnostic and is not #276 evidence. HF, host-staged, and NCCL remain token/text exact for the narrow greedy gate.
+The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, and issue #276 removed the dense-exchange allocation/sync blockers from the retained 2x RTX 5090 attribution gate. Those removed dense-exchange blockers are absent from the current readiness report. The remaining NCCL blockers are host route iteration and host-directed expert accumulation. The optional f32 NCCL graph smoke is a separate collective-only diagnostic and is not #276 evidence. HF, host-staged, and NCCL remain token/text exact for the committed case set.
 
 The next implementation should be chosen from measured evidence:
 
-1. Move the remaining NCCL decode path toward CUDA Graph coverage.
+1. Keep the widened HF / host-staged / NCCL case set current.
+   - keep the committed cases and row-level comparison shape in sync with the accuracy docs;
+   - treat the widened oracle as correctness evidence only, not serving evidence;
+   - keep host-staged as the baseline oracle while it exists.
+
+2. Move the remaining NCCL decode path toward CUDA Graph coverage.
    - keep HF / host-staged / NCCL exact before and after;
    - keep host-staged as the correctness baseline while it exists;
    - preserve attribution before and after the change;
@@ -113,19 +117,19 @@ The next implementation should be chosen from measured evidence:
    - avoid broad generic EP or multi-node work;
    - judge issue #170 by whether it reduces NCCL decode overhead and makes the path more graph-friendly.
 
-2. Keep a fair serving benchmark contract around future performance work.
+3. Keep a fair serving benchmark contract around future performance work.
    - OpenInfer host-staged.
    - OpenInfer NCCL.
    - vLLM TP2.
    - vLLM TP2+EP2 when supported.
    - default vLLM configuration plus a controlled configuration with cache/flag choices recorded.
 
-3. Add real request batching / serving semantics before broader throughput claims.
+4. Add real request batching / serving semantics before broader throughput claims.
    - request admission;
    - per-request KV ownership;
    - mixed request state;
    - decode iterations that carry multiple live `/v1/completions` requests.
 
-4. Keep MoE internals readable.
+5. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;
    - avoid introducing a generic EP framework before the DeepSeek-V2-Lite EP2 path has a measured reason to need it.
