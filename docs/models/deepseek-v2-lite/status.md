@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, while host-directed routing/expert accumulation still block full decode graph capture. Current batch and vLLM data remain diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, and NCCL replay now uses a precomputed route plan while full decode graph capture remains blocked. Current batch and vLLM data remain diagnostic and do not claim production serving parity.
 
 Last touched: 2026-06
 
@@ -16,7 +16,8 @@ Last touched: 2026-06
 | Direct same-prompt diagnostic batch | Available | PR #184 and PR #196 cover batch sizes `1`, `4`, and `8` for the fixed same-prompt direct path. |
 | Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
 | Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
-| NCCL CUDA Graph readiness | Diagnostic only | The attribution binary emits `cuda_graph_readiness`. Current NCCL full decode capture remains blocked by host route iteration and host-directed expert accumulation; the removed dense-exchange allocation/sync blockers should stay absent. |
+| NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
+| NCCL CUDA Graph readiness | Diagnostic only | The attribution binary emits `cuda_graph_readiness`. Current NCCL full decode capture remains blocked by host route-plan construction/replay; the removed dense-exchange allocation/sync and old per-token route-iteration blockers should stay absent. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
 | vLLM production parity | Not claimed | The manual vLLM snapshot below is for understanding the gap requested in issue #170. |
 
@@ -100,7 +101,7 @@ Do not claim:
 
 Issue #205 records the model roadmap. Maintainer feedback there calls out NCCL plus CUDA Graph as the likely best decode direction, with host staging possibly deprecated later. Treat that as a future direction, not as current evidence.
 
-The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, and issue #276 removed the dense-exchange allocation/sync blockers from the retained 2x RTX 5090 attribution gate. Those removed dense-exchange blockers are absent from the current readiness report. The remaining NCCL blockers are host route iteration and host-directed expert accumulation. The optional f32 NCCL graph smoke is a separate collective-only diagnostic and is not #276 evidence. HF, host-staged, and NCCL remain token/text exact for the committed case set.
+The current graph-readiness diagnostic is intentionally fail-closed: `full_decode_capture_ready=false` for NCCL. Issue #275 removed the old NCCL combine H2D/D2H/allocation/sync blockers, issue #276 removed the dense-exchange allocation/sync blockers, and issue #277 narrows the remaining NCCL route work into a precomputed host route plan plus host-directed replay. The old per-token route-iteration and host-directed expert-accumulation blocker IDs should stay absent from the current readiness report. The optional f32 NCCL graph smoke is a separate collective-only diagnostic and is not #276/#277 evidence. HF, host-staged, and NCCL remain token/text exact for the committed case set.
 
 The next implementation should be chosen from measured evidence:
 
@@ -113,7 +114,7 @@ The next implementation should be chosen from measured evidence:
    - keep HF / host-staged / NCCL exact before and after;
    - keep host-staged as the correctness baseline while it exists;
    - preserve attribution before and after the change;
-   - attack host route iteration and host-directed expert accumulation next;
+   - keep narrowing host route-plan construction/replay before claiming full decode capture;
    - avoid broad generic EP or multi-node work;
    - judge issue #170 by whether it reduces NCCL decode overhead and makes the path more graph-friendly.
 

@@ -179,7 +179,7 @@ fn single_report(
             "failure_count": attribution.gpu_timing_failure_count(),
             "nvtx_enabled": attribution.nvtx_enabled(),
             "nvtx_range_count": attribution.nvtx_range_count(),
-            "scope": "selected GPU/NCCL sections only; host routing, host-directed route iteration, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+            "scope": "selected GPU/NCCL sections only; host route-plan construction/replay and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
         },
         "schedule_source": "fixed DeepSeek-V2-Lite EP2 greedy gate: prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
         "by_section": by_section,
@@ -281,7 +281,7 @@ fn batch_report(
             "failure_count": attribution.gpu_timing_failure_count(),
             "nvtx_enabled": attribution.nvtx_enabled(),
             "nvtx_range_count": attribution.nvtx_range_count(),
-            "scope": "selected GPU/NCCL sections only; host routing, host-directed route iteration, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+            "scope": "selected GPU/NCCL sections only; host route-plan construction/replay and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
         },
         "schedule_source": format!(
             "fixed DeepSeek-V2-Lite EP2 greedy gate: batch_size={}, prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",

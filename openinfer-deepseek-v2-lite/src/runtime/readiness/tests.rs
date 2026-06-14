@@ -8,8 +8,8 @@ fn nccl_readiness_reports_only_remaining_graph_blockers() {
     assert_eq!(
         ids,
         vec![
-            "nccl_route_iteration_on_host",
-            "nccl_expert_accumulation_host_directed",
+            "nccl_route_plan_built_on_host",
+            "nccl_route_plan_replay_host_directed",
         ]
     );
 }

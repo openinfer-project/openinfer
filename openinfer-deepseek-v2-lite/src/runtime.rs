@@ -6,6 +6,7 @@ mod helpers;
 mod layers;
 mod moe;
 mod readiness;
+mod routing;
 #[cfg(test)]
 mod tests;
 mod types;

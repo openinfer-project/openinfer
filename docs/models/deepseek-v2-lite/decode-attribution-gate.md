@@ -39,7 +39,7 @@ Out of scope:
 
 Host-staged `dispatch_calls` / `combine_calls` count MoE layer invocations in the fixed greedy run. Host-staged `dispatch_elements` / `combine_elements` count selected routed hidden vectors, so the value is route count times hidden size. NCCL `exchange` and `combine` counters count the dense all-reduce calls and elements used by the current naive NCCL gate.
 
-The GPU event rows are intentionally narrower than the CPU rows. They cover sections that enqueue device work or NCCL work on known streams, including projections, dense/shared/routed experts, NCCL dense exchange, NCCL combine clear, device contribution accumulation, and NCCL combine. They do not relabel pure host routing or host-directed route iteration as GPU work, and the mixed `attention_host_path` stays CPU-side because it includes host attention assembly as well as internal GPU projections.
+The GPU event rows are intentionally narrower than the CPU rows. They cover sections that enqueue device work or NCCL work on known streams, including projections, dense/shared/routed experts, NCCL dense exchange, NCCL combine clear, device contribution accumulation, and NCCL combine. They do not relabel host route-plan construction/replay as GPU work, and the mixed `attention_host_path` stays CPU-side because it includes host attention assembly as well as internal GPU projections.
 
 ## Commands
 
@@ -140,7 +140,7 @@ The HF oracle needs a Python environment that can load DeepSeek-V2-Lite with `tr
 
 ## Latest Validation
 
-The issue #276 refresh was rerun on 2026-06-10 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. HF, host-staged, and NCCL were dumped from the same model directory and compared with `--require-all-exact`. The Rust path loaded NCCL `2.30.7+cuda12.9` from the Python CUDA wheel path because the system NCCL `2.25.1+cuda12.8` failed the init smoke on this Blackwell host before model-level validation.
+The issue #277 route-plan refresh was rerun on 2026-06-14 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x RTX 5090. HF, host-staged, and NCCL were dumped from the same model directory and compared with `--require-all-exact`. The NCCL run used a Python CUDA wheel runtime after the system NCCL runtime failed communicator initialization on this Blackwell host; this is an environment prerequisite, not a model-logic change.
 
 - HF / host-staged / NCCL comparison: `all_token_text_exact`.
 - Token SHA256: `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`.
@@ -148,15 +148,15 @@ The issue #276 refresh was rerun on 2026-06-10 with DeepSeek-V2-Lite snapshot `6
 - Generated text: `, I am a 19 year old girl from the UK. I am`.
 - Candidate NCCL attribution: `gpu_timing.sample_count=8384`, `failure_count=0`.
 
-The candidate readiness report still has `full_decode_capture_ready=false`. Compared with the issue #275 candidate, it removes the dense-exchange allocation/sync blockers. The remaining blockers are `nccl_route_iteration_on_host` and `nccl_expert_accumulation_host_directed`.
+The candidate readiness report still has `full_decode_capture_ready=false`. Compared with the issue #276 candidate, it removes the old per-token route-iteration and host-directed expert-accumulation blocker IDs. The remaining blockers are `nccl_route_plan_built_on_host` and `nccl_route_plan_replay_host_directed`.
 
-Current NCCL attribution for the issue #276 gate:
+Current NCCL attribution for the issue #277 gate:
 
 | Batch | GPU event samples | GPU failures | NCCL exchange/combine calls | Route counters | Readiness blockers |
 | ---: | ---: | ---: | --- | --- | --- |
-| 1 | 8384 | 0 | `416 / 416` | `local=1284`, `remote=1212`, `combine=2496` | `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
-| 4 | 23996 | 0 | `494 / 494` | `local=5136`, `remote=4848`, `combine=9984` | `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
-| 8 | 44812 | 0 | `598 / 598` | `local=10272`, `remote=9696`, `combine=19968` | `nccl_route_iteration_on_host`, `nccl_expert_accumulation_host_directed` |
+| 1 | 8384 | 0 | `416 / 416` | `local=1284`, `remote=1212`, `combine=2496` | `nccl_route_plan_built_on_host`, `nccl_route_plan_replay_host_directed` |
+| 4 | 23996 | 0 | `494 / 494` | `local=5136`, `remote=4848`, `combine=9984` | `nccl_route_plan_built_on_host`, `nccl_route_plan_replay_host_directed` |
+| 8 | 44812 | 0 | `598 / 598` | `local=10272`, `remote=9696`, `combine=19968` | `nccl_route_plan_built_on_host`, `nccl_route_plan_replay_host_directed` |
 
 The previous A800 strict same-host accuracy gate was rerun on 2026-06-04 with DeepSeek-V2-Lite snapshot `604d5664dddd88a0433dbae533b7fe9472482de0`, `prompt="Hello"`, `output_len=16`, and 2x A800-SXM4-80GB. The token/text oracle is confirmed by a real HF `AutoModelForCausalLM.generate(..., do_sample=false, use_cache=true)` run on the same model directory as the Rust E2E gate.
 
