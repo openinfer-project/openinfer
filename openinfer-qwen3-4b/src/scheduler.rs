@@ -8,6 +8,7 @@
 mod effects;
 mod plan;
 mod resolve;
+mod speculative;
 
 use std::collections::{HashSet, VecDeque};
 use std::thread;
@@ -43,6 +44,9 @@ pub(super) struct ActiveRequestState {
     pub(super) params: SamplingParams,
     /// Number of top logprobs to return (0 = disabled).
     pub(super) logprobs: usize,
+    /// Full token context (prompt + generated so far). Maintained for the
+    /// n-gram speculative proposer; empty/unused when speculation is off.
+    pub(super) token_history: Vec<u32>,
 }
 
 pub(super) struct PendingRequest {
@@ -370,6 +374,16 @@ fn scheduler_loop<E>(
     // prefill). FIFO by request id; each step takes chunks off the front.
     let mut prefilling: Vec<PendingRequest> = Vec::new();
 
+    // N-gram speculative decode. Off unless OPENINFER_QWEN3_SPEC is set
+    // (see SpeculativeConfig::from_env). When on, pure-decode ticks route
+    // through `speculative::speculative_decode_step` instead of the batched
+    // single-token decode.
+    let spec_config = crate::speculative::SpeculativeConfig::from_env();
+    if spec_config.enabled {
+        info!("speculative decode enabled: {}", spec_config.method);
+    }
+    let spec_proposer = spec_config.build_proposer();
+
     info!("Scheduler ready");
 
     loop {
@@ -443,6 +457,17 @@ fn scheduler_loop<E>(
         let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
             continue;
         };
+        // Speculative decode replaces the batched single-token decode on
+        // pure-decode ticks (no new prefill this step). Lossless under greedy.
+        if spec_config.enabled && matches!(plan, self::plan::ExecutionPlan::Decode) {
+            self::speculative::speculative_decode_step(
+                &mut executor,
+                &mut active,
+                spec_proposer.as_ref(),
+                &mut rng,
+            );
+            continue;
+        }
         let failure_targets = failure_targets_for(&active, &plan);
         let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
             Ok(v) => v,
@@ -1275,6 +1300,22 @@ mod tests {
             })
         }
 
+        fn execute_speculative(
+            &mut self,
+            item: &crate::executor::SpeculativeStepItem,
+        ) -> Result<Vec<u32>> {
+            // Deterministic: accept every draft, then append one bonus token.
+            let mut committed = item.drafts.clone();
+            committed.push(300 + item.request_id.get() as u32);
+            let current = self
+                .held_tokens
+                .get(&item.request_id)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
+            self.ensure_request_tokens(item.request_id, current + committed.len())?;
+            Ok(committed)
+        }
+
         fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
             self.prefill_batches.lock().unwrap().push(
                 plan.prefill_requests
@@ -1356,6 +1397,7 @@ mod tests {
             prompt_len: 16,
             params: SamplingParams::default(),
             logprobs: 0,
+            token_history: Vec::new(),
         };
         assert_eq!(current_active_tokens(&after_prefill), 16);
         assert_eq!(max_active_tokens(&after_prefill), 32);
@@ -1372,6 +1414,7 @@ mod tests {
             prompt_len: 16,
             params: SamplingParams::default(),
             logprobs: 0,
+            token_history: Vec::new(),
         };
         assert_eq!(current_active_tokens(&after_one_decode), 17);
         assert_eq!(max_active_tokens(&after_one_decode), 32);
@@ -1394,6 +1437,7 @@ mod tests {
             prompt_len: 16,
             params: SamplingParams::default(),
             logprobs: 0,
+            token_history: Vec::new(),
         }];
 
         let mk = |id: u64, prompt_len, max_tokens| {
@@ -1490,6 +1534,7 @@ mod tests {
                 prompt_len: 16,
                 params: SamplingParams::default(),
                 logprobs: 0,
+                token_history: Vec::new(),
             });
         }
         let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
@@ -2280,6 +2325,7 @@ mod tests {
                 prompt_len: 16,
                 params: SamplingParams::default(),
                 logprobs: 0,
+                token_history: Vec::new(),
             });
             executor
                 .ensure_request_tokens(request_id, 16)
@@ -2430,5 +2476,135 @@ mod tests {
             .expect("join load thread")
             .expect_err("adapter load should be a stub error");
         assert!(matches!(error, EngineControlError::OperationFailed(_)));
+    }
+
+    fn spec_active(
+        request_id: RequestId,
+        max_tokens: usize,
+        history: Vec<u32>,
+    ) -> (ActiveRequestState, mpsc::UnboundedReceiver<TokenEvent>) {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let last_token = *history.last().unwrap();
+        (
+            ActiveRequestState {
+                request_id,
+                lora_adapter: None,
+                token_tx,
+                last_token,
+                generated_count: 1,
+                max_tokens,
+                prompt_len: history.len(),
+                params: SamplingParams::default(),
+                logprobs: 0,
+                token_history: history,
+            },
+            token_rx,
+        )
+    }
+
+    fn ngram2() -> crate::ngram::NgramProposer {
+        crate::ngram::NgramProposer::new(crate::ngram::NgramConfig {
+            max_ngram: 1,
+            min_ngram: 1,
+            num_speculative: 2,
+        })
+    }
+
+    fn drain_tokens(rx: &mut mpsc::UnboundedReceiver<TokenEvent>) -> Vec<u32> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let TokenEvent::Token { id, .. } = ev {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    // A speculative step streams every committed token, advances the request's
+    // history/count, and keeps it active when no stop condition is hit.
+    #[test]
+    fn speculative_step_streams_committed_tokens() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
+        // history [5,6,5]: suffix [5] recurs at idx 0 -> drafts [6,5];
+        // FakeExecutor commits drafts + bonus 300 -> [6,5,300].
+        let (state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
+        let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
+
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
+
+        assert_eq!(drain_tokens(&mut rx), vec![6, 5, 300]);
+        assert_eq!(active.len(), 1, "request continues");
+        assert_eq!(active[0].generated_count, 4, "1 + 3 committed");
+        assert_eq!(active[0].last_token, 300);
+        assert_eq!(active[0].token_history, vec![5, 6, 5, 6, 5, 300]);
+        assert!(dropped.lock().unwrap().is_empty());
+    }
+
+    // A request near its max_tokens budget caps the draft count so the commit
+    // lands exactly on the limit instead of over-committing. max_tokens 3,
+    // generated 1 -> only 2 tokens of budget, so drafts [6,5] are capped to [6]
+    // (1 draft); commit [6,300] -> emit 6 (gen 2), 300 (gen 3 == limit ->
+    // Length), then finish + retire.
+    #[test]
+    fn speculative_step_caps_drafts_at_max_tokens() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
+        let (state, mut rx) = spec_active(RequestId(0), 3, vec![5, 6, 5]);
+        let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
+
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
+
+        assert_eq!(drain_tokens(&mut rx), vec![6, 300]);
+        assert!(active.is_empty(), "request retired at length limit");
+        assert_eq!(dropped.lock().unwrap().clone(), vec![0]);
+    }
+
+    // A non-greedy (sampled) request must NOT use the speculative path even when
+    // speculation is enabled: it takes a normal single-token decode (FakeExecutor
+    // -> 200 + id), so its sampling is preserved instead of being forced to argmax.
+    #[test]
+    fn sampled_request_bypasses_speculation() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
+        let (mut state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
+        state.params.temperature = 1.0; // non-greedy -> not spec-eligible
+        let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
+
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
+
+        // One token from the normal decode path, not the multi-token spec commit.
+        assert_eq!(drain_tokens(&mut rx), vec![200]);
+        assert_eq!(active.len(), 1, "request continues");
+        assert_eq!(active[0].generated_count, 2, "1 + 1 decoded");
+        assert_eq!(active[0].last_token, 200);
+        assert_eq!(active[0].token_history, vec![5, 6, 5, 200]);
+        assert!(dropped.lock().unwrap().is_empty());
+    }
+
+    // A request that asked for decode logprobs is likewise not spec-eligible
+    // (speculation drops per-token logprobs), so it takes the normal decode path.
+    #[test]
+    fn logprobs_request_bypasses_speculation() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
+        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
+        let (mut state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
+        state.logprobs = 1; // requested decode logprobs -> not spec-eligible
+        let mut active = vec![state];
+        let mut rng = StdRng::seed_from_u64(0);
+
+        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
+
+        assert_eq!(drain_tokens(&mut rx), vec![200]);
+        assert_eq!(active.len(), 1, "request continues");
+        assert_eq!(active[0].last_token, 200);
+        assert!(dropped.lock().unwrap().is_empty());
     }
 }

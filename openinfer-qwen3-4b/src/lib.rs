@@ -8,8 +8,10 @@ mod config;
 mod executor;
 pub mod kernel_bench;
 mod lora;
+pub mod ngram;
 mod prefill;
 mod scheduler;
+pub mod speculative;
 mod unified_forward;
 mod weights;
 
@@ -111,7 +113,7 @@ pub mod runtime {
     pub use crate::executor::{
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
         PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,
-        UnifiedPlan, UnifiedResult,
+        SpeculativeStepItem, UnifiedPlan, UnifiedResult,
     };
 }
 
