@@ -1,6 +1,6 @@
 # DFlash Speculative Decoding
 
-> **TL;DR:** Qwen3-4B DFlash is wired end-to-end for greedy TP1 serving with native Rust/CUDA drafter, target verifier, INFO acceptance logs with `committed_tokens`, profiling-only timing, verifier-span/full-draft HF regret gate, request-local draft scratch, reusable pending-context buffer, config-derived DFlash memory reserve, chunked-prefill DFlash context continuity checks, and DFlash small-N cublasLt tuning. Speculative protocol types live in `openinfer-qwen3-4b/src/speculative.rs`, and DFlash lane state lives in `openinfer-qwen3-4b/src/executor/dflash_lane.rs`. Local 5070 Ti Step 9 Spec-Bench bs=1 reaches 148.34 tok/s (1.65x vs baseline). 5090 OpenInfer bs=1 reaches 251.48 tok/s on Spec-Bench (1.50x), but ShareGPT/random expose under-optimized policy/kernel paths; upstream vLLM 0.22.1 supports Qwen3 DFlash and reaches 289.57 tok/s on the same Spec-Bench (1.78x vs vLLM baseline), with native `vllm bench serve` acceptance metrics. The current OpenInfer DFlash path is not CUDA-graph captured: local nsys shows draft eager at ~2.7-2.9 ms/step, ~98-106 kernel launches/step, dominated by GEMM/GEMV.
+> **TL;DR:** Qwen3-4B DFlash is wired end-to-end for greedy TP1 serving with native Rust/CUDA drafter, target verifier, INFO acceptance logs with `committed_tokens`, profiling-only timing, verifier-span/full-draft HF regret gate, request-local draft scratch, reusable pending-context buffer, config-derived DFlash memory reserve, DFlash-aware context admission, chunked-prefill DFlash context continuity checks, and DFlash small-N cublasLt tuning. Speculative protocol types live in `openinfer-qwen3-4b/src/speculative.rs`, and DFlash lane state lives in `openinfer-qwen3-4b/src/executor/dflash_lane.rs`. Draft PR: #380. Latest local 5070 Ti PR-head `vllm bench serve` results: Spec-Bench bs=1 149.32 tok/s (1.66x), Spec-Bench c4 330.42 tok/s (1.09x), random 1024/128 bs=1 136.09 tok/s (1.57x), random c4 349.50 tok/s (1.29x). 5090 OpenInfer bs=1 reaches 251.48 tok/s on Spec-Bench (1.50x); upstream vLLM 0.22.1 supports Qwen3 DFlash and reaches 289.57 tok/s on the same Spec-Bench (1.78x vs vLLM baseline), with native `vllm bench serve` acceptance metrics. The current OpenInfer DFlash path is not CUDA-graph captured: local nsys shows draft eager at ~2.7-2.9 ms/step, ~98-106 kernel launches/step, dominated by GEMM/GEMV. Multi-active DFlash is enabled for all eligible greedy requests, but the draft side is still per-request serial; target verification is batched.
 >
 > **Last touched:** 2026-06
 
@@ -43,8 +43,8 @@
   - `openinfer-qwen3-4b/src/executor/speculative_exec.rs` owns Qwen3 executor-side speculative draft/verify scheduling and KV apply.
   - `openinfer-qwen3-4b/src/executor/{lifecycle,model_executor,worker}.rs` split executor construction/offload lifecycle, runtime trait implementation, and worker-lane plumbing; every `src/executor/*.rs` file is now under 1k lines.
   - `openinfer-qwen3-4b/src/dflash.rs` owns the DFlash model weights, request-local draft scratch, reusable pending-context buffer, DFlash-specific small-N cublasLt tuning, and GPU forward kernels.
-- **Initial policy**: DFlash should be opt-in and greedy-only until verifier-span correctness and acceptance/timing metrics prove the path. Unsupported combinations should fail closed or route clearly to baseline, not silently change semantics.
-- **Concurrency boundary**: the current production path is intentionally bs=1 speculative decode. Multi-request prefill does not capture DFlash context, and speculative decode yields to pending prefill chunks before drafting. This avoids paying DFlash KV/memory cost for requests that cannot yet use the drafter and preserves serving fairness.
+- **Initial policy**: DFlash is opt-in and greedy-only. Unsupported combinations fail closed or route clearly to baseline, not silently change semantics.
+- **Concurrency boundary**: when DFlash is configured, every eligible active greedy request may enter speculative decode. Pending prefill chunks still run before the next draft step so new requests can capture DFlash hidden context and join the speculative set. The current multi-active implementation drafts serially per request, then batches the target verifier; this is correct and measurable, but not the final throughput shape.
 
 ## Execution Log
 
@@ -509,7 +509,7 @@
 - OpenInfer concurrency probe: Spec-Bench `--max-concurrency 4`, 40 prompts, output 64:
   - baseline: 558.18 tok/s, mean TPOT 6.83 ms
   - DFlash: 540.23 tok/s, mean TPOT 6.91 ms
-  - This confirms the current bs=1 speculative policy should not blindly compete with baseline batching once multiple active requests are present.
+  - This was measured before the multi-active default policy landed, and is retained as historical evidence that the first bs=1-only policy left batch-concurrency behavior under-optimized.
 - 5090 DFlash INFO logs:
   - `/data/dflash-bench/dflash-server-5090.log`: 485 rows, accepted/verified draft tokens 775 / 6478 = 0.1196, committed 1260 tokens, 2.60 committed tokens/step, no old `emitted=` field.
   - `/data/dflash-bench/dflash-server-5090-r2.log`: 477 rows, accepted/verified draft tokens 669 / 6795 = 0.0985, committed 1146 tokens, 2.40 committed tokens/step, no old `emitted=` field.
@@ -569,15 +569,38 @@
   - DFlash verify logs: 491 rows, accepted/verified draft tokens 769 / 6524 = 0.1179, committed 1260 tokens, or 2.57 committed tokens/speculative step.
   - Default timing fields stayed `draft_ms=-1.000`, `verify_ms=-1.000`, and no DFlash verify row used the old `emitted=` field.
 
+### Step 10: Draft PR and local multi-active validation
+- Draft PR opened: <https://github.com/openinfer-project/openinfer/pull/380>.
+- After user direction to remove the single-active restriction, scheduler policy now lets all eligible active greedy requests enter DFlash when the draft model is configured. The executor drafts each active request and batches target verification.
+- Local Spec-Bench dataset materialized for vLLM 0.21:
+  ```bash
+  curl -L --fail --show-error https://raw.githubusercontent.com/hemingkx/Spec-Bench/refs/heads/main/data/spec_bench/question.jsonl -o target/dflash-bench/spec_bench_question.jsonl
+  wc -l target/dflash-bench/spec_bench_question.jsonl
+  ```
+  The file has 480 JSONL rows with the expected `turns` field.
+- Latest local PR-head serving results on RTX 5070 Ti, greedy `vllm bench serve`, `--temperature 0`, OpenAI `/v1/completions` endpoint:
+
+| Dataset | Concurrency | Prompts | Output len | Baseline tok/s | DFlash tok/s | Speedup | Baseline mean TPOT | DFlash mean TPOT | Result files |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Spec-Bench | 1 | 20 | 64 | 89.72 | 149.32 | 1.66x | 10.77 ms | 6.33 ms | `baseline-local-pr380-specbench-n20-out64-c1.json`, `dflash-local-pr380-specbench-n20-out64-c1-r2.json` |
+| Spec-Bench | 4 | 40 | 64 | 303.92 | 330.42 | 1.09x | 12.09 ms | 10.95 ms | `baseline-local-pr380-specbench-n40-out64-c4.json`, `dflash-local-pr380-specbench-n40-out64-c4-r2.json` |
+| Random 1024/128 | 1 | 20 | 128 | 86.61 | 136.09 | 1.57x | 10.86 ms | 6.63 ms | `baseline-local-pr380-random-in1024-out128-n20-c1.json`, `dflash-local-pr380-random-in1024-out128-n20-c1.json` |
+| Random 1024/128 | 4 | 40 | 128 | 270.93 | 349.50 | 1.29x | 13.41 ms | 10.18 ms | `baseline-local-pr380-random-in1024-out128-n40-c4.json`, `dflash-local-pr380-random-in1024-out128-n40-c4.json` |
+
+- DFlash server log for the local multi-active session: `target/dflash-bench/dflash-local-pr380-multiactive-server.log`.
+  - The log contains DFlash rows for 180 internal request IDs (`0..179`) and shows multiple request IDs logging DFlash acceptance in the same decode wave, e.g. request `0/1/2/3` immediately after the first c4 batch.
+  - Aggregate over the session log: 5529 DFlash rows, accepted/verified draft tokens 9651 / 75682 = 0.1275, committed 15180 tokens, or 2.75 committed tokens/speculative row.
+  - The aggregate includes the discarded overlapping Spec-Bench c1/c4 attempt, so it is only evidence of multi-active coverage and acceptance logging, not a per-dataset performance number.
+
 ## Debrief
 
-- **Outcome**: DFlash is integrated end-to-end for the conservative Qwen3-4B TP1 greedy path, with native drafter loading/forward, reusable draft scratch, per-draft CPU allocation cleanup, reusable D2H host output buffer for greedy token selection, config-derived request-state memory reserve, DFlash-aware effective context admission, DFlash-specific small-N cublasLt tuning, speculative scheduler stages, hidden-state capture, acceptance/timing logs, NVTX profiling ranges, local and 5090 standard bs=1 serving measurements, verifier-span plus full draft→verify HF gates, executor files split under 1k lines, 5090 real-weight gates, and a vLLM 0.22.1 DFlash baseline for comparison.
-- **Review**: toxic reviewer previously returned Ready for review after the executor split and 8193-vocab argmax equivalence test, then a later follow-up caught the chunked-prefill lifecycle and `emitted` log-field issues fixed in Step 9. Re-review after Step 9 is still pending. Non-blockers called out in the review are intentionally documented here: DFlash is not in CUDA Graph, bs>1 policy is not complete, and HTTP/scheduler-level DFlash E2E coverage can be broadened later.
+- **Outcome**: DFlash is integrated end-to-end for the Qwen3-4B TP1 greedy path, with native drafter loading/forward, reusable draft scratch, per-draft CPU allocation cleanup, reusable D2H host output buffer for greedy token selection, config-derived request-state memory reserve, DFlash-aware effective context admission, DFlash-specific small-N cublasLt tuning, speculative scheduler stages, hidden-state capture, acceptance/timing logs, NVTX profiling ranges, local and 5090 standard bs=1 serving measurements, local multi-active serving measurements, verifier-span plus full draft→verify HF gates, executor files split under 1k lines, 5090 real-weight gates, a vLLM 0.22.1 DFlash baseline for comparison, and draft PR #380.
+- **Review**: toxic reviewer previously returned Ready for review after the executor split and 8193-vocab argmax equivalence test, then a later follow-up caught the chunked-prefill lifecycle and `emitted` log-field issues fixed in Step 9. Re-review after the multi-active policy change is still pending. Non-blockers called out in the review are intentionally documented here: DFlash is not in CUDA Graph, draft execution is not batched/fused, and HTTP/scheduler-level DFlash E2E coverage can be broadened later.
 - **Pitfalls encountered**:
   - Draft tokens must be clamped to remaining `max_tokens` before building the verify span; otherwise speculative KV views can request a span larger than the committed output budget.
   - `vllm bench serve` no longer forces greedy requests by default. DFlash only engages when requests are greedy, so benchmark commands must include `--temperature 0` when the server default is not enough.
   - Per-step timing must not synchronize the hot path by default. Use no-sync INFO logs for acceptance/shape observability and `OPENINFER_QWEN3_DFLASH_NVTX=1` when profiling timing/graphs.
-  - bs>1 requires a real batched DFlash policy. Until that exists, multi-request prefill should not allocate DFlash cache and speculative decode should yield to pending prefill.
+  - Multi-active DFlash is correct enough to benchmark, but the draft path is still per-request serial. This preserves the user's "DFlash on means eligible requests use DFlash" semantics, while leaving real batched/fused draft execution as the next performance target.
   - Chunked prefill needs continuity checks on the hidden-state side channel. Dropping state on a non-final chunk or accepting a mismatched `chunk_start` corrupts the drafter context without touching the normal target KV path.
   - DFlash request memory is not just the 1.1 GB safetensors file. Long prompts can grow drafter KV, pending hidden-state context, and projection scratch by multiple GiB, so the KV pool reserve must be config-derived and the admission context limit must leave one draft block of headroom.
   - Local NVTX capture-range triggering did not match reliably; a bounded full nsys capture plus sqlite post-processing produced the useful draft/verify breakdown.
@@ -591,4 +614,5 @@
   - A production-quality next step is DFlash graph capture or a fused/smaller-launch draft path, plus aligning OpenInfer's request-state policy with vLLM's proven bs=1 behavior. Tuning acceptance policy alone will not answer the draft-kernel efficiency question.
 - **Follow-ups**:
   - Optimize bs=1 first against the 5090 vLLM DFlash reference: inspect why OpenInfer ShareGPT barely enters or barely benefits from DFlash, then profile draft/verify graph capture and kernel fill.
-  - Add the bs>1 policy gate: one active request can use DFlash; multiple active decode requests should prefer baseline batching until a real batched DFlash policy beats it.
+  - Re-run the latest multi-active PR head on 5090 once the host is convenient again; local 5070 Ti shows positive c4 throughput, but 5090 is still the release performance gate.
+  - Replace the per-request serial DFlash draft loop with a batched/fused draft path or graph-captured draft replay, then re-run the same Spec-Bench/random c1/c4 gates.
