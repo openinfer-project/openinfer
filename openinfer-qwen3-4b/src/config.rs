@@ -38,6 +38,29 @@ pub(crate) struct Config {
     pub(crate) stop_token_ids: Vec<u32>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct DFlashConfig {
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) num_target_layers: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) vocab_size: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) block_size: usize,
+    pub(crate) dflash_config: DFlashInnerConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct DFlashInnerConfig {
+    pub(crate) mask_token_id: u32,
+    pub(crate) target_layer_ids: Vec<usize>,
+}
+
 fn default_max_position_embeddings() -> usize {
     40960
 }
@@ -114,6 +137,85 @@ impl Config {
             }
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+impl DFlashConfig {
+    pub(crate) fn from_file(model_path: &str) -> Result<Self> {
+        let config_path = format!("{}/config.json", model_path);
+        let content = fs::read_to_string(&config_path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    pub(crate) fn validate_for_target(&self, target: &Config) -> Result<()> {
+        anyhow::ensure!(
+            self.hidden_size == target.hidden_size,
+            "DFlash hidden_size {} does not match target {}",
+            self.hidden_size,
+            target.hidden_size
+        );
+        anyhow::ensure!(
+            self.num_target_layers == target.num_hidden_layers,
+            "DFlash num_target_layers {} does not match target layers {}",
+            self.num_target_layers,
+            target.num_hidden_layers
+        );
+        anyhow::ensure!(
+            self.num_attention_heads == target.num_attention_heads
+                && self.num_key_value_heads == target.num_key_value_heads
+                && self.head_dim == target.head_dim,
+            "DFlash attention geometry does not match target"
+        );
+        anyhow::ensure!(
+            self.vocab_size == target.vocab_size,
+            "DFlash vocab_size {} does not match target {}",
+            self.vocab_size,
+            target.vocab_size
+        );
+        anyhow::ensure!(
+            self.rope_theta == target.rope_theta,
+            "DFlash rope_theta {} does not match target {}",
+            self.rope_theta,
+            target.rope_theta
+        );
+        anyhow::ensure!(
+            self.max_position_embeddings >= target.max_position_embeddings,
+            "DFlash max_position_embeddings {} is smaller than target {}",
+            self.max_position_embeddings,
+            target.max_position_embeddings
+        );
+        anyhow::ensure!(
+            self.block_size >= 2,
+            "DFlash block_size must be >= 2, got {}",
+            self.block_size
+        );
+        anyhow::ensure!(
+            self.dflash_config.mask_token_id < target.vocab_size as u32,
+            "DFlash mask_token_id {} is outside target vocab_size {}",
+            self.dflash_config.mask_token_id,
+            target.vocab_size
+        );
+        anyhow::ensure!(
+            self.dflash_config.target_layer_ids.len() == self.num_hidden_layers,
+            "DFlash target_layer_ids length {} does not match draft layers {}",
+            self.dflash_config.target_layer_ids.len(),
+            self.num_hidden_layers
+        );
+        anyhow::ensure!(
+            self.dflash_config
+                .target_layer_ids
+                .iter()
+                .all(|&layer| layer < target.num_hidden_layers),
+            "DFlash target_layer_ids must be within target layer count"
+        );
+        anyhow::ensure!(
+            self.dflash_config
+                .target_layer_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "DFlash target_layer_ids must be strictly increasing"
+        );
+        Ok(())
     }
 }
 

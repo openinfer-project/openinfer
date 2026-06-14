@@ -11,7 +11,7 @@ use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
 #[cfg(feature = "qwen3-4b")]
-use openinfer_qwen3_4b::{Qwen3LoraOptions, Qwen3OffloadOptions};
+use openinfer_qwen3_4b::{Qwen3LoraOptions, Qwen3OffloadOptions, Qwen3SpeculativeOptions};
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -97,6 +97,11 @@ struct Args {
     /// prefix is restored from the host tier — for measuring the L2 TTFT win.
     #[arg(long, default_value_t = false)]
     no_prefix_cache: bool,
+
+    /// Enable Qwen3 DFlash speculative decoding with this drafter model path.
+    #[cfg(feature = "qwen3-4b")]
+    #[arg(long = "dflash-draft-model-path")]
+    dflash_draft_model_path: Option<PathBuf>,
 
     /// Cap on total prompt tokens forwarded in one Qwen3 scheduler step
     /// (chunked prefill). Prefill activation scratch scales with the step's
@@ -320,6 +325,24 @@ fn load_engine(
             } else {
                 Qwen3OffloadOptions::disabled()
             };
+            let speculative = if let Some(path) = args.dflash_draft_model_path.as_ref() {
+                if args.enable_lora {
+                    bail!("--dflash-draft-model-path is not supported with --enable-lora");
+                }
+                if args.kv_offload {
+                    bail!("--dflash-draft-model-path is not supported with --kv-offload");
+                }
+                if args.tp_size != 1 {
+                    bail!("--dflash-draft-model-path currently requires --tp-size=1");
+                }
+                info!(
+                    "Qwen3 DFlash enabled: draft_model_path={}, prefix cache disabled for hidden-state capture",
+                    path.display()
+                );
+                Qwen3SpeculativeOptions::dflash(path.clone())
+            } else {
+                Qwen3SpeculativeOptions::disabled()
+            };
 
             if args.enable_lora {
                 let lora_options = Qwen3LoraOptions {
@@ -339,10 +362,11 @@ fn load_engine(
                     args.max_prefill_tokens,
                 )
             } else {
-                openinfer_qwen3_4b::start_engine_with_offload(
+                openinfer_qwen3_4b::start_engine_with_offload_and_speculative(
                     &args.model_path,
                     options,
                     offload,
+                    speculative,
                     args.no_prefix_cache,
                     args.max_prefill_tokens,
                 )

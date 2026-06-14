@@ -5,12 +5,18 @@ use crate::executor::{
     DecodePlan, DecodeResult, DecodeStepItem, ModelExecutor, PrefillPlan, PrefillResult,
     PrefillStepItem, UnifiedPlan, UnifiedResult,
 };
+use crate::speculative::{
+    DraftPlan as SpeculativeDraftPlan, DraftRequestResult as SpeculativeDraftRequestResult,
+    DraftStepItem as SpeculativeDraftStepItem, VerifyPlan as SpeculativeVerifyPlan,
+    VerifyResult as SpeculativeVerifyResult, VerifyStepItem as SpeculativeVerifyStepItem,
+};
 
 use super::{ActiveRequestState, PendingRequest};
 
 pub(super) enum ExecutionPlan {
     Prefill { pending: Vec<PendingRequest> },
     Decode,
+    SpeculativeDecode,
     Unified { pending: Vec<PendingRequest> },
 }
 
@@ -25,6 +31,9 @@ pub(super) enum ExecutionArtifacts {
     },
     Decode {
         result: DecodeResult,
+    },
+    SpeculativeDecode {
+        verify: SpeculativeVerifyResult,
     },
     Unified {
         pending: Vec<PendingRequest>,
@@ -80,6 +89,19 @@ pub(super) fn execute_plan(
             sort_decode_results(&mut result.requests);
             Ok(ExecutionArtifacts::Decode { result })
         }
+        ExecutionPlan::SpeculativeDecode => {
+            let draft_requests = build_speculative_draft_items(active);
+            let mut draft = executor.execute_speculative_draft(SpeculativeDraftPlan {
+                requests: &draft_requests,
+            })?;
+            draft.requests.sort_by_key(|result| result.request_id);
+            let verify_requests = build_speculative_verify_items(active, &draft.requests);
+            let mut verify = executor.execute_speculative_verify(SpeculativeVerifyPlan {
+                requests: &verify_requests,
+            })?;
+            verify.requests.sort_by_key(|result| result.request_id);
+            Ok(ExecutionArtifacts::SpeculativeDecode { verify })
+        }
         ExecutionPlan::Unified { pending } => {
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
@@ -99,6 +121,20 @@ pub(super) fn execute_plan(
             })
         }
     }
+}
+
+pub(super) fn should_speculative_decode(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+) -> bool {
+    executor.speculative_enabled()
+        && !active.is_empty()
+        && active.iter().all(|req| {
+            executor.speculative_request_ready(req.request_id)
+                && req.lora_adapter.is_none()
+                && req.logprobs == 0
+                && req.params.is_greedy()
+        })
 }
 
 fn build_prefill_items(
@@ -149,6 +185,44 @@ fn build_decode_items(
         .collect()
 }
 
+fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<SpeculativeDraftStepItem> {
+    active
+        .iter()
+        .map(|r| SpeculativeDraftStepItem {
+            request_id: r.request_id,
+            current_token: r.last_token,
+            params: r.params,
+        })
+        .collect()
+}
+
+fn build_speculative_verify_items(
+    active: &[ActiveRequestState],
+    draft_results: &[SpeculativeDraftRequestResult],
+) -> Vec<SpeculativeVerifyStepItem> {
+    draft_results
+        .iter()
+        .map(|draft| {
+            let active = active
+                .iter()
+                .find(|req| req.request_id == draft.request_id)
+                .expect("draft request_id must exist in active set");
+            SpeculativeVerifyStepItem {
+                request_id: draft.request_id,
+                token_ids: {
+                    let remaining = active.max_tokens.saturating_sub(active.generated_count);
+                    assert!(remaining > 0, "active request must have output budget");
+                    let mut token_ids = draft.token_ids.clone();
+                    token_ids.truncate(remaining);
+                    token_ids
+                },
+                params: active.params,
+                lora_adapter: None,
+            }
+        })
+        .collect()
+}
+
 fn sort_prefill_results(results: &mut [crate::executor::PrefillRequestResult]) {
     results.sort_by_key(|result| result.request_id);
 }
@@ -182,6 +256,21 @@ mod tests {
         }
     }
 
+    fn active(generated_count: usize, max_tokens: usize) -> ActiveRequestState {
+        let (token_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ActiveRequestState {
+            request_id: RequestId::new(7),
+            lora_adapter: None,
+            token_tx,
+            last_token: 42,
+            generated_count,
+            max_tokens,
+            prompt_len: 10,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }
+    }
+
     // The plan selector is the whole batch-formation policy: what the scheduler
     // does each tick is fully determined by (have_active, has_pending). Pin the
     // 2×2 truth table so a policy regression can't slip through silently.
@@ -209,5 +298,20 @@ mod tests {
             ),
             "active + pending fuses prefill and decode into one unified step"
         );
+    }
+
+    #[test]
+    fn speculative_verify_items_clamp_to_remaining_output_budget() {
+        let active = [active(24, 32)];
+        let draft = SpeculativeDraftRequestResult {
+            request_id: RequestId::new(7),
+            token_ids: (0..16).collect(),
+        };
+
+        let verify = build_speculative_verify_items(&active, &[draft]);
+
+        assert_eq!(verify.len(), 1);
+        assert_eq!(verify[0].token_ids.len(), 8);
+        assert_eq!(verify[0].token_ids, (0..8).collect::<Vec<_>>());
     }
 }

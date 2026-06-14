@@ -176,6 +176,90 @@ pub fn gather_hidden_tokens_into(
     Ok(())
 }
 
+pub fn copy_hidden_rows_into(
+    ctx: &DeviceContext,
+    src: &HiddenStates,
+    dst: &mut HiddenStates,
+    row_offset: usize,
+) -> Result<()> {
+    assert!(
+        row_offset + src.hidden_dim <= dst.hidden_dim,
+        "row range [{}..{}) exceeds destination hidden_dim {}",
+        row_offset,
+        row_offset + src.hidden_dim,
+        dst.hidden_dim
+    );
+    assert_eq!(
+        src.seq_len, dst.seq_len,
+        "copy_hidden_rows_into seq_len mismatch: src {}, dst {}",
+        src.seq_len, dst.seq_len
+    );
+
+    let (src_ptr, _gs) = src.data.device_ptr(&ctx.stream);
+    let (dst_ptr, _gd) = dst.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::copy_hidden_rows_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            src.hidden_dim as i32,
+            dst.hidden_dim as i32,
+            row_offset as i32,
+            src.hidden_dim as i32,
+            src.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+pub fn copy_hidden_token_range_into(
+    ctx: &DeviceContext,
+    src: &HiddenStates,
+    src_token_offset: usize,
+    dst: &mut HiddenStates,
+    dst_token_offset: usize,
+    token_count: usize,
+) -> Result<()> {
+    assert_eq!(
+        src.hidden_dim, dst.hidden_dim,
+        "copy_hidden_token_range_into hidden_dim mismatch: src {}, dst {}",
+        src.hidden_dim, dst.hidden_dim
+    );
+    assert!(
+        src_token_offset + token_count <= src.seq_len,
+        "source token range [{}..{}) exceeds seq_len {}",
+        src_token_offset,
+        src_token_offset + token_count,
+        src.seq_len
+    );
+    assert!(
+        dst_token_offset + token_count <= dst.seq_len,
+        "destination token range [{}..{}) exceeds seq_len {}",
+        dst_token_offset,
+        dst_token_offset + token_count,
+        dst.seq_len
+    );
+
+    let (src_ptr, _gs) = src.data.device_ptr(&ctx.stream);
+    let (dst_ptr, _gd) = dst.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::copy_hidden_token_range_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            src.hidden_dim as i32,
+            src_token_offset as i32,
+            dst_token_offset as i32,
+            token_count as i32,
+            src.seq_len as i32,
+            dst.seq_len as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 pub fn scaled_add_rows_indexed_into(
     ctx: &DeviceContext,
     delta: &HiddenStates,

@@ -15,7 +15,8 @@ pub use attention::{
 };
 pub use openinfer_kernels::ops::{
     GEMM_LT_MAX_N, LoraDecodeGroupedProjection, accumulate_bf16_token_scaled_to_f32_into,
-    add_batch, add_batch_into, bf16_hidden_to_f32_into, embedding_decode_into, extract_vec,
+    add_batch, add_batch_into, bf16_hidden_to_f32_into, copy_hidden_rows_into,
+    copy_hidden_token_range_into, dflash_qk_norm_rope_into, embedding_decode_into, extract_vec,
     extract_vec_into, extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into,
     fused_add_rms_norm_into, gather_hidden_tokens_into, gemm, gemm_into_checked, gemm_lt_tune,
     gemm_per_token, gemv, linear, lora_decode_fused_delta_group3_into,
@@ -23,7 +24,8 @@ pub use openinfer_kernels::ops::{
     qk_norm_partial_rope_batched_decode_hd256_into, rms_norm, rms_norm_batch_offset_into,
     rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into, scale_f32_in_place,
     scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
-    scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into, write_vec_into,
+    scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into,
+    single_prefill_nhd_noncausal_into, write_vec_into,
 };
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use openinfer_kernels::ops::{
@@ -34,8 +36,8 @@ pub use openinfer_kernels::ops::{
 pub use paged_plan::PrefillPagedPlan;
 pub use sampling::{
     argmax, argmax_batch_bf16_into, argmax_batch_bf16_split_indexed_into,
-    argmax_batch_bf16_split_partials_len, flashinfer_topk_row_states_bytes, gpu_sample,
-    gpu_sample_into, select_batch_tokens_into,
+    argmax_batch_bf16_split_into, argmax_batch_bf16_split_partials_len,
+    flashinfer_topk_row_states_bytes, gpu_sample, gpu_sample_into, select_batch_tokens_into,
 };
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::{

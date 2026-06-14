@@ -5,15 +5,17 @@ mod batch_decode_buffers;
 mod batch_decode_dag;
 pub mod batch_decode_trace;
 mod config;
+mod dflash;
 mod executor;
 pub mod kernel_bench;
 mod lora;
 mod prefill;
 mod scheduler;
+mod speculative;
 mod unified_forward;
 mod weights;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, ModelInfo};
@@ -103,6 +105,30 @@ impl Default for Qwen3OffloadOptions {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Qwen3SpeculativeOptions {
+    pub dflash: Option<Qwen3DFlashOptions>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen3DFlashOptions {
+    pub model_path: PathBuf,
+}
+
+impl Qwen3SpeculativeOptions {
+    pub fn disabled() -> Self {
+        Self { dflash: None }
+    }
+
+    pub fn dflash(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            dflash: Some(Qwen3DFlashOptions {
+                model_path: model_path.into(),
+            }),
+        }
+    }
+}
+
 /// Low-level Qwen3 execution interface.
 ///
 /// This is the production phase boundary used by the Qwen3 scheduler and by
@@ -112,6 +138,12 @@ pub mod runtime {
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
         PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,
         UnifiedPlan, UnifiedResult,
+    };
+    pub use crate::speculative::{
+        DraftPlan as SpeculativeDraftPlan, DraftRequestResult as SpeculativeDraftRequestResult,
+        DraftResult as SpeculativeDraftResult, DraftStepItem as SpeculativeDraftStepItem,
+        VerifyPlan as SpeculativeVerifyPlan, VerifyRequestResult as SpeculativeVerifyRequestResult,
+        VerifyResult as SpeculativeVerifyResult, VerifyStepItem as SpeculativeVerifyStepItem,
     };
 }
 
@@ -167,6 +199,24 @@ pub fn start_engine_with_offload(
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
+    start_engine_with_offload_and_speculative(
+        model_path,
+        options,
+        offload_options,
+        Qwen3SpeculativeOptions::disabled(),
+        no_prefix_cache,
+        max_prefill_tokens,
+    )
+}
+
+pub fn start_engine_with_offload_and_speculative(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    offload_options: Qwen3OffloadOptions,
+    speculative_options: Qwen3SpeculativeOptions,
+    no_prefix_cache: bool,
+    max_prefill_tokens: usize,
+) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -182,6 +232,7 @@ pub fn start_engine_with_offload(
         &device_ordinals,
         seed,
         offload_options,
+        speculative_options,
         no_prefix_cache,
         max_prefill_tokens,
     )
@@ -211,6 +262,7 @@ pub fn start_engine_with_lora_control(
         seed,
         lora_options.validate()?,
         offload_options,
+        Qwen3SpeculativeOptions::disabled(),
         no_prefix_cache,
         max_prefill_tokens,
     )

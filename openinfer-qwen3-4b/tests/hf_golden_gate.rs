@@ -58,7 +58,10 @@ use openinfer_core::engine::TokenLogprob;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
+    SpeculativeDraftPlan, SpeculativeDraftStepItem, SpeculativeVerifyPlan,
+    SpeculativeVerifyStepItem,
 };
+use openinfer_qwen3_4b::{Qwen3LoraOptions, Qwen3OffloadOptions, Qwen3SpeculativeOptions};
 use safetensors::{Dtype, SafeTensors};
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
@@ -120,6 +123,25 @@ fn model_path_or_skip() -> Option<String> {
         Err(_) => {
             eprintln!(
                 "skipping qwen3 hf_golden_gate: {MODEL_PATH}/config.json is missing; set OPENINFER_TEST_MODEL_PATH to run it"
+            );
+            None
+        }
+    }
+}
+
+fn dflash_model_path_or_skip() -> Option<String> {
+    match std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") {
+        Ok(path) => Some(path),
+        Err(_)
+            if Path::new("/data/models/Qwen3-4B-DFlash-b16")
+                .join("config.json")
+                .exists() =>
+        {
+            Some("/data/models/Qwen3-4B-DFlash-b16".to_string())
+        }
+        Err(_) => {
+            eprintln!(
+                "skipping qwen3 DFlash verifier-span golden gate: set OPENINFER_DFLASH_TEST_MODEL_PATH"
             );
             None
         }
@@ -289,6 +311,26 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
     )
 }
 
+fn dflash_prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
+    PrefillStepItem::new(
+        id,
+        prompt,
+        MAX_OUTPUT_TOKENS,
+        SamplingParams::default(),
+        0,
+        false,
+        0.0,
+    )
+}
+
+fn dflash_chunked_prefill_item(
+    id: RequestId,
+    prompt: Vec<u32>,
+    chunk_budget: usize,
+) -> PrefillStepItem {
+    dflash_prefill_item(id, prompt).with_chunk_budget(chunk_budget)
+}
+
 fn decode_item(id: RequestId, fed: u32) -> DecodeStepItem {
     DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS, 0.0)
 }
@@ -442,6 +484,21 @@ fn report_and_assert(label: &str, stats: &Stats) {
     let _ = max; // reported above, but not asserted: the worst single delta grows with coverage
 }
 
+fn assert_token_within_hf_regret(label: &str, token: u32, hf: &[(u32, f32)]) {
+    let hf_top = hf[0].1;
+    let Some((_, token_lp)) = hf.iter().find(|(id, _)| *id == token) else {
+        panic!(
+            "{label}: verifier selected token {token}, which is absent from HF top-{}",
+            hf.len()
+        );
+    };
+    let regret = hf_top - *token_lp;
+    assert!(
+        regret <= MARGIN_TOL,
+        "{label}: verifier selected token {token}, which HF scores {regret:.4} nat below its best (> {MARGIN_TOL})"
+    );
+}
+
 /// Number of visible CUDA devices; 0 when the driver cannot be queried.
 fn cuda_device_count() -> usize {
     cudarc::driver::CudaContext::device_count().map_or(0, |n| n.max(0) as usize)
@@ -567,4 +624,196 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
         return;
     }
     run_eager_suite(&golden, &model_path, &[0, 1], "tp2 ");
+}
+
+#[test]
+fn dflash_speculative_verify_matches_hf_argmax_regret_gate() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let Some(dflash_path) = dflash_model_path_or_skip() else {
+        return;
+    };
+    let golden = Golden::load();
+    let span_len = 16.min(golden.decode_len);
+    assert!(span_len > 0, "golden decode span must not be empty");
+
+    let mut ex = Qwen3Executor::from_runtime_with_options(
+        &model_path,
+        false,
+        &[0],
+        Qwen3LoraOptions::default(),
+        Qwen3OffloadOptions::disabled(),
+        Qwen3SpeculativeOptions::dflash(dflash_path),
+    )
+    .expect("build DFlash-enabled executor");
+    ex.set_prefix_cache_enabled(false);
+
+    let seqs = 0..golden.num_seqs.min(8);
+    let mut checked = 0usize;
+    for seq in seqs {
+        let id = RequestId::new(50_000 + seq as u64);
+        ex.execute_prefill(PrefillPlan {
+            requests: &[dflash_prefill_item(id, golden.prompt(seq))],
+            echo: false,
+        })
+        .expect("DFlash prefill hidden capture");
+
+        let verify_tokens: Vec<u32> = (0..span_len).map(|step| golden.decode(seq, step)).collect();
+        let result = ex
+            .execute_speculative_verify(SpeculativeVerifyPlan {
+                requests: &[SpeculativeVerifyStepItem::new(
+                    id,
+                    verify_tokens,
+                    SamplingParams::default(),
+                )],
+            })
+            .expect("DFlash speculative verify");
+        let request = &result.requests[0];
+        assert_eq!(request.request_id, id);
+        assert_eq!(request.target_tokens.len(), span_len);
+        for (pos, &token) in request.target_tokens.iter().enumerate() {
+            assert_token_within_hf_regret(
+                &format!("seq {seq} verify pos {pos}"),
+                token,
+                &golden.topk(seq, pos + 1),
+            );
+            checked += 1;
+        }
+        ex.drop_request(id).expect("drop DFlash golden request");
+    }
+
+    let mut full_path_matched = 0usize;
+    for seq in 0..golden.num_seqs.min(8) {
+        let id = RequestId::new(70_000 + seq as u64);
+        ex.execute_prefill(PrefillPlan {
+            requests: &[dflash_prefill_item(id, golden.prompt(seq))],
+            echo: false,
+        })
+        .expect("DFlash full-path prefill hidden capture");
+
+        let current_token = golden.decode(seq, 0);
+        let draft = ex
+            .execute_speculative_draft(SpeculativeDraftPlan {
+                requests: &[SpeculativeDraftStepItem::new(
+                    id,
+                    current_token,
+                    SamplingParams::default(),
+                )],
+            })
+            .expect("DFlash native draft");
+        let draft_request = &draft.requests[0];
+        assert_eq!(draft_request.request_id, id);
+        assert_eq!(draft_request.token_ids[0], current_token);
+        assert_eq!(
+            draft_request.token_ids.len(),
+            span_len,
+            "DFlash draft span should match the verifier block size"
+        );
+
+        let result = ex
+            .execute_speculative_verify(SpeculativeVerifyPlan {
+                requests: &[SpeculativeVerifyStepItem::new(
+                    id,
+                    draft_request.token_ids.clone(),
+                    SamplingParams::default(),
+                )],
+            })
+            .expect("DFlash native draft verify");
+        let request = &result.requests[0];
+        assert_eq!(request.request_id, id);
+        assert_eq!(request.target_tokens.len(), draft_request.token_ids.len());
+        assert_token_within_hf_regret(
+            &format!("full-path seq {seq} verify pos 0"),
+            request.target_tokens[0],
+            &golden.topk(seq, 1),
+        );
+        assert_eq!(
+            request.accepted_tokens.len(),
+            request.matched_draft_tokens + 1
+        );
+        assert_eq!(
+            request.accepted_tokens.last().copied(),
+            request
+                .target_tokens
+                .get(request.matched_draft_tokens)
+                .copied()
+        );
+        for matched in 0..request.matched_draft_tokens {
+            assert_eq!(
+                request.accepted_tokens[matched],
+                draft_request.token_ids[matched + 1],
+                "full-path accepted draft token mismatch at seq {seq} matched {matched}"
+            );
+        }
+        full_path_matched += request.matched_draft_tokens;
+        checked += 1;
+        ex.drop_request(id)
+            .expect("drop DFlash full-path golden request");
+    }
+    assert!(
+        full_path_matched > 0,
+        "DFlash full draft→verify gate accepted no draft candidates"
+    );
+
+    let chunked_seq = 0usize;
+    let chunked_prompt = golden.prompt(chunked_seq);
+    assert!(
+        chunked_prompt.len() >= 2,
+        "chunked DFlash gate needs a prompt with at least two tokens"
+    );
+    let chunk_budget = (chunked_prompt.len() / 2).max(1);
+    let chunked_id = RequestId::new(60_000);
+    let mut chunked_completed = false;
+    let mut chunked_steps = 0usize;
+    while !chunked_completed {
+        let result = ex
+            .execute_prefill(PrefillPlan {
+                requests: &[dflash_chunked_prefill_item(
+                    chunked_id,
+                    chunked_prompt.clone(),
+                    chunk_budget,
+                )],
+                echo: false,
+            })
+            .expect("DFlash chunked prefill hidden capture");
+        let request = &result.requests[0];
+        assert_eq!(request.request_id, chunked_id);
+        chunked_completed = request.completed;
+        chunked_steps += 1;
+        assert!(
+            chunked_steps <= chunked_prompt.len(),
+            "chunked DFlash prefill failed to make progress"
+        );
+    }
+    assert!(
+        chunked_steps > 1,
+        "DFlash chunked prefill gate did not force multiple chunks"
+    );
+    let verify_tokens: Vec<u32> = (0..span_len)
+        .map(|step| golden.decode(chunked_seq, step))
+        .collect();
+    let result = ex
+        .execute_speculative_verify(SpeculativeVerifyPlan {
+            requests: &[SpeculativeVerifyStepItem::new(
+                chunked_id,
+                verify_tokens,
+                SamplingParams::default(),
+            )],
+        })
+        .expect("DFlash speculative verify after chunked prefill");
+    let request = &result.requests[0];
+    assert_eq!(request.request_id, chunked_id);
+    assert_eq!(request.target_tokens.len(), span_len);
+    for (pos, &token) in request.target_tokens.iter().enumerate() {
+        assert_token_within_hf_regret(
+            &format!("chunked seq {chunked_seq} verify pos {pos}"),
+            token,
+            &golden.topk(chunked_seq, pos + 1),
+        );
+        checked += 1;
+    }
+    ex.drop_request(chunked_id)
+        .expect("drop chunked DFlash golden request");
+    eprintln!("dflash verifier-span golden gate checked {checked} target positions");
 }

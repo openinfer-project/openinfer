@@ -1,22 +1,34 @@
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::thread;
 
-use anyhow::Result;
-use crossbeam_channel as channel;
-
-use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::config::{Config, TensorParallelConfig};
-use crate::weights::{ModelRuntimeConfig, Qwen3Model};
-use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
+use crate::batch_decode_buffers::BATCH_BUCKETS;
+use crate::config::{Config, DFlashConfig};
+use crate::speculative::{
+    DraftPlan as SpeculativeDraftPlan, DraftResult as SpeculativeDraftResult,
+    VerifyPlan as SpeculativeVerifyPlan, VerifyResult as SpeculativeVerifyResult,
+    VerifyStepItem as SpeculativeVerifyStepItem, build_verify_results,
+};
+use crate::weights::Qwen3Model;
+use crate::{Qwen3LoraOptions, Qwen3SpeculativeOptions};
 use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest};
-use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
-use openinfer_kv_cache::{
-    KvBlockGuard, KvBuffer, KvCacheManager, KvView, LoadReservation, PrefixProbe,
-};
-use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_kv_cache::{KvCacheManager, LoadReservation, PrefixProbe};
+use openinfer_kv_offload::{LoadHandle, OffloadEngine};
+
+mod dflash_lane;
+mod dflash_prefill;
+mod lifecycle;
+mod model_executor;
+mod speculative_exec;
+mod worker;
+
+use self::worker::{LocalQwen3Lane, RankWorker, StepCommand, WorkerStepOutcome};
+
+const BF16_BYTES: usize = 2;
+const DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES: usize = 1024 * 1024 * 1024;
+const DFLASH_ALLOCATOR_MARGIN_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) u64);
@@ -81,6 +93,11 @@ impl PrefillStepItem {
             chunk_start: 0,
             chunk_tokens,
         }
+    }
+
+    pub fn with_chunk_budget(mut self, chunk_budget: usize) -> Self {
+        self.chunk_budget = chunk_budget;
+        self
     }
 
     /// Prompt tokens forwarded this step.
@@ -248,6 +265,154 @@ fn build_batch_decode_request_results(
     Ok(outputs)
 }
 
+pub(super) struct DFlashMemoryReserve {
+    total_bytes: usize,
+    request_state_budget_bytes: usize,
+}
+
+fn dflash_memory_reserve(options: &Qwen3SpeculativeOptions) -> Result<DFlashMemoryReserve> {
+    let Some(dflash) = options.dflash.as_ref() else {
+        return Ok(DFlashMemoryReserve {
+            total_bytes: 0,
+            request_state_budget_bytes: 0,
+        });
+    };
+    let path = dflash
+        .model_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("DFlash model path must be valid UTF-8"))?;
+    let config = DFlashConfig::from_file(path)?;
+    let (shard_paths, _) = openinfer_core::weight_loader::load_shard_info(path)?;
+    let weight_bytes = shard_paths.iter().try_fold(0usize, |acc, path| {
+        let len = std::fs::metadata(path)
+            .with_context(|| format!("stat DFlash shard {path}"))?
+            .len() as usize;
+        Ok::<usize, anyhow::Error>(acc + len)
+    })?;
+    let extra_bytes = dflash_request_state_reserve_bytes(&config)?;
+    let state_budget_bytes = extra_bytes.saturating_sub(DFLASH_ALLOCATOR_MARGIN_BYTES);
+    let reserved = weight_bytes
+        .checked_add(extra_bytes)
+        .context("DFlash memory reserve overflow")?;
+    log::info!(
+        "Qwen3 DFlash memory reserve: weights={:.1} MB, extra={:.1} MB, state_budget={:.1} MB, total={:.1} MB",
+        weight_bytes as f64 / 1e6,
+        extra_bytes as f64 / 1e6,
+        state_budget_bytes as f64 / 1e6,
+        reserved as f64 / 1e6,
+    );
+    Ok(DFlashMemoryReserve {
+        total_bytes: reserved,
+        request_state_budget_bytes: state_budget_bytes,
+    })
+}
+
+fn checked_product(values: &[usize], context: &'static str) -> Result<usize> {
+    values.iter().try_fold(1usize, |acc, &value| {
+        acc.checked_mul(value).context(context)
+    })
+}
+
+fn checked_sum(values: &[usize], context: &'static str) -> Result<usize> {
+    values.iter().try_fold(0usize, |acc, &value| {
+        acc.checked_add(value).context(context)
+    })
+}
+
+fn bf16_tensor_bytes(rows: usize, cols: usize, context: &'static str) -> Result<usize> {
+    checked_product(&[rows, cols, BF16_BYTES], context)
+}
+
+fn dflash_request_state_reserve_bytes(config: &DFlashConfig) -> Result<usize> {
+    let footprint =
+        dflash_request_state_footprint_bytes_for_len(config, config.max_position_embeddings)?;
+    let with_margin = footprint
+        .checked_add(DFLASH_ALLOCATOR_MARGIN_BYTES)
+        .context("DFlash request-state reserve overflow")?;
+    Ok(with_margin.max(DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES))
+}
+
+pub(super) fn dflash_request_state_footprint_bytes_for_len(
+    config: &DFlashConfig,
+    max_cache_len: usize,
+) -> Result<usize> {
+    let max_tokens = max_cache_len;
+    let block = config.block_size;
+    let hidden = config.hidden_size;
+    let q_dim = checked_product(
+        &[config.num_attention_heads, config.head_dim],
+        "DFlash q dimension overflow",
+    )?;
+    let kv_dim = checked_product(
+        &[config.num_key_value_heads, config.head_dim],
+        "DFlash KV dimension overflow",
+    )?;
+    let inter = config.intermediate_size;
+    let context_feature_dim = hidden
+        .checked_mul(config.dflash_config.target_layer_ids.len())
+        .context("DFlash context feature dimension overflow")?;
+
+    let kv_cache = checked_product(
+        &[config.num_hidden_layers, 2, max_tokens, kv_dim, BF16_BYTES],
+        "DFlash KV cache reserve overflow",
+    )?;
+    let pending_context = bf16_tensor_bytes(
+        max_tokens,
+        context_feature_dim,
+        "DFlash pending-context reserve overflow",
+    )?;
+    let context_projected = bf16_tensor_bytes(
+        max_tokens,
+        hidden,
+        "DFlash projected-context reserve overflow",
+    )?;
+    let context_hidden =
+        bf16_tensor_bytes(max_tokens, hidden, "DFlash context-hidden reserve overflow")?;
+    let tail_input = bf16_tensor_bytes(max_tokens, hidden, "DFlash tail-input reserve overflow")?;
+    let k_tail = bf16_tensor_bytes(max_tokens, kv_dim, "DFlash K-tail reserve overflow")?;
+    let v_tail = bf16_tensor_bytes(max_tokens, kv_dim, "DFlash V-tail reserve overflow")?;
+
+    let block_hidden_count = checked_product(
+        &[5, block, hidden, BF16_BYTES],
+        "DFlash block hidden scratch reserve overflow",
+    )?;
+    let block_q_count = checked_product(
+        &[2, block, q_dim, BF16_BYTES],
+        "DFlash block attention scratch reserve overflow",
+    )?;
+    let block_mlp_count = checked_product(
+        &[3, block, inter, BF16_BYTES],
+        "DFlash block MLP scratch reserve overflow",
+    )?;
+    let block_logits = bf16_tensor_bytes(
+        block,
+        config.vocab_size,
+        "DFlash block logits reserve overflow",
+    )?;
+    let block_token_ids = checked_product(
+        &[block, std::mem::size_of::<u32>()],
+        "DFlash token-id scratch reserve overflow",
+    )?;
+
+    checked_sum(
+        &[
+            kv_cache,
+            pending_context,
+            context_projected,
+            context_hidden,
+            tail_input,
+            k_tail,
+            v_tail,
+            block_hidden_count,
+            block_q_count,
+            block_mlp_count,
+            block_logits,
+            block_token_ids,
+        ],
+        "DFlash request-state reserve overflow",
+    )
+}
+
 fn execute_step_on_lane(
     lane: &mut LocalQwen3Lane,
     step: &StepCommand,
@@ -264,8 +429,24 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            let (logits, all_position_logits) =
-                lane.execute_prefill(&prompts, kv_views, &lora_adapters, *echo)?;
+            let capture_dflash_context = lane.should_capture_dflash_prefill_context(requests);
+            let capture_layer_ids = if capture_dflash_context {
+                lane.dflash_capture_layer_ids()
+            } else {
+                None
+            };
+            let (logits, all_position_logits, _captured_hidden) = lane.execute_prefill(
+                &prompts,
+                kv_views,
+                &lora_adapters,
+                *echo,
+                capture_layer_ids.as_deref(),
+            )?;
+            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
+                requests,
+                capture_dflash_context,
+                _captured_hidden.as_ref(),
+            )?;
             if collect_result {
                 let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
                 let random_vals: Vec<f32> = requests.iter().map(|r| r.random_val).collect();
@@ -279,7 +460,73 @@ fn execute_step_on_lane(
                         all_position_logits.as_ref(),
                         *echo,
                     )?,
+                    dflash_context_captured_requests,
                 }))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::SpeculativeVerify { requests, kv_views } => {
+            for req in requests {
+                anyhow::ensure!(
+                    req.params.is_greedy(),
+                    "speculative verification currently supports greedy sampling only"
+                );
+            }
+            let prompts: Vec<&[u32]> = requests
+                .iter()
+                .map(SpeculativeVerifyStepItem::as_slice)
+                .collect();
+            let lora_adapters: Vec<Option<&str>> = requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+            let capture_layer_ids = lane.dflash_capture_layer_ids();
+            let verify_start = lane.start_dflash_timing()?;
+            let verify_nvtx_range = if lane.dflash_nvtx_enabled() {
+                Some(nvtx::range!("qwen3.dflash.verify"))
+            } else {
+                None
+            };
+            let (_last_logits, all_position_logits, captured_hidden) = lane.execute_prefill(
+                &prompts,
+                kv_views,
+                &lora_adapters,
+                true,
+                capture_layer_ids.as_deref(),
+            )?;
+            if collect_result {
+                let all_position_logits = all_position_logits.ok_or_else(|| {
+                    anyhow::anyhow!("speculative verification did not return all-position logits")
+                })?;
+                let params: Vec<&SamplingParams> = requests
+                    .iter()
+                    .flat_map(|req| std::iter::repeat_n(&req.params, req.token_ids.len()))
+                    .collect();
+                let random_vals = vec![0.0; params.len()];
+                let target_tokens =
+                    lane.select_step_tokens(&all_position_logits, &params, &random_vals)?;
+                let verify_ms = lane.finish_dflash_timing(verify_start)?;
+                drop(verify_nvtx_range);
+                let results = build_verify_results(requests, &target_tokens)?;
+                lane.record_verify_dflash_context(
+                    requests,
+                    &results,
+                    captured_hidden.as_ref(),
+                    verify_ms,
+                )?;
+                Ok(WorkerStepOutcome::SpeculativeVerify(
+                    SpeculativeVerifyResult { requests: results },
+                ))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::SpeculativeDraft { requests } => {
+            if collect_result {
+                Ok(WorkerStepOutcome::SpeculativeDraft(
+                    lane.execute_dflash_draft(requests)?,
+                ))
             } else {
                 Ok(WorkerStepOutcome::Ack)
             }
@@ -382,6 +629,7 @@ struct SamplingScratch {
     row_states: cudarc::driver::CudaSlice<u8>,
     valid: cudarc::driver::CudaSlice<u8>,
     out: cudarc::driver::CudaSlice<i32>,
+    out_host: Vec<i32>,
 }
 
 impl SamplingScratch {
@@ -399,6 +647,7 @@ impl SamplingScratch {
                 .alloc_zeros(openinfer_core::ops::flashinfer_topk_row_states_bytes())?,
             valid: ctx.stream.alloc_zeros(1)?,
             out: ctx.stream.alloc_zeros(max_batch_bucket)?,
+            out_host: vec![0; max_batch_bucket],
         })
     }
 }
@@ -550,6 +799,7 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
+    pub dflash_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -572,6 +822,30 @@ pub(crate) trait ModelExecutor: Send {
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
+    fn execute_speculative_verify(
+        &mut self,
+        _plan: SpeculativeVerifyPlan<'_>,
+    ) -> Result<SpeculativeVerifyResult> {
+        anyhow::bail!("speculative verification is not implemented for this executor")
+    }
+    fn execute_speculative_draft(
+        &mut self,
+        _plan: SpeculativeDraftPlan<'_>,
+    ) -> Result<SpeculativeDraftResult> {
+        anyhow::bail!("speculative draft is not implemented for this executor")
+    }
+    fn speculative_enabled(&self) -> bool {
+        false
+    }
+    fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
+        self.speculative_enabled()
+    }
+    fn speculative_state_budget_bytes(&self) -> Option<usize> {
+        None
+    }
+    fn speculative_request_state_bytes(&self, _prompt_len: usize, _max_tokens: usize) -> usize {
+        0
+    }
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -639,6 +913,9 @@ struct Qwen3ExecutorMetadata {
     block_size: usize,
     stop_token_ids: Vec<u32>,
     config: Config,
+    max_context_tokens: usize,
+    dflash_config: Option<DFlashConfig>,
+    dflash_state_budget_bytes: usize,
 }
 
 pub struct Qwen3Executor {
@@ -668,6 +945,8 @@ pub struct Qwen3Executor {
     /// so prefix matching itself stays enabled). Set via
     /// [`Self::set_no_prefix_cache`].
     l1_retention_disabled: bool,
+    speculative_enabled: bool,
+    dflash_ready_requests: HashSet<RequestId>,
 }
 
 /// One request's in-flight CPU-tier KV prefetch.
@@ -684,1092 +963,6 @@ struct PrefetchState {
     handle: Option<LoadHandle>,
 }
 
-impl Qwen3Executor {
-    pub(crate) fn single(model: Qwen3Model, offload_opts: &Qwen3OffloadOptions) -> Result<Self> {
-        let budget = model.kv_budget();
-        let kv_mgr = KvCacheManager::new(
-            &model.device_ctx().stream,
-            budget.num_layers,
-            budget.num_kv_heads,
-            budget.head_dim,
-            budget.block_size,
-            budget.num_blocks,
-        )?;
-        let metadata = Qwen3ExecutorMetadata {
-            block_size: budget.block_size,
-            stop_token_ids: model.config().stop_token_ids.clone(),
-            config: model.config().clone(),
-        };
-        let kv_buffer = kv_mgr.buffer().clone();
-        // Build the offload engine while the model's stream is still in hand
-        // (it moves into the RankWorker below). Registers the fused KV buffer.
-        let offload = build_offload(offload_opts, &kv_mgr, model.device_ctx())?;
-        let total_blocks = kv_mgr.pool().total_blocks();
-        let padding_block_id = kv_mgr.pool().padding_block_id();
-        Ok(Self {
-            metadata,
-            kv_mgr,
-            request_kvs: HashMap::new(),
-            primary: RankWorker::spawn(
-                0,
-                LocalQwen3Lane::new(model, kv_buffer, total_blocks, padding_block_id)?,
-            )?,
-            workers: Vec::new(),
-            loaded_lora_adapters: HashSet::new(),
-            prefix_cache_enabled: true,
-            lora_options: Qwen3LoraOptions::default(),
-            offload,
-            saved_cursor: HashMap::new(),
-            prefetch: HashMap::new(),
-            l1_retention_disabled: false,
-        })
-    }
-
-    pub fn from_runtime(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        device_ordinals: &[usize],
-    ) -> Result<Self> {
-        Self::from_runtime_with_lora_options(
-            model_path,
-            enable_cuda_graph,
-            device_ordinals,
-            Qwen3LoraOptions::default(),
-            Qwen3OffloadOptions::disabled(),
-        )
-    }
-
-    pub fn from_runtime_with_lora_options(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        device_ordinals: &[usize],
-        lora_options: Qwen3LoraOptions,
-        offload_options: Qwen3OffloadOptions,
-    ) -> Result<Self> {
-        let lora_options = lora_options.validate()?;
-        anyhow::ensure!(
-            !device_ordinals.is_empty(),
-            "Qwen3 executor requires at least one device"
-        );
-        anyhow::ensure!(
-            !offload_options.enabled || device_ordinals.len() == 1,
-            "KV offload is only supported on the single-GPU path (tensor parallel \
-             shards KV per rank); got {} devices",
-            device_ordinals.len()
-        );
-        if device_ordinals.len() == 1 {
-            let model = Qwen3Model::from_safetensors_with_runtime(
-                model_path,
-                ModelRuntimeConfig {
-                    enable_cuda_graph,
-                    tensor_parallel: None,
-                    device_ordinal: device_ordinals[0],
-                    max_loras: lora_options.max_loras,
-                    max_lora_rank: lora_options.max_lora_rank,
-                },
-            )?;
-            let mut executor = Self::single(model, &offload_options)?;
-            executor.lora_options = lora_options;
-            return Ok(executor);
-        }
-
-        let world_size = device_ordinals.len();
-        let mut models = Vec::with_capacity(world_size);
-        for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
-            models.push(Qwen3Model::from_safetensors_with_runtime(
-                model_path,
-                ModelRuntimeConfig {
-                    enable_cuda_graph,
-                    tensor_parallel: Some(TensorParallelConfig { rank, world_size }),
-                    device_ordinal,
-                    max_loras: lora_options.max_loras,
-                    max_lora_rank: lora_options.max_lora_rank,
-                },
-            )?);
-        }
-
-        // Compute budget from first model (all ranks share geometry).
-        let budget = models[0].kv_budget();
-
-        // Create the centralized KvCacheManager on rank 0's stream.
-        let kv_mgr = KvCacheManager::new(
-            &models[0].device_ctx().stream,
-            budget.num_layers,
-            budget.num_kv_heads,
-            budget.head_dim,
-            budget.block_size,
-            budget.num_blocks,
-        )?;
-
-        let metadata = Qwen3ExecutorMetadata {
-            block_size: budget.block_size,
-            stop_token_ids: models[0].config().stop_token_ids.clone(),
-            config: models[0].config().clone(),
-        };
-
-        // Create extra KvBuffers for ranks 1+ on their respective streams.
-        let mut extra_kv_buffers = Vec::with_capacity(world_size - 1);
-        for model in &models[1..] {
-            extra_kv_buffers.push(KvBuffer::new(
-                &model.device_ctx().stream,
-                budget.num_layers,
-                budget.num_kv_heads,
-                budget.head_dim,
-                budget.block_size,
-                budget.num_blocks,
-            )?);
-        }
-
-        let streams = models
-            .iter()
-            .map(|m| m.device_ctx().stream.clone())
-            .collect();
-        let comms = cudarc::nccl::safe::Comm::from_devices(streams)
-            .map_err(|e| anyhow::anyhow!("failed to initialize NCCL comms: {e:?}"))?;
-        for (model, comm) in models.iter_mut().zip(comms) {
-            model.attach_tp_comm(comm);
-        }
-
-        let total_blocks = kv_mgr.pool().total_blocks();
-        let padding_block_id = kv_mgr.pool().padding_block_id();
-
-        // Primary rank gets the KvBuffer from the centralized manager.
-        let primary_buffer = kv_mgr.buffer().clone();
-        let mut models_iter = models.into_iter();
-        let primary_model = models_iter.next().unwrap();
-        let primary = RankWorker::spawn(
-            0,
-            LocalQwen3Lane::new(
-                primary_model,
-                primary_buffer,
-                total_blocks,
-                padding_block_id,
-            )?,
-        )?;
-
-        // Worker ranks get their own extra KvBuffers.
-        let workers = models_iter
-            .zip(extra_kv_buffers)
-            .enumerate()
-            .map(|(index, (model, buffer))| {
-                let lane = LocalQwen3Lane::new(model, buffer, total_blocks, padding_block_id)?;
-                RankWorker::spawn(index + 1, lane)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            metadata,
-            kv_mgr,
-            request_kvs: HashMap::new(),
-            primary,
-            workers,
-            loaded_lora_adapters: HashSet::new(),
-            prefix_cache_enabled: true,
-            lora_options,
-            // Offload is single-GPU only (asserted above); never built here.
-            offload: None,
-            saved_cursor: HashMap::new(),
-            prefetch: HashMap::new(),
-            l1_retention_disabled: false,
-        })
-    }
-
-    pub fn block_size(&self) -> usize {
-        <Self as ModelExecutor>::block_size(self)
-    }
-
-    pub fn max_request_blocks(&self) -> usize {
-        <Self as ModelExecutor>::max_request_blocks(self)
-    }
-
-    pub fn available_blocks(&self) -> usize {
-        <Self as ModelExecutor>::available_blocks(self)
-    }
-
-    pub fn is_stop_token(&self, token_id: u32) -> bool {
-        <Self as ModelExecutor>::is_stop_token(self, token_id)
-    }
-
-    pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
-        <Self as ModelExecutor>::drop_request(self, request_id)
-    }
-
-    pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        <Self as ModelExecutor>::execute_prefill(self, plan)
-    }
-
-    pub fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
-        <Self as ModelExecutor>::execute_decode(self, plan)
-    }
-
-    pub fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        <Self as ModelExecutor>::execute_unified(self, plan)
-    }
-
-    /// Prefix caching is on by default; tests that assert bit-identical
-    /// replay disable it (a cache hit changes prefill GEMM shapes, which
-    /// drifts logits by bf16 ULPs).
-    pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
-        self.prefix_cache_enabled = enabled;
-    }
-
-    /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
-    /// active:
-    ///   * **No offload** — classic: disable prefix matching outright, so every
-    ///     prefill recomputes the full prompt.
-    ///   * **With offload** — pure-L2 mode: keep matching on (the host-tier
-    ///     restore registers blocks and relies on `match_and_add_prefix` to pick
-    ///     them up) but stop retaining completed blocks in HBM, so no request
-    ///     ever serves its prefix from a cross-request L1 hit. Every reuse then
-    ///     comes from the host tier, which is the point of the L2 benchmark.
-    ///
-    /// A resident HBM block and its host-tier copy share one content hash, so
-    /// the cache cannot be told to prefer L2 for a block still in HBM — the only
-    /// way to force the bytes from L2 is to not keep the HBM copy around.
-    pub fn set_no_prefix_cache(&mut self, on: bool) {
-        if self.offload.is_some() {
-            self.l1_retention_disabled = on;
-        } else {
-            self.prefix_cache_enabled = !on;
-        }
-    }
-
-    /// Whether KV offload is active on this executor.
-    pub fn offload_enabled(&self) -> bool {
-        self.offload.is_some()
-    }
-
-    /// Flush pending offload saves into the host read cache so a following
-    /// query can see them. A persistence barrier for handoff and tests; no-op
-    /// without offload.
-    pub fn flush_offload_saves(&self) {
-        if let Some(offload) = &self.offload {
-            offload.flush_saves();
-        }
-    }
-
-    /// Drop every cached-but-unused GPU prefix block. With offload on, this
-    /// forces a cold prefix to be restored from the host tier on its next
-    /// request (rather than served from HBM).
-    pub fn evict_cached_blocks(&self) {
-        self.kv_mgr.pool().evict_inactive();
-    }
-
-    /// Begin an async CPU-tier KV prefetch for `request_id`; see the
-    /// [`ModelExecutor`] hook. Public so admission drivers and tests can park a
-    /// request on its load. Returns `true` when a load is in flight.
-    pub fn begin_kv_prefetch(
-        &mut self,
-        request_id: RequestId,
-        prompt_tokens: &[u32],
-        lora_adapter: Option<&str>,
-        reserve_floor: usize,
-    ) -> bool {
-        <Self as ModelExecutor>::begin_kv_prefetch(
-            self,
-            request_id,
-            prompt_tokens,
-            lora_adapter,
-            reserve_floor,
-        )
-    }
-
-    /// Block until at least one in-flight prefetch settles, then sweep the
-    /// rest; returns the settled request ids (now prefill-eligible).
-    pub fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
-        <Self as ModelExecutor>::wait_ready_prefetch(self)
-    }
-
-    // ── KV-offload SAVE ────────────────────────────────────────────────
-
-    /// Save every block that sealed since this request's last save to the host
-    /// tier (fire-and-forget). Safe to call right after `apply_prefill`/
-    /// `apply_decode`: the producing step's token read-back has already
-    /// synchronized the compute stream, so the sealed KV is fully written.
-    fn save_sealed_blocks(&mut self, request_id: RequestId) {
-        if self.offload.is_none() {
-            return;
-        }
-        let Some(rkv) = self.request_kvs.get(&request_id) else {
-            return;
-        };
-        // `assigned_block_hashes` lists only sealed (registered) blocks; the
-        // partial tail block has no hash and never appears here.
-        let assigned = rkv.assigned_block_hashes();
-        let prefix_matched = rkv.prefix_matched_blocks();
-        let cursor = self
-            .saved_cursor
-            .entry(request_id)
-            .or_insert(prefix_matched);
-        if assigned.len() <= *cursor {
-            return;
-        }
-        let fresh = &assigned[*cursor..];
-        let block_ids: Vec<i32> = fresh.iter().map(|(id, _)| *id).collect();
-        let block_hashes: Vec<Vec<u8>> = fresh.iter().map(|(_, h)| h.to_vec()).collect();
-        // Pin exactly the blocks being saved (aligned 1:1 with `assigned`) for
-        // the duration of the async D2H, so a finished request can't hand the
-        // slot to a new request that overwrites it before the copy lands.
-        let pins: Vec<KvBlockGuard> = rkv
-            .assigned_block_guards()
-            .into_iter()
-            .skip(*cursor)
-            .collect();
-        *cursor = assigned.len();
-        self.offload
-            .as_ref()
-            .expect("offload present")
-            .save(&block_ids, &block_hashes, pins);
-    }
-
-    // ── Chunked prefill ────────────────────────────────────────────────
-
-    /// Prepare one prefill step for `req`: create its `RequestKv` on the
-    /// first chunk (matching the prefix cache), then clamp the scheduler's
-    /// chunk budget to the prompt tokens actually remaining and allocate KV
-    /// for them. Sets `chunk_start`/`chunk_tokens` on the item.
-    fn schedule_prefill_chunk(&mut self, req: &mut PrefillStepItem) -> Result<()> {
-        if !self.request_kvs.contains_key(&req.request_id) {
-            let mut rkv = self.kv_mgr.pool().new_request(
-                req.prompt_tokens.clone(),
-                req.max_output_tokens,
-                req.lora_adapter.as_deref(),
-            );
-            // Echo needs logits for every prompt position; cached positions
-            // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
-            }
-            self.request_kvs.insert(req.request_id, rkv);
-            // match_and_add_prefix above already absorbed any CPU-prefetched
-            // blocks (now held by the request's sequence), so release the
-            // prefetch's separate hold.
-            self.prefetch.remove(&req.request_id);
-        }
-        let rkv = self
-            .request_kvs
-            .get_mut(&req.request_id)
-            .expect("inserted above");
-        req.chunk_start = rkv.kv_position();
-        let remaining = req.prompt_tokens.len() - req.chunk_start;
-        // Echo must produce all-position logits in a single forward, so it is
-        // exempt from chunking (the scheduler never splits echo requests).
-        req.chunk_tokens = if req.echo {
-            remaining
-        } else {
-            remaining.min(req.chunk_budget)
-        };
-        assert!(
-            req.chunk_tokens > 0,
-            "zero-token prefill chunk for {:?} (budget {})",
-            req.request_id,
-            req.chunk_budget
-        );
-        rkv.schedule_prefill(req.chunk_tokens, self.kv_mgr.pool())
-            .map_err(|e| anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id))
-    }
-
-    /// Register a finished prefill step on the request's KV: the final chunk
-    /// carries the first generated token, non-final chunks only advance the
-    /// KV position.
-    fn apply_prefill_result(&mut self, result: &PrefillRequestResult) -> Result<()> {
-        let rkv = self
-            .request_kvs
-            .get_mut(&result.request_id)
-            .expect("request must exist after prefill");
-        if result.completed {
-            rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
-        } else {
-            rkv.apply_prefill_chunk(self.kv_mgr.pool())
-        }
-    }
-
-    // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
-    // The trait-facing prefetch hooks (`begin_kv_prefetch`,
-    // `drain_ready_prefetch`, `wait_ready_prefetch`, `has_pending_prefetch`)
-    // live in the `ModelExecutor` impl below; `settle_prefetch` is their shared
-    // helper.
-
-    /// Finalize one prefetch whose load returned `result`. On success the
-    /// reserved blocks are staged + registered (held by the probe until the
-    /// request prefills); on failure the state is dropped so the request
-    /// prefills from scratch.
-    fn settle_prefetch(
-        &mut self,
-        id: RequestId,
-        result: Result<(), openinfer_kv_offload::EngineError>,
-    ) {
-        if let Some(st) = self.prefetch.get_mut(&id) {
-            st.handle = None;
-        }
-        match result {
-            Ok(()) => {
-                let reservation = self
-                    .prefetch
-                    .get_mut(&id)
-                    .and_then(|st| st.reservation.take())
-                    .expect("reservation present until commit");
-                let st = self.prefetch.get_mut(&id).expect("prefetch present");
-                self.kv_mgr
-                    .pool()
-                    .commit_loaded_blocks(&mut st.probe, reservation);
-            }
-            Err(e) => {
-                log::warn!("KV offload load failed for {id:?} (prefill from scratch): {e}");
-                self.prefetch.remove(&id);
-            }
-        }
-    }
-
-    fn wait_for_step_ack(
-        pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
-        op_name: &'static str,
-    ) -> Result<()> {
-        for recv in pending {
-            match recv
-                .recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??
-            {
-                WorkerStepOutcome::Ack => {}
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
-                        other.kind()
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn run_step(&self, step: &StepCommand) -> Result<WorkerStepOutcome> {
-        let primary = self.primary.run_step(step.clone(), true)?;
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for worker in &self.workers {
-            pending.push(worker.run_step(step.clone(), false)?);
-        }
-        let primary_result = primary
-            .recv()
-            .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
-        Self::wait_for_step_ack(pending, step.kind())?;
-        Ok(primary_result)
-    }
-}
-
-/// Build the KV-offload engine for the single-GPU path, or `None` when offload
-/// is disabled. Registers the fused KV buffer with pegaflow against the model's
-/// device/stream — must be called while that stream is still owned by the model
-/// (before it moves into the `RankWorker`).
-fn build_offload(
-    opts: &Qwen3OffloadOptions,
-    kv_mgr: &KvCacheManager,
-    ctx: &DeviceContext,
-) -> Result<Option<OffloadEngine>> {
-    if !opts.enabled {
-        return Ok(None);
-    }
-    let device_id = ctx.device_ordinal as i32;
-    let config = OffloadConfig::new(
-        format!("qwen3-4b-dev{device_id}"),
-        device_id,
-        opts.pinned_pool_bytes,
-    );
-    let engine = OffloadEngine::new(config, kv_mgr.buffer(), &ctx.stream)
-        .map_err(|e| anyhow::anyhow!("KV offload engine init failed: {e}"))?;
-    log::info!(
-        "KV offload enabled on device {device_id} ({} MiB host tier)",
-        opts.pinned_pool_bytes >> 20
-    );
-    Ok(Some(engine))
-}
-
-fn ensure_lora_capacity(
-    loaded_lora_adapters: &HashSet<String>,
-    lora_name: &str,
-    max_loras: usize,
-    load_inplace: bool,
-) -> Result<()> {
-    if loaded_lora_adapters.contains(lora_name) {
-        anyhow::ensure!(
-            load_inplace,
-            "Qwen3 LoRA adapter {lora_name} is already loaded"
-        );
-        return Ok(());
-    }
-    anyhow::ensure!(
-        loaded_lora_adapters.len() < max_loras,
-        "Qwen3 LoRA adapter capacity exceeded: max_loras={}, loaded_adapters={}, requested={}",
-        max_loras,
-        loaded_lora_adapters.len(),
-        lora_name
-    );
-    Ok(())
-}
-
-impl ModelExecutor for Qwen3Executor {
-    fn block_size(&self) -> usize {
-        self.metadata.block_size
-    }
-
-    fn max_request_blocks(&self) -> usize {
-        self.kv_mgr.pool().max_request_blocks()
-    }
-
-    fn max_context_tokens(&self) -> usize {
-        self.metadata.config.max_position_embeddings
-    }
-
-    fn max_decode_batch_size(&self) -> usize {
-        *BATCH_BUCKETS.last().unwrap()
-    }
-
-    fn available_blocks(&self) -> usize {
-        self.kv_mgr.pool().available_blocks()
-    }
-
-    fn is_stop_token(&self, token_id: u32) -> bool {
-        self.metadata.stop_token_ids.contains(&token_id)
-    }
-
-    fn prefetched_blocks(&self, request_id: RequestId) -> usize {
-        self.prefetch
-            .get(&request_id)
-            .map_or(0, |st| st.probe.held_blocks())
-    }
-
-    fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
-        // Remove and drop — RAII on SchedulableSequence's block guards
-        // returns all allocated blocks regardless of lifecycle state. The same
-        // RAII frees any parked prefetch's reserved/held blocks.
-        self.request_kvs.remove(&request_id);
-        // A parked prefetch may still have a load in flight: pegaflow's worker
-        // is writing the reserved GPU blocks (H2D). Dropping the reservation now
-        // frees those physical pages for immediate reuse while the DMA keeps
-        // landing on them — silent KV corruption, the load-side mirror of the
-        // SAVE keep-alive pin. Block until the copy finishes before the
-        // reservation drops. The scheduler is a dedicated synchronous thread, so
-        // this brief wait costs nothing it could spend elsewhere.
-        if let Some(mut state) = self.prefetch.remove(&request_id) {
-            if let Some(handle) = state.handle.take() {
-                let _ = handle.wait();
-            }
-        }
-        self.saved_cursor.remove(&request_id);
-        Ok(())
-    }
-
-    fn begin_kv_prefetch(
-        &mut self,
-        request_id: RequestId,
-        prompt_tokens: &[u32],
-        lora_adapter: Option<&str>,
-        reserve_floor: usize,
-    ) -> bool {
-        let Some(offload) = self.offload.as_ref() else {
-            return false;
-        };
-        if !self.prefix_cache_enabled {
-            return false;
-        }
-        if self.l1_retention_disabled {
-            // Pure-L2 mode: drop any cross-request HBM retention so the probe
-            // sees gpu_hit == 0 and queries the whole cacheable prefix from the
-            // host tier. Only inactive (completed, unheld) blocks are drained —
-            // the current request holds nothing yet, and in-flight prefetches
-            // keep their reserved blocks, so this never touches live KV.
-            self.kv_mgr.pool().evict_inactive();
-        }
-        let probe = self
-            .kv_mgr
-            .pool()
-            .probe_prefix(prompt_tokens.to_vec(), lora_adapter);
-        let query_hashes = probe.cpu_query_hashes();
-        if query_hashes.is_empty() {
-            return false;
-        }
-        let hit = match offload.query(&request_id.0.to_string(), &query_hashes) {
-            Ok(hit) => hit,
-            Err(e) => {
-                log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");
-                return false;
-            }
-        };
-        let (Some(lease), num_blocks) = (hit.lease, hit.num_blocks) else {
-            return false; // miss
-        };
-        // Blocks promised to admitted requests are off-limits: reserving into
-        // them makes a later prefill chunk or decode growth fail allocation.
-        if self
-            .kv_mgr
-            .pool()
-            .available_blocks()
-            .saturating_sub(reserve_floor)
-            < num_blocks
-        {
-            offload.release_query_lease(lease);
-            return false;
-        }
-        let Some(reservation) = self.kv_mgr.pool().reserve_loaded_blocks(num_blocks) else {
-            // Block pressure: release the lease so its pinned host blocks aren't
-            // held for the full lease TTL, and prefill from scratch rather than
-            // stall.
-            offload.release_query_lease(lease);
-            return false;
-        };
-        let page_ids = reservation.page_ids();
-        let handle = match offload.load(lease, page_ids) {
-            Ok(handle) => handle,
-            Err(e) => {
-                log::warn!("KV offload load submit failed for {request_id:?} (skipping): {e}");
-                // `load` consumes the lease only past its early validation; a
-                // submit error may leave it pinned, so release it (no-op if it
-                // was already consumed).
-                offload.release_query_lease(lease);
-                return false;
-            }
-        };
-        self.prefetch.insert(
-            request_id,
-            PrefetchState {
-                probe,
-                reservation: Some(reservation),
-                handle: Some(handle),
-            },
-        );
-        true
-    }
-
-    fn drain_ready_prefetch(&mut self) -> Vec<RequestId> {
-        let ids: Vec<RequestId> = self.prefetch.keys().copied().collect();
-        let mut done = Vec::new();
-        for id in ids {
-            let poll = match self.prefetch.get_mut(&id).and_then(|st| st.handle.as_mut()) {
-                Some(handle) => handle.poll(),
-                None => continue, // already settled, awaiting prefill
-            };
-            if let Some(result) = poll {
-                self.settle_prefetch(id, result);
-                done.push(id);
-            }
-        }
-        done
-    }
-
-    fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
-        let mut done = Vec::new();
-        if let Some(id) = self
-            .prefetch
-            .iter()
-            .find(|(_, st)| st.handle.is_some())
-            .map(|(id, _)| *id)
-        {
-            let handle = self
-                .prefetch
-                .get_mut(&id)
-                .and_then(|st| st.handle.take())
-                .expect("in-flight handle present");
-            let result = handle.wait();
-            self.settle_prefetch(id, result);
-            // `settle_prefetch` clears the handle, so the drain below skips it;
-            // record it here as the one we blocked on.
-            done.push(id);
-        }
-        // Sweep any others that completed concurrently.
-        for id in self.drain_ready_prefetch() {
-            if !done.contains(&id) {
-                done.push(id);
-            }
-        }
-        done
-    }
-
-    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        // 1. Create RequestKvs (first chunk only), clamp chunk budgets,
-        // schedule KV for this step's tokens
-        let mut requests = plan.requests.to_vec();
-        for req in &mut requests {
-            self.schedule_prefill_chunk(req)?;
-        }
-
-        // 2. Build KvViews (seq_len = chunk_start + this chunk)
-        let kv_views: Vec<KvView> = requests
-            .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.chunk_tokens))
-            .collect();
-
-        // 3. Execute forward
-        let step = StepCommand::Prefill {
-            requests,
-            kv_views,
-            echo: plan.echo,
-        };
-        let outcome = self.run_step(&step)?;
-
-        // 4. Apply prefill
-        let result = match outcome {
-            WorkerStepOutcome::Prefill(result) => result,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "prefill returned unexpected: {}",
-                    other.kind()
-                ));
-            }
-        };
-        for req_result in &result.requests {
-            self.apply_prefill_result(req_result)?;
-        }
-        // 5. Offload the blocks this prefill just sealed (post-step-sync).
-        for req_result in &result.requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-
-        Ok(result)
-    }
-
-    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
-        // 1. Schedule decode for all active requests
-        for req in plan.requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req.request_id)
-                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
-            rkv.schedule_decode(self.kv_mgr.pool()).map_err(|e| {
-                anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
-            })?;
-        }
-
-        // 2. Build KvViews
-        let kv_views: Vec<KvView> = plan
-            .requests
-            .iter()
-            .map(|req| self.request_kvs[&req.request_id].decode_view())
-            .collect();
-
-        // 3. Execute forward
-        let step = StepCommand::Decode {
-            requests: plan.requests.to_vec(),
-            kv_views,
-        };
-        let outcome = self.run_step(&step)?;
-
-        // 4. Apply decode
-        let result = match outcome {
-            WorkerStepOutcome::Decode(result) => result,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "decode returned unexpected: {}",
-                    other.kind()
-                ));
-            }
-        };
-        for req_result in &result.requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after decode");
-            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
-        }
-        // 5. Offload any block this decode step just sealed (post-step-sync).
-        for req_result in &result.requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-
-        Ok(result)
-    }
-
-    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        // 1. Create RequestKvs for prefill requests (first chunk only), clamp
-        // chunk budgets, schedule KV for this step's tokens
-        let mut prefill_requests = plan.prefill_requests.to_vec();
-        for req in &mut prefill_requests {
-            self.schedule_prefill_chunk(req)?;
-        }
-
-        // Schedule decode for active requests
-        for req in plan.decode_requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req.request_id)
-                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
-            rkv.schedule_decode(self.kv_mgr.pool()).map_err(|e| {
-                anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
-            })?;
-        }
-
-        // 2. Build KvViews
-        let prefill_kv_views: Vec<KvView> = prefill_requests
-            .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.chunk_tokens))
-            .collect();
-        let decode_kv_views: Vec<KvView> = plan
-            .decode_requests
-            .iter()
-            .map(|req| self.request_kvs[&req.request_id].decode_view())
-            .collect();
-
-        // 3. Execute forward
-        let step = StepCommand::Unified {
-            prefill_requests,
-            prefill_kv_views,
-            decode_requests: plan.decode_requests.to_vec(),
-            decode_kv_views,
-        };
-        let outcome = self.run_step(&step)?;
-
-        // 4. Apply both prefill and decode
-        let result = match outcome {
-            WorkerStepOutcome::Unified(result) => result,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "unified returned unexpected: {}",
-                    other.kind()
-                ));
-            }
-        };
-        for req_result in &result.prefill_requests {
-            self.apply_prefill_result(req_result)?;
-        }
-        for req_result in &result.decode_requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after unified decode");
-            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
-        }
-        // 5. Offload sealed blocks from both halves (post-step-sync).
-        for req_result in &result.prefill_requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-        for req_result in &result.decode_requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-
-        Ok(result)
-    }
-
-    fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
-        ensure_lora_capacity(
-            &self.loaded_lora_adapters,
-            &request.lora_name,
-            self.lora_options.max_loras,
-            request.load_inplace,
-        )?;
-        let adapter = crate::lora::load_lora_adapter(
-            &request.lora_path,
-            &self.metadata.config,
-            self.lora_options.max_lora_rank,
-        )?;
-        let world_size = self.workers.len() + 1;
-        let projection_count: usize = adapter
-            .layers
-            .iter()
-            .map(|layer| layer.projections.len())
-            .sum();
-        let element_count: usize = adapter
-            .layers
-            .iter()
-            .flat_map(|layer| layer.projections.values())
-            .map(|projection| projection.a.data.len() + projection.b.data.len())
-            .sum();
-        let shape_elems: usize = adapter
-            .layers
-            .iter()
-            .flat_map(|layer| layer.projections.values())
-            .map(|projection| {
-                projection.a.rows * projection.a.cols + projection.b.rows * projection.b.cols
-            })
-            .sum();
-        debug_assert_eq!(element_count, shape_elems);
-        let rank = adapter.manifest.rank;
-        let targets = adapter.manifest.target_modules.join(", ");
-        let path = adapter.manifest.path.display().to_string();
-        let mut sharded_adapters = Vec::with_capacity(world_size);
-        for rank in 0..world_size {
-            sharded_adapters.push(adapter.shard_for_tensor_parallel(
-                &self.metadata.config,
-                TensorParallelConfig { rank, world_size },
-            )?);
-        }
-
-        let mut sharded_adapters = sharded_adapters.into_iter();
-        let primary_adapter = sharded_adapters
-            .next()
-            .expect("rank 0 adapter must exist for nonzero world_size");
-        let primary_response = self.primary.load_lora_adapter(
-            request.lora_name.clone(),
-            primary_adapter,
-            request.load_inplace,
-        )?;
-        let mut pending = Vec::with_capacity(self.workers.len());
-        let mut errors = Vec::new();
-        for (index, worker) in self.workers.iter().enumerate() {
-            let rank = index + 1;
-            let rank_adapter = sharded_adapters
-                .next()
-                .expect("worker adapter must exist for every tensor-parallel rank");
-            match worker.load_lora_adapter(
-                request.lora_name.clone(),
-                rank_adapter,
-                request.load_inplace,
-            ) {
-                Ok(response) => pending.push((rank, response)),
-                Err(err) => errors.push(format!("rank {rank} dispatch: {err:#}")),
-            }
-        }
-
-        match primary_response.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => errors.push(format!("rank 0: {err:#}")),
-            Err(_) => errors.push("rank 0: dropped LoRA load response".to_string()),
-        }
-        for (rank, response) in pending {
-            match response.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => errors.push(format!("rank {rank}: {err:#}")),
-                Err(_) => errors.push(format!("rank {rank}: dropped LoRA load response")),
-            }
-        }
-        if !errors.is_empty() {
-            let mut cleanup_errors = Vec::new();
-            match self.primary.discard_lora_adapter(request.lora_name.clone()) {
-                Ok(response) => match response.recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => cleanup_errors.push(format!("rank 0 cleanup: {err:#}")),
-                    Err(_) => cleanup_errors
-                        .push("rank 0 cleanup: dropped LoRA discard response".to_string()),
-                },
-                Err(err) => cleanup_errors.push(format!("rank 0 cleanup dispatch: {err:#}")),
-            }
-            for (index, worker) in self.workers.iter().enumerate() {
-                let rank = index + 1;
-                match worker.discard_lora_adapter(request.lora_name.clone()) {
-                    Ok(response) => match response.recv() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            cleanup_errors.push(format!("rank {rank} cleanup: {err:#}"));
-                        }
-                        Err(_) => cleanup_errors.push(format!(
-                            "rank {rank} cleanup: dropped LoRA discard response"
-                        )),
-                    },
-                    Err(err) => {
-                        cleanup_errors.push(format!("rank {rank} cleanup dispatch: {err:#}"));
-                    }
-                }
-            }
-            if cleanup_errors.is_empty() {
-                self.loaded_lora_adapters.remove(&request.lora_name);
-            }
-            let cleanup_suffix = if cleanup_errors.is_empty() {
-                String::new()
-            } else {
-                format!("; cleanup errors: {}", cleanup_errors.join("; "))
-            };
-            anyhow::bail!(
-                "failed to load Qwen3 LoRA adapter {} on tensor-parallel ranks: {}{}",
-                request.lora_name,
-                errors.join("; "),
-                cleanup_suffix
-            );
-        }
-
-        log::info!(
-            "Loaded Qwen3 LoRA adapter {} from {} (rank={}, targets={}, projections={}, bf16_elements={}, tp_world_size={}, load_inplace={})",
-            request.lora_name,
-            path,
-            rank,
-            targets,
-            projection_count,
-            element_count,
-            world_size,
-            request.load_inplace
-        );
-        self.loaded_lora_adapters.insert(request.lora_name.clone());
-        Ok(())
-    }
-
-    fn unload_lora_adapter(&mut self, request: &UnloadLoraAdapterRequest) -> Result<()> {
-        let primary_response = self
-            .primary
-            .unload_lora_adapter(request.lora_name.clone())?;
-        let mut pending = Vec::with_capacity(self.workers.len());
-        for (index, worker) in self.workers.iter().enumerate() {
-            pending.push((
-                index + 1,
-                worker.unload_lora_adapter(request.lora_name.clone())?,
-            ));
-        }
-
-        let mut errors = Vec::new();
-        match primary_response.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => errors.push(format!("rank 0: {err:#}")),
-            Err(_) => errors.push("rank 0: dropped LoRA unload response".to_string()),
-        }
-        for (rank, response) in pending {
-            match response.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => errors.push(format!("rank {rank}: {err:#}")),
-                Err(_) => errors.push(format!("rank {rank}: dropped LoRA unload response")),
-            }
-        }
-        if !errors.is_empty() {
-            anyhow::bail!(
-                "failed to unload Qwen3 LoRA adapter {} on tensor-parallel ranks: {}",
-                request.lora_name,
-                errors.join("; ")
-            );
-        }
-
-        log::info!("Unloaded Qwen3 LoRA adapter {}", request.lora_name);
-        self.loaded_lora_adapters.remove(&request.lora_name);
-        Ok(())
-    }
-
-    fn list_lora_adapters(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
-        names.sort();
-        names
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ensure_lora_capacity;
-    use std::collections::HashSet;
-
-    #[test]
-    fn lora_capacity_rejects_new_adapter_at_limit() {
-        let loaded = HashSet::from(["adapter-a".to_string()]);
-
-        let error = ensure_lora_capacity(&loaded, "adapter-b", 1, false)
-            .expect_err("new adapter should exceed capacity")
-            .to_string();
-
-        assert!(error.contains("max_loras=1"));
-        assert!(error.contains("requested=adapter-b"));
-    }
-
-    #[test]
-    fn lora_capacity_allows_existing_adapter_replacement_at_limit_with_load_inplace() {
-        let loaded = HashSet::from(["adapter-a".to_string()]);
-
-        ensure_lora_capacity(&loaded, "adapter-a", 1, true)
-            .expect("existing adapter should fit with load_inplace");
-    }
-
-    #[test]
-    fn lora_capacity_rejects_duplicate_without_load_inplace() {
-        let loaded = HashSet::from(["adapter-a".to_string()]);
-
-        let error = ensure_lora_capacity(&loaded, "adapter-a", 1, false)
-            .expect_err("duplicate without load_inplace should fail")
-            .to_string();
-
-        assert!(error.contains("already loaded"));
-    }
-}
-
 impl Drop for Qwen3Executor {
     fn drop(&mut self) {
         self.primary.shutdown();
@@ -1779,387 +972,69 @@ impl Drop for Qwen3Executor {
     }
 }
 
-struct LocalQwen3Lane {
-    model: Qwen3Model,
-    kv_buffer: KvBuffer,
-    layout: KvLayout,
-    bufs: BatchDecodeBuffers,
-    sample_scratch: SamplingScratch,
-}
+#[cfg(test)]
+mod tests {
+    use super::{
+        DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES, dflash_request_state_footprint_bytes_for_len,
+        dflash_request_state_reserve_bytes,
+    };
+    use crate::config::{DFlashConfig, DFlashInnerConfig};
 
-impl LocalQwen3Lane {
-    fn new(
-        model: Qwen3Model,
-        kv_buffer: KvBuffer,
-        total_blocks: usize,
-        padding_block_id: i32,
-    ) -> Result<Self> {
-        let buf_layout = kv_buffer.layout();
-        let layout = KvLayout::new(
-            buf_layout.num_layers,
-            buf_layout.num_kv_heads,
-            buf_layout.head_dim,
-            buf_layout.page_size,
+    #[test]
+    fn dflash_request_state_reserve_covers_long_context_scratch() {
+        let config = DFlashConfig {
+            hidden_size: 2560,
+            intermediate_size: 9728,
+            num_hidden_layers: 5,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_target_layers: 5,
+            head_dim: 128,
+            vocab_size: 151936,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 40960,
+            block_size: 16,
+            dflash_config: DFlashInnerConfig {
+                mask_token_id: 151669,
+                target_layer_ids: vec![1, 9, 17, 25, 33],
+            },
+        };
+
+        let reserve = dflash_request_state_reserve_bytes(&config).unwrap();
+
+        assert!(
+            reserve > DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES * 2,
+            "Qwen3-4B DFlash reserve should account for long-context request state, got {reserve}"
         );
-        let max_bucket = *BATCH_BUCKETS.last().unwrap();
-        let bufs = BatchDecodeBuffers::new(
-            model.device_ctx(),
-            model.config().hidden_size,
-            model.local_q_dim(),
-            model.local_kv_dim(),
-            model.local_intermediate_size(),
-            model.config().vocab_size,
-            max_bucket,
-            total_blocks,
-            padding_block_id,
-            model.local_num_attention_heads(),
-        )?;
-        let sample_scratch =
-            SamplingScratch::new(model.device_ctx(), model.config().vocab_size, max_bucket)?;
-        Ok(Self {
-            model,
-            kv_buffer,
-            layout,
-            bufs,
-            sample_scratch,
-        })
     }
 
-    fn bind(&self) -> Result<CublasThreadGuard> {
-        bind_model_thread(&self.model)?;
-        tune_decode_gemm_algos(&self.model)?;
-        Ok(CublasThreadGuard)
-    }
+    #[test]
+    fn dflash_short_request_footprint_does_not_include_global_allocator_floor() {
+        let config = DFlashConfig {
+            hidden_size: 2560,
+            intermediate_size: 9728,
+            num_hidden_layers: 5,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_target_layers: 5,
+            head_dim: 128,
+            vocab_size: 151936,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 40960,
+            block_size: 16,
+            dflash_config: DFlashInnerConfig {
+                mask_token_id: 151669,
+                target_layer_ids: vec![1, 9, 17, 25, 33],
+            },
+        };
 
-    /// Pick one token per logits column (batched argmax for greedy rows,
-    /// per-row sampler otherwise). Grows the sampling scratch when a step
-    /// is wider than the decode bucket it was sized for.
-    fn select_step_tokens(
-        &mut self,
-        logits: &HiddenStates,
-        params: &[&SamplingParams],
-        random_vals: &[f32],
-    ) -> Result<Vec<u32>> {
-        if params.len() > self.sample_scratch.row_indices.len() {
-            self.sample_scratch = SamplingScratch::new(
-                self.model.device_ctx(),
-                self.model.config().vocab_size,
-                params.len(),
-            )?;
-        }
-        openinfer_core::ops::select_batch_tokens_into(
-            self.model.device_ctx(),
-            logits,
-            params,
-            random_vals,
-            &mut self.sample_scratch.row_indices,
-            &mut self.sample_scratch.argmax_partial_values,
-            &mut self.sample_scratch.argmax_partial_indices,
-            &mut self.sample_scratch.probs,
-            &mut self.sample_scratch.top1_values,
-            &mut self.sample_scratch.row_states,
-            &mut self.sample_scratch.valid,
-            &mut self.sample_scratch.out,
-        )
-    }
+        let footprint = dflash_request_state_footprint_bytes_for_len(&config, 80).unwrap();
 
-    fn extract_logprobs(
-        &self,
-        logits: &DeviceVec,
-        sampled_token: u32,
-        top_k: usize,
-    ) -> Result<TokenLogprob> {
-        let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
-            .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
-    }
-
-    fn extract_prompt_logprobs(
-        &self,
-        all_logits: &HiddenStates,
-        prev_pos: usize,
-        target_token: u32,
-        top_k: usize,
-    ) -> Option<TokenLogprob> {
-        openinfer_core::ops::extract_vec(self.model.device_ctx(), all_logits, prev_pos)
-            .ok()
-            .and_then(|logits_vec| {
-                let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
-                compute_logprobs_from_cpu(&logits_f32, target_token, top_k)
-            })
-    }
-
-    fn execute_prefill(
-        &mut self,
-        prompts: &[&[u32]],
-        kv_views: &[KvView],
-        lora_adapters: &[Option<&str>],
-        echo: bool,
-    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
-        self.model.batch_prefill(
-            prompts,
-            kv_views,
-            lora_adapters,
-            self.kv_buffer.buffer(),
-            &self.layout,
-            echo,
-        )
-    }
-
-    fn execute_decode(
-        &mut self,
-        token_ids: &[u32],
-        kv_views: &[KvView],
-        lora_adapters: &[Option<&str>],
-    ) -> Result<()> {
-        self.model.batch_decode(
-            token_ids,
-            kv_views,
-            lora_adapters,
-            self.kv_buffer.buffer(),
-            &self.layout,
-            &mut self.bufs,
-        )
-    }
-
-    fn execute_unified(
-        &mut self,
-        prefill_prompts: &[&[u32]],
-        prefill_views: &[KvView],
-        prefill_lora_adapters: &[Option<&str>],
-        decode_tokens: &[u32],
-        decode_views: &[KvView],
-        decode_lora_adapters: &[Option<&str>],
-    ) -> Result<HiddenStates> {
-        self.model.unified_step(
-            prefill_prompts,
-            prefill_views,
-            prefill_lora_adapters,
-            decode_tokens,
-            decode_views,
-            decode_lora_adapters,
-            self.kv_buffer.buffer(),
-            &self.layout,
-        )
-    }
-
-    fn load_lora_adapter(
-        &mut self,
-        name: String,
-        adapter: crate::lora::LoraAdapter,
-        load_inplace: bool,
-    ) -> Result<()> {
-        let device_adapter =
-            crate::lora::load_device_lora_adapter(self.model.device_ctx(), name, adapter)?;
-        self.model
-            .install_lora_adapter(device_adapter, load_inplace)
-    }
-
-    fn unload_lora_adapter(&mut self, name: &str) -> Result<()> {
-        self.model.uninstall_lora_adapter(name)
-    }
-
-    fn discard_lora_adapter(&mut self, name: &str) -> Result<()> {
-        self.model.discard_lora_adapter(name)
-    }
-}
-
-#[derive(Clone)]
-enum StepCommand {
-    Prefill {
-        requests: Vec<PrefillStepItem>,
-        kv_views: Vec<KvView>,
-        echo: bool,
-    },
-    Decode {
-        requests: Vec<DecodeStepItem>,
-        kv_views: Vec<KvView>,
-    },
-    Unified {
-        prefill_requests: Vec<PrefillStepItem>,
-        prefill_kv_views: Vec<KvView>,
-        decode_requests: Vec<DecodeStepItem>,
-        decode_kv_views: Vec<KvView>,
-    },
-}
-
-impl StepCommand {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Prefill { .. } => "prefill",
-            Self::Decode { .. } => "decode",
-            Self::Unified { .. } => "unified",
-        }
-    }
-}
-
-enum WorkerCommand {
-    RunStep {
-        step: StepCommand,
-        collect_result: bool,
-        resp: channel::Sender<Result<WorkerStepOutcome>>,
-    },
-    LoadLoraAdapter {
-        name: String,
-        adapter: crate::lora::LoraAdapter,
-        load_inplace: bool,
-        resp: channel::Sender<Result<()>>,
-    },
-    UnloadLoraAdapter {
-        name: String,
-        resp: channel::Sender<Result<()>>,
-    },
-    DiscardLoraAdapter {
-        name: String,
-        resp: channel::Sender<Result<()>>,
-    },
-    Shutdown,
-}
-
-enum WorkerStepOutcome {
-    Ack,
-    Prefill(PrefillResult),
-    Decode(DecodeResult),
-    Unified(UnifiedResult),
-}
-
-impl WorkerStepOutcome {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Ack => "ack",
-            Self::Prefill(_) => "prefill",
-            Self::Decode(_) => "decode",
-            Self::Unified(_) => "unified",
-        }
-    }
-}
-
-struct RankWorker {
-    tx: channel::Sender<WorkerCommand>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl RankWorker {
-    fn spawn(rank: usize, mut lane: LocalQwen3Lane) -> Result<Self> {
-        let (tx, rx) = channel::unbounded();
-        let (startup_tx, startup_rx) = channel::bounded(1);
-        let handle = thread::Builder::new()
-            .name(format!("qwen3-tp-rank-{rank}"))
-            .spawn(move || {
-                let startup = lane.bind();
-                match startup {
-                    Ok(_guard) => {
-                        let _ = startup_tx.send(Ok(()));
-                        while let Ok(cmd) = rx.recv() {
-                            match cmd {
-                                WorkerCommand::RunStep {
-                                    step,
-                                    collect_result,
-                                    resp,
-                                } => {
-                                    let result =
-                                        execute_step_on_lane(&mut lane, &step, collect_result);
-                                    let _ = resp.send(result);
-                                }
-                                WorkerCommand::LoadLoraAdapter {
-                                    name,
-                                    adapter,
-                                    load_inplace,
-                                    resp,
-                                } => {
-                                    let result =
-                                        lane.load_lora_adapter(name, adapter, load_inplace);
-                                    let _ = resp.send(result);
-                                }
-                                WorkerCommand::UnloadLoraAdapter { name, resp } => {
-                                    let result = lane.unload_lora_adapter(&name);
-                                    let _ = resp.send(result);
-                                }
-                                WorkerCommand::DiscardLoraAdapter { name, resp } => {
-                                    let result = lane.discard_lora_adapter(&name);
-                                    let _ = resp.send(result);
-                                }
-                                WorkerCommand::Shutdown => break,
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let _ = startup_tx.send(Err(err));
-                    }
-                }
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn tensor-parallel worker {rank}: {e}"))?;
-        startup_rx.recv().map_err(|_| {
-            anyhow::anyhow!("tensor-parallel worker {rank} exited during startup")
-        })??;
-        Ok(Self {
-            tx,
-            handle: Some(handle),
-        })
-    }
-
-    fn run_step(
-        &self,
-        step: StepCommand,
-        collect_result: bool,
-    ) -> Result<channel::Receiver<Result<WorkerStepOutcome>>> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::RunStep {
-                step,
-                collect_result,
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
-        Ok(resp_rx)
-    }
-
-    fn load_lora_adapter(
-        &self,
-        name: String,
-        adapter: crate::lora::LoraAdapter,
-        load_inplace: bool,
-    ) -> Result<channel::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::LoadLoraAdapter {
-                name,
-                adapter,
-                load_inplace,
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA load"))?;
-        Ok(resp_rx)
-    }
-
-    fn unload_lora_adapter(&self, name: String) -> Result<channel::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::UnloadLoraAdapter {
-                name,
-                resp: resp_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker channel closed on LoRA unload"))?;
-        Ok(resp_rx)
-    }
-
-    fn discard_lora_adapter(&self, name: String) -> Result<channel::Receiver<Result<()>>> {
-        let (resp_tx, resp_rx) = channel::bounded(1);
-        self.tx
-            .send(WorkerCommand::DiscardLoraAdapter {
-                name,
-                resp: resp_tx,
-            })
-            .map_err(|_| {
-                anyhow::anyhow!("tensor-parallel worker channel closed on LoRA discard")
-            })?;
-        Ok(resp_rx)
-    }
-
-    fn shutdown(&mut self) {
-        let _ = self.tx.send(WorkerCommand::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        assert!(
+            footprint < DFLASH_MIN_EXTRA_MEMORY_RESERVE_BYTES / 8,
+            "short-request admission must charge true DFlash state footprint, not the global floor: {footprint}"
+        );
     }
 }
