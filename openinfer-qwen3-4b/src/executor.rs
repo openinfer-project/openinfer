@@ -392,6 +392,12 @@ fn execute_step_on_lane(
 
             // Launch prefill on prefill partition stream (will run concurrently
             // with decode on the GPU thanks to Green Context SM partitions).
+            //
+            // DEBUG: sync original stream first to ensure all H2D/allocs are
+            // visible, then launch and sync each stream separately to isolate
+            // the faulting kernel.
+            lane.model.device_ctx().sync()?;
+
             unsafe { set_stream_override(prefill_stream.0) };
             let (prefill_logits, _) = lane.execute_prefill(
                 &prefill_prompts,
@@ -401,6 +407,12 @@ fn execute_step_on_lane(
             )?;
             clear_stream_override();
 
+            // Sync prefill stream to check for errors immediately.
+            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                anyhow::bail!("SplitConcurrent: prefill stream sync failed: {r:?}");
+            }
+
             // Launch decode on decode partition stream.
             let saved_graph = lane.model.enable_cuda_graph;
             lane.model.enable_cuda_graph = false;
@@ -409,10 +421,10 @@ fn execute_step_on_lane(
             clear_stream_override();
             lane.model.enable_cuda_graph = saved_graph;
 
-            // Only sync decode stream — decode result is ready for sampling.
+            // Sync decode stream.
             let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(decode_stream.0) };
             if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                anyhow::bail!("cuStreamSynchronize(decode) failed: {r:?}");
+                anyhow::bail!("SplitConcurrent: decode stream sync failed: {r:?}");
             }
 
             if collect_result {
