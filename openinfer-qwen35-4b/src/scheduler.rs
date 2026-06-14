@@ -349,7 +349,10 @@ fn prefill_batch(
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id, prompt_len, 0, FinishReason::Stop
+                req.request_id,
+                prompt_len,
+                0,
+                FinishReason::Stop
             );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
@@ -377,7 +380,10 @@ fn prefill_batch(
         if req.max_tokens <= 1 {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id, prompt_len, 1, FinishReason::Length
+                req.request_id,
+                prompt_len,
+                1,
+                FinishReason::Length
             );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
@@ -506,7 +512,10 @@ fn unified_step_sched(
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id, prompt_len, 0, FinishReason::Stop
+                req.request_id,
+                prompt_len,
+                0,
+                FinishReason::Stop
             );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
@@ -534,7 +543,10 @@ fn unified_step_sched(
         if req.max_tokens <= 1 {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id, prompt_len, 1, FinishReason::Length
+                req.request_id,
+                prompt_len,
+                1,
+                FinishReason::Length
             );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
@@ -706,7 +718,10 @@ fn dispatch_decode_tokens(
         if is_eos {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id, req.prompt_len, req.generated_count, FinishReason::Stop
+                req.request_id,
+                req.prompt_len,
+                req.generated_count,
+                FinishReason::Stop
             );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
@@ -717,7 +732,10 @@ fn dispatch_decode_tokens(
         } else if at_limit {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id, req.prompt_len, req.generated_count, FinishReason::Length
+                req.request_id,
+                req.prompt_len,
+                req.generated_count,
+                FinishReason::Length
             );
             let _ = req.token_tx.send(TokenEvent::Token { id: token, logprob });
             let _ = req.token_tx.send(TokenEvent::Finished {
