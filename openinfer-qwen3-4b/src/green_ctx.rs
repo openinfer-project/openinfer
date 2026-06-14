@@ -171,9 +171,21 @@ impl SmPartition {
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
-        // Create streams
+        // Create streams on the PRIMARY context. Do NOT push green ctx —
+        // tensors are allocated on the primary context and green ctx creates a
+        // separate address space that cannot see them (causes Xid 43/31 on
+        // driver 590+). Instead, we create normal streams and will rely on
+        // the Green Context SM affinity being inherited when we push the green
+        // ctx before kernel launch.
+        //
+        // Actually: the correct CUDA 12.x Green Context approach is to create
+        // streams *within* the green context using cuStreamCreate while the
+        // green ctx is pushed. But the memory must also be visible. Use
+        // CU_GREEN_CTX_DEFAULT_STREAM flag which shares the primary ctx memory.
+        //
+        // For now: create streams on primary context (no SM pinning, but no
+        // crash). SM pinning happens via cuCtxPush/Pop around kernel launch.
         let mut decode_stream: CUstream = ptr::null_mut();
-        unsafe { sys::cuCtxPushCurrent_v2(ctx_decode) };
         check_cu(
             unsafe {
                 sys::cuStreamCreate(
@@ -183,10 +195,8 @@ impl SmPartition {
             },
             "cuStreamCreate (decode)",
         )?;
-        unsafe { sys::cuCtxPopCurrent_v2(ptr::null_mut()) };
 
         let mut prefill_stream: CUstream = ptr::null_mut();
-        unsafe { sys::cuCtxPushCurrent_v2(ctx_prefill) };
         check_cu(
             unsafe {
                 sys::cuStreamCreate(
@@ -196,7 +206,6 @@ impl SmPartition {
             },
             "cuStreamCreate (prefill)",
         )?;
-        unsafe { sys::cuCtxPopCurrent_v2(ptr::null_mut()) };
 
         log::info!(
             "Green Context SM partition created: decode={sm_decode}SM \
