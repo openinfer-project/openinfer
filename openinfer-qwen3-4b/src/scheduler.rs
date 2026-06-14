@@ -13,7 +13,7 @@ use std::collections::{HashSet, VecDeque};
 use std::thread;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -888,6 +888,12 @@ fn admit_deferred_requests(
         if fresh_needed <= budget && decode_slots > 0 {
             budget -= fresh_needed;
             decode_slots -= 1;
+            debug!(
+                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                req.request_id,
+                req.prompt_tokens.len(),
+                req.max_tokens
+            );
             pending.push(req);
         } else {
             still_deferred.push(req);

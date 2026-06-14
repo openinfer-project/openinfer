@@ -1,5 +1,7 @@
 use tokio::sync::mpsc;
 
+use log::debug;
+
 use crate::executor::RequestId;
 use openinfer_core::engine::{FinishReason, TokenLogprob};
 
@@ -125,6 +127,10 @@ pub(super) fn apply_effects(
                     continue;
                 };
                 let req = &active[index];
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, req.prompt_len, completion_tokens, finish_reason
+                );
                 let _ = req.token_tx.send(TokenEvent::Finished {
                     finish_reason,
                     prompt_tokens: req.prompt_len,
@@ -144,6 +150,10 @@ pub(super) fn apply_effects(
                     continue;
                 };
                 let req = &active[index];
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, req.prompt_len, completion_tokens, finish_reason
+                );
                 if req
                     .token_tx
                     .send(TokenEvent::Token { id: token, logprob })
@@ -173,6 +183,10 @@ pub(super) fn apply_effects(
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_err()
                 {
+                    debug!(
+                        "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                        request_id, completion_tokens
+                    );
                     let _ = executor.drop_request(request_id);
                     to_retire.push(index);
                 } else {
@@ -209,6 +223,10 @@ pub(super) fn apply_effects(
                 prompt_tokens,
                 completion_tokens,
             } => {
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, prompt_tokens, completion_tokens, finish_reason
+                );
                 let _ = token_tx.send(TokenEvent::Finished {
                     finish_reason,
                     prompt_tokens,
@@ -225,6 +243,10 @@ pub(super) fn apply_effects(
                 prompt_tokens,
                 completion_tokens,
             } => {
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, prompt_tokens, completion_tokens, finish_reason
+                );
                 if token_tx
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_ok()
