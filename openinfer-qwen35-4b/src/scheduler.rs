@@ -13,7 +13,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -39,6 +39,7 @@ use self::plan::{
 /// An in-flight request being decoded. Recurrent state lives in the
 /// `BatchDecodeGraphState` at `graph_slot_idx` — NOT owned here.
 struct ActiveRequest35 {
+    request_id: Option<String>,
     token_tx: mpsc::UnboundedSender<TokenEvent>,
     kv: KvState,
     /// Index into `BatchDecodeGraphState.slot_states`.
@@ -220,6 +221,14 @@ fn scheduler_loop(
             send_rejection(rejected, *reason);
         }
         let pending = admission.pending;
+        for req in &pending {
+            debug!(
+                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                req.request_id,
+                req.prompt_tokens.len(),
+                req.max_tokens
+            );
+        }
         deferred = admission.deferred;
 
         if let Some(plan) = plan::build_next_plan(!active.is_empty(), pending) {
@@ -338,6 +347,10 @@ fn prefill_batch(
         }
 
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id, prompt_len, 0, FinishReason::Stop
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: prompt_len,
@@ -354,10 +367,18 @@ fn prefill_batch(
             })
             .is_err()
         {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, 0
+            );
             continue;
         }
 
         if req.max_tokens <= 1 {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id, prompt_len, 1, FinishReason::Length
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: prompt_len,
@@ -375,6 +396,7 @@ fn prefill_batch(
 
         let kv = std::mem::replace(&mut kv_states[i], model.alloc_kv());
         active.push(ActiveRequest35 {
+            request_id: req.request_id,
             token_tx: req.token_tx,
             kv,
             graph_slot_idx: slot_idx,
@@ -482,6 +504,10 @@ fn unified_step_sched(
         }
 
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id, prompt_len, 0, FinishReason::Stop
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: prompt_len,
@@ -498,10 +524,18 @@ fn unified_step_sched(
             })
             .is_err()
         {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, 0
+            );
             continue;
         }
 
         if req.max_tokens <= 1 {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id, prompt_len, 1, FinishReason::Length
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: prompt_len,
@@ -519,6 +553,7 @@ fn unified_step_sched(
 
         let kv = std::mem::replace(&mut prefill_kv_states[i], model.alloc_kv());
         active.push(ActiveRequest35 {
+            request_id: req.request_id,
             token_tx: req.token_tx,
             kv,
             graph_slot_idx: slot_idx,
@@ -669,6 +704,10 @@ fn dispatch_decode_tokens(
         let at_limit = req.generated_count >= req.max_tokens;
 
         if is_eos {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id, req.prompt_len, req.generated_count, FinishReason::Stop
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: req.prompt_len,
@@ -676,6 +715,10 @@ fn dispatch_decode_tokens(
             });
             to_retire.push(i);
         } else if at_limit {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id, req.prompt_len, req.generated_count, FinishReason::Length
+            );
             let _ = req.token_tx.send(TokenEvent::Token { id: token, logprob });
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
@@ -688,6 +731,10 @@ fn dispatch_decode_tokens(
             .send(TokenEvent::Token { id: token, logprob })
             .is_err()
         {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, req.generated_count
+            );
             to_retire.push(i);
         } else {
             req.last_token = token;
