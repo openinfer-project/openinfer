@@ -142,9 +142,13 @@ def load_case_set(path: Path) -> list[dict[str, Any]]:
         if output_len <= 0:
             raise ValueError(f"case {case_id!r} output_len must be positive")
         batch_size = int(item.get("batch_size", 1))
-        if batch_size <= 0:
-            raise ValueError(f"case {case_id!r} batch_size must be positive")
         ignore_eos = bool(item.get("ignore_eos", False))
+        if not 1 <= batch_size <= 8:
+            raise ValueError(f"case {case_id!r} batch_size must be in 1..=8")
+        if batch_size > 1 and not ignore_eos:
+            raise ValueError(
+                f"case {case_id!r} batch_size={batch_size} requires ignore_eos=true"
+            )
 
         cases.append(
             {

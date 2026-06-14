@@ -447,6 +447,33 @@ def output_summary(output: Output) -> dict[str, Any]:
     }
 
 
+def legacy_output_summary(output: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model_path": output["model_path"],
+        "backend": output["backend"],
+        "prompt": output["prompt"],
+        "prompt_token_ids": output["prompt_token_ids"],
+        "generated_token_ids": output["generated_token_ids"],
+        "generated_text": output["generated_text"],
+        "token_sha256": output["token_sha256"],
+        "text_sha256": output["text_sha256"],
+        "reported_token_sha256": output["reported_token_sha256"],
+        "reported_text_sha256": output["reported_text_sha256"],
+    }
+
+
+def legacy_pair_summary(pair: dict[str, Any]) -> dict[str, Any]:
+    first_diff = pair["first_different_token"]
+    if isinstance(first_diff, dict):
+        first_diff = dict(first_diff)
+        first_diff.pop("row_index", None)
+    return {
+        "token_exact": pair["token_exact"],
+        "text_exact": pair["text_exact"],
+        "first_different_token": first_diff,
+    }
+
+
 def compare_cases(
     hf_cases: dict[str, list[Output]],
     host_cases: dict[str, list[Output]],
@@ -525,10 +552,17 @@ def main() -> int:
         public_case.pop("_outputs_for_table", None)
         result_cases.append(public_case)
     if len(result_cases) == 1 and result_cases[0]["id"] == "default":
+        default_case = result_cases[0]
         result = {
             "classification": classification,
-            "outputs": result_cases[0]["outputs"],
-            "pairs": result_cases[0]["pairs"],
+            "outputs": {
+                name: legacy_output_summary(outputs[0]) if outputs else {}
+                for name, outputs in default_case["outputs"].items()
+            },
+            "pairs": {
+                name: legacy_pair_summary(pair)
+                for name, pair in default_case["pairs"].items()
+            },
             "warnings": warnings,
         }
     else:
@@ -546,7 +580,9 @@ def main() -> int:
         out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
         print(f"wrote {out_path}")
 
-    if args.require_all_exact and classification != "all_token_text_exact":
+    if args.require_all_exact and (
+        classification != "all_token_text_exact" or warnings
+    ):
         return 1
     return 0
 
