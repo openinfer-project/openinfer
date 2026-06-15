@@ -32,6 +32,11 @@ pub fn clear_stream_override() {
     STREAM_OVERRIDE.with(|c| c.set(None));
 }
 
+/// Returns true if a stream override is currently active on this thread.
+pub fn has_stream_override() -> bool {
+    STREAM_OVERRIDE.with(|c| c.get().is_some())
+}
+
 /// Returns the effective CUDA stream: the thread-local override if set,
 /// otherwise the context's own stream.
 #[inline]
