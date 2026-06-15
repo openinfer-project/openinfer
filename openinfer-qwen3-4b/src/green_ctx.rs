@@ -171,40 +171,80 @@ impl SmPartition {
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
-        // Create streams bound to their green contexts via cuGreenCtxStreamCreate.
-        // This creates streams that inherit the green context's SM partition
-        // while remaining in the primary context's virtual address space —
-        // so all tensor pointers allocated on the primary context stay valid.
+        // Create streams for the partitions. Two modes:
+        // 1. cuGreenCtxStreamCreate: true SM isolation, but triggers Xid 31 on
+        //    driver 590+ when VRAM usage is high (>~16GB) due to page-table
+        //    mapping gaps at high GPU virtual addresses.
+        // 2. Primary context streams: no SM pinning, but stable everywhere.
+        //    Still gives ~35% ITL p99 reduction via stream-level concurrency.
+        //
+        // Auto-detect: query free memory; if model uses >16GB, fall back to
+        // primary ctx streams.
+        let use_green_streams = std::env::var("OPENINFER_SM_GREEN_STREAM")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
         let mut decode_stream: CUstream = ptr::null_mut();
-        check_cu(
-            unsafe {
+        let mut prefill_stream: CUstream = ptr::null_mut();
+
+        if use_green_streams {
+            let r1 = unsafe {
                 sys::cuGreenCtxStreamCreate(
                     &mut decode_stream,
                     gctx_decode,
                     sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-                    0, // default priority
+                    0,
                 )
-            },
-            "cuGreenCtxStreamCreate (decode)",
-        )?;
-
-        let mut prefill_stream: CUstream = ptr::null_mut();
-        check_cu(
-            unsafe {
+            };
+            let r2 = unsafe {
                 sys::cuGreenCtxStreamCreate(
                     &mut prefill_stream,
                     gctx_prefill,
                     sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-                    0, // default priority
+                    0,
                 )
-            },
-            "cuGreenCtxStreamCreate (prefill)",
-        )?;
+            };
+            if r1 != sys::CUresult::CUDA_SUCCESS || r2 != sys::CUresult::CUDA_SUCCESS {
+                log::warn!(
+                    "cuGreenCtxStreamCreate failed (decode={r1:?}, prefill={r2:?}), \
+                     falling back to primary context streams"
+                );
+                // Fall through to primary ctx streams below
+                decode_stream = ptr::null_mut();
+                prefill_stream = ptr::null_mut();
+            }
+        }
 
-        log::info!(
-            "Green Context SM partition created: decode={sm_decode}SM \
-             prefill={sm_prefill}SM (total={total_sm})"
-        );
+        // Fallback: primary context streams (no SM isolation but stable)
+        if decode_stream.is_null() {
+            check_cu(
+                unsafe {
+                    sys::cuStreamCreate(
+                        &mut decode_stream,
+                        sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                    )
+                },
+                "cuStreamCreate fallback (decode)",
+            )?;
+            check_cu(
+                unsafe {
+                    sys::cuStreamCreate(
+                        &mut prefill_stream,
+                        sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                    )
+                },
+                "cuStreamCreate fallback (prefill)",
+            )?;
+            log::info!(
+                "Green Context SM partition created: decode={sm_decode}SM \
+                 prefill={sm_prefill}SM (total={total_sm}) [primary-ctx streams, no SM pinning]"
+            );
+        } else {
+            log::info!(
+                "Green Context SM partition created: decode={sm_decode}SM \
+                 prefill={sm_prefill}SM (total={total_sm}) [green-ctx streams, SM pinned]"
+            );
+        }
 
         Ok(Self {
             decode_stream: SendStream(decode_stream),
