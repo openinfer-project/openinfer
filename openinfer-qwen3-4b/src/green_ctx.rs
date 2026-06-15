@@ -171,21 +171,14 @@ impl SmPartition {
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
-        // Create streams on the PRIMARY context. Do NOT push green ctx —
-        // tensors are allocated on the primary context and green ctx creates a
-        // separate address space that cannot see them (causes Xid 43/31 on
-        // driver 590+). Instead, we create normal streams and will rely on
-        // the Green Context SM affinity being inherited when we push the green
-        // ctx before kernel launch.
-        //
-        // Actually: the correct CUDA 12.x Green Context approach is to create
-        // streams *within* the green context using cuStreamCreate while the
-        // green ctx is pushed. But the memory must also be visible. Use
-        // CU_GREEN_CTX_DEFAULT_STREAM flag which shares the primary ctx memory.
-        //
-        // For now: create streams on primary context (no SM pinning, but no
-        // crash). SM pinning happens via cuCtxPush/Pop around kernel launch.
+        // Create streams within their respective green contexts.
+        // CU_GREEN_CTX_DEFAULT_STREAM ensures the green ctx shares the
+        // primary context's virtual address space (memory allocated on
+        // the primary ctx is visible). Streams created while a green ctx
+        // is pushed inherit its SM partition — kernels launched on these
+        // streams are constrained to the partition's SMs.
         let mut decode_stream: CUstream = ptr::null_mut();
+        unsafe { sys::cuCtxPushCurrent_v2(ctx_decode) };
         check_cu(
             unsafe {
                 sys::cuStreamCreate(
@@ -193,10 +186,12 @@ impl SmPartition {
                     sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
                 )
             },
-            "cuStreamCreate (decode)",
+            "cuStreamCreate (decode on green ctx)",
         )?;
+        unsafe { sys::cuCtxPopCurrent_v2(ptr::null_mut()) };
 
         let mut prefill_stream: CUstream = ptr::null_mut();
+        unsafe { sys::cuCtxPushCurrent_v2(ctx_prefill) };
         check_cu(
             unsafe {
                 sys::cuStreamCreate(
@@ -204,8 +199,9 @@ impl SmPartition {
                     sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
                 )
             },
-            "cuStreamCreate (prefill)",
+            "cuStreamCreate (prefill on green ctx)",
         )?;
+        unsafe { sys::cuCtxPopCurrent_v2(ptr::null_mut()) };
 
         log::info!(
             "Green Context SM partition created: decode={sm_decode}SM \
