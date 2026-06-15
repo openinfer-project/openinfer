@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, and NCCL replay now uses a precomputed route plan while full decode graph capture remains blocked. Current batch, HTTP, and vLLM data remain diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, and NCCL replay now uses a precomputed route plan while full decode graph capture remains blocked. Current direct batch, OpenInfer HTTP pressure, and vLLM TP2 / TP2+EP2 data from a documented validation environment remain diagnostic and do not claim production serving parity.
 
 Last touched: 2026-06
 
@@ -19,7 +19,7 @@ Last touched: 2026-06
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL CUDA Graph readiness | Diagnostic only | The attribution binary emits `cuda_graph_readiness`. Current NCCL full decode capture remains blocked by host route-plan construction/replay; the removed dense-exchange allocation/sync and old per-token route-iteration blockers should stay absent. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
-| vLLM production parity | Not claimed | The vLLM startup-failure evidence below keeps the issue #170 comparison matrix honest without claiming serving parity. |
+| vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 snapshot below is a runnable comparison from a documented validation environment, not serving parity or a stock-install claim. |
 
 ## Correctness Contract
 
@@ -74,14 +74,31 @@ OpenInfer streaming currently makes the client-side TPOT fields near-zero in thi
 | NCCL | 4 | 24/24 | 6.326 | 158.083 | 9491.680 | 10097.244 |
 | NCCL | 8 | 24/24 | 6.341 | 157.710 | 17242.941 | 20110.121 |
 
-### vLLM Startup Failures
+### vLLM Repaired-Environment Comparison
 
-In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, keep vLLM in the matrix when the selected validation environment can bring the server to readiness. The 2026-06-15 attempts on the same 2x RTX 5090 host failed before `/v1/models` readiness for both the older retained vLLM environment and a freshly installed current vLLM environment. Earlier manual vLLM rows should not be mixed with this current branch/hardware snapshot; they only show that vLLM may be viable in other environments.
+In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, the 2026-06-15 2x RTX 5090 run now has a successful vLLM baseline for the same DeepSeek-V2-Lite model/tokenizer snapshot and short HTTP benchmark shape as the OpenInfer table above.
+
+This is a validation environment with documented package/toolchain fixes, not a stock vLLM install claim. The working run used vLLM `0.22.1`, Torch `2.11.0+cu130`, Transformers `5.12.0`, FlashInfer `0.6.12`, `FLASHINFER_CUDA_ARCH_LIST=12.0f`, CUDA 13.3-aligned Python CUDA packages, and FastAPI `0.115.14` / Starlette `0.46.2` / `prometheus-fastapi-instrumentator` `7.1.0`. Those fixes were needed after earlier SM120 FlashInfer JIT/linking and HTTP middleware failures.
+
+The server was launched eager bf16 with `--max-model-len 512`, `--gpu-memory-utilization 0.70`, `--tensor-parallel-size 2`; TP2+EP2 additionally used `--enable-expert-parallel`, and the server log confirmed expert parallelism with `32/64` local/global experts.
+
+Client shape: `vllm bench serve --backend openai --endpoint /v1/completions --model DeepSeek-V2-Lite --tokenizer models/DeepSeek-V2-Lite --dataset-name random --random-input-len 2 --random-output-len 16 --num-prompts 24 --temperature 0 --ignore-eos`, run separately with `--max-concurrency 1`, `4`, and `8`.
+
+| Runtime | conc | completed | output tok/s | mean TTFT ms | median TTFT ms | mean TPOT ms | median TPOT ms | mean ITL ms | median ITL ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| vLLM TP2 | 1 | 24/24 | 19.140 | 217.484 | 48.451 | 41.193 | 41.193 | 41.193 | 40.312 |
+| vLLM TP2 | 4 | 24/24 | 84.790 | 125.694 | 125.623 | 41.678 | 41.635 | 41.678 | 41.247 |
+| vLLM TP2 | 8 | 24/24 | 167.600 | 129.826 | 125.069 | 41.933 | 41.810 | 41.933 | 41.033 |
+| vLLM TP2+EP2 | 1 | 24/24 | 23.834 | 62.245 | 46.911 | 40.576 | 40.596 | 40.576 | 40.502 |
+| vLLM TP2+EP2 | 4 | 24/24 | 87.078 | 121.439 | 121.553 | 40.641 | 40.409 | 40.641 | 40.253 |
+| vLLM TP2+EP2 | 8 | 24/24 | 174.097 | 125.144 | 119.399 | 40.348 | 40.272 | 40.348 | 40.117 |
+
+Earlier failed vLLM attempts are still useful as environment-discovery evidence:
 
 | Environment | Modes tried | Result |
 | --- | --- | --- |
 | vLLM `0.9.2`, Torch `2.7.0+cu128`, Transformers `4.53.3` | TP2, TP2+EP2, V1/V0, default/eager fallback, plus one low-memory smoke | server never reached readiness; failures were `CUBLAS_STATUS_NOT_INITIALIZED` during worker profile plus one low-memory illegal-memory-access smoke |
-| vLLM `0.22.1`, Torch `2.11.0+cu130`, Transformers `5.12.0` | TP2 and TP2+EP2 default/eager fallback | server never reached readiness; failures were FlashInfer / SM12x backend selection errors (`No supported CUDA architectures found for major versions [12]`, `FlashInfer requires GPUs with sm75 or higher`) |
+| vLLM `0.22.1`, Torch `2.11.0+cu130`, Transformers `5.12.0` | TP2 and TP2+EP2 default/eager fallback | server never reached readiness until FlashInfer SM120f, CUDA 13.3 headers/libs, unversioned CUDA linker names, and FastAPI middleware compatibility were repaired |
 | vLLM `0.22.1` controlled backend fallback | TP2 and TP2+EP2 with `--attention-backend TRITON_ATTN --moe-backend triton` | server never reached readiness; `TRITON_ATTN` is not valid for DeepSeek-V2 MLA (`MLA not supported`) |
 
 Interpretation:
@@ -89,7 +106,9 @@ Interpretation:
 - direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
 - OpenInfer HTTP throughput did not scale with concurrency in this snapshot, so serving batching remains open;
-- vLLM comparison rows should remain failed/missing for this environment until a selected vLLM build reaches server readiness; standalone Torch bf16 GEMM passed on both GPUs in both tested vLLM environments, so the retained failure is specific to the vLLM DeepSeek-V2 server/model startup path rather than a blanket CUDA outage.
+- vLLM TP2 and TP2+EP2 both show higher aggregate output tok/s under this short HTTP pressure shape than the current OpenInfer HTTP pressure rows;
+- TP2+EP2 is slightly ahead of TP2 in this short snapshot, but this is one workload and one documented validation environment;
+- standalone Torch bf16 GEMM passed on both GPUs in the failed and repaired vLLM environments, so the earlier failures were specific to the vLLM DeepSeek-V2 server/model startup and Python package/toolchain path rather than a blanket CUDA outage.
 
 ## Claim Boundaries
 
@@ -100,6 +119,7 @@ Use these labels consistently:
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
+| `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 after target-environment package/toolchain fixes. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
 
 Do not claim:
 
