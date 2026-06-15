@@ -2114,6 +2114,9 @@ impl LocalQwen3Lane {
             anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
         }
 
+        // Now safe to drop deferred GPU buffers (prefill kernels are done).
+        crate::prefill::drain_deferred_drops();
+
         // Sample prefill tokens
         let params: Vec<&SamplingParams> =
             state.prefill_requests.iter().map(|r| &r.params).collect();

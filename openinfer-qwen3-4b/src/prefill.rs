@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
@@ -8,6 +10,24 @@ use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_to
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
+
+/// Thread-local deferred-drop queue for SM-partition mode.
+/// Buffers pushed here during prefill (under stream override) will be
+/// dropped later when `drain_deferred_drops()` is called after the
+/// prefill stream is synchronized.
+thread_local! {
+    static DEFERRED_DROPS: std::cell::RefCell<Vec<Box<dyn Any>>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Defer an object's drop until `drain_deferred_drops()` is called.
+fn defer_drop<T: 'static>(val: T) {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().push(Box::new(val)));
+}
+
+/// Drop all deferred objects. Call after prefill stream sync.
+pub(crate) fn drain_deferred_drops() {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().clear());
+}
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::KvView;
 
@@ -62,39 +82,15 @@ impl Qwen3Model {
         let seq_len = token_ids.len();
         let hidden_dim = self.config.hidden_size;
 
-        // Copy token IDs to GPU on the active stream (which may be the green-ctx
-        // override stream). This ensures alloc+H2D+kernel+free all happen on the
-        // same stream, avoiding cross-stream use-after-free.
+        // Copy token IDs to GPU
         let token_ids_gpu = self
             .ctx
             .stream
             .clone_htod(token_ids)
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
-        // If a stream override is active, the embedding kernel runs on a different
-        // stream than the alloc. We must keep token_ids_gpu alive until that kernel
-        // completes. Record an event on the override stream after the kernel and
-        // make ctx.stream wait before the buffer can be freed.
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
         ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
-
-        // If override is active, prevent premature free by syncing ordering.
-        if openinfer_kernels::tensor::has_stream_override() {
-            let override_stream = openinfer_kernels::tensor::active_cu_stream(&self.ctx);
-            let orig = self.ctx.stream.cu_stream();
-            unsafe {
-                let mut ev: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-                cudarc::driver::sys::cuEventCreate(
-                    &mut ev,
-                    cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-                );
-                // Record after embedding kernel on override stream
-                cudarc::driver::sys::cuEventRecord(ev, override_stream);
-                // ctx.stream must wait before it can free token_ids_gpu
-                cudarc::driver::sys::cuStreamWaitEvent(orig, ev, 0);
-                cudarc::driver::sys::cuEventDestroy_v2(ev);
-            }
-        }
 
         Ok(out)
     }
@@ -402,6 +398,14 @@ impl Qwen3Model {
             offset += seq_len;
         }
         let logits = self.batch_token_logits(&hidden, &last_indices)?;
+
+        // In SM-partition mode (stream override active), defer dropping
+        // GPU-backed temp buffers until after the prefill stream is synced.
+        // Otherwise cuMemFreeAsync on ctx.stream races with green-stream kernels.
+        if openinfer_kernels::tensor::has_stream_override() {
+            defer_drop(hidden);
+            defer_drop(plan);
+        }
 
         Ok((logits, all_logits))
     }
