@@ -28,6 +28,24 @@ pub unsafe fn set_stream_override(stream: CUstream) {
 }
 
 /// Clear the thread-local stream override, reverting to the context's default.
+/// If a DeviceContext is provided, records an event on the override stream and
+/// makes ctx.stream wait on it — ensuring that any subsequent frees on ctx.stream
+/// happen after kernels on the override stream complete (prevents use-after-free).
+pub fn clear_stream_override_with_ctx(ctx: &DeviceContext) {
+    if let Some(override_stream) = STREAM_OVERRIDE.with(|c| c.get()) {
+        let orig = ctx.stream.cu_stream();
+        if orig != override_stream {
+            unsafe {
+                let ev = stream_dep_event();
+                cudarc::driver::sys::cuEventRecord(ev, override_stream);
+                cudarc::driver::sys::cuStreamWaitEvent(orig, ev, 0);
+            }
+        }
+    }
+    STREAM_OVERRIDE.with(|c| c.set(None));
+}
+
+/// Clear the thread-local stream override, reverting to the context's default.
 pub fn clear_stream_override() {
     STREAM_OVERRIDE.with(|c| c.set(None));
 }
@@ -39,28 +57,10 @@ pub fn has_stream_override() -> bool {
 
 /// Returns the effective CUDA stream: the thread-local override if set,
 /// otherwise the context's own stream.
-///
-/// When an override is active and differs from ctx.stream, records an event on
-/// ctx.stream and makes the override stream wait on it. This ensures that any
-/// stream-ordered allocations (cuMemAllocAsync) on ctx.stream are visible to
-/// kernels launched on the override stream.
 #[inline]
 pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
     STREAM_OVERRIDE
         .with(|c| c.get())
-        .map(|override_stream| {
-            // Ensure override stream can see allocations on ctx.stream.
-            // Use a thread-local persistent event to avoid alloc overhead.
-            unsafe {
-                let orig = ctx.stream.cu_stream();
-                if orig != override_stream {
-                    let ev = stream_dep_event();
-                    cudarc::driver::sys::cuEventRecord(ev, orig);
-                    cudarc::driver::sys::cuStreamWaitEvent(override_stream, ev, 0);
-                }
-            }
-            override_stream
-        })
         .unwrap_or_else(|| ctx.stream.cu_stream())
 }
 

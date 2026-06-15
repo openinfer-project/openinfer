@@ -368,7 +368,7 @@ fn execute_step_on_lane(
             prefill_stream,
             decode_stream,
         } => {
-            use openinfer_kernels::tensor::{clear_stream_override, set_stream_override};
+            use openinfer_kernels::tensor::{clear_stream_override, clear_stream_override_with_ctx, set_stream_override};
 
             // If there's still an inflight prefill from a previous step, sync it
             // now (shouldn't happen normally, but safety).
@@ -393,10 +393,10 @@ fn execute_step_on_lane(
             // Launch prefill on prefill partition stream (will run concurrently
             // with decode on the GPU thanks to Green Context SM partitions).
             //
-            // active_cu_stream() automatically records events on ctx.stream and
-            // makes the override stream wait, so stream-ordered allocations
-            // (cuMemAllocAsync) done inside execute_prefill/decode are visible
-            // to kernels on the green-ctx stream.
+            // Sync ctx.stream first: ensures all prior stream-ordered allocs
+            // and H2D copies are complete before green streams touch them.
+            lane.model.device_ctx().sync()?;
+
             unsafe { set_stream_override(prefill_stream.0) };
             let (prefill_logits, _) = lane.execute_prefill(
                 &prefill_prompts,

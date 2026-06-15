@@ -62,15 +62,39 @@ impl Qwen3Model {
         let seq_len = token_ids.len();
         let hidden_dim = self.config.hidden_size;
 
-        // Copy token IDs to GPU
+        // Copy token IDs to GPU on the active stream (which may be the green-ctx
+        // override stream). This ensures alloc+H2D+kernel+free all happen on the
+        // same stream, avoiding cross-stream use-after-free.
         let token_ids_gpu = self
             .ctx
             .stream
             .clone_htod(token_ids)
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
+        // If a stream override is active, the embedding kernel runs on a different
+        // stream than the alloc. We must keep token_ids_gpu alive until that kernel
+        // completes. Record an event on the override stream after the kernel and
+        // make ctx.stream wait before the buffer can be freed.
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
         ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
+
+        // If override is active, prevent premature free by syncing ordering.
+        if openinfer_kernels::tensor::has_stream_override() {
+            let override_stream = openinfer_kernels::tensor::active_cu_stream(&self.ctx);
+            let orig = self.ctx.stream.cu_stream();
+            unsafe {
+                let mut ev: cudarc::driver::sys::CUevent = std::ptr::null_mut();
+                cudarc::driver::sys::cuEventCreate(
+                    &mut ev,
+                    cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+                );
+                // Record after embedding kernel on override stream
+                cudarc::driver::sys::cuEventRecord(ev, override_stream);
+                // ctx.stream must wait before it can free token_ids_gpu
+                cudarc::driver::sys::cuStreamWaitEvent(orig, ev, 0);
+                cudarc::driver::sys::cuEventDestroy_v2(ev);
+            }
+        }
 
         Ok(out)
     }
