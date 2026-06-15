@@ -330,3 +330,11 @@ OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openi
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported from
 NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
+
+## Star History
+
+<p align="center">
+  <a href="https://star-history.com/#openinfer-project/openinfer&Date">
+    <img src="https://api.star-history.com/svg?repos=openinfer-project/openinfer&type=Date" alt="Star History Chart">
+  </a>
+</p>
