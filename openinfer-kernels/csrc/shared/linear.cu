@@ -124,6 +124,7 @@ void cublas_init() {
     cublasCreate(&g_cublas_prefill_handle);
     cublasSetMathMode(g_cublas_prefill_handle, CUBLAS_TENSOR_OP_MATH);
     cudaMalloc(&g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
+    fprintf(stderr, "[OPENINFER] g_cublas_workspace=%p (size=%zu)\n", g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
     cublasSetWorkspace(g_cublas_prefill_handle, g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
   }
 }
@@ -265,6 +266,7 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
       g_lt_workspace = nullptr;
       return static_cast<int>(alloc_status);
     }
+    fprintf(stderr, "[OPENINFER] g_lt_workspace=%p (size=%zu)\n", g_lt_workspace, LT_WORKSPACE_SIZE);
   }
 
   LtGemmPlan plan;
