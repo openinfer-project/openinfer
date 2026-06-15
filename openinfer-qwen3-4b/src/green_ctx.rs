@@ -171,37 +171,35 @@ impl SmPartition {
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
-        // Create streams within their respective green contexts.
-        // CU_GREEN_CTX_DEFAULT_STREAM ensures the green ctx shares the
-        // primary context's virtual address space (memory allocated on
-        // the primary ctx is visible). Streams created while a green ctx
-        // is pushed inherit its SM partition — kernels launched on these
-        // streams are constrained to the partition's SMs.
+        // Create streams bound to their green contexts via cuGreenCtxStreamCreate.
+        // This creates streams that inherit the green context's SM partition
+        // while remaining in the primary context's virtual address space —
+        // so all tensor pointers allocated on the primary context stay valid.
         let mut decode_stream: CUstream = ptr::null_mut();
-        unsafe { sys::cuCtxPushCurrent_v2(ctx_decode) };
         check_cu(
             unsafe {
-                sys::cuStreamCreate(
+                sys::cuGreenCtxStreamCreate(
                     &mut decode_stream,
+                    gctx_decode,
                     sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                    0, // default priority
                 )
             },
-            "cuStreamCreate (decode on green ctx)",
+            "cuGreenCtxStreamCreate (decode)",
         )?;
-        unsafe { sys::cuCtxPopCurrent_v2(ptr::null_mut()) };
 
         let mut prefill_stream: CUstream = ptr::null_mut();
-        unsafe { sys::cuCtxPushCurrent_v2(ctx_prefill) };
         check_cu(
             unsafe {
-                sys::cuStreamCreate(
+                sys::cuGreenCtxStreamCreate(
                     &mut prefill_stream,
+                    gctx_prefill,
                     sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                    0, // default priority
                 )
             },
-            "cuStreamCreate (prefill on green ctx)",
+            "cuGreenCtxStreamCreate (prefill)",
         )?;
-        unsafe { sys::cuCtxPopCurrent_v2(ptr::null_mut()) };
 
         log::info!(
             "Green Context SM partition created: decode={sm_decode}SM \
