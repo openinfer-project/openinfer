@@ -92,6 +92,12 @@ impl Qwen3Model {
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
         ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
 
+        // Defer drop of token_ids_gpu in SM-partition mode to prevent
+        // use-after-free (allocated on ctx.stream, kernel on green stream).
+        if openinfer_kernels::tensor::has_stream_override() {
+            defer_drop(token_ids_gpu);
+        }
+
         Ok(out)
     }
 
@@ -443,6 +449,11 @@ impl Qwen3Model {
                 lora_groups,
                 &mut bufs,
             )?;
+        }
+
+        // Defer drop of PrefillBuffers in SM-partition mode.
+        if openinfer_kernels::tensor::has_stream_override() {
+            defer_drop(bufs);
         }
 
         Ok(hidden)
