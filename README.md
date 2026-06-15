@@ -184,8 +184,24 @@ At 16k that turns a 1.14 s cold prefill into a 126 ms host-tier restore (9.1×; 
 tokens). The tiering ladder at 16k: HBM hit ~26 ms < host-tier restore ~126 ms ≪ cold prefill
 ~1.14 s.
 
-Qwen3.5-4B single-stream latency sits at the same level — see
-[Qwen3.5 optimization notes](docs/models/qwen35/optimization.md).
+### Qwen3.5-4B vs current vLLM
+
+Single RTX 5090 (32 GB), Qwen3.5-4B, BF16, TP1 — openinfer @ `f3dcdf4`,
+vLLM 0.23.0 (latest stable checked 2026-06-15), both driven by
+`vllm bench serve` 0.23.0. Fixed random prompts, 30 measured requests,
+1 warmup, max concurrency 1, vLLM text-only with prefix cache off. Full flags and caveats
+are in the [Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md).
+
+| Workload | Metric | openinfer | vLLM 0.23.0 |
+|---|---|---:|---:|
+| 2048 input / 1 output | TTFT p50 | **101.8 ms** | 115.2 ms |
+| 2048 input / 1 output | TTFT p99 | **108.7 ms** | 123.7 ms |
+| 1024 input / 256 output | TTFT p50 | **53.7 ms** | 67.4 ms |
+| 1024 input / 256 output | TPOT p50 | 7.31 ms | **6.32 ms** |
+| 1024 input / 256 output | output tok/s | 133.6 | **152.3** |
+
+openinfer now leads first-token latency on both fixed single-concurrency shapes.
+vLLM still has the steady decode edge on this Qwen3.5 workload.
 
 ## Architecture
 
