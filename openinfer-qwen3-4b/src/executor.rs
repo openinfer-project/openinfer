@@ -390,13 +390,11 @@ fn execute_step_on_lane(
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
 
-            // Launch prefill on prefill partition stream (will run concurrently
-            // with decode on the GPU thanks to Green Context SM partitions).
-            //
-            // Sync ctx.stream first: ensures all prior stream-ordered allocs
-            // and H2D copies are complete before green streams touch them.
+            // Sync ctx.stream: ensures all prior stream-ordered allocs and
+            // H2D copies are complete before green streams touch them.
             lane.model.device_ctx().sync()?;
 
+            // Launch prefill on prefill partition stream.
             unsafe { set_stream_override(prefill_stream.0) };
             let (prefill_logits, _) = lane.execute_prefill(
                 &prefill_prompts,
