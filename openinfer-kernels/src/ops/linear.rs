@@ -347,19 +347,10 @@ fn launch_gemm(
         // Small-N projections run the cublasLt algo selected by gemm_lt_tune.
         // Shapes this thread never tuned report GEMM_LT_UNTUNED and keep their
         // existing cublasGemmEx path (and its capture behavior) unchanged.
-        let mut status = if n <= GEMM_LT_MAX_N {
-            ffi::gemm_lt_cuda(
-                w_ptr,
-                x_ptr,
-                y_ptr,
-                m as i32,
-                n as i32,
-                k as i32,
-                crate::tensor::active_cu_stream(ctx),
-            )
-        } else {
-            GEMM_LT_UNTUNED
-        };
+        //
+        // DEBUG: skip gemm_lt entirely to test if cuBLASLt workspace is the
+        // source of Xid 31 under green-ctx concurrent execution.
+        let mut status = GEMM_LT_UNTUNED;
         if status == GEMM_LT_UNTUNED {
             status = if graphsafe {
                 ffi::gemm_graphsafe_cuda(
