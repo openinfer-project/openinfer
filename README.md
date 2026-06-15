@@ -194,13 +194,16 @@ are in the [Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx
 
 | Workload | Metric | openinfer | vLLM 0.23.0 |
 |---|---|---:|---:|
-| 2048 input / 1 output | TTFT p50 | **101.8 ms** | 115.2 ms |
-| 2048 input / 1 output | TTFT p99 | **108.7 ms** | 123.7 ms |
-| 1024 input / 256 output | TTFT p50 | **53.7 ms** | 67.4 ms |
+| 2048 input / 1 output | reported input tokens | 58,324 (1,944/request) | 61,440 (2,048/request) |
+| 2048 input / 1 output | TTFT p50 (client-contract) | 101.8 ms | 115.2 ms |
+| 2048 input / 1 output | TTFT p99 (client-contract) | 108.7 ms | 123.7 ms |
+| 1024 input / 256 output | reported input tokens | 29,123 (971/request) | 30,720 (1,024/request) |
+| 1024 input / 256 output | TTFT p50 (client-contract) | 53.7 ms | 67.4 ms |
 | 1024 input / 256 output | TPOT p50 | 7.31 ms | **6.32 ms** |
 | 1024 input / 256 output | output tok/s | 133.6 | **152.3** |
 
-openinfer now leads first-token latency on both fixed single-concurrency shapes.
+openinfer reports lower TTFT in this fixed-client run, but it also reports about 5%
+fewer prompt tokens, so these rows are not a token-normalized prefill comparison.
 vLLM still has the steady decode edge on this Qwen3.5 workload.
 
 ## Architecture

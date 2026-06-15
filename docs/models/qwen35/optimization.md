@@ -1,6 +1,6 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: openinfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). In that vLLM 0.23.0 HTTP probe, openinfer leads TTFT p50 (`101.8` vs `115.2 ms` on 2048/1, `53.7` vs `67.4 ms` on 1024/256) while vLLM keeps the decode TPOT edge (`6.32` vs `7.31 ms`).
+> **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: openinfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). In that vLLM 0.23.0 HTTP probe, openinfer reports lower TTFT p50 under the fixed-client contract (`101.8` vs `115.2 ms` on 2048/1, `53.7` vs `67.4 ms` on 1024/256), but prompt-token counts differ; vLLM keeps the decode TPOT edge (`6.32` vs `7.31 ms`).
 >
 > **Last touched:** 2026-06. Qwen3.5 runtime code lives in top-level `openinfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
