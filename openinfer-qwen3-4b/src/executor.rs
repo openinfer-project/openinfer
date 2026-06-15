@@ -393,34 +393,10 @@ fn execute_step_on_lane(
             // Launch prefill on prefill partition stream (will run concurrently
             // with decode on the GPU thanks to Green Context SM partitions).
             //
-            // Stream-ordered allocations (cuMemAllocAsync) on ctx.stream create
-            // memory whose page-table mappings are only guaranteed visible to
-            // streams that have an ordering dependency. A bare sync() makes the
-            // CPU see completion but does NOT propagate memory-pool visibility
-            // to other streams. We must record an event on the original stream
-            // and have the green-ctx streams wait on it — this establishes the
-            // required inter-stream dependency for stream-ordered memory.
-            let orig_stream = lane.model.device_ctx().stream.cu_stream();
-            let mut dep_event: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-            unsafe {
-                cudarc::driver::sys::cuEventCreate(
-                    &mut dep_event,
-                    cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-                );
-                cudarc::driver::sys::cuEventRecord(dep_event, orig_stream);
-                cudarc::driver::sys::cuStreamWaitEvent(
-                    prefill_stream.0,
-                    dep_event,
-                    0,
-                );
-                cudarc::driver::sys::cuStreamWaitEvent(
-                    decode_stream.0,
-                    dep_event,
-                    0,
-                );
-                cudarc::driver::sys::cuEventDestroy_v2(dep_event);
-            }
-
+            // active_cu_stream() automatically records events on ctx.stream and
+            // makes the override stream wait, so stream-ordered allocations
+            // (cuMemAllocAsync) done inside execute_prefill/decode are visible
+            // to kernels on the green-ctx stream.
             unsafe { set_stream_override(prefill_stream.0) };
             let (prefill_logits, _) = lane.execute_prefill(
                 &prefill_prompts,

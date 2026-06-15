@@ -39,11 +39,51 @@ pub fn has_stream_override() -> bool {
 
 /// Returns the effective CUDA stream: the thread-local override if set,
 /// otherwise the context's own stream.
+///
+/// When an override is active and differs from ctx.stream, records an event on
+/// ctx.stream and makes the override stream wait on it. This ensures that any
+/// stream-ordered allocations (cuMemAllocAsync) on ctx.stream are visible to
+/// kernels launched on the override stream.
 #[inline]
 pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
     STREAM_OVERRIDE
         .with(|c| c.get())
+        .map(|override_stream| {
+            // Ensure override stream can see allocations on ctx.stream.
+            // Use a thread-local persistent event to avoid alloc overhead.
+            unsafe {
+                let orig = ctx.stream.cu_stream();
+                if orig != override_stream {
+                    let ev = stream_dep_event();
+                    cudarc::driver::sys::cuEventRecord(ev, orig);
+                    cudarc::driver::sys::cuStreamWaitEvent(override_stream, ev, 0);
+                }
+            }
+            override_stream
+        })
         .unwrap_or_else(|| ctx.stream.cu_stream())
+}
+
+/// Thread-local persistent event used to propagate stream-ordered memory
+/// dependencies from ctx.stream to the override stream.
+unsafe fn stream_dep_event() -> cudarc::driver::sys::CUevent {
+    thread_local! {
+        static EVENT: std::cell::Cell<cudarc::driver::sys::CUevent> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+    EVENT.with(|c| {
+        let ev = c.get();
+        if ev.is_null() {
+            let mut new_ev: cudarc::driver::sys::CUevent = std::ptr::null_mut();
+            cudarc::driver::sys::cuEventCreate(
+                &mut new_ev,
+                cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+            );
+            c.set(new_ev);
+            new_ev
+        } else {
+            ev
+        }
+    })
 }
 
 /// Marker trait for tensor metadata tags.
