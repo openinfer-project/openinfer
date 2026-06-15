@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, and NCCL replay now uses a precomputed route plan while full decode graph capture remains blocked. Current batch and vLLM data remain diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. The original `Hello` / 16 greedy gate is now widened through a committed small case set for HF / host-staged / NCCL comparison; NCCL decode combine and dense exchange use reusable device scratch, and NCCL replay now uses a precomputed route plan while full decode graph capture remains blocked. Current batch, HTTP, and vLLM data remain diagnostic and do not claim production serving parity.
 
 Last touched: 2026-06
 
@@ -19,7 +19,7 @@ Last touched: 2026-06
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL CUDA Graph readiness | Diagnostic only | The attribution binary emits `cuda_graph_readiness`. Current NCCL full decode capture remains blocked by host route-plan construction/replay; the removed dense-exchange allocation/sync and old per-token route-iteration blockers should stay absent. |
 | Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
-| vLLM production parity | Not claimed | The manual vLLM snapshot below is for understanding the gap requested in issue #170. |
+| vLLM production parity | Not claimed | The vLLM startup-failure evidence below keeps the issue #170 comparison matrix honest without claiming serving parity. |
 
 ## Correctness Contract
 
@@ -46,38 +46,50 @@ This path is useful for attribution and for avoiding the earlier row-loop TPOT m
 - the direct benchmark path is not `/v1/completions` serving;
 - it does not prove request admission, per-request KV ownership, fairness, or mixed-request scheduling.
 
-Current retained direct snapshot from PR #184:
+Current retained direct snapshot from the issue #277 branch (`2f52ed6`, 2026-06-15, 2x RTX 5090 / SYS interconnect). Shape: `prompt="Hello"`, `output_len=16`, `warmup=5`, `iters=20`; every row produced token trace hash `ed0eab52473991fc`. `decode tok/s` is the benchmark report's aggregate `metrics.decode_tok_s`. This refresh replaces the older PR #184 row values for the current branch ledger, but it should not be read as an isolated route-plan speedup because the retained snapshot was rerun on a different validation environment.
 
 | Batch | Backend | steady TPOT p50 ms | steady TPOT avg ms | decode tok/s |
 | ---: | --- | ---: | ---: | ---: |
-| 1 | host-staged | 58.558 | 62.009 | 16.144 |
-| 1 | NCCL | 193.650 | 201.276 | 4.982 |
-| 4 | host-staged | 202.186 | 210.409 | 19.124 |
-| 4 | NCCL | 333.321 | 344.764 | 11.528 |
-| 8 | host-staged | 394.753 | 411.348 | 19.423 |
-| 8 | NCCL | 522.917 | 539.643 | 14.874 |
+| 1 | host-staged | 55.727 | 57.313 | 17.486 |
+| 1 | NCCL | 181.795 | 188.420 | 5.321 |
+| 4 | host-staged | 193.954 | 198.905 | 20.106 |
+| 4 | NCCL | 303.389 | 311.621 | 12.821 |
+| 8 | host-staged | 385.013 | 394.908 | 20.270 |
+| 8 | NCCL | 472.045 | 483.538 | 16.517 |
 
 PR #196 extends attribution for the same direct diagnostic shapes. The retained A800 attribution gate keeps `batch-size=1/4/8`, `prompt="Hello"`, `output_len=16`, host-staged, and NCCL exact against the same-host HF gate.
 
-### Manual vLLM Snapshot
+### HTTP Concurrency Pressure
 
-In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, a manual same-model snapshot was collected with `vllm bench serve` concurrency pressure `1`, `4`, and `8`.
+The issue #277 branch was also run through `/v1/completions` with `vllm bench serve` used only as the common HTTP client. Shape: random input length `2`, output length `16`, `24` prompts, `temperature=0`, `ignore_eos`, `--max-concurrency 1/4/8`, OpenInfer `--cuda-graph=false`.
 
-This table is retained only to document the current gap. It is not evidence of a complete, fair production-serving parity comparison, and `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal OpenInfer batch size.
+OpenInfer streaming currently makes the client-side TPOT fields near-zero in this shape, so this table reports output throughput and throughput-derived milliseconds per output token computed as `duration / total_output_tokens`. `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal OpenInfer batch size.
 
-| Engine | Mode | conc=1 TPOT ms | conc=4 TPOT ms | conc=8 TPOT ms | Output tok/s at 1/4/8 |
-| --- | --- | ---: | ---: | ---: | --- |
-| OpenInfer | host-staged | 49.95 | 51.30 | 51.22 | 19.84 / 19.53 / 19.56 |
-| OpenInfer | NCCL | 178.31 | 173.22 | 174.46 | 5.59 / 5.77 / 5.73 |
-| vLLM | TP2 default | 35.61 | 36.43 | 36.37 | 27.54 / 97.72 / 195.28 |
-| vLLM | TP2+EP2 default | 34.15 | 34.97 | 34.88 | 28.87 / 101.52 / 204.08 |
+| Backend | conc | completed | output tok/s | throughput-derived ms/output token | mean TTFT ms | median TTFT ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| host-staged | 1 | 24/24 | 20.912 | 47.820 | 764.471 | 740.296 |
+| host-staged | 4 | 24/24 | 21.030 | 47.552 | 2838.390 | 3036.649 |
+| host-staged | 8 | 24/24 | 20.964 | 47.700 | 5198.935 | 5991.506 |
+| NCCL | 1 | 24/24 | 6.302 | 158.689 | 2538.216 | 2553.374 |
+| NCCL | 4 | 24/24 | 6.326 | 158.083 | 9491.680 | 10097.244 |
+| NCCL | 8 | 24/24 | 6.341 | 157.710 | 17242.941 | 20110.121 |
+
+### vLLM Startup Failures
+
+In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, keep vLLM in the matrix when the selected validation environment can bring the server to readiness. The 2026-06-15 attempts on the same 2x RTX 5090 host failed before `/v1/models` readiness for both the older retained vLLM environment and a freshly installed current vLLM environment. Earlier manual vLLM rows should not be mixed with this current branch/hardware snapshot; they only show that vLLM may be viable in other environments.
+
+| Environment | Modes tried | Result |
+| --- | --- | --- |
+| vLLM `0.9.2`, Torch `2.7.0+cu128`, Transformers `4.53.3` | TP2, TP2+EP2, V1/V0, default/eager fallback, plus one low-memory smoke | server never reached readiness; failures were `CUBLAS_STATUS_NOT_INITIALIZED` during worker profile plus one low-memory illegal-memory-access smoke |
+| vLLM `0.22.1`, Torch `2.11.0+cu130`, Transformers `5.12.0` | TP2 and TP2+EP2 default/eager fallback | server never reached readiness; failures were FlashInfer / SM12x backend selection errors (`No supported CUDA architectures found for major versions [12]`, `FlashInfer requires GPUs with sm75 or higher`) |
+| vLLM `0.22.1` controlled backend fallback | TP2 and TP2+EP2 with `--attention-backend TRITON_ATTN --moe-backend triton` | server never reached readiness; `TRITON_ATTN` is not valid for DeepSeek-V2 MLA (`MLA not supported`) |
 
 Interpretation:
 
-- at single-concurrency TPOT, host-staged is closer to vLLM than the current NCCL backend;
+- direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
 - OpenInfer HTTP throughput did not scale with concurrency in this snapshot, so serving batching remains open;
-- vLLM TP2+EP2 worked in this environment and should stay in future comparison matrices.
+- vLLM comparison rows should remain failed/missing for this environment until a selected vLLM build reaches server readiness; standalone Torch bf16 GEMM passed on both GPUs in both tested vLLM environments, so the retained failure is specific to the vLLM DeepSeek-V2 server/model startup path rather than a blanket CUDA outage.
 
 ## Claim Boundaries
 
