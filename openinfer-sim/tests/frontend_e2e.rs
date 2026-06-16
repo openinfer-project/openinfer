@@ -427,5 +427,6 @@ const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
 
 const TINY_CONFIG_JSON: &str = r#"{
   "model_type": "openinfer_sim",
-  "max_position_embeddings": 128
+  "max_position_embeddings": 128,
+  "vocab_size": 3
 }"#;

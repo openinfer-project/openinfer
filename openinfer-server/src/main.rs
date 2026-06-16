@@ -111,13 +111,17 @@ async fn main() -> anyhow::Result<()> {
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
-        ModelType::DeepSeekV4 => {
-            openinfer_deepseek_v4::launch(&args.model_path, args.cuda_graph, args.deepseek_prefill_profile)
-                .context("failed to start DeepSeek V4 engine")?
-        }
+        ModelType::DeepSeekV4 => openinfer_deepseek_v4::launch(
+            &args.model_path,
+            args.cuda_graph,
+            args.deepseek_prefill_profile,
+        )
+        .context("failed to start DeepSeek V4 engine")?,
         #[cfg(feature = "deepseek-v2-lite")]
-        ModelType::DeepSeekV2Lite => openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
-            .context("failed to start DeepSeek V2 Lite engine")?,
+        ModelType::DeepSeekV2Lite => {
+            openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
+                .context("failed to start DeepSeek V2 Lite engine")?
+        }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,

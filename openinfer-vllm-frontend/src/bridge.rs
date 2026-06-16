@@ -390,7 +390,9 @@ fn reduce_request(
             TokenEvent::PromptTokens { .. } => {
                 // Prompt logprobs are intentionally deferred for this bridge.
             }
-            TokenEvent::Finished { finish_reason: fr, .. } => {
+            TokenEvent::Finished {
+                finish_reason: fr, ..
+            } => {
                 finish_reason = Some(convert_finish_reason(fr));
                 terminated = true;
             }
@@ -604,8 +606,10 @@ mod tests {
         fn add(&mut self, id: &str) -> Arc<AtomicBool> {
             let tag: RequestTag = Arc::from(id);
             let cancelled = Arc::new(AtomicBool::new(false));
-            self.streams
-                .insert(Arc::clone(&tag), RequestStreamState::new(Arc::clone(&cancelled)));
+            self.streams.insert(
+                Arc::clone(&tag),
+                RequestStreamState::new(Arc::clone(&cancelled)),
+            );
             cancelled
         }
 
@@ -619,8 +623,13 @@ mod tests {
         fn drain(&mut self) -> bool {
             match self.event_rx.try_recv() {
                 Ok(first) => {
-                    dispatch_burst(first, &mut self.event_rx, &mut self.streams, &self.output_tx)
-                        .expect("dispatch burst");
+                    dispatch_burst(
+                        first,
+                        &mut self.event_rx,
+                        &mut self.streams,
+                        &self.output_tx,
+                    )
+                    .expect("dispatch burst");
                     true
                 }
                 Err(_) => false,
@@ -664,7 +673,10 @@ mod tests {
             ))
         );
         assert!(d.next_output().is_none());
-        assert!(!d.streams.contains_key("req-1"), "finished stream is removed");
+        assert!(
+            !d.streams.contains_key("req-1"),
+            "finished stream is removed"
+        );
     }
 
     /// Token(s) and the terminal arriving in one burst (EmitAndFinish) coalesce
