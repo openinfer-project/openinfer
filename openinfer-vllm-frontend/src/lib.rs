@@ -237,6 +237,7 @@ where
         chat_template: None,
         default_chat_template_kwargs: None,
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
+        max_logprobs: None,
         language_model_only: true,
         api_keys: Vec::new(),
         api_server_options: ApiServerOptions {

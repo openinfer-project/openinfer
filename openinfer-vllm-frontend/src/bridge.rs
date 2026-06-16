@@ -59,9 +59,14 @@ impl LocalEngineBridge {
         let ready = EngineCoreReadyResponse {
             max_model_len: self.max_model_len as u64,
             num_gpu_blocks: 0,
+            // TODO(#401): report the real paged-KV block size and capacity from the
+            // openinfer scheduler once the vLLM frontend consumes ready_response KV fields.
+            block_size: 16,
             dp_stats_address: None,
             dtype: ModelDtype::BFloat16,
             vllm_version: "openinfer-local-bridge".to_string(),
+            kv_cache_size_tokens: None,
+            kv_cache_max_concurrency: None,
         };
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))

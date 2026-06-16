@@ -167,10 +167,10 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
 velo = "0.1.0"
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
 zeromq = { version = "0.6.0", default-features = false, features = [
     "tokio-runtime",
