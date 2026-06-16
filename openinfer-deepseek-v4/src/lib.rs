@@ -17,6 +17,37 @@ pub use direct::{
     DirectKvCacheActiveSnapshot, DirectKvCacheLease, DirectKvCacheReject,
     DirectKvCacheRejectReason, DirectKvCacheSnapshot, start_engine,
 };
+
+/// Start the DeepSeek V4 engine for the server. The binary forwards the user's
+/// `cuda_graph` request to every model uniformly — whether it can be honored is
+/// the model's call, not the server's. V4's direct engine has no CUDA Graph
+/// capture, so it ignores the request (warning if one came in). The MP8
+/// topology (devices `0..7`) is likewise fixed by the model.
+#[cfg(feature = "deepseek-v4")]
+pub fn launch(
+    model_path: &std::path::Path,
+    cuda_graph: bool,
+    prefill_profile: bool,
+) -> anyhow::Result<openinfer_core::engine::EngineHandle> {
+    use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+
+    if cuda_graph {
+        log::warn!(
+            "DeepSeek V4 does not support CUDA Graph (direct engine has no capture yet); ignoring --cuda-graph=true"
+        );
+    }
+    start_engine(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            enable_prefill_profile: prefill_profile,
+            device_ordinals: (0..8).collect(),
+            parallel_config: None,
+            ep_backend: EpBackend::Nccl,
+            seed: 42,
+        },
+    )
+}
 #[cfg(feature = "deepseek-v4")]
 pub use model::{
     AttentionWeightNames, AttentionWeights, BlockWeightNames, BlockWeights, CompressorWeightNames,
