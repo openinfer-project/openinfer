@@ -11,18 +11,13 @@ static TOKENIZER_RESOLVER_RUNTIME: OnceCell<Mutex<Runtime>> = OnceCell::new();
 pub fn load_tokenizer(model_id: &str) -> Result<DynTokenizer> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(Error::Tokenizer(
-            "openinfer_vllm_support::load_tokenizer is synchronous and cannot be called from \
-             inside an active Tokio runtime; use load_tokenizer_async instead"
+            "openinfer_vllm_support::load_tokenizer cannot be called from inside an active \
+             Tokio runtime"
                 .to_string(),
         ));
     }
 
     let files = resolve_model_files(model_id)?;
-    tokenizer_from_source(&files.tokenizer)
-}
-
-pub async fn load_tokenizer_async(model_id: &str) -> Result<DynTokenizer> {
-    let files = ResolvedModelFiles::new(model_id).await?;
     tokenizer_from_source(&files.tokenizer)
 }
 
@@ -72,7 +67,7 @@ mod tests {
         });
 
         assert!(
-            err.to_string().contains("load_tokenizer_async"),
+            err.to_string().contains("active Tokio runtime"),
             "unexpected error: {err}"
         );
     }
