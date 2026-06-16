@@ -43,6 +43,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/accuracy.md` | Qwen3.5-4B HF bf16 logits goldens through `past_key_values`: short replay covers sequential graph, bucket-straddling batched graph, and slot-compaction; long replay covers 4097/8192-token prompts; full GSM8K 8-shot now matches the HF baseline within 0.15 percentage points. |
 | `models/qwen35/model-crate.md` | `openinfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; feature-gated behind `qwen35-4b` (Triton AOT is the only Python build dependency); root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, historical Qwen3.5 e2e, and scheduler e2e records live here. |
 | `models/qwen35/kernel-plan.md` | Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3 module — enumerates every prefill/decode/unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites. Pure refactor (issue #256), no kernel behavior change. |
+| `models/qwen35/step-tail-issue353.md` | Qwen3.5 issue #353 implementation record: final prefill tail is batched, decode/unified sample from batched logits, host full-vocab copies are logprobs-only, HF + scheduler e2e pass, and final serving A/B supports only the first-token/short-output TTFT claim. |
 
 ## models / deepseek-v4
 

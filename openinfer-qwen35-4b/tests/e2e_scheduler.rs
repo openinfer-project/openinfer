@@ -8,7 +8,7 @@ use log::info;
 use tokio::sync::mpsc;
 
 use openinfer_core::engine::FinishReason;
-use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenLogprob};
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
@@ -93,12 +93,29 @@ struct TestCase {
     max_new_tokens: usize,
 }
 
+struct GenerationResult {
+    tokens: Vec<u32>,
+    logprobs: Vec<Option<TokenLogprob>>,
+    finish_reason: FinishReason,
+}
+
 fn generate_tokens(
     handle: &EngineHandle,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> (Vec<u32>, FinishReason) {
+    let result = generate_tokens_with_logprobs(handle, tokenizer, prompt, max_tokens, 0);
+    (result.tokens, result.finish_reason)
+}
+
+fn generate_tokens_with_logprobs(
+    handle: &EngineHandle,
+    tokenizer: &DynTokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    logprobs: usize,
+) -> GenerationResult {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let (token_tx, mut token_rx) = mpsc::unbounded_channel();
 
@@ -111,22 +128,66 @@ fn generate_tokens(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
+            logprobs,
             echo: false,
         })
         .expect("submit failed");
 
+    collect_generation(&mut token_rx, prompt, logprobs)
+}
+
+fn collect_generation(
+    token_rx: &mut mpsc::UnboundedReceiver<TokenEvent>,
+    name: &str,
+    logprobs: usize,
+) -> GenerationResult {
     let mut tokens = Vec::new();
+    let mut token_logprobs = Vec::new();
     loop {
         match token_rx.blocking_recv() {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
+            Some(TokenEvent::Token { id, logprob }) => {
+                if logprobs == 0 {
+                    assert!(
+                        logprob.is_none(),
+                        "{name}: logprobs=0 should not return token logprobs"
+                    );
+                } else {
+                    let lp = logprob
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{name}: logprobs={logprobs} returned None"));
+                    assert!(
+                        lp.logprob.is_finite(),
+                        "{name}: sampled token logprob must be finite"
+                    );
+                    assert_eq!(
+                        lp.top_logprobs.len(),
+                        logprobs,
+                        "{name}: top_logprobs length should match the request"
+                    );
+                    assert!(
+                        lp.top_logprobs.iter().all(|&(_, v)| v.is_finite()),
+                        "{name}: top_logprobs must be finite"
+                    );
+                    assert_eq!(
+                        lp.top_logprobs.first().map(|&(token, _)| token),
+                        Some(id),
+                        "{name}: greedy sampled token should match top-1 logprob row"
+                    );
+                }
+                tokens.push(id);
+                token_logprobs.push(logprob);
+            }
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
-                return (tokens, finish_reason);
+                return GenerationResult {
+                    tokens,
+                    logprobs: token_logprobs,
+                    finish_reason,
+                };
             }
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
+            None => panic!("{name}: scheduler channel closed without Finished"),
         }
     }
 }
@@ -193,8 +254,43 @@ fn test_e2e_qwen35_scheduler() {
     expect_context_window_rejection(&handle, max_context_tokens);
     info!("  PASS: over-context request rejected before prefill");
 
-    // ── 1. Sequential scheduler requests ────────────────────────────────
-    info!("=== Phase 1: Qwen3.5 sequential scheduler requests ===");
+    // ── 1. logprobs must not change greedy tokens ─────────────────────
+    info!("=== Phase 1: logprobs/no-logprobs token parity ===");
+    for case in CASES.iter().take(3) {
+        let max_tokens = case.max_new_tokens.min(16);
+        let no_logprobs =
+            generate_tokens_with_logprobs(&handle, &tokenizer, case.prompt, max_tokens, 0);
+        let with_logprobs =
+            generate_tokens_with_logprobs(&handle, &tokenizer, case.prompt, max_tokens, 1);
+        assert_eq!(no_logprobs.finish_reason, with_logprobs.finish_reason);
+        assert_eq!(
+            no_logprobs.tokens, with_logprobs.tokens,
+            "greedy token ids must not depend on whether logprobs are requested for {:?}",
+            case.name
+        );
+        assert!(
+            no_logprobs.logprobs.iter().all(Option::is_none),
+            "logprobs=0 should keep the no-host-logprobs path for {:?}",
+            case.name
+        );
+        assert!(
+            with_logprobs.logprobs.iter().all(Option::is_some),
+            "logprobs=1 should attach token logprobs for {:?}",
+            case.name
+        );
+        assert!(
+            !no_logprobs.tokens.is_empty(),
+            "logprobs parity regression prompt {:?} produced no tokens",
+            case.name
+        );
+        info!(
+            "  PASS: {:?} logprobs=0 and logprobs=1 produced identical greedy tokens",
+            case.name
+        );
+    }
+
+    // ── 2. Sequential scheduler requests ────────────────────────────────
+    info!("=== Phase 2: Qwen3.5 sequential scheduler requests ===");
     for case in CASES {
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
@@ -221,8 +317,8 @@ fn test_e2e_qwen35_scheduler() {
         info!("  PASS: {:?}", case.name);
     }
 
-    // ── 2. Multi-request (scheduler state reuse) ────────────────────────
-    info!("=== Phase 2: Multi-request ===");
+    // ── 3. Multi-request (scheduler state reuse) ────────────────────────
+    info!("=== Phase 3: Multi-request ===");
     for case in CASES {
         let (tokens, _) = generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
@@ -234,10 +330,10 @@ fn test_e2e_qwen35_scheduler() {
         info!("  PASS: {:?} → {} tokens", case.name, tokens.len());
     }
 
-    // ── 3. Concurrent requests ──────────────────────────────────────────
-    info!("=== Phase 3: Concurrent requests ===");
+    // ── 4. Concurrent requests ──────────────────────────────────────────
+    info!("=== Phase 4: Concurrent requests ===");
     {
-        let mut receivers: Vec<(String, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
+        let mut receivers: Vec<(String, usize, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
 
         // Submit all cases concurrently
         for case in CASES {
@@ -256,34 +352,68 @@ fn test_e2e_qwen35_scheduler() {
                     echo: false,
                 })
                 .expect("submit failed");
-            receivers.push((case.name.to_string(), token_rx));
+            receivers.push((case.name.to_string(), 0, token_rx));
         }
 
         // Collect all results
-        for (name, mut rx) in receivers {
-            let mut tokens = Vec::new();
-            loop {
-                match rx.blocking_recv() {
-                    Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
-                    Some(TokenEvent::Finished { .. }) => break,
-                    Some(TokenEvent::Error { message, .. }) => {
-                        panic!("generation failed: {message}")
-                    }
-                    Some(TokenEvent::Rejected { message, .. }) => {
-                        panic!("generation rejected: {message}")
-                    }
-                    None => panic!("channel closed for {:?}", name),
-                }
-            }
-            let text = tokenizer.decode(&tokens, true).expect("decode failed");
+        for (name, logprobs, mut rx) in receivers {
+            let result = collect_generation(&mut rx, &name, logprobs);
+            let text = tokenizer
+                .decode(&result.tokens, true)
+                .expect("decode failed");
             assert!(!text.is_empty(), "empty output for concurrent: {:?}", name);
-            info!("  PASS: {:?} → {} tokens", name, tokens.len());
+            info!("  PASS: {:?} → {} tokens", name, result.tokens.len());
         }
     }
 
-    // ── 4. Consumer drop safety ─────────────────────────────────────────
-    info!("=== Phase 4: Consumer drop ===");
+    // ── 4b. Mixed concurrent logprobs requests ─────────────────────────
+    info!("=== Phase 4b: Mixed concurrent logprobs ===");
+    {
+        let mixed = [
+            ("mixed_no_logprobs", CASES[0].prompt, 0usize),
+            ("mixed_with_logprobs", CASES[1].prompt, 1usize),
+        ];
+        let mut receivers: Vec<(&str, usize, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
+
+        for (name, prompt, logprobs) in mixed {
+            let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+            let (token_tx, token_rx) = mpsc::unbounded_channel();
+            handle
+                .submit(GenerateRequest {
+                    request_id: Some(name.to_string()),
+                    queued_at_unix_s: None,
+                    prompt_tokens,
+                    params: SamplingParams::default(),
+                    max_tokens: 8,
+                    lora_adapter: None,
+                    token_tx,
+                    logprobs,
+                    echo: false,
+                })
+                .expect("submit failed");
+            receivers.push((name, logprobs, token_rx));
+        }
+
+        for (name, logprobs, mut rx) in receivers {
+            let result = collect_generation(&mut rx, name, logprobs);
+            assert!(!result.tokens.is_empty(), "{name}: produced no tokens");
+            if logprobs == 0 {
+                assert!(
+                    result.logprobs.iter().all(Option::is_none),
+                    "{name}: no-logprobs request should stay on the no-copy path"
+                );
+            } else {
+                assert!(
+                    result.logprobs.iter().all(Option::is_some),
+                    "{name}: requested logprobs should be present"
+                );
+            }
+            info!("  PASS: {name} → {} tokens", result.tokens.len());
+        }
+    }
+
+    // ── 5. Consumer drop safety ─────────────────────────────────────────
+    info!("=== Phase 5: Consumer drop ===");
     {
         let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
         let (token_tx, rx) = mpsc::unbounded_channel();

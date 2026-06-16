@@ -10,14 +10,68 @@ use super::recurrent_state::RecurrentState;
 use super::weights::{FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model};
 use crate::ops;
 use openinfer_core::kv_pool::{KvLayout, KvState};
+use openinfer_core::sampler::SamplingParams;
+use openinfer_core::tensor::HiddenStates;
 
 impl Qwen35Model {
+    pub(crate) fn select_tokens_from_logits_varied(
+        &self,
+        logits: &HiddenStates,
+        bufs: &mut BatchDecodeBuffers35,
+        params: &[&SamplingParams],
+        rng: &mut rand::rngs::StdRng,
+    ) -> Result<Vec<u32>> {
+        anyhow::ensure!(
+            params.len() == logits.seq_len,
+            "Qwen3.5 sampling params/logits row mismatch: params={}, logits_rows={}",
+            params.len(),
+            logits.seq_len
+        );
+        anyhow::ensure!(
+            params.len() <= bufs.max_batch_size,
+            "Qwen3.5 sampling batch {} exceeds scratch capacity {}",
+            params.len(),
+            bufs.max_batch_size
+        );
+        let random_vals: Vec<f32> = params.iter().map(|_| rand::RngExt::random(rng)).collect();
+        ops::select_batch_tokens_into(
+            &self.ctx,
+            logits,
+            params,
+            &random_vals,
+            &mut bufs.sample_row_indices,
+            &mut bufs.sample_argmax_partial_values,
+            &mut bufs.sample_argmax_partial_indices,
+            &mut bufs.sample_probs,
+            &mut bufs.sample_top1_value,
+            &mut bufs.sample_row_states,
+            &mut bufs.sample_valid,
+            &mut bufs.sample_out,
+        )
+    }
+
     pub(crate) fn select_tokens_batch_varied(
         &self,
         bufs: &mut BatchDecodeBuffers35,
-        params: &[&openinfer_core::sampler::SamplingParams],
+        params: &[&SamplingParams],
         rng: &mut rand::rngs::StdRng,
     ) -> Result<Vec<u32>> {
+        anyhow::ensure!(
+            !params.is_empty(),
+            "Qwen3.5 decode sampling requires at least one request"
+        );
+        anyhow::ensure!(
+            params.len() <= bufs.logits.seq_len,
+            "Qwen3.5 decode sampling params/logits row mismatch: params={}, logits_rows={}",
+            params.len(),
+            bufs.logits.seq_len
+        );
+        anyhow::ensure!(
+            params.len() <= bufs.max_batch_size,
+            "Qwen3.5 decode sampling batch {} exceeds scratch capacity {}",
+            params.len(),
+            bufs.max_batch_size
+        );
         let random_vals: Vec<f32> = params.iter().map(|_| rand::RngExt::random(rng)).collect();
         ops::select_batch_tokens_into(
             &self.ctx,
