@@ -21,7 +21,7 @@ token_rx.recv()  ←──────────────  token_tx.send(to
 tokenizer.decode() + SSE
 ```
 
-The scheduler thread owns the model, `BatchDecodeBuffers`, and `KvPool` exclusively. No `Mutex` — single-threaded GPU ownership. HTTP handlers and scheduler talk over channels only. Consumer drop (`token_tx.send` returns `Err`) is the cancellation signal.
+The scheduler thread owns the model, `BatchDecodeBuffers`, and `KvPool` exclusively. No `Mutex` — single-threaded GPU ownership. HTTP handlers and scheduler talk over channels only. `token_tx` is now a `TokenSink` over one shared request-tagged channel (see `output-dispatch.md`); `token_tx.send` returns `Err` when the request's cancel flag is flipped (abort) or the engine shuts down, which is the cancellation signal the scheduler retires on.
 
 ## Paged KV cache
 
@@ -95,6 +95,7 @@ Related: FlashInfer's f32 fused RoPE rounds differently from a precomputed bf16 
 
 - **ITL p99 tail (291 vs vLLM 211ms).** Large prefills block in-flight decode. Chunked prefill would fix it. Low priority — varied-length workloads break the waves naturally, and fixed-length ITL p99 already beats vLLM.
 - **9 failures at QPS=2.** Needs root-cause — likely KV pressure or empty-prompt rejection from the random dataset.
+- **Worker-panic wedge at high concurrency (RTX 5070 Ti, verified 2026-06).** Under sustained high load (c≈128–192, mixed prefill+decode), the GPU worker thread `qwen3-tp-rank-0` panics in a cudarc copy: `assertion failed: dst.len() >= src.len()` (`cudarc .../driver/safe/core.rs:1607`) — a pre-allocated buffer is too small for some batch/shape the step produces. Two distinct faults compound: (1) the undersized buffer (proximate crash); (2) **blast radius + no recovery** — `fail_touched_requests` clears the *entire* active batch on any step `Err`, the worker thread is never restarted, so every subsequent step returns "worker step channel closed" and **all** in-flight and future requests fail. `/health` still returns 200 (separate layer), so it reads as a silent permanent wedge until process restart. Not KV admission: a 160-request single burst defers cleanly with 0 errors, so full-lifetime admission works. Independent of the output-dispatch change (the panic is in the executor copy path; `main` fails identically). Next: `RUST_BACKTRACE=1` to capture the call site — prime suspects are the prefill/unified or batched step-tail logits/sampling readback (not the decode token H2D, which is sized to the 256 bucket).
 - **Batch decode per-row sampling.** `(0..bs).map(gpu_sample_into)` regresses to O(bs) launches; scheduler still hot-pathes through this. See memory entry on FlashInfer sampling for the redesign target (batched per-request sampling metadata, mini-sglang/vLLM style).
 - **Qwen3.5 partial paged migration.** Decode is fully paged via the scheduler. Prefill still scatters from contiguous HND staging into paged KV before attention. Migration mirrors Qwen3's step 2 with HD256 + partial RoPE (rotary_dim=64 of head_dim=256) wrinkles.
 
@@ -104,3 +105,4 @@ Related: FlashInfer's f32 fused RoPE rounds differently from a precomputed bf16 
 - Batch sampling redesign with per-request metadata
 - Chunked prefill — only if ITL p99 becomes a hard requirement
 - Preemption / priority queuing — deferred, no current pain
+- **Output-dispatch redesign — landed 2026-06** (see `output-dispatch.md`): the per-request `token_tx` fan-out (N channels + N tasks, N wakeups/step ≈ 3µs×batch GPU bubble) is collapsed to one request-tagged channel + one demux loop; `token_tx` is a `TokenSink` drop-in and cancellation rides an `Arc<AtomicBool>` flag (no separate cancel channel). Remaining: re-measure the bubble on the migrated path; small win on this GPU, material on fast decode GPUs (H20/H100) or N≫128.

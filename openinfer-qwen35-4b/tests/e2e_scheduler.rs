@@ -5,10 +5,11 @@
 use std::time::Instant;
 
 use log::info;
-use tokio::sync::mpsc;
 
 use openinfer_core::engine::FinishReason;
-use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenLogprob};
+use openinfer_core::engine::{
+    EngineHandle, GenerateRequest, TokenEvent, TokenLogprob, TokenSink, TokenStreamReceiver,
+};
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
@@ -117,7 +118,7 @@ fn generate_tokens_with_logprobs(
     logprobs: usize,
 ) -> GenerationResult {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
 
     handle
         .submit(GenerateRequest {
@@ -137,14 +138,14 @@ fn generate_tokens_with_logprobs(
 }
 
 fn collect_generation(
-    token_rx: &mut mpsc::UnboundedReceiver<TokenEvent>,
+    token_rx: &mut TokenStreamReceiver,
     name: &str,
     logprobs: usize,
 ) -> GenerationResult {
     let mut tokens = Vec::new();
     let mut token_logprobs = Vec::new();
     loop {
-        match token_rx.blocking_recv() {
+        match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, logprob }) => {
                 if logprobs == 0 {
                     assert!(
@@ -193,7 +194,7 @@ fn collect_generation(
 }
 
 fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: usize) {
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
 
     handle
         .submit(GenerateRequest {
@@ -209,7 +210,7 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
         })
         .expect("submit over-context request");
 
-    match token_rx.blocking_recv() {
+    match token_rx.blocking_recv().map(|(_, event)| event) {
         Some(TokenEvent::Rejected {
             message,
             prompt_tokens,
@@ -333,12 +334,12 @@ fn test_e2e_qwen35_scheduler() {
     // ── 4. Concurrent requests ──────────────────────────────────────────
     info!("=== Phase 4: Concurrent requests ===");
     {
-        let mut receivers: Vec<(String, usize, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
+        let mut receivers: Vec<(String, usize, TokenStreamReceiver)> = Vec::new();
 
         // Submit all cases concurrently
         for case in CASES {
             let prompt_tokens = tokenizer.encode(case.prompt, false).expect("encode failed");
-            let (token_tx, token_rx) = mpsc::unbounded_channel();
+            let (token_tx, token_rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
                     request_id: None,
@@ -373,11 +374,11 @@ fn test_e2e_qwen35_scheduler() {
             ("mixed_no_logprobs", CASES[0].prompt, 0usize),
             ("mixed_with_logprobs", CASES[1].prompt, 1usize),
         ];
-        let mut receivers: Vec<(&str, usize, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
+        let mut receivers: Vec<(&str, usize, TokenStreamReceiver)> = Vec::new();
 
         for (name, prompt, logprobs) in mixed {
             let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-            let (token_tx, token_rx) = mpsc::unbounded_channel();
+            let (token_tx, token_rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
                     request_id: Some(name.to_string()),
@@ -416,7 +417,7 @@ fn test_e2e_qwen35_scheduler() {
     info!("=== Phase 5: Consumer drop ===");
     {
         let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
-        let (token_tx, rx) = mpsc::unbounded_channel();
+        let (token_tx, rx) = TokenSink::standalone();
         drop(rx);
         handle
             .submit(GenerateRequest {

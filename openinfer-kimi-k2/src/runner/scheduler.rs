@@ -12,7 +12,7 @@ use crate::runner::worker::{KimiKvStepPages, KimiRowOptions};
 use anyhow::{Context, Result};
 use lifecycle::{preflight_prefill_candidate, send_scheduled, validate_kv_capacity};
 use log::error;
-use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_kv_cache::{BlockPool, RequestKv};
 use tokio::sync::mpsc;
 
@@ -35,7 +35,7 @@ fn row_options(req: &GenerateRequest) -> KimiRowOptions {
 }
 
 struct ActiveKimiRequest {
-    token_tx: mpsc::UnboundedSender<TokenEvent>,
+    token_tx: TokenSink,
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
@@ -754,8 +754,8 @@ mod tests {
     fn request_with_channel(
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
-    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
+    ) -> (GenerateRequest, openinfer_core::engine::TokenStreamReceiver) {
+        let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
@@ -831,10 +831,10 @@ mod tests {
             "a rejected sampling request must not reach the executor"
         );
         // Scheduled event precedes the rejection.
-        let Ok(TokenEvent::Scheduled { .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Scheduled { .. })) = token_rx.try_recv() else {
             panic!("expected Scheduled event");
         };
-        let Ok(TokenEvent::Rejected { message, .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Rejected { message, .. })) = token_rx.try_recv() else {
             panic!("expected Rejected event");
         };
         assert!(
@@ -857,10 +857,10 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "a rejected echo request must not reach the executor"
         );
-        let Ok(TokenEvent::Scheduled { .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Scheduled { .. })) = token_rx.try_recv() else {
             panic!("expected Scheduled event");
         };
-        let Ok(TokenEvent::Rejected { message, .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Rejected { message, .. })) = token_rx.try_recv() else {
             panic!("expected Rejected event");
         };
         assert!(
@@ -889,10 +889,10 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "a rejected over-cap request must not reach the executor"
         );
-        let Ok(TokenEvent::Scheduled { .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Scheduled { .. })) = token_rx.try_recv() else {
             panic!("expected Scheduled event");
         };
-        let Ok(TokenEvent::Rejected { message, .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Rejected { message, .. })) = token_rx.try_recv() else {
             panic!("expected Rejected event");
         };
         assert!(

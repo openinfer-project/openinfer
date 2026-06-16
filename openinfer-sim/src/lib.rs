@@ -155,6 +155,7 @@ fn now_secs_f64() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use openinfer_engine::engine::TokenSink;
     use openinfer_engine::sampler::SamplingParams;
 
     use super::*;
@@ -180,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn simulated_request_emits_scheduled_tokens_and_finished() {
         let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 42).unwrap();
-        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        let (token_tx, mut token_rx) = TokenSink::standalone();
 
         run_simulated_request(
             GenerateRequest {
@@ -199,35 +200,35 @@ mod tests {
         .await;
 
         assert!(matches!(
-            token_rx.recv().await,
+            token_rx.recv().await.map(|(_, event)| event),
             Some(TokenEvent::Scheduled {
                 prompt_tokens: 2,
                 ..
             })
         ));
         assert!(matches!(
-            token_rx.recv().await,
+            token_rx.recv().await.map(|(_, event)| event),
             Some(TokenEvent::Token {
                 id: 7,
                 logprob: Some(_)
             })
         ));
         assert!(matches!(
-            token_rx.recv().await,
+            token_rx.recv().await.map(|(_, event)| event),
             Some(TokenEvent::Token {
                 id: 9,
                 logprob: Some(_)
             })
         ));
         assert!(matches!(
-            token_rx.recv().await,
+            token_rx.recv().await.map(|(_, event)| event),
             Some(TokenEvent::Token {
                 id: 7,
                 logprob: Some(_)
             })
         ));
         assert!(matches!(
-            token_rx.recv().await,
+            token_rx.recv().await.map(|(_, event)| event),
             Some(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: 2,

@@ -1,14 +1,12 @@
-use tokio::sync::mpsc;
-
 use log::debug;
 
 use crate::executor::RequestId;
-use openinfer_core::engine::{FinishReason, TokenLogprob};
+use openinfer_core::engine::{FinishReason, TokenLogprob, TokenSink};
 
 use super::{ActiveRequestState, PendingRequest, TokenEvent};
 
 pub(super) struct PromptEchoEffect {
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) ids: Vec<u32>,
     pub(super) logprobs: Vec<Option<TokenLogprob>>,
 }
@@ -18,7 +16,7 @@ pub(super) struct PromptEchoEffect {
 /// scheduled timestamp was stamped when the batch was formed, not when the
 /// event is sent, so queue-time metrics exclude prefill execution.
 pub(super) struct ScheduledEffect {
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) queued_at_unix_s: Option<f64>,
     pub(super) scheduled_at_unix_s: f64,
     pub(super) prompt_tokens: usize,
@@ -28,14 +26,14 @@ pub(super) struct ScheduledEffect {
 pub(super) enum PendingEffect {
     Finish {
         request_id: RequestId,
-        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        token_tx: TokenSink,
         finish_reason: FinishReason,
         prompt_tokens: usize,
         completion_tokens: usize,
     },
     EmitAndFinish {
         request_id: RequestId,
-        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        token_tx: TokenSink,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
