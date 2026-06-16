@@ -12,6 +12,7 @@ pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod logprobs;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;
