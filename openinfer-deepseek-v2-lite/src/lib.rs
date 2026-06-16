@@ -12,7 +12,7 @@ mod weights;
 use std::path::Path;
 
 use anyhow::Result;
-use openinfer_engine::engine::{EngineHandle, EngineLoadOptions};
+use openinfer_engine::engine::{EngineHandle, EngineLoadOptions, EpBackend};
 
 pub use attribution::{CallSiteRollup, DecodeAttributionProfile, SectionRollup, SectionSample};
 pub use config::Config;
@@ -50,4 +50,26 @@ pub fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     engine::start_engine(model_path, options)
+}
+
+/// Start the DeepSeek-V2-Lite engine for the server. The binary forwards the
+/// user's `cuda_graph` request uniformly; whether to honor it is the model's
+/// call. The EP=2 path has no CUDA Graph capture, so it ignores the request
+/// (warning if one came in). The EP=2 topology (devices `0..1`) is fixed by the
+/// model.
+pub fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
+    if cuda_graph {
+        log::warn!("DeepSeek V2 Lite does not support CUDA Graph; ignoring --cuda-graph=true");
+    }
+    engine::start_engine(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            enable_prefill_profile: false,
+            device_ordinals: vec![0, 1],
+            parallel_config: None,
+            ep_backend: EpBackend::Nccl,
+            seed: 42,
+        },
+    )
 }

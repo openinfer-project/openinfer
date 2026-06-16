@@ -77,6 +77,7 @@ impl SimServer {
         let engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
         let server_shutdown = shutdown.clone();
         let model_path = model_dir.path.to_string_lossy().into_owned();
+        let model_path_buf = model_dir.path.clone();
         let mut task = tokio::spawn(async move {
             if enable_lora_routes {
                 openinfer_vllm_frontend::serve_model_with_lora_routes(
@@ -90,12 +91,12 @@ impl SimServer {
                 )
                 .await
             } else {
-                openinfer_vllm_frontend::serve_model(
-                    engine,
-                    model_path,
+                openinfer_vllm_frontend::serve(
+                    std::future::ready(Ok(engine)),
+                    &model_path_buf,
                     vec![MODEL_NAME.to_string()],
                     port,
-                    128,
+                    Some(128),
                     server_shutdown,
                 )
                 .await

@@ -25,10 +25,10 @@ mod sampling_guard;
 mod wire;
 
 use bridge::{LocalEngineBridge, ipc_endpoint, local_ipc_namespace};
-use lora::{bad_request, load_startup_lora_modules, lora_openai_routes};
+use lora::{bad_request, load_startup_lora_modules, lora_openai_routes, lora_routes};
 use sampling_guard::{ServableCap, guard_generation_request};
 
-pub use lora::{LoraModule, lora_routes};
+pub use lora::LoraModule;
 
 const COMPLETION_ROUTE_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -49,53 +49,25 @@ impl ModelLenConfig {
 /// chat templates) starts immediately and the engine bridge attaches once
 /// `engine` resolves. HTTP binds only after the bridge registers, so a
 /// reachable port still means the engine is ready.
+///
+/// Pass `max_model_len: None` to read `max_position_embeddings` from
+/// `model_path/config.json`; pass `Some(n)` when the path has no config
+/// (e.g. a HuggingFace model id for the sim frontend).
 pub async fn serve(
     engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
     model_path: &Path,
-    served_model_name: Option<&str>,
+    served_model_name: Vec<String>,
     port: u16,
+    max_model_len: Option<u32>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let max_model_len = load_max_model_len(model_path).unwrap_or_else(|| {
-        const FALLBACK_MAX_MODEL_LEN: u32 = 4096;
-        warn!(
-            "max_position_embeddings not found in {}/config.json; capping max_model_len at {FALLBACK_MAX_MODEL_LEN}. \
-             Requests are limited to this length — set max_position_embeddings in the model config if it supports more.",
-            model_path.display()
-        );
-        FALLBACK_MAX_MODEL_LEN
-    });
     serve_model_on_host(
         engine,
         model_path.to_string_lossy().into_owned(),
-        served_model_name
-            .into_iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
-        "0.0.0.0".to_string(),
-        port,
-        max_model_len,
-        shutdown,
-    )
-    .await
-}
-
-pub async fn serve_model(
-    handle: EngineHandle,
-    model_id: impl Into<String>,
-    served_model_name: Vec<String>,
-    port: u16,
-    max_model_len: u32,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let model_id = model_id.into();
-    serve_model_on_host(
-        std::future::ready(Ok(handle)),
-        model_id,
         served_model_name,
         "0.0.0.0".to_string(),
         port,
-        max_model_len,
+        resolve_max_model_len(model_path, max_model_len),
         shutdown,
     )
     .await
@@ -280,6 +252,20 @@ pub fn load_max_model_len(model_path: &Path) -> Option<u32> {
     serde_json::from_str::<ModelLenConfig>(&content)
         .ok()?
         .max_model_len()
+}
+
+fn resolve_max_model_len(model_path: &Path, max_model_len: Option<u32>) -> u32 {
+    max_model_len.unwrap_or_else(|| {
+        load_max_model_len(model_path).unwrap_or_else(|| {
+            const FALLBACK_MAX_MODEL_LEN: u32 = 4096;
+            warn!(
+                "max_position_embeddings not found in {}/config.json; capping max_model_len at {FALLBACK_MAX_MODEL_LEN}. \
+                 Requests are limited to this length — set max_position_embeddings in the model config if it supports more.",
+                model_path.display()
+            );
+            FALLBACK_MAX_MODEL_LEN
+        })
+    })
 }
 
 /// Cancel `token` on the first CTRL+C. Installing the handler replaces the

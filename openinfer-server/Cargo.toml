@@ -61,16 +61,5 @@ deepseek-v4-cutedsl-diagnostic = [
     "openinfer-deepseek-v4/deepseek-v4-cutedsl-diagnostic",
 ]
 
-[dev-dependencies]
-criterion = { workspace = true }
-
 [lints]
 workspace = true
-
-[[bench]]
-name = "ops_bench"
-harness = false
-
-[[bench]]
-name = "nccl_bench"
-harness = false
