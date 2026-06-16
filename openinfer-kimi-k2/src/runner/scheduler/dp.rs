@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use log::error;
-use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_kv_cache::{BlockPool, RequestKv};
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -49,7 +49,7 @@ pub(in crate::runner) struct DpRankState {
 }
 
 struct RequestState {
-    token_tx: mpsc::UnboundedSender<TokenEvent>,
+    token_tx: TokenSink,
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
@@ -1092,7 +1092,7 @@ mod tests {
     use super::*;
 
     fn dummy_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> GenerateRequest {
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let (token_tx, _token_rx) = TokenSink::standalone();
         GenerateRequest {
             request_id: None,
             queued_at_unix_s: None,
@@ -1141,7 +1141,7 @@ mod tests {
         max_tokens: usize,
         last_token: u32,
     ) -> RequestState {
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let (token_tx, _token_rx) = TokenSink::standalone();
         RequestState {
             token_tx,
             prompt_len,
@@ -1307,7 +1307,7 @@ mod tests {
         let mut rank = DpRankState {
             slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
         };
-        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        let (token_tx, mut token_rx) = TokenSink::standalone();
         let mut kv = dummy_kv(&pool, 4, 1, 16, 7);
         kv.schedule_decode(&pool).expect("decode block");
         rank.slots[0] = Some(RequestState {
@@ -1323,11 +1323,14 @@ mod tests {
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586], &pool);
 
         assert!(rank.slots[0].is_none());
-        let Ok(TokenEvent::Finished {
-            finish_reason,
-            completion_tokens,
-            ..
-        }) = token_rx.try_recv()
+        let Ok((
+            _,
+            TokenEvent::Finished {
+                finish_reason,
+                completion_tokens,
+                ..
+            },
+        )) = token_rx.try_recv()
         else {
             panic!("expected Finished event");
         };
@@ -1343,7 +1346,7 @@ mod tests {
         let mut rank = DpRankState {
             slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
         };
-        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        let (token_tx, mut token_rx) = TokenSink::standalone();
         let mut kv = dummy_kv(&pool, 4, 1, 16, 7);
         kv.schedule_decode(&pool).expect("decode block");
         rank.slots[0] = Some(RequestState {
@@ -1365,7 +1368,7 @@ mod tests {
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586], &pool);
 
         assert!(rank.slots[0].is_some());
-        let Ok(TokenEvent::Token { id, .. }) = token_rx.try_recv() else {
+        let Ok((_, TokenEvent::Token { id, .. })) = token_rx.try_recv() else {
             panic!("expected Token event");
         };
         assert_eq!(id, 163_586);

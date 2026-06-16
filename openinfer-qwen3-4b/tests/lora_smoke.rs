@@ -7,13 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use half::bf16;
 use openinfer_core::engine::{
     EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
-    TokenEvent,
+    TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
 use safetensors::Dtype;
 use safetensors::tensor::View;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -166,7 +165,7 @@ fn generate_tokens(
     lora_adapter: Option<String>,
 ) -> (Vec<u32>, FinishReason) {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
 
     handle
         .submit(GenerateRequest {
@@ -184,7 +183,7 @@ fn generate_tokens(
 
     let mut tokens = Vec::new();
     loop {
-        match token_rx.blocking_recv() {
+        match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => return (tokens, finish_reason),

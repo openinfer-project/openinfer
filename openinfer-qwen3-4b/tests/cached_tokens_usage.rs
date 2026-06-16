@@ -11,9 +11,10 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
+};
 use openinfer_core::sampler::SamplingParams;
-use tokio::sync::mpsc;
 
 mod common;
 
@@ -38,7 +39,7 @@ fn model_path_or_skip() -> Option<String> {
 /// Submit `prompt_tokens`, drain the stream to `Finished`, and return the
 /// `cached_tokens` carried by the `Scheduled` event.
 fn run_and_capture_cached(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> usize {
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -55,7 +56,7 @@ fn run_and_capture_cached(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> usi
 
     let mut cached = None;
     loop {
-        match rx.blocking_recv() {
+        match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Scheduled { cached_tokens, .. }) => {
                 assert!(
                     cached.replace(cached_tokens).is_none(),

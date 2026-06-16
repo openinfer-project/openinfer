@@ -17,9 +17,10 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
+};
 use openinfer_core::sampler::SamplingParams;
-use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -49,7 +50,7 @@ fn generate_text(
     max_tokens: usize,
 ) -> String {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -66,7 +67,7 @@ fn generate_text(
 
     let mut tokens = Vec::new();
     loop {
-        match rx.blocking_recv() {
+        match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
@@ -99,7 +100,7 @@ fn oversized_prompt_is_rejected_with_context_length_error() {
     // Qwen3-4B's max_position_embeddings is 40960; 60k tokens overflows it outright.
     // Token id is irrelevant — the request is rejected before any embedding lookup.
     let prompt_tokens = vec![1u32; 60_000];
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -114,7 +115,7 @@ fn oversized_prompt_is_rejected_with_context_length_error() {
         })
         .expect("submit failed");
 
-    match rx.blocking_recv() {
+    match rx.blocking_recv().map(|(_, event)| event) {
         Some(TokenEvent::Rejected { message, .. }) => {
             assert!(
                 message.contains("context length"),

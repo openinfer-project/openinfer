@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn send_rejection_reports_kv_lifetime_request_tokens() {
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
     let req = SchedulerRequest {
         request_id: Some("too-large".to_string()),
         queued_at_unix_s: None,
@@ -17,7 +17,7 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
 
     send_rejection(&req, RejectReason::KvBudget);
 
-    match token_rx.blocking_recv() {
+    match token_rx.blocking_recv().map(|(_, event)| event) {
         Some(TokenEvent::Rejected {
             message,
             prompt_tokens,
@@ -36,7 +36,7 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
 
 #[test]
 fn send_rejection_reports_context_window_limit() {
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
     let req = SchedulerRequest {
         request_id: Some("too-long".to_string()),
         queued_at_unix_s: None,
@@ -51,7 +51,7 @@ fn send_rejection_reports_context_window_limit() {
 
     send_rejection(&req, RejectReason::ContextLength { limit: 32 });
 
-    match token_rx.blocking_recv() {
+    match token_rx.blocking_recv().map(|(_, event)| event) {
         Some(TokenEvent::Rejected {
             message,
             prompt_tokens,

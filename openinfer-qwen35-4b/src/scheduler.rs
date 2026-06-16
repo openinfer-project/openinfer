@@ -24,7 +24,7 @@ use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
     EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, TokenEvent,
-    TokenLogprob,
+    TokenLogprob, TokenSink,
 };
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
@@ -41,7 +41,7 @@ use self::plan::{
 /// `BatchDecodeGraphState` at `graph_slot_idx` — NOT owned here.
 struct ActiveRequest35 {
     request_id: Option<String>,
-    token_tx: mpsc::UnboundedSender<TokenEvent>,
+    token_tx: TokenSink,
     kv: KvState,
     /// Index into `BatchDecodeGraphState.slot_states`.
     graph_slot_idx: usize,

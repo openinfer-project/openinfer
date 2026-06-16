@@ -14,9 +14,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
+};
 use openinfer_core::sampler::SamplingParams;
-use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -46,7 +47,7 @@ fn generate_text(
     max_tokens: usize,
 ) -> String {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -63,7 +64,7 @@ fn generate_text(
 
     let mut tokens = Vec::new();
     loop {
-        match rx.blocking_recv() {
+        match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
@@ -100,7 +101,7 @@ fn scheduler_survives_consumer_drop() {
     // Submit, then drop the receiver immediately — the scheduler should notice
     // the send failures and retire the request rather than spinning on it.
     let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
-    let (token_tx, rx) = mpsc::unbounded_channel();
+    let (token_tx, rx) = TokenSink::standalone();
     drop(rx);
     handle
         .submit(GenerateRequest {

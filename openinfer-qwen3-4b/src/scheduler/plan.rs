@@ -164,7 +164,7 @@ mod tests {
     use openinfer_core::sampler::SamplingParams;
 
     fn pending() -> PendingRequest {
-        let (token_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (token_tx, _rx) = openinfer_core::engine::TokenSink::standalone();
         PendingRequest {
             request_id: RequestId::new(0),
             lora_adapter: None,

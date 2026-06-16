@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use openinfer_engine::engine::{
-    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent,
+    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenSink,
 };
 use tokio::sync::mpsc;
 
@@ -92,11 +92,7 @@ fn reject_request(req: &GenerateRequest, prompt_tokens: usize, message: String) 
     });
 }
 
-fn emit_generation_result(
-    token_tx: &mpsc::UnboundedSender<TokenEvent>,
-    prompt_tokens: usize,
-    result: &GenerationResult,
-) {
+fn emit_generation_result(token_tx: &TokenSink, prompt_tokens: usize, result: &GenerationResult) {
     for token in &result.tokens {
         let _ = token_tx.send(TokenEvent::Token {
             id: *token,
@@ -123,7 +119,7 @@ mod tests {
 
     #[test]
     fn stop_generation_streams_tokens_and_stop_finish() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = TokenSink::standalone();
 
         emit_generation_result(
             &tx,
@@ -136,15 +132,15 @@ mod tests {
         );
         drop(tx);
 
-        match rx.try_recv().expect("expected first token") {
+        match rx.try_recv().expect("expected first token").1 {
             TokenEvent::Token { id, .. } => assert_eq!(id, 10),
             _ => panic!("expected first token event"),
         }
-        match rx.try_recv().expect("expected second token") {
+        match rx.try_recv().expect("expected second token").1 {
             TokenEvent::Token { id, .. } => assert_eq!(id, 11),
             _ => panic!("expected second token event"),
         }
-        match rx.try_recv().expect("expected finished event") {
+        match rx.try_recv().expect("expected finished event").1 {
             TokenEvent::Finished {
                 finish_reason,
                 prompt_tokens,

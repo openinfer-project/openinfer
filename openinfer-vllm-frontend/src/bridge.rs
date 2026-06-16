@@ -1,12 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
@@ -23,7 +23,9 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
-use openinfer_engine::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenLogprob};
+use openinfer_engine::engine::{
+    EngineHandle, GenerateRequest, RequestTag, TokenEvent, TokenSink, TokenStreamReceiver,
+};
 
 use crate::wire::{
     convert_finish_reason, convert_sampling, lora_adapter_from_sampling_params, requested_logprobs,
@@ -87,8 +89,12 @@ impl LocalEngineBridge {
         let (output_tx, output_rx) = mpsc::unbounded_channel();
         let output_task = tokio::spawn(output_loop(output, output_rx));
 
-        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<String>();
-        let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
+        // One shared channel carries every request's token events, tagged by
+        // request id; this loop is the sole consumer. Per-request state lives
+        // in `streams`, keyed by the same tag, and holds the cancel flag the
+        // scheduler observes (via `TokenSink`) when an abort flips it.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut streams: HashMap<RequestTag, RequestStreamState> = HashMap::new();
 
         info!(
             "local vLLM engine bridge connected: input={}, output={}, max_model_len={}",
@@ -98,16 +104,20 @@ impl LocalEngineBridge {
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                Some(request_id) = done_rx.recv() => {
-                    active.remove(&request_id);
+                Some(first) = event_rx.recv() => {
+                    if let Err(error) =
+                        dispatch_burst(first, &mut event_rx, &mut streams, &output_tx)
+                    {
+                        warn!("local engine bridge output failed: {error:#}");
+                    }
                 }
                 recv = input.recv() => {
                     let message = recv.context("failed to receive local engine request")?;
                     if let Err(error) = self.handle_message(
                         message,
+                        &event_tx,
                         &output_tx,
-                        &done_tx,
-                        &mut active,
+                        &mut streams,
                     ) {
                         warn!("local engine bridge request failed: {error:#}");
                     }
@@ -115,8 +125,10 @@ impl LocalEngineBridge {
             }
         }
 
-        for (_, task) in active {
-            task.abort();
+        // Cancel every in-flight request so the scheduler retires them on its
+        // next emit instead of pushing into a channel no one drains.
+        for state in streams.values() {
+            state.cancelled.store(true, Ordering::Release);
         }
         drop(output_tx);
         output_task.abort();
@@ -127,9 +139,9 @@ impl LocalEngineBridge {
     fn handle_message(
         &self,
         message: ZmqMessage,
+        event_tx: &mpsc::UnboundedSender<(RequestTag, TokenEvent)>,
         output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
-        done_tx: &mpsc::UnboundedSender<String>,
-        active: &mut HashMap<String, JoinHandle<()>>,
+        streams: &mut HashMap<RequestTag, RequestStreamState>,
     ) -> Result<()> {
         let frames = message.into_vec();
         if frames.len() != 2 {
@@ -143,14 +155,20 @@ impl LocalEngineBridge {
             ty if ty == EngineCoreRequestType::Add.to_frame().as_ref() => {
                 let request: EngineCoreRequest =
                     vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
-                self.start_request(request, output_tx, done_tx, active)
+                self.start_request(request, event_tx, output_tx, streams)
             }
             ty if ty == EngineCoreRequestType::Abort.to_frame().as_ref() => {
                 let request_ids: Vec<String> =
                     vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
                 for request_id in request_ids {
-                    if let Some(task) = active.remove(&request_id) {
-                        task.abort();
+                    // Drop our state first, then flip the cancel flag (so the
+                    // scheduler's next emit fails and retires the request). The
+                    // `Release` store orders the `streams.remove` before the
+                    // flag the scheduler reads with `Acquire`; any token already
+                    // in flight for this id is discarded by the demux when it
+                    // finds no stream entry.
+                    if let Some(state) = streams.remove(request_id.as_str()) {
+                        state.cancelled.store(true, Ordering::Release);
                     }
                 }
                 Ok(())
@@ -171,9 +189,9 @@ impl LocalEngineBridge {
     fn start_request(
         &self,
         request: EngineCoreRequest,
+        event_tx: &mpsc::UnboundedSender<(RequestTag, TokenEvent)>,
         output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
-        done_tx: &mpsc::UnboundedSender<String>,
-        active: &mut HashMap<String, JoinHandle<()>>,
+        streams: &mut HashMap<RequestTag, RequestStreamState>,
     ) -> Result<()> {
         let EngineCoreRequest {
             request_id,
@@ -206,10 +224,12 @@ impl LocalEngineBridge {
             return Ok(());
         };
 
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let tag: RequestTag = Arc::from(request_id.as_str());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token_tx = TokenSink::new(tag.clone(), event_tx.clone(), Arc::clone(&cancelled));
         self.handle
             .submit(GenerateRequest {
-                request_id: Some(request_id.clone()),
+                request_id: Some(request_id),
                 queued_at_unix_s: Some(request.arrival_time),
                 prompt_tokens,
                 params: convert_sampling(&sampling_params),
@@ -221,36 +241,113 @@ impl LocalEngineBridge {
             })
             .context("failed to submit request to scheduler")?;
 
-        let output_tx = output_tx.clone();
-        let done_tx = done_tx.clone();
-        let task_request_id = request_id.clone();
-        let task = tokio::spawn(async move {
-            run_request_stream(task_request_id.clone(), token_rx, output_tx).await;
-            let _ = done_tx.send(task_request_id);
-        });
-        active.insert(request_id, task);
-
+        streams.insert(tag, RequestStreamState::new(cancelled));
         Ok(())
     }
 }
 
-async fn run_request_stream(
-    request_id: String,
-    mut token_rx: mpsc::UnboundedReceiver<TokenEvent>,
-    output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
-) {
-    let mut first_token_events = None;
-    let mut first_token_prefill_stats = None;
-    let mut has_sent_token_output = false;
-    let mut pending_event = None;
-    loop {
-        let event = match pending_event.take() {
-            Some(event) => event,
-            None => match token_rx.recv().await {
-                Some(event) => event,
-                None => return,
-            },
+/// Per-request demux state held by the bridge loop, keyed by [`RequestTag`].
+/// Replaces the former per-request task's locals; `first_token_*` flush onto
+/// the request's first output, `cancelled` is the flag the scheduler's
+/// [`TokenSink`] checks so an abort retires the request without closing the
+/// shared channel.
+struct RequestStreamState {
+    first_token_events: Option<Vec<EngineCoreEvent>>,
+    first_token_prefill_stats: Option<PrefillStats>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RequestStreamState {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            first_token_events: None,
+            first_token_prefill_stats: None,
+            cancelled,
+        }
+    }
+}
+
+/// Drain the ready burst from the shared token channel (the `first` event plus
+/// everything already queued), bucket it per request preserving event order,
+/// fold each request's events into at most one `EngineCoreOutput`, and ship the
+/// whole burst as a single `EngineCoreOutputs` — collapsing what used to be N
+/// per-request ZMQ messages per step into one.
+fn dispatch_burst(
+    first: (RequestTag, TokenEvent),
+    event_rx: &mut TokenStreamReceiver,
+    streams: &mut HashMap<RequestTag, RequestStreamState>,
+    output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+) -> Result<()> {
+    // Bucket the burst by request, keeping first-seen order so outputs are
+    // deterministic and each request's events stay in arrival order.
+    let mut order: Vec<RequestTag> = Vec::new();
+    let mut buckets: HashMap<RequestTag, Vec<TokenEvent>> = HashMap::new();
+    let mut bucket = |tag: RequestTag, event: TokenEvent| {
+        if let Some(events) = buckets.get_mut(&tag) {
+            events.push(event);
+        } else {
+            order.push(Arc::clone(&tag));
+            buckets.insert(tag, vec![event]);
+        }
+    };
+    bucket(first.0, first.1);
+    while let Ok((tag, event)) = event_rx.try_recv() {
+        bucket(tag, event);
+    }
+
+    let mut outputs: Vec<EngineCoreOutput> = Vec::with_capacity(order.len());
+    let mut finished_requests: BTreeSet<String> = BTreeSet::new();
+    for tag in order {
+        let events = buckets.remove(&tag).expect("bucket for ordered tag");
+        // No stream entry means the request was aborted or already finished;
+        // its late events are dropped.
+        let Some(state) = streams.get_mut(&tag) else {
+            continue;
         };
+        let (output, terminated) = reduce_request(&tag, state, events);
+        if let Some(output) = output {
+            outputs.push(output);
+        }
+        if terminated {
+            streams.remove(&tag);
+            finished_requests.insert(tag.to_string());
+        }
+    }
+
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    send_outputs(
+        output_tx,
+        EngineCoreOutputs {
+            engine_index: ENGINE_INDEX,
+            outputs,
+            finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
+            timestamp: now_secs_f64(),
+            ..Default::default()
+        },
+    )
+}
+
+/// Fold one request's events from a single burst into at most one output.
+/// Tokens coalesce, and a trailing terminal rides the same output carrying its
+/// finish reason; `first_token_events`/`prefill_stats` flush onto whichever
+/// output goes first. A lone `Scheduled` (no token, no terminal) yields no
+/// output — its metadata waits in `state` for the first real output. Returns
+/// `(output, terminated)`.
+fn reduce_request(
+    request_id: &str,
+    state: &mut RequestStreamState,
+    events: Vec<TokenEvent>,
+) -> (Option<EngineCoreOutput>, bool) {
+    let mut token_ids: Vec<u32> = Vec::new();
+    let mut positions: Vec<PositionLogprobs> = Vec::new();
+    let mut has_logprobs = false;
+    let mut finish_reason: Option<EngineCoreFinishReason> = None;
+    let mut stop_reason: Option<StopReason> = None;
+    let mut terminated = false;
+
+    for event in events {
         match event {
             TokenEvent::Scheduled {
                 queued_at_unix_s,
@@ -258,7 +355,7 @@ async fn run_request_stream(
                 prompt_tokens,
                 cached_tokens,
             } => {
-                first_token_events = Some(vec![
+                state.first_token_events = Some(vec![
                     EngineCoreEvent {
                         r#type: EngineCoreEventType::Queued,
                         timestamp: queued_at_unix_s,
@@ -271,7 +368,7 @@ async fn run_request_stream(
                 // Upstream invariant: computed (actual prefill work) +
                 // cached (prefix-cache hit) == prompt; double-counting skews
                 // the per-source prompt token metrics.
-                first_token_prefill_stats = Some(PrefillStats {
+                state.first_token_prefill_stats = Some(PrefillStats {
                     num_prompt_tokens: prompt_tokens as u32,
                     num_computed_tokens: prompt_tokens.saturating_sub(cached_tokens) as u32,
                     num_cached_tokens: cached_tokens as u32,
@@ -280,74 +377,55 @@ async fn run_request_stream(
                 });
             }
             TokenEvent::Token { id, logprob } => {
-                // Keep the first streamed token on the direct path so TTFT
-                // does not pay an extra scheduler turn. Later decode bursts
-                // still benefit from one-turn coalescing before draining the
-                // ready queue into one bridge output.
-                if has_sent_token_output {
-                    tokio::task::yield_now().await;
+                token_ids.push(id);
+                if let Some(position) = to_wire_position_logprobs(id, logprob) {
+                    has_logprobs = true;
+                    positions.push(position);
+                } else {
+                    positions.push(PositionLogprobs {
+                        entries: Vec::new(),
+                    });
                 }
-                let (token_ids, batched_logprobs, next_event) =
-                    collect_ready_token_batch(id, logprob, &mut token_rx);
-                pending_event = next_event;
-                if send_token_output(
-                    &output_tx,
-                    &request_id,
-                    token_ids,
-                    batched_logprobs,
-                    first_token_events.take(),
-                    first_token_prefill_stats.take(),
-                )
-                .is_err()
-                {
-                    return;
-                }
-                has_sent_token_output = true;
             }
             TokenEvent::PromptTokens { .. } => {
                 // Prompt logprobs are intentionally deferred for this bridge.
             }
-            TokenEvent::Finished { finish_reason, .. } => {
-                // A request can finish without emitting a token (EOS sampled
-                // on prefill) — flush the pending scheduled events and prefill
-                // stats with the terminal output or they are lost.
-                let _ = send_terminal_output(
-                    &output_tx,
-                    request_id,
-                    convert_finish_reason(finish_reason),
-                    None,
-                    first_token_events.take(),
-                    first_token_prefill_stats.take(),
-                );
-                return;
+            TokenEvent::Finished { finish_reason: fr, .. } => {
+                finish_reason = Some(convert_finish_reason(fr));
+                terminated = true;
             }
             TokenEvent::Error { message, .. } => {
                 warn!("request {request_id} failed: {message}");
-                let _ = send_terminal_output(
-                    &output_tx,
-                    request_id,
-                    EngineCoreFinishReason::Error,
-                    Some(StopReason::Text(message)),
-                    None,
-                    None,
-                );
-                return;
+                finish_reason = Some(EngineCoreFinishReason::Error);
+                stop_reason = Some(StopReason::Text(message));
+                terminated = true;
             }
             TokenEvent::Rejected { message, .. } => {
-                // Rejected means the request could not be admitted, not that it completed cleanly.
+                // Rejected means the request could not be admitted, not that it
+                // completed cleanly.
                 warn!("request {request_id} rejected: {message}");
-                let _ = send_terminal_output(
-                    &output_tx,
-                    request_id,
-                    EngineCoreFinishReason::Error,
-                    Some(StopReason::Text(message)),
-                    None,
-                    None,
-                );
-                return;
+                finish_reason = Some(EngineCoreFinishReason::Error);
+                stop_reason = Some(StopReason::Text(message));
+                terminated = true;
             }
         }
     }
+
+    if token_ids.is_empty() && !terminated {
+        return (None, false);
+    }
+
+    let logprobs = has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions }));
+    let output = engine_output(
+        request_id.to_string(),
+        token_ids,
+        logprobs,
+        finish_reason,
+        stop_reason,
+        state.first_token_events.take(),
+        state.first_token_prefill_stats.take(),
+    );
+    (Some(output), terminated)
 }
 
 async fn output_loop(
@@ -361,33 +439,6 @@ async fn output_loop(
             .context("failed to send local engine output")?;
     }
     Ok(())
-}
-
-fn send_token_output(
-    output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
-    request_id: &str,
-    token_ids: Vec<u32>,
-    logprobs: Option<MaybeWireLogprobs>,
-    events: Option<Vec<EngineCoreEvent>>,
-    prefill_stats: Option<PrefillStats>,
-) -> Result<()> {
-    send_outputs(
-        output_tx,
-        EngineCoreOutputs {
-            engine_index: ENGINE_INDEX,
-            outputs: vec![engine_output(
-                request_id.to_string(),
-                token_ids,
-                logprobs,
-                None,
-                None,
-                events,
-                prefill_stats,
-            )],
-            timestamp: now_secs_f64(),
-            ..Default::default()
-        },
-    )
 }
 
 fn send_terminal_output(
@@ -481,49 +532,6 @@ fn engine_output(
     }
 }
 
-fn collect_ready_token_batch(
-    first_id: u32,
-    first_logprob: Option<TokenLogprob>,
-    token_rx: &mut mpsc::UnboundedReceiver<TokenEvent>,
-) -> (Vec<u32>, Option<MaybeWireLogprobs>, Option<TokenEvent>) {
-    let mut token_ids = Vec::with_capacity(4);
-    let mut positions = Vec::with_capacity(4);
-    let mut has_logprobs = false;
-
-    let mut push_token = |token_id: u32, logprob: Option<TokenLogprob>| {
-        token_ids.push(token_id);
-        if let Some(position) = to_wire_position_logprobs(token_id, logprob) {
-            has_logprobs = true;
-            positions.push(position);
-        } else {
-            positions.push(PositionLogprobs {
-                entries: Vec::new(),
-            });
-        }
-    };
-    push_token(first_id, first_logprob);
-
-    loop {
-        match token_rx.try_recv() {
-            Ok(TokenEvent::Token { id, logprob }) => push_token(id, logprob),
-            Ok(other) => {
-                return (
-                    token_ids,
-                    has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions })),
-                    Some(other),
-                );
-            }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                return (
-                    token_ids,
-                    has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions })),
-                    None,
-                );
-            }
-        }
-    }
-}
-
 fn now_secs_f64() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -563,27 +571,82 @@ async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> R
 
 #[cfg(test)]
 mod tests {
-    use openinfer_engine::engine::FinishReason;
+    use openinfer_engine::engine::{FinishReason, TokenLogprob};
 
     use super::*;
 
-    #[tokio::test]
-    async fn rejected_request_is_reported_as_error() {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    /// Test harness that exercises the bridge's demux path directly: register
+    /// requests, emit tagged events onto the shared channel, drain one ready
+    /// burst at a time, and inspect the coalesced outputs — the same flow the
+    /// `run` loop drives, minus the sockets.
+    struct Demux {
+        event_tx: mpsc::UnboundedSender<(RequestTag, TokenEvent)>,
+        event_rx: TokenStreamReceiver,
+        streams: HashMap<RequestTag, RequestStreamState>,
+        output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
+        output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
+    }
 
-        token_tx
-            .send(TokenEvent::Rejected {
+    impl Demux {
+        fn new() -> Self {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (output_tx, output_rx) = mpsc::unbounded_channel();
+            Self {
+                event_tx,
+                event_rx,
+                streams: HashMap::new(),
+                output_tx,
+                output_rx,
+            }
+        }
+
+        /// Register a request as `start_request` does and return its cancel flag.
+        fn add(&mut self, id: &str) -> Arc<AtomicBool> {
+            let tag: RequestTag = Arc::from(id);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.streams
+                .insert(Arc::clone(&tag), RequestStreamState::new(Arc::clone(&cancelled)));
+            cancelled
+        }
+
+        fn emit(&self, id: &str, event: TokenEvent) {
+            self.event_tx
+                .send((Arc::from(id), event))
+                .expect("emit token event");
+        }
+
+        /// Process one ready burst. Returns false if nothing was queued.
+        fn drain(&mut self) -> bool {
+            match self.event_rx.try_recv() {
+                Ok(first) => {
+                    dispatch_burst(first, &mut self.event_rx, &mut self.streams, &self.output_tx)
+                        .expect("dispatch burst");
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        fn next_output(&mut self) -> Option<EngineCoreOutputs> {
+            self.output_rx.try_recv().ok()
+        }
+    }
+
+    #[test]
+    fn rejected_request_is_reported_as_error() {
+        let mut d = Demux::new();
+        d.add("req-1");
+        d.emit(
+            "req-1",
+            TokenEvent::Rejected {
                 message: "request is too large for KV cache".to_string(),
                 prompt_tokens: 16,
                 completion_tokens: 0,
-            })
-            .expect("send rejected event");
-        drop(token_tx);
+            },
+        );
+        assert!(d.drain());
 
-        run_request_stream("req-1".to_string(), token_rx, output_tx).await;
-
-        let outputs = output_rx.recv().await.expect("terminal output");
+        let outputs = d.next_output().expect("terminal output");
         assert!(
             outputs
                 .finished_requests
@@ -600,63 +663,72 @@ mod tests {
                 "request is too large for KV cache".to_string()
             ))
         );
+        assert!(d.next_output().is_none());
+        assert!(!d.streams.contains_key("req-1"), "finished stream is removed");
     }
 
-    #[tokio::test]
-    async fn consecutive_tokens_are_batched_into_one_output() {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-
-        token_tx
-            .send(TokenEvent::Scheduled {
+    /// Token(s) and the terminal arriving in one burst (EmitAndFinish) coalesce
+    /// into a single output carrying both the tokens and the finish reason —
+    /// the canonical vLLM shape, one wire message instead of two.
+    #[test]
+    fn token_and_finish_in_one_burst_coalesce() {
+        let mut d = Demux::new();
+        d.add("req-1");
+        d.emit(
+            "req-1",
+            TokenEvent::Scheduled {
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 16,
                 cached_tokens: 0,
-            })
-            .expect("send scheduled");
-        token_tx
-            .send(TokenEvent::Token {
+            },
+        );
+        d.emit(
+            "req-1",
+            TokenEvent::Token {
                 id: 11,
                 logprob: Some(TokenLogprob {
                     logprob: -0.1,
                     top_logprobs: vec![(11, -0.1), (12, -0.5)],
                 }),
-            })
-            .expect("send token 1");
-        token_tx
-            .send(TokenEvent::Token {
+            },
+        );
+        d.emit(
+            "req-1",
+            TokenEvent::Token {
                 id: 21,
                 logprob: Some(TokenLogprob {
                     logprob: -0.2,
                     top_logprobs: vec![(21, -0.2), (22, -0.6)],
                 }),
-            })
-            .expect("send token 2");
-        token_tx
-            .send(TokenEvent::Finished {
+            },
+        );
+        d.emit(
+            "req-1",
+            TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: 16,
                 completion_tokens: 2,
-            })
-            .expect("send finished");
-        drop(token_tx);
+            },
+        );
+        assert!(d.drain());
 
-        run_request_stream("req-1".to_string(), token_rx, output_tx).await;
+        let outputs = d.next_output().expect("coalesced output");
+        assert_eq!(outputs.outputs.len(), 1);
+        let output = &outputs.outputs[0];
+        assert_eq!(output.request_id, "req-1");
+        assert_eq!(output.new_token_ids, vec![11, 21]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Length));
+        assert!(output.events.is_some());
+        assert!(output.prefill_stats.is_some());
+        assert!(
+            outputs
+                .finished_requests
+                .as_ref()
+                .is_some_and(|requests| requests.contains("req-1"))
+        );
 
-        let token_outputs = output_rx.recv().await.expect("token output");
-        assert_eq!(token_outputs.outputs.len(), 1);
-        assert_eq!(token_outputs.outputs[0].request_id, "req-1");
-        assert_eq!(token_outputs.outputs[0].new_token_ids, vec![11, 21]);
-        assert!(token_outputs.outputs[0].finish_reason.is_none());
-        assert!(token_outputs.outputs[0].events.is_some());
-        assert!(token_outputs.outputs[0].prefill_stats.is_some());
-
-        let direct = match token_outputs.outputs[0]
-            .new_logprobs
-            .as_ref()
-            .expect("batched logprobs")
-        {
+        let direct = match output.new_logprobs.as_ref().expect("batched logprobs") {
             MaybeWireLogprobs::Direct(direct) => direct,
             MaybeWireLogprobs::Wire(_) => panic!("expected direct batched logprobs"),
         };
@@ -664,7 +736,47 @@ mod tests {
         assert_eq!(direct.positions[0].entries[0].token_id, 11);
         assert_eq!(direct.positions[1].entries[0].token_id, 21);
 
-        let terminal = output_rx.recv().await.expect("terminal output");
+        assert!(d.next_output().is_none());
+    }
+
+    /// Tokens that stream over several steps and a finish that lands later
+    /// arrive in separate bursts: a token output first, a terminal output once
+    /// the finish shows up.
+    #[test]
+    fn tokens_then_finish_in_separate_bursts() {
+        let mut d = Demux::new();
+        d.add("req-1");
+        d.emit(
+            "req-1",
+            TokenEvent::Token {
+                id: 11,
+                logprob: None,
+            },
+        );
+        d.emit(
+            "req-1",
+            TokenEvent::Token {
+                id: 21,
+                logprob: None,
+            },
+        );
+        assert!(d.drain());
+        let token_out = d.next_output().expect("token output");
+        assert_eq!(token_out.outputs[0].new_token_ids, vec![11, 21]);
+        assert!(token_out.outputs[0].finish_reason.is_none());
+        assert!(token_out.finished_requests.is_none());
+
+        d.emit(
+            "req-1",
+            TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: 16,
+                completion_tokens: 2,
+            },
+        );
+        assert!(d.drain());
+        let terminal = d.next_output().expect("terminal output");
+        assert!(terminal.outputs[0].new_token_ids.is_empty());
         assert_eq!(
             terminal.outputs[0].finish_reason,
             Some(EngineCoreFinishReason::Length)
@@ -675,46 +787,49 @@ mod tests {
                 .as_ref()
                 .is_some_and(|requests| requests.contains("req-1"))
         );
-        assert!(output_rx.recv().await.is_none());
+        assert!(d.next_output().is_none());
     }
 
-    #[tokio::test]
-    async fn first_token_metadata_is_only_sent_with_first_batch() {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-
-        token_tx
-            .send(TokenEvent::Scheduled {
+    #[test]
+    fn first_token_metadata_is_only_sent_with_first_output() {
+        let mut d = Demux::new();
+        d.add("req-2");
+        d.emit(
+            "req-2",
+            TokenEvent::Scheduled {
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 8,
                 cached_tokens: 5,
-            })
-            .expect("send scheduled");
-        token_tx
-            .send(TokenEvent::Token {
+            },
+        );
+        d.emit(
+            "req-2",
+            TokenEvent::Token {
                 id: 1,
                 logprob: None,
-            })
-            .expect("send first token");
-        token_tx
-            .send(TokenEvent::PromptTokens {
+            },
+        );
+        assert!(d.drain());
+
+        d.emit(
+            "req-2",
+            TokenEvent::PromptTokens {
                 ids: vec![9],
                 logprobs: vec![None],
-            })
-            .expect("send prompt token metadata");
-        token_tx
-            .send(TokenEvent::Token {
+            },
+        );
+        d.emit(
+            "req-2",
+            TokenEvent::Token {
                 id: 2,
                 logprob: None,
-            })
-            .expect("send second token");
-        drop(token_tx);
+            },
+        );
+        assert!(d.drain());
 
-        run_request_stream("req-2".to_string(), token_rx, output_tx).await;
-
-        let first_batch = output_rx.recv().await.expect("first batch");
-        let second_batch = output_rx.recv().await.expect("second batch");
+        let first_batch = d.next_output().expect("first batch");
+        let second_batch = d.next_output().expect("second batch");
         assert_eq!(first_batch.outputs[0].new_token_ids, vec![1]);
         assert_eq!(second_batch.outputs[0].new_token_ids, vec![2]);
         assert!(first_batch.outputs[0].events.is_some());
@@ -731,37 +846,71 @@ mod tests {
         );
         assert!(second_batch.outputs[0].events.is_none());
         assert!(second_batch.outputs[0].prefill_stats.is_none());
-        assert!(output_rx.recv().await.is_none());
+        assert!(d.next_output().is_none());
+    }
+
+    /// A lone `Scheduled` (no token yet) emits nothing; its metadata waits in
+    /// the stream state and flushes onto the first real output.
+    #[test]
+    fn lone_scheduled_defers_until_first_token() {
+        let mut d = Demux::new();
+        d.add("req-defer");
+        d.emit(
+            "req-defer",
+            TokenEvent::Scheduled {
+                queued_at_unix_s: 1.0,
+                scheduled_at_unix_s: 2.0,
+                prompt_tokens: 4,
+                cached_tokens: 0,
+            },
+        );
+        assert!(d.drain());
+        assert!(d.next_output().is_none(), "scheduled alone emits nothing");
+        assert!(d.streams.contains_key("req-defer"), "stream is retained");
+
+        d.emit(
+            "req-defer",
+            TokenEvent::Token {
+                id: 7,
+                logprob: None,
+            },
+        );
+        assert!(d.drain());
+        let output = d.next_output().expect("first token output");
+        assert_eq!(output.outputs[0].new_token_ids, vec![7]);
+        assert!(
+            output.outputs[0].events.is_some(),
+            "deferred scheduled events flush onto the first token"
+        );
     }
 
     /// A request that stops on its first sampled token never emits `Token`
     /// — the terminal output must still deliver the scheduled events and
     /// prefill stats or cached_tokens silently vanishes from usage.
-    #[tokio::test]
-    async fn stop_on_prefill_terminal_output_carries_prefill_stats() {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-
-        token_tx
-            .send(TokenEvent::Scheduled {
+    #[test]
+    fn stop_on_prefill_terminal_output_carries_prefill_stats() {
+        let mut d = Demux::new();
+        d.add("req-stop");
+        d.emit(
+            "req-stop",
+            TokenEvent::Scheduled {
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 16,
                 cached_tokens: 4,
-            })
-            .expect("send scheduled");
-        token_tx
-            .send(TokenEvent::Finished {
+            },
+        );
+        d.emit(
+            "req-stop",
+            TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: 16,
                 completion_tokens: 0,
-            })
-            .expect("send finished");
-        drop(token_tx);
+            },
+        );
+        assert!(d.drain());
 
-        run_request_stream("req-stop".to_string(), token_rx, output_tx).await;
-
-        let terminal = output_rx.recv().await.expect("terminal output");
+        let terminal = d.next_output().expect("terminal output");
         let output = &terminal.outputs[0];
         assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
         assert!(
@@ -774,34 +923,33 @@ mod tests {
             .expect("terminal output must flush prefill stats");
         assert_eq!(stats.num_cached_tokens, 4);
         assert_eq!(stats.num_computed_tokens, 12);
-        assert!(output_rx.recv().await.is_none());
+        assert!(d.next_output().is_none());
     }
 
-    #[tokio::test]
-    async fn mixed_logprob_batch_keeps_token_alignment() {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-
-        token_tx
-            .send(TokenEvent::Token {
+    #[test]
+    fn mixed_logprob_batch_keeps_token_alignment() {
+        let mut d = Demux::new();
+        d.add("req-3");
+        d.emit(
+            "req-3",
+            TokenEvent::Token {
                 id: 31,
                 logprob: None,
-            })
-            .expect("send token without logprob");
-        token_tx
-            .send(TokenEvent::Token {
+            },
+        );
+        d.emit(
+            "req-3",
+            TokenEvent::Token {
                 id: 32,
                 logprob: Some(TokenLogprob {
                     logprob: -0.3,
                     top_logprobs: vec![(32, -0.3), (33, -0.7)],
                 }),
-            })
-            .expect("send token with logprob");
-        drop(token_tx);
+            },
+        );
+        assert!(d.drain());
 
-        run_request_stream("req-3".to_string(), token_rx, output_tx).await;
-
-        let batch = output_rx.recv().await.expect("batched output");
+        let batch = d.next_output().expect("batched output");
         let direct = match batch.outputs[0]
             .new_logprobs
             .as_ref()
@@ -815,7 +963,73 @@ mod tests {
         assert_eq!(direct.positions.len(), 2);
         assert!(direct.positions[0].entries.is_empty());
         assert_eq!(direct.positions[1].entries[0].token_id, 32);
-        assert!(output_rx.recv().await.is_none());
+        assert!(d.next_output().is_none());
+    }
+
+    /// Many requests' tokens in one burst coalesce into a single
+    /// `EngineCoreOutputs` with one `EngineCoreOutput` each — the N→1 wire
+    /// collapse that motivated the demux.
+    #[test]
+    fn burst_batches_multiple_requests_into_one_message() {
+        let mut d = Demux::new();
+        d.add("req-a");
+        d.add("req-b");
+        d.emit(
+            "req-a",
+            TokenEvent::Token {
+                id: 1,
+                logprob: None,
+            },
+        );
+        d.emit(
+            "req-b",
+            TokenEvent::Token {
+                id: 2,
+                logprob: None,
+            },
+        );
+        assert!(d.drain());
+
+        let outputs = d.next_output().expect("one coalesced message");
+        assert_eq!(outputs.outputs.len(), 2);
+        let a = outputs
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "req-a")
+            .expect("req-a output");
+        let b = outputs
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "req-b")
+            .expect("req-b output");
+        assert_eq!(a.new_token_ids, vec![1]);
+        assert_eq!(b.new_token_ids, vec![2]);
+        assert!(d.next_output().is_none(), "exactly one wire message");
+    }
+
+    /// After an abort removes the stream entry, a token already in flight for
+    /// that request is dropped instead of producing a stray output.
+    #[test]
+    fn aborted_request_drops_late_tokens() {
+        let mut d = Demux::new();
+        let cancelled = d.add("req-abort");
+
+        // Replicate the Abort handler: flip the cancel flag, drop the stream.
+        cancelled.store(true, Ordering::Relaxed);
+        d.streams.remove("req-abort");
+
+        d.emit(
+            "req-abort",
+            TokenEvent::Token {
+                id: 99,
+                logprob: None,
+            },
+        );
+        assert!(d.drain(), "the late event is consumed");
+        assert!(
+            d.next_output().is_none(),
+            "no output is produced for an aborted request"
+        );
     }
 
     #[test]

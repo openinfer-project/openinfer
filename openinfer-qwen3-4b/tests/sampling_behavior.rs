@@ -15,9 +15,10 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
+};
 use openinfer_core::sampler::SamplingParams;
-use tokio::sync::mpsc;
 
 mod common;
 
@@ -41,7 +42,7 @@ fn model_path_or_skip() -> Option<String> {
 
 /// Submit one request and collect the generated token ids until `Finished`.
 fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingParams) -> Vec<u32> {
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -58,7 +59,7 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingPara
 
     let mut tokens = Vec::new();
     loop {
-        match rx.blocking_recv() {
+        match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { .. }) => return tokens,
