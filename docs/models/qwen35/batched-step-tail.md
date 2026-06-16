@@ -1,4 +1,4 @@
-# Qwen3.5 Step-Tail Issue #353
+# Qwen3.5 Batched Step Tail
 
 > **TL;DR:** Qwen3.5 issue #353 is implemented in the local branch: prefill gathers per-request last hidden rows, runs batched offset RMSNorm + one lm_head GEMM, and scheduler/executor decode sample from batched logits. Full-vocab host copies now happen only for `logprobs > 0`. HF logits + scheduler e2e pass; benchmark evidence supports a first-token/short-output TTFT claim only.
 >
