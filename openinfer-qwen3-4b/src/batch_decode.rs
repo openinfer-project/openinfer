@@ -461,10 +461,10 @@ mod tests {
     use crate::weights::ModelRuntimeConfig;
     use openinfer_core::ops;
     use openinfer_core::sampler::SamplingParams;
-    use openinfer_core::tensor::DeviceVec;
+    use openinfer_core::tensor::{DeviceVec, HiddenStatesRef};
     use openinfer_kv_cache::{KvCacheManager, RequestKv};
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
     use std::path::Path;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
@@ -508,37 +508,35 @@ mod tests {
         params: &[&SamplingParams],
         rng: &mut StdRng,
     ) -> Vec<u32> {
-        let mut scratch_probs = model
-            .ctx
-            .stream
-            .alloc_zeros(model.config.vocab_size)
-            .unwrap();
-        let mut scratch_top1 = model.ctx.stream.alloc_zeros(1).unwrap();
-        let mut scratch_row_states = model
-            .ctx
-            .stream
-            .alloc_zeros(openinfer_core::ops::flashinfer_topk_row_states_bytes())
-            .unwrap();
-        let mut scratch_valid = model.ctx.stream.alloc_zeros(1).unwrap();
-        let mut scratch_out = model.ctx.stream.alloc_zeros(1).unwrap();
-        (0..params.len())
-            .map(|i| {
-                let logits_i = ops::extract_vec(&model.ctx, &bufs.logits, i).unwrap();
-                let random_val: f32 = rand::RngExt::random(rng);
-                ops::gpu_sample_into(
-                    &model.ctx,
-                    &logits_i,
-                    &mut scratch_probs,
-                    &mut scratch_top1,
-                    &mut scratch_row_states,
-                    &mut scratch_valid,
-                    &mut scratch_out,
-                    params[i],
-                    random_val,
-                )
-                .unwrap()
-            })
-            .collect()
+        let rows = params.len();
+        let partials = openinfer_core::ops::argmax_batch_bf16_split_partials_len(
+            rows,
+            model.config.vocab_size,
+        );
+        let mut row_indices = model.ctx.stream.alloc_zeros(rows).unwrap();
+        let mut partial_values = model.ctx.stream.alloc_zeros(partials).unwrap();
+        let mut partial_indices = model.ctx.stream.alloc_zeros(partials).unwrap();
+        let mut top1_values = model.ctx.stream.alloc_zeros(rows).unwrap();
+        let mut out = model.ctx.stream.alloc_zeros(rows).unwrap();
+        let mut batch_sampling = openinfer_core::ops::BatchSamplingScratch::new(
+            &model.ctx,
+            rows,
+            model.config.vocab_size,
+        )
+        .unwrap();
+        ops::select_batch_tokens_into(
+            &model.ctx,
+            &bufs.logits,
+            params,
+            rng.random(),
+            &mut row_indices,
+            &mut partial_values,
+            &mut partial_indices,
+            &mut top1_values,
+            &mut out,
+            &mut batch_sampling,
+        )
+        .unwrap()
     }
 
     fn sample_logits(
@@ -547,33 +545,31 @@ mod tests {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> u32 {
-        let mut probs: cudarc::driver::CudaSlice<f32> = model
-            .ctx
-            .stream
-            .alloc_zeros(model.config.vocab_size)
-            .unwrap();
-        let mut top1_value: cudarc::driver::CudaSlice<half::bf16> =
-            model.ctx.stream.alloc_zeros(1).unwrap();
-        let mut row_states: cudarc::driver::CudaSlice<u8> = model
-            .ctx
-            .stream
-            .alloc_zeros(openinfer_core::ops::flashinfer_topk_row_states_bytes())
-            .unwrap();
-        let mut valid: cudarc::driver::CudaSlice<u8> = model.ctx.stream.alloc_zeros(1).unwrap();
-        let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(1).unwrap();
-        let random_val: f32 = rand::RngExt::random(rng);
-        ops::gpu_sample_into(
+        if ops::sampling_params_effectively_greedy(params, logits.len) {
+            return ops::argmax(&model.ctx, logits).unwrap();
+        }
+        let logits_ref = HiddenStatesRef {
+            data: &logits.data,
+            hidden_dim: logits.len,
+            seq_len: 1,
+        };
+        let rows = [openinfer_core::ops::BatchSamplingRow {
+            row: 0,
+            temperature: params.temperature,
+            top_k: params.top_k,
+            top_p: params.top_p,
+        }];
+        let mut scratch =
+            openinfer_core::ops::BatchSamplingScratch::new(&model.ctx, 1, model.config.vocab_size)
+                .unwrap();
+        openinfer_kernels::ops::gpu_sample_batch_into(
             &model.ctx,
-            logits,
-            &mut probs,
-            &mut top1_value,
-            &mut row_states,
-            &mut valid,
-            &mut out,
-            params,
-            random_val,
+            logits_ref,
+            &rows,
+            rng.random(),
+            &mut scratch,
         )
-        .unwrap()
+        .unwrap()[0]
     }
 
     /// Split batched `[vocab, n]` logits into one `DeviceVec` per column.

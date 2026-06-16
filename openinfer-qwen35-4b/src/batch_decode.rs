@@ -19,7 +19,7 @@ impl Qwen35Model {
         logits: &HiddenStates,
         bufs: &mut BatchDecodeBuffers35,
         params: &[&SamplingParams],
-        rng: &mut rand::rngs::StdRng,
+        sample_seed: u64,
     ) -> Result<Vec<u32>> {
         anyhow::ensure!(
             params.len() == logits.seq_len,
@@ -33,20 +33,17 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        let random_vals: Vec<f32> = params.iter().map(|_| rand::RngExt::random(rng)).collect();
         ops::select_batch_tokens_into(
             &self.ctx,
             logits,
             params,
-            &random_vals,
+            sample_seed,
             &mut bufs.sample_row_indices,
             &mut bufs.sample_argmax_partial_values,
             &mut bufs.sample_argmax_partial_indices,
-            &mut bufs.sample_probs,
             &mut bufs.sample_top1_value,
-            &mut bufs.sample_row_states,
-            &mut bufs.sample_valid,
             &mut bufs.sample_out,
+            &mut bufs.sample_batch_sampling,
         )
     }
 
@@ -54,7 +51,7 @@ impl Qwen35Model {
         &self,
         bufs: &mut BatchDecodeBuffers35,
         params: &[&SamplingParams],
-        rng: &mut rand::rngs::StdRng,
+        sample_seed: u64,
     ) -> Result<Vec<u32>> {
         anyhow::ensure!(
             !params.is_empty(),
@@ -72,20 +69,17 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        let random_vals: Vec<f32> = params.iter().map(|_| rand::RngExt::random(rng)).collect();
         ops::select_batch_tokens_into(
             &self.ctx,
             &bufs.logits,
             params,
-            &random_vals,
+            sample_seed,
             &mut bufs.sample_row_indices,
             &mut bufs.sample_argmax_partial_values,
             &mut bufs.sample_argmax_partial_indices,
-            &mut bufs.sample_probs,
             &mut bufs.sample_top1_value,
-            &mut bufs.sample_row_states,
-            &mut bufs.sample_valid,
             &mut bufs.sample_out,
+            &mut bufs.sample_batch_sampling,
         )
     }
 

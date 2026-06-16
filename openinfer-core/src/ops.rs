@@ -33,9 +33,9 @@ pub use openinfer_kernels::ops::{
 };
 pub use paged_plan::PrefillPagedPlan;
 pub use sampling::{
-    argmax, argmax_batch_bf16_into, argmax_batch_bf16_split_indexed_into,
-    argmax_batch_bf16_split_partials_len, flashinfer_topk_row_states_bytes, gpu_sample,
-    gpu_sample_into, select_batch_tokens_into,
+    BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
+    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
+    flashinfer_top1_row_states_bytes, sampling_params_effectively_greedy, select_batch_tokens_into,
 };
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::{

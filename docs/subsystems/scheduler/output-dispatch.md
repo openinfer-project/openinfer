@@ -34,7 +34,7 @@ Drive load over HTTP: `scripts/bench_http_serving.py --concurrency 128 --num-req
 - `apply` (apply_effects) dominates: ~250µs of ~380µs at bs=128. Decomposes into ~240µs of N `token_tx.send()` (each wakes one frontend task, ~1.9µs) + ~14µs of the O(N²) `active.iter().position` scan and state writes. The O(N²) scans (`resolve` + `apply`) are negligible now (~14µs total) but quadratic — they bite at bs≳256.
 - `exec_cpu` (~0.9µs/req): per-request `schedule_decode`/`apply_decode`/kv_views in the executor.
 - **Bubble % is small *here* only because the decode step is huge** (bs=1 = 10.6ms ⇒ memory-bandwidth-bound, 7.67GB weights / ~0.75TB/s). The ~380µs absolute cost is fixed; on a ~4TB/s GPU (bs=128 decode ≈ 3ms) it is ~12%.
-- Greedy only. `temperature>0` takes the per-row `gpu_sample_into` path (O(bs) launch+sync), which would inflate `exec_cpu` far beyond these numbers — a separate bubble source (see scheduler.md "Batch decode per-row sampling").
+- Greedy-only profile. #284 later removed the Qwen per-row non-greedy sampler, so remeasure mixed sampling separately before using this bubble table for non-greedy workloads.
 
 ## Why pipelining is *not* the cheap answer (and what it actually costs)
 

@@ -285,12 +285,11 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         SamplingParams::default(),
         LOGPROBS,
         false,
-        0.0,
     )
 }
 
 fn decode_item(id: RequestId, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS, 0.0)
+    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS)
 }
 
 /// Teacher-force the golden sequences `seqs` through `ex` and fold every
@@ -319,6 +318,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
             .collect();
         let pr = ex
             .execute_prefill(PrefillPlan {
+                sample_seed: 0,
                 requests: &items,
                 echo: false,
             })
@@ -339,7 +339,10 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
                 .map(|(&s, &id)| decode_item(id, g.decode(s, step)))
                 .collect();
             let dr = ex
-                .execute_decode(DecodePlan { requests: &items })
+                .execute_decode(DecodePlan {
+                    sample_seed: 0,
+                    requests: &items,
+                })
                 .expect("decode");
             for (i, &s) in seqs.iter().enumerate() {
                 fold(
@@ -358,6 +361,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
             let id = RequestId::new(seq as u64);
             let pr = ex
                 .execute_prefill(PrefillPlan {
+                    sample_seed: 0,
                     requests: &[prefill_item(id, g.prompt(seq))],
                     echo: false,
                 })
@@ -372,6 +376,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
             for step in 0..g.decode_len {
                 let dr = ex
                     .execute_decode(DecodePlan {
+                        sample_seed: 0,
                         requests: &[decode_item(id, g.decode(seq, step))],
                     })
                     .expect("decode");

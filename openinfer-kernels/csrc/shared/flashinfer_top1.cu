@@ -1,10 +1,15 @@
 #include "common.cuh"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
+
+extern "C" size_t flashinfer_top1_row_states_bytes_cuda() {
+  return sizeof(flashinfer::sampling::RadixRowState);
+}
 
 extern "C" void flashinfer_top1_cuda(const __nv_bfloat16* logits,
                                      __nv_bfloat16* top1_value_scratch,

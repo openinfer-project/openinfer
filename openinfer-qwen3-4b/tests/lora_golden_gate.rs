@@ -349,13 +349,12 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>, lora: bool) -> PrefillStepItem 
         SamplingParams::default(),
         LOGPROBS,
         false,
-        0.0,
     )
     .with_lora_adapter(lora.then(|| ADAPTER_NAME.to_string()))
 }
 
 fn decode_item(id: RequestId, fed: u32, lora: bool) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS, 0.0)
+    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS)
         .with_lora_adapter(lora.then(|| ADAPTER_NAME.to_string()))
 }
 
@@ -386,6 +385,7 @@ fn run(
             .collect();
         let pr = ex
             .execute_prefill(PrefillPlan {
+                sample_seed: 0,
                 requests: &items,
                 echo: false,
             })
@@ -405,7 +405,10 @@ fn run(
                 .map(|(&s, &id)| decode_item(id, g.decode(s, step), use_lora(s)))
                 .collect();
             let dr = ex
-                .execute_decode(DecodePlan { requests: &items })
+                .execute_decode(DecodePlan {
+                    sample_seed: 0,
+                    requests: &items,
+                })
                 .expect("decode");
             for (i, &s) in seqs.iter().enumerate() {
                 fold(
@@ -424,6 +427,7 @@ fn run(
             let id = RequestId::new(seq as u64);
             let pr = ex
                 .execute_prefill(PrefillPlan {
+                    sample_seed: 0,
                     requests: &[prefill_item(id, g.prompt(seq), use_lora(seq))],
                     echo: false,
                 })
@@ -437,6 +441,7 @@ fn run(
             for step in 0..g.decode_len {
                 let dr = ex
                     .execute_decode(DecodePlan {
+                        sample_seed: 0,
                         requests: &[decode_item(id, g.decode(seq, step), use_lora(seq))],
                     })
                     .expect("decode");

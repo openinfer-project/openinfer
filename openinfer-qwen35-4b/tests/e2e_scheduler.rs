@@ -193,6 +193,19 @@ fn collect_generation(
     }
 }
 
+fn concurrent_params(case_idx: usize) -> SamplingParams {
+    if case_idx % 2 == 0 {
+        SamplingParams::default()
+    } else {
+        SamplingParams {
+            temperature: 0.9,
+            top_k: 32,
+            top_p: 0.9,
+            ..SamplingParams::default()
+        }
+    }
+}
+
 fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: usize) {
     let (token_tx, mut token_rx) = TokenSink::standalone();
 
@@ -336,8 +349,9 @@ fn test_e2e_qwen35_scheduler() {
     {
         let mut receivers: Vec<(String, usize, TokenStreamReceiver)> = Vec::new();
 
-        // Submit all cases concurrently
-        for case in CASES {
+        // Submit all cases concurrently, alternating greedy and sampled rows so
+        // batch decode covers the mixed token-selection path from #284.
+        for (case_idx, case) in CASES.iter().enumerate() {
             let prompt_tokens = tokenizer.encode(case.prompt, false).expect("encode failed");
             let (token_tx, token_rx) = TokenSink::standalone();
             handle
@@ -345,7 +359,7 @@ fn test_e2e_qwen35_scheduler() {
                     request_id: None,
                     queued_at_unix_s: None,
                     prompt_tokens,
-                    params: SamplingParams::default(),
+                    params: concurrent_params(case_idx),
                     max_tokens: case.max_new_tokens,
                     lora_adapter: None,
                     token_tx,

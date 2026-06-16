@@ -232,7 +232,7 @@ pub(super) fn sample_local_top1_with_value(
     let mut top1_value_scratch = ctx.stream.alloc_zeros::<half::bf16>(1)?;
     let mut row_states_scratch = ctx
         .stream
-        .alloc_zeros::<u8>(flashinfer_topk_row_states_bytes())?;
+        .alloc_zeros::<u8>(flashinfer_top1_row_states_bytes())?;
     let mut out = ctx.stream.alloc_zeros::<i32>(1)?;
     sample_local_top1_with_value_reuse(
         ctx,
@@ -255,10 +255,10 @@ pub(super) fn sample_local_top1_with_value_reuse(
         "Kimi top1 scratch must have scalar value/id outputs"
     );
     ensure!(
-        row_states_scratch.len() >= flashinfer_topk_row_states_bytes(),
+        row_states_scratch.len() >= flashinfer_top1_row_states_bytes(),
         "Kimi top1 row-states scratch too small: have {}, need {}",
         row_states_scratch.len(),
-        flashinfer_topk_row_states_bytes()
+        flashinfer_top1_row_states_bytes()
     );
     {
         let (logits_ptr, _logits_guard) = logits.data.device_ptr(&ctx.stream);
