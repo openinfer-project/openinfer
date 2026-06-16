@@ -14,9 +14,9 @@
 use std::path::Path;
 
 use anyhow::Result;
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::engine::EpBackend;
+use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 #[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;

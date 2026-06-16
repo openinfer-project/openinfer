@@ -78,7 +78,10 @@ struct ModelCardBody {
     owned_by: &'static str,
 }
 
-pub(crate) fn lora_routes(handle: EngineHandle, adapter_names: Arc<RwLock<HashSet<String>>>) -> Router {
+pub(crate) fn lora_routes(
+    handle: EngineHandle,
+    adapter_names: Arc<RwLock<HashSet<String>>>,
+) -> Router {
     Router::new()
         .route("/v1/load_lora_adapter", post(load_lora_adapter))
         .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
