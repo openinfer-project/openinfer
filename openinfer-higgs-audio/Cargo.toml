@@ -22,7 +22,19 @@ cudarc = { workspace = true, optional = true }
 
 [features]
 default = []
-higgs-audio = ["dep:openinfer-core", "dep:openinfer-kernels", "dep:openinfer-kv-cache", "dep:cudarc"]
+higgs-audio = [
+  "dep:openinfer-core",
+  "dep:openinfer-kernels",
+  "dep:openinfer-kv-cache",
+  "dep:cudarc",
+]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+safetensors = { workspace = true }
+
+[[test]]
+name = "backbone_parity"
+required-features = ["higgs-audio"]
