@@ -148,11 +148,9 @@ impl DecodeStepItem {
     }
 }
 
-/// Fold one prefill chunk's partial echo prompt logprobs into the running
-/// accumulator. `partial` is full-length but only the prompt positions this
-/// chunk forwarded are `Some`; since each prompt index is produced by exactly
-/// one chunk, a present value always overwrites the accumulator's `None` and
-/// chunks never clobber each other's slots.
+/// Fold one chunk's partial echo prompt logprobs into the accumulator. Each
+/// prompt index is produced by exactly one chunk (see
+/// `build_prefill_request_results`), so every `Some` lands on a `None`.
 fn fold_prompt_logprobs_chunk(
     acc: &mut [Option<TokenLogprob>],
     partial: Vec<Option<TokenLogprob>>,
@@ -183,15 +181,13 @@ fn build_prefill_request_results(
         } else {
             None
         };
-        // Echo emits a per-chunk *partial*: this chunk forwarded prompt
-        // positions [chunk_start, chunk_start + chunk_tokens). The logprob of
-        // prompt token `k` comes from the distribution at position `k - 1`, so
-        // position `p` (logits column `token_offset + (p - chunk_start)`) fills
-        // `prompt_logprobs[p + 1]`. Index 0 has no predecessor and stays None;
-        // the position predicting the first *generated* token (`p + 1 ==
-        // prompt_len`) is the request's first token, not a prompt token. The
-        // executor merges these partials across chunks and only emits the full
-        // vector once the prompt is fully prefilled.
+        // Echo emits a per-chunk *partial*: this chunk's local position `local`
+        // (logits column `token_offset + local`) predicts prompt token
+        // `chunk_start + local + 1`, so it fills that slot. Index 0 has no
+        // predecessor; the column predicting the first generated token
+        // (`target == prompt_len`) is skipped. Partials are stitched across
+        // chunks by `merge_echo_prompt_logprobs`, surfacing the full vector on
+        // the final chunk.
         let prompt_logprobs = if req.echo {
             let mut partial = vec![None; req.prompt_tokens.len()];
             if compute_prompt_logprobs {
@@ -1138,14 +1134,9 @@ impl Qwen3Executor {
         }
     }
 
-    /// Fold one prefill chunk's partial echo prompt logprobs into the
-    /// per-request accumulator. The worker fills `result.prompt_logprobs` with
-    /// a full-length vector where only the positions this chunk forwarded are
-    /// `Some` (every prompt index is produced by exactly one chunk, so a
-    /// present value always wins over the accumulator's `None`). On the final
-    /// chunk the completed accumulator is moved into `result`; earlier chunks
-    /// clear it so the resolver emits the prompt echo only once. A no-op for
-    /// non-echo results (their `prompt_logprobs` is `None`).
+    /// Accumulate each chunk's partial echo prompt logprobs, surfacing the full
+    /// vector on the final chunk and nothing on earlier ones. No-op for non-echo
+    /// results (their `prompt_logprobs` is `None`).
     fn merge_echo_prompt_logprobs(&mut self, result: &mut PrefillRequestResult) {
         let Some(partial) = result.prompt_logprobs.take() else {
             return;

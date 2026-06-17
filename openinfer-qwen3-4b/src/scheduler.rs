@@ -930,15 +930,16 @@ fn failure_targets_for(
 ) -> Vec<RequestFailureTarget> {
     let mut targets = Vec::new();
     match plan {
-        self::plan::ExecutionPlan::Prefill { pending } => {
+        // A Prefill step can run with active decodes present (echo+logprobs is
+        // routed here even then), and a failure clears all active state, so the
+        // active requests must be failed too — same as Unified.
+        self::plan::ExecutionPlan::Prefill { pending }
+        | self::plan::ExecutionPlan::Unified { pending } => {
+            targets.extend(active.iter().map(active_failure_target));
             targets.extend(pending.iter().map(pending_failure_target));
         }
         self::plan::ExecutionPlan::Decode => {
             targets.extend(active.iter().map(active_failure_target));
-        }
-        self::plan::ExecutionPlan::Unified { pending } => {
-            targets.extend(active.iter().map(active_failure_target));
-            targets.extend(pending.iter().map(pending_failure_target));
         }
     }
     targets
@@ -2227,6 +2228,46 @@ mod tests {
                 Some(TokenEvent::Finished { .. })
             ),
             "request after failure should finish"
+        );
+    }
+
+    // A Prefill step can run while decodes are active (echo+logprobs is routed
+    // to Prefill even then). On execution failure the scheduler clears all
+    // active state, so failure_targets_for must include the active requests too;
+    // otherwise they'd be dropped without an Error event or a drop_request,
+    // leaking KV and hanging the client.
+    #[test]
+    fn prefill_failure_targets_include_active_decodes() {
+        let (active_tx, _active_rx) = mpsc::unbounded_channel();
+        let active = vec![ActiveRequestState {
+            request_id: RequestId(100),
+            lora_adapter: None,
+            token_tx: active_tx,
+            last_token: 1,
+            generated_count: 1,
+            max_tokens: 4,
+            prompt_len: 16,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }];
+
+        let mut echo_lp = pending(200, true);
+        echo_lp.logprobs = 5;
+        let plan = self::plan::ExecutionPlan::Prefill {
+            pending: vec![echo_lp],
+        };
+
+        let ids: Vec<u64> = failure_targets_for(&active, &plan)
+            .iter()
+            .map(|t| t.request_id.get())
+            .collect();
+        assert!(
+            ids.contains(&100),
+            "active decode must be failed on a prefill error"
+        );
+        assert!(
+            ids.contains(&200),
+            "the prefilling request must be failed too"
         );
     }
 
