@@ -1035,7 +1035,8 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
             artifact_dir: "gated_delta_rule_chunk_state",
             kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
             kernel_name: "gdr_chunk_state_qwen35_kernel",
-            signature: "*bf16,*bf16,*bf16,*fp32,*fp32,*fp32,*bf16,*fp32,i32,i32,32,64,128,128,64",
+            // `g` (pos 4) stays bare — not a contiguous block-ptr load, so `:16` would be untrue.
+            signature: "*bf16:16,*bf16:16,*bf16:16,*fp32,*fp32:16,*fp32:16,*bf16:16,*fp32:16,i32,i32,32,64,128,128,64",
             grid: "4,num_value_heads,1",
             out_name: "triton_gated_delta_rule_chunk_state",
             num_warps: 4,

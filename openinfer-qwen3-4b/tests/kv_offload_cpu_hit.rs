@@ -71,7 +71,6 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         SamplingParams::default(),
         LOGPROBS,
         false,
-        0.0,
     )
 }
 
@@ -155,6 +154,7 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     // sealed blocks to the host tier. ──
     let cold = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(1, &p)],
             echo: false,
         })
@@ -184,6 +184,7 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     // match the same way the GPU prefix cache does). ──
     let warm = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(2, &p)],
             echo: false,
         })
@@ -211,6 +212,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     // ── Cold-compute `full`, saving all 6 blocks to the host tier. ──
     let cold = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(1, &full)],
             echo: false,
         })
@@ -229,6 +231,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     ex.evict_cached_blocks();
     let s = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(2, &short)],
             echo: false,
         })
@@ -256,6 +259,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     // CPU continuation this would be 3. ──
     let warm = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(3, &full)],
             echo: false,
         })

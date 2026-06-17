@@ -17,6 +17,7 @@ cudarc = { workspace = true }
 half = { workspace = true }
 hex = { workspace = true }
 libloading = "0.9"
+log = { workspace = true }
 memmap2 = { workspace = true }
 nvtx = { workspace = true }
 openinfer-core = { workspace = true }

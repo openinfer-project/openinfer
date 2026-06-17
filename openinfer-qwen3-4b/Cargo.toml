@@ -10,6 +10,7 @@ openinfer-bench = { workspace = true, optional = true }
 openinfer-core = { workspace = true }
 openinfer-cupti = { workspace = true, optional = true }
 openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, optional = true }
 comfy-table = { workspace = true, optional = true }

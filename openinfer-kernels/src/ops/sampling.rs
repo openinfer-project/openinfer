@@ -4,8 +4,6 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
 
-const FLASHINFER_TOPK_ROW_STATES_BYTES: usize = 1024 * 1024;
-
 /// One non-greedy row of a batched sampling call.
 ///
 /// `temperature` must be > 0 and `top_p` in (0, 1] — greedy rows
@@ -99,6 +97,8 @@ pub fn gpu_sample_batch_into(
     let mut temperature = Vec::with_capacity(n);
     let mut top_k = Vec::with_capacity(n);
     let mut top_p = Vec::with_capacity(n);
+    let mut has_top_k_filter = false;
+    let mut has_top_p_filter = false;
     for r in rows {
         ensure!(
             r.row < logits.seq_len,
@@ -120,11 +120,16 @@ pub fn gpu_sample_batch_into(
         temperature.push(r.temperature);
         // FlashInfer reads top_k as u32; "disabled" is any k >= vocab.
         let vocab = i32::try_from(scratch.vocab)?;
-        top_k.push(if r.top_k <= 0 || r.top_k > vocab {
-            vocab
-        } else {
+        let clamped_top_k = if r.top_k > 0 && r.top_k < vocab {
+            has_top_k_filter = true;
             r.top_k
-        });
+        } else {
+            vocab
+        };
+        top_k.push(clamped_top_k);
+        if r.top_p < 1.0 {
+            has_top_p_filter = true;
+        }
         top_p.push(r.top_p);
     }
     ctx.stream
@@ -160,6 +165,8 @@ pub fn gpu_sample_batch_into(
                 softmax_workspace_bytes,
                 n as i32,
                 scratch.vocab as i32,
+                i32::from(has_top_k_filter),
+                i32::from(has_top_p_filter),
                 seed,
                 0,
                 ctx.stream.cu_stream(),
@@ -199,8 +206,8 @@ pub fn gpu_sample_batch_into(
 
 /// Argmax — returns the index of the maximum element.
 ///
-/// Allocates a temporary output buffer. Used by benchmarks; model code uses
-/// `gpu_sample_into` for both greedy and non-greedy paths.
+/// Allocates a temporary output buffer. Model decode paths use batched argmax
+/// through `openinfer-sample`'s `select_batch`.
 pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     let mut out_gpu: CudaSlice<i32> = ctx
         .stream
@@ -346,134 +353,8 @@ pub fn argmax_batch_bf16_split_indexed_into(
     Ok(())
 }
 
-/// GPU sampling: temperature → softmax → top-k → top-p → multinomial.
-/// Allocates a temporary output buffer — use `gpu_sample_into` for the decode loop.
-pub fn gpu_sample(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    probs_scratch: &mut CudaSlice<f32>,
-    top1_value_scratch: &mut CudaSlice<half::bf16>,
-    row_states_scratch: &mut CudaSlice<u8>,
-    temperature: f32,
-    top_k: i32,
-    top_p: f32,
-    random_val: f32,
-) -> Result<u32> {
-    let mut valid_scratch: CudaSlice<u8> = ctx
-        .stream
-        .alloc_zeros(1)
-        .map_err(|e| anyhow!("Alloc failed: {}", e))?;
-    let mut out_gpu: CudaSlice<i32> = ctx
-        .stream
-        .alloc_zeros(1)
-        .map_err(|e| anyhow!("Alloc failed: {}", e))?;
-
-    gpu_sample_core(
-        ctx,
-        logits,
-        probs_scratch,
-        top1_value_scratch,
-        row_states_scratch,
-        &mut valid_scratch,
-        &mut out_gpu,
-        temperature,
-        top_k,
-        top_p,
-        random_val,
-    )
-}
-
-/// GPU sampling into pre-allocated buffers — zero allocation, suitable for decode loop.
-pub fn gpu_sample_into(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    probs_scratch: &mut CudaSlice<f32>,
-    top1_value_scratch: &mut CudaSlice<half::bf16>,
-    row_states_scratch: &mut CudaSlice<u8>,
-    valid_scratch: &mut CudaSlice<u8>,
-    out: &mut CudaSlice<i32>,
-    temperature: f32,
-    top_k: i32,
-    top_p: f32,
-    random_val: f32,
-) -> Result<u32> {
-    gpu_sample_core(
-        ctx,
-        logits,
-        probs_scratch,
-        top1_value_scratch,
-        row_states_scratch,
-        valid_scratch,
-        out,
-        temperature,
-        top_k,
-        top_p,
-        random_val,
-    )
-}
-
-fn gpu_sample_core(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    probs_scratch: &mut CudaSlice<f32>,
-    _top1_value_scratch: &mut CudaSlice<half::bf16>,
-    _row_states_scratch: &mut CudaSlice<u8>,
-    valid_scratch: &mut CudaSlice<u8>,
-    out: &mut CudaSlice<i32>,
-    temperature: f32,
-    top_k: i32,
-    top_p: f32,
-    random_val: f32,
-) -> Result<u32> {
-    // temperature <= 0 is argmax regardless of top_p (the temperature -> 0
-    // limit), and top_k == 1 leaves a single token for top_p to renormalize.
-    // Routing these to the sampler would also divide by temperature = 0.
-    if temperature <= 0.0 || top_k == 1 {
-        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::argmax_cuda(
-                l_ptr as *const ffi::Half,
-                o_ptr as *mut i32,
-                logits.len as i32,
-                ctx.stream.cu_stream(),
-            );
-        }
-    } else {
-        let inv_temperature = 1.0 / temperature;
-
-        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (p_ptr, _gp) = probs_scratch.device_ptr_mut(&ctx.stream);
-        let (v_ptr, _gv) = valid_scratch.device_ptr_mut(&ctx.stream);
-        let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-
-        unsafe {
-            ffi::gpu_sample_flashinfer_cuda(
-                l_ptr as *const ffi::Half,
-                p_ptr as *mut f32,
-                v_ptr as *mut u8,
-                o_ptr as *mut i32,
-                logits.len as i32,
-                inv_temperature,
-                top_k,
-                top_p,
-                u64::from(random_val.to_bits()),
-                ctx.stream.cu_stream(),
-            );
-        }
-    }
-    let result = ctx
-        .stream
-        .clone_dtoh(out)
-        .map_err(|e| anyhow!("D2H sample read failed: {}", e))?;
-    ctx.sync()?;
-
-    Ok(result[0] as u32)
-}
-
-pub fn flashinfer_topk_row_states_bytes() -> usize {
-    FLASHINFER_TOPK_ROW_STATES_BYTES
+pub fn flashinfer_top1_row_states_bytes() -> usize {
+    unsafe { ffi::flashinfer_top1_row_states_bytes_cuda() }
 }
 
 pub fn flashinfer_top1_batch_into(
@@ -498,11 +379,12 @@ pub fn flashinfer_top1_batch_into(
             rows
         ));
     }
-    if row_states_scratch.len() < FLASHINFER_TOPK_ROW_STATES_BYTES {
+    let row_states_bytes = flashinfer_top1_row_states_bytes();
+    if row_states_scratch.len() < row_states_bytes {
         return Err(anyhow!(
             "top1 row states scratch too small: have {}, need {}",
             row_states_scratch.len(),
-            FLASHINFER_TOPK_ROW_STATES_BYTES
+            row_states_bytes
         ));
     }
 
@@ -624,6 +506,26 @@ mod tests {
                 "seed {seed}: near-zero temperature row missed the argmax"
             );
         }
+    }
+
+    #[test]
+    fn batch_sampling_top_p_only_small_nucleus_collapses_to_argmax() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        let mut row = flat_row(0.0);
+        row[123] = 2.0;
+        row[456] = 1.5;
+        row[789] = 1.0;
+        let logits = arena_with_rows(&ctx, &[(2, row)]);
+        let mut scratch = BatchSamplingScratch::new(&ctx, ARENA_ROWS, VOCAB).expect("scratch");
+        let rows = [BatchSamplingRow {
+            row: 2,
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1e-6,
+        }];
+        let tokens =
+            gpu_sample_batch_into(&ctx, logits.as_ref(), &rows, 17, &mut scratch).expect("sample");
+        assert_eq!(tokens, vec![123], "tiny top_p should collapse to argmax");
     }
 
     #[test]

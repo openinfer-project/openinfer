@@ -12,6 +12,7 @@ pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod logprobs;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;
@@ -24,7 +25,7 @@ mod weights;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
+use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
 
 pub use kernel_plan::kernel_plan;
 
@@ -51,6 +52,22 @@ pub mod runtime_ops {
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     start_engine_with_capacity(model_path, options, batch_decode_graph::MAX_BATCH)
+}
+
+/// Start the Qwen3.5 engine for the server. Qwen3.5 is single-GPU, so the only
+/// knobs are the device ordinal and whether to capture a decode CUDA Graph.
+pub fn launch(model_path: &Path, device_ordinal: usize, cuda_graph: bool) -> Result<EngineHandle> {
+    start_engine(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: cuda_graph,
+            enable_prefill_profile: false,
+            device_ordinals: vec![device_ordinal],
+            parallel_config: None,
+            ep_backend: EpBackend::Nccl,
+            seed: 42,
+        },
+    )
 }
 
 pub fn start_engine_with_capacity(

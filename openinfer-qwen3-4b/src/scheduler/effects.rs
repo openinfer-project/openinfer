@@ -1,12 +1,12 @@
-use tokio::sync::mpsc;
+use log::debug;
 
 use crate::executor::RequestId;
-use openinfer_core::engine::{FinishReason, TokenLogprob};
+use openinfer_core::engine::{FinishReason, TokenLogprob, TokenSink};
 
 use super::{ActiveRequestState, PendingRequest, TokenEvent};
 
 pub(super) struct PromptEchoEffect {
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) ids: Vec<u32>,
     pub(super) logprobs: Vec<Option<TokenLogprob>>,
 }
@@ -16,7 +16,7 @@ pub(super) struct PromptEchoEffect {
 /// scheduled timestamp was stamped when the batch was formed, not when the
 /// event is sent, so queue-time metrics exclude prefill execution.
 pub(super) struct ScheduledEffect {
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) queued_at_unix_s: Option<f64>,
     pub(super) scheduled_at_unix_s: f64,
     pub(super) prompt_tokens: usize,
@@ -26,14 +26,14 @@ pub(super) struct ScheduledEffect {
 pub(super) enum PendingEffect {
     Finish {
         request_id: RequestId,
-        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        token_tx: TokenSink,
         finish_reason: FinishReason,
         prompt_tokens: usize,
         completion_tokens: usize,
     },
     EmitAndFinish {
         request_id: RequestId,
-        token_tx: mpsc::UnboundedSender<TokenEvent>,
+        token_tx: TokenSink,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
@@ -125,6 +125,10 @@ pub(super) fn apply_effects(
                     continue;
                 };
                 let req = &active[index];
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, req.prompt_len, completion_tokens, finish_reason
+                );
                 let _ = req.token_tx.send(TokenEvent::Finished {
                     finish_reason,
                     prompt_tokens: req.prompt_len,
@@ -144,6 +148,10 @@ pub(super) fn apply_effects(
                     continue;
                 };
                 let req = &active[index];
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, req.prompt_len, completion_tokens, finish_reason
+                );
                 if req
                     .token_tx
                     .send(TokenEvent::Token { id: token, logprob })
@@ -173,6 +181,10 @@ pub(super) fn apply_effects(
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_err()
                 {
+                    debug!(
+                        "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                        request_id, completion_tokens
+                    );
                     let _ = executor.drop_request(request_id);
                     to_retire.push(index);
                 } else {
@@ -209,6 +221,10 @@ pub(super) fn apply_effects(
                 prompt_tokens,
                 completion_tokens,
             } => {
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, prompt_tokens, completion_tokens, finish_reason
+                );
                 let _ = token_tx.send(TokenEvent::Finished {
                     finish_reason,
                     prompt_tokens,
@@ -225,6 +241,10 @@ pub(super) fn apply_effects(
                 prompt_tokens,
                 completion_tokens,
             } => {
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, prompt_tokens, completion_tokens, finish_reason
+                );
                 if token_tx
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_ok()

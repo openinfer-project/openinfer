@@ -67,12 +67,13 @@ pub(super) fn execute_plan(
         ExecutionPlan::Prefill { pending } => {
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
-            let requests = build_prefill_items(&pending, &indices, rng);
+            let requests = build_prefill_items(&pending, &indices);
             // `echo` here = "compute all-position logits"; only echo+logprobs
             // needs them.
             let mut result = executor.execute_prefill(PrefillPlan {
                 requests: &requests,
                 echo: batch_needs_prompt_logprobs(&pending),
+                sample_seed: rand::RngExt::random(rng),
             })?;
             sort_prefill_results(&mut result.requests);
             Ok(ExecutionArtifacts::Prefill {
@@ -83,9 +84,10 @@ pub(super) fn execute_plan(
         }
         ExecutionPlan::Decode => {
             let indices: Vec<usize> = (0..active.len()).collect();
-            let requests = build_decode_items(active, &indices, rng);
+            let requests = build_decode_items(active, &indices);
             let mut result = executor.execute_decode(DecodePlan {
                 requests: &requests,
+                sample_seed: rand::RngExt::random(rng),
             })?;
             sort_decode_results(&mut result.requests);
             Ok(ExecutionArtifacts::Decode { result })
@@ -94,11 +96,12 @@ pub(super) fn execute_plan(
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
             let active_indices: Vec<usize> = (0..active.len()).collect();
-            let prefill_requests = build_prefill_items(&pending, &pending_indices, rng);
-            let decode_requests = build_decode_items(active, &active_indices, rng);
+            let prefill_requests = build_prefill_items(&pending, &pending_indices);
+            let decode_requests = build_decode_items(active, &active_indices);
             let mut result = executor.execute_unified(UnifiedPlan {
                 prefill_requests: &prefill_requests,
                 decode_requests: &decode_requests,
+                sample_seed: rand::RngExt::random(rng),
             })?;
             sort_prefill_results(&mut result.prefill_requests);
             sort_decode_results(&mut result.decode_requests);
@@ -111,11 +114,7 @@ pub(super) fn execute_plan(
     }
 }
 
-fn build_prefill_items(
-    pending: &[PendingRequest],
-    indices: &[usize],
-    rng: &mut StdRng,
-) -> Vec<PrefillStepItem> {
+fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
     indices
         .iter()
         .map(|&index| {
@@ -128,7 +127,6 @@ fn build_prefill_items(
                 logprobs: r.logprobs,
                 echo: r.echo,
                 lora_adapter: r.lora_adapter.clone(),
-                random_val: rand::RngExt::random(rng),
                 cached_tokens: r.cached_tokens,
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
@@ -138,11 +136,7 @@ fn build_prefill_items(
         .collect()
 }
 
-fn build_decode_items(
-    active: &[ActiveRequestState],
-    indices: &[usize],
-    rng: &mut StdRng,
-) -> Vec<DecodeStepItem> {
+fn build_decode_items(active: &[ActiveRequestState], indices: &[usize]) -> Vec<DecodeStepItem> {
     indices
         .iter()
         .map(|&index| {
@@ -153,7 +147,6 @@ fn build_decode_items(
                 params: r.params,
                 logprobs: r.logprobs,
                 lora_adapter: r.lora_adapter.clone(),
-                random_val: rand::RngExt::random(rng),
             }
         })
         .collect()
@@ -174,7 +167,7 @@ mod tests {
     use openinfer_core::sampler::SamplingParams;
 
     fn pending() -> PendingRequest {
-        let (token_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (token_tx, _rx) = openinfer_core::engine::TokenSink::standalone();
         PendingRequest {
             request_id: RequestId::new(0),
             lora_adapter: None,

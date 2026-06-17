@@ -4,7 +4,7 @@
 >
 > **Last touched:** 2026-06
 
-Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: `docs/models/qwen3/roadmap.md` — batched sampling and non-greedy coverage are shared items owned there.
+Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: `docs/models/qwen3/roadmap.md` — batched sampling is shared and #284 now routes Qwen3.5 decode through the same compact batched sampler; Qwen3.5 now has its own model-level non-greedy behavior gate, while qwen3 keeps the sibling gate on its side.
 
 ## Where the line stands
 
@@ -19,6 +19,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | Long context | Partial: #250/#253 size the RoPE cache from `max_position_embeddings`; prefill/decode check cache coverage before use; scheduler admission rejects `prompt + max_tokens` past the position window and exposes the servable cap to the frontend; the scheduler e2e now covers the over-window rejection path | `config.rs`, `weights.rs`, `prefill.rs`, `batch_decode.rs`, `scheduler.rs`, `tests/e2e_scheduler.rs`, `src/scheduler/plan.rs` |
 | Admission | ✓ existing full-lifetime KV admission and explicit `Rejected` events cover impossible KV requests; #253 adds the context-window rejection reason before prefill/decode | `scheduler.rs`, `src/scheduler/plan.rs`, `docs/models/qwen35/kv-admission.md` |
 | Scheduler tests | Partial: current plan selection, full-lifetime admission, context-window rejection, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
+| Step tail | Local branch verified: #353 batches the prefill final norm/lm_head tail, samples decode/unified rows from batched logits, and keeps host full-vocab copies only for requested logprobs; HF/e2e gates pass, short-output serving A/B shows TTFT benefit, long-decode TPOT remains a no-claim diagnostic | `docs/models/qwen35/batched-step-tail.md` |
 | TP | ✗ absent (single GPU only) | — |
 | Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
 
@@ -29,13 +30,13 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 1. **Keep #250's score evidence attached to the PR.** The current #250 slice proves a concrete long-prompt logits gate at 4097/8192 tokens, fixes the RoPE cache boundary, and passes full GSM8K 8-shot against `/v1/completions`: `strict-match` 79.38%, `flexible-extract` 79.30%, compared with the HF reference 79.45%.
 2. **HF gate widening after the long-prompt root cause.** #186 provides the teacher-forced HF logits gate and qwen35 replay surfaces: sequential graph decode, bucket-straddling graph decode, and slot-compaction replay. #250 adds the first long-prompt case. Future widening should add recurrent-state handoff coverage once prefix work creates that surface.
 3. **RoPE cache sibling follow-through.** Qwen3.5 now follows the qwen3 #220 shape for the unscaled checkpoint: cache length comes from config, runtime checks fail closed before prefill/decode uses a missing position, and admission rejects requests that would run past the position window. Keep the YaRN #8 caveat for scaled checkpoints when porting or comparing model families.
+4. **Step-tail batching (#353).** The local branch removes the request-by-request final tail from Qwen3.5 prefill, executor decode, and scheduler unified/decode paths. HF logits + scheduler e2e pass; same-host `bench_serving request` supports a first-token/short-output TTFT claim only. Keep long-decode TPOT as a no-claim diagnostic until a stronger contract says otherwise.
 
 ### Next
 
-4. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → RoPE/context-window invariants → opens the door to prefix-cache design.
-5. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
-6. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 4.
-7. **kernel_plan port.** qwen3's `kernel_plan.rs` (runtime kernel selection + plan dump) has no qwen35 counterpart; decode kernel picks are hardwired. Mechanical port, community-friendly.
+5. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → RoPE/context-window invariants → opens the door to prefix-cache design.
+6. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
+7. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 5.
 
 ### Later
 
@@ -46,7 +47,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 - **Dead code:** ✓ qwen35 `probe_model()`+`ModelInfo` and the `start_with_model` entry point removed (#258); the same dead pair still exists in qwen3 (owned there).
 - **Docs:** ✓ qwen35 docs cleaned (#258): `Status:` enum headers dropped, obsolete `crates/` paths corrected to top-level, parity numbers reconciled to one ledger (234ms/11.77ms), and the e2e-gibberish story lifted to `docs/lessons/exact-match-gate-thread-cublas.md`. #186 then added the HF logits gate and retired the exact-text baseline.
-- **Shared with qwen3 (owned there):** batched greedy decode sampling (`batch_decode.rs` has the same per-row pattern), non-greedy sampling correctness coverage, frontend usage accounting (#78).
+- **Shared with qwen3 (owned there):** batched decode sampling is implemented for greedy and non-greedy rows (#307/#284); Qwen3.5 now also has a model-level non-greedy sampling behavior gate; remaining shared items are frontend usage accounting (#78).
 
 ## Done criteria
 

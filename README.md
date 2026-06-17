@@ -184,8 +184,27 @@ At 16k that turns a 1.14 s cold prefill into a 126 ms host-tier restore (9.1×; 
 tokens). The tiering ladder at 16k: HBM hit ~26 ms < host-tier restore ~126 ms ≪ cold prefill
 ~1.14 s.
 
-Qwen3.5-4B single-stream latency sits at the same level — see
-[Qwen3.5 optimization notes](docs/models/qwen35/optimization.md).
+### Qwen3.5-4B vs current vLLM
+
+Single RTX 5090 (32 GB), Qwen3.5-4B, BF16, TP1 — openinfer @ `f3dcdf4`,
+vLLM 0.23.0 (latest stable checked 2026-06-15), both driven by
+`vllm bench serve` 0.23.0. Fixed random prompts, 30 measured requests,
+1 warmup, max concurrency 1, vLLM text-only with prefix cache off. Full flags and caveats
+are in the [Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md).
+
+| Workload | Metric | openinfer | vLLM 0.23.0 |
+|---|---|---:|---:|
+| 2048 input / 1 output | reported input tokens | 58,324 (1,944/request) | 61,440 (2,048/request) |
+| 2048 input / 1 output | TTFT p50 (client-contract) | 101.8 ms | 115.2 ms |
+| 2048 input / 1 output | TTFT p99 (client-contract) | 108.7 ms | 123.7 ms |
+| 1024 input / 256 output | reported input tokens | 29,123 (971/request) | 30,720 (1,024/request) |
+| 1024 input / 256 output | TTFT p50 (client-contract) | 53.7 ms | 67.4 ms |
+| 1024 input / 256 output | TPOT p50 | 7.31 ms | **6.32 ms** |
+| 1024 input / 256 output | output tok/s | 133.6 | **152.3** |
+
+openinfer reports lower TTFT in this fixed-client run, but it also reports about 5%
+fewer prompt tokens, so these rows are not a token-normalized prefill comparison.
+vLLM still has the steady decode edge on this Qwen3.5 workload.
 
 ## Architecture
 
@@ -311,3 +330,11 @@ OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openi
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported from
 NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
+
+## Star History
+
+<p align="center">
+  <a href="https://star-history.com/#openinfer-project/openinfer&Date">
+    <img src="https://api.star-history.com/svg?repos=openinfer-project/openinfer&type=Date" alt="Star History Chart">
+  </a>
+</p>

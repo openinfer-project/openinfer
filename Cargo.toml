@@ -17,6 +17,7 @@ members = [
     "openinfer-kimi-k2",
     "openinfer-qwen3-4b",
     "openinfer-qwen35-4b",
+    "openinfer-sample",
     "openinfer-kv-cache",
     "openinfer-kv-offload",
     # ---- openinfer-comm (EP all-to-all) ----
@@ -129,6 +130,7 @@ openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
 openinfer-qwen3-4b = { path = "openinfer-qwen3-4b" }
 openinfer-qwen35-4b = { path = "openinfer-qwen35-4b" }
+openinfer-sample = { path = "openinfer-sample" }
 openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
 openinfer-vllm-frontend = { path = "openinfer-vllm-frontend" }
 openinfer-vllm-support = { path = "openinfer-vllm-support" }
@@ -141,7 +143,9 @@ rand = "0.10"
 smallvec = { version = "1.15.1", features = ["serde", "union"] }
 syscalls = "0.7.0"
 thiserror = "2.0.17"
-tracing = "0.1.41"
+# logforth consumes the `log` facade only; the `log` feature bridges tracing
+# events into log so they reach logforth instead of vanishing silently.
+tracing = { version = "0.1.41", features = ["log"] }
 tracing-core = "0.1.34"
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
@@ -165,10 +169,10 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
 velo = "0.1.0"
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "5d5591d99bb7b2ba695766a992dc328ca5867a4c" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "a7fdfeef72323eb3db6f0620e4ea200290d0ca5a" }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
 zeromq = { version = "0.6.0", default-features = false, features = [
     "tokio-runtime",

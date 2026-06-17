@@ -57,7 +57,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 // shared prefill prologue
                 KernelOp {
                     id: "embedding_prefill",
-                    rust: "prefill::prefill_forward -> ops::embedding_batch",
+                    rust: "prefill::prefill_last_hidden -> ops::embedding_batch",
                     backend: "CUDA",
                     notes: "prompt tokens to hidden states",
                 },
@@ -148,18 +148,18 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                     backend: "CUDA",
                     notes: "residual connections (post-attn, post-mlp)",
                 },
-                // final norm + lm head (once per prefill, not per layer)
+                // final norm + lm head (once per prefill step, not per request row)
                 KernelOp {
                     id: "final_norm_prefill",
-                    rust: "prefill::prefill_forward -> ops::rms_norm_offset_into",
+                    rust: "prefill::batch_last_hidden_logits -> ops::rms_norm_batch_offset_into",
                     backend: "FlashInfer",
-                    notes: "final RMSNorm on last hidden state (via flashinfer::norm::GemmaRMSNorm, single vec)",
+                    notes: "batched final RMSNorm over gathered last hidden states (via flashinfer::norm::GemmaRMSNorm)",
                 },
                 KernelOp {
                     id: "lm_head_prefill",
-                    rust: "prefill::prefill_forward -> ops::linear (tied embed_tokens)",
+                    rust: "prefill::batch_last_hidden_logits -> ops::gemm (tied embed_tokens)",
                     backend: "cuBLAS",
-                    notes: "LM head using tied embeddings (cuBLAS GEMV)",
+                    notes: "LM head using tied embeddings (one cuBLAS GEMM over request rows)",
                 },
             ],
         },
@@ -270,14 +270,14 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                     id: "lm_head_decode",
                     rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (tied embed_tokens)",
                     backend: "cuBLAS",
-                    notes: "LM head using tied embeddings (cuBLAS GEMV over bucket-padded batch)",
+                    notes: "LM head using tied embeddings (one cuBLAS GEMM over the bucket-padded batch)",
                 },
-                // per-request sampling
+                // batched sampling
                 KernelOp {
                     id: "sampling_decode",
-                    rust: "batch_decode::select_tokens_batch_varied -> ops::gpu_sample_into",
+                    rust: "batch_decode::select_tokens_batch_varied -> openinfer_sample::select_batch",
                     backend: "FlashInfer + CUDA",
-                    notes: "greedy path = argmax_cuda (CUDA); stochastic path = flashinfer::sampling::TopKTopPSamplingFromProb (real FlashInfer)",
+                    notes: "greedy rows use indexed batched argmax; non-greedy rows use one batched FlashInfer sampling pass per step",
                 },
             ],
         },
@@ -295,10 +295,10 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                     notes: "scheduler step combining new prefill requests and active CUDA-Graph decode requests",
                 },
                 KernelOp {
-                    id: "extract_logits",
-                    rust: "unified_forward::unified_step / executor::execute_decode -> ops::extract_vec",
-                    backend: "CUDA (cudarc D2D memcpy)",
-                    notes: "extract per-request logits from the batched logits buffer — NOT a kernel launch, just cudarc memcpy_dtod",
+                    id: "decode_sampling",
+                    rust: "scheduler::process_decode_logits -> batch_decode::select_tokens_batch_varied -> openinfer_sample::select_batch",
+                    backend: "CUDA + FlashInfer",
+                    notes: "logprobs snapshot only extracts requested rows; token selection samples directly from batched logits",
                 },
             ],
         },

@@ -40,7 +40,6 @@ pub struct PrefillStepItem {
     pub(crate) logprobs: usize,
     pub(crate) echo: bool,
     pub(crate) lora_adapter: Option<String>,
-    pub(crate) random_val: f32,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
     /// the remaining suffix.
@@ -64,7 +63,6 @@ impl PrefillStepItem {
         params: SamplingParams,
         logprobs: usize,
         echo: bool,
-        random_val: f32,
     ) -> Self {
         let chunk_tokens = prompt_tokens.len();
         Self {
@@ -75,7 +73,6 @@ impl PrefillStepItem {
             logprobs,
             echo,
             lora_adapter: None,
-            random_val,
             cached_tokens: 0,
             chunk_budget: usize::MAX,
             chunk_start: 0,
@@ -120,7 +117,6 @@ pub struct DecodeStepItem {
     pub(crate) params: SamplingParams,
     pub(crate) logprobs: usize,
     pub(crate) lora_adapter: Option<String>,
-    pub(crate) random_val: f32,
 }
 
 impl DecodeStepItem {
@@ -129,7 +125,6 @@ impl DecodeStepItem {
         token_id: u32,
         params: SamplingParams,
         logprobs: usize,
-        random_val: f32,
     ) -> Self {
         Self {
             request_id,
@@ -137,7 +132,6 @@ impl DecodeStepItem {
             params,
             logprobs,
             lora_adapter: None,
-            random_val,
         }
     }
 
@@ -253,22 +247,15 @@ fn build_decode_request_results(
 fn build_batch_decode_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[DecodeStepItem],
+    sample_seed: u64,
 ) -> Result<Vec<DecodeRequestResult>> {
     let params: Vec<&SamplingParams> = requests.iter().map(|req| &req.params).collect();
-    let random_vals: Vec<f32> = requests.iter().map(|req| req.random_val).collect();
-    let tokens = openinfer_core::ops::select_batch_tokens_into(
+    let tokens = openinfer_sample::select_batch(
         lane.model.device_ctx(),
         &lane.bufs.logits,
         &params,
-        &random_vals,
-        &mut lane.sample_scratch.row_indices,
-        &mut lane.sample_scratch.argmax_partial_values,
-        &mut lane.sample_scratch.argmax_partial_indices,
-        &mut lane.sample_scratch.probs,
-        &mut lane.sample_scratch.top1_values,
-        &mut lane.sample_scratch.row_states,
-        &mut lane.sample_scratch.valid,
-        &mut lane.sample_scratch.out,
+        sample_seed,
+        &mut lane.sample_scratch,
     )?;
 
     let mut outputs = Vec::with_capacity(requests.len());
@@ -299,6 +286,7 @@ fn execute_step_on_lane(
             requests,
             kv_views,
             echo,
+            sample_seed,
         } => {
             let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
             let lora_adapters: Vec<Option<&str>> = requests
@@ -309,8 +297,7 @@ fn execute_step_on_lane(
                 lane.execute_prefill(&prompts, kv_views, &lora_adapters, *echo)?;
             if collect_result {
                 let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
-                let random_vals: Vec<f32> = requests.iter().map(|r| r.random_val).collect();
-                let tokens = lane.select_step_tokens(&logits, &params, &random_vals)?;
+                let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
                         lane,
@@ -325,7 +312,11 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
-        StepCommand::Decode { requests, kv_views } => {
+        StepCommand::Decode {
+            requests,
+            kv_views,
+            sample_seed,
+        } => {
             let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
             let lora_adapters: Vec<Option<&str>> = requests
                 .iter()
@@ -334,7 +325,7 @@ fn execute_step_on_lane(
             lane.execute_decode(&token_ids, kv_views, &lora_adapters)?;
             if collect_result {
                 Ok(WorkerStepOutcome::Decode(DecodeResult {
-                    requests: build_batch_decode_request_results(lane, requests)?,
+                    requests: build_batch_decode_request_results(lane, requests, *sample_seed)?,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -345,6 +336,7 @@ fn execute_step_on_lane(
             prefill_kv_views,
             decode_requests,
             decode_kv_views,
+            sample_seed,
         } => {
             let prefill_prompts: Vec<&[u32]> = prefill_requests
                 .iter()
@@ -374,12 +366,7 @@ fn execute_step_on_lane(
                     .map(|r| &r.params)
                     .chain(decode_requests.iter().map(|r| &r.params))
                     .collect();
-                let random_vals: Vec<f32> = prefill_requests
-                    .iter()
-                    .map(|r| r.random_val)
-                    .chain(decode_requests.iter().map(|r| r.random_val))
-                    .collect();
-                let tokens = lane.select_step_tokens(&logits, &params, &random_vals)?;
+                let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
                     prefill_requests: build_prefill_request_results(
                         lane,
@@ -412,74 +399,6 @@ impl Drop for CublasThreadGuard {
             openinfer_core::ffi::cublas_destroy();
         }
     }
-}
-
-struct SamplingScratch {
-    row_indices: cudarc::driver::CudaSlice<i32>,
-    argmax_partial_values: cudarc::driver::CudaSlice<f32>,
-    argmax_partial_indices: cudarc::driver::CudaSlice<i32>,
-    probs: cudarc::driver::CudaSlice<f32>,
-    top1_values: cudarc::driver::CudaSlice<half::bf16>,
-    row_states: cudarc::driver::CudaSlice<u8>,
-    valid: cudarc::driver::CudaSlice<u8>,
-    out: cudarc::driver::CudaSlice<i32>,
-}
-
-impl SamplingScratch {
-    fn new(ctx: &DeviceContext, vocab_size: usize, max_batch_bucket: usize) -> Result<Self> {
-        let partials =
-            openinfer_core::ops::argmax_batch_bf16_split_partials_len(max_batch_bucket, vocab_size);
-        Ok(Self {
-            row_indices: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            argmax_partial_values: ctx.stream.alloc_zeros(partials)?,
-            argmax_partial_indices: ctx.stream.alloc_zeros(partials)?,
-            probs: ctx.stream.alloc_zeros(vocab_size)?,
-            top1_values: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            row_states: ctx
-                .stream
-                .alloc_zeros(openinfer_core::ops::flashinfer_topk_row_states_bytes())?,
-            valid: ctx.stream.alloc_zeros(1)?,
-            out: ctx.stream.alloc_zeros(max_batch_bucket)?,
-        })
-    }
-}
-
-fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    sampled_token: u32,
-    top_k: usize,
-) -> Option<TokenLogprob> {
-    if logits_f32.is_empty() {
-        return None;
-    }
-
-    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
-    let log_sum_exp = max_val + sum_exp.ln();
-    let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
-
-    let k = top_k.min(logits_f32.len());
-    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-    if k > 0 {
-        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        for (idx, &val) in logits_f32.iter().enumerate() {
-            if best.len() < k || val > best.last().unwrap().1 {
-                let pos = best.partition_point(|&(_, v)| v > val);
-                best.insert(pos, (idx as u32, val));
-                if best.len() > k {
-                    best.pop();
-                }
-            }
-        }
-        for (idx, val) in best {
-            top.push((idx, val - log_sum_exp));
-        }
-    }
-
-    Some(TokenLogprob {
-        logprob: sampled_logprob,
-        top_logprobs: top,
-    })
 }
 
 fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
@@ -555,15 +474,18 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
 pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
     pub echo: bool,
+    pub sample_seed: u64,
 }
 
 pub struct DecodePlan<'a> {
     pub requests: &'a [DecodeStepItem],
+    pub sample_seed: u64,
 }
 
 pub struct UnifiedPlan<'a> {
     pub prefill_requests: &'a [PrefillStepItem],
     pub decode_requests: &'a [DecodeStepItem],
+    pub sample_seed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1472,6 +1394,7 @@ impl ModelExecutor for Qwen3Executor {
             requests,
             kv_views,
             echo: plan.echo,
+            sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
 
@@ -1524,6 +1447,7 @@ impl ModelExecutor for Qwen3Executor {
         let step = StepCommand::Decode {
             requests: plan.requests.to_vec(),
             kv_views,
+            sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
 
@@ -1588,6 +1512,7 @@ impl ModelExecutor for Qwen3Executor {
             prefill_kv_views,
             decode_requests: plan.decode_requests.to_vec(),
             decode_kv_views,
+            sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
 
@@ -1905,7 +1830,7 @@ struct LocalQwen3Lane {
     kv_buffer: KvBuffer,
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
-    sample_scratch: SamplingScratch,
+    sample_scratch: openinfer_sample::SampleScratch,
 }
 
 impl LocalQwen3Lane {
@@ -1935,8 +1860,11 @@ impl LocalQwen3Lane {
             padding_block_id,
             model.local_num_attention_heads(),
         )?;
-        let sample_scratch =
-            SamplingScratch::new(model.device_ctx(), model.config().vocab_size, max_bucket)?;
+        let sample_scratch = openinfer_sample::SampleScratch::new(
+            model.device_ctx(),
+            model.config().vocab_size,
+            max_bucket,
+        )?;
         Ok(Self {
             model,
             kv_buffer,
@@ -1953,34 +1881,27 @@ impl LocalQwen3Lane {
     }
 
     /// Pick one token per logits column (batched argmax for greedy rows,
-    /// per-row sampler otherwise). Grows the sampling scratch when a step
-    /// is wider than the decode bucket it was sized for.
+    /// one batched sampler call for non-greedy rows). Grows the sampling
+    /// scratch when a step is wider than the decode bucket it was sized for.
     fn select_step_tokens(
         &mut self,
         logits: &HiddenStates,
         params: &[&SamplingParams],
-        random_vals: &[f32],
+        sample_seed: u64,
     ) -> Result<Vec<u32>> {
-        if params.len() > self.sample_scratch.row_indices.len() {
-            self.sample_scratch = SamplingScratch::new(
+        if params.len() > self.sample_scratch.max_rows() {
+            self.sample_scratch = openinfer_sample::SampleScratch::new(
                 self.model.device_ctx(),
                 self.model.config().vocab_size,
                 params.len(),
             )?;
         }
-        openinfer_core::ops::select_batch_tokens_into(
+        openinfer_sample::select_batch(
             self.model.device_ctx(),
             logits,
             params,
-            random_vals,
-            &mut self.sample_scratch.row_indices,
-            &mut self.sample_scratch.argmax_partial_values,
-            &mut self.sample_scratch.argmax_partial_indices,
-            &mut self.sample_scratch.probs,
-            &mut self.sample_scratch.top1_values,
-            &mut self.sample_scratch.row_states,
-            &mut self.sample_scratch.valid,
-            &mut self.sample_scratch.out,
+            sample_seed,
+            &mut self.sample_scratch,
         )
     }
 
@@ -1991,7 +1912,7 @@ impl LocalQwen3Lane {
         top_k: usize,
     ) -> Result<TokenLogprob> {
         let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+        openinfer_sample::token_logprob_from_row(&logits_f32, sampled_token, top_k)
             .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
     }
 
@@ -2006,7 +1927,7 @@ impl LocalQwen3Lane {
             .ok()
             .and_then(|logits_vec| {
                 let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
-                compute_logprobs_from_cpu(&logits_f32, target_token, top_k)
+                openinfer_sample::token_logprob_from_row(&logits_f32, target_token, top_k)
             })
     }
 
@@ -2091,16 +2012,19 @@ enum StepCommand {
         requests: Vec<PrefillStepItem>,
         kv_views: Vec<KvView>,
         echo: bool,
+        sample_seed: u64,
     },
     Decode {
         requests: Vec<DecodeStepItem>,
         kv_views: Vec<KvView>,
+        sample_seed: u64,
     },
     Unified {
         prefill_requests: Vec<PrefillStepItem>,
         prefill_kv_views: Vec<KvView>,
         decode_requests: Vec<DecodeStepItem>,
         decode_kv_views: Vec<KvView>,
+        sample_seed: u64,
     },
 }
 

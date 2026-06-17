@@ -149,7 +149,7 @@ pub(crate) struct SamplingScratch {
     /// Buffers for non-greedy rows (f32 probs are batch x vocab, ~42 MB at
     /// batch 64) — allocated on the first sampling request so greedy-only
     /// serving pays nothing.
-    batch_sampling: Option<openinfer_kernels::ops::BatchSamplingScratch>,
+    batch_sampling: Option<openinfer_sample::BatchSamplingScratch>,
     batch_size: usize,
 }
 
@@ -169,9 +169,9 @@ impl SamplingScratch {
     pub(crate) fn batch_sampling(
         &mut self,
         ctx: &DeviceContext,
-    ) -> Result<&mut openinfer_kernels::ops::BatchSamplingScratch> {
+    ) -> Result<&mut openinfer_sample::BatchSamplingScratch> {
         if self.batch_sampling.is_none() {
-            self.batch_sampling = Some(openinfer_kernels::ops::BatchSamplingScratch::new(
+            self.batch_sampling = Some(openinfer_sample::BatchSamplingScratch::new(
                 ctx,
                 self.batch_size,
                 KIMI_K2_VOCAB,

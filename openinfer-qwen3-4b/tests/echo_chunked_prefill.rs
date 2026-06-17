@@ -116,7 +116,6 @@ fn echo_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         SamplingParams::default(),
         LOGPROBS,
         true, // echo
-        0.0,
     )
 }
 
@@ -128,6 +127,7 @@ fn single_pass(ex: &mut Qwen3Executor, prompt: &[u32]) -> Vec<Option<TokenLogpro
         .execute_prefill(PrefillPlan {
             requests: &[echo_item(id, prompt.to_vec())],
             echo: true,
+            sample_seed: 0,
         })
         .expect("single-pass echo prefill");
     let req = &result.requests[0];
@@ -153,6 +153,7 @@ fn single_chunk_via_budget(ex: &mut Qwen3Executor, prompt: &[u32]) -> Vec<Option
         .execute_prefill(PrefillPlan {
             requests: &[echo_item(id, prompt.to_vec()).with_chunk_budget(prompt.len())],
             echo: true,
+            sample_seed: 0,
         })
         .expect("single-chunk echo prefill");
     let req = &result.requests[0];
@@ -177,6 +178,7 @@ fn chunked(ex: &mut Qwen3Executor, prompt: &[u32], budget: usize) -> Vec<Option<
             .execute_prefill(PrefillPlan {
                 requests: &[echo_item(id, prompt.to_vec()).with_chunk_budget(budget)],
                 echo: true,
+                sample_seed: 0,
             })
             .expect("chunked echo prefill");
         let req = &result.requests[0];
