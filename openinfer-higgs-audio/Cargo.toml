@@ -1,0 +1,40 @@
+[package]
+name = "openinfer-higgs-audio"
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+autobenches = false
+autobins = false
+autotests = false
+
+[dependencies]
+# Pure Rust / CPU — always compiled (Mac can build)
+anyhow = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# GPU stack — only under higgs-audio feature
+openinfer-core = { workspace = true, optional = true }
+openinfer-kernels = { workspace = true, optional = true }
+openinfer-kv-cache = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+
+[features]
+default = []
+higgs-audio = [
+  "dep:openinfer-core",
+  "dep:openinfer-kernels",
+  "dep:openinfer-kv-cache",
+  "dep:cudarc",
+]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+safetensors = { workspace = true }
+
+[[test]]
+name = "backbone_parity"
+required-features = ["higgs-audio"]

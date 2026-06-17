@@ -3801,6 +3801,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-higgs-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "openinfer-core",
+ "openinfer-kernels",
+ "openinfer-kv-cache",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "openinfer-kernels"
 version = "0.1.0"
 dependencies = [
