@@ -64,7 +64,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "sampling",
-                    rust: "executor::LocalQwen3Lane::select_step_tokens -> openinfer_core::ops::select_batch_tokens_into",
+                    rust: "executor::LocalQwen3Lane::select_step_tokens -> openinfer_sample::select_batch",
                     backend: "CUDA + FlashInfer",
                     notes: "greedy rows use indexed batched argmax; non-greedy rows use one batched FlashInfer sampling pass per step",
                 },

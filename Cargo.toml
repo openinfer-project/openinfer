@@ -17,6 +17,7 @@ members = [
     "openinfer-kimi-k2",
     "openinfer-qwen3-4b",
     "openinfer-qwen35-4b",
+    "openinfer-sample",
     "openinfer-kv-cache",
     "openinfer-kv-offload",
     # ---- openinfer-comm (EP all-to-all) ----
@@ -129,6 +130,7 @@ openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
 openinfer-qwen3-4b = { path = "openinfer-qwen3-4b" }
 openinfer-qwen35-4b = { path = "openinfer-qwen35-4b" }
+openinfer-sample = { path = "openinfer-sample" }
 openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
 openinfer-vllm-frontend = { path = "openinfer-vllm-frontend" }
 openinfer-vllm-support = { path = "openinfer-vllm-support" }

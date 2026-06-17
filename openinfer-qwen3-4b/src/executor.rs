@@ -221,17 +221,12 @@ fn build_batch_decode_request_results(
     sample_seed: u64,
 ) -> Result<Vec<DecodeRequestResult>> {
     let params: Vec<&SamplingParams> = requests.iter().map(|req| &req.params).collect();
-    let tokens = openinfer_core::ops::select_batch_tokens_into(
+    let tokens = openinfer_sample::select_batch(
         lane.model.device_ctx(),
         &lane.bufs.logits,
         &params,
         sample_seed,
-        &mut lane.sample_scratch.row_indices,
-        &mut lane.sample_scratch.argmax_partial_values,
-        &mut lane.sample_scratch.argmax_partial_indices,
-        &mut lane.sample_scratch.top1_values,
-        &mut lane.sample_scratch.out,
-        &mut lane.sample_scratch.batch_sampling,
+        &mut lane.sample_scratch,
     )?;
 
     let mut outputs = Vec::with_capacity(requests.len());
@@ -375,72 +370,6 @@ impl Drop for CublasThreadGuard {
             openinfer_core::ffi::cublas_destroy();
         }
     }
-}
-
-struct SamplingScratch {
-    row_indices: cudarc::driver::CudaSlice<i32>,
-    argmax_partial_values: cudarc::driver::CudaSlice<f32>,
-    argmax_partial_indices: cudarc::driver::CudaSlice<i32>,
-    top1_values: cudarc::driver::CudaSlice<half::bf16>,
-    out: cudarc::driver::CudaSlice<i32>,
-    batch_sampling: openinfer_core::ops::BatchSamplingScratch,
-}
-
-impl SamplingScratch {
-    fn new(ctx: &DeviceContext, vocab_size: usize, max_batch_bucket: usize) -> Result<Self> {
-        let partials =
-            openinfer_core::ops::argmax_batch_bf16_split_partials_len(max_batch_bucket, vocab_size);
-        Ok(Self {
-            row_indices: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            argmax_partial_values: ctx.stream.alloc_zeros(partials)?,
-            argmax_partial_indices: ctx.stream.alloc_zeros(partials)?,
-            top1_values: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            out: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            batch_sampling: openinfer_core::ops::BatchSamplingScratch::new(
-                ctx,
-                max_batch_bucket,
-                vocab_size,
-            )?,
-        })
-    }
-}
-
-fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    sampled_token: u32,
-    top_k: usize,
-) -> Option<TokenLogprob> {
-    if logits_f32.is_empty() {
-        return None;
-    }
-
-    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
-    let log_sum_exp = max_val + sum_exp.ln();
-    let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
-
-    let k = top_k.min(logits_f32.len());
-    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-    if k > 0 {
-        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        for (idx, &val) in logits_f32.iter().enumerate() {
-            if best.len() < k || val > best.last().unwrap().1 {
-                let pos = best.partition_point(|&(_, v)| v > val);
-                best.insert(pos, (idx as u32, val));
-                if best.len() > k {
-                    best.pop();
-                }
-            }
-        }
-        for (idx, val) in best {
-            top.push((idx, val - log_sum_exp));
-        }
-    }
-
-    Some(TokenLogprob {
-        logprob: sampled_logprob,
-        top_logprobs: top,
-    })
 }
 
 fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
@@ -1796,7 +1725,7 @@ struct LocalQwen3Lane {
     kv_buffer: KvBuffer,
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
-    sample_scratch: SamplingScratch,
+    sample_scratch: openinfer_sample::SampleScratch,
 }
 
 impl LocalQwen3Lane {
@@ -1826,8 +1755,11 @@ impl LocalQwen3Lane {
             padding_block_id,
             model.local_num_attention_heads(),
         )?;
-        let sample_scratch =
-            SamplingScratch::new(model.device_ctx(), model.config().vocab_size, max_bucket)?;
+        let sample_scratch = openinfer_sample::SampleScratch::new(
+            model.device_ctx(),
+            model.config().vocab_size,
+            max_bucket,
+        )?;
         Ok(Self {
             model,
             kv_buffer,
@@ -1852,24 +1784,19 @@ impl LocalQwen3Lane {
         params: &[&SamplingParams],
         sample_seed: u64,
     ) -> Result<Vec<u32>> {
-        if params.len() > self.sample_scratch.row_indices.len() {
-            self.sample_scratch = SamplingScratch::new(
+        if params.len() > self.sample_scratch.max_rows() {
+            self.sample_scratch = openinfer_sample::SampleScratch::new(
                 self.model.device_ctx(),
                 self.model.config().vocab_size,
                 params.len(),
             )?;
         }
-        openinfer_core::ops::select_batch_tokens_into(
+        openinfer_sample::select_batch(
             self.model.device_ctx(),
             logits,
             params,
             sample_seed,
-            &mut self.sample_scratch.row_indices,
-            &mut self.sample_scratch.argmax_partial_values,
-            &mut self.sample_scratch.argmax_partial_indices,
-            &mut self.sample_scratch.top1_values,
-            &mut self.sample_scratch.out,
-            &mut self.sample_scratch.batch_sampling,
+            &mut self.sample_scratch,
         )
     }
 
@@ -1880,7 +1807,7 @@ impl LocalQwen3Lane {
         top_k: usize,
     ) -> Result<TokenLogprob> {
         let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+        openinfer_sample::token_logprob_from_row(&logits_f32, sampled_token, top_k)
             .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
     }
 
@@ -1895,7 +1822,7 @@ impl LocalQwen3Lane {
             .ok()
             .and_then(|logits_vec| {
                 let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
-                compute_logprobs_from_cpu(&logits_f32, target_token, top_k)
+                openinfer_sample::token_logprob_from_row(&logits_f32, target_token, top_k)
             })
     }
 

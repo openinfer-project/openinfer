@@ -33,18 +33,7 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        ops::select_batch_tokens_into(
-            &self.ctx,
-            logits,
-            params,
-            sample_seed,
-            &mut bufs.sample_row_indices,
-            &mut bufs.sample_argmax_partial_values,
-            &mut bufs.sample_argmax_partial_indices,
-            &mut bufs.sample_top1_value,
-            &mut bufs.sample_out,
-            &mut bufs.sample_batch_sampling,
-        )
+        openinfer_sample::select_batch(&self.ctx, logits, params, sample_seed, &mut bufs.sample)
     }
 
     pub(crate) fn select_tokens_batch_varied(
@@ -69,17 +58,12 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        ops::select_batch_tokens_into(
+        openinfer_sample::select_batch(
             &self.ctx,
             &bufs.logits,
             params,
             sample_seed,
-            &mut bufs.sample_row_indices,
-            &mut bufs.sample_argmax_partial_values,
-            &mut bufs.sample_argmax_partial_indices,
-            &mut bufs.sample_top1_value,
-            &mut bufs.sample_out,
-            &mut bufs.sample_batch_sampling,
+            &mut bufs.sample,
         )
     }
 

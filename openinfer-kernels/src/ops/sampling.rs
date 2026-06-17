@@ -165,8 +165,8 @@ pub fn gpu_sample_batch_into(
                 softmax_workspace_bytes,
                 n as i32,
                 scratch.vocab as i32,
-                if has_top_k_filter { 1 } else { 0 },
-                if has_top_p_filter { 1 } else { 0 },
+                i32::from(has_top_k_filter),
+                i32::from(has_top_p_filter),
                 seed,
                 0,
                 ctx.stream.cu_stream(),
@@ -207,7 +207,7 @@ pub fn gpu_sample_batch_into(
 /// Argmax — returns the index of the maximum element.
 ///
 /// Allocates a temporary output buffer. Model decode paths use batched argmax
-/// through `select_batch_tokens_into`.
+/// through `openinfer-sample`'s `select_batch`.
 pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     let mut out_gpu: CudaSlice<i32> = ctx
         .stream

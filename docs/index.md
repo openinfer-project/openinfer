@@ -105,6 +105,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/scheduler/output-dispatch.md` | GPU bubble study + token-dispatch redesign (**landed 2026-06**). Single-thread CPU↔GPU(sync) alternation idles the GPU through scheduling; bubble ≈3µs×batch (bs=128 → ~380µs, 2% of an 18ms step on 5070 Ti), dominated by N per-request `token_tx.send` wakeups. Fix shipped: `token_tx` is a `TokenSink` drop-in over one request-tagged channel + one bridge demux loop (N→1 wakeups/tasks/ZMQ msgs); cancellation rides an `Arc<AtomicBool>` flag, not a separate channel. Bubble target ~150µs (exec_cpu floor). Trigger: fast GPUs (→10–15%) or N≫128. |
 | `subsystems/scheduler/qwen-batched-sampling.md` | Issue #284 record: Qwen3/Qwen3.5 mixed greedy/non-greedy token selection compacts non-greedy rows into one batched FlashInfer sampling call per step, with greedy rows staying on indexed batched argmax. |
 
+## subsystems / sampling
+
+| Path | TL;DR |
+| --- | --- |
+| `subsystems/sampling/openinfer-sample.md` | `openinfer-sample` is the one crate every model routes through for batched token selection (`select_batch`) and host logprobs (`token_logprob_from_row`, generic over f32/bf16). Replaces `core::ops::select_batch_tokens_into` + three copies of the logprob math. Kimi keeps its sharded-vocab greedy argmax (a DP concern the whole-vocab `select_batch` can't express) but shares the non-greedy sampler and the logprob math. |
+
 ## subsystems / frontend
 
 | Path | TL;DR |

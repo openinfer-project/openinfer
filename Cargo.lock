@@ -3829,6 +3829,7 @@ dependencies = [
  "openinfer-core",
  "openinfer-kernels",
  "openinfer-kv-cache",
+ "openinfer-sample",
  "rand 0.10.1",
  "safetensors",
  "serde",
@@ -3882,6 +3883,7 @@ dependencies = [
  "openinfer-kernels",
  "openinfer-kv-cache",
  "openinfer-kv-offload",
+ "openinfer-sample",
  "openinfer-vllm-support",
  "rand 0.10.1",
  "safetensors",
@@ -3905,6 +3907,7 @@ dependencies = [
  "log",
  "openinfer-core",
  "openinfer-kernels",
+ "openinfer-sample",
  "openinfer-vllm-support",
  "rand 0.10.1",
  "safetensors",
@@ -3913,6 +3916,18 @@ dependencies = [
  "sha2 0.11.0",
  "tokio",
  "vllm-text",
+]
+
+[[package]]
+name = "openinfer-sample"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion 0.8.2",
+ "cudarc",
+ "half",
+ "openinfer-engine",
+ "openinfer-kernels",
 ]
 
 [[package]]

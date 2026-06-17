@@ -275,7 +275,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 // batched sampling
                 KernelOp {
                     id: "sampling_decode",
-                    rust: "batch_decode::select_tokens_batch_varied -> ops::select_batch_tokens_into",
+                    rust: "batch_decode::select_tokens_batch_varied -> openinfer_sample::select_batch",
                     backend: "FlashInfer + CUDA",
                     notes: "greedy rows use indexed batched argmax; non-greedy rows use one batched FlashInfer sampling pass per step",
                 },
@@ -296,7 +296,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "decode_sampling",
-                    rust: "scheduler::process_decode_logits -> batch_decode::select_tokens_batch_varied -> ops::select_batch_tokens_into",
+                    rust: "scheduler::process_decode_logits -> batch_decode::select_tokens_batch_varied -> openinfer_sample::select_batch",
                     backend: "CUDA + FlashInfer",
                     notes: "logprobs snapshot only extracts requested rows; token selection samples directly from batched logits",
                 },

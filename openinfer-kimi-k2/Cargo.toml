@@ -19,6 +19,7 @@ memmap2 = { workspace = true }
 openinfer-bench = { workspace = true }
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 openinfer-kv-cache = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
