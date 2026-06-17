@@ -20,11 +20,13 @@ use vllm_server::{
 use openinfer_engine::engine::EngineHandle;
 
 mod bridge;
+mod health;
 mod lora;
 mod sampling_guard;
 mod wire;
 
 use bridge::{LocalEngineBridge, ipc_endpoint, local_ipc_namespace};
+use health::{HealthProbe, guard_health_request};
 use lora::{bad_request, load_startup_lora_modules, lora_openai_routes, lora_routes};
 use sampling_guard::{ServableCap, guard_generation_request};
 
@@ -157,10 +159,12 @@ where
     // failure it cancels the server so the error surfaces instead of hanging
     // in the registration wait.
     let servable_cap = ServableCap::default();
+    let health_probe = HealthProbe::default();
     let server_shutdown = shutdown.child_token();
     let bridge_shutdown = shutdown.child_token();
     let engine_task = tokio::spawn({
         let servable_cap = servable_cap.clone();
+        let health_probe = health_probe.clone();
         let server_shutdown = server_shutdown.clone();
         let bridge_shutdown = bridge_shutdown.clone();
         let input_address = input_address.clone();
@@ -175,6 +179,10 @@ where
             };
             let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
             servable_cap.set(servable_limit);
+            assert!(
+                health_probe.set(handle.health()).is_ok(),
+                "engine health probe must be set exactly once"
+            );
             let bridge = LocalEngineBridge {
                 input_address,
                 output_address,
@@ -223,7 +231,9 @@ where
     };
 
     let extend_router = move |router: Router| {
-        extend_router(router).layer(from_fn_with_state(servable_cap, guard_generation_request))
+        extend_router(router)
+            .layer(from_fn_with_state(servable_cap, guard_generation_request))
+            .layer(from_fn_with_state(health_probe, guard_health_request))
     };
     let result =
         vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;

@@ -134,7 +134,7 @@ impl<'a> BatchDecodeDag<'a> {
         rows: usize,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
+    ) -> Result<()> {
         #[cfg(feature = "kernel-call-trace")]
         Self::record(gemm_rows_call::<Out>(
             label,
@@ -144,7 +144,14 @@ impl<'a> BatchDecodeDag<'a> {
             row_offset,
             x.seq_len,
         ));
-        openinfer_kernels::ops::gemm_rows_into(&self.model.ctx, weight, row_offset, rows, x, out);
+        openinfer_kernels::ops::gemm_rows_into_checked(
+            &self.model.ctx,
+            weight,
+            row_offset,
+            rows,
+            x,
+            out,
+        )
     }
 
     // `Out`/`In` label the kernel-call-trace record; unused without the feature.
@@ -158,7 +165,7 @@ impl<'a> BatchDecodeDag<'a> {
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
+    ) -> Result<()> {
         #[cfg(feature = "kernel-call-trace")]
         Self::record(gemm_call::<Out, In>(
             label,
@@ -166,7 +173,7 @@ impl<'a> BatchDecodeDag<'a> {
             weight.cols,
             x.seq_len,
         ));
-        openinfer_kernels::ops::gemm_into(&self.model.ctx, weight, x, out);
+        openinfer_kernels::ops::gemm_into_checked(&self.model.ctx, weight, x, out)
     }
 
     pub(crate) fn qk_norm_rope(
@@ -305,8 +312,8 @@ impl<'a> BatchDecodeDag<'a> {
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm::<Hidden, QDim>(label, weight, x, out);
+    ) -> Result<()> {
+        self.gemm::<Hidden, QDim>(label, weight, x, out)
     }
 
     pub(crate) fn mlp_gate_proj(
@@ -315,8 +322,8 @@ impl<'a> BatchDecodeDag<'a> {
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm_rows::<Intermediate>(label, weight, 0, out.hidden_dim, x, out);
+    ) -> Result<()> {
+        self.gemm_rows::<Intermediate>(label, weight, 0, out.hidden_dim, x, out)
     }
 
     pub(crate) fn mlp_up_proj(
@@ -325,8 +332,8 @@ impl<'a> BatchDecodeDag<'a> {
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm_rows::<Intermediate>(label, weight, out.hidden_dim, out.hidden_dim, x, out);
+    ) -> Result<()> {
+        self.gemm_rows::<Intermediate>(label, weight, out.hidden_dim, out.hidden_dim, x, out)
     }
 
     pub(crate) fn silu_mul_split(
@@ -351,8 +358,8 @@ impl<'a> BatchDecodeDag<'a> {
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm::<Hidden, Intermediate>(label, weight, x, out);
+    ) -> Result<()> {
+        self.gemm::<Hidden, Intermediate>(label, weight, x, out)
     }
 
     pub(crate) fn lm_head(
@@ -361,8 +368,8 @@ impl<'a> BatchDecodeDag<'a> {
         weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm::<Vocab, InDim>(label, weight, x, out);
+    ) -> Result<()> {
+        self.gemm::<Vocab, InDim>(label, weight, x, out)
     }
 
     #[cfg(feature = "kernel-call-trace")]

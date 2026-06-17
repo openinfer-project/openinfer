@@ -9,6 +9,7 @@ use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_kernels::ops::gemm_rows_into_checked;
 use openinfer_kv_cache::KvView;
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -103,14 +104,14 @@ impl Qwen3Model {
         // 2. QKV projections from fused qkv_proj
         let q_dim = layer.attention.q_dim;
         let kv_dim = layer.attention.kv_dim;
-        ops::gemm_rows_into(
+        gemm_rows_into_checked(
             &self.ctx,
             &layer.attention.qkv_proj,
             0,
             q_dim,
             &bufs.normed,
             &mut bufs.q_batch,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -119,14 +120,14 @@ impl Qwen3Model {
             &mut bufs.q_batch,
             0,
         )?;
-        ops::gemm_rows_into(
+        gemm_rows_into_checked(
             &self.ctx,
             &layer.attention.qkv_proj,
             q_dim,
             kv_dim,
             &bufs.normed,
             &mut bufs.k_batch,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -135,14 +136,14 @@ impl Qwen3Model {
             &mut bufs.k_batch,
             0,
         )?;
-        ops::gemm_rows_into(
+        gemm_rows_into_checked(
             &self.ctx,
             &layer.attention.qkv_proj,
             q_dim + kv_dim,
             kv_dim,
             &bufs.normed,
             &mut bufs.v_batch,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -174,12 +175,12 @@ impl Qwen3Model {
         )?;
 
         // 4. O projection → bufs.o_buf (as o_batch)
-        ops::gemm_into(
+        ops::gemm_into_checked(
             &self.ctx,
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -202,22 +203,22 @@ impl Qwen3Model {
 
         // 7. MLP: split gate/up GEMMs → silu_mul → down → bufs.o_buf
         let inter_dim = self.local_intermediate_size();
-        ops::gemm_rows_into(
+        gemm_rows_into_checked(
             &self.ctx,
             &layer.mlp.gate_up_proj,
             0,
             inter_dim,
             &bufs.normed,
             &mut bufs.gate_out,
-        );
-        ops::gemm_rows_into(
+        )?;
+        gemm_rows_into_checked(
             &self.ctx,
             &layer.mlp.gate_up_proj,
             inter_dim,
             inter_dim,
             &bufs.normed,
             &mut bufs.up_out,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -235,12 +236,12 @@ impl Qwen3Model {
             0,
         )?;
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
+        ops::gemm_into_checked(
             &self.ctx,
             &layer.mlp.down_proj,
             &bufs.act_out,
             &mut bufs.o_buf,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,

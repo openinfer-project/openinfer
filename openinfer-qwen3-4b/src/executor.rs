@@ -1,4 +1,6 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 
 use anyhow::Result;
@@ -8,7 +10,9 @@ use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{ModelRuntimeConfig, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
-use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest};
+use openinfer_core::engine::{
+    ExecutionError, ExecutionResult, LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest,
+};
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
@@ -504,9 +508,9 @@ pub(crate) trait ModelExecutor: Send {
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
 
-    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
-    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
-    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
+    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> ExecutionResult<PrefillResult>;
+    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> ExecutionResult<DecodeResult>;
+    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> ExecutionResult<UnifiedResult>;
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         anyhow::bail!(
@@ -829,15 +833,15 @@ impl Qwen3Executor {
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        <Self as ModelExecutor>::execute_prefill(self, plan)
+        <Self as ModelExecutor>::execute_prefill(self, plan).map_err(anyhow::Error::new)
     }
 
     pub fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
-        <Self as ModelExecutor>::execute_decode(self, plan)
+        <Self as ModelExecutor>::execute_decode(self, plan).map_err(anyhow::Error::new)
     }
 
     pub fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        <Self as ModelExecutor>::execute_unified(self, plan)
+        <Self as ModelExecutor>::execute_unified(self, plan).map_err(anyhow::Error::new)
     }
 
     pub fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -987,9 +991,20 @@ impl Qwen3Executor {
         let rkv = self
             .request_kvs
             .get_mut(&req.request_id)
-            .expect("inserted above");
+            .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
         req.chunk_start = rkv.kv_position();
-        let remaining = req.prompt_tokens.len() - req.chunk_start;
+        let remaining = req
+            .prompt_tokens
+            .len()
+            .checked_sub(req.chunk_start)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "prefill position {} exceeds prompt length {} for {:?}",
+                    req.chunk_start,
+                    req.prompt_tokens.len(),
+                    req.request_id
+                )
+            })?;
         // Echo must produce all-position logits in a single forward, so it is
         // exempt from chunking (the scheduler never splits echo requests).
         req.chunk_tokens = if req.echo {
@@ -997,7 +1012,7 @@ impl Qwen3Executor {
         } else {
             remaining.min(req.chunk_budget)
         };
-        assert!(
+        anyhow::ensure!(
             req.chunk_tokens > 0,
             "zero-token prefill chunk for {:?} (budget {})",
             req.request_id,
@@ -1010,16 +1025,21 @@ impl Qwen3Executor {
     /// Register a finished prefill step on the request's KV: the final chunk
     /// carries the first generated token, non-final chunks only advance the
     /// KV position.
-    fn apply_prefill_result(&mut self, result: &PrefillRequestResult) -> Result<()> {
+    fn apply_prefill_result(&mut self, result: &PrefillRequestResult) -> ExecutionResult<()> {
         let rkv = self
             .request_kvs
             .get_mut(&result.request_id)
-            .expect("request must exist after prefill");
-        if result.completed {
+            .ok_or_else(|| {
+                ExecutionError::unexpected_worker_response(
+                    "prefill",
+                    format!("unknown request id {:?}", result.request_id),
+                )
+            })?;
+        recoverable(if result.completed {
             rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
         } else {
             rkv.apply_prefill_chunk(self.kv_mgr.pool())
-        }
+        })
     }
 
     // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
@@ -1060,19 +1080,19 @@ impl Qwen3Executor {
     }
 
     fn wait_for_step_ack(
-        pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
+        pending: Vec<channel::Receiver<ExecutionResult<WorkerStepOutcome>>>,
         op_name: &'static str,
-    ) -> Result<()> {
+    ) -> ExecutionResult<()> {
         for recv in pending {
-            match recv
-                .recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??
-            {
+            let outcome = recv.recv().map_err(|_| {
+                ExecutionError::worker_response_dropped("tensor-parallel peer", op_name)
+            })?;
+            match outcome? {
                 WorkerStepOutcome::Ack => {}
                 other => {
-                    return Err(anyhow::anyhow!(
-                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
-                        other.kind()
+                    return Err(ExecutionError::unexpected_worker_response(
+                        op_name,
+                        other.kind(),
                     ));
                 }
             }
@@ -1080,7 +1100,7 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    fn run_step(&self, step: &StepCommand) -> Result<WorkerStepOutcome> {
+    fn run_step(&self, step: &StepCommand) -> ExecutionResult<WorkerStepOutcome> {
         let primary = self.primary.run_step(step.clone(), true)?;
         let mut pending = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
@@ -1088,9 +1108,28 @@ impl Qwen3Executor {
         }
         let primary_result = primary
             .recv()
-            .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
+            .map_err(|_| ExecutionError::worker_response_dropped("primary", step.kind()))?;
+        let primary_result = primary_result?;
         Self::wait_for_step_ack(pending, step.kind())?;
         Ok(primary_result)
+    }
+}
+
+fn recoverable_error(error: anyhow::Error) -> ExecutionError {
+    ExecutionError::step_failed(error.to_string())
+}
+
+fn recoverable<T>(result: Result<T>) -> ExecutionResult<T> {
+    result.map_err(recoverable_error)
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -1321,12 +1360,12 @@ impl ModelExecutor for Qwen3Executor {
         done
     }
 
-    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> ExecutionResult<PrefillResult> {
         // 1. Create RequestKvs (first chunk only), clamp chunk budgets,
         // schedule KV for this step's tokens
         let mut requests = plan.requests.to_vec();
         for req in &mut requests {
-            self.schedule_prefill_chunk(req)?;
+            recoverable(self.schedule_prefill_chunk(req))?;
         }
 
         // 2. Build KvViews (seq_len = chunk_start + this chunk)
@@ -1348,9 +1387,9 @@ impl ModelExecutor for Qwen3Executor {
         let result = match outcome {
             WorkerStepOutcome::Prefill(result) => result,
             other => {
-                return Err(anyhow::anyhow!(
-                    "prefill returned unexpected: {}",
-                    other.kind()
+                return Err(ExecutionError::unexpected_worker_response(
+                    "prefill",
+                    other.kind(),
                 ));
             }
         };
@@ -1365,16 +1404,19 @@ impl ModelExecutor for Qwen3Executor {
         Ok(result)
     }
 
-    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> ExecutionResult<DecodeResult> {
         // 1. Schedule decode for all active requests
         for req in plan.requests {
             let rkv = self
                 .request_kvs
                 .get_mut(&req.request_id)
-                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
-            rkv.schedule_decode(self.kv_mgr.pool()).map_err(|e| {
-                anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
-            })?;
+                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))
+                .map_err(recoverable_error)?;
+            rkv.schedule_decode(self.kv_mgr.pool())
+                .map_err(|e| {
+                    anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
+                })
+                .map_err(recoverable_error)?;
         }
 
         // 2. Build KvViews
@@ -1396,9 +1438,9 @@ impl ModelExecutor for Qwen3Executor {
         let result = match outcome {
             WorkerStepOutcome::Decode(result) => result,
             other => {
-                return Err(anyhow::anyhow!(
-                    "decode returned unexpected: {}",
-                    other.kind()
+                return Err(ExecutionError::unexpected_worker_response(
+                    "decode",
+                    other.kind(),
                 ));
             }
         };
@@ -1406,8 +1448,13 @@ impl ModelExecutor for Qwen3Executor {
             let rkv = self
                 .request_kvs
                 .get_mut(&req_result.request_id)
-                .expect("request must exist after decode");
-            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                .ok_or_else(|| {
+                    ExecutionError::unexpected_worker_response(
+                        "decode",
+                        format!("unknown request id {:?}", req_result.request_id),
+                    )
+                })?;
+            recoverable(rkv.apply_decode(req_result.token, self.kv_mgr.pool()))?;
         }
         // 5. Offload any block this decode step just sealed (post-step-sync).
         for req_result in &result.requests {
@@ -1417,12 +1464,12 @@ impl ModelExecutor for Qwen3Executor {
         Ok(result)
     }
 
-    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> ExecutionResult<UnifiedResult> {
         // 1. Create RequestKvs for prefill requests (first chunk only), clamp
         // chunk budgets, schedule KV for this step's tokens
         let mut prefill_requests = plan.prefill_requests.to_vec();
         for req in &mut prefill_requests {
-            self.schedule_prefill_chunk(req)?;
+            recoverable(self.schedule_prefill_chunk(req))?;
         }
 
         // Schedule decode for active requests
@@ -1430,10 +1477,13 @@ impl ModelExecutor for Qwen3Executor {
             let rkv = self
                 .request_kvs
                 .get_mut(&req.request_id)
-                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))?;
-            rkv.schedule_decode(self.kv_mgr.pool()).map_err(|e| {
-                anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
-            })?;
+                .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", req.request_id))
+                .map_err(recoverable_error)?;
+            rkv.schedule_decode(self.kv_mgr.pool())
+                .map_err(|e| {
+                    anyhow::anyhow!("schedule_decode failed for {:?}: {e}", req.request_id)
+                })
+                .map_err(recoverable_error)?;
         }
 
         // 2. Build KvViews
@@ -1461,9 +1511,9 @@ impl ModelExecutor for Qwen3Executor {
         let result = match outcome {
             WorkerStepOutcome::Unified(result) => result,
             other => {
-                return Err(anyhow::anyhow!(
-                    "unified returned unexpected: {}",
-                    other.kind()
+                return Err(ExecutionError::unexpected_worker_response(
+                    "unified",
+                    other.kind(),
                 ));
             }
         };
@@ -1474,8 +1524,13 @@ impl ModelExecutor for Qwen3Executor {
             let rkv = self
                 .request_kvs
                 .get_mut(&req_result.request_id)
-                .expect("request must exist after unified decode");
-            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                .ok_or_else(|| {
+                    ExecutionError::unexpected_worker_response(
+                        "unified decode",
+                        format!("unknown request id {:?}", req_result.request_id),
+                    )
+                })?;
+            recoverable(rkv.apply_decode(req_result.token, self.kv_mgr.pool()))?;
         }
         // 5. Offload sealed blocks from both halves (post-step-sync).
         for req_result in &result.prefill_requests {
@@ -1937,7 +1992,7 @@ enum WorkerCommand {
     RunStep {
         step: StepCommand,
         collect_result: bool,
-        resp: channel::Sender<Result<WorkerStepOutcome>>,
+        resp: channel::Sender<ExecutionResult<WorkerStepOutcome>>,
     },
     LoadLoraAdapter {
         name: String,
@@ -1997,9 +2052,21 @@ impl RankWorker {
                                     collect_result,
                                     resp,
                                 } => {
-                                    let result =
-                                        execute_step_on_lane(&mut lane, &step, collect_result);
+                                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                                        execute_step_on_lane(&mut lane, &step, collect_result)
+                                    }));
+                                    let should_exit = result.is_err();
+                                    let result = match result {
+                                        Ok(result) => result.map_err(recoverable_error),
+                                        Err(payload) => Err(ExecutionError::worker_panic(
+                                            format!("qwen3-tp-rank-{rank}"),
+                                            panic_message(payload),
+                                        )),
+                                    };
                                     let _ = resp.send(result);
+                                    if should_exit {
+                                        break;
+                                    }
                                 }
                                 WorkerCommand::LoadLoraAdapter {
                                     name,
@@ -2042,7 +2109,7 @@ impl RankWorker {
         &self,
         step: StepCommand,
         collect_result: bool,
-    ) -> Result<channel::Receiver<Result<WorkerStepOutcome>>> {
+    ) -> ExecutionResult<channel::Receiver<ExecutionResult<WorkerStepOutcome>>> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::RunStep {
@@ -2050,7 +2117,7 @@ impl RankWorker {
                 collect_result,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
+            .map_err(|_| ExecutionError::worker_command_channel_closed("step"))?;
         Ok(resp_rx)
     }
 
@@ -2100,6 +2167,96 @@ impl RankWorker {
         let _ = self.tx.send(WorkerCommand::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use openinfer_core::engine::ExecutionRecovery;
+
+    fn empty_decode_step() -> StepCommand {
+        StepCommand::Decode {
+            requests: Vec::new(),
+            kv_views: Vec::new(),
+            sample_seed: 0,
+        }
+    }
+
+    #[test]
+    fn worker_panic_is_reported_as_domain_fatal_then_worker_exits() {
+        let mut worker = RankWorker::spawn_test_panic_worker();
+
+        let response = worker
+            .run_step(empty_decode_step(), true)
+            .expect("dispatch panic step");
+        let err = match response.recv().expect("panic response") {
+            Ok(_) => panic!("worker panic must be returned as an error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.recovery(), ExecutionRecovery::DomainFatal);
+        assert!(err.to_string().contains("injected worker panic"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !worker.handle.as_ref().expect("worker handle").is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "panic worker did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let dispatch = worker.run_step(empty_decode_step(), true);
+        assert!(
+            matches!(
+                dispatch,
+                Err(ExecutionError::WorkerCommandChannelClosed { .. })
+            ),
+            "panic worker exits after reporting the fatal error"
+        );
+        worker.shutdown();
+    }
+}
+
+#[cfg(test)]
+impl RankWorker {
+    fn spawn_test_panic_worker() -> Self {
+        let (tx, rx) = channel::unbounded();
+        let handle = thread::Builder::new()
+            .name("qwen3-test-panic-rank".into())
+            .spawn(move || {
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        WorkerCommand::RunStep { resp, .. } => {
+                            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                                panic!("injected worker panic")
+                            }));
+                            let result = match result {
+                                Ok(()) => unreachable!("test worker always panics"),
+                                Err(payload) => Err(ExecutionError::worker_panic(
+                                    "qwen3-test-panic-rank",
+                                    panic_message(payload),
+                                )),
+                            };
+                            let _ = resp.send(result);
+                            break;
+                        }
+                        WorkerCommand::Shutdown => break,
+                        WorkerCommand::LoadLoraAdapter { resp, .. }
+                        | WorkerCommand::UnloadLoraAdapter { resp, .. }
+                        | WorkerCommand::DiscardLoraAdapter { resp, .. } => {
+                            let _ = resp.send(Err(anyhow::anyhow!(
+                                "test panic worker does not handle LoRA commands"
+                            )));
+                        }
+                    }
+                }
+            })
+            .expect("spawn test panic worker");
+        Self {
+            tx,
+            handle: Some(handle),
         }
     }
 }

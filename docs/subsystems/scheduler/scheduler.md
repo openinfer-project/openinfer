@@ -2,7 +2,7 @@
 
 > **TL;DR:** Single dedicated thread owns all GPU resources. Continuous batching with FCFS prefill-priority, paged KV cache, bucket CUDA Graphs for batch decode, and a unified forward pass when prefill and decode coexist. On Qwen3-4B (varied-length Poisson QPS=2, RTX 5070 Ti) within 2% of vLLM throughput while winning TTFT (−16%), TPOT (−3%), and latency stability across the board. Remaining gap is ITL p99 tail from prefill stalls.
 >
-> **Last touched:** 2026-05.
+> **Last touched:** 2026-06.
 
 ## Why this shape
 
@@ -95,7 +95,7 @@ Related: FlashInfer's f32 fused RoPE rounds differently from a precomputed bf16 
 
 - **ITL p99 tail (291 vs vLLM 211ms).** Large prefills block in-flight decode. Chunked prefill would fix it. Low priority — varied-length workloads break the waves naturally, and fixed-length ITL p99 already beats vLLM.
 - **9 failures at QPS=2.** Needs root-cause — likely KV pressure or empty-prompt rejection from the random dataset.
-- **Worker-panic wedge at high concurrency (RTX 5070 Ti, verified 2026-06).** Under sustained high load (c≈128–192, mixed prefill+decode), the GPU worker thread `qwen3-tp-rank-0` panics in a cudarc copy: `assertion failed: dst.len() >= src.len()` (`cudarc .../driver/safe/core.rs:1607`) — a pre-allocated buffer is too small for some batch/shape the step produces. Two distinct faults compound: (1) the undersized buffer (proximate crash); (2) **blast radius + no recovery** — `fail_touched_requests` clears the *entire* active batch on any step `Err`, the worker thread is never restarted, so every subsequent step returns "worker step channel closed" and **all** in-flight and future requests fail. `/health` still returns 200 (separate layer), so it reads as a silent permanent wedge until process restart. Not KV admission: a 160-request single burst defers cleanly with 0 errors, so full-lifetime admission works. Independent of the output-dispatch change (the panic is in the executor copy path; `main` fails identically). Next: `RUST_BACKTRACE=1` to capture the call site — prime suspects are the prefill/unified or batched step-tail logits/sampling readback (not the decode token H2D, which is sized to the 256 bucket).
+- **Worker-panic containment vs root crash.** The high-concurrency Qwen3 worker panic root cause is still the undersized cudarc copy (`dst.len() >= src.len()`) and needs a backtrace/shape fix in the executor path. Containment is now separate and landed in `worker-fatal-containment.md`: recoverable execution errors stay local, worker-channel death marks the execution domain unhealthy, `/health` reports 503 for unhealthy, and post-fatal submissions are rejected explicitly instead of silently wedging on a dead worker.
 - **Batched Qwen sampling regression guard.** #284 removes the Qwen per-row sampling path: greedy rows use indexed batched argmax, and non-greedy rows compact into one FlashInfer batched sampling call per step. Keep the release HF/nsys/TPOT gate when sampling params or decode batching change.
 - **Qwen3.5 partial paged migration.** Decode is fully paged via the scheduler. Prefill still scatters from contiguous HND staging into paged KV before attention. Migration mirrors Qwen3's step 2 with HD256 + partial RoPE (rotary_dim=64 of head_dim=256) wrinkles.
 

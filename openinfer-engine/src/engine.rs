@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -13,6 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
+
+pub mod error;
+pub use error::{ExecutionError, ExecutionRecovery, ExecutionResult};
 
 #[derive(Clone, Debug)]
 pub struct EngineLoadOptions {
@@ -134,6 +137,57 @@ impl fmt::Display for EngineControlError {
 impl Error for EngineControlError {}
 
 pub type EngineControlResult<T> = std::result::Result<T, EngineControlError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EngineReadiness {
+    Healthy,
+    Unhealthy { reason: String },
+}
+
+impl EngineReadiness {
+    pub fn unservable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Healthy => None,
+            Self::Unhealthy { reason } => Some(reason),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct EngineHealth {
+    unhealthy_reason: Arc<OnceLock<String>>,
+}
+
+impl Default for EngineHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EngineHealth {
+    pub fn new() -> Self {
+        Self {
+            unhealthy_reason: Arc::new(OnceLock::new()),
+        }
+    }
+
+    pub fn readiness(&self) -> EngineReadiness {
+        match self.unhealthy_reason() {
+            Some(reason) => EngineReadiness::Unhealthy {
+                reason: reason.to_string(),
+            },
+            None => EngineReadiness::Healthy,
+        }
+    }
+
+    pub fn mark_unhealthy(&self, reason: impl Into<String>) {
+        let _ = self.unhealthy_reason.set(reason.into());
+    }
+
+    pub fn unhealthy_reason(&self) -> Option<&str> {
+        self.unhealthy_reason.get().map(String::as_str)
+    }
+}
 
 pub enum TokenEvent {
     Scheduled {
@@ -291,6 +345,7 @@ pub struct EngineHandle {
     /// KV pool capacity in blocks + block size, or `None` if the engine did not
     /// report it. See [`KvCapacity`].
     kv_capacity: Option<KvCapacity>,
+    health: EngineHealth,
 }
 
 struct EngineInner {
@@ -340,7 +395,14 @@ impl EngineHandle {
             }),
             servable_len: None,
             kv_capacity: None,
+            health: EngineHealth::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_health(mut self, health: EngineHealth) -> Self {
+        self.health = health;
+        self
     }
 
     #[must_use]
@@ -366,11 +428,28 @@ impl EngineHandle {
         self.kv_capacity
     }
 
+    pub fn readiness(&self) -> EngineReadiness {
+        self.health.readiness()
+    }
+
+    pub fn health(&self) -> EngineHealth {
+        self.health.clone()
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn submit(
         &self,
         req: GenerateRequest,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
+        let readiness = self.readiness();
+        if let Some(reason) = readiness.unservable_reason() {
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message: reason.to_string(),
+                prompt_tokens: req.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            return Ok(());
+        }
         match self.inner.submit_tx.as_ref() {
             Some(submit_tx) => submit_tx.send(req),
             None => match self.inner.command_tx.as_ref() {
@@ -393,6 +472,9 @@ impl EngineHandle {
         &self,
         request: LoadLoraAdapterRequest,
     ) -> EngineControlResult<()> {
+        if let Some(reason) = self.readiness().unservable_reason() {
+            return Err(EngineControlError::OperationFailed(reason.to_string()));
+        }
         match self.inner.command_tx.as_ref() {
             Some(command_tx) => {
                 let (response_tx, response_rx) = oneshot::channel();
@@ -417,6 +499,9 @@ impl EngineHandle {
     }
 
     pub async fn list_lora_adapters(&self) -> EngineControlResult<Vec<String>> {
+        if let Some(reason) = self.readiness().unservable_reason() {
+            return Err(EngineControlError::OperationFailed(reason.to_string()));
+        }
         match self.inner.command_tx.as_ref() {
             Some(command_tx) => {
                 let (response_tx, response_rx) = oneshot::channel();
@@ -441,6 +526,9 @@ impl EngineHandle {
         &self,
         request: UnloadLoraAdapterRequest,
     ) -> EngineControlResult<()> {
+        if let Some(reason) = self.readiness().unservable_reason() {
+            return Err(EngineControlError::OperationFailed(reason.to_string()));
+        }
         match self.inner.command_tx.as_ref() {
             Some(command_tx) => {
                 let (response_tx, response_rx) = oneshot::channel();
@@ -514,6 +602,83 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::unbounded_channel::<EngineCommand>();
         let handle = EngineHandle::new_with_command_channel(command_tx);
         assert!(handle.supports_lora_control());
+    }
+
+    #[test]
+    fn engine_health_is_shared_across_handle_clones() {
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let handle = EngineHandle::new(submit_tx);
+        let clone = handle.clone();
+
+        assert_eq!(handle.readiness(), EngineReadiness::Healthy);
+        clone.health().mark_unhealthy("worker died");
+
+        assert_eq!(
+            handle.readiness(),
+            EngineReadiness::Unhealthy {
+                reason: "worker died".to_string()
+            }
+        );
+        assert_eq!(handle.readiness().unservable_reason(), Some("worker died"));
+    }
+
+    #[test]
+    fn execution_error_separates_recoverable_from_domain_fatal() {
+        let recoverable = ExecutionError::step_failed("request cleanup failed");
+        assert_eq!(recoverable.recovery(), ExecutionRecovery::Recoverable);
+        assert!(!recoverable.is_domain_fatal());
+        assert_eq!(recoverable.to_string(), "request cleanup failed");
+
+        let fatal = ExecutionError::worker_command_channel_closed("decode");
+        assert_eq!(fatal.recovery(), ExecutionRecovery::DomainFatal);
+        assert!(fatal.is_domain_fatal());
+        assert_eq!(
+            fatal.to_string(),
+            "worker command channel closed during decode"
+        );
+    }
+
+    #[test]
+    fn unhealthy_engine_rejects_submit_without_enqueueing() {
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let handle = EngineHandle::new(submit_tx);
+        handle.health().mark_unhealthy("worker died");
+
+        let (token_tx, mut token_rx) = TokenSink::standalone();
+        let req = GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: vec![1, 2, 3],
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        };
+
+        handle
+            .submit(req)
+            .expect("submit should be explicitly rejected");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "unhealthy submit must not enqueue work"
+        );
+        match token_rx.blocking_recv() {
+            Some((
+                _,
+                TokenEvent::Error {
+                    message,
+                    prompt_tokens,
+                    completion_tokens,
+                },
+            )) => {
+                assert_eq!(message, "worker died");
+                assert_eq!(prompt_tokens, 3);
+                assert_eq!(completion_tokens, 0);
+            }
+            _ => panic!("expected explicit submit rejection"),
+        }
     }
 
     #[tokio::test]
