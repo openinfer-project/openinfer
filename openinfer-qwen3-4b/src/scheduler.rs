@@ -1567,7 +1567,10 @@ mod tests {
         let mut prefilling = vec![mk_echo(1, 64)];
         let taken = take_prefill_chunks(&mut prefilling, 32);
         assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].step_chunk, 32, "echo chunk is capped at the budget");
+        assert_eq!(
+            taken[0].step_chunk, 32,
+            "echo chunk is capped at the budget"
+        );
         assert_eq!(
             taken[0].remaining_prompt_tokens(),
             64,

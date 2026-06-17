@@ -153,7 +153,10 @@ impl DecodeStepItem {
 /// chunk forwarded are `Some`; since each prompt index is produced by exactly
 /// one chunk, a present value always overwrites the accumulator's `None` and
 /// chunks never clobber each other's slots.
-fn fold_prompt_logprobs_chunk(acc: &mut [Option<TokenLogprob>], partial: Vec<Option<TokenLogprob>>) {
+fn fold_prompt_logprobs_chunk(
+    acc: &mut [Option<TokenLogprob>],
+    partial: Vec<Option<TokenLogprob>>,
+) {
     for (slot, value) in acc.iter_mut().zip(partial) {
         if value.is_some() {
             *slot = value;

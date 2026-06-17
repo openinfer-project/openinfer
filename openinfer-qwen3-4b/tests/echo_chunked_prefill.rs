@@ -65,7 +65,9 @@ const MAX_TOL: f32 = 0.50;
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => Some(MODEL_PATH.to_string()),
+        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
+            Some(MODEL_PATH.to_string())
+        }
         Err(_) => {
             eprintln!(
                 "skipping echo_chunked_prefill: {MODEL_PATH}/config.json is missing; set OPENINFER_TEST_MODEL_PATH to run it"
@@ -129,7 +131,10 @@ fn single_pass(ex: &mut Qwen3Executor, prompt: &[u32]) -> Vec<Option<TokenLogpro
         })
         .expect("single-pass echo prefill");
     let req = &result.requests[0];
-    assert!(req.completed, "single pass must finish the prompt in one step");
+    assert!(
+        req.completed,
+        "single pass must finish the prompt in one step"
+    );
     let lps = req
         .prompt_logprobs
         .clone()
@@ -151,7 +156,10 @@ fn single_chunk_via_budget(ex: &mut Qwen3Executor, prompt: &[u32]) -> Vec<Option
         })
         .expect("single-chunk echo prefill");
     let req = &result.requests[0];
-    assert!(req.completed, "budget == prompt_len must finish in one chunk");
+    assert!(
+        req.completed,
+        "budget == prompt_len must finish in one chunk"
+    );
     let lps = req.prompt_logprobs.clone().expect("prompt logprobs");
     ex.drop_request(id).expect("drop single-chunk request");
     lps
