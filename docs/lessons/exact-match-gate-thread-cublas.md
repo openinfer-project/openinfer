@@ -64,7 +64,7 @@ The regression first appeared at `6a5b826` after cuBLAS handles became thread-lo
   - `cargo check --release --workspace --all-targets`
   - `cargo clippy --release --workspace --all-targets -- -D warnings`
   - Two-run same-seed regen comparison with a temporary model alias while evaluating FlashInfer top1 behavior.
-  - `cargo test --release -p openinfer test_gpu_sample -- --nocapture`
+  - `cargo test --release -p openinfer-kernels batch_sampling_top_p_only_small_nucleus_collapses_to_argmax -- --nocapture`
   - `OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test e2e -- --nocapture`
   - `OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test e2e_scheduler -- --nocapture`
   - `git diff --check`

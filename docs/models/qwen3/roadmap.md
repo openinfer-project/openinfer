@@ -1,6 +1,6 @@
 # Qwen3-4B Roadmap
 
-> **TL;DR:** Qwen3-4B is the maturity bar of the project — continuous batching, TP=2, default-on prefix cache (#216), and the HF logits golden gate are all live — so its roadmap is sharpening, not bring-up. The #220 RoPE OOB bug is now fixed (cos/sin cache sized from `max_position_embeddings`, admission rejects past the window, kernel traps an out-of-range position; gated by both an oversized-reject and an in-window >4096 IT). The verified open set: per-row batch-decode sampling (O(batch) launches + syncs per step despite a production-proven batched primitive in-tree), zero TP correctness coverage, LoRA built but gated only by a zero-adapter smoke, prefix-cache observability dropped at the scheduler boundary, a docs layer that describes deleted tooling, and the YaRN #8 follow-up for rope-scaled checkpoints. Open-set findings verified 2026-06-04 against `6ee9247`. Since then: batched greedy sampling phase 1 landed (#307) and in-process pegaflow KV offload / L2 host tier shipped (#316, pure-L2 TTFT 195→40ms) — both folded into the table below; phase-2 random sampling and the rest of the open set stand.
+> **TL;DR:** Qwen3-4B is the maturity bar of the project — continuous batching, TP=2, default-on prefix cache (#216), and the HF logits golden gate are all live — so its roadmap is sharpening, not bring-up. The #220 RoPE OOB bug is fixed (cos/sin cache sized from `max_position_embeddings`, admission rejects past the window, kernel traps an out-of-range position; gated by both an oversized-reject and an in-window >4096 IT). Since the 2026-06-04 open-set review, batched greedy sampling (#307), mixed greedy/non-greedy batched sampling (#284), and in-process pegaflow KV offload / L2 host tier (#316, pure-L2 TTFT 195→40ms) have landed in the table below. Remaining open set: zero TP correctness coverage, LoRA gated only by a zero-adapter smoke, prefix-cache observability dropped at the scheduler boundary, stale docs, and the YaRN #8 follow-up for rope-scaled checkpoints.
 >
 > **Last touched:** 2026-06
 
@@ -14,11 +14,11 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 | Prefix cache | ✓ default-on full-block kvbm matching (#216); 4 cache-hit replay passes in the golden gate | `executor.rs:750-751`, `tests/hf_golden_gate.rs` |
 | Accuracy gate | ✓ HF bf16 golden, bs=1/batched/graph + cached replays; single-GPU, ≤256-token prompts | `tests/hf_golden_gate.rs:451` |
 | Long context | ✓ fixed: RoPE cache sized from `max_position_embeddings`, admission rejects past the window, kernel traps OOB; gated by reject + in-window >4096 ITs. YaRN #8 still open for scaled checkpoints | `weights.rs:310-318`, `tests/context_window.rs`, `tests/context_window_in_window.rs` |
-| Batch sampling | ⚠ greedy phase landed (#307: one `argmax_batch_bf16_into` launch/step, not O(batch)); batched random per-row path + 1MB scratch-from-literal still open (phase 2) | `ops/sampling.rs`, `csrc/shared/argmax.cu` |
+| Batch sampling | ✓ #307/#284: greedy rows use indexed batched argmax; non-greedy rows compact into one FlashInfer batched sampling call per step; top1 scratch sizing now comes from the kernel | `openinfer-core/src/ops/sampling.rs`, `openinfer-kernels/csrc/shared/flashinfer_sampling.cu` |
 | KV offload (L2) | ✓ in-process pegaflow host-tier save/restore (#316); CLI `--kv-offload`/`--no-prefix-cache`, plain + LoRA; pure-L2 TTFT 195→40ms | `subsystems/runtime/pegaflow-offload-integration.md` |
 | TP correctness | ✗ zero automated coverage — every test runs `device_ordinals: vec![0]` | grep `tests/` |
 | LoRA | ⚠ load/unload/TP/request-level all built; only test uses a **zero adapter** | `lora.rs`, `tests/lora_smoke.rs:91-130` |
-| Non-greedy sampling | ✗ zero correctness coverage (all tests greedy); penalties/min_p absent from `SamplingParams` | grep `tests/` |
+| Non-greedy sampling | ⚠ qwen3/qwen35 model behavior gates now cover `temperature` / `top_k` / `top_p`; penalties/min_p are still absent from `SamplingParams` | `tests/sampling_behavior.rs`, `openinfer-kernels/src/ops/sampling.rs` |
 | Bench snapshots | ⚠ exist but ~187 commits stale; not refreshed by #216; no mixed-load ITL profile | `bench_snapshots/` |
 | PP | greenfield (aspiration only) | — |
 
@@ -27,8 +27,8 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 ### Now
 
 1. **YaRN for rope-scaled checkpoints (#8).** The #220 RoPE OOB fix landed scope (a): the cos/sin cache is sized from `config.max_position_embeddings`, admission crash-early rejects past the window (distinct context-length vs KV-budget reasons), the kernel `__trap`s an out-of-range position as a last-resort backstop, and the gate now covers both an oversized reject and an in-window >4096 case (`tests/context_window.rs`, `tests/context_window_in_window.rs`). That precompute is correct *only because this checkpoint has `rope_scaling: null`*. Scope (b) remains open: #8 YaRN is the prerequisite for any rope-scaled checkpoint — the precompute length must come from the scaled schedule, coordinated with the qwen3.5 sibling fix so both crates share the pattern.
-2. **Batched greedy decode sampling.** ✓ Phase 1 landed (#307): all-greedy batches route through `argmax_batch_bf16_into` — one launch + one D2H per step (the deepseek-v2-lite-proven primitive, now in `openinfer-core` + `csrc/shared/argmax.cu`). Phase 2 still open: batched random path with per-row params; source the 1MB FlashInfer row-state scratch from the kernel instead of the literal. Shared `openinfer-core/kernels` work — covers qwen35 too. Gated by the existing golden gate.
-3. **Sampling correctness coverage.** Every test in both qwen crates is greedy. Add seed-determinism + temperature/top_k/top_p behavioral tests, and audit the frontend for silently-dropped params (penalties, min_p are absent from `SamplingParams` entirely) — the kimi-k2 silent-greedy bug (#237) shows this class is real and currently nothing would catch it here.
+2. **Batched decode sampling.** ✓ #307/#284 route all-greedy batches through indexed batched argmax and mixed batches through one compact FlashInfer batched sampling pass for non-greedy rows. Shared `openinfer-core/kernels` work covers qwen35 too; keep the HF gate and nsys no-per-row-sampler check as the regression surface.
+3. **Sampling correctness coverage.** Shared sampler tests cover seed determinism and temperature/top_k/top_p behavior, and qwen3/qwen35 each now have a model-level non-greedy behavior gate. Keep auditing the frontend for silently-dropped params (penalties, min_p are absent from `SamplingParams` entirely) — the kimi-k2 silent-greedy bug (#237) shows this class is real.
 4. **Prefix-cache observability.** `cached_tokens` is computed (`executor.rs:751`) and dies at the scheduler boundary; the frontend hardcodes `num_cached_tokens: 0`. Thread it through `TokenEvent::Scheduled` into usage; log hit rate. Adjacent: #78 (streaming usage discards completion_tokens) — same usage-accounting surface.
 
 ### Next
@@ -54,7 +54,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 ## Done criteria
 
 - No admitted request can read past the RoPE cache; long-context behavior is gated.
-- A bs=32 greedy decode step issues one sampling launch, not 32.
+- A mixed greedy/non-greedy decode step issues one indexed argmax pass for greedy rows and one batched FlashInfer sampling pass for non-greedy rows, not O(batch) per-row sampling.
 - TP and LoRA paths sit under the same golden-gate tolerances as the single-GPU path.
 - Usage reporting (cached tokens, streaming completion tokens) is truthful.
 - The docs describe the crate that exists.

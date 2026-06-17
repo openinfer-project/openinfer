@@ -132,7 +132,6 @@ mod tests {
     fn greedy_sample_batch(model: &Qwen35Model, logits: &HiddenStates, rows: usize) -> Vec<u32> {
         let params = vec![openinfer_core::sampler::SamplingParams::default(); rows];
         let params_refs: Vec<&openinfer_core::sampler::SamplingParams> = params.iter().collect();
-        let random_vals = vec![0.0; rows];
         let mut row_indices: cudarc::driver::CudaSlice<i32> =
             model.ctx.stream.alloc_zeros(rows).unwrap();
         let mut argmax_partial_values: cudarc::driver::CudaSlice<f32> = model
@@ -151,33 +150,26 @@ mod tests {
                 model.config.vocab_size,
             ))
             .unwrap();
-        let mut probs: cudarc::driver::CudaSlice<f32> = model
-            .ctx
-            .stream
-            .alloc_zeros(model.config.vocab_size)
-            .unwrap();
         let mut top1_value: cudarc::driver::CudaSlice<half::bf16> =
             model.ctx.stream.alloc_zeros(rows).unwrap();
-        let mut row_states: cudarc::driver::CudaSlice<u8> = model
-            .ctx
-            .stream
-            .alloc_zeros(openinfer_core::ops::flashinfer_topk_row_states_bytes())
-            .unwrap();
-        let mut valid: cudarc::driver::CudaSlice<u8> = model.ctx.stream.alloc_zeros(1).unwrap();
         let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(rows).unwrap();
+        let mut batch_sampling = openinfer_core::ops::BatchSamplingScratch::new(
+            &model.ctx,
+            rows,
+            model.config.vocab_size,
+        )
+        .unwrap();
         openinfer_core::ops::select_batch_tokens_into(
             &model.ctx,
             logits,
             &params_refs,
-            &random_vals,
+            0,
             &mut row_indices,
             &mut argmax_partial_values,
             &mut argmax_partial_indices,
-            &mut probs,
             &mut top1_value,
-            &mut row_states,
-            &mut valid,
             &mut out,
+            &mut batch_sampling,
         )
         .unwrap()
     }

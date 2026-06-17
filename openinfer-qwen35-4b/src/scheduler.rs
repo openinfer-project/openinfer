@@ -397,11 +397,12 @@ fn sample_prefill_logits(
     let requested_logprobs: Vec<usize> = pending.iter().map(|r| r.logprobs).collect();
     let cpu_logits = snapshot_requested_logprobs(model.device_ctx(), logits, &requested_logprobs)?;
     let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
+    let sample_seed = rand::RngExt::random(rng);
     let tokens = model.select_tokens_from_logits_varied(
         logits,
         &mut graph_state.buffers,
         &params_refs,
-        rng,
+        sample_seed,
     )?;
 
     let logprobs = cpu_logits
@@ -630,22 +631,24 @@ fn decode_step(
     };
 
     let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-    let tokens = match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, rng)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("sampling error: {e}");
-            let message = e.to_string();
-            for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens: req.generated_count,
-                });
+    let sample_seed = rand::RngExt::random(rng);
+    let tokens =
+        match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, sample_seed)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("sampling error: {e}");
+                let message = e.to_string();
+                for req in active.drain(..) {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens: req.generated_count,
+                    });
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
         .into_iter()
@@ -689,22 +692,24 @@ fn process_decode_logits(
     };
 
     let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-    let tokens = match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, rng)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("decode sampling error: {e}");
-            let message = e.to_string();
-            for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens: req.generated_count,
-                });
+    let sample_seed = rand::RngExt::random(rng);
+    let tokens =
+        match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, sample_seed)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("decode sampling error: {e}");
+                let message = e.to_string();
+                for req in active.drain(..) {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens: req.generated_count,
+                    });
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
         .into_iter()

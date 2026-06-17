@@ -2,96 +2,44 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::CudaSlice;
 
 use crate::sampler::SamplingParams;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, HiddenStates};
 
 pub use openinfer_kernels::ops::{
-    argmax, argmax_batch_bf16_into, argmax_batch_bf16_split_indexed_into,
-    argmax_batch_bf16_split_partials_len, flashinfer_topk_row_states_bytes,
+    BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
+    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
+    flashinfer_top1_row_states_bytes,
 };
-
-/// GPU sampling: temperature -> softmax -> top-k -> top-p -> multinomial.
-///
-/// Root owns request sampling policy; the kernels crate only sees primitive
-/// launch parameters.
-pub fn gpu_sample(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    probs_scratch: &mut CudaSlice<f32>,
-    top1_value_scratch: &mut CudaSlice<half::bf16>,
-    row_states_scratch: &mut CudaSlice<u8>,
-    params: &SamplingParams,
-    random_val: f32,
-) -> Result<u32> {
-    openinfer_kernels::ops::gpu_sample(
-        ctx,
-        logits,
-        probs_scratch,
-        top1_value_scratch,
-        row_states_scratch,
-        params.temperature,
-        params.top_k,
-        params.top_p,
-        random_val,
-    )
-}
-
-/// GPU sampling into pre-allocated buffers.
-pub fn gpu_sample_into(
-    ctx: &DeviceContext,
-    logits: &DeviceVec,
-    probs_scratch: &mut CudaSlice<f32>,
-    top1_value_scratch: &mut CudaSlice<half::bf16>,
-    row_states_scratch: &mut CudaSlice<u8>,
-    valid_scratch: &mut CudaSlice<u8>,
-    out: &mut CudaSlice<i32>,
-    params: &SamplingParams,
-    random_val: f32,
-) -> Result<u32> {
-    openinfer_kernels::ops::gpu_sample_into(
-        ctx,
-        logits,
-        probs_scratch,
-        top1_value_scratch,
-        row_states_scratch,
-        valid_scratch,
-        out,
-        params.temperature,
-        params.top_k,
-        params.top_p,
-        random_val,
-    )
-}
 
 /// Pick the next token for each row in a decode batch.
 ///
 /// Greedy rows are selected together with indexed batched argmax. Non-greedy
-/// rows still use the existing per-row sampler because each row may have its
-/// own random value and sampling parameters.
+/// rows are compacted and sent through one batched FlashInfer sampling call.
 #[allow(clippy::too_many_arguments)]
 pub fn select_batch_tokens_into(
     ctx: &DeviceContext,
     logits: &HiddenStates,
     params: &[&SamplingParams],
-    random_vals: &[f32],
+    sample_seed: u64,
     row_indices_scratch: &mut CudaSlice<i32>,
     argmax_partial_values_scratch: &mut CudaSlice<f32>,
     argmax_partial_indices_scratch: &mut CudaSlice<i32>,
-    probs_scratch: &mut CudaSlice<f32>,
     top1_value_scratch: &mut CudaSlice<half::bf16>,
-    row_states_scratch: &mut CudaSlice<u8>,
-    valid_scratch: &mut CudaSlice<u8>,
     out: &mut CudaSlice<i32>,
+    batch_sampling_scratch: &mut BatchSamplingScratch,
 ) -> Result<Vec<u32>> {
     let batch_size = params.len();
+    let vocab_size = logits.hidden_dim;
     let mut tokens = vec![0; batch_size];
+    let is_greedy =
+        |params_i: &&SamplingParams| sampling_params_effectively_greedy(params_i, vocab_size);
     let greedy_rows = params
         .iter()
         .enumerate()
-        .filter_map(|(i, params_i)| params_i.is_greedy().then_some(i as i32))
+        .filter_map(|(i, params_i)| is_greedy(params_i).then_some(i as i32))
         .collect::<Vec<_>>();
 
     if !greedy_rows.is_empty() {
-        // Batch sampling for greedy rows.
+        // Batched argmax for greedy rows.
         if row_indices_scratch.len() < greedy_rows.len() {
             return Err(anyhow!(
                 "row_indices_scratch too small: have {}, need {}",
@@ -126,24 +74,41 @@ pub fn select_batch_tokens_into(
         }
     }
 
-    // Per-row sampling for non-greedy rows.
-    for (i, params_i) in params.iter().enumerate() {
-        if params_i.is_greedy() {
-            continue;
-        }
-        let logits_i = openinfer_kernels::ops::extract_vec(ctx, logits, i)?;
-        tokens[i] = gpu_sample_into(
+    let sampling_rows = params
+        .iter()
+        .enumerate()
+        .filter(|(_, params_i)| !is_greedy(params_i))
+        .map(|(i, params_i)| BatchSamplingRow {
+            row: i,
+            temperature: params_i.temperature,
+            top_k: params_i.top_k,
+            top_p: params_i.top_p,
+        })
+        .collect::<Vec<_>>();
+    if !sampling_rows.is_empty() {
+        let sampled = openinfer_kernels::ops::gpu_sample_batch_into(
             ctx,
-            &logits_i,
-            probs_scratch,
-            top1_value_scratch,
-            row_states_scratch,
-            valid_scratch,
-            out,
-            params_i,
-            random_vals[i],
+            logits.as_ref(),
+            &sampling_rows,
+            sample_seed,
+            batch_sampling_scratch,
         )?;
+        for (row, token) in sampling_rows.iter().zip(sampled) {
+            tokens[row.row] = token;
+        }
     }
 
     Ok(tokens)
+}
+
+/// Whether a request can use argmax without changing sampling semantics.
+///
+/// Besides explicit greedy params, a top-p threshold at or below `1 / vocab`
+/// leaves only the argmax token in the nucleus for any normalized distribution.
+pub fn sampling_params_effectively_greedy(params: &SamplingParams, vocab_size: usize) -> bool {
+    params.is_greedy()
+        || (vocab_size > 0
+            && params.top_p.is_finite()
+            && params.top_p > 0.0
+            && params.top_p <= 1.0 / vocab_size as f32)
 }

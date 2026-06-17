@@ -59,11 +59,9 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) sample_row_indices: CudaSlice<i32>,
     pub(crate) sample_argmax_partial_values: CudaSlice<f32>,
     pub(crate) sample_argmax_partial_indices: CudaSlice<i32>,
-    pub(crate) sample_probs: CudaSlice<f32>,
     pub(crate) sample_top1_value: CudaSlice<half::bf16>,
-    pub(crate) sample_row_states: CudaSlice<u8>,
-    pub(crate) sample_valid: CudaSlice<u8>,
     pub(crate) sample_out: CudaSlice<i32>,
+    pub(crate) sample_batch_sampling: openinfer_core::ops::BatchSamplingScratch,
 
     /// Page index reserved for CUDA Graph padding slots. Padding entries point
     /// here with seq_len=1 so FlashInfer accesses valid (but discarded) memory.
@@ -136,13 +134,13 @@ impl BatchDecodeBuffers35 {
             sample_argmax_partial_indices: ctx.stream.alloc_zeros(
                 openinfer_core::ops::argmax_batch_bf16_split_partials_len(bs, config.vocab_size),
             )?,
-            sample_probs: ctx.stream.alloc_zeros(config.vocab_size)?,
             sample_top1_value: ctx.stream.alloc_zeros(bs)?,
-            sample_row_states: ctx
-                .stream
-                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
-            sample_valid: ctx.stream.alloc_zeros(1)?,
             sample_out: ctx.stream.alloc_zeros(bs)?,
+            sample_batch_sampling: openinfer_core::ops::BatchSamplingScratch::new(
+                ctx,
+                bs,
+                config.vocab_size,
+            )?,
 
             padding_page_id,
         })

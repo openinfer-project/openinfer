@@ -11,7 +11,6 @@ use openinfer_core::engine::TokenLogprob;
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
-use rand::SeedableRng;
 
 use crate::batch_decode_graph::{BatchDecodeGraphState, MAX_BATCH};
 use crate::decode_buffers::BatchDecodeBuffers35;
@@ -256,11 +255,10 @@ impl Qwen35Executor {
         )?;
         let params = vec![SamplingParams::default(); plan.requests.len()];
         let params_refs: Vec<&SamplingParams> = params.iter().collect();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
         let tokens = self.model.select_tokens_batch_varied(
             &mut self.graph_state.buffers,
             &params_refs,
-            &mut rng,
+            0,
         )?;
 
         let mut results = Vec::with_capacity(plan.requests.len());
@@ -342,6 +340,5 @@ fn select_default_tokens_from_logits(
 ) -> Result<Vec<u32>> {
     let params = vec![SamplingParams::default(); logits.seq_len];
     let params_refs: Vec<&SamplingParams> = params.iter().collect();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
-    model.select_tokens_from_logits_varied(logits, bufs, &params_refs, &mut rng)
+    model.select_tokens_from_logits_varied(logits, bufs, &params_refs, 0)
 }
