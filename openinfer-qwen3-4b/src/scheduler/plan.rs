@@ -33,11 +33,20 @@ pub(super) enum ExecutionArtifacts {
     },
 }
 
+/// Whether the batch needs all-position prompt logprobs, i.e. it has an echo
+/// request that also asked for logprobs. Echo alone only echoes ids back.
+fn batch_needs_prompt_logprobs(pending: &[PendingRequest]) -> bool {
+    pending.iter().any(|req| req.echo && req.logprobs > 0)
+}
+
 pub(super) fn build_next_plan(
     have_active: bool,
     pending: Vec<PendingRequest>,
 ) -> Option<ExecutionPlan> {
-    if !pending.is_empty() && have_active {
+    // echo+logprobs needs a dedicated Prefill: the unified forward can't produce
+    // all-position logits. Active decodes wait those ticks; it's rare.
+    let needs_dedicated_prefill = batch_needs_prompt_logprobs(&pending);
+    if !pending.is_empty() && have_active && !needs_dedicated_prefill {
         Some(ExecutionPlan::Unified { pending })
     } else if !pending.is_empty() {
         Some(ExecutionPlan::Prefill { pending })
@@ -59,10 +68,11 @@ pub(super) fn execute_plan(
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
             let requests = build_prefill_items(&pending, &indices, rng);
-            let any_echo = pending.iter().any(|req| req.echo);
+            // `echo` here = "compute all-position logits"; only echo+logprobs
+            // needs them.
             let mut result = executor.execute_prefill(PrefillPlan {
                 requests: &requests,
-                echo: any_echo,
+                echo: batch_needs_prompt_logprobs(&pending),
             })?;
             sort_prefill_results(&mut result.requests);
             Ok(ExecutionArtifacts::Prefill {
@@ -208,6 +218,90 @@ mod tests {
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
             "active + pending fuses prefill and decode into one unified step"
+        );
+    }
+
+    // Regression for #372: an echo+logprobs request must not be fused into a
+    // Unified step (the unified forward can't produce all-position prompt
+    // logprobs), even when decodes are active. It takes a dedicated Prefill.
+    #[test]
+    fn echo_logprobs_pending_forces_dedicated_prefill() {
+        let echo_logprobs = || {
+            let mut p = pending();
+            p.echo = true;
+            p.logprobs = 5;
+            p
+        };
+        assert!(
+            matches!(
+                build_next_plan(true, vec![echo_logprobs()]),
+                Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+            ),
+            "echo+logprobs must take a dedicated prefill, not a unified step"
+        );
+        // A mixed batch with any echo+logprobs request also takes prefill.
+        assert!(
+            matches!(
+                build_next_plan(true, vec![pending(), echo_logprobs()]),
+                Some(ExecutionPlan::Prefill { .. })
+            ),
+            "a batch containing an echo+logprobs request takes prefill"
+        );
+        // echo without logprobs still fuses (no all-position logits needed).
+        let echo_only = || {
+            let mut p = pending();
+            p.echo = true;
+            p
+        };
+        assert!(
+            matches!(
+                build_next_plan(true, vec![echo_only()]),
+                Some(ExecutionPlan::Unified { .. })
+            ),
+            "echo without logprobs does not need a dedicated prefill"
+        );
+    }
+
+    // All-position logits fire only for echo+logprobs: plain, echo-only, and
+    // logprobs-only batches must not, a mixed batch with one such request must.
+    #[test]
+    fn all_position_logits_gated_on_echo_plus_logprobs() {
+        let echo_logprobs = || {
+            let mut p = pending();
+            p.echo = true;
+            p.logprobs = 5;
+            p
+        };
+        let echo_only = || {
+            let mut p = pending();
+            p.echo = true;
+            p
+        };
+        let logprobs_only = || {
+            let mut p = pending();
+            p.logprobs = 5;
+            p
+        };
+
+        assert!(
+            !batch_needs_prompt_logprobs(&[pending()]),
+            "a plain prompt needs no all-position logits"
+        );
+        assert!(
+            !batch_needs_prompt_logprobs(&[echo_only()]),
+            "echo without logprobs only echoes ids back — no all-position logits"
+        );
+        assert!(
+            !batch_needs_prompt_logprobs(&[logprobs_only()]),
+            "logprobs without echo only needs the sampled token's logprob"
+        );
+        assert!(
+            batch_needs_prompt_logprobs(&[echo_logprobs()]),
+            "echo+logprobs needs all-position logits"
+        );
+        assert!(
+            batch_needs_prompt_logprobs(&[echo_only(), echo_logprobs()]),
+            "one echo+logprobs request in the batch turns the scratch on"
         );
     }
 }

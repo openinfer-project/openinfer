@@ -97,35 +97,26 @@ impl PendingRequest {
 
 /// Pull the next prefill step set off the front of `prefilling`, capping the
 /// step's total forwarded tokens at `max_prefill_tokens`. Each taken request
-/// gets its per-step chunk recorded in `step_chunk`. Echo requests need
-/// logits for every prompt position in one forward, so they only run when
-/// their whole remainder fits — or alone at the head of an empty step, which
-/// also guarantees the queue always makes progress.
+/// gets its per-step chunk recorded in `step_chunk`. Echo requests chunk like
+/// any other: each chunk forwards only its own tokens and computes
+/// all-position logits for that slice (`vocab × chunk`), and the executor
+/// stitches the prompt logprobs across chunks, so a long echo prompt never
+/// has to materialize logits for every position at once.
 fn take_prefill_chunks(
     prefilling: &mut Vec<PendingRequest>,
     max_prefill_tokens: usize,
 ) -> Vec<PendingRequest> {
     let mut budget = max_prefill_tokens;
     let mut taken: Vec<PendingRequest> = Vec::new();
-    let mut i = 0;
-    while i < prefilling.len() && budget > 0 {
-        let remaining = prefilling[i].remaining_prompt_tokens();
-        let chunk = if prefilling[i].echo {
-            if remaining > budget && !taken.is_empty() {
-                i += 1;
-                continue;
-            }
-            remaining
-        } else {
-            remaining.min(budget)
-        };
-        let mut req = prefilling.remove(i);
+    while !prefilling.is_empty() && budget > 0 {
+        let remaining = prefilling[0].remaining_prompt_tokens();
+        let chunk = remaining.min(budget);
+        let mut req = prefilling.remove(0);
         req.step_chunk = chunk;
         budget = budget.saturating_sub(chunk);
         taken.push(req);
     }
-    // Echo skips can take items out of arrival order; results come back
-    // sorted by request id, so the step set must be too.
+    // Results come back sorted by request id, so the step set must be too.
     taken.sort_by_key(|req| req.request_id);
     taken
 }
@@ -819,9 +810,10 @@ fn prefilling_future_blocks(
 /// batch can eat the post-KV-pool VRAM headroom and OOM mid-serving under a
 /// request burst. Prompts longer than the budget are split across steps, so
 /// long prompts can't monopolize a step and starve running decodes.
-/// Exception: echo requests need all-position logits in one forward and run
-/// whole regardless of the budget — an oversized echo prompt still spikes
-/// activation memory.
+/// Echo requests chunk under the same budget: each chunk computes all-position
+/// logits only for its own tokens and the executor stitches the prompt
+/// logprobs across chunks, so echo activation scratch is bounded by one chunk
+/// (`vocab × budget`) rather than the whole prompt.
 ///
 /// A unified step's duration scales with its prefill tokens, and every decode
 /// request in the batch stalls for the whole step — the budget bounds that
@@ -1562,39 +1554,40 @@ mod tests {
     }
 
     #[test]
-    fn echo_requests_never_split_but_run_alone_when_oversized() {
+    fn echo_requests_chunk_under_the_prefill_budget() {
         let mk_echo = |id: u64, prompt_len| {
             let (req, _rx) = request(prompt_len, 1);
             let mut pending = PendingRequest::from_scheduler_request(RequestId(id), req);
             pending.echo = true;
             pending
         };
-        let mk = |id: u64, prompt_len| {
-            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
-        };
 
-        // Oversized echo at the head of an empty step runs whole — chunking it
-        // would lose the all-position logits echo needs.
-        let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
+        // An oversized echo prompt is split like any other: the first chunk
+        // fills the budget and the remainder stays queued for the next step.
+        let mut prefilling = vec![mk_echo(1, 64)];
         let taken = take_prefill_chunks(&mut prefilling, 32);
         assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].step_chunk, 64, "echo takes its full prompt");
-        assert_eq!(prefilling[0].request_id, RequestId(2));
+        assert_eq!(taken[0].step_chunk, 32, "echo chunk is capped at the budget");
+        assert_eq!(
+            taken[0].remaining_prompt_tokens(),
+            64,
+            "prefill_pos only advances once the executor confirms the chunk, so the \
+             remainder is re-queued for the next step"
+        );
+        assert!(prefilling.is_empty());
 
-        // An echo that doesn't fit behind earlier work is skipped, not split;
-        // later requests may still fill the leftover budget, and the step set
-        // stays sorted by request id.
-        let mut prefilling = vec![mk(3, 24), mk_echo(4, 16), mk(5, 8)];
+        // Echo packs alongside other requests under the shared budget.
+        let mut prefilling = vec![mk_echo(2, 16), mk_echo(3, 8)];
         let taken = take_prefill_chunks(&mut prefilling, 32);
         assert_eq!(
             taken
                 .iter()
                 .map(|r| (r.request_id.get(), r.step_chunk))
                 .collect::<Vec<_>>(),
-            vec![(3, 24), (5, 8)],
-            "echo skipped, leftover budget goes to the next non-echo request"
+            vec![(2, 16), (3, 8)],
+            "two short echo prompts share one step"
         );
-        assert_eq!(prefilling[0].request_id, RequestId(4));
+        assert!(prefilling.is_empty());
     }
 
     #[test]

@@ -89,6 +89,18 @@ impl PrefillStepItem {
         self
     }
 
+    /// Cap the prompt tokens this step forwards (chunked prefill). The executor
+    /// clamps it to the tokens actually remaining and advances `chunk_start`
+    /// from the request's KV position across calls, so re-issuing the same
+    /// request id with the same budget walks the prompt one chunk at a time.
+    /// The scheduler sets this from its own budget; it is also the public hook
+    /// for driving chunked prefill directly against the executor.
+    #[must_use]
+    pub fn with_chunk_budget(mut self, chunk_budget: usize) -> Self {
+        self.chunk_budget = chunk_budget;
+        self
+    }
+
     /// Prompt tokens forwarded this step.
     fn as_slice(&self) -> &[u32] {
         &self.prompt_tokens[self.chunk_start..self.chunk_start + self.chunk_tokens]
@@ -136,6 +148,19 @@ impl DecodeStepItem {
     }
 }
 
+/// Fold one prefill chunk's partial echo prompt logprobs into the running
+/// accumulator. `partial` is full-length but only the prompt positions this
+/// chunk forwarded are `Some`; since each prompt index is produced by exactly
+/// one chunk, a present value always overwrites the accumulator's `None` and
+/// chunks never clobber each other's slots.
+fn fold_prompt_logprobs_chunk(acc: &mut [Option<TokenLogprob>], partial: Vec<Option<TokenLogprob>>) {
+    for (slot, value) in acc.iter_mut().zip(partial) {
+        if value.is_some() {
+            *slot = value;
+        }
+    }
+}
+
 fn build_prefill_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[PrefillStepItem],
@@ -155,30 +180,35 @@ fn build_prefill_request_results(
         } else {
             None
         };
+        // Echo emits a per-chunk *partial*: this chunk forwarded prompt
+        // positions [chunk_start, chunk_start + chunk_tokens). The logprob of
+        // prompt token `k` comes from the distribution at position `k - 1`, so
+        // position `p` (logits column `token_offset + (p - chunk_start)`) fills
+        // `prompt_logprobs[p + 1]`. Index 0 has no predecessor and stays None;
+        // the position predicting the first *generated* token (`p + 1 ==
+        // prompt_len`) is the request's first token, not a prompt token. The
+        // executor merges these partials across chunks and only emits the full
+        // vector once the prompt is fully prefilled.
         let prompt_logprobs = if req.echo {
+            let mut partial = vec![None; req.prompt_tokens.len()];
             if compute_prompt_logprobs {
-                let mut echo_logprobs = Vec::with_capacity(req.prompt_tokens.len());
-                echo_logprobs.push(None);
                 if let Some(all_logits) = all_position_logits {
-                    for j in 1..req.prompt_tokens.len() {
-                        let prev_pos = token_offset + j - 1;
-                        let target_token = req.prompt_tokens[j];
-                        echo_logprobs.push(lane.extract_prompt_logprobs(
+                    for local in 0..req.chunk_tokens {
+                        let target = req.chunk_start + local + 1;
+                        if target >= req.prompt_tokens.len() {
+                            break;
+                        }
+                        let target_token = req.prompt_tokens[target];
+                        partial[target] = lane.extract_prompt_logprobs(
                             all_logits,
-                            prev_pos,
+                            token_offset + local,
                             target_token,
                             req.logprobs,
-                        ));
-                    }
-                } else {
-                    for _ in 1..req.prompt_tokens.len() {
-                        echo_logprobs.push(None);
+                        );
                     }
                 }
-                Some(echo_logprobs)
-            } else {
-                Some(vec![None; req.prompt_tokens.len()])
             }
+            Some(partial)
         } else {
             None
         };
@@ -680,6 +710,12 @@ pub struct Qwen3Executor {
     /// so prefix matching itself stays enabled). Set via
     /// [`Self::set_no_prefix_cache`].
     l1_retention_disabled: bool,
+    /// Per-request accumulator for echo prompt logprobs while the prompt is
+    /// chunk-prefilled. Each chunk computes the logprobs for the prompt
+    /// positions it forwarded; the full vector is moved into the result on the
+    /// final chunk (see [`Self::merge_echo_prompt_logprobs`]). Empty unless an
+    /// echo request is mid-prefill.
+    echo_prompt_logprobs: HashMap<RequestId, Vec<Option<TokenLogprob>>>,
 }
 
 /// One request's in-flight CPU-tier KV prefetch.
@@ -734,6 +770,7 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
+            echo_prompt_logprobs: HashMap::new(),
         })
     }
 
@@ -883,6 +920,7 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
+            echo_prompt_logprobs: HashMap::new(),
         })
     }
 
@@ -1068,13 +1106,10 @@ impl Qwen3Executor {
             .expect("inserted above");
         req.chunk_start = rkv.kv_position();
         let remaining = req.prompt_tokens.len() - req.chunk_start;
-        // Echo must produce all-position logits in a single forward, so it is
-        // exempt from chunking (the scheduler never splits echo requests).
-        req.chunk_tokens = if req.echo {
-            remaining
-        } else {
-            remaining.min(req.chunk_budget)
-        };
+        // Echo chunks like everything else: each chunk computes all-position
+        // logits for its own slice and the executor stitches the prompt
+        // logprobs across chunks (see `merge_echo_prompt_logprobs`).
+        req.chunk_tokens = remaining.min(req.chunk_budget);
         assert!(
             req.chunk_tokens > 0,
             "zero-token prefill chunk for {:?} (budget {})",
@@ -1097,6 +1132,28 @@ impl Qwen3Executor {
             rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
         } else {
             rkv.apply_prefill_chunk(self.kv_mgr.pool())
+        }
+    }
+
+    /// Fold one prefill chunk's partial echo prompt logprobs into the
+    /// per-request accumulator. The worker fills `result.prompt_logprobs` with
+    /// a full-length vector where only the positions this chunk forwarded are
+    /// `Some` (every prompt index is produced by exactly one chunk, so a
+    /// present value always wins over the accumulator's `None`). On the final
+    /// chunk the completed accumulator is moved into `result`; earlier chunks
+    /// clear it so the resolver emits the prompt echo only once. A no-op for
+    /// non-echo results (their `prompt_logprobs` is `None`).
+    fn merge_echo_prompt_logprobs(&mut self, result: &mut PrefillRequestResult) {
+        let Some(partial) = result.prompt_logprobs.take() else {
+            return;
+        };
+        let acc = self
+            .echo_prompt_logprobs
+            .entry(result.request_id)
+            .or_insert_with(|| vec![None; partial.len()]);
+        fold_prompt_logprobs_chunk(acc, partial);
+        if result.completed {
+            result.prompt_logprobs = self.echo_prompt_logprobs.remove(&result.request_id);
         }
     }
 
@@ -1271,6 +1328,9 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         self.saved_cursor.remove(&request_id);
+        // Drop any half-accumulated echo prompt logprobs for a request that
+        // disconnected mid-prefill, so the buffer doesn't leak.
+        self.echo_prompt_logprobs.remove(&request_id);
         Ok(())
     }
 
@@ -1422,7 +1482,7 @@ impl ModelExecutor for Qwen3Executor {
         let outcome = self.run_step(&step)?;
 
         // 4. Apply prefill
-        let result = match outcome {
+        let mut result = match outcome {
             WorkerStepOutcome::Prefill(result) => result,
             other => {
                 return Err(anyhow::anyhow!(
@@ -1431,6 +1491,11 @@ impl ModelExecutor for Qwen3Executor {
                 ));
             }
         };
+        // Stitch each echo request's per-chunk prompt logprobs; the full vector
+        // surfaces on the final chunk, earlier chunks emit nothing.
+        for req_result in &mut result.requests {
+            self.merge_echo_prompt_logprobs(req_result);
+        }
         for req_result in &result.requests {
             self.apply_prefill_result(req_result)?;
         }
@@ -1533,7 +1598,7 @@ impl ModelExecutor for Qwen3Executor {
         let outcome = self.run_step(&step)?;
 
         // 4. Apply both prefill and decode
-        let result = match outcome {
+        let mut result = match outcome {
             WorkerStepOutcome::Unified(result) => result,
             other => {
                 return Err(anyhow::anyhow!(
@@ -1542,6 +1607,9 @@ impl ModelExecutor for Qwen3Executor {
                 ));
             }
         };
+        for req_result in &mut result.prefill_requests {
+            self.merge_echo_prompt_logprobs(req_result);
+        }
         for req_result in &result.prefill_requests {
             self.apply_prefill_result(req_result)?;
         }
@@ -1751,8 +1819,51 @@ impl ModelExecutor for Qwen3Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_lora_capacity;
+    use super::{ensure_lora_capacity, fold_prompt_logprobs_chunk};
+    use openinfer_core::engine::TokenLogprob;
     use std::collections::HashSet;
+
+    fn lp(logprob: f32) -> TokenLogprob {
+        TokenLogprob {
+            logprob,
+            top_logprobs: Vec::new(),
+        }
+    }
+
+    // Echo chunking computes prompt token `k`'s logprob from the chunk that
+    // forwarded position `k - 1`. Folding each chunk's partial must reconstruct
+    // exactly the same vector a single whole-prompt pass would produce: index 0
+    // stays None (no predecessor), every other index is filled once, and a
+    // boundary index whose predecessor is the previous chunk's last position is
+    // produced by that previous chunk — not dropped or double-written.
+    #[test]
+    fn folding_echo_chunks_reconstructs_the_full_prompt_logprobs() {
+        // 5-token prompt, chunk budget 2: positions [0,1], [2,3], [4].
+        // Chunk [0,2) fills indices 1,2; chunk [2,4) fills 3,4; chunk [4,5)
+        // fills nothing in-prompt (position 4 predicts the first *generated*
+        // token). prompt_logprobs has indices 0..5.
+        let mut acc = vec![None; 5];
+
+        let chunk0 = vec![None, Some(lp(-1.0)), Some(lp(-2.0)), None, None];
+        fold_prompt_logprobs_chunk(&mut acc, chunk0);
+        assert_eq!(acc[0], None, "index 0 has no predecessor");
+        assert_eq!(acc[1].as_ref().map(|l| l.logprob), Some(-1.0));
+        assert_eq!(acc[2].as_ref().map(|l| l.logprob), Some(-2.0));
+        assert_eq!(acc[3], None, "index 3's predecessor is in the next chunk");
+
+        let chunk1 = vec![None, None, None, Some(lp(-3.0)), Some(lp(-4.0))];
+        fold_prompt_logprobs_chunk(&mut acc, chunk1);
+
+        let chunk2 = vec![None, None, None, None, None];
+        fold_prompt_logprobs_chunk(&mut acc, chunk2);
+
+        let got: Vec<Option<f32>> = acc.iter().map(|l| l.as_ref().map(|l| l.logprob)).collect();
+        assert_eq!(
+            got,
+            vec![None, Some(-1.0), Some(-2.0), Some(-3.0), Some(-4.0)],
+            "every prompt index is filled exactly once, index 0 stays None"
+        );
+    }
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
