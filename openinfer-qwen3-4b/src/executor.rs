@@ -368,7 +368,9 @@ fn execute_step_on_lane(
             prefill_stream,
             decode_stream,
         } => {
-            use openinfer_kernels::tensor::{clear_stream_override, clear_stream_override_with_ctx, set_stream_override};
+            use openinfer_kernels::tensor::{
+                clear_stream_override, clear_stream_override_with_ctx, set_stream_override,
+            };
 
             // If there's still an inflight prefill from a previous step, sync it
             // now (shouldn't happen normally, but safety).
@@ -404,13 +406,14 @@ fn execute_step_on_lane(
             )?;
             clear_stream_override();
 
-            // Launch decode on decode partition stream.
-            let saved_graph = lane.model.enable_cuda_graph;
-            lane.model.enable_cuda_graph = false;
+            // Launch decode on the decode partition stream. CUDA graph stays
+            // enabled: batch_decode captures into the split graph cache keyed on
+            // the active stream override, so the replayed kernel nodes stay
+            // pinned to the decode SM partition (CUDA PG §4.6.5 — capture stream
+            // determines a node's execution context).
             unsafe { set_stream_override(decode_stream.0) };
             lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
             clear_stream_override();
-            lane.model.enable_cuda_graph = saved_graph;
 
             // Only sync decode stream — decode result is ready for sampling.
             // Prefill continues async on GPU; polled later via event.
