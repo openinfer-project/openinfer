@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
-    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
-    TokenSink,
+    EngineCommand, EngineControlRequest, EngineHandle, EngineHealth, ExecutionRecovery,
+    GenerateRequest, KvCapacity, TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
 
@@ -210,15 +210,24 @@ where
         block_size: executor.block_size(),
     };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let health = EngineHealth::new();
+    let scheduler_health = health.clone();
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop(executor, submit_rx, seed, max_prefill_tokens);
+            scheduler_loop(
+                executor,
+                submit_rx,
+                scheduler_health,
+                seed,
+                max_prefill_tokens,
+            );
         })
         .expect("failed to spawn scheduler thread");
 
     EngineHandle::new(submit_tx)
+        .with_health(health)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
 }
@@ -248,15 +257,24 @@ where
         block_size: executor.block_size(),
     };
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let health = EngineHealth::new();
+    let scheduler_health = health.clone();
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop_with_lora_control(executor, command_rx, seed, max_prefill_tokens);
+            scheduler_loop_with_lora_control(
+                executor,
+                command_rx,
+                scheduler_health,
+                seed,
+                max_prefill_tokens,
+            );
         })
         .expect("failed to spawn scheduler thread");
 
     EngineHandle::new_with_command_channel(command_tx)
+        .with_health(health)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
 }
@@ -349,11 +367,73 @@ fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
     }
 }
 
+fn reject_submissions_after_fatal(
+    submit_rx: &mut mpsc::UnboundedReceiver<GenerateRequest>,
+    reason: &str,
+) -> bool {
+    let Some(req) = submit_rx.blocking_recv() else {
+        return false;
+    };
+    send_generation_fatal(req, reason);
+    while let Ok(req) = submit_rx.try_recv() {
+        send_generation_fatal(req, reason);
+    }
+    true
+}
+
+fn reject_commands_after_fatal(
+    command_rx: &mut mpsc::UnboundedReceiver<EngineCommand>,
+    reason: &str,
+) -> bool {
+    let Some(command) = command_rx.blocking_recv() else {
+        return false;
+    };
+    reject_engine_command(command, reason);
+    while let Ok(command) = command_rx.try_recv() {
+        reject_engine_command(command, reason);
+    }
+    true
+}
+
+fn reject_engine_command(command: EngineCommand, reason: &str) {
+    match command {
+        EngineCommand::Generate(req) => send_generation_fatal(req, reason),
+        EngineCommand::Control(control) => fail_control_request(control, reason),
+    }
+}
+
+fn send_generation_fatal(req: GenerateRequest, reason: &str) {
+    let _ = req.token_tx.send(TokenEvent::Error {
+        message: reason.to_string(),
+        prompt_tokens: req.prompt_tokens.len(),
+        completion_tokens: 0,
+    });
+}
+
+fn fail_control_requests(controls: impl IntoIterator<Item = EngineControlRequest>, reason: &str) {
+    for control in controls {
+        fail_control_request(control, reason);
+    }
+}
+
+fn fail_control_request(control: EngineControlRequest, reason: &str) {
+    match control {
+        EngineControlRequest::LoadLoraAdapter { response_tx, .. }
+        | EngineControlRequest::UnloadLoraAdapter { response_tx, .. } => {
+            let _ = response_tx.send(Err(reason.to_string()));
+        }
+        EngineControlRequest::ListLoraAdapters { response_tx } => {
+            let _ = response_tx.send(Err(reason.to_string()));
+        }
+    }
+}
+
 // ── Main loop ───────────────────────────────────────────────────────────
 
 fn scheduler_loop<E>(
     mut executor: E,
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
+    health: EngineHealth,
     seed: u64,
     max_prefill_tokens: usize,
 ) where
@@ -374,6 +454,14 @@ fn scheduler_loop<E>(
     info!("Scheduler ready");
 
     loop {
+        if let Some(reason) = health.unhealthy_reason() {
+            if !reject_submissions_after_fatal(&mut submit_rx, reason) {
+                info!("Scheduler: all handles dropped after fatal state, exiting");
+                return;
+            }
+            continue;
+        }
+
         // 1. Drain all incoming requests into deferred.
         while let Ok(req) = submit_rx.try_recv() {
             deferred.push(PendingRequest::from_scheduler_request(
@@ -445,15 +533,38 @@ fn scheduler_loop<E>(
             continue;
         };
         let failure_targets = failure_targets_for(&active, &plan);
-        let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
+        let effects = match execute_plan(&mut executor, &mut active, plan, &mut rng)
+            .and_then(|artifacts| resolve_step(&executor, &active, artifacts))
+        {
             Ok(v) => v,
             Err(e) => {
                 warn!("Execution step failed: {e}");
-                fail_touched_requests(&mut executor, &mut active, failure_targets, &e.to_string());
+                match e.recovery() {
+                    ExecutionRecovery::DomainFatal => {
+                        let reason = e.to_string();
+                        health.mark_unhealthy(reason.clone());
+                        fail_execution_domain(
+                            &mut executor,
+                            &mut active,
+                            &mut deferred,
+                            &mut loading,
+                            &mut prefilling,
+                            failure_targets,
+                            &reason,
+                        );
+                    }
+                    ExecutionRecovery::Recoverable => {
+                        fail_touched_requests(
+                            &mut executor,
+                            &mut active,
+                            failure_targets,
+                            &e.to_string(),
+                        );
+                    }
+                }
                 continue;
             }
         };
-        let effects = resolve_step(&executor, &active, artifacts);
         apply_effects(&mut executor, &mut active, &mut prefilling, effects);
     }
 }
@@ -461,6 +572,7 @@ fn scheduler_loop<E>(
 fn scheduler_loop_with_lora_control<E>(
     mut executor: E,
     mut command_rx: mpsc::UnboundedReceiver<EngineCommand>,
+    health: EngineHealth,
     seed: u64,
     max_prefill_tokens: usize,
 ) where
@@ -478,6 +590,14 @@ fn scheduler_loop_with_lora_control<E>(
     info!("Scheduler ready with LoRA control");
 
     loop {
+        if let Some(reason) = health.unhealthy_reason() {
+            if !reject_commands_after_fatal(&mut command_rx, reason) {
+                info!("Scheduler: all handles dropped after fatal state, exiting");
+                return;
+            }
+            continue;
+        }
+
         // 1. Drain incoming commands. Generation submitted after a pending
         // control command waits until that control command is handled at idle.
         while let Ok(command) = command_rx.try_recv() {
@@ -594,15 +714,44 @@ fn scheduler_loop_with_lora_control<E>(
             continue;
         };
         let failure_targets = failure_targets_for(&active, &plan);
-        let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
+        let effects = match execute_plan(&mut executor, &mut active, plan, &mut rng)
+            .and_then(|artifacts| resolve_step(&executor, &active, artifacts))
+        {
             Ok(v) => v,
             Err(e) => {
                 warn!("Execution step failed: {e}");
-                fail_touched_requests(&mut executor, &mut active, failure_targets, &e.to_string());
+                match e.recovery() {
+                    ExecutionRecovery::DomainFatal => {
+                        let reason = e.to_string();
+                        health.mark_unhealthy(reason.clone());
+                        fail_execution_domain(
+                            &mut executor,
+                            &mut active,
+                            &mut deferred,
+                            &mut loading,
+                            &mut prefilling,
+                            failure_targets,
+                            &reason,
+                        );
+                        fail_pending_requests(
+                            &mut executor,
+                            post_control_deferred.drain(..),
+                            &reason,
+                        );
+                        fail_control_requests(pending_control.drain(..), &reason);
+                    }
+                    ExecutionRecovery::Recoverable => {
+                        fail_touched_requests(
+                            &mut executor,
+                            &mut active,
+                            failure_targets,
+                            &e.to_string(),
+                        );
+                    }
+                }
                 continue;
             }
         };
-        let effects = resolve_step(&executor, &active, artifacts);
         apply_effects(&mut executor, &mut active, &mut prefilling, effects);
     }
 }
@@ -983,7 +1132,9 @@ fn fail_touched_requests(
     targets: Vec<RequestFailureTarget>,
     message: &str,
 ) {
+    let mut failed_ids = HashSet::with_capacity(targets.len());
     for target in targets {
+        failed_ids.insert(target.request_id);
         let _ = target.token_tx.send(TokenEvent::Error {
             message: message.to_string(),
             prompt_tokens: target.prompt_tokens,
@@ -996,7 +1147,44 @@ fn fail_touched_requests(
             );
         }
     }
-    active.clear();
+    active.retain(|req| !failed_ids.contains(&req.request_id));
+}
+
+fn fail_pending_requests(
+    executor: &mut impl ModelExecutor,
+    requests: impl IntoIterator<Item = PendingRequest>,
+    message: &str,
+) {
+    for req in requests {
+        let _ = req.token_tx.send(TokenEvent::Error {
+            message: message.to_string(),
+            prompt_tokens: req.prompt_tokens.len(),
+            completion_tokens: 0,
+        });
+        if let Err(error) = executor.drop_request(req.request_id) {
+            warn!(
+                "failed to drop pending request state after fatal error for {:?}: {error}",
+                req.request_id
+            );
+        }
+    }
+}
+
+fn fail_execution_domain(
+    executor: &mut impl ModelExecutor,
+    active: &mut Vec<ActiveRequestState>,
+    deferred: &mut Vec<PendingRequest>,
+    loading: &mut Vec<PendingRequest>,
+    prefilling: &mut Vec<PendingRequest>,
+    failure_targets: Vec<RequestFailureTarget>,
+    message: &str,
+) {
+    fail_touched_requests(executor, active, failure_targets, message);
+    let remaining_active: Vec<_> = active.iter().map(active_failure_target).collect();
+    fail_touched_requests(executor, active, remaining_active, message);
+    fail_pending_requests(executor, deferred.drain(..), message);
+    fail_pending_requests(executor, loading.drain(..), message);
+    fail_pending_requests(executor, prefilling.drain(..), message);
 }
 
 #[cfg(test)]
@@ -1007,7 +1195,8 @@ mod tests {
 
     use anyhow::Result;
     use openinfer_core::engine::{
-        EngineControlError, LoadLoraAdapterRequest, UnloadLoraAdapterRequest,
+        EngineControlError, ExecutionError, ExecutionResult, LoadLoraAdapterRequest,
+        UnloadLoraAdapterRequest,
     };
     use openinfer_kv_cache::BlockPool;
 
@@ -1016,6 +1205,14 @@ mod tests {
         DecodePlan, DecodeRequestResult, PrefillPlan, PrefillRequestResult, PrefillResult,
         PrefillStepItem, UnifiedPlan, UnifiedResult,
     };
+
+    fn recoverable_error(error: anyhow::Error) -> ExecutionError {
+        ExecutionError::step_failed(error.to_string())
+    }
+
+    fn recoverable<T>(result: Result<T>) -> ExecutionResult<T> {
+        result.map_err(recoverable_error)
+    }
 
     struct FakeExecutor {
         block_size: usize,
@@ -1028,6 +1225,7 @@ mod tests {
         // executor's kv_position so multi-chunk scheduling is exercised).
         prefill_positions: HashMap<RequestId, usize>,
         fail_decode_once: bool,
+        fatal_decode_once: bool,
         decode_delay: Duration,
         loaded_lora_adapters: HashSet<String>,
         dropped: Arc<Mutex<Vec<u64>>>,
@@ -1049,6 +1247,7 @@ mod tests {
                 held_tokens: HashMap::new(),
                 prefill_positions: HashMap::new(),
                 fail_decode_once: false,
+                fatal_decode_once: false,
                 decode_delay: Duration::ZERO,
                 loaded_lora_adapters: HashSet::new(),
                 dropped,
@@ -1067,6 +1266,11 @@ mod tests {
 
         fn with_decode_failure(mut self) -> Self {
             self.fail_decode_once = true;
+            self
+        }
+
+        fn with_fatal_decode_failure(mut self) -> Self {
+            self.fatal_decode_once = true;
             self
         }
 
@@ -1211,7 +1415,7 @@ mod tests {
             Ok(())
         }
 
-        fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+        fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> ExecutionResult<PrefillResult> {
             self.prefill_batches.lock().unwrap().push(
                 plan.requests
                     .iter()
@@ -1225,7 +1429,7 @@ mod tests {
                     .collect(),
             );
             for req in plan.requests {
-                self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
+                recoverable(self.ensure_request_tokens(req.request_id, req.prompt_tokens.len()))?;
             }
             Ok(PrefillResult {
                 requests: plan
@@ -1239,13 +1443,19 @@ mod tests {
         fn execute_decode(
             &mut self,
             plan: DecodePlan<'_>,
-        ) -> Result<crate::executor::DecodeResult> {
+        ) -> ExecutionResult<crate::executor::DecodeResult> {
             if !self.decode_delay.is_zero() {
                 std::thread::sleep(self.decode_delay);
             }
+            if self.fatal_decode_once {
+                self.fatal_decode_once = false;
+                return Err(ExecutionError::worker_panic("fake", "fake worker panic"));
+            }
             if self.fail_decode_once {
                 self.fail_decode_once = false;
-                anyhow::bail!("fake decode KV capacity exhausted");
+                return Err(ExecutionError::step_failed(
+                    "fake decode KV capacity exhausted",
+                ));
             }
 
             self.decode_batches.lock().unwrap().push(
@@ -1265,8 +1475,9 @@ mod tests {
                     .held_tokens
                     .get(&req.request_id)
                     .copied()
-                    .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-                self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
+                    .ok_or_else(|| anyhow::anyhow!("missing fake request state"))
+                    .map_err(recoverable_error)?;
+                recoverable(self.ensure_request_tokens(req.request_id, current_tokens + 1))?;
             }
 
             Ok(crate::executor::DecodeResult {
@@ -1282,7 +1493,7 @@ mod tests {
             })
         }
 
-        fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+        fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> ExecutionResult<UnifiedResult> {
             self.prefill_batches.lock().unwrap().push(
                 plan.prefill_requests
                     .iter()
@@ -1308,15 +1519,16 @@ mod tests {
                     .collect(),
             );
             for req in plan.prefill_requests {
-                self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
+                recoverable(self.ensure_request_tokens(req.request_id, req.prompt_tokens.len()))?;
             }
             for req in plan.decode_requests {
                 let current_tokens = self
                     .held_tokens
                     .get(&req.request_id)
                     .copied()
-                    .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-                self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
+                    .ok_or_else(|| anyhow::anyhow!("missing fake request state"))
+                    .map_err(recoverable_error)?;
+                recoverable(self.ensure_request_tokens(req.request_id, current_tokens + 1))?;
             }
 
             Ok(UnifiedResult {
@@ -2260,6 +2472,67 @@ mod tests {
             ),
             "request after failure should finish"
         );
+    }
+
+    #[test]
+    fn fatal_worker_error_marks_engine_unhealthy_and_rejects_future_work() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_fatal_decode_failure();
+        let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
+
+        let (will_fatal, mut fatal_rx) = request(16, 2);
+        handle.submit(will_fatal).expect("submit will_fatal");
+        assert!(
+            matches!(
+                recv_skipping_scheduled(&mut fatal_rx),
+                Some(TokenEvent::Token { id: 100, .. })
+            ),
+            "prefill should emit before the worker-domain fatal decode"
+        );
+        match recv_skipping_scheduled(&mut fatal_rx) {
+            Some(TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            }) => {
+                assert!(message.contains("fake worker panic"));
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 1);
+            }
+            _ => panic!("domain fatal should surface as TokenEvent::Error"),
+        }
+        assert!(
+            wait_until(Duration::from_secs(1), || dropped
+                .lock()
+                .unwrap()
+                .contains(&0)),
+            "fatal request state should be dropped"
+        );
+        assert!(
+            matches!(
+                handle.readiness(),
+                openinfer_core::engine::EngineReadiness::Unhealthy { ref reason }
+                    if reason.contains("fake worker panic")
+            ),
+            "engine readiness should expose the fatal execution domain"
+        );
+
+        let (after_fatal, mut after_rx) = request(16, 1);
+        handle
+            .submit(after_fatal)
+            .expect("scheduler should stay alive to reject explicitly after fatal");
+        match recv_skipping_scheduled(&mut after_rx) {
+            Some(TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            }) => {
+                assert!(message.contains("fake worker panic"));
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(completion_tokens, 0);
+            }
+            _ => panic!("post-fatal work should be rejected with a clear error"),
+        }
     }
 
     #[test]

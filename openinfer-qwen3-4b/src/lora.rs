@@ -389,7 +389,7 @@ pub(crate) fn apply_lora_projection_delta_range(
     let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_len)?;
     ops::gemm_token_range_into_checked(ctx, &projection.a, input, token_offset, &mut rank_out)?;
     let mut delta = HiddenStates::zeros(ctx, projection.b.rows, token_len)?;
-    ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
+    ops::gemm_into_checked(ctx, &projection.b, &rank_out, &mut delta)?;
     ops::scaled_add_rows_token_range_into(ctx, &delta, scale, out, row_offset, token_offset)
 }
 
@@ -412,7 +412,7 @@ pub(crate) fn apply_lora_projection_delta_indexed(
     let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_count)?;
     ops::gemm_into_checked(ctx, &projection.a, &compact_input, &mut rank_out)?;
     let mut delta = HiddenStates::zeros(ctx, projection.b.rows, token_count)?;
-    ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
+    ops::gemm_into_checked(ctx, &projection.b, &rank_out, &mut delta)?;
     ops::scaled_add_rows_indexed_into(
         ctx,
         &delta,

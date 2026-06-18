@@ -1,5 +1,6 @@
-use anyhow::Result;
 use rand::rngs::StdRng;
+
+use openinfer_core::engine::ExecutionResult;
 
 use crate::executor::{
     DecodePlan, DecodeResult, DecodeStepItem, ModelExecutor, PrefillPlan, PrefillResult,
@@ -53,7 +54,7 @@ pub(super) fn execute_plan(
     active: &mut [ActiveRequestState],
     plan: ExecutionPlan,
     rng: &mut StdRng,
-) -> Result<ExecutionArtifacts> {
+) -> ExecutionResult<ExecutionArtifacts> {
     match plan {
         ExecutionPlan::Prefill { pending } => {
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();

@@ -1,5 +1,5 @@
 use crate::executor::{DecodeRequestResult, ModelExecutor, PrefillRequestResult};
-use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::{ExecutionError, ExecutionResult, FinishReason};
 
 use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, ScheduledEffect, StepEffects};
 use super::plan::ExecutionArtifacts;
@@ -9,19 +9,19 @@ pub(super) fn resolve_step(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
     artifacts: ExecutionArtifacts,
-) -> StepEffects {
+) -> ExecutionResult<StepEffects> {
     match artifacts {
         ExecutionArtifacts::Prefill {
             pending,
             result,
             scheduled_at_unix_s,
         } => resolve_prefill_outputs(executor, pending, result.requests, scheduled_at_unix_s),
-        ExecutionArtifacts::Decode { result } => StepEffects {
+        ExecutionArtifacts::Decode { result } => Ok(StepEffects {
             scheduled: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
-            decode: resolve_decode_outputs(executor, active, &result.requests),
-        },
+            decode: resolve_decode_outputs(executor, active, &result.requests)?,
+        }),
         ExecutionArtifacts::Unified {
             pending,
             result,
@@ -32,9 +32,9 @@ pub(super) fn resolve_step(
                 pending,
                 result.prefill_requests,
                 scheduled_at_unix_s,
-            );
-            effects.decode = resolve_decode_outputs(executor, active, &result.decode_requests);
-            effects
+            )?;
+            effects.decode = resolve_decode_outputs(executor, active, &result.decode_requests)?;
+            Ok(effects)
         }
     }
 }
@@ -44,13 +44,32 @@ fn resolve_prefill_outputs(
     pending: Vec<PendingRequest>,
     request_results: Vec<PrefillRequestResult>,
     scheduled_at_unix_s: f64,
-) -> StepEffects {
+) -> ExecutionResult<StepEffects> {
+    if pending.len() != request_results.len() {
+        return Err(ExecutionError::unexpected_worker_response(
+            "prefill resolve",
+            format!(
+                "result count {} does not match request count {}",
+                request_results.len(),
+                pending.len()
+            ),
+        ));
+    }
+
     let mut effects = StepEffects::empty();
     for (mut req, result) in pending.into_iter().zip(request_results) {
         // Results are matched to requests positionally; a misalignment here
         // would deliver request A's tokens to request B, so fail loudly in
         // release builds too.
-        assert_eq!(req.request_id, result.request_id);
+        if req.request_id != result.request_id {
+            return Err(ExecutionError::unexpected_worker_response(
+                "prefill resolve",
+                format!(
+                    "result request id {:?} does not match pending {:?}",
+                    result.request_id, req.request_id
+                ),
+            ));
+        }
         let prompt_len = req.prompt_tokens.len();
 
         // Fire Scheduled on the request's first chunk only: queue time ends
@@ -124,46 +143,50 @@ fn resolve_prefill_outputs(
         });
     }
 
-    effects
+    Ok(effects)
 }
 
 fn resolve_decode_outputs(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
     request_results: &[DecodeRequestResult],
-) -> Vec<DecodeEffect> {
-    request_results
-        .iter()
-        .map(|result| {
-            let req = active
-                .iter()
-                .find(|req| req.request_id == result.request_id)
-                .expect("decode request_id must exist in active set");
-            let completion_tokens = req.generated_count + 1;
-            let is_eos = !req.params.ignore_eos && executor.is_stop_token(result.token);
-            let at_limit = completion_tokens >= req.max_tokens;
-            if is_eos {
-                DecodeEffect::Finish {
-                    request_id: result.request_id,
-                    finish_reason: FinishReason::Stop,
-                    completion_tokens,
-                }
-            } else if at_limit {
-                DecodeEffect::EmitAndFinish {
-                    request_id: result.request_id,
-                    token: result.token,
-                    logprob: result.logprob.clone(),
-                    finish_reason: FinishReason::Length,
-                    completion_tokens,
-                }
-            } else {
-                DecodeEffect::EmitAndContinue {
-                    request_id: result.request_id,
-                    token: result.token,
-                    logprob: result.logprob.clone(),
-                    completion_tokens,
-                }
+) -> ExecutionResult<Vec<DecodeEffect>> {
+    let mut effects = Vec::with_capacity(request_results.len());
+    for result in request_results {
+        let req = active
+            .iter()
+            .find(|req| req.request_id == result.request_id)
+            .ok_or_else(|| {
+                ExecutionError::unexpected_worker_response(
+                    "decode resolve",
+                    format!("unknown request id {:?}", result.request_id),
+                )
+            })?;
+        let completion_tokens = req.generated_count + 1;
+        let is_eos = !req.params.ignore_eos && executor.is_stop_token(result.token);
+        let at_limit = completion_tokens >= req.max_tokens;
+        effects.push(if is_eos {
+            DecodeEffect::Finish {
+                request_id: result.request_id,
+                finish_reason: FinishReason::Stop,
+                completion_tokens,
             }
-        })
-        .collect()
+        } else if at_limit {
+            DecodeEffect::EmitAndFinish {
+                request_id: result.request_id,
+                token: result.token,
+                logprob: result.logprob.clone(),
+                finish_reason: FinishReason::Length,
+                completion_tokens,
+            }
+        } else {
+            DecodeEffect::EmitAndContinue {
+                request_id: result.request_id,
+                token: result.token,
+                logprob: result.logprob.clone(),
+                completion_tokens,
+            }
+        });
+    }
+    Ok(effects)
 }

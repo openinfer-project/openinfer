@@ -193,7 +193,7 @@ impl Qwen3Model {
             self.output_projection(),
             &bufs.normed,
             &mut bufs.logits,
-        );
+        )?;
 
         Ok(())
     }
@@ -220,7 +220,7 @@ impl Qwen3Model {
             q_dim,
             &bufs.normed,
             &mut bufs.q,
-        );
+        )?;
         dag.gemm_rows::<KvDim>(
             dag_label!(format!("L{layer_idx}.attn.k_proj")),
             &layer.attention.qkv_proj,
@@ -228,7 +228,7 @@ impl Qwen3Model {
             kv_dim,
             &bufs.normed,
             &mut bufs.k,
-        );
+        )?;
         dag.gemm_rows::<KvDim>(
             dag_label!(format!("L{layer_idx}.attn.v_proj")),
             &layer.attention.qkv_proj,
@@ -236,7 +236,7 @@ impl Qwen3Model {
             kv_dim,
             &bufs.normed,
             &mut bufs.v,
-        );
+        )?;
         self.apply_decode_lora_projection_group3(
             layer_idx,
             LoraProjectionKind::Q,
@@ -273,7 +273,7 @@ impl Qwen3Model {
             &layer.attention.o_proj,
             &bufs.attn_out,
             &mut bufs.attn_proj,
-        );
+        )?;
         self.apply_decode_lora_projection(
             layer_idx,
             LoraProjectionKind::O,
@@ -303,13 +303,13 @@ impl Qwen3Model {
             &layer.mlp.gate_up_proj,
             &bufs.normed,
             &mut bufs.gate_out,
-        );
+        )?;
         dag.mlp_up_proj(
             dag_label!(format!("L{layer_idx}.mlp.up_proj")),
             &layer.mlp.gate_up_proj,
             &bufs.normed,
             &mut bufs.up_out,
-        );
+        )?;
         self.apply_decode_lora_projection_group2(
             layer_idx,
             LoraProjectionKind::Gate,
@@ -331,7 +331,7 @@ impl Qwen3Model {
             &layer.mlp.down_proj,
             &bufs.mlp_act,
             &mut bufs.mlp_out,
-        );
+        )?;
         self.apply_decode_lora_projection(
             layer_idx,
             LoraProjectionKind::Down,
