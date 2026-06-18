@@ -1,6 +1,6 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: openinfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). The latest decode-tuning branch fuses Qwen3.5 MLP gate/up weights at load time and tunes decode cuBLASLt buckets before CUDA Graph capture. Same-host direct TPOT improves by `2.1-3.2%`, but vLLM 0.23.0 still leads HTTP decode on 1024/256 (`6.346 ms` vs openinfer `7.110 ms` TPOT mean at concurrency 1), and the high-concurrency HTTP gap remains open.
+> **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: openinfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). The decode-tuning refresh fuses MLP gate/up and tunes decode cuBLASLt buckets, improving direct TPOT by `2.1-3.2%`; vLLM still leads 1024/256 HTTP decode and high-concurrency throughput.
 >
 > **Last touched:** 2026-06. Qwen3.5 runtime code lives in top-level `openinfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
@@ -9,22 +9,18 @@ Historical command logs below keep the command paths that were actually run at t
 ## Goal
 
 Close Qwen3.5's decode and serving gap against the current vLLM baseline on the
-same GPU/workload. The current branch is a measured incremental step: direct
+same GPU/workload. The current refresh is a measured incremental step: direct
 OpenInfer decode gets a few-percent TPOT improvement, but HTTP 1024/256 and
 high-concurrency serving still trail vLLM and remain active optimization work.
 
 ## Current Decode Refresh
 
-Changes in the latest branch:
+Changes in the decode-tuning refresh:
 
-- Load-time MLP fusion: each layer stores one `gate_up_proj` matrix instead of
-  separate `gate_proj` and `up_proj` runtime GEMMs.
-- Decode cublasLt tuning: all CUDA Graph decode buckets up to
-  `GEMM_LT_MAX_N` tune the full-attention projections, linear-attention
-  projections, MLP gate_up/down, and LM head on the bound model thread.
-- Sampling path: Qwen3.5 token selection routes through the shared batched
-  sampler, so mixed greedy/non-greedy rows no longer need per-row sampling
-  wrappers on this path.
+- MLP gate/up weights are stacked at load time, so runtime uses one gate-up GEMM
+  plus fused SiLU*mul.
+- Decode cublasLt buckets are tuned before CUDA Graph capture.
+- Token selection stays on the shared batched sampler path.
 
 Same-host direct A/B:
 
@@ -35,7 +31,7 @@ Same-host direct A/B:
 | 1024 input / 256 output | steady TPOT avg | 7.338 ms | 7.100 ms | -3.2% |
 | 2048 input / 1 output | TTFT avg | 97.978 ms | 95.855 ms | -2.2% |
 
-Current vLLM comparison boundary:
+Current vLLM boundary:
 
 - Prompt-len-1 HTTP decode is close: 1/256 TPOT mean `6.282 ms` vs vLLM
   `6.214 ms`, and 1/512 TPOT mean `6.381 ms` vs vLLM `6.221 ms`.
@@ -43,11 +39,9 @@ Current vLLM comparison boundary:
   at concurrency 1, widening to `15.566 ms` vs `9.823 ms` at concurrency 16.
 - 2048/1 and 1024/256 TTFT rows are fixed-client timings, not token-normalized
   prefill throughput, because the servers report different prompt-token totals.
-- Nsight Systems measured the direct 1024/256 concurrency-16 model path at
-  `9.320 ms` steady TPOT avg, while the HTTP sweep is `15.566 ms` at the same
-  client shape. The full HTTP trace is coarse because it includes startup and
-  warmup, but it points the next gap search at serving/scheduler/event-sync
-  overhead rather than a single dominant Qwen3.5 kernel.
+- Nsight Systems measured the direct 1024/256 concurrency-16 path at `9.320 ms`
+  steady TPOT avg; the HTTP row is `15.566 ms`. The next gap search is
+  serving/scheduler/event-sync overhead.
 
 ## Known Caveat
 

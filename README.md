@@ -187,7 +187,7 @@ tokens). The tiering ladder at 16k: HBM hit ~26 ms < host-tier restore ~126 ms â
 ### Qwen3.5-4B vs current vLLM
 
 Single RTX 5090 (32 GB), Qwen3.5-4B, BF16, TP1 â€” openinfer with the
-Qwen3.5 decode-tuning branch, vLLM 0.23.0, both driven by `vllm bench serve`
+Qwen3.5 decode-tuning change, vLLM 0.23.0, both driven by `vllm bench serve`
 0.23.0. Fixed random prompts, 64 measured requests, 2 warmups, text-only
 serving with prefix cache off on both engines. Full flags and caveats are in the
 [Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md).
@@ -203,7 +203,7 @@ serving with prefix cache off on both engines. Full flags and caveats are in the
 | 2048 input / 1 output | reported input tokens | 126,957 (1,984/request) | 131,072 (2,048/request) |
 | 2048 input / 1 output | TTFT mean (client-contract) | 97.4 ms | 101.9 ms |
 
-This branch improves openinfer's own direct Qwen3.5 decode TPOT by about 2-3%.
+The decode-tuning change improves openinfer's own direct Qwen3.5 decode TPOT by about 2-3%.
 Against vLLM, prompt-len-1 decode is close, but vLLM still leads the 1024/256
 decode and high-concurrency HTTP rows. TTFT rows are fixed-client timings
 because reported prompt-token totals differ on the longer prompts.

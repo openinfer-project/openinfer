@@ -4,14 +4,10 @@
 
 **Updated**: 2026-06
 
-**TL;DR**: This Qwen3.5 decode-tuning branch improves openinfer's same-host
-direct benchmark by `2.1-3.2%` steady TPOT on decode-heavy shapes and `2.2%`
-TTFT on 2048/1. Against vLLM 0.23.0 through the same `vllm bench serve` HTTP
-client, openinfer is close on 1-token-prompt decode (`+1.1%` TPOT on 1/256,
-`+2.6%` on 1/512), but still trails vLLM on 1024/256 (`+12.0%` TPOT at
-concurrency 1) and the gap widens at higher HTTP concurrency. TTFT rows are a
-fixed-client contract only; 1024/256 and 2048/1 report different prompt-token
-totals between the servers.
+**TL;DR**: This Qwen3.5 decode-tuning refresh improves openinfer's direct TPOT
+by `2.1-3.2%`. HTTP decode is close on 1-token prompts, but vLLM 0.23.0 still
+leads 1024/256 TPOT and high-concurrency output throughput. TTFT rows are
+fixed-client timings because the longer prompts report different token totals.
 
 Source benchmark for the README Qwen3.5 performance rows.
 
@@ -27,7 +23,7 @@ Source benchmark for the README Qwen3.5 performance rows.
 | vLLM serve flags | `--language-model-only`, `--no-enable-prefix-caching`, `--max-model-len 8192`, `--gpu-memory-utilization 0.9` |
 | vLLM env | `VLLM_USE_FLASHINFER_SAMPLER=0`; this SM120/CUDA 12.8 host hit a FlashInfer sampler startup error otherwise. Attention selected FlashAttention 2. |
 | Client | `vllm bench serve` 0.23.0 on localhost, OpenAI `/v1/completions` backend |
-| Profiler | Nsight Systems 2025.3.2 for OpenInfer direct measured-range and full HTTP traces. Nsight Compute was not used for claims on this host. |
+| Profiler | Nsight Systems 2025.3.2 for OpenInfer direct and HTTP diagnostics |
 
 Client flags for both HTTP engines:
 
@@ -88,33 +84,13 @@ client probes, prefix cache disabled on both servers.
 | 8 | 352.18 ms | 232.45 ms | 11.333 ms | **8.650 ms** | 631.33 | **839.05** |
 | 16 | 741.95 ms | 358.21 ms | 15.566 ms | **9.823 ms** | 868.63 | **1425.72** |
 
-Extra diagnostic: an in-process openinfer 1024/256 concurrency-16 direct run
-reported steady TPOT avg `9.202 ms`, far below openinfer's HTTP concurrency-16
-TPOT `15.566 ms`. That points to a serving/scheduler/client interaction gap to
-investigate before treating the high-concurrency HTTP delta as purely a model
-kernel problem.
+## Attribution
 
-## Profiling Notes
-
-Nsight Systems confirms the direct OpenInfer model path and the HTTP serving
-path should be read separately:
-
-- Direct `bench_serving request` with CUDA profiler capture around the measured
-  1024/256 concurrency-16 iteration reported steady TPOT avg `9.320 ms`
-  (`9.201 ms` p50, `9.300 ms` p99). The top GPU kernels were the tuned
-  cublasLt/CUTLASS GEMMs: 256x128 tile `50.9%` of kernel time, 128x256
-  `15.4%`, and 64x256 `13.5%`. Qwen3.5 GDR, conv, SiLU, and FlashInfer
-  attention were much smaller in that trace.
-- The full HTTP concurrency-16 trace measured TPOT avg `16.010 ms` for the
-  benchmarked requests, close to the standalone HTTP sweep row. Because the
-  trace includes server startup and warmup, its kernel-time totals are not a
-  measured-only attribution table. Still, the CUDA API/OS runtime summaries
-  showed large `cudaEventSynchronize`, `cuMemcpyHtoDAsync`, `futex`, `poll`,
-  and `epoll_wait` time, which points at serving/scheduler/event synchronization
-  work rather than one obvious missing model kernel.
-- `bench_serving decode` was not usable as a pure Qwen3.5 decode profile yet:
-  it requires cached-token accounting to prove prefill was excluded, and Qwen3.5
-  does not currently report that surface.
+OpenInfer's measured in-process 1024/256 concurrency-16 run reported `9.320 ms`
+steady TPOT avg, while the HTTP row is `15.566 ms`. Nsight Systems therefore
+points the high-concurrency gap at serving/scheduler/event-sync overhead before
+another model-kernel rewrite. The full HTTP trace includes startup and warmup,
+so it is coarse attribution only.
 
 ## Caveats
 
@@ -126,9 +102,8 @@ path should be read separately:
 - vLLM startup was made serviceable on this host by disabling the FlashInfer
   sampler path. The measured decode was greedy (`temperature=0`); attention
   still selected FlashAttention 2.
-- Nsight Systems was used for OpenInfer direct and HTTP diagnostics. The direct
-  trace has a measured CUDA profiler range; the HTTP trace is full-process and
-  should be treated as coarse attribution only.
+- Nsight Systems direct traces are measured-range. HTTP traces are full-process
+  diagnostics and should be treated as coarse attribution only.
 - The current honest claim is narrower than vLLM parity: this branch improves
   openinfer Qwen3.5 decode TPOT by a few percent, closes most of the prompt-len
   1 HTTP decode gap, and leaves the 1024/256 plus high-concurrency HTTP gap as
