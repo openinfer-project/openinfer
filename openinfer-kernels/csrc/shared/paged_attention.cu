@@ -22,6 +22,7 @@ using namespace flashinfer;
 using DType  = __nv_bfloat16;
 using IdType = int32_t;
 using ParamsT = BatchDecodeParams<DType, DType, DType, IdType>;
+using BatchPrefillRaggedParamsT = BatchPrefillRaggedParams<DType, DType, DType, IdType>;
 using Variant = DefaultAttention</*custom_mask=*/false,
                                  /*sliding_window=*/false,
                                  /*logits_soft_cap=*/false,
@@ -604,6 +605,157 @@ int single_prefill_cuda(
             PrefillParamsT>(
             params,
             /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+}
+
+// ---------------------------------------------------------------------------
+// Single-request non-causal prefill over contiguous NHD K/V.
+//
+// DFlash draft attention materializes K/V as token-major HiddenStates:
+//   q: [q_len, num_qo_heads, head_dim]
+//   k/v: [kv_len, num_kv_heads, head_dim]
+// This wrapper mirrors vLLM's non-causal FlashAttention/FlashInfer semantics:
+// no causal mask, no sliding window, and GQA handled by FlashInfer.
+// ---------------------------------------------------------------------------
+int single_prefill_nhd_noncausal_cuda(
+    void*    q,
+    void*    output,
+    void*    k,
+    void*    v,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  q_len,
+    int32_t  kv_len,
+    float    sm_scale,
+    void*    stream)
+{
+    uint32_t q_stride_n = num_qo_heads * head_dim;
+    uint32_t q_stride_h = head_dim;
+    uint32_t kv_stride_n = num_kv_heads * head_dim;
+    uint32_t kv_stride_h = head_dim;
+
+    PrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k),
+        reinterpret_cast<DType*>(v),
+        /*maybe_custom_mask=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        static_cast<uint32_t>(q_len),
+        static_cast<uint32_t>(kv_len),
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        static_cast<uint32_t>(head_dim),
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SinglePrefillWithKVCacheDispatched<
+            /*HEAD_DIM_QK=*/128,
+            /*HEAD_DIM_VO=*/128,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kNone,
+            Variant,
+            PrefillParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+}
+
+// ---------------------------------------------------------------------------
+// Batched non-causal prefill over compact ragged NHD K/V.
+//
+// DFlash groups exact-shape draft requests into compact token-major tensors:
+//   q: [sum(q_len), num_qo_heads, head_dim]
+//   k/v: [sum(kv_len), num_kv_heads, head_dim]
+// with q_indptr/kv_indptr separating requests. This maps directly to
+// FlashInfer BatchPrefillWithRaggedKVCache with MaskMode::kNone.
+// ---------------------------------------------------------------------------
+int batch_prefill_ragged_nhd_noncausal_cuda(
+    void*    q,
+    void*    output,
+    void*    k,
+    void*    v,
+    int32_t* q_indptr,
+    int32_t* kv_indptr,
+    int32_t* request_indices,
+    int32_t* qo_tile_indices,
+    int32_t* kv_tile_indices,
+    int32_t* kv_chunk_size_ptr,
+    uint32_t* total_num_rows,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  total_q_len,
+    int32_t  batch_size,
+    int32_t  padded_batch_size,
+    float    sm_scale,
+    void*    stream)
+{
+    uint32_t q_stride_n = num_qo_heads * head_dim;
+    uint32_t q_stride_h = head_dim;
+    uint32_t kv_stride_n = num_kv_heads * head_dim;
+    uint32_t kv_stride_h = head_dim;
+
+    BatchPrefillRaggedParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k),
+        reinterpret_cast<DType*>(v),
+        /*maybe_custom_mask=*/nullptr,
+        q_indptr,
+        kv_indptr,
+        /*maybe_mask_indptr=*/nullptr,
+        /*maybe_q_rope_offset=*/nullptr,
+        /*maybe_k_rope_offset=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    params.request_indices = request_indices;
+    params.qo_tile_indices = qo_tile_indices;
+    params.kv_tile_indices = kv_tile_indices;
+    params.o_indptr = q_indptr;
+    params.kv_chunk_size_ptr = kv_chunk_size_ptr;
+    params.total_num_rows = total_num_rows;
+    params.max_total_num_rows = static_cast<uint32_t>(total_q_len);
+    params.padded_batch_size = static_cast<uint32_t>(padded_batch_size);
+    params.partition_kv = false;
+
+    return static_cast<int>(
+        BatchPrefillWithRaggedKVCacheDispatched<
+            /*CTA_TILE_Q=*/16,
+            /*HEAD_DIM_QK=*/128,
+            /*HEAD_DIM_VO=*/128,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kNone,
+            Variant,
+            BatchPrefillRaggedParamsT>(
+            params,
+            /*tmp_v=*/nullptr,
+            /*tmp_s=*/nullptr,
+            /*enable_pdl=*/false,
             reinterpret_cast<cudaStream_t>(stream)));
 }
 

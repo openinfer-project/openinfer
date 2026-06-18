@@ -3894,6 +3894,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-qwen3-4b-dflash"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "cudarc",
+ "half",
+ "log",
+ "memmap2",
+ "openinfer-core",
+ "openinfer-kernels",
+ "safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "openinfer-qwen35-4b"
 version = "0.1.0"
 dependencies = [

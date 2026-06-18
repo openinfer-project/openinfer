@@ -3,6 +3,7 @@
 mod attention;
 #[cfg(feature = "kimi-k2")]
 mod deepep;
+mod dense_attention;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "kimi-k2")]
@@ -20,6 +21,10 @@ pub use attention::{
 #[cfg(feature = "kimi-k2")]
 pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
+};
+pub use dense_attention::{
+    RaggedPrefillPlan, batch_prefill_ragged_nhd_noncausal_into,
+    single_prefill_nhd_noncausal_into,
 };
 pub use elementwise::{
     accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, bf16_hidden_to_f32_into,

@@ -1,0 +1,640 @@
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use half::bf16;
+use openinfer_core::tensor::HiddenStates;
+
+use crate::batch_buffers::DFlashBatchBuffers;
+use crate::batch_forward::{DFlashBatchInput, DFlashHostBatchInput, copy_hidden};
+use crate::forward::{DFlashDraftCache, DFlashTargetHidden};
+use crate::weights::DFlashDraftModel;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct DFlashRequestId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum DFlashCacheMode {
+    NoCache,
+    DraftCache,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct DFlashBatchKey {
+    pub q_len: usize,
+    pub ctx_len: usize,
+    pub past_len: usize,
+    pub cache_mode: DFlashCacheMode,
+}
+
+pub struct DFlashDraftRequest {
+    pub request_id: DFlashRequestId,
+    pub noise_embedding: HiddenStates,
+    pub target_hidden: HiddenStates,
+    pub position_ids: Vec<i32>,
+    pub cache_mode: DFlashCacheMode,
+}
+
+pub struct DFlashDraftHostRequest {
+    pub request_id: DFlashRequestId,
+    pub noise_embedding: Vec<bf16>,
+    pub target_hidden: Vec<bf16>,
+    pub position_ids: Vec<i32>,
+    pub q_len: usize,
+    pub ctx_len: usize,
+    pub cache_mode: DFlashCacheMode,
+}
+
+pub struct DFlashDraftResponse {
+    pub request_id: DFlashRequestId,
+    pub output: HiddenStates,
+    pub cache_seq_len: usize,
+    pub batch_size: usize,
+    pub elapsed: Duration,
+}
+
+pub struct DFlashDraftHostResponse {
+    pub request_id: DFlashRequestId,
+    pub output: Vec<bf16>,
+    pub hidden_dim: usize,
+    pub seq_len: usize,
+    pub cache_seq_len: usize,
+    pub batch_size: usize,
+    pub elapsed: Duration,
+}
+
+pub struct DFlashDraftBatchResponse {
+    pub request_ids: Vec<DFlashRequestId>,
+    pub output: HiddenStates,
+    pub cache_seq_lens: Vec<usize>,
+    pub batch_size: usize,
+    pub q_len: usize,
+    pub elapsed: Duration,
+}
+
+pub struct DFlashDraftBatchView<'a> {
+    pub request_ids: Vec<DFlashRequestId>,
+    pub output: &'a HiddenStates,
+    pub cache_seq_lens: Vec<usize>,
+    pub batch_size: usize,
+    pub q_len: usize,
+    pub elapsed: Duration,
+}
+
+pub struct DFlashExecutorOptions {
+    pub max_batch_size: usize,
+    pub max_step_context_len: usize,
+    pub max_seq_len: usize,
+}
+
+impl Default for DFlashExecutorOptions {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 32,
+            max_step_context_len: 16,
+            max_seq_len: 4096,
+        }
+    }
+}
+
+pub struct DFlashExecutor {
+    model: DFlashDraftModel,
+    options: DFlashExecutorOptions,
+    buffers: HashMap<(usize, usize, usize), DFlashBatchBuffers>,
+    caches: HashMap<DFlashRequestId, DFlashDraftCache>,
+}
+
+impl DFlashExecutor {
+    pub fn load(
+        model_path: &Path,
+        device_ordinal: usize,
+        options: DFlashExecutorOptions,
+    ) -> Result<Self> {
+        let model = DFlashDraftModel::load(model_path, device_ordinal)?;
+        Ok(Self {
+            model,
+            options,
+            buffers: HashMap::new(),
+            caches: HashMap::new(),
+        })
+    }
+
+    pub fn model(&self) -> &DFlashDraftModel {
+        &self.model
+    }
+
+    pub fn max_batch_size(&self) -> usize {
+        self.options.max_batch_size
+    }
+
+    pub fn batch_key(&self, req: &DFlashDraftRequest) -> Result<DFlashBatchKey> {
+        let target = DFlashTargetHidden {
+            concatenated: &req.target_hidden,
+        };
+        let (q_len, ctx_len) =
+            self.model
+                .validate_forward_inputs(&req.noise_embedding, &target, &req.position_ids)?;
+        let past_len = self
+            .caches
+            .get(&req.request_id)
+            .map(DFlashDraftCache::seq_len)
+            .unwrap_or(0);
+        Ok(DFlashBatchKey {
+            q_len,
+            ctx_len,
+            past_len,
+            cache_mode: req.cache_mode,
+        })
+    }
+
+    pub fn host_batch_key(&self, req: &DFlashDraftHostRequest) -> Result<DFlashBatchKey> {
+        let config = self.model.config();
+        anyhow::ensure!(
+            req.noise_embedding.len() == req.q_len * config.hidden_size,
+            "noise_embedding len {} != q_len * hidden_size {}",
+            req.noise_embedding.len(),
+            req.q_len * config.hidden_size
+        );
+        anyhow::ensure!(
+            req.target_hidden.len()
+                == req.ctx_len * config.hidden_size * config.target_layer_count(),
+            "target_hidden len {} != ctx_len * target_layer_count * hidden_size {}",
+            req.target_hidden.len(),
+            req.ctx_len * config.hidden_size * config.target_layer_count()
+        );
+        anyhow::ensure!(
+            req.position_ids.len() == req.ctx_len + req.q_len,
+            "position_ids len {} != ctx_len + q_len {}",
+            req.position_ids.len(),
+            req.ctx_len + req.q_len
+        );
+        let past_len = self
+            .caches
+            .get(&req.request_id)
+            .map(DFlashDraftCache::seq_len)
+            .unwrap_or(0);
+        Ok(DFlashBatchKey {
+            q_len: req.q_len,
+            ctx_len: req.ctx_len,
+            past_len,
+            cache_mode: req.cache_mode,
+        })
+    }
+
+    pub fn execute_batch(
+        &mut self,
+        requests: Vec<DFlashDraftRequest>,
+    ) -> Result<Vec<DFlashDraftResponse>> {
+        let batch = self.execute_batch_compact(requests)?;
+        self.split_compact_response(batch)
+    }
+
+    pub fn execute_host_batch_compact(
+        &mut self,
+        requests: Vec<DFlashDraftHostRequest>,
+    ) -> Result<DFlashDraftBatchResponse> {
+        anyhow::ensure!(!requests.is_empty(), "DFlash host executor batch is empty");
+        anyhow::ensure!(
+            requests.len() <= self.options.max_batch_size,
+            "DFlash host executor batch size {} exceeds max_batch_size {}",
+            requests.len(),
+            self.options.max_batch_size
+        );
+        let key = self.host_batch_key(&requests[0])?;
+        for req in &requests[1..] {
+            let req_key = self.host_batch_key(req)?;
+            anyhow::ensure!(
+                req_key == key,
+                "DFlash host executor requires exact-shape batch: first={key:?}, got={req_key:?}"
+            );
+        }
+        if key.cache_mode == DFlashCacheMode::DraftCache {
+            return self.execute_cached_host_requests_serial_compact(requests, key);
+        }
+        let started = Instant::now();
+        let batch_size = requests.len();
+        let request_ids = requests
+            .iter()
+            .map(|request| request.request_id)
+            .collect::<Vec<_>>();
+        let buffer_key = (self.options.max_batch_size, key.q_len, key.ctx_len);
+        if !self.buffers.contains_key(&buffer_key) {
+            let bufs = self.model.create_batch_buffers(
+                self.options.max_batch_size,
+                key.q_len,
+                key.ctx_len,
+            )?;
+            self.buffers.insert(buffer_key, bufs);
+        }
+        let bufs = self.buffers.get_mut(&buffer_key).expect("buffer inserted");
+        let inputs = requests
+            .iter()
+            .map(|req| DFlashHostBatchInput {
+                noise_embedding: &req.noise_embedding,
+                target_hidden: &req.target_hidden,
+                position_ids: &req.position_ids,
+            })
+            .collect::<Vec<_>>();
+        let batch_output = self.model.forward_host_batch(&inputs, bufs)?;
+        self.model.device_context().sync()?;
+        let elapsed = started.elapsed();
+        let mut output = HiddenStates::zeros(
+            self.model.device_context(),
+            batch_output.hidden_dim,
+            batch_output.seq_len,
+        )?;
+        copy_hidden(
+            self.model.device_context(),
+            batch_output,
+            0,
+            &mut output,
+            0,
+            batch_output.hidden_dim,
+            batch_output.seq_len,
+        )?;
+        Ok(DFlashDraftBatchResponse {
+            request_ids,
+            output,
+            cache_seq_lens: vec![0; batch_size],
+            batch_size,
+            q_len: key.q_len,
+            elapsed,
+        })
+    }
+
+    pub fn execute_host_batch(
+        &mut self,
+        requests: Vec<DFlashDraftHostRequest>,
+    ) -> Result<Vec<DFlashDraftResponse>> {
+        let batch = self.execute_host_batch_compact(requests)?;
+        self.split_compact_response(batch)
+    }
+
+    pub fn execute_host_batch_host(
+        &mut self,
+        requests: Vec<DFlashDraftHostRequest>,
+    ) -> Result<Vec<DFlashDraftHostResponse>> {
+        let batch = self.execute_host_batch_compact(requests)?;
+        self.split_compact_host_response(batch)
+    }
+
+    pub fn execute_host_batch_view(
+        &mut self,
+        requests: Vec<DFlashDraftHostRequest>,
+    ) -> Result<DFlashDraftBatchView<'_>> {
+        anyhow::ensure!(!requests.is_empty(), "DFlash host executor batch is empty");
+        anyhow::ensure!(
+            requests.len() <= self.options.max_batch_size,
+            "DFlash host executor batch size {} exceeds max_batch_size {}",
+            requests.len(),
+            self.options.max_batch_size
+        );
+        let key = self.host_batch_key(&requests[0])?;
+        for req in &requests[1..] {
+            let req_key = self.host_batch_key(req)?;
+            anyhow::ensure!(
+                req_key == key,
+                "DFlash host executor requires exact-shape batch: first={key:?}, got={req_key:?}"
+            );
+        }
+        anyhow::ensure!(
+            key.cache_mode == DFlashCacheMode::NoCache,
+            "borrowed host batch view currently supports only NoCache mode"
+        );
+        let started = Instant::now();
+        let batch_size = requests.len();
+        let request_ids = requests
+            .iter()
+            .map(|request| request.request_id)
+            .collect::<Vec<_>>();
+        let buffer_key = (self.options.max_batch_size, key.q_len, key.ctx_len);
+        if !self.buffers.contains_key(&buffer_key) {
+            let bufs = self.model.create_batch_buffers(
+                self.options.max_batch_size,
+                key.q_len,
+                key.ctx_len,
+            )?;
+            self.buffers.insert(buffer_key, bufs);
+        }
+        let bufs = self.buffers.get_mut(&buffer_key).expect("buffer inserted");
+        let inputs = requests
+            .iter()
+            .map(|req| DFlashHostBatchInput {
+                noise_embedding: &req.noise_embedding,
+                target_hidden: &req.target_hidden,
+                position_ids: &req.position_ids,
+            })
+            .collect::<Vec<_>>();
+        let output = self.model.forward_host_batch(&inputs, bufs)?;
+        self.model.device_context().sync()?;
+        Ok(DFlashDraftBatchView {
+            request_ids,
+            output,
+            cache_seq_lens: vec![0; batch_size],
+            batch_size,
+            q_len: key.q_len,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    pub fn execute_batch_compact(
+        &mut self,
+        requests: Vec<DFlashDraftRequest>,
+    ) -> Result<DFlashDraftBatchResponse> {
+        anyhow::ensure!(!requests.is_empty(), "DFlash executor batch is empty");
+        anyhow::ensure!(
+            requests.len() <= self.options.max_batch_size,
+            "DFlash executor batch size {} exceeds max_batch_size {}",
+            requests.len(),
+            self.options.max_batch_size
+        );
+        let key = self.batch_key(&requests[0])?;
+        for req in &requests[1..] {
+            let req_key = self.batch_key(req)?;
+            anyhow::ensure!(
+                req_key == key,
+                "DFlash executor requires exact-shape batch: first={key:?}, got={req_key:?}"
+            );
+        }
+        match key.cache_mode {
+            DFlashCacheMode::NoCache => self.execute_uncached_batch_compact(requests, key),
+            DFlashCacheMode::DraftCache => {
+                self.execute_cached_requests_serial_compact(requests, key)
+            }
+        }
+    }
+
+    pub fn reset_cache(&mut self, request_id: DFlashRequestId) -> Result<()> {
+        let Some(cache) = self.caches.get_mut(&request_id) else {
+            anyhow::bail!("unknown DFlash cache request_id {:?}", request_id);
+        };
+        cache.reset();
+        Ok(())
+    }
+
+    pub fn crop_cache(&mut self, request_id: DFlashRequestId, seq_len: usize) -> Result<()> {
+        let Some(cache) = self.caches.get_mut(&request_id) else {
+            anyhow::bail!("unknown DFlash cache request_id {:?}", request_id);
+        };
+        cache.crop(seq_len)?;
+        Ok(())
+    }
+
+    pub fn cache_seq_len(&self, request_id: DFlashRequestId) -> Result<usize> {
+        self.caches
+            .get(&request_id)
+            .map(DFlashDraftCache::seq_len)
+            .ok_or_else(|| anyhow::anyhow!("unknown DFlash cache request_id {:?}", request_id))
+    }
+
+    fn execute_uncached_batch_compact(
+        &mut self,
+        requests: Vec<DFlashDraftRequest>,
+        key: DFlashBatchKey,
+    ) -> Result<DFlashDraftBatchResponse> {
+        let started = Instant::now();
+        let batch_size = requests.len();
+        let request_ids = requests
+            .iter()
+            .map(|request| request.request_id)
+            .collect::<Vec<_>>();
+        let buffer_key = (self.options.max_batch_size, key.q_len, key.ctx_len);
+        if !self.buffers.contains_key(&buffer_key) {
+            let bufs = self.model.create_batch_buffers(
+                self.options.max_batch_size,
+                key.q_len,
+                key.ctx_len,
+            )?;
+            self.buffers.insert(buffer_key, bufs);
+        }
+        let bufs = self.buffers.get_mut(&buffer_key).expect("buffer inserted");
+        let inputs = requests
+            .iter()
+            .map(|req| DFlashBatchInput {
+                noise_embedding: &req.noise_embedding,
+                target_hidden: DFlashTargetHidden {
+                    concatenated: &req.target_hidden,
+                },
+                position_ids: &req.position_ids,
+            })
+            .collect::<Vec<_>>();
+        let batch_output = self.model.forward_batch(&inputs, bufs)?;
+        self.model.device_context().sync()?;
+        let elapsed = started.elapsed();
+        let mut output = HiddenStates::zeros(
+            self.model.device_context(),
+            self.model.config().hidden_size,
+            batch_size * key.q_len,
+        )?;
+        copy_hidden(
+            self.model.device_context(),
+            batch_output,
+            0,
+            &mut output,
+            0,
+            self.model.config().hidden_size,
+            batch_size * key.q_len,
+        )?;
+        Ok(DFlashDraftBatchResponse {
+            request_ids,
+            output,
+            cache_seq_lens: vec![0; batch_size],
+            batch_size,
+            q_len: key.q_len,
+            elapsed,
+        })
+    }
+
+    fn execute_cached_requests_serial_compact(
+        &mut self,
+        requests: Vec<DFlashDraftRequest>,
+        key: DFlashBatchKey,
+    ) -> Result<DFlashDraftBatchResponse> {
+        let started = Instant::now();
+        let batch_size = requests.len();
+        let mut request_ids = Vec::with_capacity(batch_size);
+        let mut cache_seq_lens = Vec::with_capacity(batch_size);
+        let mut output = HiddenStates::zeros(
+            self.model.device_context(),
+            self.model.config().hidden_size,
+            batch_size * key.q_len,
+        )?;
+        for (i, req) in requests.into_iter().enumerate() {
+            if !self.caches.contains_key(&req.request_id) {
+                let cache = self.model.create_draft_cache(
+                    key.q_len,
+                    self.options.max_step_context_len,
+                    self.options.max_seq_len,
+                )?;
+                self.caches.insert(req.request_id, cache);
+            }
+            let cache = self.caches.get_mut(&req.request_id).expect("cache exists");
+            self.model.prepare_step_context(
+                DFlashTargetHidden {
+                    concatenated: &req.target_hidden,
+                },
+                &req.position_ids,
+                cache,
+            )?;
+            let out = self.model.forward_with_draft_cache(
+                &req.noise_embedding,
+                &req.position_ids,
+                cache,
+            )?;
+            self.model.device_context().sync()?;
+            copy_hidden(
+                self.model.device_context(),
+                out,
+                0,
+                &mut output,
+                i * key.q_len,
+                self.model.config().hidden_size,
+                key.q_len,
+            )?;
+            request_ids.push(req.request_id);
+            cache_seq_lens.push(cache.seq_len());
+        }
+        Ok(DFlashDraftBatchResponse {
+            request_ids,
+            output,
+            cache_seq_lens,
+            batch_size,
+            q_len: key.q_len,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    fn execute_cached_host_requests_serial_compact(
+        &mut self,
+        requests: Vec<DFlashDraftHostRequest>,
+        key: DFlashBatchKey,
+    ) -> Result<DFlashDraftBatchResponse> {
+        let started = Instant::now();
+        let batch_size = requests.len();
+        let config = self.model.config();
+        let mut request_ids = Vec::with_capacity(batch_size);
+        let mut cache_seq_lens = Vec::with_capacity(batch_size);
+        let mut output = HiddenStates::zeros(
+            self.model.device_context(),
+            config.hidden_size,
+            batch_size * key.q_len,
+        )?;
+        for (i, req) in requests.into_iter().enumerate() {
+            if !self.caches.contains_key(&req.request_id) {
+                let cache = self.model.create_draft_cache(
+                    key.q_len,
+                    self.options.max_step_context_len,
+                    self.options.max_seq_len,
+                )?;
+                self.caches.insert(req.request_id, cache);
+            }
+            let noise_embedding = HiddenStates {
+                data: self
+                    .model
+                    .device_context()
+                    .stream
+                    .clone_htod(&req.noise_embedding)?,
+                hidden_dim: config.hidden_size,
+                seq_len: key.q_len,
+            };
+            let target_hidden = HiddenStates {
+                data: self
+                    .model
+                    .device_context()
+                    .stream
+                    .clone_htod(&req.target_hidden)?,
+                hidden_dim: config.hidden_size * config.target_layer_count(),
+                seq_len: key.ctx_len,
+            };
+            let cache = self.caches.get_mut(&req.request_id).expect("cache exists");
+            self.model.prepare_step_context(
+                DFlashTargetHidden {
+                    concatenated: &target_hidden,
+                },
+                &req.position_ids,
+                cache,
+            )?;
+            let out =
+                self.model
+                    .forward_with_draft_cache(&noise_embedding, &req.position_ids, cache)?;
+            self.model.device_context().sync()?;
+            copy_hidden(
+                self.model.device_context(),
+                out,
+                0,
+                &mut output,
+                i * key.q_len,
+                config.hidden_size,
+                key.q_len,
+            )?;
+            request_ids.push(req.request_id);
+            cache_seq_lens.push(cache.seq_len());
+        }
+        Ok(DFlashDraftBatchResponse {
+            request_ids,
+            output,
+            cache_seq_lens,
+            batch_size,
+            q_len: key.q_len,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    fn split_compact_response(
+        &self,
+        batch: DFlashDraftBatchResponse,
+    ) -> Result<Vec<DFlashDraftResponse>> {
+        let mut responses = Vec::with_capacity(batch.batch_size);
+        for i in 0..batch.batch_size {
+            let mut output = HiddenStates::zeros(
+                self.model.device_context(),
+                self.model.config().hidden_size,
+                batch.q_len,
+            )?;
+            copy_hidden(
+                self.model.device_context(),
+                &batch.output,
+                i * batch.q_len,
+                &mut output,
+                0,
+                self.model.config().hidden_size,
+                batch.q_len,
+            )?;
+            responses.push(DFlashDraftResponse {
+                request_id: batch.request_ids[i],
+                output,
+                cache_seq_len: batch.cache_seq_lens[i],
+                batch_size: batch.batch_size,
+                elapsed: batch.elapsed,
+            });
+        }
+        Ok(responses)
+    }
+
+    fn split_compact_host_response(
+        &self,
+        batch: DFlashDraftBatchResponse,
+    ) -> Result<Vec<DFlashDraftHostResponse>> {
+        let host = self
+            .model
+            .device_context()
+            .stream
+            .clone_dtoh(&batch.output.data)?;
+        self.model.device_context().sync()?;
+        let row_len = batch.output.hidden_dim * batch.q_len;
+        let mut responses = Vec::with_capacity(batch.batch_size);
+        for i in 0..batch.batch_size {
+            responses.push(DFlashDraftHostResponse {
+                request_id: batch.request_ids[i],
+                output: host[i * row_len..(i + 1) * row_len].to_vec(),
+                hidden_dim: batch.output.hidden_dim,
+                seq_len: batch.q_len,
+                cache_seq_len: batch.cache_seq_lens[i],
+                batch_size: batch.batch_size,
+                elapsed: batch.elapsed,
+            });
+        }
+        Ok(responses)
+    }
+}

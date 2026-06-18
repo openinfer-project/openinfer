@@ -478,6 +478,42 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn single_prefill_nhd_noncausal_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k: *const Half,
+        v: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_len: i32,
+        kv_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn batch_prefill_ragged_nhd_noncausal_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k: *const Half,
+        v: *const Half,
+        q_indptr: *const i32,
+        kv_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        total_q_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn repeat_f32_for_reduce_scatter_cuda(
         local: *const f32,
         repeated: *mut f32,
