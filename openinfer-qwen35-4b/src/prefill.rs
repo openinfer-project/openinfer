@@ -256,9 +256,9 @@ impl Qwen35Model {
             self.batched_rms_norm_offset(&hidden_plus_attn, &layer.post_attention_layernorm, eps)?;
 
         // 4. MLP (batched)
-        let gate_out = ops::gemm(&self.ctx, &layer.mlp.gate_proj, &normed_batch)?;
-        let up_out = ops::gemm(&self.ctx, &layer.mlp.up_proj, &normed_batch)?;
-        let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
+        let gate_up_out = ops::gemm(&self.ctx, &layer.mlp.gate_up_proj, &normed_batch)?;
+        let mut act_out = HiddenStates::zeros(&self.ctx, c.intermediate_size, seq_len)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &gate_up_out, &mut act_out)?;
         let mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
 
         // 5. Residual

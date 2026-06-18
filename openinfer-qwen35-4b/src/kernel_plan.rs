@@ -138,9 +138,9 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "mlp_prefill",
-                    rust: "prefill::prefill_layer -> ops::gemm (gate/up/down) + silu_mul_batch",
+                    rust: "prefill::prefill_layer -> ops::gemm (gate_up/down) + silu_mul_fused_batch_into",
                     backend: "CUDA + cuBLAS",
-                    notes: "SwiGLU MLP — 3 cuBLAS GEMMs (gate, up, down) + 1 CUDA silu_mul",
+                    notes: "SwiGLU MLP — fused gate+up cuBLAS GEMM, CUDA SiLU*mul, down cuBLAS GEMM",
                 },
                 KernelOp {
                     id: "residual_add_prefill",
@@ -255,9 +255,9 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "mlp_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (gate/up/down) + silu_mul_batch_into",
+                    rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (gate_up/down) + silu_mul_fused_batch_into",
                     backend: "CUDA + cuBLAS",
-                    notes: "SwiGLU MLP — 3 cuBLAS GEMMs (gate, up, down) + 1 CUDA silu_mul",
+                    notes: "SwiGLU MLP — fused gate+up cuBLAS GEMM, CUDA SiLU*mul, down cuBLAS GEMM",
                 },
                 // final norm + sampling (once per decode step, not per layer)
                 KernelOp {

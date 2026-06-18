@@ -135,6 +135,7 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
     unsafe {
         crate::ffi::cublas_init();
     }
+    model.tune_decode_gemm_algos()?;
     Ok(CublasThreadGuard)
 }
 

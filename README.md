@@ -186,25 +186,27 @@ tokens). The tiering ladder at 16k: HBM hit ~26 ms < host-tier restore ~126 ms �
 
 ### Qwen3.5-4B vs current vLLM
 
-Single RTX 5090 (32 GB), Qwen3.5-4B, BF16, TP1 — openinfer @ `f3dcdf4`,
-vLLM 0.23.0 (latest stable checked 2026-06-15), both driven by
-`vllm bench serve` 0.23.0. Fixed random prompts, 30 measured requests,
-1 warmup, max concurrency 1, vLLM text-only with prefix cache off. Full flags and caveats
-are in the [Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md).
+Single RTX 5090 (32 GB), Qwen3.5-4B, BF16, TP1 — openinfer with the
+Qwen3.5 decode-tuning branch, vLLM 0.23.0, both driven by `vllm bench serve`
+0.23.0. Fixed random prompts, 64 measured requests, 2 warmups, text-only
+serving with prefix cache off on both engines. Full flags and caveats are in the
+[Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md).
 
 | Workload | Metric | openinfer | vLLM 0.23.0 |
 |---|---|---:|---:|
-| 2048 input / 1 output | reported input tokens | 58,324 (1,944/request) | 61,440 (2,048/request) |
-| 2048 input / 1 output | TTFT p50 (client-contract) | 101.8 ms | 115.2 ms |
-| 2048 input / 1 output | TTFT p99 (client-contract) | 108.7 ms | 123.7 ms |
-| 1024 input / 256 output | reported input tokens | 29,123 (971/request) | 30,720 (1,024/request) |
-| 1024 input / 256 output | TTFT p50 (client-contract) | 53.7 ms | 67.4 ms |
-| 1024 input / 256 output | TPOT p50 | 7.31 ms | **6.32 ms** |
-| 1024 input / 256 output | output tok/s | 133.6 | **152.3** |
+| 1 input / 256 output | TPOT mean | 6.282 ms | **6.214 ms** |
+| 1 input / 512 output | TPOT mean | 6.381 ms | **6.221 ms** |
+| 1024 input / 256 output | reported input tokens | 63,459 (992/request) | 65,536 (1,024/request) |
+| 1024 input / 256 output | TTFT mean (client-contract) | 55.3 ms | 66.3 ms |
+| 1024 input / 256 output | TPOT mean | 7.110 ms | **6.346 ms** |
+| 1024 input / 256 output | output tok/s | 137.0 | **151.9** |
+| 2048 input / 1 output | reported input tokens | 126,957 (1,984/request) | 131,072 (2,048/request) |
+| 2048 input / 1 output | TTFT mean (client-contract) | 97.4 ms | 101.9 ms |
 
-openinfer reports lower TTFT in this fixed-client run, but it also reports about 5%
-fewer prompt tokens, so these rows are not a token-normalized prefill comparison.
-vLLM still has the steady decode edge on this Qwen3.5 workload.
+This branch improves openinfer's own direct Qwen3.5 decode TPOT by about 2-3%.
+Against vLLM, prompt-len-1 decode is close, but vLLM still leads the 1024/256
+decode and high-concurrency HTTP rows. TTFT rows are fixed-client timings
+because reported prompt-token totals differ on the longer prompts.
 
 ## Architecture
 

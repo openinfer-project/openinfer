@@ -1,6 +1,6 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is fast and decode-correct — GDR kernels optimized, CUDA-graph decode, TTFT/TPOT at vLLM parity, current bench snapshots — and now has a long-prompt logits gate over the old 4096-position RoPE cache boundary. The #250/#253 RoPE slice sizes the Qwen3.5 cache from `max_position_embeddings`, fails closed before prefill/decode can read a missing position, verifies 4097/8192-token HF bf16 logits replay, and recovers full GSM8K 8-shot within 0.15 percentage points of the HF baseline (`strict-match` 79.38%, `flexible-extract` 79.30% vs HF 79.45%). Remaining structural items include the HND prefill staging footprint; full-lifetime KV admission and context-window rejection now live in the scheduler plan/e2e tests. Findings originally verified 2026-06-04 against `6ee9247`; #186 gate status updated 2026-06-05, #250 long-prompt and GSM8K status updated 2026-06-05, #255 scheduler seam updated 2026-06-06, #253 context-window admission updated 2026-06-11.
+> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: GDR kernels are optimized, CUDA-graph decode is active, the latest decode branch improves openinfer direct TPOT by `2.1-3.2%`, and the current HTTP benchmark shows vLLM still leading 1024/256 decode and high-concurrency throughput. Nsight Systems now narrows the high-concurrency gap toward serving/scheduler/event-sync overhead, not one dominant model kernel. It also has a long-prompt logits gate over the old 4096-position RoPE cache boundary. The #250/#253 RoPE slice sizes the Qwen3.5 cache from `max_position_embeddings`, fails closed before prefill/decode can read a missing position, verifies 4097/8192-token HF bf16 logits replay, and recovers full GSM8K 8-shot within 0.15 percentage points of the HF baseline (`strict-match` 79.38%, `flexible-extract` 79.30% vs HF 79.45%). Remaining structural items include the HND prefill staging footprint, full-lifetime KV/context-window admission maintenance, and the serving-level high-concurrency gap.
 >
 > **Last touched:** 2026-06
 
@@ -10,7 +10,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 | Area | State | Evidence |
 | --- | --- | --- |
-| Decode perf | ✓ GDR fused recurrent optimized; CUDA-graph decode; parity with vLLM | `docs/models/qwen35/optimization.md` |
+| Decode perf | Partial: GDR fused recurrent optimized and CUDA-graph decode active; latest branch improves direct OpenInfer TPOT, but vLLM 0.23.0 still leads 1024/256 HTTP decode and high-concurrency throughput. Nsight Systems points the next gap search at serving/scheduler/event-sync overhead. | `docs/models/qwen35/optimization.md`, `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md` |
 | Bench snapshots | ✓ current (unlike qwen3's) | `bench_snapshots/` |
 | **Long-prompt accuracy** | Recovered for the measured path: the 4097/8192-token HF logits replay passes after the RoPE cache fix; full GSM8K 8-shot at `batch_size=1` recovers to `strict-match` 79.38% / `flexible-extract` 79.30% vs HF 79.45% | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-long-golden.safetensors`, `docs/benchmarks/accuracy-eval-results.md`, issue #250 |
 | Accuracy gate | ✓ small and long HF bf16 logits gates for pinned Qwen3.5-4B; exact-text e2e/regen retired; broader rand/hash corpus deferred until cross-arch policy exists | `tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, `test_data/qwen35-4b-hf-long-golden.safetensors`, `docs/models/qwen35/accuracy.md` |
@@ -35,8 +35,13 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 ### Next
 
 5. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → RoPE/context-window invariants → opens the door to prefix-cache design.
-6. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
-7. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 5.
+6. **Serving-level concurrency profiling.** Add a measured-only server-side
+   profiling range, then split the 1024/256 concurrency-16 gap across scheduler
+   wait, event sync, request dispatch, and model execution. Also teach the
+   Qwen3.5 direct decode bench to prove cached-token/prefix exclusion before it
+   reports pure decode TPOT.
+7. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
+8. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 5.
 
 ### Later
 

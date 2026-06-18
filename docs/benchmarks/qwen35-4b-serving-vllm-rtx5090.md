@@ -2,14 +2,16 @@
 
 **Created**: 2026-06-15
 
-**TL;DR**: TP1 Qwen3.5-4B on one RTX 5090, measured through the same
-`vllm bench serve` HTTP client against vLLM 0.23.0, the latest stable release
-checked on 2026-06-15. On fixed-length single-concurrency client-contract
-probes, openinfer reports lower TTFT, but it also reports fewer prompt tokens
-per request (`1,944` vs `2,048` on 2048/1, `971` vs `1,024` on 1024/256), so
-TTFT is not a token-normalized prefill comparison. vLLM keeps the steady decode
-edge: `6.32 ms` TPOT p50 vs openinfer `7.31 ms`, or `152.3` vs `133.6` output
-tok/s.
+**Updated**: 2026-06
+
+**TL;DR**: This Qwen3.5 decode-tuning branch improves openinfer's same-host
+direct benchmark by `2.1-3.2%` steady TPOT on decode-heavy shapes and `2.2%`
+TTFT on 2048/1. Against vLLM 0.23.0 through the same `vllm bench serve` HTTP
+client, openinfer is close on 1-token-prompt decode (`+1.1%` TPOT on 1/256,
+`+2.6%` on 1/512), but still trails vLLM on 1024/256 (`+12.0%` TPOT at
+concurrency 1) and the gap widens at higher HTTP concurrency. TTFT rows are a
+fixed-client contract only; 1024/256 and 2048/1 report different prompt-token
+totals between the servers.
 
 Source benchmark for the README Qwen3.5 performance rows.
 
@@ -17,61 +19,117 @@ Source benchmark for the README Qwen3.5 performance rows.
 
 | Item | Value |
 | --- | --- |
-| GPU | 1x NVIDIA GeForce RTX 5090 (32 GB), driver 580.105.08, same GPU for both engines (sequential runs) |
+| GPU | 1x NVIDIA GeForce RTX 5090 (32 GB), driver 580.105.08, same GPU for each sequential run |
 | Model | Qwen3.5-4B, BF16 safetensors, TP1, text-only serving |
-| openinfer | main @ `f3dcdf4`, release build with `--features qwen35-4b`, CUDA Graph on by default |
-| vLLM | 0.23.0 from PyPI, checked as the latest stable release on 2026-06-15 ([PyPI](https://pypi.org/project/vllm/), [GitHub releases](https://github.com/vllm-project/vllm/releases)) |
+| openinfer | branch based on upstream/main `a1846ca`, release build with `--features qwen35-4b`, CUDA Graph decode on by default |
+| vLLM | 0.23.0 from PyPI, latest stable release checked in June 2026 |
+| openinfer serve flags | `--no-prefix-cache`, CUDA Graph decode on by default |
 | vLLM serve flags | `--language-model-only`, `--no-enable-prefix-caching`, `--max-model-len 8192`, `--gpu-memory-utilization 0.9` |
-| vLLM env | `VLLM_USE_FLASHINFER_SAMPLER=0`; this SM120/CUDA 12.8 host hit a FlashInfer sampler startup error otherwise. Attention still selected FlashAttention 2. |
+| vLLM env | `VLLM_USE_FLASHINFER_SAMPLER=0`; this SM120/CUDA 12.8 host hit a FlashInfer sampler startup error otherwise. Attention selected FlashAttention 2. |
 | Client | `vllm bench serve` 0.23.0 on localhost, OpenAI `/v1/completions` backend |
+| Profiler | Nsight Systems 2025.3.2 for OpenInfer direct measured-range and full HTTP traces. Nsight Compute was not used for claims on this host. |
 
-Client flags for both engines:
+Client flags for both HTTP engines:
 
 | Field | Value |
 | --- | --- |
 | Dataset | random |
-| Request count | `--num-prompts 30` |
-| Warmup | `--num-warmups 1` |
-| Concurrency | `--max-concurrency 1`, `--request-rate inf` |
+| Request count | `--num-prompts 64` |
+| Warmup | `--num-warmups 2` |
+| Request rate | `--request-rate inf` |
 | Length control | `--random-range-ratio 0.0` |
 | Decoding | `--temperature 0`, `--ignore-eos` |
+| Seed | `--seed 20260618` |
 
-## Results
+## OpenInfer Direct A/B
+
+Same binary interface, same model, same GPU. Baseline is upstream/main before
+the Qwen3.5 gate/up MLP fusion and decode cublasLt tuning in this branch.
+
+| Workload | Metric | upstream/main | tuned branch | Delta |
+| --- | --- | ---: | ---: | ---: |
+| 1 input / 256 output | steady TPOT avg | 6.524 ms | 6.386 ms | -2.1% |
+| 1 input / 512 output | steady TPOT avg | 6.603 ms | 6.397 ms | -3.1% |
+| 1024 input / 256 output | steady TPOT avg | 7.338 ms | 7.100 ms | -3.2% |
+| 2048 input / 1 output | TTFT avg | 97.978 ms | 95.855 ms | -2.2% |
+
+## HTTP Fixed Shapes
 
 | Workload | Metric | openinfer | vLLM 0.23.0 | Read |
 | --- | --- | ---: | ---: | --- |
-| 2048 input / 1 output | completed | 30/30 | 30/30 | both clean |
-| 2048 input / 1 output | reported input tokens | 58,324 (1,944.1/request) | 61,440 (2,048.0/request) | openinfer 5.1% fewer |
-| 2048 input / 1 output | TTFT p50 | 101.77 ms | 115.23 ms | reported lower; prompt-token counts differ |
-| 2048 input / 1 output | TTFT p99 | 108.69 ms | 123.73 ms | reported lower; prompt-token counts differ |
-| 2048 input / 1 output | request/output tok/s | 9.94 | 8.61 | client-contract throughput; prompt-token counts differ |
-| 1024 input / 256 output | completed | 30/30 | 30/30 | both clean |
-| 1024 input / 256 output | reported input tokens | 29,123 (970.8/request) | 30,720 (1,024.0/request) | openinfer 5.2% fewer |
-| 1024 input / 256 output | TTFT p50 | 53.75 ms | 67.38 ms | reported lower; prompt-token counts differ |
-| 1024 input / 256 output | TPOT p50 | 7.31 ms | **6.32 ms** | vLLM 13.4% lower |
-| 1024 input / 256 output | TPOT p99 | 7.36 ms | **6.35 ms** | vLLM 13.7% lower |
-| 1024 input / 256 output | output tok/s | 133.57 | **152.28** | vLLM 14.0% higher |
+| 1 input / 256 output | completed | 64/64 | 64/64 | both clean |
+| 1 input / 256 output | TTFT mean | 11.83 ms | 15.46 ms | openinfer lower on this client path |
+| 1 input / 256 output | TPOT mean | 6.282 ms | **6.214 ms** | vLLM 1.1% lower |
+| 1 input / 256 output | output tok/s | 158.58 | **159.95** | vLLM 0.9% higher |
+| 1 input / 512 output | completed | 64/64 | 64/64 | both clean |
+| 1 input / 512 output | TTFT mean | 11.55 ms | 16.23 ms | openinfer lower on this client path |
+| 1 input / 512 output | TPOT mean | 6.381 ms | **6.221 ms** | vLLM 2.5% lower |
+| 1 input / 512 output | output tok/s | 156.45 | **160.22** | vLLM 2.4% higher |
+| 1024 input / 256 output | completed | 64/64 | 64/64 | both clean |
+| 1024 input / 256 output | reported input tokens | 63,459 (991.5/request) | 65,536 (1,024.0/request) | prompt-token totals differ |
+| 1024 input / 256 output | TTFT mean | 55.29 ms | 66.34 ms | fixed-client timing, not token-normalized prefill |
+| 1024 input / 256 output | TPOT mean | 7.110 ms | **6.346 ms** | vLLM 10.8% lower |
+| 1024 input / 256 output | output tok/s | 136.98 | **151.92** | vLLM 10.9% higher |
+| 2048 input / 1 output | completed | 64/64 | 64/64 | both clean |
+| 2048 input / 1 output | reported input tokens | 126,957 (1,983.7/request) | 131,072 (2,048.0/request) | prompt-token totals differ |
+| 2048 input / 1 output | TTFT mean | 97.41 ms | 101.93 ms | fixed-client timing, not token-normalized prefill |
+| 2048 input / 1 output | output tok/s | 10.24 | 9.78 | client-contract throughput; prompt-token totals differ |
 
-Raw result JSONs were kept on the 5090 validation host under these filenames:
+## HTTP Concurrency Sweep
 
-- `openinfer-qwen35-prefill-2048x1-n30-warm1.json`
-- `openinfer-qwen35-decode-1024x256-n30-warm1.json`
-- `vllm023-qwen35-prefill-2048x1-n30-warm1.json`
-- `vllm023-qwen35-decode-1024x256-n30-warm1.json`
+Workload: 1024 input / 256 output, `num_prompts=64`, random fixed-length
+client probes, prefix cache disabled on both servers.
+
+| Max concurrency | openinfer TTFT mean | vLLM TTFT mean | openinfer TPOT mean | vLLM TPOT mean | openinfer output tok/s | vLLM output tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 55.29 ms | 66.34 ms | 7.110 ms | **6.346 ms** | 136.98 | **151.92** |
+| 2 | 82.07 ms | 97.64 ms | 8.146 ms | **7.148 ms** | 237.06 | **266.55** |
+| 4 | 167.04 ms | 165.88 ms | 9.263 ms | **7.459 ms** | 404.76 | **494.85** |
+| 8 | 352.18 ms | 232.45 ms | 11.333 ms | **8.650 ms** | 631.33 | **839.05** |
+| 16 | 741.95 ms | 358.21 ms | 15.566 ms | **9.823 ms** | 868.63 | **1425.72** |
+
+Extra diagnostic: an in-process openinfer 1024/256 concurrency-16 direct run
+reported steady TPOT avg `9.202 ms`, far below openinfer's HTTP concurrency-16
+TPOT `15.566 ms`. That points to a serving/scheduler/client interaction gap to
+investigate before treating the high-concurrency HTTP delta as purely a model
+kernel problem.
+
+## Profiling Notes
+
+Nsight Systems confirms the direct OpenInfer model path and the HTTP serving
+path should be read separately:
+
+- Direct `bench_serving request` with CUDA profiler capture around the measured
+  1024/256 concurrency-16 iteration reported steady TPOT avg `9.320 ms`
+  (`9.201 ms` p50, `9.300 ms` p99). The top GPU kernels were the tuned
+  cublasLt/CUTLASS GEMMs: 256x128 tile `50.9%` of kernel time, 128x256
+  `15.4%`, and 64x256 `13.5%`. Qwen3.5 GDR, conv, SiLU, and FlashInfer
+  attention were much smaller in that trace.
+- The full HTTP concurrency-16 trace measured TPOT avg `16.010 ms` for the
+  benchmarked requests, close to the standalone HTTP sweep row. Because the
+  trace includes server startup and warmup, its kernel-time totals are not a
+  measured-only attribution table. Still, the CUDA API/OS runtime summaries
+  showed large `cudaEventSynchronize`, `cuMemcpyHtoDAsync`, `futex`, `poll`,
+  and `epoll_wait` time, which points at serving/scheduler/event synchronization
+  work rather than one obvious missing model kernel.
+- `bench_serving decode` was not usable as a pure Qwen3.5 decode profile yet:
+  it requires cached-token accounting to prove prefill was excluded, and Qwen3.5
+  does not currently report that surface.
 
 ## Caveats
 
-- This is a fixed-length, single-concurrency HTTP serving probe. It is not a
-  QPS sweep, saturation result, prefix-cache result, or production-load claim.
-- The table uses the client-requested input/output lengths as the workload
-  contract. Response `usage.prompt_tokens` totals differ between the two
-  servers on these random text prompts: `58,324` vs `61,440` for 2048/1 and
-  `29,123` vs `30,720` for 1024/256. Read the TTFT rows as fixed-client
-  workload timings, not token-normalized prefill throughput.
+- This is a same-host synthetic benchmark, not a production traffic trace.
+- The 1-token-prompt decode rows have equal reported input/output token totals.
+  The 1024/256 and 2048/1 rows do not, so TTFT is a fixed-client workload
+  timing rather than token-normalized prefill throughput.
+- Prefix cache was disabled on both servers for this refresh.
 - vLLM startup was made serviceable on this host by disabling the FlashInfer
-  sampler path. That changes sampling implementation, not the measured
-  attention backend; the server log selected FlashAttention 2.
-- vLLM still has the decode TPOT edge on this shape. The openinfer result to
-  carry into the README is narrower: lower reported TTFT on both fixed-client
-  shapes, with a prompt-token-count caveat and a decode throughput gap still
-  visible.
+  sampler path. The measured decode was greedy (`temperature=0`); attention
+  still selected FlashAttention 2.
+- Nsight Systems was used for OpenInfer direct and HTTP diagnostics. The direct
+  trace has a measured CUDA profiler range; the HTTP trace is full-process and
+  should be treated as coarse attribution only.
+- The current honest claim is narrower than vLLM parity: this branch improves
+  openinfer Qwen3.5 decode TPOT by a few percent, closes most of the prompt-len
+  1 HTTP decode gap, and leaves the 1024/256 plus high-concurrency HTTP gap as
+  follow-up work.

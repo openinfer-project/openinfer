@@ -56,8 +56,7 @@ pub(super) enum LayerKind {
 /// MLP layer weights (shared between both layer types).
 #[allow(clippy::struct_field_names)]
 pub(super) struct MLP35 {
-    pub(super) gate_proj: DeviceMatrix,
-    pub(super) up_proj: DeviceMatrix,
+    pub(super) gate_up_proj: DeviceMatrix,
     pub(super) down_proj: DeviceMatrix,
 }
 
@@ -243,6 +242,22 @@ impl Qwen35Model {
                 }
             };
 
+            let gate_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.mlp.gate_proj.weight", prefix),
+            )?;
+            let up_proj = load_tensor_2d(
+                &ctx,
+                &shards,
+                &weight_map,
+                &format!("{}.mlp.up_proj.weight", prefix),
+            )?;
+            let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
+            drop(gate_proj);
+            drop(up_proj);
+
             let block = TransformerBlock35 {
                 input_layernorm: load_tensor_1d(
                     &ctx,
@@ -258,18 +273,7 @@ impl Qwen35Model {
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
                 mlp: MLP35 {
-                    gate_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.gate_proj.weight", prefix),
-                    )?,
-                    up_proj: load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.up_proj.weight", prefix),
-                    )?,
+                    gate_up_proj,
                     down_proj: load_tensor_2d(
                         &ctx,
                         &shards,
@@ -385,6 +389,113 @@ impl Qwen35Model {
     pub(crate) fn kv_pool(&self) -> &openinfer_core::kv_pool::KvPool {
         &self.kv_pool
     }
+
+    /// Tune small-batch decode GEMM algorithms on the thread that will capture
+    /// or replay the CUDA Graph. cuBLASLt plans are thread-local, so scheduler
+    /// workers and model-local executors must call this after binding CUDA.
+    /// Repeated calls on the same thread return from the existing plan cache;
+    /// calls on different worker threads populate separate thread-local plans.
+    pub(crate) fn tune_decode_gemm_algos(&self) -> Result<()> {
+        let ctx = &self.ctx;
+        let hidden = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let full_q = self.config.full_attn_q_proj_dim();
+        let full_kv = self.config.full_attn_kv_dim();
+        let linear_qkv = self.config.linear_attn_qkv_dim();
+        let linear_z = self.config.linear_attn_z_dim();
+        let linear_ba = self.config.linear_num_value_heads;
+        let intermediate = self.config.intermediate_size;
+
+        let full_q_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::FullAttention(attn) => Some((&attn.q_proj, 0)),
+                LayerKind::LinearAttention(_) => None,
+            })
+            .collect();
+        let full_kv_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::FullAttention(attn) => Some([(&attn.k_proj, 0), (&attn.v_proj, 0)]),
+                LayerKind::LinearAttention(_) => None,
+            })
+            .flatten()
+            .collect();
+        let full_o_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::FullAttention(attn) => Some((&attn.o_proj, 0)),
+                LayerKind::LinearAttention(_) => None,
+            })
+            .collect();
+        let linear_qkv_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::LinearAttention(attn) => Some((&attn.in_proj_qkv, 0)),
+                LayerKind::FullAttention(_) => None,
+            })
+            .collect();
+        let linear_z_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::LinearAttention(attn) => Some((&attn.in_proj_z, 0)),
+                LayerKind::FullAttention(_) => None,
+            })
+            .collect();
+        let linear_ba_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::LinearAttention(attn) => {
+                    Some([(&attn.in_proj_b, 0), (&attn.in_proj_a, 0)])
+                }
+                LayerKind::FullAttention(_) => None,
+            })
+            .flatten()
+            .collect();
+        let linear_out_samples: Vec<_> = self
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                LayerKind::LinearAttention(attn) => Some((&attn.out_proj, 0)),
+                LayerKind::FullAttention(_) => None,
+            })
+            .collect();
+        let gate_up_samples: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| (&layer.mlp.gate_up_proj, 0))
+            .collect();
+        let down_samples: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| (&layer.mlp.down_proj, 0))
+            .collect();
+        let lm_head_samples = [(&self.embed_tokens, 0)];
+
+        for &n in super::batch_decode_graph::BATCH_BUCKETS
+            .iter()
+            .filter(|&&bucket| bucket <= crate::ops::GEMM_LT_MAX_N)
+        {
+            tune_if_nonempty(ctx, &full_q_samples, full_q, n)?;
+            tune_if_nonempty(ctx, &full_kv_samples, full_kv, n)?;
+            tune_if_nonempty(ctx, &full_o_samples, hidden, n)?;
+            tune_if_nonempty(ctx, &linear_qkv_samples, linear_qkv, n)?;
+            tune_if_nonempty(ctx, &linear_z_samples, linear_z, n)?;
+            tune_if_nonempty(ctx, &linear_ba_samples, linear_ba, n)?;
+            tune_if_nonempty(ctx, &linear_out_samples, hidden, n)?;
+            crate::ops::gemm_lt_tune(ctx, &gate_up_samples, 2 * intermediate, n)?;
+            crate::ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
+            crate::ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
+        }
+        Ok(())
+    }
+
     /// Create a CUDA Graph batch decode state with a custom slot capacity.
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
@@ -401,4 +512,16 @@ impl Qwen35Model {
     pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
         token_id == self.config.eos_token_id
     }
+}
+
+fn tune_if_nonempty(
+    ctx: &DeviceContext,
+    samples: &[(&DeviceMatrix, usize)],
+    rows: usize,
+    n: usize,
+) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    crate::ops::gemm_lt_tune(ctx, samples, rows, n)
 }

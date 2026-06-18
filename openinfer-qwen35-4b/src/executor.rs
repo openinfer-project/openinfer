@@ -133,6 +133,7 @@ impl Qwen35Executor {
             enable_cuda_graph,
             device_ordinals[0],
         )?;
+        model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
         Ok(Self {
             model,

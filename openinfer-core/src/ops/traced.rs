@@ -174,7 +174,7 @@ pub fn silu_mul_fused_batch_into(
     ctx: &DeviceContext,
     gate_up: &HiddenStates,
     out: &mut HiddenStates,
-) {
+) -> anyhow::Result<()> {
     if call_trace::is_enabled() {
         let label = call_trace::current_label("silu_mul_fused_batch");
         call_trace::record_call(silu_mul_fused_batch_call(
@@ -183,7 +183,7 @@ pub fn silu_mul_fused_batch_into(
             gate_up.seq_len,
         ));
     }
-    openinfer_kernels::ops::silu_mul_fused_batch_into(ctx, gate_up, out);
+    openinfer_kernels::ops::silu_mul_fused_batch_into(ctx, gate_up, out)
 }
 
 pub(crate) fn paged_decode_call_spec(

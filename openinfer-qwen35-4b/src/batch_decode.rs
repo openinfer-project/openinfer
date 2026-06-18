@@ -283,17 +283,11 @@ impl Qwen35Model {
 
             ops::gemm_into(
                 &self.ctx,
-                &layer.mlp.gate_proj,
+                &layer.mlp.gate_up_proj,
                 &bufs.normed,
-                &mut bufs.gate_out,
+                &mut bufs.gate_up_out,
             );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &bufs.normed,
-                &mut bufs.up_out,
-            );
-            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
             ops::gemm_into(
                 &self.ctx,
                 &layer.mlp.down_proj,
