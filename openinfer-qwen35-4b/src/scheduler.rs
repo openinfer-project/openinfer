@@ -213,11 +213,8 @@ fn scheduler_loop(
             }
         }
 
-        // 3. Compute the available budget and admit new prompts. Each in-flight
-        //    prefill reserves the graph slot it will promote into and the future
-        //    KV growth it will still claim, so shrink the slot/page budgets handed
-        //    to admission accordingly. This guarantees `active + prefilling ≤
-        //    max_batch`, so a promotion's `slot_for_new_request` never fails.
+        // 3. Admit new prompts. In-flight prefills reserve their promotion slot
+        //    and future KV growth, so shrink the slot/page budgets accordingly
         let active_budget: Vec<ActiveKvBudget> = active
             .iter()
             .map(|req| ActiveKvBudget {
@@ -235,9 +232,6 @@ fn scheduler_loop(
                 max_tokens: p.req.max_tokens,
             })
             .collect();
-        // `available_pages` already excludes pages held by in-flight prefill KV
-        // (the `cursor` tokens); subtract the future growth those prefills will
-        // still claim, the same reservation `active_future_pages` makes for decode.
         let page_budget = model
             .kv_pool()
             .available_pages()
@@ -259,10 +253,8 @@ fn scheduler_loop(
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
         }
-        deferred = admission.deferred;
 
-        // 4. Move freshly admitted prompts into the chunked-prefill queue. Their
-        //    KV and recurrent state persist here across steps as chunks advance.
+        // 4. Move freshly admitted prompts into the chunked-prefill queue.
         for req in admission.pending {
             debug!(
                 "request admitted: request_id={:?} prompt_len={} max_tokens={}",
@@ -289,9 +281,10 @@ fn scheduler_loop(
             }
         }
 
+        deferred = admission.deferred;
+
         // 5. Take this step's budgeted prefill chunk off the front of the queue,
-        //    then dispatch by plan. Unfinished chunks are re-queued at the FRONT
-        //    of `prefilling` inside `prefill_batch` / `unified_step_sched`.
+        //    then dispatch by plan.
         let scheduled = take_prefill_chunks(&mut prefilling, prefill_budget);
         if let Some(plan) = plan::build_next_plan(!active.is_empty(), scheduled) {
             match plan {
@@ -344,10 +337,6 @@ fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
 
 // ── Batch prefill ───────────────────────────────────────────────────────
 
-/// Prefill this step's scheduled chunk for each queued prompt, then promote the
-/// prompts that finished and re-queue the rest. Mirrors the whole-prompt path,
-/// but the prompts are the per-step chunk windows and the KV/recurrent state
-/// comes from (and returns to) the `prefilling` queue.
 fn prefill_batch(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
@@ -435,10 +424,6 @@ fn sample_prefill_logits(
 
 // ── Unified step (prefill chunk + decode in one forward pass) ──────────────
 
-/// Prefill this step's scheduled chunk AND decode the active batch in one
-/// `unified_step` call. Decode results are processed first (it may retire
-/// requests and free graph slots), then finished prompts are promoted into the
-/// freed slots and unfinished chunks re-queued.
 fn unified_step_sched(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
@@ -777,16 +762,14 @@ fn compact_slot(
 
 // ── Chunked-prefill helpers ────────────────────────────────────────────────
 
-/// This step's scheduled prefill set, decomposed into parallel arrays so the
-/// owned KV / recurrent state can be passed to the executor (`&mut [KvState]`)
-/// and then moved into the decode batch (finished) or back into the queue.
+/// Step's scheduled prefill set
 struct ScheduledChunk {
     reqs: Vec<SchedulerRequest>,
     kvs: Vec<KvState>,
     recs: Vec<RecurrentState>,
-    /// Prompt cursor after this step's chunk (== prompt len ⇒ finished).
+    /// Prompt cursor after this step's chunk
     ends: Vec<usize>,
-    /// This step's chunk slice per request (`prompt_tokens[cursor..end]`).
+    /// This step's chunked token slice per request
     windows: Vec<Vec<u32>>,
 }
 
@@ -866,8 +849,7 @@ fn promote_or_requeue(
     let mut still_prefilling: Vec<PrefillingRequest35> = Vec::new();
 
     for (i, (((req, kv), rec), end)) in reqs.into_iter().zip(kvs).zip(recs).zip(ends).enumerate() {
-        // Not finished: re-queue with the advanced cursor; its sampled token
-        // (a mid-prompt position) is discarded.
+        // Not finished: re-queue with the advanced cursor
         if end < req.prompt_tokens.len() {
             still_prefilling.push(PrefillingRequest35 {
                 req,
