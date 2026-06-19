@@ -21,6 +21,7 @@ struct Demux {
     streams: HashMap<RequestTag, RequestStreamState>,
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
+    telemetry: Telemetry,
 }
 
 impl Demux {
@@ -33,6 +34,7 @@ impl Demux {
             streams: HashMap::new(),
             output_tx,
             output_rx,
+            telemetry: Telemetry::new(),
         }
     }
 
@@ -40,9 +42,13 @@ impl Demux {
     fn add(&mut self, id: &str) -> Arc<AtomicBool> {
         let tag: RequestTag = Arc::from(id);
         let cancelled = Arc::new(AtomicBool::new(false));
+        self.telemetry.request_started();
         self.streams.insert(
             Arc::clone(&tag),
-            RequestStreamState::new(Arc::clone(&cancelled)),
+            RequestStreamState::new(
+                Arc::clone(&cancelled),
+                RequestTrace::new(id.to_string(), 1.0, 0),
+            ),
         );
         cancelled
     }
@@ -62,6 +68,7 @@ impl Demux {
                     &mut self.event_rx,
                     &mut self.streams,
                     &self.output_tx,
+                    &self.telemetry,
                 )
                 .expect("dispatch burst");
                 true
@@ -145,6 +152,49 @@ fn token_and_finish_in_one_burst_coalesce() {
     assert_eq!(direct.positions[1].entries[0].token_id, 21);
 
     assert!(d.next_output().is_none());
+}
+
+#[test]
+fn telemetry_records_finished_request_once() {
+    let mut d = Demux::new();
+    let now = now_secs_f64();
+    d.add("req-metrics");
+    d.emit(
+        "req-metrics",
+        TokenEvent::Scheduled {
+            queued_at_unix_s: now - 0.010,
+            scheduled_at_unix_s: now,
+            prompt_tokens: 8,
+            cached_tokens: 3,
+        },
+    );
+    d.emit(
+        "req-metrics",
+        TokenEvent::Token {
+            id: 7,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-metrics",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            prompt_tokens: 8,
+            completion_tokens: 1,
+        },
+    );
+    assert!(d.drain());
+
+    let text = d.telemetry.render();
+    assert!(text.contains("openinfer_frontend_active_requests 0"));
+    assert!(text.contains("openinfer_frontend_requests_started_total 1"));
+    assert!(text.contains("openinfer_frontend_requests_finished_total{outcome=\"length\"} 1"));
+    assert!(text.contains("openinfer_frontend_prompt_tokens_total 8"));
+    assert!(text.contains("openinfer_frontend_cached_prompt_tokens_total 3"));
+    assert!(text.contains("openinfer_frontend_completion_tokens_total 1"));
+    assert!(text.contains("openinfer_frontend_queue_wait_ms_count 1"));
+    assert!(text.contains("openinfer_frontend_ttft_ms_count 1"));
+    assert!(text.contains("openinfer_frontend_request_duration_ms_count 1"));
 }
 
 /// A lone `Scheduled` (no token yet) emits nothing; its metadata waits in the
@@ -333,11 +383,13 @@ fn burst_batches_multiple_requests_into_one_message() {
 #[test]
 fn aborted_request_drops_late_tokens() {
     let mut d = Demux::new();
-    let cancelled = d.add("req-abort");
+    d.add("req-abort");
 
     // Replicate the Abort handler: flip the cancel flag, drop the stream.
-    cancelled.store(true, Ordering::Relaxed);
-    d.streams.remove("req-abort");
+    let state = d.streams.remove("req-abort").expect("registered stream");
+    state.cancelled.store(true, Ordering::Relaxed);
+    d.telemetry
+        .finish_request(&state.trace, RequestOutcome::Aborted, now_secs_f64());
 
     d.emit(
         "req-abort",
@@ -351,6 +403,9 @@ fn aborted_request_drops_late_tokens() {
         d.next_output().is_none(),
         "no output is produced for an aborted request"
     );
+    let text = d.telemetry.render();
+    assert!(text.contains("openinfer_frontend_active_requests 0"));
+    assert!(text.contains("openinfer_frontend_requests_finished_total{outcome=\"aborted\"} 1"));
 }
 
 /// A rejected request (could not be admitted, e.g. too large for the KV cache)

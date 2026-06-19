@@ -182,6 +182,65 @@ pub type RequestTag = Arc<str>;
 pub type TokenStreamSender = mpsc::UnboundedSender<(RequestTag, TokenEvent)>;
 pub type TokenStreamReceiver = mpsc::UnboundedReceiver<(RequestTag, TokenEvent)>;
 
+// Request tracing level policy:
+// - DEBUG span/event: successful request lifecycle, useful while debugging.
+// - WARN terminal event: rejected requests.
+// - ERROR terminal event: execution failures.
+// High-volume success counts and token totals belong to `metrics`; the shared
+// serving path intentionally does not emit per-token tracing events.
+macro_rules! request_span {
+    ($request_id:expr) => {
+        tracing::debug_span!(
+            "openinfer.request",
+            request_id = $request_id,
+            queued_at_unix_s = tracing::field::Empty,
+            scheduled_at_unix_s = tracing::field::Empty,
+            terminal_at_unix_s = tracing::field::Empty,
+            finish_reason = tracing::field::Empty,
+            prompt_tokens = tracing::field::Empty,
+            cached_prompt_tokens = tracing::field::Empty,
+            completion_tokens = tracing::field::Empty,
+        )
+    };
+}
+
+macro_rules! request_scheduled_event {
+    ($span:expr, $queued_at_unix_s:expr, $scheduled_at_unix_s:expr, $prompt_tokens:expr, $cached_tokens:expr) => {
+        tracing::debug!(
+            parent: $span,
+            queued_at_unix_s = $queued_at_unix_s,
+            scheduled_at_unix_s = $scheduled_at_unix_s,
+            prompt_tokens = $prompt_tokens as u64,
+            cached_prompt_tokens = $cached_tokens as u64,
+            "openinfer_request_scheduled"
+        )
+    };
+}
+
+macro_rules! request_terminal_event {
+    ($level:ident, $span:expr, $terminal_at_unix_s:expr, $finish_reason:expr, $prompt_tokens:expr, $completion_tokens:expr) => {
+        tracing::$level!(
+            parent: $span,
+            terminal_at_unix_s = $terminal_at_unix_s,
+            finish_reason = $finish_reason,
+            prompt_tokens = $prompt_tokens as u64,
+            completion_tokens = $completion_tokens as u64,
+            "openinfer_request_finished"
+        )
+    };
+    ($level:ident, $span:expr, $terminal_at_unix_s:expr, $finish_reason:expr, $prompt_tokens:expr, $completion_tokens:expr, $message:expr) => {
+        tracing::$level!(
+            parent: $span,
+            terminal_at_unix_s = $terminal_at_unix_s,
+            finish_reason = $finish_reason,
+            prompt_tokens = $prompt_tokens as u64,
+            completion_tokens = $completion_tokens as u64,
+            message = $message.as_str(),
+            "openinfer_request_finished"
+        )
+    };
+}
+
 /// Per-request handle the scheduler holds to emit [`TokenEvent`]s.
 ///
 /// Drop-in for the former `UnboundedSender<TokenEvent>`: it keeps the same
@@ -203,11 +262,18 @@ pub struct TokenSink {
     tag: RequestTag,
     tx: TokenStreamSender,
     cancelled: Arc<AtomicBool>,
+    span: tracing::Span,
 }
 
 impl TokenSink {
     pub fn new(tag: RequestTag, tx: TokenStreamSender, cancelled: Arc<AtomicBool>) -> Self {
-        Self { tag, tx, cancelled }
+        let span = request_span!(tag.as_ref());
+        Self {
+            tag,
+            tx,
+            cancelled,
+            span,
+        }
     }
 
     /// Emit one event for this request. Returns `Err` (handing the event back)
@@ -219,6 +285,7 @@ impl TokenSink {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(mpsc::error::SendError(event));
         }
+        self.observe_event(&event);
         self.tx.send((self.tag.clone(), event)).map_err(|err| {
             let (_, event) = err.0;
             mpsc::error::SendError(event)
@@ -235,6 +302,155 @@ impl TokenSink {
         &self.tag
     }
 
+    fn observe_event(&self, event: &TokenEvent) {
+        match event {
+            TokenEvent::Scheduled {
+                queued_at_unix_s,
+                scheduled_at_unix_s,
+                prompt_tokens,
+                cached_tokens,
+            } => {
+                metrics::counter!("openinfer_engine_requests_scheduled_total").increment(1);
+                metrics::counter!("openinfer_engine_cached_prompt_tokens_total")
+                    .increment(*cached_tokens as u64);
+                metrics::histogram!("openinfer_engine_queue_wait_ms")
+                    .record((scheduled_at_unix_s - queued_at_unix_s).max(0.0) * 1_000.0);
+                self.span.record("queued_at_unix_s", *queued_at_unix_s);
+                self.span
+                    .record("scheduled_at_unix_s", *scheduled_at_unix_s);
+                self.span.record("prompt_tokens", *prompt_tokens as u64);
+                self.span
+                    .record("cached_prompt_tokens", *cached_tokens as u64);
+                request_scheduled_event!(
+                    &self.span,
+                    *queued_at_unix_s,
+                    *scheduled_at_unix_s,
+                    *prompt_tokens,
+                    *cached_tokens
+                );
+            }
+            TokenEvent::Token { .. } | TokenEvent::PromptTokens { .. } => {}
+            TokenEvent::Finished {
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let terminal_at_unix_s = unix_now_s();
+                let finish_reason = finish_reason_label(*finish_reason);
+                metrics::counter!(
+                    "openinfer_engine_requests_finished_total",
+                    "outcome" => finish_reason
+                )
+                .increment(1);
+                metrics::counter!("openinfer_engine_prompt_tokens_total")
+                    .increment(*prompt_tokens as u64);
+                metrics::counter!("openinfer_engine_completion_tokens_total")
+                    .increment(*completion_tokens as u64);
+                self.record_terminal_fields(
+                    terminal_at_unix_s,
+                    finish_reason,
+                    *prompt_tokens,
+                    *completion_tokens,
+                );
+                if finish_reason == "error" {
+                    request_terminal_event!(
+                        error,
+                        &self.span,
+                        terminal_at_unix_s,
+                        finish_reason,
+                        *prompt_tokens,
+                        *completion_tokens
+                    );
+                } else {
+                    request_terminal_event!(
+                        debug,
+                        &self.span,
+                        terminal_at_unix_s,
+                        finish_reason,
+                        *prompt_tokens,
+                        *completion_tokens
+                    );
+                }
+            }
+            TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let terminal_at_unix_s = unix_now_s();
+                metrics::counter!(
+                    "openinfer_engine_requests_finished_total",
+                    "outcome" => "error"
+                )
+                .increment(1);
+                metrics::counter!("openinfer_engine_prompt_tokens_total")
+                    .increment(*prompt_tokens as u64);
+                metrics::counter!("openinfer_engine_completion_tokens_total")
+                    .increment(*completion_tokens as u64);
+                self.record_terminal_fields(
+                    terminal_at_unix_s,
+                    "error",
+                    *prompt_tokens,
+                    *completion_tokens,
+                );
+                request_terminal_event!(
+                    error,
+                    &self.span,
+                    terminal_at_unix_s,
+                    "error",
+                    *prompt_tokens,
+                    *completion_tokens,
+                    message
+                );
+            }
+            TokenEvent::Rejected {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let terminal_at_unix_s = unix_now_s();
+                metrics::counter!(
+                    "openinfer_engine_requests_finished_total",
+                    "outcome" => "rejected"
+                )
+                .increment(1);
+                metrics::counter!("openinfer_engine_prompt_tokens_total")
+                    .increment(*prompt_tokens as u64);
+                metrics::counter!("openinfer_engine_completion_tokens_total")
+                    .increment(*completion_tokens as u64);
+                self.record_terminal_fields(
+                    terminal_at_unix_s,
+                    "rejected",
+                    *prompt_tokens,
+                    *completion_tokens,
+                );
+                request_terminal_event!(
+                    warn,
+                    &self.span,
+                    terminal_at_unix_s,
+                    "rejected",
+                    *prompt_tokens,
+                    *completion_tokens,
+                    message
+                );
+            }
+        }
+    }
+
+    fn record_terminal_fields(
+        &self,
+        terminal_at_unix_s: f64,
+        finish_reason: &'static str,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    ) {
+        self.span.record("terminal_at_unix_s", terminal_at_unix_s);
+        self.span.record("finish_reason", finish_reason);
+        self.span.record("prompt_tokens", prompt_tokens as u64);
+        self.span
+            .record("completion_tokens", completion_tokens as u64);
+    }
+
     /// A sink backed by its own private channel, for direct drivers
     /// (benchmarks, integration tests, the simulator) that consume one
     /// request's events without the shared frontend demux. The returned
@@ -243,6 +459,14 @@ impl TokenSink {
         let (tx, rx) = mpsc::unbounded_channel();
         let sink = Self::new(Arc::from("local"), tx, Arc::new(AtomicBool::new(false)));
         (sink, rx)
+    }
+}
+
+fn finish_reason_label(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Length => "length",
+        FinishReason::Stop => "stop",
+        FinishReason::Error => "error",
     }
 }
 
@@ -371,7 +595,7 @@ impl EngineHandle {
         &self,
         req: GenerateRequest,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
-        match self.inner.submit_tx.as_ref() {
+        let result = match self.inner.submit_tx.as_ref() {
             Some(submit_tx) => submit_tx.send(req),
             None => match self.inner.command_tx.as_ref() {
                 Some(command_tx) => command_tx
@@ -382,7 +606,11 @@ impl EngineHandle {
                     }),
                 None => Err(mpsc::error::SendError(req)),
             },
+        };
+        if result.is_ok() {
+            metrics::counter!("openinfer_engine_requests_submitted_total").increment(1);
         }
+        result
     }
 
     pub fn supports_lora_control(&self) -> bool {

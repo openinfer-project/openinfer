@@ -27,6 +27,7 @@ use openinfer_engine::engine::{
     EngineHandle, GenerateRequest, RequestTag, TokenEvent, TokenSink, TokenStreamReceiver,
 };
 
+use crate::telemetry::{RequestOutcome, RequestTrace, Telemetry};
 use crate::wire::{
     convert_finish_reason, convert_sampling, lora_adapter_from_sampling_params, requested_logprobs,
     to_wire_position_logprobs,
@@ -39,6 +40,7 @@ pub(crate) struct LocalEngineBridge {
     pub(crate) output_address: String,
     pub(crate) handle: EngineHandle,
     pub(crate) max_model_len: u32,
+    pub(crate) telemetry: Telemetry,
 }
 
 impl LocalEngineBridge {
@@ -106,7 +108,7 @@ impl LocalEngineBridge {
                 () = shutdown.cancelled() => break,
                 Some(first) = event_rx.recv() => {
                     if let Err(error) =
-                        dispatch_burst(first, &mut event_rx, &mut streams, &output_tx)
+                        dispatch_burst(first, &mut event_rx, &mut streams, &output_tx, &self.telemetry)
                     {
                         warn!("local engine bridge output failed: {error:#}");
                     }
@@ -169,6 +171,11 @@ impl LocalEngineBridge {
                     // finds no stream entry.
                     if let Some(state) = streams.remove(request_id.as_str()) {
                         state.cancelled.store(true, Ordering::Release);
+                        self.telemetry.finish_request(
+                            &state.trace,
+                            RequestOutcome::Aborted,
+                            now_secs_f64(),
+                        );
                     }
                 }
                 Ok(())
@@ -201,6 +208,7 @@ impl LocalEngineBridge {
         } = request;
         let Some(prompt_tokens) = prompt_token_ids else {
             warn!("request {request_id} dropped: missing prompt_token_ids");
+            self.telemetry.request_rejected(0);
             send_terminal_output(
                 output_tx,
                 request_id,
@@ -213,6 +221,7 @@ impl LocalEngineBridge {
         };
         let Some(sampling_params) = sampling_params else {
             warn!("request {request_id} dropped: missing sampling_params");
+            self.telemetry.request_rejected(prompt_tokens.len());
             send_terminal_output(
                 output_tx,
                 request_id,
@@ -227,6 +236,11 @@ impl LocalEngineBridge {
         let tag: RequestTag = Arc::from(request_id.as_str());
         let cancelled = Arc::new(AtomicBool::new(false));
         let token_tx = TokenSink::new(tag.clone(), event_tx.clone(), Arc::clone(&cancelled));
+        let trace = RequestTrace::new(
+            request_id.clone(),
+            request.arrival_time,
+            prompt_tokens.len(),
+        );
         self.handle
             .submit(GenerateRequest {
                 request_id: Some(request_id),
@@ -241,7 +255,8 @@ impl LocalEngineBridge {
             })
             .context("failed to submit request to scheduler")?;
 
-        streams.insert(tag, RequestStreamState::new(cancelled));
+        self.telemetry.request_started();
+        streams.insert(tag, RequestStreamState::new(cancelled, trace));
         Ok(())
     }
 }
@@ -255,14 +270,16 @@ struct RequestStreamState {
     first_token_events: Option<Vec<EngineCoreEvent>>,
     first_token_prefill_stats: Option<PrefillStats>,
     cancelled: Arc<AtomicBool>,
+    trace: RequestTrace,
 }
 
 impl RequestStreamState {
-    fn new(cancelled: Arc<AtomicBool>) -> Self {
+    fn new(cancelled: Arc<AtomicBool>, trace: RequestTrace) -> Self {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
             cancelled,
+            trace,
         }
     }
 }
@@ -277,6 +294,7 @@ fn dispatch_burst(
     event_rx: &mut TokenStreamReceiver,
     streams: &mut HashMap<RequestTag, RequestStreamState>,
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
+    telemetry: &Telemetry,
 ) -> Result<()> {
     // Bucket the burst by request, keeping first-seen order so outputs are
     // deterministic and each request's events stay in arrival order.
@@ -304,11 +322,12 @@ fn dispatch_burst(
         let Some(state) = streams.get_mut(&tag) else {
             continue;
         };
-        let (output, terminated) = reduce_request(&tag, state, events);
+        let (output, terminal_outcome) = reduce_request(&tag, state, events);
         if let Some(output) = output {
             outputs.push(output);
         }
-        if terminated {
+        if let Some(outcome) = terminal_outcome {
+            telemetry.finish_request(&state.trace, outcome, now_secs_f64());
             streams.remove(&tag);
             finished_requests.insert(tag.to_string());
         }
@@ -333,21 +352,21 @@ fn dispatch_burst(
 /// Tokens coalesce, and a trailing terminal rides the same output carrying its
 /// finish reason; `first_token_events`/`prefill_stats` flush onto whichever
 /// output goes first. A lone `Scheduled` (no token, no terminal) yields no
-/// output — its metadata waits in `state` for the first real output. Returns
-/// `(output, terminated)`.
+/// output — its metadata waits in `state` for the first real output.
 fn reduce_request(
     request_id: &str,
     state: &mut RequestStreamState,
     events: Vec<TokenEvent>,
-) -> (Option<EngineCoreOutput>, bool) {
+) -> (Option<EngineCoreOutput>, Option<RequestOutcome>) {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut positions: Vec<PositionLogprobs> = Vec::new();
     let mut has_logprobs = false;
     let mut finish_reason: Option<EngineCoreFinishReason> = None;
     let mut stop_reason: Option<StopReason> = None;
-    let mut terminated = false;
+    let mut terminal_outcome: Option<RequestOutcome> = None;
 
     for event in events {
+        terminal_outcome = state.trace.observe_event(&event).or(terminal_outcome);
         match event {
             TokenEvent::Scheduled {
                 queued_at_unix_s,
@@ -394,13 +413,11 @@ fn reduce_request(
                 finish_reason: fr, ..
             } => {
                 finish_reason = Some(convert_finish_reason(fr));
-                terminated = true;
             }
             TokenEvent::Error { message, .. } => {
                 warn!("request {request_id} failed: {message}");
                 finish_reason = Some(EngineCoreFinishReason::Error);
                 stop_reason = Some(StopReason::Text(message));
-                terminated = true;
             }
             TokenEvent::Rejected { message, .. } => {
                 // Rejected means the request could not be admitted, not that it
@@ -408,13 +425,13 @@ fn reduce_request(
                 warn!("request {request_id} rejected: {message}");
                 finish_reason = Some(EngineCoreFinishReason::Error);
                 stop_reason = Some(StopReason::Text(message));
-                terminated = true;
             }
         }
     }
+    let terminated = terminal_outcome.is_some();
 
     if token_ids.is_empty() && !terminated {
-        return (None, false);
+        return (None, None);
     }
 
     let logprobs = has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions }));
@@ -427,7 +444,7 @@ fn reduce_request(
         state.first_token_events.take(),
         state.first_token_prefill_stats.take(),
     );
-    (Some(output), terminated)
+    (Some(output), terminal_outcome)
 }
 
 async fn output_loop(

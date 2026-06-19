@@ -22,13 +22,19 @@ use openinfer_engine::engine::EngineHandle;
 mod bridge;
 mod lora;
 mod sampling_guard;
+pub mod telemetry;
 mod wire;
 
 use bridge::{LocalEngineBridge, ipc_endpoint, local_ipc_namespace};
 use lora::{bad_request, load_startup_lora_modules, lora_openai_routes, lora_routes};
 use sampling_guard::{ServableCap, guard_generation_request};
+use telemetry::{guard_metrics_request, traces_router};
 
 pub use lora::LoraModule;
+pub use telemetry::{
+    OpenTelemetryOptions, OpenTelemetrySink, RequestMetrics, RequestOutcome, Telemetry,
+    TelemetryOptions,
+};
 
 const COMPLETION_ROUTE_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -61,6 +67,27 @@ pub async fn serve(
     max_model_len: Option<u32>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    serve_with_telemetry(
+        engine,
+        model_path,
+        served_model_name,
+        port,
+        max_model_len,
+        shutdown,
+        Telemetry::new(),
+    )
+    .await
+}
+
+pub async fn serve_with_telemetry(
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    model_path: &Path,
+    served_model_name: Vec<String>,
+    port: u16,
+    max_model_len: Option<u32>,
+    shutdown: CancellationToken,
+    telemetry: Telemetry,
+) -> Result<()> {
     serve_model_on_host(
         engine,
         model_path.to_string_lossy().into_owned(),
@@ -69,6 +96,7 @@ pub async fn serve(
         port,
         resolve_max_model_len(model_path, max_model_len),
         shutdown,
+        telemetry,
     )
     .await
 }
@@ -81,6 +109,29 @@ pub async fn serve_model_with_lora_routes(
     port: u16,
     max_model_len: u32,
     shutdown: CancellationToken,
+) -> Result<()> {
+    serve_model_with_lora_routes_and_telemetry(
+        handle,
+        model_id,
+        served_model_name,
+        lora_modules,
+        port,
+        max_model_len,
+        shutdown,
+        Telemetry::new(),
+    )
+    .await
+}
+
+pub async fn serve_model_with_lora_routes_and_telemetry(
+    handle: EngineHandle,
+    model_id: impl Into<String>,
+    served_model_name: Vec<String>,
+    lora_modules: Vec<LoraModule>,
+    port: u16,
+    max_model_len: u32,
+    shutdown: CancellationToken,
+    telemetry: Telemetry,
 ) -> Result<()> {
     let model_id = model_id.into();
     let adapter_names = Arc::new(RwLock::new(HashSet::new()));
@@ -97,6 +148,7 @@ pub async fn serve_model_with_lora_routes(
         port,
         max_model_len,
         shutdown,
+        telemetry,
         move |router| {
             let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
             let openai_router = lora_openai_routes(
@@ -119,6 +171,7 @@ async fn serve_model_on_host(
     port: u16,
     max_model_len: u32,
     shutdown: CancellationToken,
+    telemetry: Telemetry,
 ) -> Result<()> {
     serve_model_on_host_with_router_extension(
         engine,
@@ -128,6 +181,7 @@ async fn serve_model_on_host(
         port,
         max_model_len,
         shutdown,
+        telemetry,
         |router| router,
     )
     .await
@@ -141,6 +195,7 @@ async fn serve_model_on_host_with_router_extension<F>(
     port: u16,
     max_model_len: u32,
     shutdown: CancellationToken,
+    telemetry: Telemetry,
     extend_router: F,
 ) -> Result<()>
 where
@@ -161,6 +216,7 @@ where
     let bridge_shutdown = shutdown.child_token();
     let engine_task = tokio::spawn({
         let servable_cap = servable_cap.clone();
+        let telemetry = telemetry.clone();
         let server_shutdown = server_shutdown.clone();
         let bridge_shutdown = bridge_shutdown.clone();
         let input_address = input_address.clone();
@@ -180,6 +236,7 @@ where
                 output_address,
                 handle,
                 max_model_len: servable_limit.unwrap_or(max_model_len),
+                telemetry,
             };
             if let Err(error) = bridge.run(bridge_shutdown).await {
                 warn!("local vLLM engine bridge exited: {error:#}");
@@ -223,7 +280,10 @@ where
     };
 
     let extend_router = move |router: Router| {
-        extend_router(router).layer(from_fn_with_state(servable_cap, guard_generation_request))
+        extend_router(router)
+            .merge(traces_router(telemetry.clone()))
+            .layer(from_fn_with_state(telemetry, guard_metrics_request))
+            .layer(from_fn_with_state(servable_cap, guard_generation_request))
     };
     let result =
         vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
