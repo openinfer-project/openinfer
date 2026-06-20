@@ -240,12 +240,13 @@ impl OverlapStreams {
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
-        // SM-pinned streams. cuGreenCtxStreamCreate triggers Xid 31 on driver
-        // 590+ when VRAM usage is high (>~16GB) due to page-table mapping gaps
-        // at high GPU virtual addresses. We do NOT silently fall back to shared
-        // streams here: the caller asked for an SM partition, so failing loudly
-        // keeps benchmarks honest. Use `--decode-overlap stream` for the
-        // partition-free two-stream path on such drivers.
+        // SM-pinned streams. If cuGreenCtxStreamCreate fails we do NOT silently
+        // fall back to shared streams: the caller asked for an SM partition, so
+        // failing loudly keeps benchmarks honest (use `--decode-overlap stream`
+        // for the partition-free two-stream path). The cross-stream buffer
+        // use-after-free that once surfaced as Xid 31/43 here is handled
+        // elsewhere — prefill temp buffers are kept alive until the prefill
+        // stream syncs (see `prefill::DEFERRED_DROPS`), not by avoiding this call.
         let mut decode_stream: CUstream = ptr::null_mut();
         let mut prefill_stream: CUstream = ptr::null_mut();
         let r1 = unsafe {
