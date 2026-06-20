@@ -368,9 +368,7 @@ fn execute_step_on_lane(
             prefill_stream,
             decode_stream,
         } => {
-            use openinfer_kernels::tensor::{
-                clear_stream_override, clear_stream_override_with_ctx, set_stream_override,
-            };
+            use openinfer_kernels::tensor::{clear_stream_override, set_stream_override};
 
             // If there's still an inflight prefill from a previous step, sync it
             // now (shouldn't happen normally, but safety).
@@ -732,18 +730,11 @@ pub(crate) trait ModelExecutor: Send {
         0
     }
 
-    // ── SM-partition async prefill ───────────────────────────────────────
+    // ── Decode-overlap async prefill ─────────────────────────────────────
 
-    /// Whether SM partitioning is enabled (async prefill supported).
-    fn has_sm_partition(&self) -> bool {
+    /// Whether prefill/decode overlap is enabled (async prefill supported).
+    fn has_decode_overlap(&self) -> bool {
         false
-    }
-
-    /// Launch prefill asynchronously on the prefill SM partition stream.
-    /// Returns immediately without waiting for GPU completion.
-    /// The caller must later call [`Self::poll_async_prefill`] to collect results.
-    fn launch_prefill_async(&mut self, _plan: PrefillPlan<'_>) -> Result<()> {
-        anyhow::bail!("launch_prefill_async not supported")
     }
 
     /// Poll whether the async prefill has completed. Returns `Some(result)` if
@@ -788,13 +779,13 @@ pub struct Qwen3Executor {
     l1_retention_disabled: bool,
     /// Green Context SM partition for concurrent prefill/decode. `None` when
     /// disabled (default) or when the GPU does not support Green Contexts.
-    sm_partition: Option<crate::green_ctx::SmPartition>,
-    /// In-flight async prefill state. Populated by `launch_prefill_async`,
+    overlap: Option<crate::green_ctx::OverlapStreams>,
+    /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
     async_prefill: Option<AsyncPrefillState>,
 }
 
-/// State for an in-flight async prefill on the prefill SM partition stream.
+/// State for an in-flight async prefill on the prefill overlap stream.
 struct AsyncPrefillState {
     event: cudarc::driver::sys::CUevent,
 }
@@ -861,7 +852,7 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
-            sm_partition: None,
+            overlap: None,
             async_prefill: None,
         })
     }
@@ -1012,7 +1003,7 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
-            sm_partition: None,
+            overlap: None,
             async_prefill: None,
         })
     }
@@ -1056,22 +1047,18 @@ impl Qwen3Executor {
         self.prefix_cache_enabled = enabled;
     }
 
-    /// Enable Green Context SM partitioning for concurrent prefill/decode.
-    /// Returns `Ok(())` if the partition was created successfully, or an error
-    /// if the GPU does not support it.
-    pub fn enable_sm_partition(
-        &mut self,
-        config: crate::green_ctx::SmPartitionConfig,
-    ) -> Result<()> {
+    /// Configure two-stream prefill/decode overlap (see [`crate::DecodeOverlap`]).
+    /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
+    /// returning an error if the GPU/driver cannot honor the requested mode.
+    pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
         let device_ordinal = 0; // single-GPU path
-        let partition = crate::green_ctx::SmPartition::create(device_ordinal, config)?;
-        self.sm_partition = Some(partition);
+        self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
         Ok(())
     }
 
-    /// Whether SM partitioning is active.
-    pub fn sm_partition_enabled(&self) -> bool {
-        self.sm_partition.is_some()
+    /// Whether prefill/decode overlap (two-stream or SM partition) is active.
+    pub fn decode_overlap_enabled(&self) -> bool {
+        self.overlap.is_some()
     }
 
     /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
@@ -1668,15 +1655,15 @@ impl ModelExecutor for Qwen3Executor {
             .map(|req| self.request_kvs[&req.request_id].decode_view())
             .collect();
 
-        // 3. Execute forward — use split-concurrent if SM partition is active
-        let step = if let Some(ref partition) = self.sm_partition {
+        // 3. Execute forward — use split-concurrent if overlap streams are active
+        let step = if let Some(ref overlap) = self.overlap {
             StepCommand::SplitConcurrent {
                 prefill_requests,
                 prefill_kv_views,
                 decode_requests: plan.decode_requests.to_vec(),
                 decode_kv_views,
-                prefill_stream: partition.prefill_stream,
-                decode_stream: partition.decode_stream,
+                prefill_stream: overlap.prefill_stream,
+                decode_stream: overlap.decode_stream,
             }
         } else {
             StepCommand::Unified {
@@ -1947,13 +1934,8 @@ impl ModelExecutor for Qwen3Executor {
         names
     }
 
-    fn has_sm_partition(&self) -> bool {
-        self.sm_partition.is_some()
-    }
-
-    fn launch_prefill_async(&mut self, _plan: PrefillPlan<'_>) -> Result<()> {
-        // Not used in the new design — prefill is launched inside SplitConcurrent.
-        anyhow::bail!("launch_prefill_async not supported in new design")
+    fn has_decode_overlap(&self) -> bool {
+        self.overlap.is_some()
     }
 
     fn poll_async_prefill(&mut self) -> Option<PrefillResult> {

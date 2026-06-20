@@ -11,10 +11,9 @@ use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 
-/// Thread-local deferred-drop queue for SM-partition mode.
-/// Buffers pushed here during prefill (under stream override) will be
-/// dropped later when `drain_deferred_drops()` is called after the
-/// prefill stream is synchronized.
+// Thread-local deferred-drop queue for decode-overlap mode. Buffers pushed here
+// during prefill (under stream override) are dropped later when
+// `drain_deferred_drops()` runs after the prefill stream is synchronized.
 thread_local! {
     static DEFERRED_DROPS: std::cell::RefCell<Vec<Box<dyn Any>>> = std::cell::RefCell::new(Vec::new());
 }

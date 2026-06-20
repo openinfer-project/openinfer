@@ -18,7 +18,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
-use crate::executor::{ModelExecutor, PrefillPlan, Qwen3Executor, RequestId};
+use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
@@ -141,6 +141,7 @@ pub(crate) fn start_qwen3(
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
+    decode_overlap: crate::DecodeOverlap,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -150,16 +151,7 @@ pub(crate) fn start_qwen3(
         offload_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-
-    // Enable Green Context SM partitioning if requested via env var.
-    // OPENINFER_SM_PARTITION=<decode_pct>  (e.g. "20" for 20% decode / 80% prefill)
-    if let Ok(val) = std::env::var("OPENINFER_SM_PARTITION") {
-        let decode_pct: u32 = val.parse().unwrap_or(20);
-        match executor.enable_sm_partition(crate::green_ctx::SmPartitionConfig { decode_pct }) {
-            Ok(()) => log::info!("SM partition enabled: decode_pct={decode_pct}"),
-            Err(e) => log::warn!("SM partition requested but failed: {e}; continuing without"),
-        }
-    }
+    executor.enable_decode_overlap(decode_overlap)?;
 
     Ok(start_with_executor(executor, seed, max_prefill_tokens))
 }
@@ -173,6 +165,7 @@ pub(crate) fn start_qwen3_with_lora_control(
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
+    decode_overlap: crate::DecodeOverlap,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -182,6 +175,7 @@ pub(crate) fn start_qwen3_with_lora_control(
         offload_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
+    executor.enable_decode_overlap(decode_overlap)?;
     Ok(start_with_executor_with_lora_control(
         executor,
         seed,
@@ -381,19 +375,19 @@ fn scheduler_loop<E>(
     // Admitted requests whose prompts are not fully prefilled yet (chunked
     // prefill). FIFO by request id; each step takes chunks off the front.
     let mut prefilling: Vec<PendingRequest> = Vec::new();
-    // SM-partition async prefill: pending requests whose prefill is in-flight
-    // on the prefill partition stream. `None` when no async prefill is running.
+    // Decode-overlap async prefill: pending requests whose prefill is in-flight
+    // on the prefill overlap stream. `None` when no async prefill is running.
     let mut inflight_prefill_pending: Option<Vec<PendingRequest>> = None;
 
     info!("Scheduler ready");
 
     loop {
-        // 0. Poll in-flight async prefill (SM partition mode).
+        // 0. Poll in-flight async prefill (decode-overlap mode).
         if inflight_prefill_pending.is_some() {
             if let Some(prefill_result) = executor.poll_async_prefill() {
                 let pending = inflight_prefill_pending.take().unwrap();
                 info!(
-                    "SM-partition: async prefill completed ({} reqs)",
+                    "decode-overlap: async prefill completed ({} reqs)",
                     pending.len()
                 );
                 let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
@@ -484,19 +478,19 @@ fn scheduler_loop<E>(
             continue;
         };
 
-        // SM-partition path: when a Unified plan appears and SM partition is
-        // active (and no async prefill is already in-flight), execute_unified
+        // Decode-overlap path: when a Unified plan appears and overlap streams
+        // are active (and no async prefill is already in-flight), execute_unified
         // internally uses SplitConcurrent which only syncs decode and defers
         // the prefill sync. This lets the scheduler advance decode immediately.
         // The prefill result is polled at the top of the next iteration.
-        if executor.has_sm_partition()
+        if executor.has_decode_overlap()
             && inflight_prefill_pending.is_none()
             && matches!(plan, ExecutionPlan::Unified { .. })
         {
             if let ExecutionPlan::Unified { pending } = plan {
                 let prefill_tokens: usize = pending.iter().map(|r| r.step_chunk).sum();
                 info!(
-                    "SM-partition: unified step with async prefill ({} reqs, ~{} tokens)",
+                    "decode-overlap: unified step with async prefill ({} reqs, ~{} tokens)",
                     pending.len(),
                     prefill_tokens
                 );

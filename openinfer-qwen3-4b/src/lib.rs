@@ -65,6 +65,10 @@ impl Default for Qwen3LoraOptions {
     }
 }
 
+/// Prefill/decode GPU-sharing mode (`--decode-overlap`). Defined alongside the
+/// stream plumbing in [`green_ctx`].
+pub use green_ctx::DecodeOverlap;
+
 /// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
 ///
 /// Disabled by default — the existing GPU-only prefix cache is unchanged.
@@ -146,6 +150,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         Qwen3OffloadOptions::disabled(),
         false,
         DEFAULT_MAX_PREFILL_TOKENS,
+        DecodeOverlap::Off,
     )
 }
 
@@ -167,6 +172,7 @@ pub fn start_engine_with_offload(
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
+    decode_overlap: DecodeOverlap,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -185,6 +191,7 @@ pub fn start_engine_with_offload(
         offload_options,
         no_prefix_cache,
         max_prefill_tokens,
+        decode_overlap,
     )
 }
 
@@ -195,6 +202,7 @@ pub fn start_engine_with_lora_control(
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
+    decode_overlap: DecodeOverlap,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -214,5 +222,6 @@ pub fn start_engine_with_lora_control(
         offload_options,
         no_prefix_cache,
         max_prefill_tokens,
+        decode_overlap,
     )
 }

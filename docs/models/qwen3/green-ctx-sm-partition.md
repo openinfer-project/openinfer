@@ -1,10 +1,18 @@
 # Qwen3-4B Green Context SM partition (concurrent prefill/decode)
 
-> **TL;DR:** Enabling Green Context SM partitioning (`OPENINFER_SM_PARTITION=20`) runs prefill and decode on disjoint SM partitions (decode 32 SM / prefill 138 SM on a 5090's 170 SM) so a decode no longer stalls behind a co-scheduled prefill in the unified step. On the 5090 mid-band (`vllm bench serve` random in=1024/out=128, QPS 8–12) this **halves ITL p99** (44.8→22.5 / 46.7→24.7 / 56.6→26.9 ms) and cuts TPOT mean (up to −22% @QPS12) — at the cost of a **2–4× TTFT regression** (prefill loses SMs *and* is deferred to the next scheduler iteration). Restoring decode's CUDA graph under the partition (the "two-graph" change) adds a further **~5% ITL p99 / 1–4% TPOT** with zero correctness cost. Net: this is a TTFT↔ITL/TPOT trade, not a free win — turn it on only when steady-state token smoothness matters more than first-token latency.
+> **TL;DR:** Enabling Green Context SM partitioning (`--decode-overlap green-ctx --decode-sm-pct 20`) runs prefill and decode on disjoint SM partitions (decode 32 SM / prefill 138 SM on a 5090's 170 SM) so a decode no longer stalls behind a co-scheduled prefill in the unified step. On the 5090 mid-band (`vllm bench serve` random in=1024/out=128, QPS 8–12) this **halves ITL p99** (44.8→22.5 / 46.7→24.7 / 56.6→26.9 ms) and cuts TPOT mean (up to −22% @QPS12) — at the cost of a **2–4× TTFT regression** (prefill loses SMs *and* is deferred to the next scheduler iteration). Restoring decode's CUDA graph under the partition (the "two-graph" change) adds a further **~5% ITL p99 / 1–4% TPOT** with zero correctness cost. Net: this is a TTFT↔ITL/TPOT trade, not a free win — turn it on only when steady-state token smoothness matters more than first-token latency.
 >
 > **Last touched:** 2026-06
 
-Enable: `OPENINFER_SM_PARTITION=<decode_pct>` (e.g. `20` → decode gets ~20% of SMs, prefill the rest). Off by default. `OPENINFER_SM_GREEN_STREAM=0` forces the primary-context-stream fallback (stream concurrency without SM pinning). Implementation: `green_ctx.rs` (partition + streams), `executor.rs` `SplitConcurrent` (the split step), `scheduler.rs:492` (when it fires).
+Select the prefill/decode overlap mode with one CLI flag (`--decode-overlap`, off by default):
+
+| `--decode-overlap` | what it does |
+|---|---|
+| `off` | single stream; prefill and decode serialize. Lowest TTFT. |
+| `stream` | two CUDA streams sharing all SMs — concurrency, no SM partition. |
+| `green-ctx` | two streams pinned to disjoint Green Context SM partitions; `--decode-sm-pct <N>` (default 20) sets decode's share. |
+
+`green-ctx` fails loudly: if the driver/VRAM combo rejects SM-pinned streams (the Xid-31 risk below), startup aborts with a message pointing at `--decode-overlap stream` — it does **not** silently degrade to the shared path, so a benchmark always measures the mode you asked for. The public knob is the `DecodeOverlap` enum (`green_ctx.rs`), threaded through `start_engine_with_offload`. Implementation: `green_ctx.rs` (`OverlapStreams` — partition + streams), `executor.rs` `SplitConcurrent` (the split step), `scheduler.rs` (when it fires).
 
 ## When the split actually fires
 
@@ -55,7 +63,7 @@ Power climbs with QPS: at QPS 8 the board still has headroom (draw oscillates ~5
 
 ## Pitfalls
 
-- **Driver 590 + Green Context streams + >16 GB resident is the documented Xid-31 risk** — the comment in `green_ctx.rs` claims a ">16 GB → primary-stream fallback" auto-detect, but **that auto-detect is not implemented**; only `OPENINFER_SM_GREEN_STREAM=0` forces the fallback. On this 5090 (driver 590.48.01, ~27 GB resident — 19.3 GB of it KV) the green-ctx-stream SM-pinned path nonetheless ran clean across both sweeps and the smoke. Treat Xid 31 as a watch item per driver/VRAM combo, not a settled rule; if it fires, set `OPENINFER_SM_GREEN_STREAM=0`.
+- **Driver 590 + Green Context streams + >16 GB resident is the documented Xid-31 risk.** `green-ctx` mode now surfaces this as a hard startup error (`cuGreenCtxStreamCreate` failure → abort) rather than the old silent fallback. On this 5090 (driver 590.48.01, ~27 GB resident — 19.3 GB of it KV) the SM-pinned path nonetheless ran clean across both sweeps and the smoke. Treat Xid 31 as a watch item per driver/VRAM combo, not a settled rule; if it fires, run `--decode-overlap stream` (two streams sharing all SMs, no pinning) instead.
 - **`gemm_lt` is still disabled under the stream override** (`5af4fd5`, to avoid the cuBLASLt workspace Xid-31 path). So split-path decode keeps its CUDA graph but loses the per-shape Lt tuning — a remaining decode-side lever, not yet re-measured under the partition.
 - **A single request never exercises the split path** — smoke-test with concurrent load or you are only testing the full-SM graph.
 - **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/openinfer"`, and kill/launch in separate ssh invocations.

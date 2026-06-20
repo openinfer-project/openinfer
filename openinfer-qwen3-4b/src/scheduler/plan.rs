@@ -128,15 +128,6 @@ fn build_prefill_items(
         .collect()
 }
 
-/// Public re-export for scheduler SM-partition split path.
-pub(super) fn build_prefill_items_pub(
-    pending: &[PendingRequest],
-    indices: &[usize],
-    rng: &mut StdRng,
-) -> Vec<PrefillStepItem> {
-    build_prefill_items(pending, indices, rng)
-}
-
 fn build_decode_items(
     active: &[ActiveRequestState],
     indices: &[usize],

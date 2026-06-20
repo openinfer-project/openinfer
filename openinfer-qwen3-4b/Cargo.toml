@@ -49,10 +49,6 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 vllm-text = { workspace = true }
 
 [[bin]]
-name = "qwen3_sm_partition_bench"
-path = "src/bin/qwen3_sm_partition_bench.rs"
-
-[[bin]]
 name = "qwen3_kernel_report"
 path = "src/bin/qwen3_kernel_report.rs"
 required-features = ["kernel-report"]

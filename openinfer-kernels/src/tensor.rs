@@ -28,24 +28,6 @@ pub unsafe fn set_stream_override(stream: CUstream) {
 }
 
 /// Clear the thread-local stream override, reverting to the context's default.
-/// If a DeviceContext is provided, records an event on the override stream and
-/// makes ctx.stream wait on it — ensuring that any subsequent frees on ctx.stream
-/// happen after kernels on the override stream complete (prevents use-after-free).
-pub fn clear_stream_override_with_ctx(ctx: &DeviceContext) {
-    if let Some(override_stream) = STREAM_OVERRIDE.with(|c| c.get()) {
-        let orig = ctx.stream.cu_stream();
-        if orig != override_stream {
-            unsafe {
-                let ev = stream_dep_event();
-                cudarc::driver::sys::cuEventRecord(ev, override_stream);
-                cudarc::driver::sys::cuStreamWaitEvent(orig, ev, 0);
-            }
-        }
-    }
-    STREAM_OVERRIDE.with(|c| c.set(None));
-}
-
-/// Clear the thread-local stream override, reverting to the context's default.
 pub fn clear_stream_override() {
     STREAM_OVERRIDE.with(|c| c.set(None));
 }
@@ -60,30 +42,8 @@ pub fn has_stream_override() -> bool {
 #[inline]
 pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
     STREAM_OVERRIDE
-        .with(|c| c.get())
+        .with(Cell::get)
         .unwrap_or_else(|| ctx.stream.cu_stream())
-}
-
-/// Thread-local persistent event used to propagate stream-ordered memory
-/// dependencies from ctx.stream to the override stream.
-unsafe fn stream_dep_event() -> cudarc::driver::sys::CUevent {
-    thread_local! {
-        static EVENT: std::cell::Cell<cudarc::driver::sys::CUevent> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-    }
-    EVENT.with(|c| {
-        let ev = c.get();
-        if ev.is_null() {
-            let mut new_ev: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-            cudarc::driver::sys::cuEventCreate(
-                &mut new_ev,
-                cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-            );
-            c.set(new_ev);
-            new_ev
-        } else {
-            ev
-        }
-    })
 }
 
 /// Marker trait for tensor metadata tags.

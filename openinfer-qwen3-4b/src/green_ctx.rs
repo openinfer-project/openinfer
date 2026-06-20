@@ -1,26 +1,37 @@
-//! Green Context SM-partition support for concurrent prefill/decode.
+//! Two-stream prefill/decode overlap for Qwen3, optionally backed by Green
+//! Context SM partitions.
 //!
-//! When enabled, the executor uses two CUDA streams backed by Green Context
-//! SM partitions: a decode partition (fewer SMs, memory-bound workload) and a
-//! prefill partition (more SMs, compute-bound workload). When no prefill is
-//! pending, decode runs on the original full-SM stream.
+//! Selected on the CLI via `--decode-overlap` (see [`DecodeOverlap`]):
+//!   * [`DecodeOverlap::Off`] — no streams here; the executor keeps its single stream.
+//!   * [`DecodeOverlap::SharedSm`] — two CUDA streams on the primary context,
+//!     sharing all SMs. Overlap without partitioning.
+//!   * [`DecodeOverlap::GreenCtx`] — two streams pinned to disjoint Green Context
+//!     SM partitions: decode gets `decode_pct`% of the SMs (memory-bound), the
+//!     prefill stream the rest (compute-bound). When no prefill is pending,
+//!     decode runs on the original full-SM stream.
 
 use std::ptr;
 
 use anyhow::{Result, bail};
 use cudarc::driver::sys::{self, CUdevice, CUstream};
 
-/// SM partition configuration.
-#[derive(Clone, Copy, Debug)]
-pub struct SmPartitionConfig {
-    /// Percentage of total SMs assigned to decode (e.g. 20 means 20%).
-    pub decode_pct: u32,
-}
-
-impl Default for SmPartitionConfig {
-    fn default() -> Self {
-        Self { decode_pct: 20 }
-    }
+/// How prefill and decode share the GPU within a scheduler step. Selected on
+/// the CLI via `--decode-overlap`.
+///
+/// `Off` keeps a single stream (lowest TTFT). The other two run prefill and
+/// decode on separate CUDA streams so a long prefill no longer stalls running
+/// decodes: `SharedSm` lets both streams use every SM, while `GreenCtx` pins
+/// each to a disjoint Green Context SM partition (lower decode ITL p99 at the
+/// cost of higher TTFT). Single-GPU Qwen3 only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum DecodeOverlap {
+    /// Single stream; prefill and decode serialize.
+    #[default]
+    Off,
+    /// Two CUDA streams sharing all SMs.
+    SharedSm,
+    /// Green Context SM partition; `decode_pct`% of SMs assigned to decode.
+    GreenCtx { decode_pct: u32 },
 }
 
 /// A `CUstream` wrapper that is `Send + Sync + Clone + Copy`.
@@ -32,18 +43,25 @@ pub(crate) struct SendStream(pub CUstream);
 unsafe impl Send for SendStream {}
 unsafe impl Sync for SendStream {}
 
-/// Active Green Context SM partition with two streams.
-pub(crate) struct SmPartition {
+/// Two CUDA streams used to overlap prefill and decode within one scheduler
+/// step. In [`DecodeOverlap::GreenCtx`] mode they are pinned to disjoint SM
+/// partitions via Green Contexts; in [`DecodeOverlap::SharedSm`] mode they are
+/// plain primary-context streams that share all SMs.
+pub(crate) struct OverlapStreams {
     pub decode_stream: SendStream,
     pub prefill_stream: SendStream,
-    pub sm_decode: u32,
-    pub sm_prefill: u32,
+    /// Green contexts owning the SM partitions; `None` in `SharedSm` mode.
+    green: Option<GreenContexts>,
+}
+
+/// Green Context handles kept alive for the lifetime of the partition streams.
+struct GreenContexts {
     gctx_decode: sys::CUgreenCtx,
     gctx_prefill: sys::CUgreenCtx,
-    #[allow(dead_code)]
-    ctx_decode: sys::CUcontext,
-    #[allow(dead_code)]
-    ctx_prefill: sys::CUcontext,
+    // CUcontext handles derived from the green contexts; held so the streams'
+    // backing contexts outlive them.
+    _ctx_decode: sys::CUcontext,
+    _ctx_prefill: sys::CUcontext,
 }
 
 fn check_cu(result: sys::CUresult, msg: &str) -> Result<()> {
@@ -53,13 +71,67 @@ fn check_cu(result: sys::CUresult, msg: &str) -> Result<()> {
     Ok(())
 }
 
-impl SmPartition {
-    /// Create an SM partition on the given device.
-    /// `decode_pct` is the percentage of SMs to assign to decode.
-    pub fn create(device_ordinal: usize, config: SmPartitionConfig) -> Result<Self> {
-        let device: CUdevice = device_ordinal as i32;
+/// Total SM count of the device.
+fn query_total_sm(device: CUdevice) -> Result<u32> {
+    let mut sm_res: sys::CUdevResource = unsafe { std::mem::zeroed() };
+    check_cu(
+        unsafe {
+            sys::cuDeviceGetDevResource(
+                device,
+                &mut sm_res,
+                sys::CUdevResourceType::CU_DEV_RESOURCE_TYPE_SM,
+            )
+        },
+        "cuDeviceGetDevResource",
+    )?;
+    Ok(unsafe { sm_res.__bindgen_anon_1.sm.smCount })
+}
 
-        // Query SM resource
+/// Create a non-blocking stream on the current (primary) context.
+fn create_primary_stream() -> Result<CUstream> {
+    let mut stream: CUstream = ptr::null_mut();
+    check_cu(
+        unsafe {
+            sys::cuStreamCreate(
+                &mut stream,
+                sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            )
+        },
+        "cuStreamCreate",
+    )?;
+    Ok(stream)
+}
+
+impl OverlapStreams {
+    /// Set up the overlap streams for the given device, or `None` when overlap
+    /// is [`DecodeOverlap::Off`] (the executor keeps its single stream).
+    pub(crate) fn create(device_ordinal: usize, overlap: DecodeOverlap) -> Result<Option<Self>> {
+        let device: CUdevice = device_ordinal as i32;
+        match overlap {
+            DecodeOverlap::Off => Ok(None),
+            DecodeOverlap::SharedSm => Self::create_shared(device).map(Some),
+            DecodeOverlap::GreenCtx { decode_pct } => {
+                Self::create_green(device, decode_pct).map(Some)
+            }
+        }
+    }
+
+    /// Two plain streams on the primary context — no SM partition.
+    fn create_shared(device: CUdevice) -> Result<Self> {
+        let total_sm = query_total_sm(device)?;
+        let decode_stream = create_primary_stream()?;
+        let prefill_stream = create_primary_stream()?;
+        log::info!("Decode overlap: shared-SM, 2 primary-ctx streams (total={total_sm} SM)");
+        Ok(Self {
+            decode_stream: SendStream(decode_stream),
+            prefill_stream: SendStream(prefill_stream),
+            green: None,
+        })
+    }
+
+    /// Green Context SM partition with SM-pinned streams.
+    fn create_green(device: CUdevice, decode_pct: u32) -> Result<Self> {
+        // Query SM resource and the minimum split granularity.
         let mut sm_res: sys::CUdevResource = unsafe { std::mem::zeroed() };
         check_cu(
             unsafe {
@@ -73,7 +145,6 @@ impl SmPartition {
         )?;
         let total_sm = unsafe { sm_res.__bindgen_anon_1.sm.smCount };
 
-        // Get minimum SM granularity
         let mut nb: u32 = 1;
         let mut probe_grp: sys::CUdevResource = unsafe { std::mem::zeroed() };
         let mut probe_rem: sys::CUdevResource = unsafe { std::mem::zeroed() };
@@ -92,16 +163,16 @@ impl SmPartition {
         )?;
         let min_sm = unsafe { probe_grp.__bindgen_anon_1.sm.smCount };
 
-        // Compute decode SM count aligned to minimum
-        let sm_for_decode = (total_sm * config.decode_pct / 100 / min_sm) * min_sm;
+        // Compute decode SM count aligned to the minimum granularity.
+        let sm_for_decode = (total_sm * decode_pct / 100 / min_sm) * min_sm;
         if sm_for_decode < min_sm || total_sm - sm_for_decode < min_sm {
             bail!(
-                "SM partition not viable: total={total_sm} min={min_sm} \
-                 decode_target={sm_for_decode}"
+                "green-ctx SM partition not viable: total={total_sm} min={min_sm} \
+                 decode_pct={decode_pct} decode_target={sm_for_decode}"
             );
         }
 
-        // Split
+        // Split SMs into a decode group and a prefill group.
         let mut grp_decode: sys::CUdevResource = unsafe { std::mem::zeroed() };
         let mut grp_prefill: sys::CUdevResource = unsafe { std::mem::zeroed() };
         nb = 1;
@@ -121,7 +192,7 @@ impl SmPartition {
         let sm_decode = unsafe { grp_decode.__bindgen_anon_1.sm.smCount };
         let sm_prefill = unsafe { grp_prefill.__bindgen_anon_1.sm.smCount };
 
-        // Generate resource descriptors
+        // Generate resource descriptors and green contexts.
         let mut desc_decode: sys::CUdevResourceDesc = ptr::null_mut();
         let mut desc_prefill: sys::CUdevResourceDesc = ptr::null_mut();
         check_cu(
@@ -133,7 +204,6 @@ impl SmPartition {
             "cuDevResourceGenerateDesc (prefill)",
         )?;
 
-        // Create green contexts
         let mut gctx_decode: sys::CUgreenCtx = ptr::null_mut();
         let mut gctx_prefill: sys::CUgreenCtx = ptr::null_mut();
         check_cu(
@@ -159,7 +229,6 @@ impl SmPartition {
             "cuGreenCtxCreate (prefill)",
         )?;
 
-        // Get CUcontext from green contexts
         let mut ctx_decode: sys::CUcontext = ptr::null_mut();
         let mut ctx_prefill: sys::CUcontext = ptr::null_mut();
         check_cu(
@@ -171,120 +240,76 @@ impl SmPartition {
             "cuCtxFromGreenCtx (prefill)",
         )?;
 
-        // Create streams for the partitions. Two modes:
-        // 1. cuGreenCtxStreamCreate: true SM isolation, but triggers Xid 31 on
-        //    driver 590+ when VRAM usage is high (>~16GB) due to page-table
-        //    mapping gaps at high GPU virtual addresses.
-        // 2. Primary context streams: no SM pinning, but stable everywhere.
-        //    Still gives ~35% ITL p99 reduction via stream-level concurrency.
-        //
-        // Auto-detect: query free memory; if model uses >16GB, fall back to
-        // primary ctx streams.
-        let use_green_streams = std::env::var("OPENINFER_SM_GREEN_STREAM")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-
+        // SM-pinned streams. cuGreenCtxStreamCreate triggers Xid 31 on driver
+        // 590+ when VRAM usage is high (>~16GB) due to page-table mapping gaps
+        // at high GPU virtual addresses. We do NOT silently fall back to shared
+        // streams here: the caller asked for an SM partition, so failing loudly
+        // keeps benchmarks honest. Use `--decode-overlap stream` for the
+        // partition-free two-stream path on such drivers.
         let mut decode_stream: CUstream = ptr::null_mut();
         let mut prefill_stream: CUstream = ptr::null_mut();
-
-        if use_green_streams {
-            let r1 = unsafe {
-                sys::cuGreenCtxStreamCreate(
-                    &mut decode_stream,
-                    gctx_decode,
-                    sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-                    0,
-                )
-            };
-            let r2 = unsafe {
-                sys::cuGreenCtxStreamCreate(
-                    &mut prefill_stream,
-                    gctx_prefill,
-                    sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-                    0,
-                )
-            };
-            if r1 != sys::CUresult::CUDA_SUCCESS || r2 != sys::CUresult::CUDA_SUCCESS {
-                log::warn!(
-                    "cuGreenCtxStreamCreate failed (decode={r1:?}, prefill={r2:?}), \
-                     falling back to primary context streams"
-                );
-                // Fall through to primary ctx streams below
-                decode_stream = ptr::null_mut();
-                prefill_stream = ptr::null_mut();
+        let r1 = unsafe {
+            sys::cuGreenCtxStreamCreate(
+                &mut decode_stream,
+                gctx_decode,
+                sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                0,
+            )
+        };
+        let r2 = unsafe {
+            sys::cuGreenCtxStreamCreate(
+                &mut prefill_stream,
+                gctx_prefill,
+                sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                0,
+            )
+        };
+        if r1 != sys::CUresult::CUDA_SUCCESS || r2 != sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                if !decode_stream.is_null() {
+                    sys::cuStreamDestroy_v2(decode_stream);
+                }
+                if !prefill_stream.is_null() {
+                    sys::cuStreamDestroy_v2(prefill_stream);
+                }
+                sys::cuGreenCtxDestroy(gctx_decode);
+                sys::cuGreenCtxDestroy(gctx_prefill);
             }
-        }
-
-        // Fallback: primary context streams (no SM isolation but stable)
-        if decode_stream.is_null() {
-            check_cu(
-                unsafe {
-                    sys::cuStreamCreate(
-                        &mut decode_stream,
-                        sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-                    )
-                },
-                "cuStreamCreate fallback (decode)",
-            )?;
-            check_cu(
-                unsafe {
-                    sys::cuStreamCreate(
-                        &mut prefill_stream,
-                        sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-                    )
-                },
-                "cuStreamCreate fallback (prefill)",
-            )?;
-            log::info!(
-                "Green Context SM partition created: decode={sm_decode}SM \
-                 prefill={sm_prefill}SM (total={total_sm}) [primary-ctx streams, no SM pinning]"
-            );
-        } else {
-            log::info!(
-                "Green Context SM partition created: decode={sm_decode}SM \
-                 prefill={sm_prefill}SM (total={total_sm}) [green-ctx streams, SM pinned]"
+            bail!(
+                "cuGreenCtxStreamCreate failed (decode={r1:?}, prefill={r2:?}); this driver/VRAM \
+                 config may not support SM-pinned streams — use --decode-overlap stream"
             );
         }
 
+        log::info!(
+            "Decode overlap: green-ctx SM partition decode={sm_decode}SM prefill={sm_prefill}SM \
+             (total={total_sm}) [SM pinned]"
+        );
         Ok(Self {
             decode_stream: SendStream(decode_stream),
             prefill_stream: SendStream(prefill_stream),
-            sm_decode,
-            sm_prefill,
-            gctx_decode,
-            gctx_prefill,
-            ctx_decode,
-            ctx_prefill,
+            green: Some(GreenContexts {
+                gctx_decode,
+                gctx_prefill,
+                _ctx_decode: ctx_decode,
+                _ctx_prefill: ctx_prefill,
+            }),
         })
-    }
-
-    /// Synchronize the decode partition stream.
-    pub fn sync_decode(&self) -> Result<()> {
-        check_cu(
-            unsafe { sys::cuStreamSynchronize(self.decode_stream.0) },
-            "sync decode stream",
-        )
-    }
-
-    /// Synchronize the prefill partition stream.
-    pub fn sync_prefill(&self) -> Result<()> {
-        check_cu(
-            unsafe { sys::cuStreamSynchronize(self.prefill_stream.0) },
-            "sync prefill stream",
-        )
     }
 }
 
-impl Drop for SmPartition {
+impl Drop for OverlapStreams {
     fn drop(&mut self) {
         unsafe {
             sys::cuStreamDestroy_v2(self.decode_stream.0);
             sys::cuStreamDestroy_v2(self.prefill_stream.0);
-            sys::cuGreenCtxDestroy(self.gctx_decode);
-            sys::cuGreenCtxDestroy(self.gctx_prefill);
+            if let Some(green) = &self.green {
+                sys::cuGreenCtxDestroy(green.gctx_decode);
+                sys::cuGreenCtxDestroy(green.gctx_prefill);
+            }
         }
     }
 }
 
-// SAFETY: SmPartition is only used from the executor's single GPU worker thread.
-unsafe impl Send for SmPartition {}
+// SAFETY: OverlapStreams is only used from the executor's single GPU worker thread.
+unsafe impl Send for OverlapStreams {}
