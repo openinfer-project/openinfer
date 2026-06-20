@@ -1,10 +1,31 @@
 #include "common.cuh"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
+
+extern "C" size_t flashinfer_top1_row_states_bytes_cuda() {
+  int device = 0;
+  int sm_count = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) {
+    err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+  }
+  size_t groups = err == cudaSuccess && sm_count > 0
+                      ? static_cast<size_t>(sm_count)
+                      : static_cast<size_t>(
+                            flashinfer::sampling::RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP);
+  size_t radix_bytes =
+      groups * (sizeof(flashinfer::sampling::RadixRowState) +
+                sizeof(flashinfer::sampling::RadixDeterministicCollectScratch));
+  // Preserve the old 1MiB floor while covering FlashInfer's multi-CTA deterministic
+  // radix collect scratch, which is laid out after the row-state array.
+  return std::max<size_t>(1024 * 1024, radix_bytes);
+}
 
 extern "C" void flashinfer_top1_cuda(const __nv_bfloat16* logits,
                                      __nv_bfloat16* top1_value_scratch,

@@ -5,7 +5,11 @@ use openinfer_core::{
     tensor::{HiddenStates, HiddenStatesRef},
 };
 
-use super::{DeepSeekV2LiteEp2Generator, backend::EpBackendRuntime};
+use super::{
+    DeepSeekV2LiteEp2Generator,
+    backend::EpBackendRuntime,
+    routing::{MoeRouteEntry, MoeRoutePlan},
+};
 use crate::{
     attribution::DecodeAttributionProfile,
     device::activate,
@@ -196,7 +200,7 @@ impl DeepSeekV2LiteEp2Generator {
         shared_per_token_gemm: bool,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
-        let routes = attribution.record_result(
+        let route_plan = attribution.record_result(
             phase,
             "ep_route_host",
             || format!("layer.{layer_idx}.nccl.route"),
@@ -205,11 +209,8 @@ impl DeepSeekV2LiteEp2Generator {
             || {
                 let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
                 let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
-                Ok(topk_softmax_routes(
-                    &self.config,
-                    &route_logits_host,
-                    input.seq_len,
-                ))
+                let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+                MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
             },
         )?;
 
@@ -256,78 +257,16 @@ impl DeepSeekV2LiteEp2Generator {
                 )
             },
         )?;
-        let mut local_routes = 0usize;
-        let mut remote_routes = 0usize;
-        let mut live_expert_outputs =
-            Vec::with_capacity(input.seq_len * self.config.num_experts_per_token);
-
-        for (token, token_routes) in routes.iter().enumerate() {
-            for &(global_expert, weight) in token_routes {
-                let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
-                let out = match owner_rank {
-                    0 => {
-                        local_routes += 1;
-                        let expert = self.rank0.routed_expert(layer_idx, global_expert)?;
-                        attribution.record_gpu_result(
-                            &self.rank0.ctx,
-                            phase,
-                            "nccl_local_expert",
-                            || format!("layer.{layer_idx}.nccl.local_expert"),
-                            Some(layer_idx),
-                            token_index,
-                            || {
-                                expert_forward_device(
-                                    &self.rank0.ctx,
-                                    expert,
-                                    input.as_ref(),
-                                    token,
-                                )
-                            },
-                        )?
-                    }
-                    1 => {
-                        remote_routes += 1;
-                        let expert = self.rank1.routed_expert(layer_idx, global_expert)?;
-                        attribution.record_gpu_result(
-                            &self.rank1.ctx,
-                            phase,
-                            "nccl_remote_expert",
-                            || format!("layer.{layer_idx}.nccl.remote_expert"),
-                            Some(layer_idx),
-                            token_index,
-                            || expert_forward_device(&self.rank1.ctx, expert, rank1_hidden, token),
-                        )?
-                    }
-                    other => {
-                        bail!("routed expert {global_expert} maps to unsupported EP rank {other}")
-                    }
-                };
-                let expert_ctx = if owner_rank == 0 {
-                    &self.rank0.ctx
-                } else {
-                    &self.rank1.ctx
-                };
-                attribution.record_gpu_result(
-                    expert_ctx,
-                    phase,
-                    "nccl_contribution_accumulate_device",
-                    || format!("layer.{layer_idx}.nccl.contribution_accumulate_device"),
-                    Some(layer_idx),
-                    token_index,
-                    || {
-                        nccl.accumulate_device_contribution(
-                            owner_rank,
-                            expert_ctx,
-                            &out,
-                            token,
-                            input.seq_len,
-                            weight,
-                        )
-                    },
-                )?;
-                live_expert_outputs.push(out);
-            }
-        }
+        let live_expert_outputs = self.replay_nccl_route_plan(
+            nccl,
+            layer_idx,
+            input,
+            rank1_hidden,
+            &route_plan,
+            attribution,
+            phase,
+            token_index,
+        )?;
 
         let routed = attribution.record_gpu_pair_result(
             &self.rank0.ctx,
@@ -357,7 +296,11 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || ops::add_batch(&self.rank0.ctx, &routed, &shared),
         )?;
-        Ok((hidden, local_routes, remote_routes))
+        Ok((
+            hidden,
+            route_plan.local_routes(),
+            route_plan.remote_routes(),
+        ))
     }
 
     fn expert_forward_host(
@@ -382,6 +325,101 @@ impl DeepSeekV2LiteEp2Generator {
         let input = hidden_from_bf16_host(ctx, token_input, self.config.hidden_size, 1)?;
         let out = dense_mlp_forward(ctx, &expert.dense, &input)?;
         Ok((hidden_to_f32(ctx, &out)?, owner_rank != 0))
+    }
+
+    fn replay_nccl_route_plan(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        rank1_hidden: HiddenStatesRef<'_>,
+        route_plan: &MoeRoutePlan,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
+    ) -> Result<Vec<HiddenStates>> {
+        let mut live_expert_outputs = Vec::with_capacity(route_plan.route_count());
+        for route in route_plan.entries() {
+            let out = self.forward_nccl_route(
+                layer_idx,
+                input.as_ref(),
+                rank1_hidden,
+                route,
+                attribution,
+                phase,
+                token_index,
+            )?;
+            let expert_ctx = match route.owner_rank {
+                0 => &self.rank0.ctx,
+                1 => &self.rank1.ctx,
+                other => bail!(
+                    "routed expert {} maps to unsupported EP rank {other}",
+                    route.global_expert
+                ),
+            };
+            attribution.record_gpu_result(
+                expert_ctx,
+                phase,
+                "nccl_contribution_accumulate_device",
+                || format!("layer.{layer_idx}.nccl.contribution_accumulate_device"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    nccl.accumulate_device_contribution(
+                        route.owner_rank,
+                        expert_ctx,
+                        &out,
+                        route.token,
+                        input.seq_len,
+                        route.weight,
+                    )
+                },
+            )?;
+            live_expert_outputs.push(out);
+        }
+        Ok(live_expert_outputs)
+    }
+
+    fn forward_nccl_route(
+        &self,
+        layer_idx: usize,
+        rank0_hidden: HiddenStatesRef<'_>,
+        rank1_hidden: HiddenStatesRef<'_>,
+        route: &MoeRouteEntry,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
+    ) -> Result<HiddenStates> {
+        match route.owner_rank {
+            0 => {
+                let expert = self.rank0.routed_expert(layer_idx, route.global_expert)?;
+                attribution.record_gpu_result(
+                    &self.rank0.ctx,
+                    phase,
+                    "nccl_local_expert",
+                    || format!("layer.{layer_idx}.nccl.local_expert"),
+                    Some(layer_idx),
+                    token_index,
+                    || expert_forward_device(&self.rank0.ctx, expert, rank0_hidden, route.token),
+                )
+            }
+            1 => {
+                let expert = self.rank1.routed_expert(layer_idx, route.global_expert)?;
+                attribution.record_gpu_result(
+                    &self.rank1.ctx,
+                    phase,
+                    "nccl_remote_expert",
+                    || format!("layer.{layer_idx}.nccl.remote_expert"),
+                    Some(layer_idx),
+                    token_index,
+                    || expert_forward_device(&self.rank1.ctx, expert, rank1_hidden, route.token),
+                )
+            }
+            other => bail!(
+                "routed expert {} maps to unsupported EP rank {other}",
+                route.global_expert
+            ),
+        }
     }
 }
 

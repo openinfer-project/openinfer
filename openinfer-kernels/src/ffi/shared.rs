@@ -90,18 +90,7 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub fn gpu_sample_flashinfer_cuda(
-        logits: *const Half,
-        probs_scratch: *mut f32,
-        valid_scratch: *mut u8,
-        output: *mut i32,
-        vocab_size: i32,
-        inv_temperature: f32,
-        top_k: i32,
-        top_p: f32,
-        seed: u64,
-        stream: CUstream,
-    );
+    pub fn flashinfer_top1_row_states_bytes_cuda() -> usize;
 
     pub fn gpu_sample_batch_flashinfer_cuda(
         logits: *const Half,
@@ -116,6 +105,8 @@ unsafe extern "C" {
         softmax_workspace_bytes: usize,
         n_rows: i32,
         vocab_size: i32,
+        has_top_k_filter: i32,
+        has_top_p_filter: i32,
         seed: u64,
         offset: u64,
         stream: CUstream,
@@ -175,7 +166,7 @@ unsafe extern "C" {
         intermediate_size: i32,
         bs: i32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     pub fn cublas_init();
     pub fn cublas_destroy();

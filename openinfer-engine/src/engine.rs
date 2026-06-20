@@ -2,7 +2,10 @@ use std::{
     error::Error,
     fmt,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
@@ -69,7 +72,10 @@ pub struct GenerateRequest {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
-    pub token_tx: mpsc::UnboundedSender<TokenEvent>,
+    /// Where the scheduler emits this request's `TokenEvent`s. All requests on
+    /// one engine share a single tagged output channel behind this sink (see
+    /// [`TokenSink`]); the frontend demuxes by tag.
+    pub token_tx: TokenSink,
     pub logprobs: usize,
     pub echo: bool,
 }
@@ -161,6 +167,83 @@ pub enum TokenEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+}
+
+/// The tag that routes a [`TokenEvent`] back to its request on the shared
+/// output channel — the external request id (vLLM's `request_id`). `Arc<str>`
+/// keeps per-event tagging to a refcount bump instead of a string copy.
+pub type RequestTag = Arc<str>;
+
+/// The single output channel an engine dispatches *all* requests' token events
+/// into, each tagged with its [`RequestTag`]. One receiver (the frontend demux
+/// loop) drains it, replacing the former per-request fan-out of N channels and
+/// N consumer tasks — N distinct sleeping consumers cost N wakeups per step,
+/// one shared consumer costs ~1.
+pub type TokenStreamSender = mpsc::UnboundedSender<(RequestTag, TokenEvent)>;
+pub type TokenStreamReceiver = mpsc::UnboundedReceiver<(RequestTag, TokenEvent)>;
+
+/// Per-request handle the scheduler holds to emit [`TokenEvent`]s.
+///
+/// Drop-in for the former `UnboundedSender<TokenEvent>`: it keeps the same
+/// `send` / `is_closed` / `Clone` surface, so scheduler call sites are
+/// unchanged. Internally each event is tagged with the request's
+/// [`RequestTag`] and pushed onto one shared [`TokenStreamSender`].
+///
+/// Cancellation moved from "drop the per-request receiver" to a shared
+/// `cancelled` flag: the frontend aborts a *single* request by flipping its
+/// flag without closing the channel the other requests still use. `send` and
+/// `is_closed` then report that request as gone, so the scheduler retires it on
+/// its next emit — the same *reactive* retirement the old consumer-drop gave,
+/// reached through the flag rather than channel closure. `tx.is_closed()` is
+/// the engine-wide signal (the whole demux is gone); the per-request signal is
+/// the flag. The flag is set with `Release` and read with `Acquire` so the
+/// abort is ordered against the frontend dropping the request's stream state.
+#[derive(Clone)]
+pub struct TokenSink {
+    tag: RequestTag,
+    tx: TokenStreamSender,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TokenSink {
+    pub fn new(tag: RequestTag, tx: TokenStreamSender, cancelled: Arc<AtomicBool>) -> Self {
+        Self { tag, tx, cancelled }
+    }
+
+    /// Emit one event for this request. Returns `Err` (handing the event back)
+    /// when the request was cancelled or the shared receiver is gone — both of
+    /// which the scheduler reads as "consumer dropped, retire the request",
+    /// the same contract as the old per-request channel.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, event: TokenEvent) -> Result<(), mpsc::error::SendError<TokenEvent>> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(mpsc::error::SendError(event));
+        }
+        self.tx.send((self.tag.clone(), event)).map_err(|err| {
+            let (_, event) = err.0;
+            mpsc::error::SendError(event)
+        })
+    }
+
+    /// `true` once the request is cancelled or the shared receiver is gone.
+    pub fn is_closed(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || self.tx.is_closed()
+    }
+
+    /// The request id this sink tags its events with.
+    pub fn tag(&self) -> &RequestTag {
+        &self.tag
+    }
+
+    /// A sink backed by its own private channel, for direct drivers
+    /// (benchmarks, integration tests, the simulator) that consume one
+    /// request's events without the shared frontend demux. The returned
+    /// receiver yields the tagged events; the cancel flag is never tripped.
+    pub fn standalone() -> (Self, TokenStreamReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = Self::new(Arc::from("local"), tx, Arc::new(AtomicBool::new(false)));
+        (sink, rx)
+    }
 }
 
 /// Seconds since `UNIX_EPOCH` as `f64` — the clock base for `TokenEvent`

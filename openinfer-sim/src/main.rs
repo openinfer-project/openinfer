@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use clap::Parser;
 use openinfer_sim::{SimulatedEngineConfig, start_engine};
@@ -50,12 +52,12 @@ async fn main() -> Result<()> {
     )?;
     let handle = start_engine(config);
 
-    openinfer_vllm_frontend::serve_model(
-        handle,
-        args.model_id,
+    openinfer_vllm_frontend::serve(
+        std::future::ready(Ok(handle)),
+        Path::new(&args.model_id),
         Vec::new(),
         args.port,
-        args.max_model_len,
+        Some(args.max_model_len),
         openinfer_vllm_frontend::shutdown_token_from_ctrl_c(),
     )
     .await

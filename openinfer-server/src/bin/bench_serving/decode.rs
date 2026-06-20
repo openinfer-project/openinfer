@@ -22,9 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use log::{info, warn};
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{KvCapacity, SchedulerHandle, SchedulerRequest, TokenEvent};
+use openinfer::scheduler::{KvCapacity, SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
 use openinfer::server_engine::ModelType;
-use tokio::sync::mpsc;
 
 use crate::cli::{Cli, DecodeArgs};
 use crate::exec::{BenchModel, run_scheduler_stream};
@@ -276,7 +275,7 @@ fn measure_decode_stream(
     params: SamplingParams,
     max_tokens: usize,
 ) -> Result<StreamResult> {
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
     handle
         .submit(SchedulerRequest {
             request_id: Some(request_id),
@@ -297,7 +296,7 @@ fn measure_decode_stream(
     let mut first_at: Option<Instant> = None;
     let mut prev_at: Option<Instant> = None;
     loop {
-        match token_rx.blocking_recv() {
+        match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Scheduled {
                 cached_tokens: cached,
                 ..

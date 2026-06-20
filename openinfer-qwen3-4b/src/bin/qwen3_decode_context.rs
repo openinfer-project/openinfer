@@ -187,11 +187,11 @@ fn prefill_one(
         params,
         0,
         false,
-        rng.random(),
     )];
     let result = executor.execute_prefill(PrefillPlan {
         requests: &requests,
         echo: false,
+        sample_seed: rng.random(),
     })?;
     Ok(result.requests[0].first_token)
 }
@@ -203,16 +203,11 @@ fn decode_one_step(
     params: SamplingParams,
     rng: &mut StdRng,
 ) -> Result<Duration> {
-    let requests = [DecodeStepItem::new(
-        request_id,
-        *token,
-        params,
-        0,
-        rng.random(),
-    )];
+    let requests = [DecodeStepItem::new(request_id, *token, params, 0)];
     let start = Instant::now();
     let result = executor.execute_decode(DecodePlan {
         requests: &requests,
+        sample_seed: rng.random(),
     })?;
     let elapsed = start.elapsed();
     *token = result.requests[0].token;
@@ -247,11 +242,12 @@ fn decode_batch_step(
 ) -> Result<Duration> {
     let requests: Vec<DecodeStepItem> = batch
         .iter()
-        .map(|&(request_id, token)| DecodeStepItem::new(request_id, token, params, 0, rng.random()))
+        .map(|&(request_id, token)| DecodeStepItem::new(request_id, token, params, 0))
         .collect();
     let start = Instant::now();
     let result = executor.execute_decode(DecodePlan {
         requests: &requests,
+        sample_seed: rng.random(),
     })?;
     let elapsed = start.elapsed();
     for (slot, req_result) in batch.iter_mut().zip(&result.requests) {

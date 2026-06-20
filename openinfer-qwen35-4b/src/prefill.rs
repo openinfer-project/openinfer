@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 /// This is not an admission cap. Actual prompt admission is governed by the
 /// paged KV pool, RoPE cache coverage, and allocation success. Prompts longer
 /// than this are handled by chunking prefill at `PREFILL_CHUNK_LEN` rather than
-/// being rejected (see `prefill_forward`).
+/// being rejected (see `prefill_last_hidden`).
 pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 
 /// Maximum number of tokens processed in a single prefill forward pass.
@@ -45,16 +45,18 @@ fn checked_prefill_end_pos(
 }
 
 impl Qwen35Model {
-    pub(super) fn prefill_forward(
+    pub(super) fn prefill_last_hidden(
         &self,
         token_ids: &[u32],
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
     ) -> Result<DeviceVec> {
         let seq_len = token_ids.len();
-        anyhow::ensure!(seq_len > 0, "prefill_forward requires at least one token");
+        anyhow::ensure!(
+            seq_len > 0,
+            "Qwen3.5 prefill_last_hidden requires at least one token"
+        );
         let c = &self.config;
-        let hidden_dim = c.hidden_size;
 
         // Validate the full target range up front (position overflow + RoPE cache
         // coverage) so an out-of-range prompt is rejected before any chunk mutates
@@ -79,23 +81,38 @@ impl Qwen35Model {
         let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
 
         // Last-token logic runs once, on the final chunk's output.
-        let last_hidden = ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)?;
+        ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)
+    }
 
-        // Final norm (1+weight offset)
-        let normed = {
-            let mut out = DeviceVec::zeros(&self.ctx, hidden_dim)?;
-            ops::rms_norm_offset_into(
-                &self.ctx,
-                &last_hidden,
-                &self.norm,
-                c.rms_norm_eps,
-                &mut out,
-            )?;
-            out
-        };
+    pub(super) fn batch_last_hidden_logits(
+        &self,
+        last_hiddens: &[DeviceVec],
+    ) -> Result<HiddenStates> {
+        let n = last_hiddens.len();
+        anyhow::ensure!(n > 0, "batch_last_hidden_logits requires at least one row");
+        let hidden_dim = self.config.hidden_size;
 
-        // LM head (tied embeddings)
-        ops::linear(&self.ctx, &normed, &self.embed_tokens)
+        let mut batched = HiddenStates::zeros(&self.ctx, hidden_dim, n)?;
+        for (request_idx, last_hidden) in last_hiddens.iter().enumerate() {
+            anyhow::ensure!(
+                last_hidden.len == hidden_dim,
+                "Qwen3.5 last hidden row {request_idx} has len {}, expected {hidden_dim}",
+                last_hidden.len
+            );
+            ops::write_vec_into(&self.ctx, last_hidden, &mut batched, request_idx)?;
+        }
+
+        let mut normed = HiddenStates::zeros(&self.ctx, hidden_dim, n)?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &batched,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        )?;
+        let logits = ops::gemm(&self.ctx, &self.embed_tokens, &normed)?;
+        debug_assert_eq!(logits.seq_len, n);
+        Ok(logits)
     }
 
     /// Forward one prefill chunk through all layers, advancing the paged KV state
@@ -239,9 +256,9 @@ impl Qwen35Model {
             self.batched_rms_norm_offset(&hidden_plus_attn, &layer.post_attention_layernorm, eps)?;
 
         // 4. MLP (batched)
-        let gate_out = ops::gemm(&self.ctx, &layer.mlp.gate_proj, &normed_batch)?;
-        let up_out = ops::gemm(&self.ctx, &layer.mlp.up_proj, &normed_batch)?;
-        let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
+        let gate_up_out = ops::gemm(&self.ctx, &layer.mlp.gate_up_proj, &normed_batch)?;
+        let mut act_out = HiddenStates::zeros(&self.ctx, c.intermediate_size, seq_len)?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &gate_up_out, &mut act_out)?;
         let mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
 
         // 5. Residual

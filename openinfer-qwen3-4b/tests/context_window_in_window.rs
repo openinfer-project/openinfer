@@ -22,9 +22,8 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_core::sampler::SamplingParams;
-use tokio::sync::mpsc;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
@@ -66,7 +65,7 @@ fn in_window_prompt_past_old_rope_table_is_served() {
     // Token id 1 is a valid vocab id — a forward pass actually runs here (unlike
     // the rejection test, which never reaches prefill).
     let prompt_tokens = vec![1u32; 4097];
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -83,7 +82,7 @@ fn in_window_prompt_past_old_rope_table_is_served() {
 
     let mut generated = 0usize;
     loop {
-        match rx.blocking_recv() {
+        match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { .. }) => generated += 1,
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,

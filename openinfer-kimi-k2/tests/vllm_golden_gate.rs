@@ -55,7 +55,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, EpBackend, TokenEvent, TokenLogprob,
+    EngineHandle, EngineLoadOptions, EpBackend, TokenEvent, TokenLogprob, TokenSink,
+    TokenStreamReceiver,
 };
 use openinfer_core::parallel::ParallelConfig;
 use openinfer_core::sampler::SamplingParams;
@@ -310,7 +311,7 @@ fn start_engine(path: &str) -> EngineHandle {
 
 struct PendingRequest {
     label: String,
-    rx: tokio::sync::mpsc::UnboundedReceiver<TokenEvent>,
+    rx: TokenStreamReceiver,
 }
 
 fn submit(
@@ -320,7 +321,7 @@ fn submit(
     max_tokens: usize,
     logprobs: usize,
 ) -> PendingRequest {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = TokenSink::standalone();
     engine
         .submit(openinfer_core::engine::GenerateRequest {
             request_id: Some(label.clone()),
@@ -351,7 +352,7 @@ impl PendingRequest {
         let mut tokens = Vec::new();
         let deadline = Instant::now() + RECV_TIMEOUT;
         loop {
-            match self.rx.try_recv() {
+            match self.rx.try_recv().map(|(_, event)| event) {
                 Ok(TokenEvent::Token { id, logprob }) => {
                     let logprob = logprob.unwrap_or_else(|| {
                         panic!(

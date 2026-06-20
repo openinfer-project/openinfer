@@ -1,7 +1,12 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, bail, ensure};
 use half::bf16;
+use log::info;
 use openinfer_core::{
     ops,
     tensor::{DeviceContext, DeviceMatrix, HiddenStates},
@@ -72,7 +77,8 @@ impl DriverRankModel {
         let ctx = DeviceContext::new_with_device(device_ordinal)?;
         activate(&ctx)?;
 
-        with_weight_shards(model_path, |shards, weight_map| {
+        with_weight_shards(model_path, layout.rank(), "driver", |shards, weight_map| {
+            let gpu_started = Instant::now();
             let embed_tokens =
                 load_tensor_2d(&ctx, shards, weight_map, "model.embed_tokens.weight")?;
             ensure!(
@@ -149,6 +155,13 @@ impl DriverRankModel {
                 });
             }
 
+            ctx.sync()?;
+            info!(
+                "DeepSeek-V2-Lite EP rank {} driver GPU model loaded in {:.0}ms",
+                layout.rank(),
+                duration_ms(gpu_started.elapsed())
+            );
+
             Ok(Self {
                 ctx,
                 layout,
@@ -186,7 +199,8 @@ impl ExpertRankModel {
         let ctx = DeviceContext::new_with_device(device_ordinal)?;
         activate(&ctx)?;
 
-        with_weight_shards(model_path, |shards, weight_map| {
+        with_weight_shards(model_path, layout.rank(), "expert", |shards, weight_map| {
+            let gpu_started = Instant::now();
             let mut layers = Vec::with_capacity(config.num_hidden_layers);
             for layer_idx in 0..config.num_hidden_layers {
                 if config.is_moe_layer(layer_idx) {
@@ -198,6 +212,13 @@ impl ExpertRankModel {
                     layers.push(None);
                 }
             }
+
+            ctx.sync()?;
+            info!(
+                "DeepSeek-V2-Lite EP rank {} expert GPU model loaded in {:.0}ms",
+                layout.rank(),
+                duration_ms(gpu_started.elapsed())
+            );
 
             Ok(Self {
                 ctx,
@@ -224,14 +245,26 @@ impl ExpertRankModel {
 
 fn with_weight_shards<T>(
     model_path: &Path,
+    rank: usize,
+    role: &str,
     load: impl FnOnce(&[safetensors::SafeTensors<'_>], &HashMap<String, usize>) -> Result<T>,
 ) -> Result<T> {
     let model_path_str = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
     let (shard_paths, weight_map) = load_shard_info(model_path_str)?;
+    info!(
+        "DeepSeek-V2-Lite EP rank {rank} {role}: loading {} safetensor shard(s)",
+        shard_paths.len()
+    );
+    let host_started = Instant::now();
     let mmaps = mmap_shards(&shard_paths)?;
     let shards = deserialize_shards(&mmaps)?;
+    info!(
+        "DeepSeek-V2-Lite EP rank {rank} {role}: mmap+deserialize {} safetensor shard(s) in {:.0}ms",
+        shard_paths.len(),
+        duration_ms(host_started.elapsed())
+    );
     load(&shards, &weight_map)
 }
 
@@ -403,6 +436,10 @@ fn load_owned_experts(
     Ok(experts)
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
 pub(crate) fn dense_mlp_forward(
     ctx: &DeviceContext,
     mlp: &DenseMlp,
@@ -411,7 +448,7 @@ pub(crate) fn dense_mlp_forward(
     activate(ctx)?;
     let gate_up = ops::gemm(ctx, &mlp.gate_up_proj, input)?;
     let mut act = HiddenStates::zeros(ctx, gate_up.hidden_dim / 2, input.seq_len)?;
-    ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act);
+    ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act)?;
     ops::gemm(ctx, &mlp.down_proj, &act)
 }
 
@@ -423,6 +460,6 @@ pub(crate) fn dense_mlp_forward_per_token(
     activate(ctx)?;
     let gate_up = ops::gemm_per_token(ctx, &mlp.gate_up_proj, input)?;
     let mut act = HiddenStates::zeros(ctx, gate_up.hidden_dim / 2, input.seq_len)?;
-    ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act);
+    ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act)?;
     ops::gemm_per_token(ctx, &mlp.down_proj, &act)
 }

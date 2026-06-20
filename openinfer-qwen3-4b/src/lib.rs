@@ -17,7 +17,8 @@ mod weights;
 use std::path::Path;
 
 use anyhow::Result;
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, ModelInfo};
+use log::{info, warn};
+use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelInfo};
 
 pub use kernel_plan::kernel_plan;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
@@ -141,6 +142,88 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| u32::try_from(value).ok()),
     }))
+}
+
+/// Server-facing launch knobs for the Qwen3 engine.
+///
+/// The binary maps raw CLI flags into this struct; [`launch`] then owns the
+/// Qwen3 startup policy — the TP→device mapping and the LoRA↔CUDA-Graph
+/// exclusion — and dispatches to the right low-level entry. That policy lives
+/// with the model instead of leaking into the server.
+#[derive(Clone, Copy, Debug)]
+pub struct Qwen3LaunchOptions {
+    /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
+    pub device_ordinal: usize,
+    /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
+    pub tp_size: usize,
+    /// Whether the user requested CUDA Graph. LoRA serving forces it off.
+    pub cuda_graph: bool,
+    pub offload: Qwen3OffloadOptions,
+    pub no_prefix_cache: bool,
+    pub max_prefill_tokens: usize,
+    /// `Some` switches on LoRA serving (and disables CUDA Graph).
+    pub lora: Option<Qwen3LoraOptions>,
+    /// How prefill and decode share the GPU (`--decode-overlap`).
+    pub decode_overlap: DecodeOverlap,
+}
+
+/// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
+pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHandle> {
+    let device_ordinals = if options.tp_size == 1 {
+        vec![options.device_ordinal]
+    } else {
+        (0..options.tp_size).collect()
+    };
+    // LoRA serving repoints adapter weights between steps, which a captured
+    // decode graph bakes in — the two cannot coexist, so LoRA wins.
+    let enable_cuda_graph = if options.lora.is_some() {
+        if options.cuda_graph {
+            warn!("Qwen3: CUDA Graph is disabled while LoRA serving is enabled");
+        }
+        false
+    } else {
+        options.cuda_graph
+    };
+    let engine = EngineLoadOptions {
+        enable_cuda_graph,
+        enable_prefill_profile: false,
+        device_ordinals,
+        parallel_config: None,
+        ep_backend: EpBackend::Nccl,
+        seed: 42,
+    };
+    if options.offload.enabled {
+        info!(
+            "Qwen3 KV offload enabled: host tier {:.1} GiB, no_prefix_cache={}",
+            options.offload.pinned_pool_bytes as f64 / f64::from(1u32 << 30),
+            options.no_prefix_cache
+        );
+    }
+    match options.lora {
+        Some(lora) => {
+            info!(
+                "Starting Qwen3 engine with LoRA control; max_loras={}, max_lora_rank={}",
+                lora.max_loras, lora.max_lora_rank
+            );
+            start_engine_with_lora_control(
+                model_path,
+                engine,
+                lora,
+                options.offload,
+                options.no_prefix_cache,
+                options.max_prefill_tokens,
+                options.decode_overlap,
+            )
+        }
+        None => start_engine_with_offload(
+            model_path,
+            engine,
+            options.offload,
+            options.no_prefix_cache,
+            options.max_prefill_tokens,
+            options.decode_overlap,
+        ),
+    }
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {

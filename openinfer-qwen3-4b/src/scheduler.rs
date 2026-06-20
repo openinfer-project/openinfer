@@ -13,7 +13,7 @@ use std::collections::{HashSet, VecDeque};
 use std::thread;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -22,6 +22,7 @@ use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
+    TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
 
@@ -35,7 +36,7 @@ use self::resolve::resolve_step;
 pub(super) struct ActiveRequestState {
     pub(super) request_id: RequestId,
     pub(super) lora_adapter: Option<String>,
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) last_token: u32,
     pub(super) generated_count: usize,
     pub(super) max_tokens: usize,
@@ -52,7 +53,7 @@ pub(super) struct PendingRequest {
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) params: SamplingParams,
     pub(super) max_tokens: usize,
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) logprobs: usize,
     pub(super) echo: bool,
     pub(super) queued_at_unix_s: Option<f64>,
@@ -762,7 +763,7 @@ fn handle_control_request(executor: &mut impl ModelExecutor, control: EngineCont
 #[derive(Clone)]
 struct RequestFailureTarget {
     request_id: RequestId,
-    token_tx: mpsc::UnboundedSender<TokenEvent>,
+    token_tx: TokenSink,
     prompt_tokens: usize,
     completion_tokens: usize,
 }
@@ -974,6 +975,12 @@ fn admit_deferred_requests(
         if fresh_needed <= budget && decode_slots > 0 {
             budget -= fresh_needed;
             decode_slots -= 1;
+            debug!(
+                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                req.request_id,
+                req.prompt_tokens.len(),
+                req.max_tokens
+            );
             pending.push(req);
         } else {
             still_deferred.push(req);
@@ -1431,7 +1438,7 @@ mod tests {
         assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 2);
         assert_eq!(pending_lifetime_blocks(&pending, 16), 3);
 
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let (token_tx, _token_rx) = TokenSink::standalone();
         let after_prefill = ActiveRequestState {
             request_id: RequestId(8),
             lora_adapter: None,
@@ -1447,7 +1454,7 @@ mod tests {
         assert_eq!(max_active_tokens(&after_prefill), 32);
         assert_eq!(active_lifetime_blocks(&after_prefill, 16), 3);
 
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let (token_tx, _token_rx) = TokenSink::standalone();
         let after_one_decode = ActiveRequestState {
             request_id: RequestId(9),
             lora_adapter: None,
@@ -1469,7 +1476,7 @@ mod tests {
         // block_size 16, per-request cap 4 blocks (max 64 tokens). One active
         // request is mid-flight and will grow into 2 more blocks, so it
         // pre-reserves them out of the budget.
-        let (token_tx, _rx) = mpsc::unbounded_channel();
+        let (token_tx, _rx) = TokenSink::standalone();
         let active = [ActiveRequestState {
             request_id: RequestId(0),
             lora_adapter: None,
@@ -1565,7 +1572,7 @@ mod tests {
     fn admission_respects_decode_batch_capacity() {
         let mut active = Vec::new();
         for id in 0..64 {
-            let (token_tx, _rx) = mpsc::unbounded_channel();
+            let (token_tx, _rx) = TokenSink::standalone();
             active.push(ActiveRequestState {
                 request_id: RequestId(id),
                 lora_adapter: None,
@@ -1696,7 +1703,7 @@ mod tests {
         let (req, mut rx) = request(32, 2);
         handle.submit(req).expect("submit chunked request");
         match rx.blocking_recv() {
-            Some(TokenEvent::Scheduled { prompt_tokens, .. }) => {
+            Some((_, TokenEvent::Scheduled { prompt_tokens, .. })) => {
                 assert_eq!(
                     prompt_tokens, 32,
                     "Scheduled fires once, on the first chunk"
@@ -1705,16 +1712,22 @@ mod tests {
             _ => panic!("stream opens with Scheduled"),
         }
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
+            matches!(
+                rx.blocking_recv(),
+                Some((_, TokenEvent::Token { id: 100, .. }))
+            ),
             "first token arrives only after the final chunk, with no duplicate Scheduled"
         );
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 200, .. })),
+            matches!(
+                rx.blocking_recv(),
+                Some((_, TokenEvent::Token { id: 200, .. }))
+            ),
             "decode continues normally after promotion"
         );
         assert!(matches!(
             rx.blocking_recv(),
-            Some(TokenEvent::Finished { .. })
+            Some((_, TokenEvent::Finished { .. }))
         ));
 
         let batches = prefill_batches.lock().unwrap();
@@ -1790,12 +1803,15 @@ mod tests {
         handle.submit(req).expect("submit");
 
         match rx.blocking_recv() {
-            Some(TokenEvent::Scheduled {
-                prompt_tokens,
-                cached_tokens,
-                queued_at_unix_s,
-                scheduled_at_unix_s,
-            }) => {
+            Some((
+                _,
+                TokenEvent::Scheduled {
+                    prompt_tokens,
+                    cached_tokens,
+                    queued_at_unix_s,
+                    scheduled_at_unix_s,
+                },
+            )) => {
                 assert_eq!(prompt_tokens, 32);
                 assert_eq!(cached_tokens, 7);
                 assert!(queued_at_unix_s <= scheduled_at_unix_s);
@@ -1805,10 +1821,10 @@ mod tests {
 
         loop {
             match rx.blocking_recv() {
-                Some(TokenEvent::Scheduled { .. }) => {
+                Some((_, TokenEvent::Scheduled { .. })) => {
                     panic!("Scheduled must be emitted exactly once")
                 }
-                Some(TokenEvent::Finished { .. }) => break,
+                Some((_, TokenEvent::Finished { .. })) => break,
                 Some(_) => {}
                 None => panic!("stream closed without Finished"),
             }
@@ -1983,17 +1999,20 @@ mod tests {
 
     /// Engine streams now open with `TokenEvent::Scheduled` (#246); these
     /// tests assert on the token/terminal events, so skip past it.
-    fn recv_skipping_scheduled(rx: &mut mpsc::UnboundedReceiver<TokenEvent>) -> Option<TokenEvent> {
+    fn recv_skipping_scheduled(
+        rx: &mut openinfer_core::engine::TokenStreamReceiver,
+    ) -> Option<TokenEvent> {
         loop {
             match rx.blocking_recv() {
-                Some(TokenEvent::Scheduled { .. }) => {}
-                other => return other,
+                Some((_, TokenEvent::Scheduled { .. })) => {}
+                Some((_, event)) => return Some(event),
+                None => return None,
             }
         }
     }
 
     fn pending(request_id: u64, echo: bool) -> PendingRequest {
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        let (token_tx, _token_rx) = TokenSink::standalone();
         PendingRequest {
             request_id: RequestId::new(request_id),
             lora_adapter: None,
@@ -2036,8 +2055,8 @@ mod tests {
     fn request(
         prompt_len: usize,
         max_tokens: usize,
-    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
+    ) -> (GenerateRequest, openinfer_core::engine::TokenStreamReceiver) {
+        let (token_tx, token_rx) = TokenSink::standalone();
         (
             GenerateRequest {
                 request_id: None,
@@ -2058,7 +2077,7 @@ mod tests {
         prompt_len: usize,
         max_tokens: usize,
         lora_adapter: Option<&str>,
-    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
+    ) -> (GenerateRequest, openinfer_core::engine::TokenStreamReceiver) {
         let (mut request, token_rx) = request(prompt_len, max_tokens);
         request.lora_adapter = lora_adapter.map(ToString::to_string);
         (request, token_rx)
@@ -2084,11 +2103,14 @@ mod tests {
         let (too_large, mut too_large_rx) = request(16, 34);
         handle.submit(too_large).expect("submit too_large");
         match too_large_rx.blocking_recv() {
-            Some(TokenEvent::Rejected {
-                prompt_tokens,
-                completion_tokens,
-                message,
-            }) => {
+            Some((
+                _,
+                TokenEvent::Rejected {
+                    prompt_tokens,
+                    completion_tokens,
+                    message,
+                },
+            )) => {
                 assert_eq!(prompt_tokens, 16);
                 assert_eq!(completion_tokens, 0);
                 assert!(message.contains("requires more KV blocks"));
@@ -2124,11 +2146,14 @@ mod tests {
         let (too_long, mut too_long_rx) = request(16, 100);
         handle.submit(too_long).expect("submit too_long");
         match too_long_rx.blocking_recv() {
-            Some(TokenEvent::Rejected {
-                prompt_tokens,
-                completion_tokens,
-                message,
-            }) => {
+            Some((
+                _,
+                TokenEvent::Rejected {
+                    prompt_tokens,
+                    completion_tokens,
+                    message,
+                },
+            )) => {
                 assert_eq!(prompt_tokens, 16);
                 assert_eq!(completion_tokens, 0);
                 assert!(
@@ -2239,11 +2264,14 @@ mod tests {
         handle.submit(base).expect("submit base");
 
         match unknown_rx.blocking_recv() {
-            Some(TokenEvent::Rejected {
-                message,
-                prompt_tokens,
-                completion_tokens,
-            }) => {
+            Some((
+                _,
+                TokenEvent::Rejected {
+                    message,
+                    prompt_tokens,
+                    completion_tokens,
+                },
+            )) => {
                 assert!(message.contains("LoRA adapter is not loaded: missing-adapter"));
                 assert_eq!(prompt_tokens, 16);
                 assert_eq!(completion_tokens, 0);
@@ -2355,7 +2383,7 @@ mod tests {
         let mut active = Vec::new();
 
         for request_id in [RequestId(10), RequestId(1), RequestId(7)] {
-            let (token_tx, _token_rx) = mpsc::unbounded_channel();
+            let (token_tx, _token_rx) = TokenSink::standalone();
             active.push(ActiveRequestState {
                 request_id,
                 lora_adapter: None,

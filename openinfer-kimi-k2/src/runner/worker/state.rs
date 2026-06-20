@@ -349,11 +349,11 @@ impl KimiRankThreadState {
         // Non-greedy rows: one batched FlashInfer sampling pass over the
         // logits arena (its own sync, in addition to the argmax read below).
         // All-greedy batches skip this entirely — the greedy path is unchanged.
-        let sampling_rows: Vec<openinfer_kernels::ops::BatchSamplingRow> = rows
+        let sampling_rows: Vec<openinfer_sample::BatchSamplingRow> = rows
             .iter()
             .enumerate()
             .filter(|(_, r)| !r.sampling.is_greedy())
-            .map(|(i, r)| openinfer_kernels::ops::BatchSamplingRow {
+            .map(|(i, r)| openinfer_sample::BatchSamplingRow {
                 row: i,
                 temperature: r.sampling.temperature,
                 top_k: r.sampling.top_k,
@@ -369,7 +369,7 @@ impl KimiRankThreadState {
                  cannot sample the global distribution (#237, #226)"
             );
             let scratch = decode_arena.scratch.sampling.batch_sampling(&device_ctx)?;
-            openinfer_kernels::ops::gpu_sample_batch_into(
+            openinfer_sample::gpu_sample_batch_into(
                 &device_ctx,
                 decode_arena.logits.as_ref(),
                 &sampling_rows,
@@ -411,11 +411,11 @@ impl KimiRankThreadState {
         let mut reports = Vec::with_capacity(active_len);
         for (row, (local_next, local_top_logit_f32)) in picks.into_iter().enumerate() {
             let logprob = match &host_logits {
-                Some(host) if rows[row].logprobs > 0 => Some(host_token_logprob(
+                Some(host) if rows[row].logprobs > 0 => openinfer_sample::token_logprob_from_row(
                     &host[row * cache.vocab_rows..(row + 1) * cache.vocab_rows],
-                    local_next as usize,
+                    local_next,
                     rows[row].logprobs,
-                )),
+                ),
                 _ => None,
             };
             reports.push(KimiOneTokenForwardReport {
@@ -626,14 +626,14 @@ impl KimiRankThreadState {
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
                  cannot sample the global distribution (#237, #226)"
             );
-            let sampling_rows = [openinfer_kernels::ops::BatchSamplingRow {
+            let sampling_rows = [openinfer_sample::BatchSamplingRow {
                 row: 0,
                 temperature: row.sampling.temperature,
                 top_k: row.sampling.top_k,
                 top_p: row.sampling.top_p,
             }];
             let scratch = decode_arena.scratch.sampling.batch_sampling(&device_ctx)?;
-            let sampled = openinfer_kernels::ops::gpu_sample_batch_into(
+            let sampled = openinfer_sample::gpu_sample_batch_into(
                 &device_ctx,
                 openinfer_kernels::tensor::HiddenStatesRef {
                     data: &logits.data,
@@ -657,7 +657,7 @@ impl KimiRankThreadState {
                 .stream
                 .clone_dtoh(&logits.data)
                 .with_context(|| format!("Kimi rank {rank} D2H prefill logits"))?;
-            Some(host_token_logprob(&host, local_next as usize, row.logprobs))
+            openinfer_sample::token_logprob_from_row(&host, local_next, row.logprobs)
         } else {
             None
         };

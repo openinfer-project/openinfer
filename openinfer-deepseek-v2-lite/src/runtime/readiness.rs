@@ -94,14 +94,14 @@ fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
         ],
         EpBackendKind::Nccl => vec![
             DecodeGraphBlocker {
-                id: "nccl_route_iteration_on_host",
-                source: "runtime/moe.rs::moe_forward_nccl",
-                reason: "expert routing and per-route loop decisions stay on the host",
+                id: "nccl_route_plan_built_on_host",
+                source: "runtime/routing.rs::MoeRoutePlan::from_topk_routes",
+                reason: "the NCCL path still builds the routed-expert replay plan from host-side top-k routing",
             },
             DecodeGraphBlocker {
-                id: "nccl_expert_accumulation_host_directed",
-                source: "runtime/moe.rs::moe_forward_nccl",
-                reason: "expert launches and device-side scratch accumulation are still driven by the host route loop",
+                id: "nccl_route_plan_replay_host_directed",
+                source: "runtime/moe.rs::replay_nccl_route_plan",
+                reason: "expert launches and device scratch accumulation now replay a precomputed plan, but replay is still host-directed",
             },
         ],
     }

@@ -82,6 +82,10 @@ impl ModelManifest {
         self.tensors.get(name)
     }
 
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
     pub(crate) fn validate_rank_plan(&self, plan: &RankLoadPlan) -> Result<()> {
         for req in &plan.tensors {
             let info = self
@@ -107,6 +111,10 @@ impl ModelManifest {
 }
 
 impl RankLoadPlan {
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
     pub(crate) fn for_driver_rank(config: &Config, layout: &ExpertParallelLayout) -> Self {
         let mut tensors = Vec::new();
         push_top_level(config, &mut tensors);

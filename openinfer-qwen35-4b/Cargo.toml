@@ -8,6 +8,7 @@ autobenches = false
 [dependencies]
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 fastrace = { workspace = true }
@@ -38,6 +39,10 @@ required-features = ["qwen35-4b"]
 
 [[test]]
 name = "e2e_scheduler"
+required-features = ["qwen35-4b"]
+
+[[test]]
+name = "sampling_behavior"
 required-features = ["qwen35-4b"]
 
 [[bench]]

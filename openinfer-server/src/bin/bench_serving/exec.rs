@@ -6,10 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use rand::rngs::StdRng;
-use tokio::sync::mpsc;
 
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
+use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
 
 pub(crate) struct GenTimings {
     pub(crate) ttft: Duration,
@@ -121,7 +120,7 @@ pub(crate) fn run_scheduler_stream(
     max_tokens: usize,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Result<StreamOutcome> {
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
     handle
         .submit(SchedulerRequest {
             request_id,
@@ -137,7 +136,7 @@ pub(crate) fn run_scheduler_stream(
         .map_err(|e| anyhow::anyhow!("scheduler submit failed: {e}"))?;
 
     loop {
-        match token_rx.blocking_recv() {
+        match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => {
                 if !on_token(id) {
                     return Ok(StreamOutcome { finished: false });

@@ -17,7 +17,7 @@ use openinfer_kernels::{
         KimiInt4WeightManifest, KimiMarlinFusedW13Int4Weight, KimiMarlinInt4Weight,
         KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
         KimiRouterConfig, KimiRouterOutput, add_batch_into, embedding_batch_vocab_shard,
-        flashinfer_top1_batch_into, flashinfer_topk_row_states_bytes,
+        flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes,
         fused_add_rms_norm_round_batch_into, gemm_graphsafe_into_checked,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
         kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm,
@@ -276,7 +276,7 @@ fn measure_top1(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let logits = HiddenStates::zeros(&ctx, vocab, batch)?;
     let mut top1_values: CudaSlice<bf16> = ctx.stream.alloc_zeros(batch)?;
     let mut row_states: CudaSlice<u8> =
-        ctx.stream.alloc_zeros(flashinfer_topk_row_states_bytes())?;
+        ctx.stream.alloc_zeros(flashinfer_top1_row_states_bytes())?;
     let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
     measure_loop(&ctx, iters, || {
         flashinfer_top1_batch_into(&ctx, &logits, &mut top1_values, &mut row_states, &mut out)

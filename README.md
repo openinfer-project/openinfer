@@ -184,8 +184,29 @@ At 16k that turns a 1.14 s cold prefill into a 126 ms host-tier restore (9.1×; 
 tokens). The tiering ladder at 16k: HBM hit ~26 ms < host-tier restore ~126 ms ≪ cold prefill
 ~1.14 s.
 
-Qwen3.5-4B single-stream latency sits at the same level — see
-[Qwen3.5 optimization notes](docs/models/qwen35/optimization.md).
+### Qwen3.5-4B vs current vLLM
+
+Single RTX 5090 (32 GB), Qwen3.5-4B, BF16, TP1 — openinfer with the
+Qwen3.5 decode-tuning change, vLLM 0.23.0, both driven by `vllm bench serve`
+0.23.0. Fixed random prompts, 64 measured requests, 2 warmups, text-only
+serving with prefix cache off on both engines. Full flags and caveats are in the
+[Qwen3.5 benchmark report](docs/benchmarks/qwen35-4b-serving-vllm-rtx5090.md).
+
+| Workload | Metric | openinfer | vLLM 0.23.0 |
+|---|---|---:|---:|
+| 1 input / 256 output | TPOT mean | 6.282 ms | **6.214 ms** |
+| 1 input / 512 output | TPOT mean | 6.381 ms | **6.221 ms** |
+| 1024 input / 256 output | reported input tokens | 63,459 (992/request) | 65,536 (1,024/request) |
+| 1024 input / 256 output | TTFT mean (client-contract) | 55.3 ms | 66.3 ms |
+| 1024 input / 256 output | TPOT mean | 7.110 ms | **6.346 ms** |
+| 1024 input / 256 output | output tok/s | 137.0 | **151.9** |
+| 2048 input / 1 output | reported input tokens | 126,957 (1,984/request) | 131,072 (2,048/request) |
+| 2048 input / 1 output | TTFT mean (client-contract) | 97.4 ms | 101.9 ms |
+
+The decode-tuning change improves openinfer's own direct Qwen3.5 decode TPOT by about 2-3%.
+Against vLLM, prompt-len-1 decode is close, but vLLM still leads the 1024/256
+decode and high-concurrency HTTP rows. TTFT rows are fixed-client timings
+because reported prompt-token totals differ on the longer prompts.
 
 ## Architecture
 
@@ -311,3 +332,11 @@ OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V4-Flash cargo test --release -p openi
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported from
 NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
+
+## Star History
+
+<p align="center">
+  <a href="https://star-history.com/#openinfer-project/openinfer&Date">
+    <img src="https://api.star-history.com/svg?repos=openinfer-project/openinfer&type=Date" alt="Star History Chart">
+  </a>
+</p>

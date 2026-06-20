@@ -160,7 +160,7 @@ impl GdrChunkwiseScratch35 {
         let full_out = config.num_attention_heads * config.head_dim;
         let full_attn_temps = (full_qkv + full_kv * 2 + full_out * 2) * seq;
 
-        // MLP: gate_out + up_out + act_out
+        // MLP: gate_up_out + act_out (same peak footprint as separate gate/up)
         let mlp_temps = intermediate * seq * 3;
 
         let peak_layer = shared_layer + full_attn_temps.max(mlp_temps);

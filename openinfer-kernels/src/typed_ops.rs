@@ -251,13 +251,21 @@ where
     );
     let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
     let (o_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::silu_mul_fused_cuda(
             gu_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             INTER as i32,
             gate_up.seq_len as i32,
             crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "typed silu_mul CUDA launch failed: cuda_status={}, intermediate={}, batch={}",
+            result,
+            INTER,
+            gate_up.seq_len
         );
     }
     Ok(())
@@ -574,13 +582,21 @@ pub fn silu_mul_hs_fused_into(
     );
     let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
     let (o_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::silu_mul_fused_cuda(
             gu_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             inter as i32,
             gate_up.seq_len as i32,
             crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "typed silu_mul_hs CUDA launch failed: cuda_status={}, intermediate={}, batch={}",
+            result,
+            inter,
+            gate_up.seq_len
         );
     }
     Ok(())

@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::{
-    engine::{EngineLoadOptions, GenerateRequest, TokenEvent},
+    engine::{EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink},
     ops::call_trace,
     sampler::SamplingParams,
 };
@@ -9,8 +9,6 @@ use openinfer_kernels::tensor::{
     AxisSpec, Bf16, Contiguous1D, F32, HiddenStatesLayout, I32, KernelCall, RowMajor2D, TensorSpec,
     U32,
 };
-#[cfg(feature = "kernel-call-trace")]
-use tokio::sync::mpsc;
 
 use crate::config::{
     KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS,
@@ -119,7 +117,7 @@ pub fn trace_runtime_decode_kernel_calls(
     let ((), calls) = call_trace::collect_result(|| {
         let mut receivers = Vec::with_capacity(batch_size);
         for request_idx in 0..batch_size {
-            let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+            let (token_tx, mut token_rx) = TokenSink::standalone();
             engine.submit(GenerateRequest {
                 request_id: Some(format!("kimi-trace-{request_idx}")),
                 queued_at_unix_s: None,
@@ -137,7 +135,7 @@ pub fn trace_runtime_decode_kernel_calls(
                 echo: false,
             })?;
             receivers.push(std::thread::spawn(move || -> Result<()> {
-                while let Some(event) = token_rx.blocking_recv() {
+                while let Some((_, event)) = token_rx.blocking_recv() {
                     match event {
                         TokenEvent::Scheduled { .. }
                         | TokenEvent::Token { .. }

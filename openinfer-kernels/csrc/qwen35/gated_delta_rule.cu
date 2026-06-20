@@ -74,6 +74,11 @@ __global__ void gated_delta_rule_decode_kernel(
         smem_norm[0] = rsqrtf(total + 1e-12f);
     }
 
+    // Reused buffer: fence thread 0's q-norm read of warp_norms above before the warps
+    // overwrite it with k_sq below. Cross-warp; without this, two co-resident streams race
+    // read-vs-overwrite into a corrupted q-norm (nondeterministic decode). Do not remove.
+    __syncthreads();
+
     float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
     k_sq = warp_reduce_sum(k_sq);
     if (lane_id == 0) warp_norms[warp_id] = k_sq;

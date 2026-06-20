@@ -1,17 +1,20 @@
 use std::{
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use log::info;
 use openinfer_engine::engine::{
-    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent,
+    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenSink,
 };
 use tokio::sync::mpsc;
 
 use crate::runtime::{DeepSeekV2LiteEp2Generator, GenerationResult};
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
+    let started = Instant::now();
+    info!("starting DeepSeek-V2-Lite EP2 engine");
     let mut generator = DeepSeekV2LiteEp2Generator::load(model_path, options)?;
     let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
 
@@ -24,6 +27,10 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         })
         .context("spawn DeepSeek-V2-Lite EP=2 engine thread")?;
 
+    info!(
+        "DeepSeek-V2-Lite EP2 engine started cost {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(EngineHandle::new_with_join_handle(submit_tx, join_handle))
 }
 
@@ -92,11 +99,7 @@ fn reject_request(req: &GenerateRequest, prompt_tokens: usize, message: String) 
     });
 }
 
-fn emit_generation_result(
-    token_tx: &mpsc::UnboundedSender<TokenEvent>,
-    prompt_tokens: usize,
-    result: &GenerationResult,
-) {
+fn emit_generation_result(token_tx: &TokenSink, prompt_tokens: usize, result: &GenerationResult) {
     for token in &result.tokens {
         let _ = token_tx.send(TokenEvent::Token {
             id: *token,
@@ -123,7 +126,7 @@ mod tests {
 
     #[test]
     fn stop_generation_streams_tokens_and_stop_finish() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = TokenSink::standalone();
 
         emit_generation_result(
             &tx,
@@ -136,15 +139,15 @@ mod tests {
         );
         drop(tx);
 
-        match rx.try_recv().expect("expected first token") {
+        match rx.try_recv().expect("expected first token").1 {
             TokenEvent::Token { id, .. } => assert_eq!(id, 10),
             _ => panic!("expected first token event"),
         }
-        match rx.try_recv().expect("expected second token") {
+        match rx.try_recv().expect("expected second token").1 {
             TokenEvent::Token { id, .. } => assert_eq!(id, 11),
             _ => panic!("expected second token event"),
         }
-        match rx.try_recv().expect("expected finished event") {
+        match rx.try_recv().expect("expected finished event").1 {
             TokenEvent::Finished {
                 finish_reason,
                 prompt_tokens,

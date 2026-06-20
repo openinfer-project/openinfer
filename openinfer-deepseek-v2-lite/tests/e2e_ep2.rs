@@ -615,7 +615,7 @@ fn validate_generation_stats(
             ensure!(
                 stats.nccl_dense_exchange_calls > 0
                     && stats.nccl_combine_calls == stats.nccl_dense_exchange_calls,
-                "case {} NCCL EP gate did not record matching dense exchange/combine calls",
+                "case {} NCCL EP gate did not record matching dense exchange/combine calls: exchange={}, combine={}",
                 case.id,
                 stats.nccl_dense_exchange_calls,
                 stats.nccl_combine_calls
@@ -623,7 +623,7 @@ fn validate_generation_stats(
             ensure!(
                 stats.nccl_dense_exchange_elements > 0
                     && stats.nccl_combine_elements == stats.nccl_dense_exchange_elements,
-                "case {} NCCL EP gate did not record matching dense exchange/combine elements",
+                "case {} NCCL EP gate did not record matching dense exchange/combine elements: exchange={}, combine={}",
                 case.id,
                 stats.nccl_dense_exchange_elements,
                 stats.nccl_combine_elements
