@@ -37,7 +37,11 @@ pub(super) fn build_next_plan(
     have_active: bool,
     pending: Vec<PendingRequest>,
 ) -> Option<ExecutionPlan> {
-    if !pending.is_empty() && have_active {
+    // echo+logprobs requests need all-position logits, which the unified
+    // forward does not compute (it passes all_position_logits=None). Route
+    // them through a dedicated prefill step instead of degrading silently.
+    let needs_prompt_logprobs = pending.iter().any(|r| r.echo && r.logprobs > 0);
+    if !pending.is_empty() && have_active && !needs_prompt_logprobs {
         Some(ExecutionPlan::Unified { pending })
     } else if !pending.is_empty() {
         Some(ExecutionPlan::Prefill { pending })
@@ -201,6 +205,28 @@ mod tests {
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
             "active + pending fuses prefill and decode into one unified step"
+        );
+        // echo+logprobs requests need all-position logits; route to Prefill
+        // even when decodes are active so prompt logprobs are not silently lost.
+        let mut echo_req = pending();
+        echo_req.echo = true;
+        echo_req.logprobs = 5;
+        assert!(
+            matches!(
+                build_next_plan(true, vec![echo_req]),
+                Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+            ),
+            "active + pending echo+logprobs request routes to prefill not unified"
+        );
+        // echo without logprobs (no prompt logprobs needed) can still use unified.
+        let mut echo_no_lp = pending();
+        echo_no_lp.echo = true;
+        assert!(
+            matches!(
+                build_next_plan(true, vec![echo_no_lp]),
+                Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
+            ),
+            "active + pending echo-only request (no logprobs) can use unified"
         );
     }
 }
