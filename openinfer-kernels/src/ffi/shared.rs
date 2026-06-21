@@ -154,6 +154,8 @@ unsafe extern "C" {
     // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
     pub fn gemm_lt_pin_tune_cuda(M: i32, rep_n: i32, K: i32) -> i32;
 
+    pub fn stream_is_capturing_cuda(stream: CUstream) -> i32;
+
     pub fn gemm_lt_pin_cuda(
         W: *const Half,
         X: *const Half,

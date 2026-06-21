@@ -648,4 +648,14 @@ int gemm_per_token_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+// 1 if `stream` is mid graph-capture, 0 if not, <0 (negated cudaError_t) on query failure.
+int stream_is_capturing_cuda(cudaStream_t stream) {
+  cudaStreamCaptureStatus capture_status;
+  cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
+  if (err != cudaSuccess) {
+    return -static_cast<int>(err);
+  }
+  return capture_status == cudaStreamCaptureStatusNone ? 0 : 1;
+}
+
 } // extern "C"

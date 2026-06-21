@@ -529,6 +529,11 @@ fn record_pin_fallback(m: usize, n: usize, k: usize, reason: &str) {
 /// N (NOT first-call-N, which would make the pinned algo call-order-dependent).
 const PIN_REP_N: i32 = 32;
 
+/// Pin one `(num_rows, cols)` algo at the canonical `PIN_REP_N`, reused for all N.
+pub fn gemm_lt_pin_warmup(num_rows: usize, cols: usize) -> Result<()> {
+    gemm_lt_pin_tune(num_rows, PIN_REP_N as usize, cols)
+}
+
 /// `Pin` policy: lazily pin (m,k) at PIN_REP_N, run at live N, per-token fallback if it can't serve N.
 fn launch_gemm_pin(
     w_ptr: *const ffi::Half,
@@ -549,10 +554,19 @@ fn launch_gemm_pin(
         );
         return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx);
     }
-    // Lazy-pin (m,k). In the Qwen3 served path, non-overlap prefill should have pinned every decode
-    // projection shape before decode graph capture; tuning a new shape here may allocate.
+    // The eager warmup (gemm_lt_pin_warmup in tune_decode_gemm_algos) pins every decode shape before
+    // capture; a lazy tune here allocates, illegal mid-capture — so refuse under capture, don't 900.
     if gemm_lt_pin_inspect(m, k).is_none() {
-        gemm_lt_pin_tune(m, PIN_REP_N as usize, k)?;
+        match unsafe { ffi::stream_is_capturing_cuda(crate::tensor::active_cu_stream(ctx)) } {
+            0 => gemm_lt_pin_tune(m, PIN_REP_N as usize, k)?,
+            s if s < 0 => bail!(
+                "cudaStreamIsCapturing query failed: status={}, m={m}, k={k}",
+                -s
+            ),
+            _ => bail!(
+                "batch-invariant pin: ({m},{k}) reached graph capture unpinned — the decode pin warmup must run before capture"
+            ),
+        }
     }
     unsafe {
         let status = ffi::gemm_lt_pin_cuda(

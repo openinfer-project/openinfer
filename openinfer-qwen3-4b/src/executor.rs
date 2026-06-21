@@ -493,11 +493,10 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
     Ok(())
 }
 
-/// Pick the fastest cublasLt algo for every decode GEMM shape (buckets up to
-/// `GEMM_LT_MAX_N`) before the first step, so CUDA-Graph capture bakes in the
-/// tuned kernels; adds a few seconds of startup per model thread. Every
-/// layer's weights enter the timing rotation to keep the loop L2-cold, the
-/// regime steady-state decode runs in.
+/// Prepare decode GEMM algos before capture, per the active numeric policy: under `Pin`, eagerly pin
+/// one algo per projection {M,K} (reused for all N); otherwise tune the fastest cublasLt algo per
+/// decode shape (buckets up to `GEMM_LT_MAX_N`, every layer's weights in the L2-cold timing rotation).
+/// Adds a few seconds of startup per model thread.
 fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
@@ -505,6 +504,19 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
     let q_dim = model.local_q_dim();
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
+
+    use openinfer_kernels::ops::{NumericPolicy, gemm_lt_pin_warmup, numeric_policy};
+    if numeric_policy() == NumericPolicy::Pin {
+        // Eager pin before capture: the lazy pin-workspace alloc is illegal mid-capture.
+        gemm_lt_pin_warmup(q_dim, hidden)?;
+        gemm_lt_pin_warmup(kv_dim, hidden)?;
+        gemm_lt_pin_warmup(hidden, q_dim)?;
+        gemm_lt_pin_warmup(intermediate, hidden)?;
+        gemm_lt_pin_warmup(hidden, intermediate)?;
+        gemm_lt_pin_warmup(vocab, hidden)?;
+        return Ok(());
+    }
+
     let layers = &model.layers;
 
     let q_samples: Vec<_> = layers.iter().map(|l| (&l.attention.qkv_proj, 0)).collect();
