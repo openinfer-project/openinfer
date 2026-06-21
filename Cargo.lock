@@ -3809,6 +3809,7 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+ "log",
  "openinfer-build",
  "serde",
  "tvm-ffi",

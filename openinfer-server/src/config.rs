@@ -118,6 +118,11 @@ pub(crate) struct Args {
     /// go to prefill). Ignored in other modes.
     #[arg(long, default_value_t = 20)]
     pub decode_sm_pct: u32,
+
+    /// Enable Qwen3 projection-GEMM batch-invariant pinning. Off by default;
+    /// does not cover path-selection residuals. Qwen3-only.
+    #[arg(long, default_value_t = false)]
+    pub batch_invariant: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -168,11 +173,24 @@ impl Args {
             bail!("--lora-modules requires --enable-lora");
         }
         #[cfg(feature = "qwen3-4b")]
-        let lora_capable = matches!(model_type, ModelType::Qwen3);
+        let is_qwen3 = matches!(model_type, ModelType::Qwen3);
         #[cfg(not(feature = "qwen3-4b"))]
-        let lora_capable = false;
-        if self.enable_lora && !lora_capable {
+        let is_qwen3 = false;
+        if self.enable_lora && !is_qwen3 {
             bail!("--enable-lora is currently supported only for Qwen3");
+        }
+        if self.batch_invariant && !is_qwen3 {
+            bail!("--batch-invariant is currently supported only for Qwen3");
+        }
+        if self.batch_invariant && self.enable_lora {
+            bail!(
+                "--batch-invariant is not yet validated with --enable-lora; enable one at a time"
+            );
+        }
+        if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
+            bail!(
+                "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+            );
         }
         Ok(())
     }

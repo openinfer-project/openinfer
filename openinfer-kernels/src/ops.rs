@@ -37,9 +37,10 @@ pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_deco
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{
-    GEMM_LT_MAX_N, NumericPolicy, gemm, gemm_graphsafe_into_checked, gemm_graphsafe_ref_into_checked,
-    gemm_into, gemm_into_checked, gemm_lt_pin_inspect, gemm_lt_pin_into_checked, gemm_lt_pin_tune,
-    gemm_lt_tune, gemm_per_token, gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
+    GEMM_LT_MAX_N, NumericPolicy, gemm, gemm_graphsafe_into_checked,
+    gemm_graphsafe_ref_into_checked, gemm_into, gemm_into_checked, gemm_lt_pin_inspect,
+    gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_lt_tune, gemm_per_token,
+    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
     gemm_token_range_into_checked, gemv, linear, numeric_policy, pin_counters, pin_fallback_shapes,
     reset_pin_counters, set_numeric_policy,
 };

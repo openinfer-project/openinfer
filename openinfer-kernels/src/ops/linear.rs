@@ -449,10 +449,11 @@ fn gemm_ref_into_with_policy(
     )
 }
 
-/// Process-global numeric policy for projection GEMMs (atomics, not thread-local: the probe sets it
-/// from the main thread, the model reads it on a worker thread). `Tuned` (default) = production
-/// path; `Pin` = batch-invariant pinned algo (per-token fallback when it can't run); `PerToken` =
-/// N=1 oracle. `OPENINFER_NUMERIC_POLICY=pin|pertoken` sets the initial value.
+/// Process-global numeric policy for projection GEMMs (atomics, not thread-local: set on the main
+/// thread before worker construction, read on the worker). `Tuned` (default) = production path;
+/// `Pin` = batch-invariant pinned algo (per-token fallback when it can't serve an N, or under a
+/// stream override); `PerToken` = N=1 oracle. Set via `set_numeric_policy` before executor
+/// construction / graph capture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum NumericPolicy {
@@ -461,18 +462,7 @@ pub enum NumericPolicy {
     PerToken = 2,
 }
 
-impl NumericPolicy {
-    fn from_env() -> Self {
-        match std::env::var("OPENINFER_NUMERIC_POLICY").as_deref() {
-            Ok("pin") => NumericPolicy::Pin,
-            Ok("pertoken") => NumericPolicy::PerToken,
-            _ => NumericPolicy::Tuned,
-        }
-    }
-}
-
-const POLICY_UNINIT: u8 = u8::MAX;
-static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(POLICY_UNINIT);
+static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(NumericPolicy::Tuned as u8);
 static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
 static PIN_FALLBACK: AtomicU64 = AtomicU64::new(0);
 type FallbackShapeMap = Mutex<BTreeMap<(usize, usize, usize), u64>>;
@@ -483,38 +473,23 @@ fn pin_fallback_shapes_map() -> &'static FallbackShapeMap {
     PIN_FALLBACK_SHAPES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Override the cached policy in-process — to drive baseline/pin/per-token in one run, vs the
-/// `OPENINFER_NUMERIC_POLICY` env var that `numeric_policy()` lazy-reads.
+/// Set the process-global policy. Must run before executor construction / graph capture (the
+/// captured algo is the one live at capture). Tests drive baseline/pin/per-token through it.
 pub fn set_numeric_policy(p: NumericPolicy) {
     NUMERIC_POLICY.store(p as u8, Ordering::Release);
 }
 
 pub fn numeric_policy() -> NumericPolicy {
-    let mut v = NUMERIC_POLICY.load(Ordering::Acquire);
-    if v == POLICY_UNINIT {
-        // Only win the lazy-init race while still uninit, so a concurrent
-        // set_numeric_policy() is never clobbered by the env default.
-        let env = NumericPolicy::from_env() as u8;
-        v = match NUMERIC_POLICY.compare_exchange(
-            POLICY_UNINIT,
-            env,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => env,
-            Err(actual) => actual,
-        };
-    }
-    match v {
+    match NUMERIC_POLICY.load(Ordering::Acquire) {
         1 => NumericPolicy::Pin,
         2 => NumericPolicy::PerToken,
         _ => NumericPolicy::Tuned,
     }
 }
 
-/// `(pin_served, pin_fallback)` projection-GEMM counts. Guards the experiment
-/// against a maxΔ=0 that is actually all per-token fallback (already known
-/// invariant), not the pin.
+/// `(pin_served, pin_fallback)` projection-GEMM counts: process-global, mixed across prefill +
+/// decode + unified and across TP ranks (not decode-specific). Decode counts the graph capture,
+/// not replays; read quiesced.
 pub fn pin_counters() -> (u64, u64) {
     (
         PIN_SERVED.load(Ordering::Relaxed),
@@ -528,7 +503,9 @@ pub fn reset_pin_counters() {
     pin_fallback_shapes_map().lock().unwrap().clear();
 }
 
-/// `((m, n, k), count)` per shape that fell back to per-token; empty iff `pin_fallback` is 0.
+/// `((m, n, k), count)` per shape that fell back to per-token. Quiesced and single-threaded, an
+/// empty list means no recorded fallback; under TP/concurrency the map and counter can momentarily
+/// disagree.
 pub fn pin_fallback_shapes() -> Vec<((usize, usize, usize), u64)> {
     pin_fallback_shapes_map()
         .lock()
@@ -536,6 +513,16 @@ pub fn pin_fallback_shapes() -> Vec<((usize, usize, usize), u64)> {
         .iter()
         .map(|(&shape, &count)| (shape, count))
         .collect()
+}
+
+fn record_pin_fallback(m: usize, n: usize, k: usize, reason: &str) {
+    PIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    let mut shapes = pin_fallback_shapes_map().lock().unwrap();
+    let count = shapes.entry((m, n, k)).or_insert(0);
+    if *count == 0 {
+        log::warn!("batch-invariant pin fell back to per-token at (m={m}, n={n}, k={k}): {reason}");
+    }
+    *count += 1;
 }
 
 /// Fixed representative N at which every (M,K) pin is resolved — one algo for ALL
@@ -552,18 +539,18 @@ fn launch_gemm_pin(
     k: usize,
     ctx: &DeviceContext,
 ) -> Result<()> {
-    // cuBLASLt (gemm_lt_pin) risks Xid 31 under a stream override — see launch_gemm; use per-token.
+    // cuBLASLt (gemm_lt_pin) risks Xid 31 under a stream override; fall back to per-token.
     if crate::tensor::has_stream_override() {
-        PIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
-        *pin_fallback_shapes_map()
-            .lock()
-            .unwrap()
-            .entry((m, n, k))
-            .or_insert(0) += 1;
+        record_pin_fallback(
+            m,
+            n,
+            k,
+            "stream override active (cuBLASLt would risk Xid 31)",
+        );
         return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx);
     }
-    // Lazy-pin (m,k); a no-op during decode graph capture, since prefill pins all shapes
-    // first (the tune's cudaMalloc would otherwise invalidate the capture).
+    // Lazy-pin (m,k). In the Qwen3 served path, non-overlap prefill should have pinned every decode
+    // projection shape before decode graph capture; tuning a new shape here may allocate.
     if gemm_lt_pin_inspect(m, k).is_none() {
         gemm_lt_pin_tune(m, PIN_REP_N as usize, k)?;
     }
@@ -583,12 +570,7 @@ fn launch_gemm_pin(
                 Ok(())
             }
             GEMM_LT_PIN_UNSUPPORTED | GEMM_LT_PIN_UNTUNED => {
-                PIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
-                *pin_fallback_shapes_map()
-                    .lock()
-                    .unwrap()
-                    .entry((m, n, k))
-                    .or_insert(0) += 1;
+                record_pin_fallback(m, n, k, "pinned algo cannot serve this N");
                 let st = ffi::gemm_per_token_cuda(
                     w_ptr,
                     x_ptr,
