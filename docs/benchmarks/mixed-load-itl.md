@@ -1,4 +1,4 @@
-# Mixed-Load ITL — long prompts arriving into steady-state decode (Qwen3-4B)
+# Mixed-Load ITL — long prompts arriving into steady-state decode (Qwen3-4B + Qwen3.5)
 
 **Created**: 2026-06-08
 
@@ -44,7 +44,20 @@ throttles the GPU and *fabricates* saturation (12k prefill inflated 2235→4400m
 The sweep script inserts inter-cell cooldowns(`sleep`) — the throttle-check table below
 (cold prefill ≈ constant across QPS) confirms the numbers are clock-clean.
 
-## Results — sweep (RTX 5070 Ti, Qwen3-4B, greedy, 4-way background)
+## Results — chunked-prefill A/B (#375)
+
+Both lines swept with chunking **off** (whole prompt in one unified step — the
+#244 condition), to characterize the raw stall; #375's chunked prefill (cap each
+step at `--max-prefill-tokens`) is the fix that bounds it. `bench_serving mixed`,
+4-way / 512-prompt / 1024-out background, greedy, RTX 5070 Ti. Cells are **ITL p99
+(ms)**; `*` = saturated (`qps·prefill_s ≳ 1`: prefills run back-to-back and decode
+never recovers — a throughput wall chunking can't fix; needs rate-limit / bigger
+card).
+
+
+### Qwen3-4B
+
+Results — sweep (RTX 5070 Ti, Qwen3-4B, greedy, 4-way background)
 
 **Baseline (decode-only): p50 13.7 / p99 14.7 ms.** Cells are **ITL p99 (ms)**;
 `*` = saturated (prefill > 1/qps, prefills overlap, decode starves).
@@ -80,32 +93,67 @@ injection's one-time cold cache-fill — the rest are hits, so p99 is clean.)
 | 8k  | 1213 | 1170 | 1167 |
 | 12k | 2192 | 2180 | 2304 |
 
-## Explaination
 
-Two independent knobs explain every cell:
+### Qwen3.5-4B
 
-1. **Severity = the prefill wall-time** (throttle-check row): the one stalled gap ≈
-   the entire prefill. Scales ~linearly with prompt (4k→8k→12k ≈ 0.5→1.2→2.2s).
+Results — sweep (RTX 5070 Ti, Qwen3.5-4B, greedy, 4-way background), chunking off.
 
-2. **Frequency decides if it reaches p99** = stall-gap fraction
-   `≈ qps / (qps + (1−qps·prefill_s)/TPOT)`. It rises with *both* QPS and prompt
-   length (a long stall eats decode time, inflating its own share). p99 ≈ baseline
-   while frac < ~1%, and climbs toward the per-event stall above it. So the
-   **p99-break frontier moves left (lower QPS) as prompts grow**:
-   - **4k** stays clean until **1 req/s**.
-   - **8k** breaks by **0.5 req/s** (1161ms).
-   - **12k** saturates by **0.5 req/s** (3.3s).
-   - **qps 0.25 is clean at every length** — even a 12k stall only hits `max`.
+**Baseline (decode-only): p50 15.1 / p99 15.7 ms.** Cells are **ITL p99 (ms)** —
+every cell sits at baseline. Qwen3.5 **does** freeze decode per injection, same as
+Qwen3: a pending prefill with active decodes runs as a unified step (serial prefill
+then the decode graph, in one call), so each active decode eats one ~prefill-length
+gap — `max` confirms it (459 / 906 / 1408ms ≈ the prefill wall, throttle-check
+below). 
 
-3. **Prefix reuse defeats it universally** (`warm` column: 14.6–34.5ms everywhere) —
-   a cache hit isn't a prefill. **warm½** only helps when halving the cold rate
-   drops below the knee: rescues 8k@0.5 (1161→**29**) but not 12k@0.5 (the cold
-   half alone saturates → 3.8s).
+p99 stays at baseline only as a **measurement artifact**: the background is
+capped at `--bg-output-len 1024` (~15s) and dies mid-run, so only the ~7 injections
+overlapping live decodes stall anything — ~0.7% of gaps, just under the 1% p99 knee
+(raising injections 5→15 doesn't move p99, since total gaps are capped by the
+1024-token background, not injection count). **Not** architectural immunity —
+chunked prefill bounds Qwen3.5's per-step freeze the same way it does Qwen3's.
 
-4. **Saturation** (`*`): when `qps·prefill_s ≳ 1`, prefills run back-to-back and
-   decode never recovers (stall% → ~50–60%, even p50 rises). This is a throughput
-   wall, not just a tail — chunked prefill can't add prefill FLOPs; needs
-   rate-limit / bigger card.
+**qps = 0.25**
+| prompt | cold | warm½ | warm |
+|--------|-----:|------:|-----:|
+| 4k  | 16 | 15 | 15 |
+| 8k  | 16 | 16 | 16 |
+| 12k | 16 | 15 | 16 |
+
+**qps = 0.5**
+| prompt | cold | warm½ | warm |
+|--------|-----:|------:|-----:|
+| 4k  | 17 | 16 | 16 |
+| 8k  | 16 | 16 | 16 |
+| 12k | 16 | 15 | 16 |
+
+**qps = 1.0**
+| prompt | cold | warm½ | warm |
+|--------|-----:|------:|-----:|
+| 4k  | 16 | 16 | 15 |
+| 8k  | 15 | 16 | 16 |
+| 12k | 16 | 16 | 16 |
+
+**Throttle-check — cold prefill median (ms):**
+| prompt | qps 0.25 | 0.5 | 1.0 |
+|--------|---------:|----:|----:|
+| 4k  | 459 | 444 | 441 |
+| 8k  | 906 | 898 | 900 |
+| 12k | 1408 | 1381 | 1422 |
+
+Three findings:
+
+- **The unified-step freeze hits both lines and scales with the prefill wall.** A
+  prefill admitted with active decodes runs in one fused step, so every active
+  decode stalls for ~the whole prefill (cold prefill ≈ 0.45–0.5 / 0.9–1.2 /
+  1.4–2.2s at 4k / 8k / 12k, throttle-checks above). The freeze itself is the same
+  on Qwen3 and Qwen3.5.
+- **Whether it reaches p99 is a frequency question.** Qwen3's stall fraction
+  crosses the ~1% knee, so p99 blows up with prompt length (8k 1161, 12k 3270ms at
+  qps ≥ 0.5); Qwen3.5's lands just under it (its 1024-token background dies before
+  enough injections overlap), so the freeze shows only in `max` (see the Qwen3.5
+  note). Don't read Qwen3.5's flat p99 as immunity.
+- **Prefix reuse defeats it** — Qwen3's warm columns collapse to ~15–35ms: a cache
+  hit isn't a prefill, so there's no freeze.
 
 ## Decision for chunked prefill
 
@@ -133,19 +181,32 @@ CUDA_HOME=/opt/cuda NVCC_PREPEND_FLAGS="-ccbin g++-13" \
   OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=/abs/.venv/bin/python \
   cargo build -r -p openinfer-server --bin bench_serving
 
-BIN=./target/release/bench_serving; M=models/Qwen3-4B
+BIN=./target/release/bench_serving
 BG="--bg-prompt-len 512 --bg-concurrency 4 --bg-output-len 1024"
-for p in 4096 8192; do for q in 0.5 1.0; do
-  sleep 25
-  $BIN --model-path $M --format json --out /tmp/itl.json \
-    mixed $BG --inj-prompt-len $p --inj-output-len 1 --qps $q \
-    --num-injections 5 --warmup 5 --inj-warm-frac 0.0 --skip-baseline >/dev/null 2>&1
-  echo "p=$p q=$q  p99=$(python3 -c "import json;print(f\"{json.load(open('/tmp/itl.json'))['mixed_itl']['all']['p99_ms']:.0f}\")")ms"
-done; done
+# Chunking OFF (the sweeps above): --max-prefill-tokens ≥ the prompt forwards the
+# whole prompt in one unified step. Omit the flag for the model default (1024).
+sweep() {  # $1 = model path
+  for q in 0.25 0.5 1.0; do for p in 4096 8192 12288; do for w in 0.0 0.5 1.0; do
+    sleep 25
+    $BIN --model-path "$1" --max-prefill-tokens 99999999 --format json --out /tmp/itl.json \
+      mixed $BG --inj-prompt-len $p --inj-output-len 1 --qps $q \
+      --num-injections 5 --warmup 5 --inj-warm-frac $w --skip-baseline >/dev/null 2>&1
+    echo "$1 q=$q p=$p w=$w  $(python3 -c "import json;d=json.load(open('/tmp/itl.json'))['mixed_itl']['all'];print(f\"p99={d['p99_ms']:.0f} max={d['max_ms']:.0f}\")")"
+  done; done; done
+}
+sweep models/Qwen3-4B
+sweep models/Qwen3.5-4B
 
+# Canonical mixed_itl cell folded into the regression snapshot:
 CUDA_HOME=/opt/cuda LIBRARY_PATH=/usr/lib/wsl/lib:/opt/cuda/lib64 \
-  ./target/release/bench_serving --model-path models/Qwen3-4B snapshot --warmup 5 --iters 20
+  $BIN --model-path models/Qwen3-4B snapshot --warmup 5 --iters 20
 ```
+
+`bench_serving --max-prefill-tokens` is the same knob as the serving binary's flag
+(no env var). A value ≥ the longest prompt = chunking off (these sweeps); a smaller
+value (e.g. the 1024 default) = the #375 chunked path, which caps the per-step
+freeze. **Report `max`, not just p99** — for Qwen3.5 the freeze lives in `max` (the
+1024-token background dilutes it out of p99).
 
 The canonical cell is folded into the `snapshot` subcommand as the `mixed_itl`
 profile, so it refreshes with the prefill/decode profiles and its history lives in
