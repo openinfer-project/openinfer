@@ -102,8 +102,7 @@ impl PendingRequest {
 /// step's total forwarded tokens at `max_prefill_tokens`. Each taken request
 /// gets its per-step chunk recorded in `step_chunk`. Echo requests need
 /// logits for every prompt position in one forward, so they only run when
-/// their whole remainder fits — or alone at the head of an empty step, which
-/// also guarantees the queue always makes progress.
+/// their whole remainder fits the profiled prefill bound.
 fn take_prefill_chunks(
     prefilling: &mut Vec<PendingRequest>,
     max_prefill_tokens: usize,
@@ -114,7 +113,7 @@ fn take_prefill_chunks(
     while i < prefilling.len() && budget > 0 {
         let remaining = prefilling[i].remaining_prompt_tokens();
         let chunk = if prefilling[i].echo {
-            if remaining > budget && !taken.is_empty() {
+            if remaining > budget {
                 i += 1;
                 continue;
             }
@@ -466,6 +465,7 @@ fn scheduler_loop<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
@@ -652,6 +652,7 @@ fn scheduler_loop_with_lora_control<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
@@ -780,6 +781,9 @@ struct RequestFailureTarget {
 enum RejectReason {
     /// Worst-case length exceeds the model's position-encoding window.
     ContextLength { limit: usize },
+    /// Echo needs all-position logits in one forward, so it must fit the
+    /// profiled prefill bound.
+    EchoPrefillTokens { limit: usize },
     /// Worst-case length needs more KV blocks than this instance can ever provide.
     KvBudget,
 }
@@ -876,6 +880,10 @@ fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usi
         .sum()
 }
 
+fn echo_exceeds_prefill_bound(req: &PendingRequest, max_prefill_tokens: usize) -> bool {
+    req.echo && req.prompt_tokens.len() > max_prefill_tokens
+}
+
 /// Free blocks already promised to admitted requests (active decode growth +
 /// remaining prefill chunks). A KV prefetch reservation must stay out of this
 /// floor or a later chunk/decode fails allocation and kills the whole step.
@@ -913,9 +921,8 @@ fn prefilling_future_blocks(
 /// batch can eat the post-KV-pool VRAM headroom and OOM mid-serving under a
 /// request burst. Prompts longer than the budget are split across steps, so
 /// long prompts can't monopolize a step and starve running decodes.
-/// Exception: echo requests need all-position logits in one forward and run
-/// whole regardless of the budget — an oversized echo prompt still spikes
-/// activation memory.
+/// Echo requests need all-position logits in one forward and are rejected when
+/// their prompt exceeds this bound.
 ///
 /// A unified step's duration scales with its prefill tokens, and every decode
 /// request in the batch stalls for the whole step — the budget bounds that
@@ -936,6 +943,7 @@ fn admit_deferred_requests(
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
+    max_prefill_tokens: usize,
     // Blocks a request already holds from a settled prefetch. These are already
     // out of `available_blocks`, so they must be credited against the request's
     // need or admission double-counts them and can wedge a near-budget CPU-hit
@@ -963,6 +971,16 @@ fn admit_deferred_requests(
                 req,
                 RejectReason::ContextLength {
                     limit: max_context_tokens,
+                },
+            ));
+            continue;
+        }
+
+        if echo_exceeds_prefill_bound(&req, max_prefill_tokens) {
+            rejected.push((
+                req,
+                RejectReason::EchoPrefillTokens {
+                    limit: max_prefill_tokens,
                 },
             ));
             continue;
@@ -1009,6 +1027,11 @@ fn send_rejection(req: &PendingRequest, reason: RejectReason) {
             req.prompt_tokens.len().saturating_add(req.max_tokens),
             req.prompt_tokens.len(),
             req.max_tokens
+        ),
+        RejectReason::EchoPrefillTokens { limit } => format!(
+            "echo request prompt exceeds the profiled prefill limit of {} tokens: prompt_tokens={}",
+            limit,
+            req.prompt_tokens.len()
         ),
         RejectReason::KvBudget => format!(
             "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
@@ -1508,7 +1531,7 @@ mod tests {
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
         let outcome =
-            admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, |_| 0);
+            admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32, |_| 0);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1548,7 +1571,7 @@ mod tests {
         ];
 
         let outcome =
-            admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, |_| 0);
+            admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, 64, |_| 0);
 
         let pending_ids = outcome
             .pending
@@ -1603,6 +1626,7 @@ mod tests {
             1024,
             usize::MAX,
             64,
+            32,
             |_| 0,
         );
 
@@ -1662,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn echo_requests_never_split_but_run_alone_when_oversized() {
+    fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
         let mk_echo = |id: u64, prompt_len| {
             let (req, _rx) = request(prompt_len, 1);
             let mut pending = PendingRequest::from_scheduler_request(RequestId(id), req);
@@ -1673,13 +1697,19 @@ mod tests {
             PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
         };
 
-        // Oversized echo at the head of an empty step runs whole — chunking it
-        // would lose the all-position logits echo needs.
+        // Oversized echo is rejected by admission. If a caller bypasses
+        // admission, the chunk picker must still keep it out of the profiled
+        // prefill shape instead of running it whole.
         let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
         let taken = take_prefill_chunks(&mut prefilling, 32);
         assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].step_chunk, 64, "echo takes its full prompt");
-        assert_eq!(prefilling[0].request_id, RequestId(2));
+        assert_eq!(taken[0].request_id, RequestId(2));
+        assert_eq!(taken[0].step_chunk, 16);
+        assert_eq!(
+            prefilling[0].request_id,
+            RequestId(1),
+            "oversized echo stays queued if admission was bypassed"
+        );
 
         // An echo that doesn't fit behind earlier work is skipped, not split;
         // later requests may still fill the leftover budget, and the step set
@@ -1695,6 +1725,91 @@ mod tests {
             "echo skipped, leftover budget goes to the next non-echo request"
         );
         assert_eq!(prefilling[0].request_id, RequestId(4));
+    }
+
+    #[test]
+    fn oversized_echo_request_is_rejected_at_admission() {
+        let active: [ActiveRequestState; 0] = [];
+        let mk_echo = |id: u64, prompt_len| {
+            let (mut req, _rx) = request(prompt_len, 1);
+            req.echo = true;
+            PendingRequest::from_scheduler_request(RequestId(id), req)
+        };
+        let mk = |id: u64, prompt_len| {
+            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
+        };
+
+        let outcome = admit_deferred_requests(
+            vec![mk_echo(1, 33), mk(2, 64)],
+            &active,
+            &[],
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            32,
+            |_| 0,
+        );
+
+        assert_eq!(
+            outcome
+                .pending
+                .iter()
+                .map(|r| r.request_id.get())
+                .collect::<Vec<_>>(),
+            vec![2],
+            "non-echo oversized prompts can still be admitted and chunked"
+        );
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].0.request_id, RequestId(1));
+        assert!(
+            matches!(
+                outcome.rejected[0].1,
+                RejectReason::EchoPrefillTokens { limit: 32 }
+            ),
+            "oversized echo should be rejected against the profiled prefill bound"
+        );
+    }
+
+    #[test]
+    fn oversized_echo_request_is_rejected_through_scheduler_loop() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(1024, Arc::clone(&dropped));
+        let handle = start_with_executor(executor, 42, 8);
+
+        let (mut too_long_echo, mut too_long_rx) = request(9, 1);
+        too_long_echo.echo = true;
+        handle.submit(too_long_echo).expect("submit oversized echo");
+
+        match too_long_rx.blocking_recv() {
+            Some((
+                _,
+                TokenEvent::Rejected {
+                    prompt_tokens,
+                    completion_tokens,
+                    message,
+                },
+            )) => {
+                assert_eq!(prompt_tokens, 9);
+                assert_eq!(completion_tokens, 0);
+                assert!(
+                    message.contains("echo request prompt exceeds"),
+                    "expected echo-bound rejection, got: {message}"
+                );
+            }
+            _ => panic!("oversized echo request should be rejected"),
+        }
+
+        let (fits, mut fits_rx) = request(16, 1);
+        handle.submit(fits).expect("submit fitting request");
+        assert!(
+            matches!(
+                recv_skipping_scheduled(&mut fits_rx),
+                Some(TokenEvent::Token { .. })
+            ),
+            "later non-echo request should still run"
+        );
     }
 
     #[test]
@@ -1854,6 +1969,7 @@ mod tests {
             2,
             usize::MAX,
             64,
+            32,
             |_| 0,
         );
         assert!(
@@ -1875,6 +1991,7 @@ mod tests {
             3,
             usize::MAX,
             64,
+            32,
             |_| 0,
         );
         assert_eq!(
