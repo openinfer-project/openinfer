@@ -6,6 +6,7 @@ mod batch_decode_dag;
 pub mod batch_decode_trace;
 mod config;
 mod executor;
+pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
 mod prefill;
@@ -67,6 +68,10 @@ impl Default for Qwen3LoraOptions {
         }
     }
 }
+
+/// Prefill/decode GPU-sharing mode (`--decode-overlap`). Defined alongside the
+/// stream plumbing in [`green_ctx`].
+pub use green_ctx::DecodeOverlap;
 
 /// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
 ///
@@ -162,6 +167,8 @@ pub struct Qwen3LaunchOptions {
     pub memory: Qwen3MemoryOptions,
     /// `Some` switches on LoRA serving (and disables CUDA Graph).
     pub lora: Option<Qwen3LoraOptions>,
+    /// How prefill and decode share the GPU (`--decode-overlap`).
+    pub decode_overlap: DecodeOverlap,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -210,6 +217,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
                 options.no_prefix_cache,
                 options.max_prefill_tokens,
                 options.memory,
+                options.decode_overlap,
             )
         }
         None => start_engine_with_offload(
@@ -219,6 +227,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.no_prefix_cache,
             options.max_prefill_tokens,
             options.memory,
+            options.decode_overlap,
         ),
     }
 }
@@ -231,6 +240,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         false,
         DEFAULT_MAX_PREFILL_TOKENS,
         Qwen3MemoryOptions::default(),
+        DecodeOverlap::Off,
     )
 }
 
@@ -253,6 +263,7 @@ pub fn start_engine_with_offload(
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
+    decode_overlap: DecodeOverlap,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -272,6 +283,7 @@ pub fn start_engine_with_offload(
         no_prefix_cache,
         max_prefill_tokens,
         memory_options,
+        decode_overlap,
     )
 }
 
@@ -283,6 +295,7 @@ pub fn start_engine_with_lora_control(
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
+    decode_overlap: DecodeOverlap,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -303,5 +316,6 @@ pub fn start_engine_with_lora_control(
         no_prefix_cache,
         max_prefill_tokens,
         memory_options,
+        decode_overlap,
     )
 }

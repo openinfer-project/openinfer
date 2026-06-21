@@ -1,12 +1,50 @@
 //! Device tensor types and CUDA context.
 
 use anyhow::{Result, anyhow};
+use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::bf16;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::ffi;
+
+// ─── Thread-local stream override for Green Context SM partitioning ────────
+
+thread_local! {
+    static STREAM_OVERRIDE: Cell<Option<CUstream>> = const { Cell::new(None) };
+}
+
+/// Set a thread-local stream override. All subsequent kernel launches via
+/// [`DeviceContext::active_cu_stream`] will use this stream instead of the
+/// context's default stream. Call [`clear_stream_override`] to revert.
+///
+/// # Safety
+/// The caller must ensure the stream is valid for the lifetime of the override
+/// and belongs to the same CUDA device as the `DeviceContext`.
+pub unsafe fn set_stream_override(stream: CUstream) {
+    STREAM_OVERRIDE.with(|c| c.set(Some(stream)));
+}
+
+/// Clear the thread-local stream override, reverting to the context's default.
+pub fn clear_stream_override() {
+    STREAM_OVERRIDE.with(|c| c.set(None));
+}
+
+/// Returns true if a stream override is currently active on this thread.
+pub fn has_stream_override() -> bool {
+    STREAM_OVERRIDE.with(|c| c.get().is_some())
+}
+
+/// Returns the effective CUDA stream: the thread-local override if set,
+/// otherwise the context's own stream.
+#[inline]
+pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
+    STREAM_OVERRIDE
+        .with(Cell::get)
+        .unwrap_or_else(|| ctx.stream.cu_stream())
+}
 
 /// Marker trait for tensor metadata tags.
 pub trait NamedTag {

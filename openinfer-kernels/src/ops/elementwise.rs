@@ -34,7 +34,7 @@ pub fn add_batch_into(
             b_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -78,7 +78,7 @@ pub fn scaled_add_rows_into(
             row_offset as i32,
             delta.hidden_dim as i32,
             delta.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -127,7 +127,7 @@ pub fn scaled_add_rows_token_range_into(
             row_offset as i32,
             delta.hidden_dim as i32,
             delta.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -169,7 +169,7 @@ pub fn gather_hidden_tokens_into(
             input.hidden_dim as i32,
             token_count as i32,
             input.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -222,7 +222,7 @@ pub fn scaled_add_rows_indexed_into(
             delta.hidden_dim as i32,
             token_count as i32,
             out.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -258,7 +258,7 @@ pub fn bf16_hidden_to_f32_into(
             input_ptr as *const ffi::Half,
             output_ptr as *mut f32,
             input.data.len() as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -284,7 +284,7 @@ pub fn f32_to_bf16_hidden_into(
             input_ptr as *const f32,
             output_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -309,7 +309,7 @@ pub fn scale_f32_in_place(
             values_ptr as *mut f32,
             scale,
             len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -356,7 +356,7 @@ pub fn accumulate_bf16_token_scaled_to_f32_into(
             token.hidden_dim as i32,
             token_idx as i32,
             seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -391,7 +391,7 @@ pub fn repeat_f32_for_reduce_scatter_into(
             repeated_ptr as *mut f32,
             local_elems as i32,
             world_size as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -432,7 +432,7 @@ pub fn silu_mul_batch_into(
             u_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -467,7 +467,7 @@ pub fn silu_mul_fused_batch_into(
             out_ptr as *mut ffi::Half,
             intermediate_size as i32,
             bs as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     if result != 0 {

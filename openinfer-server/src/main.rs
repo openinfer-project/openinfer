@@ -169,6 +169,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     )
                     .validate()?,
                     lora,
+                    decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
                 },
             )
             .context("failed to start Qwen3 engine")?

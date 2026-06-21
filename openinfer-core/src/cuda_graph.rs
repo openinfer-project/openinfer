@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use log::debug;
 
-use cudarc::driver::safe::CudaGraph;
+use cudarc::driver::CudaContext;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::sys::{self, CUgraph, CUgraphExec};
 
-use crate::tensor::DeviceContext;
+use crate::tensor::{DeviceContext, active_cu_stream};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CudaGraphPhase {
@@ -19,17 +22,47 @@ pub enum CudaGraphPhase {
 
 /// CUDA Graph state for decode path.
 /// First decode call captures the graph; subsequent calls replay it.
+///
+/// Capture and replay both run on the context's *currently active* stream
+/// ([`active_cu_stream`]) — normally `ctx.stream`, but the thread-local stream
+/// override used by Green Context SM partitioning redirects them. This matters
+/// because stream capture binds each kernel node to the execution context of
+/// the stream it was captured on (CUDA Programming Guide §4.6.5): a graph
+/// captured on a Green Context decode stream replays on that partition's SMs no
+/// matter which stream launches it. A `CudaGraphState` is therefore tied to one
+/// stream — a caller that decodes on more than one stream (full-SM and a green
+/// partition) must keep one state per stream.
 pub struct CudaGraphState {
-    graph: Option<CudaGraph>,
+    graph: CUgraph,
+    exec: CUgraphExec,
+    /// Keeps the CUDA primary context alive for as long as the graph handles
+    /// exist. The raw `CUgraph`/`CUgraphExec` carry no ownership of their own,
+    /// so without this anchor the `cuGraphDestroy` in `Drop` would rely on the
+    /// enclosing struct happening to declare its `CudaSlice` buffers *before*
+    /// this field. `Drop::drop` runs before the struct's fields are dropped, so
+    /// holding the `Arc` here guarantees the context outlives the destroy calls
+    /// regardless of field order. `None` until the first capture instantiates.
+    _ctx: Option<Arc<CudaContext>>,
 }
 
-// SAFETY: CudaGraph contains raw CUDA pointers that are not Send by default.
-// We only access the graph from the single inference thread that owns the model.
+// SAFETY: the graph/exec handles are only ever touched from the single
+// inference thread that owns the model.
 unsafe impl Send for CudaGraphState {}
+
+fn check(result: sys::CUresult, what: &str) -> Result<()> {
+    if result != sys::CUresult::CUDA_SUCCESS {
+        anyhow::bail!("{what} failed: {result:?}");
+    }
+    Ok(())
+}
 
 impl CudaGraphState {
     pub fn new() -> Self {
-        Self { graph: None }
+        Self {
+            graph: std::ptr::null_mut(),
+            exec: std::ptr::null_mut(),
+            _ctx: None,
+        }
     }
 
     /// Run kernel closure directly, or capture into a graph and replay.
@@ -52,38 +85,66 @@ impl CudaGraphState {
         F: FnOnce() -> Result<()>,
         S: FnMut(CudaGraphPhase),
     {
-        if let Some(graph) = &self.graph {
+        let stream = active_cu_stream(ctx);
+
+        if !self.exec.is_null() {
             synchronize(CudaGraphPhase::BeforeLaunch);
-            graph
-                .launch()
-                .map_err(|e| anyhow::anyhow!("CUDA Graph launch failed: {}", e))?;
+            check(
+                unsafe { sys::cuGraphLaunch(self.exec, stream) },
+                "cuGraphLaunch",
+            )?;
             synchronize(CudaGraphPhase::AfterLaunch);
-        } else {
-            debug!("Capturing CUDA Graph for decode path...");
-            synchronize(CudaGraphPhase::BeforeBeginCapture);
-            ctx.stream
-                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .map_err(|e| anyhow::anyhow!("begin_capture failed: {}", e))?;
-            synchronize(CudaGraphPhase::AfterBeginCapture);
-
-            kernels()?;
-
-            synchronize(CudaGraphPhase::BeforeEndCapture);
-            self.graph = ctx
-                .stream
-                .end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-                .map_err(|e| anyhow::anyhow!("end_capture failed: {}", e))?;
-            synchronize(CudaGraphPhase::AfterEndCapture);
-            debug!("CUDA Graph captured successfully");
-
-            if let Some(ref graph) = self.graph {
-                synchronize(CudaGraphPhase::BeforeLaunch);
-                graph
-                    .launch()
-                    .map_err(|e| anyhow::anyhow!("CUDA Graph first launch failed: {}", e))?;
-                synchronize(CudaGraphPhase::AfterLaunch);
-            }
+            return Ok(());
         }
+
+        debug!("Capturing CUDA Graph for decode path...");
+        synchronize(CudaGraphPhase::BeforeBeginCapture);
+        check(
+            unsafe { sys::cuStreamBeginCapture_v2(stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) },
+            "cuStreamBeginCapture",
+        )?;
+        synchronize(CudaGraphPhase::AfterBeginCapture);
+
+        // On kernel error, end the in-progress capture so the stream is not left
+        // stuck in the capturing state, then propagate the original error.
+        if let Err(e) = kernels() {
+            let mut aborted: CUgraph = std::ptr::null_mut();
+            unsafe { sys::cuStreamEndCapture(stream, &mut aborted) };
+            if !aborted.is_null() {
+                unsafe { sys::cuGraphDestroy(aborted) };
+            }
+            return Err(e);
+        }
+
+        synchronize(CudaGraphPhase::BeforeEndCapture);
+        let mut graph: CUgraph = std::ptr::null_mut();
+        check(
+            unsafe { sys::cuStreamEndCapture(stream, &mut graph) },
+            "cuStreamEndCapture",
+        )?;
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        check(
+            unsafe {
+                sys::cuGraphInstantiateWithFlags(
+                    &mut exec,
+                    graph,
+                    CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64,
+                )
+            },
+            "cuGraphInstantiateWithFlags",
+        )?;
+        self.graph = graph;
+        self.exec = exec;
+        self._ctx = Some(ctx.ctx.clone());
+        synchronize(CudaGraphPhase::AfterEndCapture);
+        debug!("CUDA Graph captured successfully");
+
+        synchronize(CudaGraphPhase::BeforeLaunch);
+        check(
+            unsafe { sys::cuGraphLaunch(self.exec, stream) },
+            "cuGraphLaunch first launch",
+        )?;
+        synchronize(CudaGraphPhase::AfterLaunch);
         Ok(())
     }
 }
@@ -91,5 +152,18 @@ impl CudaGraphState {
 impl Default for CudaGraphState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for CudaGraphState {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.exec.is_null() {
+                sys::cuGraphExecDestroy(self.exec);
+            }
+            if !self.graph.is_null() {
+                sys::cuGraphDestroy(self.graph);
+            }
+        }
     }
 }
