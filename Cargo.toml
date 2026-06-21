@@ -107,6 +107,7 @@ log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
 libc = "0.2"
 memmap2 = "0.9"
+metrics = "0.24.6"
 mio = "=1.1.1"
 mockall = "0.13.1"
 nvtx = "1.3.0"

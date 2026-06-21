@@ -198,6 +198,8 @@ async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
     assert_models_endpoint(&client, &server.base_url).await?;
     assert_non_streaming_completion_has_output(&client, &server.base_url).await?;
     assert_streaming_completion_emits_done(&client, &server.base_url).await?;
+    assert_metrics_endpoint(&client, &server.base_url).await?;
+    assert_traces_endpoint_disabled_by_default(&client, &server.base_url).await?;
 
     server.shutdown().await
 }
@@ -314,6 +316,47 @@ async fn assert_streaming_completion_emits_done(client: &Client, base_url: &str)
         bail!("streaming completion did not emit terminal data: [DONE]: {stream}");
     }
 
+    Ok(())
+}
+
+async fn assert_metrics_endpoint(client: &Client, base_url: &str) -> Result<()> {
+    let metrics = client
+        .get(format!("{base_url}/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    for expected in [
+        "openinfer_frontend_active_requests 0",
+        "openinfer_frontend_requests_started_total 2",
+        "openinfer_frontend_requests_finished_total{outcome=\"length\"} 2",
+        "openinfer_frontend_completion_tokens_total 6",
+    ] {
+        if !metrics.contains(expected) {
+            bail!("/metrics missing {expected}: {metrics}");
+        }
+    }
+    Ok(())
+}
+
+async fn assert_traces_endpoint_disabled_by_default(client: &Client, base_url: &str) -> Result<()> {
+    let traces: Value = client
+        .get(format!("{base_url}/openinfer/traces"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if traces["enabled"] != false || traces["capacity"] != 0 {
+        bail!("trace endpoint should be disabled by default: {traces}");
+    }
+    let trace_list = traces["traces"]
+        .as_array()
+        .ok_or_else(|| anyhow!("trace endpoint has no traces array: {traces}"))?;
+    if !trace_list.is_empty() {
+        bail!("disabled trace endpoint should have no traces: {traces}");
+    }
     Ok(())
 }
 
