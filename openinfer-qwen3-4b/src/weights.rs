@@ -914,8 +914,19 @@ impl Qwen3Model {
             memory_options.gpu_memory_utilization
         );
 
-        let profile_rows = max_prefill_tokens + max_decode_batch_size;
-        let profile_blocks = profile_temp_blocks(max_prefill_tokens, max_decode_batch_size);
+        anyhow::ensure!(
+            max_prefill_tokens > 0,
+            "Qwen3 memory profile requires positive max_prefill_tokens"
+        );
+        let profile_prefill_rows = 1;
+        let profile_decode_rows = max_decode_batch_size.saturating_sub(profile_prefill_rows);
+        anyhow::ensure!(
+            profile_decode_rows > 0,
+            "Qwen3 memory profile requires decode capacity above prefill rows"
+        );
+        let profile_rows = profile_prefill_rows + profile_decode_rows;
+        let profile_blocks =
+            profile_temp_blocks(max_prefill_tokens, profile_decode_rows, geometry.block_size);
         let profile_kv_bytes = profile_blocks * bytes_per_block;
         let mut peak_used_bytes = initial_used_bytes;
         let mut record_peak = || -> Result<()> {
@@ -960,7 +971,7 @@ impl Qwen3Model {
 
         self.profile_unified_step_memory(
             max_prefill_tokens,
-            max_decode_batch_size,
+            profile_decode_rows,
             &profile_kv,
             &mut decode_bufs,
             &mut sample_scratch,
@@ -1060,10 +1071,14 @@ fn mem_info_bytes() -> Result<(usize, usize)> {
     Ok((free, total))
 }
 
-fn profile_temp_blocks(max_prefill_tokens: usize, max_decode_batch_size: usize) -> usize {
+fn profile_temp_blocks(
+    max_prefill_tokens: usize,
+    profile_decode_rows: usize,
+    block_size: usize,
+) -> usize {
     // Block 0 is reserved as the decode padding block. Worst-case scheduling can
-    // admit max_prefill_tokens one-token prefill rows plus the decode batch.
-    1 + max_prefill_tokens + max_decode_batch_size
+    // run one max-sized prefill row plus the remaining decode rows.
+    1 + max_prefill_tokens.div_ceil(block_size) + profile_decode_rows
 }
 
 fn install_lora_adapter_in_registry(

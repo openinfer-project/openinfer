@@ -25,7 +25,7 @@ impl Qwen3Model {
     pub(crate) fn profile_unified_step_memory(
         &self,
         max_prefill_tokens: usize,
-        max_decode_batch_size: usize,
+        profile_decode_rows: usize,
         kv_buffer: &KvBuffer,
         decode_bufs: &mut BatchDecodeBuffers,
         sample_scratch: &mut openinfer_sample::SampleScratch,
@@ -36,8 +36,8 @@ impl Qwen3Model {
             "profile prefill tokens must be positive"
         );
         anyhow::ensure!(
-            max_decode_batch_size > 0,
-            "profile decode batch must be positive"
+            profile_decode_rows > 0,
+            "profile decode rows must be positive"
         );
 
         let layout = KvLayout::new(
@@ -47,13 +47,14 @@ impl Qwen3Model {
             kv_buffer.layout().page_size,
         );
         let page_size = layout.page_size;
-        let num_prefill_reqs = max_prefill_tokens;
-        let decode_views: Vec<KvView> = (0..max_decode_batch_size)
-            .map(|i| KvView::new(vec![(1 + num_prefill_reqs + i) as i32], 1, page_size))
+        let num_prefill_reqs = 1;
+        let prefill_pages = max_prefill_tokens.div_ceil(page_size);
+        let decode_views: Vec<KvView> = (0..profile_decode_rows)
+            .map(|i| KvView::new(vec![(1 + prefill_pages + i) as i32], 1, page_size))
             .collect();
 
-        let decode_tokens = vec![0u32; max_decode_batch_size];
-        let decode_adapters = vec![None; max_decode_batch_size];
+        let decode_tokens = vec![0u32; profile_decode_rows];
+        let decode_adapters = vec![None; profile_decode_rows];
 
         // Force the decode CUDA-Graph/buffer path before the unified peak
         // sample. The synthetic views are short, but the pre-allocated decode
@@ -68,16 +69,18 @@ impl Qwen3Model {
         )?;
         mark_peak()?;
 
-        // Worst-case prefill batch: max_prefill_tokens single-token requests
-        // (one chunk per request). The scheduler can pack many short prompts
-        // into the same step, so the logits and sampling scratch must be sized
-        // for prefill_count + decode_count rows, not 1 + decode_count.
-        let prefill_tokens_per_req = [0u32; 1];
-        let prefill_tokens_list: Vec<&[u32]> =
-            vec![prefill_tokens_per_req.as_slice(); num_prefill_reqs];
-        let prefill_single_views: Vec<KvView> = (0..num_prefill_reqs)
-            .map(|i| KvView::new(vec![(1 + i) as i32], 1, page_size))
-            .collect();
+        // Reachable worst-case unified profile: admission caps
+        // active decode rows + admitted/prefilling rows at the decode batch
+        // capacity, while max_prefill_tokens caps total prefill tokens. One
+        // max-sized prefill row plus the remaining decode slots exercises the
+        // largest activation shape without inventing unreachable row count.
+        let prefill_tokens_per_req = vec![0u32; max_prefill_tokens];
+        let prefill_tokens_list: Vec<&[u32]> = vec![prefill_tokens_per_req.as_slice()];
+        let prefill_single_views: Vec<KvView> = vec![KvView::new(
+            (1..=prefill_pages).map(|page| page as i32).collect(),
+            max_prefill_tokens,
+            page_size,
+        )];
         let prefill_adapters: Vec<Option<&str>> = vec![None; num_prefill_reqs];
 
         let logits = self.unified_step_with_peak(
@@ -93,7 +96,7 @@ impl Qwen3Model {
         )?;
         mark_peak()?;
 
-        let total_reqs = num_prefill_reqs + max_decode_batch_size;
+        let total_reqs = num_prefill_reqs + profile_decode_rows;
         let params = vec![SamplingParams::default(); total_reqs];
         let param_refs: Vec<&SamplingParams> = params.iter().collect();
         let _ = openinfer_sample::select_batch(
