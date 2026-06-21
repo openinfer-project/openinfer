@@ -41,10 +41,28 @@ thread_local cublasLtHandle_t g_lt_handle = nullptr;
 thread_local void *g_lt_workspace = nullptr;
 thread_local std::map<std::array<int, 3>, LtGemmPlan> g_lt_plans;
 static const size_t LT_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
+
+// Pin-path workspace, separate from the 32MB default. Arch-dependent, with 128MB kept as margin
+// for the tested decode buckets. Allocated lazily on first Pin use.
+thread_local void *g_lt_pin_workspace = nullptr;
+static const size_t LT_PIN_WORKSPACE_SIZE = 128 * 1024 * 1024;
+// Tuner pref kept smaller than the buffer: cuBLASLt picks a larger-workspace algo given a larger
+// budget, so 64MB pref forces a small-workspace algo and the 128MB buffer stays margin.
+static const size_t LT_PIN_TUNER_PREF = 64 * 1024 * 1024;
 // gemm_lt_cuda returns this when the calling thread has no tuned plan for the
 // shape; callers fall back to the cublasGemmEx paths so untuned models keep
 // their existing kernel selection and capture behavior.
 static constexpr int GEMM_LT_UNTUNED = -1;
+
+// Keyed on {M,K} only (g_lt_plans uses {M,N,K}): one cublasLt algo chosen at rep_n, reused for every N.
+static constexpr int GEMM_LT_PIN_UNTUNED = -1;     // no pinned plan for {M,K}
+static constexpr int GEMM_LT_PIN_UNSUPPORTED = -2; // pinned algo cannot serve this N
+struct LtPinPlan {
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t a = nullptr; // [K, M], independent of N
+  cublasLtMatmulAlgo_t algo{};
+};
+thread_local std::map<std::array<int, 2>, LtPinPlan> g_lt_pin_plans;
 
 static void lt_plan_destroy(LtGemmPlan &plan) {
   if (plan.c != nullptr) {
@@ -60,6 +78,67 @@ static void lt_plan_destroy(LtGemmPlan &plan) {
     cublasLtMatmulDescDestroy(plan.op);
   }
   plan = LtGemmPlan{};
+}
+
+static void lt_pin_destroy(LtPinPlan &plan) {
+  if (plan.a != nullptr) {
+    cublasLtMatrixLayoutDestroy(plan.a);
+  }
+  if (plan.op != nullptr) {
+    cublasLtMatmulDescDestroy(plan.op);
+  }
+  plan = LtPinPlan{};
+}
+
+// Lazily create this thread's cublasLt handle + 32MB workspace (shared by tuner and pin paths).
+static int ensure_lt_resources() {
+  if (g_lt_handle == nullptr) {
+    cublasStatus_t status = cublasLtCreate(&g_lt_handle);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      g_lt_handle = nullptr;
+      return cublas_status_to_error(status);
+    }
+  }
+  if (g_lt_workspace == nullptr) {
+    cudaError_t status = cudaMalloc(&g_lt_workspace, LT_WORKSPACE_SIZE);
+    if (status != cudaSuccess) {
+      g_lt_workspace = nullptr;
+      return static_cast<int>(status);
+    }
+  }
+  return static_cast<int>(cudaSuccess);
+}
+
+static int ensure_lt_pin_workspace() {
+  if (g_lt_pin_workspace == nullptr) {
+    cudaError_t status = cudaMalloc(&g_lt_pin_workspace, LT_PIN_WORKSPACE_SIZE);
+    if (status != cudaSuccess) {
+      g_lt_pin_workspace = nullptr;
+      return static_cast<int>(status);
+    }
+  }
+  return static_cast<int>(cudaSuccess);
+}
+
+// Op descriptor + A layout [K,M] for the pinned path; B/C rebuilt per call from N.
+static cublasStatus_t lt_pin_desc_create(LtPinPlan &plan, int M, int K) {
+  cublasStatus_t status = cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return status;
+  }
+  const cublasOperation_t transa = CUBLAS_OP_T;
+  const cublasOperation_t transb = CUBLAS_OP_N;
+  status = cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &transa,
+                                          sizeof(transa));
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return status;
+  }
+  status = cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSB, &transb,
+                                          sizeof(transb));
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return status;
+  }
+  return cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_16BF, K, M, K);
 }
 
 // Same math as gemm_cuda: Y[M,N] = W[M,K]^T-layout @ X[K,N], all bf16/FP32 compute.
@@ -194,6 +273,10 @@ void cublas_destroy() {
     lt_plan_destroy(entry.second);
   }
   g_lt_plans.clear();
+  for (auto &entry : g_lt_pin_plans) {
+    lt_pin_destroy(entry.second);
+  }
+  g_lt_pin_plans.clear();
   if (g_lt_handle != nullptr) {
     cublasLtDestroy(g_lt_handle);
     g_lt_handle = nullptr;
@@ -201,6 +284,10 @@ void cublas_destroy() {
   if (g_lt_workspace != nullptr) {
     cudaFree(g_lt_workspace);
     g_lt_workspace = nullptr;
+  }
+  if (g_lt_pin_workspace != nullptr) {
+    cudaFree(g_lt_pin_workspace);
+    g_lt_pin_workspace = nullptr;
   }
 }
 
@@ -301,19 +388,9 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   }
   // Lt resources are created here rather than in cublas_init so only threads
   // that actually tune (model executor threads) pay the 32MB workspace.
-  if (g_lt_handle == nullptr) {
-    cublasStatus_t create_status = cublasLtCreate(&g_lt_handle);
-    if (create_status != CUBLAS_STATUS_SUCCESS) {
-      g_lt_handle = nullptr;
-      return cublas_status_to_error(create_status);
-    }
-  }
-  if (g_lt_workspace == nullptr) {
-    cudaError_t alloc_status = cudaMalloc(&g_lt_workspace, LT_WORKSPACE_SIZE);
-    if (alloc_status != cudaSuccess) {
-      g_lt_workspace = nullptr;
-      return static_cast<int>(alloc_status);
-    }
+  int lt_rc = ensure_lt_resources();
+  if (lt_rc != static_cast<int>(cudaSuccess)) {
+    return lt_rc;
   }
 
   const std::array<int, 3> key{M, N, K};
@@ -413,6 +490,127 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   }
   plan.algo = results[best].algo;
   g_lt_plans.emplace(key, plan);
+  return static_cast<int>(cudaSuccess);
+}
+
+// Pin one cublasLt algo for (M,K) at rep_n (heuristic top, no timing → deterministic), keyed {M,K}.
+int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
+  if (M <= 0 || rep_n <= 0 || K <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  int rc = ensure_lt_resources();
+  if (rc == static_cast<int>(cudaSuccess)) {
+    rc = ensure_lt_pin_workspace();
+  }
+  if (rc != static_cast<int>(cudaSuccess)) {
+    return rc;
+  }
+
+  LtPinPlan plan;
+  cublasStatus_t status = lt_pin_desc_create(plan, M, K);
+  cublasLtMatrixLayout_t b = nullptr, c = nullptr;
+  cublasLtMatmulPreference_t pref = nullptr;
+  cublasLtMatmulHeuristicResult_t results[16];
+  int returned = 0;
+  size_t ws = LT_PIN_TUNER_PREF;
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, K, rep_n, K);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatrixLayoutCreate(&c, CUDA_R_16BF, M, rep_n, M);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulPreferenceCreate(&pref);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoGetHeuristic(g_lt_handle, plan.op, plan.a, b, c, c, pref, 16, results,
+                                            &returned);
+  if (pref != nullptr) cublasLtMatmulPreferenceDestroy(pref);
+  if (status == CUBLAS_STATUS_SUCCESS && returned == 0) status = CUBLAS_STATUS_NOT_SUPPORTED;
+  if (c != nullptr) cublasLtMatrixLayoutDestroy(c);
+  if (b != nullptr) cublasLtMatrixLayoutDestroy(b);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    lt_pin_destroy(plan);
+    return cublas_status_to_error(status);
+  }
+
+  plan.algo = results[0].algo;
+  const std::array<int, 2> key{M, K};
+  auto existing = g_lt_pin_plans.find(key);
+  if (existing != g_lt_pin_plans.end()) {
+    lt_pin_destroy(existing->second);
+    g_lt_pin_plans.erase(existing);
+  }
+  g_lt_pin_plans.emplace(key, plan);
+  return static_cast<int>(cudaSuccess);
+}
+
+// Run the pinned (M,K) algo at an arbitrary N (rebuilds only B/C). Returns PIN_UNTUNED (no plan)
+// or PIN_UNSUPPORTED (algo can't serve this N; caller falls back).
+int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
+                     int K, cudaStream_t stream) {
+  if (g_lt_handle == nullptr || g_lt_pin_workspace == nullptr) {
+    return GEMM_LT_PIN_UNTUNED;
+  }
+  auto it = g_lt_pin_plans.find(std::array<int, 2>{M, K});
+  if (it == g_lt_pin_plans.end()) {
+    return GEMM_LT_PIN_UNTUNED;
+  }
+  LtPinPlan &plan = it->second;
+
+  cublasLtMatrixLayout_t b = nullptr, c = nullptr;
+  cublasStatus_t status = cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, K, N, K);
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    status = cublasLtMatrixLayoutCreate(&c, CUDA_R_16BF, M, N, M);
+  }
+  int result;
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    result = cublas_status_to_error(status);
+  } else {
+    cublasLtMatmulHeuristicResult_t check{};
+    cublasStatus_t check_status =
+        cublasLtMatmulAlgoCheck(g_lt_handle, plan.op, plan.a, b, c, c, &plan.algo, &check);
+    if (check_status != CUBLAS_STATUS_SUCCESS) {
+      result = GEMM_LT_PIN_UNSUPPORTED;
+    } else if (check.workspaceSize > LT_PIN_WORKSPACE_SIZE) {
+      result = GEMM_LT_PIN_UNSUPPORTED;
+    } else {
+      const float h_alpha = 1.0f;
+      const float h_beta = 0.0f;
+      cublasStatus_t mm =
+          cublasLtMatmul(g_lt_handle, plan.op, &h_alpha, W, plan.a, X, b, &h_beta, Y, c, Y, c,
+                         &plan.algo, g_lt_pin_workspace, LT_PIN_WORKSPACE_SIZE, stream);
+      result = (mm == CUBLAS_STATUS_SUCCESS) ? static_cast<int>(cudaPeekAtLastError())
+                                             : cublas_status_to_error(mm);
+    }
+  }
+  if (c != nullptr) cublasLtMatrixLayoutDestroy(c);
+  if (b != nullptr) cublasLtMatrixLayoutDestroy(b);
+  return result;
+}
+
+// Diagnostics: write [tile_id, stages_id, splitk_num, reduction_scheme] for (M,K) into out4;
+// GEMM_LT_PIN_UNTUNED if no pinned plan.
+int gemm_lt_pin_inspect_cuda(int M, int K, int *out4) {
+  if (out4 == nullptr) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  auto it = g_lt_pin_plans.find(std::array<int, 2>{M, K});
+  if (it == g_lt_pin_plans.end()) {
+    return GEMM_LT_PIN_UNTUNED;
+  }
+  cublasLtMatmulAlgo_t &algo = it->second.algo;
+  int tile = -1, stages = -1, splitk = -1, reduction = -1;
+  size_t written = 0;
+  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile),
+                                       &written);
+  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages,
+                                       sizeof(stages), &written);
+  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk,
+                                       sizeof(splitk), &written);
+  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction,
+                                       sizeof(reduction), &written);
+  out4[0] = tile, out4[1] = stages, out4[2] = splitk, out4[3] = reduction;
   return static_cast<int>(cudaSuccess);
 }
 

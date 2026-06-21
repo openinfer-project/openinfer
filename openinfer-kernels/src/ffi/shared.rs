@@ -151,6 +151,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
+    pub fn gemm_lt_pin_tune_cuda(M: i32, rep_n: i32, K: i32) -> i32;
+
+    pub fn gemm_lt_pin_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gemm_lt_pin_inspect_cuda(M: i32, K: i32, out4: *mut i32) -> i32;
+
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(
         embed: *const Half,

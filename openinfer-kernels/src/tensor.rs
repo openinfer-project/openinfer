@@ -477,6 +477,35 @@ impl HiddenStates {
             seq_len,
         })
     }
+
+    /// Create from host data: `hidden_dim * seq_len` bf16, token `i` at `i * hidden_dim`.
+    pub fn from_host(
+        ctx: &DeviceContext,
+        data: &[bf16],
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<Self> {
+        assert_eq!(data.len(), hidden_dim * seq_len);
+        let gpu_data = ctx
+            .stream
+            .clone_htod(data)
+            .map_err(|e| anyhow!("H2D copy failed: {}", e))?;
+        Ok(Self {
+            data: gpu_data,
+            hidden_dim,
+            seq_len,
+        })
+    }
+
+    /// Copy to host as f32. bf16 → f32 is lossless, so f32 equality is bitwise.
+    pub fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
+        let host = ctx
+            .stream
+            .clone_dtoh(&self.data)
+            .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
+        ctx.sync()?;
+        Ok(host.iter().map(|x| x.to_f32()).collect())
+    }
 }
 
 // ── Typed tensor layer ───────────────────────────────────────────────

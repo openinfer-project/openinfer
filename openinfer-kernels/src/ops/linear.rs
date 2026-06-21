@@ -1,3 +1,7 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{Result, bail};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
@@ -62,6 +66,99 @@ pub fn gemm_lt_tune(
         );
     }
     Ok(())
+}
+
+/// Mirrors the GEMM_LT_PIN_* sentinels in csrc/shared/linear.cu.
+const GEMM_LT_PIN_UNTUNED: i32 = -1;
+const GEMM_LT_PIN_UNSUPPORTED: i32 = -2;
+
+/// Pin one cublasLt algo for `(num_rows, cols)`, selected by the heuristic at `rep_n` (shape-only),
+/// reused for every N. Run on the GEMM-issuing thread (the plan cache is thread-local).
+pub fn gemm_lt_pin_tune(num_rows: usize, rep_n: usize, cols: usize) -> Result<()> {
+    let status = unsafe { ffi::gemm_lt_pin_tune_cuda(num_rows as i32, rep_n as i32, cols as i32) };
+    if status != 0 {
+        bail!(
+            "cublasLt pin tuning failed: status={}, m={}, rep_n={}, k={}",
+            status,
+            num_rows,
+            rep_n,
+            cols
+        );
+    }
+    Ok(())
+}
+
+/// Run the pinned `(rows, cols)` algo at this N. `Ok(false)` = algo can't serve this N (caller
+/// falls back); bails if never pinned.
+pub fn gemm_lt_pin_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    assert_eq!(
+        weight.cols, x.hidden_dim,
+        "weight cols {} != hidden_dim {}",
+        weight.cols, x.hidden_dim
+    );
+    assert_eq!(
+        out.hidden_dim, weight.rows,
+        "out hidden_dim {} != weight rows {}",
+        out.hidden_dim, weight.rows
+    );
+    assert_eq!(
+        out.seq_len, x.seq_len,
+        "out seq_len {} != x seq_len {}",
+        out.seq_len, x.seq_len
+    );
+
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    let status = unsafe {
+        ffi::gemm_lt_pin_cuda(
+            w_ptr as *const ffi::Half,
+            x_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            weight.rows as i32,
+            x.seq_len as i32,
+            weight.cols as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    match status {
+        0 => Ok(true),
+        GEMM_LT_PIN_UNSUPPORTED => Ok(false),
+        GEMM_LT_PIN_UNTUNED => bail!(
+            "gemm_lt_pin_into_checked: (m={}, k={}) was never pinned — call gemm_lt_pin_tune first",
+            weight.rows,
+            weight.cols
+        ),
+        s if s >= 100_000 => bail!(
+            "cublasLt pin GEMM failed: cublas_status={}, m={}, n={}, k={}",
+            s - 100_000,
+            weight.rows,
+            x.seq_len,
+            weight.cols
+        ),
+        s => bail!(
+            "cublasLt pin GEMM launch failed: cuda_status={}, m={}, n={}, k={}",
+            s,
+            weight.rows,
+            x.seq_len,
+            weight.cols
+        ),
+    }
+}
+
+/// Diagnostics: the pinned algo's `[tile_id, stages_id, splitk_num, reduction_scheme]` for
+/// `(rows, cols)`, or `None` if never pinned.
+pub fn gemm_lt_pin_inspect(rows: usize, cols: usize) -> Option<[i32; 4]> {
+    let mut out = [0i32; 4];
+    let status =
+        unsafe { ffi::gemm_lt_pin_inspect_cuda(rows as i32, cols as i32, out.as_mut_ptr()) };
+    if status == 0 { Some(out) } else { None }
 }
 
 /// GEMM on a row sub-range of a weight matrix: Y = W[row_offset..row_offset+M, :] @ X
@@ -352,6 +449,204 @@ fn gemm_ref_into_with_policy(
     )
 }
 
+/// Process-global numeric policy for projection GEMMs (atomics, not thread-local: the probe sets it
+/// from the main thread, the model reads it on a worker thread). `Tuned` (default) = production
+/// path; `Pin` = batch-invariant pinned algo (per-token fallback when it can't run); `PerToken` =
+/// N=1 oracle. `OPENINFER_NUMERIC_POLICY=pin|pertoken` sets the initial value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum NumericPolicy {
+    Tuned = 0,
+    Pin = 1,
+    PerToken = 2,
+}
+
+impl NumericPolicy {
+    fn from_env() -> Self {
+        match std::env::var("OPENINFER_NUMERIC_POLICY").as_deref() {
+            Ok("pin") => NumericPolicy::Pin,
+            Ok("pertoken") => NumericPolicy::PerToken,
+            _ => NumericPolicy::Tuned,
+        }
+    }
+}
+
+const POLICY_UNINIT: u8 = u8::MAX;
+static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(POLICY_UNINIT);
+static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
+static PIN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+type FallbackShapeMap = Mutex<BTreeMap<(usize, usize, usize), u64>>;
+/// Per-(m, n, k) fallback tally; only the fallback branch touches it (served path stays lock-free).
+static PIN_FALLBACK_SHAPES: OnceLock<FallbackShapeMap> = OnceLock::new();
+
+fn pin_fallback_shapes_map() -> &'static FallbackShapeMap {
+    PIN_FALLBACK_SHAPES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Override the cached policy in-process — to drive baseline/pin/per-token in one run, vs the
+/// `OPENINFER_NUMERIC_POLICY` env var that `numeric_policy()` lazy-reads.
+pub fn set_numeric_policy(p: NumericPolicy) {
+    NUMERIC_POLICY.store(p as u8, Ordering::Release);
+}
+
+pub fn numeric_policy() -> NumericPolicy {
+    let mut v = NUMERIC_POLICY.load(Ordering::Acquire);
+    if v == POLICY_UNINIT {
+        // Only win the lazy-init race while still uninit, so a concurrent
+        // set_numeric_policy() is never clobbered by the env default.
+        let env = NumericPolicy::from_env() as u8;
+        v = match NUMERIC_POLICY.compare_exchange(
+            POLICY_UNINIT,
+            env,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => env,
+            Err(actual) => actual,
+        };
+    }
+    match v {
+        1 => NumericPolicy::Pin,
+        2 => NumericPolicy::PerToken,
+        _ => NumericPolicy::Tuned,
+    }
+}
+
+/// `(pin_served, pin_fallback)` projection-GEMM counts. Guards the experiment
+/// against a maxΔ=0 that is actually all per-token fallback (already known
+/// invariant), not the pin.
+pub fn pin_counters() -> (u64, u64) {
+    (
+        PIN_SERVED.load(Ordering::Relaxed),
+        PIN_FALLBACK.load(Ordering::Relaxed),
+    )
+}
+
+pub fn reset_pin_counters() {
+    PIN_SERVED.store(0, Ordering::Relaxed);
+    PIN_FALLBACK.store(0, Ordering::Relaxed);
+    pin_fallback_shapes_map().lock().unwrap().clear();
+}
+
+/// `((m, n, k), count)` per shape that fell back to per-token; empty iff `pin_fallback` is 0.
+pub fn pin_fallback_shapes() -> Vec<((usize, usize, usize), u64)> {
+    pin_fallback_shapes_map()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&shape, &count)| (shape, count))
+        .collect()
+}
+
+/// Fixed representative N at which every (M,K) pin is resolved — one algo for ALL
+/// N (NOT first-call-N, which would make the pinned algo call-order-dependent).
+const PIN_REP_N: i32 = 32;
+
+/// `Pin` policy: lazily pin (m,k) at PIN_REP_N, run at live N, per-token fallback if it can't serve N.
+fn launch_gemm_pin(
+    w_ptr: *const ffi::Half,
+    x_ptr: *const ffi::Half,
+    y_ptr: *mut ffi::Half,
+    m: usize,
+    n: usize,
+    k: usize,
+    ctx: &DeviceContext,
+) -> Result<()> {
+    // cuBLASLt (gemm_lt_pin) risks Xid 31 under a stream override — see launch_gemm; use per-token.
+    if crate::tensor::has_stream_override() {
+        PIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        *pin_fallback_shapes_map()
+            .lock()
+            .unwrap()
+            .entry((m, n, k))
+            .or_insert(0) += 1;
+        return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx);
+    }
+    // Lazy-pin (m,k); a no-op during decode graph capture, since prefill pins all shapes
+    // first (the tune's cudaMalloc would otherwise invalidate the capture).
+    if gemm_lt_pin_inspect(m, k).is_none() {
+        gemm_lt_pin_tune(m, PIN_REP_N as usize, k)?;
+    }
+    unsafe {
+        let status = ffi::gemm_lt_pin_cuda(
+            w_ptr,
+            x_ptr,
+            y_ptr,
+            m as i32,
+            n as i32,
+            k as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+        match status {
+            0 => {
+                PIN_SERVED.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            GEMM_LT_PIN_UNSUPPORTED | GEMM_LT_PIN_UNTUNED => {
+                PIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                *pin_fallback_shapes_map()
+                    .lock()
+                    .unwrap()
+                    .entry((m, n, k))
+                    .or_insert(0) += 1;
+                let st = ffi::gemm_per_token_cuda(
+                    w_ptr,
+                    x_ptr,
+                    y_ptr,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    crate::tensor::active_cu_stream(ctx),
+                );
+                if st != 0 {
+                    bail!("pin per-token fallback failed: status={st}, m={m}, n={n}, k={k}");
+                }
+                Ok(())
+            }
+            s if s >= 100_000 => {
+                bail!(
+                    "cuBLAS pin GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
+                    s - 100_000
+                )
+            }
+            s => bail!("CUDA pin GEMM launch failed: cuda_status={s}, m={m}, n={n}, k={k}"),
+        }
+    }
+}
+
+/// `PerToken` policy: the N=1-per-column oracle (invariant by construction).
+fn launch_gemm_pertoken(
+    w_ptr: *const ffi::Half,
+    x_ptr: *const ffi::Half,
+    y_ptr: *mut ffi::Half,
+    m: usize,
+    n: usize,
+    k: usize,
+    ctx: &DeviceContext,
+) -> Result<()> {
+    unsafe {
+        let status = ffi::gemm_per_token_cuda(
+            w_ptr,
+            x_ptr,
+            y_ptr,
+            m as i32,
+            n as i32,
+            k as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+        if status != 0 {
+            if status >= 100_000 {
+                bail!(
+                    "cuBLAS per-token GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
+                    status - 100_000
+                );
+            }
+            bail!("CUDA per-token GEMM launch failed: cuda_status={status}, m={m}, n={n}, k={k}");
+        }
+    }
+    Ok(())
+}
+
 fn launch_gemm(
     w_ptr: *const ffi::Half,
     x_ptr: *const ffi::Half,
@@ -362,6 +657,12 @@ fn launch_gemm(
     graphsafe: bool,
     ctx: &DeviceContext,
 ) -> Result<()> {
+    // Non-Tuned policies route every N through the pinned/per-token path; Tuned falls through.
+    match numeric_policy() {
+        NumericPolicy::Pin => return launch_gemm_pin(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
+        NumericPolicy::PerToken => return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
+        NumericPolicy::Tuned => {}
+    }
     unsafe {
         // Small-N projections run the cublasLt algo selected by gemm_lt_tune.
         // Shapes this thread never tuned report GEMM_LT_UNTUNED and keep their
