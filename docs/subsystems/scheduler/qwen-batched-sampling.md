@@ -1,6 +1,6 @@
 # Qwen Batched Sampling
 
-> **TL;DR:** Issue #284 migrates Qwen3/Qwen3.5 mixed greedy/non-greedy token selection to one batched FlashInfer sampling call per step, while keeping greedy/effectively-greedy rows on batched argmax. The retained evidence is a model-path correctness gate, an nsys kernel-composition proof, and a same-workload Qwen3 greedy TPOT A/B. This does not claim HTTP serving coverage.
+> **TL;DR:** Issue #284 migrates Qwen3/Qwen3.5 mixed greedy/non-greedy token selection to one batched FlashInfer sampling call per step, while keeping greedy/effectively-greedy rows on batched argmax. The #284 evidence remains correctness/nsys/direct-bench evidence; #412 adds separate HTTP serving evidence in [qwen-mixed-sampling-http.md](../../benchmarks/qwen-mixed-sampling-http.md).
 >
 > **Last touched:** 2026-06
 
