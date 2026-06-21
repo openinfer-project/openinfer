@@ -914,11 +914,8 @@ impl Qwen3Model {
             memory_options.gpu_memory_utilization
         );
 
-        let profile_blocks = profile_temp_blocks(
-            max_prefill_tokens,
-            max_decode_batch_size,
-            geometry.block_size,
-        );
+        let profile_rows = max_prefill_tokens + max_decode_batch_size;
+        let profile_blocks = profile_temp_blocks(max_prefill_tokens, max_decode_batch_size);
         let profile_kv_bytes = profile_blocks * bytes_per_block;
         let mut peak_used_bytes = initial_used_bytes;
         let mut record_peak = || -> Result<()> {
@@ -956,7 +953,7 @@ impl Qwen3Model {
         let mut sample_scratch = openinfer_sample::SampleScratch::new(
             self.device_ctx(),
             self.config.vocab_size,
-            max_decode_batch_size + 1,
+            profile_rows,
         )
         .context("Qwen3 memory profile sampling scratch alloc failed")?;
         record_peak()?;
@@ -1063,12 +1060,10 @@ fn mem_info_bytes() -> Result<(usize, usize)> {
     Ok((free, total))
 }
 
-fn profile_temp_blocks(
-    max_prefill_tokens: usize,
-    max_decode_batch_size: usize,
-    block_size: usize,
-) -> usize {
-    max_prefill_tokens.div_ceil(block_size) + max_decode_batch_size + 1
+fn profile_temp_blocks(max_prefill_tokens: usize, max_decode_batch_size: usize) -> usize {
+    // Block 0 is reserved as the decode padding block. Worst-case scheduling can
+    // admit max_prefill_tokens one-token prefill rows plus the decode batch.
+    1 + max_prefill_tokens + max_decode_batch_size
 }
 
 fn install_lora_adapter_in_registry(

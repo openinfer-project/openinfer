@@ -47,14 +47,11 @@ impl Qwen3Model {
             kv_buffer.layout().page_size,
         );
         let page_size = layout.page_size;
-        let prefill_pages = max_prefill_tokens.div_ceil(page_size);
-        let prefill_page_indices: Vec<i32> = (0..prefill_pages).map(|p| p as i32).collect();
-        let prefill_view = KvView::new(prefill_page_indices, max_prefill_tokens, page_size);
+        let num_prefill_reqs = max_prefill_tokens;
         let decode_views: Vec<KvView> = (0..max_decode_batch_size)
-            .map(|i| KvView::new(vec![(prefill_pages + i) as i32], 1, page_size))
+            .map(|i| KvView::new(vec![(1 + num_prefill_reqs + i) as i32], 1, page_size))
             .collect();
 
-        let prefill_tokens = vec![0u32; max_prefill_tokens];
         let decode_tokens = vec![0u32; max_decode_batch_size];
         let decode_adapters = vec![None; max_decode_batch_size];
 
@@ -71,10 +68,22 @@ impl Qwen3Model {
         )?;
         mark_peak()?;
 
+        // Worst-case prefill batch: max_prefill_tokens single-token requests
+        // (one chunk per request). The scheduler can pack many short prompts
+        // into the same step, so the logits and sampling scratch must be sized
+        // for prefill_count + decode_count rows, not 1 + decode_count.
+        let prefill_tokens_per_req = [0u32; 1];
+        let prefill_tokens_list: Vec<&[u32]> =
+            vec![prefill_tokens_per_req.as_slice(); num_prefill_reqs];
+        let prefill_single_views: Vec<KvView> = (0..num_prefill_reqs)
+            .map(|i| KvView::new(vec![(1 + i) as i32], 1, page_size))
+            .collect();
+        let prefill_adapters: Vec<Option<&str>> = vec![None; num_prefill_reqs];
+
         let logits = self.unified_step_with_peak(
-            &[prefill_tokens.as_slice()],
-            &[prefill_view],
-            &[None],
+            &prefill_tokens_list,
+            &prefill_single_views,
+            &prefill_adapters,
             &decode_tokens,
             &decode_views,
             &decode_adapters,
@@ -84,7 +93,8 @@ impl Qwen3Model {
         )?;
         mark_peak()?;
 
-        let params = vec![SamplingParams::default(); max_decode_batch_size + 1];
+        let total_reqs = num_prefill_reqs + max_decode_batch_size;
+        let params = vec![SamplingParams::default(); total_reqs];
         let param_refs: Vec<&SamplingParams> = params.iter().collect();
         let _ = openinfer_sample::select_batch(
             self.device_ctx(),
