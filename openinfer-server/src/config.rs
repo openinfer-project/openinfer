@@ -96,6 +96,18 @@ pub(crate) struct Args {
     /// ticking. Echo requests are never split. Must be positive.
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
     pub max_prefill_tokens: usize,
+
+    /// How prefill and decode share the GPU (single-GPU Qwen3 only).
+    /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
+    /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green
+    /// Context SM partition (lower decode ITL p99, higher TTFT).
+    #[arg(long, value_enum, default_value_t = CliDecodeOverlap::Off)]
+    pub decode_overlap: CliDecodeOverlap,
+
+    /// Percent of SMs pinned to decode in `--decode-overlap green-ctx` (the rest
+    /// go to prefill). Ignored in other modes.
+    #[arg(long, default_value_t = 20)]
+    pub decode_sm_pct: u32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -110,6 +122,32 @@ impl From<CliEpBackend> for EpBackend {
         match value {
             CliEpBackend::Nccl => Self::Nccl,
             CliEpBackend::DeepEp => Self::DeepEp,
+        }
+    }
+}
+
+/// CLI selector for prefill/decode overlap. Mapped to
+/// [`openinfer_qwen3_4b::DecodeOverlap`] together with `--decode-sm-pct`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliDecodeOverlap {
+    /// One stream; prefill and decode serialize.
+    Off,
+    /// Two CUDA streams sharing all SMs.
+    Stream,
+    /// Green Context SM partition (SM-pinned streams).
+    #[value(name = "green-ctx")]
+    GreenCtx,
+}
+
+impl CliDecodeOverlap {
+    pub(crate) fn resolve(self, decode_sm_pct: u32) -> openinfer_qwen3_4b::DecodeOverlap {
+        use openinfer_qwen3_4b::DecodeOverlap;
+        match self {
+            Self::Off => DecodeOverlap::Off,
+            Self::Stream => DecodeOverlap::SharedSm,
+            Self::GreenCtx => DecodeOverlap::GreenCtx {
+                decode_pct: decode_sm_pct,
+            },
         }
     }
 }

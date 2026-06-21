@@ -267,6 +267,11 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     }
   }
 
+  const std::array<int, 3> key{M, N, K};
+  if (g_lt_plans.find(key) != g_lt_plans.end()) {
+    return static_cast<int>(cudaSuccess);
+  }
+
   LtGemmPlan plan;
   cublasStatus_t status = lt_plan_create(plan, M, N, K);
   cublasLtMatmulHeuristicResult_t results[16];
@@ -358,12 +363,6 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     return cublas_status_to_error(CUBLAS_STATUS_NOT_SUPPORTED);
   }
   plan.algo = results[best].algo;
-  const std::array<int, 3> key{M, N, K};
-  auto existing = g_lt_plans.find(key);
-  if (existing != g_lt_plans.end()) {
-    lt_plan_destroy(existing->second);
-    g_lt_plans.erase(existing);
-  }
   g_lt_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }

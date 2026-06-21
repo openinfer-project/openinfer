@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
@@ -8,6 +10,23 @@ use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_to
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
+
+// Thread-local deferred-drop queue for decode-overlap mode. Buffers pushed here
+// during prefill (under stream override) are dropped later when
+// `drain_deferred_drops()` runs after the prefill stream is synchronized.
+thread_local! {
+    static DEFERRED_DROPS: std::cell::RefCell<Vec<Box<dyn Any>>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Defer an object's drop until `drain_deferred_drops()` is called.
+fn defer_drop<T: 'static>(val: T) {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().push(Box::new(val)));
+}
+
+/// Drop all deferred objects. Call after prefill stream sync.
+pub(crate) fn drain_deferred_drops() {
+    DEFERRED_DROPS.with(|q| q.borrow_mut().clear());
+}
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
 use openinfer_kv_cache::KvView;
 
@@ -71,6 +90,12 @@ impl Qwen3Model {
 
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
         ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
+
+        // Defer drop of token_ids_gpu in SM-partition mode to prevent
+        // use-after-free (allocated on ctx.stream, kernel on green stream).
+        if openinfer_kernels::tensor::has_stream_override() {
+            defer_drop(token_ids_gpu);
+        }
 
         Ok(out)
     }
@@ -379,6 +404,14 @@ impl Qwen3Model {
         }
         let logits = self.batch_token_logits(&hidden, &last_indices)?;
 
+        // In SM-partition mode (stream override active), defer dropping
+        // GPU-backed temp buffers until after the prefill stream is synced.
+        // Otherwise cuMemFreeAsync on ctx.stream races with green-stream kernels.
+        if openinfer_kernels::tensor::has_stream_override() {
+            defer_drop(hidden);
+            defer_drop(plan);
+        }
+
         Ok((logits, all_logits))
     }
 
@@ -415,6 +448,11 @@ impl Qwen3Model {
                 lora_groups,
                 &mut bufs,
             )?;
+        }
+
+        // Defer drop of PrefillBuffers in SM-partition mode.
+        if openinfer_kernels::tensor::has_stream_override() {
+            defer_drop(bufs);
         }
 
         Ok(hidden)

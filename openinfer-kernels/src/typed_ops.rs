@@ -121,7 +121,7 @@ pub fn rms_norm_into<const DIM: usize>(
             DIM as i32,
             x.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
     Ok(())
@@ -156,7 +156,7 @@ pub fn fused_add_rms_norm_into<const DIM: usize>(
             DIM as i32,
             hidden.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
     Ok(())
@@ -194,7 +194,7 @@ pub fn fused_add_rms_norm_round_into<const DIM: usize>(
             DIM as i32,
             hidden.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -227,7 +227,7 @@ pub fn add_into<const DIM: usize>(
             b_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -251,13 +251,21 @@ where
     );
     let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
     let (o_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::silu_mul_fused_cuda(
             gu_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             INTER as i32,
             gate_up.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "typed silu_mul CUDA launch failed: cuda_status={}, intermediate={}, batch={}",
+            result,
+            INTER,
+            gate_up.seq_len
         );
     }
     Ok(())
@@ -293,7 +301,7 @@ pub fn embedding_vocab_shard_into<const DIM: usize>(
             out.seq_len as i32,
             vocab_start,
             vocab_rows,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -342,7 +350,7 @@ pub fn bf16_to_f32_into<const DIM: usize>(
             x_ptr as *const ffi::Half,
             o_ptr as *mut f32,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -368,7 +376,7 @@ pub fn f32_to_bf16_into<const DIM: usize>(
             x_ptr as *const f32,
             o_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -574,13 +582,21 @@ pub fn silu_mul_hs_fused_into(
     );
     let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
     let (o_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
+    let result = unsafe {
         ffi::silu_mul_fused_cuda(
             gu_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             inter as i32,
             gate_up.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "typed silu_mul_hs CUDA launch failed: cuda_status={}, intermediate={}, batch={}",
+            result,
+            inter,
+            gate_up.seq_len
         );
     }
     Ok(())
@@ -607,7 +623,7 @@ fn launch_gemm(
                 m as i32,
                 n as i32,
                 k as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             )
         } else {
             ffi::gemm_cuda(
@@ -617,7 +633,7 @@ fn launch_gemm(
                 m as i32,
                 n as i32,
                 k as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             )
         };
         if status != 0 {
@@ -650,7 +666,7 @@ fn launch_gemm_per_token(
             m as i32,
             batch as i32,
             k as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
             if status >= 100_000 {

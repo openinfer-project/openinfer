@@ -34,7 +34,7 @@ pub fn add_batch_into(
             b_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -78,7 +78,7 @@ pub fn scaled_add_rows_into(
             row_offset as i32,
             delta.hidden_dim as i32,
             delta.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -127,7 +127,7 @@ pub fn scaled_add_rows_token_range_into(
             row_offset as i32,
             delta.hidden_dim as i32,
             delta.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -169,7 +169,7 @@ pub fn gather_hidden_tokens_into(
             input.hidden_dim as i32,
             token_count as i32,
             input.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -222,7 +222,7 @@ pub fn scaled_add_rows_indexed_into(
             delta.hidden_dim as i32,
             token_count as i32,
             out.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -258,7 +258,7 @@ pub fn bf16_hidden_to_f32_into(
             input_ptr as *const ffi::Half,
             output_ptr as *mut f32,
             input.data.len() as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -284,7 +284,7 @@ pub fn f32_to_bf16_hidden_into(
             input_ptr as *const f32,
             output_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -309,7 +309,7 @@ pub fn scale_f32_in_place(
             values_ptr as *mut f32,
             scale,
             len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -356,7 +356,7 @@ pub fn accumulate_bf16_token_scaled_to_f32_into(
             token.hidden_dim as i32,
             token_idx as i32,
             seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -391,7 +391,7 @@ pub fn repeat_f32_for_reduce_scatter_into(
             repeated_ptr as *mut f32,
             local_elems as i32,
             world_size as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -432,7 +432,7 @@ pub fn silu_mul_batch_into(
             u_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             n as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -446,7 +446,7 @@ pub fn silu_mul_fused_batch_into(
     ctx: &DeviceContext,
     gate_up: &HiddenStates,
     out: &mut HiddenStates,
-) {
+) -> Result<()> {
     let intermediate_size = out.hidden_dim;
     let bs = gate_up.seq_len;
     assert_eq!(
@@ -461,15 +461,24 @@ pub fn silu_mul_fused_batch_into(
     let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
     let (out_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::silu_mul_fused_cuda(
             gu_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             intermediate_size as i32,
             bs as i32,
-            ctx.stream.cu_stream(),
-        );
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        return Err(anyhow!(
+            "silu_mul_fused CUDA launch failed: cuda_status={}, intermediate={}, batch={}",
+            result,
+            intermediate_size,
+            bs
+        ));
     }
+    Ok(())
 }
 
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
@@ -544,6 +553,7 @@ pub fn write_vec_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::DeviceMatrix;
     use half::bf16;
 
     fn hidden_from_host(
@@ -595,7 +605,7 @@ mod tests {
         let split = silu_mul_batch(&ctx, &gate_hidden, &up_hidden)?;
         let mut fused = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
 
-        silu_mul_fused_batch_into(&ctx, &gate_up_hidden, &mut fused);
+        silu_mul_fused_batch_into(&ctx, &gate_up_hidden, &mut fused)?;
 
         let split_host = hidden_to_host(&ctx, &split)?;
         let fused_host = hidden_to_host(&ctx, &fused)?;
@@ -607,6 +617,56 @@ mod tests {
                 split_value.to_bits(),
                 fused_value.to_bits(),
                 "fused/split silu_mul mismatch at index {idx}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vstacked_gate_up_gemm_matches_split_mlp_projection() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden_dim = 2;
+        let intermediate = 4;
+        let seq_len = 3;
+
+        let gate_w: Vec<_> = [1.0, -0.5, -2.0, 0.25, 0.75, 1.5, -1.25, -0.75]
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let up_w: Vec<_> = [-0.25, 2.0, 1.25, -1.0, 0.5, 0.75, -1.5, 1.0]
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let input: Vec<_> = [0.5, -1.0, 2.0, 0.25, -0.75, 1.5]
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+
+        let gate_w = DeviceMatrix::from_host(&ctx, &gate_w, intermediate, hidden_dim)?;
+        let up_w = DeviceMatrix::from_host(&ctx, &up_w, intermediate, hidden_dim)?;
+        let gate_up_w = DeviceMatrix::vstack(&ctx, &[&gate_w, &up_w])?;
+        let input = hidden_from_host(&ctx, &input, hidden_dim, seq_len)?;
+
+        let gate = crate::ops::gemm(&ctx, &gate_w, &input)?;
+        let up = crate::ops::gemm(&ctx, &up_w, &input)?;
+        let split = silu_mul_batch(&ctx, &gate, &up)?;
+
+        let gate_up = crate::ops::gemm(&ctx, &gate_up_w, &input)?;
+        let mut fused = HiddenStates::zeros(&ctx, intermediate, seq_len)?;
+        silu_mul_fused_batch_into(&ctx, &gate_up, &mut fused)?;
+
+        let split_host = hidden_to_host(&ctx, &split)?;
+        let fused_host = hidden_to_host(&ctx, &fused)?;
+        assert_eq!(split_host.len(), fused_host.len());
+        for (idx, (split_value, fused_value)) in
+            split_host.iter().zip(fused_host.iter()).enumerate()
+        {
+            let split_f32 = split_value.to_f32();
+            let fused_f32 = fused_value.to_f32();
+            let diff = (split_f32 - fused_f32).abs();
+            assert!(
+                diff <= 0.02,
+                "vstacked gate_up GEMM mismatch at index {idx}: split={split_f32} fused={fused_f32} diff={diff}"
             );
         }
         Ok(())

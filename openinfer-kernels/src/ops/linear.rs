@@ -49,7 +49,7 @@ pub fn gemm_lt_tune(
             num_rows as i32,
             n as i32,
             cols as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     if status != 0 {
@@ -270,7 +270,7 @@ pub fn gemm_per_token_into_checked(
             weight.rows as i32,
             x.seq_len as i32,
             weight.cols as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
             if status >= 100_000 {
@@ -347,7 +347,11 @@ fn launch_gemm(
         // Small-N projections run the cublasLt algo selected by gemm_lt_tune.
         // Shapes this thread never tuned report GEMM_LT_UNTUNED and keep their
         // existing cublasGemmEx path (and its capture behavior) unchanged.
-        let mut status = if n <= GEMM_LT_MAX_N {
+        //
+        // NOTE: gemm_lt is disabled when a stream override is active (SM-partition
+        // concurrent mode). cuBLASLt has device-global state that conflicts when
+        // two green-ctx streams run cublasLtMatmul concurrently, causing Xid 31.
+        let mut status = if n <= GEMM_LT_MAX_N && !crate::tensor::has_stream_override() {
             ffi::gemm_lt_cuda(
                 w_ptr,
                 x_ptr,
@@ -355,7 +359,7 @@ fn launch_gemm(
                 m as i32,
                 n as i32,
                 k as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             )
         } else {
             GEMM_LT_UNTUNED
@@ -369,7 +373,7 @@ fn launch_gemm(
                     m as i32,
                     n as i32,
                     k as i32,
-                    ctx.stream.cu_stream(),
+                    crate::tensor::active_cu_stream(ctx),
                 )
             } else {
                 ffi::gemm_cuda(
@@ -379,7 +383,7 @@ fn launch_gemm(
                     m as i32,
                     n as i32,
                     k as i32,
-                    ctx.stream.cu_stream(),
+                    crate::tensor::active_cu_stream(ctx),
                 )
             };
         }

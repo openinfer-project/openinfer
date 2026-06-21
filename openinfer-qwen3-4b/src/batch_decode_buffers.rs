@@ -112,8 +112,15 @@ pub(crate) struct BatchDecodeBuffers {
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
 
-    /// One CudaGraphState per `(bucket, attention_path)`.
+    /// One CudaGraphState per `(bucket, attention_path)`, captured on the
+    /// full-SM `ctx.stream` — used by the normal decode-only path.
     pub(crate) graphs: Vec<CudaGraphState>,
+
+    /// Parallel cache captured on the Green Context decode-partition stream,
+    /// used when decode runs concurrently with prefill (SplitConcurrent). A
+    /// graph captured on `ctx.stream` would replay on all SMs, so the split
+    /// path needs its own graphs whose nodes are pinned to the decode partition.
+    pub(crate) graphs_split: Vec<CudaGraphState>,
 }
 
 impl BatchDecodeBuffers {
@@ -171,6 +178,10 @@ impl BatchDecodeBuffers {
             max_seq_len: 0,
             padding_page_id,
             graphs: BATCH_BUCKETS
+                .iter()
+                .flat_map(|_| (0..DECODE_ATTENTION_PATH_COUNT).map(|_| CudaGraphState::new()))
+                .collect(),
+            graphs_split: BATCH_BUCKETS
                 .iter()
                 .flat_map(|_| (0..DECODE_ATTENTION_PATH_COUNT).map(|_| CudaGraphState::new()))
                 .collect(),

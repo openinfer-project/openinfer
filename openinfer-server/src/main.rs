@@ -155,6 +155,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     no_prefix_cache: args.no_prefix_cache,
                     max_prefill_tokens: args.max_prefill_tokens,
                     lora,
+                    decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
                 },
             )
             .context("failed to start Qwen3 engine")?

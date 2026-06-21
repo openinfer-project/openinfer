@@ -23,7 +23,7 @@ pub fn rms_norm_into(
             out_ptr as *mut ffi::Half,
             x.len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
     Ok(())
@@ -65,7 +65,7 @@ pub fn fused_add_rms_norm_into(
             o_ptr as *mut ffi::Half,
             hidden.len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
     Ok(())
@@ -99,7 +99,7 @@ pub fn fused_add_rms_norm_batch_into(
             hidden.hidden_dim as i32,
             hidden.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 }
@@ -132,7 +132,7 @@ pub fn fused_add_rms_norm_round_batch_into(
             hidden.hidden_dim as i32,
             hidden.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -161,7 +161,7 @@ pub fn rms_norm_batch_into(
             x.hidden_dim as i32,
             x.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 }
@@ -188,7 +188,7 @@ pub fn rms_norm_batch_offset_into(
             x.hidden_dim as i32,
             x.seq_len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
     Ok(())
@@ -213,7 +213,7 @@ pub fn rms_norm_offset_into(
             out_ptr as *mut ffi::Half,
             x.len as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
     Ok(())
@@ -251,7 +251,7 @@ pub fn rms_norm_gated_batch_into(
             total_heads as i32,
             head_dim as i32,
             eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 }

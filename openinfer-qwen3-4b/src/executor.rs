@@ -359,6 +359,105 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
+        StepCommand::SplitConcurrent {
+            prefill_requests,
+            prefill_kv_views,
+            decode_requests,
+            decode_kv_views,
+            prefill_stream,
+            decode_stream,
+            sample_seed,
+        } => {
+            use openinfer_kernels::tensor::{clear_stream_override, set_stream_override};
+
+            // If there's still an inflight prefill from a previous step, sync it
+            // now (shouldn't happen normally, but safety).
+            if lane.inflight_prefill.is_some() {
+                lane.resolve_inflight_prefill()?;
+            }
+
+            let prefill_prompts: Vec<&[u32]> = prefill_requests
+                .iter()
+                .map(PrefillStepItem::as_slice)
+                .collect();
+            let prefill_lora_adapters: Vec<Option<&str>> = prefill_requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+            let decode_tokens: Vec<u32> = decode_requests.iter().map(|req| req.token_id).collect();
+            let decode_lora_adapters: Vec<Option<&str>> = decode_requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+
+            // Sync ctx.stream: ensures all prior stream-ordered allocs and
+            // H2D copies are complete before green streams touch them.
+            lane.model.device_ctx().sync()?;
+
+            // Launch prefill on prefill partition stream.
+            unsafe { set_stream_override(prefill_stream.0) };
+            let (prefill_logits, _) = lane.execute_prefill(
+                &prefill_prompts,
+                prefill_kv_views,
+                &prefill_lora_adapters,
+                false,
+            )?;
+            clear_stream_override();
+
+            // Launch decode on the decode partition stream. CUDA graph stays
+            // enabled: batch_decode captures into the split graph cache keyed on
+            // the active stream override, so the replayed kernel nodes stay
+            // pinned to the decode SM partition (CUDA PG §4.6.5 — capture stream
+            // determines a node's execution context).
+            unsafe { set_stream_override(decode_stream.0) };
+            lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
+            clear_stream_override();
+
+            // Only sync decode stream — decode result is ready for sampling.
+            // Prefill continues async on GPU; polled later via event.
+            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(decode_stream.0) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                anyhow::bail!("cuStreamSynchronize(decode) failed: {r:?}");
+            }
+
+            if collect_result {
+                // Sample decode tokens immediately.
+                let decode_result =
+                    build_batch_decode_request_results(lane, decode_requests, *sample_seed)?;
+
+                // Record event on prefill stream for non-blocking poll.
+                let mut event: cudarc::driver::sys::CUevent = std::ptr::null_mut();
+                unsafe {
+                    cudarc::driver::sys::cuEventCreate(
+                        &mut event,
+                        cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+                    );
+                    cudarc::driver::sys::cuEventRecord(event, prefill_stream.0);
+                }
+
+                // Store prefill state for deferred sync+sample.
+                lane.inflight_prefill = Some(InflightPrefillState {
+                    prefill_stream: prefill_stream.0,
+                    prefill_logits,
+                    prefill_requests: prefill_requests.clone(),
+                    sample_seed: *sample_seed,
+                });
+
+                Ok(WorkerStepOutcome::SplitDecodeReady {
+                    decode: DecodeResult {
+                        requests: decode_result,
+                    },
+                    prefill_event: SendEvent(event),
+                })
+            } else {
+                // Non-primary worker: still need to sync prefill before returning.
+                let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
+                }
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
     }
 }
 
@@ -567,6 +666,19 @@ pub(crate) trait ModelExecutor: Send {
     fn prefetched_blocks(&self, _request_id: RequestId) -> usize {
         0
     }
+
+    // ── Decode-overlap async prefill ─────────────────────────────────────
+
+    /// Whether prefill/decode overlap is enabled (async prefill supported).
+    fn has_decode_overlap(&self) -> bool {
+        false
+    }
+
+    /// Poll whether the async prefill has completed. Returns `Some(result)` if
+    /// done, `None` if still in-flight.
+    fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
+        None
+    }
 }
 
 struct Qwen3ExecutorMetadata {
@@ -602,7 +714,28 @@ pub struct Qwen3Executor {
     /// so prefix matching itself stays enabled). Set via
     /// [`Self::set_no_prefix_cache`].
     l1_retention_disabled: bool,
+    /// Green Context SM partition for concurrent prefill/decode. `None` when
+    /// disabled (default) or when the GPU does not support Green Contexts.
+    overlap: Option<crate::green_ctx::OverlapStreams>,
+    /// In-flight async prefill state. Populated by the SplitConcurrent step,
+    /// consumed by `poll_async_prefill`.
+    async_prefill: Option<AsyncPrefillState>,
 }
+
+/// State for an in-flight async prefill on the prefill overlap stream.
+struct AsyncPrefillState {
+    event: cudarc::driver::sys::CUevent,
+}
+
+// SAFETY: AsyncPrefillState is only accessed from the single executor/scheduler
+// thread that owns the GPU context. The raw CUevent pointer is not shared.
+unsafe impl Send for AsyncPrefillState {}
+
+/// Wrapper to send CUevent across the worker→executor channel boundary.
+/// SAFETY: The event is created on the worker thread's GPU context and consumed
+/// on the executor thread (same device, sequential access).
+struct SendEvent(cudarc::driver::sys::CUevent);
+unsafe impl Send for SendEvent {}
 
 /// One request's in-flight CPU-tier KV prefetch.
 ///
@@ -656,6 +789,8 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
+            overlap: None,
+            async_prefill: None,
         })
     }
 
@@ -805,6 +940,8 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
+            overlap: None,
+            async_prefill: None,
         })
     }
 
@@ -849,6 +986,20 @@ impl Qwen3Executor {
     /// drifts logits by bf16 ULPs).
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
         self.prefix_cache_enabled = enabled;
+    }
+
+    /// Configure two-stream prefill/decode overlap (see [`crate::DecodeOverlap`]).
+    /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
+    /// returning an error if the GPU/driver cannot honor the requested mode.
+    pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
+        let device_ordinal = 0; // single-GPU path
+        self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
+        Ok(())
+    }
+
+    /// Whether prefill/decode overlap (two-stream or SM partition) is active.
+    pub fn decode_overlap_enabled(&self) -> bool {
+        self.overlap.is_some()
     }
 
     /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
@@ -1447,45 +1598,100 @@ impl ModelExecutor for Qwen3Executor {
             .map(|req| self.request_kvs[&req.request_id].decode_view())
             .collect();
 
-        // 3. Execute forward
-        let step = StepCommand::Unified {
-            prefill_requests,
-            prefill_kv_views,
-            decode_requests: plan.decode_requests.to_vec(),
-            decode_kv_views,
-            sample_seed: plan.sample_seed,
+        // 3. Execute forward — use split-concurrent if overlap streams are active
+        let step = if let Some(ref overlap) = self.overlap {
+            StepCommand::SplitConcurrent {
+                prefill_requests,
+                prefill_kv_views,
+                decode_requests: plan.decode_requests.to_vec(),
+                decode_kv_views,
+                prefill_stream: overlap.prefill_stream,
+                decode_stream: overlap.decode_stream,
+                sample_seed: plan.sample_seed,
+            }
+        } else {
+            StepCommand::Unified {
+                prefill_requests,
+                prefill_kv_views,
+                decode_requests: plan.decode_requests.to_vec(),
+                decode_kv_views,
+                sample_seed: plan.sample_seed,
+            }
         };
         let outcome = self.run_step(&step)?;
 
-        // 4. Apply both prefill and decode
-        let result = match outcome {
-            WorkerStepOutcome::Unified(result) => result,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "unified returned unexpected: {}",
-                    other.kind()
-                ));
+        // 4. Apply results
+        match outcome {
+            WorkerStepOutcome::Unified(result) => {
+                // Normal unified path: both results ready
+                for req_result in &result.prefill_requests {
+                    self.apply_prefill_result(req_result)?;
+                }
+                for req_result in &result.decode_requests {
+                    let rkv = self
+                        .request_kvs
+                        .get_mut(&req_result.request_id)
+                        .expect("request must exist after unified decode");
+                    rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                }
+                for req_result in &result.prefill_requests {
+                    self.save_sealed_blocks(req_result.request_id);
+                }
+                for req_result in &result.decode_requests {
+                    self.save_sealed_blocks(req_result.request_id);
+                }
+                Ok(result)
             }
-        };
-        for req_result in &result.prefill_requests {
-            self.apply_prefill_result(req_result)?;
+            WorkerStepOutcome::SplitDecodeReady {
+                decode: decode_result,
+                prefill_event: SendEvent(event),
+            } => {
+                // SM-partition path: decode done, prefill still in-flight.
+                // Apply decode immediately.
+                for req_result in &decode_result.requests {
+                    let rkv = self
+                        .request_kvs
+                        .get_mut(&req_result.request_id)
+                        .expect("request must exist after split decode");
+                    rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                }
+                for req_result in &decode_result.requests {
+                    self.save_sealed_blocks(req_result.request_id);
+                }
+                // Store event for non-blocking poll by scheduler.
+                // If a previous async prefill wasn't consumed, wait for it now.
+                if let Some(old) = self.async_prefill.take() {
+                    unsafe {
+                        cudarc::driver::sys::cuEventSynchronize(old.event);
+                    }
+                    unsafe {
+                        cudarc::driver::sys::cuEventDestroy_v2(old.event);
+                    }
+                    // Force resolve the worker's inflight prefill too
+                    if let Ok(rx) = self.primary.resolve_prefill() {
+                        if let Ok(Ok(result)) = rx.recv() {
+                            for req_result in &result.requests {
+                                let _ = self.apply_prefill_result(req_result);
+                            }
+                            for req_result in &result.requests {
+                                self.save_sealed_blocks(req_result.request_id);
+                            }
+                        }
+                    }
+                }
+                self.async_prefill = Some(AsyncPrefillState { event });
+                // Return a UnifiedResult with empty prefill — scheduler will
+                // get prefill results via poll_async_prefill.
+                Ok(UnifiedResult {
+                    prefill_requests: Vec::new(),
+                    decode_requests: decode_result.requests,
+                })
+            }
+            other => Err(anyhow::anyhow!(
+                "unified returned unexpected: {}",
+                other.kind()
+            )),
         }
-        for req_result in &result.decode_requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after unified decode");
-            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
-        }
-        // 5. Offload sealed blocks from both halves (post-step-sync).
-        for req_result in &result.prefill_requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-        for req_result in &result.decode_requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-
-        Ok(result)
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -1672,6 +1878,44 @@ impl ModelExecutor for Qwen3Executor {
         names.sort();
         names
     }
+
+    fn has_decode_overlap(&self) -> bool {
+        self.overlap.is_some()
+    }
+
+    fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
+        let state = self.async_prefill.as_ref()?;
+        // Non-blocking check: is the prefill stream done?
+        let status = unsafe { cudarc::driver::sys::cuEventQuery(state.event) };
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            // Not ready yet (CUDA_ERROR_NOT_READY)
+            return None;
+        }
+        // Prefill is done — resolve it via the worker.
+        let event = self.async_prefill.take().unwrap().event;
+        unsafe {
+            cudarc::driver::sys::cuEventDestroy_v2(event);
+        }
+
+        // Ask worker to sync + sample the prefill result.
+        let rx = match self.primary.resolve_prefill() {
+            Ok(rx) => rx,
+            Err(_) => return None,
+        };
+        let result = match rx.recv() {
+            Ok(Ok(r)) => r,
+            _ => return None,
+        };
+
+        // Apply prefill results (KV commit)
+        for req_result in &result.requests {
+            let _ = self.apply_prefill_result(req_result);
+        }
+        for req_result in &result.requests {
+            self.save_sealed_blocks(req_result.request_id);
+        }
+        Some(result)
+    }
 }
 
 #[cfg(test)]
@@ -1726,7 +1970,23 @@ struct LocalQwen3Lane {
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
     sample_scratch: openinfer_sample::SampleScratch,
+    /// In-flight prefill from a previous SplitConcurrent step (not yet synced).
+    inflight_prefill: Option<InflightPrefillState>,
 }
+
+/// Stored state for an async prefill that was launched but not yet synced.
+struct InflightPrefillState {
+    prefill_stream: cudarc::driver::sys::CUstream,
+    prefill_logits: HiddenStates,
+    prefill_requests: Vec<PrefillStepItem>,
+    /// Per-step sampling seed captured when the prefill was launched, replayed
+    /// when its tokens are sampled after the deferred sync.
+    sample_seed: u64,
+}
+
+// SAFETY: InflightPrefillState lives entirely within the worker thread that
+// owns the GPU context. It is never shared across threads.
+unsafe impl Send for InflightPrefillState {}
 
 impl LocalQwen3Lane {
     fn new(
@@ -1766,6 +2026,7 @@ impl LocalQwen3Lane {
             layout,
             bufs,
             sample_scratch,
+            inflight_prefill: None,
         })
     }
 
@@ -1773,6 +2034,41 @@ impl LocalQwen3Lane {
         bind_model_thread(&self.model)?;
         tune_decode_gemm_algos(&self.model)?;
         Ok(CublasThreadGuard)
+    }
+
+    /// Sync the in-flight prefill stream and sample prefill tokens.
+    /// Returns the prefill result. Panics if no inflight prefill exists.
+    fn resolve_inflight_prefill(&mut self) -> Result<PrefillResult> {
+        let state = self
+            .inflight_prefill
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no inflight prefill to resolve"))?;
+
+        // Sync prefill stream
+        let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(state.prefill_stream) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
+        }
+
+        // Now safe to drop deferred GPU buffers (prefill kernels are done).
+        crate::prefill::drain_deferred_drops();
+
+        // Sample prefill tokens
+        let params: Vec<&SamplingParams> =
+            state.prefill_requests.iter().map(|r| &r.params).collect();
+        let tokens = self.select_step_tokens(&state.prefill_logits, &params, state.sample_seed)?;
+
+        // Build prefill result
+        let results = build_prefill_request_results(
+            self,
+            &state.prefill_requests,
+            &state.prefill_logits,
+            &tokens,
+            None,
+            false,
+        )?;
+
+        Ok(PrefillResult { requests: results })
     }
 
     /// Pick one token per logits column (batched argmax for greedy rows,
@@ -1921,6 +2217,17 @@ enum StepCommand {
         decode_kv_views: Vec<KvView>,
         sample_seed: u64,
     },
+    /// Split-concurrent: prefill and decode launch on separate Green Context
+    /// streams (different SM partitions) for true GPU-level parallelism.
+    SplitConcurrent {
+        prefill_requests: Vec<PrefillStepItem>,
+        prefill_kv_views: Vec<KvView>,
+        decode_requests: Vec<DecodeStepItem>,
+        decode_kv_views: Vec<KvView>,
+        prefill_stream: crate::green_ctx::SendStream,
+        decode_stream: crate::green_ctx::SendStream,
+        sample_seed: u64,
+    },
 }
 
 impl StepCommand {
@@ -1929,6 +2236,7 @@ impl StepCommand {
             Self::Prefill { .. } => "prefill",
             Self::Decode { .. } => "decode",
             Self::Unified { .. } => "unified",
+            Self::SplitConcurrent { .. } => "split_concurrent",
         }
     }
 }
@@ -1953,6 +2261,11 @@ enum WorkerCommand {
         name: String,
         resp: channel::Sender<Result<()>>,
     },
+    /// Sync the in-flight prefill from a previous SplitConcurrent step and
+    /// return the sampled prefill result.
+    ResolvePrefill {
+        resp: channel::Sender<Result<PrefillResult>>,
+    },
     Shutdown,
 }
 
@@ -1961,6 +2274,15 @@ enum WorkerStepOutcome {
     Prefill(PrefillResult),
     Decode(DecodeResult),
     Unified(UnifiedResult),
+    /// SM-partition split: decode result is ready; prefill is still in-flight
+    /// on the prefill stream. The executor must call a follow-up to sync+sample
+    /// prefill before using prefill scratch buffers again.
+    SplitDecodeReady {
+        decode: DecodeResult,
+        /// Event recorded on prefill stream after all prefill kernels;
+        /// query this to check if prefill is done without blocking.
+        prefill_event: SendEvent,
+    },
 }
 
 impl WorkerStepOutcome {
@@ -1970,6 +2292,7 @@ impl WorkerStepOutcome {
             Self::Prefill(_) => "prefill",
             Self::Decode(_) => "decode",
             Self::Unified(_) => "unified",
+            Self::SplitDecodeReady { .. } => "split_decode_ready",
         }
     }
 }
@@ -2019,6 +2342,10 @@ impl RankWorker {
                                     let result = lane.discard_lora_adapter(&name);
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::ResolvePrefill { resp } => {
+                                    let result = lane.resolve_inflight_prefill();
+                                    let _ = resp.send(result);
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -2051,6 +2378,15 @@ impl RankWorker {
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    /// Ask the worker to sync its in-flight prefill and return the result.
+    fn resolve_prefill(&self) -> Result<channel::Receiver<Result<PrefillResult>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::ResolvePrefill { resp: resp_tx })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on resolve_prefill"))?;
         Ok(resp_rx)
     }
 

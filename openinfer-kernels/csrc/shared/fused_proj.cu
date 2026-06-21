@@ -32,7 +32,7 @@ __global__ void silu_mul_fused_kernel(
 
 extern "C" {
 
-void silu_mul_fused_cuda(
+int silu_mul_fused_cuda(
     const __nv_bfloat16 *gate_up, __nv_bfloat16 *out,
     int intermediate_size, int bs, cudaStream_t stream) {
   int total = intermediate_size * bs;
@@ -40,6 +40,7 @@ void silu_mul_fused_cuda(
   int grid = (total + block - 1) / block;
   silu_mul_fused_kernel<<<grid, block, 0, stream>>>(
       gate_up, out, intermediate_size, bs);
+  return static_cast<int>(cudaGetLastError());
 }
 
 } // extern "C"

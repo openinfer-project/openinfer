@@ -230,6 +230,7 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
         openinfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
         false,
         openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS,
+        openinfer_qwen3_4b::DecodeOverlap::Off,
     )
     .expect("start LoRA-capable Qwen3 engine");
 

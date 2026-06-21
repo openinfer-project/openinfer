@@ -17,8 +17,7 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) normed: HiddenStates,
     pub(crate) attn_results: HiddenStates,
     pub(crate) hidden_mid: HiddenStates,
-    pub(crate) gate_out: HiddenStates,
-    pub(crate) up_out: HiddenStates,
+    pub(crate) gate_up_out: HiddenStates,
     pub(crate) act_out: HiddenStates,
     pub(crate) mlp_out: HiddenStates,
     pub(crate) logits: HiddenStates,
@@ -87,8 +86,7 @@ impl BatchDecodeBuffers35 {
             normed: HiddenStates::zeros(ctx, h, bs)?,
             attn_results: HiddenStates::zeros(ctx, h, bs)?,
             hidden_mid: HiddenStates::zeros(ctx, h, bs)?,
-            gate_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
-            up_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * config.intermediate_size, bs)?,
             act_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, h, bs)?,
             logits: HiddenStates::zeros(ctx, config.vocab_size, bs)?,
@@ -134,8 +132,7 @@ impl BatchDecodeBuffers35 {
         self.normed.seq_len = bs;
         self.attn_results.seq_len = bs;
         self.hidden_mid.seq_len = bs;
-        self.gate_out.seq_len = bs;
-        self.up_out.seq_len = bs;
+        self.gate_up_out.seq_len = bs;
         self.act_out.seq_len = bs;
         self.mlp_out.seq_len = bs;
         self.logits.seq_len = bs;

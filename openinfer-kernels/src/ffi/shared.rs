@@ -166,7 +166,7 @@ unsafe extern "C" {
         intermediate_size: i32,
         bs: i32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     pub fn cublas_init();
     pub fn cublas_destroy();
