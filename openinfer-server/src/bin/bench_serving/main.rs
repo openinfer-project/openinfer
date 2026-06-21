@@ -173,7 +173,14 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "qwen3-4b")]
         ModelType::Qwen3 => {
-            let handle = openinfer_qwen3_4b::start_engine(
+            // Chunked-prefill budget from --max-prefill-tokens (a huge value
+            // forwards the whole prompt in one step, i.e. chunking off, for the
+            // chunked-vs-not sweep); omit for the model default.
+            let max_prefill_tokens = cli
+                .max_prefill_tokens
+                .filter(|&v| v > 0)
+                .unwrap_or(openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS);
+            let handle = openinfer_qwen3_4b::start_engine_with_offload(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
@@ -183,11 +190,20 @@ fn main() -> Result<()> {
                     ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
+                openinfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
+                false,
+                max_prefill_tokens,
             )?;
             finish(handle, cli.cuda_graph)
         }
         #[cfg(feature = "qwen35-4b")]
         ModelType::Qwen35 => {
+            // Chunked-prefill budget from --max-prefill-tokens (mirrors the Qwen3
+            // path); omit for the model default.
+            let max_prefill_tokens = cli
+                .max_prefill_tokens
+                .filter(|&v| v > 0)
+                .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS);
             let handle = openinfer_qwen35_4b::start_engine_with_capacity(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
@@ -199,6 +215,7 @@ fn main() -> Result<()> {
                     seed: command_seed(&cli),
                 },
                 4,
+                max_prefill_tokens,
             )?;
             finish(handle, cli.cuda_graph)
         }

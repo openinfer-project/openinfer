@@ -65,17 +65,7 @@ struct PrefillingRequest35 {
     step_chunk: usize,
 }
 
-/// Default per-step chunked-prefill token budget
-const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
-
-/// Per-step prefill token budget, overridable via `OPENINFER_QWEN35_PREFILL_BUDGET`.
-fn prefill_tokens_per_step() -> usize {
-    std::env::var("OPENINFER_QWEN35_PREFILL_BUDGET")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_MAX_PREFILL_TOKENS)
-}
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
@@ -87,7 +77,12 @@ pub fn start_with_capacity(
     model: Qwen35Model,
     seed: u64,
     max_batch: usize,
+    max_prefill_tokens: usize,
 ) -> Result<SchedulerHandle> {
+    assert!(
+        max_prefill_tokens > 0,
+        "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
+    );
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
     let servable = servable_len(
@@ -105,7 +100,7 @@ pub fn start_with_capacity(
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                scheduler_loop(model, graph_state, submit_rx, seed);
+                scheduler_loop(model, graph_state, submit_rx, seed, max_prefill_tokens);
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -170,13 +165,13 @@ fn scheduler_loop(
     mut graph_state: BatchDecodeGraphState,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
+    prefill_budget: usize,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
     let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
     let max_batch = graph_state.slot_states.len();
-    let prefill_budget = prefill_tokens_per_step();
 
     info!("scheduler ready (max_batch={})", max_batch);
 

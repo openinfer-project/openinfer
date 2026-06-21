@@ -150,13 +150,17 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "deepep")]
     pub(crate) ep_backend: CliEpBackend,
 
+    /// Per-step chunked-prefill token budget (Qwen3 / Qwen3.5).
+    #[arg(long)]
+    pub(crate) max_prefill_tokens: Option<usize>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct PromptInputArgs {
-    /// Inline prompt text
+   max_prefill_tokens /// Inline prompt text
     #[arg(long, conflicts_with_all = ["prompt_file", "prompt_len"])]
     pub(crate) prompt: Option<String>,
 

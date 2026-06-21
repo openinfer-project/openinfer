@@ -259,8 +259,13 @@ fn test_e2e_qwen35_scheduler() {
             .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
     // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
-    let handle = openinfer_qwen35_4b::runtime::start_with_capacity(model, 42, 8)
-        .expect("Failed to start Qwen3.5 scheduler");
+    let handle = openinfer_qwen35_4b::runtime::start_with_capacity(
+        model,
+        42,
+        8,
+        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
+    )
+    .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
     // ── 0. Static context-window rejection ─────────────────────────────

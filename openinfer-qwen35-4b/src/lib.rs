@@ -28,6 +28,7 @@ use anyhow::{Result, anyhow};
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend};
 
 pub use kernel_plan::kernel_plan;
+pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Low-level Qwen3.5 execution interface.
 ///
@@ -51,13 +52,24 @@ pub mod runtime_ops {
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    start_engine_with_capacity(model_path, options, batch_decode_graph::MAX_BATCH)
+    start_engine_with_capacity(
+        model_path,
+        options,
+        batch_decode_graph::MAX_BATCH,
+        DEFAULT_MAX_PREFILL_TOKENS,
+    )
 }
 
-/// Start the Qwen3.5 engine for the server. Qwen3.5 is single-GPU, so the only
-/// knobs are the device ordinal and whether to capture a decode CUDA Graph.
-pub fn launch(model_path: &Path, device_ordinal: usize, cuda_graph: bool) -> Result<EngineHandle> {
-    start_engine(
+/// Start the Qwen3.5 engine for the server. Qwen3.5 is single-GPU, so the
+/// knobs are the device ordinal, whether to capture a decode CUDA Graph, and
+/// the per-step chunked-prefill budget (from `--max-prefill-tokens`).
+pub fn launch(
+    model_path: &Path,
+    device_ordinal: usize,
+    cuda_graph: bool,
+    max_prefill_tokens: usize,
+) -> Result<EngineHandle> {
+    start_engine_with_capacity(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: cuda_graph,
@@ -67,6 +79,8 @@ pub fn launch(model_path: &Path, device_ordinal: usize, cuda_graph: bool) -> Res
             ep_backend: EpBackend::Nccl,
             seed: 42,
         },
+        batch_decode_graph::MAX_BATCH,
+        max_prefill_tokens,
     )
 }
 
@@ -74,6 +88,7 @@ pub fn start_engine_with_capacity(
     model_path: &Path,
     options: EngineLoadOptions,
     max_batch: usize,
+    max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -99,5 +114,5 @@ pub fn start_engine_with_capacity(
         enable_cuda_graph,
         device_ordinal,
     )?;
-    scheduler::start_with_capacity(model, seed, max_batch)
+    scheduler::start_with_capacity(model, seed, max_batch, max_prefill_tokens)
 }
