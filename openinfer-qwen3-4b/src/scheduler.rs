@@ -28,7 +28,9 @@ use openinfer_core::engine::{
 use openinfer_core::sampler::SamplingParams;
 
 use self::effects::apply_effects;
-use self::plan::{ExecutionArtifacts, ExecutionPlan, build_next_plan, execute_plan};
+use self::plan::{
+    ExecutionArtifacts, ExecutionPlan, build_next_plan, execute_plan, should_speculative_decode,
+};
 use self::resolve::resolve_step;
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -134,6 +136,7 @@ fn take_prefill_chunks(
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_qwen3(
     model_path: &str,
     enable_cuda_graph: bool,
@@ -144,6 +147,7 @@ pub(crate) fn start_qwen3(
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
+    dflash_draft_model_path: Option<&str>,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -156,6 +160,12 @@ pub(crate) fn start_qwen3(
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     executor.enable_decode_overlap(decode_overlap)?;
+    // Speculative decoding loads its draft model after the target is up (the
+    // draft is built against the target's embeddings/head) and forces the
+    // prefix cache off, so it must follow set_no_prefix_cache.
+    if let Some(draft_path) = dflash_draft_model_path {
+        executor.load_dflash_draft_model(draft_path)?;
+    }
 
     Ok(start_with_executor(executor, seed, max_prefill_tokens))
 }
@@ -482,7 +492,7 @@ fn scheduler_loop<E>(
             take_prefill_chunks(&mut prefilling, max_prefill_tokens)
         };
 
-        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
+        let Some(plan) = runtime_plan(&executor, &active, pending) else {
             continue;
         };
 
@@ -684,7 +694,7 @@ fn scheduler_loop_with_lora_control<E>(
             continue;
         }
 
-        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
+        let Some(plan) = runtime_plan(&executor, &active, pending) else {
             continue;
         };
         let failure_targets = failure_targets_for(&active, &plan);
@@ -1055,6 +1065,26 @@ fn send_unknown_lora_rejection(req: &PendingRequest) {
     });
 }
 
+/// Choose the step plan, preferring a speculative-decode step when the whole
+/// active batch is draft-ready. Prefill of new arrivals still takes priority —
+/// a speculative step only runs when there is nothing to prefill, so the two
+/// never mix in one step.
+fn runtime_plan(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    pending: Vec<PendingRequest>,
+) -> Option<ExecutionPlan> {
+    if should_speculative_decode(executor, active) {
+        if pending.is_empty() {
+            Some(ExecutionPlan::SpeculativeDecode)
+        } else {
+            Some(ExecutionPlan::Prefill { pending })
+        }
+    } else {
+        build_next_plan(!active.is_empty(), pending)
+    }
+}
+
 fn failure_targets_for(
     active: &[ActiveRequestState],
     plan: &self::plan::ExecutionPlan,
@@ -1065,6 +1095,9 @@ fn failure_targets_for(
             targets.extend(pending.iter().map(pending_failure_target));
         }
         self::plan::ExecutionPlan::Decode => {
+            targets.extend(active.iter().map(active_failure_target));
+        }
+        self::plan::ExecutionPlan::SpeculativeDecode => {
             targets.extend(active.iter().map(active_failure_target));
         }
         self::plan::ExecutionPlan::Unified { pending } => {

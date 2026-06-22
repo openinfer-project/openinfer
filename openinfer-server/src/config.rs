@@ -89,6 +89,12 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub no_prefix_cache: bool,
 
+    /// Enable Qwen3 DFlash speculative decoding with this drafter model path.
+    /// Single-GPU greedy only; incompatible with --enable-lora and --kv-offload,
+    /// and forces the prefix cache off (it needs clean target hidden states).
+    #[arg(long = "dflash-draft-model-path")]
+    pub dflash_draft_model_path: Option<PathBuf>,
+
     /// Cap on total prompt tokens forwarded in one Qwen3 scheduler step
     /// (chunked prefill). Prefill activation scratch scales with the step's
     /// prompt tokens, so this bounds peak VRAM under request bursts; prompts

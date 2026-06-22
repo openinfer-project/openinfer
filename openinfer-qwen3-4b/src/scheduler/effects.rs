@@ -69,6 +69,20 @@ pub(super) enum DecodeEffect {
         logprob: Option<TokenLogprob>,
         completion_tokens: usize,
     },
+    /// Commit several accepted speculative tokens and keep the request running.
+    EmitManyAndContinue {
+        request_id: RequestId,
+        tokens: Vec<u32>,
+        completion_tokens: usize,
+    },
+    /// Commit several accepted speculative tokens, then finish — a stop token or
+    /// the max-output budget was hit partway through the accepted span.
+    EmitManyAndFinish {
+        request_id: RequestId,
+        tokens: Vec<u32>,
+        finish_reason: FinishReason,
+        completion_tokens: usize,
+    },
 }
 
 pub(super) struct StepEffects {
@@ -191,6 +205,81 @@ pub(super) fn apply_effects(
                     req.last_token = token;
                     req.generated_count = completion_tokens;
                 }
+            }
+            DecodeEffect::EmitManyAndContinue {
+                request_id,
+                tokens,
+                completion_tokens,
+            } => {
+                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
+                    continue;
+                };
+                let req = &mut active[index];
+                let mut sent = true;
+                for &token in &tokens {
+                    if req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: token,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
+                        sent = false;
+                        break;
+                    }
+                }
+                if sent {
+                    req.last_token = *tokens
+                        .last()
+                        .expect("EmitManyAndContinue must carry at least one token");
+                    req.generated_count = completion_tokens;
+                } else {
+                    debug!(
+                        "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                        request_id, completion_tokens
+                    );
+                    let _ = executor.drop_request(request_id);
+                    to_retire.push(index);
+                }
+            }
+            DecodeEffect::EmitManyAndFinish {
+                request_id,
+                tokens,
+                finish_reason,
+                completion_tokens,
+            } => {
+                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
+                    continue;
+                };
+                let req = &active[index];
+                debug!(
+                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                    request_id, req.prompt_len, completion_tokens, finish_reason
+                );
+                let mut sent = true;
+                for &token in &tokens {
+                    if req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: token,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
+                        sent = false;
+                        break;
+                    }
+                }
+                if sent {
+                    let _ = req.token_tx.send(TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens,
+                    });
+                }
+                let _ = executor.drop_request(request_id);
+                to_retire.push(index);
             }
         }
     }

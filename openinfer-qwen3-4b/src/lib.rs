@@ -5,16 +5,18 @@ mod batch_decode_buffers;
 mod batch_decode_dag;
 pub mod batch_decode_trace;
 mod config;
+mod dflash;
 mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
 mod prefill;
 mod scheduler;
+mod speculative;
 mod unified_forward;
 mod weights;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use log::{info, warn};
@@ -153,7 +155,7 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 /// Qwen3 startup policy — the TP→device mapping and the LoRA↔CUDA-Graph
 /// exclusion — and dispatches to the right low-level entry. That policy lives
 /// with the model instead of leaking into the server.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Qwen3LaunchOptions {
     /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
     pub device_ordinal: usize,
@@ -170,6 +172,9 @@ pub struct Qwen3LaunchOptions {
     /// How prefill and decode share the GPU (`--decode-overlap`).
     pub decode_overlap: DecodeOverlap,
     pub batch_invariant: bool,
+    /// `Some` enables DFlash speculative decoding with this drafter model.
+    /// Single-GPU only and mutually exclusive with LoRA and KV offload.
+    pub dflash_draft_model_path: Option<PathBuf>,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -204,6 +209,10 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.no_prefix_cache
         );
     }
+    anyhow::ensure!(
+        !(options.dflash_draft_model_path.is_some() && options.lora.is_some()),
+        "DFlash speculative decoding cannot be combined with LoRA serving"
+    );
     match options.lora {
         Some(lora) => {
             info!(
@@ -231,6 +240,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.memory,
             options.decode_overlap,
             options.batch_invariant,
+            options.dflash_draft_model_path.as_deref(),
         ),
     }
 }
@@ -245,6 +255,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         Qwen3MemoryOptions::default(),
         DecodeOverlap::Off,
         false,
+        None,
     )
 }
 
@@ -260,6 +271,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
 ///
 /// `max_prefill_tokens` caps the total prompt tokens batch-prefilled in one
 /// scheduler step (see [`DEFAULT_MAX_PREFILL_TOKENS`]).
+#[allow(clippy::too_many_arguments)]
 pub fn start_engine_with_offload(
     model_path: &Path,
     options: EngineLoadOptions,
@@ -269,6 +281,7 @@ pub fn start_engine_with_offload(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
+    dflash_draft_model_path: Option<&Path>,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -281,6 +294,12 @@ pub fn start_engine_with_offload(
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
     ensure_batch_invariant_supported(decode_overlap, batch_invariant)?;
     apply_batch_invariant_policy(batch_invariant);
+    let dflash_draft_model_path = dflash_draft_model_path
+        .map(|path| {
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("DFlash draft model path must be valid UTF-8"))
+        })
+        .transpose()?;
     scheduler::start_qwen3(
         model_path,
         enable_cuda_graph,
@@ -291,6 +310,7 @@ pub fn start_engine_with_offload(
         max_prefill_tokens,
         memory_options,
         decode_overlap,
+        dflash_draft_model_path,
     )
 }
 

@@ -285,6 +285,7 @@ pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize 
     rows * vocab.div_ceil(TILE_ELEMS)
 }
 
+
 /// Two-stage indexed batched argmax: tile-parallel partials then a per-row
 /// finalize. Lowest index wins ties; each vocab row spreads over many CTAs
 /// instead of one.

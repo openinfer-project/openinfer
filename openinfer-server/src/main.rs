@@ -109,6 +109,16 @@ async fn main() -> anyhow::Result<()> {
 // defaults, capability constraints, cross-arg validation). The server only
 // picks the crate by detected model type and forwards the relevant CLI knobs.
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
+    // Only Qwen3 wires the DFlash drafter; fail loud rather than silently
+    // ignoring the flag for another model line.
+    #[cfg(feature = "qwen3-4b")]
+    let is_qwen3 = matches!(model_type, ModelType::Qwen3);
+    #[cfg(not(feature = "qwen3-4b"))]
+    let is_qwen3 = false;
+    anyhow::ensure!(
+        args.dflash_draft_model_path.is_none() || is_qwen3,
+        "--dflash-draft-model-path is only supported for Qwen3 (got {model_type:?})"
+    );
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => openinfer_deepseek_v4::launch(
@@ -154,6 +164,24 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                         args.kv_cache_memory_margin_mib
                     )
                 })?;
+            let dflash_draft_model_path = match args.dflash_draft_model_path.clone() {
+                Some(path) => {
+                    anyhow::ensure!(
+                        !args.enable_lora,
+                        "--dflash-draft-model-path is not supported with --enable-lora"
+                    );
+                    anyhow::ensure!(
+                        !args.kv_offload,
+                        "--dflash-draft-model-path is not supported with --kv-offload"
+                    );
+                    anyhow::ensure!(
+                        args.tp_size == 1,
+                        "--dflash-draft-model-path currently requires --tp-size=1"
+                    );
+                    Some(path)
+                }
+                None => None,
+            };
             openinfer_qwen3_4b::launch(
                 &args.model_path,
                 Qwen3LaunchOptions {
@@ -171,6 +199,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     lora,
                     decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
                     batch_invariant: args.batch_invariant,
+                    dflash_draft_model_path,
                 },
             )
             .context("failed to start Qwen3 engine")?

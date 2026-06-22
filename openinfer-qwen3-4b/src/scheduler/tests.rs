@@ -28,6 +28,7 @@ struct FakeExecutor {
     loaded_lora_adapters: HashSet<String>,
     dropped: Arc<Mutex<Vec<u64>>>,
     prefetch_offers: Arc<Mutex<Vec<u64>>>,
+    stop_token: Option<u32>,
 }
 
 impl FakeExecutor {
@@ -44,7 +45,13 @@ impl FakeExecutor {
             loaded_lora_adapters: HashSet::new(),
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
+            stop_token: None,
         }
+    }
+
+    fn with_stop_token(mut self, token: u32) -> Self {
+        self.stop_token = Some(token);
+        self
     }
 
     fn with_decode_failure(mut self) -> Self {
@@ -125,8 +132,8 @@ impl ModelExecutor for FakeExecutor {
         self.available_blocks
     }
 
-    fn is_stop_token(&self, _token_id: u32) -> bool {
-        false
+    fn is_stop_token(&self, token_id: u32) -> bool {
+        self.stop_token == Some(token_id)
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
@@ -174,6 +181,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| self.fake_prefill_result(req))
                 .collect(),
+            dflash_context_captured_requests: Vec::new(),
         })
     }
 
@@ -1018,4 +1026,141 @@ fn lora_control_waits_until_scheduler_idle() {
         .expect("join load thread")
         .expect_err("adapter load should be a stub error");
     assert!(matches!(error, EngineControlError::OperationFailed(_)));
+}
+
+// ── Speculative span resolution (multi-token emission) ──────────────────────
+// resolve_speculative_outputs walks an accepted span [t_0, .., t_m] and decides,
+// per request, whether to emit-and-continue or truncate at a stop token / the
+// max-output budget. These were GPU-test-only; the truth table below pins the
+// branch behaviour with the existing FakeExecutor (only is_stop_token matters).
+
+use crate::speculative::VerifyRequestResult;
+use openinfer_core::engine::FinishReason;
+
+fn spec_active(id: u64, generated_count: usize, max_tokens: usize, ignore_eos: bool) -> ActiveRequestState {
+    let (token_tx, _rx) = TokenSink::standalone();
+    ActiveRequestState {
+        request_id: RequestId(id),
+        lora_adapter: None,
+        token_tx,
+        last_token: 1,
+        generated_count,
+        max_tokens,
+        prompt_len: 16,
+        params: SamplingParams {
+            ignore_eos,
+            ..SamplingParams::default()
+        },
+        logprobs: 0,
+    }
+}
+
+fn spec_result(id: u64, accepted: Vec<u32>) -> VerifyRequestResult {
+    VerifyRequestResult {
+        request_id: RequestId(id),
+        matched_draft_tokens: accepted.len().saturating_sub(1),
+        accepted_tokens: accepted,
+    }
+}
+
+const SPEC_EOS: u32 = 99;
+
+#[test]
+fn speculative_full_span_accept_continues() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+    let active = [spec_active(1, 3, 100, false)];
+    let results = [spec_result(1, vec![10, 11, 12, 13])];
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+    match &effects[..] {
+        [effects::DecodeEffect::EmitManyAndContinue { request_id, tokens, completion_tokens }] => {
+            assert_eq!(*request_id, RequestId(1));
+            assert_eq!(tokens, &vec![10, 11, 12, 13]);
+            assert_eq!(*completion_tokens, 3 + 4, "completion = prior generated + span len");
+        }
+        _ => panic!("expected EmitManyAndContinue"),
+    }
+}
+
+#[test]
+fn speculative_stop_token_midspan_finishes_and_suppresses_eos() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+    let active = [spec_active(1, 5, 100, false)];
+    // EOS lands at span position 2; tokens before it are emitted, EOS is not.
+    let results = [spec_result(1, vec![10, 11, SPEC_EOS, 13])];
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+    match &effects[..] {
+        [effects::DecodeEffect::EmitManyAndFinish { tokens, finish_reason, completion_tokens, .. }] => {
+            assert_eq!(tokens, &vec![10, 11], "EOS itself is suppressed from emission");
+            assert!(matches!(finish_reason, FinishReason::Stop));
+            assert_eq!(*completion_tokens, 5 + 3, "the EOS still counts toward completion length");
+        }
+        _ => panic!("expected EmitManyAndFinish(Stop)"),
+    }
+}
+
+#[test]
+fn speculative_stop_token_at_span_start_emits_nothing() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+    let active = [spec_active(1, 5, 100, false)];
+    let results = [spec_result(1, vec![SPEC_EOS, 11, 12])];
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+    match &effects[..] {
+        [effects::DecodeEffect::EmitManyAndFinish { tokens, finish_reason, completion_tokens, .. }] => {
+            assert!(tokens.is_empty(), "stop at position 0 emits no tokens");
+            assert!(matches!(finish_reason, FinishReason::Stop));
+            assert_eq!(*completion_tokens, 5 + 1);
+        }
+        _ => panic!("expected EmitManyAndFinish(Stop)"),
+    }
+}
+
+#[test]
+fn speculative_max_tokens_truncates_midspan() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+    // generated 8, budget 10 -> only 2 more tokens fit; the span offers 4.
+    let active = [spec_active(1, 8, 10, false)];
+    let results = [spec_result(1, vec![10, 11, 12, 13])];
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+    match &effects[..] {
+        [effects::DecodeEffect::EmitManyAndFinish { tokens, finish_reason, completion_tokens, .. }] => {
+            assert_eq!(tokens, &vec![10, 11], "the budget-hitting token is emitted, the rest dropped");
+            assert!(matches!(finish_reason, FinishReason::Length));
+            assert_eq!(*completion_tokens, 10, "completion stops exactly at max_tokens");
+        }
+        _ => panic!("expected EmitManyAndFinish(Length)"),
+    }
+}
+
+#[test]
+fn speculative_ignore_eos_does_not_stop() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+    let active = [spec_active(1, 0, 100, true)];
+    let results = [spec_result(1, vec![SPEC_EOS, SPEC_EOS])];
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+    match &effects[..] {
+        [effects::DecodeEffect::EmitManyAndContinue { tokens, .. }] => {
+            assert_eq!(tokens, &vec![SPEC_EOS, SPEC_EOS], "ignore_eos passes stop tokens through");
+        }
+        _ => panic!("expected EmitManyAndContinue"),
+    }
+}
+
+#[test]
+fn speculative_resolves_each_request_independently() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+    let active = [spec_active(1, 0, 100, false), spec_active(2, 0, 100, false)];
+    let results = [
+        spec_result(1, vec![10, 11]),         // continues
+        spec_result(2, vec![20, SPEC_EOS]),   // finishes on EOS
+    ];
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+    assert!(matches!(
+        &effects[0],
+        effects::DecodeEffect::EmitManyAndContinue { request_id, .. } if *request_id == RequestId(1)
+    ));
+    assert!(matches!(
+        &effects[1],
+        effects::DecodeEffect::EmitManyAndFinish { request_id, finish_reason: FinishReason::Stop, .. }
+            if *request_id == RequestId(2)
+    ));
 }

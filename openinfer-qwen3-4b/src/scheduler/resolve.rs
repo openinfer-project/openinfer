@@ -1,4 +1,5 @@
 use crate::executor::{DecodeRequestResult, ModelExecutor, PrefillRequestResult};
+use crate::speculative::VerifyRequestResult;
 use openinfer_core::engine::FinishReason;
 
 use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, ScheduledEffect, StepEffects};
@@ -22,6 +23,12 @@ pub(super) fn resolve_step(
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
         },
+        ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
+            scheduled: Vec::new(),
+            prompt_echoes: Vec::new(),
+            pending: Vec::new(),
+            decode: resolve_speculative_outputs(executor, active, &verify.requests),
+        },
         ExecutionArtifacts::Unified {
             pending,
             result,
@@ -37,6 +44,54 @@ pub(super) fn resolve_step(
             effects
         }
     }
+}
+
+/// Turn each request's accepted speculative span into a decode effect. A span
+/// commits 1..=K+1 tokens at once; we walk it in order so a stop token or the
+/// max-output budget truncates exactly where it lands (the executor already
+/// suppressed nothing — stop handling lives here, mirroring single-token decode).
+pub(super) fn resolve_speculative_outputs(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    request_results: &[VerifyRequestResult],
+) -> Vec<DecodeEffect> {
+    request_results
+        .iter()
+        .map(|result| {
+            let req = active
+                .iter()
+                .find(|req| req.request_id == result.request_id)
+                .expect("speculative request_id must exist in active set");
+            let mut emitted = Vec::new();
+            let mut completion_tokens = req.generated_count;
+            for &token in &result.accepted_tokens {
+                completion_tokens += 1;
+                let is_eos = !req.params.ignore_eos && executor.is_stop_token(token);
+                if is_eos {
+                    return DecodeEffect::EmitManyAndFinish {
+                        request_id: result.request_id,
+                        tokens: emitted,
+                        finish_reason: FinishReason::Stop,
+                        completion_tokens,
+                    };
+                }
+                emitted.push(token);
+                if completion_tokens >= req.max_tokens {
+                    return DecodeEffect::EmitManyAndFinish {
+                        request_id: result.request_id,
+                        tokens: emitted,
+                        finish_reason: FinishReason::Length,
+                        completion_tokens,
+                    };
+                }
+            }
+            DecodeEffect::EmitManyAndContinue {
+                request_id: result.request_id,
+                tokens: emitted,
+                completion_tokens,
+            }
+        })
+        .collect()
 }
 
 fn resolve_prefill_outputs(

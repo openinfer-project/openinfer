@@ -30,6 +30,29 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn copy_hidden_rows_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        src_hidden_dim: i32,
+        dst_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn copy_hidden_token_range_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        hidden_dim: i32,
+        src_token_offset: i32,
+        dst_token_offset: i32,
+        token_count: i32,
+        src_seq_len: i32,
+        dst_seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn fused_add_rms_norm_cuda(
         hidden: *mut Half,
         residual: *const Half,
@@ -249,6 +272,25 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn dflash_qk_norm_rope_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_len: i32,
+        k_len: i32,
+        q_start_pos: i32,
+        k_start_pos: i32,
+        rms_eps: f32,
+        cos_max_pos: i32,
+        stream: CUstream,
+    ) -> i32;
+
     // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
     pub fn paged_kv_scatter_cuda(
         kv_data: *const Half,
@@ -361,6 +403,21 @@ unsafe extern "C" {
 
     // Single-request prefill with contiguous HND KV cache (FlashInfer SinglePrefill, causal).
     pub fn single_prefill_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn single_prefill_nhd_noncausal_cuda(
         q: *const Half,
         output: *mut Half,
         k_cache: *const Half,

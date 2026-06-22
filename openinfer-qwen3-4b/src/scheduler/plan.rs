@@ -5,12 +5,17 @@ use crate::executor::{
     DecodePlan, DecodeResult, DecodeStepItem, ModelExecutor, PrefillPlan, PrefillResult,
     PrefillStepItem, UnifiedPlan, UnifiedResult,
 };
+use crate::speculative::{
+    DraftPlan, DraftRequestResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
+};
 
 use super::{ActiveRequestState, PendingRequest};
 
 pub(super) enum ExecutionPlan {
     Prefill { pending: Vec<PendingRequest> },
     Decode,
+    /// Draft + verify the whole active batch (all requests are draft-ready).
+    SpeculativeDecode,
     Unified { pending: Vec<PendingRequest> },
 }
 
@@ -25,6 +30,9 @@ pub(super) enum ExecutionArtifacts {
     },
     Decode {
         result: DecodeResult,
+    },
+    SpeculativeDecode {
+        verify: VerifyResult,
     },
     Unified {
         pending: Vec<PendingRequest>,
@@ -86,6 +94,22 @@ pub(super) fn execute_plan(
             sort_decode_results(&mut result.requests);
             Ok(ExecutionArtifacts::Decode { result })
         }
+        ExecutionPlan::SpeculativeDecode => {
+            // Two executor calls per step: draft proposes K tokens per request,
+            // then a single target forward verifies the K+1 span. Both index by
+            // request_id; sorting keeps draft and verify results aligned.
+            let draft_requests = build_speculative_draft_items(active);
+            let mut draft = executor.execute_speculative_draft(DraftPlan {
+                requests: &draft_requests,
+            })?;
+            draft.requests.sort_by_key(|result| result.request_id);
+            let verify_requests = build_speculative_verify_items(active, &draft.requests);
+            let mut verify = executor.execute_speculative_verify(VerifyPlan {
+                requests: &verify_requests,
+            })?;
+            verify.requests.sort_by_key(|result| result.request_id);
+            Ok(ExecutionArtifacts::SpeculativeDecode { verify })
+        }
         ExecutionPlan::Unified { pending } => {
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
@@ -106,6 +130,52 @@ pub(super) fn execute_plan(
             })
         }
     }
+}
+
+/// All-or-nothing: speculate the whole active batch only when every request is
+/// draft-ready and greedy (no LoRA, no logprobs). A single non-ready request
+/// falls the batch back to plain decode rather than running a mixed step.
+pub(super) fn should_speculative_decode(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+) -> bool {
+    executor.speculative_enabled()
+        && !active.is_empty()
+        && active.iter().all(|req| {
+            executor.speculative_request_ready(req.request_id)
+                && req.lora_adapter.is_none()
+                && req.logprobs == 0
+                && req.params.is_greedy()
+        })
+}
+
+fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
+    active
+        .iter()
+        .map(|r| DraftStepItem::new(r.request_id, r.last_token, r.params))
+        .collect()
+}
+
+fn build_speculative_verify_items(
+    active: &[ActiveRequestState],
+    draft_results: &[DraftRequestResult],
+) -> Vec<VerifyStepItem> {
+    draft_results
+        .iter()
+        .map(|draft| {
+            let active = active
+                .iter()
+                .find(|req| req.request_id == draft.request_id)
+                .expect("draft request_id must exist in active set");
+            // Clamp the verify span to the request's remaining output budget so
+            // a long accepted run can't overshoot max_tokens.
+            let remaining = active.max_tokens.saturating_sub(active.generated_count);
+            assert!(remaining > 0, "active request must have output budget");
+            let mut token_ids = draft.token_ids.clone();
+            token_ids.truncate(remaining);
+            VerifyStepItem::new(draft.request_id, token_ids, active.params)
+        })
+        .collect()
 }
 
 fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
@@ -177,6 +247,37 @@ mod tests {
             step_chunk: 3,
             cached_tokens: 0,
         }
+    }
+
+    fn active(generated_count: usize, max_tokens: usize) -> ActiveRequestState {
+        let (token_tx, _rx) = openinfer_core::engine::TokenSink::standalone();
+        ActiveRequestState {
+            request_id: RequestId::new(7),
+            lora_adapter: None,
+            token_tx,
+            last_token: 42,
+            generated_count,
+            max_tokens,
+            prompt_len: 10,
+            params: SamplingParams::default(),
+            logprobs: 0,
+        }
+    }
+
+    #[test]
+    fn speculative_verify_items_clamp_to_remaining_output_budget() {
+        let active = [active(24, 32)];
+        let draft = DraftRequestResult {
+            request_id: RequestId::new(7),
+            token_ids: (0..16).collect(),
+        };
+
+        let verify = build_speculative_verify_items(&active, &[draft]);
+
+        assert_eq!(verify.len(), 1);
+        // 32 - 24 = 8 remaining → the 16-token span truncates to 8.
+        assert_eq!(verify[0].as_slice().len(), 8);
+        assert_eq!(verify[0].as_slice(), (0..8).collect::<Vec<_>>());
     }
 
     // The plan selector is the whole batch-formation policy: what the scheduler
