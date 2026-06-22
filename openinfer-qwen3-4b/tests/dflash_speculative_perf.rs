@@ -148,7 +148,7 @@ fn dflash_speculative_single_stream_speedup() {
     };
 
     let speedup = spec_tps / baseline_tps;
-    eprintln!("───────────── DFlash single-stream decode A/B (5070 Ti, bs=1) ─────────────");
+    eprintln!("───────────── DFlash single-stream decode A/B (bs=1) ─────────────");
     eprintln!("  spec OFF (plain decode): {baseline_tps:7.1} tok/s");
     eprintln!("  spec ON  (DFlash):       {spec_tps:7.1} tok/s");
     eprintln!("  speedup:                 {speedup:7.2}×");

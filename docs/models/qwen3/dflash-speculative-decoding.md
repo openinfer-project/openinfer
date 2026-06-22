@@ -1,6 +1,6 @@
 # DFlash Speculative Decoding (Qwen3-4B)
 
-**TL;DR:** Qwen3-4B gains DFlash speculative decoding behind `--dflash-draft-model-path`. Speculative decode is modelled as an **optimistic transaction**: the DFlash drafter proposes K tokens, one target "verify" forward over the K+1 span confirms them, and we commit the longest argmax-matching prefix + 1 bonus token (rolling back the rest of the speculative KV). Greedy decode is **lossless up to bf16 numerical tie-flips** — the same non-determinism that already affects plain greedy decode at genuine bifurcation points. Measured single-stream decode A/B on RTX 5070 Ti (bs=1): **93.4 → 170.0 tok/s, 1.82×**.
+**TL;DR:** Qwen3-4B gains DFlash speculative decoding behind `--dflash-draft-model-path`. Speculative decode is modelled as an **optimistic transaction**: the DFlash drafter proposes K tokens, one target "verify" forward over the K+1 span confirms them, and we commit the longest argmax-matching prefix + 1 bonus token (rolling back the rest of the speculative KV). Greedy decode is **lossless up to bf16 numerical tie-flips** — the same non-determinism that already affects plain greedy decode at genuine bifurcation points; lm-eval gsm8k strict-match is identical with spec on vs off. Measured single-stream decode A/B: **1.82× on RTX 5070 Ti** (93.4 → 170.0 tok/s), **1.56× on RTX 5090** (168.9 → 263.2 tok/s).
 
 Last touched: 2026-06
 
@@ -42,17 +42,33 @@ The gate runs a baseline (spec off, logprobs on) and a spec engine on the same p
 
 Single-stream decode is where speculative decoding pays off directly: plain decode is memory-bound (one target forward per token); spec amortizes that forward over the accepted run. A/B harness: `tests/dflash_speculative_perf.rs` (bs=1, 256 tokens, `ignore_eos`, one warm-up discarded).
 
-| Config | RTX 5070 Ti, bs=1 |
-| --- | --- |
-| spec OFF (plain decode) | 93.4 tok/s |
-| spec ON (DFlash) | 170.0 tok/s |
-| **speedup** | **1.82×** |
+| Config | RTX 5070 Ti, bs=1 | RTX 5090, bs=1 |
+| --- | --- | --- |
+| spec OFF (plain decode) | 93.4 tok/s | 168.9 tok/s |
+| spec ON (DFlash) | 170.0 tok/s | 263.2 tok/s |
+| **speedup** | **1.82×** | **1.56×** |
 
-Throughput under concurrent load is a separate axis (`vllm bench serve` A/B) and is best measured on the 5090 — pending.
+The speedup is smaller on the 5090: its higher memory bandwidth makes the baseline decode less memory-bound, so amortizing the target forward buys less. Both builds use CUDA 13.x (the 5090's default 12.9 has the documented cuBLAS N=1025 cliff).
+
+Throughput under concurrent load is a separate axis (`vllm bench serve` A/B). Speculative decoding's win shrinks — and can invert — as batch concurrency rises and the GPU turns compute-bound, so the crossover point is the interesting number. Still pending.
+
+## Task-level accuracy parity (lm-eval gsm8k)
+
+Token-level losslessness should imply task-level parity. Confirmed on the 5090 with `lm-eval` gsm8k (5-shot, greedy, `local-completions` against the openinfer server, 50 questions):
+
+| | flexible-extract | strict-match |
+| --- | --- | --- |
+| spec OFF | 0.86 | 0.86 |
+| spec ON (DFlash) | 0.88 | 0.86 |
+
+`strict-match` is identical; `flexible-extract` differs by one question (within the ±0.05 stderr), the same single bf16 tie-flip the losslessness gate sees. DFlash does not change task accuracy.
+
+Harness note: openinfer's `/v1/completions` rejects a per-request `seed` field (`"per-request seed is not supported by this engine"` → 400), which the OpenAI/lm-eval client sends by default. For the eval the client was patched to drop `seed`; making the frontend accept-and-ignore `seed` under greedy is a separate, unrelated improvement (not part of this change).
 
 ## Constraints & open follow-ups
 
 - **TP=1, primary rank only.** The DFlash lane runs on the worker thread of the primary rank; the launch path gates `!(dflash && lora)` and `tp_size == 1`. The server fails loud (`--dflash-draft-model-path` is rejected for non-Qwen3 model lines rather than silently ignored).
 - **Second proposer → introduce the trait.** Until then the proposer is concrete on purpose.
 - **File size.** `executor.rs` (~2.8k lines) and `scheduler/tests.rs` (~1.2k lines) exceed the 1k guideline; the spec arms in `execute_step_on_lane` are candidates to move into `executor/spec.rs` in a follow-up.
-- **5090 validation** — golden gate + `vllm bench serve` throughput A/B on the company 5090 (same sm_120 arch as the 5070 Ti, so correctness carries; the 5090 is for representative throughput numbers).
+- **5090 validation — done** for correctness and single-stream: `hf_golden_gate` passes (bs1 / batched / cuda-graph / tp2), the losslessness gate passes, single-stream A/B is 1.56×, and lm-eval gsm8k parity holds (above). Still pending: `vllm bench serve` concurrent-throughput A/B (the spec-helps-vs-hurts crossover under load).
+- **Frontend `seed`.** `/v1/completions` 400s on a per-request `seed` instead of accepting-and-ignoring it under greedy — surfaced while wiring lm-eval; orthogonal to spec decode, worth a small separate fix.
