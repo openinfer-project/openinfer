@@ -156,13 +156,15 @@ pub(crate) fn start_qwen3(
         Qwen3LoraOptions::default(),
         offload_options,
         max_prefill_tokens,
+        dflash_draft_model_path,
         memory_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     executor.enable_decode_overlap(decode_overlap)?;
     // Speculative decoding loads its draft model after the target is up (the
     // draft is built against the target's embeddings/head) and forces the
-    // prefix cache off, so it must follow set_no_prefix_cache.
+    // prefix cache off, so it must follow set_no_prefix_cache. Its GPU footprint
+    // was already reserved during profiling from the draft path passed above.
     if let Some(draft_path) = dflash_draft_model_path {
         executor.load_dflash_draft_model(draft_path)?;
     }
@@ -189,6 +191,7 @@ pub(crate) fn start_qwen3_with_lora_control(
         lora_options,
         offload_options,
         max_prefill_tokens,
+        None,
         memory_options,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);

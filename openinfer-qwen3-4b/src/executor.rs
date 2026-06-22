@@ -873,10 +873,15 @@ impl Qwen3Executor {
         model: Qwen3Model,
         offload_opts: &Qwen3OffloadOptions,
         max_prefill_tokens: usize,
+        dflash_kv_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
     ) -> Result<Self> {
-        let (model, budget) =
-            profile_kv_budget_on_worker(model, max_prefill_tokens, memory_options)?;
+        let (model, budget) = profile_kv_budget_on_worker(
+            model,
+            max_prefill_tokens,
+            dflash_kv_bytes_per_token,
+            memory_options,
+        )?;
         let kv_mgr = KvCacheManager::new(
             &model.device_ctx().stream,
             budget.num_layers,
@@ -931,6 +936,7 @@ impl Qwen3Executor {
             Qwen3LoraOptions::default(),
             Qwen3OffloadOptions::disabled(),
             crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            None,
             Qwen3MemoryOptions::default(),
         )
     }
@@ -942,9 +948,10 @@ impl Qwen3Executor {
         lora_options: Qwen3LoraOptions,
         offload_options: Qwen3OffloadOptions,
         max_prefill_tokens: usize,
+        dflash_draft_path: Option<&str>,
         memory_options: Qwen3MemoryOptions,
     ) -> Result<Self> {
-        let memory_options = memory_options.validate()?;
+        let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
         anyhow::ensure!(
             !device_ordinals.is_empty(),
@@ -967,11 +974,36 @@ impl Qwen3Executor {
                     max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
-            let mut executor =
-                Self::single(model, &offload_options, max_prefill_tokens, memory_options)?;
+            // The DFlash draft model loads after profiling but lives outside the
+            // paged KV pool, so reserve its footprint up front from the draft
+            // config: fixed bytes (weights + block scratch) via the margin, and
+            // pool-scaling per-token bytes folded into the block budget.
+            let dflash_kv_bytes_per_token = match dflash_draft_path {
+                Some(path) => {
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        path,
+                        *BATCH_BUCKETS.last().unwrap(),
+                    )?;
+                    memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
+                    reservation.kv_bytes_per_token
+                }
+                None => 0,
+            };
+            let mut executor = Self::single(
+                model,
+                &offload_options,
+                max_prefill_tokens,
+                dflash_kv_bytes_per_token,
+                memory_options,
+            )?;
             executor.lora_options = lora_options;
             return Ok(executor);
         }
+        anyhow::ensure!(
+            dflash_draft_path.is_none(),
+            "speculative decoding requires the single-GPU path (got {} devices)",
+            device_ordinals.len()
+        );
 
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
@@ -994,8 +1026,9 @@ impl Qwen3Executor {
         let mut profiled_models = Vec::with_capacity(world_size);
         let mut budgets = Vec::with_capacity(world_size);
         for model in models {
+            // DFlash is single-GPU only, so the TP path reserves nothing for it.
             let (model, budget) =
-                profile_kv_budget_on_worker(model, max_prefill_tokens, memory_options)?;
+                profile_kv_budget_on_worker(model, max_prefill_tokens, 0, memory_options)?;
             profiled_models.push(model);
             budgets.push(budget);
         }
@@ -1429,6 +1462,7 @@ impl Qwen3Executor {
 fn profile_kv_budget_on_worker(
     model: Qwen3Model,
     max_prefill_tokens: usize,
+    dflash_kv_bytes_per_token: usize,
     memory_options: Qwen3MemoryOptions,
 ) -> Result<(Qwen3Model, KvBudget)> {
     let handle = thread::Builder::new()
@@ -1445,6 +1479,7 @@ fn profile_kv_budget_on_worker(
             let budget = model.profiled_kv_budget(
                 max_prefill_tokens,
                 *BATCH_BUCKETS.last().unwrap(),
+                dflash_kv_bytes_per_token,
                 memory_options,
             )?;
             Ok((model, budget))
@@ -1515,7 +1550,15 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn max_context_tokens(&self) -> usize {
-        self.metadata.config.max_position_embeddings
+        let target = self.metadata.config.max_position_embeddings;
+        match &self.speculative {
+            // The draft's fixed-width in-fill block writes `block_size` positions
+            // past the committed length each step, so a request may use at most
+            // `draft.max_pos - block_size` tokens before the draft cache would
+            // overflow. Reject the rest at admission instead of crashing mid-prefill.
+            Some(meta) => target.min(meta.max_position_embeddings.saturating_sub(meta.block_size)),
+            None => target,
+        }
     }
 
     fn max_decode_batch_size(&self) -> usize {
@@ -2231,6 +2274,9 @@ impl Drop for Qwen3Executor {
 #[derive(Clone, Debug)]
 struct DFlashMeta {
     block_size: usize,
+    /// Draft's max cacheable position; with the `block_size` in-fill headroom
+    /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
+    max_position_embeddings: usize,
     #[allow(dead_code)]
     target_layer_ids: Vec<usize>,
 }
@@ -2317,6 +2363,7 @@ impl LocalQwen3Lane {
         model.tune_gemm_algos(&self.model)?;
         let meta = DFlashMeta {
             block_size: model.block_size(),
+            max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),
         };
         self.dflash = Some(DFlashLaneState::new(model));

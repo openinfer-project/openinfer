@@ -63,6 +63,11 @@ const LOGPROBS: usize = 20;
 /// ULP at typical logit magnitudes — mirrors `hf_golden_gate`'s `MARGIN_TOL`.
 const MARGIN_TOL: f32 = 0.20;
 
+/// Both tests launch a Qwen3-4B engine, and two at once overflow a 16 GB card.
+/// Cargo runs tests in one binary concurrently, so serialize the engine-holding
+/// bodies — only one engine is ever resident on the GPU.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn target_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
@@ -191,6 +196,7 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
 
     let prompts = [
         "The capital of France is",
@@ -359,4 +365,71 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         "speculative greedy decode is not lossless:\n{}",
         failures.join("\n")
     );
+}
+
+/// P2 regression: a request that fits the target context window but lands in the
+/// draft's `block_size` in-fill headroom (`max_pos - block_size < prompt +
+/// max_tokens <= max_pos`) must be rejected cleanly at admission. Before the
+/// admission cap, such a request was admitted on the target's limit and then
+/// panicked mid-prefill when the draft allocated KV past its own max positions.
+#[test]
+fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Read the real context window so the boundary is exact regardless of the
+    // checkpoint, then size the request to sit inside the draft's final in-fill
+    // block — it fits the target window but not the DFlash-effective one.
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&model_path).join("config.json")).expect("read config"),
+    )
+    .expect("parse config");
+    let max_pos = config["max_position_embeddings"]
+        .as_u64()
+        .expect("max_position_embeddings") as usize;
+    const BLOCK_SIZE: usize = 16; // DFlash drafter block size.
+    let prompt_len = 16usize;
+    // total in (max_pos - BLOCK_SIZE, max_pos]: clears the target check, trips
+    // the DFlash admission cap (max_pos - BLOCK_SIZE).
+    let max_tokens = max_pos - BLOCK_SIZE / 2 - prompt_len;
+
+    let handle = openinfer_qwen3_4b::launch(
+        Path::new(&model_path),
+        launch_options(Some(PathBuf::from(&draft_path))),
+    )
+    .expect("failed to start speculative engine");
+
+    let (token_tx, mut rx) = TokenSink::standalone();
+    handle
+        .submit(GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: vec![100u32; prompt_len],
+            params: SamplingParams::default(),
+            max_tokens,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .expect("submit failed");
+
+    loop {
+        match rx.blocking_recv().map(|(_, event)| event) {
+            Some(TokenEvent::Rejected { message, .. }) => {
+                eprintln!("draft-headroom request rejected as expected: {message}");
+                break;
+            }
+            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
+                panic!("draft-headroom request was admitted instead of rejected")
+            }
+            Some(TokenEvent::Error { message, .. }) => {
+                panic!("draft-headroom request errored mid-flight instead of clean rejection: {message}")
+            }
+            None => panic!("scheduler channel closed without a rejection"),
+        }
+    }
 }

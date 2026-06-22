@@ -92,8 +92,14 @@ impl LocalQwen3Lane {
         for req in requests {
             let pending_exists = dflash.requests.contains_key(&req.request_id);
             if dflash_prefill_can_capture(req, pending_exists) {
-                let max_cache_len =
-                    req.prompt_tokens.len() + req.max_output_tokens + dflash.model.block_size();
+                // Admission already caps the request at `draft.max_pos - block_size`
+                // (see `max_context_tokens`), so this `.min` is a defensive floor:
+                // it keeps the draft KV alloc within the draft's max positions even
+                // if a caller bypasses admission.
+                let max_cache_len = (req.prompt_tokens.len()
+                    + req.max_output_tokens
+                    + dflash.model.block_size())
+                .min(dflash.model.max_position_embeddings());
                 let mut state = match dflash.requests.remove(&req.request_id) {
                     Some(state) => state,
                     None => dflash.model.new_request_state(&ctx, max_cache_len)?,

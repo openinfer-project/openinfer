@@ -30,6 +30,76 @@ pub(crate) struct DFlashRequestState {
     max_cache_len: usize,
 }
 
+/// GPU memory DFlash needs on top of the target KV pool, derived from the draft
+/// config so the KV budget can reserve it *before* the draft model loads (the
+/// draft buffers live outside the paged `KvCacheManager`). Split by how it scales:
+///
+/// - `kv_bytes_per_token` scales with the KV pool (billed by shrinking the target
+///   block count): the draft's own KV cache plus the scratch-context and
+///   pending-context buffers, which currently persist at prompt length per
+///   request (see `dflash-speculative-decoding.md` — collapsing that persistence
+///   is a tracked follow-up that would shrink this term to the draft KV alone).
+/// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
+///   the draft weights plus the block-sized scratch across the decode batch.
+pub(crate) struct DFlashMemoryReservation {
+    pub(crate) kv_bytes_per_token: usize,
+    pub(crate) fixed_bytes: usize,
+}
+
+impl DFlashMemoryReservation {
+    pub(crate) fn from_path(draft_path: &str, max_decode_batch_size: usize) -> Result<Self> {
+        let config = DFlashConfig::from_file(draft_path)?;
+        Ok(Self::from_config(&config, max_decode_batch_size))
+    }
+
+    fn from_config(config: &DFlashConfig, max_decode_batch_size: usize) -> Self {
+        const BF16: usize = 2;
+        let hidden = config.hidden_size;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let inter = config.intermediate_size;
+        let capture_layers = config.dflash_config.target_layer_ids.len();
+
+        // Per-sequence-token, pool-scaling buffers.
+        let draft_kv = config.num_hidden_layers * 2 * kv_dim * BF16; // DFlashLayerCache k+v
+        // Scratch split by what it tracks: `context_*` grows with the committed
+        // prefix; `tail_*` (tail_input + k_tail + v_tail) grows with the in-fill
+        // tail, which is one block past the prefix.
+        let context_scratch = 2 * hidden * BF16; // context_projected + context_hidden
+        let tail_scratch = (hidden + 2 * kv_dim) * BF16; // tail_input + k_tail + v_tail
+        let pending = hidden * capture_layers * BF16; // context_feature_dim
+        let kv_bytes_per_token = draft_kv + context_scratch + tail_scratch + pending;
+
+        // Block-sized scratch held per live request (DFlashDraftScratch fixed buffers).
+        let fixed_scratch_per_request =
+            BF16 * config.block_size * (config.vocab_size + 5 * hidden + 2 * q_dim + 3 * inter);
+        let scratch_total = fixed_scratch_per_request * max_decode_batch_size;
+
+        // Draft weights (5 transformer layers + the context projection), +10% slack
+        // for norms, rope caches, and allocator alignment.
+        let per_layer = BF16
+            * (hidden * (q_dim + 2 * kv_dim) // qkv_proj
+                + q_dim * hidden // o_proj
+                + hidden * 2 * inter // gate_up_proj
+                + inter * hidden); // down_proj
+        let fc = BF16 * hidden * (hidden * capture_layers); // context projection
+        let weights = per_layer * config.num_hidden_layers + fc;
+        let weights = weights + weights / 10;
+
+        // The durable draft KV and the tail scratch are sized to `context +
+        // block_size` — one in-fill block past the lifetime the KV pool reserves
+        // for the request. The per-token term bills only the pool's tokens, so
+        // reserve that one-block headroom per concurrently decoding request to
+        // keep the reservation an upper bound.
+        let block_headroom = max_decode_batch_size * config.block_size * (draft_kv + tail_scratch);
+
+        Self {
+            kv_bytes_per_token,
+            fixed_bytes: weights + scratch_total + block_headroom,
+        }
+    }
+}
+
 struct DFlashLayerCache {
     k: HiddenStates,
     v: HiddenStates,
@@ -357,6 +427,14 @@ impl DFlashDraftModel {
 
     pub(crate) fn block_size(&self) -> usize {
         self.config.block_size
+    }
+
+    /// Largest sequence position the draft can cache. `validate_for_target`
+    /// guarantees this is `>=` the target's, but the draft's per-step in-fill
+    /// block writes `block_size` transient positions past the committed length,
+    /// so the usable context is `max_position_embeddings - block_size`.
+    pub(crate) fn max_position_embeddings(&self) -> usize {
+        self.config.max_position_embeddings
     }
 
     pub(crate) fn mask_token_id(&self) -> u32 {
@@ -771,6 +849,30 @@ mod tests {
         assert_eq!(
             dflash.dflash_config.target_layer_ids,
             vec![1, 9, 17, 25, 33]
+        );
+
+        // Pin the memory reservation the KV budget bills against. The per-token
+        // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending
+        // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
+        // regression here would silently over/under-reserve and risk OOM.
+        let reservation =
+            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256);
+        assert_eq!(
+            reservation.kv_bytes_per_token, 65_536,
+            "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
+        );
+        // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
+        // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
+        // headroom (~0.5 MiB) add across the decode batch.
+        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1).fixed_bytes;
+        assert!(
+            (1_150_000_000..1_220_000_000).contains(&fixed_batch1),
+            "draft weights ~1.1GiB, got {fixed_batch1}"
+        );
+        assert!(
+            (2_900_000_000..3_000_000_000).contains(&reservation.fixed_bytes),
+            "weights + 256 * (~6.5MiB scratch + ~0.5MiB block headroom), got {}",
+            reservation.fixed_bytes
         );
     }
 }
