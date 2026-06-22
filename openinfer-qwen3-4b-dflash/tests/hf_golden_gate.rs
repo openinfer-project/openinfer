@@ -267,6 +267,7 @@ fn dflash_executor_returns_request_tagged_batch_outputs() {
             max_step_context_len: 2,
             max_q_len: 3,
             max_seq_len: 8,
+            max_caches: 8,
         },
     )
     .expect("load executor");
@@ -353,6 +354,7 @@ fn dflash_scheduler_accepts_host_requests() {
                 max_step_context_len: 2,
                 max_q_len: 3,
                 max_seq_len: 8,
+                max_caches: 8,
             },
             max_wait: std::time::Duration::from_millis(50),
             max_total_tokens: 16,
@@ -441,6 +443,7 @@ fn dflash_scheduler_manages_draft_cache() {
                 max_step_context_len: 2,
                 max_q_len: 3,
                 max_seq_len: 8,
+                max_caches: 8,
             },
             max_wait: std::time::Duration::from_millis(10),
             max_total_tokens: 16,
@@ -508,6 +511,7 @@ fn dflash_scheduler_control_messages_are_fifo() {
                 max_step_context_len: 2,
                 max_q_len: 3,
                 max_seq_len: 8,
+                max_caches: 8,
             },
             max_wait: std::time::Duration::from_millis(100),
             max_total_tokens: 16,
@@ -515,32 +519,29 @@ fn dflash_scheduler_control_messages_are_fifo() {
     )
     .expect("start scheduler");
     let request_id = DFlashRequestId(123);
-    let submitter = scheduler.clone();
-    let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
-    let submit = std::thread::spawn(move || {
-        submitter.submit_with_enqueued_ack(
-            DFlashDraftHostRequest {
-                request_id,
-                noise_embedding: noise,
-                target_hidden: target,
-                position_ids: positions,
-                q_len: 3,
-                ctx_len: 2,
-                cache_mode: DFlashCacheMode::DraftCache,
-            },
-            ack_tx,
-        )
-    });
-    ack_rx.recv().expect("submit should be enqueued");
-    let seq_len = scheduler
-        .cache_seq_len(request_id)
-        .expect("cache seq len must follow pending submit");
-    let response = submit
-        .join()
-        .expect("join cached submit")
+    // The scheduler uses one unbounded channel for both submit and control
+    // messages, so FIFO ordering is guaranteed by construction: each call
+    // blocks until the scheduler thread has processed it. Submit the cached
+    // request first; when it returns the cache must exist, then the following
+    // control calls run strictly after it.
+    let response = scheduler
+        .submit(DFlashDraftHostRequest {
+            request_id,
+            noise_embedding: noise,
+            target_hidden: target,
+            position_ids: positions,
+            q_len: 3,
+            ctx_len: 2,
+            cache_mode: DFlashCacheMode::DraftCache,
+        })
         .expect("cached submit");
     assert_eq!(response.cache_seq_len, 5);
-    assert_eq!(seq_len, 5);
+    assert_eq!(
+        scheduler
+            .cache_seq_len(request_id)
+            .expect("cache seq len after submit"),
+        5
+    );
     scheduler.reset_cache(request_id).expect("reset cache");
     assert_eq!(
         scheduler.cache_seq_len(request_id).expect("cache seq len"),
@@ -561,6 +562,7 @@ fn dflash_cache_control_rejects_unknown_request_ids() {
             max_step_context_len: 2,
             max_q_len: 3,
             max_seq_len: 8,
+            max_caches: 8,
         },
     )
     .expect("load executor");
@@ -617,6 +619,108 @@ fn dflash_cache_control_rejects_unknown_request_ids() {
             .to_string()
             .contains("unknown DFlash cache request_id"),
         "unexpected scheduler seq len error: {seq_err}"
+    );
+}
+
+#[test]
+fn dflash_cache_drop_releases_and_capacity_fails_closed() {
+    let Some(model_path) = model_path_or_skip("dflash cache drop gate") else {
+        return;
+    };
+    let golden_path = Path::new(GOLDEN);
+    if !golden_path.exists() {
+        eprintln!("skipping dflash cache drop gate: {GOLDEN} does not exist");
+        return;
+    }
+
+    let bytes = std::fs::read(golden_path).expect("read golden");
+    let st = SafeTensors::deserialize(&bytes).expect("parse golden");
+    let config =
+        openinfer_qwen3_4b_dflash::DFlashConfig::from_model_dir(&model_path).expect("load config");
+    let noise = bf16_tensor(&st, "noise_embedding", &[1, 3, config.hidden_size]);
+    let target = bf16_tensor(
+        &st,
+        "target_hidden",
+        &[1, 2, config.hidden_size * config.target_layer_count()],
+    );
+    let positions = i32_tensor(&st, "position_ids", &[1, 5]);
+
+    // Cap the pool at one cache so a second concurrent request must fail closed
+    // until the first is retired via drop_cache.
+    let scheduler = DFlashSchedulerHandle::start(
+        &model_path,
+        0,
+        DFlashSchedulerOptions {
+            executor: DFlashExecutorOptions {
+                max_batch_size: 2,
+                max_step_context_len: 2,
+                max_q_len: 3,
+                max_seq_len: 8,
+                max_caches: 1,
+            },
+            max_wait: std::time::Duration::from_millis(10),
+            max_total_tokens: 16,
+        },
+    )
+    .expect("start scheduler");
+
+    let first = DFlashRequestId(1);
+    let second = DFlashRequestId(2);
+    let submit = |id: DFlashRequestId| {
+        scheduler.submit(DFlashDraftHostRequest {
+            request_id: id,
+            noise_embedding: noise.clone(),
+            target_hidden: target.clone(),
+            position_ids: positions.clone(),
+            q_len: 3,
+            ctx_len: 2,
+            cache_mode: DFlashCacheMode::DraftCache,
+        })
+    };
+
+    submit(first).expect("first cached submit creates a cache");
+    assert_eq!(
+        scheduler.cache_seq_len(first).expect("first cache exists"),
+        5
+    );
+
+    // Pool is full (max_caches=1): a second distinct request must fail closed.
+    let overflow_err = match submit(second) {
+        Ok(_) => panic!("overflow submit must fail closed, but succeeded"),
+        Err(err) => err,
+    };
+    assert!(
+        overflow_err.to_string().contains("DFlash cache pool full"),
+        "unexpected overflow error: {overflow_err}"
+    );
+
+    // drop_cache is idempotent and releases the slot for reuse.
+    scheduler.drop_cache(first).expect("drop first cache");
+    // Idempotent: dropping an already-removed (or never-seen) id is not an error.
+    scheduler
+        .drop_cache(first)
+        .expect("drop_cache is idempotent");
+    scheduler
+        .drop_cache(DFlashRequestId(999))
+        .expect("drop_cache unknown id is idempotent");
+    // The retired id's cache is gone, so reads fail closed.
+    let gone_err = scheduler
+        .cache_seq_len(first)
+        .expect_err("retired cache must be gone");
+    assert!(
+        gone_err
+            .to_string()
+            .contains("unknown DFlash cache request_id"),
+        "unexpected retired-cache error: {gone_err}"
+    );
+
+    // Slot is reclaimed: the second request now succeeds.
+    submit(second).expect("second submit after drop succeeds");
+    assert_eq!(
+        scheduler
+            .cache_seq_len(second)
+            .expect("second cache exists"),
+        5
     );
 }
 

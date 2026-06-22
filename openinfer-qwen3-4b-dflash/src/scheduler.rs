@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::thread;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -27,9 +28,36 @@ impl Default for DFlashSchedulerOptions {
     }
 }
 
+/// Handle to the DFlash draft scheduler thread. Mirrors the `EngineHandle`
+/// pattern (`openinfer-engine::engine::EngineHandle`): the handle is cheaply
+/// cloneable (shared sender), and the last clone's `Drop` closes the channel
+/// and joins the scheduler thread, replying "stopped" to any in-flight
+/// requests. This prevents leaking the GPU-owner thread when a caller drops
+/// the handle without an explicit shutdown.
 #[derive(Clone)]
 pub struct DFlashSchedulerHandle {
-    submit_tx: channel::Sender<SchedulerMessage>,
+    inner: Arc<DFlashSchedulerInner>,
+}
+
+struct DFlashSchedulerInner {
+    submit_tx: Option<channel::Sender<SchedulerMessage>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for DFlashSchedulerInner {
+    fn drop(&mut self) {
+        // Drop our sender first; when the last sender goes, the scheduler
+        // loop's `recv` returns `Err` and the thread flushes pending requests
+        // via `send_stopped` before exiting (mirrors EngineHandle::Drop in
+        // openinfer-engine/src/engine.rs).
+        self.submit_tx.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            // Never join from inside the scheduler thread itself.
+            if join_handle.thread().id() != thread::current().id() {
+                let _ = join_handle.join();
+            }
+        }
+    }
 }
 
 enum SchedulerMessage {
@@ -38,6 +66,10 @@ enum SchedulerMessage {
         response_tx: channel::Sender<Result<DFlashDraftHostResponse>>,
     },
     ResetCache {
+        request_id: DFlashRequestId,
+        response_tx: channel::Sender<Result<()>>,
+    },
+    DropCache {
         request_id: DFlashRequestId,
         response_tx: channel::Sender<Result<()>>,
     },
@@ -68,6 +100,10 @@ enum SchedulerControl {
         request_id: DFlashRequestId,
         response_tx: channel::Sender<Result<()>>,
     },
+    DropCache {
+        request_id: DFlashRequestId,
+        response_tx: channel::Sender<Result<()>>,
+    },
     CropCache {
         request_id: DFlashRequestId,
         seq_len: usize,
@@ -90,7 +126,7 @@ impl DFlashSchedulerHandle {
         let model_path = PathBuf::from(model_path);
         let max_wait = options.max_wait;
         let max_total_tokens = options.max_total_tokens;
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("qwen3-dflash-scheduler".into())
             .spawn(move || {
                 let mut executor =
@@ -108,35 +144,29 @@ impl DFlashSchedulerHandle {
         init_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("DFlash scheduler initialization channel closed"))??;
-        Ok(Self { submit_tx })
+        Ok(Self {
+            inner: Arc::new(DFlashSchedulerInner {
+                submit_tx: Some(submit_tx),
+                join_handle: Some(join_handle),
+            }),
+        })
+    }
+
+    fn submit_tx(&self) -> Result<&channel::Sender<SchedulerMessage>> {
+        self.inner
+            .submit_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DFlash scheduler is closed"))
     }
 
     pub fn submit(&self, request: DFlashDraftHostRequest) -> Result<DFlashDraftHostResponse> {
         let (response_tx, response_rx) = channel::bounded(1);
-        self.submit_tx
+        self.submit_tx()?
             .send(SchedulerMessage::Submit {
                 request,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("DFlash scheduler is closed"))?;
-        response_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("DFlash scheduler response channel closed"))?
-    }
-
-    pub fn submit_with_enqueued_ack(
-        &self,
-        request: DFlashDraftHostRequest,
-        ack_tx: channel::Sender<()>,
-    ) -> Result<DFlashDraftHostResponse> {
-        let (response_tx, response_rx) = channel::bounded(1);
-        self.submit_tx
-            .send(SchedulerMessage::Submit {
-                request,
-                response_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("DFlash scheduler is closed"))?;
-        let _ = ack_tx.send(());
         response_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("DFlash scheduler response channel closed"))?
@@ -144,8 +174,27 @@ impl DFlashSchedulerHandle {
 
     pub fn reset_cache(&self, request_id: DFlashRequestId) -> Result<()> {
         let (response_tx, response_rx) = channel::bounded(1);
-        self.submit_tx
+        self.submit_tx()?
             .send(SchedulerMessage::ResetCache {
+                request_id,
+                response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("DFlash scheduler is closed"))?;
+        response_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("DFlash scheduler response channel closed"))?
+    }
+
+    /// Release a request's draft cache and reclaim its GPU buffers. Mirrors
+    /// Qwen3's `drop_request`: the executor removes the cache entry and RAII
+    /// frees the per-layer past K/V + scratch. Idempotent — retiring a
+    /// request that never created a cache is not an error. Callers should
+    /// invoke this once a draft request is verified or abandoned so the
+    /// `max_caches` pool does not fill with dead entries.
+    pub fn drop_cache(&self, request_id: DFlashRequestId) -> Result<()> {
+        let (response_tx, response_rx) = channel::bounded(1);
+        self.submit_tx()?
+            .send(SchedulerMessage::DropCache {
                 request_id,
                 response_tx,
             })
@@ -157,7 +206,7 @@ impl DFlashSchedulerHandle {
 
     pub fn crop_cache(&self, request_id: DFlashRequestId, seq_len: usize) -> Result<()> {
         let (response_tx, response_rx) = channel::bounded(1);
-        self.submit_tx
+        self.submit_tx()?
             .send(SchedulerMessage::CropCache {
                 request_id,
                 seq_len,
@@ -171,7 +220,7 @@ impl DFlashSchedulerHandle {
 
     pub fn cache_seq_len(&self, request_id: DFlashRequestId) -> Result<usize> {
         let (response_tx, response_rx) = channel::bounded(1);
-        self.submit_tx
+        self.submit_tx()?
             .send(SchedulerMessage::CacheSeqLen {
                 request_id,
                 response_tx,
@@ -237,6 +286,13 @@ fn handle_message_or_enqueue(msg: SchedulerMessage, pending: &mut VecDeque<Pendi
             request_id,
             response_tx,
         } => pending.push_back(PendingItem::Control(SchedulerControl::ResetCache {
+            request_id,
+            response_tx,
+        })),
+        SchedulerMessage::DropCache {
+            request_id,
+            response_tx,
+        } => pending.push_back(PendingItem::Control(SchedulerControl::DropCache {
             request_id,
             response_tx,
         })),
@@ -392,6 +448,12 @@ impl SchedulerControl {
             } => {
                 let _ = response_tx.send(executor.reset_cache(request_id));
             }
+            SchedulerControl::DropCache {
+                request_id,
+                response_tx,
+            } => {
+                let _ = response_tx.send(executor.drop_cache(request_id));
+            }
             SchedulerControl::CropCache {
                 request_id,
                 seq_len,
@@ -411,6 +473,7 @@ impl SchedulerControl {
     fn send_stopped(self) {
         match self {
             SchedulerControl::ResetCache { response_tx, .. }
+            | SchedulerControl::DropCache { response_tx, .. }
             | SchedulerControl::CropCache { response_tx, .. } => {
                 let _ = response_tx.send(Err(anyhow::anyhow!("DFlash scheduler stopped")));
             }

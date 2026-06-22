@@ -1,6 +1,6 @@
 # Qwen3-4B-DFlash model
 
-**TL;DR**: `openinfer-qwen3-4b-dflash` supports only the `z-lab/Qwen3-4B-DFlash-b16` model. It now has two draft-only execution surfaces: the original bs1 transformers-parity forward path, and an internal exact-shape batch runner/scheduler that batches already-prepared `noise_embedding`, selected target hidden states, and `position_ids`. The forward gate currently measures mean delta `0.034243`, p99 `0.125000`, max `0.500000` over 7,680 output values for uncached, unified-cache one-shot, and first-step draft-cache paths; batch-vs-single and executor request-tag smoke extend that gate. Cache control APIs are fail-closed for unknown request ids. Target verification, acceptance, fallback token selection, and OpenAI serving remain out of scope.
+**TL;DR**: `openinfer-qwen3-4b-dflash` supports only the `z-lab/Qwen3-4B-DFlash-b16` model. It now has two draft-only execution surfaces: the original bs1 transformers-parity forward path, and an internal exact-shape batch runner/scheduler that batches already-prepared `noise_embedding`, selected target hidden states, and `position_ids`. The forward gate currently measures mean delta `0.034243`, p99 `0.125000`, max `0.500000` over 7,680 output values for uncached, unified-cache one-shot, and first-step draft-cache paths; batch-vs-single and executor request-tag smoke extend that gate. Cache control APIs are fail-closed for unknown request ids. The scheduler thread now joins on handle drop (mirrors `EngineHandle`) and resident draft caches are bounded by `max_caches` with an explicit `drop_cache` retirement path (mirrors Qwen3 `drop_request`); over-cap admission fails closed. Target verification, acceptance, fallback token selection, and OpenAI serving remain out of scope.
 
 Last touched: 2026-06
 
@@ -116,12 +116,21 @@ batching, a small `max_wait` coalescing window, and `max_total_tokens`
 admission over `(ctx_len + q_len + past_len)` for each candidate batch. Its
 public `submit` boundary uses host bf16 buffers and returns host bf16 output so
 CUDA device tensors do not cross thread/context ownership boundaries. It also
-owns per-request draft cache state through `reset_cache`, `crop_cache`, and
-`cache_seq_len`, and these calls now error on unknown request ids instead of
-silently treating them as empty state; `NoCache` requests use the real batched path, while host
-`DraftCache` requests run serially until compact past-K/V batching lands. The
-executor also exposes a borrowed compact batch view for same-thread controller
-experiments.
+owns per-request draft cache state through `reset_cache`, `crop_cache`,
+`cache_seq_len`, and `drop_cache`, and the cache-reading calls error on unknown
+request ids instead of silently treating them as empty state; `drop_cache` is
+idempotent (a missing cache is not an error) so callers can retire a request
+from any lifecycle state. Resident caches are bounded by `max_caches`
+(`DFlashExecutorOptions`, default 64); exceeding it fails closed until a
+retired request's cache is dropped — this mirrors Qwen3's per-request block
+accounting under the fixed `KvCacheManager` pool and prevents the unbounded
+GPU-memory leak the old grow-only `HashMap` had. The handle joins the scheduler
+thread on drop (the last clone closes the channel and joins, mirroring
+`EngineHandle`), so dropping the handle without an explicit shutdown no longer
+leaks the GPU-owner thread. `NoCache` requests use the real batched path, while
+host `DraftCache` requests run serially until compact past-K/V batching lands.
+The executor also exposes a borrowed compact batch view for same-thread
+controller experiments.
 
 ## Draft Cache
 
@@ -162,6 +171,7 @@ The accuracy bar is transformers parity. For the draft crate that means:
 | batch-vs-single parity | Compare two exact-shape batched rows against the bs1 forward output under the same DFlash tolerance |
 | executor smoke | Submit request-tagged exact-shape `NoCache` requests and assert output shape/request ids |
 | scheduler cache smoke | Submit host `DraftCache` request, then assert scheduler-owned `cache_seq_len`, `crop_cache`, and `reset_cache` behavior; also checks control messages preserve FIFO ordering behind pending submits |
+| cache control rejection | `reset_cache` / `crop_cache` / `cache_seq_len` fail closed on unknown request ids; `drop_cache` is idempotent (retiring an unknown id is not an error) |
 | drafter generation parity | Run a greedy bs1 transformers target loop twice, once with the HF drafter and once with the OpenInfer drafter, then compare generated token ids/text and acceptance lengths |
 
 Do not use `Qwen3-4B-Instruct-2507` as a correctness baseline for this model. The checkpoint is documented for `Qwen/Qwen3-4B`, but this task's gate is the DFlash draft model's own transformers forward, not target acceptance rate.

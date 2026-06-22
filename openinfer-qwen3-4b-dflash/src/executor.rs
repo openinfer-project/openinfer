@@ -7,7 +7,7 @@ use half::bf16;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 use crate::batch_buffers::DFlashBatchBuffers;
-use crate::batch_forward::{copy_hidden, DFlashBatchInput, DFlashHostBatchInput};
+use crate::batch_forward::{DFlashBatchInput, DFlashHostBatchInput, copy_hidden};
 use crate::forward::{DFlashDraftCache, DFlashTargetHidden};
 use crate::weights::DFlashDraftModel;
 
@@ -90,6 +90,13 @@ pub struct DFlashExecutorOptions {
     /// below it reuses the same allocation (mirrors Qwen3's `BatchDecodeBuffers`).
     pub max_q_len: usize,
     pub max_seq_len: usize,
+    /// Upper bound on resident draft caches. Each `DraftCache` request creates
+    /// a per-request `DFlashDraftCache` (full `ForwardBuffers` + per-layer past
+    /// K/V); without a cap they accumulate forever and leak GPU memory.
+    /// Admission fails closed when this is exceeded — callers must `drop_cache`
+    /// a retired request before submitting a new one. Mirrors Qwen3's per-
+    /// request block accounting under the fixed `KvCacheManager` pool.
+    pub max_caches: usize,
 }
 
 impl Default for DFlashExecutorOptions {
@@ -99,6 +106,7 @@ impl Default for DFlashExecutorOptions {
             max_step_context_len: 16,
             max_q_len: 16,
             max_seq_len: 4096,
+            max_caches: 64,
         }
     }
 }
@@ -394,6 +402,47 @@ impl DFlashExecutor {
             .ok_or_else(|| anyhow::anyhow!("unknown DFlash cache request_id {:?}", request_id))
     }
 
+    /// Release a request's draft cache. Mirrors Qwen3's `drop_request`
+    /// (`openinfer-qwen3-4b/src/executor.rs`): remove the entry and let RAII
+    /// drop the GPU buffers. Idempotent — a missing cache is not an error, so
+    /// callers can retire a request from any lifecycle state.
+    pub fn drop_cache(&mut self, request_id: DFlashRequestId) -> Result<()> {
+        self.caches.remove(&request_id);
+        Ok(())
+    }
+
+    /// Resident cache count, for admission diagnostics.
+    pub fn cache_count(&self) -> usize {
+        self.caches.len()
+    }
+
+    /// Ensure a draft cache exists for `request_id`, enforcing the
+    /// `max_caches` cap. Existing caches are reused (a re-submitted request
+    /// keeps its past state). Over-cap admission fails closed. Returns without
+    /// borrowing the cache so callers can then use disjoint `&self.model` and
+    /// `&mut self.caches` borrows in the same scope (NLL split borrow).
+    fn ensure_cache_entry(
+        &mut self,
+        request_id: DFlashRequestId,
+        key: &DFlashBatchKey,
+    ) -> Result<()> {
+        if !self.caches.contains_key(&request_id) {
+            anyhow::ensure!(
+                self.caches.len() < self.options.max_caches,
+                "DFlash cache pool full: {} resident caches, max_caches={}; drop_cache a retired request before submitting a new one",
+                self.caches.len(),
+                self.options.max_caches,
+            );
+            let cache = self.model.create_draft_cache(
+                key.q_len,
+                self.options.max_step_context_len,
+                self.options.max_seq_len,
+            )?;
+            self.caches.insert(request_id, cache);
+        }
+        Ok(())
+    }
+
     fn execute_uncached_batch_compact(
         &mut self,
         requests: Vec<DFlashDraftRequest>,
@@ -456,14 +505,7 @@ impl DFlashExecutor {
             batch_size * key.q_len,
         )?;
         for (i, req) in requests.into_iter().enumerate() {
-            if !self.caches.contains_key(&req.request_id) {
-                let cache = self.model.create_draft_cache(
-                    key.q_len,
-                    self.options.max_step_context_len,
-                    self.options.max_seq_len,
-                )?;
-                self.caches.insert(req.request_id, cache);
-            }
+            self.ensure_cache_entry(req.request_id, &key)?;
             let cache = self.caches.get_mut(&req.request_id).expect("cache exists");
             self.model.prepare_step_context(
                 DFlashTargetHidden {
@@ -508,29 +550,20 @@ impl DFlashExecutor {
         let started = Instant::now();
         let batch_size = requests.len();
         let config = self.model.config();
+        let hidden = config.hidden_size;
+        let target_hidden_dim = config.hidden_size * config.target_layer_count();
         let mut request_ids = Vec::with_capacity(batch_size);
         let mut cache_seq_lens = Vec::with_capacity(batch_size);
-        let mut output = HiddenStates::zeros(
-            self.model.device_context(),
-            config.hidden_size,
-            batch_size * key.q_len,
-        )?;
+        let mut output =
+            HiddenStates::zeros(self.model.device_context(), hidden, batch_size * key.q_len)?;
         for (i, req) in requests.into_iter().enumerate() {
-            if !self.caches.contains_key(&req.request_id) {
-                let cache = self.model.create_draft_cache(
-                    key.q_len,
-                    self.options.max_step_context_len,
-                    self.options.max_seq_len,
-                )?;
-                self.caches.insert(req.request_id, cache);
-            }
             let noise_embedding = HiddenStates {
                 data: self
                     .model
                     .device_context()
                     .stream
                     .clone_htod(&req.noise_embedding)?,
-                hidden_dim: config.hidden_size,
+                hidden_dim: hidden,
                 seq_len: key.q_len,
             };
             let target_hidden = HiddenStates {
@@ -539,9 +572,10 @@ impl DFlashExecutor {
                     .device_context()
                     .stream
                     .clone_htod(&req.target_hidden)?,
-                hidden_dim: config.hidden_size * config.target_layer_count(),
+                hidden_dim: target_hidden_dim,
                 seq_len: key.ctx_len,
             };
+            self.ensure_cache_entry(req.request_id, &key)?;
             let cache = self.caches.get_mut(&req.request_id).expect("cache exists");
             self.model.prepare_step_context(
                 DFlashTargetHidden {
@@ -560,7 +594,7 @@ impl DFlashExecutor {
                 0,
                 &mut output,
                 i * key.q_len,
-                config.hidden_size,
+                hidden,
                 key.q_len,
             )?;
             request_ids.push(req.request_id);

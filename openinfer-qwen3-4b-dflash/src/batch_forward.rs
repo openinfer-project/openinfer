@@ -56,19 +56,23 @@ impl DFlashDraftModel {
             bufs.max_q_len,
             bufs.max_ctx_len,
         );
+        // Exact-shape batch: the first request is fully validated above, so the
+        // rest only need to match the three lengths that fix (q_len, ctx_len)
+        // — re-running the full validator per request just repeats the same
+        // hidden_dim / positivity checks against the same config.
         for req in &requests[1..] {
-            let (actual_q, actual_ctx) = self.validate_forward_inputs(
-                req.noise_embedding,
-                &req.target_hidden,
-                req.position_ids,
-            )?;
             anyhow::ensure!(
-                actual_q == q_len && actual_ctx == ctx_len,
-                "DFlash exact-shape batch expected q_len={}, ctx_len={} but got q_len={}, ctx_len={}",
-                q_len,
-                ctx_len,
-                actual_q,
-                actual_ctx
+                req.noise_embedding.seq_len == q_len
+                    && req.noise_embedding.hidden_dim == requests[0].noise_embedding.hidden_dim,
+                "DFlash exact-shape batch noise_embedding shape mismatch"
+            );
+            anyhow::ensure!(
+                req.target_hidden.concatenated.seq_len == ctx_len,
+                "DFlash exact-shape batch target_hidden seq_len mismatch"
+            );
+            anyhow::ensure!(
+                req.position_ids.len() == ctx_len + q_len,
+                "DFlash exact-shape batch position_ids len mismatch"
             );
         }
         bufs.set_active_shape(requests.len(), q_len, ctx_len);
