@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use half::bf16;
-use openinfer_core::tensor::HiddenStates;
+use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 use crate::batch_buffers::DFlashBatchBuffers;
-use crate::batch_forward::{DFlashBatchInput, DFlashHostBatchInput, copy_hidden};
+use crate::batch_forward::{copy_hidden, DFlashBatchInput, DFlashHostBatchInput};
 use crate::forward::{DFlashDraftCache, DFlashTargetHidden};
 use crate::weights::DFlashDraftModel;
 
@@ -85,6 +85,10 @@ pub struct DFlashDraftBatchView<'a> {
 pub struct DFlashExecutorOptions {
     pub max_batch_size: usize,
     pub max_step_context_len: usize,
+    /// Largest draft length (`q_len`) the executor must serve. Batch buffers
+    /// are sized once for `max_batch_size × max_q_len`, so every shape at or
+    /// below it reuses the same allocation (mirrors Qwen3's `BatchDecodeBuffers`).
+    pub max_q_len: usize,
     pub max_seq_len: usize,
 }
 
@@ -93,6 +97,7 @@ impl Default for DFlashExecutorOptions {
         Self {
             max_batch_size: 32,
             max_step_context_len: 16,
+            max_q_len: 16,
             max_seq_len: 4096,
         }
     }
@@ -101,7 +106,10 @@ impl Default for DFlashExecutorOptions {
 pub struct DFlashExecutor {
     model: DFlashDraftModel,
     options: DFlashExecutorOptions,
-    buffers: HashMap<(usize, usize, usize), DFlashBatchBuffers>,
+    /// Single-instance batch buffer, sized for the worst case
+    /// (`max_batch_size × max_q_len × max_step_context_len`). Each forward
+    /// narrows the active shape via `set_active_shape` instead of reallocating.
+    buffers: DFlashBatchBuffers,
     caches: HashMap<DFlashRequestId, DFlashDraftCache>,
 }
 
@@ -112,10 +120,15 @@ impl DFlashExecutor {
         options: DFlashExecutorOptions,
     ) -> Result<Self> {
         let model = DFlashDraftModel::load(model_path, device_ordinal)?;
+        let buffers = model.create_batch_buffers(
+            options.max_batch_size,
+            options.max_q_len,
+            options.max_step_context_len,
+        )?;
         Ok(Self {
             model,
             options,
-            buffers: HashMap::new(),
+            buffers,
             caches: HashMap::new(),
         })
     }
@@ -212,22 +225,24 @@ impl DFlashExecutor {
         if key.cache_mode == DFlashCacheMode::DraftCache {
             return self.execute_cached_host_requests_serial_compact(requests, key);
         }
+        anyhow::ensure!(
+            key.q_len <= self.options.max_q_len,
+            "DFlash host q_len {} exceeds executor max_q_len {}",
+            key.q_len,
+            self.options.max_q_len
+        );
+        anyhow::ensure!(
+            key.ctx_len <= self.options.max_step_context_len,
+            "DFlash host ctx_len {} exceeds executor max_step_context_len {}",
+            key.ctx_len,
+            self.options.max_step_context_len
+        );
         let started = Instant::now();
         let batch_size = requests.len();
         let request_ids = requests
             .iter()
             .map(|request| request.request_id)
             .collect::<Vec<_>>();
-        let buffer_key = (self.options.max_batch_size, key.q_len, key.ctx_len);
-        if !self.buffers.contains_key(&buffer_key) {
-            let bufs = self.model.create_batch_buffers(
-                self.options.max_batch_size,
-                key.q_len,
-                key.ctx_len,
-            )?;
-            self.buffers.insert(buffer_key, bufs);
-        }
-        let bufs = self.buffers.get_mut(&buffer_key).expect("buffer inserted");
         let inputs = requests
             .iter()
             .map(|req| DFlashHostBatchInput {
@@ -236,23 +251,12 @@ impl DFlashExecutor {
                 position_ids: &req.position_ids,
             })
             .collect::<Vec<_>>();
-        let batch_output = self.model.forward_host_batch(&inputs, bufs)?;
+        let batch_output = self.model.forward_host_batch(&inputs, &mut self.buffers)?;
         self.model.device_context().sync()?;
         let elapsed = started.elapsed();
-        let mut output = HiddenStates::zeros(
-            self.model.device_context(),
-            batch_output.hidden_dim,
-            batch_output.seq_len,
-        )?;
-        copy_hidden(
-            self.model.device_context(),
-            batch_output,
-            0,
-            &mut output,
-            0,
-            batch_output.hidden_dim,
-            batch_output.seq_len,
-        )?;
+        // forward returns a borrow into self.buffers; materialize an owned copy
+        // so the next batch can reuse the buffer without aliasing the response.
+        let output = clone_batch_output(self.model.device_context(), batch_output)?;
         Ok(DFlashDraftBatchResponse {
             request_ids,
             output,
@@ -302,22 +306,24 @@ impl DFlashExecutor {
             key.cache_mode == DFlashCacheMode::NoCache,
             "borrowed host batch view currently supports only NoCache mode"
         );
+        anyhow::ensure!(
+            key.q_len <= self.options.max_q_len,
+            "DFlash host q_len {} exceeds executor max_q_len {}",
+            key.q_len,
+            self.options.max_q_len
+        );
+        anyhow::ensure!(
+            key.ctx_len <= self.options.max_step_context_len,
+            "DFlash host ctx_len {} exceeds executor max_step_context_len {}",
+            key.ctx_len,
+            self.options.max_step_context_len
+        );
         let started = Instant::now();
         let batch_size = requests.len();
         let request_ids = requests
             .iter()
             .map(|request| request.request_id)
             .collect::<Vec<_>>();
-        let buffer_key = (self.options.max_batch_size, key.q_len, key.ctx_len);
-        if !self.buffers.contains_key(&buffer_key) {
-            let bufs = self.model.create_batch_buffers(
-                self.options.max_batch_size,
-                key.q_len,
-                key.ctx_len,
-            )?;
-            self.buffers.insert(buffer_key, bufs);
-        }
-        let bufs = self.buffers.get_mut(&buffer_key).expect("buffer inserted");
         let inputs = requests
             .iter()
             .map(|req| DFlashHostBatchInput {
@@ -326,7 +332,7 @@ impl DFlashExecutor {
                 position_ids: &req.position_ids,
             })
             .collect::<Vec<_>>();
-        let output = self.model.forward_host_batch(&inputs, bufs)?;
+        let output = self.model.forward_host_batch(&inputs, &mut self.buffers)?;
         self.model.device_context().sync()?;
         Ok(DFlashDraftBatchView {
             request_ids,
@@ -393,22 +399,24 @@ impl DFlashExecutor {
         requests: Vec<DFlashDraftRequest>,
         key: DFlashBatchKey,
     ) -> Result<DFlashDraftBatchResponse> {
+        anyhow::ensure!(
+            key.q_len <= self.options.max_q_len,
+            "DFlash q_len {} exceeds executor max_q_len {}",
+            key.q_len,
+            self.options.max_q_len
+        );
+        anyhow::ensure!(
+            key.ctx_len <= self.options.max_step_context_len,
+            "DFlash ctx_len {} exceeds executor max_step_context_len {}",
+            key.ctx_len,
+            self.options.max_step_context_len
+        );
         let started = Instant::now();
         let batch_size = requests.len();
         let request_ids = requests
             .iter()
             .map(|request| request.request_id)
             .collect::<Vec<_>>();
-        let buffer_key = (self.options.max_batch_size, key.q_len, key.ctx_len);
-        if !self.buffers.contains_key(&buffer_key) {
-            let bufs = self.model.create_batch_buffers(
-                self.options.max_batch_size,
-                key.q_len,
-                key.ctx_len,
-            )?;
-            self.buffers.insert(buffer_key, bufs);
-        }
-        let bufs = self.buffers.get_mut(&buffer_key).expect("buffer inserted");
         let inputs = requests
             .iter()
             .map(|req| DFlashBatchInput {
@@ -419,23 +427,10 @@ impl DFlashExecutor {
                 position_ids: &req.position_ids,
             })
             .collect::<Vec<_>>();
-        let batch_output = self.model.forward_batch(&inputs, bufs)?;
+        let batch_output = self.model.forward_batch(&inputs, &mut self.buffers)?;
         self.model.device_context().sync()?;
         let elapsed = started.elapsed();
-        let mut output = HiddenStates::zeros(
-            self.model.device_context(),
-            self.model.config().hidden_size,
-            batch_size * key.q_len,
-        )?;
-        copy_hidden(
-            self.model.device_context(),
-            batch_output,
-            0,
-            &mut output,
-            0,
-            self.model.config().hidden_size,
-            batch_size * key.q_len,
-        )?;
+        let output = clone_batch_output(self.model.device_context(), batch_output)?;
         Ok(DFlashDraftBatchResponse {
             request_ids,
             output,
@@ -637,4 +632,16 @@ impl DFlashExecutor {
         }
         Ok(responses)
     }
+}
+
+/// Materialize an owned snapshot of a batch forward's output (a borrow into
+/// the single-instance buffer). One allocation + one device-to-device copy of
+/// the active region; the next batch may overwrite the buffer immediately.
+fn clone_batch_output(ctx: &DeviceContext, src: &HiddenStates) -> Result<HiddenStates> {
+    let mut dst = HiddenStates::zeros(ctx, src.hidden_dim, src.seq_len)?;
+    let len = src.hidden_dim * src.seq_len;
+    let src_view = src.data.slice(..len);
+    let mut dst_view = dst.data.slice_mut(..len);
+    ctx.stream.memcpy_dtod(&src_view, &mut dst_view)?;
+    Ok(dst)
 }

@@ -7,6 +7,11 @@ use crate::weights::DFlashDraftModel;
 
 pub struct DFlashBatchBuffers {
     pub(crate) max_batch_size: usize,
+    pub(crate) max_q_len: usize,
+    pub(crate) max_ctx_len: usize,
+    /// Active shape for the current batch — set by `set_active_shape` before
+    /// each forward. `q_len`/`ctx_len` may shrink below `max_*`; the physical
+    /// buffers are sized for the max, so the active values only narrow the view.
     pub(crate) q_len: usize,
     pub(crate) ctx_len: usize,
     pub(crate) total_q_len: usize,
@@ -38,32 +43,40 @@ pub struct DFlashBatchBuffers {
 
 pub(crate) struct CachedRaggedPlan {
     pub(crate) batch_size: usize,
+    pub(crate) q_len: usize,
+    pub(crate) ctx_len: usize,
     pub(crate) plan: RaggedPrefillPlan,
 }
 
 impl DFlashBatchBuffers {
+    /// Allocate a single-instance buffer sized for the worst case
+    /// (`max_batch_size × max_q_len` / `× max_ctx_len`). Each forward narrows
+    /// the active shape via `set_active_shape`, mirroring Qwen3's
+    /// `BatchDecodeBuffers` (one allocation, dynamic `set_batch_size`).
     pub(crate) fn new(
         model: &DFlashDraftModel,
         max_batch_size: usize,
-        q_len: usize,
-        ctx_len: usize,
+        max_q_len: usize,
+        max_ctx_len: usize,
     ) -> Result<Self> {
         anyhow::ensure!(max_batch_size > 0, "max_batch_size must be positive");
-        anyhow::ensure!(q_len > 0, "q_len must be positive");
-        anyhow::ensure!(ctx_len > 0, "ctx_len must be positive");
+        anyhow::ensure!(max_q_len > 0, "max_q_len must be positive");
+        anyhow::ensure!(max_ctx_len > 0, "max_ctx_len must be positive");
         let config = model.config();
         let ctx = model.device_context();
         let hidden = config.hidden_size;
         let target_hidden_dim = config.hidden_size * config.target_layer_count();
         let q_dim = config.q_dim();
         let kv_dim = config.kv_dim();
-        let total_q_len = max_batch_size * q_len;
-        let total_ctx_len = max_batch_size * ctx_len;
-        let total_kv_len = max_batch_size * (ctx_len + q_len);
+        let total_q_len = max_batch_size * max_q_len;
+        let total_ctx_len = max_batch_size * max_ctx_len;
+        let total_kv_len = max_batch_size * (max_ctx_len + max_q_len);
         Ok(Self {
             max_batch_size,
-            q_len,
-            ctx_len,
+            max_q_len,
+            max_ctx_len,
+            q_len: max_q_len,
+            ctx_len: max_ctx_len,
             total_q_len,
             total_ctx_len,
             total_kv_len,
@@ -92,11 +105,18 @@ impl DFlashBatchBuffers {
         })
     }
 
-    pub(crate) fn set_active_batch(&mut self, batch_size: usize) {
+    /// Narrow the active shape for this forward: sets `q_len`/`ctx_len` and
+    /// recomputes every buffer's `seq_len` to `batch_size × (q|ctx)`. Buffers
+    /// stay sized for the max, so callers can freely vary batch/q/ctx below it.
+    pub(crate) fn set_active_shape(&mut self, batch_size: usize, q_len: usize, ctx_len: usize) {
         debug_assert!(batch_size <= self.max_batch_size);
-        self.total_q_len = batch_size * self.q_len;
-        self.total_ctx_len = batch_size * self.ctx_len;
-        self.total_kv_len = batch_size * (self.ctx_len + self.q_len);
+        debug_assert!(q_len <= self.max_q_len);
+        debug_assert!(ctx_len <= self.max_ctx_len);
+        self.q_len = q_len;
+        self.ctx_len = ctx_len;
+        self.total_q_len = batch_size * q_len;
+        self.total_ctx_len = batch_size * ctx_len;
+        self.total_kv_len = batch_size * (ctx_len + q_len);
         self.noise.seq_len = self.total_q_len;
         self.target_hidden.seq_len = self.total_ctx_len;
         self.target_projected.seq_len = self.total_ctx_len;
@@ -123,10 +143,17 @@ impl DFlashBatchBuffers {
         model: &DFlashDraftModel,
         batch_size: usize,
     ) -> Result<()> {
+        // The plan depends on (batch_size, q_len, ctx_len); with a single
+        // instance buffer any of them can change between forwards, so all three
+        // must be part of the cache key.
         let needs_rebuild = self
             .ragged_plan
             .as_ref()
-            .map(|cached| cached.batch_size != batch_size)
+            .map(|cached| {
+                cached.batch_size != batch_size
+                    || cached.q_len != self.q_len
+                    || cached.ctx_len != self.ctx_len
+            })
             .unwrap_or(true);
         if needs_rebuild {
             let config = model.config();
@@ -138,7 +165,12 @@ impl DFlashBatchBuffers {
                 &kv_lens,
                 config.num_attention_heads / config.num_key_value_heads,
             )?;
-            self.ragged_plan = Some(CachedRaggedPlan { batch_size, plan });
+            self.ragged_plan = Some(CachedRaggedPlan {
+                batch_size,
+                q_len: self.q_len,
+                ctx_len: self.ctx_len,
+                plan,
+            });
         }
         Ok(())
     }

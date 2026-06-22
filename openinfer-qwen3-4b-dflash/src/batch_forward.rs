@@ -23,10 +23,10 @@ impl DFlashDraftModel {
     pub fn create_batch_buffers(
         &self,
         max_batch_size: usize,
-        q_len: usize,
-        ctx_len: usize,
+        max_q_len: usize,
+        max_ctx_len: usize,
     ) -> Result<DFlashBatchBuffers> {
-        DFlashBatchBuffers::new(self, max_batch_size, q_len, ctx_len)
+        DFlashBatchBuffers::new(self, max_batch_size, max_q_len, max_ctx_len)
     }
 
     pub fn forward_batch<'a>(
@@ -41,9 +41,22 @@ impl DFlashDraftModel {
             requests.len(),
             bufs.max_batch_size
         );
-        let q_len = bufs.q_len;
-        let ctx_len = bufs.ctx_len;
-        for req in requests {
+        // All requests in an exact-shape batch share one (q_len, ctx_len); read
+        // it from the first, then narrow the buffer's active shape to match.
+        let (q_len, ctx_len) = self.validate_forward_inputs(
+            requests[0].noise_embedding,
+            &requests[0].target_hidden,
+            requests[0].position_ids,
+        )?;
+        anyhow::ensure!(
+            q_len <= bufs.max_q_len && ctx_len <= bufs.max_ctx_len,
+            "DFlash batch shape q_len={}, ctx_len={} exceeds buffer capacity q_len={}, ctx_len={}",
+            q_len,
+            ctx_len,
+            bufs.max_q_len,
+            bufs.max_ctx_len,
+        );
+        for req in &requests[1..] {
             let (actual_q, actual_ctx) = self.validate_forward_inputs(
                 req.noise_embedding,
                 &req.target_hidden,
@@ -58,7 +71,7 @@ impl DFlashDraftModel {
                 actual_ctx
             );
         }
-        bufs.set_active_batch(requests.len());
+        bufs.set_active_shape(requests.len(), q_len, ctx_len);
         compact_inputs(self.device_context(), requests, bufs)?;
         self.forward_compact_batch(requests.len(), bufs)?;
         Ok(&bufs.normed)
@@ -77,10 +90,39 @@ impl DFlashDraftModel {
             bufs.max_batch_size
         );
         let config = self.config();
-        let noise_len = bufs.q_len * config.hidden_size;
-        let target_len = bufs.ctx_len * config.hidden_size * config.target_layer_count();
-        let position_len = bufs.ctx_len + bufs.q_len;
-        for req in requests {
+        let hidden = config.hidden_size;
+        let target_hidden_dim = config.hidden_size * config.target_layer_count();
+        // Derive the shared (q_len, ctx_len) from the first request, the same
+        // way forward_batch derives it from device tensors.
+        let first = &requests[0];
+        anyhow::ensure!(
+            first.noise_embedding.len() % hidden == 0,
+            "noise_embedding len {} is not a multiple of hidden_size {}",
+            first.noise_embedding.len(),
+            hidden,
+        );
+        let q_len = first.noise_embedding.len() / hidden;
+        anyhow::ensure!(
+            first.target_hidden.len() % target_hidden_dim == 0,
+            "target_hidden len {} is not a multiple of target_hidden_dim {}",
+            first.target_hidden.len(),
+            target_hidden_dim,
+        );
+        let ctx_len = first.target_hidden.len() / target_hidden_dim;
+        anyhow::ensure!(q_len > 0, "DFlash host batch q_len must be positive");
+        anyhow::ensure!(ctx_len > 0, "DFlash host batch ctx_len must be positive");
+        anyhow::ensure!(
+            q_len <= bufs.max_q_len && ctx_len <= bufs.max_ctx_len,
+            "DFlash host batch shape q_len={}, ctx_len={} exceeds buffer capacity q_len={}, ctx_len={}",
+            q_len,
+            ctx_len,
+            bufs.max_q_len,
+            bufs.max_ctx_len,
+        );
+        let noise_len = q_len * hidden;
+        let target_len = ctx_len * target_hidden_dim;
+        let position_len = ctx_len + q_len;
+        for req in &requests[1..] {
             anyhow::ensure!(
                 req.noise_embedding.len() == noise_len,
                 "noise_embedding len {} != {}",
@@ -100,7 +142,7 @@ impl DFlashDraftModel {
                 position_len
             );
         }
-        bufs.set_active_batch(requests.len());
+        bufs.set_active_shape(requests.len(), q_len, ctx_len);
         compact_host_inputs(self.device_context(), requests, bufs)?;
         self.forward_compact_batch(requests.len(), bufs)?;
         Ok(&bufs.normed)
@@ -323,27 +365,28 @@ fn compact_host_inputs(
 ) -> Result<()> {
     let hidden = bufs.noise.hidden_dim;
     let target_hidden = bufs.target_hidden.hidden_dim;
-    let mut pos_q = Vec::with_capacity(bufs.total_q_len);
-    let mut pos_ctx = Vec::with_capacity(bufs.total_ctx_len);
-    for (i, req) in requests.iter().enumerate() {
-        let noise_offset = i * bufs.q_len * hidden;
-        let mut noise_dst = bufs
-            .noise
-            .data
-            .slice_mut(noise_offset..noise_offset + req.noise_embedding.len());
-        ctx.stream
-            .memcpy_htod(req.noise_embedding, &mut noise_dst)?;
+    let q_len = bufs.q_len;
+    let ctx_len = bufs.ctx_len;
+    let batch_size = requests.len();
 
-        let target_offset = i * bufs.ctx_len * target_hidden;
-        let mut target_dst = bufs
-            .target_hidden
-            .data
-            .slice_mut(target_offset..target_offset + req.target_hidden.len());
-        ctx.stream.memcpy_htod(req.target_hidden, &mut target_dst)?;
-
-        pos_ctx.extend_from_slice(&req.position_ids[..bufs.ctx_len]);
-        pos_q.extend_from_slice(&req.position_ids[bufs.ctx_len..]);
+    // Stitch all requests into contiguous host slices, then upload each tensor
+    // in a single H2D copy — matches Qwen3's batch metadata upload pattern and
+    // avoids one launch per request per tensor.
+    let mut noise_flat = Vec::with_capacity(batch_size * q_len * hidden);
+    let mut target_flat = Vec::with_capacity(batch_size * ctx_len * target_hidden);
+    let mut pos_q = Vec::with_capacity(batch_size * q_len);
+    let mut pos_ctx = Vec::with_capacity(batch_size * ctx_len);
+    for req in requests {
+        noise_flat.extend_from_slice(req.noise_embedding);
+        target_flat.extend_from_slice(req.target_hidden);
+        pos_ctx.extend_from_slice(&req.position_ids[..ctx_len]);
+        pos_q.extend_from_slice(&req.position_ids[ctx_len..]);
     }
+
+    let mut noise_dst = bufs.noise.data.slice_mut(..noise_flat.len());
+    ctx.stream.memcpy_htod(&noise_flat, &mut noise_dst)?;
+    let mut target_dst = bufs.target_hidden.data.slice_mut(..target_flat.len());
+    ctx.stream.memcpy_htod(&target_flat, &mut target_dst)?;
     let mut dst_q = bufs.positions_q.slice_mut(..pos_q.len());
     ctx.stream.memcpy_htod(&pos_q, &mut dst_q)?;
     let mut dst_ctx = bufs.positions_ctx.slice_mut(..pos_ctx.len());

@@ -265,6 +265,7 @@ fn dflash_executor_returns_request_tagged_batch_outputs() {
         DFlashExecutorOptions {
             max_batch_size: 2,
             max_step_context_len: 2,
+            max_q_len: 3,
             max_seq_len: 8,
         },
     )
@@ -350,6 +351,7 @@ fn dflash_scheduler_accepts_host_requests() {
             executor: DFlashExecutorOptions {
                 max_batch_size: 2,
                 max_step_context_len: 2,
+                max_q_len: 3,
                 max_seq_len: 8,
             },
             max_wait: std::time::Duration::from_millis(50),
@@ -437,6 +439,7 @@ fn dflash_scheduler_manages_draft_cache() {
             executor: DFlashExecutorOptions {
                 max_batch_size: 2,
                 max_step_context_len: 2,
+                max_q_len: 3,
                 max_seq_len: 8,
             },
             max_wait: std::time::Duration::from_millis(10),
@@ -503,6 +506,7 @@ fn dflash_scheduler_control_messages_are_fifo() {
             executor: DFlashExecutorOptions {
                 max_batch_size: 2,
                 max_step_context_len: 2,
+                max_q_len: 3,
                 max_seq_len: 8,
             },
             max_wait: std::time::Duration::from_millis(100),
@@ -555,6 +559,7 @@ fn dflash_cache_control_rejects_unknown_request_ids() {
         DFlashExecutorOptions {
             max_batch_size: 2,
             max_step_context_len: 2,
+            max_q_len: 3,
             max_seq_len: 8,
         },
     )
