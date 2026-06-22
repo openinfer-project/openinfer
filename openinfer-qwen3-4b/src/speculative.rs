@@ -231,7 +231,11 @@ mod tests {
 
     #[test]
     fn batched_accepts_matching_prefix_plus_posterior_bonus() {
-        let req = VerifyStepItem::new(RequestId(7), vec![10, 11, 12, 13], SamplingParams::default());
+        let req = VerifyStepItem::new(
+            RequestId(7),
+            vec![10, 11, 12, 13],
+            SamplingParams::default(),
+        );
         let results = build_verify_results(&[req], &[11, 12, 99, 100]).expect("verify results");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].request_id, RequestId(7));

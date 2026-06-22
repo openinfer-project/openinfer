@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_core::sampler::SamplingParams;
 use openinfer_qwen3_4b::{
-    DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
-    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS,
+    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap,
+    Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
 };
 
 mod common;
@@ -34,7 +34,9 @@ const GENERATED_TOKENS: usize = 256;
 fn target_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => Some(MODEL_PATH.to_string()),
+        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
+            Some(MODEL_PATH.to_string())
+        }
         Err(_) => None,
     }
 }
@@ -42,7 +44,9 @@ fn target_path_or_skip() -> Option<String> {
 fn draft_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(DRAFT_PATH).join("config.json").exists() => Some(DRAFT_PATH.to_string()),
+        Err(_) if Path::new(DRAFT_PATH).join("config.json").exists() => {
+            Some(DRAFT_PATH.to_string())
+        }
         Err(_) => None,
     }
 }
@@ -115,7 +119,9 @@ fn measure(handle: &EngineHandle, prompts: &[Vec<u32>]) -> f64 {
 #[test]
 fn dflash_speculative_single_stream_speedup() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
-        eprintln!("skipping dflash perf A/B: set OPENINFER_TEST_MODEL_PATH + OPENINFER_DFLASH_TEST_MODEL_PATH");
+        eprintln!(
+            "skipping dflash perf A/B: set OPENINFER_TEST_MODEL_PATH + OPENINFER_DFLASH_TEST_MODEL_PATH"
+        );
         return;
     };
 

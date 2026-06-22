@@ -16,7 +16,10 @@ pub(super) fn dflash_prefill_supported(req: &PrefillStepItem) -> bool {
 
 /// Eligible AND continuous: either the first chunk, or a later chunk whose
 /// earlier chunks already captured context (no gaps in the pending buffer).
-pub(super) fn dflash_prefill_can_capture(req: &PrefillStepItem, pending_state_exists: bool) -> bool {
+pub(super) fn dflash_prefill_can_capture(
+    req: &PrefillStepItem,
+    pending_state_exists: bool,
+) -> bool {
     dflash_prefill_supported(req) && (req.chunk_start == 0 || pending_state_exists)
 }
 
@@ -59,12 +62,21 @@ mod tests {
 
     #[test]
     fn prefill_action_table() {
-        assert_eq!(dflash_prefill_action(true, true), DFlashPrefillAction::MarkReady);
+        assert_eq!(
+            dflash_prefill_action(true, true),
+            DFlashPrefillAction::MarkReady
+        );
         assert_eq!(
             dflash_prefill_action(true, false),
             DFlashPrefillAction::KeepPending
         );
-        assert_eq!(dflash_prefill_action(false, true), DFlashPrefillAction::Drop);
-        assert_eq!(dflash_prefill_action(false, false), DFlashPrefillAction::Drop);
+        assert_eq!(
+            dflash_prefill_action(false, true),
+            DFlashPrefillAction::Drop
+        );
+        assert_eq!(
+            dflash_prefill_action(false, false),
+            DFlashPrefillAction::Drop
+        );
     }
 }

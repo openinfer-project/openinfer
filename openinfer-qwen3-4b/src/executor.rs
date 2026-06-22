@@ -490,10 +490,7 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
-        StepCommand::SpeculativeVerify {
-            requests,
-            kv_views,
-        } => {
+        StepCommand::SpeculativeVerify { requests, kv_views } => {
             // One target forward over each request's K+1 draft span with a
             // speculative KV view. echo=true yields all-position logits so we
             // can argmax every span position — accept_greedy needs the target's
@@ -526,11 +523,9 @@ fn execute_step_on_lane(
                 requests: request_results,
             }))
         }
-        StepCommand::SpeculativeDraft { requests } => {
-            Ok(WorkerStepOutcome::SpeculativeDraft(
-                lane.execute_dflash_draft(requests)?,
-            ))
-        }
+        StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
+            lane.execute_dflash_draft(requests)?,
+        )),
     }
 }
 
@@ -2584,9 +2579,7 @@ enum StepCommand {
     },
     /// Speculative draft: roll the DFlash draft model forward one block per
     /// request. Uses the draft's own KV — no target KV views.
-    SpeculativeDraft {
-        requests: Vec<DraftStepItem>,
-    },
+    SpeculativeDraft { requests: Vec<DraftStepItem> },
 }
 
 impl StepCommand {

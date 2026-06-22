@@ -96,10 +96,9 @@ impl LocalQwen3Lane {
                 // (see `max_context_tokens`), so this `.min` is a defensive floor:
                 // it keeps the draft KV alloc within the draft's max positions even
                 // if a caller bypasses admission.
-                let max_cache_len = (req.prompt_tokens.len()
-                    + req.max_output_tokens
-                    + dflash.model.block_size())
-                .min(dflash.model.max_position_embeddings());
+                let max_cache_len =
+                    (req.prompt_tokens.len() + req.max_output_tokens + dflash.model.block_size())
+                        .min(dflash.model.max_position_embeddings());
                 let mut state = match dflash.requests.remove(&req.request_id) {
                     Some(state) => state,
                     None => dflash.model.new_request_state(&ctx, max_cache_len)?,
@@ -224,13 +223,13 @@ impl LocalQwen3Lane {
         let result = (|| -> Result<Vec<DraftRequestResult>> {
             let mut outputs = Vec::with_capacity(requests.len());
             for req in requests {
-                let mut state = dflash
-                    .requests
-                    .remove(&req.request_id)
-                    .ok_or_else(|| anyhow::anyhow!("missing DFlash state for {:?}", req.request_id))?;
-                let draft_logits = dflash
-                    .model
-                    .draft_logits(&self.model, &mut state, req.current_token)?;
+                let mut state = dflash.requests.remove(&req.request_id).ok_or_else(|| {
+                    anyhow::anyhow!("missing DFlash state for {:?}", req.request_id)
+                })?;
+                let draft_logits =
+                    dflash
+                        .model
+                        .draft_logits(&self.model, &mut state, req.current_token)?;
                 let draft_len = draft_logits.seq_len;
                 let greedy = SamplingParams::default();
                 let params: Vec<&SamplingParams> = vec![&greedy; draft_len];

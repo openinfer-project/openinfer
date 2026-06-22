@@ -1037,7 +1037,12 @@ fn lora_control_waits_until_scheduler_idle() {
 use crate::speculative::VerifyRequestResult;
 use openinfer_core::engine::FinishReason;
 
-fn spec_active(id: u64, generated_count: usize, max_tokens: usize, ignore_eos: bool) -> ActiveRequestState {
+fn spec_active(
+    id: u64,
+    generated_count: usize,
+    max_tokens: usize,
+    ignore_eos: bool,
+) -> ActiveRequestState {
     let (token_tx, _rx) = TokenSink::standalone();
     ActiveRequestState {
         request_id: RequestId(id),
@@ -1072,10 +1077,20 @@ fn speculative_full_span_accept_continues() {
     let results = [spec_result(1, vec![10, 11, 12, 13])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndContinue { request_id, tokens, completion_tokens }] => {
+        [
+            effects::DecodeEffect::EmitManyAndContinue {
+                request_id,
+                tokens,
+                completion_tokens,
+            },
+        ] => {
             assert_eq!(*request_id, RequestId(1));
             assert_eq!(tokens, &vec![10, 11, 12, 13]);
-            assert_eq!(*completion_tokens, 3 + 4, "completion = prior generated + span len");
+            assert_eq!(
+                *completion_tokens,
+                3 + 4,
+                "completion = prior generated + span len"
+            );
         }
         _ => panic!("expected EmitManyAndContinue"),
     }
@@ -1089,10 +1104,25 @@ fn speculative_stop_token_midspan_finishes_and_suppresses_eos() {
     let results = [spec_result(1, vec![10, 11, SPEC_EOS, 13])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndFinish { tokens, finish_reason, completion_tokens, .. }] => {
-            assert_eq!(tokens, &vec![10, 11], "EOS itself is suppressed from emission");
+        [
+            effects::DecodeEffect::EmitManyAndFinish {
+                tokens,
+                finish_reason,
+                completion_tokens,
+                ..
+            },
+        ] => {
+            assert_eq!(
+                tokens,
+                &vec![10, 11],
+                "EOS itself is suppressed from emission"
+            );
             assert!(matches!(finish_reason, FinishReason::Stop));
-            assert_eq!(*completion_tokens, 5 + 3, "the EOS still counts toward completion length");
+            assert_eq!(
+                *completion_tokens,
+                5 + 3,
+                "the EOS still counts toward completion length"
+            );
         }
         _ => panic!("expected EmitManyAndFinish(Stop)"),
     }
@@ -1105,7 +1135,14 @@ fn speculative_stop_token_at_span_start_emits_nothing() {
     let results = [spec_result(1, vec![SPEC_EOS, 11, 12])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndFinish { tokens, finish_reason, completion_tokens, .. }] => {
+        [
+            effects::DecodeEffect::EmitManyAndFinish {
+                tokens,
+                finish_reason,
+                completion_tokens,
+                ..
+            },
+        ] => {
             assert!(tokens.is_empty(), "stop at position 0 emits no tokens");
             assert!(matches!(finish_reason, FinishReason::Stop));
             assert_eq!(*completion_tokens, 5 + 1);
@@ -1122,10 +1159,24 @@ fn speculative_max_tokens_truncates_midspan() {
     let results = [spec_result(1, vec![10, 11, 12, 13])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndFinish { tokens, finish_reason, completion_tokens, .. }] => {
-            assert_eq!(tokens, &vec![10, 11], "the budget-hitting token is emitted, the rest dropped");
+        [
+            effects::DecodeEffect::EmitManyAndFinish {
+                tokens,
+                finish_reason,
+                completion_tokens,
+                ..
+            },
+        ] => {
+            assert_eq!(
+                tokens,
+                &vec![10, 11],
+                "the budget-hitting token is emitted, the rest dropped"
+            );
             assert!(matches!(finish_reason, FinishReason::Length));
-            assert_eq!(*completion_tokens, 10, "completion stops exactly at max_tokens");
+            assert_eq!(
+                *completion_tokens, 10,
+                "completion stops exactly at max_tokens"
+            );
         }
         _ => panic!("expected EmitManyAndFinish(Length)"),
     }
@@ -1139,7 +1190,11 @@ fn speculative_ignore_eos_does_not_stop() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [effects::DecodeEffect::EmitManyAndContinue { tokens, .. }] => {
-            assert_eq!(tokens, &vec![SPEC_EOS, SPEC_EOS], "ignore_eos passes stop tokens through");
+            assert_eq!(
+                tokens,
+                &vec![SPEC_EOS, SPEC_EOS],
+                "ignore_eos passes stop tokens through"
+            );
         }
         _ => panic!("expected EmitManyAndContinue"),
     }
@@ -1150,8 +1205,8 @@ fn speculative_resolves_each_request_independently() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 0, 100, false), spec_active(2, 0, 100, false)];
     let results = [
-        spec_result(1, vec![10, 11]),         // continues
-        spec_result(2, vec![20, SPEC_EOS]),   // finishes on EOS
+        spec_result(1, vec![10, 11]),       // continues
+        spec_result(2, vec![20, SPEC_EOS]), // finishes on EOS
     ];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     assert!(matches!(

@@ -45,8 +45,8 @@ use std::time::Duration;
 use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_core::sampler::SamplingParams;
 use openinfer_qwen3_4b::{
-    DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
-    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS,
+    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap,
+    Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
 };
 
 mod common;
@@ -71,7 +71,9 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn target_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => Some(MODEL_PATH.to_string()),
+        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
+            Some(MODEL_PATH.to_string())
+        }
         Err(_) => {
             eprintln!(
                 "skipping dflash gate: {MODEL_PATH}/config.json missing; set OPENINFER_TEST_MODEL_PATH"
@@ -84,7 +86,9 @@ fn target_path_or_skip() -> Option<String> {
 fn draft_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(DRAFT_PATH).join("config.json").exists() => Some(DRAFT_PATH.to_string()),
+        Err(_) if Path::new(DRAFT_PATH).join("config.json").exists() => {
+            Some(DRAFT_PATH.to_string())
+        }
         Err(_) => {
             eprintln!(
                 "skipping dflash gate: {DRAFT_PATH}/config.json missing; set OPENINFER_DFLASH_TEST_MODEL_PATH"
@@ -180,7 +184,7 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
                 return Step {
                     id,
                     top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-                }
+                };
             }
             Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
             Some(TokenEvent::Finished { .. }) => panic!("echo prefill finished without a token"),
@@ -427,7 +431,9 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
                 panic!("draft-headroom request was admitted instead of rejected")
             }
             Some(TokenEvent::Error { message, .. }) => {
-                panic!("draft-headroom request errored mid-flight instead of clean rejection: {message}")
+                panic!(
+                    "draft-headroom request errored mid-flight instead of clean rejection: {message}"
+                )
             }
             None => panic!("scheduler channel closed without a rejection"),
         }

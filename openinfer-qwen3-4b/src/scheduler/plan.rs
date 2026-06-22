@@ -12,11 +12,15 @@ use crate::speculative::{
 use super::{ActiveRequestState, PendingRequest};
 
 pub(super) enum ExecutionPlan {
-    Prefill { pending: Vec<PendingRequest> },
+    Prefill {
+        pending: Vec<PendingRequest>,
+    },
     Decode,
     /// Draft + verify the whole active batch (all requests are draft-ready).
     SpeculativeDecode,
-    Unified { pending: Vec<PendingRequest> },
+    Unified {
+        pending: Vec<PendingRequest>,
+    },
 }
 
 pub(super) enum ExecutionArtifacts {
