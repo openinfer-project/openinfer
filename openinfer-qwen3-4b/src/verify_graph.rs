@@ -9,25 +9,28 @@
 //! capture moving pointers.
 //!
 //! [`VerifyGraphBuffers`] pre-allocates all of that once at the worst-case shape
-//! (`max_batch * span` rows) and refills it in place each step.
-//! [`Qwen3Model::batch_prefill_into`] is the buffer-reusing twin of
-//! `batch_prefill`: it issues the *same* kernel sequence
-//! (`forward_layer_batch_paged`, identical to the allocating path) so the verify
-//! result stays bit-for-bit equivalent. This is the pre-requisite refactor for
-//! capturing the verify forward into a CUDA Graph — this phase does the buffer
-//! reuse only, no graph capture yet.
+//! (`max_batch * span` rows) and refills it in place each step, then captures the
+//! forward into a **piecewise** CUDA Graph: the dense ops (embedding, RMSNorm,
+//! every GEMM, SwiGLU, residual adds — ~84% of the per-step kernel-launch gap)
+//! are captured per segment and replayed, while the attention op runs EAGER
+//! between segments. Attention must stay eager because FlashInfer's paged-prefill
+//! kernel fixes its KV-iteration count when the graph is recorded; with the verify
+//! context growing every step, a captured attention would under-read KV and
+//! corrupt later tokens. The dense segments are shape-stable in the fixed
+//! `span`-row layout, so one capture replays losslessly for the request's life.
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
+use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::tensor::HiddenStates;
 use openinfer_kv_cache::KvView;
 
+use crate::batch_decode_buffers::BATCH_BUCKETS;
 use crate::config::PREFILL_ATTENTION_CTA_TILE_Q;
-use crate::lora::DeviceLoraTokenGroup;
 use crate::prefill::PrefillBuffers;
 use crate::weights::Qwen3Model;
 
@@ -50,6 +53,11 @@ pub(crate) struct VerifyGraphBuffers {
     token_ids_d: CudaSlice<u32>,
     /// Paged-attention plan, refilled in place each step.
     plan: PrefillPagedPlan,
+    /// Piecewise CUDA Graphs: `graphs[bucket_idx][segment]`. Each bucket's verify
+    /// forward is split into `num_layers + 1` dense segments (attention runs eager
+    /// between them); a segment is captured once at its exact-bucket batch and
+    /// replayed thereafter. Empty (`CudaGraphState::new()`) until first captured.
+    graphs: Vec<Vec<CudaGraphState>>,
     max_batch: usize,
     span: usize,
 }
@@ -108,6 +116,15 @@ impl VerifyGraphBuffers {
                 max_batch,
                 max_tiles,
             )?,
+            // num_layers + 1 dense segments per bucket (attention is eager between).
+            graphs: BATCH_BUCKETS
+                .iter()
+                .map(|_| {
+                    (0..model.config().num_hidden_layers + 1)
+                        .map(|_| CudaGraphState::new())
+                        .collect()
+                })
+                .collect(),
             max_batch,
             span,
         })
@@ -141,12 +158,13 @@ impl VerifyGraphBuffers {
 }
 
 impl Qwen3Model {
-    /// Buffer-reusing twin of [`Qwen3Model::batch_prefill`] for the DFlash verify
-    /// forward. Issues the identical kernel sequence
-    /// ([`Self::forward_layer_batch_paged`] is reused verbatim), so the all-
-    /// position logits and captured hidden states are bit-for-bit equal to the
-    /// allocating path; only the buffer *source* differs (reused vs. freshly
-    /// allocated). Results land in `bufs` (`all_logits()` / `captured_hidden()`).
+    /// Fixed-buffer, piecewise-CUDA-Graph twin of [`Qwen3Model::batch_prefill`]
+    /// for the DFlash verify forward. Issues the same per-op kernels as the
+    /// allocating path (split into `forward_layer_pre_attn` / `forward_layer_attn`
+    /// / `forward_layer_post_attn`), so the all-position logits and captured hidden
+    /// states match it; only the buffer *source* differs (reused vs. freshly
+    /// allocated) and the dense ops replay from a graph. Results land in `bufs`
+    /// (`all_logits()` / `captured_hidden()`).
     ///
     /// `capture_layer_ids` must be the strictly-increasing DFlash target layers
     /// whose count matches the `num_capture_layers` `bufs` was built with.
@@ -199,8 +217,9 @@ impl Qwen3Model {
 
         bufs.set_rows(total_tokens);
 
-        // Embed the concatenated verify tokens directly into the fixed `hidden`
-        // buffer (device token staging, no host round-trip or allocation).
+        // --- prep: H2D staging that MUST stay outside the graph capture (CUDA
+        // Graph forbids host round-trips in a captured segment). The embedding
+        // kernel itself runs inside graph segment 0 and reads this buffer. ---
         let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
         anyhow::ensure!(
             all_tokens.len() == total_tokens,
@@ -209,10 +228,9 @@ impl Qwen3Model {
         );
         let ctx = self.device_ctx();
         // Stage the active tokens into the front of the fixed device buffer; the
-        // embedding kernel reads exactly `bufs.hidden.seq_len` (= total_tokens)
-        // ids from its base pointer, so the unused tail is never touched.
+        // embedding kernel reads exactly `total_tokens` ids from its base pointer,
+        // so the unused tail is never touched.
         ctx.stream.memcpy_htod(&all_tokens, &mut bufs.token_ids_d)?;
-        self.get_embeddings_batch_into(&bufs.token_ids_d, &mut bufs.hidden)?;
 
         // Refill the paged plan in place (same host math as the allocating path).
         let page_indices: Vec<Vec<i32>> =
@@ -233,40 +251,138 @@ impl Qwen3Model {
             PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
 
-        // Verify never uses LoRA — the draft/verify boundary is a plain token span.
-        let lora_groups: [DeviceLoraTokenGroup<'_>; 0] = [];
-        let mut next_capture = 0usize;
-        let hidden_size = self.config().hidden_size;
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // `forward_layer_batch_paged` ping-pongs: it writes the layer output
-            // into `bufs.prefill_bufs.hidden_out`, then swaps it with `hidden`.
-            // After the call `bufs.hidden` again holds the live residual stream
-            // (and `hidden_out` holds the now-free previous buffer). Both are
-            // pre-allocated, so the pointer swap is harmless across steps.
-            self.forward_layer_batch_paged(
-                layer_idx,
-                layer,
-                &mut bufs.hidden,
-                kv_buffer,
-                layout,
-                &bufs.plan,
-                &lora_groups,
-                &mut bufs.prefill_bufs,
-            )?;
-            if capture_layer_ids.get(next_capture) == Some(&layer_idx) {
-                ops::copy_hidden_rows_into(
-                    ctx,
-                    &bufs.hidden,
-                    &mut bufs.captured_hidden,
-                    next_capture * hidden_size,
-                )?;
-                next_capture += 1;
+        // --- piecewise CUDA Graph: dense ops captured per segment, attention
+        // EAGER between segments. FlashInfer's prefill attention freezes its KV
+        // iteration count at capture time (it tracks the growing context), so
+        // capturing it corrupts later tokens; every other op is shape-stable in
+        // the fixed `span`-row layout. Segments: [embed + L0.pre] [L0.attn]
+        // [L0.post + L1.pre] [L1.attn] ... [L_last.post + lm_head]. ---
+        let num_layers = self.layers.len();
+        match BATCH_BUCKETS.iter().position(|&b| b == batch_size) {
+            Some(bidx) => {
+                // Take the bucket's segment graphs out so the capture closures can
+                // borrow `bufs` mutably; restore them after (even on error).
+                let mut segs = std::mem::take(&mut bufs.graphs[bidx]);
+                let result = (|| -> Result<()> {
+                    segs[0].run_or_capture(ctx, || self.verify_seg_embed_pre(bufs))?;
+                    self.verify_attn(0, kv_buffer, layout, bufs)?;
+                    for i in 1..num_layers {
+                        segs[i].run_or_capture(ctx, || {
+                            self.verify_seg_post_pre(i, capture_layer_ids, bufs)
+                        })?;
+                        self.verify_attn(i, kv_buffer, layout, bufs)?;
+                    }
+                    segs[num_layers].run_or_capture(ctx, || {
+                        self.verify_seg_post_logits(capture_layer_ids, bufs)
+                    })?;
+                    Ok(())
+                })();
+                bufs.graphs[bidx] = segs;
+                result?;
+            }
+            None => {
+                // Off-bucket batch: run the same segments eager (no capture).
+                self.verify_seg_embed_pre(bufs)?;
+                self.verify_attn(0, kv_buffer, layout, bufs)?;
+                for i in 1..num_layers {
+                    self.verify_seg_post_pre(i, capture_layer_ids, bufs)?;
+                    self.verify_attn(i, kv_buffer, layout, bufs)?;
+                }
+                self.verify_seg_post_logits(capture_layer_ids, bufs)?;
             }
         }
 
-        // All-position logits: final RMS norm into `all_logits_normed`, then the
-        // lm_head GEMM into `all_logits` (both pre-allocated). Mirrors
-        // `compute_all_position_logits` but writes into fixed buffers.
+        Ok(())
+    }
+
+    /// Graph segment 0: embedding (reads the staged `token_ids_d`) plus layer 0's
+    /// pre-attention dense ops. Verify never uses LoRA, so the LoRA group is empty.
+    fn verify_seg_embed_pre(&self, bufs: &mut VerifyGraphBuffers) -> Result<()> {
+        self.get_embeddings_batch_into(&bufs.token_ids_d, &mut bufs.hidden)?;
+        self.forward_layer_pre_attn(
+            0,
+            &self.layers[0],
+            &bufs.hidden,
+            &[],
+            &mut bufs.prefill_bufs,
+        )
+    }
+
+    /// Eager attention for layer `i` — kept out of every graph (see
+    /// [`Self::forward_layer_attn`]). Touches only the fixed `prefill_bufs` and
+    /// the refilled `plan`.
+    fn verify_attn(
+        &self,
+        i: usize,
+        kv_buffer: &CudaSlice<half::bf16>,
+        layout: &KvLayout,
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<()> {
+        self.forward_layer_attn(
+            i,
+            &self.layers[i],
+            kv_buffer,
+            layout,
+            &bufs.plan,
+            &mut bufs.prefill_bufs,
+        )
+    }
+
+    /// Middle graph segment `i` (`1..num_layers`): finish layer `i-1`
+    /// (post-attention dense + DFlash-context capture), then start layer `i`
+    /// (pre-attention dense).
+    ///
+    /// The ping-pong swap inside `post_attn` is graph-safe regardless of layer
+    /// parity: `run_or_capture` runs the closure (and thus the CPU-side swap) only
+    /// on the capture step, so the captured graph bakes the exact buffer pointers
+    /// for every op; replay just relaunches them. Each step's segment-0 embedding
+    /// overwrites the same baked buffer that this segment's first `post_attn`
+    /// reads, so no stale residual can leak across steps. The only live (eager) op
+    /// between segments — attention — touches just `q/k/v_batch` / `attn_output`,
+    /// which never participate in the swap, so it is independent of `hidden`'s
+    /// logical pointer. Parity only decides which physical buffer holds the final
+    /// hidden; that choice is baked into the last segment either way.
+    fn verify_seg_post_pre(
+        &self,
+        i: usize,
+        capture_layer_ids: &[usize],
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<()> {
+        let prev = i - 1;
+        self.forward_layer_post_attn(
+            prev,
+            &self.layers[prev],
+            &mut bufs.hidden,
+            &[],
+            &mut bufs.prefill_bufs,
+        )?;
+        self.verify_capture_if_needed(prev, capture_layer_ids, bufs)?;
+        self.forward_layer_pre_attn(
+            i,
+            &self.layers[i],
+            &bufs.hidden,
+            &[],
+            &mut bufs.prefill_bufs,
+        )
+    }
+
+    /// Final graph segment: finish the last layer (post-attention + capture), then
+    /// the all-position logits (final RMSNorm + lm_head GEMM) into `all_logits`.
+    fn verify_seg_post_logits(
+        &self,
+        capture_layer_ids: &[usize],
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<()> {
+        let last = self.layers.len() - 1;
+        self.forward_layer_post_attn(
+            last,
+            &self.layers[last],
+            &mut bufs.hidden,
+            &[],
+            &mut bufs.prefill_bufs,
+        )?;
+        self.verify_capture_if_needed(last, capture_layer_ids, bufs)?;
+        let ctx = self.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
             &bufs.hidden,
@@ -280,7 +396,27 @@ impl Qwen3Model {
             &bufs.all_logits_normed,
             &mut bufs.all_logits,
         );
+        Ok(())
+    }
 
+    /// Copy layer `layer_idx`'s residual-stream hidden into the captured-hidden
+    /// buffer when that layer is a DFlash target. `capture_layer_ids` is strictly
+    /// increasing, so its position is the capture slot.
+    fn verify_capture_if_needed(
+        &self,
+        layer_idx: usize,
+        capture_layer_ids: &[usize],
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<()> {
+        if let Some(slot) = capture_layer_ids.iter().position(|&l| l == layer_idx) {
+            let hidden_size = self.config().hidden_size;
+            ops::copy_hidden_rows_into(
+                self.device_ctx(),
+                &bufs.hidden,
+                &mut bufs.captured_hidden,
+                slot * hidden_size,
+            )?;
+        }
         Ok(())
     }
 }

@@ -146,10 +146,24 @@ impl Qwen3Model {
         lora_groups: &[DeviceLoraTokenGroup<'_>],
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {
-        let num_heads = self.local_num_attention_heads();
-        let num_kv_heads = self.local_num_key_value_heads();
-        let head_dim = self.config.head_dim;
+        self.forward_layer_pre_attn(layer_idx, layer, hidden, lora_groups, bufs)?;
+        self.forward_layer_attn(layer_idx, layer, kv_buffer, layout, plan, bufs)?;
+        self.forward_layer_post_attn(layer_idx, layer, hidden, lora_groups, bufs)?;
+        Ok(())
+    }
 
+    /// Pre-attention dense ops: input RMSNorm + fused QKV projections (+ LoRA).
+    /// Reads `hidden`; writes `bufs.normed` / `bufs.q_batch` / `bufs.k_batch` /
+    /// `bufs.v_batch`. Graph-safe — shapes depend only on the fixed row count, not
+    /// on KV length — so the verify piecewise CUDA Graph captures it.
+    pub(crate) fn forward_layer_pre_attn(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        hidden: &HiddenStates,
+        lora_groups: &[DeviceLoraTokenGroup<'_>],
+        bufs: &mut PrefillBuffers,
+    ) -> Result<()> {
         // 1. RMSNorm → bufs.normed
         ops::rms_norm_batch_into(
             &self.ctx,
@@ -210,6 +224,26 @@ impl Qwen3Model {
             &mut bufs.v_batch,
             0,
         )?;
+        Ok(())
+    }
+
+    /// The attention op: q/k norm + RoPE + paged KV append + paged attention.
+    /// This is the ONLY part of the layer whose KV iteration count tracks the
+    /// (growing) context length, so the verify piecewise graph keeps it EAGER —
+    /// capturing it would freeze the KV length at capture time (`num_iterations`
+    /// in FlashInfer's prefill kernel is fixed when the graph is recorded).
+    pub(crate) fn forward_layer_attn(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        layout: &openinfer_core::kv_pool::KvLayout,
+        plan: &PrefillPagedPlan,
+        bufs: &mut PrefillBuffers,
+    ) -> Result<()> {
+        let num_heads = self.local_num_attention_heads();
+        let num_kv_heads = self.local_num_key_value_heads();
+        let head_dim = self.config.head_dim;
 
         // 3. Paged prefill: norm+RoPE → append K/V to paged → batch attention
         ops::prefill_attention_paged_into(
@@ -231,7 +265,21 @@ impl Qwen3Model {
             head_dim,
             self.config.rms_norm_eps,
         )?;
+        Ok(())
+    }
 
+    /// Post-attention dense ops: O projection + residual + MLP + final residual
+    /// add. Reads `bufs.attn_output` and `hidden`; writes the layer output back
+    /// into `hidden` via the ping-pong buffer swap. Graph-safe (no KV-length
+    /// dependence) — captured into the verify piecewise CUDA Graph.
+    pub(crate) fn forward_layer_post_attn(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        hidden: &mut HiddenStates,
+        lora_groups: &[DeviceLoraTokenGroup<'_>],
+        bufs: &mut PrefillBuffers,
+    ) -> Result<()> {
         // 4. O projection → bufs.o_buf (as o_batch)
         ops::gemm_into(
             &self.ctx,
