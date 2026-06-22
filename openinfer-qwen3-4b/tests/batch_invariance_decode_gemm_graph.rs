@@ -16,7 +16,7 @@ use openinfer_qwen3_4b::runtime::{
 
 const LOGPROBS: usize = 64;
 const MAX_OUTPUT_TOKENS: usize = 4;
-const SHORT_LEN: usize = 8; // < split-KV threshold (1024) -> NonPartition decode attention
+const SHORT_LEN: usize = 8; // short decode context; path now depends on bucket, not length (<=32 SplitKv, else NonPartition)
 
 // (label, real_small, real_large). bucket_for: 1->1, 3->4, 7->8, 15->16.
 // A (row 0) identical in all; only the bucket A pads into changes (decode GEMM N).

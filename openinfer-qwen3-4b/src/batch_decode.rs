@@ -94,7 +94,7 @@ impl Qwen3Model {
 
         let kv_refs: Vec<&KvView> = kv_views.iter().collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
-        let attention_path = bufs.attention_path(padded_bs);
+        let attention_path = BatchDecodeBuffers::attention_path(padded_bs);
         #[cfg(feature = "kernel-call-trace")]
         let trace_kv_len = kv_views.iter().map(|v| v.seq_len()).max().unwrap_or(0);
         if use_cuda_graph {

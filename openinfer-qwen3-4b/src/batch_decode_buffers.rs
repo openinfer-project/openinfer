@@ -22,15 +22,17 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[
     160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
-// Split-KV decode attention: the non-partitioned kernel runs one CTA per
-// request x head, starving SMs at small batch. 64-token chunks measured
-// fastest on RTX 5090 at ctx1024 (128/256 are 1-7% slower, 32 is past the
-// merge-overhead knee). Wins shrink with batch (bs8 -1.0ms, bs32 -0.4ms) and
-// reach noise level past bs40, where 320+ CTAs already fill the GPU.
+// Split-KV decode attention: the non-partitioned kernel issues one CTA per
+// (request x kv-head), starving SMs at small batch. The path is therefore
+// chosen by batch (CTA count vs SM count), NOT context length — at bs=1 the
+// 8 CTAs underfill the GPU at any seq_len, so SplitKv wins across the whole
+// context range. SPLIT_KV_MAX_BATCH_SIZE caps it where NonPartition's CTAs
+// already saturate the SMs (bs<=8 wins big, ~bs16 even, bs32 within ~1%).
+// 64-token chunks measured fastest on RTX 5090 (128/256 are 1-7% slower, 32
+// past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
 const SPLIT_KV_CHUNK_TOKENS: usize = 64;
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
-const SPLIT_KV_MIN_SEQ_LEN: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DecodeAttentionPath {
@@ -318,8 +320,8 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
-    pub(crate) fn attention_path(&self, padded_bs: usize) -> DecodeAttentionPath {
-        if padded_bs <= SPLIT_KV_MAX_BATCH_SIZE && self.max_seq_len >= SPLIT_KV_MIN_SEQ_LEN {
+    pub(crate) fn attention_path(padded_bs: usize) -> DecodeAttentionPath {
+        if padded_bs <= SPLIT_KV_MAX_BATCH_SIZE {
             DecodeAttentionPath::SplitKv
         } else {
             DecodeAttentionPath::NonPartition
