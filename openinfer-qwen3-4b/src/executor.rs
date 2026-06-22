@@ -2361,7 +2361,12 @@ impl LocalQwen3Lane {
             max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),
         };
-        self.dflash = Some(DFlashLaneState::new(model));
+        let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
+        self.dflash = Some(DFlashLaneState::new(
+            self.model.device_ctx(),
+            model,
+            max_decode_batch_size,
+        )?);
         Ok(meta)
     }
 

@@ -13,26 +13,36 @@ use openinfer_core::tensor::HiddenStates;
 
 use super::dflash_prefill::{dflash_prefill_can_capture, should_capture_dflash_prefill_context};
 use super::{LocalQwen3Lane, PrefillStepItem, RequestId};
-use crate::dflash::{DFlashDraftModel, DFlashRequestState};
+use crate::dflash::{DFlashBatchScratch, DFlashDraftModel, DFlashRequestState};
 use crate::speculative::{
     DraftRequestResult, DraftResult, DraftStepItem, VerifyRequestResult, VerifyStepItem,
 };
+use openinfer_core::tensor::DeviceContext;
 
 pub(super) struct DFlashLaneState {
     pub(super) model: DFlashDraftModel,
     pub(super) requests: HashMap<RequestId, DFlashRequestState>,
+    /// Lane-level batched draft scratch, allocated once for the whole decode
+    /// batch so the dense draft ops run once instead of once per request.
+    scratch: DFlashBatchScratch,
     verified_draft_tokens: usize,
     accepted_draft_tokens: usize,
 }
 
 impl DFlashLaneState {
-    pub(super) fn new(model: DFlashDraftModel) -> Self {
-        Self {
+    pub(super) fn new(
+        ctx: &DeviceContext,
+        model: DFlashDraftModel,
+        max_decode_batch_size: usize,
+    ) -> Result<Self> {
+        let scratch = model.new_batch_scratch(ctx, max_decode_batch_size)?;
+        Ok(Self {
             model,
             requests: HashMap::new(),
+            scratch,
             verified_draft_tokens: 0,
             accepted_draft_tokens: 0,
-        }
+        })
     }
 }
 
@@ -215,36 +225,81 @@ impl LocalQwen3Lane {
         }
 
         // Take the lane out of `self` so the draft forward (which borrows
-        // `self.model`) and the argmax (which borrows `self.sample_scratch`)
-        // don't collide on a `self` borrow.
+        // `dflash.model`/`dflash.scratch`) and the argmax (which borrows
+        // `self.sample_scratch`) don't collide on a `self` borrow.
         let Some(mut dflash) = self.dflash.take() else {
             anyhow::bail!("DFlash draft requested but DFlash is not loaded");
         };
         let result = (|| -> Result<Vec<DraftRequestResult>> {
-            let mut outputs = Vec::with_capacity(requests.len());
+            // Pull every active request's state out of the map so the batched
+            // forward can hold `&mut` to all of them at once. Re-inserted below.
+            let mut taken: Vec<(RequestId, DFlashRequestState)> =
+                Vec::with_capacity(requests.len());
             for req in requests {
-                let mut state = dflash.requests.remove(&req.request_id).ok_or_else(|| {
+                let state = dflash.requests.remove(&req.request_id).ok_or_else(|| {
                     anyhow::anyhow!("missing DFlash state for {:?}", req.request_id)
                 })?;
-                let draft_logits =
-                    dflash
-                        .model
-                        .draft_logits(&self.model, &mut state, req.current_token)?;
+                taken.push((req.request_id, state));
+            }
+
+            let block_size = dflash.model.block_size();
+            let current_tokens: Vec<u32> = requests.iter().map(|req| req.current_token).collect();
+            let DFlashLaneState {
+                model,
+                scratch,
+                requests: state_map,
+                ..
+            } = &mut dflash;
+            let mut state_refs: Vec<&mut DFlashRequestState> =
+                taken.iter_mut().map(|(_, state)| state).collect();
+
+            let sampled = {
+                let draft_logits = model.draft_logits_batched(
+                    &self.model,
+                    &mut state_refs,
+                    &current_tokens,
+                    scratch,
+                )?;
                 let draft_len = draft_logits.seq_len;
+                anyhow::ensure!(
+                    draft_len == requests.len() * block_size,
+                    "DFlash batched draft produced {} logits rows for {} requests x block {}",
+                    draft_len,
+                    requests.len(),
+                    block_size
+                );
                 let greedy = SamplingParams::default();
                 let params: Vec<&SamplingParams> = vec![&greedy; draft_len];
-                let sampled = self.select_step_tokens(draft_logits, &params, 0)?;
-                dflash.requests.insert(req.request_id, state);
+                self.select_step_tokens(draft_logits, &params, 0)?
+            };
+
+            // Re-insert every request's state before splitting the result.
+            for (request_id, state) in taken {
+                state_map.insert(request_id, state);
+            }
+
+            anyhow::ensure!(
+                sampled.len() == requests.len() * block_size,
+                "DFlash batched draft sampled {} tokens for {} requests x block {}",
+                sampled.len(),
+                requests.len(),
+                block_size
+            );
+
+            // Split the batched samples per request: request `i` owns rows
+            // `[i * block_size, (i + 1) * block_size)`. Verify span = [current
+            // dangling token, draft_1, …, draft_{K}].
+            let mut outputs = Vec::with_capacity(requests.len());
+            for (i, req) in requests.iter().enumerate() {
+                let block = &sampled[i * block_size..(i + 1) * block_size];
                 anyhow::ensure!(
-                    sampled.len() == draft_len && sampled.len() >= 2,
-                    "DFlash draft sampled {} tokens from {} logits columns",
-                    sampled.len(),
-                    draft_len
+                    block.len() >= 2,
+                    "DFlash draft block {} has fewer than 2 tokens",
+                    i
                 );
-                // Verify span = [current dangling token, draft_1, …, draft_{K}].
-                let mut token_ids = Vec::with_capacity(sampled.len());
+                let mut token_ids = Vec::with_capacity(block.len());
                 token_ids.push(req.current_token);
-                token_ids.extend(sampled.into_iter().skip(1));
+                token_ids.extend(block[1..].iter().copied());
                 outputs.push(DraftRequestResult {
                     request_id: req.request_id,
                     token_ids,

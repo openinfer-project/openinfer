@@ -25,7 +25,10 @@ pub(crate) struct DFlashDraftModel {
 pub(crate) struct DFlashRequestState {
     layers: Vec<DFlashLayerCache>,
     pending_context: DFlashPendingContext,
-    scratch: DFlashDraftScratch,
+    /// Projected target context for the current draft round. Computed once from
+    /// `pending_context` and read by every layer's tail concat, so it lives with
+    /// the request (the batched scratch only holds one request's varlen tail).
+    context: DFlashContextScratch,
     committed_len: usize,
     max_cache_len: usize,
 }
@@ -35,12 +38,20 @@ pub(crate) struct DFlashRequestState {
 /// draft buffers live outside the paged `KvCacheManager`). Split by how it scales:
 ///
 /// - `kv_bytes_per_token` scales with the KV pool (billed by shrinking the target
-///   block count): the draft's own KV cache plus the scratch-context and
-///   pending-context buffers, which currently persist at prompt length per
+///   block count): the draft's own KV cache plus the per-request context-projection
+///   and pending-context buffers, which currently persist at prompt length per
 ///   request (see `dflash-speculative-decoding.md` — collapsing that persistence
 ///   is a tracked follow-up that would shrink this term to the draft KV alone).
 /// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
-///   the draft weights plus the block-sized scratch across the decode batch.
+///   the draft weights plus the lane-level batched scratch sized for the whole
+///   decode batch.
+///
+// TODO: the draft scratch is now a single lane-level `DFlashBatchScratch`
+// allocated once (dense buffers sized `max_batch * block_size`, plus one shared
+// varlen tail), not a per-request buffer. The per-token `tail_scratch` term and
+// the per-request `block_headroom` tail term are therefore over-estimates — kept
+// as a conservative upper bound until the accounting is retuned against the
+// batched allocation.
 pub(crate) struct DFlashMemoryReservation {
     pub(crate) kv_bytes_per_token: usize,
     pub(crate) fixed_bytes: usize,
@@ -70,10 +81,13 @@ impl DFlashMemoryReservation {
         let pending = hidden * capture_layers * BF16; // context_feature_dim
         let kv_bytes_per_token = draft_kv + context_scratch + tail_scratch + pending;
 
-        // Block-sized scratch held per live request (DFlashDraftScratch fixed buffers).
-        let fixed_scratch_per_request =
-            BF16 * config.block_size * (config.vocab_size + 5 * hidden + 2 * q_dim + 3 * inter);
-        let scratch_total = fixed_scratch_per_request * max_decode_batch_size;
+        // Lane-level batched dense scratch: every dense buffer is sized for the
+        // whole decode batch (`max_batch * block_size` rows), allocated once.
+        // Same total magnitude as the old per-request scratch summed over the
+        // batch, but now one contiguous allocation.
+        let dense_scratch_per_block_row =
+            BF16 * (config.vocab_size + 5 * hidden + 2 * q_dim + 3 * inter);
+        let scratch_total = dense_scratch_per_block_row * config.block_size * max_decode_batch_size;
 
         // Draft weights (5 transformer layers + the context projection), +10% slack
         // for norms, rope caches, and allocator alignment.
@@ -111,19 +125,34 @@ struct DFlashPendingContext {
     capacity: usize,
 }
 
-struct DFlashDraftScratch {
+/// Per-request projected context. The fc projection + hidden_norm turn the
+/// captured target hidden context into draft hidden space once per draft round;
+/// every layer's tail concat reads `context_hidden`, so it must persist across
+/// the layer loop and therefore lives in the request (not the shared scratch).
+struct DFlashContextScratch {
     max_context_len: usize,
-    block_token_ids_h: Vec<u32>,
-    token_ids_d: CudaSlice<u32>,
     context_projected: HiddenStates,
     context_hidden: HiddenStates,
+}
+
+/// Lane-level batched draft scratch, allocated once for the whole decode batch.
+///
+/// Dense buffers (`hidden`, `normed`, `q_batch`, `attn_output`, the MLP buffers,
+/// and `logits`) hold `max_batch * block_size` rows so the GEMM / rms_norm /
+/// silu / add / logits / embedding ops run ONCE over the batched buffer. The
+/// varlen tail buffers (`tail_input`, `k_tail`, `v_tail`) stay sized for a single
+/// request and are reused inside the per-request loop, because their ops (tail
+/// concat, k/v GEMMs, rope, KV copy, attention) still loop per request — Step 2
+/// will batch those via CUDA-kernel changes.
+pub(crate) struct DFlashBatchScratch {
+    max_batch_block_rows: usize,
+    max_tail_len: usize,
+    block_token_ids_h: Vec<u32>,
+    token_ids_d: CudaSlice<u32>,
     hidden: HiddenStates,
     hidden_out: HiddenStates,
     normed: HiddenStates,
-    tail_input: HiddenStates,
     q_batch: HiddenStates,
-    k_tail: HiddenStates,
-    v_tail: HiddenStates,
     attn_output: HiddenStates,
     o_buf: HiddenStates,
     gate_out: HiddenStates,
@@ -131,6 +160,10 @@ struct DFlashDraftScratch {
     act_out: HiddenStates,
     logits_normed: HiddenStates,
     logits: HiddenStates,
+    // Shared single-request varlen tail scratch (reused inside the per-request loop).
+    tail_input: HiddenStates,
+    k_tail: HiddenStates,
+    v_tail: HiddenStates,
 }
 
 impl DFlashRequestState {
@@ -228,66 +261,115 @@ impl DFlashPendingContext {
     }
 }
 
-impl DFlashDraftScratch {
-    fn new(ctx: &DeviceContext, config: &DFlashConfig, max_context_len: usize) -> Result<Self> {
+impl DFlashContextScratch {
+    fn new(ctx: &DeviceContext, hidden_size: usize, max_context_len: usize) -> Result<Self> {
+        Ok(Self {
+            max_context_len,
+            context_projected: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
+            context_hidden: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
+        })
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        ctx: &DeviceContext,
+        hidden_size: usize,
+        context_len: usize,
+    ) -> Result<()> {
+        if context_len > self.max_context_len {
+            *self = Self::new(ctx, hidden_size, context_len)?;
+        }
+        self.context_projected.seq_len = context_len;
+        self.context_hidden.seq_len = context_len;
+        Ok(())
+    }
+}
+
+impl DFlashBatchScratch {
+    fn new(
+        ctx: &DeviceContext,
+        config: &DFlashConfig,
+        max_decode_batch_size: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            max_decode_batch_size > 0,
+            "DFlash batch scratch needs a non-zero batch size"
+        );
         let block_size = config.block_size;
         let hidden_size = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let inter_dim = config.intermediate_size;
-        let tail_capacity = max_context_len + block_size;
+        // Dense buffers span the whole decode batch so the dense ops run once.
+        let batch_rows = block_size * max_decode_batch_size;
+        // The shared varlen tail starts at one block (no committed context yet)
+        // and grows on demand via `ensure_tail_capacity`.
+        let tail_capacity = block_size;
 
         Ok(Self {
-            max_context_len,
-            block_token_ids_h: vec![config.dflash_config.mask_token_id; block_size],
-            token_ids_d: ctx.stream.alloc_zeros(block_size)?,
-            context_projected: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
-            context_hidden: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
-            hidden: HiddenStates::zeros(ctx, hidden_size, block_size)?,
-            hidden_out: HiddenStates::zeros(ctx, hidden_size, block_size)?,
-            normed: HiddenStates::zeros(ctx, hidden_size, block_size)?,
+            max_batch_block_rows: batch_rows,
+            max_tail_len: tail_capacity,
+            block_token_ids_h: vec![config.dflash_config.mask_token_id; batch_rows],
+            token_ids_d: ctx.stream.alloc_zeros(batch_rows)?,
+            hidden: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
+            hidden_out: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
+            normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
+            q_batch: HiddenStates::zeros(ctx, q_dim, batch_rows)?,
+            attn_output: HiddenStates::zeros(ctx, q_dim, batch_rows)?,
+            o_buf: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
+            gate_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
+            up_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
+            act_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
+            logits_normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
+            logits: HiddenStates::zeros(ctx, config.vocab_size, batch_rows)?,
             tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
-            q_batch: HiddenStates::zeros(ctx, q_dim, block_size)?,
             k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
             v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
-            attn_output: HiddenStates::zeros(ctx, q_dim, block_size)?,
-            o_buf: HiddenStates::zeros(ctx, hidden_size, block_size)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, block_size)?,
-            up_out: HiddenStates::zeros(ctx, inter_dim, block_size)?,
-            act_out: HiddenStates::zeros(ctx, inter_dim, block_size)?,
-            logits_normed: HiddenStates::zeros(ctx, hidden_size, block_size)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, block_size)?,
         })
     }
 
-    fn ensure_context_capacity(
+    /// Point every dense buffer at the active `batch_block_rows = active_batch *
+    /// block_size` prefix. Allocated for the max decode batch, so this only
+    /// shrinks `seq_len`; it never reallocates.
+    fn activate_dense(&mut self, batch_block_rows: usize) {
+        assert!(
+            batch_block_rows <= self.max_batch_block_rows,
+            "DFlash batched draft {} block rows exceeds scratch capacity {}",
+            batch_block_rows,
+            self.max_batch_block_rows
+        );
+        self.hidden.seq_len = batch_block_rows;
+        self.hidden_out.seq_len = batch_block_rows;
+        self.normed.seq_len = batch_block_rows;
+        self.q_batch.seq_len = batch_block_rows;
+        self.attn_output.seq_len = batch_block_rows;
+        self.o_buf.seq_len = batch_block_rows;
+        self.gate_out.seq_len = batch_block_rows;
+        self.up_out.seq_len = batch_block_rows;
+        self.act_out.seq_len = batch_block_rows;
+        self.logits_normed.seq_len = batch_block_rows;
+        self.logits.seq_len = batch_block_rows;
+    }
+
+    /// Size the shared varlen tail buffers for one request's `tail_len =
+    /// context_len + block_size`, growing the allocation if needed.
+    fn ensure_tail_capacity(
         &mut self,
         ctx: &DeviceContext,
         config: &DFlashConfig,
-        context_len: usize,
+        tail_len: usize,
     ) -> Result<()> {
-        if context_len > self.max_context_len {
-            *self = Self::new(ctx, config, context_len)?;
+        if tail_len > self.max_tail_len {
+            let hidden_size = config.hidden_size;
+            let kv_dim = config.num_key_value_heads * config.head_dim;
+            self.tail_input = HiddenStates::zeros(ctx, hidden_size, tail_len)?;
+            self.k_tail = HiddenStates::zeros(ctx, kv_dim, tail_len)?;
+            self.v_tail = HiddenStates::zeros(ctx, kv_dim, tail_len)?;
+            self.max_tail_len = tail_len;
         }
-        let block_size = config.block_size;
-        let tail_len = context_len + block_size;
-
-        self.context_projected.seq_len = context_len;
-        self.context_hidden.seq_len = context_len;
-        self.hidden.seq_len = block_size;
-        self.hidden_out.seq_len = block_size;
-        self.normed.seq_len = block_size;
         self.tail_input.seq_len = tail_len;
-        self.q_batch.seq_len = block_size;
         self.k_tail.seq_len = tail_len;
         self.v_tail.seq_len = tail_len;
-        self.attn_output.seq_len = block_size;
-        self.o_buf.seq_len = block_size;
-        self.gate_out.seq_len = block_size;
-        self.up_out.seq_len = block_size;
-        self.act_out.seq_len = block_size;
-        self.logits_normed.seq_len = block_size;
-        self.logits.seq_len = block_size;
         Ok(())
     }
 }
@@ -487,6 +569,16 @@ impl DFlashDraftModel {
         Ok(())
     }
 
+    /// Allocate the lane-level batched draft scratch once, sized for the whole
+    /// decode batch. The per-request `DFlashRequestState` no longer owns scratch.
+    pub(crate) fn new_batch_scratch(
+        &self,
+        ctx: &DeviceContext,
+        max_decode_batch_size: usize,
+    ) -> Result<DFlashBatchScratch> {
+        DFlashBatchScratch::new(ctx, &self.config, max_decode_batch_size)
+    }
+
     pub(crate) fn new_request_state(
         &self,
         ctx: &DeviceContext,
@@ -513,7 +605,11 @@ impl DFlashDraftModel {
                 self.context_feature_dim(),
                 self.config.block_size.min(max_cache_len),
             )?,
-            scratch: DFlashDraftScratch::new(ctx, &self.config, self.config.block_size)?,
+            context: DFlashContextScratch::new(
+                ctx,
+                self.config.hidden_size,
+                self.config.block_size,
+            )?,
             committed_len: 0,
             max_cache_len,
         })
@@ -563,159 +659,229 @@ impl DFlashDraftModel {
         Ok(())
     }
 
-    pub(crate) fn draft_logits<'a>(
+    /// Batched draft forward over all active requests at once.
+    ///
+    /// The *dense* ops (embedding, rms_norm, q / o / gate_up / down GEMMs, silu,
+    /// add, fused_add_rms_norm, logits) run ONCE over an `active_batch *
+    /// block_size` batched buffer. The *varlen* ops (context projection, tail
+    /// concat, k/v GEMMs, rope, KV copy, attention) still loop per request,
+    /// slicing each request's `block_size` rows at offset `i * block_size` in the
+    /// batched buffers — those are Step 2/3's job to batch via CUDA-kernel changes.
+    ///
+    /// Returns the batched logits (`active_batch * block_size` rows): request `i`
+    /// owns rows `[i * block_size, (i + 1) * block_size)`.
+    pub(crate) fn draft_logits_batched<'a>(
         &self,
         target: &Qwen3Model,
-        state: &'a mut DFlashRequestState,
-        current_token: u32,
+        states: &mut [&mut DFlashRequestState],
+        current_tokens: &[u32],
+        scratch: &'a mut DFlashBatchScratch,
     ) -> Result<&'a HiddenStates> {
         let ctx = target.device_ctx();
-        let Some(context_len) = state.pending_context_len() else {
-            anyhow::bail!("DFlash draft requested before target hidden context is available");
-        };
-        let block_size = self.block_size();
-        let tail_len = context_len + block_size;
+        let active_batch = states.len();
         anyhow::ensure!(
-            state.committed_len + tail_len <= state.max_cache_len,
-            "DFlash draft cache overflow: committed={}, tail={}, max={}",
-            state.committed_len,
-            tail_len,
-            state.max_cache_len
+            active_batch > 0,
+            "DFlash batched draft needs active requests"
         );
+        anyhow::ensure!(
+            states.len() == current_tokens.len(),
+            "DFlash batched draft: {} states vs {} current tokens",
+            states.len(),
+            current_tokens.len()
+        );
+        let block_size = self.block_size();
+        let batch_block_rows = active_batch * block_size;
 
-        state
-            .scratch
-            .ensure_context_capacity(ctx, &self.config, context_len)?;
-        state.scratch.block_token_ids_h.fill(self.mask_token_id());
-        state.scratch.block_token_ids_h[0] = current_token;
+        // Each request's committed context length for this round; advancing
+        // `committed_len` is deferred until after the layer loop (the rope start
+        // positions and KV write offsets read the pre-advance value).
+        let mut context_lens = Vec::with_capacity(active_batch);
+        for (i, state) in states.iter().enumerate() {
+            let Some(context_len) = state.pending_context_len() else {
+                anyhow::bail!(
+                    "DFlash draft requested before target hidden context is available (request slot {i})"
+                );
+            };
+            let tail_len = context_len + block_size;
+            anyhow::ensure!(
+                state.committed_len + tail_len <= state.max_cache_len,
+                "DFlash draft cache overflow: committed={}, tail={}, max={}",
+                state.committed_len,
+                tail_len,
+                state.max_cache_len
+            );
+            context_lens.push(context_len);
+        }
+
+        scratch.activate_dense(batch_block_rows);
+
+        // Build the batched token id buffer: each request's block is
+        // [current_token, mask, mask, ...].
+        scratch.block_token_ids_h[..batch_block_rows].fill(self.mask_token_id());
+        for (i, &current_token) in current_tokens.iter().enumerate() {
+            scratch.block_token_ids_h[i * block_size] = current_token;
+        }
+        // token_ids_d holds `max_batch * block_size` ids; copy only the active
+        // prefix. The embedding kernel reads `out.seq_len = batch_block_rows` ids
+        // from the buffer start, so the active prefix is what it consumes.
+        let mut token_ids_dst = scratch.token_ids_d.slice_mut(..batch_block_rows);
         ctx.stream.memcpy_htod(
-            &state.scratch.block_token_ids_h,
-            &mut state.scratch.token_ids_d,
+            &scratch.block_token_ids_h[..batch_block_rows],
+            &mut token_ids_dst,
         )?;
-        target.get_embeddings_batch_into(&state.scratch.token_ids_d, &mut state.scratch.hidden)?;
+        target.get_embeddings_batch_into(&scratch.token_ids_d, &mut scratch.hidden)?;
 
-        state.pending_context.activate_for_read();
-        self.project_context_into(ctx, &state.pending_context.buffer, &mut state.scratch)?;
-        state.pending_context.clear();
+        // Per-request context projection: varlen (each request's committed
+        // prefix differs), persisted in the request so every layer can read it.
+        for (i, state) in states.iter_mut().enumerate() {
+            let context_len = context_lens[i];
+            state
+                .context
+                .ensure_capacity(ctx, self.config.hidden_size, context_len)?;
+            state.pending_context.activate_for_read();
+            self.project_context_into(ctx, &state.pending_context.buffer, &mut state.context)?;
+            state.pending_context.clear();
+        }
 
         let hidden_size = self.config.hidden_size;
         let q_dim = self.config.num_attention_heads * self.config.head_dim;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
         let inter_dim = self.config.intermediate_size;
-        debug_assert_eq!(state.scratch.hidden.hidden_dim, hidden_size);
-        debug_assert_eq!(state.scratch.q_batch.hidden_dim, q_dim);
-        debug_assert_eq!(state.scratch.k_tail.hidden_dim, kv_dim);
-        debug_assert_eq!(state.scratch.gate_out.hidden_dim, inter_dim);
+        debug_assert_eq!(scratch.hidden.hidden_dim, hidden_size);
+        debug_assert_eq!(scratch.q_batch.hidden_dim, q_dim);
+        debug_assert_eq!(scratch.k_tail.hidden_dim, kv_dim);
+        debug_assert_eq!(scratch.gate_out.hidden_dim, inter_dim);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Dense: input layernorm over the whole batch.
             ops::rms_norm_batch_into(
                 ctx,
-                &state.scratch.hidden,
+                &scratch.hidden,
                 &layer.input_layernorm,
                 self.config.rms_norm_eps,
-                &mut state.scratch.normed,
+                &mut scratch.normed,
             );
 
-            ops::copy_hidden_token_range_into(
-                ctx,
-                &state.scratch.context_hidden,
-                0,
-                &mut state.scratch.tail_input,
-                0,
-                context_len,
-            )?;
-            ops::copy_hidden_token_range_into(
-                ctx,
-                &state.scratch.normed,
-                0,
-                &mut state.scratch.tail_input,
-                context_len,
-                block_size,
-            )?;
-
+            // Dense: Q projection over the whole batch (per-token, no cross-request
+            // mixing). Computed before the per-request loop reads `normed`, and
+            // before the post-attention norm overwrites it.
             ops::gemm_rows_into(
                 ctx,
                 &layer.attention.qkv_proj,
                 0,
                 q_dim,
-                &state.scratch.normed,
-                &mut state.scratch.q_batch,
-            );
-            ops::gemm_rows_into(
-                ctx,
-                &layer.attention.qkv_proj,
-                q_dim,
-                kv_dim,
-                &state.scratch.tail_input,
-                &mut state.scratch.k_tail,
-            );
-            ops::gemm_rows_into(
-                ctx,
-                &layer.attention.qkv_proj,
-                q_dim + kv_dim,
-                kv_dim,
-                &state.scratch.tail_input,
-                &mut state.scratch.v_tail,
+                &scratch.normed,
+                &mut scratch.q_batch,
             );
 
-            ops::dflash_qk_norm_rope_into(
-                ctx,
-                &mut state.scratch.q_batch,
-                &mut state.scratch.k_tail,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &self.cos_cache,
-                &self.sin_cache,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-                state.committed_len + context_len,
-                state.committed_len,
-                self.config.rms_norm_eps,
-            )?;
+            // Per-request varlen attention: tail concat, k/v GEMMs, rope, KV copy,
+            // single-request prefill. Each request slices its `block_size` rows at
+            // offset `i * block_size` of the batched `normed`/`q_batch`/`attn_output`.
+            for (i, state) in states.iter_mut().enumerate() {
+                let context_len = context_lens[i];
+                let tail_len = context_len + block_size;
+                let row_offset = i * block_size;
+                scratch.ensure_tail_capacity(ctx, &self.config, tail_len)?;
 
-            let cache = &mut state.layers[layer_idx];
-            ops::copy_hidden_token_range_into(
-                ctx,
-                &state.scratch.k_tail,
-                0,
-                &mut cache.k,
-                state.committed_len,
-                tail_len,
-            )?;
-            ops::copy_hidden_token_range_into(
-                ctx,
-                &state.scratch.v_tail,
-                0,
-                &mut cache.v,
-                state.committed_len,
-                tail_len,
-            )?;
-            ops::single_prefill_nhd_noncausal_into(
-                ctx,
-                &state.scratch.q_batch,
-                &cache.k,
-                &cache.v,
-                &mut state.scratch.attn_output,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-                state.committed_len + tail_len,
-            )?;
+                // tail_input = [context_hidden(context_len) | normed_block(block_size)].
+                ops::copy_hidden_token_range_into(
+                    ctx,
+                    &state.context.context_hidden,
+                    0,
+                    &mut scratch.tail_input,
+                    0,
+                    context_len,
+                )?;
+                ops::copy_hidden_token_range_into(
+                    ctx,
+                    &scratch.normed,
+                    row_offset,
+                    &mut scratch.tail_input,
+                    context_len,
+                    block_size,
+                )?;
 
+                ops::gemm_rows_into(
+                    ctx,
+                    &layer.attention.qkv_proj,
+                    q_dim,
+                    kv_dim,
+                    &scratch.tail_input,
+                    &mut scratch.k_tail,
+                );
+                ops::gemm_rows_into(
+                    ctx,
+                    &layer.attention.qkv_proj,
+                    q_dim + kv_dim,
+                    kv_dim,
+                    &scratch.tail_input,
+                    &mut scratch.v_tail,
+                );
+
+                ops::dflash_qk_norm_rope_into(
+                    ctx,
+                    &mut scratch.q_batch,
+                    row_offset,
+                    block_size,
+                    &mut scratch.k_tail,
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    state.committed_len + context_len,
+                    state.committed_len,
+                    self.config.rms_norm_eps,
+                )?;
+
+                let cache = &mut state.layers[layer_idx];
+                ops::copy_hidden_token_range_into(
+                    ctx,
+                    &scratch.k_tail,
+                    0,
+                    &mut cache.k,
+                    state.committed_len,
+                    tail_len,
+                )?;
+                ops::copy_hidden_token_range_into(
+                    ctx,
+                    &scratch.v_tail,
+                    0,
+                    &mut cache.v,
+                    state.committed_len,
+                    tail_len,
+                )?;
+                ops::single_prefill_nhd_noncausal_into(
+                    ctx,
+                    &scratch.q_batch,
+                    row_offset,
+                    block_size,
+                    &cache.k,
+                    &cache.v,
+                    &mut scratch.attn_output,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    state.committed_len + tail_len,
+                )?;
+            }
+
+            // Dense: o_proj + residual + post-attention norm + MLP over the batch.
             ops::gemm_into(
                 ctx,
                 &layer.attention.o_proj,
-                &state.scratch.attn_output,
-                &mut state.scratch.o_buf,
+                &scratch.attn_output,
+                &mut scratch.o_buf,
             );
             openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
                 ctx,
-                &mut state.scratch.hidden,
-                &state.scratch.o_buf,
+                &mut scratch.hidden,
+                &scratch.o_buf,
                 &layer.post_attention_layernorm,
                 self.config.rms_norm_eps,
-                &mut state.scratch.normed,
+                &mut scratch.normed,
             )?;
 
             ops::gemm_rows_into(
@@ -723,41 +889,43 @@ impl DFlashDraftModel {
                 &layer.mlp.gate_up_proj,
                 0,
                 inter_dim,
-                &state.scratch.normed,
-                &mut state.scratch.gate_out,
+                &scratch.normed,
+                &mut scratch.gate_out,
             );
             ops::gemm_rows_into(
                 ctx,
                 &layer.mlp.gate_up_proj,
                 inter_dim,
                 inter_dim,
-                &state.scratch.normed,
-                &mut state.scratch.up_out,
+                &scratch.normed,
+                &mut scratch.up_out,
             );
             ops::silu_mul_batch_into(
                 ctx,
-                &state.scratch.gate_out,
-                &state.scratch.up_out,
-                &mut state.scratch.act_out,
+                &scratch.gate_out,
+                &scratch.up_out,
+                &mut scratch.act_out,
             )?;
             ops::gemm_into(
                 ctx,
                 &layer.mlp.down_proj,
-                &state.scratch.act_out,
-                &mut state.scratch.o_buf,
+                &scratch.act_out,
+                &mut scratch.o_buf,
             );
             ops::add_batch_into(
                 ctx,
-                &state.scratch.hidden,
-                &state.scratch.o_buf,
-                &mut state.scratch.hidden_out,
+                &scratch.hidden,
+                &scratch.o_buf,
+                &mut scratch.hidden_out,
             )?;
-            std::mem::swap(&mut state.scratch.hidden, &mut state.scratch.hidden_out);
+            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
         }
 
-        state.committed_len += context_len;
-        self.compute_logits_with_target_head_into(target, &mut state.scratch)?;
-        Ok(&state.scratch.logits)
+        for (i, state) in states.iter_mut().enumerate() {
+            state.committed_len += context_lens[i];
+        }
+        self.compute_logits_with_target_head_into(target, scratch)?;
+        Ok(&scratch.logits)
     }
 
     fn context_feature_dim(&self) -> usize {
@@ -768,20 +936,20 @@ impl DFlashDraftModel {
         &self,
         ctx: &DeviceContext,
         context_features: &HiddenStates,
-        scratch: &mut DFlashDraftScratch,
+        context: &mut DFlashContextScratch,
     ) -> Result<()> {
         ops::gemm_into(
             ctx,
             &self.fc,
             context_features,
-            &mut scratch.context_projected,
+            &mut context.context_projected,
         );
         ops::rms_norm_batch_into(
             ctx,
-            &scratch.context_projected,
+            &context.context_projected,
             &self.hidden_norm,
             self.config.rms_norm_eps,
-            &mut scratch.context_hidden,
+            &mut context.context_hidden,
         );
         Ok(())
     }
@@ -789,7 +957,7 @@ impl DFlashDraftModel {
     fn compute_logits_with_target_head_into(
         &self,
         target: &Qwen3Model,
-        scratch: &mut DFlashDraftScratch,
+        scratch: &mut DFlashBatchScratch,
     ) -> Result<()> {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
