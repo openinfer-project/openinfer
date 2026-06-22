@@ -73,6 +73,23 @@ impl PrefillBuffers {
             attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
         })
     }
+
+    /// Point every scratch buffer's logical row count at `rows` without
+    /// reallocating. Used by the fixed-buffer verify path (see
+    /// [`crate::verify_graph`]); the buffers must have been allocated for at
+    /// least `rows`.
+    pub(super) fn set_rows(&mut self, rows: usize) {
+        self.hidden_out.seq_len = rows;
+        self.normed.seq_len = rows;
+        self.q_batch.seq_len = rows;
+        self.k_batch.seq_len = rows;
+        self.v_batch.seq_len = rows;
+        self.o_buf.seq_len = rows;
+        self.gate_out.seq_len = rows;
+        self.up_out.seq_len = rows;
+        self.act_out.seq_len = rows;
+        self.attn_output.seq_len = rows;
+    }
 }
 
 impl Qwen3Model {
@@ -118,7 +135,7 @@ impl Qwen3Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_layer_batch_paged(
+    pub(crate) fn forward_layer_batch_paged(
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,

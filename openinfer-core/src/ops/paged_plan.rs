@@ -147,6 +147,53 @@ impl PrefillPagedPlan {
         })
     }
 
+    /// Pre-allocate a worst-case-sized plan to be refilled in place by
+    /// [`Self::update_batch_with_cta_tile_q`] (graph-stable buffer reuse).
+    pub fn new_preallocated(
+        ctx: &DeviceContext,
+        max_total_tokens: usize,
+        max_total_pages: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: openinfer_kernels::ops::PrefillPagedPlan::new_preallocated(
+                ctx,
+                max_total_tokens,
+                max_total_pages,
+                max_batch,
+                max_tiles,
+            )?,
+        })
+    }
+
+    /// Refill a pre-allocated plan in place (no allocation, pointers unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_batch_with_cta_tile_q(
+        &mut self,
+        ctx: &DeviceContext,
+        page_indices: &[Vec<i32>],
+        last_page_lens: &[usize],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
+    ) -> Result<()> {
+        self.inner.update_batch_with_cta_tile_q(
+            ctx,
+            page_indices,
+            last_page_lens,
+            start_positions,
+            seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            cta_tile_q_override,
+        )
+    }
+
     pub fn page_indices_d(&self) -> &CudaSlice<i32> {
         self.inner.page_indices_d()
     }

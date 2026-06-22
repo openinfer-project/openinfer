@@ -14,6 +14,7 @@ mod prefill;
 mod scheduler;
 mod speculative;
 mod unified_forward;
+mod verify_graph;
 mod weights;
 
 use std::path::{Path, PathBuf};

@@ -30,6 +30,8 @@ use crate::speculative::{
 use dflash_lane::DFlashLaneState;
 use dflash_prefill::{DFlashPrefillAction, dflash_prefill_action};
 
+use crate::verify_graph::VerifyGraphBuffers;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) u64);
 
@@ -492,36 +494,13 @@ fn execute_step_on_lane(
         }
         StepCommand::SpeculativeVerify { requests, kv_views } => {
             // One target forward over each request's K+1 draft span with a
-            // speculative KV view. echo=true yields all-position logits so we
-            // can argmax every span position — accept_greedy needs the target's
-            // posterior at each position. The same forward captures target
-            // hidden states (at the DFlash layers) to seed the next draft.
-            let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
-            let no_lora: Vec<Option<&str>> = vec![None; requests.len()];
-            let capture_layer_ids = lane.dflash_capture_layer_ids();
-            let (_last_logits, all_logits, captured_hidden) = lane.execute_prefill(
-                &spans,
-                kv_views,
-                &no_lora,
-                true,
-                capture_layer_ids.as_deref(),
-            )?;
-            let all_logits = all_logits.ok_or_else(|| {
-                anyhow::anyhow!("speculative verify produced no per-position logits")
-            })?;
-            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
-            let greedy = SamplingParams::default();
-            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
-            let target_tokens = lane.select_step_tokens(&all_logits, &params, 0)?;
-            let request_results = build_verify_results(requests, &target_tokens)?;
-            lane.record_verify_dflash_context(
-                requests,
-                &request_results,
-                captured_hidden.as_ref(),
-            )?;
-            Ok(WorkerStepOutcome::SpeculativeVerify(VerifyResult {
-                requests: request_results,
-            }))
+            // speculative KV view. The fixed-buffer verify path computes all-
+            // position logits (accept_greedy needs the target's posterior at
+            // each span position) and captures the target hidden states (at the
+            // DFlash layers) to seed the next draft — all into reused,
+            // pointer-stable scratch (`VerifyGraphBuffers`).
+            let result = lane.execute_dflash_verify(requests, kv_views)?;
+            Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
             lane.execute_dflash_draft(requests)?,
@@ -2287,6 +2266,13 @@ struct LocalQwen3Lane {
     /// DFlash draft lane (the draft model + per-request draft state). `None`
     /// unless speculative decoding is enabled; only the primary rank carries it.
     dflash: Option<DFlashLaneState>,
+    /// Fixed, pre-allocated scratch for the DFlash verify forward. Lazily built
+    /// on the first verify step (its shape depends on the loaded draft model's
+    /// block size and the target's capture layers). Pointer-stable for the
+    /// upcoming verify CUDA Graph.
+    verify_bufs: Option<VerifyGraphBuffers>,
+    /// KV pool block count — the worst-case page-list bound for `verify_bufs`.
+    total_blocks: usize,
 }
 
 /// Stored state for an async prefill that was launched but not yet synced.
@@ -2343,6 +2329,8 @@ impl LocalQwen3Lane {
             sample_scratch,
             inflight_prefill: None,
             dflash: None,
+            verify_bufs: None,
+            total_blocks,
         })
     }
 
@@ -2484,6 +2472,69 @@ impl LocalQwen3Lane {
             echo,
             capture_layer_ids,
         )
+    }
+
+    /// DFlash verify forward over each request's `block_size`-token span, using
+    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation).
+    /// Numerically equivalent to the `batch_prefill(echo=true)` verify path it
+    /// replaces; the buffers are lazily built on first use.
+    fn execute_dflash_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+    ) -> Result<VerifyResult> {
+        let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
+            anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
+        })?;
+        let block_size = self
+            .dflash
+            .as_ref()
+            .expect("DFlash present when capture layers exist")
+            .model
+            .block_size();
+
+        if self.verify_bufs.is_none() {
+            let max_batch = *BATCH_BUCKETS.last().unwrap();
+            self.verify_bufs = Some(VerifyGraphBuffers::new(
+                &self.model,
+                max_batch,
+                block_size,
+                capture_layer_ids.len(),
+                self.total_blocks,
+            )?);
+        }
+
+        // Take the buffers out of `self` so the forward (borrows `&self.model`,
+        // `&mut bufs`) and the subsequent sampling (`&mut self.sample_scratch`)
+        // and context record (`&mut self.dflash`) don't alias a `self` borrow.
+        let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
+        let result = (|| -> Result<VerifyResult> {
+            let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
+            self.model.batch_prefill_into(
+                &spans,
+                kv_views,
+                self.kv_buffer.buffer(),
+                &self.layout,
+                &capture_layer_ids,
+                &mut bufs,
+            )?;
+
+            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
+            let greedy = SamplingParams::default();
+            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
+            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
+            let request_results = build_verify_results(requests, &target_tokens)?;
+            self.record_verify_dflash_context(
+                requests,
+                &request_results,
+                Some(bufs.captured_hidden()),
+            )?;
+            Ok(VerifyResult {
+                requests: request_results,
+            })
+        })();
+        self.verify_bufs = Some(bufs);
+        result
     }
 
     fn execute_decode(
