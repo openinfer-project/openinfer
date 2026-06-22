@@ -113,6 +113,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
             .expect("valid memory options"),
         lora: None,
         decode_overlap: DecodeOverlap::Off,
+        batch_invariant: false,
         dflash_draft_model_path: draft,
     }
 }

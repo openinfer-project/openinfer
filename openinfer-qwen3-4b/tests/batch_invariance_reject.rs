@@ -27,6 +27,7 @@ fn batch_invariant_rejects_decode_overlap() {
         Qwen3MemoryOptions::default(),
         DecodeOverlap::SharedSm,
         true,
+        None,
     )
     .err()
     .expect("--batch-invariant + --decode-overlap must be rejected");
