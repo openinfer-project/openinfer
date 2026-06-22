@@ -168,6 +168,21 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    /// Strided segment copy for DFlash batch K/V concatenation. Copies one
+    /// segment (ctx or noise) of every request from a contiguous source to a
+    /// strided destination in a single launch. See `strided_segment_copy_cuda`
+    /// in `csrc/shared/elementwise.cu`.
+    pub fn strided_segment_copy_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        dim: i32,
+        src_seg_len: i32,
+        dst_seg_total: i32,
+        dst_row_offset: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn cublas_init();
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;

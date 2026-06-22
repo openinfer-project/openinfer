@@ -263,23 +263,47 @@ impl DFlashDraftModel {
             config.rms_norm_eps,
         );
 
-        compact_kv(
+        // Concatenate per-request [ctx | noise] K/V into the contiguous layout
+        // the ragged attention kernel expects. Two strided segment copies per
+        // tensor (ctx segment at offset 0, noise segment at offset ctx_len)
+        // replace the old 2 * batch_size memcpy_dtod loop (`compact_kv`):
+        // bs=32 dropped from 128 launches/layer to 4.
+        let kv_seg_total = bufs.ctx_len + bufs.q_len;
+        ops::strided_segment_copy_into(
             ctx,
             &bufs.k_ctx,
+            &mut bufs.k_all,
+            bufs.ctx_len,
+            kv_seg_total,
+            0,
+            batch_size,
+        )?;
+        ops::strided_segment_copy_into(
+            ctx,
             &bufs.k_noise,
             &mut bufs.k_all,
-            batch_size,
-            bufs.ctx_len,
             bufs.q_len,
+            kv_seg_total,
+            bufs.ctx_len,
+            batch_size,
         )?;
-        compact_kv(
+        ops::strided_segment_copy_into(
             ctx,
             &bufs.v_ctx,
+            &mut bufs.v_all,
+            bufs.ctx_len,
+            kv_seg_total,
+            0,
+            batch_size,
+        )?;
+        ops::strided_segment_copy_into(
+            ctx,
             &bufs.v_noise,
             &mut bufs.v_all,
-            batch_size,
-            bufs.ctx_len,
             bufs.q_len,
+            kv_seg_total,
+            bufs.ctx_len,
+            batch_size,
         )?;
         bufs.prepare_ragged_plan(self, batch_size)?;
         let cached_plan = bufs.ragged_plan.take().expect("ragged plan exists");
@@ -395,39 +419,6 @@ fn compact_host_inputs(
     ctx.stream.memcpy_htod(&pos_q, &mut dst_q)?;
     let mut dst_ctx = bufs.positions_ctx.slice_mut(..pos_ctx.len());
     ctx.stream.memcpy_htod(&pos_ctx, &mut dst_ctx)?;
-    Ok(())
-}
-
-fn compact_kv(
-    ctx: &DeviceContext,
-    ctx_part: &HiddenStates,
-    noise_part: &HiddenStates,
-    out: &mut HiddenStates,
-    batch_size: usize,
-    ctx_len: usize,
-    q_len: usize,
-) -> Result<()> {
-    let dim = ctx_part.hidden_dim;
-    for i in 0..batch_size {
-        copy_hidden(
-            ctx,
-            ctx_part,
-            i * ctx_len,
-            out,
-            i * (ctx_len + q_len),
-            dim,
-            ctx_len,
-        )?;
-        copy_hidden(
-            ctx,
-            noise_part,
-            i * q_len,
-            out,
-            i * (ctx_len + q_len) + ctx_len,
-            dim,
-            q_len,
-        )?;
-    }
     Ok(())
 }
 

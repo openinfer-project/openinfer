@@ -1,6 +1,6 @@
 # Qwen3-4B-DFlash model
 
-**TL;DR**: `openinfer-qwen3-4b-dflash` supports only the `z-lab/Qwen3-4B-DFlash-b16` model. It now has two draft-only execution surfaces: the original bs1 transformers-parity forward path, and an internal exact-shape batch runner/scheduler that batches already-prepared `noise_embedding`, selected target hidden states, and `position_ids`. The forward gate currently measures mean delta `0.034243`, p99 `0.125000`, max `0.500000` over 7,680 output values for uncached, unified-cache one-shot, and first-step draft-cache paths; batch-vs-single and executor request-tag smoke extend that gate. Cache control APIs are fail-closed for unknown request ids. The scheduler thread now joins on handle drop (mirrors `EngineHandle`) and resident draft caches are bounded by `max_caches` with an explicit `drop_cache` retirement path (mirrors Qwen3 `drop_request`); over-cap admission fails closed. Target verification, acceptance, fallback token selection, and OpenAI serving remain out of scope.
+**TL;DR**: `openinfer-qwen3-4b-dflash` supports only the `z-lab/Qwen3-4B-DFlash-b16` model. It now has two draft-only execution surfaces: the original bs1 transformers-parity forward path, and an internal exact-shape batch runner/scheduler that batches already-prepared `noise_embedding`, selected target hidden states, and `position_ids`. The forward gate currently measures mean delta `0.034243`, p99 `0.125000`, max `0.500000` over 7,680 output values for uncached, unified-cache one-shot, and first-step draft-cache paths; batch-vs-single and executor request-tag smoke extend that gate. Cache control APIs are fail-closed for unknown request ids. The scheduler thread now joins on handle drop (mirrors `EngineHandle`) and resident draft caches are bounded by `max_caches` with an explicit `drop_cache` retirement path (mirrors Qwen3 `drop_request`); over-cap admission fails closed. The batch K/V concatenation now uses a fused `strided_segment_copy` kernel instead of a per-request `memcpy_dtod` loop, lifting bs32 draft throughput from ~42K to ~63K tok/s (1.5x) with zero accuracy drift. Target verification, acceptance, fallback token selection, and OpenAI serving remain out of scope.
 
 Last touched: 2026-06
 
@@ -237,17 +237,21 @@ Observed local batch runner sweep on the same WSL/CUDA `sm_120` setup,
 
 | Batch | mean ms | p50 ms | p90 ms | p99 ms | draft tok/s | req/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 2.175 | 2.175 | 2.230 | 2.308 | 7,358 | 460 |
-| 2 | 2.488 | 2.446 | 2.607 | 2.947 | 12,859 | 804 |
-| 4 | 3.790 | 3.794 | 3.928 | 4.014 | 16,886 | 1,055 |
-| 8 | 4.651 | 4.571 | 5.184 | 5.419 | 27,518 | 1,720 |
-| 16 | 7.260 | 7.223 | 7.582 | 8.302 | 35,264 | 2,204 |
-| 32 | 13.221 | 13.080 | 14.237 | 15.073 | 38,725 | 2,420 |
+| 1 | 2.065 | — | — | — | 7,748 | — |
+| 2 | 2.154 | — | — | — | 14,856 | — |
+| 4 | 3.118 | — | — | — | 20,525 | — |
+| 8 | 3.335 | — | — | — | 38,382 | — |
+| 16 | 4.699 | — | — | — | 54,476 | — |
+| 32 | 8.178 | — | — | — | 62,611 | — |
 
-The current batch path improves draft-token throughput by `5.3x` from bs1 to
-bs32 after moving the ragged attention plan into reusable batch buffers. This is
-draft-model throughput only; it does not include target hidden production,
-verification, acceptance, or fallback-token work.
+The batch path now improves draft-token throughput by `8.1x` from bs1 to bs32.
+The bs16/bs32 step gained ~1.5x after replacing the per-request `compact_kv`
+memcpy loop (`2 * batch_size` `memcpy_dtod` calls per K/V tensor per layer)
+with a single fused `strided_segment_copy` CUDA kernel — one launch copies the
+entire batch's ctx segment, another the noise segment, collapsing 128
+launches/layer at bs32 into 4. This is draft-model throughput only; it does not
+include target hidden production, verification, acceptance, or fallback-token
+work.
 
 On the local WSL setup used for the first run, the workspace-level vLLM git dependency and empty FlashInfer submodule required a narrower temporary workspace plus:
 

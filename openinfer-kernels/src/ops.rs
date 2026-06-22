@@ -23,8 +23,7 @@ pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
 };
 pub use dense_attention::{
-    RaggedPrefillPlan, batch_prefill_ragged_nhd_noncausal_into,
-    single_prefill_nhd_noncausal_into,
+    RaggedPrefillPlan, batch_prefill_ragged_nhd_noncausal_into, single_prefill_nhd_noncausal_into,
 };
 pub use elementwise::{
     accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, bf16_hidden_to_f32_into,
@@ -32,7 +31,7 @@ pub use elementwise::{
     gather_hidden_tokens_into, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
     scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
     scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into,
-    silu_mul_fused_batch_into, write_vec_into,
+    silu_mul_fused_batch_into, strided_segment_copy_into, write_vec_into,
 };
 pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
 #[cfg(feature = "kimi-k2")]
