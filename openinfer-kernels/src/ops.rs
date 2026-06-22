@@ -14,9 +14,10 @@ mod norm;
 mod sampling;
 
 pub use attention::{
-    PrefillPagedPlan, paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
-    qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
+    PrefillPagedPlan, k_norm_rope_batch_decode_into, paged_attention_batch_decode_hd256_into,
+    paged_attention_batch_decode_into, paged_attention_batch_decode_split_kv_into,
+    prefill_attention_paged_into, qk_norm_partial_rope_batched_decode_hd256_into,
+    qk_norm_rope_batch_decode_into,
 };
 #[cfg(feature = "kimi-k2")]
 pub use deepep::{

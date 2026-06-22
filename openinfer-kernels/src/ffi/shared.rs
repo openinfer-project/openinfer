@@ -246,6 +246,25 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    /// K-only norm + RoPE for the DFlash batch context-K path. Same per-head
+    /// RMSNorm + RoPE as `qk_norm_rope_batched_decode_cuda` but launches only
+    /// `num_kv_heads` blocks per token — the draft path has no context Q, so
+    /// the joint kernel wastes the Q work. See `k_norm_rope_batched_decode_cuda`
+    /// in `csrc/shared/prefill_attention.cu`.
+    pub fn k_norm_rope_batched_decode_cuda(
+        k: *mut Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        cos_max_pos: i32,
+        stream: CUstream,
+    );
+
     // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
     pub fn paged_kv_scatter_cuda(
         kv_data: *const Half,

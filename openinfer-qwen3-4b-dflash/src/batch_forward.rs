@@ -248,16 +248,17 @@ impl DFlashDraftModel {
             &bufs.target_normed,
             &mut bufs.v_ctx,
         )?;
-        ops::qk_norm_rope_batch_decode_into(
+        // Context-K needs norm + RoPE but has no corresponding Q. The K-only
+        // kernel launches num_kv_heads blocks per token instead of
+        // num_q_heads + num_kv_heads, dropping 80% of the joint kernel's work
+        // (the dead Q branch) for Qwen3-4B's 16:4 GQA ratio.
+        ops::k_norm_rope_batch_decode_into(
             ctx,
-            &mut bufs.q_ctx_scratch,
             &mut bufs.k_ctx,
-            &layer.attention.q_norm,
             &layer.attention.k_norm,
             &self.cos_cache,
             &self.sin_cache,
             &bufs.positions_ctx,
-            config.num_attention_heads,
             config.num_key_value_heads,
             config.head_dim,
             config.rms_norm_eps,
