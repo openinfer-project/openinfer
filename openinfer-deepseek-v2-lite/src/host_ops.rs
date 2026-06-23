@@ -4,12 +4,12 @@ use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 use crate::{Config, device::activate};
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct DecodeCache {
     pub(crate) layers: Vec<LayerCache>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct LayerCache {
     keys: Vec<f32>,
     values: Vec<f32>,

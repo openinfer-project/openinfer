@@ -259,11 +259,6 @@ impl MixedRequestScheduler {
         let prompt_tokens = self.active.iter().map(|state| state.prompt_len).sum();
         let mut stats = self.generator.new_generation_stats(prompt_tokens);
         let mut attribution = DecodeAttributionProfile::disabled();
-        let original_caches: Vec<_> = self
-            .active
-            .iter()
-            .map(|state| state.cache.clone())
-            .collect();
         let mut caches: Vec<_> = self
             .active
             .iter_mut()
@@ -278,23 +273,25 @@ impl MixedRequestScheduler {
             token_index,
         );
 
-        for (state, cache) in self.active.iter_mut().zip(caches) {
-            state.cache = cache;
-        }
-
         match result {
-            Ok(next_tokens) => {
-                if next_tokens.len() != self.active.len() {
-                    self.restore_caches(original_caches);
-                    self.decode_single_rows();
-                    return;
+            Ok(next_tokens) if next_tokens.len() == self.active.len() => {
+                for (state, cache) in self.active.iter_mut().zip(caches) {
+                    state.cache = cache;
                 }
                 self.apply_decoded_tokens(next_tokens);
             }
-            Err(_err) => {
-                self.restore_caches(original_caches);
-                self.decode_single_rows();
-            }
+            // The batched path mutates per-row caches as it advances through the
+            // model. This gate avoids full-cache rollback clones; a batch decode
+            // failure is therefore a shared runtime error for the active rows.
+            Ok(next_tokens) => self.retire_active_batch_error(format!(
+                "DeepSeek-V2-Lite batched decode returned {} rows for {} active requests",
+                next_tokens.len(),
+                self.active.len()
+            )),
+            Err(err) => self.retire_active_batch_error(format!(
+                "DeepSeek-V2-Lite batched decode failed for {} active requests: {err}",
+                self.active.len()
+            )),
         }
     }
 
@@ -334,10 +331,14 @@ impl MixedRequestScheduler {
         self.active = survivors;
     }
 
-    fn restore_caches(&mut self, caches: Vec<DecodeCache>) {
-        for (state, cache) in self.active.iter_mut().zip(caches) {
-            state.cache = cache;
-        }
+    fn retire_active_batch_error(&mut self, message: String) {
+        retire_active_requests_with_error(&mut self.active, message);
+    }
+}
+
+fn retire_active_requests_with_error(active: &mut Vec<ActiveRequestState>, message: String) {
+    for state in active.drain(..) {
+        state.emit_error(message.clone());
     }
 }
 
@@ -837,6 +838,71 @@ mod tests {
         };
 
         assert!(state.emit_token_or_finish(12));
+    }
+
+    #[test]
+    fn batch_decode_error_retires_all_active_requests() {
+        let config = test_lite_config();
+        let (first_tx, mut first_rx) = TokenSink::standalone();
+        let (second_tx, mut second_rx) = TokenSink::standalone();
+        let mut active = vec![
+            ActiveRequestState {
+                request_id: Some("first".to_string()),
+                token_tx: first_tx,
+                prompt_len: 3,
+                max_tokens: 8,
+                generated: 2,
+                last_token: 11,
+                finish_policy: FinishPolicy {
+                    eos_token_id: config.eos_token_id,
+                    ignore_eos: false,
+                },
+                cache: DecodeCache::new(&config),
+                stats: GenerationStats::default(),
+            },
+            ActiveRequestState {
+                request_id: Some("second".to_string()),
+                token_tx: second_tx,
+                prompt_len: 4,
+                max_tokens: 8,
+                generated: 1,
+                last_token: 12,
+                finish_policy: FinishPolicy {
+                    eos_token_id: config.eos_token_id,
+                    ignore_eos: false,
+                },
+                cache: DecodeCache::new(&config),
+                stats: GenerationStats::default(),
+            },
+        ];
+
+        retire_active_requests_with_error(&mut active, "batch failed".to_string());
+
+        assert!(active.is_empty());
+        match recv_event(&mut first_rx) {
+            TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                assert_eq!(message, "batch failed");
+                assert_eq!(prompt_tokens, 3);
+                assert_eq!(completion_tokens, 2);
+            }
+            _ => panic!("first active request should receive batch error"),
+        }
+        match recv_event(&mut second_rx) {
+            TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                assert_eq!(message, "batch failed");
+                assert_eq!(prompt_tokens, 4);
+                assert_eq!(completion_tokens, 1);
+            }
+            _ => panic!("second active request should receive batch error"),
+        }
     }
 
     #[test]
