@@ -3,6 +3,8 @@
 mod attention;
 #[cfg(feature = "kimi-k2")]
 mod deepep;
+#[cfg(feature = "deepseek-v2-lite")]
+mod deepseek_v2_lite;
 mod dense_attention;
 mod elementwise;
 mod embedding;
@@ -23,6 +25,8 @@ pub use attention::{
 pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
 };
+#[cfg(feature = "deepseek-v2-lite")]
+pub use deepseek_v2_lite::*;
 pub use dense_attention::{
     RaggedPrefillPlan, batch_prefill_ragged_nhd_noncausal_into, single_prefill_nhd_noncausal_into,
 };
@@ -38,9 +42,12 @@ pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_deco
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{
-    GEMM_LT_MAX_N, gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_lt_tune,
-    gemm_per_token, gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
-    gemm_token_range_into_checked, gemv, linear,
+    GEMM_LT_MAX_N, NumericPolicy, gemm, gemm_graphsafe_into_checked,
+    gemm_graphsafe_ref_into_checked, gemm_into, gemm_into_checked, gemm_lt_pin_inspect,
+    gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_lt_pin_warmup, gemm_lt_tune, gemm_per_token,
+    gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
+    gemm_token_range_into_checked, gemv, linear, numeric_policy, pin_counters, pin_fallback_shapes,
+    reset_pin_counters, set_numeric_policy,
 };
 pub use lora::{
     LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,

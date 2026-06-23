@@ -137,6 +137,8 @@ fn live_gpu_and_cpu_prefix_hits() {
         &[0],
         Qwen3LoraOptions::default(),
         Qwen3OffloadOptions::enabled(HOST_TIER_BYTES),
+        openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS,
+        openinfer_qwen3_4b::Qwen3MemoryOptions::default(),
     )
     .expect("build offload executor");
     assert!(ex.offload_enabled(), "offload must be active");

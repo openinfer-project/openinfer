@@ -46,7 +46,7 @@ pub fn pack_lora_b_rows_into(
             rank as i32,
             max_rank as i32,
             out_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -103,7 +103,7 @@ pub fn lora_decode_fused_delta_into(
             out_dim as i32,
             out.hidden_dim as i32,
             row_offset as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -268,7 +268,7 @@ pub fn lora_decode_fused_delta_group3_into(
             max_loras as i32,
             max_rank as i32,
             input.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;

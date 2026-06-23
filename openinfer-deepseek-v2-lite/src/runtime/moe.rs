@@ -1,8 +1,13 @@
 use anyhow::{Result, bail};
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_core::{
     ops,
     tensor::{HiddenStates, HiddenStatesRef},
+};
+use openinfer_kernels::ops::{
+    Dsv2LiteRouterOutput, dsv2_lite_router_softmax_topk_into,
+    dsv2_lite_router_softmax_topk_ref_into,
 };
 
 use super::{
@@ -17,9 +22,65 @@ use crate::{
         gate_logits_host, hidden_from_bf16_host, hidden_from_f32_host, hidden_to_bf16,
         hidden_to_f32, topk_softmax_routes,
     },
-    model::{ExpertMlp, MoeMlp, dense_mlp_forward, dense_mlp_forward_per_token},
+    model::{
+        DenseMlpForwardScratch, ExpertMlp, MoeMlp, dense_mlp_forward, dense_mlp_forward_per_token,
+        dense_mlp_forward_preallocated_into, dense_mlp_forward_preallocated_ref_into,
+    },
     nccl_backend::NaiveNcclEp2Backend,
 };
+
+pub(super) struct FixedTopologyMoeScratch {
+    rank0_topk_weight: CudaSlice<f32>,
+    rank0_topk_idx: CudaSlice<i32>,
+    rank1_topk_weight: CudaSlice<f32>,
+    rank1_topk_idx: CudaSlice<i32>,
+    shared: DenseMlpForwardScratch,
+    rank0_expert: DenseMlpForwardScratch,
+    rank1_expert: DenseMlpForwardScratch,
+    routed: HiddenStates,
+}
+
+impl FixedTopologyMoeScratch {
+    pub(super) fn new(
+        generator: &DeepSeekV2LiteEp2Generator,
+        layer_idx: usize,
+        moe: &MoeMlp,
+        seq_len: usize,
+    ) -> Result<Self> {
+        let topk_elems = seq_len * generator.config.num_experts_per_token;
+        let first_rank0_expert = generator.rank0.layout.owned_experts().start;
+        let first_rank1_expert = generator.rank1.layout.owned_experts().start;
+        let first_rank0 = generator
+            .rank0
+            .routed_expert(layer_idx, first_rank0_expert)?;
+        let first_rank1 = generator
+            .rank1
+            .routed_expert(layer_idx, first_rank1_expert)?;
+        activate(&generator.rank0.ctx)?;
+        let rank0_topk_weight = generator.rank0.ctx.stream.alloc_zeros::<f32>(topk_elems)?;
+        let rank0_topk_idx = generator.rank0.ctx.stream.alloc_zeros::<i32>(topk_elems)?;
+        let shared = DenseMlpForwardScratch::new(&generator.rank0.ctx, &moe.shared, seq_len)?;
+        let rank0_expert =
+            DenseMlpForwardScratch::new(&generator.rank0.ctx, &first_rank0.dense, seq_len)?;
+        let routed =
+            HiddenStates::zeros(&generator.rank0.ctx, generator.config.hidden_size, seq_len)?;
+        activate(&generator.rank1.ctx)?;
+        let rank1_topk_weight = generator.rank1.ctx.stream.alloc_zeros::<f32>(topk_elems)?;
+        let rank1_topk_idx = generator.rank1.ctx.stream.alloc_zeros::<i32>(topk_elems)?;
+        let rank1_expert =
+            DenseMlpForwardScratch::new(&generator.rank1.ctx, &first_rank1.dense, seq_len)?;
+        Ok(Self {
+            rank0_topk_weight,
+            rank0_topk_idx,
+            rank1_topk_weight,
+            rank1_topk_idx,
+            shared,
+            rank0_expert,
+            rank1_expert,
+            routed,
+        })
+    }
+}
 
 impl DeepSeekV2LiteEp2Generator {
     pub(super) fn moe_forward(
@@ -303,6 +364,106 @@ impl DeepSeekV2LiteEp2Generator {
         ))
     }
 
+    pub(super) fn moe_forward_nccl_fixed_topology_preallocated_into(
+        &self,
+        nccl: &NaiveNcclEp2Backend,
+        layer_idx: usize,
+        input: &HiddenStates,
+        moe: &MoeMlp,
+        scratch: &mut FixedTopologyMoeScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        activate(&self.rank0.ctx)?;
+        dsv2_lite_router_softmax_topk_into(
+            &self.rank0.ctx,
+            input,
+            &moe.gate_device,
+            self.config.num_experts_per_token,
+            &mut Dsv2LiteRouterOutput {
+                topk_weight: &mut scratch.rank0_topk_weight,
+                topk_idx: &mut scratch.rank0_topk_idx,
+            },
+        )?;
+
+        dense_mlp_forward_preallocated_into(
+            &self.rank0.ctx,
+            &moe.shared,
+            input,
+            &mut scratch.shared,
+        )?;
+
+        let rank1_input =
+            nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input)?;
+        let rank1_hidden = rank1_input.rank1_hidden()?;
+        activate(&self.rank1.ctx)?;
+        dsv2_lite_router_softmax_topk_ref_into(
+            &self.rank1.ctx,
+            rank1_hidden,
+            self.rank1.gate_device(layer_idx)?,
+            self.config.num_experts_per_token,
+            &mut Dsv2LiteRouterOutput {
+                topk_weight: &mut scratch.rank1_topk_weight,
+                topk_idx: &mut scratch.rank1_topk_idx,
+            },
+        )?;
+
+        nccl.clear_device_combine(
+            &self.rank0.ctx,
+            &self.rank1.ctx,
+            input.hidden_dim,
+            input.seq_len,
+        )?;
+
+        for global_expert in self.rank0.layout.owned_experts() {
+            let expert = self.rank0.routed_expert(layer_idx, global_expert)?;
+            dense_mlp_forward_preallocated_into(
+                &self.rank0.ctx,
+                &expert.dense,
+                input,
+                &mut scratch.rank0_expert,
+            )?;
+            nccl.accumulate_fixed_expert_contribution(
+                0,
+                &self.rank0.ctx,
+                &scratch.rank0_expert.out,
+                &scratch.rank0_topk_weight,
+                &scratch.rank0_topk_idx,
+                global_expert,
+                self.config.num_experts_per_token,
+            )?;
+        }
+
+        for global_expert in self.rank1.layout.owned_experts() {
+            let expert = self.rank1.routed_expert(layer_idx, global_expert)?;
+            dense_mlp_forward_preallocated_ref_into(
+                &self.rank1.ctx,
+                &expert.dense,
+                rank1_hidden,
+                &mut scratch.rank1_expert,
+            )?;
+            nccl.accumulate_fixed_expert_contribution(
+                1,
+                &self.rank1.ctx,
+                &scratch.rank1_expert.out,
+                &scratch.rank1_topk_weight,
+                &scratch.rank1_topk_idx,
+                global_expert,
+                self.config.num_experts_per_token,
+            )?;
+        }
+
+        nccl.combine_device_contributions_to_rank0_into(
+            &self.rank0.ctx,
+            &self.rank1.ctx,
+            input.hidden_dim,
+            input.seq_len,
+            &mut scratch.routed,
+        )?;
+        drop(rank1_input);
+        activate(&self.rank0.ctx)?;
+        ops::add_batch_into(&self.rank0.ctx, &scratch.routed, &scratch.shared.out, out)
+    }
+
     fn expert_forward_host(
         &self,
         layer_idx: usize,
@@ -438,3 +599,6 @@ fn expert_forward_device(
     };
     dense_mlp_forward(ctx, &expert.dense, &token_hidden)
 }
+
+#[cfg(test)]
+mod tests;

@@ -33,18 +33,7 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        ops::select_batch_tokens_into(
-            &self.ctx,
-            logits,
-            params,
-            sample_seed,
-            &mut bufs.sample_row_indices,
-            &mut bufs.sample_argmax_partial_values,
-            &mut bufs.sample_argmax_partial_indices,
-            &mut bufs.sample_top1_value,
-            &mut bufs.sample_out,
-            &mut bufs.sample_batch_sampling,
-        )
+        openinfer_sample::select_batch(&self.ctx, logits, params, sample_seed, &mut bufs.sample)
     }
 
     pub(crate) fn select_tokens_batch_varied(
@@ -69,17 +58,12 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        ops::select_batch_tokens_into(
+        openinfer_sample::select_batch(
             &self.ctx,
             &bufs.logits,
             params,
             sample_seed,
-            &mut bufs.sample_row_indices,
-            &mut bufs.sample_argmax_partial_values,
-            &mut bufs.sample_argmax_partial_indices,
-            &mut bufs.sample_top1_value,
-            &mut bufs.sample_out,
-            &mut bufs.sample_batch_sampling,
+            &mut bufs.sample,
         )
     }
 
@@ -299,17 +283,11 @@ impl Qwen35Model {
 
             ops::gemm_into(
                 &self.ctx,
-                &layer.mlp.gate_proj,
+                &layer.mlp.gate_up_proj,
                 &bufs.normed,
-                &mut bufs.gate_out,
+                &mut bufs.gate_up_out,
             );
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.up_proj,
-                &bufs.normed,
-                &mut bufs.up_out,
-            );
-            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
             ops::gemm_into(
                 &self.ctx,
                 &layer.mlp.down_proj,

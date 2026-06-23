@@ -94,14 +94,23 @@ impl Qwen3Model {
 
         let kv_refs: Vec<&KvView> = kv_views.iter().collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
-        let attention_path = bufs.attention_path(padded_bs);
+        let attention_path = BatchDecodeBuffers::attention_path(padded_bs);
         #[cfg(feature = "kernel-call-trace")]
         let trace_kv_len = kv_views.iter().map(|v| v.seq_len()).max().unwrap_or(0);
         if use_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
+            // A stream override means decode is running on the Green Context
+            // decode partition (SplitConcurrent). Capture/replay from the split
+            // cache so the graph's nodes stay pinned to that partition's SMs;
+            // the full-SM cache is for the normal decode-only path.
+            let on_split_stream = openinfer_kernels::tensor::has_stream_override();
             // Take graphs out of bufs to avoid split-borrow conflict with closure
-            let mut graphs = std::mem::take(&mut bufs.graphs);
+            let mut graphs = if on_split_stream {
+                std::mem::take(&mut bufs.graphs_split)
+            } else {
+                std::mem::take(&mut bufs.graphs)
+            };
             let result = graphs[graph_idx].run_or_capture(&self.ctx, || {
                 trace_decode_kv_len!(trace_kv_len, {
                     self.batch_decode_kernels(
@@ -114,7 +123,11 @@ impl Qwen3Model {
                     )
                 })
             });
-            bufs.graphs = graphs;
+            if on_split_stream {
+                bufs.graphs_split = graphs;
+            } else {
+                bufs.graphs = graphs;
+            }
             result?;
         } else {
             trace_decode_kv_len!(trace_kv_len, {

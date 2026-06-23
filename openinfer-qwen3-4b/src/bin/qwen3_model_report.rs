@@ -449,7 +449,7 @@ fn measure_silu_mul_fused(call: &KernelCall, iters: u64) -> Result<LatencyStats>
     let gate_up = HiddenStates::zeros(&ctx, inter2, batch)?;
     let mut out = HiddenStates::zeros(&ctx, inter, batch)?;
     measure_loop(&ctx, iters, || {
-        ops::silu_mul_fused_batch_into(&ctx, &gate_up, &mut out);
+        ops::silu_mul_fused_batch_into(&ctx, &gate_up, &mut out)?;
         Ok(())
     })
 }

@@ -292,6 +292,15 @@ fn is_deepseek_v4_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
+fn is_deepseek_v2_lite_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "deepseek_v2_lite"),
+        Err(_) => false,
+    }
+}
+
 fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
         Ok(relative) => relative
@@ -1119,6 +1128,7 @@ fn main() {
     let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
+    let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
     let qwen35_enabled = cfg!(feature = "qwen35-4b");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
@@ -1161,6 +1171,9 @@ fn main() {
         .filter_map(|path| {
             let file_name = path.file_name()?.to_str()?;
             if !deepseek_enabled && is_deepseek_v4_source(&csrc_dir, path) {
+                return None;
+            }
+            if !deepseek_v2_lite_enabled && is_deepseek_v2_lite_source(&csrc_dir, path) {
                 return None;
             }
             if !kimi_k2_enabled

@@ -145,6 +145,15 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 max_loras: args.max_loras,
                 max_lora_rank: args.max_lora_rank,
             });
+            let kv_cache_memory_margin_bytes = args
+                .kv_cache_memory_margin_mib
+                .checked_mul(1 << 20)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--kv-cache-memory-margin-mib is too large: {}",
+                        args.kv_cache_memory_margin_mib
+                    )
+                })?;
             openinfer_qwen3_4b::launch(
                 &args.model_path,
                 Qwen3LaunchOptions {
@@ -154,7 +163,14 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     offload,
                     no_prefix_cache: args.no_prefix_cache,
                     max_prefill_tokens: args.max_prefill_tokens,
+                    memory: openinfer_qwen3_4b::Qwen3MemoryOptions::new(
+                        args.gpu_memory_utilization,
+                        kv_cache_memory_margin_bytes,
+                    )
+                    .validate()?,
                     lora,
+                    decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
+                    batch_invariant: args.batch_invariant,
                 },
             )
             .context("failed to start Qwen3 engine")?

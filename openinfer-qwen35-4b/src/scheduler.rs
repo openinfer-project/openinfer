@@ -19,7 +19,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
-use crate::logprobs::{compute_logprobs_from_cpu, snapshot_requested_logprobs};
+use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
@@ -135,6 +135,7 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
     unsafe {
         crate::ffi::cublas_init();
     }
+    model.tune_decode_gemm_algos()?;
     Ok(CublasThreadGuard)
 }
 
@@ -410,7 +411,11 @@ fn sample_prefill_logits(
         .enumerate()
         .map(|(i, logits_opt)| {
             logits_opt.and_then(|logits_f32| {
-                compute_logprobs_from_cpu(&logits_f32, tokens[i], pending[i].logprobs)
+                openinfer_sample::token_logprob_from_row(
+                    &logits_f32,
+                    tokens[i],
+                    pending[i].logprobs,
+                )
             })
         })
         .collect();
@@ -655,7 +660,7 @@ fn decode_step(
         .enumerate()
         .map(|(i, logits_opt)| {
             logits_opt.and_then(|logits_f32| {
-                compute_logprobs_from_cpu(&logits_f32, tokens[i], active[i].logprobs)
+                openinfer_sample::token_logprob_from_row(&logits_f32, tokens[i], active[i].logprobs)
             })
         })
         .collect();
@@ -716,7 +721,7 @@ fn process_decode_logits(
         .enumerate()
         .map(|(i, logits_opt)| {
             logits_opt.and_then(|logits_f32| {
-                compute_logprobs_from_cpu(&logits_f32, tokens[i], active[i].logprobs)
+                openinfer_sample::token_logprob_from_row(&logits_f32, tokens[i], active[i].logprobs)
             })
         })
         .collect();

@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::{Arc, Mutex, MutexGuard},
+    thread,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -22,12 +23,13 @@ use cudarc::{
 use half::bf16;
 use libloading::Library;
 use openinfer_core::{
-    ops,
+    ffi as core_ffi, ops,
     tensor::{DeviceContext, HiddenStates, HiddenStatesRef},
 };
+use openinfer_kernels::ops::dsv2_lite_accumulate_fixed_expert_into;
 use serde::Serialize;
 
-use crate::device::activate;
+use crate::device::{activate, activate_graph_capture, graph_capture_activation_guard};
 
 #[cfg(test)]
 mod tests;
@@ -443,6 +445,32 @@ impl NaiveNcclEp2Backend {
         )
     }
 
+    pub(crate) fn accumulate_fixed_expert_contribution(
+        &self,
+        rank: usize,
+        ctx: &DeviceContext,
+        expert_output: &HiddenStates,
+        topk_weight: &CudaSlice<f32>,
+        topk_idx: &CudaSlice<i32>,
+        global_expert: usize,
+        topk: usize,
+    ) -> Result<()> {
+        let mut scratch = self.combine_scratch()?;
+        // Graph capture relies on `prepare_graph_shape` sizing this scratch
+        // before the capture window; this call is only a shape assertion.
+        scratch.ensure_shape(expert_output.hidden_dim, expert_output.seq_len)?;
+        activate(ctx)?;
+        dsv2_lite_accumulate_fixed_expert_into(
+            ctx,
+            expert_output,
+            topk_weight,
+            topk_idx,
+            global_expert,
+            topk,
+            scratch.send_mut(rank)?,
+        )
+    }
+
     pub(crate) fn combine_device_contributions_to_rank0(
         &self,
         rank0: &DeviceContext,
@@ -499,6 +527,85 @@ impl NaiveNcclEp2Backend {
         let mut routed = HiddenStates::zeros(rank0, hidden_dim, seq_len)?;
         ops::f32_to_bf16_hidden_into(rank0, rank0_recv, &mut routed)?;
         Ok(routed)
+    }
+
+    pub(crate) fn prepare_graph_shape(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        self.dense_exchange_scratch()?
+            .ensure(rank0, rank1, hidden_dim, seq_len)?;
+        self.combine_scratch()?
+            .ensure(rank0, rank1, hidden_dim, seq_len)?;
+        Ok(())
+    }
+
+    pub(crate) fn combine_device_contributions_to_rank0_into(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        hidden_dim: usize,
+        seq_len: usize,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        ensure!(
+            out.hidden_dim == hidden_dim && out.seq_len == seq_len,
+            "DeepSeek-V2-Lite NCCL combine output shape mismatch: out=[{}, {}], requested=[{}, {}]",
+            out.hidden_dim,
+            out.seq_len,
+            hidden_dim,
+            seq_len
+        );
+        let mut scratch = self.combine_scratch()?;
+        let elems = scratch.ensure_shape(hidden_dim, seq_len)?;
+
+        let DeviceCombineScratch {
+            rank0_send,
+            rank0_recv,
+            rank1_send,
+            rank1_recv,
+            ..
+        } = &mut *scratch;
+        let rank0_send = rank0_send
+            .as_ref()
+            .context("DeepSeek-V2-Lite NCCL rank0 combine send scratch is missing")?;
+        let rank0_recv = rank0_recv
+            .as_mut()
+            .context("DeepSeek-V2-Lite NCCL rank0 combine recv scratch is missing")?;
+        let rank1_send = rank1_send
+            .as_ref()
+            .context("DeepSeek-V2-Lite NCCL rank1 combine send scratch is missing")?;
+        let rank1_recv = rank1_recv
+            .as_mut()
+            .context("DeepSeek-V2-Lite NCCL rank1 combine recv scratch is missing")?;
+
+        self.grouped("DeepSeek-V2-Lite NCCL combine all-reduce", || {
+            activate(rank0)?;
+            self.all_reduce_f32(
+                0,
+                rank0_send,
+                rank0_recv,
+                elems,
+                rank0.stream.cu_stream(),
+                "DeepSeek-V2-Lite NCCL combine rank0 all-reduce",
+            )?;
+            activate(rank1)?;
+            self.all_reduce_f32(
+                1,
+                rank1_send,
+                rank1_recv,
+                elems,
+                rank1.stream.cu_stream(),
+                "DeepSeek-V2-Lite NCCL combine rank1 all-reduce",
+            )?;
+            Ok(())
+        })?;
+
+        activate(rank0)?;
+        ops::f32_to_bf16_hidden_into(rank0, rank0_recv, out)
     }
 
     fn smoke_all_reduce_f32(&self, rank0: &DeviceContext, rank1: &DeviceContext) -> Result<()> {
@@ -604,17 +711,18 @@ impl NaiveNcclEp2Backend {
         let mut rank0_capture_started = false;
         let mut rank1_capture_started = false;
         let capture_result = (|| -> Result<(RawCudaGraph, RawCudaGraph)> {
-            activate(rank0)?;
+            let _activation_guard = graph_capture_activation_guard();
+            activate_graph_capture(rank0)?;
             begin_capture(rank0.stream.cu_stream(), "rank0")?;
             rank0_capture_started = true;
-            activate(rank1)?;
+            activate_graph_capture(rank1)?;
             begin_capture(rank1.stream.cu_stream(), "rank1")?;
             rank1_capture_started = true;
 
             self.grouped(
                 "DeepSeek-V2-Lite NCCL graph smoke all-reduce capture",
                 || {
-                    activate(rank0)?;
+                    activate_graph_capture(rank0)?;
                     self.all_reduce_f32_raw(
                         0,
                         rank0_send_ptr,
@@ -623,7 +731,7 @@ impl NaiveNcclEp2Backend {
                         rank0.stream.cu_stream(),
                         "DeepSeek-V2-Lite NCCL graph smoke rank0 all-reduce",
                     )?;
-                    activate(rank1)?;
+                    activate_graph_capture(rank1)?;
                     self.all_reduce_f32_raw(
                         1,
                         rank1_send_ptr,
@@ -636,16 +744,16 @@ impl NaiveNcclEp2Backend {
                 },
             )?;
 
-            activate(rank0)?;
+            activate_graph_capture(rank0)?;
             let captured0 = end_capture(rank0.stream.cu_stream(), "rank0")?;
             rank0_capture_started = false;
-            activate(rank1)?;
+            activate_graph_capture(rank1)?;
             let captured1 = end_capture(rank1.stream.cu_stream(), "rank1")?;
             rank1_capture_started = false;
             report.captured = true;
-            activate(rank0)?;
+            activate_graph_capture(rank0)?;
             let graph0 = captured0.instantiate("rank0")?;
-            activate(rank1)?;
+            activate_graph_capture(rank1)?;
             let graph1 = captured1.instantiate("rank1")?;
             Ok((graph0, graph1))
         })();
@@ -662,17 +770,16 @@ impl NaiveNcclEp2Backend {
             }
         }
 
-        activate(rank0)?;
-        graph0
-            .launch(rank0.stream.cu_stream(), "rank0")
-            .context("launch captured rank0 NCCL CUDA Graph")?;
-        activate(rank1)?;
-        graph1
-            .launch(rank1.stream.cu_stream(), "rank1")
-            .context("launch captured rank1 NCCL CUDA Graph")?;
+        launch_graph_pair_and_sync(
+            &graph0,
+            &graph1,
+            rank0.device_ordinal,
+            rank0.stream.cu_stream(),
+            rank1.device_ordinal,
+            rank1.stream.cu_stream(),
+        )
+        .context("launch paired NCCL CUDA Graph smoke graphs")?;
         report.replayed = true;
-        rank0.sync()?;
-        rank1.sync()?;
         drop(rank0_send_guard);
         drop(rank0_recv_guard);
         drop(rank1_send_guard);
@@ -896,12 +1003,12 @@ fn cleanup_capture(ctx: &DeviceContext, capture_started: bool) {
     }
 }
 
-struct CapturedCudaGraph {
+pub(crate) struct CapturedCudaGraph {
     graph: CUgraph,
 }
 
 impl CapturedCudaGraph {
-    fn instantiate(mut self, rank_label: &str) -> Result<RawCudaGraph> {
+    pub(crate) fn instantiate(mut self, rank_label: &str) -> Result<RawCudaGraph> {
         let mut exec = ptr::null_mut();
         let status = unsafe {
             // SAFETY: `graph` was returned by `cuStreamEndCapture` and is
@@ -930,24 +1037,97 @@ impl Drop for CapturedCudaGraph {
     }
 }
 
-struct RawCudaGraph {
+pub(crate) struct RawCudaGraph {
     graph: CUgraph,
     exec: CUgraphExec,
 }
 
 impl RawCudaGraph {
-    fn launch(&self, stream: CUstream, label: &str) -> Result<()> {
-        let status = unsafe {
-            // SAFETY: `exec` is instantiated from the graph captured on this
-            // rank stream, and launch is part of the paired NCCL graph smoke.
-            cudarc::driver::sys::cuGraphLaunch(self.exec, stream)
-        };
-        ensure!(
-            status == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-            "{label}: cuGraphLaunch failed with {status:?}"
-        );
-        Ok(())
+    fn exec(&self) -> CUgraphExec {
+        self.exec
     }
+}
+
+fn launch_exec_and_sync_on_device(
+    exec: usize,
+    device_ordinal: usize,
+    stream: usize,
+    label: &'static str,
+) -> Result<()> {
+    let err = unsafe { core_ffi::cuda_set_device(device_ordinal as i32) };
+    ensure!(
+        err == 0,
+        "{label}: failed to activate CUDA device {device_ordinal}: cudaError={err}"
+    );
+    let stream = stream as CUstream;
+    let status = unsafe {
+        // SAFETY: `exec` is a live graph exec owned by the caller for the
+        // duration of the paired replay, and `stream` is that rank's stream.
+        cudarc::driver::sys::cuGraphLaunch(exec as CUgraphExec, stream)
+    };
+    ensure!(
+        status == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "{label}: cuGraphLaunch failed with {status:?}"
+    );
+    let status = unsafe {
+        // SAFETY: `stream` is the live rank stream used for graph replay.
+        cudarc::driver::sys::cuStreamSynchronize(stream)
+    };
+    ensure!(
+        status == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "{label}: cuStreamSynchronize failed with {status:?}"
+    );
+    Ok(())
+}
+
+pub(crate) fn launch_graph_pair_and_sync(
+    graph0: &RawCudaGraph,
+    graph1: &RawCudaGraph,
+    rank0_device_ordinal: usize,
+    rank0_stream: CUstream,
+    rank1_device_ordinal: usize,
+    rank1_stream: CUstream,
+) -> Result<()> {
+    ensure!(
+        !graph0.exec().is_null() && !graph1.exec().is_null(),
+        "cannot launch destroyed CUDA Graph exec"
+    );
+    let rank0_exec = graph0.exec() as usize;
+    let rank1_exec = graph1.exec() as usize;
+    let rank0_stream = rank0_stream as usize;
+    let rank1_stream = rank1_stream as usize;
+    let rank0 = thread::Builder::new()
+        .name("dsv2-lite-rank0-graph-replay".to_string())
+        .spawn(move || {
+            launch_exec_and_sync_on_device(
+                rank0_exec,
+                rank0_device_ordinal,
+                rank0_stream,
+                "rank0 CUDA Graph replay",
+            )
+        })
+        .context("spawn rank0 CUDA Graph replay thread")?;
+    let rank1 = thread::Builder::new()
+        .name("dsv2-lite-rank1-graph-replay".to_string())
+        .spawn(move || {
+            launch_exec_and_sync_on_device(
+                rank1_exec,
+                rank1_device_ordinal,
+                rank1_stream,
+                "rank1 CUDA Graph replay",
+            )
+        })
+        .context("spawn rank1 CUDA Graph replay thread")?;
+
+    let rank0_result = rank0
+        .join()
+        .map_err(|_| anyhow::anyhow!("rank0 CUDA Graph replay thread panicked"))?;
+    let rank1_result = rank1
+        .join()
+        .map_err(|_| anyhow::anyhow!("rank1 CUDA Graph replay thread panicked"))?;
+    rank0_result?;
+    rank1_result?;
+    Ok(())
 }
 
 impl Drop for RawCudaGraph {
@@ -971,7 +1151,7 @@ impl Drop for RawCudaGraph {
     }
 }
 
-fn begin_capture(stream: CUstream, rank_label: &str) -> Result<()> {
+pub(crate) fn begin_capture(stream: CUstream, rank_label: &str) -> Result<()> {
     let status = unsafe {
         // SAFETY: `stream` is a live rank stream. This smoke intentionally
         // avoids context rebinding inside the capture window to match
@@ -985,7 +1165,7 @@ fn begin_capture(stream: CUstream, rank_label: &str) -> Result<()> {
     Ok(())
 }
 
-fn end_capture(stream: CUstream, rank_label: &str) -> Result<CapturedCudaGraph> {
+pub(crate) fn end_capture(stream: CUstream, rank_label: &str) -> Result<CapturedCudaGraph> {
     let mut graph = ptr::null_mut();
     let status = unsafe {
         // SAFETY: Matches `begin_capture` on the same live rank stream.

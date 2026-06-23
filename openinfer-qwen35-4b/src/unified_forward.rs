@@ -109,7 +109,6 @@ mod tests {
 
     use super::*;
     use openinfer_core::kv_pool::KvState;
-    use openinfer_core::ops::argmax_batch_bf16_split_partials_len;
     use openinfer_core::tensor::HiddenStates;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
@@ -132,46 +131,10 @@ mod tests {
     fn greedy_sample_batch(model: &Qwen35Model, logits: &HiddenStates, rows: usize) -> Vec<u32> {
         let params = vec![openinfer_core::sampler::SamplingParams::default(); rows];
         let params_refs: Vec<&openinfer_core::sampler::SamplingParams> = params.iter().collect();
-        let mut row_indices: cudarc::driver::CudaSlice<i32> =
-            model.ctx.stream.alloc_zeros(rows).unwrap();
-        let mut argmax_partial_values: cudarc::driver::CudaSlice<f32> = model
-            .ctx
-            .stream
-            .alloc_zeros(argmax_batch_bf16_split_partials_len(
-                rows,
-                model.config.vocab_size,
-            ))
-            .unwrap();
-        let mut argmax_partial_indices: cudarc::driver::CudaSlice<i32> = model
-            .ctx
-            .stream
-            .alloc_zeros(argmax_batch_bf16_split_partials_len(
-                rows,
-                model.config.vocab_size,
-            ))
-            .unwrap();
-        let mut top1_value: cudarc::driver::CudaSlice<half::bf16> =
-            model.ctx.stream.alloc_zeros(rows).unwrap();
-        let mut out: cudarc::driver::CudaSlice<i32> = model.ctx.stream.alloc_zeros(rows).unwrap();
-        let mut batch_sampling = openinfer_core::ops::BatchSamplingScratch::new(
-            &model.ctx,
-            rows,
-            model.config.vocab_size,
-        )
-        .unwrap();
-        openinfer_core::ops::select_batch_tokens_into(
-            &model.ctx,
-            logits,
-            &params_refs,
-            0,
-            &mut row_indices,
-            &mut argmax_partial_values,
-            &mut argmax_partial_indices,
-            &mut top1_value,
-            &mut out,
-            &mut batch_sampling,
-        )
-        .unwrap()
+        let mut scratch =
+            openinfer_sample::SampleScratch::new(&model.ctx, model.config.vocab_size, rows)
+                .unwrap();
+        openinfer_sample::select_batch(&model.ctx, logits, &params_refs, 0, &mut scratch).unwrap()
     }
 
     /// Verify that unified_step decode output matches batch_decode_graph standalone.

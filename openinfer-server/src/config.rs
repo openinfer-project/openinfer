@@ -96,6 +96,33 @@ pub(crate) struct Args {
     /// ticking. Echo requests are never split. Must be positive.
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
     pub max_prefill_tokens: usize,
+
+    /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
+    /// sized from this budget after startup profiling accounts for weights,
+    /// runtime buffers, activation peak, CUDA Graph capture, and margin.
+    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_GPU_MEMORY_UTILIZATION)]
+    pub gpu_memory_utilization: f64,
+
+    /// Additional Qwen3 GPU memory to hold back after profile-based KV sizing,
+    /// in MiB. Covers allocator fragmentation and small unprofiled drift.
+    #[arg(long, default_value_t = (openinfer_qwen3_4b::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
+    pub kv_cache_memory_margin_mib: usize,
+    /// How prefill and decode share the GPU (single-GPU Qwen3 only).
+    /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
+    /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green
+    /// Context SM partition (lower decode ITL p99, higher TTFT).
+    #[arg(long, value_enum, default_value_t = CliDecodeOverlap::Off)]
+    pub decode_overlap: CliDecodeOverlap,
+
+    /// Percent of SMs pinned to decode in `--decode-overlap green-ctx` (the rest
+    /// go to prefill). Ignored in other modes.
+    #[arg(long, default_value_t = 20)]
+    pub decode_sm_pct: u32,
+
+    /// Enable Qwen3 projection-GEMM batch-invariant pinning. Off by default;
+    /// does not cover path-selection residuals. Qwen3-only.
+    #[arg(long, default_value_t = false)]
+    pub batch_invariant: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -114,17 +141,56 @@ impl From<CliEpBackend> for EpBackend {
     }
 }
 
+/// CLI selector for prefill/decode overlap. Mapped to
+/// [`openinfer_qwen3_4b::DecodeOverlap`] together with `--decode-sm-pct`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliDecodeOverlap {
+    /// One stream; prefill and decode serialize.
+    Off,
+    /// Two CUDA streams sharing all SMs.
+    Stream,
+    /// Green Context SM partition (SM-pinned streams).
+    #[value(name = "green-ctx")]
+    GreenCtx,
+}
+
+impl CliDecodeOverlap {
+    pub(crate) fn resolve(self, decode_sm_pct: u32) -> openinfer_qwen3_4b::DecodeOverlap {
+        use openinfer_qwen3_4b::DecodeOverlap;
+        match self {
+            Self::Off => DecodeOverlap::Off,
+            Self::Stream => DecodeOverlap::SharedSm,
+            Self::GreenCtx => DecodeOverlap::GreenCtx {
+                decode_pct: decode_sm_pct,
+            },
+        }
+    }
+}
+
 impl Args {
     pub(crate) fn validate(&self, model_type: ModelType) -> Result<()> {
         if !self.enable_lora && !self.lora_modules.is_empty() {
             bail!("--lora-modules requires --enable-lora");
         }
         #[cfg(feature = "qwen3-4b")]
-        let lora_capable = matches!(model_type, ModelType::Qwen3);
+        let is_qwen3 = matches!(model_type, ModelType::Qwen3);
         #[cfg(not(feature = "qwen3-4b"))]
-        let lora_capable = false;
-        if self.enable_lora && !lora_capable {
+        let is_qwen3 = false;
+        if self.enable_lora && !is_qwen3 {
             bail!("--enable-lora is currently supported only for Qwen3");
+        }
+        if self.batch_invariant && !is_qwen3 {
+            bail!("--batch-invariant is currently supported only for Qwen3");
+        }
+        if self.batch_invariant && self.enable_lora {
+            bail!(
+                "--batch-invariant is not yet validated with --enable-lora; enable one at a time"
+            );
+        }
+        if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
+            bail!(
+                "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+            );
         }
         Ok(())
     }

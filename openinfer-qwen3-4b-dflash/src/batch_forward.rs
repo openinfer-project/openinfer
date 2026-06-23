@@ -341,7 +341,7 @@ impl DFlashDraftModel {
             &bufs.normed,
             &mut bufs.gate_up,
         )?;
-        ops::silu_mul_fused_batch_into(ctx, &bufs.gate_up, &mut bufs.act_out);
+        ops::silu_mul_fused_batch_into(ctx, &bufs.gate_up, &mut bufs.act_out)?;
         ops::gemm_into_checked(ctx, &layer.mlp.down_proj, &bufs.act_out, &mut bufs.o_buf)?;
         ops::add_batch_into(ctx, &bufs.hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(&mut bufs.hidden, &mut bufs.hidden_out);

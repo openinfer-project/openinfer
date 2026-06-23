@@ -54,7 +54,86 @@ class RequestResult:
     output_chars: int
     output_hash: str
     text_prefix: str
+    sampling_label: str = "single"
+    temperature: float = 0.0
+    top_k: int = -1
+    top_p: float = 1.0
     server_trace: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class SamplingProfile:
+    label: str
+    temperature: float
+    top_k: int
+    top_p: float
+
+
+def arg_value(args: argparse.Namespace, name: str, default: Any) -> Any:
+    return getattr(args, name, default)
+
+
+def sampling_mode(args: argparse.Namespace) -> str:
+    return arg_value(args, "sampling_mode", "single")
+
+
+def single_profile(args: argparse.Namespace) -> SamplingProfile:
+    return SamplingProfile(
+        label="single",
+        temperature=float(arg_value(args, "temperature", 0.0)),
+        top_k=int(arg_value(args, "top_k", -1)),
+        top_p=float(arg_value(args, "top_p", 1.0)),
+    )
+
+
+def greedy_profile() -> SamplingProfile:
+    return SamplingProfile(label="greedy", temperature=0.0, top_k=-1, top_p=1.0)
+
+
+def sampled_profile(args: argparse.Namespace) -> SamplingProfile:
+    return SamplingProfile(
+        label="sampled",
+        temperature=float(arg_value(args, "sample_temperature", 0.8)),
+        top_k=int(arg_value(args, "sample_top_k", 40)),
+        top_p=float(arg_value(args, "sample_top_p", 0.95)),
+    )
+
+
+def sampling_profile_for(args: argparse.Namespace, global_index: int) -> SamplingProfile:
+    if sampling_mode(args) == "mixed-greedy-sampled":
+        return greedy_profile() if global_index % 2 == 0 else sampled_profile(args)
+    return single_profile(args)
+
+
+def sampling_profiles_for_report(args: argparse.Namespace) -> dict[str, dict[str, float | int | str]]:
+    if sampling_mode(args) == "mixed-greedy-sampled":
+        profiles = [greedy_profile(), sampled_profile(args)]
+    else:
+        profiles = [single_profile(args)]
+    return {profile.label: asdict(profile) for profile in profiles}
+
+
+def count_sampling(results: list[RequestResult]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.sampling_label] = counts.get(result.sampling_label, 0) + 1
+    return counts
+
+
+def wire_top_k(top_k: int) -> int:
+    return 0 if top_k <= 0 else top_k
+
+
+def validate_top_p(name: str, value: float) -> None:
+    if value <= 0.0 or value > 1.0:
+        raise SystemExit(f"{name} must be in (0, 1]")
+
+
+def validate_sampling_args(args: argparse.Namespace) -> None:
+    validate_top_p("--top-p", args.top_p)
+    validate_top_p("--sample-top-p", args.sample_top_p)
+    if args.sampling_mode == "mixed-greedy-sampled" and args.sample_temperature <= 0.0:
+        raise SystemExit("--sample-temperature must be positive in mixed-greedy-sampled mode")
 
 
 def percentile(sorted_values: list[float], pct: float) -> float:
@@ -195,6 +274,9 @@ def request_once(
     temperature: float,
     timeout: float,
     ignore_eos: bool,
+    top_k: int = -1,
+    top_p: float = 1.0,
+    sampling_label: str = "single",
 ) -> RequestResult:
     start = time.perf_counter()
     start_wall = time.time()
@@ -215,6 +297,8 @@ def request_once(
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_k": wire_top_k(top_k),
+            "top_p": top_p,
             "stream": True,
             "ignore_eos": ignore_eos,
             "request_id": request_id,
@@ -294,6 +378,10 @@ def request_once(
             output_chars=len(text),
             output_hash=output_hash,
             text_prefix=text[:80],
+            sampling_label=sampling_label,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
         )
     except (TimeoutError, socket.timeout) as exc:
         end = time.perf_counter()
@@ -302,6 +390,10 @@ def request_once(
             request_id,
             prompt_words,
             max_tokens,
+            sampling_label,
+            temperature,
+            top_k,
+            top_p,
             status,
             start,
             start_wall,
@@ -316,6 +408,10 @@ def request_once(
             request_id,
             prompt_words,
             max_tokens,
+            sampling_label,
+            temperature,
+            top_k,
+            top_p,
             status,
             start,
             start_wall,
@@ -330,6 +426,10 @@ def failed_result(
     request_id: str,
     prompt_words: int,
     max_tokens: int,
+    sampling_label: str,
+    temperature: float,
+    top_k: int,
+    top_p: float,
     status: int | None,
     start: float,
     start_wall: float,
@@ -361,6 +461,10 @@ def failed_result(
         output_chars=0,
         output_hash="",
         text_prefix="",
+        sampling_label=sampling_label,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
     )
 
 
@@ -467,8 +571,17 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
     shapes = workload_shapes(args.prompt_words, args.max_tokens)
     workloads = []
     for idx in range(count):
-        prompt_words, max_tokens = shapes[(offset + idx) % len(shapes)]
-        workloads.append((prompt_words, max_tokens, make_prompt(offset + idx, prompt_words)))
+        global_index = offset + idx
+        prompt_words, max_tokens = shapes[global_index % len(shapes)]
+        workloads.append(
+            (
+                global_index,
+                prompt_words,
+                max_tokens,
+                make_prompt(global_index, prompt_words),
+                sampling_profile_for(args, global_index),
+            )
+        )
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [
@@ -481,11 +594,14 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
                 prompt_words,
                 prompt,
                 max_tokens,
-                args.temperature,
+                profile.temperature,
                 args.timeout,
                 args.ignore_eos,
+                top_k=profile.top_k,
+                top_p=profile.top_p,
+                sampling_label=profile.label,
             )
-            for idx, (prompt_words, max_tokens, prompt) in enumerate(workloads)
+            for idx, (_global_index, prompt_words, max_tokens, prompt, profile) in enumerate(workloads)
         ]
         results = [future.result() for future in concurrent.futures.as_completed(futures)]
     ended = time.perf_counter()
@@ -536,6 +652,11 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "max_tokens": single_or_list(args.max_tokens),
             "mixed_shapes": shape_counts,
             "temperature": args.temperature,
+            "top_k": int(arg_value(args, "top_k", -1)),
+            "top_p": float(arg_value(args, "top_p", 1.0)),
+            "sampling_mode": sampling_mode(args),
+            "sampling_profiles": sampling_profiles_for_report(args),
+            "sampling_counts": count_sampling(measured),
             "ignore_eos": args.ignore_eos,
             "timeout_s": args.timeout,
         },
@@ -544,6 +665,9 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "completed": len(successes),
             "failed": len(failures),
             "timeouts": sum(1 for result in failures if result.timed_out),
+            "sampling_mode": sampling_mode(args),
+            "completed_sampling_counts": count_sampling(successes),
+            "failed_sampling_counts": count_sampling(failures),
             "qps": len(successes) / wall_s if wall_s > 0 else 0.0,
             "input_tokens_total": sum(input_tokens),
             "output_tokens_total": sum(output_tokens),
@@ -591,6 +715,20 @@ def main() -> None:
         help="Completion token count, or comma-separated counts for a mixed workload.",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["single", "mixed-greedy-sampled"],
+        default="single",
+        help=(
+            "single uses --temperature/--top-k/--top-p for every request; "
+            "mixed-greedy-sampled alternates greedy and sampled profiles by global request index."
+        ),
+    )
+    parser.add_argument("--sample-temperature", type=float, default=0.8)
+    parser.add_argument("--sample-top-k", type=int, default=40)
+    parser.add_argument("--sample-top-p", type=float, default=0.95)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -605,6 +743,7 @@ def main() -> None:
         raise SystemExit("--concurrency must be positive")
     if args.num_requests <= 0:
         raise SystemExit("--num-requests must be positive")
+    validate_sampling_args(args)
     if args.warmup > 0:
         warmup_results, _ = run_batch(args, measured=False)
         failed = [result for result in warmup_results if not result.ok]

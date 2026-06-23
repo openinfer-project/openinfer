@@ -1,9 +1,10 @@
 use std::{
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use log::info;
 use openinfer_engine::engine::{
     EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenSink,
 };
@@ -12,6 +13,8 @@ use tokio::sync::mpsc;
 use crate::runtime::{DeepSeekV2LiteEp2Generator, GenerationResult};
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
+    let started = Instant::now();
+    info!("starting DeepSeek-V2-Lite EP2 engine");
     let mut generator = DeepSeekV2LiteEp2Generator::load(model_path, options)?;
     let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
 
@@ -24,6 +27,10 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         })
         .context("spawn DeepSeek-V2-Lite EP=2 engine thread")?;
 
+    info!(
+        "DeepSeek-V2-Lite EP2 engine started cost {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
     Ok(EngineHandle::new_with_join_handle(submit_tx, join_handle))
 }
 

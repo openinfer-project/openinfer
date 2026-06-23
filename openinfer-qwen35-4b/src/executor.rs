@@ -14,7 +14,7 @@ use openinfer_core::tensor::HiddenStates;
 
 use crate::batch_decode_graph::{BatchDecodeGraphState, MAX_BATCH};
 use crate::decode_buffers::BatchDecodeBuffers35;
-use crate::logprobs::{compute_logprobs_from_cpu, snapshot_requested_logprobs};
+use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
@@ -133,6 +133,7 @@ impl Qwen35Executor {
             enable_cuda_graph,
             device_ordinals[0],
         )?;
+        model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
         Ok(Self {
             model,
@@ -201,9 +202,9 @@ impl Qwen35Executor {
         let mut results = Vec::with_capacity(plan.requests.len());
         for (i, (req, kv)) in plan.requests.iter().zip(kv_states).enumerate() {
             let first_token = tokens[i];
-            let first_token_logprob = cpu_logits[i]
-                .as_ref()
-                .and_then(|row| compute_logprobs_from_cpu(row, first_token, req.logprobs));
+            let first_token_logprob = cpu_logits[i].as_ref().and_then(|row| {
+                openinfer_sample::token_logprob_from_row(row, first_token, req.logprobs)
+            });
             let slot_idx = self.active.len();
             self.graph_state.copy_state_to_slot(
                 self.model.device_ctx(),
@@ -266,7 +267,7 @@ impl Qwen35Executor {
             let token = tokens[i];
             let logprob = cpu_logits[i]
                 .as_ref()
-                .and_then(|row| compute_logprobs_from_cpu(row, token, req.logprobs));
+                .and_then(|row| openinfer_sample::token_logprob_from_row(row, token, req.logprobs));
             results.push(DecodeRequestResult {
                 request_id: req.request_id,
                 token,

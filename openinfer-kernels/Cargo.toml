@@ -8,6 +8,7 @@ edition = "2024"
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true }
 tvm-ffi = { version = "0.1.0-alpha.0", optional = true }
 
@@ -23,6 +24,7 @@ tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35-4b"]
 qwen35-4b = []
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
+deepseek-v2-lite = []
 kimi-k2 = []
 
 [[example]]

@@ -6,6 +6,7 @@ mod batch_decode_dag;
 pub mod batch_decode_trace;
 mod config;
 mod executor;
+pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
 mod prefill;
@@ -21,6 +22,9 @@ use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelIn
 
 pub use kernel_plan::kernel_plan;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
+pub use weights::{
+    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, Qwen3MemoryOptions,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3LoraOptions {
@@ -64,6 +68,10 @@ impl Default for Qwen3LoraOptions {
         }
     }
 }
+
+/// Prefill/decode GPU-sharing mode (`--decode-overlap`). Defined alongside the
+/// stream plumbing in [`green_ctx`].
+pub use green_ctx::DecodeOverlap;
 
 /// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
 ///
@@ -156,8 +164,12 @@ pub struct Qwen3LaunchOptions {
     pub offload: Qwen3OffloadOptions,
     pub no_prefix_cache: bool,
     pub max_prefill_tokens: usize,
+    pub memory: Qwen3MemoryOptions,
     /// `Some` switches on LoRA serving (and disables CUDA Graph).
     pub lora: Option<Qwen3LoraOptions>,
+    /// How prefill and decode share the GPU (`--decode-overlap`).
+    pub decode_overlap: DecodeOverlap,
+    pub batch_invariant: bool,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -205,6 +217,9 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
                 options.offload,
                 options.no_prefix_cache,
                 options.max_prefill_tokens,
+                options.memory,
+                options.decode_overlap,
+                options.batch_invariant,
             )
         }
         None => start_engine_with_offload(
@@ -213,6 +228,9 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.offload,
             options.no_prefix_cache,
             options.max_prefill_tokens,
+            options.memory,
+            options.decode_overlap,
+            options.batch_invariant,
         ),
     }
 }
@@ -224,6 +242,9 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         Qwen3OffloadOptions::disabled(),
         false,
         DEFAULT_MAX_PREFILL_TOKENS,
+        Qwen3MemoryOptions::default(),
+        DecodeOverlap::Off,
+        false,
     )
 }
 
@@ -245,6 +266,9 @@ pub fn start_engine_with_offload(
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+    decode_overlap: DecodeOverlap,
+    batch_invariant: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -255,6 +279,8 @@ pub fn start_engine_with_offload(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
+    ensure_batch_invariant_supported(decode_overlap, batch_invariant)?;
+    apply_batch_invariant_policy(batch_invariant);
     scheduler::start_qwen3(
         model_path,
         enable_cuda_graph,
@@ -263,6 +289,8 @@ pub fn start_engine_with_offload(
         offload_options,
         no_prefix_cache,
         max_prefill_tokens,
+        memory_options,
+        decode_overlap,
     )
 }
 
@@ -273,6 +301,9 @@ pub fn start_engine_with_lora_control(
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+    decode_overlap: DecodeOverlap,
+    batch_invariant: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -283,6 +314,11 @@ pub fn start_engine_with_lora_control(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
+    ensure_batch_invariant_supported(decode_overlap, batch_invariant)?;
+    if batch_invariant {
+        anyhow::bail!("--batch-invariant is not yet validated with LoRA serving");
+    }
+    apply_batch_invariant_policy(batch_invariant);
     scheduler::start_qwen3_with_lora_control(
         model_path,
         enable_cuda_graph,
@@ -292,5 +328,30 @@ pub fn start_engine_with_lora_control(
         offload_options,
         no_prefix_cache,
         max_prefill_tokens,
+        memory_options,
+        decode_overlap,
     )
+}
+
+fn apply_batch_invariant_policy(batch_invariant: bool) {
+    use openinfer_kernels::ops::{NumericPolicy, set_numeric_policy};
+    let policy = if batch_invariant {
+        NumericPolicy::Pin
+    } else {
+        NumericPolicy::Tuned
+    };
+    info!("Qwen3 numeric policy: {policy:?} (--batch-invariant={batch_invariant})");
+    set_numeric_policy(policy);
+}
+
+fn ensure_batch_invariant_supported(
+    decode_overlap: DecodeOverlap,
+    batch_invariant: bool,
+) -> Result<()> {
+    if batch_invariant && !matches!(decode_overlap, DecodeOverlap::Off) {
+        anyhow::bail!(
+            "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+        );
+    }
+    Ok(())
 }

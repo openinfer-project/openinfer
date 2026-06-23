@@ -82,6 +82,10 @@ impl ModelManifest {
         self.tensors.get(name)
     }
 
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
     pub(crate) fn validate_rank_plan(&self, plan: &RankLoadPlan) -> Result<()> {
         for req in &plan.tensors {
             let info = self
@@ -107,6 +111,10 @@ impl ModelManifest {
 }
 
 impl RankLoadPlan {
+    pub(crate) fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
     pub(crate) fn for_driver_rank(config: &Config, layout: &ExpertParallelLayout) -> Self {
         let mut tensors = Vec::new();
         push_top_level(config, &mut tensors);
@@ -126,6 +134,7 @@ impl RankLoadPlan {
         let mut tensors = Vec::new();
         for layer in 0..config.num_hidden_layers {
             if config.is_moe_layer(layer) {
+                push_moe_gate(config, layer, &mut tensors);
                 push_owned_experts(config, layout, layer, &mut tensors);
             }
         }
@@ -246,12 +255,7 @@ fn push_moe_layer(
     tensors: &mut Vec<TensorRequirement>,
 ) {
     let prefix = format!("model.layers.{layer}.mlp");
-    push_req(
-        tensors,
-        format!("{prefix}.gate.weight"),
-        Dtype::BF16,
-        [config.n_routed_experts, config.hidden_size],
-    );
+    push_moe_gate(config, layer, tensors);
     let shared = format!("{prefix}.shared_experts");
     push_req(
         tensors,
@@ -272,6 +276,16 @@ fn push_moe_layer(
         [config.hidden_size, config.shared_moe_intermediate()],
     );
     push_owned_experts(config, layout, layer, tensors);
+}
+
+fn push_moe_gate(config: &Config, layer: usize, tensors: &mut Vec<TensorRequirement>) {
+    let prefix = format!("model.layers.{layer}.mlp");
+    push_req(
+        tensors,
+        format!("{prefix}.gate.weight"),
+        Dtype::BF16,
+        [config.n_routed_experts, config.hidden_size],
+    );
 }
 
 fn push_owned_experts(
@@ -362,19 +376,20 @@ mod tests {
     }
 
     #[test]
-    fn expert_rank_load_plan_only_requires_owned_routed_experts() {
+    fn expert_rank_load_plan_requires_gate_and_owned_routed_experts() {
         let config = test_lite_config();
         let rank1 = ExpertParallelConfig::ep2(1).validate_for(&config).unwrap();
         let plan = RankLoadPlan::for_expert_rank(&config, &rank1);
-        let expected_routed_tensors =
-            (config.num_hidden_layers - config.first_k_dense_replace) * 32 * 3;
+        let moe_layers = config.num_hidden_layers - config.first_k_dense_replace;
+        let expected_routed_tensors = moe_layers * (config.n_routed_experts / rank1.ep_size()) * 3;
 
-        assert_eq!(plan.tensors.len(), expected_routed_tensors);
+        assert_eq!(plan.tensors.len(), expected_routed_tensors + moe_layers);
         assert_eq!(routed_expert_tensor_count(&plan), expected_routed_tensors);
+        assert_eq!(moe_gate_tensor_count(&plan), moe_layers);
         assert!(
             plan.tensors
                 .iter()
-                .all(|req| req.name.contains(".experts."))
+                .all(|req| req.name.ends_with(".gate.weight") || req.name.contains(".experts."))
         );
         assert_eq!(routed_experts(&plan), (32..64).collect());
     }
@@ -383,6 +398,13 @@ mod tests {
         plan.tensors
             .iter()
             .filter(|req| req.name.contains(".experts."))
+            .count()
+    }
+
+    fn moe_gate_tensor_count(plan: &RankLoadPlan) -> usize {
+        plan.tensors
+            .iter()
+            .filter(|req| req.name.ends_with(".mlp.gate.weight"))
             .count()
     }
 

@@ -9,7 +9,7 @@ autotests = false
 
 [features]
 default = []
-deepseek-v2-lite = []
+deepseek-v2-lite = ["dep:openinfer-kernels", "openinfer-kernels/deepseek-v2-lite"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -21,6 +21,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 nvtx = { workspace = true }
 openinfer-core = { workspace = true }
+openinfer-kernels = { workspace = true, optional = true }
 openinfer-engine = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }

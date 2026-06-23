@@ -165,11 +165,11 @@ pub fn gpu_sample_batch_into(
                 softmax_workspace_bytes,
                 n as i32,
                 scratch.vocab as i32,
-                if has_top_k_filter { 1 } else { 0 },
-                if has_top_p_filter { 1 } else { 0 },
+                i32::from(has_top_k_filter),
+                i32::from(has_top_p_filter),
                 seed,
                 0,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             )
         };
         ensure!(err == 0, "batch sampling kernel failed: cudaError {err}");
@@ -207,7 +207,7 @@ pub fn gpu_sample_batch_into(
 /// Argmax — returns the index of the maximum element.
 ///
 /// Allocates a temporary output buffer. Model decode paths use batched argmax
-/// through `select_batch_tokens_into`.
+/// through `openinfer-sample`'s `select_batch`.
 pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     let mut out_gpu: CudaSlice<i32> = ctx
         .stream
@@ -223,7 +223,7 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
                 x_ptr as *const ffi::Half,
                 out_ptr as *mut i32,
                 x.len as i32,
-                ctx.stream.cu_stream(),
+                crate::tensor::active_cu_stream(ctx),
             );
         }
     }
@@ -273,7 +273,7 @@ pub fn argmax_batch_bf16_into(
             out_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 
@@ -346,7 +346,7 @@ pub fn argmax_batch_bf16_split_indexed_into(
             pi_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 
@@ -401,7 +401,7 @@ pub fn flashinfer_top1_batch_into(
             o_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 

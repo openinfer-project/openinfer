@@ -8,6 +8,7 @@ autobenches = false
 [dependencies]
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 fastrace = { workspace = true }

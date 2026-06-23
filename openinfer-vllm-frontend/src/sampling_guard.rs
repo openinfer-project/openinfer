@@ -83,6 +83,17 @@ struct Probe {
     stop_token_ids: Option<Vec<i64>>,
     allowed_token_ids: Option<Vec<i64>>,
     prompt_logprobs: Option<i64>,
+    // logprobs is an integer top-k count on /v1/completions and
+    // /inference/v1/generate (sampling_params), but a *boolean* on
+    // /v1/chat/completions (paired with top_logprobs). Parse it as a raw JSON
+    // value so a chat `logprobs: true` does not fail Probe deserialization --
+    // a parse failure would make the guard skip every check and silently drop
+    // unsupported fields. Only the integer -1 (full vocabulary) is rejected.
+    logprobs: Option<serde_json::Value>,
+    // cache_salt provides prefix-cache tenant isolation; the engine does not
+    // implement tenant-aware caching, so requests with a salt would silently
+    // share cache entries with other tenants.
+    cache_salt: Option<serde_json::Value>,
     // `/inference/v1/generate` extras the OpenAI lowering never sets.
     bad_words: Option<Vec<serde_json::Value>>,
     logprob_token_ids: Option<Vec<i64>>,
@@ -191,6 +202,27 @@ impl Probe {
                 "prompt_logprobs is not supported by this engine".to_string(),
             ));
         }
+        // logprobs=-1 requests full-vocabulary logprobs; the engine only
+        // supports top-k (non-negative values) and would silently return no
+        // logprobs if -1 reached the wire protocol (usize::try_from(-1).ok() =
+        // None). Only an integer -1 is rejected; a boolean (chat) or any
+        // non-negative count passes through.
+        if self.logprobs.as_ref().and_then(serde_json::Value::as_i64) == Some(-1) {
+            return Some((
+                "logprobs",
+                "logprobs=-1 (full vocabulary) is not supported by this engine; use a non-negative top-k value".to_string(),
+            ));
+        }
+        // cache_salt enables prefix-cache tenant isolation; the engine does
+        // not implement tenant-aware caching, so a salt would be silently
+        // discarded and requests from different tenants would share cache
+        // entries.
+        if self.cache_salt.as_ref().is_some_and(|v| !v.is_null()) {
+            return Some((
+                "cache_salt",
+                "cache_salt is not supported by this engine".to_string(),
+            ));
+        }
         if self
             .bad_words
             .as_ref()
@@ -235,10 +267,13 @@ impl Probe {
     }
 }
 
-/// `/inference/v1/generate` nests its sampling fields.
+/// `/inference/v1/generate` nests its sampling fields under `sampling_params`,
+/// but `cache_salt` rides at the top level of the request (a sibling of
+/// `sampling_params`), so it has to be captured here and folded into the probe.
 #[derive(Deserialize)]
 struct GenerateProbe {
     sampling_params: Option<Probe>,
+    cache_salt: Option<serde_json::Value>,
 }
 
 /// The engine honors `temperature` / `top_p` / `top_k` / `ignore_eos`; every
@@ -283,7 +318,13 @@ pub(crate) async fn guard_generation_request(
     let probe = if nested {
         serde_json::from_slice::<GenerateProbe>(&bytes)
             .ok()
-            .map(|generate| generate.sampling_params.unwrap_or_default())
+            .map(|generate| {
+                let mut probe = generate.sampling_params.unwrap_or_default();
+                // cache_salt is top-level on the generate request, not inside
+                // sampling_params, so it never lands in the nested probe above.
+                probe.cache_salt = generate.cache_salt;
+                probe
+            })
     } else {
         serde_json::from_slice::<Probe>(&bytes).ok()
     };
@@ -389,6 +430,8 @@ mod tests {
             (r#"{"stop_token_ids": [151645]}"#, "stop_token_ids"),
             (r#"{"allowed_token_ids": [1, 2]}"#, "allowed_token_ids"),
             (r#"{"prompt_logprobs": 0}"#, "prompt_logprobs"),
+            (r#"{"logprobs": -1}"#, "logprobs"),
+            (r#"{"cache_salt": "tenant-a"}"#, "cache_salt"),
         ];
         for (body, param) in cases {
             for path in ["/v1/completions", "/v1/chat/completions"] {
@@ -429,6 +472,16 @@ mod tests {
                 r#"{"token_ids": [1], "sampling_params": {"structured_outputs": {"json": {}}}}"#,
                 "structured_outputs",
             ),
+            (
+                r#"{"token_ids": [1], "sampling_params": {"logprobs": -1}}"#,
+                "logprobs",
+            ),
+            // cache_salt rides at the top level of the generate request, not
+            // inside sampling_params (mirrors GenerateRequest on the wire).
+            (
+                r#"{"token_ids": [1], "cache_salt": "tenant-a"}"#,
+                "cache_salt",
+            ),
         ];
         for (body, param) in cases {
             let (status, error) =
@@ -456,6 +509,32 @@ mod tests {
             guarded_router(Some(100)),
             "/v1/chat/completions",
             r#"{"max_tokens": 999999, "max_completion_tokens": 10}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn chat_boolean_logprobs_does_not_disable_guards() {
+        // Chat sends `logprobs: true` (a boolean, paired with top_logprobs),
+        // unlike completions/generate where logprobs is an integer. The probe
+        // must still parse so the remaining guards run -- otherwise an
+        // unsupported field riding alongside it (here cache_salt) slips
+        // through the silent drop this guard exists to prevent.
+        let (status, error) = send_json(
+            guarded_router(Some(100)),
+            "/v1/chat/completions",
+            r#"{"logprobs": true, "top_logprobs": 5, "cache_salt": "tenant-a"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["error"]["param"], "cache_salt");
+
+        // A valid chat logprobs request (boolean, no unsupported fields) passes.
+        let (status, _) = send_json(
+            guarded_router(Some(100)),
+            "/v1/chat/completions",
+            r#"{"logprobs": true, "top_logprobs": 5}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -531,6 +610,10 @@ mod tests {
             r#"{"stop_token_ids": [], "allowed_token_ids": []}"#,
             r#"{"prompt_logprobs": null}"#,
             r#"{"temperature": 0.7, "top_p": 0.9, "top_k": 40}"#,
+            // positive logprobs (top-k) is valid; only -1 (full-vocab) is not
+            r#"{"logprobs": 5}"#,
+            // null cache_salt is a no-op (common SDK default)
+            r#"{"cache_salt": null}"#,
         ];
         for body in bodies {
             let (status, _) = send_json(guarded_router(Some(100)), "/v1/completions", body).await;

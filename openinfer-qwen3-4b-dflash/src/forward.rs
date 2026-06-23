@@ -515,7 +515,7 @@ impl DFlashDraftModel {
             &bufs.normed,
             &mut bufs.gate_up,
         )?;
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up, &mut bufs.act_out);
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up, &mut bufs.act_out)?;
         ops::gemm_into_checked(
             &self.ctx,
             &layer.mlp.down_proj,
@@ -635,7 +635,7 @@ impl DFlashDraftModel {
             &bufs.normed,
             &mut bufs.gate_up,
         )?;
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up, &mut bufs.act_out);
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up, &mut bufs.act_out)?;
         ops::gemm_into_checked(
             &self.ctx,
             &layer.mlp.down_proj,

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use openinfer_core::engine::TokenLogprob;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
 pub(crate) fn snapshot_requested_logprobs(
@@ -29,43 +28,4 @@ pub(crate) fn snapshot_requested_logprobs(
             }
         })
         .collect()
-}
-
-pub(crate) fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    sampled_token: u32,
-    top_k: usize,
-) -> Option<TokenLogprob> {
-    if logits_f32.is_empty() {
-        return None;
-    }
-
-    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
-    let log_sum_exp = max_val + sum_exp.ln();
-
-    let sampled_logprob = logits_f32.get(sampled_token as usize)? - log_sum_exp;
-
-    let k = top_k.min(logits_f32.len());
-    let mut top = Vec::with_capacity(k);
-    if k > 0 {
-        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        for (idx, &val) in logits_f32.iter().enumerate() {
-            if best.len() < k || val > best.last().unwrap().1 {
-                let pos = best.partition_point(|&(_, v)| v > val);
-                best.insert(pos, (idx as u32, val));
-                if best.len() > k {
-                    best.pop();
-                }
-            }
-        }
-        for (idx, val) in best {
-            top.push((idx, val - log_sum_exp));
-        }
-    }
-
-    Some(TokenLogprob {
-        logprob: sampled_logprob,
-        top_logprobs: top,
-    })
 }

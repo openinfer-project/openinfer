@@ -9,6 +9,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 
+use super::batch_decode_buffers::BatchDecodeBuffers;
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
 use super::weights::{Qwen3Model, TransformerBlock};
@@ -16,10 +17,100 @@ use crate::lora::{DeviceLoraTokenGroup, build_lora_token_ranges, prepare_lora_to
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
+use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
-use openinfer_kv_cache::KvView;
+use openinfer_kv_cache::{KvBuffer, KvView};
 
 impl Qwen3Model {
+    pub(crate) fn profile_unified_step_memory(
+        &self,
+        max_prefill_tokens: usize,
+        profile_decode_rows: usize,
+        kv_buffer: &KvBuffer,
+        decode_bufs: &mut BatchDecodeBuffers,
+        sample_scratch: &mut openinfer_sample::SampleScratch,
+        mark_peak: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            max_prefill_tokens > 0,
+            "profile prefill tokens must be positive"
+        );
+        anyhow::ensure!(
+            profile_decode_rows > 0,
+            "profile decode rows must be positive"
+        );
+
+        let layout = KvLayout::new(
+            kv_buffer.layout().num_layers,
+            kv_buffer.layout().num_kv_heads,
+            kv_buffer.layout().head_dim,
+            kv_buffer.layout().page_size,
+        );
+        let page_size = layout.page_size;
+        let num_prefill_reqs = 1;
+        let prefill_pages = max_prefill_tokens.div_ceil(page_size);
+        let decode_views: Vec<KvView> = (0..profile_decode_rows)
+            .map(|i| KvView::new(vec![(1 + prefill_pages + i) as i32], 1, page_size))
+            .collect();
+
+        let decode_tokens = vec![0u32; profile_decode_rows];
+        let decode_adapters = vec![None; profile_decode_rows];
+
+        // Force the decode CUDA-Graph/buffer path before the unified peak
+        // sample. The synthetic views are short, but the pre-allocated decode
+        // arena and graph state are the same serving objects used later.
+        self.batch_decode(
+            &decode_tokens,
+            &decode_views,
+            &decode_adapters,
+            kv_buffer.buffer(),
+            &layout,
+            decode_bufs,
+        )?;
+        mark_peak()?;
+
+        // Reachable worst-case unified profile: admission caps
+        // active decode rows + admitted/prefilling rows at the decode batch
+        // capacity, while max_prefill_tokens caps total prefill tokens. One
+        // max-sized prefill row plus the remaining decode slots exercises the
+        // largest activation shape without inventing unreachable row count.
+        let prefill_tokens_per_req = vec![0u32; max_prefill_tokens];
+        let prefill_tokens_list: Vec<&[u32]> = vec![prefill_tokens_per_req.as_slice()];
+        let prefill_single_views: Vec<KvView> = vec![KvView::new(
+            (1..=prefill_pages).map(|page| page as i32).collect(),
+            max_prefill_tokens,
+            page_size,
+        )];
+        let prefill_adapters: Vec<Option<&str>> = vec![None; num_prefill_reqs];
+
+        let logits = self.unified_step_with_peak(
+            &prefill_tokens_list,
+            &prefill_single_views,
+            &prefill_adapters,
+            &decode_tokens,
+            &decode_views,
+            &decode_adapters,
+            kv_buffer.buffer(),
+            &layout,
+            mark_peak,
+        )?;
+        mark_peak()?;
+
+        let total_reqs = num_prefill_reqs + profile_decode_rows;
+        let params = vec![SamplingParams::default(); total_reqs];
+        let param_refs: Vec<&SamplingParams> = params.iter().collect();
+        let _ = openinfer_sample::select_batch(
+            self.device_ctx(),
+            &logits,
+            &param_refs,
+            0,
+            sample_scratch,
+        )?;
+        mark_peak()?;
+        self.ctx.sync()?;
+        Ok(())
+    }
+
     /// Unified step: prefill + decode in one forward pass.
     ///
     /// Returns batched last-token logits `[vocab_size, n_prefill + n_decode]`:
@@ -34,6 +125,32 @@ impl Qwen3Model {
         decode_lora_adapters: &[Option<&str>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
+    ) -> Result<HiddenStates> {
+        let mut mark_peak = || Ok(());
+        self.unified_step_with_peak(
+            prefill_prompts,
+            prefill_views,
+            prefill_lora_adapters,
+            decode_tokens,
+            decode_views,
+            decode_lora_adapters,
+            kv_buffer,
+            layout,
+            &mut mark_peak,
+        )
+    }
+
+    fn unified_step_with_peak(
+        &self,
+        prefill_prompts: &[&[u32]],
+        prefill_views: &[KvView],
+        prefill_lora_adapters: &[Option<&str>],
+        decode_tokens: &[u32],
+        decode_views: &[KvView],
+        decode_lora_adapters: &[Option<&str>],
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
+        mark_peak: &mut dyn FnMut() -> Result<()>,
     ) -> Result<HiddenStates> {
         let num_prefill_reqs = prefill_prompts.len();
         let num_decode_reqs = decode_tokens.len();
@@ -70,6 +187,7 @@ impl Qwen3Model {
         }
         all_tokens.extend_from_slice(decode_tokens);
         let hidden = self.get_embeddings_batch(&all_tokens)?;
+        mark_peak()?;
 
         // ── 2. Derive positions from views ────────────────────────────
         let prefill_start_positions: Vec<usize> = prefill_views
@@ -109,10 +227,18 @@ impl Qwen3Model {
             self.config.head_dim,
             PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
+        mark_peak()?;
 
         // ── 4. Process layers ─────────────────────────────────────────
-        let hidden =
-            self.unified_layers(hidden, total_tokens, &plan, &lora_groups, kv_buffer, layout)?;
+        let hidden = self.unified_layers_with_peak(
+            hidden,
+            total_tokens,
+            &plan,
+            &lora_groups,
+            kv_buffer,
+            layout,
+            mark_peak,
+        )?;
 
         // ── 5. Extract logits ─────────────────────────────────────────
         // Last token of each prefill sequence, then every decode token —
@@ -126,10 +252,12 @@ impl Qwen3Model {
         for i in 0..num_decode_reqs {
             last_indices.push((total_prefill + i) as i32);
         }
-        self.batch_token_logits(&hidden, &last_indices)
+        let logits = self.batch_token_logits(&hidden, &last_indices)?;
+        mark_peak()?;
+        Ok(logits)
     }
 
-    fn unified_layers(
+    fn unified_layers_with_peak(
         &self,
         mut hidden: HiddenStates,
         total_tokens: usize,
@@ -137,6 +265,7 @@ impl Qwen3Model {
         lora_groups: &[DeviceLoraTokenGroup<'_>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
+        mark_peak: &mut dyn FnMut() -> Result<()>,
     ) -> Result<HiddenStates> {
         let inter_dim = self.local_intermediate_size();
         let q_dim = self.local_q_dim();
@@ -150,6 +279,7 @@ impl Qwen3Model {
             inter_dim,
             total_tokens,
         )?;
+        mark_peak()?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.unified_forward_layer(
@@ -163,6 +293,7 @@ impl Qwen3Model {
                 layout,
             )?;
         }
+        mark_peak()?;
 
         Ok(hidden)
     }
