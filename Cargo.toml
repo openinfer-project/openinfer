@@ -40,12 +40,13 @@ members = [
     "kvbm/kvbm-logical",
 ]
 
-# openinfer-dynamo-backend is its OWN workspace (it depends on dynamo-runtime /
-# dynamo-llm). Excluding it keeps that heavy dep tree out of this workspace's
-# `--workspace` build + test graph, so the default openinfer build stays pure
-# Rust + CUDA with no NATS/etcd/tonic. Build it from its own directory.
+# openinfer-dynamo-backend / -frontend are their OWN workspaces (they depend on
+# dynamo-runtime / dynamo-llm). Excluding them keeps that heavy dep tree out of
+# this workspace's `--workspace` build + test graph, so the default openinfer
+# build stays pure Rust + CUDA with no NATS/etcd/tonic. Build from their own dirs.
 exclude = [
     "openinfer-dynamo-backend",
+    "openinfer-dynamo-frontend",
 ]
 
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
