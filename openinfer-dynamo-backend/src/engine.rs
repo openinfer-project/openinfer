@@ -150,6 +150,9 @@ impl OpeninferBackend {
             lora: None,
             decode_overlap: DecodeOverlap::Off,
             batch_invariant: false,
+            // Speculative decoding is a standalone-server knob; the Dynamo
+            // worker never drafts.
+            dflash_draft_model_path: None,
             enable_kv_events,
         };
 
@@ -197,7 +200,10 @@ impl LLMEngine for OpeninferBackend {
         // The model load is blocking (weights -> GPU, kernel warmup, optional
         // graph capture) and must not stall the runtime's reactor.
         let model_path = self.model_path.clone();
-        let launch = self.launch;
+        // `Qwen3LaunchOptions` is no longer `Copy` (it now carries an optional
+        // draft-model path); clone it into the blocking task and keep `self`
+        // intact for the `enable_kv_events` check below.
+        let launch = self.launch.clone();
         let handle =
             tokio::task::spawn_blocking(move || openinfer_qwen3_4b::launch(&model_path, launch))
                 .await
