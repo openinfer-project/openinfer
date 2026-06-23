@@ -164,6 +164,63 @@ fn generate(
     }
 }
 
+/// Submit several greedy requests at once, then collect each one's steps. They
+/// run concurrently in the one engine — the scheduler batches them — so with
+/// heterogeneous `max_tokens` the verify spans differ across a batch, exercising
+/// the real bs>1 draft+verify path. Each tuple is `(prompt_tokens, max_tokens)`;
+/// logprobs are off so the speculative path stays active. Returns one step list
+/// per request, in submission order.
+fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) -> Vec<Vec<Step>> {
+    // Submit all up front so they coexist in the engine and form real batches.
+    let receivers: Vec<_> = requests
+        .into_iter()
+        .map(|(prompt_tokens, max_tokens)| {
+            let (token_tx, rx) = TokenSink::standalone();
+            handle
+                .submit(GenerateRequest {
+                    request_id: None,
+                    queued_at_unix_s: None,
+                    prompt_tokens,
+                    params: SamplingParams::default(),
+                    max_tokens,
+                    lora_adapter: None,
+                    token_tx,
+                    logprobs: 0,
+                    echo: false,
+                })
+                .expect("submit failed");
+            rx
+        })
+        .collect();
+
+    // Drain each request's channel to completion (events are buffered per-channel,
+    // so the drain order doesn't matter — they all ran concurrently).
+    receivers
+        .into_iter()
+        .map(|mut rx| {
+            let mut steps = Vec::new();
+            loop {
+                match rx.blocking_recv().map(|(_, event)| event) {
+                    Some(TokenEvent::Token { id, logprob }) => steps.push(Step {
+                        id,
+                        top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
+                    }),
+                    Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+                    Some(TokenEvent::Finished { .. }) => break,
+                    Some(TokenEvent::Error { message, .. }) => {
+                        panic!("generation failed: {message}")
+                    }
+                    Some(TokenEvent::Rejected { message, .. }) => {
+                        panic!("generation rejected: {message}")
+                    }
+                    None => panic!("scheduler channel closed without Finished"),
+                }
+            }
+            steps
+        })
+        .collect()
+}
+
 /// Prefill `context` (echo) and return the next-token distribution the *prefill*
 /// kernel produces — the kernel the speculative verify path also uses. This is
 /// the reference the spec pick should match (vs the plain-decode baseline, whose
@@ -496,6 +553,92 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
         "verify capture-shape bug: the long request diverged from plain greedy after a short \
          request poisoned the bucket-bs=1 graph at a truncated span:\n{}",
         result.unwrap_err()
+    );
+}
+
+/// Concurrent, heterogeneous-`max_tokens` losslessness coverage for the bs>1
+/// draft+verify path. The bs=1 gate and the homogeneous c8/c16 benches never
+/// exercise a real batch with requests at *different* verify-span lengths; this
+/// runs several greedy requests concurrently with staggered budgets and asserts
+/// each stays lossless vs its own plain-greedy baseline (tolerating only the
+/// benign bf16 tie-flip via the shared regret check). A batched-draft indexing
+/// regression or a capture-shape mismatch at bs>1 would surface here as a real
+/// (non-tie) divergence.
+#[test]
+fn dflash_concurrent_heterogeneous_is_lossless() {
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Distinct prompts with staggered budgets: at any tick the in-flight batch
+    // mixes full and near-budget (truncated) verify spans.
+    let cases: [(&str, usize); 4] = [
+        ("def fibonacci(n):", 64),
+        ("The three primary colors are", 24),
+        (
+            "Q: What is 17 multiplied by 23? A: Let's think step by step.",
+            48,
+        ),
+        ("Here is a short story about a dragon. Once upon a time", 40),
+    ];
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let encoded: Vec<Vec<u32>> = cases
+        .iter()
+        .map(|(p, _)| tokenizer.encode(p, false).expect("encode failed"))
+        .collect();
+
+    // 1. Baselines: each prompt's plain-greedy decode (spec off) at ITS budget,
+    //    with logprobs for the regret reference. Sequential, one engine.
+    let baselines: Vec<Vec<Step>> = {
+        let handle = openinfer_qwen3_4b::launch(Path::new(&model_path), launch_options(None))
+            .expect("failed to start baseline engine");
+        let out = encoded
+            .iter()
+            .zip(&cases)
+            .map(|(t, (_, max_tokens))| generate(&handle, t.clone(), LOGPROBS, *max_tokens))
+            .collect();
+        drop(handle);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+
+    // 2. Speculative engine: submit all four at once so they form real batches.
+    let handle = openinfer_qwen3_4b::launch(
+        Path::new(&model_path),
+        launch_options(Some(PathBuf::from(&draft_path))),
+    )
+    .expect("failed to start speculative engine");
+    let specs = generate_concurrent(
+        &handle,
+        encoded
+            .iter()
+            .zip(&cases)
+            .map(|(t, (_, max_tokens))| (t.clone(), *max_tokens))
+            .collect(),
+    );
+
+    let mut failures = Vec::new();
+    for (i, (prompt, _)) in cases.iter().enumerate() {
+        if let Err(failure) = check_lossless(
+            &handle,
+            &tokenizer,
+            i,
+            prompt,
+            &encoded[i],
+            &baselines[i],
+            &specs[i],
+        ) {
+            failures.push(failure);
+        }
+    }
+    drop(handle);
+
+    assert!(
+        failures.is_empty(),
+        "concurrent heterogeneous speculative decode is not lossless:\n{}",
+        failures.join("\n")
     );
 }
 
