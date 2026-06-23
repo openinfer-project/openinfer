@@ -18,18 +18,25 @@ fn main() -> Result<()> {
         let bytes = std::fs::read(fixture)
             .with_context(|| format!("failed to read fixture {}", fixture.display()))?;
         let st = SafeTensors::deserialize(&bytes).context("parse fixture")?;
-        let noise = read_bf16(&st, "noise_embedding", &[1, args.q_len, config.hidden_size])?;
+        // Derive ctx_len/q_len from the fixture's actual tensor shapes so the
+        // bench works for any --ctx-len/--q-len the Python side used, rather
+        // than requiring the caller to repeat them on both sides.
+        let noise_view = st
+            .tensor("noise_embedding")
+            .with_context(|| "missing tensor noise_embedding")?;
+        let q_len = noise_view.shape()[1];
+        let target_view = st
+            .tensor("target_hidden")
+            .with_context(|| "missing tensor target_hidden")?;
+        let ctx_len = target_view.shape()[1];
+        let noise = read_bf16(&st, "noise_embedding", &[1, q_len, config.hidden_size])?;
         let target_hidden = read_bf16(
             &st,
             "target_hidden",
-            &[
-                1,
-                args.ctx_len,
-                config.hidden_size * config.target_layer_count(),
-            ],
+            &[1, ctx_len, config.hidden_size * config.target_layer_count()],
         )?;
-        let positions = read_i32(&st, "position_ids", &[1, args.ctx_len + args.q_len])?;
-        (noise, target_hidden, positions, args.ctx_len, args.q_len)
+        let positions = read_i32(&st, "position_ids", &[1, ctx_len + q_len])?;
+        (noise, target_hidden, positions, ctx_len, q_len)
     } else {
         let noise = deterministic_bf16(args.q_len * config.hidden_size, 0xD4A5_4B16);
         let target_hidden = deterministic_bf16(
