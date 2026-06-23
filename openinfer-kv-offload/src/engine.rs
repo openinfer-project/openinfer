@@ -409,7 +409,7 @@ impl OffloadEngine {
     ) -> Result<LoadHandle, EngineError> {
         let layer_refs: Vec<&str> = self.layer_names.iter().map(String::as_str).collect();
         // pegaflow indexes GPU blocks by `usize` (see `build_saves`).
-        let dst_block_ids: Vec<usize> = dst_block_ids.iter().map(|&id| id as usize).collect();
+        let dst_block_ids: Vec<usize> = dst_block_ids.into_iter().map(|id| id as usize).collect();
         let loads = [(lease, dst_block_ids)];
         let rx = self.engine.batch_load_kv_blocks_multi_layer_inproc(
             &self.instance_id,
