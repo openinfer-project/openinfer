@@ -32,12 +32,26 @@ const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // 64-token chunks measured fastest on RTX 5090 (128/256 are 1-7% slower, 32
 // past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
 const SPLIT_KV_CHUNK_TOKENS: usize = 64;
-const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
+const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
+const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // workspace/guard bound; Pin's fixed split = ceil(max_context / this)
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 
-/// Chunk size bounding a `basis`-token request to `SPLIT_KV_MAX_CHUNKS_PER_REQUEST` chunks.
+/// Tuned chunk size: 64-token floor, coarsened to keep a `basis`-token request to <= SPLIT_KV_TUNED_MAX_CHUNKS chunks.
 pub fn split_chunk_size_for(basis: usize) -> usize {
-    SPLIT_KV_CHUNK_TOKENS.max(basis.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST))
+    SPLIT_KV_CHUNK_TOKENS.max(basis.div_ceil(SPLIT_KV_TUNED_MAX_CHUNKS))
+}
+
+/// Pin/PerToken fixed chunk size: the finest split that fits the SPLIT_KV_MAX_CHUNKS_PER_REQUEST bound.
+pub(crate) fn pin_chunk_size(max_context_tokens: usize) -> usize {
+    SPLIT_KV_CHUNK_TOKENS.max(max_context_tokens.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST))
+}
+
+/// Per-request chunk cap (split-KV padded grid width + guard) for the active policy; Tuned stays at 64.
+fn max_split_chunks() -> usize {
+    match numeric_policy() {
+        NumericPolicy::Tuned => SPLIT_KV_TUNED_MAX_CHUNKS,
+        NumericPolicy::Pin | NumericPolicy::PerToken => SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,8 +164,8 @@ impl BatchDecodeBuffers {
     ) -> Result<Self> {
         let bs = max_batch_size;
         // The split-KV path is gated on padded_bs <= SPLIT_KV_MAX_BATCH_SIZE,
-        // so its workspace only needs slots for that many requests (~16 MiB
-        // instead of ~128 MiB at bucket 256).
+        // so its workspace only needs slots for that many requests (~65 MiB
+        // instead of ~520 MiB at bucket 256).
         let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
 
         Ok(Self {
@@ -274,15 +288,13 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
-    /// The chunk count sets the online-softmax rescale order, hence the bf16 result. `Pin`/`PerToken`
-    /// key the chunk-size basis on the `max_context_tokens` constant, so the count does not vary with
-    /// the batch.
+    /// Chunk count sets the online-softmax rescale order. `Pin`/`PerToken` fix the split SIZE so the
+    /// count is request-local (batch-invariant); `Tuned` sizes off the live batch.
     fn split_chunk_size(&self) -> usize {
-        let basis = match numeric_policy() {
-            NumericPolicy::Tuned => self.max_seq_len,
-            NumericPolicy::Pin | NumericPolicy::PerToken => self.max_context_tokens,
-        };
-        split_chunk_size_for(basis)
+        match numeric_policy() {
+            NumericPolicy::Tuned => split_chunk_size_for(self.max_seq_len),
+            NumericPolicy::Pin | NumericPolicy::PerToken => pin_chunk_size(self.max_context_tokens),
+        }
     }
 
     fn sync_split_kv_meta(
@@ -297,7 +309,8 @@ impl BatchDecodeBuffers {
             return Ok(());
         }
         let split_chunk_size = self.split_chunk_size();
-        let split_padded_slots = padded_bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
+        let cap = max_split_chunks();
+        let split_padded_slots = padded_bs * cap;
         let mut split_request_indices = Vec::with_capacity(split_padded_slots);
         let mut split_kv_tile_indices = Vec::with_capacity(split_padded_slots);
         let mut split_o_indptr = Vec::with_capacity(padded_bs + 1);
@@ -307,8 +320,8 @@ impl BatchDecodeBuffers {
         for (request_idx, kv) in kv_views.iter().enumerate() {
             let chunks = kv.seq_len().div_ceil(split_chunk_size).max(1);
             anyhow::ensure!(
-                chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
-                "split-KV chunk count {chunks} exceeds workspace bound {SPLIT_KV_MAX_CHUNKS_PER_REQUEST} \
+                chunks <= cap,
+                "split-KV chunk count {chunks} exceeds bound {cap} \
                  (seq_len={}, split_chunk_size={split_chunk_size}) — context limit misconfigured",
                 kv.seq_len()
             );
