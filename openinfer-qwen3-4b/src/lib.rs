@@ -214,6 +214,13 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         !(options.dflash_draft_model_path.is_some() && options.lora.is_some()),
         "DFlash speculative decoding cannot be combined with LoRA serving"
     );
+    anyhow::ensure!(
+        !(options.dflash_draft_model_path.is_some()
+            && !matches!(options.decode_overlap, DecodeOverlap::Off)),
+        "DFlash speculative decoding cannot be combined with decode overlap \
+         (--decode-overlap): the speculative path never takes the unified overlap \
+         route, so the overlap streams would only waste VRAM the drafter needs"
+    );
     match options.lora {
         Some(lora) => {
             info!(
