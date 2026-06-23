@@ -396,6 +396,17 @@ fn token_stream(
 ) -> impl futures::Stream<Item = Result<LLMEngineOutput, DynamoError>> {
     async_stream::stream! {
         let mut completion_tokens: u32 = 0;
+        // Prefix-cache hit, carried out of the schedule event and stamped onto
+        // whichever terminal we emit (natural, cancelled, or stopped).
+        let mut cached_tokens: u32 = 0;
+        // A cancelled/stopped terminal has no engine usage to inherit, so build
+        // one from the counts we have and stamp the cache hit the same way the
+        // natural terminal carries it.
+        let cancel_usage = |completion_tokens, cached_tokens| {
+            let mut u = usage(prompt_tokens, completion_tokens);
+            convert::apply_cached_tokens(&mut u, cached_tokens);
+            u
+        };
         loop {
             // `biased` is load-bearing: when both a cancel and a pending token
             // are ready we must prefer cancellation (yield Cancelled, not one
@@ -409,13 +420,13 @@ fn token_stream(
                 _ = cancel.cancelled() => {
                     cancelled.store(true, Ordering::Release);
                     yield Ok(LLMEngineOutput::cancelled()
-                        .with_usage(usage(prompt_tokens, completion_tokens)));
+                        .with_usage(cancel_usage(completion_tokens, cached_tokens)));
                     break;
                 }
                 _ = ctx.stopped() => {
                     cancelled.store(true, Ordering::Release);
                     yield Ok(LLMEngineOutput::cancelled()
-                        .with_usage(usage(prompt_tokens, completion_tokens)));
+                        .with_usage(cancel_usage(completion_tokens, cached_tokens)));
                     break;
                 }
                 recv = rx.recv() => {
@@ -424,8 +435,15 @@ fn token_stream(
                         break;
                     };
                     match convert::map_token_event(event) {
+                        Mapped::Cached(c) => { cached_tokens = c; }
                         Mapped::Chunk(c) => { completion_tokens += 1; yield Ok(c); }
-                        Mapped::Terminal(t) => { yield Ok(t); break; }
+                        Mapped::Terminal(mut t) => {
+                            if let Some(u) = t.completion_usage.as_mut() {
+                                convert::apply_cached_tokens(u, cached_tokens);
+                            }
+                            yield Ok(t);
+                            break;
+                        }
                         Mapped::Fail(e) => { yield Err(e); break; }
                         Mapped::Ignore => {}
                     }

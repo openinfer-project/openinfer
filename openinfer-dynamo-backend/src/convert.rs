@@ -8,8 +8,8 @@
 //! thin imperative shell over these functions.
 
 use dynamo_backend_common::{
-    BackendError, ComponentSnapshot, DynamoError, ErrorType, LLMEngineOutput, LLMEngineOutputExt,
-    PreprocessedRequest, chunk, usage,
+    BackendError, CompletionUsage, ComponentSnapshot, DynamoError, ErrorType, LLMEngineOutput,
+    LLMEngineOutputExt, PreprocessedRequest, chunk, usage,
 };
 use dynamo_kv_router::protocols::{
     ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
@@ -54,6 +54,10 @@ pub fn resolve_max_tokens(request: &PreprocessedRequest) -> usize {
 
 /// Outcome of mapping a single openinfer `TokenEvent` into the Dynamo stream.
 pub enum Mapped {
+    /// Prefix-cache hit count (`Scheduled.cached_tokens`): not a client-visible
+    /// item, but the caller must remember it to stamp the terminal usage. Keep
+    /// draining.
+    Cached(u32),
     /// Non-terminal chunk to yield; keep draining.
     Chunk(LLMEngineOutput),
     /// Terminal chunk to yield, then stop (the single `finish_reason`-bearing
@@ -96,9 +100,26 @@ pub fn map_token_event(event: TokenEvent) -> Mapped {
         }
         TokenEvent::Error { message, .. } => Mapped::Fail(backend_error(message)),
         TokenEvent::Rejected { message, .. } => Mapped::Fail(invalid_argument(message)),
-        // Timing telemetry and echo / prompt-logprobs are not surfaced in M1.
-        TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. } => Mapped::Ignore,
+        // The schedule event carries the matched prefix length — the only place
+        // openinfer reports a cache hit. Carry it out so the terminal usage can
+        // surface it as OpenAI `prompt_tokens_details.cached_tokens`.
+        TokenEvent::Scheduled { cached_tokens, .. } => Mapped::Cached(cached_tokens as u32),
+        // Echo / prompt-logprobs are not surfaced in M1.
+        TokenEvent::PromptTokens { .. } => Mapped::Ignore,
     }
+}
+
+/// Stamp the prefix-cache hit onto an existing usage as OpenAI
+/// `prompt_tokens_details.cached_tokens`. A zero hit is left absent (the field
+/// stays `None`) so "no cache" and "cache reported zero" read alike downstream.
+/// This is the only signal openinfer gives the Dynamo frontend's KV-hit metric.
+pub fn apply_cached_tokens(usage: &mut CompletionUsage, cached_tokens: u32) {
+    if cached_tokens == 0 {
+        return;
+    }
+    let mut details = usage.prompt_tokens_details.take().unwrap_or_default();
+    details.cached_tokens = Some(cached_tokens);
+    usage.prompt_tokens_details = Some(details);
 }
 
 /// Build the Dynamo router/Prometheus snapshot from openinfer's live KV load.
@@ -440,16 +461,20 @@ mod tests {
     }
 
     #[test]
-    fn bookkeeping_events_are_ignored() {
+    fn scheduled_event_carries_prefix_cache_hit() {
         assert!(matches!(
             map_token_event(TokenEvent::Scheduled {
                 queued_at_unix_s: 0.0,
                 scheduled_at_unix_s: 0.0,
-                prompt_tokens: 3,
-                cached_tokens: 0,
+                prompt_tokens: 100,
+                cached_tokens: 48,
             }),
-            Mapped::Ignore
+            Mapped::Cached(48)
         ));
+    }
+
+    #[test]
+    fn prompt_tokens_event_is_ignored() {
         assert!(matches!(
             map_token_event(TokenEvent::PromptTokens {
                 ids: vec![1, 2],
@@ -457,5 +482,19 @@ mod tests {
             }),
             Mapped::Ignore
         ));
+    }
+
+    #[test]
+    fn apply_cached_tokens_stamps_only_positive_hits() {
+        // Zero hit leaves the field absent — "no cache" and "reported zero" alike.
+        let mut u = usage(100, 5);
+        apply_cached_tokens(&mut u, 0);
+        assert!(u.prompt_tokens_details.is_none());
+
+        apply_cached_tokens(&mut u, 48);
+        assert_eq!(
+            u.prompt_tokens_details.expect("details set").cached_tokens,
+            Some(48)
+        );
     }
 }
