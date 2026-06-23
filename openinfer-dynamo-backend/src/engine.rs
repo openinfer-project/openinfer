@@ -3,31 +3,36 @@
 //! KV router. Run one process per GPU (`--device-ordinal 0..N`); the router
 //! fans requests across the replicas.
 //!
-//! M1 scope: `start` (load Qwen3) / `generate` (stream tokens) / `cleanup`.
-//! The engine advertises its real KV block size + capacity, so KV-aware
-//! routing is well-defined — with no KV events yet the router's radix tree is
-//! empty, every prefix misses, and routing falls back to load / round-robin.
-//! The load signal (`setup_metrics`) and KV-event publishing
-//! (`kv_event_sources`) are later milestones and use the trait defaults here.
+//! `start` (load Qwen3) / `generate` (stream tokens) / `cleanup` cover serving;
+//! `setup_metrics` (M2) publishes the live KV-load signal the router scores
+//! against, so an idle/busy replica is visible and load-balancing works. The
+//! engine also advertises its real KV block size + capacity, so the router's
+//! KV-aware cost function is well-defined — but with no KV events published yet
+//! (`kv_event_sources`, M3) its radix tree stays empty and every prefix misses,
+//! so routing leans on the load signal until M3 lands cache-aware routing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dynamo_backend_common::{
     AsyncEngineContext, CommonArgs, DynamoError, EngineConfig, GenerateContext, LLMEngine,
-    LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, PreprocessedRequest, WorkerConfig, usage,
+    LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, MetricsBindings, MetricsCtx,
+    OnSnapshotPublisherReady, PreprocessedRequest, SnapshotPublisher, WorkerConfig, usage,
 };
 use futures::stream::BoxStream;
-use openinfer_engine::engine::{EngineHandle, GenerateRequest, TokenSink, TokenStreamReceiver};
+use openinfer_engine::engine::{
+    EngineHandle, GenerateRequest, LoadSnapshot, TokenSink, TokenStreamReceiver,
+};
 use openinfer_qwen3_4b::{
     DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
     DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions,
     Qwen3OffloadOptions,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::convert::{self, Mapped};
@@ -76,10 +81,14 @@ pub struct OpeninferBackend {
     /// and dropping it closes the submit channel that signals the (detached)
     /// scheduler thread to finish.
     handle: Mutex<Option<EngineHandle>>,
-    /// Fired by `cleanup`; every in-flight `generate` stream selects on it so
-    /// shutdown yields a clean `Cancelled` terminal instead of racing the
-    /// channel-close path into a spurious "stream incomplete" error.
-    cancel: CancellationToken,
+    /// Fired by `cleanup`; every in-flight `generate` stream and the metrics
+    /// publish task select on it so shutdown yields a clean `Cancelled` terminal
+    /// instead of racing the channel-close path into a spurious "stream
+    /// incomplete" error. Behind a `Mutex` and reset at the top of `start`: a
+    /// `cleanup` → `start` cycle on the same instance must get a fresh token,
+    /// else the next run's `generate`/metrics tasks observe the already-tripped
+    /// token and silently yield `Cancelled` / go dark.
+    cancel: Mutex<CancellationToken>,
 }
 
 impl OpeninferBackend {
@@ -126,7 +135,7 @@ impl OpeninferBackend {
             served_model_name: served_model_name.clone(),
             launch,
             handle: Mutex::new(None),
-            cancel: CancellationToken::new(),
+            cancel: Mutex::new(CancellationToken::new()),
         };
 
         let config = WorkerConfig {
@@ -147,6 +156,12 @@ impl OpeninferBackend {
     fn handle(&self) -> std::sync::MutexGuard<'_, Option<EngineHandle>> {
         self.handle.lock().expect("engine handle mutex poisoned")
     }
+
+    /// The current cancellation token (cloned). Reset by `start`, tripped by
+    /// `cleanup`.
+    fn cancel_token(&self) -> CancellationToken {
+        self.cancel.lock().expect("cancel mutex poisoned").clone()
+    }
 }
 
 #[async_trait]
@@ -157,6 +172,9 @@ impl LLMEngine for OpeninferBackend {
                 "openinfer backend already started",
             ));
         }
+        // Fresh lifecycle: a prior `cleanup` left the token tripped, which would
+        // make this run's generate/metrics tasks born-cancelled. Reset it.
+        *self.cancel.lock().expect("cancel mutex poisoned") = CancellationToken::new();
 
         tracing::info!(
             model_path = %self.model_path.display(),
@@ -257,7 +275,7 @@ impl LLMEngine for OpeninferBackend {
             rx,
             cancelled,
             ctx.inner_arc(),
-            self.cancel.clone(),
+            self.cancel_token(),
             prompt_tokens,
         )))
     }
@@ -273,10 +291,35 @@ impl LLMEngine for OpeninferBackend {
         // drains its current step and exits once the channel is closed.
         // Idempotent: a second call sees an already-cancelled token and a
         // `None` handle.
-        self.cancel.cancel();
+        self.cancel.lock().expect("cancel mutex poisoned").cancel();
         let _ = self.handle().take();
         tracing::info!("openinfer backend: cleanup complete");
         Ok(())
+    }
+
+    async fn setup_metrics(&self, _ctx: MetricsCtx<'_>) -> Result<MetricsBindings, DynamoError> {
+        // The scheduler thread republishes live KV occupancy to this watch feed
+        // after every step (and a heartbeat when idle). `setup_metrics` runs
+        // only after a successful `start`, so the handle and its feed exist.
+        let load_watch = self
+            .handle()
+            .as_ref()
+            .and_then(EngineHandle::load_watch)
+            .ok_or_else(|| convert::engine_shutdown("setup_metrics called before start"))?;
+        let cancel = self.cancel_token();
+
+        // Framework constructs the SnapshotPublisher and hands it back here; we
+        // own the publish loop thereafter. It is cancelled in `cleanup` via
+        // `self.cancel`, so a start→cleanup→start cycle never leaks a task.
+        let on_publisher_ready: OnSnapshotPublisherReady = Box::new(move |publisher| {
+            tokio::spawn(publish_load_loop(publisher, load_watch, cancel));
+            Ok(())
+        });
+
+        Ok(MetricsBindings {
+            dp_ranks: vec![DP_RANK],
+            on_publisher_ready: Some(on_publisher_ready),
+        })
     }
 }
 
@@ -327,6 +370,44 @@ fn token_stream(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Idle heartbeat for the load signal. An idle worker stops stepping, so the
+/// watch goes quiet; without a floor the router could read "no recent update"
+/// as "worker gone" and stop routing to a healthy idle replica. Far coarser
+/// than the per-step change wakeups that carry the real signal under load.
+const LOAD_HEARTBEAT: Duration = Duration::from_millis(100);
+
+/// Forward openinfer's live KV load to the Dynamo KV router.
+///
+/// openinfer's scheduler is a plain OS thread that writes a lock-free `watch`
+/// each step; this task bridges that to the async `SnapshotPublisher` without
+/// coupling the engine to tokio and without ever letting a metrics read stall
+/// the GPU step. It republishes on every change (≈ once per decode step under
+/// load) and at least every [`LOAD_HEARTBEAT`] when idle — until `cleanup`
+/// cancels it or the engine drops the watch sender.
+async fn publish_load_loop(
+    publisher: Arc<SnapshotPublisher>,
+    mut load_watch: watch::Receiver<LoadSnapshot>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let load = *load_watch.borrow_and_update();
+        publisher.publish(DP_RANK, convert::load_to_component_snapshot(load, DP_RANK));
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            changed = load_watch.changed() => {
+                // Err means the engine dropped the sender (scheduler gone) —
+                // nothing left to report.
+                if changed.is_err() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(LOAD_HEARTBEAT) => {}
         }
     }
 }
@@ -390,6 +471,13 @@ mod tests {
     use futures::StreamExt as _;
     use std::time::Duration;
 
+    /// Each GPU test loads a full Qwen3 onto the device; cargo runs tests
+    /// concurrently by default, which races two model loads into one GPU and
+    /// OOMs the smaller cards. Serialize the model-loading tests behind one
+    /// async lock so the suite is green without `--test-threads=1`.
+    static GPU_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     fn test_model_path() -> Option<String> {
         let p = std::env::var("OPENINFER_TEST_MODEL_PATH")
             .unwrap_or_else(|_| "models/Qwen3-4B".to_string());
@@ -433,6 +521,7 @@ mod tests {
         let Some(model_path) = test_model_path() else {
             return;
         };
+        let _gpu = GPU_TEST_LOCK.lock().await;
         let backend = test_backend(&model_path);
         backend.start(0).await.expect("start");
         eprintln!("[smoke] engine loaded");
@@ -498,6 +587,77 @@ mod tests {
             .await
             .expect("second cleanup must be idempotent");
         eprintln!("[smoke] cleanup idempotent ok");
+    }
+
+    /// The router-facing load signal actually tracks KV occupancy: zero while
+    /// idle, rises above zero while a request decodes, and falls back to zero
+    /// once it finishes — bounded by the advertised capacity throughout. Reads
+    /// the same `EngineHandle::load_watch` feed `setup_metrics` publishes from,
+    /// so it covers the openinfer→watch wiring without needing a live router.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn load_signal_tracks_kv_usage() {
+        let Some(model_path) = test_model_path() else {
+            return;
+        };
+        let _gpu = GPU_TEST_LOCK.lock().await;
+        let backend = test_backend(&model_path);
+        backend.start(0).await.expect("start");
+
+        let handle = backend.handle().as_ref().expect("started").clone();
+        let kv_total = handle.kv_capacity().expect("kv capacity").total_blocks as u64;
+        let mut load_rx = handle.load_watch().expect("load feed wired");
+
+        // Idle: nothing in flight, so the whole pool reads as free.
+        let idle = *load_rx.borrow_and_update();
+        assert_eq!(idle.kv_used_blocks, 0, "idle pool must report 0 used");
+        assert_eq!(idle.kv_total_blocks, kv_total);
+
+        // Drive a bounded generate and watch usage climb above zero.
+        let stream = backend
+            .generate(gen_request(64), GenerateContext::new(mock_context(), None))
+            .await
+            .expect("generate");
+
+        let rose = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if load_rx.borrow_and_update().kv_used_blocks > 0 {
+                    return true;
+                }
+                if load_rx.changed().await.is_err() {
+                    return false; // engine dropped the feed
+                }
+            }
+        })
+        .await
+        .expect("kv_used_blocks must rise within the deadline");
+        assert!(rose, "engine dropped the load feed before usage rose");
+        let peak = load_rx.borrow().kv_used_blocks;
+        assert!(
+            peak <= kv_total,
+            "used {peak} cannot exceed total {kv_total}"
+        );
+
+        // Drain to completion; usage falls back to zero as the request's blocks
+        // free.
+        let _: Vec<_> = stream.map(|r| r.expect("stream item Ok")).collect().await;
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if load_rx.borrow_and_update().kv_used_blocks == 0 {
+                    return;
+                }
+                if load_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "kv_used_blocks must return to 0 after the request finishes"
+        );
+
+        backend.cleanup().await.expect("cleanup");
+        eprintln!("[load] idle=0 → peak={peak}/{kv_total} → settled=0 ok");
     }
 
     /// Exhaustive official Dynamo `LLMEngine` conformance: start →

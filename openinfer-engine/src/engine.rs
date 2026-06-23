@@ -9,7 +9,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
@@ -284,6 +284,20 @@ impl KvCapacity {
     }
 }
 
+/// Live KV-cache occupancy the scheduler republishes after every step.
+///
+/// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
+/// KV router) scores against; `kv_total_blocks` is the engine's whole-pool
+/// capacity (the same number advertised as the servable ceiling), so the
+/// consumer can derive fractional usage without a second query. Carried over a
+/// [`watch`] channel: the scheduler is the sole writer and never blocks on a
+/// reader, and a reader only ever sees the latest snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadSnapshot {
+    pub kv_used_blocks: u64,
+    pub kv_total_blocks: u64,
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<EngineInner>,
@@ -291,6 +305,9 @@ pub struct EngineHandle {
     /// KV pool capacity in blocks + block size, or `None` if the engine did not
     /// report it. See [`KvCapacity`].
     kv_capacity: Option<KvCapacity>,
+    /// Live KV-load feed, or `None` if the engine did not wire one. Each clone
+    /// of the handle holds its own receiver; `watch` fans out to all of them.
+    load_watch: Option<watch::Receiver<LoadSnapshot>>,
 }
 
 struct EngineInner {
@@ -340,6 +357,7 @@ impl EngineHandle {
             }),
             servable_len: None,
             kv_capacity: None,
+            load_watch: None,
         }
     }
 
@@ -364,6 +382,20 @@ impl EngineHandle {
     /// at once.
     pub fn kv_capacity(&self) -> Option<KvCapacity> {
         self.kv_capacity
+    }
+
+    #[must_use]
+    pub fn with_load_watch(mut self, load_watch: watch::Receiver<LoadSnapshot>) -> Self {
+        self.load_watch = Some(load_watch);
+        self
+    }
+
+    /// A receiver for the engine's live KV load, if it wired one. Awaiting
+    /// [`watch::Receiver::changed`] wakes once per scheduler step under load and
+    /// stays quiet when idle, so a consumer republishes on real change rather
+    /// than polling. `None` if the engine reported no load feed.
+    pub fn load_watch(&self) -> Option<watch::Receiver<LoadSnapshot>> {
+        self.load_watch.clone()
     }
 
     #[allow(clippy::result_large_err)]

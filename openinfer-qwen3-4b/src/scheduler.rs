@@ -16,14 +16,14 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
 use crate::weights::Qwen3MemoryOptions;
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
-    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, TokenEvent,
-    TokenSink,
+    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, LoadSnapshot,
+    TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
 
@@ -230,22 +230,35 @@ where
     // Executor just built: the only committed block is the leaked CUDA-graph
     // padding slot, so available_blocks() is total − 1. Conservative by one
     // block, which is the right side to err on for a capacity ceiling.
+    let kv_total = executor.available_blocks() as u64;
     let kv_capacity = KvCapacity {
-        total_blocks: executor.available_blocks(),
+        total_blocks: kv_total as usize,
         block_size: executor.block_size(),
     };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_used_blocks: 0,
+        kv_total_blocks: kv_total,
+    });
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop(executor, submit_rx, seed, max_prefill_tokens);
+            scheduler_loop(
+                executor,
+                submit_rx,
+                seed,
+                max_prefill_tokens,
+                kv_total,
+                &load_tx,
+            );
         })
         .expect("failed to spawn scheduler thread");
 
     EngineHandle::new(submit_tx)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
+        .with_load_watch(load_rx)
 }
 
 pub(crate) fn start_with_executor_with_lora_control<E>(
@@ -268,22 +281,35 @@ where
     // Executor just built: the only committed block is the leaked CUDA-graph
     // padding slot, so available_blocks() is total − 1. Conservative by one
     // block, which is the right side to err on for a capacity ceiling.
+    let kv_total = executor.available_blocks() as u64;
     let kv_capacity = KvCapacity {
-        total_blocks: executor.available_blocks(),
+        total_blocks: kv_total as usize,
         block_size: executor.block_size(),
     };
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_used_blocks: 0,
+        kv_total_blocks: kv_total,
+    });
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop_with_lora_control(executor, command_rx, seed, max_prefill_tokens);
+            scheduler_loop_with_lora_control(
+                executor,
+                command_rx,
+                seed,
+                max_prefill_tokens,
+                kv_total,
+                &load_tx,
+            );
         })
         .expect("failed to spawn scheduler thread");
 
     EngineHandle::new_with_command_channel(command_tx)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
+        .with_load_watch(load_rx)
 }
 
 // ── KV-offload prefetch admission helpers ────────────────────────────────
@@ -376,11 +402,33 @@ fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
+/// Republish live KV occupancy to the load-watch feed. Called once at the top of
+/// every loop iteration (before this step admits/allocates), so it reports the
+/// resident occupancy *between* steps — the steady-state load a router wants,
+/// not a transient in-step peak. Top-of-loop placement guarantees exactly one
+/// publish per iteration regardless of which `continue` the step takes, and the
+/// post-completion free shows up at the next iteration's top before the loop
+/// parks idle. `watch` coalesces (a consumer wakes at most once per step and
+/// reads the latest); `send_replace` ignores a dropped receiver, so the
+/// scheduler runs whether or not anyone is watching.
+fn publish_load<E: ModelExecutor>(
+    load_tx: &watch::Sender<LoadSnapshot>,
+    kv_total: u64,
+    executor: &E,
+) {
+    load_tx.send_replace(LoadSnapshot {
+        kv_used_blocks: kv_total.saturating_sub(executor.available_blocks() as u64),
+        kv_total_blocks: kv_total,
+    });
+}
+
 fn scheduler_loop<E>(
     mut executor: E,
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     seed: u64,
     max_prefill_tokens: usize,
+    kv_total: u64,
+    load_tx: &watch::Sender<LoadSnapshot>,
 ) where
     E: ModelExecutor,
 {
@@ -402,6 +450,8 @@ fn scheduler_loop<E>(
     info!("Scheduler ready");
 
     loop {
+        publish_load(load_tx, kv_total, &executor);
+
         // 0. Poll in-flight async prefill (decode-overlap mode).
         if inflight_prefill_pending.is_some() {
             if let Some(prefill_result) = executor.poll_async_prefill() {
@@ -569,6 +619,8 @@ fn scheduler_loop_with_lora_control<E>(
     mut command_rx: mpsc::UnboundedReceiver<EngineCommand>,
     seed: u64,
     max_prefill_tokens: usize,
+    kv_total: u64,
+    load_tx: &watch::Sender<LoadSnapshot>,
 ) where
     E: ModelExecutor,
 {
@@ -584,6 +636,8 @@ fn scheduler_loop_with_lora_control<E>(
     info!("Scheduler ready with LoRA control");
 
     loop {
+        publish_load(load_tx, kv_total, &executor);
+
         // 1. Drain incoming commands. Generation submitted after a pending
         // control command waits until that control command is handled at idle.
         while let Ok(command) = command_rx.try_recv() {

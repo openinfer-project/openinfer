@@ -8,10 +8,10 @@
 //! thin imperative shell over these functions.
 
 use dynamo_backend_common::{
-    BackendError, DynamoError, ErrorType, LLMEngineOutput, LLMEngineOutputExt, PreprocessedRequest,
-    chunk, usage,
+    BackendError, ComponentSnapshot, DynamoError, ErrorType, LLMEngineOutput, LLMEngineOutputExt,
+    PreprocessedRequest, chunk, usage,
 };
-use openinfer_engine::engine::{FinishReason as EngineFinishReason, TokenEvent};
+use openinfer_engine::engine::{FinishReason as EngineFinishReason, LoadSnapshot, TokenEvent};
 use openinfer_engine::sampler::SamplingParams;
 
 /// Fallback token cap when the client leaves `stop_conditions.max_tokens`
@@ -92,6 +92,28 @@ pub fn map_token_event(event: TokenEvent) -> Mapped {
         TokenEvent::Rejected { message, .. } => Mapped::Fail(invalid_argument(message)),
         // Timing telemetry and echo / prompt-logprobs are not surfaced in M1.
         TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. } => Mapped::Ignore,
+    }
+}
+
+/// Build the Dynamo router/Prometheus snapshot from openinfer's live KV load.
+///
+/// `gpu_cache_usage` is the fraction of the pool in use; a zero-capacity pool
+/// (degenerate, should not happen post-load) maps to 0.0 rather than the NaN
+/// `0/0` would feed the gauge. `kv_cache_hit_rate` is `None`: M2 does not yet
+/// surface a prefix-cache hit rate, and `None` (tri-state "no data") is the
+/// honest value — `Some(0.0)` would read as a measured 0% hit rate.
+pub fn load_to_component_snapshot(load: LoadSnapshot, dp_rank: u32) -> ComponentSnapshot {
+    let gpu_cache_usage = if load.kv_total_blocks == 0 {
+        0.0
+    } else {
+        load.kv_used_blocks as f32 / load.kv_total_blocks as f32
+    };
+    ComponentSnapshot {
+        kv_used_blocks: load.kv_used_blocks,
+        kv_total_blocks: load.kv_total_blocks,
+        gpu_cache_usage,
+        kv_cache_hit_rate: None,
+        dp_rank,
     }
 }
 
@@ -273,6 +295,30 @@ mod tests {
             }
             _ => panic!("Error must map to a Fail"),
         }
+    }
+
+    #[test]
+    fn load_snapshot_maps_to_component_snapshot() {
+        let snap = load_to_component_snapshot(
+            LoadSnapshot {
+                kv_used_blocks: 25,
+                kv_total_blocks: 100,
+            },
+            0,
+        );
+        assert_eq!(snap.kv_used_blocks, 25);
+        assert_eq!(snap.kv_total_blocks, 100);
+        assert!((snap.gpu_cache_usage - 0.25).abs() < 1e-6);
+        // Tri-state: M2 has no hit-rate counter, so "no data" not measured-0%.
+        assert_eq!(snap.kv_cache_hit_rate, None);
+        assert_eq!(snap.dp_rank, 0);
+    }
+
+    #[test]
+    fn zero_capacity_maps_usage_to_zero_not_nan() {
+        let snap = load_to_component_snapshot(LoadSnapshot::default(), 0);
+        assert_eq!(snap.gpu_cache_usage, 0.0);
+        assert!(snap.gpu_cache_usage.is_finite());
     }
 
     #[test]
