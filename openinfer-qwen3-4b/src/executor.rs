@@ -514,6 +514,11 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
         gemm_lt_pin_warmup(intermediate, hidden)?;
         gemm_lt_pin_warmup(hidden, intermediate)?;
         gemm_lt_pin_warmup(vocab, hidden)?;
+        let max_context = model.config().max_position_embeddings;
+        log::info!(
+            "Qwen3 split-KV decode chunk pinned: {} tokens (max_context_tokens={max_context})",
+            crate::batch_decode_buffers::split_chunk_size_for(max_context)
+        );
         return Ok(());
     }
 
@@ -2088,6 +2093,7 @@ impl LocalQwen3Lane {
             total_blocks,
             padding_block_id,
             model.local_num_attention_heads(),
+            model.config().max_position_embeddings,
         )?;
         let sample_scratch = openinfer_sample::SampleScratch::new(
             model.device_ctx(),

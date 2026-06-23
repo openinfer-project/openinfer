@@ -6,6 +6,7 @@ use cudarc::driver::CudaSlice;
 
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
 use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
@@ -33,6 +34,11 @@ const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 const SPLIT_KV_CHUNK_TOKENS: usize = 64;
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
+
+/// Chunk size bounding a `basis`-token request to `SPLIT_KV_MAX_CHUNKS_PER_REQUEST` chunks.
+pub fn split_chunk_size_for(basis: usize) -> usize {
+    SPLIT_KV_CHUNK_TOKENS.max(basis.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DecodeAttentionPath {
@@ -110,6 +116,9 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) split_tmp_s: CudaSlice<f32>,
     pub(crate) split_padded_slots: usize,
     max_seq_len: usize,
+    /// Model context limit (`max_position_embeddings`) — the `Pin` split-KV chunk basis (see
+    /// `split_chunk_size`).
+    max_context_tokens: usize,
 
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
@@ -137,6 +146,7 @@ impl BatchDecodeBuffers {
         max_total_pages: usize,
         padding_page_id: i32,
         num_qo_heads: usize,
+        max_context_tokens: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
         // The split-KV path is gated on padded_bs <= SPLIT_KV_MAX_BATCH_SIZE,
@@ -178,6 +188,7 @@ impl BatchDecodeBuffers {
             split_tmp_s: ctx.stream.alloc_zeros(max_split_slots * num_qo_heads)?,
             split_padded_slots: 0,
             max_seq_len: 0,
+            max_context_tokens,
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()
@@ -263,6 +274,17 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
+    /// The chunk count sets the online-softmax rescale order, hence the bf16 result. `Pin`/`PerToken`
+    /// key the chunk-size basis on the `max_context_tokens` constant, so the count does not vary with
+    /// the batch.
+    fn split_chunk_size(&self) -> usize {
+        let basis = match numeric_policy() {
+            NumericPolicy::Tuned => self.max_seq_len,
+            NumericPolicy::Pin | NumericPolicy::PerToken => self.max_context_tokens,
+        };
+        split_chunk_size_for(basis)
+    }
+
     fn sync_split_kv_meta(
         &mut self,
         ctx: &DeviceContext,
@@ -274,8 +296,7 @@ impl BatchDecodeBuffers {
         if padded_bs > SPLIT_KV_MAX_BATCH_SIZE {
             return Ok(());
         }
-        let split_chunk_size =
-            SPLIT_KV_CHUNK_TOKENS.max(self.max_seq_len.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST));
+        let split_chunk_size = self.split_chunk_size();
         let split_padded_slots = padded_bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
         let mut split_request_indices = Vec::with_capacity(split_padded_slots);
         let mut split_kv_tile_indices = Vec::with_capacity(split_padded_slots);
@@ -285,7 +306,12 @@ impl BatchDecodeBuffers {
 
         for (request_idx, kv) in kv_views.iter().enumerate() {
             let chunks = kv.seq_len().div_ceil(split_chunk_size).max(1);
-            debug_assert!(chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST);
+            anyhow::ensure!(
+                chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
+                "split-KV chunk count {chunks} exceeds workspace bound {SPLIT_KV_MAX_CHUNKS_PER_REQUEST} \
+                 (seq_len={}, split_chunk_size={split_chunk_size}) — context limit misconfigured",
+                kv.seq_len()
+            );
             for chunk_idx in 0..chunks {
                 split_request_indices.push(request_idx as i32);
                 split_kv_tile_indices.push(chunk_idx as i32);

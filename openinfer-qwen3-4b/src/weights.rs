@@ -957,6 +957,7 @@ impl Qwen3Model {
             profile_blocks,
             0,
             self.local_num_attention_heads(),
+            self.config.max_position_embeddings,
         )
         .context("Qwen3 memory profile decode buffer alloc failed")?;
         record_peak()?;

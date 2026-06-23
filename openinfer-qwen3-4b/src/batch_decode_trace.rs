@@ -88,6 +88,7 @@ pub fn trace_decode_kernel_calls(
         kv_mgr.pool().total_blocks(),
         kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
+        model.config().max_position_embeddings,
     )?;
     let token_ids = vec![0_u32; batch_size];
     let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();

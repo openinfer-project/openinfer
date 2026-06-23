@@ -117,6 +117,7 @@ impl Default for Qwen3OffloadOptions {
 /// This is the production phase boundary used by the Qwen3 scheduler and by
 /// model-local benchmarks. The root server should use `start_engine` instead.
 pub mod runtime {
+    pub use crate::batch_decode_buffers::split_chunk_size_for;
     pub use crate::executor::{
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
         PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,

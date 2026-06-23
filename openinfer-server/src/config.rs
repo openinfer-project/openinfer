@@ -119,8 +119,8 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 20)]
     pub decode_sm_pct: u32,
 
-    /// Enable Qwen3 projection-GEMM batch-invariant pinning. Off by default;
-    /// does not cover path-selection residuals. Qwen3-only.
+    /// Enable Qwen3 projection-GEMM and split-KV chunk-count batch-invariant
+    /// pinning. Off by default; does not cover path-selection residuals. Qwen3-only.
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
 }
