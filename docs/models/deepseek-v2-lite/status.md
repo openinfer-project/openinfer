@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and attribution target. HF / host-staged / NCCL exactness is guarded by a committed case set. #278 adds probe-only CUDA Graph evidence for one NCCL batch-1 decode step: capture, instantiate, replay, and token verification all pass. Direct batch, HTTP pressure, and vLLM rows remain diagnostic and do not claim production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and serving-semantics target. HF / host-staged / NCCL exactness is guarded by a committed case set, and #281 adds the first greedy mixed-request serving gate with per-request decode KV ownership. CUDA Graph, direct batch, HTTP pressure, and vLLM rows remain diagnostic or unclaimed as production serving parity.
 
 Last touched: 2026-06
 
@@ -19,7 +19,7 @@ Last touched: 2026-06
 | Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. This remains the eager NCCL oracle path. |
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
-| Production continuous batching | Not available | The direct diagnostic batch path is not mixed-request HTTP serving. |
+| First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 snapshot below is a runnable comparison from a documented validation environment, not serving parity or a stock-install claim. |
 
 ## Correctness Contract
@@ -32,7 +32,9 @@ The retained correctness gate is deliberately narrow:
 - generation mode: greedy;
 - backends: host-staged and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
 
-The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-20 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, and no comparison warnings.
+The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-23 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, and no comparison warnings.
+
+The mixed-request serving E2E computes sequential greedy token-id oracles with `DeepSeekV2LiteEp2Generator::generate_greedy`, then submits concurrent requests through `start_engine`. The retained 2026-06-23 run covers same-length mixed prompts for same-position batch decode, different-length mixed prompts for single-row decode fallback, and a valid request submitted beside an invalid `logprobs` request to prove explicit rejection does not poison the valid stream. Host-staged and NCCL both passed the mixed-serving E2E.
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, because the same model snapshot has produced different exact greedy text on those hosts while still matching HF on each host. Do not use the static hash pair list as a substitute for the same-host HF comparison when changing accuracy-sensitive code.
 
@@ -40,7 +42,7 @@ The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for thi
 
 ### Direct Same-Prompt Diagnostic Batch
 
-This path is useful for attribution and for avoiding the earlier row-loop TPOT measurement. It is not production continuous batching:
+This path is useful for attribution and for avoiding the earlier row-loop TPOT measurement. It is separate from the first mixed-request serving gate and is not production continuous batching:
 
 - every row uses the same prompt;
 - prefill remains conservative;
@@ -119,6 +121,7 @@ Use these labels consistently:
 | --- | --- | --- |
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
+| `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
 | `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 after target-environment package/toolchain fixes. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
@@ -159,11 +162,11 @@ The next implementation should be chosen from measured evidence:
    - vLLM TP2+EP2 when supported.
    - default vLLM configuration plus a controlled configuration with cache/flag choices recorded.
 
-4. Add real request batching / serving semantics before broader throughput claims.
-   - request admission;
-   - per-request KV ownership;
-   - mixed request state;
-   - decode iterations that carry multiple live `/v1/completions` requests.
+4. Widen the first mixed-request serving gate before broader throughput claims.
+   - keep the fixed EP2 path and exact sequential oracle until a wider oracle replaces it;
+   - keep greedy-only admission explicit until sampling/logprobs have their own gate;
+   - keep direct same-prompt batch labeled diagnostic;
+   - add HTTP-serving evidence before claiming `/v1/completions` parity or production continuous batching.
 
 5. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;

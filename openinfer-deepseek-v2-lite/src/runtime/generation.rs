@@ -165,6 +165,21 @@ impl DeepSeekV2LiteEp2Generator {
         Ok((result, attribution))
     }
 
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) fn new_generation_stats(&self, prompt_tokens: usize) -> GenerationStats {
+        GenerationStats {
+            model_path: self.model_path.clone(),
+            device_ordinals: self.device_ordinals.clone(),
+            ep_backend: self.backend.kind().as_str().to_string(),
+            ep_size: 2,
+            prompt_tokens,
+            ..GenerationStats::default()
+        }
+    }
+
     pub fn generate_greedy_batch_same_prompt_with_timings(
         &mut self,
         prompt_tokens: &[u32],
@@ -230,14 +245,7 @@ impl DeepSeekV2LiteEp2Generator {
         );
 
         let generation_start = Instant::now();
-        let mut stats = GenerationStats {
-            model_path: self.model_path.clone(),
-            device_ordinals: self.device_ordinals.clone(),
-            ep_backend: self.backend.kind().as_str().to_string(),
-            ep_size: 2,
-            prompt_tokens: prompt_tokens.len() * batch_size,
-            ..GenerationStats::default()
-        };
+        let mut stats = self.new_generation_stats(prompt_tokens.len() * batch_size);
         let mut caches: Vec<_> = (0..batch_size)
             .map(|_| DecodeCache::new(&self.config))
             .collect();
@@ -319,14 +327,7 @@ impl DeepSeekV2LiteEp2Generator {
             max_new_tokens
         );
 
-        let mut stats = GenerationStats {
-            model_path: self.model_path.clone(),
-            device_ordinals: self.device_ordinals.clone(),
-            ep_backend: self.backend.kind().as_str().to_string(),
-            ep_size: 2,
-            prompt_tokens: prompt_tokens.len(),
-            ..GenerationStats::default()
-        };
+        let mut stats = self.new_generation_stats(prompt_tokens.len());
 
         let mut cache = DecodeCache::new(&self.config);
         let mut generated = Vec::with_capacity(max_new_tokens);
@@ -370,7 +371,7 @@ impl DeepSeekV2LiteEp2Generator {
         })
     }
 
-    pub(super) fn prefill_next_token(
+    pub(crate) fn prefill_next_token(
         &mut self,
         prompt_tokens: &[u32],
         cache: &mut DecodeCache,
@@ -396,7 +397,7 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
-    pub(super) fn decode_next_token(
+    pub(crate) fn decode_next_token(
         &mut self,
         token: u32,
         position: usize,
@@ -432,7 +433,7 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
-    fn decode_next_tokens_batch(
+    pub(crate) fn decode_next_tokens_batch(
         &mut self,
         tokens: &[u32],
         position: usize,

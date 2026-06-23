@@ -15,6 +15,8 @@ mod nccl_backend;
 #[cfg(feature = "deepseek-v2-lite")]
 mod runtime;
 #[cfg(feature = "deepseek-v2-lite")]
+mod scheduler;
+#[cfg(feature = "deepseek-v2-lite")]
 mod weights;
 
 use std::path::Path;

@@ -41,6 +41,27 @@ impl DecodeCache {
                 .collect(),
         }
     }
+
+    pub(crate) fn position(&self, config: &Config) -> Result<usize> {
+        ensure!(
+            self.layers.len() == config.num_hidden_layers,
+            "decode cache layer count mismatch: cache={}, expected={}",
+            self.layers.len(),
+            config.num_hidden_layers
+        );
+        let Some(first) = self.layers.first() else {
+            return Ok(0);
+        };
+        let position = first.len(config);
+        for (layer_idx, layer) in self.layers.iter().enumerate().skip(1) {
+            ensure!(
+                layer.len(config) == position,
+                "decode cache layer {layer_idx} position mismatch: cache_len={}, expected={position}",
+                layer.len(config)
+            );
+        }
+        Ok(position)
+    }
 }
 
 pub(crate) fn normalize_compressed_kv(

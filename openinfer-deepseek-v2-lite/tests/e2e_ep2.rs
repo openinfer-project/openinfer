@@ -1,11 +1,19 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Barrier},
+    thread,
 };
 
 use anyhow::{Context, Result, ensure};
 use openinfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
-use openinfer_engine::engine::{EngineLoadOptions, FinishReason};
+use openinfer_engine::{
+    engine::{
+        EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenSink,
+        TokenStreamReceiver,
+    },
+    sampler::SamplingParams,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
@@ -72,7 +80,8 @@ fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
         "duplicate CUDA ordinal error should mention distinct devices, got {duplicate_ordinal_err:#}"
     );
 
-    run_rust_generation(&model_path_label, &model_path)
+    run_rust_generation(&model_path_label, &model_path)?;
+    run_mixed_serving_generation(&model_path, &model_path_label)
 }
 
 fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> {
@@ -470,6 +479,363 @@ fn run_case_set_case(
             "matched_output_oracle": matched_output_oracle,
             "ep": ep_payload(&result.stats),
         }))
+    }
+}
+
+fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Result<()> {
+    let tokenizer_path = model_path.join("tokenizer.json");
+    let tokenizer = HuggingFaceTokenizer::new(&tokenizer_path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to load tokenizer {}: {err:?}",
+            tokenizer_path.display()
+        )
+    })?;
+    let cases = [
+        ("mixed-hello", "Hello", 8usize, false),
+        ("mixed-world", "World", 8usize, false),
+        ("mixed-paris", "Paris", 8usize, false),
+        ("mixed-china", "China", 8usize, false),
+    ];
+
+    let mut sequential = DeepSeekV2LiteEp2Generator::load(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            enable_prefill_profile: false,
+            device_ordinals: vec![0, 1],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+    )?;
+    let mut encoded_cases = Vec::with_capacity(cases.len());
+    let mut expected = Vec::with_capacity(cases.len());
+    for (id, prompt, max_tokens, ignore_eos) in cases {
+        let prompt_tokens = tokenizer
+            .encode(prompt, false)
+            .map_err(|err| anyhow::anyhow!("encode prompt for {id} failed: {err:?}"))?;
+        ensure!(
+            !prompt_tokens.is_empty(),
+            "tokenizer returned empty prompt for mixed-serving case {id}"
+        );
+        let result = sequential.generate_greedy(&prompt_tokens, max_tokens, ignore_eos)?;
+        expected.push((id.to_string(), result.tokens, result.finish_reason));
+        encoded_cases.push((
+            id.to_string(),
+            prompt.to_string(),
+            prompt_tokens,
+            max_tokens,
+            ignore_eos,
+        ));
+    }
+    let hello_len = encoded_cases
+        .iter()
+        .find(|(id, _, _, _, _)| id == "mixed-hello")
+        .map(|(_, _, prompt_tokens, _, _)| prompt_tokens.len())
+        .context("mixed-hello case missing")?;
+    let world_len = encoded_cases
+        .iter()
+        .find(|(id, _, _, _, _)| id == "mixed-world")
+        .map(|(_, _, prompt_tokens, _, _)| prompt_tokens.len())
+        .context("mixed-world case missing")?;
+    ensure!(
+        hello_len == world_len,
+        "mixed-serving e2e requires Hello and World to tokenize to the same length so the batch decode path is exercised; got Hello={hello_len}, World={world_len}"
+    );
+    for (id, _, prompt_tokens, _, _) in &encoded_cases {
+        ensure!(
+            prompt_tokens.len() == hello_len,
+            "mixed-serving e2e requires every main prompt to share one tokenized length so the batch decode path is exercised; case {id} has {}, expected {hello_len}",
+            prompt_tokens.len()
+        );
+    }
+    let isolation_id = "mixed-valid-beside-invalid";
+    let isolation_prompt = "A valid request beside a rejected request";
+    let isolation_prompt_tokens = tokenizer
+        .encode(isolation_prompt, false)
+        .map_err(|err| anyhow::anyhow!("encode prompt for {isolation_id} failed: {err:?}"))?;
+    ensure!(
+        !isolation_prompt_tokens.is_empty(),
+        "tokenizer returned empty prompt for mixed-serving case {isolation_id}"
+    );
+    let isolation_expected = sequential.generate_greedy(&isolation_prompt_tokens, 6, false)?;
+
+    let fallback_cases = [
+        ("mixed-short-single-row", "Hello", 6usize, false),
+        (
+            "mixed-long-single-row",
+            "A valid request beside a rejected request",
+            6usize,
+            false,
+        ),
+    ];
+    let mut fallback_encoded = Vec::with_capacity(fallback_cases.len());
+    let mut fallback_expected = Vec::with_capacity(fallback_cases.len());
+    for (id, prompt, max_tokens, ignore_eos) in fallback_cases {
+        let prompt_tokens = tokenizer
+            .encode(prompt, false)
+            .map_err(|err| anyhow::anyhow!("encode prompt for {id} failed: {err:?}"))?;
+        ensure!(
+            !prompt_tokens.is_empty(),
+            "tokenizer returned empty prompt for mixed-serving case {id}"
+        );
+        let result = sequential.generate_greedy(&prompt_tokens, max_tokens, ignore_eos)?;
+        fallback_expected.push((id.to_string(), result.tokens, result.finish_reason));
+        fallback_encoded.push((id.to_string(), prompt_tokens, max_tokens, ignore_eos));
+    }
+    let fallback_prompt_lengths: Vec<_> = fallback_encoded
+        .iter()
+        .map(|(_, prompt_tokens, _, _)| prompt_tokens.len())
+        .collect();
+    ensure!(
+        fallback_prompt_lengths
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]),
+        "mixed-serving fallback e2e requires at least two prompt lengths so single-row decode is exercised; got {fallback_prompt_lengths:?}"
+    );
+    drop(sequential);
+
+    let handle = openinfer_deepseek_v2_lite::start_engine(
+        model_path,
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            enable_prefill_profile: false,
+            device_ordinals: vec![0, 1],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+    )?;
+
+    let mut requests = Vec::with_capacity(encoded_cases.len());
+    let mut receivers = Vec::with_capacity(encoded_cases.len());
+    for (id, _prompt, prompt_tokens, max_tokens, ignore_eos) in encoded_cases {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        let req = GenerateRequest {
+            request_id: Some(id.clone()),
+            queued_at_unix_s: None,
+            prompt_tokens,
+            params: SamplingParams {
+                ignore_eos,
+                ..SamplingParams::default()
+            },
+            max_tokens,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        };
+        receivers.push((id, token_rx));
+        requests.push(req);
+    }
+    submit_concurrently(&handle, requests)?;
+
+    let mut actual = Vec::with_capacity(receivers.len());
+    for (id, mut token_rx) in receivers {
+        let (tokens, finish_reason) = drain_engine_stream(&id, &mut token_rx)?;
+        actual.push((id, tokens, finish_reason));
+    }
+
+    ensure!(
+        actual == expected,
+        "mixed-serving output drift on {model_path_label}: actual={actual:?} expected={expected:?}"
+    );
+
+    run_mixed_serving_position_fallback(&handle, fallback_encoded, fallback_expected, &mut actual)?;
+
+    run_mixed_serving_rejection_isolation(
+        &handle,
+        isolation_id,
+        isolation_prompt_tokens,
+        isolation_expected.tokens,
+        isolation_expected.finish_reason,
+        &mut actual,
+    )?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "report_type": "deepseek-v2-lite-ep2-mixed-serving-e2e",
+            "model_path": model_path_label,
+            "ep_backend": current_backend(),
+            "case_count": actual.len(),
+            "cases": actual
+                .iter()
+                .map(|(id, tokens, finish_reason)| {
+                    serde_json::json!({
+                        "id": id,
+                        "generated_tokens": tokens.len(),
+                        "output_token_sha256": token_sha256(tokens),
+                        "finish_reason": format!("{finish_reason:?}"),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }))?
+    );
+    Ok(())
+}
+
+fn run_mixed_serving_position_fallback(
+    handle: &openinfer_engine::engine::EngineHandle,
+    encoded_cases: Vec<(String, Vec<u32>, usize, bool)>,
+    expected: Vec<(String, Vec<u32>, FinishReason)>,
+    actual: &mut Vec<(String, Vec<u32>, FinishReason)>,
+) -> Result<()> {
+    let mut requests = Vec::with_capacity(encoded_cases.len());
+    let mut receivers = Vec::with_capacity(encoded_cases.len());
+    for (id, prompt_tokens, max_tokens, ignore_eos) in encoded_cases {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        let req = GenerateRequest {
+            request_id: Some(id.clone()),
+            queued_at_unix_s: None,
+            prompt_tokens,
+            params: SamplingParams {
+                ignore_eos,
+                ..SamplingParams::default()
+            },
+            max_tokens,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        };
+        receivers.push((id, token_rx));
+        requests.push(req);
+    }
+    submit_concurrently(handle, requests)?;
+
+    let mut fallback_actual = Vec::with_capacity(receivers.len());
+    for (id, mut token_rx) in receivers {
+        let (tokens, finish_reason) = drain_engine_stream(&id, &mut token_rx)?;
+        fallback_actual.push((id, tokens, finish_reason));
+    }
+
+    ensure!(
+        fallback_actual == expected,
+        "mixed-serving single-row fallback output drift: actual={fallback_actual:?} expected={expected:?}"
+    );
+    actual.extend(fallback_actual);
+    Ok(())
+}
+
+fn submit_concurrently(
+    handle: &openinfer_engine::engine::EngineHandle,
+    requests: Vec<GenerateRequest>,
+) -> Result<()> {
+    let barrier = Arc::new(Barrier::new(requests.len() + 1));
+    let mut threads = Vec::with_capacity(requests.len());
+    for req in requests {
+        let handle = handle.clone();
+        let barrier = Arc::clone(&barrier);
+        threads.push(thread::spawn(move || -> Result<()> {
+            barrier.wait();
+            handle
+                .submit(req)
+                .map_err(|_| anyhow::anyhow!("DeepSeek-V2-Lite mixed-serving engine closed"))?;
+            Ok(())
+        }));
+    }
+    barrier.wait();
+    for submit_thread in threads {
+        submit_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("mixed-serving submit thread panicked"))??;
+    }
+    Ok(())
+}
+
+fn run_mixed_serving_rejection_isolation(
+    handle: &openinfer_engine::engine::EngineHandle,
+    valid_id: &str,
+    valid_prompt_tokens: Vec<u32>,
+    expected_tokens: Vec<u32>,
+    expected_finish_reason: FinishReason,
+    actual: &mut Vec<(String, Vec<u32>, FinishReason)>,
+) -> Result<()> {
+    let (invalid_tx, mut invalid_rx) = TokenSink::standalone();
+    let invalid_req = GenerateRequest {
+        request_id: Some("mixed-invalid-logprobs".to_string()),
+        queued_at_unix_s: None,
+        prompt_tokens: vec![1, 2, 3],
+        params: SamplingParams::default(),
+        max_tokens: 4,
+        lora_adapter: None,
+        token_tx: invalid_tx,
+        logprobs: 1,
+        echo: false,
+    };
+
+    let (valid_tx, mut valid_rx) = TokenSink::standalone();
+    let valid_req = GenerateRequest {
+        request_id: Some(valid_id.to_string()),
+        queued_at_unix_s: None,
+        prompt_tokens: valid_prompt_tokens,
+        params: SamplingParams::default(),
+        max_tokens: 6,
+        lora_adapter: None,
+        token_tx: valid_tx,
+        logprobs: 0,
+        echo: false,
+    };
+    submit_concurrently(handle, vec![invalid_req, valid_req])?;
+
+    let mut saw_rejection = false;
+    while let Some((_tag, event)) = invalid_rx.blocking_recv() {
+        match event {
+            TokenEvent::Scheduled { .. } => {}
+            TokenEvent::Rejected { message, .. } => {
+                ensure!(
+                    message.contains("logprobs"),
+                    "invalid request rejection should mention logprobs, got {message}"
+                );
+                saw_rejection = true;
+                break;
+            }
+            TokenEvent::Token { .. }
+            | TokenEvent::PromptTokens { .. }
+            | TokenEvent::Finished { .. }
+            | TokenEvent::Error { .. } => {
+                anyhow::bail!("invalid mixed-serving request reached unexpected event")
+            }
+        }
+    }
+    ensure!(
+        saw_rejection,
+        "invalid mixed-serving request stream closed without Rejected"
+    );
+
+    let (tokens, finish_reason) = drain_engine_stream(valid_id, &mut valid_rx)?;
+    ensure!(
+        tokens == expected_tokens && finish_reason == expected_finish_reason,
+        "valid mixed-serving request drifted next to invalid request: actual_tokens={tokens:?} expected_tokens={expected_tokens:?} actual_finish={finish_reason:?} expected_finish={expected_finish_reason:?}"
+    );
+    ensure!(
+        !tokens.is_empty(),
+        "valid mixed-serving request produced no tokens after neighboring rejection"
+    );
+    actual.push((valid_id.to_string(), tokens, finish_reason));
+    Ok(())
+}
+
+fn drain_engine_stream(
+    case_id: &str,
+    token_rx: &mut TokenStreamReceiver,
+) -> Result<(Vec<u32>, FinishReason)> {
+    let mut tokens = Vec::new();
+    loop {
+        match token_rx.blocking_recv() {
+            Some((_tag, TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. })) => {}
+            Some((_tag, TokenEvent::Token { id, .. })) => tokens.push(id),
+            Some((_tag, TokenEvent::Finished { finish_reason, .. })) => {
+                return Ok((tokens, finish_reason));
+            }
+            Some((_tag, TokenEvent::Error { message, .. })) => {
+                anyhow::bail!("mixed-serving case {case_id} failed: {message}")
+            }
+            Some((_tag, TokenEvent::Rejected { message, .. })) => {
+                anyhow::bail!("mixed-serving case {case_id} rejected: {message}")
+            }
+            None => anyhow::bail!("mixed-serving case {case_id} stream closed before Finished"),
+        }
     }
 }
 
