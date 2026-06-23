@@ -1,16 +1,16 @@
 use anyhow::{Context, Result};
 use cudarc::driver::CudaSlice;
-use log::debug;
 
 use crate::config::DFlashConfig;
-use crate::weights::{Attention, MLP, Qwen3Model, TransformerBlock};
+use crate::weights::{Qwen3Model, TransformerBlock};
 use openinfer_core::ops;
 use openinfer_core::tensor::HiddenStates;
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
-    precompute_rope,
-};
+
+mod loading;
+mod reservation;
+
+pub(crate) use reservation::DFlashMemoryReservation;
 
 pub(crate) struct DFlashDraftModel {
     config: DFlashConfig,
@@ -31,87 +31,6 @@ pub(crate) struct DFlashRequestState {
     context: DFlashContextScratch,
     committed_len: usize,
     max_cache_len: usize,
-}
-
-/// GPU memory DFlash needs on top of the target KV pool, derived from the draft
-/// config so the KV budget can reserve it *before* the draft model loads (the
-/// draft buffers live outside the paged `KvCacheManager`). Split by how it scales:
-///
-/// - `kv_bytes_per_token` scales with the KV pool (billed by shrinking the target
-///   block count): the draft's own KV cache plus the per-request context-projection
-///   and pending-context buffers, which currently persist at prompt length per
-///   request (see `dflash-speculative-decoding.md` — collapsing that persistence
-///   is a tracked follow-up that would shrink this term to the draft KV alone).
-/// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
-///   the draft weights plus the lane-level batched scratch sized for the whole
-///   decode batch.
-///
-// TODO: the draft scratch is now a single lane-level `DFlashBatchScratch`
-// allocated once (dense buffers sized `max_batch * block_size`, plus one shared
-// varlen tail), not a per-request buffer. The per-token `tail_scratch` term and
-// the per-request `block_headroom` tail term are therefore over-estimates — kept
-// as a conservative upper bound until the accounting is retuned against the
-// batched allocation.
-pub(crate) struct DFlashMemoryReservation {
-    pub(crate) kv_bytes_per_token: usize,
-    pub(crate) fixed_bytes: usize,
-}
-
-impl DFlashMemoryReservation {
-    pub(crate) fn from_path(draft_path: &str, max_decode_batch_size: usize) -> Result<Self> {
-        let config = DFlashConfig::from_file(draft_path)?;
-        Ok(Self::from_config(&config, max_decode_batch_size))
-    }
-
-    fn from_config(config: &DFlashConfig, max_decode_batch_size: usize) -> Self {
-        const BF16: usize = 2;
-        let hidden = config.hidden_size;
-        let kv_dim = config.num_key_value_heads * config.head_dim;
-        let q_dim = config.num_attention_heads * config.head_dim;
-        let inter = config.intermediate_size;
-        let capture_layers = config.dflash_config.target_layer_ids.len();
-
-        // Per-sequence-token, pool-scaling buffers.
-        let draft_kv = config.num_hidden_layers * 2 * kv_dim * BF16; // DFlashLayerCache k+v
-        // Scratch split by what it tracks: `context_*` grows with the committed
-        // prefix; `tail_*` (tail_input + k_tail + v_tail) grows with the in-fill
-        // tail, which is one block past the prefix.
-        let context_scratch = 2 * hidden * BF16; // context_projected + context_hidden
-        let tail_scratch = (hidden + 2 * kv_dim) * BF16; // tail_input + k_tail + v_tail
-        let pending = hidden * capture_layers * BF16; // context_feature_dim
-        let kv_bytes_per_token = draft_kv + context_scratch + tail_scratch + pending;
-
-        // Lane-level batched dense scratch: every dense buffer is sized for the
-        // whole decode batch (`max_batch * block_size` rows), allocated once.
-        // Same total magnitude as the old per-request scratch summed over the
-        // batch, but now one contiguous allocation.
-        let dense_scratch_per_block_row =
-            BF16 * (config.vocab_size + 5 * hidden + 2 * q_dim + 3 * inter);
-        let scratch_total = dense_scratch_per_block_row * config.block_size * max_decode_batch_size;
-
-        // Draft weights (5 transformer layers + the context projection), +10% slack
-        // for norms, rope caches, and allocator alignment.
-        let per_layer = BF16
-            * (hidden * (q_dim + 2 * kv_dim) // qkv_proj
-                + q_dim * hidden // o_proj
-                + hidden * 2 * inter // gate_up_proj
-                + inter * hidden); // down_proj
-        let fc = BF16 * hidden * (hidden * capture_layers); // context projection
-        let weights = per_layer * config.num_hidden_layers + fc;
-        let weights = weights + weights / 10;
-
-        // The durable draft KV and the tail scratch are sized to `context +
-        // block_size` — one in-fill block past the lifetime the KV pool reserves
-        // for the request. The per-token term bills only the pool's tokens, so
-        // reserve that one-block headroom per concurrently decoding request to
-        // keep the reservation an upper bound.
-        let block_headroom = max_decode_batch_size * config.block_size * (draft_kv + tail_scratch);
-
-        Self {
-            kv_bytes_per_token,
-            fixed_bytes: weights + scratch_total + block_headroom,
-        }
-    }
 }
 
 struct DFlashLayerCache {
@@ -375,138 +294,6 @@ impl DFlashBatchScratch {
 }
 
 impl DFlashDraftModel {
-    pub(crate) fn from_safetensors_for_target(
-        ctx: &DeviceContext,
-        model_path: &str,
-        target: &Qwen3Model,
-    ) -> Result<Self> {
-        let config = DFlashConfig::from_file(model_path)
-            .with_context(|| format!("load DFlash config from {model_path}"))?;
-        config.validate_for_target(target.config())?;
-
-        let (shard_paths, weight_map) = load_shard_info(model_path)?;
-        debug!(
-            "Loading DFlash drafter from {model_path}: {} shard(s)",
-            shard_paths.len()
-        );
-        let mmaps = mmap_shards(&shard_paths)?;
-        let shards = deserialize_shards(&mmaps)?;
-
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for layer_idx in 0..config.num_hidden_layers {
-            let prefix = format!("layers.{layer_idx}");
-
-            let q_proj = load_tensor_2d(
-                ctx,
-                &shards,
-                &weight_map,
-                &format!("{prefix}.self_attn.q_proj.weight"),
-            )?;
-            let k_proj = load_tensor_2d(
-                ctx,
-                &shards,
-                &weight_map,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-            )?;
-            let v_proj = load_tensor_2d(
-                ctx,
-                &shards,
-                &weight_map,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-            )?;
-            let q_dim = q_proj.rows;
-            let kv_dim = k_proj.rows;
-            let qkv_proj = DeviceMatrix::vstack(ctx, &[&q_proj, &k_proj, &v_proj])?;
-            drop(q_proj);
-            drop(k_proj);
-            drop(v_proj);
-
-            let gate_proj = load_tensor_2d(
-                ctx,
-                &shards,
-                &weight_map,
-                &format!("{prefix}.mlp.gate_proj.weight"),
-            )?;
-            let up_proj = load_tensor_2d(
-                ctx,
-                &shards,
-                &weight_map,
-                &format!("{prefix}.mlp.up_proj.weight"),
-            )?;
-            let gate_up_proj = DeviceMatrix::vstack(ctx, &[&gate_proj, &up_proj])?;
-            drop(gate_proj);
-            drop(up_proj);
-
-            layers.push(TransformerBlock {
-                input_layernorm: load_tensor_1d(
-                    ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?,
-                attention: Attention {
-                    qkv_proj,
-                    o_proj: load_tensor_2d(
-                        ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{prefix}.self_attn.o_proj.weight"),
-                    )?,
-                    q_norm: load_tensor_1d(
-                        ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{prefix}.self_attn.q_norm.weight"),
-                    )?,
-                    k_norm: load_tensor_1d(
-                        ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{prefix}.self_attn.k_norm.weight"),
-                    )?,
-                    q_dim,
-                    kv_dim,
-                },
-                post_attention_layernorm: load_tensor_1d(
-                    ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?,
-                mlp: MLP {
-                    gate_up_proj,
-                    down_proj: load_tensor_2d(
-                        ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{prefix}.mlp.down_proj.weight"),
-                    )?,
-                },
-            });
-        }
-
-        let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
-        let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
-        let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
-        let (cos_cache, sin_cache) = precompute_rope(
-            ctx,
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-        )?;
-        ctx.sync()?;
-
-        Ok(Self {
-            config,
-            layers,
-            norm,
-            hidden_norm,
-            fc,
-            cos_cache,
-            sin_cache,
-        })
-    }
-
     pub(crate) fn block_size(&self) -> usize {
         self.config.block_size
     }
