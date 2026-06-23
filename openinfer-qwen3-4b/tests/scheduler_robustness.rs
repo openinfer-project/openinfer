@@ -105,6 +105,7 @@ fn scheduler_survives_consumer_drop() {
         openinfer_qwen3_4b::DecodeOverlap::Off,
         true,
         None,
+        false,
     )
     .expect("failed to start engine");
     assert_eq!(

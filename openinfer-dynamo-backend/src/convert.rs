@@ -11,7 +11,13 @@ use dynamo_backend_common::{
     BackendError, ComponentSnapshot, DynamoError, ErrorType, LLMEngineOutput, LLMEngineOutputExt,
     PreprocessedRequest, chunk, usage,
 };
-use openinfer_engine::engine::{FinishReason as EngineFinishReason, LoadSnapshot, TokenEvent};
+use dynamo_kv_router::protocols::{
+    ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
+    KvCacheStoredBlockData, LocalBlockHash,
+};
+use openinfer_engine::engine::{
+    FinishReason as EngineFinishReason, KvBlockEvent, LoadSnapshot, TokenEvent,
+};
 use openinfer_engine::sampler::SamplingParams;
 
 /// Fallback token cap when the client leaves `stop_conditions.max_tokens`
@@ -114,6 +120,42 @@ pub fn load_to_component_snapshot(load: LoadSnapshot, dp_rank: u32) -> Component
         gpu_cache_usage,
         kv_cache_hit_rate: None,
         dp_rank,
+    }
+}
+
+/// Translate one neutral engine [`KvBlockEvent`] into the router's wire event.
+///
+/// The engine already speaks the router's u64 hash space (block sequence-hash
+/// and tokens-hash come straight off the token blocks), so this is a pure
+/// field rename into Dynamo's newtypes — no hashing, no projection. `event_id`
+/// is the publisher's monotonic counter; `dp_rank` is 0 because each openinfer
+/// worker process owns exactly one rank. Multimodal extra-info and absolute
+/// `start_position` have no openinfer analogue and are left `None`.
+pub fn kv_block_event_to_dynamo(event: KvBlockEvent, event_id: u64) -> KvCacheEvent {
+    let data = match event {
+        KvBlockEvent::Stored {
+            parent_hash,
+            blocks,
+        } => KvCacheEventData::Stored(KvCacheStoreData {
+            parent_hash: parent_hash.map(ExternalSequenceBlockHash),
+            start_position: None,
+            blocks: blocks
+                .into_iter()
+                .map(|b| KvCacheStoredBlockData {
+                    block_hash: ExternalSequenceBlockHash(b.sequence_hash),
+                    tokens_hash: LocalBlockHash(b.tokens_hash),
+                    mm_extra_info: None,
+                })
+                .collect(),
+        }),
+        KvBlockEvent::Removed { sequence_hash } => KvCacheEventData::Removed(KvCacheRemoveData {
+            block_hashes: vec![ExternalSequenceBlockHash(sequence_hash)],
+        }),
+    };
+    KvCacheEvent {
+        event_id,
+        data,
+        dp_rank: 0,
     }
 }
 
@@ -319,6 +361,82 @@ mod tests {
         let snap = load_to_component_snapshot(LoadSnapshot::default(), 0);
         assert_eq!(snap.gpu_cache_usage, 0.0);
         assert!(snap.gpu_cache_usage.is_finite());
+    }
+
+    #[test]
+    fn stored_event_renames_hashes_into_dynamo_newtypes() {
+        use openinfer_engine::engine::KvStoredBlock;
+        let ev = kv_block_event_to_dynamo(
+            KvBlockEvent::Stored {
+                parent_hash: Some(0xAAAA),
+                blocks: vec![
+                    KvStoredBlock {
+                        sequence_hash: 0x1111,
+                        tokens_hash: 0x2222,
+                    },
+                    KvStoredBlock {
+                        sequence_hash: 0x3333,
+                        tokens_hash: 0x4444,
+                    },
+                ],
+            },
+            7,
+        );
+        assert_eq!(ev.event_id, 7);
+        assert_eq!(ev.dp_rank, 0);
+        match ev.data {
+            KvCacheEventData::Stored(store) => {
+                assert_eq!(store.parent_hash, Some(ExternalSequenceBlockHash(0xAAAA)));
+                assert_eq!(store.start_position, None);
+                assert_eq!(store.blocks.len(), 2);
+                // u64 carried verbatim — block_hash is the router's
+                // ExternalSequenceBlockHash, tokens_hash its LocalBlockHash.
+                assert_eq!(
+                    store.blocks[0].block_hash,
+                    ExternalSequenceBlockHash(0x1111)
+                );
+                assert_eq!(store.blocks[0].tokens_hash, LocalBlockHash(0x2222));
+                assert_eq!(
+                    store.blocks[1].block_hash,
+                    ExternalSequenceBlockHash(0x3333)
+                );
+                assert_eq!(store.blocks[1].tokens_hash, LocalBlockHash(0x4444));
+                assert!(store.blocks[0].mm_extra_info.is_none());
+            }
+            _ => panic!("Stored must map to KvCacheEventData::Stored"),
+        }
+    }
+
+    #[test]
+    fn stored_root_block_has_no_parent() {
+        let ev = kv_block_event_to_dynamo(
+            KvBlockEvent::Stored {
+                parent_hash: None,
+                blocks: vec![],
+            },
+            0,
+        );
+        match ev.data {
+            KvCacheEventData::Stored(store) => assert_eq!(store.parent_hash, None),
+            _ => panic!("Stored must map to KvCacheEventData::Stored"),
+        }
+    }
+
+    #[test]
+    fn removed_event_carries_single_block_hash() {
+        let ev = kv_block_event_to_dynamo(
+            KvBlockEvent::Removed {
+                sequence_hash: 0x9999,
+            },
+            3,
+        );
+        assert_eq!(ev.event_id, 3);
+        match ev.data {
+            KvCacheEventData::Removed(rm) => {
+                assert_eq!(rm.block_hashes, vec![ExternalSequenceBlockHash(0x9999)]);
+            }
+            _ => panic!("Removed must map to KvCacheEventData::Removed"),
+        }
     }
 
     #[test]

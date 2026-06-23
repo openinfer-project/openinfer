@@ -11,6 +11,7 @@ dynamo-tokens = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 dynamo-kv-hashing = { workspace = true }

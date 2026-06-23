@@ -24,6 +24,10 @@ openinfer-qwen3-4b = { path = "../openinfer-qwen3-4b" }
 # pegainfer workspace so the shared git checkout (and its internal type
 # identity) stay consistent.
 dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
+# KV-router event protocol types (KvCacheEvent / KvCacheStoreData / ...). Not
+# re-exported by backend-common, so depended on directly — same rev so the
+# `KvCacheEvent` we build is the exact type `KvEventPublisher::publish` accepts.
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
 
 anyhow = "1"
 async-trait = "0.1"

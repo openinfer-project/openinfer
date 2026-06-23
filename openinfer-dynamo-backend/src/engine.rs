@@ -5,11 +5,12 @@
 //!
 //! `start` (load Qwen3) / `generate` (stream tokens) / `cleanup` cover serving;
 //! `setup_metrics` (M2) publishes the live KV-load signal the router scores
-//! against, so an idle/busy replica is visible and load-balancing works. The
-//! engine also advertises its real KV block size + capacity, so the router's
-//! KV-aware cost function is well-defined — but with no KV events published yet
-//! (`kv_event_sources`, M3) its radix tree stays empty and every prefix misses,
-//! so routing leans on the load signal until M3 lands cache-aware routing.
+//! against, so an idle/busy replica is visible and load-balancing works.
+//! `kv_event_sources` (M3) streams block store/remove events to the router's
+//! radix tree, so a warm prefix on this replica steers matching requests here.
+//! The engine advertises its real KV block size + capacity too, so the router's
+//! KV-aware cost function is well-defined. Both publishers run only under
+//! `enable_kv_routing`; a routing-off worker stays event-free and zero-cost.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,13 +20,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dynamo_backend_common::{
-    AsyncEngineContext, CommonArgs, DynamoError, EngineConfig, GenerateContext, LLMEngine,
-    LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, MetricsBindings, MetricsCtx,
-    OnSnapshotPublisherReady, PreprocessedRequest, SnapshotPublisher, WorkerConfig, usage,
+    AsyncEngineContext, CommonArgs, DynamoError, EngineConfig, GenerateContext, KvEventPublisher,
+    KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, LlmRegistration,
+    MetricsBindings, MetricsCtx, OnPublisherReady, OnSnapshotPublisherReady, PreprocessedRequest,
+    SnapshotPublisher, WorkerConfig, usage,
 };
 use futures::stream::BoxStream;
 use openinfer_engine::engine::{
-    EngineHandle, GenerateRequest, LoadSnapshot, TokenSink, TokenStreamReceiver,
+    EngineHandle, GenerateRequest, KvBlockEvent, LoadSnapshot, TokenSink, TokenStreamReceiver,
 };
 use openinfer_qwen3_4b::{
     DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
@@ -114,30 +116,6 @@ impl OpeninferBackend {
         .validate()
         .map_err(|e| convert::invalid_argument(format!("invalid memory options: {e:#}")))?;
 
-        let launch = Qwen3LaunchOptions {
-            device_ordinal: args.device_ordinal,
-            tp_size: 1,
-            cuda_graph: !args.no_cuda_graph,
-            offload: Qwen3OffloadOptions::disabled(),
-            // Keep the prefix cache on: it is both a single-worker win and the
-            // source of the KV events a later milestone will publish to the
-            // router for cache-aware routing.
-            no_prefix_cache: false,
-            max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
-            memory,
-            lora: None,
-            decode_overlap: DecodeOverlap::Off,
-            batch_invariant: false,
-        };
-
-        let backend = OpeninferBackend {
-            model_path: args.model_path.clone(),
-            served_model_name: served_model_name.clone(),
-            launch,
-            handle: Mutex::new(None),
-            cancel: Mutex::new(CancellationToken::new()),
-        };
-
         let config = WorkerConfig {
             namespace: args.common.namespace,
             component: args.common.component,
@@ -146,8 +124,41 @@ impl OpeninferBackend {
             custom_jinja_template: args.common.custom_jinja_template,
             disaggregation_mode: args.common.disaggregation_mode,
             model_name: args.model_path.to_string_lossy().into_owned(),
-            served_model_name: Some(served_model_name),
+            served_model_name: Some(served_model_name.clone()),
             ..Default::default()
+        };
+
+        // KV block events are consumed only when the worker enables KV routing:
+        // the framework calls `kv_event_sources()` (which takes the engine's
+        // event receiver) solely under `enable_kv_routing`. Tying the engine's
+        // event production to the same flag keeps the invariant that we never
+        // feed a channel no one drains — a routing-off worker stays event-free
+        // and zero-cost, exactly like plain single-machine openinfer.
+        let enable_kv_events = config.enable_kv_routing;
+
+        let launch = Qwen3LaunchOptions {
+            device_ordinal: args.device_ordinal,
+            tp_size: 1,
+            cuda_graph: !args.no_cuda_graph,
+            offload: Qwen3OffloadOptions::disabled(),
+            // Keep the prefix cache on: it is both a single-worker win and the
+            // source of the KV store/remove events published to the router for
+            // cache-aware routing.
+            no_prefix_cache: false,
+            max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
+            memory,
+            lora: None,
+            decode_overlap: DecodeOverlap::Off,
+            batch_invariant: false,
+            enable_kv_events,
+        };
+
+        let backend = OpeninferBackend {
+            model_path: args.model_path.clone(),
+            served_model_name,
+            launch,
+            handle: Mutex::new(None),
+            cancel: Mutex::new(CancellationToken::new()),
         };
 
         Ok((backend, config))
@@ -194,6 +205,15 @@ impl LLMEngine for OpeninferBackend {
                 .map_err(|e| convert::backend_error(format!("Qwen3 engine load failed: {e:#}")))?;
 
         let kv = handle.kv_capacity();
+        // KV events require a block-structured KV cache: the framework advertises
+        // (and drains) the Push source only when `kv_cache_block_size` is set, so
+        // events without a paged cache would leave the scheduler producing into a
+        // channel no one reads. Fail loudly at load rather than leak silently.
+        if self.launch.enable_kv_events && kv.is_none() {
+            return Err(convert::backend_error(
+                "enable_kv_events requires a paged KV cache, but the engine reported none",
+            ));
+        }
         let context_length = handle.servable_len();
         tracing::info!(
             context_length = ?context_length,
@@ -295,6 +315,41 @@ impl LLMEngine for OpeninferBackend {
         let _ = self.handle().take();
         tracing::info!("openinfer backend: cleanup complete");
         Ok(())
+    }
+
+    async fn kv_event_sources(&self) -> Result<Vec<KvEventSource>, DynamoError> {
+        // The advertised source set must be stable across calls (the
+        // conformance kit calls this twice and rejects a changed dp_rank set),
+        // so gate it on the immutable launch flag — NOT on the take-once event
+        // receiver, whose presence flips after the first take. Events off
+        // (routing disabled at load) ⇒ opt out; the router leans on the load
+        // signal.
+        if !self.launch.enable_kv_events {
+            return Ok(Vec::new());
+        }
+        let handle = self
+            .handle()
+            .clone()
+            .ok_or_else(|| convert::engine_shutdown("kv_event_sources called before start"))?;
+        let cancel = self.cancel_token();
+
+        // Framework builds the KvEventPublisher and invokes this once after a
+        // successful start; we take the engine's neutral event receiver here
+        // (lazily, so the twice-called check above never consumes it) and own
+        // the pump thereafter. Cancelled in `cleanup` via `self.cancel`, so a
+        // start→cleanup→start cycle never leaks a task.
+        let on_ready: OnPublisherReady = Box::new(move |publisher| {
+            let events = handle.take_kv_events().ok_or_else(|| {
+                convert::engine_shutdown("kv event receiver already taken or unavailable")
+            })?;
+            tokio::spawn(publish_kv_events_loop(publisher, events, cancel));
+            Ok(())
+        });
+
+        Ok(vec![KvEventSource::Push {
+            on_ready,
+            dp_rank: DP_RANK,
+        }])
     }
 
     async fn setup_metrics(&self, _ctx: MetricsCtx<'_>) -> Result<MetricsBindings, DynamoError> {
@@ -408,6 +463,36 @@ async fn publish_load_loop(
                 }
             }
             _ = tokio::time::sleep(LOAD_HEARTBEAT) => {}
+        }
+    }
+}
+
+/// Forward openinfer's neutral KV block events to the Dynamo KV router.
+///
+/// Each event the engine emits — a block sealed into the prefix cache, or one
+/// evicted — becomes a single `KvCacheEvent` on the router's radix tree,
+/// stamped with the publisher's monotonic id. The engine already speaks the
+/// router's u64 hash space, so the translation is a pure field rename
+/// ([`convert::kv_block_event_to_dynamo`]). Spawned from the Push `on_ready`
+/// handoff; ends when `cleanup` cancels it or the engine drops the event sender
+/// (scheduler gone) or the router-side receiver closes.
+async fn publish_kv_events_loop(
+    publisher: Arc<KvEventPublisher>,
+    mut events: mpsc::UnboundedReceiver<KvBlockEvent>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            recv = events.recv() => {
+                let Some(event) = recv else { break };
+                let dynamo_event =
+                    convert::kv_block_event_to_dynamo(event, publisher.next_event_id());
+                if publisher.publish(dynamo_event).is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -658,6 +743,118 @@ mod tests {
 
         backend.cleanup().await.expect("cleanup");
         eprintln!("[load] idle=0 → peak={peak}/{kv_total} → settled=0 ok");
+    }
+
+    /// M3 on-GPU proof: the KV events a real generate emits round-trip through
+    /// the exact dynamo primitive the router runs. Replaying them into a
+    /// `RadixTree` must succeed for every event — `apply_stored` rejects a
+    /// broken parent chain with `ParentBlockNotFound`, so a swapped
+    /// parent/block hash (the M3 crux) would fail here — and querying the tree
+    /// by the blocks' content hashes must return a full-length prefix match for
+    /// this worker. That closes the loop that source review opened: openinfer's
+    /// u64 block hashes *are* the router's hash space, end to end on real
+    /// weights.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_events_roundtrip_through_dynamo_radix_tree() {
+        use dynamo_kv_router::indexer::RadixTree;
+        use dynamo_kv_router::protocols::{LocalBlockHash, RouterEvent, WorkerWithDpRank};
+        use openinfer_engine::engine::KvBlockEvent;
+
+        let Some(model_path) = test_model_path() else {
+            return;
+        };
+        let _gpu = GPU_TEST_LOCK.lock().await;
+        let backend = test_backend(&model_path);
+        backend.start(0).await.expect("start");
+
+        let handle = backend.handle().as_ref().expect("started").clone();
+        let block_size = handle.kv_capacity().expect("kv capacity").block_size;
+        // The default backend has KV routing (hence events) on; take the neutral
+        // receiver the framework would otherwise consume in kv_event_sources.
+        let mut events = handle
+            .take_kv_events()
+            .expect("kv events are enabled for the dynamo backend");
+
+        // A prompt spanning several full blocks plus a partial tail, so the
+        // sealed prefix has real multi-block chain structure to validate.
+        let prompt_len = 3 * block_size + block_size / 2;
+        let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + (i % 200)).collect();
+        let request = PreprocessedRequest::builder()
+            .model("qwen3".to_string())
+            .token_ids(prompt)
+            .stop_conditions(StopConditions {
+                max_tokens: Some(16),
+                ..Default::default()
+            })
+            .sampling_options(SamplingOptions::default())
+            .output_options(Default::default())
+            .build()
+            .expect("build request");
+
+        let stream = backend
+            .generate(request, GenerateContext::new(mock_context(), None))
+            .await
+            .expect("generate");
+        let _: Vec<_> = stream.map(|r| r.expect("stream item Ok")).collect().await;
+
+        // The producer emits at the top of the scheduler loop, one iteration
+        // behind registration, and the request's final blocks are stashed at
+        // drop and emitted on a later tick — so poll until the feed goes quiet
+        // rather than reading once.
+        let mut stored: Vec<KvBlockEvent> = Vec::new();
+        let mut removed = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
+                Ok(Some(ev)) => match ev {
+                    KvBlockEvent::Stored { .. } => stored.push(ev),
+                    KvBlockEvent::Removed { .. } => removed += 1,
+                },
+                Ok(None) => break, // engine dropped the feed
+                Err(_) => break,   // quiet for the timeout => drained
+            }
+        }
+        assert!(
+            !stored.is_empty(),
+            "a multi-block generate must emit at least one KV store event"
+        );
+
+        // Replay into the router's own tree, exactly as the publisher pump
+        // would. A single small request against a large pool should not evict,
+        // so removes are not expected; tolerate but report them.
+        const WORKER_ID: u64 = 0;
+        let mut tree = RadixTree::new();
+        let mut query: Vec<LocalBlockHash> = Vec::new();
+        for (event_id, ev) in stored.iter().enumerate() {
+            if let KvBlockEvent::Stored { blocks, .. } = ev {
+                for b in blocks {
+                    query.push(LocalBlockHash(b.tokens_hash));
+                }
+            }
+            let dynamo_event = convert::kv_block_event_to_dynamo(ev.clone(), event_id as u64);
+            tree.apply_event(RouterEvent::new(WORKER_ID, dynamo_event))
+                .expect("every emitted store applies — parent chain matches the router's");
+        }
+        assert!(!query.is_empty(), "store events must carry blocks");
+
+        let scores = tree.find_matches(query.clone(), false);
+        let matched = scores
+            .scores
+            .get(&WorkerWithDpRank::new(WORKER_ID, 0))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            matched as usize,
+            query.len(),
+            "the full stored prefix must match for this worker (got {matched}/{})",
+            query.len()
+        );
+
+        backend.cleanup().await.expect("cleanup");
+        eprintln!(
+            "[kv-events] {} store events, {} blocks, {removed} removes, full prefix match ok",
+            stored.len(),
+            query.len()
+        );
     }
 
     /// Exhaustive official Dynamo `LLMEngine` conformance: start →

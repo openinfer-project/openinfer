@@ -177,6 +177,10 @@ pub struct Qwen3LaunchOptions {
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
+    /// Publish KV block store/remove events for an out-of-band cache-aware
+    /// router (e.g. a Dynamo KV router). Off for plain single-machine serving;
+    /// single-GPU + base-model only (rejected with LoRA or tensor parallel).
+    pub enable_kv_events: bool,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -222,6 +226,9 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"
     );
+    if options.enable_kv_events && options.lora.is_some() {
+        anyhow::bail!("KV block events are not supported with LoRA serving");
+    }
     match options.lora {
         Some(lora) => {
             info!(
@@ -250,6 +257,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.decode_overlap,
             options.batch_invariant,
             options.dflash_draft_model_path.as_deref(),
+            options.enable_kv_events,
         ),
     }
 }
@@ -265,6 +273,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         DecodeOverlap::Off,
         false,
         None,
+        false,
     )
 }
 
@@ -291,6 +300,7 @@ pub fn start_engine_with_offload(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
     dflash_draft_model_path: Option<&Path>,
+    enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -320,6 +330,7 @@ pub fn start_engine_with_offload(
         memory_options,
         decode_overlap,
         dflash_draft_model_path,
+        enable_kv_events,
     )
 }
 

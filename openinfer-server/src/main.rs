@@ -200,6 +200,9 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
                     batch_invariant: args.batch_invariant,
                     dflash_draft_model_path,
+                    // KV block events are a Dynamo-backend concern; the plain
+                    // server never publishes them.
+                    enable_kv_events: false,
                 },
             )
             .context("failed to start Qwen3 engine")?

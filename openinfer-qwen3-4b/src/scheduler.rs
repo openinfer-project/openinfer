@@ -6,6 +6,7 @@
 //! individual channels.
 
 mod effects;
+mod kv_events;
 mod plan;
 mod resolve;
 
@@ -28,6 +29,7 @@ use openinfer_core::engine::{
 use openinfer_core::sampler::SamplingParams;
 
 use self::effects::apply_effects;
+use self::kv_events::KvEventProducer;
 use self::plan::{
     ExecutionArtifacts, ExecutionPlan, build_next_plan, execute_plan, should_speculative_decode,
 };
@@ -148,6 +150,7 @@ pub(crate) fn start_qwen3(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
     dflash_draft_model_path: Option<&str>,
+    enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -158,6 +161,7 @@ pub(crate) fn start_qwen3(
         max_prefill_tokens,
         dflash_draft_model_path,
         memory_options,
+        enable_kv_events,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     executor.enable_decode_overlap(decode_overlap)?;
@@ -193,6 +197,9 @@ pub(crate) fn start_qwen3_with_lora_control(
         max_prefill_tokens,
         None,
         memory_options,
+        // LoRA serving never emits KV events: the router-facing cache feed is
+        // base-model single-rank only.
+        false,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     executor.enable_decode_overlap(decode_overlap)?;
@@ -211,7 +218,7 @@ fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32
 }
 
 pub(crate) fn start_with_executor<E>(
-    executor: E,
+    mut executor: E,
     seed: u64,
     max_prefill_tokens: usize,
 ) -> EngineHandle
@@ -241,6 +248,20 @@ where
         kv_total_blocks: kv_total,
     });
 
+    // Opt-in KV block-event feed: `Some` only when the executor was built with
+    // events on (single-GPU, no LoRA). The producer runs on the scheduler
+    // thread; the neutral receiver is handed to the engine handle.
+    let (producer, kv_events_rx) = match executor.take_kv_event_receiver() {
+        Some(removes) => {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            (
+                Some(KvEventProducer::new(event_tx, removes)),
+                Some(event_rx),
+            )
+        }
+        None => (None, None),
+    };
+
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
@@ -251,14 +272,19 @@ where
                 max_prefill_tokens,
                 kv_total,
                 &load_tx,
+                producer,
             );
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new(submit_tx)
+    let handle = EngineHandle::new(submit_tx)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
-        .with_load_watch(load_rx)
+        .with_load_watch(load_rx);
+    match kv_events_rx {
+        Some(rx) => handle.with_kv_events(rx),
+        None => handle,
+    }
 }
 
 pub(crate) fn start_with_executor_with_lora_control<E>(
@@ -429,6 +455,7 @@ fn scheduler_loop<E>(
     max_prefill_tokens: usize,
     kv_total: u64,
     load_tx: &watch::Sender<LoadSnapshot>,
+    mut kv_producer: Option<KvEventProducer>,
 ) where
     E: ModelExecutor,
 {
@@ -451,6 +478,15 @@ fn scheduler_loop<E>(
 
     loop {
         publish_load(load_tx, kv_total, &executor);
+        // Flush the prior step's cache changes to a router (no-op unless the
+        // event feed is on). Top-of-loop, like `publish_load`: one pass per
+        // iteration regardless of which branch the step takes, at the cost of a
+        // one-iteration announcement lag the router tolerates. Stores first so a
+        // block evicted the same step it registered is announced before removed.
+        if let Some(producer) = kv_producer.as_mut() {
+            producer.emit_stores(executor.take_kv_store_events());
+            producer.drain_removes();
+        }
 
         // 0. Poll in-flight async prefill (decode-overlap mode).
         if inflight_prefill_pending.is_some() {
