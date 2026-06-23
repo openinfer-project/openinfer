@@ -16,8 +16,10 @@
 //! between segments. Attention must stay eager because FlashInfer's paged-prefill
 //! kernel fixes its KV-iteration count when the graph is recorded; with the verify
 //! context growing every step, a captured attention would under-read KV and
-//! corrupt later tokens. The dense segments are shape-stable in the fixed
-//! `span`-row layout, so one capture replays losslessly for the request's life.
+//! corrupt later tokens. The dense segments bake their row count, so a captured
+//! segment is only ever replayed at the exact full `batch_size * span` shape it
+//! was recorded at; a step whose span is truncated near a request's output
+//! budget falls back to eager (see [`Qwen3Model::batch_prefill_into`]).
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -258,8 +260,19 @@ impl Qwen3Model {
         // the fixed `span`-row layout. Segments: [embed + L0.pre] [L0.attn]
         // [L0.post + L1.pre] [L1.attn] ... [L_last.post + lm_head]. ---
         let num_layers = self.layers.len();
+        // Each captured dense segment bakes its row count (`total_tokens`) into
+        // every kernel launch. A request near its output budget shortens its span
+        // (the scheduler truncates the verify span to the remaining budget), so
+        // `total_tokens` varies at a fixed `batch_size`. Replaying a segment that
+        // was captured at one row count at a *different* count processes the wrong
+        // number of rows and leaves the tail rows stale — silently corrupting the
+        // verify logits of the trailing requests. So only the full, maximal
+        // `batch_size * span` shape (every request contributing a full span) uses
+        // the graph; any truncated step runs eager. This makes
+        // capture-shape == replay-shape an invariant by construction.
+        let full_shape = total_tokens == batch_size * bufs.span;
         match BATCH_BUCKETS.iter().position(|&b| b == batch_size) {
-            Some(bidx) => {
+            Some(bidx) if full_shape => {
                 // Take the bucket's segment graphs out so the capture closures can
                 // borrow `bufs` mutably; restore them after (even on error).
                 let mut segs = std::mem::take(&mut bufs.graphs[bidx]);
@@ -280,8 +293,9 @@ impl Qwen3Model {
                 bufs.graphs[bidx] = segs;
                 result?;
             }
-            None => {
-                // Off-bucket batch: run the same segments eager (no capture).
+            // Off-bucket batch, or a truncated (non-full-span) step: run the same
+            // segments eager (no capture).
+            _ => {
                 self.verify_seg_embed_pre(bufs)?;
                 self.verify_attn(0, kv_buffer, layout, bufs)?;
                 for i in 1..num_layers {

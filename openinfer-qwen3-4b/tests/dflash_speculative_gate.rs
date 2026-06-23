@@ -48,6 +48,7 @@ use openinfer_qwen3_4b::{
     DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap,
     Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
 };
+use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
@@ -126,7 +127,12 @@ struct Step {
 }
 
 /// Submit one greedy request and collect the decoded steps until `Finished`.
-fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, logprobs: usize) -> Vec<Step> {
+fn generate(
+    handle: &EngineHandle,
+    prompt_tokens: Vec<u32>,
+    logprobs: usize,
+    max_tokens: usize,
+) -> Vec<Step> {
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
@@ -134,7 +140,7 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, logprobs: usize) -> 
             queued_at_unix_s: None,
             prompt_tokens,
             params: SamplingParams::default(),
-            max_tokens: GENERATED_TOKENS,
+            max_tokens,
             lora_adapter: None,
             token_tx,
             logprobs,
@@ -196,6 +202,133 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
     }
 }
 
+/// Compare one prompt's speculative `spec` steps against its plain-greedy `base`,
+/// tolerating only the benign prefill-vs-decode kernel-gap tie flip (the spec
+/// pick sits within `MARGIN_TOL` of the prefill kernel's own argmax, measured in
+/// the prefill distribution the verify path actually runs). `Ok(())` ⇒ lossless
+/// or a benign tie; `Err(diagnostic)` ⇒ a real spec bug. `handle` must be the
+/// live speculative engine — at a divergence it re-prefills the shared context
+/// (`prompt_tokens` + the matched prefix) to read that prefill-kernel reference.
+fn check_lossless(
+    handle: &EngineHandle,
+    tokenizer: &DynTokenizer,
+    i: usize,
+    prompt: &str,
+    prompt_tokens: &[u32],
+    base: &[Step],
+    spec: &[Step],
+) -> Result<(), String> {
+    let matched = base
+        .iter()
+        .zip(spec)
+        .take_while(|(b, s)| b.id == s.id)
+        .count();
+
+    // Identical sequences (or one a prefix of the other): perfectly lossless.
+    if matched == base.len().min(spec.len()) {
+        eprintln!(
+            "prompt {i} ({prompt:?}): {matched}/{} tokens identical (100% lossless)",
+            base.len()
+        );
+        return Ok(());
+    }
+
+    let spec_id = spec[matched].id;
+    let decode_argmax = base[matched].top_logprobs[0].0;
+
+    // Diagnostic: show the exact branch point.
+    {
+        let lo = matched.saturating_sub(2);
+        let hi = (matched + 3).min(base.len()).min(spec.len());
+        let base_ids: Vec<u32> = base[..hi].iter().map(|s| s.id).collect();
+        let spec_ids: Vec<u32> = spec[..hi].iter().map(|s| s.id).collect();
+        eprintln!("  [diag] prompt {i} matched={matched}");
+        eprintln!(
+            "  [diag] context+gen base ids {:?} = {:?}",
+            &base_ids,
+            tokenizer.decode(&base_ids, false).unwrap_or_default()
+        );
+        eprintln!(
+            "  [diag] base[{lo}..{hi}] = {:?}",
+            base[lo..hi]
+                .iter()
+                .map(|s| (s.id, tokenizer.decode(&[s.id], false).unwrap_or_default()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "  [diag] spec[{lo}..{hi}] = {:?}",
+            spec[lo..hi]
+                .iter()
+                .map(|s| (s.id, tokenizer.decode(&[s.id], false).unwrap_or_default()))
+                .collect::<Vec<_>>()
+        );
+        let _ = spec_ids;
+    }
+
+    // The verify path runs the prefill kernel, so the right reference for the
+    // spec pick is a plain *prefill* of the same shared context — not the
+    // plain-decode baseline, whose kernel resolves a bifurcation tie to the
+    // other side and amplifies the gap.
+    let mut context = prompt_tokens.to_vec();
+    context.extend(base[..matched].iter().map(|s| s.id));
+    let prefill_ref = prefill_next(handle, context, LOGPROBS);
+
+    if prefill_ref.id == spec_id {
+        // Spec faithfully reproduced the prefill-kernel greedy pick; the
+        // divergence is purely the pre-existing prefill-vs-decode kernel gap.
+        let decode_lp = base[matched]
+            .top_logprobs
+            .iter()
+            .find(|(t, _)| *t == spec_id)
+            .map(|(_, lp)| base[matched].top_logprobs[0].1 - lp);
+        eprintln!(
+            "prompt {i} ({prompt:?}): kernel-gap flip at token {matched} — verify(prefill)→{spec_id}, \
+             decode→{decode_argmax}; spec matches prefill greedy (decode-margin {:?}). Not a spec bug.",
+            decode_lp
+        );
+        return Ok(());
+    }
+
+    // Spec's greedy pick differs from the prefill-kernel argmax too. The verify
+    // path builds its committed KV incrementally across batched speculative
+    // spans while this reference prefill builds it in one shot; the two differ by
+    // a few bf16 ULP. Within MARGIN_TOL of the prefill argmax ⇒ a benign tie
+    // flip; clearly worse ⇒ the verify/accept/capture logic picked a token the
+    // forward never favored — a real bug.
+    let prefill_regret = prefill_ref
+        .top_logprobs
+        .iter()
+        .find(|(t, _)| *t == spec_id)
+        .map(|(_, lp)| prefill_ref.top_logprobs[0].1 - lp);
+
+    if let Some(regret) = prefill_regret {
+        if regret <= MARGIN_TOL {
+            eprintln!(
+                "prompt {i} ({prompt:?}): tie flip at token {matched} — \
+                 verify(prefill)→{}, spec→{spec_id}, decode→{decode_argmax}; \
+                 spec pick is #2 in the prefill distribution (regret {regret:.3} ≤ {MARGIN_TOL}). \
+                 Not a spec bug.",
+                prefill_ref.id,
+            );
+            return Ok(());
+        }
+    }
+
+    // Either the spec pick is outside the prefill top-K entirely, or it sits
+    // clearly below the prefill argmax — neither is a benign tie.
+    let decode_regret = base[matched]
+        .top_logprobs
+        .iter()
+        .find(|(t, _)| *t == spec_id)
+        .map(|(_, lp)| base[matched].top_logprobs[0].1 - lp);
+    Err(format!(
+        "prompt {i}: at token {matched} spec chose {spec_id} but prefill greedy says {} and \
+         decode greedy says {decode_argmax} (spec regret in prefill dist: {prefill_regret:?} > \
+         {MARGIN_TOL}; in decode dist: {decode_regret:?}) — real spec bug",
+        prefill_ref.id,
+    ))
+}
+
 #[test]
 fn dflash_speculative_greedy_matches_plain_greedy() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
@@ -224,7 +357,7 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
             .expect("failed to start baseline engine");
         let out = encoded
             .iter()
-            .map(|t| generate(&handle, t.clone(), LOGPROBS))
+            .map(|t| generate(&handle, t.clone(), LOGPROBS, GENERATED_TOKENS))
             .collect();
         drop(handle);
         // Let the scheduler thread tear down and free GPU memory before the
@@ -244,123 +377,19 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     .expect("failed to start speculative engine");
 
     let mut failures = Vec::new();
-    for (i, prompt) in prompts.iter().enumerate() {
-        let base = &baseline[i];
-        let spec = generate(&handle, encoded[i].clone(), 0);
-        let matched = base
-            .iter()
-            .zip(&spec)
-            .take_while(|(b, s)| b.id == s.id)
-            .count();
-
-        // Identical sequences (or one a prefix of the other): perfectly lossless.
-        if matched == base.len().min(spec.len()) {
-            eprintln!(
-                "prompt {i} ({prompt:?}): {matched}/{} tokens identical (100% lossless)",
-                base.len()
-            );
-            continue;
+    for (i, &prompt) in prompts.iter().enumerate() {
+        let spec = generate(&handle, encoded[i].clone(), 0, GENERATED_TOKENS);
+        if let Err(failure) = check_lossless(
+            &handle,
+            &tokenizer,
+            i,
+            prompt,
+            &encoded[i],
+            &baseline[i],
+            &spec,
+        ) {
+            failures.push(failure);
         }
-
-        let spec_id = spec[matched].id;
-        let decode_argmax = base[matched].top_logprobs[0].0;
-
-        // Diagnostic: show the exact branch point.
-        {
-            let lo = matched.saturating_sub(2);
-            let hi = (matched + 3).min(base.len()).min(spec.len());
-            let base_ids: Vec<u32> = base[..hi].iter().map(|s| s.id).collect();
-            let spec_ids: Vec<u32> = spec[..hi].iter().map(|s| s.id).collect();
-            eprintln!("  [diag] prompt {i} matched={matched}");
-            eprintln!(
-                "  [diag] context+gen base ids {:?} = {:?}",
-                &base_ids,
-                tokenizer.decode(&base_ids, false).unwrap_or_default()
-            );
-            eprintln!(
-                "  [diag] base[{lo}..{hi}] = {:?}",
-                base[lo..hi]
-                    .iter()
-                    .map(|s| (s.id, tokenizer.decode(&[s.id], false).unwrap_or_default()))
-                    .collect::<Vec<_>>()
-            );
-            eprintln!(
-                "  [diag] spec[{lo}..{hi}] = {:?}",
-                spec[lo..hi]
-                    .iter()
-                    .map(|s| (s.id, tokenizer.decode(&[s.id], false).unwrap_or_default()))
-                    .collect::<Vec<_>>()
-            );
-            let _ = spec_ids;
-        }
-
-        // The verify path runs the prefill kernel, so the right reference for the
-        // spec pick is a plain *prefill* of the same shared context — not the
-        // plain-decode baseline, whose kernel resolves a bifurcation tie to the
-        // other side and amplifies the gap. Build that context from the matched
-        // tokens and ask what the prefill kernel predicts next.
-        let mut context = encoded[i].clone();
-        context.extend(base[..matched].iter().map(|s| s.id));
-        let prefill_ref = prefill_next(&handle, context, LOGPROBS);
-
-        if prefill_ref.id == spec_id {
-            // Spec faithfully reproduced the prefill-kernel greedy pick; the
-            // divergence is purely the pre-existing prefill-vs-decode kernel gap
-            // at a near-tie (here decode→{decode_argmax}, prefill→{spec_id}).
-            let decode_lp = base[matched]
-                .top_logprobs
-                .iter()
-                .find(|(t, _)| *t == spec_id)
-                .map(|(_, lp)| base[matched].top_logprobs[0].1 - lp);
-            eprintln!(
-                "prompt {i} ({prompt:?}): kernel-gap flip at token {matched} — verify(prefill)→{spec_id}, \
-                 decode→{decode_argmax}; spec matches prefill greedy (decode-margin {:?}). Not a spec bug.",
-                decode_lp
-            );
-            continue;
-        }
-
-        // Spec's greedy pick differs from the prefill-kernel argmax too. The
-        // verify path builds its committed KV incrementally across batched
-        // speculative spans, while this reference prefill builds it in one
-        // shot; the two differ by a few bf16 ULP. On a near-tie that flips the
-        // argmax — benign. So the deciding question is *how far* below the
-        // prefill argmax the spec pick sits IN THE PREFILL KERNEL'S OWN
-        // distribution (the kernel the verify path uses). Within MARGIN_TOL ⇒
-        // a numerical tie flip, not a bug. Clearly worse ⇒ the verify/accept
-        // logic picked a token the forward never favored — a real bug.
-        let prefill_regret = prefill_ref
-            .top_logprobs
-            .iter()
-            .find(|(t, _)| *t == spec_id)
-            .map(|(_, lp)| prefill_ref.top_logprobs[0].1 - lp);
-
-        if let Some(regret) = prefill_regret {
-            if regret <= MARGIN_TOL {
-                eprintln!(
-                    "prompt {i} ({prompt:?}): tie flip at token {matched} — \
-                     verify(prefill)→{}, spec→{spec_id}, decode→{decode_argmax}; \
-                     spec pick is #2 in the prefill distribution (regret {regret:.3} ≤ {MARGIN_TOL}). \
-                     Not a spec bug.",
-                    prefill_ref.id,
-                );
-                continue;
-            }
-        }
-
-        // Either the spec pick is outside the prefill top-K entirely, or it sits
-        // clearly below the prefill argmax — neither is a benign tie.
-        let decode_regret = base[matched]
-            .top_logprobs
-            .iter()
-            .find(|(t, _)| *t == spec_id)
-            .map(|(_, lp)| base[matched].top_logprobs[0].1 - lp);
-        failures.push(format!(
-            "prompt {i}: at token {matched} spec chose {spec_id} but prefill greedy says {} and \
-             decode greedy says {decode_argmax} (spec regret in prefill dist: {prefill_regret:?} > \
-             {MARGIN_TOL}; in decode dist: {decode_regret:?}) — real spec bug",
-            prefill_ref.id,
-        ));
     }
 
     drop(handle);
@@ -369,6 +398,104 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         failures.is_empty(),
         "speculative greedy decode is not lossless:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Verify-graph capture-shape regression (heterogeneous `max_tokens`).
+///
+/// The piecewise verify CUDA Graph keys its captured dense segments by
+/// `batch_size` alone, but a request near its output budget shortens its verify
+/// span (`scheduler::plan` truncates the span to the remaining budget), so
+/// `total_tokens` — the row count the captured segments bake into their launch
+/// grid — varies at a *fixed* batch size. A graph captured at a short span and
+/// then replayed at a longer one processes too few rows: the trailing requests
+/// read stale logits, silently breaking the lossless contract.
+///
+/// Neither existing check can see this. The bs=1 gate above issues each request
+/// sequentially, so every fresh request's first verify is a *full* span and
+/// bucket bs=1 is always first-captured at the maximal shape (only the harmless
+/// over-compute direction occurs). A homogeneous concurrent benchmark is no
+/// better: lockstep requests capture every bucket at full span during ramp-up,
+/// and all truncation happens later as they finish together (still the safe
+/// direction). The dangerous direction needs *heterogeneous* progress.
+///
+/// This reproduces it deterministically, single-stream: a `max_tokens=8` request
+/// (span < `block_size`) captures the bucket-bs=1 graph at a truncated shape,
+/// then a `max_tokens=64` request on the *same* engine replays that poisoned
+/// graph at the full span. On the buggy code the long request diverges from
+/// plain greedy; with full-shape gating (truncated spans run eager, so the graph
+/// is only ever captured/replayed at the maximal shape) it stays lossless.
+#[test]
+fn dflash_short_then_long_verify_capture_is_lossless() {
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+
+    // << block_size (16): the poison request's only verify step is a short
+    // truncated span, capturing the bucket-bs=1 graph at total_tokens far below
+    // the full span. The fewer valid rows, the sooner a full-span replay hits the
+    // stale tail — so the victim diverges early, well clear of its token budget.
+    const POISON_MAX_TOKENS: usize = 4;
+    let poison_prompt = "Hello, world! Tell me a story.";
+    let victim_prompt = "Q: What is 17 multiplied by 23? A: Let's think step by step.";
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let poison_tokens = tokenizer
+        .encode(poison_prompt, false)
+        .expect("encode failed");
+    let victim_tokens = tokenizer
+        .encode(victim_prompt, false)
+        .expect("encode failed");
+
+    // 1. Baseline: the victim's plain-greedy decode (spec off) with logprobs, for
+    //    the regret reference at any divergence.
+    let baseline = {
+        let handle = openinfer_qwen3_4b::launch(Path::new(&model_path), launch_options(None))
+            .expect("failed to start baseline engine");
+        let out = generate(&handle, victim_tokens.clone(), LOGPROBS, GENERATED_TOKENS);
+        drop(handle);
+        // Free the target before the speculative engine loads the same 8 GB.
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+
+    // 2. Speculative engine, shared across both requests so the bucket-bs=1
+    //    capture from the poison request persists into the victim's replay.
+    let handle = openinfer_qwen3_4b::launch(
+        Path::new(&model_path),
+        launch_options(Some(PathBuf::from(&draft_path))),
+    )
+    .expect("failed to start speculative engine");
+
+    // Poison: a short request whose only verify step has total_tokens < span,
+    // first-capturing the bucket-bs=1 graph at the truncated shape.
+    let poison = generate(&handle, poison_tokens, 0, POISON_MAX_TOKENS);
+    assert!(
+        poison.len() <= POISON_MAX_TOKENS,
+        "poison request emitted {} tokens, expected <= {POISON_MAX_TOKENS}",
+        poison.len()
+    );
+
+    // Victim: a full-span replay of the poisoned bucket-bs=1 graph.
+    let spec = generate(&handle, victim_tokens.clone(), 0, GENERATED_TOKENS);
+
+    let result = check_lossless(
+        &handle,
+        &tokenizer,
+        0,
+        victim_prompt,
+        &victim_tokens,
+        &baseline,
+        &spec,
+    );
+    drop(handle);
+
+    assert!(
+        result.is_ok(),
+        "verify capture-shape bug: the long request diverged from plain greedy after a short \
+         request poisoned the bucket-bs=1 graph at a truncated span:\n{}",
+        result.unwrap_err()
     );
 }
 
