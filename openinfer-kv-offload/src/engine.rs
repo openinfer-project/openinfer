@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::CudaStream;
 use openinfer_kv_cache::KvBuffer;
 use pegaflow_core::{
-    EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId, StorageConfig,
+    EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId, StorageConfig, TransferMode,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -219,7 +219,6 @@ impl OffloadEngine {
             PP_RANK,
             TP_SIZE,
             WORLD_SIZE,
-            reg.layer_names.len(),
             &reg.layer_names,
             &reg.data_ptrs,
             &reg.size_bytes,
@@ -227,7 +226,18 @@ impl OffloadEngine {
             &reg.bytes_per_block,
             &reg.kv_stride_bytes,
             &reg.segments,
-            Some(&reg.block_stride_bytes),
+            Some(reg.block_stride_bytes.as_slice()),
+            // Direct (cuMemcpyAsync on the DMA engines) suits this path's few,
+            // large per-layer copies; the Kernel backend only wins for highly
+            // fragmented batches.
+            TransferMode::Direct,
+            // page_first = false: openinfer registers one pegaflow layer per
+            // model layer (see `Registration::from_buffer`) and expresses the
+            // page-interleaved gap via `block_stride_bytes` — the layer-first
+            // model. The page-first path instead collapses all layers into a
+            // single page slot per block, which this per-layer registration is
+            // not laid out for.
+            false,
         )?;
 
         Ok(Self {
@@ -243,11 +253,15 @@ impl OffloadEngine {
     /// Fan one (block_id, hash) list across every layer — the device data
     /// differs per layer, the ids and hashes don't.
     fn build_saves(&self, block_ids: &[i32], block_hashes: &[Vec<u8>]) -> Vec<LayerSave> {
+        // pegaflow indexes GPU blocks by `usize`; openinfer carries them as
+        // `i32` (its kvbm/CUDA convention). Convert once at this boundary —
+        // block ids are slot indices, always non-negative.
+        let block_ids: Vec<usize> = block_ids.iter().map(|&id| id as usize).collect();
         self.layer_names
             .iter()
             .map(|name| LayerSave {
                 layer_name: name.clone(),
-                block_ids: block_ids.to_vec(),
+                block_ids: block_ids.clone(),
                 block_hashes: block_hashes.to_vec(),
             })
             .collect()
@@ -394,6 +408,8 @@ impl OffloadEngine {
         dst_block_ids: Vec<i32>,
     ) -> Result<LoadHandle, EngineError> {
         let layer_refs: Vec<&str> = self.layer_names.iter().map(String::as_str).collect();
+        // pegaflow indexes GPU blocks by `usize` (see `build_saves`).
+        let dst_block_ids: Vec<usize> = dst_block_ids.iter().map(|&id| id as usize).collect();
         let loads = [(lease, dst_block_ids)];
         let rx = self.engine.batch_load_kv_blocks_multi_layer_inproc(
             &self.instance_id,

@@ -40,6 +40,14 @@ members = [
     "kvbm/kvbm-logical",
 ]
 
+# openinfer-dynamo-backend is its OWN workspace (it depends on dynamo-runtime /
+# dynamo-llm). Excluding it keeps that heavy dep tree out of this workspace's
+# `--workspace` build + test graph, so the default openinfer build stays pure
+# Rust + CUDA with no NATS/etcd/tonic. Build it from its own directory.
+exclude = [
+    "openinfer-dynamo-backend",
+]
+
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
 [workspace.package]
 version = "1.2.0"
@@ -76,17 +84,24 @@ colored = "3"
 comfy-table = "7.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-channel = "0.5"
-# 0.19.5+ required: per-symbol lazy loading keeps the cuda-12090 binding
-# level from imposing a runtime driver floor (issue #263).
-cudarc = { version = "0.19.7", features = [
+# Floor 0.19.3 (caret), the lowest that satisfies dynamo's `=0.19.3` pin in the
+# openinfer-dynamo-backend sub-workspace. The MAIN openinfer workspace stays
+# locked at 0.19.7 (caret-satisfied, no re-resolve), so the standalone engine
+# keeps the 0.19.5+ per-symbol lazy nvrtc loading that holds the cuda-12090
+# binding off a runtime driver floor (issue #263). Only the dynamo-backend
+# worker resolves to exactly 0.19.3 (eager symbol load, below the #263 floor) —
+# acceptable there: offload is OFF so the nvrtc JIT path is never exercised at
+# runtime, and the eager load is satisfied on the target deploy HW (verified
+# loading + serving on the 5090, driver 590 / CUDA 13.1).
+cudarc = { version = "0.19.3", features = [
     "cuda-12090",
     "cublas",
     "f16",
     "nccl",
     # nvrtc: embedded pegaflow-core's transfer/kernel.rs references the nvrtc
-    # bindings unconditionally (its KernelBackend JIT-compiles the copy kernel).
-    # Lazy per-symbol loading (0.19.5+) keeps this off the runtime driver floor,
-    # so it stays compatible with the cuda-12090 binding level (issue #263).
+    # bindings unconditionally (its KernelBackend JIT-compiles the copy kernel),
+    # so the symbol is linked even with offload disabled. See the cudarc version
+    # note above for the 0.19.3-vs-0.19.5 (#263) lazy-loading tradeoff.
     "nvrtc",
 ] }
 cxx = "1.0.187"
