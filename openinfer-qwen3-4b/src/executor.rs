@@ -1912,6 +1912,18 @@ impl ModelExecutor for Qwen3Executor {
                         .expect("request must exist after unified decode");
                     rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
                 }
+                // A plain decode via the fused unified step advances the sequence
+                // outside the speculative path, so any captured draft context is
+                // now stale — drop it, mirroring execute_decode. (Eligible pending
+                // are routed to a dedicated prefill step, so unified prefills never
+                // need DFlash mark-ready here.)
+                if self.speculative.is_some() {
+                    for req_result in &result.decode_requests {
+                        if self.dflash_ready_requests.remove(&req_result.request_id) {
+                            self.primary.drop_dflash_request(req_result.request_id)?;
+                        }
+                    }
+                }
                 for req_result in &result.prefill_requests {
                     self.save_sealed_blocks(req_result.request_id);
                 }

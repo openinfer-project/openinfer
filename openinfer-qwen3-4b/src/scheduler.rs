@@ -1084,7 +1084,7 @@ fn runtime_plan(
             Some(ExecutionPlan::Prefill { pending })
         }
     } else {
-        build_next_plan(!active.is_empty(), pending)
+        build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
     }
 }
 

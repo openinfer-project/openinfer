@@ -48,12 +48,26 @@ pub(super) enum ExecutionArtifacts {
 pub(super) fn build_next_plan(
     have_active: bool,
     pending: Vec<PendingRequest>,
+    speculative: bool,
 ) -> Option<ExecutionPlan> {
-    // echo+logprobs requests need all-position logits, which the unified
-    // forward does not compute (it passes all_position_logits=None). Route
-    // them through a dedicated prefill step instead of degrading silently.
+    // echo+logprobs requests need all-position logits, which the unified forward
+    // does not compute (it passes all_position_logits=None). And under DFlash
+    // speculation, an eligible request must capture its target hidden context
+    // during prefill — the unified forward skips that capture, so a request
+    // prefilled via Unified would never become draft-ready and DFlash would
+    // silently no-op for it forever. Either way, route pending through a
+    // dedicated prefill step instead of degrading silently.
     let needs_prompt_logprobs = pending.iter().any(|r| r.echo && r.logprobs > 0);
-    if !pending.is_empty() && have_active && !needs_prompt_logprobs {
+    // Deliberately a loose superset of the real capture eligibility
+    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && !echo`):
+    // over-routing an ineligible request to a dedicated prefill only costs one
+    // fusion, but under-routing a capture-eligible one into Unified would silently
+    // break its readiness. Never tighten this into the dangerous direction.
+    let needs_dflash_capture = speculative
+        && pending
+            .iter()
+            .any(|r| r.lora_adapter.is_none() && r.logprobs == 0 && r.params.is_greedy());
+    if !pending.is_empty() && have_active && !needs_prompt_logprobs && !needs_dflash_capture {
         Some(ExecutionPlan::Unified { pending })
     } else if !pending.is_empty() {
         Some(ExecutionPlan::Prefill { pending })
@@ -174,7 +188,11 @@ fn build_speculative_verify_items(
             // Clamp the verify span to the request's remaining output budget so
             // a long accepted run can't overshoot max_tokens.
             let remaining = active.max_tokens.saturating_sub(active.generated_count);
-            assert!(remaining > 0, "active request must have output budget");
+            // A continuing active request always has budget left (resolve emits
+            // EmitManyAndFinish the moment generated_count hits max_tokens), so
+            // this is a true invariant, not a runtime condition — don't crash the
+            // scheduler thread in release on a state we've proven unreachable.
+            debug_assert!(remaining > 0, "active request must have output budget");
             let mut token_ids = draft.token_ids.clone();
             token_ids.truncate(remaining);
             VerifyStepItem::new(draft.request_id, token_ids, active.params)
@@ -290,23 +308,26 @@ mod tests {
     #[test]
     fn plan_selection_follows_active_and_pending_state() {
         assert!(
-            build_next_plan(false, vec![]).is_none(),
+            build_next_plan(false, vec![], false).is_none(),
             "idle scheduler (no active, no pending) produces no plan"
         );
         assert!(
-            matches!(build_next_plan(true, vec![]), Some(ExecutionPlan::Decode)),
+            matches!(
+                build_next_plan(true, vec![], false),
+                Some(ExecutionPlan::Decode)
+            ),
             "active-only ticks decode the running batch"
         );
         assert!(
             matches!(
-                build_next_plan(false, vec![pending()]),
+                build_next_plan(false, vec![pending()], false),
                 Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
             ),
             "pending-only prefills the new arrivals"
         );
         assert!(
             matches!(
-                build_next_plan(true, vec![pending()]),
+                build_next_plan(true, vec![pending()], false),
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
             "active + pending fuses prefill and decode into one unified step"
@@ -318,7 +339,7 @@ mod tests {
         echo_req.logprobs = 5;
         assert!(
             matches!(
-                build_next_plan(true, vec![echo_req]),
+                build_next_plan(true, vec![echo_req], false),
                 Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
             ),
             "active + pending echo+logprobs request routes to prefill not unified"
@@ -328,10 +349,35 @@ mod tests {
         echo_no_lp.echo = true;
         assert!(
             matches!(
-                build_next_plan(true, vec![echo_no_lp]),
+                build_next_plan(true, vec![echo_no_lp], false),
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
             "active + pending echo-only request (no logprobs) can use unified"
+        );
+        // Under DFlash speculation, an eligible (greedy) pending must capture its
+        // target context during prefill — the unified forward skips that capture,
+        // so route it to a dedicated prefill step rather than let DFlash silently
+        // no-op for it.
+        assert!(
+            matches!(
+                build_next_plan(true, vec![pending()], true),
+                Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+            ),
+            "spec + active + eligible pending routes to prefill so the drafter context is captured"
+        );
+        // A non-greedy pending needs no draft capture, so unified fusion is still
+        // fine even under speculation.
+        let mut sampled = pending();
+        sampled.params = SamplingParams {
+            temperature: 1.0,
+            ..SamplingParams::default()
+        };
+        assert!(
+            matches!(
+                build_next_plan(true, vec![sampled], true),
+                Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
+            ),
+            "spec + active + non-greedy pending (no capture needed) can still use unified"
         );
     }
 }
