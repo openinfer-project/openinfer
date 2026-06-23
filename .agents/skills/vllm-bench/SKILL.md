@@ -131,7 +131,7 @@ without hitting the server:
 vllm-bench \
   --backend openai-chat \
   --model Qwen/Qwen3-4B \
-  --tokenizer /data/models/Qwen3-4B \
+  --tokenizer <model-path> \
   --dataset-name random \
   --multi-turn --multi-turn-num-turns 2 \
   --random-input-len 16 --random-output-len 4 \
@@ -139,8 +139,8 @@ vllm-bench \
   --dry-run
 ```
 
-For a public example, replace `--tokenizer /data/models/Qwen3-4B` with the
-served model id or a local model directory.
+`<model-path>` is a local tokenizer/model directory; for a public example,
+replace it with the served model id or any local model directory.
 
 ## Example: Generic vLLM Multi-Turn
 
@@ -181,9 +181,9 @@ This was validated locally with OpenInfer Qwen3-4B and `vllm-bench` built from
 this repo. Start OpenInfer:
 
 ```bash
-cd /data/code/workspace-rustllm/pegainfer-2
+cd <openinfer-repo>
 cargo run --release -p openinfer-server -- \
-  --model-path /data/models/Qwen3-4B \
+  --model-path <model-path> \
   --served-model-name Qwen/Qwen3-4B \
   --port 18080 \
   --cuda-graph=false
@@ -198,12 +198,12 @@ curl -s http://127.0.0.1:18080/v1/models
 Run a tiny multi-turn benchmark:
 
 ```bash
-cd /data/code/workspace-rustllm/vllm-bench
+cd <vllm-bench-repo>
 target/release/vllm-bench \
   --backend openai-chat \
   --base-url http://127.0.0.1:18080 \
   --model Qwen/Qwen3-4B \
-  --tokenizer /data/models/Qwen3-4B \
+  --tokenizer <model-path> \
   --dataset-name random \
   --multi-turn \
   --multi-turn-min-turns 2 \
