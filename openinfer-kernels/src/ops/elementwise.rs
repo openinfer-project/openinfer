@@ -206,7 +206,7 @@ pub fn copy_hidden_rows_into(
             row_offset as i32,
             src.hidden_dim as i32,
             src.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -253,7 +253,7 @@ pub fn copy_hidden_token_range_into(
             token_count as i32,
             src.seq_len as i32,
             dst.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
