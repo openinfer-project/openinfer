@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-41scnc53a-d0McNJDjK2lVqFGoSLUgXA">
+    <img src="https://img.shields.io/badge/Slack-join%20the%20community-4A154B?logo=slack&logoColor=white" alt="Join the openinfer Slack">
+  </a>
+</p>
+
+<p align="center">
   <a href="#quickstart">Quickstart</a> &middot;
   <a href="#supported-models">Models</a> &middot;
   <a href="#api">API</a> &middot;
