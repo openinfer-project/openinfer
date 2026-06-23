@@ -136,4 +136,112 @@ void qk_norm_rope_batched_decode_cuda(
     );
 }
 
+// ============================================================================
+// K-only norm + RoPE variant for the DFlash batch path.
+//
+// The context-hidden K projection needs RMSNorm + RoPE, but there is no
+// corresponding Q (the draft Q comes only from the noise tokens). Calling the
+// joint QK kernel on the context K would waste num_q_heads / (num_q_heads +
+// num_kv_heads) of the GPU work — 80% for Qwen3-4B's 16:4 GQA ratio — on a Q
+// buffer whose result is immediately discarded. This variant launches only
+// num_kv_heads blocks per token.
+//
+// It reuses the same in-place per-head RMSNorm + RoPE logic as the joint
+// kernel, restricted to the K tensor.
+// ============================================================================
+
+__global__ void k_norm_rope_kernel(
+    __nv_bfloat16* __restrict__ k,        // [kv_dim, seq_len] modified in-place
+    const __nv_bfloat16* __restrict__ k_norm_weight,  // [head_dim]
+    const __nv_bfloat16* __restrict__ cos_cache,      // [max_pos * head_dim]
+    const __nv_bfloat16* __restrict__ sin_cache,
+    int num_kv_heads, int head_dim,
+    int seq_len, int kv_dim,
+    const int* start_pos_d,  // if non-null, overrides start_pos per token
+    float eps,
+    int cos_max_pos
+) {
+    int head_local = blockIdx.x;
+    int token = blockIdx.y;
+    int d = threadIdx.x;
+
+    int offset = head_local * head_dim + d + token * kv_dim;
+    float val = __bfloat162float(k[offset]);
+
+    // RMSNorm: sum of squares via warp reduction
+    float sq = val * val;
+    sq = warp_reduce_sum(sq);
+
+    int warp_id = d / WARP_SIZE;
+    int lane_id = d % WARP_SIZE;
+    __shared__ float warp_sums[4];  // head_dim/32 = 4 warps
+    if (lane_id == 0) warp_sums[warp_id] = sq;
+    __syncthreads();
+
+    __shared__ float s_inv_rms;
+    {
+        float v = (lane_id < 4) ? warp_sums[lane_id] : 0.0f;
+        float total = warp_reduce_sum(v);
+        if (lane_id == 0) s_inv_rms = rsqrtf(total / head_dim + eps);
+    }
+    __syncthreads();
+
+    __nv_bfloat16 normed = __float2bfloat16(val * s_inv_rms);
+    float normed_f = __bfloat162float(normed) * __bfloat162float(k_norm_weight[d]);
+
+    __shared__ __nv_bfloat16 smem[HEAD_DIM];
+    smem[d] = __float2bfloat16(normed_f);
+    __syncthreads();
+
+    int half = head_dim / 2;
+    int pos = start_pos_d ? __ldg(start_pos_d + token) : token;
+    if (pos < 0 || pos >= cos_max_pos) __trap();
+
+    __nv_bfloat16 result;
+    if (d < half) {
+        float lo = __bfloat162float(smem[d]);
+        float hi = __bfloat162float(smem[d + half]);
+        float c = __bfloat162float(cos_cache[pos * head_dim + d]);
+        float s = __bfloat162float(sin_cache[pos * head_dim + d]);
+        float lo_cos = __bfloat162float(__float2bfloat16(lo * c));
+        float hi_sin = __bfloat162float(__float2bfloat16(hi * s));
+        result = __float2bfloat16(lo_cos - hi_sin);
+    } else {
+        int pair_d = d - half;
+        float lo = __bfloat162float(smem[pair_d]);
+        float hi = __bfloat162float(smem[d]);
+        float c = __bfloat162float(cos_cache[pos * head_dim + pair_d]);
+        float s = __bfloat162float(sin_cache[pos * head_dim + pair_d]);
+        float lo_sin = __bfloat162float(__float2bfloat16(lo * s));
+        float hi_cos = __bfloat162float(__float2bfloat16(hi * c));
+        result = __float2bfloat16(lo_sin + hi_cos);
+    }
+
+    k[offset] = result;
+}
+
+void k_norm_rope_batched_decode_cuda(
+    __nv_bfloat16* k,                    // [kv_dim * batch_size] in-place
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    const int* positions,                // [batch_size] per-request positions on GPU
+    int num_kv_heads,
+    int head_dim,
+    int batch_size,
+    float rms_eps,
+    int cos_max_pos,
+    cudaStream_t stream
+) {
+    int kv_dim = num_kv_heads * head_dim;
+    dim3 grid(num_kv_heads, batch_size);
+    k_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+        k, k_norm_weight, cos_cache, sin_cache,
+        num_kv_heads, head_dim,
+        /*seq_len=*/batch_size, kv_dim,
+        /*start_pos_d=*/positions,
+        rms_eps, cos_max_pos
+    );
+}
+
 } // extern "C"

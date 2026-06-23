@@ -185,6 +185,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// Strided segment copy for DFlash batch K/V concatenation. Copies one
+    /// segment (ctx or noise) of every request from a contiguous source to a
+    /// strided destination in a single launch. See `strided_segment_copy_cuda`
+    /// in `csrc/shared/elementwise.cu`.
+    pub fn strided_segment_copy_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        dim: i32,
+        src_seg_len: i32,
+        dst_seg_total: i32,
+        dst_row_offset: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn cublas_init();
     pub fn cublas_activate_device_handles() -> i32;
     pub fn cublas_destroy();
@@ -241,6 +256,25 @@ unsafe extern "C" {
         sin_cache: *const Half,
         positions: *const i32,
         num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        cos_max_pos: i32,
+        stream: CUstream,
+    );
+
+    /// K-only norm + RoPE for the DFlash batch context-K path. Same per-head
+    /// RMSNorm + RoPE as `qk_norm_rope_batched_decode_cuda` but launches only
+    /// `num_kv_heads` blocks per token — the draft path has no context Q, so
+    /// the joint kernel wastes the Q work. See `k_norm_rope_batched_decode_cuda`
+    /// in `csrc/shared/prefill_attention.cu`.
+    pub fn k_norm_rope_batched_decode_cuda(
+        k: *mut Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
         num_kv_heads: i32,
         head_dim: i32,
         batch_size: i32,
@@ -493,6 +527,42 @@ unsafe extern "C" {
         M: i32,
         batch: i32,
         K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn single_prefill_nhd_noncausal_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k: *const Half,
+        v: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_len: i32,
+        kv_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn batch_prefill_ragged_nhd_noncausal_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k: *const Half,
+        v: *const Half,
+        q_indptr: *const i32,
+        kv_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        total_q_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        sm_scale: f32,
         stream: CUstream,
     ) -> i32;
 

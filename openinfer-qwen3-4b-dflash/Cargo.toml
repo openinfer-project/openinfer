@@ -1,0 +1,33 @@
+[package]
+name = "openinfer-qwen3-4b-dflash"
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+openinfer-core = { workspace = true }
+openinfer-kernels = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "qwen3_dflash_forward_fixture"
+path = "src/bin/qwen3_dflash_forward_fixture.rs"
+
+[[bin]]
+name = "qwen3_dflash_forward_bench"
+path = "src/bin/qwen3_dflash_forward_bench.rs"
+
+[[bin]]
+name = "qwen3_dflash_batch_bench"
+path = "src/bin/qwen3_dflash_batch_bench.rs"
+
+[lints]
+workspace = true

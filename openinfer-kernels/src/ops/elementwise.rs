@@ -481,6 +481,49 @@ pub fn silu_mul_fused_batch_into(
     Ok(())
 }
 
+/// Strided segment copy for DFlash batch K/V concatenation.
+///
+/// Copies `src_seg_len` rows from every request in the batch from a contiguous
+/// source (`[batch_size * src_seg_len, dim]`) into a strided destination
+/// (`[batch_size * dst_seg_total, dim]`), placing each request's segment at
+/// `dst_row_offset` within its per-request block. One launch copies the entire
+/// batch's segment, replacing `batch_size` individual `memcpy_dtod` calls.
+///
+/// Used to build the ragged-attention K/V layout `[ctx | noise]` per request
+/// from the separately-projected `k_ctx`/`k_noise` buffers.
+pub fn strided_segment_copy_into(
+    ctx: &DeviceContext,
+    src: &HiddenStates,
+    dst: &mut HiddenStates,
+    src_seg_len: usize,
+    dst_seg_total: usize,
+    dst_row_offset: usize,
+    batch_size: usize,
+) -> Result<()> {
+    let dim = src.hidden_dim;
+    assert_eq!(dst.hidden_dim, dim);
+    assert_eq!(src.seq_len, batch_size * src_seg_len);
+    assert!(dst_row_offset + src_seg_len <= dst_seg_total);
+    assert!(batch_size * dst_seg_total <= dst.seq_len);
+
+    let (src_ptr, _g0) = src.data.device_ptr(&ctx.stream);
+    let (dst_ptr, _g1) = dst.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::strided_segment_copy_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            dim as i32,
+            src_seg_len as i32,
+            dst_seg_total as i32,
+            dst_row_offset as i32,
+            batch_size as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
 pub fn extract_vec(
     ctx: &DeviceContext,

@@ -427,4 +427,54 @@ CUresult embedding_batched_vocab_shard_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// ============================================================================
+// Strided segment copy for DFlash batch K/V concatenation.
+//
+// Copies one segment (ctx or noise) of every request in a batch from a
+// contiguous source layout to a strided destination layout in a single
+// kernel launch, replacing 2 * batch_size memcpy_dtod calls per K/V tensor.
+//
+//   src: [batch_size * src_seg_len, dim]  row-major, contiguous
+//   dst: [batch_size * dst_seg_total, dim] row-major, request r occupies
+//       rows [r * dst_seg_total + dst_row_offset,
+//             r * dst_seg_total + dst_row_offset + src_seg_len)
+//
+// Each thread copies one bf16 element. The total work is
+// batch_size * src_seg_len * dim.
+// ============================================================================
+
+__global__ void strided_segment_copy_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    __nv_bfloat16 *__restrict__ dst,
+    int dim, int src_seg_len, int dst_seg_total, int dst_row_offset,
+    int batch_size) {
+  int total = batch_size * src_seg_len * dim;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int element = idx % dim;
+    int row_in_seg = (idx / dim) % src_seg_len;
+    int req = idx / (dim * src_seg_len);
+    int src_row = req * src_seg_len + row_in_seg;
+    int dst_row = req * dst_seg_total + dst_row_offset + row_in_seg;
+    dst[dst_row * dim + element] = src[src_row * dim + element];
+  }
+}
+
+CUresult strided_segment_copy_cuda(
+    const __nv_bfloat16 *src, __nv_bfloat16 *dst,
+    int dim, int src_seg_len, int dst_seg_total, int dst_row_offset,
+    int batch_size, cudaStream_t stream) {
+  int total = batch_size * src_seg_len * dim;
+  int block = 256;
+  // The kernel uses a grid-stride loop, so any grid size >= 1 is correct.
+  // Size the grid to the work so every element is covered in the first pass
+  // (no upper cap — a cap would silently drop elements for large copies).
+  int grid = (total + block - 1) / block;
+  if (grid < 1) grid = 1;
+  strided_segment_copy_kernel<<<grid, block, 0, stream>>>(
+      src, dst, dim, src_seg_len, dst_seg_total, dst_row_offset, batch_size);
+  return (CUresult)cudaGetLastError();
+}
+
 } // extern "C"

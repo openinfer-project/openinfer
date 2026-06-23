@@ -497,6 +497,50 @@ pub fn qk_norm_rope_batch_decode_into(
     }
 }
 
+/// K-only norm + RoPE for the DFlash batch context-K path.
+///
+/// Applies in-place RMSNorm + RoPE to `k` only — the draft path's context K
+/// projection has no corresponding Q, so the joint `qk_norm_rope` kernel would
+/// waste `num_q_heads / (num_q_heads + num_kv_heads)` of its work on a Q buffer
+/// whose result is discarded (80% for Qwen3-4B's 16:4 GQA). This variant
+/// launches only `num_kv_heads` blocks per token.
+#[allow(clippy::too_many_arguments)]
+pub fn k_norm_rope_batch_decode_into(
+    ctx: &DeviceContext,
+    k: &mut HiddenStates,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    positions_d: &CudaSlice<i32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rms_eps: f32,
+) {
+    let batch_size = k.seq_len;
+
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _gp) = positions_d.device_ptr(&ctx.stream);
+
+    unsafe {
+        ffi::k_norm_rope_batched_decode_cuda(
+            k_ptr as *mut ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            batch_size as i32,
+            rms_eps,
+            (cos_cache.data.len() / head_dim) as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
+}
+
 /// Batched QK RMSNorm + partial RoPE for Qwen3.5 HD256 decode.
 ///
 /// Reads Q from interleaved `q_full` ([q, gate] per head), writes prepared Q into `q`,
