@@ -166,7 +166,7 @@ impl DeepSeekV2LiteEp2Generator {
         )?;
         let position = prompt_tokens.len();
 
-        let mut retained_cache = prefill_cache.clone();
+        let mut retained_cache = prefill_cache.clone_for_graph_probe();
         trace_graph_probe("run retained eager decode oracle");
         let retained_next = self.decode_next_token(
             first_token,

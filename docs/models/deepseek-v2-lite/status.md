@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and serving-semantics target. HF / host-staged / NCCL exactness is guarded by a committed case set, and #281 adds the first greedy mixed-request serving gate with per-request decode KV ownership. CUDA Graph, direct batch, HTTP pressure, and vLLM rows remain diagnostic or unclaimed as production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and serving-semantics target. HF / host-staged / NCCL exactness is guarded by a committed case set; #281 adds the first greedy mixed-request serving gate; #280 adds HTTP trace evidence, position-subgroup decode batching, and chunked NCCL collectives so 128-word and mixed 16/128-word HTTP runs complete. The subgroup fast-path lifts short-shape throughput, but CUDA Graph, direct batch, vLLM rows, and long-prompt latency remain diagnostic or unclaimed as production serving parity.
 
 Last touched: 2026-06
 
@@ -20,6 +20,8 @@ Last touched: 2026-06
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. This remains the eager NCCL oracle path. |
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
+| Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
+| HTTP trace and position-subgroup decode batching | HTTP evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups while letting singleton or lagging positions decode independently. The 2026-06-24 2x RTX 5090 NCCL HTTP sweeps below complete short same-shape, 128-word smoke, and mixed 16/128-word cells with full trace coverage. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 snapshot below is a runnable comparison from a documented validation environment, not serving parity or a stock-install claim. |
 
 ## Correctness Contract
@@ -32,7 +34,7 @@ The retained correctness gate is deliberately narrow:
 - generation mode: greedy;
 - backends: host-staged and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
 
-The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-23 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, and no comparison warnings.
+The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-24 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, no comparison warnings, token hash `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`, and text hash `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 
 The mixed-request serving E2E computes sequential greedy token-id oracles with `DeepSeekV2LiteEp2Generator::generate_greedy`, then submits concurrent requests through `start_engine`. The retained 2026-06-23 run covers same-length mixed prompts for same-position batch decode, different-length mixed prompts for single-row decode fallback, and a valid request submitted beside an invalid `logprobs` request to prove explicit rejection does not poison the valid stream. Host-staged and NCCL both passed the mixed-serving E2E.
 
@@ -77,6 +79,46 @@ OpenInfer streaming currently makes the client-side TPOT fields near-zero in thi
 | NCCL | 4 | 24/24 | 6.326 | 158.083 | 9491.680 | 10097.244 |
 | NCCL | 8 | 24/24 | 6.341 | 157.710 | 17242.941 | 20110.121 |
 
+### Issue #280 HTTP Trace, Subgroup Decode, And Long Prompts
+
+Retained 2026-06-24 evidence on 2x RTX 5090, NCCL EP2 with chunked large collectives, release `openinfer-server --features deepseek-v2-lite`, `/v1/completions`, `temperature=0`, `ignore_eos=true`, `max_tokens=16`, `num_requests=8`, `repeats=3`, with server logs consumed by `scripts/bench_http_serving.py`.
+
+This is HTTP serving evidence for request-level trace attribution, completed/failed/timeout accounting, output hash stability, and same-position decode subgroups. It does not prove vLLM parity, production EP readiness, or acceptable long-prompt latency.
+
+Long-shape NCCL direct smoke after chunking:
+
+| prompt words | prompt tokens | generated | token hash |
+| ---: | ---: | ---: | --- |
+| 24 | 32 | 16 | `78dfd3123da2ed54829027384682c6eb562a6d29b2a92ee96a7b26d7acc4e226` |
+| 64 | 86 | 16 | `920f24edd016e8e16973f304e5cb909303812a930a9c6608694d0b47f2c48918` |
+| 128 | 172 | 16 | `5fd2f30c1f1c4e4477791f233c30ce6c0148dba91737c358cb357a2065482861` |
+
+HTTP 128-word smoke: `prompt_words=128`, `concurrency=1`, `num_requests=2`, `warmup=0`, actual prompt tokens `170,171`.
+
+| completed | failed/timeouts | QPS | output tok/s | TTFT avg ms | TPOT/ITL avg ms | active max | decode batch max | traces | output hash |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 2/2 | 0/0 | 0.331 | 5.295 | 2535.3 | 32.3 | 1 | 1 | 2/2 | `2299c1c50f50e819` |
+
+Same-shape sweep: `prompt_words=16`, actual prompt tokens `20..23`.
+
+| conc | completed | failed/timeouts | QPS avg | output tok/s avg | TTFT avg ms | TPOT/ITL avg ms | active max | decode batch max | traces | output hash |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 1 | 8/8 x3 | 0/0 | 2.068 | 33.083 | 240.5 | 16.2 | 1 | 1 | 8/8 x3 | `0989a10c5d842d8b` |
+| 2 | 8/8 x3 | 0/0 | 2.248 | 35.967 | 332.8 | 36.8 | 2 | 2 | 8/8 x3 | `0989a10c5d842d8b` |
+| 4 | 8/8 x3 | 0/0 | 2.243 | 35.890 | 481.1 | 85.1 | 4 | 2 | 8/8 x3 | `0989a10c5d842d8b` |
+| 8 | 8/8 x3 | 0/0 | 2.290 | 36.635 | 985.9 | 163.1 | 8 | 4 | 8/8 x3 | `0989a10c5d842d8b` |
+
+Interpretation: short-shape throughput improved at every concurrency point, while TTFT stayed queue-sensitive and moved a little in both directions. The trace fields still prove the scheduler did batch live decode rows (`decode_batch_size_max=4` at concurrency 8), so `--max-concurrency` is no longer being inferred as batch size from the client alone.
+
+Mixed-shape proof: `prompt_words=16,128`, `num_requests=8` per repeat, four short and four long requests, `warmup=2`.
+
+| conc | completed | failed/timeouts | QPS avg | output tok/s avg | TTFT avg ms | TPOT/ITL avg ms | active max | decode batch max | traces | output hash |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 4 | 8/8 x3 | 0/0 | 0.597 | 9.545 | 2756.2 | 260.2 | 4 | 2 | 8/8 x3 | `d53e286068a7cd5e` |
+| 8 | 8/8 x3 | 0/0 | 0.602 | 9.634 | 5251.0 | 527.1 | 8 | 2 | 8/8 x3 | `d53e286068a7cd5e` |
+
+Interpretation: the old long-prompt prefill failure is fixed for this HTTP contract, and the post-fastpath rerun lifts mixed 16/128 throughput a bit, but the row is still dominated by long-prompt prefill and admission queueing. The c4/c8 rows prove subgroup batching can happen with mixed prompt lengths (`decode_batch_size_max=2` here), yet the latency profile is not a production serving claim.
+
 ### vLLM Repaired-Environment Comparison
 
 In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, the 2026-06-15 2x RTX 5090 run now has a successful vLLM baseline for the same DeepSeek-V2-Lite model/tokenizer snapshot and short HTTP benchmark shape as the OpenInfer table above.
@@ -108,7 +150,7 @@ Interpretation:
 
 - direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
-- OpenInfer HTTP throughput did not scale with concurrency in this snapshot, so serving batching remains open;
+- the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
 - vLLM TP2 and TP2+EP2 both show higher aggregate output tok/s under this short HTTP pressure shape than the current OpenInfer HTTP pressure rows;
 - TP2+EP2 is slightly ahead of TP2 in this short snapshot, but this is one workload and one documented validation environment;
 - standalone Torch bf16 GEMM passed on both GPUs in the failed and repaired vLLM environments, so the earlier failures were specific to the vLLM DeepSeek-V2 server/model startup and Python package/toolchain path rather than a blanket CUDA outage.
@@ -122,6 +164,7 @@ Use these labels consistently:
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
+| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows, and HTTP sweeps show non-1 `active_set_size` and `decode_batch_size_max`. | Fair vLLM parity, long-prompt latency readiness, or a before/after percentage unless a paired baseline run is recorded. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
 | `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 after target-environment package/toolchain fixes. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
@@ -166,7 +209,8 @@ The next implementation should be chosen from measured evidence:
    - keep the fixed EP2 path and exact sequential oracle until a wider oracle replaces it;
    - keep greedy-only admission explicit until sampling/logprobs have their own gate;
    - keep direct same-prompt batch labeled diagnostic;
-   - add HTTP-serving evidence before claiming `/v1/completions` parity or production continuous batching.
+   - reduce long-prompt prefill and admission-queue TTFT before claiming long-prompt serving readiness;
+   - add paired baseline runs before claiming a percentage speedup from subgroup batching.
 
 5. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;

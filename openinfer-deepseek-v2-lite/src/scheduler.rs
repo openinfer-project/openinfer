@@ -5,9 +5,13 @@
 //! honor exactly, and retires each request independently when validation,
 //! disconnect, EOS, length, or request-local decode errors occur.
 
-use std::{collections::VecDeque, mem};
+use std::{collections::VecDeque, mem, time::Instant};
+
+mod grouping;
+mod trace;
 
 use anyhow::{Result, ensure};
+use log::info;
 use openinfer_engine::{
     engine::{FinishReason, GenerateRequest, TokenEvent, TokenSink, unix_now_s},
     sampler::SamplingParams,
@@ -20,6 +24,8 @@ use crate::{
     host_ops::DecodeCache,
     runtime::{DeepSeekV2LiteEp2Generator, GenerationStats},
 };
+use grouping::{common_decode_position, restore_surviving_rows, take_decode_position_groups};
+use trace::{RequestTrace, ScheduledTrace, http_trace_payload};
 
 pub(crate) const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
 
@@ -53,6 +59,7 @@ struct ActiveRequestState {
     finish_policy: FinishPolicy,
     cache: DecodeCache,
     stats: GenerationStats,
+    trace: RequestTrace,
 }
 
 #[derive(Clone, Copy)]
@@ -72,13 +79,6 @@ enum AdmissionDecision {
     Admit,
     Reject(String),
     Finish(FinishReason),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DecodeGrouping {
-    Empty,
-    BatchSamePosition { position: usize, rows: usize },
-    SingleRows,
 }
 
 impl MixedRequestScheduler {
@@ -135,24 +135,38 @@ impl MixedRequestScheduler {
         );
 
         for (pending, message) in batch.rejected {
-            if send_scheduled(&pending) {
-                let _ = send_prompt_echo(&pending);
-                let _ = pending.token_tx.send(TokenEvent::Rejected {
-                    message,
-                    prompt_tokens: pending.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
+            match send_scheduled(&pending) {
+                Ok(scheduled) => {
+                    let _ = send_prompt_echo(&pending);
+                    log_pending_terminal_trace(
+                        &pending,
+                        &scheduled,
+                        FinishReason::Error,
+                        0,
+                        Some(&message),
+                    );
+                    let _ = pending.token_tx.send(TokenEvent::Rejected {
+                        message,
+                        prompt_tokens: pending.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                Err(scheduled) => log_schedule_disconnect_trace(&pending, &scheduled),
             }
         }
 
         for pending in batch.finished {
-            if send_scheduled(&pending) {
-                let _ = send_prompt_echo(&pending);
-                let _ = pending.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Length,
-                    prompt_tokens: pending.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
+            match send_scheduled(&pending) {
+                Ok(scheduled) => {
+                    let _ = send_prompt_echo(&pending);
+                    log_pending_terminal_trace(&pending, &scheduled, FinishReason::Length, 0, None);
+                    let _ = pending.token_tx.send(TokenEvent::Finished {
+                        finish_reason: FinishReason::Length,
+                        prompt_tokens: pending.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                Err(scheduled) => log_schedule_disconnect_trace(&pending, &scheduled),
             }
         }
 
@@ -169,14 +183,26 @@ impl MixedRequestScheduler {
 
     fn prefill_request(&mut self, pending: PendingRequest) -> Option<ActiveRequestState> {
         let prompt_len = pending.prompt_tokens.len();
-        if !send_scheduled(&pending) {
-            return None;
-        }
+        let scheduled = match send_scheduled(&pending) {
+            Ok(scheduled) => scheduled,
+            Err(scheduled) => {
+                log_schedule_disconnect_trace(&pending, &scheduled);
+                return None;
+            }
+        };
 
         if !send_prompt_echo(&pending) {
+            log_pending_terminal_trace(
+                &pending,
+                &scheduled,
+                FinishReason::Error,
+                0,
+                Some("client disconnected before prompt echo"),
+            );
             return None;
         }
 
+        let prefill_start = Instant::now();
         let mut cache = DecodeCache::new(self.generator.config());
         let mut stats = self.generator.new_generation_stats(prompt_len);
         let mut attribution = DecodeAttributionProfile::disabled();
@@ -188,14 +214,24 @@ impl MixedRequestScheduler {
         ) {
             Ok(token) => token,
             Err(err) => {
+                let message = err.to_string();
+                log_prefill_error_trace(
+                    &pending,
+                    &scheduled,
+                    prompt_len,
+                    prefill_start.elapsed().as_secs_f64() * 1000.0,
+                    &message,
+                );
                 let _ = pending.token_tx.send(TokenEvent::Error {
-                    message: err.to_string(),
+                    message,
                     prompt_tokens: prompt_len,
                     completion_tokens: 0,
                 });
                 return None;
             }
         };
+        let prefill_done_unix_s = unix_now_s();
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         let mut active = ActiveRequestState {
             request_id: pending.request_id,
@@ -210,7 +246,14 @@ impl MixedRequestScheduler {
             },
             cache,
             stats,
+            trace: RequestTrace::new(
+                scheduled.queued_at_unix_s,
+                scheduled.scheduled_at_unix_s,
+                prefill_done_unix_s,
+                prefill_ms,
+            ),
         };
+        active.trace.note_active_set(self.active.len() + 1);
 
         if active.emit_token_or_finish(next) {
             return None;
@@ -220,20 +263,42 @@ impl MixedRequestScheduler {
 
     fn decode_round(&mut self) {
         self.retire_bad_cache_positions();
-        let positions: Vec<_> = self
-            .active
-            .iter()
-            .map(ActiveRequestState::next_decode_position)
-            .collect();
-        match decode_grouping_for_positions(&positions) {
-            DecodeGrouping::Empty => {}
-            DecodeGrouping::BatchSamePosition { position, rows } if rows > 1 => {
-                self.decode_batch_round(position);
+        let active_set_size = self.active.len();
+        if active_set_size == 0 {
+            return;
+        }
+        for state in &mut self.active {
+            state.trace.note_active_set(active_set_size);
+        }
+        if active_set_size == 1 {
+            let row = self.active.pop().expect("single active row present");
+            if let Some(survivor) = self.decode_single_row((0, row)) {
+                self.active.push(survivor.1);
             }
-            DecodeGrouping::BatchSamePosition { .. } | DecodeGrouping::SingleRows => {
-                self.decode_single_rows();
+            return;
+        }
+
+        if let Some(position) = common_decode_position(&self.active) {
+            let rows: Vec<_> = self.active.drain(..).enumerate().collect();
+            self.active = restore_surviving_rows(self.decode_batch_group(position, rows));
+            return;
+        }
+
+        let groups = take_decode_position_groups(&mut self.active);
+        let mut survivors = Vec::new();
+        for group in groups {
+            if group.rows.len() > 1 {
+                survivors.extend(self.decode_batch_group(group.position, group.rows));
+            } else {
+                let mut rows = group.rows;
+                if let Some(row) = rows.pop() {
+                    if let Some(survivor) = self.decode_single_row(row) {
+                        survivors.push(survivor);
+                    }
+                }
             }
         }
+        self.active = restore_surviving_rows(survivors);
     }
 
     fn retire_bad_cache_positions(&mut self) {
@@ -248,22 +313,27 @@ impl MixedRequestScheduler {
         self.active = survivors;
     }
 
-    fn decode_batch_round(&mut self, position: usize) {
-        let tokens: Vec<_> = self.active.iter().map(|state| state.last_token).collect();
-        let token_index = self
-            .active
+    fn decode_batch_group(
+        &mut self,
+        position: usize,
+        rows: Vec<(usize, ActiveRequestState)>,
+    ) -> Vec<(usize, ActiveRequestState)> {
+        let group_size = rows.len();
+        let (indices, mut states): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        let tokens: Vec<_> = states.iter().map(|state| state.last_token).collect();
+        let token_index = states
             .iter()
             .map(|state| state.generated)
             .min()
             .unwrap_or(0);
-        let prompt_tokens = self.active.iter().map(|state| state.prompt_len).sum();
+        let prompt_tokens = states.iter().map(|state| state.prompt_len).sum();
         let mut stats = self.generator.new_generation_stats(prompt_tokens);
         let mut attribution = DecodeAttributionProfile::disabled();
-        let mut caches: Vec<_> = self
-            .active
+        let mut caches: Vec<_> = states
             .iter_mut()
             .map(|state| mem::take(&mut state.cache))
             .collect();
+        let decode_start = Instant::now();
         let result = self.generator.decode_next_tokens_batch(
             &tokens,
             position,
@@ -272,72 +342,89 @@ impl MixedRequestScheduler {
             &mut attribution,
             token_index,
         );
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         match result {
-            Ok(next_tokens) if next_tokens.len() == self.active.len() => {
-                for (state, cache) in self.active.iter_mut().zip(caches) {
+            Ok(next_tokens) if next_tokens.len() == group_size => {
+                for (state, cache) in states.iter_mut().zip(caches) {
                     state.cache = cache;
+                    state.trace.note_decode_step(group_size, decode_ms);
                 }
-                self.apply_decoded_tokens(next_tokens);
+                apply_decoded_tokens_to_rows(indices, states, next_tokens)
             }
             // The batched path mutates per-row caches as it advances through the
             // model. This gate avoids full-cache rollback clones; a batch decode
             // failure is therefore a shared runtime error for the active rows.
-            Ok(next_tokens) => self.retire_active_batch_error(format!(
-                "DeepSeek-V2-Lite batched decode returned {} rows for {} active requests",
-                next_tokens.len(),
-                self.active.len()
-            )),
-            Err(err) => self.retire_active_batch_error(format!(
-                "DeepSeek-V2-Lite batched decode failed for {} active requests: {err}",
-                self.active.len()
-            )),
-        }
-    }
-
-    fn decode_single_rows(&mut self) {
-        let mut survivors = Vec::with_capacity(self.active.len());
-        for mut state in self.active.drain(..) {
-            let token = state.last_token;
-            let position = state.next_decode_position();
-            let token_index = state.generated;
-            let result = self.generator.decode_next_token(
-                token,
-                position,
-                &mut state.cache,
-                &mut state.stats,
-                &mut DecodeAttributionProfile::disabled(),
-                token_index,
-            );
-            match result {
-                Ok(next) => {
-                    if !state.emit_token_or_finish(next) {
-                        survivors.push(state);
-                    }
-                }
-                Err(err) => state.emit_error(err.to_string()),
+            Ok(next_tokens) => {
+                retire_rows_with_error(
+                    states,
+                    format!(
+                        "DeepSeek-V2-Lite batched decode returned {} rows for {} active requests",
+                        next_tokens.len(),
+                        group_size
+                    ),
+                );
+                Vec::new()
+            }
+            Err(err) => {
+                retire_rows_with_error(
+                    states,
+                    format!(
+                        "DeepSeek-V2-Lite batched decode failed for {} active requests: {err}",
+                        group_size
+                    ),
+                );
+                Vec::new()
             }
         }
-        self.active = survivors;
     }
 
-    fn apply_decoded_tokens(&mut self, next_tokens: Vec<u32>) {
-        let mut survivors = Vec::with_capacity(self.active.len());
-        for (mut state, token) in self.active.drain(..).zip(next_tokens) {
-            if !state.emit_token_or_finish(token) {
-                survivors.push(state);
+    fn decode_single_row(
+        &mut self,
+        (idx, mut state): (usize, ActiveRequestState),
+    ) -> Option<(usize, ActiveRequestState)> {
+        let token = state.last_token;
+        let position = state.next_decode_position();
+        let token_index = state.generated;
+        let decode_start = Instant::now();
+        let result = self.generator.decode_next_token(
+            token,
+            position,
+            &mut state.cache,
+            &mut state.stats,
+            &mut DecodeAttributionProfile::disabled(),
+            token_index,
+        );
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        match result {
+            Ok(next) => {
+                state.trace.note_decode_step(1, decode_ms);
+                (!state.emit_token_or_finish(next)).then_some((idx, state))
+            }
+            Err(err) => {
+                state.emit_error(err.to_string());
+                None
             }
         }
-        self.active = survivors;
-    }
-
-    fn retire_active_batch_error(&mut self, message: String) {
-        retire_active_requests_with_error(&mut self.active, message);
     }
 }
 
-fn retire_active_requests_with_error(active: &mut Vec<ActiveRequestState>, message: String) {
-    for state in active.drain(..) {
+fn apply_decoded_tokens_to_rows(
+    indices: Vec<usize>,
+    states: Vec<ActiveRequestState>,
+    next_tokens: Vec<u32>,
+) -> Vec<(usize, ActiveRequestState)> {
+    indices
+        .into_iter()
+        .zip(states.into_iter().zip(next_tokens))
+        .filter_map(|(idx, (mut state, token))| {
+            (!state.emit_token_or_finish(token)).then_some((idx, state))
+        })
+        .collect()
+}
+
+fn retire_rows_with_error(states: Vec<ActiveRequestState>, message: String) {
+    for state in states {
         state.emit_error(message.clone());
     }
 }
@@ -378,6 +465,7 @@ impl ActiveRequestState {
     fn emit_token_or_finish(&mut self, token: u32) -> bool {
         self.last_token = token;
         if !self.finish_policy.ignore_eos && token == self.finish_policy.eos_token_id {
+            self.log_http_trace(FinishReason::Stop, None);
             let _ = self.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: self.prompt_len,
@@ -386,6 +474,11 @@ impl ActiveRequestState {
             return true;
         }
 
+        let first_emit_at = self
+            .trace
+            .first_token_emit_unix_s
+            .is_none()
+            .then(unix_now_s);
         if self
             .token_tx
             .send(TokenEvent::Token {
@@ -394,11 +487,19 @@ impl ActiveRequestState {
             })
             .is_err()
         {
+            self.log_http_trace(
+                FinishReason::Error,
+                Some("client disconnected before token emit"),
+            );
             return true;
+        }
+        if let Some(first_emit_at) = first_emit_at {
+            self.trace.first_token_emit_unix_s = Some(first_emit_at);
         }
         self.generated += 1;
 
         if self.generated == self.max_tokens {
+            self.log_http_trace(FinishReason::Length, None);
             let _ = self.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: self.prompt_len,
@@ -410,25 +511,47 @@ impl ActiveRequestState {
     }
 
     fn emit_error(self, message: String) {
+        self.log_http_trace(FinishReason::Error, Some(&message));
         let _ = self.token_tx.send(TokenEvent::Error {
             message,
             prompt_tokens: self.prompt_len,
             completion_tokens: self.generated,
         });
     }
+
+    fn log_http_trace(&self, finish_reason: FinishReason, error: Option<&str>) {
+        log_http_trace(
+            trace_request_id(self.request_id.as_deref(), &self.token_tx),
+            &self.trace,
+            self.prompt_len,
+            self.generated,
+            finish_reason,
+            error,
+        );
+    }
 }
 
-fn send_scheduled(pending: &PendingRequest) -> bool {
+fn send_scheduled(pending: &PendingRequest) -> std::result::Result<ScheduledTrace, ScheduledTrace> {
     let now = unix_now_s();
-    pending
+    let queued_at_unix_s = pending.queued_at_unix_s.unwrap_or(now);
+    let scheduled = ScheduledTrace {
+        queued_at_unix_s,
+        scheduled_at_unix_s: now,
+    };
+    if pending
         .token_tx
         .send(TokenEvent::Scheduled {
-            queued_at_unix_s: pending.queued_at_unix_s.unwrap_or(now),
+            queued_at_unix_s,
             scheduled_at_unix_s: now,
             prompt_tokens: pending.prompt_tokens.len(),
             cached_tokens: 0,
         })
         .is_ok()
+    {
+        Ok(scheduled)
+    } else {
+        Err(scheduled)
+    }
 }
 
 fn send_prompt_echo(pending: &PendingRequest) -> bool {
@@ -442,6 +565,78 @@ fn send_prompt_echo(pending: &PendingRequest) -> bool {
             logprobs: vec![None; pending.prompt_tokens.len()],
         })
         .is_ok()
+}
+
+fn trace_request_id<'a>(request_id: Option<&'a str>, token_tx: &'a TokenSink) -> &'a str {
+    request_id.unwrap_or_else(|| token_tx.tag().as_ref())
+}
+
+fn log_pending_terminal_trace(
+    pending: &PendingRequest,
+    scheduled: &ScheduledTrace,
+    finish_reason: FinishReason,
+    completion_tokens: usize,
+    error: Option<&str>,
+) {
+    let trace = RequestTrace::terminal(scheduled.queued_at_unix_s, scheduled.scheduled_at_unix_s);
+    log_http_trace(
+        trace_request_id(pending.request_id.as_deref(), &pending.token_tx),
+        &trace,
+        pending.prompt_tokens.len(),
+        completion_tokens,
+        finish_reason,
+        error,
+    );
+}
+
+fn log_schedule_disconnect_trace(pending: &PendingRequest, scheduled: &ScheduledTrace) {
+    log_pending_terminal_trace(
+        pending,
+        scheduled,
+        FinishReason::Error,
+        0,
+        Some("client disconnected before scheduled event"),
+    );
+}
+
+fn log_prefill_error_trace(
+    pending: &PendingRequest,
+    scheduled: &ScheduledTrace,
+    prompt_tokens: usize,
+    prefill_ms: f64,
+    message: &str,
+) {
+    let mut trace =
+        RequestTrace::terminal(scheduled.queued_at_unix_s, scheduled.scheduled_at_unix_s);
+    trace.prefill_done_unix_s = Some(unix_now_s());
+    trace.prefill_ms = Some(prefill_ms);
+    log_http_trace(
+        trace_request_id(pending.request_id.as_deref(), &pending.token_tx),
+        &trace,
+        prompt_tokens,
+        0,
+        FinishReason::Error,
+        Some(message),
+    );
+}
+
+fn log_http_trace(
+    request_id: &str,
+    trace: &RequestTrace,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    finish_reason: FinishReason,
+    error: Option<&str>,
+) {
+    let payload = http_trace_payload(
+        request_id,
+        trace,
+        prompt_tokens,
+        completion_tokens,
+        finish_reason,
+        error,
+    );
+    info!("openinfer_http_trace {payload}");
 }
 
 fn take_admission_batch(
@@ -521,407 +716,5 @@ fn admission_decision(req: &PendingRequest, supported_context: usize) -> Admissi
     AdmissionDecision::Admit
 }
 
-fn decode_grouping_for_positions(positions: &[usize]) -> DecodeGrouping {
-    let Some((&first, rest)) = positions.split_first() else {
-        return DecodeGrouping::Empty;
-    };
-    if positions.len() > 1 && rest.iter().all(|position| *position == first) {
-        return DecodeGrouping::BatchSamePosition {
-            position: first,
-            rows: positions.len(),
-        };
-    }
-    DecodeGrouping::SingleRows
-}
-
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
-
-    use openinfer_engine::engine::RequestTag;
-    use openinfer_engine::sampler::SamplingParams;
-    use tokio::sync::mpsc;
-
-    use super::*;
-    use crate::config::test_lite_config;
-
-    fn request(
-        id: &str,
-        prompt_len: usize,
-        max_tokens: usize,
-    ) -> (
-        PendingRequest,
-        openinfer_engine::engine::TokenStreamReceiver,
-    ) {
-        let (token_tx, token_rx) = TokenSink::standalone();
-        (
-            PendingRequest {
-                request_id: Some(id.to_string()),
-                queued_at_unix_s: None,
-                prompt_tokens: vec![1; prompt_len],
-                params: SamplingParams::default(),
-                max_tokens,
-                lora_adapter: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            },
-            token_rx,
-        )
-    }
-
-    fn recv_event(rx: &mut openinfer_engine::engine::TokenStreamReceiver) -> TokenEvent {
-        rx.try_recv().expect("expected event").1
-    }
-
-    #[test]
-    fn admission_rejects_unsupported_shapes() {
-        let context = 16;
-
-        let (mut sampling, _rx) = request("sampling", 1, 1);
-        sampling.params.temperature = 0.8;
-        assert!(matches!(
-            admission_decision(&sampling, context),
-            AdmissionDecision::Reject(message) if message.contains("greedy")
-        ));
-
-        let (mut logprobs, _rx) = request("logprobs", 1, 1);
-        logprobs.logprobs = 1;
-        assert!(matches!(
-            admission_decision(&logprobs, context),
-            AdmissionDecision::Reject(message) if message.contains("logprobs")
-        ));
-
-        let (mut lora, _rx) = request("lora", 1, 1);
-        lora.lora_adapter = Some("adapter-a".to_string());
-        assert!(matches!(
-            admission_decision(&lora, context),
-            AdmissionDecision::Reject(message) if message.contains("LoRA")
-        ));
-
-        let (empty, _rx) = request("empty", 0, 1);
-        assert!(matches!(
-            admission_decision(&empty, context),
-            AdmissionDecision::Reject(message) if message.contains("non-empty prompt")
-        ));
-
-        let (zero, _rx) = request("zero", 1, 0);
-        assert_eq!(
-            admission_decision(&zero, context),
-            AdmissionDecision::Finish(FinishReason::Length)
-        );
-    }
-
-    #[test]
-    fn context_overflow_is_rejected() {
-        let (req, _rx) = request("too-long", 12, 5);
-
-        assert!(matches!(
-            admission_decision(&req, 16),
-            AdmissionDecision::Reject(message)
-                if message.contains("context") && message.contains("total=17")
-        ));
-    }
-
-    #[test]
-    fn active_cap_defers_in_fcfs_order() {
-        let mut pending = VecDeque::new();
-        pending.push_back(request("first", 2, 1).0);
-        pending.push_back(request("second", 2, 1).0);
-        pending.push_back(request("third", 2, 1).0);
-
-        let batch = take_admission_batch(&mut pending, 1, 3, 16);
-
-        assert_eq!(
-            batch
-                .admitted
-                .iter()
-                .map(|req| req.request_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec![Some("first"), Some("second")]
-        );
-        assert!(batch.rejected.is_empty());
-        assert!(batch.finished.is_empty());
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].request_id.as_deref(), Some("third"));
-    }
-
-    #[test]
-    fn terminal_requests_do_not_wait_for_active_capacity() {
-        let mut pending = VecDeque::new();
-        pending.push_back(request("zero", 2, 0).0);
-        let (mut invalid, _rx) = request("invalid", 2, 1);
-        invalid.logprobs = 1;
-        pending.push_back(invalid);
-        pending.push_back(request("valid", 2, 1).0);
-
-        let batch = take_admission_batch(&mut pending, 8, 8, 16);
-
-        assert!(batch.admitted.is_empty());
-        assert_eq!(batch.finished.len(), 1);
-        assert_eq!(batch.finished[0].request_id.as_deref(), Some("zero"));
-        assert_eq!(batch.rejected.len(), 1);
-        assert_eq!(batch.rejected[0].0.request_id.as_deref(), Some("invalid"));
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].request_id.as_deref(), Some("valid"));
-    }
-
-    #[test]
-    fn invalid_request_does_not_block_later_admission_when_cap_has_room() {
-        let mut pending = VecDeque::new();
-        let (mut invalid, _rx) = request("invalid", 2, 1);
-        invalid.logprobs = 1;
-        pending.push_back(invalid);
-        pending.push_back(request("valid", 2, 1).0);
-
-        let batch = take_admission_batch(&mut pending, 0, 2, 16);
-
-        assert_eq!(batch.rejected.len(), 1);
-        assert_eq!(batch.rejected[0].0.request_id.as_deref(), Some("invalid"));
-        assert_eq!(batch.admitted.len(), 1);
-        assert_eq!(batch.admitted[0].request_id.as_deref(), Some("valid"));
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn terminal_admission_events_keep_scheduler_contract() {
-        let (mut zero, mut zero_rx) = request("zero", 2, 0);
-        zero.echo = true;
-        assert!(send_scheduled(&zero));
-        assert!(send_prompt_echo(&zero));
-        let _ = zero.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Length,
-            prompt_tokens: zero.prompt_tokens.len(),
-            completion_tokens: 0,
-        });
-
-        assert!(matches!(
-            recv_event(&mut zero_rx),
-            TokenEvent::Scheduled { .. }
-        ));
-        assert!(matches!(
-            recv_event(&mut zero_rx),
-            TokenEvent::PromptTokens { ids, .. } if ids == vec![1, 1]
-        ));
-        assert!(matches!(
-            recv_event(&mut zero_rx),
-            TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                completion_tokens: 0,
-                ..
-            }
-        ));
-
-        let (rejected, mut rejected_rx) = request("rejected", 2, 1);
-        assert!(send_scheduled(&rejected));
-        let _ = rejected.token_tx.send(TokenEvent::Rejected {
-            message: "nope".to_string(),
-            prompt_tokens: rejected.prompt_tokens.len(),
-            completion_tokens: 0,
-        });
-
-        assert!(matches!(
-            recv_event(&mut rejected_rx),
-            TokenEvent::Scheduled { .. }
-        ));
-        assert!(matches!(
-            recv_event(&mut rejected_rx),
-            TokenEvent::Rejected {
-                completion_tokens: 0,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn eos_retirement_is_independent_per_request() {
-        let config = test_lite_config();
-        let (tx_stop, mut rx_stop) = TokenSink::standalone();
-        let (tx_live, mut rx_live) = TokenSink::standalone();
-        let mut stop_state = ActiveRequestState {
-            request_id: Some("stop".to_string()),
-            token_tx: tx_stop,
-            prompt_len: 3,
-            max_tokens: 4,
-            generated: 1,
-            last_token: 10,
-            finish_policy: FinishPolicy {
-                eos_token_id: config.eos_token_id,
-                ignore_eos: false,
-            },
-            cache: DecodeCache::new(&config),
-            stats: GenerationStats::default(),
-        };
-        let mut live_state = ActiveRequestState {
-            request_id: Some("live".to_string()),
-            token_tx: tx_live,
-            prompt_len: 2,
-            max_tokens: 4,
-            generated: 1,
-            last_token: 11,
-            finish_policy: FinishPolicy {
-                eos_token_id: config.eos_token_id,
-                ignore_eos: false,
-            },
-            cache: DecodeCache::new(&config),
-            stats: GenerationStats::default(),
-        };
-
-        assert!(stop_state.emit_token_or_finish(config.eos_token_id));
-        assert!(!live_state.emit_token_or_finish(12));
-
-        match recv_event(&mut rx_stop) {
-            TokenEvent::Finished {
-                finish_reason,
-                completion_tokens,
-                ..
-            } => {
-                assert_eq!(finish_reason, FinishReason::Stop);
-                assert_eq!(completion_tokens, 1);
-            }
-            _ => panic!("EOS request should finish without emitting EOS"),
-        }
-        match recv_event(&mut rx_live) {
-            TokenEvent::Token { id, .. } => assert_eq!(id, 12),
-            _ => panic!("live request should receive its own token"),
-        }
-        assert!(rx_live.try_recv().is_err());
-    }
-
-    #[test]
-    fn cancelled_token_sink_retires_request() {
-        let config = test_lite_config();
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
-        let cancelled = Arc::new(AtomicBool::new(true));
-        let sink = TokenSink::new(
-            RequestTag::from("cancelled"),
-            stream_tx,
-            Arc::clone(&cancelled),
-        );
-        let mut state = ActiveRequestState {
-            request_id: Some("cancelled".to_string()),
-            token_tx: sink,
-            prompt_len: 2,
-            max_tokens: 4,
-            generated: 1,
-            last_token: 11,
-            finish_policy: FinishPolicy {
-                eos_token_id: config.eos_token_id,
-                ignore_eos: false,
-            },
-            cache: DecodeCache::new(&config),
-            stats: GenerationStats::default(),
-        };
-
-        assert!(state.emit_token_or_finish(12));
-        assert!(stream_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn closed_token_sink_retires_request() {
-        let config = test_lite_config();
-        let (sink, rx) = TokenSink::standalone();
-        drop(rx);
-        let mut state = ActiveRequestState {
-            request_id: Some("closed".to_string()),
-            token_tx: sink,
-            prompt_len: 2,
-            max_tokens: 4,
-            generated: 1,
-            last_token: 11,
-            finish_policy: FinishPolicy {
-                eos_token_id: config.eos_token_id,
-                ignore_eos: false,
-            },
-            cache: DecodeCache::new(&config),
-            stats: GenerationStats::default(),
-        };
-
-        assert!(state.emit_token_or_finish(12));
-    }
-
-    #[test]
-    fn batch_decode_error_retires_all_active_requests() {
-        let config = test_lite_config();
-        let (first_tx, mut first_rx) = TokenSink::standalone();
-        let (second_tx, mut second_rx) = TokenSink::standalone();
-        let mut active = vec![
-            ActiveRequestState {
-                request_id: Some("first".to_string()),
-                token_tx: first_tx,
-                prompt_len: 3,
-                max_tokens: 8,
-                generated: 2,
-                last_token: 11,
-                finish_policy: FinishPolicy {
-                    eos_token_id: config.eos_token_id,
-                    ignore_eos: false,
-                },
-                cache: DecodeCache::new(&config),
-                stats: GenerationStats::default(),
-            },
-            ActiveRequestState {
-                request_id: Some("second".to_string()),
-                token_tx: second_tx,
-                prompt_len: 4,
-                max_tokens: 8,
-                generated: 1,
-                last_token: 12,
-                finish_policy: FinishPolicy {
-                    eos_token_id: config.eos_token_id,
-                    ignore_eos: false,
-                },
-                cache: DecodeCache::new(&config),
-                stats: GenerationStats::default(),
-            },
-        ];
-
-        retire_active_requests_with_error(&mut active, "batch failed".to_string());
-
-        assert!(active.is_empty());
-        match recv_event(&mut first_rx) {
-            TokenEvent::Error {
-                message,
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                assert_eq!(message, "batch failed");
-                assert_eq!(prompt_tokens, 3);
-                assert_eq!(completion_tokens, 2);
-            }
-            _ => panic!("first active request should receive batch error"),
-        }
-        match recv_event(&mut second_rx) {
-            TokenEvent::Error {
-                message,
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                assert_eq!(message, "batch failed");
-                assert_eq!(prompt_tokens, 4);
-                assert_eq!(completion_tokens, 1);
-            }
-            _ => panic!("second active request should receive batch error"),
-        }
-    }
-
-    #[test]
-    fn decode_grouping_batches_only_uniform_positions() {
-        assert_eq!(decode_grouping_for_positions(&[]), DecodeGrouping::Empty);
-        assert_eq!(
-            decode_grouping_for_positions(&[5]),
-            DecodeGrouping::SingleRows
-        );
-        assert_eq!(
-            decode_grouping_for_positions(&[7, 7, 7]),
-            DecodeGrouping::BatchSamePosition {
-                position: 7,
-                rows: 3
-            }
-        );
-        assert_eq!(
-            decode_grouping_for_positions(&[7, 8, 7]),
-            DecodeGrouping::SingleRows
-        );
-    }
-}
+mod tests;

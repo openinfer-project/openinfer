@@ -51,6 +51,20 @@ type NcclAllReduce = unsafe extern "C" fn(
 ) -> ncclResult_t;
 type NcclGetErrorString = unsafe extern "C" fn(ncclResult_t) -> *const c_char;
 
+// Keep the correctness-first NCCL bridge below the long-prompt failure band
+// observed on the 2x RTX 5090 validation host. These are not hardware limits;
+// they are conservative per-call caps that preserve the short-shape path as one
+// collective while splitting the long bf16 dense exchange and f32 combine rows
+// that previously failed in prefill.
+const NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL: usize = 64 * 1024;
+const NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL: usize = 48 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AllReduceChunk {
+    offset: usize,
+    len: usize,
+}
+
 pub(crate) struct NaiveNcclEp2Backend {
     lib: Arc<RawNcclLib>,
     comms: Vec<ncclComm_t>,
@@ -366,27 +380,16 @@ impl NaiveNcclEp2Backend {
         // Correctness-first dense exchange: rank0 contributes the hidden state
         // and rank1 contributes zeros. This makes rank0 hidden visible on rank1
         // without pretending to be sparse routed dispatch.
-        self.grouped("DeepSeek-V2-Lite NCCL dense hidden all-reduce", || {
-            activate(rank0)?;
-            self.all_reduce_bf16(
-                0,
-                &input.data,
-                rank0_recv,
-                elems,
-                rank0.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL dense hidden rank0 all-reduce",
-            )?;
-            activate(rank1)?;
-            self.all_reduce_bf16(
-                1,
-                rank1_send_zero,
-                rank1_recv,
-                elems,
-                rank1.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL dense hidden rank1 all-reduce",
-            )?;
-            Ok(())
-        })?;
+        self.all_reduce_bf16_pair_chunked(
+            rank0,
+            rank1,
+            &input.data,
+            rank0_recv,
+            rank1_send_zero,
+            rank1_recv,
+            elems,
+            "DeepSeek-V2-Lite NCCL dense hidden all-reduce",
+        )?;
         Ok(DenseExchangeOutput { scratch })
     }
 
@@ -501,27 +504,16 @@ impl NaiveNcclEp2Backend {
             .as_mut()
             .context("DeepSeek-V2-Lite NCCL rank1 combine recv scratch is missing")?;
 
-        self.grouped("DeepSeek-V2-Lite NCCL combine all-reduce", || {
-            activate(rank0)?;
-            self.all_reduce_f32(
-                0,
-                rank0_send,
-                rank0_recv,
-                elems,
-                rank0.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL combine rank0 all-reduce",
-            )?;
-            activate(rank1)?;
-            self.all_reduce_f32(
-                1,
-                rank1_send,
-                rank1_recv,
-                elems,
-                rank1.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL combine rank1 all-reduce",
-            )?;
-            Ok(())
-        })?;
+        self.all_reduce_f32_pair_chunked(
+            rank0,
+            rank1,
+            rank0_send,
+            rank0_recv,
+            rank1_send,
+            rank1_recv,
+            elems,
+            "DeepSeek-V2-Lite NCCL combine all-reduce",
+        )?;
 
         activate(rank0)?;
         let mut routed = HiddenStates::zeros(rank0, hidden_dim, seq_len)?;
@@ -582,27 +574,16 @@ impl NaiveNcclEp2Backend {
             .as_mut()
             .context("DeepSeek-V2-Lite NCCL rank1 combine recv scratch is missing")?;
 
-        self.grouped("DeepSeek-V2-Lite NCCL combine all-reduce", || {
-            activate(rank0)?;
-            self.all_reduce_f32(
-                0,
-                rank0_send,
-                rank0_recv,
-                elems,
-                rank0.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL combine rank0 all-reduce",
-            )?;
-            activate(rank1)?;
-            self.all_reduce_f32(
-                1,
-                rank1_send,
-                rank1_recv,
-                elems,
-                rank1.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL combine rank1 all-reduce",
-            )?;
-            Ok(())
-        })?;
+        self.all_reduce_f32_pair_chunked(
+            rank0,
+            rank1,
+            rank0_send,
+            rank0_recv,
+            rank1_send,
+            rank1_recv,
+            elems,
+            "DeepSeek-V2-Lite NCCL combine all-reduce",
+        )?;
 
         activate(rank0)?;
         ops::f32_to_bf16_hidden_into(rank0, rank0_recv, out)
@@ -828,34 +809,80 @@ impl NaiveNcclEp2Backend {
         Ok(())
     }
 
-    fn all_reduce_bf16(
+    #[allow(clippy::too_many_arguments)]
+    fn all_reduce_bf16_pair_chunked(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        rank0_send: &CudaSlice<bf16>,
+        rank0_recv: &mut CudaSlice<bf16>,
+        rank1_send: &CudaSlice<bf16>,
+        rank1_recv: &mut CudaSlice<bf16>,
+        count: usize,
+        context: &str,
+    ) -> Result<()> {
+        for chunk in bf16_all_reduce_chunks(count) {
+            let chunk_context =
+                format!("{context} chunk offset={} len={}", chunk.offset, chunk.len);
+            self.grouped(&chunk_context, || {
+                activate(rank0)?;
+                self.all_reduce_bf16_range(
+                    0,
+                    rank0_send,
+                    rank0_recv,
+                    chunk.offset,
+                    chunk.len,
+                    rank0.stream.cu_stream(),
+                    "DeepSeek-V2-Lite NCCL dense hidden rank0 all-reduce",
+                )?;
+                activate(rank1)?;
+                self.all_reduce_bf16_range(
+                    1,
+                    rank1_send,
+                    rank1_recv,
+                    chunk.offset,
+                    chunk.len,
+                    rank1.stream.cu_stream(),
+                    "DeepSeek-V2-Lite NCCL dense hidden rank1 all-reduce",
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn all_reduce_bf16_range(
         &self,
         rank: usize,
         send: &CudaSlice<bf16>,
         recv: &mut CudaSlice<bf16>,
+        offset: usize,
         count: usize,
         stream: CUstream,
         context: &str,
     ) -> Result<()> {
         ensure!(
-            recv.len() >= count,
-            "{context}: recv buffer too small: recv={}, required={count}",
+            offset
+                .checked_add(count)
+                .is_some_and(|end| end <= send.len() && end <= recv.len()),
+            "{context}: dense exchange buffer range out of bounds: offset={offset}, count={count}, send={}, recv={}",
+            send.len(),
             recv.len()
-        );
-        ensure!(
-            send.len() >= count,
-            "{context}: send buffer too small: send={}, required={count}",
-            send.len()
         );
         let stream_ref = recv.stream().clone();
         let (send_ptr, _send_guard) = send.device_ptr(&stream_ref);
         let (recv_ptr, _recv_guard) = recv.device_ptr_mut(&stream_ref);
+        let byte_offset = offset
+            .checked_mul(std::mem::size_of::<bf16>())
+            .context("DeepSeek-V2-Lite NCCL bf16 all-reduce byte offset overflow")?;
         let status = unsafe {
             // SAFETY: Device pointers come from cudarc allocations on the
-            // active CUDA devices, and `count` was checked against both buffers.
+            // active CUDA devices, and `count` plus `offset` were checked
+            // against both buffers. `CUdeviceptr` arithmetic uses byte offsets.
             (self.lib.all_reduce)(
-                send_ptr as *const c_void,
-                recv_ptr as *mut c_void,
+                (send_ptr + byte_offset as u64) as *const c_void,
+                (recv_ptr + byte_offset as u64) as *mut c_void,
                 count,
                 ncclDataType_t::ncclBfloat16,
                 ncclRedOp_t::ncclSum,
@@ -881,13 +908,87 @@ impl NaiveNcclEp2Backend {
             send.len(),
             recv.len()
         );
+        self.all_reduce_f32_range(rank, send, recv, 0, count, stream, context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn all_reduce_f32_pair_chunked(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        rank0_send: &CudaSlice<f32>,
+        rank0_recv: &mut CudaSlice<f32>,
+        rank1_send: &CudaSlice<f32>,
+        rank1_recv: &mut CudaSlice<f32>,
+        count: usize,
+        context: &str,
+    ) -> Result<()> {
+        for chunk in f32_all_reduce_chunks(count) {
+            let chunk_context =
+                format!("{context} chunk offset={} len={}", chunk.offset, chunk.len);
+            self.grouped(&chunk_context, || {
+                activate(rank0)?;
+                self.all_reduce_f32_range(
+                    0,
+                    rank0_send,
+                    rank0_recv,
+                    chunk.offset,
+                    chunk.len,
+                    rank0.stream.cu_stream(),
+                    "DeepSeek-V2-Lite NCCL combine rank0 all-reduce",
+                )?;
+                activate(rank1)?;
+                self.all_reduce_f32_range(
+                    1,
+                    rank1_send,
+                    rank1_recv,
+                    chunk.offset,
+                    chunk.len,
+                    rank1.stream.cu_stream(),
+                    "DeepSeek-V2-Lite NCCL combine rank1 all-reduce",
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn all_reduce_f32_range(
+        &self,
+        rank: usize,
+        send: &CudaSlice<f32>,
+        recv: &mut CudaSlice<f32>,
+        offset: usize,
+        count: usize,
+        stream: CUstream,
+        context: &str,
+    ) -> Result<()> {
+        ensure!(
+            offset
+                .checked_add(count)
+                .is_some_and(|end| end <= send.len() && end <= recv.len()),
+            "{context}: contribution buffer range out of bounds: offset={offset}, count={count}, send={}, recv={}",
+            send.len(),
+            recv.len()
+        );
         let stream_ref = recv.stream().clone();
         let (send_ptr, _send_guard) = send.device_ptr(&stream_ref);
         let (recv_ptr, _recv_guard) = recv.device_ptr_mut(&stream_ref);
+        let byte_offset = offset
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("DeepSeek-V2-Lite NCCL f32 all-reduce byte offset overflow")?;
         let status = unsafe {
             // SAFETY: Device pointers come from cudarc allocations and `count`
-            // was checked against both buffers before enqueueing the collective.
-            self.enqueue_all_reduce_f32(rank, send_ptr, recv_ptr, count, stream)?
+            // plus `offset` were checked against both buffers before enqueueing
+            // the collective. `CUdeviceptr` arithmetic uses byte offsets.
+            self.enqueue_all_reduce_f32(
+                rank,
+                send_ptr + byte_offset as u64,
+                recv_ptr + byte_offset as u64,
+                count,
+                stream,
+            )?
         };
         self.lib.check(status, context)
     }
@@ -982,6 +1083,29 @@ fn combine_elems(hidden_dim: usize, seq_len: usize) -> Result<usize> {
             "DeepSeek-V2-Lite NCCL device combine shape overflow: hidden_dim={hidden_dim}, seq_len={seq_len}"
         )
     })
+}
+
+fn f32_all_reduce_chunks(count: usize) -> Vec<AllReduceChunk> {
+    all_reduce_chunks(count, NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL)
+}
+
+fn bf16_all_reduce_chunks(count: usize) -> Vec<AllReduceChunk> {
+    all_reduce_chunks(count, NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL)
+}
+
+fn all_reduce_chunks(count: usize, max_elems_per_call: usize) -> Vec<AllReduceChunk> {
+    debug_assert!(max_elems_per_call > 0);
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut chunks = Vec::with_capacity(count.div_ceil(max_elems_per_call));
+    let mut offset = 0usize;
+    while offset < count {
+        let len = (count - offset).min(max_elems_per_call);
+        chunks.push(AllReduceChunk { offset, len });
+        offset += len;
+    }
+    chunks
 }
 
 fn dense_exchange_elems(hidden_dim: usize, seq_len: usize) -> Result<usize> {
