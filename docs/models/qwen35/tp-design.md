@@ -177,6 +177,12 @@ Full attention TP2:
 - global gated q projection dim: `8192`
 - local gated q projection dim: `4096`
 
+Qwen3.5 full-attention `q_proj` needs a model-specific sharding rule. The
+kernel consumes `q_full` as head-local q/gate pairs, so TP sharding must keep
+each query head's q rows together with that head's gate rows. Do not reuse a
+naive contiguous row range from Qwen3 if it can split q rows and their gate rows
+across different ranks.
+
 MLP TP2:
 
 - global intermediate: `9216`
@@ -384,25 +390,23 @@ Performance sanity:
 - TP2 should not catastrophically regress versus Phase 1 on basic decode
 - exact throughput target is deferred until correctness is stable
 
-## Validation Commands
+## Validation Plan
 
 Phase 1 minimum:
 
-```bash
-OPENINFER_CUDA_SM=120 \
-OPENINFER_TEST_MODEL_PATH=/abs/path/to/Qwen3.5-4B \
-cargo test --release --features qwen35-4b \
-  -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture
-```
+- Qwen3.5 HF logits gate under TP2
+- Qwen3.5 scheduler e2e under TP2
+- basic HTTP serving smoke under TP2
 
-```bash
-OPENINFER_CUDA_SM=120 \
-OPENINFER_TEST_MODEL_PATH=/abs/path/to/Qwen3.5-4B \
-cargo test --release --features qwen35-4b \
-  -p openinfer-qwen35-4b --test e2e_scheduler -- --nocapture
-```
+Phase 2 minimum:
 
-Add TP2 variants once the CLI/API exists.
+- Phase 1 gates still pass
+- long HF logits replay under TP2
+- slot compaction replay under TP2
+- recurrent-state cleanup on finish/drop
+
+Add concrete, verified commands once the TP2 CLI/API exists and the commands have
+been run on a GPU host.
 
 ## References
 
@@ -415,4 +419,3 @@ Add TP2 variants once the CLI/API exists.
 - `openinfer-qwen35-4b/src/batch_decode.rs`
 - vLLM `Qwen3NextForCausalLM`
 - vLLM `QwenGatedDeltaNetAttention`
-
