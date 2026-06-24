@@ -62,6 +62,13 @@ impl Qwen3Model {
         assert_eq!(bs, kv_views.len());
         assert_eq!(bs, lora_adapters.len());
         assert!(bs > 0);
+        // Before the first live-policy read (sync_paged_meta) and on every decode path; see
+        // `policy_at_construction` for the workspace-overflow / stale-graph trap this guards.
+        assert_eq!(
+            openinfer_kernels::ops::numeric_policy(),
+            bufs.policy_at_construction,
+            "NumericPolicy changed after executor construction (policy-key-trap); build a fresh executor per policy"
+        );
         let lora_slots = self.decode_lora_slots(lora_adapters)?;
         let use_lora = lora_slots.is_some();
         let use_cuda_graph = self.enable_cuda_graph && lora_slots.is_none();

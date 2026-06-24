@@ -29,6 +29,7 @@ use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::ops::PrefillPagedPlan;
 use openinfer_core::tensor::HiddenStates;
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
 use openinfer_kv_cache::KvView;
 
 use crate::batch_decode_buffers::BATCH_BUCKETS;
@@ -60,6 +61,10 @@ pub(crate) struct VerifyGraphBuffers {
     /// between them); a segment is captured once at its exact-bucket batch and
     /// replayed thereafter. Empty (`CudaGraphState::new()`) until first captured.
     graphs: Vec<Vec<CudaGraphState>>,
+    /// `NumericPolicy` when these graphs were built; asserted unchanged at capture/replay. They bake
+    /// the policy-selected GEMM algo and are keyed `(bucket, segment)` without policy — the same
+    /// policy-key-trap the decode graphs guard.
+    policy_at_construction: NumericPolicy,
     max_batch: usize,
     span: usize,
 }
@@ -127,6 +132,7 @@ impl VerifyGraphBuffers {
                         .collect()
                 })
                 .collect(),
+            policy_at_construction: numeric_policy(),
             max_batch,
             span,
         })
@@ -273,6 +279,11 @@ impl Qwen3Model {
         let full_shape = total_tokens == batch_size * bufs.span;
         match BATCH_BUCKETS.iter().position(|&b| b == batch_size) {
             Some(bidx) if full_shape => {
+                assert_eq!(
+                    numeric_policy(),
+                    bufs.policy_at_construction,
+                    "NumericPolicy changed after the verify graphs were captured; they are keyed (bucket, segment) without policy, so build a fresh executor per policy (policy-key-trap)"
+                );
                 // Take the bucket's segment graphs out so the capture closures can
                 // borrow `bufs` mutably; restore them after (even on error).
                 let mut segs = std::mem::take(&mut bufs.graphs[bidx]);

@@ -135,6 +135,11 @@ pub(crate) struct BatchDecodeBuffers {
     /// `split_chunk_size`).
     max_context_tokens: usize,
 
+    /// `NumericPolicy` at construction; asserted unchanged at `batch_decode` entry. The split-KV
+    /// workspace is sized for it and decode graphs are keyed `(bucket, attention_path)` without it, so a
+    /// later switch would overflow the workspace or replay a stale graph — the policy-key-trap.
+    pub(crate) policy_at_construction: NumericPolicy,
+
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
 
@@ -164,9 +169,8 @@ impl BatchDecodeBuffers {
         max_context_tokens: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
-        // Policy-sized: default Tuned reserves only ×64, the ×256 Pin width only under
-        // --batch-invariant. Policy is fixed before construction; a later change should source it
-        // from a recorded field rather than re-read the global here.
+        // Policy-sized: Tuned (default) ×64, Pin/PerToken ×256. Re-reading the global here is safe —
+        // the `batch_decode` entry assert pins policy immutable post-construction.
         let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * max_split_chunks();
 
         Ok(Self {
@@ -204,6 +208,7 @@ impl BatchDecodeBuffers {
             split_padded_slots: 0,
             max_seq_len: 0,
             max_context_tokens,
+            policy_at_construction: numeric_policy(),
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()
