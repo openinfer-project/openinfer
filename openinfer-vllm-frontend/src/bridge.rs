@@ -67,6 +67,9 @@ impl LocalEngineBridge {
             dp_stats_address: None,
             dtype: ModelDtype::BFloat16,
             vllm_version: "openinfer-local-bridge".to_string(),
+            // The in-process bridge fronts a single engine instance.
+            world_size: 1,
+            data_parallel_size: 1,
             kv_cache_size_tokens: None,
             kv_cache_max_concurrency: None,
         };

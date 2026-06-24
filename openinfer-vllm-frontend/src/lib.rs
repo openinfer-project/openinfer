@@ -13,8 +13,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::{
-    ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, HttpListenerMode,
-    ParserSelection, RendererSelection,
+    ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
+    HttpListenerMode, ParserSelection, RendererSelection,
 };
 
 use openinfer_engine::engine::EngineHandle;
@@ -192,6 +192,7 @@ where
         transport_mode: TransportMode::Bootstrapped {
             input_address,
             output_address,
+            engine_start_index: 0,
             engine_count: 1,
             // The in-process bridge registers once the engine future resolves,
             // so this bounds the whole engine load (multi-GPU MoE models take
@@ -211,6 +212,7 @@ where
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,
+        cors: CorsConfig::default(),
         api_keys: Vec::new(),
         api_server_options: ApiServerOptions {
             enable_log_requests: true,
