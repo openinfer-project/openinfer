@@ -153,6 +153,7 @@ impl OpeninferBackend {
             // Speculative decoding is a standalone-server knob; the Dynamo
             // worker never drafts.
             dflash_draft_model_path: None,
+            ngram_speculative: false,
             enable_kv_events,
         };
 

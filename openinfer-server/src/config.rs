@@ -95,6 +95,13 @@ pub(crate) struct Args {
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
+    /// Enable Qwen3 host-side n-gram (prompt-lookup) speculative decoding. Needs
+    /// no draft model; single-GPU greedy only, and forces the prefix cache off.
+    /// Mutually exclusive with --dflash-draft-model-path, --enable-lora,
+    /// --kv-offload, and --decode-overlap.
+    #[arg(long = "ngram-speculative", default_value_t = false)]
+    pub ngram_speculative: bool,
+
     /// Cap on total prompt tokens forwarded in one Qwen3 scheduler step
     /// (chunked prefill). Prefill activation scratch scales with the step's
     /// prompt tokens, so this bounds peak VRAM under request bursts; prompts

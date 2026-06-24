@@ -150,6 +150,7 @@ pub(crate) fn start_qwen3(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
     dflash_draft_model_path: Option<&str>,
+    ngram_speculative: bool,
     enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
@@ -171,6 +172,11 @@ pub(crate) fn start_qwen3(
     // was already reserved during profiling from the draft path passed above.
     if let Some(draft_path) = dflash_draft_model_path {
         executor.load_dflash_draft_model(draft_path)?;
+    } else if ngram_speculative {
+        // Host-side n-gram drafter: no draft model to load, just enable the
+        // proposer and force the prefix cache off (same as DFlash) so verify
+        // writes each request's own speculative KV span.
+        executor.load_ngram_drafter(crate::ngram::NgramConfig::from_env())?;
     }
 
     Ok(start_with_executor(executor, seed, max_prefill_tokens))

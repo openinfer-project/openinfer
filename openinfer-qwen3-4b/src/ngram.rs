@@ -123,12 +123,6 @@ impl NgramProposer {
     }
 }
 
-impl crate::speculative::SpeculativeProposer for NgramProposer {
-    fn propose(&self, context: &[u32]) -> Vec<u32> {
-        NgramProposer::propose(self, context)
-    }
-}
-
 /// Find the latest start index `i < len - n` such that `context[i..i + n]`
 /// equals `suffix` (the trailing `n` tokens). "Latest" prefers the most recent
 /// context. Guaranteed to leave at least one following token at `i + n`.

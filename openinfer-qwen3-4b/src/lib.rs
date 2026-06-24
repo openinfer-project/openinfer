@@ -10,6 +10,7 @@ mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
+mod ngram;
 mod prefill;
 mod scheduler;
 mod speculative;
@@ -177,6 +178,10 @@ pub struct Qwen3LaunchOptions {
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
+    /// Enables host-side n-gram (prompt-lookup) speculative decoding. Needs no
+    /// draft model; single-GPU greedy only and mutually exclusive with DFlash,
+    /// LoRA, KV offload, and decode overlap.
+    pub ngram_speculative: bool,
     /// Publish KV block store/remove events for an out-of-band cache-aware
     /// router (e.g. a Dynamo KV router). Off for plain single-machine serving;
     /// single-GPU + base-model only (rejected with LoRA or tensor parallel).
@@ -226,6 +231,22 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"
     );
+    anyhow::ensure!(
+        !(options.dflash_draft_model_path.is_some() && options.ngram_speculative),
+        "n-gram speculative decoding cannot be combined with a DFlash draft model"
+    );
+    anyhow::ensure!(
+        !(options.ngram_speculative && options.lora.is_some()),
+        "n-gram speculative decoding cannot be combined with LoRA serving"
+    );
+    anyhow::ensure!(
+        !(options.ngram_speculative && options.offload.enabled),
+        "n-gram speculative decoding cannot be combined with KV offload"
+    );
+    anyhow::ensure!(
+        !(options.ngram_speculative && !matches!(options.decode_overlap, DecodeOverlap::Off)),
+        "n-gram speculative decoding cannot be combined with decode overlap (--decode-overlap)"
+    );
     if options.enable_kv_events && options.lora.is_some() {
         anyhow::bail!("KV block events are not supported with LoRA serving");
     }
@@ -257,6 +278,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.decode_overlap,
             options.batch_invariant,
             options.dflash_draft_model_path.as_deref(),
+            options.ngram_speculative,
             options.enable_kv_events,
         ),
     }
@@ -273,6 +295,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         DecodeOverlap::Off,
         false,
         None,
+        false,
         false,
     )
 }
@@ -300,6 +323,7 @@ pub fn start_engine_with_offload(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
     dflash_draft_model_path: Option<&Path>,
+    ngram_speculative: bool,
     enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
@@ -330,6 +354,7 @@ pub fn start_engine_with_offload(
         memory_options,
         decode_overlap,
         dflash_draft_model_path,
+        ngram_speculative,
         enable_kv_events,
     )
 }

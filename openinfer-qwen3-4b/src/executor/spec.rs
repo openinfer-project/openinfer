@@ -17,8 +17,8 @@ impl Qwen3Executor {
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
-            "speculative verification requested but no draft model is loaded"
+            self.speculative.is_some() || self.ngram.is_some(),
+            "speculative verification requested but no speculative method is enabled"
         );
         for req in plan.requests {
             anyhow::ensure!(
@@ -30,11 +30,13 @@ impl Qwen3Executor {
                 req.params.is_greedy(),
                 "speculative verification currently supports greedy sampling only"
             );
-            anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative verification requested before DFlash state is ready for {:?}",
-                req.request_id
-            );
+            if self.speculative.is_some() {
+                anyhow::ensure!(
+                    self.dflash_ready_requests.contains(&req.request_id),
+                    "speculative verification requested before DFlash state is ready for {:?}",
+                    req.request_id
+                );
+            }
             anyhow::ensure!(
                 self.request_kvs.contains_key(&req.request_id),
                 "missing RequestKv for {:?}",
@@ -132,6 +134,18 @@ impl Qwen3Executor {
         }
         for req_result in &result.requests {
             self.save_sealed_blocks(req_result.request_id);
+        }
+
+        // Keep the n-gram running context in sync: append every committed token
+        // so the next draft scans the full history and continues from the new
+        // dangling token. DFlash keeps its own per-request hidden state instead.
+        if self.ngram.is_some() {
+            for req_result in &result.requests {
+                self.ngram_ctx
+                    .entry(req_result.request_id)
+                    .or_default()
+                    .extend_from_slice(&req_result.accepted_tokens);
+            }
         }
 
         Ok(result)
