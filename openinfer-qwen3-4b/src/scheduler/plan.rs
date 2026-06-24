@@ -6,7 +6,8 @@ use crate::executor::{
     PrefillStepItem, UnifiedPlan, UnifiedResult,
 };
 use crate::speculative::{
-    DraftPlan, DraftRequestResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
+    DraftPlan, DraftRequestResult, DraftStepItem, VerifyPlan, VerifyRequestResult, VerifyResult,
+    VerifyStepItem,
 };
 
 use super::{ActiveRequestState, PendingRequest};
@@ -113,20 +114,65 @@ pub(super) fn execute_plan(
             Ok(ExecutionArtifacts::Decode { result })
         }
         ExecutionPlan::SpeculativeDecode => {
-            // Two executor calls per step: draft proposes K tokens per request,
-            // then a single target forward verifies the K+1 span. Both index by
-            // request_id; sorting keeps draft and verify results aligned.
+            // Propose first, then route each request by whether it actually got a
+            // draft. Drafted requests (verify span > 1) take the speculative
+            // verify forward. Requests with no draft (n-gram miss, or K = 0) would
+            // otherwise pay a full verify forward for a single token — swapping the
+            // optimized decode kernel for the prefill-style verify kernel, which
+            // both costs more and perturbs near-tie greedy picks by the
+            // prefill-vs-decode bf16 gap. Route those through the plain decode path
+            // instead: same kernel and cost as baseline, committing one token each.
+            // All-miss steps (common on non-repetitive text) thus degrade exactly
+            // to plain decode. All index by request_id; sorting keeps results
+            // aligned for resolve.
             let draft_requests = build_speculative_draft_items(active);
             let mut draft = executor.execute_speculative_draft(DraftPlan {
                 requests: &draft_requests,
             })?;
             draft.requests.sort_by_key(|result| result.request_id);
             let verify_requests = build_speculative_verify_items(active, &draft.requests);
-            let mut verify = executor.execute_speculative_verify(VerifyPlan {
-                requests: &verify_requests,
-            })?;
-            verify.requests.sort_by_key(|result| result.request_id);
-            Ok(ExecutionArtifacts::SpeculativeDecode { verify })
+            let (drafted, undrafted): (Vec<VerifyStepItem>, Vec<VerifyStepItem>) = verify_requests
+                .into_iter()
+                .partition(|item| item.token_ids.len() > 1);
+
+            let mut request_results: Vec<VerifyRequestResult> = Vec::with_capacity(active.len());
+            if !drafted.is_empty() {
+                let mut verify =
+                    executor.execute_speculative_verify(VerifyPlan { requests: &drafted })?;
+                request_results.append(&mut verify.requests);
+            }
+            if !undrafted.is_empty() {
+                // logprobs are off and LoRA is absent on the speculative path
+                // (should_speculative_decode requires both), so a minimal decode
+                // item is faithful to these requests.
+                let decode_items: Vec<DecodeStepItem> = undrafted
+                    .iter()
+                    .map(|item| DecodeStepItem {
+                        request_id: item.request_id,
+                        token_id: item.token_ids[0],
+                        params: item.params,
+                        logprobs: 0,
+                        lora_adapter: None,
+                    })
+                    .collect();
+                let decode = executor.execute_decode(DecodePlan {
+                    requests: &decode_items,
+                    sample_seed: rand::RngExt::random(rng),
+                })?;
+                for result in decode.requests {
+                    request_results.push(VerifyRequestResult {
+                        request_id: result.request_id,
+                        matched_draft_tokens: 0,
+                        accepted_tokens: vec![result.token],
+                    });
+                }
+            }
+            request_results.sort_by_key(|result| result.request_id);
+            Ok(ExecutionArtifacts::SpeculativeDecode {
+                verify: VerifyResult {
+                    requests: request_results,
+                },
+            })
         }
         ExecutionPlan::Unified { pending } => {
             let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
