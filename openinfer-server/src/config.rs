@@ -95,11 +95,12 @@ pub(crate) struct Args {
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
-    /// Cap on total prompt tokens forwarded in one Qwen3 scheduler step
-    /// (chunked prefill). Prefill activation scratch scales with the step's
-    /// prompt tokens, so this bounds peak VRAM under request bursts; prompts
-    /// longer than the cap are split across steps so running decodes keep
-    /// ticking. Echo requests are never split. Must be positive.
+    /// Cap on total prompt tokens forwarded in one scheduler step (chunked
+    /// prefill), for both the Qwen3 and Qwen3.5 schedulers. Prefill activation
+    /// scratch scales with the step's prompt tokens, so this bounds peak VRAM
+    /// under request bursts; prompts longer than the cap are split across steps
+    /// so running decodes keep ticking. On Qwen3, echo requests are never
+    /// split. Must be positive.
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
     pub max_prefill_tokens: usize,
 
