@@ -61,7 +61,9 @@ static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn target_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => Some(MODEL_PATH.to_string()),
+        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
+            Some(MODEL_PATH.to_string())
+        }
         Err(_) => {
             eprintln!(
                 "skipping ngram gate: {MODEL_PATH}/config.json missing; set OPENINFER_TEST_MODEL_PATH"
@@ -388,9 +390,15 @@ fn ngram_speculative_greedy_matches_plain_greedy() {
     let mut failures = Vec::new();
     for (i, &prompt) in prompts.iter().enumerate() {
         let spec = generate(&handle, encoded[i].clone(), 0, GENERATED_TOKENS);
-        if let Err(failure) =
-            check_lossless(&handle, &tokenizer, i, prompt, &encoded[i], &baseline[i], &spec)
-        {
+        if let Err(failure) = check_lossless(
+            &handle,
+            &tokenizer,
+            i,
+            prompt,
+            &encoded[i],
+            &baseline[i],
+            &spec,
+        ) {
             failures.push(failure);
         }
     }
@@ -418,10 +426,19 @@ fn ngram_concurrent_heterogeneous_is_lossless() {
     let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
 
     let cases: [(&str, usize); 4] = [
-        ("def fibonacci(n):\n    if n < 2:\n        return n\n    return fibonacci(", 64),
+        (
+            "def fibonacci(n):\n    if n < 2:\n        return n\n    return fibonacci(",
+            64,
+        ),
         ("1 2 3 4 1 2 3 4 1 2 3 4 1 2 3 4", 24),
-        ("Q: What is 17 multiplied by 23? A: Let's think step by step.", 48),
-        ("The quick brown fox. The quick brown fox. The quick brown fox.", 40),
+        (
+            "Q: What is 17 multiplied by 23? A: Let's think step by step.",
+            48,
+        ),
+        (
+            "The quick brown fox. The quick brown fox. The quick brown fox.",
+            40,
+        ),
     ];
 
     let tokenizer = common::load_tokenizer(&model_path);
@@ -459,9 +476,15 @@ fn ngram_concurrent_heterogeneous_is_lossless() {
 
     let mut failures = Vec::new();
     for (i, (prompt, _)) in cases.iter().enumerate() {
-        if let Err(failure) =
-            check_lossless(&handle, &tokenizer, i, prompt, &encoded[i], &baselines[i], &specs[i])
-        {
+        if let Err(failure) = check_lossless(
+            &handle,
+            &tokenizer,
+            i,
+            prompt,
+            &encoded[i],
+            &baselines[i],
+            &specs[i],
+        ) {
             failures.push(failure);
         }
     }
