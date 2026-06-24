@@ -496,3 +496,138 @@ fn ngram_concurrent_heterogeneous_is_lossless() {
         failures.join("\n")
     );
 }
+
+/// Mixed greedy + sampling traffic must not break the greedy request.
+///
+/// A non-greedy request sharing the batch flips `should_speculative_decode` to
+/// false (it requires *every* active request to be greedy), so the co-resident
+/// greedy request decodes outside the speculative path — via plain decode, or
+/// via the fused unified step when a non-greedy request is pending while the
+/// greedy one is active. Both paths must keep `ngram_ctx` anchored on the
+/// dangling token; a missed sync there silently degrades n-gram acceptance once
+/// the batch returns to pure greedy (it is not a correctness bug — the verify
+/// seed comes from the real KV, not `ngram_ctx`). This guards that mixed-traffic
+/// class: the greedy request must stay token-identical to its solo plain-greedy
+/// baseline. The sampling request's output is non-deterministic, so only the
+/// greedy request is checked; it is there purely to hold the batch non-greedy.
+///
+/// Note: deterministically landing the greedy request on the *unified* branch
+/// (vs plain decode) depends on scheduler arrival timing the public API can't
+/// pin down; the unified context-sync itself mirrors the proven `execute_decode`
+/// path, so this test guards the broader property rather than that one branch.
+#[test]
+fn ngram_mixed_greedy_and_sampling_is_lossless() {
+    let Some(model_path) = target_path_or_skip() else {
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+
+    let greedy_prompt = "def fibonacci(n):\n    if n < 2:\n        return n\n    return fibonacci(";
+    const GREEDY_MAX: usize = 48;
+    let tokenizer = common::load_tokenizer(&model_path);
+    let greedy_tokens = tokenizer
+        .encode(greedy_prompt, false)
+        .expect("encode failed");
+    let sampling_tokens = tokenizer
+        .encode("Tell me a long and winding story about a dragon.", false)
+        .expect("encode failed");
+
+    // 1. Baseline: the greedy prompt's solo plain-greedy decode (spec off) with
+    //    logprobs for the regret reference.
+    let baseline = {
+        let handle = openinfer_qwen3_4b::launch(Path::new(&model_path), launch_options(false))
+            .expect("failed to start baseline engine");
+        let out = generate(&handle, greedy_tokens.clone(), LOGPROBS, GREEDY_MAX);
+        drop(handle);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+
+    // 2. Speculative engine (n-gram on). Submit a long *sampling* request and the
+    //    greedy request concurrently so they co-reside: the sampling request keeps
+    //    the batch non-greedy, forcing the greedy one off the speculative path.
+    let handle = openinfer_qwen3_4b::launch(Path::new(&model_path), launch_options(true))
+        .expect("failed to start speculative engine");
+
+    // Non-greedy (temperature >= eps, top_k != 1) so the batch is held non-greedy;
+    // start from Default to stay robust to added fields.
+    let sampling_params = SamplingParams {
+        temperature: 0.8,
+        top_p: 0.95,
+        ..SamplingParams::default()
+    };
+    let (sampling_tx, mut sampling_rx) = TokenSink::standalone();
+    handle
+        .submit(GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: sampling_tokens,
+            params: sampling_params,
+            max_tokens: 96,
+            lora_adapter: None,
+            token_tx: sampling_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .expect("submit sampling failed");
+    let (greedy_tx, mut greedy_rx) = TokenSink::standalone();
+    handle
+        .submit(GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: greedy_tokens.clone(),
+            params: SamplingParams::default(),
+            max_tokens: GREEDY_MAX,
+            lora_adapter: None,
+            token_tx: greedy_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .expect("submit greedy failed");
+
+    // Drain the greedy request's steps; the sampling request just runs alongside.
+    let mut greedy_steps = Vec::new();
+    loop {
+        match greedy_rx.blocking_recv().map(|(_, event)| event) {
+            Some(TokenEvent::Token { id, logprob }) => greedy_steps.push(Step {
+                id,
+                top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
+            }),
+            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::Finished { .. }) => break,
+            Some(TokenEvent::Error { message, .. }) => {
+                panic!("greedy generation failed: {message}")
+            }
+            Some(TokenEvent::Rejected { message, .. }) => {
+                panic!("greedy generation rejected: {message}")
+            }
+            None => panic!("scheduler channel closed without Finished"),
+        }
+    }
+    // Drain the sampling request to completion so the engine tears down cleanly.
+    while let Some((_, event)) = sampling_rx.blocking_recv() {
+        if matches!(
+            event,
+            TokenEvent::Finished { .. } | TokenEvent::Error { .. } | TokenEvent::Rejected { .. }
+        ) {
+            break;
+        }
+    }
+
+    let result = check_lossless(
+        &handle,
+        &tokenizer,
+        0,
+        greedy_prompt,
+        &greedy_tokens,
+        &baseline,
+        &greedy_steps,
+    );
+    drop(handle);
+
+    assert!(
+        result.is_ok(),
+        "greedy n-gram request diverged from plain greedy under mixed greedy+sampling traffic:\n{}",
+        result.unwrap_err()
+    );
+}

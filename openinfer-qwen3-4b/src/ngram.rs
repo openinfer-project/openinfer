@@ -102,6 +102,13 @@ impl NgramProposer {
     /// Returns an empty `Vec` when no usable n-gram match exists or when
     /// `num_speculative == 0`. Tries the longest configured suffix first and
     /// falls back to shorter suffixes.
+    ///
+    /// Cost: each call is a linear reverse scan of `context` per suffix length,
+    /// so a miss is `O(context_len * max_ngram)` on the executor thread, every
+    /// speculative step. Fine for the target case (repetitive / bounded
+    /// contexts); a very long context could erode the speedup it buys. If that
+    /// becomes a concern, bound the look-back window (as vLLM's prompt-lookup
+    /// does) rather than scanning the whole history.
     #[must_use]
     pub fn propose(&self, context: &[u32]) -> Vec<u32> {
         if self.config.num_speculative == 0 {

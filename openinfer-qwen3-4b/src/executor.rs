@@ -1291,13 +1291,6 @@ impl Qwen3Executor {
         }
     }
 
-    /// Enable speculative decoding by loading a DFlash draft model into the
-    /// primary lane.
-    ///
-    /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
-    /// is incompatible with KV offload. Disables the prefix cache: speculative
-    /// capture needs clean, uncached target hidden states for every prompt
-    /// token, and a prefix-cache hit skips the forward that would produce them.
     /// The loaded DFlash draft metadata, or `None` under no/other method.
     fn dflash_meta(&self) -> Option<&DFlashMeta> {
         match &self.speculative_method {
@@ -1314,6 +1307,13 @@ impl Qwen3Executor {
         }
     }
 
+    /// Enable speculative decoding by loading a DFlash draft model into the
+    /// primary lane.
+    ///
+    /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
+    /// is incompatible with KV offload. Disables the prefix cache: speculative
+    /// capture needs clean, uncached target hidden states for every prompt
+    /// token, and a prefix-cache hit skips the forward that would produce them.
     pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
@@ -1681,6 +1681,12 @@ impl ModelExecutor for Qwen3Executor {
             // `draft.max_pos - block_size` tokens before the draft cache would
             // overflow. Reject the rest at admission instead of crashing mid-prefill.
             Some(meta) => target.min(meta.max_position_embeddings.saturating_sub(meta.block_size)),
+            // n-gram (or no speculation): full window. n-gram has no separate
+            // draft cache, and its verify span is clamped to the request's
+            // remaining output budget (see `build_speculative_verify_items`), so
+            // the furthest KV position it writes is `prompt + generated + span <=
+            // prompt + max_tokens <= max_position_embeddings` — never past the
+            // window. No DFlash-style block_size reduction is needed.
             None => target,
         }
     }
@@ -2151,6 +2157,19 @@ impl ModelExecutor for Qwen3Executor {
                         .expect("request must exist after unified decode");
                     rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
                 }
+                // A unified step commits one token per active request outside the
+                // speculative path; keep the n-gram context in sync (mirroring
+                // execute_decode) so it stays anchored on the dangling token when
+                // the batch returns to pure-greedy n-gram speculation. Reachable
+                // whenever a non-greedy request shares the batch and pushes the
+                // greedy ones onto the fused decode path.
+                if self.ngram_proposer().is_some() {
+                    for req_result in &result.decode_requests {
+                        if let Some(context) = self.ngram_ctx.get_mut(&req_result.request_id) {
+                            context.push(req_result.token);
+                        }
+                    }
+                }
                 // A plain decode via the fused unified step advances the sequence
                 // outside the speculative path, so any captured draft context is
                 // now stale — drop it, mirroring execute_decode. (Eligible pending
@@ -2183,6 +2202,17 @@ impl ModelExecutor for Qwen3Executor {
                         .get_mut(&req_result.request_id)
                         .expect("request must exist after split decode");
                     rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                }
+                // Defensive n-gram context sync (mirrors the Unified branch). The
+                // overlap path is unreachable under n-gram today (speculation forces
+                // decode-overlap off), but keep the context anchored if that
+                // mutual-exclusion is ever relaxed.
+                if self.ngram_proposer().is_some() {
+                    for req_result in &decode_result.requests {
+                        if let Some(context) = self.ngram_ctx.get_mut(&req_result.request_id) {
+                            context.push(req_result.token);
+                        }
+                    }
                 }
                 for req_result in &decode_result.requests {
                     self.save_sealed_blocks(req_result.request_id);
@@ -2806,7 +2836,9 @@ impl LocalQwen3Lane {
             .unwrap_or(1)
             .max(1);
         // (Re)allocate the verify scratch if it is missing or too narrow for this
-        // step's widest span. With a fixed n-gram K this allocates at most once.
+        // step's widest span. The widest span grows from 1 (no match) up to K + 1
+        // as matches lengthen, so this may reallocate a few times early on before
+        // settling at the K + 1 ceiling — never per step in steady state.
         let needs_alloc = self
             .verify_bufs
             .as_ref()
