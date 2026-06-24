@@ -438,9 +438,14 @@ fn token_stream(
                         Mapped::Cached(c) => { cached_tokens = c; }
                         Mapped::Chunk(c) => { completion_tokens += 1; yield Ok(c); }
                         Mapped::Terminal(mut t) => {
-                            if let Some(u) = t.completion_usage.as_mut() {
-                                convert::apply_cached_tokens(u, cached_tokens);
-                            }
+                            // Every terminal is built `.with_usage(...)` in
+                            // `map_token_event`, so usage is an invariant, not an
+                            // option — crash rather than silently drop the hit.
+                            let u = t
+                                .completion_usage
+                                .as_mut()
+                                .expect("terminal token event carries completion usage");
+                            convert::apply_cached_tokens(u, cached_tokens);
                             yield Ok(t);
                             break;
                         }
