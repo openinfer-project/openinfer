@@ -797,6 +797,17 @@ struct Qwen3ExecutorMetadata {
     config: Config,
 }
 
+/// The loaded speculative-decode method. Exactly one is ever active; the
+/// *propose* step is the only method-specific part (DFlash runs a draft-model
+/// forward on the worker; n-gram scans the request's token context host-side),
+/// while verify, greedy acceptance, and the KV transaction are shared.
+enum SpeculativeMethod {
+    /// DFlash draft model: worker-side draft forward with hidden-state capture.
+    Dflash(DFlashMeta),
+    /// Host-side n-gram / prompt-lookup proposer; needs no draft model.
+    Ngram(crate::ngram::NgramProposer),
+}
+
 pub struct Qwen3Executor {
     metadata: Qwen3ExecutorMetadata,
     kv_mgr: KvCacheManager,
@@ -830,21 +841,20 @@ pub struct Qwen3Executor {
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
     async_prefill: Option<AsyncPrefillState>,
-    /// DFlash draft metadata; `Some` once a draft model is loaded into the
-    /// primary lane. Speculative decoding is enabled iff this is set.
-    speculative: Option<DFlashMeta>,
+    /// The active speculative-decode method and its loaded state — DFlash draft
+    /// metadata or the n-gram proposer — or `None` when speculation is off.
+    /// Exactly one method is ever loaded; this is the single source of truth for
+    /// whether speculation is on and which kind. Only the *propose* step varies
+    /// between methods; verify, accept, and the KV transaction are shared.
+    speculative_method: Option<SpeculativeMethod>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
     dflash_ready_requests: HashSet<RequestId>,
-    /// N-gram (prompt-lookup) proposer; `Some` once host-side n-gram speculative
-    /// decoding is enabled. Mutually exclusive with [`Self::speculative`]
-    /// (DFlash): exactly one drafter is ever loaded.
-    ngram: Option<crate::ngram::NgramProposer>,
     /// Per-request running token context (prompt + every committed token),
-    /// maintained only while [`Self::ngram`] is set. The n-gram proposer scans
-    /// this to find prompt-lookup matches; it always ends with the request's
-    /// current dangling token so the next draft continues from it.
+    /// maintained only under the n-gram method. The proposer scans this for
+    /// prompt-lookup matches; it always ends with the request's current dangling
+    /// token so the next draft continues from it.
     ngram_ctx: HashMap<RequestId, Vec<u32>>,
     /// Opt-in KV block-event feed for a cache-aware router (`Some` only when the
     /// engine was built with events on — single-GPU, no LoRA). `None` on the
@@ -965,9 +975,8 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             overlap: None,
             async_prefill: None,
-            speculative: None,
+            speculative_method: None,
             dflash_ready_requests: HashSet::new(),
-            ngram: None,
             ngram_ctx: HashMap::new(),
             kv_events,
         })
@@ -1196,9 +1205,8 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             overlap: None,
             async_prefill: None,
-            speculative: None,
+            speculative_method: None,
             dflash_ready_requests: HashSet::new(),
-            ngram: None,
             ngram_ctx: HashMap::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
@@ -1290,6 +1298,22 @@ impl Qwen3Executor {
     /// is incompatible with KV offload. Disables the prefix cache: speculative
     /// capture needs clean, uncached target hidden states for every prompt
     /// token, and a prefix-cache hit skips the forward that would produce them.
+    /// The loaded DFlash draft metadata, or `None` under no/other method.
+    fn dflash_meta(&self) -> Option<&DFlashMeta> {
+        match &self.speculative_method {
+            Some(SpeculativeMethod::Dflash(meta)) => Some(meta),
+            _ => None,
+        }
+    }
+
+    /// The loaded n-gram proposer, or `None` under no/other method.
+    fn ngram_proposer(&self) -> Option<crate::ngram::NgramProposer> {
+        match &self.speculative_method {
+            Some(SpeculativeMethod::Ngram(proposer)) => Some(*proposer),
+            _ => None,
+        }
+    }
+
     pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
@@ -1306,7 +1330,7 @@ impl Qwen3Executor {
             meta.block_size
         );
         self.prefix_cache_enabled = false;
-        self.speculative = Some(meta);
+        self.speculative_method = Some(SpeculativeMethod::Dflash(meta));
         Ok(())
     }
 
@@ -1326,12 +1350,14 @@ impl Qwen3Executor {
             "speculative decoding is not supported together with KV offload"
         );
         anyhow::ensure!(
-            self.speculative.is_none(),
+            self.speculative_method.is_none(),
             "n-gram speculative decoding cannot be combined with a DFlash draft model"
         );
         log::info!("Qwen3 n-gram speculative decoding enabled: {config}");
         self.prefix_cache_enabled = false;
-        self.ngram = Some(crate::ngram::NgramProposer::new(config));
+        self.speculative_method = Some(SpeculativeMethod::Ngram(crate::ngram::NgramProposer::new(
+            config,
+        )));
         Ok(())
     }
 
@@ -1649,7 +1675,7 @@ impl ModelExecutor for Qwen3Executor {
 
     fn max_context_tokens(&self) -> usize {
         let target = self.metadata.config.max_position_embeddings;
-        match &self.speculative {
+        match self.dflash_meta() {
             // The draft's fixed-width in-fill block writes `block_size` positions
             // past the committed length each step, so a request may use at most
             // `draft.max_pos - block_size` tokens before the draft cache would
@@ -1705,7 +1731,7 @@ impl ModelExecutor for Qwen3Executor {
         }
         self.saved_cursor.remove(&request_id);
         self.ngram_ctx.remove(&request_id);
-        if self.speculative.is_some() {
+        if self.dflash_meta().is_some() {
             self.dflash_ready_requests.remove(&request_id);
             self.primary.drop_dflash_request(request_id)?;
         }
@@ -1896,7 +1922,7 @@ impl ModelExecutor for Qwen3Executor {
         // the full prompt followed by the first sampled token (the request's
         // current dangling token). Later committed tokens are appended at verify
         // and decode time so the context always ends with the dangling token.
-        if self.ngram.is_some() {
+        if self.ngram_proposer().is_some() {
             for req_result in &result.requests {
                 if req_result.completed {
                     if let Some(req) = plan
@@ -1915,7 +1941,7 @@ impl ModelExecutor for Qwen3Executor {
         // A request becomes draft-ready once its prompt is fully prefilled with
         // captured target context. Partial chunks stay pending; ineligible
         // requests drop any stale worker state.
-        if self.speculative.is_some() {
+        if self.dflash_meta().is_some() {
             for req_result in &result.requests {
                 let captured = result
                     .dflash_context_captured_requests
@@ -1988,7 +2014,7 @@ impl ModelExecutor for Qwen3Executor {
         }
         // A plain decode commits one token per request; keep the n-gram context
         // in sync so it always ends with the request's dangling token.
-        if self.ngram.is_some() {
+        if self.ngram_proposer().is_some() {
             for req_result in &result.requests {
                 if let Some(context) = self.ngram_ctx.get_mut(&req_result.request_id) {
                     context.push(req_result.token);
@@ -1997,7 +2023,7 @@ impl ModelExecutor for Qwen3Executor {
         }
         // A plain decode advances the sequence outside the speculative path, so
         // any captured draft context is now stale — drop it.
-        if self.speculative.is_some() {
+        if self.dflash_meta().is_some() {
             for req_result in &result.requests {
                 if self.dflash_ready_requests.remove(&req_result.request_id) {
                     self.primary.drop_dflash_request(req_result.request_id)?;
@@ -2016,7 +2042,7 @@ impl ModelExecutor for Qwen3Executor {
         // N-gram drafts are produced host-side on the executor thread (no worker
         // forward): scan each request's own token context for a prompt-lookup
         // match. DFlash instead runs a draft-model forward on the lane.
-        if let Some(ngram) = self.ngram {
+        if let Some(ngram) = self.ngram_proposer() {
             let mut requests = Vec::with_capacity(plan.requests.len());
             for item in plan.requests {
                 anyhow::ensure!(
@@ -2046,11 +2072,11 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn speculative_enabled(&self) -> bool {
-        self.speculative.is_some() || self.ngram.is_some()
+        self.speculative_method.is_some()
     }
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
-        if self.ngram.is_some() {
+        if self.ngram_proposer().is_some() {
             // Ready as soon as the prompt is prefilled and its context seeded;
             // n-gram needs no captured hidden state.
             self.ngram_ctx.contains_key(&request_id)
@@ -2130,7 +2156,7 @@ impl ModelExecutor for Qwen3Executor {
                 // now stale — drop it, mirroring execute_decode. (Eligible pending
                 // are routed to a dedicated prefill step, so unified prefills never
                 // need DFlash mark-ready here.)
-                if self.speculative.is_some() {
+                if self.dflash_meta().is_some() {
                     for req_result in &result.decode_requests {
                         if self.dflash_ready_requests.remove(&req_result.request_id) {
                             self.primary.drop_dflash_request(req_result.request_id)?;

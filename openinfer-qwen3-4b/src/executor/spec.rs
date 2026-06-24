@@ -17,7 +17,7 @@ impl Qwen3Executor {
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
         anyhow::ensure!(
-            self.speculative.is_some() || self.ngram.is_some(),
+            self.speculative_method.is_some(),
             "speculative verification requested but no speculative method is enabled"
         );
         for req in plan.requests {
@@ -30,7 +30,7 @@ impl Qwen3Executor {
                 req.params.is_greedy(),
                 "speculative verification currently supports greedy sampling only"
             );
-            if self.speculative.is_some() {
+            if self.dflash_meta().is_some() {
                 anyhow::ensure!(
                     self.dflash_ready_requests.contains(&req.request_id),
                     "speculative verification requested before DFlash state is ready for {:?}",
@@ -139,7 +139,7 @@ impl Qwen3Executor {
         // Keep the n-gram running context in sync: append every committed token
         // so the next draft scans the full history and continues from the new
         // dangling token. DFlash keeps its own per-request hidden state instead.
-        if self.ngram.is_some() {
+        if self.ngram_proposer().is_some() {
             for req_result in &result.requests {
                 self.ngram_ctx
                     .entry(req_result.request_id)
@@ -156,7 +156,7 @@ impl Qwen3Executor {
         plan: DraftPlan<'_>,
     ) -> Result<DraftResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
+            self.dflash_meta().is_some(),
             "speculative draft requested but no draft model is loaded"
         );
         for req in plan.requests {
