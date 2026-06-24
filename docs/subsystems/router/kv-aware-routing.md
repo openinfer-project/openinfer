@@ -7,7 +7,11 @@ with a multi-turn chat workload: follow-up-turn TTFT stays flat at ~45 ms under
 KV routing while round-robin and random balloon to 160–180 ms, because turns 2+
 of a conversation reuse the cached history on their home worker instead of
 re-prefilling it on a cold worker. Router-side prefix overlap averaged **0.72**
-under KV routing and **0** under the stateless policies.
+under KV routing and **0** under the stateless policies. An independent
+`vllm-bench --multi-turn` run cross-checks it (4096-token history → KV overall
+median TTFT **52 ms vs 214 ms** round-robin, 4×). The size of the win scales with
+how much conversation history is reused — short contexts on a fast GPU show only a
+few ms, which is expected, not a routing failure.
 
 Last touched: 2026-06
 
@@ -122,6 +126,44 @@ side. Firing one identical 1289-token prompt twice under KV routing: the first
 (cold) response carries no `prompt_tokens_details`; the second comes back with
 `prompt_tokens_details.cached_tokens = 1280` — the whole prompt minus the last
 partial block, served from the home worker's prefix cache.
+
+### vllm-bench cross-check
+
+The same effect reproduces on an independent driver (`vllm-bench --multi-turn`,
+which accumulates each turn's history into the next request), confirming it is not
+an artifact of the custom client. 4 Qwen3-4B workers, a 4096-token opening turn
+plus 64-token follow-ups, 4 turns, concurrency 4, cold-restart per mode:
+
+| metric | KV | round-robin |
+|--------|----|-------------|
+| overall median TTFT | **52.7 ms** | 213.6 ms |
+| follow-up turns (warm) | ~50 ms | ~138 ms |
+
+KV's overall median TTFT is **4×** lower because turns 2+ hit the 4096-token
+history on their home worker; round-robin re-prefills it on a cold worker almost
+every follow-up. The router kept each conversation pinned to one worker (request
+counts 12/13/12/11 across the four workers).
+
+### When the win is small
+
+The benefit is exactly the re-prefill cost it avoids, so it scales with **how
+much reused context there is** and with **whether that context is still cached**:
+
+- **Short reused context** — with a ~1k-token history, the avoided prefill is only
+  ~60 ms on a fast GPU, so KV beats round-robin by a few ms, not multiples. The
+  win grows with conversation/system-prompt length.
+- **Cache pressure** — at high concurrency relative to KV capacity (e.g. many
+  long contexts in flight per worker), the home worker's blocks can be evicted
+  before the next turn, and the router also balances load away from a busy worker.
+  Both shrink overlap. Keep concurrency at or below the worker count for a clean
+  multi-turn affinity win; that is also where the router most strongly honors the
+  prefix match over load.
+
+This is *why* a careless A/B (short prompts, saturating concurrency) can show KV
+≈ round-robin even though routing is working — the avoided cost is just small or
+the cache didn't survive. The `kv_hit_rate` gate distinguishes "no benefit
+because overlap collapsed" (a bug) from "small benefit because the reused prefix
+is short" (expected).
 
 ### Takeaway
 
