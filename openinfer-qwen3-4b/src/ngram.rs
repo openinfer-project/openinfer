@@ -75,7 +75,7 @@ fn env_usize(name: &str) -> Option<usize> {
 /// The proposer keeps no history of its own; each call scans the supplied
 /// context, so the caller is free to reuse a single instance across requests.
 #[derive(Clone, Copy, Debug)]
-pub struct NgramProposer {
+pub(crate) struct NgramProposer {
     config: NgramConfig,
 }
 
@@ -84,7 +84,7 @@ impl NgramProposer {
     /// `max_ngram`, and `max_ngram` to at least 1, so the config is always
     /// usable regardless of caller input.
     #[must_use]
-    pub fn new(config: NgramConfig) -> Self {
+    pub(crate) fn new(config: NgramConfig) -> Self {
         let max_ngram = config.max_ngram.max(1);
         let min_ngram = config.min_ngram.clamp(1, max_ngram);
         Self {
@@ -110,7 +110,7 @@ impl NgramProposer {
     /// becomes a concern, bound the look-back window (as vLLM's prompt-lookup
     /// does) rather than scanning the whole history.
     #[must_use]
-    pub fn propose(&self, context: &[u32]) -> Vec<u32> {
+    pub(crate) fn propose(&self, context: &[u32]) -> Vec<u32> {
         if self.config.num_speculative == 0 {
             return Vec::new();
         }
