@@ -9,9 +9,12 @@ use std::collections::HashSet;
 use anyhow::Result;
 use openinfer_core::engine::TokenLogprob;
 use openinfer_core::kv_pool::KvState;
-use openinfer_core::tensor::DeviceVec;
+use openinfer_core::sampler::SamplingParams;
+use openinfer_core::tensor::HiddenStates;
 
 use crate::batch_decode_graph::{BatchDecodeGraphState, MAX_BATCH};
+use crate::decode_buffers::BatchDecodeBuffers35;
+use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
@@ -62,10 +65,12 @@ impl DecodeStepItem {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
 }
 
+#[derive(Clone, Copy)]
 pub struct DecodePlan<'a> {
     pub requests: &'a [DecodeStepItem],
 }
@@ -128,6 +133,7 @@ impl Qwen35Executor {
             enable_cuda_graph,
             device_ordinals[0],
         )?;
+        model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
         Ok(Self {
             model,
@@ -183,14 +189,22 @@ impl Qwen35Executor {
             .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
-        let logits = self
-            .model
-            .batch_prefill(&prompts, &mut kv_states, &mut recurrent_refs)?;
+        let logits =
+            self.model
+                .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?;
+
+        let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
+        let cpu_logits =
+            snapshot_requested_logprobs(self.model.device_ctx(), &logits, &requested_logprobs)?;
+        let tokens =
+            select_default_tokens_from_logits(&self.model, &logits, &mut self.graph_state.buffers)?;
 
         let mut results = Vec::with_capacity(plan.requests.len());
-        for (i, (req, kv)) in plan.requests.iter().zip(kv_states.into_iter()).enumerate() {
-            let (first_token, first_token_logprob) =
-                self.token_and_logprob(&logits[i], req.logprobs)?;
+        for (i, (req, kv)) in plan.requests.iter().zip(kv_states).enumerate() {
+            let first_token = tokens[i];
+            let first_token_logprob = cpu_logits[i].as_ref().and_then(|row| {
+                openinfer_sample::token_logprob_from_row(row, first_token, req.logprobs)
+            });
             let slot_idx = self.active.len();
             self.graph_state.copy_state_to_slot(
                 self.model.device_ctx(),
@@ -234,14 +248,26 @@ impl Qwen35Executor {
         self.model
             .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)?;
 
+        let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
+        let cpu_logits = snapshot_requested_logprobs(
+            self.model.device_ctx(),
+            &self.graph_state.buffers.logits,
+            &requested_logprobs,
+        )?;
+        let params = vec![SamplingParams::default(); plan.requests.len()];
+        let params_refs: Vec<&SamplingParams> = params.iter().collect();
+        let tokens = self.model.select_tokens_batch_varied(
+            &mut self.graph_state.buffers,
+            &params_refs,
+            0,
+        )?;
+
         let mut results = Vec::with_capacity(plan.requests.len());
         for (i, req) in plan.requests.iter().enumerate() {
-            let logits = crate::ops::extract_vec(
-                self.model.device_ctx(),
-                &self.graph_state.buffers.logits,
-                i,
-            )?;
-            let (token, logprob) = self.token_and_logprob(&logits, req.logprobs)?;
+            let token = tokens[i];
+            let logprob = cpu_logits[i]
+                .as_ref()
+                .and_then(|row| openinfer_sample::token_logprob_from_row(row, token, req.logprobs));
             results.push(DecodeRequestResult {
                 request_id: req.request_id,
                 token,
@@ -306,55 +332,14 @@ impl Qwen35Executor {
         }
         Ok(())
     }
-
-    fn token_and_logprob(
-        &self,
-        logits: &DeviceVec,
-        requested_top_k: usize,
-    ) -> Result<(u32, Option<TokenLogprob>)> {
-        let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        let Some((token, logprob, top_logprobs)) =
-            compute_logprobs_from_cpu(&logits_f32, requested_top_k.max(1))
-        else {
-            anyhow::bail!("Qwen3.5 logits were empty");
-        };
-        let logprob = (requested_top_k > 0).then_some(TokenLogprob {
-            logprob,
-            top_logprobs,
-        });
-        Ok((token, logprob))
-    }
 }
 
-fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    top_k: usize,
-) -> Option<(u32, f32, Vec<(u32, f32)>)> {
-    if logits_f32.is_empty() {
-        return None;
-    }
-
-    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
-    let log_sum_exp = max_val + sum_exp.ln();
-
-    let k = top_k.min(logits_f32.len());
-    let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-    for (idx, &val) in logits_f32.iter().enumerate() {
-        if best.len() < k || val > best.last().unwrap().1 {
-            let pos = best.partition_point(|&(_, v)| v > val);
-            best.insert(pos, (idx as u32, val));
-            if best.len() > k {
-                best.pop();
-            }
-        }
-    }
-
-    let token = best[0].0;
-    let logprob = best[0].1 - log_sum_exp;
-    let top_logprobs = best
-        .into_iter()
-        .map(|(idx, val)| (idx, val - log_sum_exp))
-        .collect();
-    Some((token, logprob, top_logprobs))
+fn select_default_tokens_from_logits(
+    model: &Qwen35Model,
+    logits: &HiddenStates,
+    bufs: &mut BatchDecodeBuffers35,
+) -> Result<Vec<u32>> {
+    let params = vec![SamplingParams::default(); logits.seq_len];
+    let params_refs: Vec<&SamplingParams> = params.iter().collect();
+    model.select_tokens_from_logits_varied(logits, bufs, &params_refs, 0)
 }

@@ -73,6 +73,11 @@ pub(crate) struct Config35 {
     pub(crate) layer_types: Vec<LayerType>,
 }
 
+/// GDN dims the Triton-AOT kernels are built for; a mismatched model is rejected at load.
+const GDN_AOT_KEY_HEAD_DIM: usize = 128;
+const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
+const GDN_AOT_NUM_VALUE_HEADS: usize = 32;
+
 impl Config35 {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
@@ -107,6 +112,20 @@ impl Config35 {
         anyhow::ensure!(
             max_position_embeddings > 0,
             "Qwen3.5 max_position_embeddings must be positive"
+        );
+
+        anyhow::ensure!(
+            t.linear_key_head_dim == GDN_AOT_KEY_HEAD_DIM
+                && t.linear_value_head_dim == GDN_AOT_VALUE_HEAD_DIM
+                && t.linear_num_value_heads == GDN_AOT_NUM_VALUE_HEADS,
+            "Qwen3.5 GDN Triton-AOT kernels are baked for key/value head dim {}/{}, \
+             {} value heads; config has {}/{}, {}. Rebuild openinfer-kernels to match.",
+            GDN_AOT_KEY_HEAD_DIM,
+            GDN_AOT_VALUE_HEAD_DIM,
+            GDN_AOT_NUM_VALUE_HEADS,
+            t.linear_key_head_dim,
+            t.linear_value_head_dim,
+            t.linear_num_value_heads,
         );
 
         Ok(Self {

@@ -1,0 +1,318 @@
+//! Batched token selection and host logprob formatting — the shared sampling
+//! layer every model crate routes through.
+//!
+//! Two model-agnostic jobs live here:
+//!
+//! * [`select_batch`] — turn one logits arena into one next-token id per row.
+//!   Greedy rows take a batched indexed argmax; the rest take one FlashInfer
+//!   temperature/top-k/top-p pass. There is no per-row escape hatch, so a caller
+//!   cannot regress to `for i { sample(i) }`.
+//! * [`token_logprob_from_row`] — host-side log-softmax + top-k over one logits
+//!   row into a [`TokenLogprob`]. Generic over the row element so a caller can
+//!   feed `f32` (Qwen) or `bf16` (Kimi) without a widening copy.
+//!
+//! Layering: the `.cu`/FFI and the low-level batch primitives live in
+//! `openinfer-kernels` (the CUDA build owner); this crate owns the policy
+//! (greedy/non-greedy routing, logprob math) and the reusable scratch.
+//! `SamplingParams`/`TokenLogprob` stay in `openinfer-engine` (the CUDA-free
+//! contract crate) and are reachable from here.
+//!
+//! Kimi-K2 keeps its own greedy path — a sharded-vocab local argmax whose top-1
+//! logit feeds a cross-rank DP reduction (#236/#237), which [`select_batch`]'s
+//! whole-vocab assumption cannot express — but routes its non-greedy rows
+//! through the re-exported [`gpu_sample_batch_into`] and its logprobs through
+//! [`token_logprob_from_row`].
+
+use anyhow::{Result, anyhow, ensure};
+use cudarc::driver::CudaSlice;
+
+use openinfer_engine::engine::TokenLogprob;
+use openinfer_kernels::ops::{
+    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
+};
+use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
+
+pub use openinfer_engine::sampler::SamplingParams;
+/// Low-level batched sampling, re-exported so a model that must drive its own
+/// greedy path still reaches the single sampler entry rather than dipping into
+/// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
+pub use openinfer_kernels::ops::{BatchSamplingRow, BatchSamplingScratch, gpu_sample_batch_into};
+
+/// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
+///
+/// Reused across decode steps — the decode path needs pointer-stable buffers, so
+/// never reallocate per step. Greedy and non-greedy rows use disjoint buffers and
+/// run sequentially, so a single `SampleScratch` covers a full mixed batch.
+pub struct SampleScratch {
+    /// Greedy row indices into the logits arena (indexed argmax input).
+    row_indices: CudaSlice<i32>,
+    argmax_partial_values: CudaSlice<f32>,
+    argmax_partial_indices: CudaSlice<i32>,
+    /// Top-1 logit value per greedy row — a required out-param of the argmax
+    /// kernel, not read here.
+    top1_values: CudaSlice<half::bf16>,
+    /// One token id per greedy row, in `row_indices` order.
+    argmax_out: CudaSlice<i32>,
+    sampling: BatchSamplingScratch,
+    /// Vocab width every buffer above was sized for; `select_batch` rejects a
+    /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
+    vocab: usize,
+    max_rows: usize,
+}
+
+impl SampleScratch {
+    pub fn new(ctx: &DeviceContext, vocab: usize, max_rows: usize) -> Result<Self> {
+        ensure!(
+            vocab > 0 && max_rows > 0,
+            "SampleScratch requires vocab > 0 and max_rows > 0"
+        );
+        let partials = argmax_batch_bf16_split_partials_len(max_rows, vocab);
+        let alloc_i32 = |n: usize| -> Result<CudaSlice<i32>> {
+            ctx.stream
+                .alloc_zeros(n)
+                .map_err(|e| anyhow!("SampleScratch alloc failed: {e}"))
+        };
+        Ok(Self {
+            row_indices: alloc_i32(max_rows)?,
+            argmax_partial_values: ctx
+                .stream
+                .alloc_zeros(partials)
+                .map_err(|e| anyhow!("SampleScratch alloc failed: {e}"))?,
+            argmax_partial_indices: alloc_i32(partials)?,
+            top1_values: ctx
+                .stream
+                .alloc_zeros(max_rows)
+                .map_err(|e| anyhow!("SampleScratch alloc failed: {e}"))?,
+            argmax_out: alloc_i32(max_rows)?,
+            sampling: BatchSamplingScratch::new(ctx, max_rows, vocab)?,
+            vocab,
+            max_rows,
+        })
+    }
+
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+}
+
+/// Pick the next token for every row of a logits arena.
+///
+/// `params[i]` governs arena row `i`. Argmax rows are resolved together with a
+/// batched indexed argmax; the remaining rows are resolved together with one
+/// FlashInfer temperature/top-k/top-p pass seeded by `seed`. Returns one token
+/// id per row, in row order.
+///
+/// A row takes the argmax path when [`effectively_greedy`] holds: explicit
+/// greedy params, or a `top_p` nucleus so tight (`<= 1/vocab`) that only the
+/// argmax survives. Routing those through argmax keeps an effectively-greedy
+/// request deterministic — the rejection sampler would otherwise pick an
+/// arbitrary member of a bf16-tied top — and skips a softmax it does not need.
+///
+/// `seed` must be fresh per decode step (one engine seed at startup, advanced
+/// per step); rows decorrelate through the philox subsequence. There is
+/// deliberately no per-row RNG.
+pub fn select_batch(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    params: &[&SamplingParams],
+    seed: u64,
+    scratch: &mut SampleScratch,
+) -> Result<Vec<u32>> {
+    let n = params.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    ensure!(
+        n <= scratch.max_rows,
+        "select_batch: {n} rows exceeds scratch capacity {}",
+        scratch.max_rows
+    );
+    ensure!(
+        logits.seq_len >= n,
+        "select_batch: logits arena has {} rows, need {n}",
+        logits.seq_len
+    );
+
+    let vocab = logits.hidden_dim;
+    ensure!(
+        vocab == scratch.vocab,
+        "select_batch: logits vocab {vocab} != scratch vocab {}",
+        scratch.vocab
+    );
+    let is_argmax = |p: &&SamplingParams| effectively_greedy(p, vocab);
+    let mut tokens = vec![0u32; n];
+
+    // Argmax rows -> one batched indexed argmax.
+    let greedy: Vec<i32> = params
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| is_argmax(p).then_some(i as i32))
+        .collect();
+    if !greedy.is_empty() {
+        ctx.stream
+            .memcpy_htod(&greedy, &mut scratch.row_indices)
+            .map_err(|e| anyhow!("select_batch H2D greedy rows failed: {e}"))?;
+        argmax_batch_bf16_split_indexed_into(
+            ctx,
+            logits,
+            &scratch.row_indices,
+            greedy.len(),
+            &mut scratch.argmax_partial_values,
+            &mut scratch.argmax_partial_indices,
+            &mut scratch.top1_values,
+            &mut scratch.argmax_out,
+        )?;
+        let out = ctx
+            .stream
+            .clone_dtoh(&scratch.argmax_out)
+            .map_err(|e| anyhow!("select_batch D2H greedy tokens failed: {e}"))?;
+        ctx.sync()?;
+        for (k, &row) in greedy.iter().enumerate() {
+            tokens[row as usize] = out[k] as u32;
+        }
+    }
+
+    // The rest -> one batched FlashInfer sampling pass.
+    let sampling_rows: Vec<BatchSamplingRow> = params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !is_argmax(p))
+        .map(|(i, p)| BatchSamplingRow {
+            row: i,
+            temperature: p.temperature,
+            top_k: p.top_k,
+            top_p: p.top_p,
+        })
+        .collect();
+    if !sampling_rows.is_empty() {
+        let sampled = gpu_sample_batch_into(
+            ctx,
+            logits.as_ref(),
+            &sampling_rows,
+            seed,
+            &mut scratch.sampling,
+        )?;
+        for (r, token) in sampling_rows.iter().zip(&sampled) {
+            tokens[r.row] = *token;
+        }
+    }
+
+    Ok(tokens)
+}
+
+/// Whether a row can take the argmax path without changing sampling semantics.
+///
+/// Besides explicit greedy params, a `top_p` at or below `1/vocab` leaves only
+/// the argmax token in the nucleus: the softmax maximum is always `>= 1/vocab`.
+fn effectively_greedy(params: &SamplingParams, vocab_size: usize) -> bool {
+    params.is_greedy()
+        || (vocab_size > 0
+            && params.top_p.is_finite()
+            && params.top_p > 0.0
+            && params.top_p <= 1.0 / vocab_size as f32)
+}
+
+/// Host log-softmax of `picked` plus the top-`top_k`, from one full-vocab logits
+/// row. One O(V) pass; runs only when a request asked for logprobs.
+///
+/// Generic over the row element so callers feed `f32` (Qwen, already on host as
+/// f32) or `bf16` (Kimi, straight from the device arena) without a widening
+/// copy. Exponentials accumulate in f64 — summing a 160k-wide vocab in f32 loses
+/// precision. Returns `None` for an empty row or an out-of-range `picked`.
+///
+/// The row must be the unsharded global vocab: a shard-local logsumexp is not
+/// the global one, so sharded callers must merge across ranks first (#236).
+pub fn token_logprob_from_row<T>(row: &[T], picked: u32, top_k: usize) -> Option<TokenLogprob>
+where
+    T: Copy + Into<f32>,
+{
+    let picked = picked as usize;
+    if row.is_empty() || picked >= row.len() {
+        return None;
+    }
+
+    let mut max = f32::NEG_INFINITY;
+    for &v in row {
+        max = max.max(v.into());
+    }
+    let mut sum = 0f64;
+    for &v in row {
+        let x: f32 = v.into();
+        sum += f64::from(x - max).exp();
+    }
+    let log_sum_exp = max + sum.ln() as f32;
+
+    // Top-K by insertion into a K-sized buffer (K <= 32, V ~ 160k). Ties keep
+    // ascending token-id order.
+    let k = top_k.min(row.len());
+    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+    if k > 0 {
+        for (id, &v) in row.iter().enumerate() {
+            let val: f32 = v.into();
+            let lp = val - log_sum_exp;
+            if top.len() == k && lp <= top[k - 1].1 {
+                continue;
+            }
+            let pos = top.partition_point(|&(_, kept)| kept >= lp);
+            top.insert(pos, (id as u32, lp));
+            top.truncate(k);
+        }
+    }
+
+    let picked_val: f32 = row[picked].into();
+    Some(TokenLogprob {
+        logprob: picked_val - log_sum_exp,
+        top_logprobs: top,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_logprob_from_row;
+    use half::bf16;
+
+    #[test]
+    fn token_logprob_matches_exact_log_softmax() {
+        // bf16-exact inputs so the expected values are analytic.
+        let row: Vec<bf16> = [1.0f32, 3.0, 2.0, 0.0, 3.0]
+            .iter()
+            .map(|&v| bf16::from_f32(v))
+            .collect();
+        let lse = (1f64.exp() + 3f64.exp() + 2f64.exp() + 1.0 + 3f64.exp()).ln() as f32;
+
+        let out = token_logprob_from_row(&row, 2, 3).unwrap();
+
+        assert!((out.logprob - (2.0 - lse)).abs() < 1e-6);
+        // Top-3 sorted descending; tied logits keep ascending token-id order.
+        let ids: Vec<u32> = out.top_logprobs.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![1, 4, 2]);
+        for &(id, lp) in &out.top_logprobs {
+            assert!((lp - (row[id as usize].to_f32() - lse)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn token_logprob_k_larger_than_vocab() {
+        let row: Vec<bf16> = [0.5f32, -1.0].iter().map(|&v| bf16::from_f32(v)).collect();
+        let out = token_logprob_from_row(&row, 0, 32).unwrap();
+        assert_eq!(out.top_logprobs.len(), 2);
+        assert_eq!(out.top_logprobs[0].0, 0);
+        // log-softmax sums to 1 in probability space.
+        let total: f64 = out
+            .top_logprobs
+            .iter()
+            .map(|&(_, lp)| f64::from(lp).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn token_logprob_f32_input_and_guards() {
+        // The Qwen f32 path plus the empty/out-of-range guards.
+        let row = [0.0f32, 1.0, 2.0];
+        let out = token_logprob_from_row(&row, 2, 2).unwrap();
+        assert_eq!(out.top_logprobs[0].0, 2);
+        assert!(token_logprob_from_row::<f32>(&[], 0, 1).is_none());
+        assert!(token_logprob_from_row(&row, 9, 1).is_none());
+    }
+}

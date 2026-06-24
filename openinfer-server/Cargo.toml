@@ -1,6 +1,7 @@
 [package]
 autobenches = false
 name = "openinfer-server"
+license = "Apache-2.0"
 default-run = "openinfer"
 version = "0.1.0"
 edition = "2024"
@@ -15,15 +16,15 @@ path = "src/main.rs"
 
 [[bin]]
 name = "bench_serving"
-path = "src/bin/bench_serving.rs"
+path = "src/bin/bench_serving/main.rs"
 
 [dependencies]
 openinfer-core = { workspace = true }
 openinfer-deepseek-v2-lite = { workspace = true, optional = true }
 openinfer-deepseek-v4 = { workspace = true, optional = true }
 openinfer-kimi-k2 = { workspace = true, optional = true }
-openinfer-qwen3-4b = { workspace = true }
-openinfer-qwen35-4b = { workspace = true }
+openinfer-qwen3-4b = { workspace = true, optional = true }
+openinfer-qwen35-4b = { workspace = true, optional = true }
 openinfer-vllm-frontend = { workspace = true }
 openinfer-vllm-support = { workspace = true }
 anyhow = { workspace = true }
@@ -37,6 +38,7 @@ log = { workspace = true }
 logforth = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 vllm-text = { workspace = true }
@@ -45,7 +47,11 @@ vllm-text = { workspace = true }
 tikv-jemallocator = "0.6"
 
 [features]
-default = []
+# Qwen3-4B is the default model line: pure Rust + CUDA, no Python at build time.
+default = ["qwen3-4b"]
+qwen3-4b = ["dep:openinfer-qwen3-4b"]
+# Qwen3.5 pulls in the Triton AOT kernels (Python + Triton at build time).
+qwen35-4b = ["dep:openinfer-qwen35-4b", "openinfer-qwen35-4b/qwen35-4b"]
 deepseek-v4 = ["dep:openinfer-deepseek-v4", "openinfer-deepseek-v4/deepseek-v4"]
 deepseek-v2-lite = ["dep:openinfer-deepseek-v2-lite", "openinfer-deepseek-v2-lite/deepseek-v2-lite"]
 kimi-k2 = ["dep:openinfer-kimi-k2", "openinfer-kimi-k2/kimi-k2"]
@@ -55,16 +61,5 @@ deepseek-v4-cutedsl-diagnostic = [
     "openinfer-deepseek-v4/deepseek-v4-cutedsl-diagnostic",
 ]
 
-[dev-dependencies]
-criterion = { workspace = true }
-
 [lints]
 workspace = true
-
-[[bench]]
-name = "ops_bench"
-harness = false
-
-[[bench]]
-name = "nccl_bench"
-harness = false

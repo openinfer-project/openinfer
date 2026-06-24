@@ -1,5 +1,6 @@
 [package]
 name = "openinfer-kimi-k2"
+license = "Apache-2.0"
 version = "0.1.0"
 edition = "2024"
 autobenches = false
@@ -18,6 +19,7 @@ memmap2 = { workspace = true }
 openinfer-bench = { workspace = true }
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 openinfer-kv-cache = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }

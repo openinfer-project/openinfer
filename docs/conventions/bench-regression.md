@@ -14,14 +14,19 @@ Regressions are only meaningful when comparing the **same GPU** across commits. 
 
 ## Standard Profiles
 
-| Name | prompt_len | output_len | Key metric |
-|------|-----------|------------|------------|
-| prefill_heavy | model-dependent | 1 | TTFT |
-| decode_heavy | 1024 | 256 | TPOT (steady, excluding first decode step) |
+| Name | prompt_len | output_len | Key metric | Gated? |
+|------|-----------|------------|------------|--------|
+| prefill_heavy | model-dependent | 1 | TTFT | yes |
+| decode_heavy | 1024 | 256 | TPOT (steady, excluding first decode step) | yes |
+| mixed_itl | 4096 inj / 512 bg | 1 inj / 1024 bg | background decode ITL p50/p99 | **no** |
+
+The `mixed_itl` row carries two values per column because the profile runs two request kinds at once: `inj` is the injected long prompt that triggers the stall, `bg` is each of the background decode streams it stalls. So `4096 inj / 512 bg` = a 4096-token injection over 512-token background prompts, and `1 inj / 1024 bg` = the injection emits 1 token (prefill-only) while each background stream decodes up to 1024.
 
 Prefill prompt length is model-dependent: Qwen3 uses 10000 tokens, Qwen3.5 uses 4000 (HD256 attention needs ~4x working memory vs HD128, OOMs at 10k on 16 GB GPUs). `compare` checks shape consistency within the same model — if you change the constants, it will error until you re-baseline.
 
 `prefill_heavy` with `output_len=1` produces no steady decode steps: `steady_tpot_ms` is `null` in the JSON. This is expected.
+
+`mixed_itl` captures the [mixed-load ITL stall](../benchmarks/mixed-load-itl.md) (#244): a 4k **cold** prompt arriving at 0.5 req/s into a 4-way decode-heavy steady state, with its own decode-only baseline. It runs only for scheduler-backed models (absent on the deepseek generator path). `compare` prints its p50/p99 delta for context but **does not gate on it** — the stall tail is thermally and run-to-run noisy, so a threshold would fire on variance. Use it as a tracked, eyeballed trend, not a pass/fail.
 
 ## Workflow
 
@@ -109,6 +114,18 @@ Filename: `bench_snapshots/{gpu-slug}/{model}.json`. GPU slug is derived from `n
       "generated_tokens":     { "min": 256, "max": 256, "avg": 256.0, "samples": 20 },
       "request_tok_s":        0.0,
       "decode_tok_s":         0.0
+    }
+  },
+  "mixed_itl": {                            // omitted for non-scheduler-backed models
+    "config": { "bg_prompt_len": 512, "bg_concurrency": 4, "bg_output_len": 1024,
+                "inj_prompt_len": 4096, "inj_output_len": 1, "qps": 0.5,
+                "num_injections": 5, "inj_warm_frac": 0.0, "warmup": 5, "seed": 42 },
+    "baseline_itl": { "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "p99_ms": 0, "max_ms": 0, "samples": 0 },
+    "itl": {
+      "all":    { "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "p99_ms": 0, "max_ms": 0, "samples": 0 },
+      "steady": { "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "p99_ms": 0, "max_ms": 0, "samples": 0 },
+      "stall":  { "avg_ms": 0, "p50_ms": 0, "p95_ms": 0, "p99_ms": 0, "max_ms": 0, "samples": 0 },
+      "stall_gap_count": 0, "total_gap_count": 0
     }
   }
 }

@@ -2,11 +2,14 @@ use std::{
     error::Error,
     fmt,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
@@ -69,7 +72,10 @@ pub struct GenerateRequest {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
-    pub token_tx: mpsc::UnboundedSender<TokenEvent>,
+    /// Where the scheduler emits this request's `TokenEvent`s. All requests on
+    /// one engine share a single tagged output channel behind this sink (see
+    /// [`TokenSink`]); the frontend demuxes by tag.
+    pub token_tx: TokenSink,
     pub logprobs: usize,
     pub echo: bool,
 }
@@ -134,6 +140,9 @@ pub enum TokenEvent {
         queued_at_unix_s: f64,
         scheduled_at_unix_s: f64,
         prompt_tokens: usize,
+        /// Prompt tokens served from the prefix cache (0 when the engine has
+        /// no prefix cache or the value is not known at emit time).
+        cached_tokens: usize,
     },
     Token {
         id: u32,
@@ -160,10 +169,182 @@ pub enum TokenEvent {
     },
 }
 
+/// The tag that routes a [`TokenEvent`] back to its request on the shared
+/// output channel — the external request id (vLLM's `request_id`). `Arc<str>`
+/// keeps per-event tagging to a refcount bump instead of a string copy.
+pub type RequestTag = Arc<str>;
+
+/// The single output channel an engine dispatches *all* requests' token events
+/// into, each tagged with its [`RequestTag`]. One receiver (the frontend demux
+/// loop) drains it, replacing the former per-request fan-out of N channels and
+/// N consumer tasks — N distinct sleeping consumers cost N wakeups per step,
+/// one shared consumer costs ~1.
+pub type TokenStreamSender = mpsc::UnboundedSender<(RequestTag, TokenEvent)>;
+pub type TokenStreamReceiver = mpsc::UnboundedReceiver<(RequestTag, TokenEvent)>;
+
+/// Per-request handle the scheduler holds to emit [`TokenEvent`]s.
+///
+/// Drop-in for the former `UnboundedSender<TokenEvent>`: it keeps the same
+/// `send` / `is_closed` / `Clone` surface, so scheduler call sites are
+/// unchanged. Internally each event is tagged with the request's
+/// [`RequestTag`] and pushed onto one shared [`TokenStreamSender`].
+///
+/// Cancellation moved from "drop the per-request receiver" to a shared
+/// `cancelled` flag: the frontend aborts a *single* request by flipping its
+/// flag without closing the channel the other requests still use. `send` and
+/// `is_closed` then report that request as gone, so the scheduler retires it on
+/// its next emit — the same *reactive* retirement the old consumer-drop gave,
+/// reached through the flag rather than channel closure. `tx.is_closed()` is
+/// the engine-wide signal (the whole demux is gone); the per-request signal is
+/// the flag. The flag is set with `Release` and read with `Acquire` so the
+/// abort is ordered against the frontend dropping the request's stream state.
+#[derive(Clone)]
+pub struct TokenSink {
+    tag: RequestTag,
+    tx: TokenStreamSender,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TokenSink {
+    pub fn new(tag: RequestTag, tx: TokenStreamSender, cancelled: Arc<AtomicBool>) -> Self {
+        Self { tag, tx, cancelled }
+    }
+
+    /// Emit one event for this request. Returns `Err` (handing the event back)
+    /// when the request was cancelled or the shared receiver is gone — both of
+    /// which the scheduler reads as "consumer dropped, retire the request",
+    /// the same contract as the old per-request channel.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, event: TokenEvent) -> Result<(), mpsc::error::SendError<TokenEvent>> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(mpsc::error::SendError(event));
+        }
+        self.tx.send((self.tag.clone(), event)).map_err(|err| {
+            let (_, event) = err.0;
+            mpsc::error::SendError(event)
+        })
+    }
+
+    /// `true` once the request is cancelled or the shared receiver is gone.
+    pub fn is_closed(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || self.tx.is_closed()
+    }
+
+    /// The request id this sink tags its events with.
+    pub fn tag(&self) -> &RequestTag {
+        &self.tag
+    }
+
+    /// A sink backed by its own private channel, for direct drivers
+    /// (benchmarks, integration tests, the simulator) that consume one
+    /// request's events without the shared frontend demux. The returned
+    /// receiver yields the tagged events; the cancel flag is never tripped.
+    pub fn standalone() -> (Self, TokenStreamReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = Self::new(Arc::from("local"), tx, Arc::new(AtomicBool::new(false)));
+        (sink, rx)
+    }
+}
+
+/// Seconds since `UNIX_EPOCH` as `f64` — the clock base for `TokenEvent`
+/// timestamps.
+pub fn unix_now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before UNIX_EPOCH")
+        .as_secs_f64()
+}
+
+/// KV pool capacity as the scheduler actually allocates it: whole blocks of
+/// `block_size` tokens. A request of `L` tokens occupies `⌈L / block_size⌉`
+/// blocks no matter how `L` divides, so a fit check must round per request —
+/// summing raw token counts under-counts and can admit a batch that the
+/// scheduler then has to defer. Lets a caller (e.g. the prefill/decode bench)
+/// decide up front whether a batch fits without computing per-token KV by hand.
+#[derive(Clone, Copy, Debug)]
+pub struct KvCapacity {
+    /// Blocks available for requests when the pool is empty.
+    pub total_blocks: usize,
+    /// Tokens per block.
+    pub block_size: usize,
+}
+
+impl KvCapacity {
+    /// Total tokens the pool can hold (`total_blocks × block_size`).
+    #[must_use]
+    pub fn total_tokens(self) -> usize {
+        self.total_blocks.saturating_mul(self.block_size)
+    }
+
+    /// Blocks a single request of `tokens` tokens occupies — whole-block
+    /// allocation rounds up.
+    #[must_use]
+    pub fn blocks_for(self, tokens: usize) -> usize {
+        tokens.div_ceil(self.block_size.max(1))
+    }
+}
+
+/// Live KV-cache occupancy the scheduler republishes after every step.
+///
+/// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
+/// KV router) scores against; `kv_total_blocks` is the engine's whole-pool
+/// capacity (the same number advertised as the servable ceiling), so the
+/// consumer can derive fractional usage without a second query. Carried over a
+/// [`watch`] channel: the scheduler is the sole writer and never blocks on a
+/// reader, and a reader only ever sees the latest snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadSnapshot {
+    pub kv_used_blocks: u64,
+    pub kv_total_blocks: u64,
+}
+
+/// One full KV block that just became reusable from this engine's prefix cache.
+///
+/// The hashes are the *u64* sequence-aware / per-block token hashes a Dynamo KV
+/// router indexes by (`dynamo_tokens::TokenBlock::{sequence_hash, block_hash}`),
+/// kept as plain integers so this contract type stays free of any kvbm/dynamo
+/// dependency. They are NOT the engine's internal 128-bit lineage hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvStoredBlock {
+    /// Chained, sequence-aware block id (dynamo `ExternalSequenceBlockHash`).
+    pub sequence_hash: u64,
+    /// Un-chained per-block token hash (dynamo `LocalBlockHash`); the field a
+    /// prefix-routing radix tree keys its children by.
+    pub tokens_hash: u64,
+}
+
+/// A KV-cache block lifecycle event for an out-of-band cache-aware router.
+///
+/// Emitted only when the engine was built with a KV-event feed wired (off by
+/// default); see [`EngineHandle::take_kv_events`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KvBlockEvent {
+    /// A contiguous run of newly-registered blocks became cacheable. `parent_hash`
+    /// is the sequence hash of the block preceding `blocks[0]` (`None` if the run
+    /// starts the sequence); each later block chains off the previous one.
+    Stored {
+        parent_hash: Option<u64>,
+        blocks: Vec<KvStoredBlock>,
+    },
+    /// A previously-stored block was evicted from this engine's cache.
+    Removed { sequence_hash: u64 },
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<EngineInner>,
     servable_len: Option<u32>,
+    /// KV pool capacity in blocks + block size, or `None` if the engine did not
+    /// report it. See [`KvCapacity`].
+    kv_capacity: Option<KvCapacity>,
+    /// Live KV-load feed, or `None` if the engine did not wire one. Each clone
+    /// of the handle holds its own receiver; `watch` fans out to all of them.
+    load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    /// Block store/remove feed for a cache-aware router, or `None` if not wired.
+    /// `mpsc` (every event matters — unlike the coalescing load feed), so the
+    /// single receiver is handed out exactly once via [`Self::take_kv_events`];
+    /// the shared cell lets all handle clones agree on who took it.
+    kv_events: Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<KvBlockEvent>>>>>,
 }
 
 struct EngineInner {
@@ -212,6 +393,9 @@ impl EngineHandle {
                 join_handle,
             }),
             servable_len: None,
+            kv_capacity: None,
+            load_watch: None,
+            kv_events: None,
         }
     }
 
@@ -223,6 +407,50 @@ impl EngineHandle {
 
     pub fn servable_len(&self) -> Option<u32> {
         self.servable_len
+    }
+
+    #[must_use]
+    pub fn with_kv_capacity(mut self, kv_capacity: KvCapacity) -> Self {
+        self.kv_capacity = Some(kv_capacity);
+        self
+    }
+
+    /// KV pool capacity, if the engine reported it. A batch whose per-request
+    /// block footprint exceeds [`KvCapacity::total_blocks`] cannot be resident
+    /// at once.
+    pub fn kv_capacity(&self) -> Option<KvCapacity> {
+        self.kv_capacity
+    }
+
+    #[must_use]
+    pub fn with_load_watch(mut self, load_watch: watch::Receiver<LoadSnapshot>) -> Self {
+        self.load_watch = Some(load_watch);
+        self
+    }
+
+    /// A receiver for the engine's live KV load, if it wired one. Awaiting
+    /// [`watch::Receiver::changed`] wakes once per scheduler step under load and
+    /// stays quiet when idle, so a consumer republishes on real change rather
+    /// than polling. `None` if the engine reported no load feed.
+    pub fn load_watch(&self) -> Option<watch::Receiver<LoadSnapshot>> {
+        self.load_watch.clone()
+    }
+
+    #[must_use]
+    pub fn with_kv_events(mut self, rx: mpsc::UnboundedReceiver<KvBlockEvent>) -> Self {
+        self.kv_events = Some(Arc::new(Mutex::new(Some(rx))));
+        self
+    }
+
+    /// Take the engine's KV block-event receiver. Returns the receiver on the
+    /// first call and `None` thereafter (there is one stream and one consumer —
+    /// the cache-aware router pump). `None` also if the engine wired no feed.
+    pub fn take_kv_events(&self) -> Option<mpsc::UnboundedReceiver<KvBlockEvent>> {
+        self.kv_events
+            .as_ref()?
+            .lock()
+            .expect("kv-events cell poisoned")
+            .take()
     }
 
     #[allow(clippy::result_large_err)]
@@ -400,10 +628,10 @@ mod tests {
                 assert_eq!(actual, request);
                 response_tx.send(Ok(())).expect("send load result");
             }
-            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter { .. }) => {
-                panic!("expected LoRA load command")
-            }
-            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+            EngineCommand::Control(
+                EngineControlRequest::UnloadLoraAdapter { .. }
+                | EngineControlRequest::ListLoraAdapters { .. },
+            ) => {
                 panic!("expected LoRA load command")
             }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),
@@ -429,10 +657,10 @@ mod tests {
                     .send(Ok(vec!["adapter-a".to_string()]))
                     .expect("send list result");
             }
-            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
-                panic!("expected LoRA list command")
-            }
-            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter { .. }) => {
+            EngineCommand::Control(
+                EngineControlRequest::LoadLoraAdapter { .. }
+                | EngineControlRequest::UnloadLoraAdapter { .. },
+            ) => {
                 panic!("expected LoRA list command")
             }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),
@@ -486,10 +714,10 @@ mod tests {
                 assert_eq!(actual, request);
                 response_tx.send(Ok(())).expect("send unload result");
             }
-            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter { .. }) => {
-                panic!("expected LoRA unload command")
-            }
-            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { .. }) => {
+            EngineCommand::Control(
+                EngineControlRequest::LoadLoraAdapter { .. }
+                | EngineControlRequest::ListLoraAdapters { .. },
+            ) => {
                 panic!("expected LoRA unload command")
             }
             EngineCommand::Generate(_) => panic!("expected LoRA control command"),

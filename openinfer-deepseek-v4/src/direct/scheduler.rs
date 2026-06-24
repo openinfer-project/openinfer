@@ -1179,6 +1179,7 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
         queued_at_unix_s,
         scheduled_at_unix_s,
         prompt_tokens: prompt_len,
+        cached_tokens: 0,
     });
     if req.echo {
         let _ = req.token_tx.send(TokenEvent::PromptTokens {
@@ -1356,6 +1357,7 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
             queued_at_unix_s,
             scheduled_at_unix_s,
             prompt_tokens: prompt_len,
+            cached_tokens: 0,
         });
         if req.echo {
             let _ = req.token_tx.send(TokenEvent::PromptTokens {

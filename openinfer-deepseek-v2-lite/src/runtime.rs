@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 mod backend;
 mod generation;
+mod graph_probe;
 mod helpers;
 mod layers;
 mod moe;
 mod readiness;
+mod routing;
 #[cfg(test)]
 mod tests;
 mod types;

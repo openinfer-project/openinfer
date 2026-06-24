@@ -55,13 +55,18 @@ pub fn trace_decode_kernel_calls(
         budget.block_size,
     );
 
-    // Build dummy RequestKvs with the target kv_len
+    // Build dummy RequestKvs with the target kv_len.
+    //
+    // max_output_tokens must be at least 2: `apply_prefill` emits the first
+    // generated token (counted as 1 toward the budget), and tracing a decode
+    // step needs one more. With max_output_tokens = 1 the sequence is already
+    // complete after prefill, so `schedule_decode` fails with GenerationComplete.
     let dummy_prompt_len = if kv_len > 1 { kv_len - 1 } else { 1 };
-    let mut rkvs = (0..batch_size)
+    let rkvs = (0..batch_size)
         .map(|_| {
             let mut rkv = kv_mgr
                 .pool()
-                .new_request(vec![0; dummy_prompt_len], 1, None);
+                .new_request(vec![0; dummy_prompt_len], 2, None);
             rkv.schedule_prefill(dummy_prompt_len, kv_mgr.pool())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             rkv.apply_prefill(0, kv_mgr.pool())?;
@@ -83,6 +88,7 @@ pub fn trace_decode_kernel_calls(
         kv_mgr.pool().total_blocks(),
         kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
+        model.config().max_position_embeddings,
     )?;
     let token_ids = vec![0_u32; batch_size];
     let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();

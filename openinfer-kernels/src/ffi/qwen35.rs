@@ -1,5 +1,7 @@
 use super::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
+#[cfg(feature = "qwen35-4b")]
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
 
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu; the *_hd256 paged variants live in csrc/shared/paged_attention.cu.
@@ -82,7 +84,13 @@ unsafe extern "C" {
         kernel_size: i32,
         stream: CUstream,
     );
+}
 
+// Chunk-wise GDR prefill kernels, Triton AOT-generated at build time. The
+// `qwen35-4b` feature is what pulls Python + Triton into the build; without it
+// these symbols don't exist.
+#[cfg(feature = "qwen35-4b")]
+unsafe extern "C" {
     pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,
         b_proj: *const Half,
@@ -179,7 +187,9 @@ unsafe extern "C" {
         scale: f32,
         stream: CUstream,
     ) -> CUresult;
+}
 
+unsafe extern "C" {
     // Paged attention decode for HEAD_DIM=256 (Qwen3.5-4B full-attention layers).
     pub fn paged_attention_decode_cuda_hd256(
         q: *const Half,

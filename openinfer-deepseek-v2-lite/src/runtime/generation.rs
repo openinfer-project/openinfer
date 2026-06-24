@@ -1,6 +1,7 @@
 use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result, ensure};
+use log::{debug, info};
 use openinfer_engine::engine::{EngineLoadOptions, FinishReason};
 
 use super::{
@@ -22,19 +23,66 @@ use crate::{
 
 impl DeepSeekV2LiteEp2Generator {
     pub fn load(model_path: &Path, options: EngineLoadOptions) -> Result<Self> {
+        let started = Instant::now();
+        info!(
+            "resolving DeepSeek-V2-Lite EP2 startup: model_path={}, devices={:?}, cuda_graph={}",
+            model_path.display(),
+            options.device_ordinals,
+            options.enable_cuda_graph
+        );
+
+        let config_started = Instant::now();
         let config = Config::from_model_dir(model_path)?;
+        let moe_layers = (0..config.num_hidden_layers)
+            .filter(|&layer| config.is_moe_layer(layer))
+            .count();
+        info!(
+            "build DeepSeek-V2-Lite config cost {:.2}s: layers={}, moe_layers={}, hidden_size={}, routed_experts={}",
+            config_started.elapsed().as_secs_f64(),
+            config.num_hidden_layers,
+            moe_layers,
+            config.hidden_size,
+            config.n_routed_experts
+        );
         ensure!(
             !options.enable_cuda_graph,
             "DeepSeek-V2-Lite EP=2 first gate requires cuda_graph disabled"
         );
         let backend_kind = validate_backend_and_devices(&options.device_ordinals)?;
+        info!(
+            "validated DeepSeek-V2-Lite EP2 startup: backend={}, devices={:?}",
+            backend_kind.as_str(),
+            options.device_ordinals
+        );
 
+        let manifest_started = Instant::now();
+        info!("start validate DeepSeek-V2-Lite weight manifest");
         let rank0_layout = ExpertParallelConfig::ep2(0).validate_for(&config)?;
         let rank1_layout = ExpertParallelConfig::ep2(1).validate_for(&config)?;
         let manifest = ModelManifest::from_model_dir(model_path)?;
-        manifest.validate_rank_plan(&RankLoadPlan::for_driver_rank(&config, &rank0_layout))?;
-        manifest.validate_rank_plan(&RankLoadPlan::for_expert_rank(&config, &rank1_layout))?;
+        let rank0_plan = RankLoadPlan::for_driver_rank(&config, &rank0_layout);
+        let rank1_plan = RankLoadPlan::for_expert_rank(&config, &rank1_layout);
+        manifest.validate_rank_plan(&rank0_plan)?;
+        manifest.validate_rank_plan(&rank1_plan)?;
+        info!(
+            "validate DeepSeek-V2-Lite weight manifest cost {:.2}s: tensors={}, rank0_tensors={}, rank1_tensors={}",
+            manifest_started.elapsed().as_secs_f64(),
+            manifest.tensor_count(),
+            rank0_plan.tensor_count(),
+            rank1_plan.tensor_count()
+        );
+        debug!(
+            "DeepSeek-V2-Lite EP2 load plan detail: rank0_experts={:?}, rank1_experts={:?}",
+            rank0_layout.owned_experts(),
+            rank1_layout.owned_experts()
+        );
 
+        let rank0_started = Instant::now();
+        info!(
+            "start initialize DeepSeek-V2-Lite EP rank 0 model: device={}, tensors={}",
+            options.device_ordinals[0],
+            rank0_plan.tensor_count()
+        );
         let rank0 = DriverRankModel::load(
             model_path,
             &config,
@@ -42,6 +90,17 @@ impl DeepSeekV2LiteEp2Generator {
             options.device_ordinals[0],
         )
         .context("load DeepSeek-V2-Lite EP rank 0")?;
+        info!(
+            "initialize DeepSeek-V2-Lite EP rank 0 model cost {:.2}s",
+            rank0_started.elapsed().as_secs_f64()
+        );
+
+        let rank1_started = Instant::now();
+        info!(
+            "start initialize DeepSeek-V2-Lite EP rank 1 model: device={}, tensors={}",
+            options.device_ordinals[1],
+            rank1_plan.tensor_count()
+        );
         let rank1 = ExpertRankModel::load(
             model_path,
             &config,
@@ -49,7 +108,26 @@ impl DeepSeekV2LiteEp2Generator {
             options.device_ordinals[1],
         )
         .context("load DeepSeek-V2-Lite EP rank 1")?;
+        info!(
+            "initialize DeepSeek-V2-Lite EP rank 1 model cost {:.2}s",
+            rank1_started.elapsed().as_secs_f64()
+        );
+
+        let backend_started = Instant::now();
+        info!(
+            "start init DeepSeek-V2-Lite EP backend: backend={}, ranks=2",
+            backend_kind.as_str()
+        );
         let backend = EpBackendRuntime::new(backend_kind, &rank0.ctx, &rank1.ctx)?;
+        info!(
+            "init DeepSeek-V2-Lite EP backend cost {:.2}s: backend={}",
+            backend_started.elapsed().as_secs_f64(),
+            backend.kind().as_str()
+        );
+        info!(
+            "DeepSeek-V2-Lite EP2 generator loaded cost {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
 
         Ok(Self {
             model_path: model_path.to_path_buf(),
@@ -85,6 +163,21 @@ impl DeepSeekV2LiteEp2Generator {
             &mut attribution,
         )?;
         Ok((result, attribution))
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) fn new_generation_stats(&self, prompt_tokens: usize) -> GenerationStats {
+        GenerationStats {
+            model_path: self.model_path.clone(),
+            device_ordinals: self.device_ordinals.clone(),
+            ep_backend: self.backend.kind().as_str().to_string(),
+            ep_size: 2,
+            prompt_tokens,
+            ..GenerationStats::default()
+        }
     }
 
     pub fn generate_greedy_batch_same_prompt_with_timings(
@@ -152,14 +245,7 @@ impl DeepSeekV2LiteEp2Generator {
         );
 
         let generation_start = Instant::now();
-        let mut stats = GenerationStats {
-            model_path: self.model_path.clone(),
-            device_ordinals: self.device_ordinals.clone(),
-            ep_backend: self.backend.kind().as_str().to_string(),
-            ep_size: 2,
-            prompt_tokens: prompt_tokens.len() * batch_size,
-            ..GenerationStats::default()
-        };
+        let mut stats = self.new_generation_stats(prompt_tokens.len() * batch_size);
         let mut caches: Vec<_> = (0..batch_size)
             .map(|_| DecodeCache::new(&self.config))
             .collect();
@@ -241,14 +327,7 @@ impl DeepSeekV2LiteEp2Generator {
             max_new_tokens
         );
 
-        let mut stats = GenerationStats {
-            model_path: self.model_path.clone(),
-            device_ordinals: self.device_ordinals.clone(),
-            ep_backend: self.backend.kind().as_str().to_string(),
-            ep_size: 2,
-            prompt_tokens: prompt_tokens.len(),
-            ..GenerationStats::default()
-        };
+        let mut stats = self.new_generation_stats(prompt_tokens.len());
 
         let mut cache = DecodeCache::new(&self.config);
         let mut generated = Vec::with_capacity(max_new_tokens);
@@ -292,7 +371,7 @@ impl DeepSeekV2LiteEp2Generator {
         })
     }
 
-    fn prefill_next_token(
+    pub(crate) fn prefill_next_token(
         &mut self,
         prompt_tokens: &[u32],
         cache: &mut DecodeCache,
@@ -318,7 +397,7 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
-    fn decode_next_token(
+    pub(crate) fn decode_next_token(
         &mut self,
         token: u32,
         position: usize,
@@ -354,7 +433,7 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
-    fn decode_next_tokens_batch(
+    pub(crate) fn decode_next_tokens_batch(
         &mut self,
         tokens: &[u32],
         position: usize,

@@ -57,6 +57,7 @@ pub struct DecodeGraphReadinessReport {
     pub(super) metrics: DecodeGraphReadinessMetrics,
     pub(super) nccl_graph_smoke_requested: bool,
     pub(super) nccl_graph_smoke: Option<NcclGraphSmokeReport>,
+    pub(super) full_decode_graph_probe: FullDecodeGraphProbeReport,
     pub(super) claim_boundary: &'static str,
 }
 
@@ -65,6 +66,21 @@ pub(super) struct DecodeGraphBlocker {
     pub(super) id: &'static str,
     pub(super) source: &'static str,
     pub(super) reason: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct FullDecodeGraphProbeReport {
+    pub(super) requested: bool,
+    pub(super) captured: bool,
+    pub(super) instantiated: bool,
+    pub(super) replayed: bool,
+    pub(super) verified: bool,
+    pub(super) replay_count: usize,
+    pub(super) verified_replay_count: usize,
+    pub(super) failure_stage: &'static str,
+    pub(super) failure_summary: Option<String>,
+    pub(super) blockers: Vec<DecodeGraphBlocker>,
+    pub(super) capture_mode: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -88,7 +104,11 @@ impl DecodeGraphReadinessReport {
     }
 
     pub fn blocker_count(&self) -> usize {
-        self.blockers.len()
+        if self.full_decode_graph_probe.blockers.is_empty() {
+            self.blockers.len()
+        } else {
+            self.full_decode_graph_probe.blockers.len()
+        }
     }
 
     pub fn nccl_graph_smoke_status(&self) -> &'static str {
@@ -102,7 +122,43 @@ impl DecodeGraphReadinessReport {
             .as_ref()
             .map_or("not_run", NcclGraphSmokeReport::coverage_status)
     }
+
+    pub fn full_decode_graph_probe_status(&self) -> &'static str {
+        self.full_decode_graph_probe.coverage_status()
+    }
 }
+
+impl FullDecodeGraphProbeReport {
+    pub(super) fn ready(&self) -> bool {
+        self.captured
+            && self.instantiated
+            && self.replayed
+            && self.verified
+            && self.replay_count > 0
+            && self.verified_replay_count == self.replay_count
+    }
+
+    pub(super) fn coverage_status(&self) -> &'static str {
+        if self.ready() {
+            "captured_replayed_verified"
+        } else if !self.requested {
+            "not_requested"
+        } else if !self.blockers.is_empty() {
+            "blocked_preflight"
+        } else if self.verified {
+            "verified_but_incomplete"
+        } else if self.replayed {
+            "replayed_but_not_verified"
+        } else if self.instantiated {
+            "instantiated_but_not_replayed"
+        } else if self.captured {
+            "captured_but_not_instantiated"
+        } else {
+            "failed"
+        }
+    }
+}
+
 impl GenerationStats {
     pub(super) fn record_routes(
         &mut self,

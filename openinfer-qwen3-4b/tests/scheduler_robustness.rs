@@ -4,9 +4,12 @@
 //! this test owns the one thing that gate does not — that the scheduler keeps
 //! running when a client hangs up mid-flight. We submit a request, drop its
 //! receiver immediately, and assert the engine retires that request cleanly and
-//! still serves the next one. It drives the real engine (`start_engine` +
-//! `submit`) rather than a mocked scheduler, so it exercises the actual
-//! send-failure retirement path.
+//! still serves the next one. It drives the real engine + `submit` rather than a
+//! mocked scheduler, so it exercises the actual send-failure retirement path.
+//!
+//! Started via the `--batch-invariant` builder, it also checks that the flag sets
+//! the pin policy before serving. CUDA-graph pin behavior is covered by
+//! `batch_invariance_decode_gemm_graph`.
 //!
 //! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when the model is
 //! absent (point `OPENINFER_TEST_MODEL_PATH` at the weights to run it).
@@ -14,9 +17,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
+};
 use openinfer_core::sampler::SamplingParams;
-use tokio::sync::mpsc;
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy, pin_counters, reset_pin_counters};
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -46,7 +51,7 @@ fn generate_text(
     max_tokens: usize,
 ) -> String {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut rx) = mpsc::unbounded_channel();
+    let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
             request_id: None,
@@ -63,7 +68,7 @@ fn generate_text(
 
     let mut tokens = Vec::new();
     loop {
-        match rx.blocking_recv() {
+        match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
@@ -84,7 +89,7 @@ fn scheduler_survives_consumer_drop() {
         return;
     };
 
-    let handle = openinfer_qwen3_4b::start_engine(
+    let handle = openinfer_qwen3_4b::start_engine_with_offload(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
@@ -93,14 +98,27 @@ fn scheduler_survives_consumer_drop() {
             seed: 42,
             ..EngineLoadOptions::default()
         },
+        openinfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
+        true,
+        openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS,
+        openinfer_qwen3_4b::Qwen3MemoryOptions::default(),
+        openinfer_qwen3_4b::DecodeOverlap::Off,
+        true,
+        None,
+        false,
     )
     .expect("failed to start engine");
+    assert_eq!(
+        numeric_policy(),
+        NumericPolicy::Pin,
+        "--batch-invariant did not reach the pin policy before serving"
+    );
     let tokenizer = common::load_tokenizer(&model_path);
 
     // Submit, then drop the receiver immediately — the scheduler should notice
     // the send failures and retire the request rather than spinning on it.
     let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
-    let (token_tx, rx) = mpsc::unbounded_channel();
+    let (token_tx, rx) = TokenSink::standalone();
     drop(rx);
     handle
         .submit(GenerateRequest {
@@ -117,7 +135,27 @@ fn scheduler_survives_consumer_drop() {
         .expect("submit failed");
     std::thread::sleep(Duration::from_millis(500));
 
-    // The engine must still serve a fresh request after the orphan is retired.
+    // Barrier: drain the dropped orphan before the counted runs (else its prefill leaks into prefill_served).
+    let _ = generate_text(&handle, &tokenizer, "Hello", 1);
+
+    reset_pin_counters();
+    let _ = generate_text(&handle, &tokenizer, "Hello", 1);
+    let (prefill_served, _) = pin_counters();
+
+    reset_pin_counters();
     let text = generate_text(&handle, &tokenizer, "Hello", 5);
+    let (full_served, fallback) = pin_counters();
+    eprintln!(
+        "[scheduler-robustness] pin served: prefill={prefill_served} full={full_served} fallback={fallback}"
+    );
+
     assert!(!text.is_empty(), "scheduler dead after consumer drop");
+    assert!(
+        full_served > prefill_served,
+        "pin served no decode GEMM beyond prefill (prefill={prefill_served} full={full_served}) — flag→builder→graph-capture may be broken"
+    );
+    assert_eq!(
+        fallback, 0,
+        "Pin fell back during serving (fallback={fallback})"
+    );
 }

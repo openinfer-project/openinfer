@@ -18,7 +18,52 @@ use openinfer_core::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
     load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
+use openinfer_kv_cache::KvBuffer;
 
+use crate::batch_decode_buffers::BatchDecodeBuffers;
+
+pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
+pub const DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES: usize = 150 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Qwen3MemoryOptions {
+    /// Mirrors vLLM's `gpu_memory_utilization`: the KV pool gets what remains
+    /// inside this requested budget after weights, profiled non-KV runtime
+    /// memory, and a small safety margin are accounted for.
+    pub gpu_memory_utilization: f64,
+    /// Extra bytes held back after the profile result to cover allocator
+    /// fragmentation and small unprofiled runtime drift.
+    pub kv_cache_memory_margin_bytes: usize,
+}
+
+impl Qwen3MemoryOptions {
+    pub const fn new(gpu_memory_utilization: f64, kv_cache_memory_margin_bytes: usize) -> Self {
+        Self {
+            gpu_memory_utilization,
+            kv_cache_memory_margin_bytes,
+        }
+    }
+
+    pub fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            self.gpu_memory_utilization > 0.0 && self.gpu_memory_utilization <= 1.0,
+            "gpu_memory_utilization must be in (0, 1], got {}",
+            self.gpu_memory_utilization
+        );
+        Ok(self)
+    }
+}
+
+impl Default for Qwen3MemoryOptions {
+    fn default() -> Self {
+        Self {
+            gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
+            kv_cache_memory_margin_bytes: DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct KvBudget {
     pub(crate) num_layers: usize,
     pub(crate) num_kv_heads: usize,
@@ -163,7 +208,7 @@ impl PackedLoraProjection {
         )
         .map_err(|e| anyhow::anyhow!("packed LoRA B copy failed: {e}"))?;
 
-        let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
+        let mut scale_slot = self.scales.slice_mut(slot..=slot);
         ctx.stream
             .memcpy_htod(&[scale], &mut scale_slot)
             .map_err(|e| anyhow::anyhow!("packed LoRA scale copy failed: {e}"))?;
@@ -193,7 +238,7 @@ impl PackedLoraProjection {
             .memcpy_htod(&zero_b, &mut b_dst)
             .map_err(|e| anyhow::anyhow!("packed LoRA B clear failed: {e}"))?;
 
-        let mut scale_slot = self.scales.slice_mut(slot..slot + 1);
+        let mut scale_slot = self.scales.slice_mut(slot..=slot);
         ctx.stream
             .memcpy_htod(&[0.0f32], &mut scale_slot)
             .map_err(|e| anyhow::anyhow!("packed LoRA scale clear failed: {e}"))?;
@@ -533,6 +578,8 @@ impl Qwen3Model {
             "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
+        drop(shards);
+        drop(mmaps);
 
         let num_hidden_layers = config.num_hidden_layers;
         let model = Self {
@@ -829,34 +876,220 @@ impl Qwen3Model {
         Ok(())
     }
 
-    /// KV cache geometry and budget for the executor to create a KvCacheManager.
+    /// KV cache geometry and budget for kernel-call tracing.
+    #[cfg(feature = "kernel-call-trace")]
     pub(crate) fn kv_budget(&self) -> KvBudget {
-        let page_size = 16;
-        let num_kv_heads = self.local_num_key_value_heads();
-        let layout = openinfer_kv_cache::KvLayout::new(
-            self.config.num_hidden_layers,
-            num_kv_heads,
-            self.config.head_dim,
-            page_size,
-        );
-        let bytes_per_block = layout.page_stride * std::mem::size_of::<half::bf16>();
+        let geometry = self.kv_budget_geometry();
+        let bytes_per_block = self.kv_bytes_per_block(&geometry);
         let (free_bytes, _) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo failed");
         let kv_budget_bytes = (free_bytes as f64 * 0.85) as usize;
-        let num_blocks = (kv_budget_bytes / bytes_per_block).max(64);
-        let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
-        log::info!(
-            "KV cache: {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free)",
-            kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
-            free_bytes as f64 / 1024.0 / 1024.0
+        self.kv_budget_from_bytes(
+            geometry,
+            bytes_per_block,
+            0,
+            kv_budget_bytes,
+            free_bytes,
+            "heuristic",
+        )
+    }
+
+    pub(crate) fn profiled_kv_budget(
+        &self,
+        max_prefill_tokens: usize,
+        max_decode_batch_size: usize,
+        dflash_kv_bytes_per_token: usize,
+        memory_options: Qwen3MemoryOptions,
+    ) -> Result<KvBudget> {
+        let memory_options = memory_options.validate()?;
+        let geometry = self.kv_budget_geometry();
+        let bytes_per_block = self.kv_bytes_per_block(&geometry);
+        let (initial_free_bytes, total_bytes) = mem_info_bytes()?;
+        let requested_bytes =
+            (total_bytes as f64 * memory_options.gpu_memory_utilization).ceil() as usize;
+        let initial_used_bytes = total_bytes.saturating_sub(initial_free_bytes);
+        anyhow::ensure!(
+            initial_used_bytes < requested_bytes,
+            "Qwen3 requested GPU memory is already exhausted before KV allocation: \
+             used={} MiB, requested={} MiB (utilization {:.2})",
+            initial_used_bytes / (1024 * 1024),
+            requested_bytes / (1024 * 1024),
+            memory_options.gpu_memory_utilization
         );
+
+        anyhow::ensure!(
+            max_prefill_tokens > 0,
+            "Qwen3 memory profile requires positive max_prefill_tokens"
+        );
+        let profile_prefill_rows = 1;
+        let profile_decode_rows = max_decode_batch_size.saturating_sub(profile_prefill_rows);
+        anyhow::ensure!(
+            profile_decode_rows > 0,
+            "Qwen3 memory profile requires decode capacity above prefill rows"
+        );
+        let profile_rows = profile_prefill_rows + profile_decode_rows;
+        let profile_blocks =
+            profile_temp_blocks(max_prefill_tokens, profile_decode_rows, geometry.block_size);
+        let profile_kv_bytes = profile_blocks * bytes_per_block;
+        let mut peak_used_bytes = initial_used_bytes;
+        let mut record_peak = || -> Result<()> {
+            let (free_bytes, total_bytes) = mem_info_bytes()?;
+            peak_used_bytes = peak_used_bytes.max(total_bytes.saturating_sub(free_bytes));
+            Ok(())
+        };
+
+        let profile_kv = KvBuffer::new(
+            &self.ctx.stream,
+            geometry.num_layers,
+            geometry.num_kv_heads,
+            geometry.head_dim,
+            geometry.block_size,
+            profile_blocks,
+        )
+        .context("Qwen3 memory profile temp KV alloc failed")?;
+        record_peak()?;
+
+        let mut decode_bufs = BatchDecodeBuffers::new(
+            self.device_ctx(),
+            self.config.hidden_size,
+            self.local_q_dim(),
+            self.local_kv_dim(),
+            self.local_intermediate_size(),
+            self.config.vocab_size,
+            max_decode_batch_size,
+            profile_blocks,
+            0,
+            self.local_num_attention_heads(),
+            self.config.max_position_embeddings,
+        )
+        .context("Qwen3 memory profile decode buffer alloc failed")?;
+        record_peak()?;
+
+        let mut sample_scratch = openinfer_sample::SampleScratch::new(
+            self.device_ctx(),
+            self.config.vocab_size,
+            profile_rows,
+        )
+        .context("Qwen3 memory profile sampling scratch alloc failed")?;
+        record_peak()?;
+
+        self.profile_unified_step_memory(
+            max_prefill_tokens,
+            profile_decode_rows,
+            &profile_kv,
+            &mut decode_bufs,
+            &mut sample_scratch,
+            &mut record_peak,
+        )?;
+        record_peak()?;
+
+        // `peak_used_bytes` includes the temporary KV buffer used only to make
+        // the dummy step legal. The final KV pool is sized separately below, so
+        // remove that profile-only backing store from the measured non-KV peak.
+        let profile_peak_increase = peak_used_bytes.saturating_sub(initial_used_bytes);
+        let non_kv_peak_increase = profile_peak_increase.saturating_sub(profile_kv_bytes);
+        let non_kv_bytes = initial_used_bytes
+            .saturating_add(non_kv_peak_increase)
+            .saturating_add(memory_options.kv_cache_memory_margin_bytes);
+        anyhow::ensure!(
+            requested_bytes > non_kv_bytes,
+            "Qwen3 memory profile leaves no room for KV cache: requested={} MiB, \
+             non_kv={} MiB, margin={} MiB",
+            requested_bytes / (1024 * 1024),
+            non_kv_bytes / (1024 * 1024),
+            memory_options.kv_cache_memory_margin_bytes / (1024 * 1024)
+        );
+        let kv_budget_bytes = requested_bytes - non_kv_bytes;
+        let min_kv_bytes = 64 * bytes_per_block;
+        anyhow::ensure!(
+            kv_budget_bytes >= min_kv_bytes,
+            "Qwen3 memory profile leaves too little KV cache: available={} MiB, minimum={} MiB",
+            kv_budget_bytes / (1024 * 1024),
+            min_kv_bytes / (1024 * 1024)
+        );
+        log::info!(
+            "memory profile: total={} MiB requested={} MiB ({:.0}%) initial_used={} MiB \
+             peak_non_kv_increase={} MiB margin={} MiB -> KV budget={} MiB",
+            total_bytes / (1024 * 1024),
+            requested_bytes / (1024 * 1024),
+            memory_options.gpu_memory_utilization * 100.0,
+            initial_used_bytes / (1024 * 1024),
+            non_kv_peak_increase / (1024 * 1024),
+            memory_options.kv_cache_memory_margin_bytes / (1024 * 1024),
+            kv_budget_bytes / (1024 * 1024),
+        );
+        Ok(self.kv_budget_from_bytes(
+            geometry,
+            bytes_per_block,
+            dflash_kv_bytes_per_token,
+            kv_budget_bytes,
+            initial_free_bytes,
+            "profiled",
+        ))
+    }
+
+    fn kv_budget_geometry(&self) -> KvBudget {
+        let page_size = 16;
+        let num_kv_heads = self.local_num_key_value_heads();
         KvBudget {
             num_layers: self.config.num_hidden_layers,
             num_kv_heads,
             head_dim: self.config.head_dim,
             block_size: page_size,
-            num_blocks,
+            num_blocks: 0,
         }
     }
+
+    fn kv_bytes_per_block(&self, geometry: &KvBudget) -> usize {
+        let layout = openinfer_kv_cache::KvLayout::new(
+            geometry.num_layers,
+            geometry.num_kv_heads,
+            geometry.head_dim,
+            geometry.block_size,
+        );
+        layout.page_stride * std::mem::size_of::<half::bf16>()
+    }
+
+    fn kv_budget_from_bytes(
+        &self,
+        mut geometry: KvBudget,
+        bytes_per_block: usize,
+        dflash_kv_bytes_per_token: usize,
+        kv_budget_bytes: usize,
+        free_bytes: usize,
+        source: &'static str,
+    ) -> KvBudget {
+        // DFlash keeps its own per-request KV (plus prompt-scaling scratch) outside
+        // the paged pool, scaling with the same token count. Charge it as extra
+        // bytes per pool token so the target block count shrinks to leave room; the
+        // pool itself is still allocated at the target-only `bytes_per_block`.
+        let effective_bytes_per_block =
+            bytes_per_block + dflash_kv_bytes_per_token * geometry.block_size;
+        let num_blocks = (kv_budget_bytes / effective_bytes_per_block).max(64);
+        let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
+        log::info!(
+            "KV cache ({source}): {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+            kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
+            free_bytes as f64 / 1024.0 / 1024.0
+        );
+        geometry.num_blocks = num_blocks;
+        geometry
+    }
+}
+
+fn mem_info_bytes() -> Result<(usize, usize)> {
+    let (free, total) = cudarc::driver::result::mem_get_info()
+        .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e:?}"))?;
+    Ok((free, total))
+}
+
+fn profile_temp_blocks(
+    max_prefill_tokens: usize,
+    profile_decode_rows: usize,
+    block_size: usize,
+) -> usize {
+    // Block 0 is reserved as the decode padding block. Worst-case scheduling can
+    // run one max-sized prefill row plus the remaining decode rows.
+    1 + max_prefill_tokens.div_ceil(block_size) + profile_decode_rows
 }
 
 fn install_lora_adapter_in_registry(

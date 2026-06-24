@@ -1,8 +1,26 @@
 # Qwen3.5-4B Model Crate
 
 **Created**: 2026-05-05
-**TL;DR**: `openinfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. Root `openinfer` loads Qwen3.5 through `openinfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `openinfer::model::Qwen35Model` or `openinfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+**TL;DR**: `openinfer-qwen35-4b` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. The whole crate is behind the `qwen35-4b` feature (`--features qwen35-4b` on `openinfer-server`) because its GDR prefill kernels are Triton AOT-generated — this keeps the default Qwen3 build Python-free. Root `openinfer` loads Qwen3.5 through `openinfer_qwen35_4b::start_engine(...)` / generic `EngineHandle`; root no longer exposes `openinfer::model::Qwen35Model` or `openinfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 **Last touched**: 2026-06
+
+## Feature gate (2026-06)
+
+Qwen3.5 is the only model line whose kernels need Python at build time (Triton
+AOT for the GDR chunkwise prefill). To make the stock build pure Rust + CUDA,
+the crate is feature-gated end to end:
+
+- `openinfer-kernels/qwen35-4b` gates the Triton AOT build step and the GDR
+  chunk FFI declarations — without it, `build.rs` never probes for Python.
+- `openinfer-qwen35-4b` compiles to an empty crate without its `qwen35-4b`
+  feature (crate-root `#![cfg]`), so `cargo test --workspace --lib` stays
+  Python-free; its tests/benches carry `required-features` and fail with an
+  actionable message instead of a link error.
+- `openinfer-server` defaults to `qwen3-4b` only; serve Qwen3.5 with
+  `cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B`.
+
+The unused Triton HD256 prefill kernel (replaced by the native paged
+`batch_prefill_paged_cuda_hd256`) was deleted in the same change.
 
 ## Preparation
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import threading
 import unittest
@@ -23,8 +24,13 @@ SPEC.loader.exec_module(bench_http_serving)
 
 class DoneOnlyHandler(BaseHTTPRequestHandler):
     response_body = b"data: [DONE]\n\n"
+    request_bodies: list[dict[str, object]] = []
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API.
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b""
+        if raw_body:
+            self.request_bodies.append(json.loads(raw_body.decode("utf-8")))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -37,6 +43,7 @@ class DoneOnlyHandler(BaseHTTPRequestHandler):
 class BenchHttpServingTests(unittest.TestCase):
     def setUp(self) -> None:
         DoneOnlyHandler.response_body = b"data: [DONE]\n\n"
+        DoneOnlyHandler.request_bodies = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), DoneOnlyHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -113,6 +120,53 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status, 200)
         self.assertIn("SSE error: generation failed", result.error or "")
+
+    def test_mixed_sampling_payload_alternates_greedy_and_sampled_profiles(self) -> None:
+        DoneOnlyHandler.response_body = (
+            b'data: {"choices":[{"text":"x","finish_reason":null}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "base_url": f"http://{self.url.hostname}:{self.url.port}",
+                "model": "fake-model",
+                "num_requests": 4,
+                "concurrency": 4,
+                "warmup": 0,
+                "prompt_words": [1],
+                "max_tokens": [1],
+                "temperature": 0.0,
+                "top_k": -1,
+                "top_p": 1.0,
+                "sampling_mode": "mixed-greedy-sampled",
+                "sample_temperature": 0.8,
+                "sample_top_k": 40,
+                "sample_top_p": 0.95,
+                "ignore_eos": True,
+                "timeout": 5.0,
+            },
+        )()
+
+        results, _wall_s = bench_http_serving.run_batch(args, measured=True)
+        bodies = sorted(DoneOnlyHandler.request_bodies, key=lambda body: str(body["request_id"]))
+
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(
+            [(result.sampling_label, result.temperature, result.top_k, result.top_p) for result in results],
+            [
+                ("greedy", 0.0, -1, 1.0),
+                ("sampled", 0.8, 40, 0.95),
+                ("greedy", 0.0, -1, 1.0),
+                ("sampled", 0.8, 40, 0.95),
+            ],
+        )
+        self.assertEqual(
+            [(body["temperature"], body["top_k"], body["top_p"]) for body in bodies],
+            [(0.0, 0, 1.0), (0.8, 40, 0.95), (0.0, 0, 1.0), (0.8, 40, 0.95)],
+        )
+        self.assertTrue(all("seed" not in body for body in bodies))
 
     def test_server_trace_log_is_attached_by_vllm_completion_id_prefix(self) -> None:
         result = bench_http_serving.RequestResult(
@@ -259,6 +313,10 @@ class BenchHttpServingTests(unittest.TestCase):
                 output_chars=8,
                 output_hash="aaaa",
                 text_prefix="text",
+                sampling_label="greedy",
+                temperature=0.0,
+                top_k=-1,
+                top_p=1.0,
                 server_trace={"prompt_tokens": 22, "completion_tokens": 4},
             ),
             bench_http_serving.RequestResult(
@@ -284,6 +342,10 @@ class BenchHttpServingTests(unittest.TestCase):
                 output_chars=16,
                 output_hash="bbbb",
                 text_prefix="more",
+                sampling_label="sampled",
+                temperature=0.8,
+                top_k=40,
+                top_p=0.95,
                 server_trace={"prompt_tokens": 165, "completion_tokens": 8},
             ),
         ]
@@ -299,6 +361,12 @@ class BenchHttpServingTests(unittest.TestCase):
                 "prompt_words": [16, 128],
                 "max_tokens": [4, 8],
                 "temperature": 0.0,
+                "top_k": -1,
+                "top_p": 1.0,
+                "sampling_mode": "mixed-greedy-sampled",
+                "sample_temperature": 0.8,
+                "sample_top_k": 40,
+                "sample_top_p": 0.95,
                 "ignore_eos": True,
                 "timeout": 5.0,
             },
@@ -316,6 +384,14 @@ class BenchHttpServingTests(unittest.TestCase):
                 "prompt_words=128,max_tokens=8": 1,
             },
         )
+        self.assertEqual(report["workload"]["sampling_mode"], "mixed-greedy-sampled")
+        self.assertEqual(report["workload"]["sampling_counts"], {"greedy": 1, "sampled": 1})
+        self.assertEqual(report["summary"]["completed_sampling_counts"], {"greedy": 1, "sampled": 1})
+        self.assertEqual(report["summary"]["failed_sampling_counts"], {})
+        self.assertEqual(report["workload"]["sampling_profiles"]["greedy"]["temperature"], 0.0)
+        self.assertEqual(report["workload"]["sampling_profiles"]["sampled"]["top_k"], 40)
+        self.assertEqual(report["requests"][0]["sampling_label"], "greedy")
+        self.assertEqual(report["requests"][1]["temperature"], 0.8)
 
     def test_ignore_eos_output_token_fallback_uses_requested_max_tokens(self) -> None:
         result = bench_http_serving.RequestResult(

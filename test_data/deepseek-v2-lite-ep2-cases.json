@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "description": "Small DeepSeek-V2-Lite EP2 HF / host-staged / NCCL correctness case set for issue #274.",
+  "cases": [
+    {
+      "id": "hello_16_bs1",
+      "prompt": "Hello",
+      "output_len": 16,
+      "batch_size": 1,
+      "ignore_eos": false
+    },
+    {
+      "id": "hello_16_bs4",
+      "prompt": "Hello",
+      "output_len": 16,
+      "batch_size": 4,
+      "ignore_eos": true
+    },
+    {
+      "id": "hello_16_bs8",
+      "prompt": "Hello",
+      "output_len": 16,
+      "batch_size": 8,
+      "ignore_eos": true
+    },
+    {
+      "id": "capital_16_bs1",
+      "prompt": "The capital of France is",
+      "output_len": 16,
+      "batch_size": 1,
+      "ignore_eos": false
+    },
+    {
+      "id": "code_16_bs1",
+      "prompt": "def quicksort",
+      "output_len": 16,
+      "batch_size": 1,
+      "ignore_eos": false
+    }
+  ]
+}

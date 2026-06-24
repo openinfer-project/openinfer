@@ -284,29 +284,41 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn is_deepseek_v4_source(csrc_dir: &Path, path: &Path) -> bool {
-    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
-        relative
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "deepseek_v4")
-    })
+            .any(|part| part.as_os_str() == "deepseek_v4"),
+        Err(_) => false,
+    }
+}
+
+fn is_deepseek_v2_lite_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "deepseek_v2_lite"),
+        Err(_) => false,
+    }
 }
 
 fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
-    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
-        relative
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "kimi_k2")
-    })
+            .any(|part| part.as_os_str() == "kimi_k2"),
+        Err(_) => false,
+    }
 }
 
 /// DeepEP elastic shim (csrc/deepep/): Kimi-K2's EP all-to-all backend.
 /// Compiled only with the `kimi-k2` feature; needs NCCL >= 2.30.4 headers/lib.
 fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
-    path.strip_prefix(csrc_dir).ok().is_some_and(|relative| {
-        relative
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "deepep")
-    })
+            .any(|part| part.as_os_str() == "deepep"),
+        Err(_) => false,
+    }
 }
 
 /// NCCL >= 2.30.4 root (include/nccl.h + lib/libnccl.so.2) for the DeepEP
@@ -894,41 +906,25 @@ fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> Pa
     wrapper_path
 }
 
-fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[String]) {
+fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &[String]) {
+    // Host cc compiles the wrappers below; unlike nvcc it won't find cuda.h itself.
+    assert!(
+        cuda_include.join("cuda.h").is_file(),
+        "cuda.h not found in {}; set CUDA_HOME to a CUDA toolkit root",
+        cuda_include.display()
+    );
     let python = find_triton_python().unwrap_or_else(|message| panic!("{message}"));
     let triton_target = triton_target(sm_targets);
     let mut generated_sources = Vec::new();
     let root = crate_root();
     let chunkwise_kernel_path = root.join("tools/triton/gated_delta_rule_chunkwise_kernels.py");
-
-    let flash_attn_prefill_hd256_spec = TritonKernelSpec {
-        artifact_dir: "flash_attention_prefill_hd256",
-        kernel_path: "tools/triton/flash_attention_prefill_hd256_kernel.py",
-        kernel_name: "flash_attention_prefill_hd256_kernel",
-        signature: "*bf16,*bf16,*bf16,*bf16,i32,i32,i32,i32,*i32,i32,64,64,256",
-        grid: "(seq_len + 63) / 64,num_q_heads,1",
-        out_name: "triton_flash_attention_prefill_hd256",
-        num_warps: 4,
-        num_stages: 2,
-    };
-    let (flash_attn_hd256_func, flash_attn_hd256_c) = generate_triton_artifacts(
-        &python,
-        out_dir,
-        &triton_target,
-        &flash_attn_prefill_hd256_spec,
+    assert!(
+        chunkwise_kernel_path.exists(),
+        "Qwen3.5 GDR Triton kernel source is missing: {}",
+        chunkwise_kernel_path.display()
     );
-    let flash_attn_hd256_wrapper = write_wrapper(
-        &flash_attn_hd256_c,
-        "triton_flash_attention_prefill_hd256_wrapper.c",
-        format!(
-            "#include <cuda.h>\n#include <stdint.h>\n\nCUresult {func}(CUstream stream, CUdeviceptr Q, CUdeviceptr K_cache, CUdeviceptr V_cache, CUdeviceptr Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, CUdeviceptr start_pos_ptr, int32_t q_dim);\n\nCUresult flash_attention_prefill_hd256_cuda(const uint16_t* Q, const uint16_t* K_cache, const uint16_t* V_cache, uint16_t* Output, int32_t num_q_heads, int32_t num_kv_heads, int32_t gqa_ratio, int32_t seq_len, const int32_t* start_pos_ptr, int32_t q_dim, CUstream stream) {{\n    return {func}(stream, (CUdeviceptr)Q, (CUdeviceptr)K_cache, (CUdeviceptr)V_cache, (CUdeviceptr)Output, num_q_heads, num_kv_heads, gqa_ratio, seq_len, (CUdeviceptr)start_pos_ptr, q_dim);\n}}\n",
-            func = flash_attn_hd256_func
-        ),
-    );
-    generated_sources.push(flash_attn_hd256_c);
-    generated_sources.push(flash_attn_hd256_wrapper);
 
-    if chunkwise_kernel_path.exists() {
+    {
         let gdr_prepare_spec = TritonKernelSpec {
             artifact_dir: "gated_delta_rule_chunk_prepare",
             kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
@@ -1048,7 +1044,8 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
             artifact_dir: "gated_delta_rule_chunk_state",
             kernel_path: "tools/triton/gated_delta_rule_chunkwise_kernels.py",
             kernel_name: "gdr_chunk_state_qwen35_kernel",
-            signature: "*bf16,*bf16,*bf16,*fp32,*fp32,*fp32,*bf16,*fp32,i32,i32,32,64,128,128,64",
+            // `g` (pos 4) stays bare — not a contiguous block-ptr load, so `:16` would be untrue.
+            signature: "*bf16:16,*bf16:16,*bf16:16,*fp32,*fp32:16,*fp32:16,*bf16:16,*fp32:16,i32,i32,32,64,128,128,64",
             grid: "4,num_value_heads,1",
             out_name: "triton_gated_delta_rule_chunk_state",
             num_warps: 4,
@@ -1089,17 +1086,12 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         );
         generated_sources.push(gdr_chunk_o_c);
         generated_sources.push(gdr_chunk_o_wrapper);
-    } else {
-        println!(
-            "cargo:warning=Skipping chunk-wise GDR Triton AOT scaffolding because {} is not present yet.",
-            chunkwise_kernel_path.display()
-        );
     }
 
     let mut build = cc::Build::new();
     build
         .cuda(false)
-        .include(format!("{}/include", cuda_path))
+        .include(cuda_include)
         .flag("-std=c11")
         .warnings(false);
     for source in &generated_sources {
@@ -1111,12 +1103,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=Using Triton AOT for Qwen3.5 HD256 FlashAttention prefill and GDR chunkwise; basic ops (add, silu_mul, embedding) use native CUDA"
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("tools/triton/flash_attention_prefill_hd256_kernel.py")
-            .display()
+        "cargo:warning=Using Triton AOT for Qwen3.5 GDR chunkwise prefill; basic ops (add, silu_mul, embedding) use native CUDA"
     );
     println!(
         "cargo:rerun-if-changed={}",
@@ -1131,18 +1118,19 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 }
 
 fn main() {
-    let cuda_path = std::env::var("CUDA_HOME")
-        .or_else(|_| std::env::var("CUDA_PATH"))
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-
-    let nvcc = format!("{}/bin/nvcc", cuda_path);
-    let cuda_include = Path::new(&cuda_path).join("include");
+    let toolkit = openinfer_build::CudaToolkit::discover();
+    let nvcc = toolkit.nvcc.to_string_lossy().into_owned();
+    let cuda_include = toolkit
+        .header_dir("cuda.h")
+        .unwrap_or_else(|| toolkit.root.join("include"));
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
     let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
+    let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
+    let qwen35_enabled = cfg!(feature = "qwen35-4b");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
         Some(generate_deepseek_tilelang_artifacts(&out_dir))
@@ -1183,6 +1171,9 @@ fn main() {
         .filter_map(|path| {
             let file_name = path.file_name()?.to_str()?;
             if !deepseek_enabled && is_deepseek_v4_source(&csrc_dir, path) {
+                return None;
+            }
+            if !deepseek_v2_lite_enabled && is_deepseek_v2_lite_source(&csrc_dir, path) {
                 return None;
             }
             if !kimi_k2_enabled
@@ -1497,13 +1488,22 @@ fn main() {
 
     assert!(status.success(), "ar failed");
 
-    compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
+    if qwen35_enabled {
+        compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);
+    } else {
+        println!(
+            "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35-4b` feature to build them (needs Python + Triton at build time)"
+        );
+    }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
+        println!(
+            "cargo:rustc-link-search=native={}/lib/x64",
+            toolkit.root.display()
+        );
     } else {
-        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+        toolkit.link_search();
     }
     for dir in &cutedsl_runtime_lib_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
@@ -1524,8 +1524,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", root.join("csrc").display());
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=OPENINFER_CUDA_SM");
     println!("cargo:rerun-if-env-changed=CUDA_SM");
     println!("cargo:rerun-if-env-changed=OPENINFER_FLASHINFER_INCLUDE");

@@ -6,15 +6,39 @@ use cudarc::driver::CudaSlice;
 
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
 use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
-pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+/// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
+/// bucket, and activation buffers are shared (sized once at the largest bucket), so
+/// extra buckets cost capture time on first hit, not memory.
+///
+/// Buckets 8/16 are viable only because decode GEMMs at N <= GEMM_LT_MAX_N run
+/// tuned cublasLt algos: cuBLAS's GemmEx heuristic skips split-K for batch in
+/// [8, 16] (RTX 5090 ctx1024: 9.2/9.3ms steps vs 7.9ms at bs20), while the Lt
+/// heuristic list has full-speed candidates at every small N.
+pub(crate) const BATCH_BUCKETS: &[usize] = &[
+    1, 2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152,
+    160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
+];
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
-const SPLIT_KV_CHUNK_TOKENS: usize = 256;
+// Split-KV decode attention: the non-partitioned kernel issues one CTA per
+// (request x kv-head), starving SMs at small batch. The path is therefore
+// chosen by batch (CTA count vs SM count), NOT context length — at bs=1 the
+// 8 CTAs underfill the GPU at any seq_len, so SplitKv wins across the whole
+// context range. SPLIT_KV_MAX_BATCH_SIZE caps it where NonPartition's CTAs
+// already saturate the SMs (bs<=8 wins big, ~bs16 even, bs32 within ~1%).
+// 64-token chunks measured fastest on RTX 5090 (128/256 are 1-7% slower, 32
+// past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
+const SPLIT_KV_CHUNK_TOKENS: usize = 64;
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
-const SPLIT_KV_MAX_BATCH_SIZE: usize = 2;
-const SPLIT_KV_MIN_SEQ_LEN: usize = 1024;
+const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
+
+/// Chunk size bounding a `basis`-token request to `SPLIT_KV_MAX_CHUNKS_PER_REQUEST` chunks.
+pub fn split_chunk_size_for(basis: usize) -> usize {
+    SPLIT_KV_CHUNK_TOKENS.max(basis.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DecodeAttentionPath {
@@ -92,12 +116,22 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) split_tmp_s: CudaSlice<f32>,
     pub(crate) split_padded_slots: usize,
     max_seq_len: usize,
+    /// Model context limit (`max_position_embeddings`) — the `Pin` split-KV chunk basis (see
+    /// `split_chunk_size`).
+    max_context_tokens: usize,
 
     /// Padding page index for bucket CUDA Graph. Padding slots point here.
     padding_page_id: i32,
 
-    /// One CudaGraphState per `(bucket, attention_path)`.
+    /// One CudaGraphState per `(bucket, attention_path)`, captured on the
+    /// full-SM `ctx.stream` — used by the normal decode-only path.
     pub(crate) graphs: Vec<CudaGraphState>,
+
+    /// Parallel cache captured on the Green Context decode-partition stream,
+    /// used when decode runs concurrently with prefill (SplitConcurrent). A
+    /// graph captured on `ctx.stream` would replay on all SMs, so the split
+    /// path needs its own graphs whose nodes are pinned to the decode partition.
+    pub(crate) graphs_split: Vec<CudaGraphState>,
 }
 
 impl BatchDecodeBuffers {
@@ -112,9 +146,13 @@ impl BatchDecodeBuffers {
         max_total_pages: usize,
         padding_page_id: i32,
         num_qo_heads: usize,
+        max_context_tokens: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
-        let max_split_slots = bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
+        // The split-KV path is gated on padded_bs <= SPLIT_KV_MAX_BATCH_SIZE,
+        // so its workspace only needs slots for that many requests (~16 MiB
+        // instead of ~128 MiB at bucket 256).
+        let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
 
         Ok(Self {
             max_batch_size: bs,
@@ -150,8 +188,13 @@ impl BatchDecodeBuffers {
             split_tmp_s: ctx.stream.alloc_zeros(max_split_slots * num_qo_heads)?,
             split_padded_slots: 0,
             max_seq_len: 0,
+            max_context_tokens,
             padding_page_id,
             graphs: BATCH_BUCKETS
+                .iter()
+                .flat_map(|_| (0..DECODE_ATTENTION_PATH_COUNT).map(|_| CudaGraphState::new()))
+                .collect(),
+            graphs_split: BATCH_BUCKETS
                 .iter()
                 .flat_map(|_| (0..DECODE_ATTENTION_PATH_COUNT).map(|_| CudaGraphState::new()))
                 .collect(),
@@ -231,14 +274,29 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
+    /// The chunk count sets the online-softmax rescale order, hence the bf16 result. `Pin`/`PerToken`
+    /// key the chunk-size basis on the `max_context_tokens` constant, so the count does not vary with
+    /// the batch.
+    fn split_chunk_size(&self) -> usize {
+        let basis = match numeric_policy() {
+            NumericPolicy::Tuned => self.max_seq_len,
+            NumericPolicy::Pin | NumericPolicy::PerToken => self.max_context_tokens,
+        };
+        split_chunk_size_for(basis)
+    }
+
     fn sync_split_kv_meta(
         &mut self,
         ctx: &DeviceContext,
         kv_views: &[&KvView],
         padded_bs: usize,
     ) -> Result<()> {
-        let split_chunk_size =
-            SPLIT_KV_CHUNK_TOKENS.max(self.max_seq_len.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST));
+        // Past the batch cap the step always takes the non-partitioned path
+        // (see attention_path), and the workspace has no slots for it anyway.
+        if padded_bs > SPLIT_KV_MAX_BATCH_SIZE {
+            return Ok(());
+        }
+        let split_chunk_size = self.split_chunk_size();
         let split_padded_slots = padded_bs * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
         let mut split_request_indices = Vec::with_capacity(split_padded_slots);
         let mut split_kv_tile_indices = Vec::with_capacity(split_padded_slots);
@@ -248,7 +306,12 @@ impl BatchDecodeBuffers {
 
         for (request_idx, kv) in kv_views.iter().enumerate() {
             let chunks = kv.seq_len().div_ceil(split_chunk_size).max(1);
-            debug_assert!(chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST);
+            anyhow::ensure!(
+                chunks <= SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
+                "split-KV chunk count {chunks} exceeds workspace bound {SPLIT_KV_MAX_CHUNKS_PER_REQUEST} \
+                 (seq_len={}, split_chunk_size={split_chunk_size}) — context limit misconfigured",
+                kv.seq_len()
+            );
             for chunk_idx in 0..chunks {
                 split_request_indices.push(request_idx as i32);
                 split_kv_tile_indices.push(chunk_idx as i32);
@@ -283,8 +346,8 @@ impl BatchDecodeBuffers {
         Ok(())
     }
 
-    pub(crate) fn attention_path(&self, padded_bs: usize) -> DecodeAttentionPath {
-        if padded_bs <= SPLIT_KV_MAX_BATCH_SIZE && self.max_seq_len >= SPLIT_KV_MIN_SEQ_LEN {
+    pub(crate) fn attention_path(padded_bs: usize) -> DecodeAttentionPath {
+        if padded_bs <= SPLIT_KV_MAX_BATCH_SIZE {
             DecodeAttentionPath::SplitKv
         } else {
             DecodeAttentionPath::NonPartition

@@ -1,5 +1,6 @@
 [package]
 name = "openinfer-qwen35-4b"
+license = "Apache-2.0"
 version = "0.1.0"
 edition = "2024"
 autobenches = false
@@ -7,6 +8,7 @@ autobenches = false
 [dependencies]
 openinfer-core = { workspace = true }
 openinfer-kernels = { workspace = true }
+openinfer-sample = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 fastrace = { workspace = true }
@@ -24,9 +26,26 @@ openinfer-vllm-support = { workspace = true }
 sha2 = { workspace = true }
 vllm-text = { workspace = true }
 
+[features]
+default = []
+qwen35-4b = ["openinfer-kernels/qwen35-4b"]
+
 [lints]
 workspace = true
+
+[[test]]
+name = "hf_golden_gate"
+required-features = ["qwen35-4b"]
+
+[[test]]
+name = "e2e_scheduler"
+required-features = ["qwen35-4b"]
+
+[[test]]
+name = "sampling_behavior"
+required-features = ["qwen35-4b"]
 
 [[bench]]
 name = "qwen35_ops"
 harness = false
+required-features = ["qwen35-4b"]

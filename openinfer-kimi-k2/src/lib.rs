@@ -14,6 +14,8 @@
 use std::path::Path;
 
 use anyhow::Result;
+#[cfg(feature = "kimi-k2")]
+use openinfer_core::engine::EpBackend;
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 #[cfg(feature = "kimi-k2")]
@@ -39,4 +41,48 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
 #[cfg(not(feature = "kimi-k2"))]
 pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
     anyhow::bail!("Kimi-K2 runtime is feature-gated; rebuild with --features kimi-k2")
+}
+
+/// Server-facing launch knobs for Kimi-K2. The binary passes raw CLI values;
+/// [`launch`] owns the EP topology policy — validating TP/DP, deriving the EP
+/// world and its device ordinals — so the server never hardcodes Kimi's
+/// parallel layout.
+#[cfg(feature = "kimi-k2")]
+#[derive(Clone, Copy, Debug)]
+pub struct KimiLaunchOptions {
+    pub tp_size: usize,
+    pub dp_size: usize,
+    pub ep_backend: EpBackend,
+    pub cuda_graph: bool,
+}
+
+/// Start the Kimi-K2 engine from server-facing [`KimiLaunchOptions`].
+#[cfg(feature = "kimi-k2")]
+pub fn launch(model_path: &Path, options: KimiLaunchOptions) -> Result<EngineHandle> {
+    use log::info;
+    use openinfer_core::parallel::ParallelConfig;
+
+    anyhow::ensure!(
+        options.tp_size > 0 && options.dp_size > 0,
+        "Kimi-K2 --tp-size and --dp-size must be positive"
+    );
+    let parallel = ParallelConfig::new(options.tp_size, options.dp_size);
+    info!(
+        "Kimi-K2 EP options: tp_size={}, dp_size={}, ep_world={}, ep_backend={:?}",
+        options.tp_size,
+        options.dp_size,
+        parallel.ep_world(),
+        options.ep_backend
+    );
+    runner::start_engine(
+        model_path,
+        &EngineLoadOptions {
+            enable_cuda_graph: options.cuda_graph,
+            enable_prefill_profile: false,
+            device_ordinals: (0..parallel.ep_world()).collect(),
+            parallel_config: Some(parallel),
+            ep_backend: options.ep_backend,
+            seed: 42,
+        },
+    )
 }

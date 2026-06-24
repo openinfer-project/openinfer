@@ -2,6 +2,7 @@
 edition = "2024"
 links = "torch-lib"
 name = "openinfer-comm-torch-lib"
+license = "Apache-2.0"
 publish = false
 
 [features]
@@ -18,4 +19,5 @@ cuda-lib = { path = "../openinfer-comm-cuda-lib", package = "openinfer-comm-cuda
 
 [build-dependencies]
 cxx-build = { workspace = true }
+openinfer-build = { workspace = true }
 pkg-config = { workspace = true }

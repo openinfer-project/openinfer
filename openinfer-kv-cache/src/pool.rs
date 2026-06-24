@@ -1,11 +1,37 @@
-use kvbm_logical::SequenceHash;
+use std::sync::Arc;
+
+use dynamo_tokens::{CHAIN_XXH3_SEED, SaltHash, compute_hash_v2};
 use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
+use kvbm_logical::events::{EventsManager, KvCacheEvent};
 use kvbm_logical::integrations::{DecodeOutcome, SchedulableSequence, ScheduleError};
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
+use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
+use tokio::sync::broadcast;
 
 use crate::view::KvView;
+
+/// Broadcast capacity for the opt-in KV-event feed. Generous: the scheduler
+/// drains it every step, but a step can register/evict many blocks, and a
+/// dropped event silently desyncs the router's prefix tree. Only allocated on
+/// the [`BlockPool::with_events`] path.
+const KV_EVENT_CHANNEL_CAPACITY: usize = 65_536;
+
+/// Prefix-cache salt for a LoRA adapter.
+///
+/// Replicates upstream dynamo's canonical derivation on the no-extra-salt path
+/// (`lib/kv-hashing/src/salt.rs`, `pub(crate)` there), which is also the seed
+/// `dynamo-kv-router` uses in `compute_block_hash_for_seq` — so our block-hash
+/// chain stays byte-comparable with a dynamo KV indexer. `Some("")` shares the
+/// cache with `None`, matching the router's `filter(|n| !n.is_empty())`.
+/// Parity with upstream is pinned by `lora_salt_matches_upstream_request_hashing`.
+fn lora_salt_hash(lora_name: Option<&str>) -> SaltHash {
+    match lora_name.filter(|n| !n.is_empty()) {
+        Some(name) => CHAIN_XXH3_SEED.wrapping_add(compute_hash_v2(name.as_bytes(), 0)),
+        None => CHAIN_XXH3_SEED,
+    }
+}
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
@@ -20,9 +46,40 @@ pub struct BlockPool {
 
 impl BlockPool {
     pub fn new(block_size: usize, num_blocks: usize) -> anyhow::Result<Self> {
+        Self::build(block_size, num_blocks, BlockRegistry::builder().build())
+    }
+
+    /// Like [`new`](Self::new), but the pool also emits block store/remove
+    /// events for an out-of-band cache-aware router, returned as a raw broadcast
+    /// receiver to drain synchronously. The stream carries `Create` events too
+    /// (the emission policy can't separate them) — the consumer ignores `Create`
+    /// and sources richer store events from the seal site, and maps the lineage
+    /// hash in each `Remove` back to the router's `sequence_hash`. OFF by
+    /// default: plain single-machine serving uses [`new`](Self::new) and pays
+    /// neither the per-block event attachment nor the channel.
+    pub fn with_events(
+        block_size: usize,
+        num_blocks: usize,
+    ) -> anyhow::Result<(Self, broadcast::Receiver<KvCacheEvent>)> {
+        // Default emission policy is AllEventsPolicy (every block tracked).
+        let events = Arc::new(
+            EventsManager::builder()
+                .channel_capacity(KV_EVENT_CHANNEL_CAPACITY)
+                .build(),
+        );
+        let rx = events.subscribe_receiver();
+        let registry = BlockRegistry::builder().event_manager(events).build();
+        let pool = Self::build(block_size, num_blocks, registry)?;
+        Ok((pool, rx))
+    }
+
+    fn build(
+        block_size: usize,
+        num_blocks: usize,
+        registry: BlockRegistry,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(num_blocks >= 2, "need at least 2 blocks (1 for padding)");
 
-        let registry = BlockRegistry::builder().build();
         let block_manager = BlockManager::builder()
             .block_count(num_blocks)
             .block_size(block_size)
@@ -98,8 +155,7 @@ impl BlockPool {
         max_output_tokens: usize,
         lora_name: Option<&str>,
     ) -> RequestKv {
-        let salt_hash = dynamo_kv_hashing::compute_salt_hash(None, lora_name)
-            .expect("salt hash from lora name is infallible");
+        let salt_hash = lora_salt_hash(lora_name);
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
@@ -107,7 +163,10 @@ impl BlockPool {
             None,
             Some(salt_hash),
         );
-        RequestKv { seq }
+        RequestKv {
+            seq,
+            emitted_blocks: 0,
+        }
     }
 
     // ── KV-offload prefetch (CPU-tier load before prefill) ─────────────
@@ -247,9 +306,18 @@ impl LoadReservation {
 /// Per-request KV state wrapping `SchedulableSequence`.
 ///
 /// Lifecycle: `schedule_prefill → prefill_view/pages → forward → apply_prefill`,
-/// then `schedule_decode → decode_view/pages → forward → apply_decode` in a loop.
+/// then either `schedule_decode → decode_view → forward → apply_decode` or
+/// `schedule_speculative → speculative_view → forward → apply_speculative` in a
+/// loop (`revert_schedule` undoes a reservation whose step failed).
 pub struct RequestKv {
     seq: SchedulableSequence<()>,
+    /// Cursor for [`Self::take_newly_registered_blocks`]: how many of this
+    /// request's sequence blocks have already been surfaced as KV-router store
+    /// events. Starts past the prefix-cache hit (those were stored by whoever
+    /// first sealed them — this assumes GPU-resident reuse, i.e. KV offload off,
+    /// which holds wherever the event feed is enabled). Untouched on the plain
+    /// path where the feed is off.
+    emitted_blocks: usize,
 }
 
 impl RequestKv {
@@ -267,6 +335,10 @@ impl RequestKv {
             .seq
             .match_and_add_prefix(&pool.block_manager)
             .map_err(|e| anyhow::anyhow!("match_and_add_prefix: {e}"))?;
+        // Prefix-hit blocks are already in the router's tree (whoever first
+        // sealed them stored them, and a GPU hit means they were never evicted),
+        // so the store-event cursor skips them.
+        self.emitted_blocks = self.seq.assigned_blocks();
         Ok(blocks * self.seq.block_size())
     }
 
@@ -284,19 +356,17 @@ impl RequestKv {
         self.seq.schedule_decode(&pool.block_manager)
     }
 
-    /// Schedule a speculative decode that may commit up to `max_commit_tokens`
-    /// tokens this step — the accepted prefix of the proposed continuation plus
-    /// the model's bonus/correction token. Pre-allocates for the worst case;
-    /// [`Self::apply_speculative`] releases any blocks the accepted count does
-    /// not use. The verify forward's `KvView` is built with
-    /// `prefill_view(1 + num_draft_tokens)` (the dangling token plus drafts).
+    /// Reserve KV for a speculative verify step covering `num_draft_tokens`
+    /// consecutive positions (current dangling token + draft candidates).
+    /// [`Self::apply_speculative`] commits the accepted prefix; on any failure
+    /// [`Self::revert_schedule`] returns the reservation.
     pub fn schedule_speculative(
         &mut self,
-        max_commit_tokens: usize,
+        num_draft_tokens: usize,
         pool: &BlockPool,
     ) -> Result<(), ScheduleError> {
         self.seq
-            .schedule_speculative(max_commit_tokens, &pool.block_manager)
+            .schedule_speculative(num_draft_tokens, &pool.block_manager)
     }
 
     // ── Views (for forward pass) ───────────────────────────────────────
@@ -305,16 +375,40 @@ impl RequestKv {
     ///
     /// `prompt_len` tokens will be appended starting at `kv_position()`.
     /// The view's seq_len = kv_position + prompt_len (post-advance state
-    /// that FlashInfer attention metadata expects).
+    /// that FlashInfer attention metadata expects). The page row is exact
+    /// (`step_page_indices`), never the raw block holdings — the raw list
+    /// can carry an eagerly-allocated next block the kernel must not see.
     pub fn prefill_view(&self, prompt_len: usize) -> KvView {
         let target_seq_len = self.seq.kv_position() + prompt_len;
-        KvView::new(self.page_indices(), target_seq_len, self.seq.block_size())
+        KvView::new(
+            self.step_page_indices(prompt_len),
+            target_seq_len,
+            self.seq.block_size(),
+        )
     }
 
-    /// Build an immutable `KvView` for decode (one new token).
+    /// Build an immutable `KvView` for decode (one new token). Same exact
+    /// page-row contract as `prefill_view`.
     pub fn decode_view(&self) -> KvView {
-        let target_seq_len = self.seq.kv_position() + 1;
-        KvView::new(self.page_indices(), target_seq_len, self.seq.block_size())
+        KvView::new(
+            self.step_page_indices(1),
+            self.seq.kv_position() + 1,
+            self.seq.block_size(),
+        )
+    }
+
+    /// Build an immutable `KvView` for speculative verification: the verifier
+    /// forwards `num_draft_tokens` consecutive positions (current dangling token
+    /// followed by draft candidates). The view covers the post-step KV extent;
+    /// [`Self::apply_speculative`] later commits only the accepted prefix and
+    /// releases excess draft capacity. Same exact page-row contract as
+    /// [`Self::prefill_view`].
+    pub fn speculative_view(&self, num_draft_tokens: usize) -> KvView {
+        KvView::new(
+            self.step_page_indices(num_draft_tokens),
+            self.seq.kv_position() + num_draft_tokens,
+            self.seq.block_size(),
+        )
     }
 
     // ── Apply (register blocks, advance position) ──────────────────────
@@ -325,33 +419,35 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_prefill: {e}"))
     }
 
+    /// Apply a non-final prefill chunk: registers the chunk's blocks and
+    /// advances `kv_position` without emitting a generated token. The final
+    /// chunk must go through [`Self::apply_prefill`] instead.
+    pub fn apply_prefill_chunk(&mut self, pool: &BlockPool) -> anyhow::Result<()> {
+        self.seq
+            .apply_prefill(None, &pool.block_manager)
+            .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
+    }
+
     pub fn apply_decode(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<DecodeOutcome> {
         self.seq
             .apply_decode(token, &pool.block_manager)
             .map_err(|e| anyhow::anyhow!("apply_decode: {e}"))
     }
 
-    /// Commit the accepted tokens of a scheduled speculative step. `accepted`
-    /// is the verified continuation (accepted draft prefix plus the model's
-    /// bonus token); its length must be in `1..=max_commit_tokens`. Excess
-    /// blocks pre-allocated for rejected drafts are released (LIFO) by kvbm.
-    /// `kv_position` advances by `accepted.len()` and the last token becomes
-    /// the new dangling token for the next step.
+    /// Commit the accepted prefix of a speculative verify step. kvbm keeps the
+    /// `accepted_tokens` KV and LIFO-releases the rejected draft blocks.
     pub fn apply_speculative(
         &mut self,
-        accepted: &[u32],
+        accepted_tokens: &[u32],
         pool: &BlockPool,
     ) -> anyhow::Result<DecodeOutcome> {
         self.seq
-            .apply_speculative(accepted, &pool.block_manager)
+            .apply_speculative(accepted_tokens, &pool.block_manager)
             .map_err(|e| anyhow::anyhow!("apply_speculative: {e}"))
     }
 
-    /// Revert a scheduled-but-not-applied step, returning the sequence to its
-    /// pre-schedule (idle) state and LIFO-releasing the pre-allocated blocks.
-    /// Used to keep [`Self::schedule_speculative`] transactional: if the verify
-    /// forward fails before [`Self::apply_speculative`], the reservation is
-    /// undone instead of stranding the sequence in a half-scheduled state.
+    /// Undo a scheduled-but-unapplied KV reservation (e.g. a speculative
+    /// schedule whose forward or apply failed) and return its blocks to the pool.
     pub fn revert_schedule(&mut self) -> anyhow::Result<()> {
         self.seq
             .revert_schedule()
@@ -467,6 +563,52 @@ impl RequestKv {
     pub fn prefix_matched_blocks(&self) -> usize {
         self.seq.inner().prefix_matched_blocks()
     }
+
+    /// Blocks this request has registered (made cacheable) since the last call,
+    /// in the u64 hash space a KV-router consumes plus the kvbm lineage hash.
+    ///
+    /// A block becomes reusable by other requests once it is *registered*
+    /// (assigned an `ImmutableBlock`), which lags sealing the token block by a
+    /// step. Diffs the registered count against an internal cursor and returns
+    /// the new run in sequence order; prefix-cache hits are skipped (see
+    /// [`Self::emitted_blocks`]). Empty when nothing new registered this step.
+    pub fn take_newly_registered_blocks(&mut self) -> Vec<RegisteredBlock> {
+        let registered = self.seq.assigned_blocks();
+        if registered <= self.emitted_blocks {
+            return Vec::new();
+        }
+        let blocks = self.seq.inner().sequence().blocks();
+        debug_assert!(
+            registered <= blocks.len(),
+            "registered blocks ({registered}) exceed sealed token blocks ({})",
+            blocks.len()
+        );
+        let new = blocks[self.emitted_blocks..registered]
+            .iter()
+            .map(|b| RegisteredBlock {
+                plh: b.kvbm_sequence_hash().as_u128(),
+                sequence_hash: b.sequence_hash(),
+                tokens_hash: b.block_hash(),
+                parent_sequence_hash: b.parent_sequence_hash(),
+            })
+            .collect();
+        self.emitted_blocks = registered;
+        new
+    }
+}
+
+/// One full KV block a request just registered, ready to become a KV-router
+/// store event. `sequence_hash`/`tokens_hash`/`parent_sequence_hash` are the
+/// router's u64 hashes (`dynamo_tokens::TokenBlock` accessors, identical by
+/// construction to what the router recomputes); `plh` is the engine's 128-bit
+/// lineage hash, kept only to correlate an eviction event (which carries the
+/// lineage hash) back to `sequence_hash`.
+#[derive(Clone, Copy, Debug)]
+pub struct RegisteredBlock {
+    pub plh: u128,
+    pub sequence_hash: u64,
+    pub tokens_hash: u64,
+    pub parent_sequence_hash: Option<u64>,
 }
 
 /// Pack a kvbm [`SequenceHash`] (lineage hash) into the 16-byte content key the
@@ -478,6 +620,28 @@ fn sequence_hash_bytes(hash: &SequenceHash) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `lora_salt_hash` re-derives what upstream keeps `pub(crate)`. If upstream
+    /// ever changes the salt scheme, this is the test that catches the drift —
+    /// our hashes must equal `dynamo_kv_hashing::Request`'s for the same
+    /// (tokens, lora) so they stay comparable with a dynamo KV indexer.
+    #[test]
+    fn lora_salt_matches_upstream_request_hashing() {
+        let pool = BlockPool::new(16, 64).unwrap();
+        let tokens: Vec<u32> = (1..=64).collect(); // 4 full blocks
+        for lora in [None, Some("adapter-a")] {
+            let upstream = dynamo_kv_hashing::Request::builder()
+                .tokens(tokens.clone())
+                .lora_name(lora.map(String::from))
+                .build()
+                .unwrap()
+                .positional_lineage_hashes(16)
+                .unwrap();
+            let rkv = pool.new_request(tokens.clone(), 0, lora);
+            let ours = rkv.seq.inner().sequence().all_sequence_hashes();
+            assert_eq!(ours, upstream, "lora={lora:?}");
+        }
+    }
 
     /// The offload CPU-tier query keys are `prompt_block_hashes`. The whole
     /// load path is built on these being identical for any two requests that
@@ -517,7 +681,10 @@ mod tests {
     /// raw `page_indices()` exceeds `ceil(kv_tokens / block_size)` at every
     /// block boundary. `step_page_indices` must hand the forward pass an
     /// exact page row at every step — this deadlocked Kimi DP8 on H200 when
-    /// the raw list reached the worker's exact-match page-table check.
+    /// the raw list reached the worker's exact-match page-table check, and
+    /// made qwen3's FlashInfer metadata read one garbage page past the
+    /// sequence at every block boundary (#291). `prefill_view`/`decode_view`
+    /// must carry the same exact row.
     #[test]
     fn step_page_indices_exact_at_block_boundaries() {
         let mut raw_overshoots = 0usize;
@@ -531,6 +698,11 @@ mod tests {
                 prompt_len.div_ceil(16),
                 "prefill page row P={prompt_len}"
             );
+            assert_eq!(
+                kv.prefill_view(prompt_len).num_pages(),
+                prompt_len.div_ceil(16),
+                "prefill view P={prompt_len}"
+            );
             kv.apply_prefill(1000, &pool).unwrap();
             for step in 0..23u32 {
                 kv.schedule_decode(&pool).unwrap();
@@ -539,6 +711,17 @@ mod tests {
                     kv.step_page_indices(1).len(),
                     need,
                     "decode page row P={prompt_len} step={step}"
+                );
+                let view = kv.decode_view();
+                assert_eq!(
+                    view.num_pages(),
+                    need,
+                    "decode view P={prompt_len} step={step}"
+                );
+                assert_eq!(
+                    (view.num_pages() - 1) * 16 + view.last_page_len(),
+                    kv.kv_position() + 1,
+                    "kernel-derived length P={prompt_len} step={step}"
                 );
                 raw_overshoots += usize::from(kv.page_indices().len() > need);
                 kv.apply_decode(2000 + step, &pool).unwrap();
@@ -549,39 +732,5 @@ mod tests {
             "kvbm no longer over-allocates the generation block; \
              step_page_indices and this test can be retired"
         );
-    }
-
-    /// A speculative step commits the accepted prefix and advances
-    /// `kv_position` by exactly `accepted.len()`; the rejected drafts'
-    /// pre-allocated blocks are released by kvbm without manual rollback.
-    #[test]
-    fn speculative_commits_accepted_prefix() {
-        let pool = BlockPool::new(16, 256).unwrap();
-        let mut kv = pool.new_request((0..8u32).collect(), 32, None);
-        kv.schedule_prefill(8, &pool).unwrap();
-        kv.apply_prefill(1000, &pool).unwrap();
-        assert_eq!(kv.kv_position(), 8);
-
-        // Schedule room for 4, accept only 2 (prefix + bonus).
-        kv.schedule_speculative(4, &pool).unwrap();
-        kv.apply_speculative(&[100, 101], &pool).unwrap();
-        assert_eq!(kv.kv_position(), 10, "advances by accepted.len()");
-        assert_eq!(kv.generated_tokens(), 3, "1 from prefill + 2 committed");
-    }
-
-    /// Committing more tokens than were scheduled is rejected (the verify
-    /// forward must never accept past the pre-allocated draft budget).
-    #[test]
-    fn speculative_rejects_overcommit() {
-        let pool = BlockPool::new(16, 256).unwrap();
-        let mut kv = pool.new_request((0..8u32).collect(), 32, None);
-        kv.schedule_prefill(8, &pool).unwrap();
-        kv.apply_prefill(1000, &pool).unwrap();
-
-        kv.schedule_speculative(2, &pool).unwrap();
-        let err = kv
-            .apply_speculative(&[100, 101, 102], &pool)
-            .expect_err("committing 3 of scheduled 2 must fail");
-        assert!(err.to_string().contains("apply_speculative"));
     }
 }

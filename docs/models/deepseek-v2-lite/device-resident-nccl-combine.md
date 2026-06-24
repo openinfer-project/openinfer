@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Device-Resident NCCL Combine
 
-> **TL;DR:** Issue #275 moves the NCCL decode combine path to reusable device-resident f32 scratch buffers. The retained `Hello` / 16-token gate stays HF / host-staged / NCCL exact, and the readiness report no longer lists the old combine H2D/D2H/allocation/sync blockers. Full decode capture is still blocked by dense exchange allocation/sync and host-directed routing.
+> **TL;DR:** Issue #275 moves the NCCL decode combine path to reusable device-resident f32 scratch buffers. The retained `Hello` / 16-token gate stays HF / host-staged / NCCL exact, and the readiness report no longer lists the old combine H2D/D2H/allocation/sync blockers. Current NCCL graph-readiness blockers live in `status.md`.
 
 Last touched: 2026-06
 
@@ -23,11 +23,11 @@ Last touched: 2026-06
   1. Add a shared CUDA helper that accumulates a bf16 single-token expert output into a f32 device contribution buffer at a selected token row.
   2. Re-export that helper through `openinfer-core::ops`.
   3. Add reusable NCCL combine scratch buffers inside `NaiveNcclEp2Backend`, clear the f32 send scratch per MoE call, accumulate local/remote expert outputs on the owning device, all-reduce device buffers, and cast rank0 f32 result to bf16 on device.
-  4. Update graph-readiness blockers and attribution wording so removed combine H2D/D2H/allocation/sync blockers are no longer claimed, while remaining host routing and dense-exchange blockers stay explicit.
+  4. Update graph-readiness blockers and attribution wording so removed combine H2D/D2H/allocation/sync blockers are no longer claimed, while the remaining host routing and dense-exchange blockers stay explicit.
   5. Run formatting and local compile gates, then use the provided remote GPU host for the DeepSeek-V2-Lite EP2 exactness and attribution gates.
 - **Risks / open questions**:
   - Device f32 accumulation must preserve the existing expert-id accumulation order before the final bf16 cast.
-  - Dense exchange and host route selection still block full decode CUDA Graph capture; `full_decode_capture_ready` should remain false unless validation proves otherwise.
+  - Dense exchange and host route selection still blocked full decode CUDA Graph capture at the time of issue #275; keep the current blocker list in `status.md`.
   - The provided SSH credential should stay local to the validation session and must not be echoed into docs or final output.
 
 ## Execution Log
@@ -97,7 +97,7 @@ cargo clippy --release -p openinfer-deepseek-v2-lite \
 
 Both commands passed on the same remote source copy after syncing the follow-up `host_ops.rs` and `logging.rs` fixes. The clippy command ran without `clippy::manual_midpoint`, `clippy::needless_range_loop`, or `clippy::option_option` allows.
 
-Before/after readiness comparison for the same model snapshot and diagnostic shape:
+Before/after readiness comparison for the same model snapshot and diagnostic shape at issue #275:
 
 | Report | Readiness blockers |
 | --- | --- |
@@ -118,4 +118,4 @@ The candidate report replaces the old `nccl_contribution_accumulate` and `nccl_c
 
 The implementation keeps host-staged unchanged as the correctness oracle. The NCCL backend now owns reusable rank0/rank1 f32 send/recv scratch buffers behind `DeviceCombineScratch`; each MoE call clears the f32 send scratch on device, accumulates one-token expert outputs into the owning rank's send scratch with a CUDA helper, runs the f32 NCCL all-reduce, and casts rank0's f32 result back to bf16 on device.
 
-The final bf16 `HiddenStates` returned to the model is still allocated per combine call. That allocation is outside the removed NCCL contribution/result round trip, so it is not claimed as full CUDA Graph readiness. The remaining readiness blockers are still real and should drive the next slice.
+The final bf16 `HiddenStates` returned to the model is still allocated per combine call. That allocation is outside the removed NCCL contribution/result round trip, so issue #275 did not claim full CUDA Graph readiness. The current blocker list should stay in `status.md`.

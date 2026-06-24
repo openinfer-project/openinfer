@@ -13,25 +13,26 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
+use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
     EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, TokenEvent,
-    TokenLogprob,
+    TokenLogprob, TokenSink,
 };
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 
 use self::plan::{
-    ActiveKvBudget, ExecutionPlan, admit_pending_requests, compaction_after_retire, max_kv_tokens,
-    slot_for_new_request,
+    ActiveKvBudget, ExecutionPlan, RejectReason, admit_pending_requests, compaction_after_retire,
+    max_kv_tokens, slot_for_new_request,
 };
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -39,7 +40,8 @@ use self::plan::{
 /// An in-flight request being decoded. Recurrent state lives in the
 /// `BatchDecodeGraphState` at `graph_slot_idx` — NOT owned here.
 struct ActiveRequest35 {
-    token_tx: mpsc::UnboundedSender<TokenEvent>,
+    request_id: Option<String>,
+    token_tx: TokenSink,
     kv: KvState,
     /// Index into `BatchDecodeGraphState.slot_states`.
     graph_slot_idx: usize,
@@ -50,31 +52,6 @@ struct ActiveRequest35 {
     params: SamplingParams,
     /// Number of top logprobs to return (0 = disabled).
     logprobs: usize,
-}
-
-/// Scratch buffers for GPU sampling (reused across prefill sampling).
-struct SampleScratch {
-    probs: cudarc::driver::CudaSlice<f32>,
-    top1_value: cudarc::driver::CudaSlice<half::bf16>,
-    row_states: cudarc::driver::CudaSlice<u8>,
-    valid: cudarc::driver::CudaSlice<u8>,
-    out: cudarc::driver::CudaSlice<i32>,
-}
-
-impl SampleScratch {
-    fn new(model: &Qwen35Model) -> Result<Self> {
-        let vocab_size = model.config().vocab_size;
-        let ctx = model.device_ctx();
-        Ok(Self {
-            probs: ctx.stream.alloc_zeros(vocab_size)?,
-            top1_value: ctx.stream.alloc_zeros(1)?,
-            row_states: ctx
-                .stream
-                .alloc_zeros(crate::ops::flashinfer_topk_row_states_bytes())?,
-            valid: ctx.stream.alloc_zeros(1)?,
-            out: ctx.stream.alloc_zeros(1)?,
-        })
-    }
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -88,18 +65,24 @@ pub fn start_with_capacity(
     seed: u64,
     max_batch: usize,
 ) -> Result<SchedulerHandle> {
+    // Static instance cap for the vLLM bridge's max_model_len. Live admission
+    // still uses the current page budget inside the scheduler loop.
+    let servable = servable_len(
+        model.config().max_position_embeddings,
+        model.kv_pool().capacity_pages().saturating_sub(1),
+        model.kv_pool().layout().page_size,
+    );
     let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
-    let sample_scratch = SampleScratch::new(&model)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
 
-    thread::Builder::new()
+    let join_handle = thread::Builder::new()
         .name("scheduler-qwen35".into())
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                scheduler_loop(model, graph_state, sample_scratch, submit_rx, seed);
+                scheduler_loop(model, graph_state, submit_rx, seed);
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -107,10 +90,21 @@ pub fn start_with_capacity(
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
-    startup_rx
+    let startup = startup_rx
         .recv()
-        .map_err(|_| anyhow::anyhow!("Qwen3.5 scheduler exited during startup"))??;
-    Ok(SchedulerHandle::new(submit_tx))
+        .map_err(|_| anyhow::anyhow!("Qwen3.5 scheduler exited during startup"))?;
+    if let Err(err) = startup {
+        let _ = join_handle.join();
+        return Err(err);
+    }
+    Ok(SchedulerHandle::new_with_join_handle(submit_tx, join_handle).with_servable_len(servable))
+}
+
+fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {
+    max_context
+        .min(max_pages.saturating_mul(page_size))
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 struct CublasThreadGuard;
@@ -141,6 +135,7 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
     unsafe {
         crate::ffi::cublas_init();
     }
+    model.tune_decode_gemm_algos()?;
     Ok(CublasThreadGuard)
 }
 
@@ -150,7 +145,6 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 fn scheduler_loop(
     model: Qwen35Model,
     mut graph_state: BatchDecodeGraphState,
-    mut sample_scratch: SampleScratch,
     mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
 ) {
@@ -198,33 +192,32 @@ fn scheduler_loop(
             // KvPool capacity includes the CUDA Graph padding page reserved at
             // construction, so a real request can use at most the remaining pages.
             model.kv_pool().capacity_pages().saturating_sub(1),
+            model.config().max_position_embeddings,
             |req| req.prompt_tokens.len(),
             |req| req.max_tokens,
         );
-        for rejected in &admission.rejected {
-            send_rejection(rejected);
+        for (rejected, reason) in &admission.rejected {
+            send_rejection(rejected, *reason);
         }
         let pending = admission.pending;
+        for req in &pending {
+            debug!(
+                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                req.request_id,
+                req.prompt_tokens.len(),
+                req.max_tokens
+            );
+        }
         deferred = admission.deferred;
 
         if let Some(plan) = plan::build_next_plan(!active.is_empty(), pending) {
             match plan {
-                ExecutionPlan::Unified { pending } => unified_step_sched(
-                    &model,
-                    &mut active,
-                    pending,
-                    &mut graph_state,
-                    &mut sample_scratch,
-                    &mut rng,
-                ),
-                ExecutionPlan::Prefill { pending } => prefill_batch(
-                    &model,
-                    &mut active,
-                    pending,
-                    &mut graph_state,
-                    &mut sample_scratch,
-                    &mut rng,
-                ),
+                ExecutionPlan::Unified { pending } => {
+                    unified_step_sched(&model, &mut active, pending, &mut graph_state, &mut rng)
+                }
+                ExecutionPlan::Prefill { pending } => {
+                    prefill_batch(&model, &mut active, pending, &mut graph_state, &mut rng)
+                }
                 ExecutionPlan::Decode => {
                     decode_step(&model, &mut active, &mut graph_state, &mut rng);
                 }
@@ -233,14 +226,24 @@ fn scheduler_loop(
     }
 }
 
-fn send_rejection(req: &SchedulerRequest) {
-    let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
-    let _ = req.token_tx.send(TokenEvent::Rejected {
-        message: format!(
-            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
+fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
+    let message = match reason {
+        RejectReason::ContextLength { limit } => format!(
+            "request exceeds this model's maximum context length of {limit} tokens: requested {} (prompt={} + max_tokens={})",
+            req.prompt_tokens.len().saturating_add(req.max_tokens),
             req.prompt_tokens.len(),
-            max_request_tokens
+            req.max_tokens
         ),
+        RejectReason::KvBudget => {
+            let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+            format!(
+                "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={max_request_tokens}",
+                req.prompt_tokens.len()
+            )
+        }
+    };
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message,
         prompt_tokens: req.prompt_tokens.len(),
         completion_tokens: 0,
     });
@@ -253,7 +256,6 @@ fn prefill_batch(
     active: &mut Vec<ActiveRequest35>,
     pending: Vec<SchedulerRequest>,
     graph_state: &mut BatchDecodeGraphState,
-    scratch: &mut SampleScratch,
     rng: &mut StdRng,
 ) {
     let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
@@ -265,7 +267,7 @@ fn prefill_batch(
         .collect();
     let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
 
-    let logits_vec = match model.batch_prefill(&prompts, &mut kv_states, &mut rec_refs) {
+    let logits_vec = match model.batch_prefill_logits(&prompts, &mut kv_states, &mut rec_refs) {
         Ok(v) => v,
         Err(e) => {
             warn!("batch prefill failed: {e}");
@@ -281,28 +283,27 @@ fn prefill_batch(
         }
     };
 
-    for (i, req) in pending.into_iter().enumerate() {
-        let prompt_len = req.prompt_tokens.len();
-
-        let first_token = match sample_from_logits(model, &logits_vec[i], scratch, &req.params, rng)
-        {
-            Ok(t) => t,
+    let (tokens, logprobs_vec) =
+        match sample_prefill_logits(model, &pending, &logits_vec, graph_state, rng) {
+            Ok(v) => v,
             Err(e) => {
-                warn!("First token sampling failed for request {i}: {e}");
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: e.to_string(),
-                    prompt_tokens: prompt_len,
-                    completion_tokens: 0,
-                });
-                continue;
+                warn!("prefill sampling failed: {e}");
+                let message = e.to_string();
+                for req in pending {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                return;
             }
         };
 
-        let logprob = if req.logprobs > 0 {
-            extract_logprobs(model, &logits_vec[i], first_token, req.logprobs).ok()
-        } else {
-            None
-        };
+    for (i, req) in pending.into_iter().enumerate() {
+        let prompt_len = req.prompt_tokens.len();
+        let first_token = tokens[i];
+        let logprob = logprobs_vec[i].clone();
 
         if req.echo {
             let echo_logprobs = vec![None; req.prompt_tokens.len()];
@@ -313,6 +314,13 @@ fn prefill_batch(
         }
 
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                0,
+                FinishReason::Stop
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: prompt_len,
@@ -329,10 +337,21 @@ fn prefill_batch(
             })
             .is_err()
         {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, 0
+            );
             continue;
         }
 
         if req.max_tokens <= 1 {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                1,
+                FinishReason::Length
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: prompt_len,
@@ -350,6 +369,7 @@ fn prefill_batch(
 
         let kv = std::mem::replace(&mut kv_states[i], model.alloc_kv());
         active.push(ActiveRequest35 {
+            request_id: req.request_id,
             token_tx: req.token_tx,
             kv,
             graph_slot_idx: slot_idx,
@@ -363,6 +383,45 @@ fn prefill_batch(
     }
 }
 
+fn sample_prefill_logits(
+    model: &Qwen35Model,
+    pending: &[SchedulerRequest],
+    logits: &HiddenStates,
+    graph_state: &mut BatchDecodeGraphState,
+    rng: &mut StdRng,
+) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
+    debug_assert_eq!(
+        logits.seq_len,
+        pending.len(),
+        "Qwen3.5 prefill logits rows must preserve pending request order"
+    );
+    let requested_logprobs: Vec<usize> = pending.iter().map(|r| r.logprobs).collect();
+    let cpu_logits = snapshot_requested_logprobs(model.device_ctx(), logits, &requested_logprobs)?;
+    let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
+    let sample_seed = rand::RngExt::random(rng);
+    let tokens = model.select_tokens_from_logits_varied(
+        logits,
+        &mut graph_state.buffers,
+        &params_refs,
+        sample_seed,
+    )?;
+
+    let logprobs = cpu_logits
+        .into_iter()
+        .enumerate()
+        .map(|(i, logits_opt)| {
+            logits_opt.and_then(|logits_f32| {
+                openinfer_sample::token_logprob_from_row(
+                    &logits_f32,
+                    tokens[i],
+                    pending[i].logprobs,
+                )
+            })
+        })
+        .collect();
+    Ok((tokens, logprobs))
+}
+
 // ── Unified step (prefill + decode in one forward pass) ────────────────
 
 fn unified_step_sched(
@@ -370,7 +429,6 @@ fn unified_step_sched(
     active: &mut Vec<ActiveRequest35>,
     pending: Vec<SchedulerRequest>,
     graph_state: &mut BatchDecodeGraphState,
-    scratch: &mut SampleScratch,
     rng: &mut StdRng,
 ) {
     // Build prefill inputs
@@ -389,7 +447,7 @@ fn unified_step_sched(
     let mut decode_kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
 
     // Run unified forward pass
-    let (prefill_logits, decode_logits) = match model.unified_step(
+    let output = match model.unified_step(
         &prompts,
         &mut prefill_kv_states,
         &mut rec_refs,
@@ -422,31 +480,36 @@ fn unified_step_sched(
     };
 
     // Process decode results FIRST (before adding prefill results to active)
-    process_decode_logits(model, active, &decode_logits, graph_state, scratch, rng);
+    if output.decoded {
+        process_decode_logits(model, active, graph_state, rng);
+    }
+
+    let prefill_logits = output
+        .prefill_logits
+        .as_ref()
+        .expect("pending unified step must return prefill logits");
+    let (tokens, logprobs_vec) =
+        match sample_prefill_logits(model, &pending, prefill_logits, graph_state, rng) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("unified prefill sampling failed: {e}");
+                let message = e.to_string();
+                for req in pending {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                return;
+            }
+        };
 
     // Process prefill results: sample first token, add to active
     for (i, req) in pending.into_iter().enumerate() {
         let prompt_len = req.prompt_tokens.len();
-
-        let first_token =
-            match sample_from_logits(model, &prefill_logits[i], scratch, &req.params, rng) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("First token sampling failed for request {i}: {e}");
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: e.to_string(),
-                        prompt_tokens: prompt_len,
-                        completion_tokens: 0,
-                    });
-                    continue;
-                }
-            };
-
-        let logprob = if req.logprobs > 0 {
-            extract_logprobs(model, &prefill_logits[i], first_token, req.logprobs).ok()
-        } else {
-            None
-        };
+        let first_token = tokens[i];
+        let logprob = logprobs_vec[i].clone();
 
         if req.echo {
             let echo_logprobs = vec![None; req.prompt_tokens.len()];
@@ -457,6 +520,13 @@ fn unified_step_sched(
         }
 
         if !req.params.ignore_eos && model.is_stop_token(first_token) {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                0,
+                FinishReason::Stop
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: prompt_len,
@@ -473,10 +543,21 @@ fn unified_step_sched(
             })
             .is_err()
         {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, 0
+            );
             continue;
         }
 
         if req.max_tokens <= 1 {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                1,
+                FinishReason::Length
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: prompt_len,
@@ -494,6 +575,7 @@ fn unified_step_sched(
 
         let kv = std::mem::replace(&mut prefill_kv_states[i], model.alloc_kv());
         active.push(ActiveRequest35 {
+            request_id: req.request_id,
             token_tx: req.token_tx,
             kv,
             graph_slot_idx: slot_idx,
@@ -532,29 +614,15 @@ fn decode_step(
     }
 
     // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits)
-    let any_logprobs = active.iter().any(|r| r.logprobs > 0);
-    let cpu_logits: Vec<Option<Vec<f32>>> = if any_logprobs {
-        (0..active.len())
-            .map(|i| {
-                if active[i].logprobs > 0 {
-                    crate::ops::extract_vec(model.device_ctx(), &graph_state.buffers.logits, i)
-                        .ok()
-                        .and_then(|v| v.to_host(model.device_ctx()).ok())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        vec![None; active.len()]
-    };
-
-    let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-    let tokens = match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, rng)
-    {
-        Ok(t) => t,
+    let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
+    let cpu_logits = match snapshot_requested_logprobs(
+        model.device_ctx(),
+        &graph_state.buffers.logits,
+        &requested_logprobs,
+    ) {
+        Ok(v) => v,
         Err(e) => {
-            warn!("sampling error: {e}");
+            warn!("logprobs snapshot error: {e}");
             let message = e.to_string();
             for req in active.drain(..) {
                 let _ = req.token_tx.send(TokenEvent::Error {
@@ -567,12 +635,32 @@ fn decode_step(
         }
     };
 
+    let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
+    let sample_seed = rand::RngExt::random(rng);
+    let tokens =
+        match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, sample_seed)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("sampling error: {e}");
+                let message = e.to_string();
+                for req in active.drain(..) {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens: req.generated_count,
+                    });
+                }
+                return;
+            }
+        };
+
     let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
         .into_iter()
         .enumerate()
         .map(|(i, logits_opt)| {
             logits_opt.and_then(|logits_f32| {
-                compute_logprobs_from_cpu(&logits_f32, tokens[i], active[i].logprobs)
+                openinfer_sample::token_logprob_from_row(&logits_f32, tokens[i], active[i].logprobs)
             })
         })
         .collect();
@@ -584,24 +672,36 @@ fn decode_step(
 fn process_decode_logits(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
-    decode_logits: &[DeviceVec],
     graph_state: &mut BatchDecodeGraphState,
-    scratch: &mut SampleScratch,
     rng: &mut StdRng,
 ) {
-    let mut tokens = Vec::with_capacity(active.len());
-    let mut logprobs_vec: Vec<Option<TokenLogprob>> = Vec::with_capacity(active.len());
-    for (i, logits) in decode_logits.iter().enumerate() {
-        match sample_from_logits(model, logits, scratch, &active[i].params, rng) {
-            Ok(t) => {
-                let lp = if active[i].logprobs > 0 {
-                    extract_logprobs(model, logits, t, active[i].logprobs).ok()
-                } else {
-                    None
-                };
-                tokens.push(t);
-                logprobs_vec.push(lp);
+    let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
+    let cpu_logits = match snapshot_requested_logprobs(
+        model.device_ctx(),
+        &graph_state.buffers.logits,
+        &requested_logprobs,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("decode logprobs snapshot error: {e}");
+            let message = e.to_string();
+            for req in active.drain(..) {
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                });
             }
+            return;
+        }
+    };
+
+    let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
+    let sample_seed = rand::RngExt::random(rng);
+    let tokens =
+        match model.select_tokens_batch_varied(&mut graph_state.buffers, &params_refs, sample_seed)
+        {
+            Ok(t) => t,
             Err(e) => {
                 warn!("decode sampling error: {e}");
                 let message = e.to_string();
@@ -614,8 +714,17 @@ fn process_decode_logits(
                 }
                 return;
             }
-        }
-    }
+        };
+
+    let logprobs_vec: Vec<Option<TokenLogprob>> = cpu_logits
+        .into_iter()
+        .enumerate()
+        .map(|(i, logits_opt)| {
+            logits_opt.and_then(|logits_f32| {
+                openinfer_sample::token_logprob_from_row(&logits_f32, tokens[i], active[i].logprobs)
+            })
+        })
+        .collect();
 
     dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state);
 }
@@ -644,6 +753,13 @@ fn dispatch_decode_tokens(
         let at_limit = req.generated_count >= req.max_tokens;
 
         if is_eos {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                req.prompt_len,
+                req.generated_count,
+                FinishReason::Stop
+            );
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: req.prompt_len,
@@ -651,6 +767,13 @@ fn dispatch_decode_tokens(
             });
             to_retire.push(i);
         } else if at_limit {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                req.prompt_len,
+                req.generated_count,
+                FinishReason::Length
+            );
             let _ = req.token_tx.send(TokenEvent::Token { id: token, logprob });
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
@@ -663,6 +786,10 @@ fn dispatch_decode_tokens(
             .send(TokenEvent::Token { id: token, logprob })
             .is_err()
         {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, req.generated_count
+            );
             to_retire.push(i);
         } else {
             req.last_token = token;
@@ -723,77 +850,6 @@ fn compact_slot(
 
         active[compaction.moved_to].graph_slot_idx = compaction.moved_to;
     }
-}
-
-fn sample_from_logits(
-    model: &Qwen35Model,
-    logits: &DeviceVec,
-    scratch: &mut SampleScratch,
-    params: &SamplingParams,
-    rng: &mut StdRng,
-) -> Result<u32> {
-    let random_val: f32 = rand::RngExt::random(rng);
-    crate::ops::gpu_sample_into(
-        model.device_ctx(),
-        logits,
-        &mut scratch.probs,
-        &mut scratch.top1_value,
-        &mut scratch.row_states,
-        &mut scratch.valid,
-        &mut scratch.out,
-        params,
-        random_val,
-    )
-}
-
-fn extract_logprobs(
-    model: &Qwen35Model,
-    logits: &DeviceVec,
-    sampled_token: u32,
-    top_k: usize,
-) -> Result<TokenLogprob> {
-    let logits_f32 = logits.to_host(model.device_ctx())?;
-    compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
-        .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
-}
-
-fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    sampled_token: u32,
-    top_k: usize,
-) -> Option<TokenLogprob> {
-    if logits_f32.is_empty() {
-        return None;
-    }
-
-    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
-    let log_sum_exp = max_val + sum_exp.ln();
-
-    let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
-
-    let k = top_k.min(logits_f32.len());
-    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-    if k > 0 {
-        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        for (idx, &val) in logits_f32.iter().enumerate() {
-            if best.len() < k || val > best.last().unwrap().1 {
-                let pos = best.partition_point(|&(_, v)| v > val);
-                best.insert(pos, (idx as u32, val));
-                if best.len() > k {
-                    best.pop();
-                }
-            }
-        }
-        for (idx, val) in best {
-            top.push((idx, val - log_sum_exp));
-        }
-    }
-
-    Some(TokenLogprob {
-        logprob: sampled_logprob,
-        top_logprobs: top,
-    })
 }
 
 #[cfg(test)]

@@ -6,28 +6,33 @@
 //! individual channels.
 
 mod effects;
+mod kv_events;
 mod plan;
 mod resolve;
-mod speculative;
 
 use std::collections::{HashSet, VecDeque};
 use std::thread;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
+use crate::weights::Qwen3MemoryOptions;
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
-    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, TokenEvent,
+    EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, KvCapacity, LoadSnapshot,
+    TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
 
 use self::effects::apply_effects;
-use self::plan::{build_next_plan, execute_plan};
+use self::kv_events::KvEventProducer;
+use self::plan::{
+    ExecutionArtifacts, ExecutionPlan, build_next_plan, execute_plan, should_speculative_decode,
+};
 use self::resolve::resolve_step;
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -36,7 +41,7 @@ use self::resolve::resolve_step;
 pub(super) struct ActiveRequestState {
     pub(super) request_id: RequestId,
     pub(super) lora_adapter: Option<String>,
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) last_token: u32,
     pub(super) generated_count: usize,
     pub(super) max_tokens: usize,
@@ -44,24 +49,33 @@ pub(super) struct ActiveRequestState {
     pub(super) params: SamplingParams,
     /// Number of top logprobs to return (0 = disabled).
     pub(super) logprobs: usize,
-    /// Full token context (prompt + generated so far). Maintained for the
-    /// n-gram speculative proposer; empty/unused when speculation is off.
-    pub(super) token_history: Vec<u32>,
 }
 
+#[derive(Clone)]
 pub(super) struct PendingRequest {
     pub(super) request_id: RequestId,
     pub(super) lora_adapter: Option<String>,
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) params: SamplingParams,
     pub(super) max_tokens: usize,
-    pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
+    pub(super) token_tx: TokenSink,
     pub(super) logprobs: usize,
     pub(super) echo: bool,
+    pub(super) queued_at_unix_s: Option<f64>,
     /// Whether this request has already been offered to async KV prefetch.
     /// Offered at most once; a no-hit offer leaves the request in the normal
     /// admission flow with this set so it isn't re-probed every tick.
     pub(super) prefetch_offered: bool,
+    /// Prompt tokens whose KV is already computed (prefix-cache hits plus
+    /// chunks applied in earlier steps). Updated from the executor's
+    /// authoritative position after every chunk.
+    pub(super) prefill_pos: usize,
+    /// Prompt tokens to forward in the upcoming step. Set by
+    /// `take_prefill_chunks` when the request is packed into a step.
+    pub(super) step_chunk: usize,
+    /// Prefix-cache hits reported by the first chunk, carried across later
+    /// chunks so the final result still reports them truthfully.
+    pub(super) cached_tokens: usize,
 }
 
 impl PendingRequest {
@@ -75,13 +89,56 @@ impl PendingRequest {
             token_tx: req.token_tx,
             logprobs: req.logprobs,
             echo: req.echo,
+            queued_at_unix_s: req.queued_at_unix_s,
             prefetch_offered: false,
+            prefill_pos: 0,
+            step_chunk: 0,
+            cached_tokens: 0,
         }
     }
+
+    fn remaining_prompt_tokens(&self) -> usize {
+        self.prompt_tokens.len() - self.prefill_pos
+    }
+}
+
+/// Pull the next prefill step set off the front of `prefilling`, capping the
+/// step's total forwarded tokens at `max_prefill_tokens`. Each taken request
+/// gets its per-step chunk recorded in `step_chunk`. Echo requests need
+/// logits for every prompt position in one forward, so they only run when
+/// their whole remainder fits the profiled prefill bound.
+fn take_prefill_chunks(
+    prefilling: &mut Vec<PendingRequest>,
+    max_prefill_tokens: usize,
+) -> Vec<PendingRequest> {
+    let mut budget = max_prefill_tokens;
+    let mut taken: Vec<PendingRequest> = Vec::new();
+    let mut i = 0;
+    while i < prefilling.len() && budget > 0 {
+        let remaining = prefilling[i].remaining_prompt_tokens();
+        let chunk = if prefilling[i].echo {
+            if remaining > budget {
+                i += 1;
+                continue;
+            }
+            remaining
+        } else {
+            remaining.min(budget)
+        };
+        let mut req = prefilling.remove(i);
+        req.step_chunk = chunk;
+        budget = budget.saturating_sub(chunk);
+        taken.push(req);
+    }
+    // Echo skips can take items out of arrival order; results come back
+    // sorted by request id, so the step set must be too.
+    taken.sort_by_key(|req| req.request_id);
+    taken
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_qwen3(
     model_path: &str,
     enable_cuda_graph: bool,
@@ -89,6 +146,11 @@ pub(crate) fn start_qwen3(
     seed: u64,
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
+    max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+    decode_overlap: crate::DecodeOverlap,
+    dflash_draft_model_path: Option<&str>,
+    enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -96,9 +158,22 @@ pub(crate) fn start_qwen3(
         device_ordinals,
         Qwen3LoraOptions::default(),
         offload_options,
+        max_prefill_tokens,
+        dflash_draft_model_path,
+        memory_options,
+        enable_kv_events,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-    Ok(start_with_executor(executor, seed))
+    executor.enable_decode_overlap(decode_overlap)?;
+    // Speculative decoding loads its draft model after the target is up (the
+    // draft is built against the target's embeddings/head) and forces the
+    // prefix cache off, so it must follow set_no_prefix_cache. Its GPU footprint
+    // was already reserved during profiling from the draft path passed above.
+    if let Some(draft_path) = dflash_draft_model_path {
+        executor.load_dflash_draft_model(draft_path)?;
+    }
+
+    Ok(start_with_executor(executor, seed, max_prefill_tokens))
 }
 
 pub(crate) fn start_qwen3_with_lora_control(
@@ -109,6 +184,9 @@ pub(crate) fn start_qwen3_with_lora_control(
     lora_options: Qwen3LoraOptions,
     offload_options: Qwen3OffloadOptions,
     no_prefix_cache: bool,
+    max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+    decode_overlap: crate::DecodeOverlap,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -116,9 +194,20 @@ pub(crate) fn start_qwen3_with_lora_control(
         device_ordinals,
         lora_options,
         offload_options,
+        max_prefill_tokens,
+        None,
+        memory_options,
+        // LoRA serving never emits KV events: the router-facing cache feed is
+        // base-model single-rank only.
+        false,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-    Ok(start_with_executor_with_lora_control(executor, seed))
+    executor.enable_decode_overlap(decode_overlap)?;
+    Ok(start_with_executor_with_lora_control(
+        executor,
+        seed,
+        max_prefill_tokens,
+    ))
 }
 
 fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32 {
@@ -128,46 +217,125 @@ fn servable_len(max_context: usize, max_blocks: usize, block_size: usize) -> u32
         .unwrap_or(u32::MAX)
 }
 
-pub(crate) fn start_with_executor<E>(executor: E, seed: u64) -> EngineHandle
+pub(crate) fn start_with_executor<E>(
+    mut executor: E,
+    seed: u64,
+    max_prefill_tokens: usize,
+) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
+    assert!(
+        max_prefill_tokens > 0,
+        "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
+    );
     let servable = servable_len(
         executor.max_context_tokens(),
         executor.max_request_blocks(),
         executor.block_size(),
     );
+    // Executor just built: the only committed block is the leaked CUDA-graph
+    // padding slot, so available_blocks() is total − 1. Conservative by one
+    // block, which is the right side to err on for a capacity ceiling.
+    let kv_total = executor.available_blocks() as u64;
+    let kv_capacity = KvCapacity {
+        total_blocks: kv_total as usize,
+        block_size: executor.block_size(),
+    };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_used_blocks: 0,
+        kv_total_blocks: kv_total,
+    });
+
+    // Opt-in KV block-event feed: `Some` only when the executor was built with
+    // events on (single-GPU, no LoRA). The producer runs on the scheduler
+    // thread; the neutral receiver is handed to the engine handle.
+    let (producer, kv_events_rx) = match executor.take_kv_event_receiver() {
+        Some(removes) => {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            (
+                Some(KvEventProducer::new(event_tx, removes)),
+                Some(event_rx),
+            )
+        }
+        None => (None, None),
+    };
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop(executor, submit_rx, seed);
+            scheduler_loop(
+                executor,
+                submit_rx,
+                seed,
+                max_prefill_tokens,
+                kv_total,
+                &load_tx,
+                producer,
+            );
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new(submit_tx).with_servable_len(servable)
+    let handle = EngineHandle::new(submit_tx)
+        .with_servable_len(servable)
+        .with_kv_capacity(kv_capacity)
+        .with_load_watch(load_rx);
+    match kv_events_rx {
+        Some(rx) => handle.with_kv_events(rx),
+        None => handle,
+    }
 }
 
-pub(crate) fn start_with_executor_with_lora_control<E>(executor: E, seed: u64) -> EngineHandle
+pub(crate) fn start_with_executor_with_lora_control<E>(
+    executor: E,
+    seed: u64,
+    max_prefill_tokens: usize,
+) -> EngineHandle
 where
     E: ModelExecutor + 'static,
 {
+    assert!(
+        max_prefill_tokens > 0,
+        "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
+    );
     let servable = servable_len(
         executor.max_context_tokens(),
         executor.max_request_blocks(),
         executor.block_size(),
     );
+    // Executor just built: the only committed block is the leaked CUDA-graph
+    // padding slot, so available_blocks() is total − 1. Conservative by one
+    // block, which is the right side to err on for a capacity ceiling.
+    let kv_total = executor.available_blocks() as u64;
+    let kv_capacity = KvCapacity {
+        total_blocks: kv_total as usize,
+        block_size: executor.block_size(),
+    };
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_used_blocks: 0,
+        kv_total_blocks: kv_total,
+    });
 
     thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
-            scheduler_loop_with_lora_control(executor, command_rx, seed);
+            scheduler_loop_with_lora_control(
+                executor,
+                command_rx,
+                seed,
+                max_prefill_tokens,
+                kv_total,
+                &load_tx,
+            );
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new_with_command_channel(command_tx).with_servable_len(servable)
+    EngineHandle::new_with_command_channel(command_tx)
+        .with_servable_len(servable)
+        .with_kv_capacity(kv_capacity)
+        .with_load_watch(load_rx)
 }
 
 // ── KV-offload prefetch admission helpers ────────────────────────────────
@@ -197,6 +365,9 @@ fn offer_prefetch<E: ModelExecutor>(
     executor: &mut E,
     deferred: &mut Vec<PendingRequest>,
     loading: &mut Vec<PendingRequest>,
+    // Free blocks already promised to admitted requests; the prefetch must
+    // leave them untouched (see `ModelExecutor::begin_kv_prefetch`).
+    reserve_floor: usize,
 ) {
     let mut keep = Vec::with_capacity(deferred.len());
     for mut req in deferred.drain(..) {
@@ -206,6 +377,7 @@ fn offer_prefetch<E: ModelExecutor>(
                 req.request_id,
                 &req.prompt_tokens,
                 req.lora_adapter.as_deref(),
+                reserve_floor,
             ) {
                 loading.push(req);
                 continue;
@@ -256,10 +428,34 @@ fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
+/// Republish live KV occupancy to the load-watch feed. Called once at the top of
+/// every loop iteration (before this step admits/allocates), so it reports the
+/// resident occupancy *between* steps — the steady-state load a router wants,
+/// not a transient in-step peak. Top-of-loop placement guarantees exactly one
+/// publish per iteration regardless of which `continue` the step takes, and the
+/// post-completion free shows up at the next iteration's top before the loop
+/// parks idle. `watch` coalesces (a consumer wakes at most once per step and
+/// reads the latest); `send_replace` ignores a dropped receiver, so the
+/// scheduler runs whether or not anyone is watching.
+fn publish_load<E: ModelExecutor>(
+    load_tx: &watch::Sender<LoadSnapshot>,
+    kv_total: u64,
+    executor: &E,
+) {
+    load_tx.send_replace(LoadSnapshot {
+        kv_used_blocks: kv_total.saturating_sub(executor.available_blocks() as u64),
+        kv_total_blocks: kv_total,
+    });
+}
+
 fn scheduler_loop<E>(
     mut executor: E,
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     seed: u64,
+    max_prefill_tokens: usize,
+    kv_total: u64,
+    load_tx: &watch::Sender<LoadSnapshot>,
+    mut kv_producer: Option<KvEventProducer>,
 ) where
     E: ModelExecutor,
 {
@@ -271,20 +467,46 @@ fn scheduler_loop<E>(
     let mut deferred: Vec<PendingRequest> = Vec::new();
     // Requests parked while their async CPU-tier KV prefetch loads.
     let mut loading: Vec<PendingRequest> = Vec::new();
-
-    // N-gram speculative decode. Off unless OPENINFER_QWEN3_SPEC is set
-    // (see SpeculativeConfig::from_env). When on, pure-decode ticks route
-    // through `speculative::speculative_decode_step` instead of the batched
-    // single-token decode.
-    let spec_config = crate::speculative::SpeculativeConfig::from_env();
-    if spec_config.enabled {
-        info!("speculative decode enabled: {}", spec_config.method);
-    }
-    let spec_proposer = spec_config.build_proposer();
+    // Admitted requests whose prompts are not fully prefilled yet (chunked
+    // prefill). FIFO by request id; each step takes chunks off the front.
+    let mut prefilling: Vec<PendingRequest> = Vec::new();
+    // Decode-overlap async prefill: pending requests whose prefill is in-flight
+    // on the prefill overlap stream. `None` when no async prefill is running.
+    let mut inflight_prefill_pending: Option<Vec<PendingRequest>> = None;
 
     info!("Scheduler ready");
 
     loop {
+        publish_load(load_tx, kv_total, &executor);
+        // Flush the prior step's cache changes to a router (no-op unless the
+        // event feed is on). Top-of-loop, like `publish_load`: one pass per
+        // iteration regardless of which branch the step takes, at the cost of a
+        // one-iteration announcement lag the router tolerates. Stores first so a
+        // block evicted the same step it registered is announced before removed.
+        if let Some(producer) = kv_producer.as_mut() {
+            producer.emit_stores(executor.take_kv_store_events());
+            producer.drain_removes();
+        }
+
+        // 0. Poll in-flight async prefill (decode-overlap mode).
+        if inflight_prefill_pending.is_some() {
+            if let Some(prefill_result) = executor.poll_async_prefill() {
+                let pending = inflight_prefill_pending.take().unwrap();
+                info!(
+                    "decode-overlap: async prefill completed ({} reqs)",
+                    pending.len()
+                );
+                let scheduled_at_unix_s = openinfer_core::engine::unix_now_s();
+                let artifacts = ExecutionArtifacts::Prefill {
+                    pending,
+                    result: prefill_result,
+                    scheduled_at_unix_s,
+                };
+                let effects = resolve_step(&executor, &active, artifacts);
+                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+            }
+        }
+
         // 1. Drain all incoming requests into deferred.
         while let Ok(req) = submit_rx.try_recv() {
             deferred.push(PendingRequest::from_scheduler_request(
@@ -296,12 +518,13 @@ fn scheduler_loop<E>(
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
         reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
-        offer_prefetch(&mut executor, &mut deferred, &mut loading);
+        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+        offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
 
         // 3. Nothing active and nothing admittable → block. Prefer blocking on
         // an in-flight load (so its request prefills next) over a new submit;
         // only truly idle (no loads either) do we block on the channel.
-        if active.is_empty() && deferred.is_empty() {
+        if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             if !loading.is_empty() {
                 block_on_loading(&mut executor, &mut deferred, &mut loading);
                 continue;
@@ -335,34 +558,84 @@ fn scheduler_loop<E>(
         let admission = admit_deferred_requests(
             lora_validation.accepted,
             &active,
+            &prefilling,
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
             release_rejected(&mut executor, rejected);
         }
-        let pending = admission.pending;
+        prefilling.extend(admission.pending);
         deferred = admission.deferred;
+        // If there's an in-flight async prefill, skip taking new prefill chunks
+        // (only do decode until the async prefill completes).
+        let pending = if inflight_prefill_pending.is_some() {
+            Vec::new()
+        } else {
+            take_prefill_chunks(&mut prefilling, max_prefill_tokens)
+        };
 
-        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
+        let Some(plan) = runtime_plan(&executor, &active, pending) else {
             continue;
         };
-        // Speculative decode replaces the batched single-token decode on
-        // pure-decode ticks (no new prefill this step). Lossless under greedy.
-        if spec_config.enabled && matches!(plan, self::plan::ExecutionPlan::Decode) {
-            self::speculative::speculative_decode_step(
-                &mut executor,
-                &mut active,
-                spec_proposer.as_ref(),
-                &mut rng,
-            );
-            continue;
+
+        // Decode-overlap path: when a Unified plan appears and overlap streams
+        // are active (and no async prefill is already in-flight), execute_unified
+        // internally uses SplitConcurrent which only syncs decode and defers
+        // the prefill sync. This lets the scheduler advance decode immediately.
+        // The prefill result is polled at the top of the next iteration.
+        if executor.has_decode_overlap()
+            && inflight_prefill_pending.is_none()
+            && matches!(plan, ExecutionPlan::Unified { .. })
+        {
+            if let ExecutionPlan::Unified { pending } = plan {
+                let prefill_tokens: usize = pending.iter().map(|r| r.step_chunk).sum();
+                info!(
+                    "decode-overlap: unified step with async prefill ({} reqs, ~{} tokens)",
+                    pending.len(),
+                    prefill_tokens
+                );
+
+                // Save pending for later poll resolution.
+                let pending_for_poll = pending.clone();
+
+                // execute_plan(Unified) will internally SplitConcurrent:
+                // - sync decode immediately
+                // - defer prefill sync
+                // It returns Unified artifacts with empty prefill_requests.
+                let unified_plan = ExecutionPlan::Unified { pending };
+                let failure_targets = failure_targets_for(&active, &unified_plan);
+                let artifacts =
+                    match execute_plan(&mut executor, &mut active, unified_plan, &mut rng) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Execution step failed: {e}");
+                            fail_touched_requests(
+                                &mut executor,
+                                &mut active,
+                                failure_targets,
+                                &e.to_string(),
+                            );
+                            continue;
+                        }
+                    };
+
+                // Only apply decode effects from the unified result.
+                let effects = resolve_step(&executor, &active, artifacts);
+                apply_effects(&mut executor, &mut active, &mut prefilling, effects);
+
+                // Track the pending prefill for next-iteration polling.
+                inflight_prefill_pending = Some(pending_for_poll);
+                continue;
+            }
         }
+
         let failure_targets = failure_targets_for(&active, &plan);
         let artifacts = match execute_plan(&mut executor, &mut active, plan, &mut rng) {
             Ok(v) => v,
@@ -373,7 +646,7 @@ fn scheduler_loop<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, effects);
+        apply_effects(&mut executor, &mut active, &mut prefilling, effects);
     }
 }
 
@@ -381,6 +654,9 @@ fn scheduler_loop_with_lora_control<E>(
     mut executor: E,
     mut command_rx: mpsc::UnboundedReceiver<EngineCommand>,
     seed: u64,
+    max_prefill_tokens: usize,
+    kv_total: u64,
+    load_tx: &watch::Sender<LoadSnapshot>,
 ) where
     E: ModelExecutor,
 {
@@ -389,12 +665,15 @@ fn scheduler_loop_with_lora_control<E>(
     let mut next_request_id = 0u64;
     let mut deferred: Vec<PendingRequest> = Vec::new();
     let mut loading: Vec<PendingRequest> = Vec::new();
+    let mut prefilling: Vec<PendingRequest> = Vec::new();
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
 
     info!("Scheduler ready with LoRA control");
 
     loop {
+        publish_load(load_tx, kv_total, &executor);
+
         // 1. Drain incoming commands. Generation submitted after a pending
         // control command waits until that control command is handled at idle.
         while let Ok(command) = command_rx.try_recv() {
@@ -412,12 +691,13 @@ fn scheduler_loop_with_lora_control<E>(
         // (a prefetch must not race ahead of an adapter load it depends on).
         reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
         if pending_control.is_empty() {
-            offer_prefetch(&mut executor, &mut deferred, &mut loading);
+            let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+            offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         }
 
         // 2. Once idle, apply pending control commands before admitting newer
         // generation requests that arrived behind them.
-        if active.is_empty() && deferred.is_empty() {
+        if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             drain_idle_control(&mut executor, &mut pending_control);
             if pending_control.is_empty() && !post_control_deferred.is_empty() {
                 deferred.append(&mut post_control_deferred);
@@ -426,7 +706,7 @@ fn scheduler_loop_with_lora_control<E>(
 
         // 3. Nothing active and no deferred generation → block. An in-flight
         // load takes priority over waiting on a new command.
-        if active.is_empty() && deferred.is_empty() {
+        if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             if !loading.is_empty() {
                 block_on_loading(&mut executor, &mut deferred, &mut loading);
                 continue;
@@ -469,19 +749,22 @@ fn scheduler_loop_with_lora_control<E>(
         let admission = admit_deferred_requests(
             lora_validation.accepted,
             &active,
+            &prefilling,
             executor.block_size(),
             executor.available_blocks(),
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            max_prefill_tokens,
             |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
             release_rejected(&mut executor, rejected);
         }
-        let pending = admission.pending;
+        prefilling.extend(admission.pending);
         deferred = admission.deferred;
+        let pending = take_prefill_chunks(&mut prefilling, max_prefill_tokens);
 
         if active.is_empty() && pending.is_empty() {
             // A parked load must still be polled to completion before we block.
@@ -504,7 +787,7 @@ fn scheduler_loop_with_lora_control<E>(
             continue;
         }
 
-        let Some(plan) = build_next_plan(!active.is_empty(), pending) else {
+        let Some(plan) = runtime_plan(&executor, &active, pending) else {
             continue;
         };
         let failure_targets = failure_targets_for(&active, &plan);
@@ -517,7 +800,7 @@ fn scheduler_loop_with_lora_control<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, effects);
+        apply_effects(&mut executor, &mut active, &mut prefilling, effects);
     }
 }
 
@@ -591,7 +874,7 @@ fn handle_control_request(executor: &mut impl ModelExecutor, control: EngineCont
 #[derive(Clone)]
 struct RequestFailureTarget {
     request_id: RequestId,
-    token_tx: mpsc::UnboundedSender<TokenEvent>,
+    token_tx: TokenSink,
     prompt_tokens: usize,
     completion_tokens: usize,
 }
@@ -601,6 +884,9 @@ struct RequestFailureTarget {
 enum RejectReason {
     /// Worst-case length exceeds the model's position-encoding window.
     ContextLength { limit: usize },
+    /// Echo needs all-position logits in one forward, so it must fit the
+    /// profiled prefill bound.
+    EchoPrefillTokens { limit: usize },
     /// Worst-case length needs more KV blocks than this instance can ever provide.
     KvBudget,
 }
@@ -646,16 +932,16 @@ fn blocks_needed(token_count: usize, block_size: usize) -> usize {
     token_count.div_ceil(block_size)
 }
 
-// Prefill samples the first output token but does not append it to KV. A
-// generated token occupies KV only when it is fed as the next decode input.
-// Therefore N returned completion tokens occupy at most N - 1 generated-token
-// KV slots.
+// Prefill samples the first output token but does not write its KV. A generated
+// token's KV is written only when it is fed as the next decode input. Therefore
+// N returned completion tokens occupy at most N - 1 generated-token KV slots.
 fn max_request_tokens(req: &PendingRequest) -> usize {
     req.prompt_tokens
         .len()
         .saturating_add(req.max_tokens.saturating_sub(1))
 }
 
+#[cfg(test)]
 fn max_active_tokens(req: &ActiveRequestState) -> usize {
     req.prompt_len
         .saturating_add(req.max_tokens.saturating_sub(1))
@@ -666,32 +952,117 @@ fn current_active_tokens(req: &ActiveRequestState) -> usize {
         .saturating_add(req.generated_count.saturating_sub(1))
 }
 
+// Pool blocks a request can draw over its lifetime. One-token completions
+// finish after prefill, so schedule_decode never provisions a dangling block.
+// Multi-token requests can draw that final dangling decode block, so admission
+// reserves prompt + max_tokens for them.
+fn request_lifetime_blocks(prompt_len: usize, max_tokens: usize, block_size: usize) -> usize {
+    let lifetime_tokens = if max_tokens <= 1 {
+        prompt_len
+    } else {
+        prompt_len.saturating_add(max_tokens)
+    };
+    lifetime_tokens.div_ceil(block_size).max(1)
+}
+
+fn pending_lifetime_blocks(req: &PendingRequest, block_size: usize) -> usize {
+    request_lifetime_blocks(req.prompt_tokens.len(), req.max_tokens, block_size)
+}
+
+fn active_lifetime_blocks(req: &ActiveRequestState, block_size: usize) -> usize {
+    request_lifetime_blocks(req.prompt_len, req.max_tokens, block_size)
+}
+
 fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usize {
     active
         .iter()
         .map(|req| {
-            blocks_needed(max_active_tokens(req), block_size)
+            active_lifetime_blocks(req, block_size)
                 .saturating_sub(blocks_needed(current_active_tokens(req), block_size))
         })
         .sum()
 }
 
+fn echo_exceeds_prefill_bound(req: &PendingRequest, max_prefill_tokens: usize) -> bool {
+    req.echo && req.prompt_tokens.len() > max_prefill_tokens
+}
+
+/// Free blocks already promised to admitted requests (active decode growth +
+/// remaining prefill chunks). A KV prefetch reservation must stay out of this
+/// floor or a later chunk/decode fails allocation and kills the whole step.
+fn admitted_future_blocks<E: ModelExecutor>(
+    executor: &E,
+    active: &[ActiveRequestState],
+    prefilling: &[PendingRequest],
+) -> usize {
+    let block_size = executor.block_size();
+    active_future_blocks(active, block_size)
+        + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+}
+
+fn prefilling_future_blocks(
+    prefilling: &[PendingRequest],
+    block_size: usize,
+    // Blocks a request already holds via a settled prefetch (zero once its
+    // first chunk absorbs them). They are out of the free pool, so counting
+    // them as future need would double-charge the budget.
+    prefetch_credit: impl Fn(RequestId) -> usize,
+) -> usize {
+    prefilling
+        .iter()
+        .map(|req| {
+            pending_lifetime_blocks(req, block_size)
+                .saturating_sub(blocks_needed(req.prefill_pos, block_size))
+                .saturating_sub(prefetch_credit(req.request_id))
+        })
+        .sum()
+}
+
+/// Default for `max_prefill_tokens`: prompt tokens forwarded in a single step
+/// (chunked prefill). Prefill activation scratch scales with the step's total
+/// prompt tokens (~22 KB/token measured on Qwen3-4B), so an unbounded prefill
+/// batch can eat the post-KV-pool VRAM headroom and OOM mid-serving under a
+/// request burst. Prompts longer than the budget are split across steps, so
+/// long prompts can't monopolize a step and starve running decodes.
+/// Echo requests need all-position logits in one forward and are rejected when
+/// their prompt exceeds this bound.
+///
+/// A unified step's duration scales with its prefill tokens, and every decode
+/// request in the batch stalls for the whole step — the budget bounds that
+/// stall. 1024 halves ITL p99 vs 2048 at mid-load with the same mean TPOT;
+/// 512 chunks no longer amortize the per-step fixed cost, so prefill falls
+/// behind arrivals and TTFT queues up.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
+
 fn admit_deferred_requests(
     deferred: Vec<PendingRequest>,
     active: &[ActiveRequestState],
+    // Admitted requests still mid-prefill: they hold KV for their applied
+    // chunks and will take a decode slot when they promote, so admission
+    // must reserve both or completing chunks can overshoot capacity.
+    prefilling: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
+    max_prefill_tokens: usize,
     // Blocks a request already holds from a settled prefetch. These are already
     // out of `available_blocks`, so they must be credited against the request's
     // need or admission double-counts them and can wedge a near-budget CPU-hit
     // request forever (never admitted, prefetch never released).
     prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> AdmissionOutcome {
-    let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
-    let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
+    let mut budget = available_blocks
+        .saturating_sub(active_future_blocks(active, block_size))
+        .saturating_sub(prefilling_future_blocks(
+            prefilling,
+            block_size,
+            &prefetch_credit,
+        ));
+    let mut decode_slots = max_decode_batch_size
+        .saturating_sub(active.len())
+        .saturating_sub(prefilling.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -708,9 +1079,19 @@ fn admit_deferred_requests(
             continue;
         }
 
+        if echo_exceeds_prefill_bound(&req, max_prefill_tokens) {
+            rejected.push((
+                req,
+                RejectReason::EchoPrefillTokens {
+                    limit: max_prefill_tokens,
+                },
+            ));
+            continue;
+        }
+
         // Full physical footprint gates the per-request cap (a request occupies
         // all of it, prefetched or not)…
-        let footprint = blocks_needed(max_request_tokens(&req), block_size);
+        let footprint = pending_lifetime_blocks(&req, block_size);
         if footprint > max_request_blocks {
             rejected.push((req, RejectReason::KvBudget));
             continue;
@@ -722,6 +1103,12 @@ fn admit_deferred_requests(
         if fresh_needed <= budget && decode_slots > 0 {
             budget -= fresh_needed;
             decode_slots -= 1;
+            debug!(
+                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                req.request_id,
+                req.prompt_tokens.len(),
+                req.max_tokens
+            );
             pending.push(req);
         } else {
             still_deferred.push(req);
@@ -743,6 +1130,11 @@ fn send_rejection(req: &PendingRequest, reason: RejectReason) {
             req.prompt_tokens.len().saturating_add(req.max_tokens),
             req.prompt_tokens.len(),
             req.max_tokens
+        ),
+        RejectReason::EchoPrefillTokens { limit } => format!(
+            "echo request prompt exceeds the profiled prefill limit of {} tokens: prompt_tokens={}",
+            limit,
+            req.prompt_tokens.len()
         ),
         RejectReason::KvBudget => format!(
             "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
@@ -766,6 +1158,26 @@ fn send_unknown_lora_rejection(req: &PendingRequest) {
     });
 }
 
+/// Choose the step plan, preferring a speculative-decode step when the whole
+/// active batch is draft-ready. Prefill of new arrivals still takes priority —
+/// a speculative step only runs when there is nothing to prefill, so the two
+/// never mix in one step.
+fn runtime_plan(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    pending: Vec<PendingRequest>,
+) -> Option<ExecutionPlan> {
+    if should_speculative_decode(executor, active) {
+        if pending.is_empty() {
+            Some(ExecutionPlan::SpeculativeDecode)
+        } else {
+            Some(ExecutionPlan::Prefill { pending })
+        }
+    } else {
+        build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+    }
+}
+
 fn failure_targets_for(
     active: &[ActiveRequestState],
     plan: &self::plan::ExecutionPlan,
@@ -776,6 +1188,9 @@ fn failure_targets_for(
             targets.extend(pending.iter().map(pending_failure_target));
         }
         self::plan::ExecutionPlan::Decode => {
+            targets.extend(active.iter().map(active_failure_target));
+        }
+        self::plan::ExecutionPlan::SpeculativeDecode => {
             targets.extend(active.iter().map(active_failure_target));
         }
         self::plan::ExecutionPlan::Unified { pending } => {
@@ -827,1194 +1242,4 @@ fn fail_touched_requests(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    use anyhow::Result;
-    use openinfer_core::engine::{
-        EngineControlError, LoadLoraAdapterRequest, UnloadLoraAdapterRequest,
-    };
-
-    use super::*;
-    use crate::executor::{
-        DecodePlan, DecodeRequestResult, PrefillPlan, PrefillRequestResult, PrefillResult,
-        UnifiedPlan, UnifiedResult,
-    };
-
-    struct FakeExecutor {
-        block_size: usize,
-        max_request_blocks: usize,
-        max_context_tokens: usize,
-        available_blocks: usize,
-        held_tokens: HashMap<RequestId, usize>,
-        fail_decode_once: bool,
-        decode_delay: Duration,
-        loaded_lora_adapters: HashSet<String>,
-        dropped: Arc<Mutex<Vec<u64>>>,
-        prefetch_offers: Arc<Mutex<Vec<u64>>>,
-        prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
-        decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
-        prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
-        decode_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
-    }
-
-    impl FakeExecutor {
-        fn new(max_request_blocks: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
-            Self {
-                block_size: 16,
-                max_request_blocks,
-                max_context_tokens: usize::MAX,
-                available_blocks: max_request_blocks,
-                held_tokens: HashMap::new(),
-                fail_decode_once: false,
-                decode_delay: Duration::ZERO,
-                loaded_lora_adapters: HashSet::new(),
-                dropped,
-                prefetch_offers: Arc::new(Mutex::new(Vec::new())),
-                prefill_batches: Arc::new(Mutex::new(Vec::new())),
-                decode_batches: Arc::new(Mutex::new(Vec::new())),
-                prefill_lora_batches: Arc::new(Mutex::new(Vec::new())),
-                decode_lora_batches: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn with_decode_failure(mut self) -> Self {
-            self.fail_decode_once = true;
-            self
-        }
-
-        fn with_max_context_tokens(mut self, max_context_tokens: usize) -> Self {
-            self.max_context_tokens = max_context_tokens;
-            self
-        }
-
-        fn with_decode_delay(mut self, delay: Duration) -> Self {
-            self.decode_delay = delay;
-            self
-        }
-
-        fn with_lora_adapters(mut self, names: &[&str]) -> Self {
-            self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
-            self
-        }
-
-        fn with_batch_records(
-            mut self,
-            prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
-            decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
-        ) -> Self {
-            self.prefill_batches = prefill_batches;
-            self.decode_batches = decode_batches;
-            self
-        }
-
-        fn with_lora_batch_records(
-            mut self,
-            prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
-            decode_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
-        ) -> Self {
-            self.prefill_lora_batches = prefill_lora_batches;
-            self.decode_lora_batches = decode_lora_batches;
-            self
-        }
-
-        fn ensure_request_tokens(
-            &mut self,
-            request_id: RequestId,
-            token_count: usize,
-        ) -> Result<()> {
-            let current_tokens = self.held_tokens.get(&request_id).copied().unwrap_or(0);
-            let current_blocks = blocks_needed(current_tokens, self.block_size);
-            let needed_blocks = blocks_needed(token_count, self.block_size);
-            let grow = needed_blocks.saturating_sub(current_blocks);
-            if grow > self.available_blocks {
-                anyhow::bail!("fake KV capacity exhausted");
-            }
-            self.available_blocks -= grow;
-            self.held_tokens.insert(request_id, token_count);
-            Ok(())
-        }
-    }
-
-    impl ModelExecutor for FakeExecutor {
-        fn block_size(&self) -> usize {
-            self.block_size
-        }
-
-        fn max_request_blocks(&self) -> usize {
-            self.max_request_blocks
-        }
-
-        fn max_context_tokens(&self) -> usize {
-            self.max_context_tokens
-        }
-
-        fn max_decode_batch_size(&self) -> usize {
-            64
-        }
-
-        fn available_blocks(&self) -> usize {
-            self.available_blocks
-        }
-
-        fn is_stop_token(&self, _token_id: u32) -> bool {
-            false
-        }
-
-        fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
-            if let Some(tokens) = self.held_tokens.remove(&request_id) {
-                self.available_blocks += blocks_needed(tokens, self.block_size);
-            }
-            self.dropped.lock().unwrap().push(request_id.get());
-            Ok(())
-        }
-
-        fn begin_kv_prefetch(
-            &mut self,
-            request_id: RequestId,
-            _prompt_tokens: &[u32],
-            _lora_adapter: Option<&str>,
-        ) -> bool {
-            self.prefetch_offers.lock().unwrap().push(request_id.get());
-            false
-        }
-
-        fn list_lora_adapters(&self) -> Vec<String> {
-            let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
-            names.sort();
-            names
-        }
-
-        fn unload_lora_adapter(&mut self, request: &UnloadLoraAdapterRequest) -> Result<()> {
-            anyhow::ensure!(
-                self.loaded_lora_adapters.remove(&request.lora_name),
-                "LoRA adapter is not loaded: {}",
-                request.lora_name
-            );
-            Ok(())
-        }
-
-        fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-            self.prefill_batches.lock().unwrap().push(
-                plan.requests
-                    .iter()
-                    .map(|request| request.request_id)
-                    .collect(),
-            );
-            self.prefill_lora_batches.lock().unwrap().push(
-                plan.requests
-                    .iter()
-                    .map(|request| request.lora_adapter.clone())
-                    .collect(),
-            );
-            for req in plan.requests {
-                self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
-            }
-            Ok(PrefillResult {
-                requests: plan
-                    .requests
-                    .iter()
-                    .map(|req| PrefillRequestResult {
-                        request_id: req.request_id,
-                        first_token: 100 + req.request_id.get() as u32,
-                        first_token_logprob: None,
-                        prompt_logprobs: None,
-                        cached_tokens: 0,
-                    })
-                    .collect(),
-            })
-        }
-
-        fn execute_decode(
-            &mut self,
-            plan: DecodePlan<'_>,
-        ) -> Result<crate::executor::DecodeResult> {
-            if !self.decode_delay.is_zero() {
-                std::thread::sleep(self.decode_delay);
-            }
-            if self.fail_decode_once {
-                self.fail_decode_once = false;
-                anyhow::bail!("fake decode KV capacity exhausted");
-            }
-
-            self.decode_batches.lock().unwrap().push(
-                plan.requests
-                    .iter()
-                    .map(|request| request.request_id)
-                    .collect(),
-            );
-            self.decode_lora_batches.lock().unwrap().push(
-                plan.requests
-                    .iter()
-                    .map(|request| request.lora_adapter.clone())
-                    .collect(),
-            );
-            for req in plan.requests {
-                let current_tokens = self
-                    .held_tokens
-                    .get(&req.request_id)
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-                self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
-            }
-
-            Ok(crate::executor::DecodeResult {
-                requests: plan
-                    .requests
-                    .iter()
-                    .map(|req| DecodeRequestResult {
-                        request_id: req.request_id,
-                        token: 200 + req.request_id.get() as u32,
-                        logprob: None,
-                    })
-                    .collect(),
-            })
-        }
-
-        fn execute_speculative(
-            &mut self,
-            item: &crate::executor::SpeculativeStepItem,
-        ) -> Result<Vec<u32>> {
-            // Deterministic: accept every draft, then append one bonus token.
-            let mut committed = item.drafts.clone();
-            committed.push(300 + item.request_id.get() as u32);
-            let current = self
-                .held_tokens
-                .get(&item.request_id)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-            self.ensure_request_tokens(item.request_id, current + committed.len())?;
-            Ok(committed)
-        }
-
-        fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-            self.prefill_batches.lock().unwrap().push(
-                plan.prefill_requests
-                    .iter()
-                    .map(|request| request.request_id)
-                    .collect(),
-            );
-            self.prefill_lora_batches.lock().unwrap().push(
-                plan.prefill_requests
-                    .iter()
-                    .map(|request| request.lora_adapter.clone())
-                    .collect(),
-            );
-            self.decode_batches.lock().unwrap().push(
-                plan.decode_requests
-                    .iter()
-                    .map(|request| request.request_id)
-                    .collect(),
-            );
-            self.decode_lora_batches.lock().unwrap().push(
-                plan.decode_requests
-                    .iter()
-                    .map(|request| request.lora_adapter.clone())
-                    .collect(),
-            );
-            for req in plan.prefill_requests {
-                self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
-            }
-            for req in plan.decode_requests {
-                let current_tokens = self
-                    .held_tokens
-                    .get(&req.request_id)
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-                self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
-            }
-
-            Ok(UnifiedResult {
-                prefill_requests: plan
-                    .prefill_requests
-                    .iter()
-                    .map(|req| PrefillRequestResult {
-                        request_id: req.request_id,
-                        first_token: 100 + req.request_id.get() as u32,
-                        first_token_logprob: None,
-                        prompt_logprobs: None,
-                        cached_tokens: 0,
-                    })
-                    .collect(),
-                decode_requests: plan
-                    .decode_requests
-                    .iter()
-                    .map(|req| DecodeRequestResult {
-                        request_id: req.request_id,
-                        token: 200 + req.request_id.get() as u32,
-                        logprob: None,
-                    })
-                    .collect(),
-            })
-        }
-    }
-
-    #[test]
-    fn kv_budget_counts_only_tokens_written_to_cache() {
-        let (pending_req, _pending_rx) = request(16, 1);
-        let pending = PendingRequest::from_scheduler_request(RequestId(7), pending_req);
-        assert_eq!(max_request_tokens(&pending), 16);
-        assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 1);
-
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
-        let after_prefill = ActiveRequestState {
-            request_id: RequestId(8),
-            lora_adapter: None,
-            token_tx,
-            last_token: 100,
-            generated_count: 1,
-            max_tokens: 3,
-            prompt_len: 16,
-            params: SamplingParams::default(),
-            logprobs: 0,
-            token_history: Vec::new(),
-        };
-        assert_eq!(current_active_tokens(&after_prefill), 16);
-        assert_eq!(max_active_tokens(&after_prefill), 18);
-
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
-        let after_one_decode = ActiveRequestState {
-            request_id: RequestId(9),
-            lora_adapter: None,
-            token_tx,
-            last_token: 200,
-            generated_count: 2,
-            max_tokens: 3,
-            prompt_len: 16,
-            params: SamplingParams::default(),
-            logprobs: 0,
-            token_history: Vec::new(),
-        };
-        assert_eq!(current_active_tokens(&after_one_decode), 17);
-        assert_eq!(max_active_tokens(&after_one_decode), 18);
-    }
-
-    #[test]
-    fn admission_splits_deferred_into_pending_deferred_and_rejected() {
-        // block_size 16, per-request cap 4 blocks (max 64 tokens). One active
-        // request is mid-flight and will grow into 2 more blocks, so it
-        // pre-reserves them out of the budget.
-        let (token_tx, _rx) = mpsc::unbounded_channel();
-        let active = [ActiveRequestState {
-            request_id: RequestId(0),
-            lora_adapter: None,
-            token_tx,
-            last_token: 1,
-            generated_count: 1, // current tokens = prompt_len (16) -> 1 block
-            max_tokens: 18,     // max tokens = 16 + 17 = 33 -> 3 blocks; future growth = 2
-            prompt_len: 16,
-            params: SamplingParams::default(),
-            logprobs: 0,
-            token_history: Vec::new(),
-        }];
-
-        let mk = |id: u64, prompt_len, max_tokens| {
-            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
-        };
-        let deferred = vec![
-            mk(1, 16, 1), // 16 tokens -> 1 block: admitted
-            mk(2, 16, 1), // 1 block: admitted, budget now 0
-            mk(3, 16, 1), // 1 block: no budget left -> stays deferred
-            mk(4, 80, 1), // 80 tokens -> 5 blocks > cap of 4 -> rejected outright
-        ];
-
-        // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64, |_| 0);
-
-        let ids =
-            |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
-        assert_eq!(
-            ids(&outcome.pending),
-            vec![1, 2],
-            "admit in order until the budget is spent"
-        );
-        assert_eq!(
-            ids(&outcome.deferred),
-            vec![3],
-            "budget-starved requests stay deferred, not dropped"
-        );
-        let rejected_ids = outcome
-            .rejected
-            .iter()
-            .map(|(r, _)| r.request_id.get())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rejected_ids,
-            vec![4],
-            "requests larger than the per-request cap are rejected outright"
-        );
-    }
-
-    #[test]
-    fn requests_exceeding_context_window_are_rejected() {
-        let active: [ActiveRequestState; 0] = [];
-        let mk = |id: u64, prompt_len, max_tokens| {
-            PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
-        };
-
-        let deferred = vec![
-            mk(1, 16, 16), // reqest 1: 16 prompt + 16 max = 32 total: admitted
-            mk(2, 16, 17), // request 2: 16 prompt + 17 max = 33 total: overflows by 1 token → rejected
-            mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
-        ];
-
-        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64, |_| 0);
-
-        let pending_ids = outcome
-            .pending
-            .iter()
-            .map(|r| r.request_id.get())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            pending_ids,
-            vec![1],
-            "only the request that fits the window is admitted; overflows are rejected, not clamped"
-        );
-
-        let rejected_ids = outcome
-            .rejected
-            .iter()
-            .map(|(r, _)| r.request_id.get())
-            .collect::<Vec<_>>();
-        assert_eq!(rejected_ids, vec![2, 3]);
-        for (_, reason) in &outcome.rejected {
-            assert!(
-                matches!(reason, RejectReason::ContextLength { limit: 32 }),
-                "rejected on the context window, not the KV budget"
-            );
-        }
-    }
-
-    #[test]
-    fn admission_respects_decode_batch_capacity() {
-        let mut active = Vec::new();
-        for id in 0..64 {
-            let (token_tx, _rx) = mpsc::unbounded_channel();
-            active.push(ActiveRequestState {
-                request_id: RequestId(id),
-                lora_adapter: None,
-                token_tx,
-                last_token: 1,
-                generated_count: 1,
-                max_tokens: 2,
-                prompt_len: 16,
-                params: SamplingParams::default(),
-                logprobs: 0,
-                token_history: Vec::new(),
-            });
-        }
-        let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
-
-        let outcome = admit_deferred_requests(
-            vec![pending],
-            &active,
-            16,
-            1024,
-            1024,
-            usize::MAX,
-            64,
-            |_| 0,
-        );
-
-        assert!(
-            outcome.pending.is_empty(),
-            "new request must not be admitted past decode scratch capacity"
-        );
-        assert_eq!(
-            outcome.deferred[0].request_id,
-            RequestId(64),
-            "capacity-starved request should stay deferred"
-        );
-        assert!(outcome.rejected.is_empty());
-    }
-
-    #[test]
-    fn one_token_completion_on_page_boundary_fits_one_page() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(1, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
-
-        let (fits_exactly, mut rx) = request(16, 1);
-        handle.submit(fits_exactly).expect("submit fits_exactly");
-        assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
-            "prefill should emit the sampled token"
-        );
-        assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "one-token completion should finish without a decode KV page"
-        );
-        assert!(
-            dropped.lock().unwrap().contains(&0),
-            "finished request should release its one prompt page"
-        );
-    }
-
-    #[test]
-    fn request_waits_for_full_kv_budget_before_prefill() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
-
-        let (long_running, mut long_rx) = request(16, 18);
-        handle.submit(long_running).expect("submit long_running");
-        assert!(
-            matches!(
-                long_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 100, .. })
-            ),
-            "first request should prefill"
-        );
-
-        let (must_wait, mut wait_rx) = request(17, 1);
-        handle.submit(must_wait).expect("submit must_wait");
-
-        assert!(
-            matches!(
-                wait_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 101, .. })
-            ),
-            "waiting request should start once the active request releases its full KV budget"
-        );
-        assert!(
-            dropped.lock().unwrap().contains(&0),
-            "second request was admitted before the first request released KV"
-        );
-        assert!(
-            matches!(wait_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "waiting request should finish after admission"
-        );
-    }
-
-    fn pending(request_id: u64, echo: bool) -> PendingRequest {
-        let (token_tx, _token_rx) = mpsc::unbounded_channel();
-        PendingRequest {
-            request_id: RequestId::new(request_id),
-            lora_adapter: None,
-            prompt_tokens: vec![1; 32],
-            params: SamplingParams::default(),
-            max_tokens: 1,
-            token_tx,
-            logprobs: 0,
-            echo,
-            prefetch_offered: false,
-        }
-    }
-
-    #[test]
-    fn echo_requests_are_never_offered_to_prefetch() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(64, dropped);
-        let offers = Arc::clone(&executor.prefetch_offers);
-
-        let mut deferred = vec![pending(1, true), pending(2, false)];
-        let mut loading = Vec::new();
-        offer_prefetch(&mut executor, &mut deferred, &mut loading);
-
-        // The plain request is probed; the echo request is skipped entirely, so
-        // its prefill forwards the whole prompt without parking unspendable KV.
-        assert_eq!(*offers.lock().unwrap(), vec![2]);
-        let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
-        assert!(!echo.prefetch_offered, "echo request must stay un-probed");
-        let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
-        assert!(
-            plain.prefetch_offered,
-            "plain request must be marked probed"
-        );
-    }
-
-    fn request(
-        prompt_len: usize,
-        max_tokens: usize,
-    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        (
-            GenerateRequest {
-                request_id: None,
-                queued_at_unix_s: None,
-                prompt_tokens: vec![1; prompt_len],
-                params: SamplingParams::default(),
-                max_tokens,
-                lora_adapter: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            },
-            token_rx,
-        )
-    }
-
-    fn request_with_lora(
-        prompt_len: usize,
-        max_tokens: usize,
-        lora_adapter: Option<&str>,
-    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
-        let (mut request, token_rx) = request(prompt_len, max_tokens);
-        request.lora_adapter = lora_adapter.map(ToString::to_string);
-        (request, token_rx)
-    }
-
-    fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            if predicate() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        false
-    }
-
-    #[test]
-    fn impossible_request_is_rejected_without_blocking_later_work() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(2, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
-
-        let (too_large, mut too_large_rx) = request(16, 34);
-        handle.submit(too_large).expect("submit too_large");
-        match too_large_rx.blocking_recv() {
-            Some(TokenEvent::Rejected {
-                prompt_tokens,
-                completion_tokens,
-                message,
-            }) => {
-                assert_eq!(prompt_tokens, 16);
-                assert_eq!(completion_tokens, 0);
-                assert!(message.contains("requires more KV blocks"));
-            }
-            _ => panic!("oversized request should be rejected"),
-        }
-
-        let (fits, mut fits_rx) = request(16, 1);
-        handle.submit(fits).expect("submit fits");
-        match fits_rx.blocking_recv() {
-            Some(TokenEvent::Token { id, .. }) => assert_eq!(id, 101),
-            _ => panic!("later fitting request should emit a token"),
-        }
-        assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "later fitting request should finish"
-        );
-    }
-
-    /// End-to-end through the real scheduler loop (no GPU): a request whose
-    /// prompt + max_tokens exceeds the context window is rejected with a context-length error
-    #[test]
-    fn over_context_window_request_is_rejected_through_scheduler_loop() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        // max_positional_encoding_tokens = 32
-        let executor = FakeExecutor::new(1000, Arc::clone(&dropped)).with_max_context_tokens(32);
-        let handle = start_with_executor(executor, 42);
-
-        // prompt=16, max_new=100
-        let (too_long, mut too_long_rx) = request(16, 100);
-        handle.submit(too_long).expect("submit too_long");
-        match too_long_rx.blocking_recv() {
-            Some(TokenEvent::Rejected {
-                prompt_tokens,
-                completion_tokens,
-                message,
-            }) => {
-                assert_eq!(prompt_tokens, 16);
-                assert_eq!(completion_tokens, 0);
-                assert!(
-                    message.contains("context length"),
-                    "expected a context-length rejection, got: {message}"
-                );
-            }
-            _ => panic!("over-context request should be rejected"),
-        }
-
-        // The loop must keep serving a request that fits the window.
-        let (fits, mut fits_rx) = request(16, 1);
-        handle.submit(fits).expect("submit fits");
-        assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Token { .. })),
-            "later fitting request should emit a token"
-        );
-        assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "later fitting request should finish"
-        );
-    }
-
-    #[test]
-    fn mixed_lora_prefill_requests_run_in_one_batch() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let prefill_batches = Arc::new(Mutex::new(Vec::new()));
-        let decode_batches = Arc::new(Mutex::new(Vec::new()));
-        let prefill_lora_batches = Arc::new(Mutex::new(Vec::new()));
-        let decode_lora_batches = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(4, Arc::clone(&dropped))
-            .with_lora_adapters(&["adapter-a", "adapter-b"])
-            .with_batch_records(Arc::clone(&prefill_batches), Arc::clone(&decode_batches))
-            .with_lora_batch_records(
-                Arc::clone(&prefill_lora_batches),
-                Arc::clone(&decode_lora_batches),
-            );
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut active = Vec::new();
-
-        let (base, _base_rx) = request_with_lora(16, 1, None);
-        let (adapter_a, _adapter_a_rx) = request_with_lora(16, 1, Some("adapter-a"));
-        let (adapter_b, _adapter_b_rx) = request_with_lora(16, 1, Some("adapter-b"));
-        let pending = vec![
-            PendingRequest::from_scheduler_request(RequestId(0), adapter_b),
-            PendingRequest::from_scheduler_request(RequestId(1), base),
-            PendingRequest::from_scheduler_request(RequestId(2), adapter_a),
-        ];
-
-        let artifacts = plan::execute_plan(
-            &mut executor,
-            &mut active,
-            plan::ExecutionPlan::Prefill { pending },
-            &mut rng,
-        )
-        .expect("execute mixed-LoRA prefill");
-        let plan::ExecutionArtifacts::Prefill { result, .. } = artifacts else {
-            panic!("expected prefill artifacts");
-        };
-
-        assert_eq!(
-            result
-                .requests
-                .iter()
-                .map(|request| request.request_id)
-                .collect::<Vec<_>>(),
-            vec![RequestId(0), RequestId(1), RequestId(2)]
-        );
-        assert_eq!(
-            *prefill_batches.lock().unwrap(),
-            vec![vec![RequestId(0), RequestId(1), RequestId(2)]],
-            "one execution plan should run as one mixed-LoRA prefill batch"
-        );
-        assert_eq!(
-            *prefill_lora_batches.lock().unwrap(),
-            vec![vec![
-                Some("adapter-b".to_string()),
-                None,
-                Some("adapter-a".to_string())
-            ]],
-            "mixed-LoRA batch should preserve per-request adapter metadata"
-        );
-        assert!(
-            decode_batches.lock().unwrap().is_empty(),
-            "prefill-only plan should not execute decode batches"
-        );
-        assert!(
-            decode_lora_batches.lock().unwrap().is_empty(),
-            "prefill-only plan should not record decode LoRA metadata"
-        );
-    }
-
-    #[test]
-    fn unknown_lora_request_is_rejected_without_blocking_base_request() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
-
-        let (unknown, mut unknown_rx) = request_with_lora(16, 1, Some("missing-adapter"));
-        let (base, mut base_rx) = request_with_lora(16, 1, None);
-        handle.submit(unknown).expect("submit unknown adapter");
-        handle.submit(base).expect("submit base");
-
-        match unknown_rx.blocking_recv() {
-            Some(TokenEvent::Rejected {
-                message,
-                prompt_tokens,
-                completion_tokens,
-            }) => {
-                assert!(message.contains("LoRA adapter is not loaded: missing-adapter"));
-                assert_eq!(prompt_tokens, 16);
-                assert_eq!(completion_tokens, 0);
-            }
-            _ => panic!("unknown adapter request should be rejected"),
-        }
-
-        assert!(
-            matches!(
-                base_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 101, .. })
-            ),
-            "base request should still run after unknown adapter rejection"
-        );
-        assert!(
-            matches!(base_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "base request should finish"
-        );
-    }
-
-    #[test]
-    fn decode_error_drops_request_state_and_scheduler_recovers() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_failure();
-        let handle = start_with_executor(executor, 42);
-
-        let (will_fail, mut fail_rx) = request(16, 2);
-        handle.submit(will_fail).expect("submit will_fail");
-        assert!(
-            matches!(
-                fail_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 100, .. })
-            ),
-            "first token should be emitted before decode failure"
-        );
-        match fail_rx.blocking_recv() {
-            Some(TokenEvent::Error {
-                message,
-                prompt_tokens,
-                completion_tokens,
-            }) => {
-                assert!(message.contains("fake decode KV capacity exhausted"));
-                assert_eq!(prompt_tokens, 16);
-                assert_eq!(completion_tokens, 1);
-            }
-            _ => panic!("decode failure should surface as TokenEvent::Error"),
-        }
-        assert!(
-            wait_until(Duration::from_secs(1), || dropped
-                .lock()
-                .unwrap()
-                .contains(&0)),
-            "failed request state should be dropped"
-        );
-
-        let (after_failure, mut after_rx) = request(16, 1);
-        handle.submit(after_failure).expect("submit after_failure");
-        assert!(
-            matches!(
-                after_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 101, .. })
-            ),
-            "scheduler should accept new work after a decode error"
-        );
-        assert!(
-            matches!(after_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
-            "request after failure should finish"
-        );
-    }
-
-    #[test]
-    fn active_receiver_drop_releases_request_state() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor(executor, 42);
-
-        let (will_disconnect, mut token_rx) = request(16, 3);
-        handle
-            .submit(will_disconnect)
-            .expect("submit will_disconnect");
-        assert!(
-            matches!(
-                token_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 100, .. })
-            ),
-            "prefill should emit the first token"
-        );
-        drop(token_rx);
-
-        assert!(
-            wait_until(Duration::from_secs(1), || dropped
-                .lock()
-                .unwrap()
-                .contains(&0)),
-            "dropping an active receiver should release request state"
-        );
-    }
-
-    #[test]
-    fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(8, Arc::clone(&dropped));
-        let mut active = Vec::new();
-
-        for request_id in [RequestId(10), RequestId(1), RequestId(7)] {
-            let (token_tx, _token_rx) = mpsc::unbounded_channel();
-            active.push(ActiveRequestState {
-                request_id,
-                lora_adapter: None,
-                token_tx,
-                last_token: 100,
-                generated_count: 1,
-                max_tokens: 2,
-                prompt_len: 16,
-                params: SamplingParams::default(),
-                logprobs: 0,
-                token_history: Vec::new(),
-            });
-            executor
-                .ensure_request_tokens(request_id, 16)
-                .expect("seed fake request state");
-        }
-
-        apply_effects(
-            &mut executor,
-            &mut active,
-            effects::StepEffects {
-                prompt_echoes: Vec::new(),
-                pending: Vec::new(),
-                decode: vec![
-                    effects::DecodeEffect::EmitAndFinish {
-                        request_id: RequestId(1),
-                        token: 201,
-                        logprob: None,
-                        finish_reason: openinfer_core::engine::FinishReason::Length,
-                        completion_tokens: 2,
-                    },
-                    effects::DecodeEffect::EmitAndFinish {
-                        request_id: RequestId(10),
-                        token: 210,
-                        logprob: None,
-                        finish_reason: openinfer_core::engine::FinishReason::Length,
-                        completion_tokens: 2,
-                    },
-                    effects::DecodeEffect::EmitAndFinish {
-                        request_id: RequestId(7),
-                        token: 207,
-                        logprob: None,
-                        finish_reason: openinfer_core::engine::FinishReason::Length,
-                        completion_tokens: 2,
-                    },
-                ],
-            },
-        );
-
-        assert!(
-            active.is_empty(),
-            "all finished requests should retire without index drift"
-        );
-        let mut dropped = dropped.lock().unwrap().clone();
-        dropped.sort_unstable();
-        assert_eq!(dropped, vec![1, 7, 10]);
-    }
-
-    #[test]
-    fn lora_control_reports_unimplemented_when_idle() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-        let handle = start_with_executor_with_lora_control(executor, 42);
-
-        let error = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("build runtime")
-            .block_on(handle.load_lora_adapter(LoadLoraAdapterRequest {
-                lora_name: "adapter-a".to_string(),
-                lora_path: "/tmp/adapter-a".into(),
-                load_inplace: false,
-            }))
-            .expect_err("adapter load should be a stub error");
-
-        match error {
-            EngineControlError::OperationFailed(message) => {
-                assert!(message.contains("not implemented yet"));
-                assert!(message.contains("adapter-a"));
-            }
-            other => panic!("unexpected control error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lora_control_unloads_adapter_when_idle() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor =
-            FakeExecutor::new(4, Arc::clone(&dropped)).with_lora_adapters(&["adapter-a"]);
-        let handle = start_with_executor_with_lora_control(executor, 42);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("build runtime");
-        runtime
-            .block_on(handle.unload_lora_adapter(UnloadLoraAdapterRequest {
-                lora_name: "adapter-a".to_string(),
-                lora_int_id: None,
-            }))
-            .expect("unload adapter");
-        assert_eq!(
-            runtime
-                .block_on(handle.list_lora_adapters())
-                .expect("list adapters"),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn lora_control_waits_until_scheduler_idle() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let executor =
-            FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_delay(Duration::from_millis(80));
-        let handle = start_with_executor_with_lora_control(executor, 42);
-
-        let (long_running, mut token_rx) = request(16, 3);
-        handle.submit(long_running).expect("submit long_running");
-        assert!(
-            matches!(
-                token_rx.blocking_recv(),
-                Some(TokenEvent::Token { id: 100, .. })
-            ),
-            "first token should be emitted before decode"
-        );
-
-        let load_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let load_done_thread = Arc::clone(&load_done);
-        let load_handle = handle.clone();
-        let load_thread = thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("build runtime")
-                .block_on(load_handle.load_lora_adapter(LoadLoraAdapterRequest {
-                    lora_name: "adapter-a".to_string(),
-                    lora_path: "/tmp/adapter-a".into(),
-                    load_inplace: false,
-                }));
-            load_done_thread.store(true, std::sync::atomic::Ordering::SeqCst);
-            result
-        });
-
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(
-            !load_done.load(std::sync::atomic::Ordering::SeqCst),
-            "load_lora_adapter should wait while generation is active"
-        );
-
-        while !matches!(token_rx.blocking_recv(), Some(TokenEvent::Finished { .. })) {}
-
-        let error = load_thread
-            .join()
-            .expect("join load thread")
-            .expect_err("adapter load should be a stub error");
-        assert!(matches!(error, EngineControlError::OperationFailed(_)));
-    }
-
-    fn spec_active(
-        request_id: RequestId,
-        max_tokens: usize,
-        history: Vec<u32>,
-    ) -> (ActiveRequestState, mpsc::UnboundedReceiver<TokenEvent>) {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
-        let last_token = *history.last().unwrap();
-        (
-            ActiveRequestState {
-                request_id,
-                lora_adapter: None,
-                token_tx,
-                last_token,
-                generated_count: 1,
-                max_tokens,
-                prompt_len: history.len(),
-                params: SamplingParams::default(),
-                logprobs: 0,
-                token_history: history,
-            },
-            token_rx,
-        )
-    }
-
-    fn ngram2() -> crate::ngram::NgramProposer {
-        crate::ngram::NgramProposer::new(crate::ngram::NgramConfig {
-            max_ngram: 1,
-            min_ngram: 1,
-            num_speculative: 2,
-        })
-    }
-
-    fn drain_tokens(rx: &mut mpsc::UnboundedReceiver<TokenEvent>) -> Vec<u32> {
-        let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let TokenEvent::Token { id, .. } = ev {
-                out.push(id);
-            }
-        }
-        out
-    }
-
-    // A speculative step streams every committed token, advances the request's
-    // history/count, and keeps it active when no stop condition is hit.
-    #[test]
-    fn speculative_step_streams_committed_tokens() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
-        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
-        // history [5,6,5]: suffix [5] recurs at idx 0 -> drafts [6,5];
-        // FakeExecutor commits drafts + bonus 300 -> [6,5,300].
-        let (state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
-        let mut active = vec![state];
-        let mut rng = StdRng::seed_from_u64(0);
-
-        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
-
-        assert_eq!(drain_tokens(&mut rx), vec![6, 5, 300]);
-        assert_eq!(active.len(), 1, "request continues");
-        assert_eq!(active[0].generated_count, 4, "1 + 3 committed");
-        assert_eq!(active[0].last_token, 300);
-        assert_eq!(active[0].token_history, vec![5, 6, 5, 6, 5, 300]);
-        assert!(dropped.lock().unwrap().is_empty());
-    }
-
-    // A request near its max_tokens budget caps the draft count so the commit
-    // lands exactly on the limit instead of over-committing. max_tokens 3,
-    // generated 1 -> only 2 tokens of budget, so drafts [6,5] are capped to [6]
-    // (1 draft); commit [6,300] -> emit 6 (gen 2), 300 (gen 3 == limit ->
-    // Length), then finish + retire.
-    #[test]
-    fn speculative_step_caps_drafts_at_max_tokens() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
-        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
-        let (state, mut rx) = spec_active(RequestId(0), 3, vec![5, 6, 5]);
-        let mut active = vec![state];
-        let mut rng = StdRng::seed_from_u64(0);
-
-        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
-
-        assert_eq!(drain_tokens(&mut rx), vec![6, 300]);
-        assert!(active.is_empty(), "request retired at length limit");
-        assert_eq!(dropped.lock().unwrap().clone(), vec![0]);
-    }
-
-    // A non-greedy (sampled) request must NOT use the speculative path even when
-    // speculation is enabled: it takes a normal single-token decode (FakeExecutor
-    // -> 200 + id), so its sampling is preserved instead of being forced to argmax.
-    #[test]
-    fn sampled_request_bypasses_speculation() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
-        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
-        let (mut state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
-        state.params.temperature = 1.0; // non-greedy -> not spec-eligible
-        let mut active = vec![state];
-        let mut rng = StdRng::seed_from_u64(0);
-
-        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
-
-        // One token from the normal decode path, not the multi-token spec commit.
-        assert_eq!(drain_tokens(&mut rx), vec![200]);
-        assert_eq!(active.len(), 1, "request continues");
-        assert_eq!(active[0].generated_count, 2, "1 + 1 decoded");
-        assert_eq!(active[0].last_token, 200);
-        assert_eq!(active[0].token_history, vec![5, 6, 5, 200]);
-        assert!(dropped.lock().unwrap().is_empty());
-    }
-
-    // A request that asked for decode logprobs is likewise not spec-eligible
-    // (speculation drops per-token logprobs), so it takes the normal decode path.
-    #[test]
-    fn logprobs_request_bypasses_speculation() {
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let mut executor = FakeExecutor::new(64, Arc::clone(&dropped));
-        executor.ensure_request_tokens(RequestId(0), 3).unwrap();
-        let (mut state, mut rx) = spec_active(RequestId(0), 100, vec![5, 6, 5]);
-        state.logprobs = 1; // requested decode logprobs -> not spec-eligible
-        let mut active = vec![state];
-        let mut rng = StdRng::seed_from_u64(0);
-
-        speculative::speculative_decode_step(&mut executor, &mut active, &ngram2(), &mut rng);
-
-        assert_eq!(drain_tokens(&mut rx), vec![200]);
-        assert_eq!(active.len(), 1, "request continues");
-        assert_eq!(active[0].last_token, 200);
-        assert!(dropped.lock().unwrap().is_empty());
-    }
-}
+mod tests;

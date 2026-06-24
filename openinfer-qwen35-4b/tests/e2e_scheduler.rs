@@ -5,10 +5,11 @@
 use std::time::Instant;
 
 use log::info;
-use tokio::sync::mpsc;
 
 use openinfer_core::engine::FinishReason;
-use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, GenerateRequest, TokenEvent, TokenLogprob, TokenSink, TokenStreamReceiver,
+};
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
@@ -73,10 +74,30 @@ fn get_model_path() -> String {
     std::env::var("OPENINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
 }
 
+fn max_position_embeddings(model_path: &str) -> usize {
+    let config_path = std::path::Path::new(model_path).join("config.json");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display())),
+    )
+    .expect("config.json must be valid JSON");
+    config
+        .pointer("/text_config/max_position_embeddings")
+        .or_else(|| config.pointer("/max_position_embeddings"))
+        .and_then(serde_json::Value::as_u64)
+        .expect("Qwen3.5 config must expose max_position_embeddings") as usize
+}
+
 struct TestCase {
     name: &'static str,
     prompt: &'static str,
     max_new_tokens: usize,
+}
+
+struct GenerationResult {
+    tokens: Vec<u32>,
+    logprobs: Vec<Option<TokenLogprob>>,
+    finish_reason: FinishReason,
 }
 
 fn generate_tokens(
@@ -85,8 +106,19 @@ fn generate_tokens(
     prompt: &str,
     max_tokens: usize,
 ) -> (Vec<u32>, FinishReason) {
+    let result = generate_tokens_with_logprobs(handle, tokenizer, prompt, max_tokens, 0);
+    (result.tokens, result.finish_reason)
+}
+
+fn generate_tokens_with_logprobs(
+    handle: &EngineHandle,
+    tokenizer: &DynTokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    logprobs: usize,
+) -> GenerationResult {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
 
     handle
         .submit(GenerateRequest {
@@ -97,24 +129,119 @@ fn generate_tokens(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
+            logprobs,
             echo: false,
         })
         .expect("submit failed");
 
+    collect_generation(&mut token_rx, prompt, logprobs)
+}
+
+fn collect_generation(
+    token_rx: &mut TokenStreamReceiver,
+    name: &str,
+    logprobs: usize,
+) -> GenerationResult {
     let mut tokens = Vec::new();
+    let mut token_logprobs = Vec::new();
     loop {
-        match token_rx.blocking_recv() {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(TokenEvent::PromptTokens { .. }) => {}
-            Some(TokenEvent::Scheduled { .. }) => {}
+        match token_rx.blocking_recv().map(|(_, event)| event) {
+            Some(TokenEvent::Token { id, logprob }) => {
+                if logprobs == 0 {
+                    assert!(
+                        logprob.is_none(),
+                        "{name}: logprobs=0 should not return token logprobs"
+                    );
+                } else {
+                    let lp = logprob
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{name}: logprobs={logprobs} returned None"));
+                    assert!(
+                        lp.logprob.is_finite(),
+                        "{name}: sampled token logprob must be finite"
+                    );
+                    assert_eq!(
+                        lp.top_logprobs.len(),
+                        logprobs,
+                        "{name}: top_logprobs length should match the request"
+                    );
+                    assert!(
+                        lp.top_logprobs.iter().all(|&(_, v)| v.is_finite()),
+                        "{name}: top_logprobs must be finite"
+                    );
+                    assert_eq!(
+                        lp.top_logprobs.first().map(|&(token, _)| token),
+                        Some(id),
+                        "{name}: greedy sampled token should match top-1 logprob row"
+                    );
+                }
+                tokens.push(id);
+                token_logprobs.push(logprob);
+            }
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
-                return (tokens, finish_reason);
+                return GenerationResult {
+                    tokens,
+                    logprobs: token_logprobs,
+                    finish_reason,
+                };
             }
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
+            None => panic!("{name}: scheduler channel closed without Finished"),
         }
+    }
+}
+
+fn concurrent_params(case_idx: usize) -> SamplingParams {
+    if case_idx % 2 == 0 {
+        SamplingParams::default()
+    } else {
+        SamplingParams {
+            temperature: 0.9,
+            top_k: 32,
+            top_p: 0.9,
+            ..SamplingParams::default()
+        }
+    }
+}
+
+fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: usize) {
+    let (token_tx, mut token_rx) = TokenSink::standalone();
+
+    handle
+        .submit(GenerateRequest {
+            request_id: Some("over-context-window".to_string()),
+            queued_at_unix_s: None,
+            prompt_tokens: vec![1; max_context_tokens],
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .expect("submit over-context request");
+
+    match token_rx.blocking_recv().map(|(_, event)| event) {
+        Some(TokenEvent::Rejected {
+            message,
+            prompt_tokens,
+            completion_tokens,
+        }) => {
+            assert_eq!(prompt_tokens, max_context_tokens);
+            assert_eq!(completion_tokens, 0);
+            assert!(
+                message.contains("maximum context length"),
+                "expected context-window rejection, got: {message}"
+            );
+            assert!(
+                message.contains(&(max_context_tokens + 1).to_string()),
+                "rejection should report prompt + max_tokens, got: {message}"
+            );
+        }
+        Some(_) => panic!("expected context-window rejection"),
+        None => panic!("scheduler channel closed without rejection"),
     }
 }
 
@@ -123,6 +250,7 @@ fn test_e2e_qwen35_scheduler() {
     // logging intentionally left to the test harness
 
     let model_path = get_model_path();
+    let max_context_tokens = max_position_embeddings(&model_path);
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
@@ -135,13 +263,53 @@ fn test_e2e_qwen35_scheduler() {
         .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
-    // ── 1. Sequential scheduler requests ────────────────────────────────
-    info!("=== Phase 1: Qwen3.5 sequential scheduler requests ===");
+    // ── 0. Static context-window rejection ─────────────────────────────
+    info!("=== Phase 0: Context-window rejection ===");
+    expect_context_window_rejection(&handle, max_context_tokens);
+    info!("  PASS: over-context request rejected before prefill");
+
+    // ── 1. logprobs must not change greedy tokens ─────────────────────
+    info!("=== Phase 1: logprobs/no-logprobs token parity ===");
+    for case in CASES.iter().take(3) {
+        let max_tokens = case.max_new_tokens.min(16);
+        let no_logprobs =
+            generate_tokens_with_logprobs(&handle, &tokenizer, case.prompt, max_tokens, 0);
+        let with_logprobs =
+            generate_tokens_with_logprobs(&handle, &tokenizer, case.prompt, max_tokens, 1);
+        assert_eq!(no_logprobs.finish_reason, with_logprobs.finish_reason);
+        assert_eq!(
+            no_logprobs.tokens, with_logprobs.tokens,
+            "greedy token ids must not depend on whether logprobs are requested for {:?}",
+            case.name
+        );
+        assert!(
+            no_logprobs.logprobs.iter().all(Option::is_none),
+            "logprobs=0 should keep the no-host-logprobs path for {:?}",
+            case.name
+        );
+        assert!(
+            with_logprobs.logprobs.iter().all(Option::is_some),
+            "logprobs=1 should attach token logprobs for {:?}",
+            case.name
+        );
+        assert!(
+            !no_logprobs.tokens.is_empty(),
+            "logprobs parity regression prompt {:?} produced no tokens",
+            case.name
+        );
+        info!(
+            "  PASS: {:?} logprobs=0 and logprobs=1 produced identical greedy tokens",
+            case.name
+        );
+    }
+
+    // ── 2. Sequential scheduler requests ────────────────────────────────
+    info!("=== Phase 2: Qwen3.5 sequential scheduler requests ===");
     for case in CASES {
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
         let (tokens, finish_reason) =
-            generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
+            generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
         let elapsed = start.elapsed();
 
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
@@ -163,10 +331,10 @@ fn test_e2e_qwen35_scheduler() {
         info!("  PASS: {:?}", case.name);
     }
 
-    // ── 2. Multi-request (scheduler state reuse) ────────────────────────
-    info!("=== Phase 2: Multi-request ===");
+    // ── 3. Multi-request (scheduler state reuse) ────────────────────────
+    info!("=== Phase 3: Multi-request ===");
     for case in CASES {
-        let (tokens, _) = generate_tokens(&handle, &tokenizer, &case.prompt, case.max_new_tokens);
+        let (tokens, _) = generate_tokens(&handle, &tokenizer, case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
             !text.is_empty(),
@@ -176,23 +344,22 @@ fn test_e2e_qwen35_scheduler() {
         info!("  PASS: {:?} → {} tokens", case.name, tokens.len());
     }
 
-    // ── 3. Concurrent requests ──────────────────────────────────────────
-    info!("=== Phase 3: Concurrent requests ===");
+    // ── 4. Concurrent requests ──────────────────────────────────────────
+    info!("=== Phase 4: Concurrent requests ===");
     {
-        let mut receivers: Vec<(String, mpsc::UnboundedReceiver<TokenEvent>)> = Vec::new();
+        let mut receivers: Vec<(String, usize, TokenStreamReceiver)> = Vec::new();
 
-        // Submit all cases concurrently
-        for case in CASES {
-            let prompt_tokens = tokenizer
-                .encode(&case.prompt, false)
-                .expect("encode failed");
-            let (token_tx, token_rx) = mpsc::unbounded_channel();
+        // Submit all cases concurrently, alternating greedy and sampled rows so
+        // batch decode covers the mixed token-selection path from #284.
+        for (case_idx, case) in CASES.iter().enumerate() {
+            let prompt_tokens = tokenizer.encode(case.prompt, false).expect("encode failed");
+            let (token_tx, token_rx) = TokenSink::standalone();
             handle
                 .submit(GenerateRequest {
                     request_id: None,
                     queued_at_unix_s: None,
                     prompt_tokens,
-                    params: SamplingParams::default(),
+                    params: concurrent_params(case_idx),
                     max_tokens: case.max_new_tokens,
                     lora_adapter: None,
                     token_tx,
@@ -200,38 +367,71 @@ fn test_e2e_qwen35_scheduler() {
                     echo: false,
                 })
                 .expect("submit failed");
-            receivers.push((case.name.to_string(), token_rx));
+            receivers.push((case.name.to_string(), 0, token_rx));
         }
 
         // Collect all results
-        for (name, mut rx) in receivers {
-            let mut tokens = Vec::new();
-            loop {
-                match rx.blocking_recv() {
-                    Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::PromptTokens { .. }) => {}
-                    Some(TokenEvent::Scheduled { .. }) => {}
-                    Some(TokenEvent::Finished { .. }) => break,
-                    Some(TokenEvent::Error { message, .. }) => {
-                        panic!("generation failed: {message}")
-                    }
-                    Some(TokenEvent::Rejected { message, .. }) => {
-                        panic!("generation rejected: {message}")
-                    }
-                    None => panic!("channel closed for {:?}", name),
-                }
-            }
-            let text = tokenizer.decode(&tokens, true).expect("decode failed");
+        for (name, logprobs, mut rx) in receivers {
+            let result = collect_generation(&mut rx, &name, logprobs);
+            let text = tokenizer
+                .decode(&result.tokens, true)
+                .expect("decode failed");
             assert!(!text.is_empty(), "empty output for concurrent: {:?}", name);
-            info!("  PASS: {:?} → {} tokens", name, tokens.len());
+            info!("  PASS: {:?} → {} tokens", name, result.tokens.len());
         }
     }
 
-    // ── 4. Consumer drop safety ─────────────────────────────────────────
-    info!("=== Phase 4: Consumer drop ===");
+    // ── 4b. Mixed concurrent logprobs requests ─────────────────────────
+    info!("=== Phase 4b: Mixed concurrent logprobs ===");
+    {
+        let mixed = [
+            ("mixed_no_logprobs", CASES[0].prompt, 0usize),
+            ("mixed_with_logprobs", CASES[1].prompt, 1usize),
+        ];
+        let mut receivers: Vec<(&str, usize, TokenStreamReceiver)> = Vec::new();
+
+        for (name, prompt, logprobs) in mixed {
+            let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+            let (token_tx, token_rx) = TokenSink::standalone();
+            handle
+                .submit(GenerateRequest {
+                    request_id: Some(name.to_string()),
+                    queued_at_unix_s: None,
+                    prompt_tokens,
+                    params: SamplingParams::default(),
+                    max_tokens: 8,
+                    lora_adapter: None,
+                    token_tx,
+                    logprobs,
+                    echo: false,
+                })
+                .expect("submit failed");
+            receivers.push((name, logprobs, token_rx));
+        }
+
+        for (name, logprobs, mut rx) in receivers {
+            let result = collect_generation(&mut rx, name, logprobs);
+            assert!(!result.tokens.is_empty(), "{name}: produced no tokens");
+            if logprobs == 0 {
+                assert!(
+                    result.logprobs.iter().all(Option::is_none),
+                    "{name}: no-logprobs request should stay on the no-copy path"
+                );
+            } else {
+                assert!(
+                    result.logprobs.iter().all(Option::is_some),
+                    "{name}: requested logprobs should be present"
+                );
+            }
+            info!("  PASS: {name} → {} tokens", result.tokens.len());
+        }
+    }
+
+    // ── 5. Consumer drop safety ─────────────────────────────────────────
+    info!("=== Phase 5: Consumer drop ===");
     {
         let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
-        let (token_tx, rx) = mpsc::unbounded_channel();
+        let (token_tx, rx) = TokenSink::standalone();
         drop(rx);
         handle
             .submit(GenerateRequest {

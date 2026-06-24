@@ -6,10 +6,12 @@ Pure Rust + CUDA LLM inference engine (~83K Rust, ~11K CUDA). No PyTorch, no fra
 
 **Supported models:**
 
+Every model line is behind a cargo feature; only `qwen3-4b` is a default feature, so the stock build is pure Rust + CUDA with no Python.
+
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
-| Qwen3-4B / 8B | `openinfer-qwen3-4b` | always built | Full attention, TP support |
-| Qwen3.5-4B | `openinfer-qwen35-4b` | always built | 24 linear + 8 full attention |
+| Qwen3-4B / 8B | `openinfer-qwen3-4b` | `qwen3-4b` (default) | Full attention, TP support |
+| Qwen3.5-4B | `openinfer-qwen35-4b` | `--features qwen35-4b` (needs build-time Python + Triton) | 24 linear + 8 full attention |
 | DeepSeek-V4 | `openinfer-deepseek-v4` | `--features deepseek-v4` | MoE + compressor + indexer, 8-GPU |
 | DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
 | Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
@@ -19,17 +21,18 @@ Pure Rust + CUDA LLM inference engine (~83K Rust, ~11K CUDA). No PyTorch, no fra
 **Always use `--release`** — debug builds are extremely slow for GPU/CUDA and will timeout.
 
 ```bash
-# Qwen models (default, no feature flags needed)
-cargo run --release -- --model-path models/Qwen3.5-4B
+# Qwen3 (default feature, no Python anywhere in the build)
+cargo run --release -- --model-path models/Qwen3-4B
 
 # Feature-gated models
+cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 cargo run --release --features kimi-k2 -- --model-path models/Kimi-K2
 cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
 ```
 
 **Key env vars:**
 - `OPENINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
-- `OPENINFER_TRITON_PYTHON` — Python with Triton for build-time AOT kernel generation
+- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35-4b` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`)
 - `OPENINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 - `OPENINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
 - `OPENINFER_NVCC_JOBS` — override parallel nvcc job count
@@ -42,8 +45,8 @@ cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --test e2e_scheduler
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
 
 # Single test
 cargo test --release embedding_variants -- --nocapture
@@ -85,8 +88,7 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Build system**: the virtual workspace root has no package build script. `openinfer-kernels/build.rs` owns CUDA/Triton compilation:
 1. Compiles `openinfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py` for Qwen3.5 kernels
-3. Feature-gated: `deepseek-v4` triggers TileLang + CuTe DSL codegen; `kimi-k2` adds MLA/MoE/Marlin CUDA
+2. Feature-gated codegen: `qwen35-4b` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py` (the only step that needs Python); `deepseek-v4` triggers TileLang + CuTe DSL codegen; `kimi-k2` adds MLA/MoE/Marlin CUDA
 
 ---
 

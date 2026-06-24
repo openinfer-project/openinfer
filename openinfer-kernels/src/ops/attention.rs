@@ -216,6 +216,210 @@ impl PrefillPagedPlan {
         head_dim: usize,
         cta_tile_q_override: i32,
     ) -> Result<Self> {
+        let host = BatchPlanHost::compute(
+            page_indices,
+            last_page_lens,
+            start_positions,
+            seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            cta_tile_q_override,
+        )?;
+
+        // Upload all to GPU
+        Ok(Self {
+            page_indices_d: ctx.stream.clone_htod(&host.all_page_indices)?,
+            page_indptr_d: ctx.stream.clone_htod(&host.page_indptr)?,
+            last_page_len_d: ctx.stream.clone_htod(&host.last_page_lens_i32)?,
+            batch_indices_d: ctx.stream.clone_htod(&host.batch_indices)?,
+            positions_d: ctx.stream.clone_htod(&host.positions)?,
+            q_indptr_d: ctx.stream.clone_htod(&host.q_indptr)?,
+            request_indices_d: ctx.stream.clone_htod(&host.request_indices_v)?,
+            qo_tile_indices_d: ctx.stream.clone_htod(&host.qo_tile_indices_v)?,
+            kv_tile_indices_d: ctx.stream.clone_htod(&host.kv_tile_indices_v)?,
+            kv_chunk_size_d: ctx.stream.clone_htod(&host.kv_chunk_sizes)?,
+            total_num_rows_d: ctx.stream.clone_htod(&[host.total_tokens as u32])?,
+            num_tiles: host.num_tiles,
+            batch_size: host.batch_size as i32,
+            total_tokens: host.total_tokens,
+            cta_tile_q: host.cta_tile_q as i32,
+        })
+    }
+
+    /// Allocate a worst-case-sized plan once, to be refilled in place by
+    /// [`Self::update_batch_with_cta_tile_q`]. Buffer pointers stay fixed across
+    /// updates so a CUDA Graph captured against them remains valid on replay.
+    /// Scalar fields start at 0; an unfilled plan must not be used for a forward.
+    pub fn new_preallocated(
+        ctx: &DeviceContext,
+        max_total_tokens: usize,
+        max_total_pages: usize,
+        max_batch: usize,
+        max_tiles: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            page_indices_d: ctx.stream.alloc_zeros(max_total_pages)?,
+            page_indptr_d: ctx.stream.alloc_zeros(max_batch + 1)?,
+            last_page_len_d: ctx.stream.alloc_zeros(max_batch)?,
+            batch_indices_d: ctx.stream.alloc_zeros(max_total_tokens)?,
+            positions_d: ctx.stream.alloc_zeros(max_total_tokens)?,
+            q_indptr_d: ctx.stream.alloc_zeros(max_batch + 1)?,
+            request_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
+            qo_tile_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
+            kv_tile_indices_d: ctx.stream.alloc_zeros(max_tiles)?,
+            kv_chunk_size_d: ctx.stream.alloc_zeros(max_batch)?,
+            total_num_rows_d: ctx.stream.alloc_zeros(1)?,
+            num_tiles: 0,
+            batch_size: 0,
+            total_tokens: 0,
+            cta_tile_q: 0,
+        })
+    }
+
+    /// Recompute the host-side batch metadata and `memcpy_htod` it into the
+    /// pre-allocated device buffers (no allocation, no pointer change). The host
+    /// computation is identical to [`Self::new_batch_with_cta_tile_q`]; only the
+    /// upload differs (overwrite in place vs. fresh `clone_htod`).
+    ///
+    /// `memcpy_htod` copies `src.len()` elements and tolerates a larger
+    /// destination, so the worst-case allocation may exceed the actual fill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_batch_with_cta_tile_q(
+        &mut self,
+        ctx: &DeviceContext,
+        page_indices: &[Vec<i32>],
+        last_page_lens: &[usize],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
+    ) -> Result<()> {
+        let host = BatchPlanHost::compute(
+            page_indices,
+            last_page_lens,
+            start_positions,
+            seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            cta_tile_q_override,
+        )?;
+
+        anyhow::ensure!(
+            host.all_page_indices.len() <= self.page_indices_d.len(),
+            "verify plan page_indices ({}) exceeds preallocated capacity ({})",
+            host.all_page_indices.len(),
+            self.page_indices_d.len(),
+        );
+        anyhow::ensure!(
+            host.page_indptr.len() <= self.page_indptr_d.len(),
+            "verify plan page_indptr ({}) exceeds preallocated capacity ({})",
+            host.page_indptr.len(),
+            self.page_indptr_d.len(),
+        );
+        anyhow::ensure!(
+            host.last_page_lens_i32.len() <= self.last_page_len_d.len(),
+            "verify plan last_page_lens ({}) exceeds preallocated capacity ({})",
+            host.last_page_lens_i32.len(),
+            self.last_page_len_d.len(),
+        );
+        anyhow::ensure!(
+            host.batch_indices.len() <= self.batch_indices_d.len(),
+            "verify plan batch_indices ({}) exceeds preallocated capacity ({})",
+            host.batch_indices.len(),
+            self.batch_indices_d.len(),
+        );
+        anyhow::ensure!(
+            host.positions.len() <= self.positions_d.len(),
+            "verify plan positions ({}) exceeds preallocated capacity ({})",
+            host.positions.len(),
+            self.positions_d.len(),
+        );
+        anyhow::ensure!(
+            host.q_indptr.len() <= self.q_indptr_d.len(),
+            "verify plan q_indptr ({}) exceeds preallocated capacity ({})",
+            host.q_indptr.len(),
+            self.q_indptr_d.len(),
+        );
+        anyhow::ensure!(
+            host.request_indices_v.len() <= self.request_indices_d.len(),
+            "verify plan tiles ({}) exceeds preallocated capacity ({})",
+            host.request_indices_v.len(),
+            self.request_indices_d.len(),
+        );
+        anyhow::ensure!(
+            host.kv_chunk_sizes.len() <= self.kv_chunk_size_d.len(),
+            "verify plan kv_chunk_sizes ({}) exceeds preallocated capacity ({})",
+            host.kv_chunk_sizes.len(),
+            self.kv_chunk_size_d.len(),
+        );
+
+        ctx.stream
+            .memcpy_htod(&host.all_page_indices, &mut self.page_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&host.page_indptr, &mut self.page_indptr_d)?;
+        ctx.stream
+            .memcpy_htod(&host.last_page_lens_i32, &mut self.last_page_len_d)?;
+        ctx.stream
+            .memcpy_htod(&host.batch_indices, &mut self.batch_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&host.positions, &mut self.positions_d)?;
+        ctx.stream
+            .memcpy_htod(&host.q_indptr, &mut self.q_indptr_d)?;
+        ctx.stream
+            .memcpy_htod(&host.request_indices_v, &mut self.request_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&host.qo_tile_indices_v, &mut self.qo_tile_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&host.kv_tile_indices_v, &mut self.kv_tile_indices_d)?;
+        ctx.stream
+            .memcpy_htod(&host.kv_chunk_sizes, &mut self.kv_chunk_size_d)?;
+        ctx.stream
+            .memcpy_htod(&[host.total_tokens as u32], &mut self.total_num_rows_d)?;
+
+        self.num_tiles = host.num_tiles;
+        self.batch_size = host.batch_size as i32;
+        self.total_tokens = host.total_tokens;
+        self.cta_tile_q = host.cta_tile_q as i32;
+        Ok(())
+    }
+}
+
+/// Host-side batch-prefill metadata, computed identically for the fresh
+/// (`new_batch_with_cta_tile_q`) and in-place (`update_batch_with_cta_tile_q`)
+/// paths so the two never diverge.
+struct BatchPlanHost {
+    all_page_indices: Vec<i32>,
+    page_indptr: Vec<i32>,
+    last_page_lens_i32: Vec<i32>,
+    batch_indices: Vec<i32>,
+    positions: Vec<i32>,
+    q_indptr: Vec<i32>,
+    request_indices_v: Vec<i32>,
+    qo_tile_indices_v: Vec<i32>,
+    kv_tile_indices_v: Vec<i32>,
+    kv_chunk_sizes: Vec<i32>,
+    num_tiles: i32,
+    batch_size: usize,
+    total_tokens: usize,
+    cta_tile_q: usize,
+}
+
+impl BatchPlanHost {
+    #[allow(clippy::too_many_arguments)]
+    fn compute(
+        page_indices: &[Vec<i32>],
+        last_page_lens: &[usize],
+        start_positions: &[usize],
+        seq_lens: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        cta_tile_q_override: i32,
+    ) -> Result<Self> {
         let batch_size = page_indices.len();
         assert_eq!(batch_size, last_page_lens.len());
         assert_eq!(batch_size, start_positions.len());
@@ -281,23 +485,21 @@ impl PrefillPagedPlan {
         }
         let num_tiles = request_indices_v.len() as i32;
 
-        // Upload all to GPU
         Ok(Self {
-            page_indices_d: ctx.stream.clone_htod(&all_page_indices)?,
-            page_indptr_d: ctx.stream.clone_htod(&page_indptr)?,
-            last_page_len_d: ctx.stream.clone_htod(&last_page_lens_i32)?,
-            batch_indices_d: ctx.stream.clone_htod(&batch_indices)?,
-            positions_d: ctx.stream.clone_htod(&positions)?,
-            q_indptr_d: ctx.stream.clone_htod(&q_indptr)?,
-            request_indices_d: ctx.stream.clone_htod(&request_indices_v)?,
-            qo_tile_indices_d: ctx.stream.clone_htod(&qo_tile_indices_v)?,
-            kv_tile_indices_d: ctx.stream.clone_htod(&kv_tile_indices_v)?,
-            kv_chunk_size_d: ctx.stream.clone_htod(&kv_chunk_sizes)?,
-            total_num_rows_d: ctx.stream.clone_htod(&[total_tokens as u32])?,
+            all_page_indices,
+            page_indptr,
+            last_page_lens_i32,
+            batch_indices,
+            positions,
+            q_indptr,
+            request_indices_v,
+            qo_tile_indices_v,
+            kv_tile_indices_v,
+            kv_chunk_sizes,
             num_tiles,
-            batch_size: batch_size as i32,
+            batch_size,
             total_tokens,
-            cta_tile_q: cta_tile_q as i32,
+            cta_tile_q,
         })
     }
 }
@@ -356,7 +558,7 @@ pub fn prefill_attention_paged_into(
     let (kcs_ptr, _) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
     let (tnr_ptr, _) = plan.total_num_rows_d.device_ptr(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     unsafe {
         // RoPE positions always come from the plan's per-token array — it is
@@ -492,9 +694,146 @@ pub fn qk_norm_rope_batch_decode_into(
             batch_size as i32,
             rms_eps,
             (cos_cache.data.len() / head_dim) as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
+}
+
+/// QK RMSNorm + RoPE for one DFlash request's draft block.
+///
+/// `q` is a row sub-range of a batched buffer: `q_row_offset` rows precede this
+/// request's `q_seq_len` query rows. The kernel still sees a single-request Q
+/// shape — we just advance the device pointer to the request's slice. `k` is the
+/// request's own varlen tail scratch (whole buffer), so it needs no offset.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_qk_norm_rope_into(
+    ctx: &DeviceContext,
+    q: &mut HiddenStates,
+    q_row_offset: usize,
+    q_seq_len: usize,
+    k: &mut HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    q_start_pos: usize,
+    k_start_pos: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(k.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(q_norm_weight.len, head_dim);
+    assert_eq!(k_norm_weight.len, head_dim);
+    assert!(
+        q_row_offset + q_seq_len <= q.seq_len,
+        "dflash_qk_norm_rope q row range [{}..{}) exceeds seq_len {}",
+        q_row_offset,
+        q_row_offset + q_seq_len,
+        q.seq_len
+    );
+
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let q_ptr = q_ptr + (q_row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::dflash_qk_norm_rope_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            k.seq_len as i32,
+            q_start_pos as i32,
+            k_start_pos as i32,
+            rms_eps,
+            (cos_cache.data.len() / head_dim) as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("dflash_qk_norm_rope_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
+/// Non-causal prefill attention for one DFlash request's draft block.
+///
+/// `q` and `output` share the SAME row sub-range of batched buffers: request
+/// `i` owns rows `[row_offset, row_offset + q_seq_len)` in both, because the
+/// draft writes each request's attention output back into the row slot its
+/// queries came from. The k/v caches are the request's own whole buffers. The
+/// kernel sees a single-request shape — we advance the Q/output device pointers
+/// to the request's slice.
+#[allow(clippy::too_many_arguments)]
+pub fn single_prefill_nhd_noncausal_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    q_seq_len: usize,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, q.seq_len);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+    assert!(
+        row_offset + q_seq_len <= q.seq_len,
+        "single_prefill row range [{}..{}) exceeds seq_len {}",
+        row_offset,
+        row_offset + q_seq_len,
+        q.seq_len
+    );
+
+    // q and output share row_offset (asserted same seq_len/hidden_dim above).
+    let byte_offset = (row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + byte_offset;
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + byte_offset;
+    let result = unsafe {
+        ffi::single_prefill_nhd_noncausal_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("single_prefill_nhd_noncausal_cuda failed with error {result}");
+    }
+    Ok(())
 }
 
 /// Batched QK RMSNorm + partial RoPE for Qwen3.5 HD256 decode.
@@ -545,7 +884,7 @@ pub fn qk_norm_partial_rope_batched_decode_hd256_into(
             batch_size as i32,
             rotary_dim as i32,
             rms_eps,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         );
     }
 }
@@ -595,7 +934,7 @@ pub fn paged_attention_batch_decode_into(
     let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     // Step 1: Append K/V to paged cache (batched) using the same generic
     // scatter path as prefill, with explicit request indices and positions.
@@ -715,7 +1054,7 @@ pub fn paged_attention_batch_decode_split_kv_into(
     let (split_tmp_v_ptr, _gstmpv) = split_tmp_v.device_ptr_mut(&ctx.stream);
     let (split_tmp_s_ptr, _gstmps) = split_tmp_s.device_ptr_mut(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     let src_stride_n = (num_kv_heads * head_dim) as i64;
     let src_stride_h = head_dim as i64;
@@ -823,7 +1162,7 @@ pub fn paged_attention_batch_decode_hd256_into(
     let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
     let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
 
-    let stream = ctx.stream.cu_stream();
+    let stream = crate::tensor::active_cu_stream(ctx);
 
     let src_stride_n = (num_kv_heads * head_dim) as i64;
     let src_stride_h = head_dim as i64;

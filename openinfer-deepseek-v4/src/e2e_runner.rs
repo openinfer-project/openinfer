@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use log::info;
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent};
+use openinfer_core::engine::{
+    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink, TokenStreamReceiver,
+};
 use openinfer_core::sampler::SamplingParams;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 pub const DEFAULT_MODEL_PATH: &str = "models/DeepSeek-V4-Flash";
@@ -201,7 +202,7 @@ fn generate_text(
         .encode(prompt, false)
         .map_err(|err| anyhow::anyhow!("encode failed: {err:?}"))?;
     let prompt_token_count = prompt_tokens.len();
-    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
     let started = Instant::now();
 
     handle
@@ -228,7 +229,7 @@ fn generate_text(
 }
 
 fn collect_generation_events(
-    token_rx: &mut mpsc::UnboundedReceiver<TokenEvent>,
+    token_rx: &mut TokenStreamReceiver,
     tokenizer: &HuggingFaceTokenizer,
     expected: &str,
     started: Instant,
@@ -237,7 +238,7 @@ fn collect_generation_events(
     let mut out = Vec::new();
     let mut ttft = None;
     loop {
-        match token_rx.blocking_recv() {
+        match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => {
                 ttft.get_or_insert_with(|| started.elapsed());
                 out.push(id);

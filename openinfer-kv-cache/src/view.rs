@@ -16,7 +16,16 @@ pub struct KvView {
 }
 
 impl KvView {
+    /// `page_indices` must cover `seq_len` exactly: attention kernels derive
+    /// the sequence length as `(num_pages - 1) * page_size + last_page_len`,
+    /// so a surplus page makes them read garbage K/V past the sequence and a
+    /// missing page makes them read out of bounds (#291).
     pub fn new(page_indices: Vec<i32>, seq_len: usize, page_size: usize) -> Self {
+        assert_eq!(
+            page_indices.len(),
+            seq_len.div_ceil(page_size),
+            "KvView pages must exactly cover seq_len={seq_len} (page_size={page_size})"
+        );
         Self {
             page_indices,
             seq_len,
@@ -43,21 +52,6 @@ impl KvView {
 
     pub fn page_indices(&self) -> &[i32] {
         &self.page_indices
-    }
-
-    /// Verify pre-allocated capacity covers the requested token count.
-    pub fn ensure_capacity(&self, token_count: usize) -> anyhow::Result<()> {
-        let needed = token_count.div_ceil(self.page_size);
-        anyhow::ensure!(
-            needed <= self.page_indices.len(),
-            "KvView: need {needed} pages but only {} allocated",
-            self.page_indices.len(),
-        );
-        Ok(())
-    }
-
-    pub fn advance(&mut self, count: usize) {
-        self.seq_len += count;
     }
 
     pub fn desc<'a>(&'a self, buffer: &'a KvBuffer) -> KvViewDesc<'a> {

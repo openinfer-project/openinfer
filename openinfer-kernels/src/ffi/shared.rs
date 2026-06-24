@@ -30,6 +30,29 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn copy_hidden_rows_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        src_hidden_dim: i32,
+        dst_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn copy_hidden_token_range_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        hidden_dim: i32,
+        src_token_offset: i32,
+        dst_token_offset: i32,
+        token_count: i32,
+        src_seq_len: i32,
+        dst_seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn fused_add_rms_norm_cuda(
         hidden: *mut Half,
         residual: *const Half,
@@ -90,18 +113,7 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub fn gpu_sample_flashinfer_cuda(
-        logits: *const Half,
-        probs_scratch: *mut f32,
-        valid_scratch: *mut u8,
-        output: *mut i32,
-        vocab_size: i32,
-        inv_temperature: f32,
-        top_k: i32,
-        top_p: f32,
-        seed: u64,
-        stream: CUstream,
-    );
+    pub fn flashinfer_top1_row_states_bytes_cuda() -> usize;
 
     pub fn gpu_sample_batch_flashinfer_cuda(
         logits: *const Half,
@@ -116,6 +128,8 @@ unsafe extern "C" {
         softmax_workspace_bytes: usize,
         n_rows: i32,
         vocab_size: i32,
+        has_top_k_filter: i32,
+        has_top_p_filter: i32,
         seed: u64,
         offset: u64,
         stream: CUstream,
@@ -141,6 +155,42 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn gemm_lt_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gemm_lt_tune_cuda(
+        Ws: *const *const Half,
+        num_ws: i32,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
+    pub fn gemm_lt_pin_tune_cuda(M: i32, rep_n: i32, K: i32) -> i32;
+
+    pub fn stream_is_capturing_cuda(stream: CUstream) -> i32;
+
+    pub fn gemm_lt_pin_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gemm_lt_pin_inspect_cuda(M: i32, K: i32, out4: *mut i32) -> i32;
+
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(
         embed: *const Half,
@@ -156,9 +206,10 @@ unsafe extern "C" {
         intermediate_size: i32,
         bs: i32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     pub fn cublas_init();
+    pub fn cublas_activate_device_handles() -> i32;
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;
 
@@ -220,6 +271,25 @@ unsafe extern "C" {
         cos_max_pos: i32,
         stream: CUstream,
     );
+
+    pub fn dflash_qk_norm_rope_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_len: i32,
+        k_len: i32,
+        q_start_pos: i32,
+        k_start_pos: i32,
+        rms_eps: f32,
+        cos_max_pos: i32,
+        stream: CUstream,
+    ) -> i32;
 
     // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
     pub fn paged_kv_scatter_cuda(
@@ -347,6 +417,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn single_prefill_nhd_noncausal_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub fn paged_attention_decode_cuda(
         q: *const Half,
@@ -411,11 +496,13 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub fn argmax_batch_bf16_indexed_cuda(
+    pub fn argmax_batch_bf16_split_indexed_cuda(
         x: *const Half,
         row_indices: *const i32,
         values: *mut Half,
         indices: *mut i32,
+        partial_values: *mut f32,
+        partial_indices: *mut i32,
         rows: i32,
         n: i32,
         stream: CUstream,

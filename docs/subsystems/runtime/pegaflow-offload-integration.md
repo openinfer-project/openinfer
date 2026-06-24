@@ -39,7 +39,7 @@ pegaflow-core         ← 机制底座：D2H/H2D、DRAM/SSD/RDMA 分层
 
 ## 2. 战略决策：pegaflow 取代 kvbm 死代码做物理 tier
 
-openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是分层卸载，但**至今零接线、是死代码**（无任何非 kvbm crate 依赖）。同时养两套分层卸载违反项目复杂度红线。本 spec 采纳：**`kvbm-logical`（逻辑层 + 前缀匹配）保留，pegaflow-core 顶替它下面缺失的物理卸载层，砍掉 `kvbm-physical`/`kvbm-engine`**。理由：pegaflow 同组维护、已上 PyPI、有 H800 benchmark、库化干净；kvbm 那两层是纯负债。
+openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是分层卸载，但**至今零接线、是死代码**（无任何非 kvbm crate 依赖）。同时养两套分层卸载违反项目复杂度红线。本 spec 采纳：**`kvbm-logical`（逻辑层 + 前缀匹配）保留，pegaflow-core 顶替它下面缺失的物理卸载层，砍掉 `kvbm-physical`/`kvbm-engine`**。理由：pegaflow 同组维护、已上 PyPI、有 H800 benchmark、库化干净；kvbm 那两层是纯负债。已执行（2026-06）：vendored `kvbm/` 目录只留 `kvbm-logical` fork，`dynamo-tokens`/`dynamo-kv-hashing` 改为 ai-dynamo/dynamo 上游 git 依赖（pin rev），其余 8 个 vendored crate 删除。
 
 ## 3. 三模型三 KV 形态 → connector 边界（实据）
 

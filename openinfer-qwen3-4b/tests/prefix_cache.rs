@@ -79,18 +79,11 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         SamplingParams::default(),
         LOGPROBS,
         false,
-        0.0,
     )
 }
 
 fn decode_item(id: u64, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(
-        RequestId::new(id),
-        fed,
-        SamplingParams::default(),
-        LOGPROBS,
-        0.0,
-    )
+    DecodeStepItem::new(RequestId::new(id), fed, SamplingParams::default(), LOGPROBS)
 }
 
 fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {
@@ -104,6 +97,7 @@ fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {
 fn run_one(ex: &mut Qwen3Executor, id: u64, prompt: &[u32]) -> (usize, Vec<Vec<(u32, f32)>>) {
     let pr = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(id, prompt)],
             echo: false,
         })
@@ -113,6 +107,7 @@ fn run_one(ex: &mut Qwen3Executor, id: u64, prompt: &[u32]) -> (usize, Vec<Vec<(
     for fed in DECODE_FED {
         let dr = ex
             .execute_decode(DecodePlan {
+                sample_seed: 0,
                 requests: &[decode_item(id, fed)],
             })
             .expect("decode");
@@ -217,6 +212,7 @@ fn prefix_cache_behavior() {
     // logits must be unaffected by the neighbour.
     let pr = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(21, &d), prefill_item(22, &a)],
             echo: false,
         })
@@ -225,7 +221,7 @@ fn prefix_cache_behavior() {
     assert_eq!(pr.requests[1].cached_tokens, 3 * BLOCK, "A is warm");
     let d_mixed = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
     let a_mixed = vec![top_logprobs(pr.requests[1].first_token_logprob.as_ref())];
-    assert_close("A in mixed batch", &a_cold[..1].to_vec(), &a_mixed);
+    assert_close("A in mixed batch", &a_cold[..1], &a_mixed);
     ex.drop_request(RequestId::new(21)).expect("drop");
     ex.drop_request(RequestId::new(22)).expect("drop");
 
@@ -235,6 +231,7 @@ fn prefix_cache_behavior() {
     ex.set_prefix_cache_enabled(false);
     let pr = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(31, &d)],
             echo: false,
         })
@@ -247,6 +244,7 @@ fn prefix_cache_behavior() {
     // ── Unified path: warm prefill of A while another request decodes.
     let pr = ex
         .execute_prefill(PrefillPlan {
+            sample_seed: 0,
             requests: &[prefill_item(41, &b)],
             echo: false,
         })
@@ -254,6 +252,7 @@ fn prefix_cache_behavior() {
     assert_eq!(pr.requests[0].cached_tokens, 4 * BLOCK);
     let ur = ex
         .execute_unified(UnifiedPlan {
+            sample_seed: 0,
             prefill_requests: &[prefill_item(42, &a)],
             decode_requests: &[decode_item(41, DECODE_FED[0])],
         })
@@ -266,7 +265,7 @@ fn prefix_cache_behavior() {
     let a_unified = vec![top_logprobs(
         ur.prefill_requests[0].first_token_logprob.as_ref(),
     )];
-    assert_close("A in unified plan", &a_cold[..1].to_vec(), &a_unified);
+    assert_close("A in unified plan", &a_cold[..1], &a_unified);
     ex.drop_request(RequestId::new(41)).expect("drop");
     ex.drop_request(RequestId::new(42)).expect("drop");
 }

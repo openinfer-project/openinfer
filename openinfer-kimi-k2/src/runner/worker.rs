@@ -23,7 +23,7 @@ use openinfer_kernels::{
         KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
         KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
         KIMI_K2_MLA_V_HEAD_DIM, KIMI_O_PROJ_CUBLASLT_INPUT, KimiMarlinRouteWorkspace,
-        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, flashinfer_topk_row_states_bytes,
+        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, flashinfer_top1_row_states_bytes,
         kimi_flashinfer_batch_decode_mla_rt, kimi_flashinfer_single_prefill_mla_rt,
         kimi_mla_absorb_q_nope_rt, kimi_mla_assemble_cached_kv_rt, kimi_mla_gather_cached_ckv_rt,
         kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill_rt,

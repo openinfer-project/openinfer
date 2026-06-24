@@ -1,5 +1,6 @@
 [package]
 name = "openinfer-deepseek-v2-lite"
+license = "Apache-2.0"
 version = "0.1.0"
 edition = "2024"
 autobenches = false
@@ -8,7 +9,7 @@ autotests = false
 
 [features]
 default = []
-deepseek-v2-lite = []
+deepseek-v2-lite = ["dep:openinfer-kernels", "openinfer-kernels/deepseek-v2-lite"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -16,9 +17,11 @@ cudarc = { workspace = true }
 half = { workspace = true }
 hex = { workspace = true }
 libloading = "0.9"
+log = { workspace = true }
 memmap2 = { workspace = true }
 nvtx = { workspace = true }
 openinfer-core = { workspace = true }
+openinfer-kernels = { workspace = true, optional = true }
 openinfer-engine = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }

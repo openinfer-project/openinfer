@@ -24,9 +24,13 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/qwen3/roadmap.md` | Qwen3-4B roadmap (2026-06 review): line is the maturity bar; #220 RoPE OOB now fixed (sized cache + admission guard + kernel trap, gated by reject + in-window ITs); open set is per-row batch sampling, zero TP coverage, zero-adapter-only LoRA gate, dropped prefix-cache observability, stale docs, YaRN #8 follow-up. Sequenced Now/Next/Later + cleanup ledger. |
+| `models/qwen3/serving-perf-5090.md` | Qwen3-4B vs vLLM 0.22.1 tuning record: beats vLLM at **every measured QPS point** after unified-step attention fusion (decode rows as qo_len=1 prefill-plan entries + cta_tile_q dispatch fix). Also: batched step tail (#345), chunked prefill (default 1024), **cuBLAS 12.9 N=1025 cliff (build with CUDA ≥ 13)**, cublasLt per-shape tuning (buckets 8/16 restored), split-KV ≤bs32, two-stage argmax. |
+| `models/qwen3/decode-attention.md` | Decode attention path (`NonPartition` vs `SplitKv`) is chosen by **batch (CTA-vs-SM), not context**: the old `max_seq_len>=1024` gate stranded bs=1 mid-context decode on the SM-starved NonPartition kernel — a tpot hump peaking ~ctx800, cliff-dropping at ctx1024. Removing it flattens bs=1 tpot (5090 −16% / 5070 Ti −7.5% @ctx800); kept `padded_bs<=32` (bs≤8 wins big, bs16 even, bs32 <1% loss). Two-card A/B + CUDA-graph capture + golden-gate verified. |
+| `models/qwen3/green-ctx-sm-partition.md` | Green Context SM partition (`OPENINFER_SM_PARTITION=20`) runs prefill/decode on disjoint SMs so decode stops stalling behind co-scheduled prefill: 5090 mid-band ITL p99 ~halved, TPOT down (−22% @QPS12), but TTFT 2–4× worse (prefill deferred + fewer SMs) — a TTFT↔ITL/TPOT trade, not a free win. Two-graph change (decode CUDA graph captured on the green decode stream) adds ~5% ITL p99 / 1–4% TPOT on top. Mechanism, A/B table, Xid-31/gemm_lt pitfalls. |
+| `models/qwen3/roadmap.md` | Qwen3-4B roadmap (2026-06 review): line is the maturity bar; #220 RoPE OOB, batched greedy sampling (#307), mixed greedy/non-greedy sampling (#284), and pegaflow KV offload (#316) are landed; open set is zero TP coverage, zero-adapter-only LoRA gate, dropped prefix-cache observability, stale docs, and YaRN #8 follow-up. |
 | `models/qwen3/model-crate.md` | `openinfer-qwen3-4b` owns Qwen3 config/weights/executor/scheduler/tests/kernel plan; root sees generic `EngineHandle`; split-K retuned to `256/64`, with 4k/64 serving TPOT p50 at `6.46ms` on RTX 5090. |
 | `models/qwen3/prefix-cache.md` | Prefix caching on by default for Qwen3-4B: full-block kvbm radix matching at the executor, suffix-only prefill. Repeated ~1900-token prompt TTFT 141.8 → 16.3ms p50 (8.7×); warm TTFT ≈ TPOT + ~5ms setup. Includes the RoPE scalar-path corruption fix and the drain-the-stream TTFT measurement pitfall. |
+| `models/qwen3/dflash-speculative-decoding.md` | DFlash speculative decoding behind `--dflash-draft-model-path`, modelled as an optimistic transaction (propose K → verify K+1 span → accept longest argmax prefix + 1 bonus → commit/roll back KV). Lossless up to bf16 tie-flips (bit-identical multi-token accepts; lm-eval gsm8k strict-match identical spec on/off). Single-stream decode 1.82× on 5070 Ti, 1.56× on 5090. Concurrent throughput fixed by batching the draft forward, then a piecewise verify CUDA Graph (dense ops captured, attention eager) closed single-stream: 5090 greedy c1 274 ≈ vLLM 278, c8 1525 > 1240, c16 1834 ≈ 1846 — all batch sizes now ≥ vLLM. Accept measured equal (9.1% vs 8.85%, same drafter); draft-side piecewise graph tracked next. Proposer trait deferred to EAGLE. |
 | `models/qwen3/accuracy-gate.md` | Qwen3-4B instance of the logits golden gate (`tests/hf_golden_gate.rs`): 48 teacher-forced sequences / 816 positions vs a stored HF bf16 golden, replayed over bs=1 / batched eager / CUDA-graph. Strict guards: regret check + mean ≤ 0.06 + p99 ≤ 0.20; absolute max printed but not asserted (coverage-unstable). Methodology in `subsystems/correctness/`. |
 | `models/qwen3/kernels-crate.md` | Phase 1 split implemented and 5090-verified: Qwen3-4B kernel surface lives in `openinfer-kernels`; release build, test-target compile, accuracy gate, and bench snapshot pass. |
 | `models/qwen3/tp-design.md` | Qwen3 tensor-parallel design: `TP=2` milestone scope plus the controller/worker broadcast execution model, request identity, and coarse-grained step protocol for future TP/MoE work. |
@@ -36,12 +40,13 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): fast and decode-correct, #186 adds the teacher-forced HF logits gate, and #250 covers the old 4096 RoPE boundary with a 4097/8192-token HF logits replay plus a recovered GSM8K 8-shot score; ~640MB HND prefill staging remains, with the 20k cap now fail-closed, pre-#85 admission semantics still open, and current scheduler admission/slot/compaction policy is now CPU-tested. |
+| `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): decode-tuning refresh improves direct TPOT by 2-3%, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Open items: HND prefill staging, prefix-cache design, serving concurrency. |
 | `models/qwen35/kv-admission.md` | Issue #254 complete: Qwen3.5 now uses full-lifetime KV admission, deferred pressure handling, impossible-request rejection, explicit error semantics, direct rejection-event coverage, RTX 5090 e2e, and real HTTP pressure/post-pressure validation. |
-| `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 234ms (+2%), TPOT 11.77ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9). |
+| `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn optimization ledger. Decode-tuning refresh fuses MLP gate/up and tunes decode cublasLt buckets, improving direct TPOT by 2-3%; vLLM still leads 1024/256 HTTP decode. |
 | `models/qwen35/accuracy.md` | Qwen3.5-4B HF bf16 logits goldens through `past_key_values`: short replay covers sequential graph, bucket-straddling batched graph, and slot-compaction; long replay covers 4097/8192-token prompts; full GSM8K 8-shot now matches the HF baseline within 0.15 percentage points. |
-| `models/qwen35/model-crate.md` | `openinfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, historical Qwen3.5 e2e, and scheduler e2e records live here. |
+| `models/qwen35/model-crate.md` | `openinfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; feature-gated behind `qwen35-4b` (Triton AOT is the only Python build dependency); root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, historical Qwen3.5 e2e, and scheduler e2e records live here. |
 | `models/qwen35/kernel-plan.md` | Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3 module — enumerates every prefill/decode/unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites. Pure refactor (issue #256), no kernel behavior change. |
+| `models/qwen35/batched-step-tail.md` | Qwen3.5 issue #353 implementation record: final prefill tail is batched, decode/unified sample from batched logits, host full-vocab copies are logprobs-only, HF + scheduler e2e pass, and final serving A/B supports only the first-token/short-output TTFT claim. |
 
 ## models / deepseek-v4
 
@@ -62,11 +67,11 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 model status and benchmark ledger: HF/host-staged/NCCL are exact for the narrow greedy gate; direct same-prompt batch and manual vLLM snapshots are diagnostic evidence, not production serving parity. |
-| `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150: HF incremental greedy, host-staged EP2, and NCCL EP2 are token/text exact for `Hello`, output_len=16. |
-| `models/deepseek-v2-lite/decode-attribution-gate.md` | DeepSeek-V2-Lite EP2 decode attribution gate for `Hello`/16-token batch sizes 1/4/8: structured JSON with accuracy hashes, CPU-side timing, selected CUDA event/NVTX attribution, host-staged/NCCL EP counts, and explicit no-throughput claim boundary. |
+| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 model status and benchmark ledger: HF/host-staged/NCCL use a committed correctness case set; #281 adds the first greedy mixed-request serving gate with per-request decode KV; direct batch, HTTP pressure, and vLLM rows remain diagnostic, not production serving parity. |
+| `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150/#274: HF `generate(use_cache=true)`, host-staged EP2, and NCCL EP2 are compared across the committed small case set. |
+| `models/deepseek-v2-lite/decode-attribution-gate.md` | DeepSeek-V2-Lite EP2 decode attribution gate for `Hello`/16-token batch sizes 1/4/8: structured JSON with accuracy hashes, timing/counters, separated NCCL all-reduce smoke, and fail-closed full-decode graph probe evidence for the retained batch-1 shape. |
 | `models/deepseek-v2-lite/source-layout.md` | DeepSeek-V2-Lite runtime layout refactor: `runtime.rs` split by responsibility, HF/host-staged/NCCL EP2 E2E exact on 2x RTX 5090; NCCL CUDA Graph smoke remains a diagnostic blocker on that host, independent of the passed correctness gate. |
-| `models/deepseek-v2-lite/device-resident-nccl-combine.md` | Issue #275 record: NCCL decode combine now uses reusable device-resident f32 scratch, HF/host-staged/NCCL exact on 2x RTX 5090, and remaining graph blockers are dense exchange plus host-directed routing. |
+| `models/deepseek-v2-lite/device-resident-nccl-combine.md` | Issue #275 record: NCCL decode combine uses reusable device-resident f32 scratch; current NCCL graph-readiness blockers live in `status.md`. |
 
 ## models / kimi-k2
 
@@ -91,6 +96,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `subsystems/router/kv-aware-routing.md` | Dynamo KV-aware routing on 8×Qwen3-4B (RTX 5090): cache-affinity routing keeps a multi-turn conversation on its home worker, so follow-up-turn TTFT stays flat ~45ms vs round-robin 160–170ms / random 165–180ms (all-turns p50 3.3–3.8× lower). Router prefix overlap 0.72 under KV, 0 under stateless policies; `kv_hit_rate>0` is the gate that the worker↔router block-hash bridge is actually matching. Includes the per-response `prompt_tokens_details.cached_tokens` signal. |
 | `subsystems/runtime/runtime.md` | Runtime complexity is controlled by a shared `openinfer-core` that owns the generation contract and orchestration; per-model crates implement `ModelForward` so prefill/decode and hybrid attention stay hidden from the caller. State (`&mut`) is separated from weights (`&self`) for future bs > 1. |
 | `subsystems/runtime/kv-cache-design.md` | Dynamo 式 logical/physical 分层 KV cache：BlockManager 管 block 生命周期和 admission，PhysicalBackend trait 管 GPU 内存和布局（FullAttention / MLA）。支持 TP / DP。基于 vLLM/Dynamo/pegaflow 调研。 |
 | `subsystems/runtime/pegaflow-offload-integration.md` | 把 `pegaflow-core` 当进程内 Rust 库做 KV 卸载物理后端（HBM→DRAM/SSD/RDMA），补 kvbm 没写的卸载层。**Qwen3-4B full-attn 首发，端到端已在真实 GPU 跑通并验证**（async SAVE+LOAD 接进 executor/scheduler，纯 CPU-hit 与 GPU+CPU 组合 hit 恢复后 logits 与冷算一致）。pegaflow 经 git rev pin（#331+#333）。默认关，server CLI 已接（#316：`--kv-offload`/`--no-prefix-cache`，plain+LoRA）。linear 排除，sparse 暂缓。 |
@@ -99,7 +105,15 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/scheduler/scheduler.md` | Single dedicated thread owns GPU; FCFS prefill-priority, paged KV, bucket CUDA Graphs, unified forward for mixed prefill+decode. Qwen3-4B at QPS=2 is within 2% of vLLM throughput while winning TTFT (-16%), TPOT (-3%), and latency stability. Open: ITL p99 tail, Qwen3.5 full-paged prefill, batched per-row sampling redesign. |
+| `subsystems/scheduler/scheduler.md` | Single dedicated thread owns GPU; FCFS prefill-priority, paged KV, bucket CUDA Graphs, unified forward for mixed prefill+decode. Qwen3-4B at QPS=2 is within 2% of vLLM throughput while winning TTFT (-16%), TPOT (-3%), and latency stability. Open: ITL p99 tail, Qwen3.5 full-paged prefill, and high-concurrency wedge triage. |
+| `subsystems/scheduler/output-dispatch.md` | GPU bubble study + token-dispatch redesign (**landed 2026-06**). Single-thread CPU↔GPU(sync) alternation idles the GPU through scheduling; bubble ≈3µs×batch (bs=128 → ~380µs, 2% of an 18ms step on 5070 Ti), dominated by N per-request `token_tx.send` wakeups. Fix shipped: `token_tx` is a `TokenSink` drop-in over one request-tagged channel + one bridge demux loop (N→1 wakeups/tasks/ZMQ msgs); cancellation rides an `Arc<AtomicBool>` flag, not a separate channel. Bubble target ~150µs (exec_cpu floor). Trigger: fast GPUs (→10–15%) or N≫128. |
+| `subsystems/scheduler/qwen-batched-sampling.md` | Issue #284 record: Qwen3/Qwen3.5 mixed greedy/non-greedy token selection compacts non-greedy rows into one batched FlashInfer sampling call per step, with greedy rows staying on indexed batched argmax. |
+
+## subsystems / sampling
+
+| Path | TL;DR |
+| --- | --- |
+| `subsystems/sampling/openinfer-sample.md` | `openinfer-sample` is the one crate every model routes through for batched token selection (`select_batch`) and host logprobs (`token_logprob_from_row`, generic over f32/bf16). Replaces `core::ops::select_batch_tokens_into` + three copies of the logprob math. Kimi keeps its sharded-vocab greedy argmax (a DP concern the whole-vocab `select_batch` can't express) but shares the non-greedy sampler and the logprob math. |
 
 ## subsystems / frontend
 
@@ -107,6 +121,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `openinfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
+| `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready 3.25s → ~1.45s: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers), and the source safetensors mmap is kept alive to dodge ~0.4s of munmap stalling the next cudaMalloc. |
 
 ## subsystems / correctness
 
@@ -121,6 +136,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/kernels/openinfer-kernels-boundary.md` | Architecture decision: openinfer should use reusable frontend/runtime/data-plane layers plus per-model engines; kernels become first-class assets through a ledger, simulator, and request tracing. |
 | `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel/report tooling is feature-gated: `qwen3_kernel_report` covers per-op kernel reports, and `qwen3_model_report` emits runtime-traced eager-DAG decode operator rollups with TensorSpec `KernelCall`s, latency stats, tables, and Graphviz DOT; measured FA2 `CTA_TILE_Q=64` prefill default in place. |
 | `subsystems/kernels/typed-forward-pipeline.md` | Reusable typed tensor pipeline macro in `openinfer-kernels` so model crates can express common `typed_ops` chains without model-specific wrapper macros. |
+| `subsystems/kernels/tvm-ffi-mvp.md` | Optional `tvm-ffi-triton-cubin` bridge in `openinfer-kernels` plus a packed TVM wrapper for the Qwen3.5 GDR solve Triton AOT CUBIN launcher. |
 
 ## playbooks
 
@@ -142,12 +158,17 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `lessons/moe-zero-prefill-long-prefill.md` | ZeRO-Prefill lesson for future long-prefill MoE serving: once a router selects long-P work, maximize batch throughput by preserving compute-bound execution, hiding expert-weight movement, respecting KV handoff boundaries, and measuring bottlenecks before committing to an AsyncEP-style backend. |
 | `lessons/exact-match-gate-thread-cublas.md` | Two durable lessons from a Qwen3.5 e2e gibberish bug: worker threads that run a model must rebind the CUDA context and init thread-local cuBLAS handles, and exact-match greedy gates are sensitive to equal-logit top1 choices (keep a single FlashInfer selector). |
 | `lessons/kimi-bringup-numerics.md` | Three MoE+TP greedy-parity / reporting lessons from Kimi-K2 bring-up, reusable on any MoE+TP decode engine gated on token-id parity: reduce hidden states in F32 not BF16 (BF16 bulk all-reduce silently breaks greedy); don't merge shared+routed expert reduce into one collective (breaks cold-batch greedy); always report p50+p99, never just mean (tail dominates on barrier-synced MoE+EP decode). |
+| `lessons/cuda-green-contexts.md` | Local mirror of NVIDIA CUDA 13.1+ Green Contexts guide (§4.6): static SM/workqueue partitioning via runtime execution contexts; host-only changes, no kernel edits. Generated by `scripts/html_to_md.py`. |
 
 ## benchmarks
 
 | Path | TL;DR |
 | --- | --- |
+| `benchmarks/qwen3-4b-serving-vllm-rtx5090.md` | Qwen3-4B TP1 vs vLLM 0.22.1 on RTX 5090 (2026-06-13, @`0b42ed3`), README source: footprint ~5× smaller (771 MB vs 3.8 GB) + ~3 s vs 70 s cold start; warm prefix-cache TTFT leads all lengths, 3.6× at 16k (26.3 vs 95.6 ms); QPS sweep comparable at low load, vLLM TPOT edge mid-load, openinfer edges ahead at saturation (1794 vs 1692) post-#362; pegaflow KV-offload host restore 2.6–9.1×. |
+| `benchmarks/qwen35-4b-serving-vllm-rtx5090.md` | Qwen3.5-4B TP1 vs vLLM 0.23.0 on RTX 5090: latest direct OpenInfer A/B improves TPOT by 2-3%; HTTP `vllm bench serve` shows prompt-len-1 decode close, but vLLM still leads 1024/256 TPOT and high-concurrency output tok/s. Includes Nsight Systems direct/HTTP gap notes. |
+| `benchmarks/qwen-mixed-sampling-http.md` | Issue #412 HTTP mixed-sampling evidence: Qwen3-4B `/v1/completions` completed 64/64 with 32 greedy + 32 sampled requests, failed=0/timeouts=0, TTFT/TPOT/ITL/output tok/s retained; Qwen3.5-4B passed the same workload as supplemental evidence. |
 | `benchmarks/bs1-4k64-vllm-openinfer.md` | RTX 5090 single-concurrency probe: `input_len=4096`, `output_len=64`, no vLLM prefix cache. OpenInfer TTFT median `177ms` vs vLLM `198ms`; TPOT median `6.47ms` vs `6.36ms`; corrected output throughput `+6%` for OpenInfer. |
+| `benchmarks/mixed-load-itl.md` | Qwen3-4B mixed-load ITL (#244): long prompts into steady-state decode via `bench_serving mixed`. A prefill freezes every active decode for its full duration (4k→~490ms, 10k→~2730ms); reaches ITL p99 only when stall-gap fraction >~1%. Low-QPS moderate-prompt profile p99 baseline-order (~15–19ms); 1 req/s or 10k prompt → 487/2818ms. Chunked prefill = conditional no-go. |
 | `benchmarks/accuracy-eval-results.md` | Phase 1 GSM8K: Qwen3-4B PASS (openinfer 85.37% vs HF 85.82%, delta -0.45 pp). Qwen3.5-4B historical FAIL recovered by #250 (strict 79.38%, flexible 79.30% vs HF 79.45%). |
 | `benchmarks/pplx-ep-a2a-h20-nvlink.md` | pplx EP all-to-all latency on 8× H20 NV18 NVLink: DSV4 & Kimi-K2 shapes, tok=1..256. tok=1 p50 ~82μs, tok=256 p50 ~204/303μs. |
 | `benchmarks/deepep-v2-vs-pplx-moe-backend.md` | H20 x8 DeepEP V2 vs current OpenInfer PPLX EP backend comparison: ElasticBuffer/NCCL Gin shows a directional 2.5x-5.3x paired-run ratio on tested DSV4 and Kimi-K2 MoE exchange shapes, with dtype, correctness, harness, and PPLX baseline-drift caveats recorded. |

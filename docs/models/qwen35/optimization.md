@@ -1,6 +1,6 @@
 # Qwen3.5-4B Optimization
 
-> **TL;DR:** Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT `234ms` (+2%), TPOT `11.77ms` (+1%) — see the [E2E Dashboard](#e2e-dashboard) for the authoritative ledger. After the accuracy-parity refactor (#40) regressed decode by +4%, restoring the dedicated GDR decode kernel (#9) recovered it fully.
+> **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: openinfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). The decode-tuning refresh fuses MLP gate/up and tunes decode cuBLASLt buckets, improving direct TPOT by `2.1-3.2%`; vLLM still leads 1024/256 HTTP decode and high-concurrency throughput.
 >
 > **Last touched:** 2026-06. Qwen3.5 runtime code lives in top-level `openinfer-qwen35-4b`; root `bench_serving` loads it through the generic `EngineHandle`. Current accuracy coverage is `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
@@ -8,7 +8,40 @@ Historical command logs below keep the command paths that were actually run at t
 
 ## Goal
 
-openinfer single-request latency >= vLLM on Qwen3.5-4B, same GPU/workload. The original prefill-heavy gap is now mostly closed: chunk-wise GDR prefill gets `(2048,1)` TTFT to parity level on this GPU, so the remaining work is normal tuning and cleanup rather than a structural latency crisis.
+Close Qwen3.5's decode and serving gap against the current vLLM baseline on the
+same GPU/workload. The current refresh is a measured incremental step: direct
+OpenInfer decode gets a few-percent TPOT improvement, but HTTP 1024/256 and
+high-concurrency serving still trail vLLM and remain active optimization work.
+
+## Current Decode Refresh
+
+Changes in the decode-tuning refresh:
+
+- MLP gate/up weights are stacked at load time, so runtime uses one gate-up GEMM
+  plus fused SiLU*mul.
+- Decode cublasLt buckets are tuned before CUDA Graph capture.
+- Token selection stays on the shared batched sampler path.
+
+Same-host direct A/B:
+
+| Workload | Metric | upstream/main | tuned branch | Delta |
+| --- | --- | ---: | ---: | ---: |
+| 1 input / 256 output | steady TPOT avg | 6.524 ms | 6.386 ms | -2.1% |
+| 1 input / 512 output | steady TPOT avg | 6.603 ms | 6.397 ms | -3.1% |
+| 1024 input / 256 output | steady TPOT avg | 7.338 ms | 7.100 ms | -3.2% |
+| 2048 input / 1 output | TTFT avg | 97.978 ms | 95.855 ms | -2.2% |
+
+Current vLLM boundary:
+
+- Prompt-len-1 HTTP decode is close: 1/256 TPOT mean `6.282 ms` vs vLLM
+  `6.214 ms`, and 1/512 TPOT mean `6.381 ms` vs vLLM `6.221 ms`.
+- 1024/256 HTTP decode still trails: TPOT mean `7.110 ms` vs vLLM `6.346 ms`
+  at concurrency 1, widening to `15.566 ms` vs `9.823 ms` at concurrency 16.
+- 2048/1 and 1024/256 TTFT rows are fixed-client timings, not token-normalized
+  prefill throughput, because the servers report different prompt-token totals.
+- Nsight Systems measured the direct 1024/256 concurrency-16 path at `9.320 ms`
+  steady TPOT avg; the HTTP row is `15.566 ms`. The next gap search is
+  serving/scheduler/event-sync overhead.
 
 ## Known Caveat
 
@@ -36,7 +69,7 @@ Historical exact-text baseline note:
   - `chinese_capital`
   - `chinese_weather`
 
-## E2E Dashboard
+## Historical E2E Dashboard
 
 GPU: RTX 5070 Ti, Model: Qwen3.5-4B, vLLM 0.18.0, single concurrency.
 Both measured via `vllm bench serve` HTTP client (apples-to-apples). vLLM: torch.compile + CUDA Graph (`--max-num-seqs 1` to fit in 16 GB alongside desktop).
@@ -87,8 +120,7 @@ RMSNorm_offset [2560,seq]
   → attention_gate_batch_hd256 (apply sigmoid(gate))                  ← batched CUDA helper
   → GEMM O [4096→2560,seq]     ← batched
   → Residual + RMSNorm_offset [2560,seq]
-  → GEMM Gate [2560→9216,seq]  ← batched
-  → GEMM Up [2560→9216,seq]    ← batched
+  → GEMM Gate+Up [2560→18432,seq]  ← batched
   → SiLU*Mul [9216,seq]
   → GEMM Down [9216→2560,seq]  ← batched
   → Residual
@@ -115,8 +147,7 @@ RMSNorm_offset [2560,seq]
   → rms_norm_gated [4096,seq]  ← one launch/layer
   → GEMM O [4096→2560,seq]     ← batched
   → Residual + RMSNorm_offset [2560,seq]
-  → GEMM Gate [2560→9216,seq]
-  → GEMM Up [2560→9216,seq]
+  → GEMM Gate+Up [2560→18432,seq]
   → SiLU*Mul [9216,seq]
   → GEMM Down [9216→2560,seq]
   → Residual

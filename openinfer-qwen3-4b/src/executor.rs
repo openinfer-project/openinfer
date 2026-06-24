@@ -6,7 +6,7 @@ use crossbeam_channel as channel;
 
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
-use crate::weights::{ModelRuntimeConfig, Qwen3Model};
+use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest};
 use openinfer_core::kv_pool::KvLayout;
@@ -14,9 +14,25 @@ use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use openinfer_kv_cache::{
-    KvBlockGuard, KvBuffer, KvCacheManager, KvView, LoadReservation, PrefixProbe,
+    KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
+    RegisteredBlock,
 };
 use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
+use tokio::sync::broadcast;
+
+mod dflash_lane;
+mod dflash_prefill;
+mod spec;
+
+use crate::dflash::DFlashDraftModel;
+use crate::speculative::{
+    DraftPlan, DraftResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
+    build_verify_results,
+};
+use dflash_lane::DFlashLaneState;
+use dflash_prefill::{DFlashPrefillAction, dflash_prefill_action};
+
+use crate::verify_graph::VerifyGraphBuffers;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) u64);
@@ -40,11 +56,19 @@ pub struct PrefillStepItem {
     pub(crate) logprobs: usize,
     pub(crate) echo: bool,
     pub(crate) lora_adapter: Option<String>,
-    pub(crate) random_val: f32,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
     /// the remaining suffix.
     pub(crate) cached_tokens: usize,
+    /// Scheduler-set cap on prompt tokens forwarded this step (chunked
+    /// prefill). The executor clamps it to the tokens actually remaining.
+    pub(crate) chunk_budget: usize,
+    /// First prompt position forwarded this step. Set by the executor from
+    /// the request's KV position (covers both prefix-cache hits and chunks
+    /// applied in earlier steps).
+    pub(crate) chunk_start: usize,
+    /// Prompt tokens forwarded this step. Set by the executor.
+    pub(crate) chunk_tokens: usize,
 }
 
 impl PrefillStepItem {
@@ -55,8 +79,8 @@ impl PrefillStepItem {
         params: SamplingParams,
         logprobs: usize,
         echo: bool,
-        random_val: f32,
     ) -> Self {
+        let chunk_tokens = prompt_tokens.len();
         Self {
             request_id,
             prompt_tokens,
@@ -65,18 +89,28 @@ impl PrefillStepItem {
             logprobs,
             echo,
             lora_adapter: None,
-            random_val,
             cached_tokens: 0,
+            chunk_budget: usize::MAX,
+            chunk_start: 0,
+            chunk_tokens,
         }
     }
 
-    /// Prompt tokens that still need prefill (cached prefix excluded).
-    fn as_slice(&self) -> &[u32] {
-        &self.prompt_tokens[self.cached_tokens..]
+    #[must_use]
+    pub fn with_lora_adapter(mut self, lora_adapter: Option<String>) -> Self {
+        self.lora_adapter = lora_adapter;
+        self
     }
 
-    fn suffix_len(&self) -> usize {
-        self.prompt_tokens.len() - self.cached_tokens
+    /// Prompt tokens forwarded this step.
+    fn as_slice(&self) -> &[u32] {
+        &self.prompt_tokens[self.chunk_start..self.chunk_start + self.chunk_tokens]
+    }
+
+    /// Whether this step's chunk reaches the end of the prompt (and so
+    /// produces the first generated token).
+    fn is_final_chunk(&self) -> bool {
+        self.chunk_start + self.chunk_tokens == self.prompt_tokens.len()
     }
 }
 
@@ -87,7 +121,6 @@ pub struct DecodeStepItem {
     pub(crate) params: SamplingParams,
     pub(crate) logprobs: usize,
     pub(crate) lora_adapter: Option<String>,
-    pub(crate) random_val: f32,
 }
 
 impl DecodeStepItem {
@@ -96,7 +129,6 @@ impl DecodeStepItem {
         token_id: u32,
         params: SamplingParams,
         logprobs: usize,
-        random_val: f32,
     ) -> Self {
         Self {
             request_id,
@@ -104,47 +136,32 @@ impl DecodeStepItem {
             params,
             logprobs,
             lora_adapter: None,
-            random_val,
         }
     }
-}
 
-/// One request's speculative-decode step input: the last committed token
-/// (`token_id`, the dangling `d0`) plus the proposer's draft continuation.
-/// The verify forward runs the model on `[token_id, drafts..]` and the
-/// executor commits the greedy-accepted prefix plus one model token.
-#[derive(Clone)]
-pub struct SpeculativeStepItem {
-    pub request_id: RequestId,
-    pub token_id: u32,
-    pub drafts: Vec<u32>,
-    pub lora_adapter: Option<String>,
-}
-
-impl SpeculativeStepItem {
-    pub fn new(request_id: RequestId, token_id: u32, drafts: Vec<u32>) -> Self {
-        Self {
-            request_id,
-            token_id,
-            drafts,
-            lora_adapter: None,
-        }
+    #[must_use]
+    pub fn with_lora_adapter(mut self, lora_adapter: Option<String>) -> Self {
+        self.lora_adapter = lora_adapter;
+        self
     }
 }
 
 fn build_prefill_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[PrefillStepItem],
-    logits_vec: &[DeviceVec],
+    logits: &HiddenStates,
+    tokens: &[u32],
     all_position_logits: Option<&HiddenStates>,
     compute_prompt_logprobs: bool,
 ) -> Result<Vec<PrefillRequestResult>> {
     let mut token_offset = 0usize;
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
-        let first_token = lane.sample_from_logits(&logits_vec[i], &req.params, req.random_val)?;
-        let first_token_logprob = if req.logprobs > 0 {
-            Some(lane.extract_logprobs(&logits_vec[i], first_token, req.logprobs)?)
+        let completed = req.is_final_chunk();
+        let first_token = tokens[i];
+        let first_token_logprob = if completed && req.logprobs > 0 {
+            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, i)?;
+            Some(lane.extract_logprobs(&logits_i, first_token, req.logprobs)?)
         } else {
             None
         };
@@ -175,13 +192,15 @@ fn build_prefill_request_results(
         } else {
             None
         };
-        token_offset += req.suffix_len();
+        token_offset += req.chunk_tokens;
         outputs.push(PrefillRequestResult {
             request_id: req.request_id,
             first_token,
             first_token_logprob,
             prompt_logprobs,
             cached_tokens: req.cached_tokens,
+            completed,
+            prefill_pos: req.chunk_start + req.chunk_tokens,
         });
     }
     Ok(outputs)
@@ -190,13 +209,16 @@ fn build_prefill_request_results(
 fn build_decode_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[DecodeStepItem],
-    logits: &[DeviceVec],
+    logits: &HiddenStates,
+    row_offset: usize,
+    tokens: &[u32],
 ) -> Result<Vec<DecodeRequestResult>> {
     let mut outputs = Vec::with_capacity(requests.len());
     for (i, req) in requests.iter().enumerate() {
-        let token = lane.sample_from_logits(&logits[i], &req.params, req.random_val)?;
+        let token = tokens[row_offset + i];
         let logprob = if req.logprobs > 0 {
-            Some(lane.extract_logprobs(&logits[i], token, req.logprobs)?)
+            let logits_i = ops::extract_vec(lane.model.device_ctx(), logits, row_offset + i)?;
+            Some(lane.extract_logprobs(&logits_i, token, req.logprobs)?)
         } else {
             None
         };
@@ -212,20 +234,15 @@ fn build_decode_request_results(
 fn build_batch_decode_request_results(
     lane: &mut LocalQwen3Lane,
     requests: &[DecodeStepItem],
+    sample_seed: u64,
 ) -> Result<Vec<DecodeRequestResult>> {
     let params: Vec<&SamplingParams> = requests.iter().map(|req| &req.params).collect();
-    let random_vals: Vec<f32> = requests.iter().map(|req| req.random_val).collect();
-    let tokens = openinfer_core::ops::select_batch_tokens_into(
+    let tokens = openinfer_sample::select_batch(
         lane.model.device_ctx(),
         &lane.bufs.logits,
         &params,
-        &random_vals,
-        &mut lane.sample_scratch.row_indices,
-        &mut lane.sample_scratch.probs,
-        &mut lane.sample_scratch.top1_values,
-        &mut lane.sample_scratch.row_states,
-        &mut lane.sample_scratch.valid,
-        &mut lane.sample_scratch.out,
+        sample_seed,
+        &mut lane.sample_scratch,
     )?;
 
     let mut outputs = Vec::with_capacity(requests.len());
@@ -256,29 +273,56 @@ fn execute_step_on_lane(
             requests,
             kv_views,
             echo,
+            sample_seed,
         } => {
             let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
             let lora_adapters: Vec<Option<&str>> = requests
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            let (logits, all_position_logits) =
-                lane.execute_prefill(&prompts, kv_views, &lora_adapters, *echo)?;
+            // When DFlash is loaded, capture target hidden states for eligible
+            // requests so they can seed the draft model after prefill finishes.
+            let capture_requested = lane.should_capture_dflash_prefill_context(requests);
+            let capture_layer_ids = if capture_requested {
+                lane.dflash_capture_layer_ids()
+            } else {
+                None
+            };
+            let (logits, all_position_logits, captured_hidden) = lane.execute_prefill(
+                &prompts,
+                kv_views,
+                &lora_adapters,
+                *echo,
+                capture_layer_ids.as_deref(),
+            )?;
+            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
+                requests,
+                capture_requested,
+                captured_hidden.as_ref(),
+            )?;
             if collect_result {
+                let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
+                let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
                         lane,
                         requests,
                         &logits,
+                        &tokens,
                         all_position_logits.as_ref(),
                         *echo,
                     )?,
+                    dflash_context_captured_requests,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
             }
         }
-        StepCommand::Decode { requests, kv_views } => {
+        StepCommand::Decode {
+            requests,
+            kv_views,
+            sample_seed,
+        } => {
             let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
             let lora_adapters: Vec<Option<&str>> = requests
                 .iter()
@@ -287,7 +331,7 @@ fn execute_step_on_lane(
             lane.execute_decode(&token_ids, kv_views, &lora_adapters)?;
             if collect_result {
                 Ok(WorkerStepOutcome::Decode(DecodeResult {
-                    requests: build_batch_decode_request_results(lane, requests)?,
+                    requests: build_batch_decode_request_results(lane, requests, *sample_seed)?,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -298,6 +342,7 @@ fn execute_step_on_lane(
             prefill_kv_views,
             decode_requests,
             decode_kv_views,
+            sample_seed,
         } => {
             let prefill_prompts: Vec<&[u32]> = prefill_requests
                 .iter()
@@ -312,7 +357,7 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            let (prefill_logits, decode_logits) = lane.execute_unified(
+            let logits = lane.execute_unified(
                 &prefill_prompts,
                 prefill_kv_views,
                 &prefill_lora_adapters,
@@ -321,36 +366,147 @@ fn execute_step_on_lane(
                 &decode_lora_adapters,
             )?;
             if collect_result {
+                // Logits columns: prefill requests first, then decode rows.
+                let params: Vec<&SamplingParams> = prefill_requests
+                    .iter()
+                    .map(|r| &r.params)
+                    .chain(decode_requests.iter().map(|r| &r.params))
+                    .collect();
+                let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
                     prefill_requests: build_prefill_request_results(
                         lane,
                         prefill_requests,
-                        &prefill_logits,
+                        &logits,
+                        &tokens,
                         None,
                         false,
                     )?,
                     decode_requests: build_decode_request_results(
                         lane,
                         decode_requests,
-                        &decode_logits,
+                        &logits,
+                        prefill_requests.len(),
+                        &tokens,
                     )?,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
             }
         }
-        StepCommand::SpeculativeVerify {
-            verify_tokens,
-            kv_view,
-            lora_adapter,
+        StepCommand::SplitConcurrent {
+            prefill_requests,
+            prefill_kv_views,
+            decode_requests,
+            decode_kv_views,
+            prefill_stream,
+            decode_stream,
+            sample_seed,
         } => {
-            let argmax = lane.execute_verify(verify_tokens, kv_view, lora_adapter.as_deref())?;
+            use openinfer_kernels::tensor::{clear_stream_override, set_stream_override};
+
+            // If there's still an inflight prefill from a previous step, sync it
+            // now (shouldn't happen normally, but safety).
+            if lane.inflight_prefill.is_some() {
+                lane.resolve_inflight_prefill()?;
+            }
+
+            let prefill_prompts: Vec<&[u32]> = prefill_requests
+                .iter()
+                .map(PrefillStepItem::as_slice)
+                .collect();
+            let prefill_lora_adapters: Vec<Option<&str>> = prefill_requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+            let decode_tokens: Vec<u32> = decode_requests.iter().map(|req| req.token_id).collect();
+            let decode_lora_adapters: Vec<Option<&str>> = decode_requests
+                .iter()
+                .map(|req| req.lora_adapter.as_deref())
+                .collect();
+
+            // Sync ctx.stream: ensures all prior stream-ordered allocs and
+            // H2D copies are complete before green streams touch them.
+            lane.model.device_ctx().sync()?;
+
+            // Launch prefill on prefill partition stream.
+            unsafe { set_stream_override(prefill_stream.0) };
+            let (prefill_logits, _, _) = lane.execute_prefill(
+                &prefill_prompts,
+                prefill_kv_views,
+                &prefill_lora_adapters,
+                false,
+                None,
+            )?;
+            clear_stream_override();
+
+            // Launch decode on the decode partition stream. CUDA graph stays
+            // enabled: batch_decode captures into the split graph cache keyed on
+            // the active stream override, so the replayed kernel nodes stay
+            // pinned to the decode SM partition (CUDA PG §4.6.5 — capture stream
+            // determines a node's execution context).
+            unsafe { set_stream_override(decode_stream.0) };
+            lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
+            clear_stream_override();
+
+            // Only sync decode stream — decode result is ready for sampling.
+            // Prefill continues async on GPU; polled later via event.
+            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(decode_stream.0) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                anyhow::bail!("cuStreamSynchronize(decode) failed: {r:?}");
+            }
+
             if collect_result {
-                Ok(WorkerStepOutcome::Speculative(argmax))
+                // Sample decode tokens immediately.
+                let decode_result =
+                    build_batch_decode_request_results(lane, decode_requests, *sample_seed)?;
+
+                // Record event on prefill stream for non-blocking poll.
+                let mut event: cudarc::driver::sys::CUevent = std::ptr::null_mut();
+                unsafe {
+                    cudarc::driver::sys::cuEventCreate(
+                        &mut event,
+                        cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+                    );
+                    cudarc::driver::sys::cuEventRecord(event, prefill_stream.0);
+                }
+
+                // Store prefill state for deferred sync+sample.
+                lane.inflight_prefill = Some(InflightPrefillState {
+                    prefill_stream: prefill_stream.0,
+                    prefill_logits,
+                    prefill_requests: prefill_requests.clone(),
+                    sample_seed: *sample_seed,
+                });
+
+                Ok(WorkerStepOutcome::SplitDecodeReady {
+                    decode: DecodeResult {
+                        requests: decode_result,
+                    },
+                    prefill_event: SendEvent(event),
+                })
             } else {
+                // Non-primary worker: still need to sync prefill before returning.
+                let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
+                }
                 Ok(WorkerStepOutcome::Ack)
             }
         }
+        StepCommand::SpeculativeVerify { requests, kv_views } => {
+            // One target forward over each request's K+1 draft span with a
+            // speculative KV view. The fixed-buffer verify path computes all-
+            // position logits (accept_greedy needs the target's posterior at
+            // each span position) and captures the target hidden states (at the
+            // DFlash layers) to seed the next draft — all into reused,
+            // pointer-stable scratch (`VerifyGraphBuffers`).
+            let result = lane.execute_dflash_verify(requests, kv_views)?;
+            Ok(WorkerStepOutcome::SpeculativeVerify(result))
+        }
+        StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
+            lane.execute_dflash_draft(requests)?,
+        )),
     }
 }
 
@@ -362,68 +518,6 @@ impl Drop for CublasThreadGuard {
             openinfer_core::ffi::cublas_destroy();
         }
     }
-}
-
-struct SamplingScratch {
-    row_indices: cudarc::driver::CudaSlice<i32>,
-    probs: cudarc::driver::CudaSlice<f32>,
-    top1_values: cudarc::driver::CudaSlice<half::bf16>,
-    row_states: cudarc::driver::CudaSlice<u8>,
-    valid: cudarc::driver::CudaSlice<u8>,
-    out: cudarc::driver::CudaSlice<i32>,
-}
-
-impl SamplingScratch {
-    fn new(ctx: &DeviceContext, vocab_size: usize, max_batch_bucket: usize) -> Result<Self> {
-        Ok(Self {
-            row_indices: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            probs: ctx.stream.alloc_zeros(vocab_size)?,
-            top1_values: ctx.stream.alloc_zeros(max_batch_bucket)?,
-            row_states: ctx
-                .stream
-                .alloc_zeros(openinfer_core::ops::flashinfer_topk_row_states_bytes())?,
-            valid: ctx.stream.alloc_zeros(1)?,
-            out: ctx.stream.alloc_zeros(max_batch_bucket)?,
-        })
-    }
-}
-
-fn compute_logprobs_from_cpu(
-    logits_f32: &[f32],
-    sampled_token: u32,
-    top_k: usize,
-) -> Option<TokenLogprob> {
-    if logits_f32.is_empty() {
-        return None;
-    }
-
-    let max_val = logits_f32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f32 = logits_f32.iter().map(|&x| (x - max_val).exp()).sum();
-    let log_sum_exp = max_val + sum_exp.ln();
-    let sampled_logprob = logits_f32[sampled_token as usize] - log_sum_exp;
-
-    let k = top_k.min(logits_f32.len());
-    let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-    if k > 0 {
-        let mut best: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        for (idx, &val) in logits_f32.iter().enumerate() {
-            if best.len() < k || val > best.last().unwrap().1 {
-                let pos = best.partition_point(|&(_, v)| v > val);
-                best.insert(pos, (idx as u32, val));
-                if best.len() > k {
-                    best.pop();
-                }
-            }
-        }
-        for (idx, val) in best {
-            top.push((idx, val - log_sum_exp));
-        }
-    }
-
-    Some(TokenLogprob {
-        logprob: sampled_logprob,
-        top_logprobs: top,
-    })
 }
 
 fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
@@ -448,18 +542,86 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
     Ok(())
 }
 
+/// Prepare decode GEMM algos before capture, per the active numeric policy: under `Pin`, eagerly pin
+/// one algo per projection {M,K} (reused for all N); otherwise tune the fastest cublasLt algo per
+/// decode shape (buckets up to `GEMM_LT_MAX_N`, every layer's weights in the L2-cold timing rotation).
+/// Adds a few seconds of startup per model thread.
+fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
+    let ctx = model.device_ctx();
+    let hidden = model.config().hidden_size;
+    let vocab = model.config().vocab_size;
+    let q_dim = model.local_q_dim();
+    let kv_dim = model.local_kv_dim();
+    let intermediate = model.local_intermediate_size();
+
+    use openinfer_kernels::ops::{NumericPolicy, gemm_lt_pin_warmup, numeric_policy};
+    if numeric_policy() == NumericPolicy::Pin {
+        // Eager pin before capture: the lazy pin-workspace alloc is illegal mid-capture.
+        gemm_lt_pin_warmup(q_dim, hidden)?;
+        gemm_lt_pin_warmup(kv_dim, hidden)?;
+        gemm_lt_pin_warmup(hidden, q_dim)?;
+        gemm_lt_pin_warmup(intermediate, hidden)?;
+        gemm_lt_pin_warmup(hidden, intermediate)?;
+        gemm_lt_pin_warmup(vocab, hidden)?;
+        let max_context = model.config().max_position_embeddings;
+        log::info!(
+            "Qwen3 split-KV decode chunk pinned: {} tokens (max_context_tokens={max_context})",
+            crate::batch_decode_buffers::split_chunk_size_for(max_context)
+        );
+        return Ok(());
+    }
+
+    let layers = &model.layers;
+
+    let q_samples: Vec<_> = layers.iter().map(|l| (&l.attention.qkv_proj, 0)).collect();
+    let kv_samples: Vec<_> = layers
+        .iter()
+        .flat_map(|l| {
+            [
+                (&l.attention.qkv_proj, q_dim),
+                (&l.attention.qkv_proj, q_dim + kv_dim),
+            ]
+        })
+        .collect();
+    let o_samples: Vec<_> = layers.iter().map(|l| (&l.attention.o_proj, 0)).collect();
+    let gate_up_samples: Vec<_> = layers
+        .iter()
+        .flat_map(|l| {
+            [
+                (&l.mlp.gate_up_proj, 0),
+                (&l.mlp.gate_up_proj, intermediate),
+            ]
+        })
+        .collect();
+    let down_samples: Vec<_> = layers.iter().map(|l| (&l.mlp.down_proj, 0)).collect();
+    let lm_head_samples = [(model.output_projection(), 0)];
+
+    for &n in BATCH_BUCKETS.iter().filter(|&&b| b <= ops::GEMM_LT_MAX_N) {
+        ops::gemm_lt_tune(ctx, &q_samples, q_dim, n)?;
+        ops::gemm_lt_tune(ctx, &kv_samples, kv_dim, n)?;
+        ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
+        ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
+        ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
+        ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
+    }
+    Ok(())
+}
+
 pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
     pub echo: bool,
+    pub sample_seed: u64,
 }
 
 pub struct DecodePlan<'a> {
     pub requests: &'a [DecodeStepItem],
+    pub sample_seed: u64,
 }
 
 pub struct UnifiedPlan<'a> {
     pub prefill_requests: &'a [PrefillStepItem],
     pub decode_requests: &'a [DecodeStepItem],
+    pub sample_seed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -470,6 +632,12 @@ pub struct PrefillRequestResult {
     pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
     pub cached_tokens: usize,
+    /// Whether the prompt is fully prefilled. When false this step ran a
+    /// non-final chunk and `first_token` is meaningless.
+    pub completed: bool,
+    /// Prompt tokens with KV computed after this step (authoritative —
+    /// includes prefix-cache hits the scheduler can't see).
+    pub prefill_pos: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -481,6 +649,10 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
+    /// Requests whose DFlash target context was captured this prefill step.
+    /// Empty unless speculative decoding is enabled. The executor folds these
+    /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
+    pub dflash_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -505,12 +677,25 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
 
-    /// Run one n-gram speculative decode step for a single request, returning
-    /// the committed tokens (accepted draft prefix + one model token; >= 1).
-    /// Default: unsupported. Implemented by `Qwen3Executor`; the scheduler only
-    /// calls it when speculative decode is enabled.
-    fn execute_speculative(&mut self, _item: &SpeculativeStepItem) -> Result<Vec<u32>> {
-        anyhow::bail!("speculative decode is not supported by this executor")
+    /// Run one speculative draft round (propose `K` tokens per request). Only
+    /// meaningful when [`Self::speculative_enabled`] is true.
+    fn execute_speculative_draft(&mut self, _plan: DraftPlan<'_>) -> Result<DraftResult> {
+        anyhow::bail!("speculative draft is not implemented for this executor")
+    }
+
+    /// Verify a draft span with one target forward and accept the greedy prefix.
+    fn execute_speculative_verify(&mut self, _plan: VerifyPlan<'_>) -> Result<VerifyResult> {
+        anyhow::bail!("speculative verification is not implemented for this executor")
+    }
+
+    /// Whether a draft model is loaded and speculative decoding is active.
+    fn speculative_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether `request_id` has captured draft context and can be drafted.
+    fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
+        false
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -537,11 +722,17 @@ pub(crate) trait ModelExecutor: Send {
     /// Offer a freshly-submitted request for async CPU-tier KV prefetch.
     /// Returns `true` if a load is now in flight and the scheduler must park
     /// the request until [`Self::drain_ready_prefetch`] reports it ready.
+    ///
+    /// `reserve_floor` is the number of free blocks already promised to
+    /// admitted requests (active decode growth + remaining prefill chunks);
+    /// the prefetch must not reserve into it, or a mid-prefill request's next
+    /// chunk fails allocation and the whole step errors out.
     fn begin_kv_prefetch(
         &mut self,
         _request_id: RequestId,
         _prompt_tokens: &[u32],
         _lora_adapter: Option<&str>,
+        _reserve_floor: usize,
     ) -> bool {
         false
     }
@@ -565,6 +756,34 @@ pub(crate) trait ModelExecutor: Send {
     /// has committed for `request_id`.
     fn prefetched_blocks(&self, _request_id: RequestId) -> usize {
         0
+    }
+
+    // ── Decode-overlap async prefill ─────────────────────────────────────
+
+    /// Whether prefill/decode overlap is enabled (async prefill supported).
+    fn has_decode_overlap(&self) -> bool {
+        false
+    }
+
+    /// Poll whether the async prefill has completed. Returns `Some(result)` if
+    /// done, `None` if still in-flight.
+    fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
+        None
+    }
+
+    // ── KV block-event feed (no-op unless built with the event feed on) ──
+
+    /// Take the raw block-event receiver, once. `None` unless the engine was
+    /// built with the KV-event feed on; drives the cache-aware router pump.
+    fn take_kv_event_receiver(&mut self) -> Option<broadcast::Receiver<KvCacheEvent>> {
+        None
+    }
+
+    /// Per-request runs of blocks newly registered (made cacheable) since the
+    /// last call, including the final run of any request dropped this step.
+    /// Empty unless the feed is on.
+    fn take_kv_store_events(&mut self) -> Vec<Vec<RegisteredBlock>> {
+        Vec::new()
     }
 }
 
@@ -601,7 +820,52 @@ pub struct Qwen3Executor {
     /// so prefix matching itself stays enabled). Set via
     /// [`Self::set_no_prefix_cache`].
     l1_retention_disabled: bool,
+    /// Green Context SM partition for concurrent prefill/decode. `None` when
+    /// disabled (default) or when the GPU does not support Green Contexts.
+    overlap: Option<crate::green_ctx::OverlapStreams>,
+    /// In-flight async prefill state. Populated by the SplitConcurrent step,
+    /// consumed by `poll_async_prefill`.
+    async_prefill: Option<AsyncPrefillState>,
+    /// DFlash draft metadata; `Some` once a draft model is loaded into the
+    /// primary lane. Speculative decoding is enabled iff this is set.
+    speculative: Option<DFlashMeta>,
+    /// Requests whose DFlash context is captured and ready to draft. A request
+    /// enters this set when its prompt finishes prefilling with captured target
+    /// context, and leaves on retire or a plain (non-speculative) decode.
+    dflash_ready_requests: HashSet<RequestId>,
+    /// Opt-in KV block-event feed for a cache-aware router (`Some` only when the
+    /// engine was built with events on — single-GPU, no LoRA). `None` on the
+    /// plain path, where the whole feed costs nothing.
+    kv_events: Option<ExecutorKvEvents>,
 }
+
+/// Executor-side state for the opt-in KV block-event feed.
+struct ExecutorKvEvents {
+    /// Raw eviction/registration stream from the block pool. Taken once by the
+    /// scheduler to drive the router pump; `None` after that.
+    rx: Option<broadcast::Receiver<KvCacheEvent>>,
+    /// Final store runs of requests dropped mid-step, captured in `drop_request`
+    /// before the `RequestKv` (and its emit cursor) is gone. A request can seal
+    /// and register its last full block in the very step it finishes, so this
+    /// closes the window between that registration and removal. Drained by
+    /// [`Qwen3Executor::take_kv_store_events`].
+    pending_dropped: Vec<Vec<RegisteredBlock>>,
+}
+
+/// State for an in-flight async prefill on the prefill overlap stream.
+struct AsyncPrefillState {
+    event: cudarc::driver::sys::CUevent,
+}
+
+// SAFETY: AsyncPrefillState is only accessed from the single executor/scheduler
+// thread that owns the GPU context. The raw CUevent pointer is not shared.
+unsafe impl Send for AsyncPrefillState {}
+
+/// Wrapper to send CUevent across the worker→executor channel boundary.
+/// SAFETY: The event is created on the worker thread's GPU context and consumed
+/// on the executor thread (same device, sequential access).
+struct SendEvent(cudarc::driver::sys::CUevent);
+unsafe impl Send for SendEvent {}
 
 /// One request's in-flight CPU-tier KV prefetch.
 ///
@@ -618,16 +882,47 @@ struct PrefetchState {
 }
 
 impl Qwen3Executor {
-    pub(crate) fn single(model: Qwen3Model, offload_opts: &Qwen3OffloadOptions) -> Result<Self> {
-        let budget = model.kv_budget();
-        let kv_mgr = KvCacheManager::new(
-            &model.device_ctx().stream,
-            budget.num_layers,
-            budget.num_kv_heads,
-            budget.head_dim,
-            budget.block_size,
-            budget.num_blocks,
+    pub(crate) fn single(
+        model: Qwen3Model,
+        offload_opts: &Qwen3OffloadOptions,
+        max_prefill_tokens: usize,
+        dflash_kv_bytes_per_token: usize,
+        memory_options: Qwen3MemoryOptions,
+        enable_kv_events: bool,
+    ) -> Result<Self> {
+        let (model, budget) = profile_kv_budget_on_worker(
+            model,
+            max_prefill_tokens,
+            dflash_kv_bytes_per_token,
+            memory_options,
         )?;
+        let (kv_mgr, kv_events) = if enable_kv_events {
+            let (kv_mgr, rx) = KvCacheManager::new_with_events(
+                &model.device_ctx().stream,
+                budget.num_layers,
+                budget.num_kv_heads,
+                budget.head_dim,
+                budget.block_size,
+                budget.num_blocks,
+            )?;
+            (
+                kv_mgr,
+                Some(ExecutorKvEvents {
+                    rx: Some(rx),
+                    pending_dropped: Vec::new(),
+                }),
+            )
+        } else {
+            let kv_mgr = KvCacheManager::new(
+                &model.device_ctx().stream,
+                budget.num_layers,
+                budget.num_kv_heads,
+                budget.head_dim,
+                budget.block_size,
+                budget.num_blocks,
+            )?;
+            (kv_mgr, None)
+        };
         let metadata = Qwen3ExecutorMetadata {
             block_size: budget.block_size,
             stop_token_ids: model.config().stop_token_ids.clone(),
@@ -655,6 +950,11 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
+            overlap: None,
+            async_prefill: None,
+            speculative: None,
+            dflash_ready_requests: HashSet::new(),
+            kv_events,
         })
     }
 
@@ -669,6 +969,10 @@ impl Qwen3Executor {
             device_ordinals,
             Qwen3LoraOptions::default(),
             Qwen3OffloadOptions::disabled(),
+            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            None,
+            Qwen3MemoryOptions::default(),
+            false,
         )
     }
 
@@ -678,7 +982,12 @@ impl Qwen3Executor {
         device_ordinals: &[usize],
         lora_options: Qwen3LoraOptions,
         offload_options: Qwen3OffloadOptions,
+        max_prefill_tokens: usize,
+        dflash_draft_path: Option<&str>,
+        memory_options: Qwen3MemoryOptions,
+        enable_kv_events: bool,
     ) -> Result<Self> {
+        let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
         anyhow::ensure!(
             !device_ordinals.is_empty(),
@@ -689,6 +998,23 @@ impl Qwen3Executor {
             "KV offload is only supported on the single-GPU path (tensor parallel \
              shards KV per rank); got {} devices",
             device_ordinals.len()
+        );
+        // The KV-event feed is wired through the single-GPU pool only; TP shards
+        // KV per rank with a centralized manager that has no event hookup yet.
+        anyhow::ensure!(
+            !enable_kv_events || device_ordinals.len() == 1,
+            "KV block events are only supported on the single-GPU path; got {} devices",
+            device_ordinals.len()
+        );
+        // The store cursor announces a block as cacheable the moment it is
+        // registered, assuming GPU-resident reuse. With KV offload on, a block
+        // can be evicted to the host tier and restored under a different lineage
+        // hash, which the cursor + lineage→seq map do not model — so the two are
+        // mutually exclusive by construction rather than silently mis-announced.
+        anyhow::ensure!(
+            !enable_kv_events || !offload_options.enabled,
+            "KV block events and KV offload are mutually exclusive (the event cursor \
+             assumes GPU-resident block reuse)"
         );
         if device_ordinals.len() == 1 {
             let model = Qwen3Model::from_safetensors_with_runtime(
@@ -701,10 +1027,37 @@ impl Qwen3Executor {
                     max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
-            let mut executor = Self::single(model, &offload_options)?;
+            // The DFlash draft model loads after profiling but lives outside the
+            // paged KV pool, so reserve its footprint up front from the draft
+            // config: fixed bytes (weights + block scratch) via the margin, and
+            // pool-scaling per-token bytes folded into the block budget.
+            let dflash_kv_bytes_per_token = match dflash_draft_path {
+                Some(path) => {
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        path,
+                        *BATCH_BUCKETS.last().unwrap(),
+                    )?;
+                    memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
+                    reservation.kv_bytes_per_token
+                }
+                None => 0,
+            };
+            let mut executor = Self::single(
+                model,
+                &offload_options,
+                max_prefill_tokens,
+                dflash_kv_bytes_per_token,
+                memory_options,
+                enable_kv_events,
+            )?;
             executor.lora_options = lora_options;
             return Ok(executor);
         }
+        anyhow::ensure!(
+            dflash_draft_path.is_none(),
+            "speculative decoding requires the single-GPU path (got {} devices)",
+            device_ordinals.len()
+        );
 
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
@@ -721,8 +1074,30 @@ impl Qwen3Executor {
             )?);
         }
 
-        // Compute budget from first model (all ranks share geometry).
-        let budget = models[0].kv_budget();
+        // Profile each rank independently and use the minimum shared block
+        // count. The logical scheduler uses one block budget for all ranks, but
+        // free memory and worker-thread runtime allocations are per device.
+        let mut profiled_models = Vec::with_capacity(world_size);
+        let mut budgets = Vec::with_capacity(world_size);
+        for model in models {
+            // DFlash is single-GPU only, so the TP path reserves nothing for it.
+            let (model, budget) =
+                profile_kv_budget_on_worker(model, max_prefill_tokens, 0, memory_options)?;
+            profiled_models.push(model);
+            budgets.push(budget);
+        }
+        let mut models = profiled_models;
+        let mut budget = budgets[0];
+        budget.num_blocks = budgets
+            .iter()
+            .map(|budget| budget.num_blocks)
+            .min()
+            .expect("at least one TP rank");
+        log::info!(
+            "TP KV budget: using {} blocks (minimum across {} ranks)",
+            budget.num_blocks,
+            world_size
+        );
 
         // Create the centralized KvCacheManager on rank 0's stream.
         let kv_mgr = KvCacheManager::new(
@@ -804,6 +1179,12 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
+            overlap: None,
+            async_prefill: None,
+            speculative: None,
+            dflash_ready_requests: HashSet::new(),
+            // KV events are single-GPU only (asserted above); never wired here.
+            kv_events: None,
         })
     }
 
@@ -839,91 +1220,8 @@ impl Qwen3Executor {
         <Self as ModelExecutor>::execute_unified(self, plan)
     }
 
-    /// Run one n-gram speculative decode step for a single request and return
-    /// the committed tokens (the greedy-accepted draft prefix plus one model
-    /// token; always >= 1). The verify forward runs the model on
-    /// `[dangling, drafts..]` over the request's existing KV; kvbm releases the
-    /// blocks pre-allocated for rejected drafts. Greedy verification is
-    /// lossless: the committed tokens equal plain greedy decode.
-    ///
-    /// The proposer that produces `item.drafts` lives in the scheduler layer
-    /// (it owns the request's token history); this method only verifies and
-    /// commits. Speculative decode is disabled by default
-    /// ([`crate::speculative::SpeculativeConfig`]); the scheduler calls this
-    /// only when it is enabled and the proposer returned a non-empty draft.
-    pub fn execute_speculative(&mut self, item: &SpeculativeStepItem) -> Result<Vec<u32>> {
-        anyhow::ensure!(!item.drafts.is_empty(), "speculative step needs >= 1 draft");
-        let k = item.drafts.len();
-
-        let rkv = self
-            .request_kvs
-            .get_mut(&item.request_id)
-            .ok_or_else(|| anyhow::anyhow!("missing RequestKv for {:?}", item.request_id))?;
-        // Reserve room for every draft plus the model's bonus/correction token.
-        rkv.schedule_speculative(k + 1, self.kv_mgr.pool())
-            .map_err(|e| {
-                anyhow::anyhow!("schedule_speculative failed for {:?}: {e}", item.request_id)
-            })?;
-
-        // schedule_speculative pre-allocated KV blocks and moved the sequence
-        // into the SpeculativeScheduled state. The verify + apply below must
-        // either complete (apply_speculative) or revert that reservation, so a
-        // mid-step failure leaves the sequence idle for the next step rather
-        // than stranded half-scheduled.
-        let result = self.verify_and_commit(item);
-        if result.is_err() {
-            if let Some(rkv) = self.request_kvs.get_mut(&item.request_id) {
-                if let Err(revert_err) = rkv.revert_schedule() {
-                    log::warn!(
-                        "failed to revert speculative schedule for {:?}: {revert_err}",
-                        item.request_id
-                    );
-                }
-            }
-        }
-        result
-    }
-
-    /// The fallible body of [`Self::execute_speculative`]: build the verify
-    /// input, run the verify forward, greedily accept, and commit. Factored out
-    /// so `execute_speculative` can revert the schedule reservation on any
-    /// error here. Assumes `schedule_speculative` already succeeded.
-    fn verify_and_commit(&mut self, item: &SpeculativeStepItem) -> Result<Vec<u32>> {
-        let k = item.drafts.len();
-        let rkv = self
-            .request_kvs
-            .get_mut(&item.request_id)
-            .expect("request must exist; schedule_speculative just succeeded");
-
-        let mut verify_tokens = Vec::with_capacity(k + 1);
-        verify_tokens.push(item.token_id);
-        verify_tokens.extend_from_slice(&item.drafts);
-        let kv_view = rkv.prefill_view(verify_tokens.len());
-
-        let step = StepCommand::SpeculativeVerify {
-            verify_tokens,
-            kv_view,
-            lora_adapter: item.lora_adapter.clone(),
-        };
-        let outcome = self.run_step(&step)?;
-        let argmax = match outcome {
-            WorkerStepOutcome::Speculative(argmax) => argmax,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "speculative returned unexpected: {}",
-                    other.kind()
-                ));
-            }
-        };
-
-        let committed = crate::speculative::accept_greedy(&item.drafts, &argmax);
-        let rkv = self
-            .request_kvs
-            .get_mut(&item.request_id)
-            .expect("request must exist after speculative verify");
-        rkv.apply_speculative(&committed, self.kv_mgr.pool())?;
-        self.save_sealed_blocks(item.request_id);
-        Ok(committed)
+    pub fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
+        <Self as ModelExecutor>::load_lora_adapter(self, request)
     }
 
     /// Prefix caching is on by default; tests that assert bit-identical
@@ -931,6 +1229,20 @@ impl Qwen3Executor {
     /// drifts logits by bf16 ULPs).
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
         self.prefix_cache_enabled = enabled;
+    }
+
+    /// Configure two-stream prefill/decode overlap (see [`crate::DecodeOverlap`]).
+    /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
+    /// returning an error if the GPU/driver cannot honor the requested mode.
+    pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
+        let device_ordinal = 0; // single-GPU path
+        self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
+        Ok(())
+    }
+
+    /// Whether prefill/decode overlap (two-stream or SM partition) is active.
+    pub fn decode_overlap_enabled(&self) -> bool {
+        self.overlap.is_some()
     }
 
     /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
@@ -952,6 +1264,33 @@ impl Qwen3Executor {
         } else {
             self.prefix_cache_enabled = !on;
         }
+    }
+
+    /// Enable speculative decoding by loading a DFlash draft model into the
+    /// primary lane.
+    ///
+    /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
+    /// is incompatible with KV offload. Disables the prefix cache: speculative
+    /// capture needs clean, uncached target hidden states for every prompt
+    /// token, and a prefix-cache hit skips the forward that would produce them.
+    pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.workers.is_empty(),
+            "speculative decoding requires the single-GPU path (got {} extra ranks)",
+            self.workers.len()
+        );
+        anyhow::ensure!(
+            self.offload.is_none(),
+            "speculative decoding is not supported together with KV offload"
+        );
+        let meta = self.primary.load_dflash(draft_path.to_string())?;
+        log::info!(
+            "Qwen3 DFlash speculative decoding enabled: draft block size {}",
+            meta.block_size
+        );
+        self.prefix_cache_enabled = false;
+        self.speculative = Some(meta);
+        Ok(())
     }
 
     /// Whether KV offload is active on this executor.
@@ -983,8 +1322,15 @@ impl Qwen3Executor {
         request_id: RequestId,
         prompt_tokens: &[u32],
         lora_adapter: Option<&str>,
+        reserve_floor: usize,
     ) -> bool {
-        <Self as ModelExecutor>::begin_kv_prefetch(self, request_id, prompt_tokens, lora_adapter)
+        <Self as ModelExecutor>::begin_kv_prefetch(
+            self,
+            request_id,
+            prompt_tokens,
+            lora_adapter,
+            reserve_floor,
+        )
     }
 
     /// Block until at least one in-flight prefetch settles, then sweep the
@@ -1033,6 +1379,68 @@ impl Qwen3Executor {
             .as_ref()
             .expect("offload present")
             .save(&block_ids, &block_hashes, pins);
+    }
+
+    // ── Chunked prefill ────────────────────────────────────────────────
+
+    /// Prepare one prefill step for `req`: create its `RequestKv` on the
+    /// first chunk (matching the prefix cache), then clamp the scheduler's
+    /// chunk budget to the prompt tokens actually remaining and allocate KV
+    /// for them. Sets `chunk_start`/`chunk_tokens` on the item.
+    fn schedule_prefill_chunk(&mut self, req: &mut PrefillStepItem) -> Result<()> {
+        if !self.request_kvs.contains_key(&req.request_id) {
+            let mut rkv = self.kv_mgr.pool().new_request(
+                req.prompt_tokens.clone(),
+                req.max_output_tokens,
+                req.lora_adapter.as_deref(),
+            );
+            // Echo needs logits for every prompt position; cached positions
+            // are never forwarded, so echo requests prefill from scratch.
+            if self.prefix_cache_enabled && !req.echo {
+                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+            }
+            self.request_kvs.insert(req.request_id, rkv);
+            // match_and_add_prefix above already absorbed any CPU-prefetched
+            // blocks (now held by the request's sequence), so release the
+            // prefetch's separate hold.
+            self.prefetch.remove(&req.request_id);
+        }
+        let rkv = self
+            .request_kvs
+            .get_mut(&req.request_id)
+            .expect("inserted above");
+        req.chunk_start = rkv.kv_position();
+        let remaining = req.prompt_tokens.len() - req.chunk_start;
+        // Echo must produce all-position logits in a single forward, so it is
+        // exempt from chunking (the scheduler never splits echo requests).
+        req.chunk_tokens = if req.echo {
+            remaining
+        } else {
+            remaining.min(req.chunk_budget)
+        };
+        assert!(
+            req.chunk_tokens > 0,
+            "zero-token prefill chunk for {:?} (budget {})",
+            req.request_id,
+            req.chunk_budget
+        );
+        rkv.schedule_prefill(req.chunk_tokens, self.kv_mgr.pool())
+            .map_err(|e| anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id))
+    }
+
+    /// Register a finished prefill step on the request's KV: the final chunk
+    /// carries the first generated token, non-final chunks only advance the
+    /// KV position.
+    fn apply_prefill_result(&mut self, result: &PrefillRequestResult) -> Result<()> {
+        let rkv = self
+            .request_kvs
+            .get_mut(&result.request_id)
+            .expect("request must exist after prefill");
+        if result.completed {
+            rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
+        } else {
+            rkv.apply_prefill_chunk(self.kv_mgr.pool())
+        }
     }
 
     // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
@@ -1107,6 +1515,37 @@ impl Qwen3Executor {
     }
 }
 
+fn profile_kv_budget_on_worker(
+    model: Qwen3Model,
+    max_prefill_tokens: usize,
+    dflash_kv_bytes_per_token: usize,
+    memory_options: Qwen3MemoryOptions,
+) -> Result<(Qwen3Model, KvBudget)> {
+    let handle = thread::Builder::new()
+        .name(format!(
+            "qwen3-memory-profile-dev{}",
+            model.device_ctx().device_ordinal
+        ))
+        .spawn(move || -> Result<(Qwen3Model, KvBudget)> {
+            let _guard = {
+                bind_model_thread(&model)?;
+                tune_decode_gemm_algos(&model)?;
+                CublasThreadGuard
+            };
+            let budget = model.profiled_kv_budget(
+                max_prefill_tokens,
+                *BATCH_BUCKETS.last().unwrap(),
+                dflash_kv_bytes_per_token,
+                memory_options,
+            )?;
+            Ok((model, budget))
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn Qwen3 memory profile worker: {e}"))?;
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Qwen3 memory profile worker panicked"))?
+}
+
 /// Build the KV-offload engine for the single-GPU path, or `None` when offload
 /// is disabled. Registers the fused KV buffer with pegaflow against the model's
 /// device/stream — must be called while that stream is still owned by the model
@@ -1167,7 +1606,15 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn max_context_tokens(&self) -> usize {
-        self.metadata.config.max_position_embeddings
+        let target = self.metadata.config.max_position_embeddings;
+        match &self.speculative {
+            // The draft's fixed-width in-fill block writes `block_size` positions
+            // past the committed length each step, so a request may use at most
+            // `draft.max_pos - block_size` tokens before the draft cache would
+            // overflow. Reject the rest at admission instead of crashing mid-prefill.
+            Some(meta) => target.min(meta.max_position_embeddings.saturating_sub(meta.block_size)),
+            None => target,
+        }
     }
 
     fn max_decode_batch_size(&self) -> usize {
@@ -1185,15 +1632,23 @@ impl ModelExecutor for Qwen3Executor {
     fn prefetched_blocks(&self, request_id: RequestId) -> usize {
         self.prefetch
             .get(&request_id)
-            .map(|st| st.probe.held_blocks())
-            .unwrap_or(0)
+            .map_or(0, |st| st.probe.held_blocks())
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         // Remove and drop — RAII on SchedulableSequence's block guards
         // returns all allocated blocks regardless of lifecycle state. The same
         // RAII frees any parked prefetch's reserved/held blocks.
-        self.request_kvs.remove(&request_id);
+        let removed = self.request_kvs.remove(&request_id);
+        // With the event feed on, capture this request's still-unflushed store
+        // run before its cursor is gone: a request can register its last full
+        // block in the very step it finishes (see `ExecutorKvEvents`).
+        if let (Some(mut rkv), Some(events)) = (removed, self.kv_events.as_mut()) {
+            let run = rkv.take_newly_registered_blocks();
+            if !run.is_empty() {
+                events.pending_dropped.push(run);
+            }
+        }
         // A parked prefetch may still have a load in flight: pegaflow's worker
         // is writing the reserved GPU blocks (H2D). Dropping the reservation now
         // frees those physical pages for immediate reuse while the DMA keeps
@@ -1207,7 +1662,30 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         self.saved_cursor.remove(&request_id);
+        if self.speculative.is_some() {
+            self.dflash_ready_requests.remove(&request_id);
+            self.primary.drop_dflash_request(request_id)?;
+        }
         Ok(())
+    }
+
+    fn take_kv_event_receiver(&mut self) -> Option<broadcast::Receiver<KvCacheEvent>> {
+        self.kv_events.as_mut().and_then(|events| events.rx.take())
+    }
+
+    fn take_kv_store_events(&mut self) -> Vec<Vec<RegisteredBlock>> {
+        // Drop early — and avoid touching `request_kvs` — on the plain path.
+        let mut runs = match self.kv_events.as_mut() {
+            Some(events) => std::mem::take(&mut events.pending_dropped),
+            None => return Vec::new(),
+        };
+        for rkv in self.request_kvs.values_mut() {
+            let run = rkv.take_newly_registered_blocks();
+            if !run.is_empty() {
+                runs.push(run);
+            }
+        }
+        runs
     }
 
     fn begin_kv_prefetch(
@@ -1215,6 +1693,7 @@ impl ModelExecutor for Qwen3Executor {
         request_id: RequestId,
         prompt_tokens: &[u32],
         lora_adapter: Option<&str>,
+        reserve_floor: usize,
     ) -> bool {
         let Some(offload) = self.offload.as_ref() else {
             return false;
@@ -1248,6 +1727,18 @@ impl ModelExecutor for Qwen3Executor {
         let (Some(lease), num_blocks) = (hit.lease, hit.num_blocks) else {
             return false; // miss
         };
+        // Blocks promised to admitted requests are off-limits: reserving into
+        // them makes a later prefill chunk or decode growth fail allocation.
+        if self
+            .kv_mgr
+            .pool()
+            .available_blocks()
+            .saturating_sub(reserve_floor)
+            < num_blocks
+        {
+            offload.release_query_lease(lease);
+            return false;
+        }
         let Some(reservation) = self.kv_mgr.pool().reserve_loaded_blocks(num_blocks) else {
             // Block pressure: release the lease so its pinned host blocks aren't
             // held for the full lease TTL, and prefill from scratch rather than
@@ -1323,34 +1814,17 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        // 1. Create RequestKvs, reuse cached prefix blocks, schedule the rest
+        // 1. Create RequestKvs (first chunk only), clamp chunk budgets,
+        // schedule KV for this step's tokens
         let mut requests = plan.requests.to_vec();
         for req in &mut requests {
-            let mut rkv = self.kv_mgr.pool().new_request(
-                req.prompt_tokens.clone(),
-                req.max_output_tokens,
-                req.lora_adapter.as_deref(),
-            );
-            // Echo needs logits for every prompt position; cached positions
-            // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
-            }
-            rkv.schedule_prefill(req.suffix_len(), self.kv_mgr.pool())
-                .map_err(|e| {
-                    anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
-                })?;
-            self.request_kvs.insert(req.request_id, rkv);
-            // match_and_add_prefix above already absorbed any CPU-prefetched
-            // blocks (now held by the request's sequence), so release the
-            // prefetch's separate hold.
-            self.prefetch.remove(&req.request_id);
+            self.schedule_prefill_chunk(req)?;
         }
 
-        // 2. Build KvViews (seq_len = cached prefix + new suffix)
+        // 2. Build KvViews (seq_len = chunk_start + this chunk)
         let kv_views: Vec<KvView> = requests
             .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.suffix_len()))
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.chunk_tokens))
             .collect();
 
         // 3. Execute forward
@@ -1358,6 +1832,7 @@ impl ModelExecutor for Qwen3Executor {
             requests,
             kv_views,
             echo: plan.echo,
+            sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
 
@@ -1372,11 +1847,29 @@ impl ModelExecutor for Qwen3Executor {
             }
         };
         for req_result in &result.requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after prefill");
-            rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
+            self.apply_prefill_result(req_result)?;
+        }
+        // A request becomes draft-ready once its prompt is fully prefilled with
+        // captured target context. Partial chunks stay pending; ineligible
+        // requests drop any stale worker state.
+        if self.speculative.is_some() {
+            for req_result in &result.requests {
+                let captured = result
+                    .dflash_context_captured_requests
+                    .contains(&req_result.request_id);
+                match dflash_prefill_action(captured, req_result.completed) {
+                    DFlashPrefillAction::MarkReady => {
+                        self.dflash_ready_requests.insert(req_result.request_id);
+                    }
+                    DFlashPrefillAction::KeepPending => {
+                        self.dflash_ready_requests.remove(&req_result.request_id);
+                    }
+                    DFlashPrefillAction::Drop => {
+                        self.dflash_ready_requests.remove(&req_result.request_id);
+                        self.primary.drop_dflash_request(req_result.request_id)?;
+                    }
+                }
+            }
         }
         // 5. Offload the blocks this prefill just sealed (post-step-sync).
         for req_result in &result.requests {
@@ -1409,6 +1902,7 @@ impl ModelExecutor for Qwen3Executor {
         let step = StepCommand::Decode {
             requests: plan.requests.to_vec(),
             kv_views,
+            sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
 
@@ -1429,6 +1923,15 @@ impl ModelExecutor for Qwen3Executor {
                 .expect("request must exist after decode");
             rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
         }
+        // A plain decode advances the sequence outside the speculative path, so
+        // any captured draft context is now stale — drop it.
+        if self.speculative.is_some() {
+            for req_result in &result.requests {
+                if self.dflash_ready_requests.remove(&req_result.request_id) {
+                    self.primary.drop_dflash_request(req_result.request_id)?;
+                }
+            }
+        }
         // 5. Offload any block this decode step just sealed (post-step-sync).
         for req_result in &result.requests {
             self.save_sealed_blocks(req_result.request_id);
@@ -1437,31 +1940,28 @@ impl ModelExecutor for Qwen3Executor {
         Ok(result)
     }
 
-    fn execute_speculative(&mut self, item: &SpeculativeStepItem) -> Result<Vec<u32>> {
-        // Inherent method holds the body (and is the public surface used by
-        // tests); the trait method delegates so generic schedulers can call it.
-        Qwen3Executor::execute_speculative(self, item)
+    fn execute_speculative_draft(&mut self, plan: DraftPlan<'_>) -> Result<DraftResult> {
+        self.execute_speculative_draft_impl(plan)
+    }
+
+    fn execute_speculative_verify(&mut self, plan: VerifyPlan<'_>) -> Result<VerifyResult> {
+        self.execute_speculative_verify_impl(plan)
+    }
+
+    fn speculative_enabled(&self) -> bool {
+        self.speculative.is_some()
+    }
+
+    fn speculative_request_ready(&self, request_id: RequestId) -> bool {
+        self.dflash_ready_requests.contains(&request_id)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        // 1. Create RequestKvs for prefill requests, reuse cached prefix
-        // blocks, and schedule the rest
+        // 1. Create RequestKvs for prefill requests (first chunk only), clamp
+        // chunk budgets, schedule KV for this step's tokens
         let mut prefill_requests = plan.prefill_requests.to_vec();
         for req in &mut prefill_requests {
-            let mut rkv = self.kv_mgr.pool().new_request(
-                req.prompt_tokens.clone(),
-                req.max_output_tokens,
-                req.lora_adapter.as_deref(),
-            );
-            if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
-            }
-            rkv.schedule_prefill(req.suffix_len(), self.kv_mgr.pool())
-                .map_err(|e| {
-                    anyhow::anyhow!("schedule_prefill failed for {:?}: {e}", req.request_id)
-                })?;
-            self.request_kvs.insert(req.request_id, rkv);
-            self.prefetch.remove(&req.request_id);
+            self.schedule_prefill_chunk(req)?;
         }
 
         // Schedule decode for active requests
@@ -1478,7 +1978,7 @@ impl ModelExecutor for Qwen3Executor {
         // 2. Build KvViews
         let prefill_kv_views: Vec<KvView> = prefill_requests
             .iter()
-            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.suffix_len()))
+            .map(|req| self.request_kvs[&req.request_id].prefill_view(req.chunk_tokens))
             .collect();
         let decode_kv_views: Vec<KvView> = plan
             .decode_requests
@@ -1486,48 +1986,112 @@ impl ModelExecutor for Qwen3Executor {
             .map(|req| self.request_kvs[&req.request_id].decode_view())
             .collect();
 
-        // 3. Execute forward
-        let step = StepCommand::Unified {
-            prefill_requests,
-            prefill_kv_views,
-            decode_requests: plan.decode_requests.to_vec(),
-            decode_kv_views,
+        // 3. Execute forward — use split-concurrent if overlap streams are active
+        let step = if let Some(ref overlap) = self.overlap {
+            StepCommand::SplitConcurrent {
+                prefill_requests,
+                prefill_kv_views,
+                decode_requests: plan.decode_requests.to_vec(),
+                decode_kv_views,
+                prefill_stream: overlap.prefill_stream,
+                decode_stream: overlap.decode_stream,
+                sample_seed: plan.sample_seed,
+            }
+        } else {
+            StepCommand::Unified {
+                prefill_requests,
+                prefill_kv_views,
+                decode_requests: plan.decode_requests.to_vec(),
+                decode_kv_views,
+                sample_seed: plan.sample_seed,
+            }
         };
         let outcome = self.run_step(&step)?;
 
-        // 4. Apply both prefill and decode
-        let result = match outcome {
-            WorkerStepOutcome::Unified(result) => result,
-            other => {
-                return Err(anyhow::anyhow!(
-                    "unified returned unexpected: {}",
-                    other.kind()
-                ));
+        // 4. Apply results
+        match outcome {
+            WorkerStepOutcome::Unified(result) => {
+                // Normal unified path: both results ready
+                for req_result in &result.prefill_requests {
+                    self.apply_prefill_result(req_result)?;
+                }
+                for req_result in &result.decode_requests {
+                    let rkv = self
+                        .request_kvs
+                        .get_mut(&req_result.request_id)
+                        .expect("request must exist after unified decode");
+                    rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                }
+                // A plain decode via the fused unified step advances the sequence
+                // outside the speculative path, so any captured draft context is
+                // now stale — drop it, mirroring execute_decode. (Eligible pending
+                // are routed to a dedicated prefill step, so unified prefills never
+                // need DFlash mark-ready here.)
+                if self.speculative.is_some() {
+                    for req_result in &result.decode_requests {
+                        if self.dflash_ready_requests.remove(&req_result.request_id) {
+                            self.primary.drop_dflash_request(req_result.request_id)?;
+                        }
+                    }
+                }
+                for req_result in &result.prefill_requests {
+                    self.save_sealed_blocks(req_result.request_id);
+                }
+                for req_result in &result.decode_requests {
+                    self.save_sealed_blocks(req_result.request_id);
+                }
+                Ok(result)
             }
-        };
-        for req_result in &result.prefill_requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after unified prefill");
-            rkv.apply_prefill(req_result.first_token, self.kv_mgr.pool())?;
+            WorkerStepOutcome::SplitDecodeReady {
+                decode: decode_result,
+                prefill_event: SendEvent(event),
+            } => {
+                // SM-partition path: decode done, prefill still in-flight.
+                // Apply decode immediately.
+                for req_result in &decode_result.requests {
+                    let rkv = self
+                        .request_kvs
+                        .get_mut(&req_result.request_id)
+                        .expect("request must exist after split decode");
+                    rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                }
+                for req_result in &decode_result.requests {
+                    self.save_sealed_blocks(req_result.request_id);
+                }
+                // Store event for non-blocking poll by scheduler.
+                // If a previous async prefill wasn't consumed, wait for it now.
+                if let Some(old) = self.async_prefill.take() {
+                    unsafe {
+                        cudarc::driver::sys::cuEventSynchronize(old.event);
+                    }
+                    unsafe {
+                        cudarc::driver::sys::cuEventDestroy_v2(old.event);
+                    }
+                    // Force resolve the worker's inflight prefill too
+                    if let Ok(rx) = self.primary.resolve_prefill() {
+                        if let Ok(Ok(result)) = rx.recv() {
+                            for req_result in &result.requests {
+                                let _ = self.apply_prefill_result(req_result);
+                            }
+                            for req_result in &result.requests {
+                                self.save_sealed_blocks(req_result.request_id);
+                            }
+                        }
+                    }
+                }
+                self.async_prefill = Some(AsyncPrefillState { event });
+                // Return a UnifiedResult with empty prefill — scheduler will
+                // get prefill results via poll_async_prefill.
+                Ok(UnifiedResult {
+                    prefill_requests: Vec::new(),
+                    decode_requests: decode_result.requests,
+                })
+            }
+            other => Err(anyhow::anyhow!(
+                "unified returned unexpected: {}",
+                other.kind()
+            )),
         }
-        for req_result in &result.decode_requests {
-            let rkv = self
-                .request_kvs
-                .get_mut(&req_result.request_id)
-                .expect("request must exist after unified decode");
-            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
-        }
-        // 5. Offload sealed blocks from both halves (post-step-sync).
-        for req_result in &result.prefill_requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-        for req_result in &result.decode_requests {
-            self.save_sealed_blocks(req_result.request_id);
-        }
-
-        Ok(result)
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -1629,14 +2193,14 @@ impl ModelExecutor for Qwen3Executor {
                     Ok(response) => match response.recv() {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
-                            cleanup_errors.push(format!("rank {rank} cleanup: {err:#}"))
+                            cleanup_errors.push(format!("rank {rank} cleanup: {err:#}"));
                         }
                         Err(_) => cleanup_errors.push(format!(
                             "rank {rank} cleanup: dropped LoRA discard response"
                         )),
                     },
                     Err(err) => {
-                        cleanup_errors.push(format!("rank {rank} cleanup dispatch: {err:#}"))
+                        cleanup_errors.push(format!("rank {rank} cleanup dispatch: {err:#}"));
                     }
                 }
             }
@@ -1714,6 +2278,44 @@ impl ModelExecutor for Qwen3Executor {
         names.sort();
         names
     }
+
+    fn has_decode_overlap(&self) -> bool {
+        self.overlap.is_some()
+    }
+
+    fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
+        let state = self.async_prefill.as_ref()?;
+        // Non-blocking check: is the prefill stream done?
+        let status = unsafe { cudarc::driver::sys::cuEventQuery(state.event) };
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            // Not ready yet (CUDA_ERROR_NOT_READY)
+            return None;
+        }
+        // Prefill is done — resolve it via the worker.
+        let event = self.async_prefill.take().unwrap().event;
+        unsafe {
+            cudarc::driver::sys::cuEventDestroy_v2(event);
+        }
+
+        // Ask worker to sync + sample the prefill result.
+        let rx = match self.primary.resolve_prefill() {
+            Ok(rx) => rx,
+            Err(_) => return None,
+        };
+        let result = match rx.recv() {
+            Ok(Ok(r)) => r,
+            _ => return None,
+        };
+
+        // Apply prefill results (KV commit)
+        for req_result in &result.requests {
+            let _ = self.apply_prefill_result(req_result);
+        }
+        for req_result in &result.requests {
+            self.save_sealed_blocks(req_result.request_id);
+        }
+        Some(result)
+    }
 }
 
 #[cfg(test)]
@@ -1762,13 +2364,52 @@ impl Drop for Qwen3Executor {
     }
 }
 
+/// What the executor learns about the draft model after loading it on the
+/// worker: the draft block size (`K` candidates per round) and which target
+/// layers feed the draft (the worker captures these; kept for diagnostics).
+#[derive(Clone, Debug)]
+struct DFlashMeta {
+    block_size: usize,
+    /// Draft's max cacheable position; with the `block_size` in-fill headroom
+    /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
+    max_position_embeddings: usize,
+    #[allow(dead_code)]
+    target_layer_ids: Vec<usize>,
+}
+
 struct LocalQwen3Lane {
     model: Qwen3Model,
     kv_buffer: KvBuffer,
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
-    sample_scratch: SamplingScratch,
+    sample_scratch: openinfer_sample::SampleScratch,
+    /// In-flight prefill from a previous SplitConcurrent step (not yet synced).
+    inflight_prefill: Option<InflightPrefillState>,
+    /// DFlash draft lane (the draft model + per-request draft state). `None`
+    /// unless speculative decoding is enabled; only the primary rank carries it.
+    dflash: Option<DFlashLaneState>,
+    /// Fixed, pre-allocated scratch for the DFlash verify forward. Lazily built
+    /// on the first verify step (its shape depends on the loaded draft model's
+    /// block size and the target's capture layers). Pointer-stable for the
+    /// upcoming verify CUDA Graph.
+    verify_bufs: Option<VerifyGraphBuffers>,
+    /// KV pool block count — the worst-case page-list bound for `verify_bufs`.
+    total_blocks: usize,
 }
+
+/// Stored state for an async prefill that was launched but not yet synced.
+struct InflightPrefillState {
+    prefill_stream: cudarc::driver::sys::CUstream,
+    prefill_logits: HiddenStates,
+    prefill_requests: Vec<PrefillStepItem>,
+    /// Per-step sampling seed captured when the prefill was launched, replayed
+    /// when its tokens are sampled after the deferred sync.
+    sample_seed: u64,
+}
+
+// SAFETY: InflightPrefillState lives entirely within the worker thread that
+// owns the GPU context. It is never shared across threads.
+unsafe impl Send for InflightPrefillState {}
 
 impl LocalQwen3Lane {
     fn new(
@@ -1796,39 +2437,118 @@ impl LocalQwen3Lane {
             total_blocks,
             padding_block_id,
             model.local_num_attention_heads(),
+            model.config().max_position_embeddings,
         )?;
-        let sample_scratch =
-            SamplingScratch::new(model.device_ctx(), model.config().vocab_size, max_bucket)?;
+        let sample_scratch = openinfer_sample::SampleScratch::new(
+            model.device_ctx(),
+            model.config().vocab_size,
+            max_bucket,
+        )?;
         Ok(Self {
             model,
             kv_buffer,
             layout,
             bufs,
             sample_scratch,
+            inflight_prefill: None,
+            dflash: None,
+            verify_bufs: None,
+            total_blocks,
         })
+    }
+
+    /// Load the DFlash draft model into this lane (primary rank only). The draft
+    /// model is built here on the worker thread because it reads the co-located
+    /// target model's embeddings and head.
+    fn load_dflash(&mut self, draft_path: &str) -> Result<DFlashMeta> {
+        let model = DFlashDraftModel::from_safetensors_for_target(
+            self.model.device_ctx(),
+            draft_path,
+            &self.model,
+        )?;
+        model.tune_gemm_algos(&self.model)?;
+        let meta = DFlashMeta {
+            block_size: model.block_size(),
+            max_position_embeddings: model.max_position_embeddings(),
+            target_layer_ids: model.target_layer_ids().to_vec(),
+        };
+        let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
+        self.dflash = Some(DFlashLaneState::new(
+            self.model.device_ctx(),
+            model,
+            max_decode_batch_size,
+        )?);
+        Ok(meta)
     }
 
     fn bind(&self) -> Result<CublasThreadGuard> {
         bind_model_thread(&self.model)?;
+        tune_decode_gemm_algos(&self.model)?;
         Ok(CublasThreadGuard)
     }
 
-    fn sample_from_logits(
+    /// Sync the in-flight prefill stream and sample prefill tokens.
+    /// Returns the prefill result. Panics if no inflight prefill exists.
+    fn resolve_inflight_prefill(&mut self) -> Result<PrefillResult> {
+        let state = self
+            .inflight_prefill
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no inflight prefill to resolve"))?;
+
+        // Sync prefill stream
+        let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(state.prefill_stream) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
+        }
+
+        // Now safe to drop deferred GPU buffers (prefill kernels are done).
+        crate::prefill::drain_deferred_drops();
+
+        // Sample prefill tokens
+        let params: Vec<&SamplingParams> =
+            state.prefill_requests.iter().map(|r| &r.params).collect();
+        let tokens = self.select_step_tokens(&state.prefill_logits, &params, state.sample_seed)?;
+
+        // Build prefill result
+        let results = build_prefill_request_results(
+            self,
+            &state.prefill_requests,
+            &state.prefill_logits,
+            &tokens,
+            None,
+            false,
+        )?;
+
+        // Split-concurrent prefill never runs with DFlash (capture needs the
+        // synchronous result), so no context is captured here.
+        Ok(PrefillResult {
+            requests: results,
+            dflash_context_captured_requests: Vec::new(),
+        })
+    }
+
+    /// Pick one token per logits column (batched argmax for greedy rows,
+    /// one batched sampler call for non-greedy rows). Grows the sampling
+    /// scratch when a step is wider than the decode bucket it was sized for.
+    fn select_step_tokens(
         &mut self,
-        logits: &DeviceVec,
-        params: &SamplingParams,
-        random_val: f32,
-    ) -> Result<u32> {
-        openinfer_core::ops::gpu_sample_into(
+        logits: &HiddenStates,
+        params: &[&SamplingParams],
+        sample_seed: u64,
+    ) -> Result<Vec<u32>> {
+        if params.len() > self.sample_scratch.max_rows() {
+            self.sample_scratch = openinfer_sample::SampleScratch::new(
+                self.model.device_ctx(),
+                self.model.config().vocab_size,
+                params.len(),
+            )?;
+        }
+        openinfer_sample::select_batch(
             self.model.device_ctx(),
             logits,
-            &mut self.sample_scratch.probs,
-            &mut self.sample_scratch.top1_values,
-            &mut self.sample_scratch.row_states,
-            &mut self.sample_scratch.valid,
-            &mut self.sample_scratch.out,
             params,
-            random_val,
+            sample_seed,
+            &mut self.sample_scratch,
         )
     }
 
@@ -1839,7 +2559,7 @@ impl LocalQwen3Lane {
         top_k: usize,
     ) -> Result<TokenLogprob> {
         let logits_f32 = logits.to_host(self.model.device_ctx())?;
-        compute_logprobs_from_cpu(&logits_f32, sampled_token, top_k)
+        openinfer_sample::token_logprob_from_row(&logits_f32, sampled_token, top_k)
             .ok_or_else(|| anyhow::anyhow!("logprobs computation failed"))
     }
 
@@ -1854,7 +2574,7 @@ impl LocalQwen3Lane {
             .ok()
             .and_then(|logits_vec| {
                 let logits_f32 = logits_vec.to_host(self.model.device_ctx()).ok()?;
-                compute_logprobs_from_cpu(&logits_f32, target_token, top_k)
+                openinfer_sample::token_logprob_from_row(&logits_f32, target_token, top_k)
             })
     }
 
@@ -1864,7 +2584,8 @@ impl LocalQwen3Lane {
         kv_views: &[KvView],
         lora_adapters: &[Option<&str>],
         echo: bool,
-    ) -> Result<(Vec<DeviceVec>, Option<HiddenStates>)> {
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>, Option<HiddenStates>)> {
         self.model.batch_prefill(
             prompts,
             kv_views,
@@ -1872,7 +2593,71 @@ impl LocalQwen3Lane {
             self.kv_buffer.buffer(),
             &self.layout,
             echo,
+            capture_layer_ids,
         )
+    }
+
+    /// DFlash verify forward over each request's `block_size`-token span, using
+    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation).
+    /// Numerically equivalent to the `batch_prefill(echo=true)` verify path it
+    /// replaces; the buffers are lazily built on first use.
+    fn execute_dflash_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+    ) -> Result<VerifyResult> {
+        let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
+            anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
+        })?;
+        let block_size = self
+            .dflash
+            .as_ref()
+            .expect("DFlash present when capture layers exist")
+            .model
+            .block_size();
+
+        if self.verify_bufs.is_none() {
+            let max_batch = *BATCH_BUCKETS.last().unwrap();
+            self.verify_bufs = Some(VerifyGraphBuffers::new(
+                &self.model,
+                max_batch,
+                block_size,
+                capture_layer_ids.len(),
+                self.total_blocks,
+            )?);
+        }
+
+        // Take the buffers out of `self` so the forward (borrows `&self.model`,
+        // `&mut bufs`) and the subsequent sampling (`&mut self.sample_scratch`)
+        // and context record (`&mut self.dflash`) don't alias a `self` borrow.
+        let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
+        let result = (|| -> Result<VerifyResult> {
+            let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
+            self.model.batch_prefill_into(
+                &spans,
+                kv_views,
+                self.kv_buffer.buffer(),
+                &self.layout,
+                &capture_layer_ids,
+                &mut bufs,
+            )?;
+
+            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
+            let greedy = SamplingParams::default();
+            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
+            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
+            let request_results = build_verify_results(requests, &target_tokens)?;
+            self.record_verify_dflash_context(
+                requests,
+                &request_results,
+                Some(bufs.captured_hidden()),
+            )?;
+            Ok(VerifyResult {
+                requests: request_results,
+            })
+        })();
+        self.verify_bufs = Some(bufs);
+        result
     }
 
     fn execute_decode(
@@ -1891,45 +2676,6 @@ impl LocalQwen3Lane {
         )
     }
 
-    /// Speculative verify forward: run the model on `verify_tokens`
-    /// (`[dangling, drafts..]`) over the request's existing paged KV and return
-    /// the greedy token at each of the `verify_tokens.len()` positions.
-    ///
-    /// Structurally a prefill of `verify_tokens` at the current position
-    /// (`kv_view = prefill_view(verify_tokens.len())`), so it reuses
-    /// `batch_prefill(echo = true)` for the per-position logits and takes the
-    /// argmax on the GPU — only the position token ids are copied to host,
-    /// never the `[vocab, n]` logits.
-    fn execute_verify(
-        &mut self,
-        verify_tokens: &[u32],
-        kv_view: &KvView,
-        lora_adapter: Option<&str>,
-    ) -> Result<Vec<u32>> {
-        let (_last_logits, all_logits) = self.model.batch_prefill(
-            &[verify_tokens],
-            std::slice::from_ref(kv_view),
-            &[lora_adapter],
-            self.kv_buffer.buffer(),
-            &self.layout,
-            true,
-        )?;
-        let all_logits = all_logits
-            .ok_or_else(|| anyhow::anyhow!("verify forward must return all-position logits"))?;
-
-        let rows = verify_tokens.len();
-        let ctx = self.model.device_ctx();
-        let mut values: cudarc::driver::CudaSlice<half::bf16> = ctx.stream.alloc_zeros(rows)?;
-        let mut indices: cudarc::driver::CudaSlice<i32> = ctx.stream.alloc_zeros(rows)?;
-        openinfer_core::ops::argmax_batch_bf16_into(ctx, &all_logits, &mut values, &mut indices)?;
-        let host = ctx
-            .stream
-            .clone_dtoh(&indices)
-            .map_err(|e| anyhow::anyhow!("verify argmax D2H failed: {e}"))?;
-        ctx.sync()?;
-        Ok(host.into_iter().map(|i| i as u32).collect())
-    }
-
     fn execute_unified(
         &mut self,
         prefill_prompts: &[&[u32]],
@@ -1938,7 +2684,7 @@ impl LocalQwen3Lane {
         decode_tokens: &[u32],
         decode_views: &[KvView],
         decode_lora_adapters: &[Option<&str>],
-    ) -> Result<(Vec<DeviceVec>, Vec<DeviceVec>)> {
+    ) -> Result<HiddenStates> {
         self.model.unified_step(
             prefill_prompts,
             prefill_views,
@@ -1978,22 +2724,41 @@ enum StepCommand {
         requests: Vec<PrefillStepItem>,
         kv_views: Vec<KvView>,
         echo: bool,
+        sample_seed: u64,
     },
     Decode {
         requests: Vec<DecodeStepItem>,
         kv_views: Vec<KvView>,
+        sample_seed: u64,
     },
     Unified {
         prefill_requests: Vec<PrefillStepItem>,
         prefill_kv_views: Vec<KvView>,
         decode_requests: Vec<DecodeStepItem>,
         decode_kv_views: Vec<KvView>,
+        sample_seed: u64,
     },
+    /// Split-concurrent: prefill and decode launch on separate Green Context
+    /// streams (different SM partitions) for true GPU-level parallelism.
+    SplitConcurrent {
+        prefill_requests: Vec<PrefillStepItem>,
+        prefill_kv_views: Vec<KvView>,
+        decode_requests: Vec<DecodeStepItem>,
+        decode_kv_views: Vec<KvView>,
+        prefill_stream: crate::green_ctx::SendStream,
+        decode_stream: crate::green_ctx::SendStream,
+        sample_seed: u64,
+    },
+    /// Speculative verify: one target forward over each request's `K + 1` draft
+    /// span (with a speculative KV view), capturing target hidden states for the
+    /// next draft round. Greedy argmax per position drives [`accept_greedy`].
     SpeculativeVerify {
-        verify_tokens: Vec<u32>,
-        kv_view: KvView,
-        lora_adapter: Option<String>,
+        requests: Vec<VerifyStepItem>,
+        kv_views: Vec<KvView>,
     },
+    /// Speculative draft: roll the DFlash draft model forward one block per
+    /// request. Uses the draft's own KV — no target KV views.
+    SpeculativeDraft { requests: Vec<DraftStepItem> },
 }
 
 impl StepCommand {
@@ -2002,7 +2767,9 @@ impl StepCommand {
             Self::Prefill { .. } => "prefill",
             Self::Decode { .. } => "decode",
             Self::Unified { .. } => "unified",
+            Self::SplitConcurrent { .. } => "split_concurrent",
             Self::SpeculativeVerify { .. } => "speculative_verify",
+            Self::SpeculativeDraft { .. } => "speculative_draft",
         }
     }
 }
@@ -2027,6 +2794,23 @@ enum WorkerCommand {
         name: String,
         resp: channel::Sender<Result<()>>,
     },
+    /// Sync the in-flight prefill from a previous SplitConcurrent step and
+    /// return the sampled prefill result.
+    ResolvePrefill {
+        resp: channel::Sender<Result<PrefillResult>>,
+    },
+    /// Load the DFlash draft model into the primary lane (built on the worker
+    /// thread because it reads the co-located target model).
+    LoadDflash {
+        draft_path: String,
+        resp: channel::Sender<Result<DFlashMeta>>,
+    },
+    /// Drop a request's DFlash draft state (request retired, or it fell back to
+    /// a plain decode that advanced the sequence outside the speculative path).
+    DropDflash {
+        request_id: RequestId,
+        resp: channel::Sender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -2035,9 +2819,17 @@ enum WorkerStepOutcome {
     Prefill(PrefillResult),
     Decode(DecodeResult),
     Unified(UnifiedResult),
-    /// Per-position greedy argmax (one token per verify input) from a
-    /// speculative verify forward.
-    Speculative(Vec<u32>),
+    /// SM-partition split: decode result is ready; prefill is still in-flight
+    /// on the prefill stream. The executor must call a follow-up to sync+sample
+    /// prefill before using prefill scratch buffers again.
+    SplitDecodeReady {
+        decode: DecodeResult,
+        /// Event recorded on prefill stream after all prefill kernels;
+        /// query this to check if prefill is done without blocking.
+        prefill_event: SendEvent,
+    },
+    SpeculativeVerify(VerifyResult),
+    SpeculativeDraft(DraftResult),
 }
 
 impl WorkerStepOutcome {
@@ -2047,7 +2839,9 @@ impl WorkerStepOutcome {
             Self::Prefill(_) => "prefill",
             Self::Decode(_) => "decode",
             Self::Unified(_) => "unified",
-            Self::Speculative(_) => "speculative",
+            Self::SplitDecodeReady { .. } => "split_decode_ready",
+            Self::SpeculativeVerify(_) => "speculative_verify",
+            Self::SpeculativeDraft(_) => "speculative_draft",
         }
     }
 }
@@ -2097,6 +2891,18 @@ impl RankWorker {
                                     let result = lane.discard_lora_adapter(&name);
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::ResolvePrefill { resp } => {
+                                    let result = lane.resolve_inflight_prefill();
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::LoadDflash { draft_path, resp } => {
+                                    let result = lane.load_dflash(&draft_path);
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::DropDflash { request_id, resp } => {
+                                    lane.drop_dflash_request(request_id);
+                                    let _ = resp.send(Ok(()));
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -2130,6 +2936,44 @@ impl RankWorker {
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
         Ok(resp_rx)
+    }
+
+    /// Ask the worker to sync its in-flight prefill and return the result.
+    fn resolve_prefill(&self) -> Result<channel::Receiver<Result<PrefillResult>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::ResolvePrefill { resp: resp_tx })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on resolve_prefill"))?;
+        Ok(resp_rx)
+    }
+
+    /// Load the DFlash draft model into this worker's lane and return its
+    /// metadata. Blocks until the worker finishes loading.
+    fn load_dflash(&self, draft_path: String) -> Result<DFlashMeta> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::LoadDflash {
+                draft_path,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on load_dflash"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped load_dflash response"))?
+    }
+
+    /// Drop a request's DFlash state. Blocks until the worker acknowledges.
+    fn drop_dflash_request(&self, request_id: RequestId) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::DropDflash {
+                request_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_dflash"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped drop_dflash response"))?
     }
 
     fn load_lora_adapter(

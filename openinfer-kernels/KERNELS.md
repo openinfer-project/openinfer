@@ -12,6 +12,7 @@ Use this file as the LLM entrypoint before editing kernels. Start from `op_id`, 
 | `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/shared/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
 | `shared.elementwise.accumulate_bf16_token_scaled_to_f32` | DeepSeek-V2-Lite NCCL device combine | `ops::accumulate_bf16_token_scaled_to_f32_into` | `accumulate_bf16_token_scaled_to_f32_cuda` | `csrc/shared/elementwise.cu` | CUDA | accumulates one bf16 expert-output token into a selected row of reusable f32 device scratch before the NCCL combine all-reduce |
 | `shared.sampling.argmax_batch_bf16_indexed` | selected batched greedy gates | `ops::argmax_batch_bf16_indexed_into` | `argmax_batch_bf16_indexed_cuda` | `csrc/shared/argmax.cu` | CUDA | compact greedy top-1 results for selected source rows over `HiddenStates` logits |
+| `shared.sampling.batch_topk_topp` | mixed greedy/non-greedy decode epilogues | `ops::gpu_sample_batch_into` / `openinfer-core::ops::select_batch_tokens_into` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, gather/cast bf16 logits to f32, FlashInfer OnlineSoftmax + Sampling/TopP/TopKTopP by active per-row filters |
 
 ## Qwen3-4B Dense Full-Attention Path
 
@@ -31,8 +32,8 @@ Qwen3-4B uses bf16 dense full attention with `hidden_size=2560`, `num_attention_
 | `qwen3_4b.norm.fused_add_rms` | residual | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | residual add plus RMSNorm over batch |
 | `qwen3_4b.mlp.silu_mul_fused` | MLP | `ops::silu_mul_fused_batch_into` | `silu_mul_fused_cuda` | `csrc/shared/fused_proj.cu` | CUDA | input `[2 * intermediate, batch]`, output `[intermediate, batch]` |
 | `qwen3_4b.elementwise.add` | residual/unified | `ops::add_batch_into` | `add_cuda` | `csrc/shared/elementwise.cu` | CUDA | same-shape `HiddenStates` |
-| `qwen3_4b.sampling.greedy` | decode output | `ops::gpu_sample_into` | `argmax_cuda` | `csrc/shared/argmax.cu` | CUDA | greedy top-1 path, preserves lower-token-id tie-break |
-| `qwen3_4b.sampling.random` | decode output | `ops::gpu_sample_into` | `gpu_sample_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | temperature/top-k/top-p path |
+| `qwen3_4b.sampling.greedy` | decode output | `openinfer-core::ops::select_batch_tokens_into` | `argmax_batch_bf16_split_indexed_cuda` | `csrc/shared/argmax.cu` | CUDA | compact greedy rows, one indexed batched argmax read-back per step |
+| `qwen3_4b.sampling.random` | decode output | `openinfer-core::ops::select_batch_tokens_into` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, one batched FlashInfer sampling call per step |
 
 ## DeepSeek V4 MP8 Path
 

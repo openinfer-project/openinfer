@@ -23,7 +23,7 @@ pub fn embedding_decode_into(
             token_ptr as *const u32,
             out_ptr as *mut ffi::Half,
             embed.cols as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -49,7 +49,7 @@ pub fn embedding_batch(
             o_ptr as *mut ffi::Half,
             embed.cols as i32,
             out.seq_len as i32,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;
@@ -82,7 +82,7 @@ pub fn embedding_batch_vocab_shard(
             out.seq_len as i32,
             vocab_start,
             part_vocab_size,
-            ctx.stream.cu_stream(),
+            crate::tensor::active_cu_stream(ctx),
         )
     };
     result.result()?;

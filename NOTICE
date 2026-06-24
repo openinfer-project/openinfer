@@ -1,0 +1,8 @@
+OpenInfer
+Copyright 2026 The OpenInfer Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes components derived from NVIDIA Dynamo
+(https://github.com/ai-dynamo/dynamo), licensed under the Apache License 2.0.
+See NOTICE_DYNAMO and THIRD_PARTY_LICENSES_DYNAMO.txt for details.

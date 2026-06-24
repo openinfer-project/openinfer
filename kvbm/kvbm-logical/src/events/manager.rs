@@ -154,6 +154,14 @@ impl EventsManager {
         BroadcastStream::new(rx).filter_map(|result| result.ok())
     }
 
+    /// Subscribe and get the raw broadcast receiver, for callers that drain
+    /// synchronously (e.g. `try_recv` from a non-async scheduler thread) and
+    /// must observe `Lagged` rather than have it silently filtered. Same
+    /// late-subscriber semantics as [`Self::subscribe`].
+    pub fn subscribe_receiver(&self) -> broadcast::Receiver<KvCacheEvent> {
+        self.event_tx.subscribe()
+    }
+
     /// Hook called when a block is registered in the BlockRegistry.
     ///
     /// This method:

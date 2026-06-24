@@ -2,6 +2,7 @@
 edition = "2024"
 links = "ibverbs"
 name = "openinfer-comm-libibverbs-sys"
+license = "Apache-2.0"
 publish = false
 
 [features]
@@ -10,7 +11,7 @@ default = []
 system-bindings = []
 
 [build-dependencies]
-build-utils = { path = "../openinfer-comm-build-utils", package = "openinfer-comm-build-utils" }
+openinfer-build = { workspace = true }
 
 bindgen = { workspace = true }
 cc = { workspace = true }
