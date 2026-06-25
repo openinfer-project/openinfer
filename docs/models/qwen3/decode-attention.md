@@ -1,6 +1,6 @@
 # Qwen3-4B Decode Attention Path Selection
 
-**TL;DR:** Decode picks between two paged-attention kernels — `NonPartition` (1 CTA per request×kv-head) and `SplitKv` (KV split into 64-token chunks across SMs). The choice is driven by **batch (CTA count vs SM count), not context length**. The old `max_seq_len >= 1024` gate was a tuning artifact that left bs=1 mid-context decode on the SM-starved `NonPartition` kernel, producing a tpot hump that peaked ~ctx800 and dropped off a cliff exactly at ctx1024. Removing it flattens bs=1 tpot across the whole context range (5090 −16% @ctx800, 5070 Ti −7.5%) with no accuracy regression. Kept the `padded_bs <= 32` cap.
+**TL;DR:** Decode picks between two paged-attention kernels — `NonPartition` (1 CTA per request×kv-head) and `SplitKv` (KV split into fixed-size chunks across SMs). The choice is driven by **batch (CTA count vs SM count), not context length**. The old `max_seq_len >= 1024` gate was a tuning artifact that left bs=1 mid-context decode on the SM-starved `NonPartition` kernel, producing a tpot hump that peaked ~ctx800 and dropped off a cliff exactly at ctx1024. Removing it flattens bs=1 tpot across the whole context range (5090 −16% @ctx800, 5070 Ti −7.5%) with no accuracy regression. Kept the `padded_bs <= 32` cap.
 
 Last touched: 2026-06
 
@@ -9,7 +9,7 @@ Last touched: 2026-06
 `batch_decode_buffers.rs::attention_path()` selects per step:
 
 - **`NonPartition`** — issues one CTA per `(request × kv-head)`. Qwen3-4B GQA has 8 kv-heads, so bs=1 launches only **8 CTAs**. A 5090 has ~170 SMs and a 5070 Ti ~70 — 8 CTAs leave the GPU almost idle, and it gets worse as context grows (each CTA walks a longer KV).
-- **`SplitKv`** — splits each request's KV into 64-token chunks and runs them in parallel, then merges. This manufactures enough CTAs to fill the SMs when batch is small.
+- **`SplitKv`** — splits each request's KV into fixed-size chunks and runs them in parallel, then merges. This manufactures enough CTAs to fill the SMs when batch is small. (Chunk *size* is policy-dependent — see *Chunk size and batch-invariance*.)
 
 ## Why batch, not context
 
@@ -61,10 +61,21 @@ The transition lands exactly where CTA count crosses SM count: bs≤8 (≤64 CTA
 The grid must be fixed for graph replay, but SplitKv's chunk count varies with context. Resolved by **fixed-upper-bound grid + out-of-graph metadata**:
 
 - One captured graph per `(batch bucket, attention_path)` — `graph_index = bucket_idx × 2 + path.graph_slot()`. bs=1 has a `NonPartition` slot and a `SplitKv` slot; first use of a combination captures, later steps replay.
-- SplitKv workspace is pre-allocated at the fixed upper bound `bs × 64` chunks (`SPLIT_KV_MAX_CHUNKS_PER_REQUEST`), so buffer pointers are stable and the kernel always launches the same grid regardless of context.
+- SplitKv workspace is pre-allocated to the active policy's grid (`bs × max_split_chunks()`: default `Tuned` `bs × 64` = `SPLIT_KV_TUNED_MAX_CHUNKS`, `Pin`/`PerToken` `bs × 256`), so buffer pointers stay stable across replay — the policy is fixed before construction, so the size never shifts under a live executor. The grid is fixed per `(bucket, policy)` (see *Chunk size and batch-invariance*).
 - Per-step context differences go through `memcpy_htod` in `sync_split_kv_meta` **before** `run_or_capture` (outside the graph): chunk_size, valid-chunk count, `valid_mask`, `o_indptr`. Chunks beyond the real count are masked off (`valid_mask = 0`, those CTAs early-exit).
 
-So ctx=300 (5 chunks) and ctx=1024 (16 chunks) share the same SplitKv graph — only the metadata buffer contents differ. This is why dropping the context gate is safe: capture-time context never determined the grid. The accuracy gate's CUDA-graph replay over small-context sequences passes, confirming it.
+So under the `Tuned` 64-token floor, ctx=300 (5 chunks) and ctx=1024 (16 chunks) share the same SplitKv graph — only the metadata buffer contents differ (`Pin`/`PerToken` give different per-context counts, still within the same fixed grid). This is why dropping the context gate is safe: capture-time context never determined the grid. The accuracy gate's CUDA-graph replay over small-context sequences passes, confirming it.
+
+## Chunk size and batch-invariance
+
+The chunk *size* sets a request's chunk count, hence its online-softmax merge order; bf16 non-associativity makes the decoded logits depend on that count. `split_chunk_size()` picks it by `NumericPolicy`:
+
+- **`Tuned`** (default): `max(64, ceil(max_seq_len / SPLIT_KV_TUNED_MAX_CHUNKS))`, `SPLIT_KV_TUNED_MAX_CHUNKS = 64` — sized off the live batch, so a request's count (and decoded logits) shift with its co-batched neighbours.
+- **`Pin`/`PerToken`** (opt-in `--batch-invariant`): a fixed `max(64, ceil(max_context_tokens / SPLIT_KV_MAX_CHUNKS_PER_REQUEST))`, `SPLIT_KV_MAX_CHUNKS_PER_REQUEST = 256` → 160 tokens for Qwen3-4B. The count then depends only on the request's own length — batch-invariant by construction (#438, #435).
+
+`SPLIT_KV_MAX_CHUNKS_PER_REQUEST` (256) is the absolute upper bound — both the `Pin`/`PerToken` chunk cap and the `pin_chunk_size` divisor, which must match so a request yields ≤ cap chunks and the guard stays tight. Both the workspace and the grid are sized to the active policy: the default `Tuned` path stays `bs × 64`, and only `--batch-invariant` allocates and launches the wider `bs × 256` (~65 MiB). `--batch-invariant` also pins the decode GEMM-N reduction order (an orthogonal axis); chunk size alone does not make decode fully batch-invariant.
+
+The `batch_invariance_decode_splitkv_graph` gate covers this: co-batching a request with a longer neighbour drifts its `Tuned` chunk count (the decoded top-K changes) while `Pin`/`PerToken` replay the requested top-K logprobs bit-identically across the SplitKv CUDA-graph (the gate compares A's prefill first token and its `LOGPROBS=64` decode top-K, not full logits).
 
 ## The fix
 
