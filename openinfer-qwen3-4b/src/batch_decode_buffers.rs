@@ -33,7 +33,7 @@ const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
 const SPLIT_KV_CHUNK_TOKENS: usize = 64;
 const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
-const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // workspace/guard bound; Pin's fixed split = ceil(max_context / this)
+const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // split-KV workspace/guard bound
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 
 /// Tuned chunk size: 64-token floor, coarsened to keep a `basis`-token request to <= SPLIT_KV_TUNED_MAX_CHUNKS chunks.
@@ -41,7 +41,8 @@ pub fn split_chunk_size_for(basis: usize) -> usize {
     SPLIT_KV_CHUNK_TOKENS.max(basis.div_ceil(SPLIT_KV_TUNED_MAX_CHUNKS))
 }
 
-/// Pin/PerToken fixed chunk size: the finest split that fits the SPLIT_KV_MAX_CHUNKS_PER_REQUEST bound.
+/// Pin/PerToken fixed chunk size. The divisor `SPLIT_KV_MAX_CHUNKS_PER_REQUEST` is also the `Pin`
+/// chunk cap, so a request yields <= cap chunks and the `sync_split_kv_meta` guard stays tight.
 pub(crate) fn pin_chunk_size(max_context_tokens: usize) -> usize {
     SPLIT_KV_CHUNK_TOKENS.max(max_context_tokens.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST))
 }
@@ -163,10 +164,10 @@ impl BatchDecodeBuffers {
         max_context_tokens: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
-        // The split-KV path is gated on padded_bs <= SPLIT_KV_MAX_BATCH_SIZE,
-        // so its workspace only needs slots for that many requests (~65 MiB
-        // instead of ~520 MiB at bucket 256).
-        let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * SPLIT_KV_MAX_CHUNKS_PER_REQUEST;
+        // Policy-sized: default Tuned reserves only ×64, the ×256 Pin width only under
+        // --batch-invariant. Policy is fixed before construction; a later change should source it
+        // from a recorded field rather than re-read the global here.
+        let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * max_split_chunks();
 
         Ok(Self {
             max_batch_size: bs,
