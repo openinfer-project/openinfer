@@ -254,7 +254,23 @@ fn check_lossless(
         .take_while(|(b, s)| b.id == s.id)
         .count();
 
-    if matched == base.len().min(spec.len()) {
+    // A strict-prefix relationship (one run stops early, or runs on past the
+    // other) must fail the gate even though every overlapping token matched:
+    // greedy speculation is lossless only if the two streams are token-for-token
+    // *and* length identical. Reject length mismatches before the divergence
+    // diagnostic below, which indexes `spec[matched]` and would otherwise panic
+    // out of bounds when `spec` is the shorter run.
+    if base.len() != spec.len() {
+        return Err(format!(
+            "prompt {i} ({prompt:?}): length mismatch — baseline produced {} tokens, \
+             speculative produced {} tokens ({matched} prefix tokens matched); greedy \
+             speculation must be token-for-token identical, not merely a shared prefix",
+            base.len(),
+            spec.len(),
+        ));
+    }
+
+    if matched == base.len() {
         eprintln!(
             "prompt {i} ({prompt:?}): {matched}/{} tokens identical (100% lossless)",
             base.len()
