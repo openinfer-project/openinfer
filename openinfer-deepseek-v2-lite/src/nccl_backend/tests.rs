@@ -4,7 +4,67 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::{
+    AllReduceChunk, NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+    NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL, bf16_all_reduce_chunks, f32_all_reduce_chunks,
+};
 use super::{add_python_env_root, nccl_python_wheel_lib_dirs_from_root};
+
+#[test]
+fn f32_all_reduce_chunks_preserve_short_counts_and_split_long_counts() {
+    assert!(f32_all_reduce_chunks(0).is_empty());
+    assert_eq!(
+        f32_all_reduce_chunks(47_104),
+        vec![AllReduceChunk {
+            offset: 0,
+            len: 47_104,
+        }]
+    );
+    assert_eq!(
+        f32_all_reduce_chunks(NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL),
+        vec![AllReduceChunk {
+            offset: 0,
+            len: NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+        }]
+    );
+    assert_eq!(
+        f32_all_reduce_chunks(NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL + 16_384),
+        vec![
+            AllReduceChunk {
+                offset: 0,
+                len: NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+            },
+            AllReduceChunk {
+                offset: NCCL_F32_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+                len: 16_384,
+            },
+        ]
+    );
+}
+
+#[test]
+fn bf16_all_reduce_chunks_preserve_24_word_count_and_split_long_counts() {
+    assert_eq!(
+        bf16_all_reduce_chunks(NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL),
+        vec![AllReduceChunk {
+            offset: 0,
+            len: NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+        }]
+    );
+    assert_eq!(
+        bf16_all_reduce_chunks(NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL + 45_056),
+        vec![
+            AllReduceChunk {
+                offset: 0,
+                len: NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+            },
+            AllReduceChunk {
+                offset: NCCL_BF16_ALL_REDUCE_MAX_ELEMS_PER_CALL,
+                len: 45_056,
+            },
+        ]
+    );
+}
 
 #[test]
 fn finds_nccl_python_wheel_lib_dir_from_python_executable() {

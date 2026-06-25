@@ -86,6 +86,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
             ..EngineLoadOptions::default()
         },
         4,
+        openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("failed to start Qwen3.5 engine");
     let tokenizer = common::load_tokenizer(&model_path);

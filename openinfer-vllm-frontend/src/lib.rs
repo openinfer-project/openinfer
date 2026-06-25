@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::Router;
-use axum::middleware::from_fn_with_state;
 use log::warn;
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -21,16 +20,12 @@ use openinfer_engine::engine::EngineHandle;
 
 mod bridge;
 mod lora;
-mod sampling_guard;
 mod wire;
 
 use bridge::{LocalEngineBridge, ipc_endpoint, local_ipc_namespace};
-use lora::{bad_request, load_startup_lora_modules, lora_openai_routes, lora_routes};
-use sampling_guard::{ServableCap, guard_generation_request};
+use lora::{load_startup_lora_modules, lora_openai_routes, lora_routes};
 
 pub use lora::LoraModule;
-
-const COMPLETION_ROUTE_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {
@@ -156,11 +151,9 @@ where
     // the bridge once the engine resolves and runs it to completion; on engine
     // failure it cancels the server so the error surfaces instead of hanging
     // in the registration wait.
-    let servable_cap = ServableCap::default();
     let server_shutdown = shutdown.child_token();
     let bridge_shutdown = shutdown.child_token();
     let engine_task = tokio::spawn({
-        let servable_cap = servable_cap.clone();
         let server_shutdown = server_shutdown.clone();
         let bridge_shutdown = bridge_shutdown.clone();
         let input_address = input_address.clone();
@@ -174,7 +167,6 @@ where
                 }
             };
             let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
-            servable_cap.set(servable_limit);
             let bridge = LocalEngineBridge {
                 input_address,
                 output_address,
@@ -224,9 +216,6 @@ where
         shutdown_timeout: Duration::from_secs(10),
     };
 
-    let extend_router = move |router: Router| {
-        extend_router(router).layer(from_fn_with_state(servable_cap, guard_generation_request))
-    };
     let result =
         vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),

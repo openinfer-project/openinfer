@@ -22,7 +22,7 @@ munmap of ~8GB of touched pages costs ~0.4s of kernel page-table teardown holdin
 
 ## Concurrent startup invariant (openinfer-vllm-frontend)
 
-`serve()` takes `impl Future<Output = Result<EngineHandle>>`. vllm-server starts immediately (loads tokenizer, then waits in `EngineCoreClient::connect` for the engine to register); a spawned task awaits the engine, sets the shared `ServableCap`, and runs the `LocalEngineBridge`. Invariant chain: `ServableCap::set` → bridge registers → vllm-server builds the router (guard included) → HTTP binds. So a reachable port still means the engine can serve, and the sampling guard never reads an unset cap (unset → loud 503, dead path by construction).
+`serve()` takes `impl Future<Output = Result<EngineHandle>>`. vllm-server starts immediately (loads tokenizer, then waits in `EngineCoreClient::connect` for the engine to register); a spawned task awaits the engine and runs the `LocalEngineBridge`. Invariant chain: bridge registers (reporting `max_model_len` in the ready handshake) → vllm-server builds the router → HTTP binds. So a reachable port still means the engine can serve. Request-length limits are enforced by vllm-text natively from the reported `max_model_len` (prompt-too-long error + `max_tokens` clamp), and the scheduler rejects prompt+`max_tokens` overflow via `RejectReason::ContextLength` — there is no separate HTTP-layer guard.
 
 Consequences to keep in mind:
 

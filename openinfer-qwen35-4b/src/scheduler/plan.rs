@@ -133,6 +133,49 @@ pub(super) fn slot_for_new_request(active_count: usize, max_batch: usize) -> Opt
     (active_count < max_batch).then_some(active_count)
 }
 
+/// KV-lifetime budget of a request for chunked prefill
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrefillKvBudget {
+    pub(super) current_tokens: usize,
+    pub(super) prompt_len: usize,
+    pub(super) max_tokens: usize,
+}
+
+/// Pages an in-flight chunked prefill will still allocate before it finishes
+pub(super) fn prefilling_future_pages(prefilling: &[PrefillKvBudget], page_size: usize) -> usize {
+    prefilling
+        .iter()
+        .map(|req| {
+            let max_pages = pages_needed(max_kv_tokens(req.prompt_len, req.max_tokens), page_size);
+            let current_pages = pages_needed(req.current_tokens, page_size);
+            assert!(
+                current_pages <= max_pages,
+                "Qwen3.5 chunked prefill exceeded its admitted KV lifetime budget"
+            );
+            max_pages.saturating_sub(current_pages)
+        })
+        .sum()
+}
+
+/// Decide how many prompt tokens each FIFO-front prefilling request prefills this step
+/// return FIFO order with token budget
+pub(super) fn plan_prefill_chunks(remaining: &[usize], budget: usize) -> Vec<usize> {
+    let mut chunks = Vec::new();
+    let mut left = budget;
+    for &rem in remaining {
+        if left == 0 || rem == 0 {
+            break;
+        }
+        let take = rem.min(left);
+        chunks.push(take);
+        left -= take;
+        if take < rem {
+            break;
+        }
+    }
+    chunks
+}
+
 pub(super) fn compaction_after_retire(
     active_len_before: usize,
     retired_idx: usize,
@@ -628,5 +671,77 @@ mod tests {
             Some(3),
             "after compaction, the next request reuses the next dense slot"
         );
+    }
+
+    #[test]
+    fn prefill_chunks_slice_long_prompt_and_stop_packing() {
+        // One long prompt, budget smaller than its remaining work: take a
+        // partial chunk and stop so it stays at the front next step.
+        assert_eq!(plan_prefill_chunks(&[5000], 512), vec![512]);
+        assert_eq!(plan_prefill_chunks(&[5000, 8], 512), vec![512]);
+    }
+
+    #[test]
+    fn prefill_chunks_pack_short_prompts_up_to_budget() {
+        // Several short prompts pack into one step until the budget runs out.
+        assert_eq!(
+            plan_prefill_chunks(&[100, 100, 100], 512),
+            vec![100, 100, 100]
+        );
+        // Third prompt only partially fits: 200 + 200 = 400 used, 112 left, the
+        // 300-token prompt takes 112 and stops.
+        assert_eq!(
+            plan_prefill_chunks(&[200, 200, 300], 512),
+            vec![200, 200, 112]
+        );
+    }
+
+    #[test]
+    fn prefill_chunks_complete_then_continue_to_next() {
+        // A prompt that exactly fits the budget completes; packing continues.
+        assert_eq!(plan_prefill_chunks(&[512, 8], 1024), vec![512, 8]);
+    }
+
+    #[test]
+    fn prefill_chunks_huge_budget_prefills_everything_in_one_step() {
+        // The pre-#375 behaviour: a budget above total remaining work prefills
+        // every prompt in a single step.
+        assert_eq!(
+            plan_prefill_chunks(&[1000, 2000, 3000], usize::MAX),
+            vec![1000, 2000, 3000]
+        );
+    }
+
+    #[test]
+    fn prefill_chunks_empty_queue_schedules_nothing() {
+        assert!(plan_prefill_chunks(&[], 512).is_empty());
+    }
+
+    #[test]
+    fn prefilling_future_pages_reserves_only_remaining_growth() {
+        // current 16 tokens -> 1 page; max 48 KV tokens -> 3 pages; future = 2.
+        let prefilling = [PrefillKvBudget {
+            current_tokens: 16,
+            prompt_len: 16,
+            max_tokens: 33,
+        }];
+        assert_eq!(prefilling_future_pages(&prefilling, 16), 2);
+    }
+
+    #[test]
+    fn prefilling_future_pages_sums_across_requests() {
+        let prefilling = [
+            PrefillKvBudget {
+                current_tokens: 0, // just admitted, nothing in KV yet -> 0 pages
+                prompt_len: 16,
+                max_tokens: 17, // max 32 KV tokens -> 2 pages; future = 2
+            },
+            PrefillKvBudget {
+                current_tokens: 32, // 2 pages held
+                prompt_len: 40,
+                max_tokens: 9, // max 48 KV tokens -> 3 pages; future = 1
+            },
+        ];
+        assert_eq!(prefilling_future_pages(&prefilling, 16), 3);
     }
 }

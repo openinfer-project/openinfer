@@ -150,6 +150,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "deepep")]
     pub(crate) ep_backend: CliEpBackend,
 
+    /// Per-step chunked-prefill token budget (Qwen3 / Qwen3.5).
+    #[arg(long)]
+    pub(crate) max_prefill_tokens: Option<usize>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

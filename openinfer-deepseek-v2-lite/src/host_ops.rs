@@ -16,6 +16,13 @@ pub(crate) struct LayerCache {
 }
 
 impl LayerCache {
+    fn clone_for_graph_probe(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            values: self.values.clone(),
+        }
+    }
+
     pub(crate) fn len(&self, config: &Config) -> usize {
         let per_token = config.num_attention_heads * config.query_head_dim();
         if per_token == 0 {
@@ -61,6 +68,17 @@ impl DecodeCache {
             );
         }
         Ok(position)
+    }
+
+    pub(crate) fn clone_for_graph_probe(&self) -> Self {
+        // Keep this explicit so serving hot paths do not get blanket cache cloning.
+        Self {
+            layers: self
+                .layers
+                .iter()
+                .map(LayerCache::clone_for_graph_probe)
+                .collect(),
+        }
     }
 }
 
@@ -492,6 +510,23 @@ mod tests {
         let expected0 = bf16::from_f32(bf16::from_f32(3.0 * inv_rms).to_f32() * 3.0);
         let expected1 = bf16::from_f32(bf16::from_f32(4.0 * inv_rms).to_f32() * 0.5);
         assert_eq!(out, [expected0, expected1]);
+    }
+
+    #[test]
+    fn clone_for_graph_probe_copies_decode_cache_contents() {
+        let mut cache = DecodeCache {
+            layers: vec![LayerCache {
+                keys: vec![1.0, 2.0],
+                values: vec![3.0, 4.0],
+            }],
+        };
+
+        let cloned = cache.clone_for_graph_probe();
+        cache.layers[0].keys[0] = 9.0;
+        cache.layers[0].values[0] = 8.0;
+
+        assert_eq!(cloned.layers[0].keys, vec![1.0, 2.0]);
+        assert_eq!(cloned.layers[0].values, vec![3.0, 4.0]);
     }
 
     #[test]
