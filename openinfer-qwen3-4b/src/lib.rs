@@ -311,7 +311,11 @@ pub fn start_engine_with_offload(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    ensure_batch_invariant_supported(decode_overlap, batch_invariant)?;
+    ensure_batch_invariant_supported(
+        decode_overlap,
+        batch_invariant,
+        dflash_draft_model_path.is_some(),
+    )?;
     apply_batch_invariant_policy(batch_invariant);
     let dflash_draft_model_path = dflash_draft_model_path
         .map(|path| {
@@ -354,9 +358,13 @@ pub fn start_engine_with_lora_control(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-    ensure_batch_invariant_supported(decode_overlap, batch_invariant)?;
+    ensure_batch_invariant_supported(decode_overlap, batch_invariant, false)?;
     if batch_invariant {
-        anyhow::bail!("--batch-invariant is not yet validated with LoRA serving");
+        anyhow::bail!(
+            "--batch-invariant is not supported with LoRA: the decode-GEMM pin warms and self-checks \
+             only the base projection {{M,K}}, so LoRA's rank-K adapter GEMMs would silently fall \
+             back to the non-invariant per-token path"
+        );
     }
     apply_batch_invariant_policy(batch_invariant);
     scheduler::start_qwen3_with_lora_control(
@@ -387,10 +395,18 @@ fn apply_batch_invariant_policy(batch_invariant: bool) {
 fn ensure_batch_invariant_supported(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
+    dflash: bool,
 ) -> Result<()> {
     if batch_invariant && !matches!(decode_overlap, DecodeOverlap::Off) {
         anyhow::bail!(
             "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+        );
+    }
+    if batch_invariant && dflash {
+        anyhow::bail!(
+            "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
+             pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
+             would silently fall back to the non-invariant per-token path"
         );
     }
     Ok(())

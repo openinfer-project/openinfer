@@ -190,13 +190,16 @@ impl Args {
             bail!("--batch-invariant is currently supported only for Qwen3");
         }
         if self.batch_invariant && self.enable_lora {
-            bail!(
-                "--batch-invariant is not yet validated with --enable-lora; enable one at a time"
-            );
+            bail!("--batch-invariant is not supported with --enable-lora; enable one at a time");
         }
         if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
             bail!(
                 "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+            );
+        }
+        if self.batch_invariant && self.dflash_draft_model_path.is_some() {
+            bail!(
+                "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time"
             );
         }
         Ok(())

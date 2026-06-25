@@ -1,5 +1,5 @@
 //! `--batch-invariant` is rejected at the Qwen3 builder boundary for unsupported combos:
-//! stream overlap would silently fall back to per-token, and LoRA shapes are not gated.
+//! stream overlap and the DFlash drafter would silently fall back to per-token, and LoRA shapes are not gated.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -11,7 +11,7 @@ use openinfer_qwen3_4b::{
     Qwen3OffloadOptions, start_engine_with_lora_control, start_engine_with_offload,
 };
 
-// Serialize the two #[test]s — they share the process-global numeric policy.
+// Serialize the reject #[test]s — they share the process-global numeric policy.
 static POLICY_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
@@ -34,6 +34,35 @@ fn batch_invariant_rejects_decode_overlap() {
     .expect("--batch-invariant + --decode-overlap must be rejected");
     assert!(
         format!("{err}").contains("decode-overlap"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        numeric_policy(),
+        NumericPolicy::Tuned,
+        "guard must reject before apply_batch_invariant_policy — global policy was polluted to Pin"
+    );
+}
+
+#[test]
+fn batch_invariant_rejects_dflash() {
+    let _g = POLICY_LOCK.lock().unwrap();
+    set_numeric_policy(NumericPolicy::Tuned);
+    let err = start_engine_with_offload(
+        Path::new("/nonexistent-model"),
+        EngineLoadOptions::default(),
+        Qwen3OffloadOptions::disabled(),
+        false,
+        DEFAULT_MAX_PREFILL_TOKENS,
+        Qwen3MemoryOptions::default(),
+        DecodeOverlap::Off,
+        true,
+        Some(Path::new("/nonexistent-draft")),
+        false,
+    )
+    .err()
+    .expect("--batch-invariant + DFlash must be rejected");
+    assert!(
+        format!("{err}").contains("DFlash"),
         "unexpected error: {err}"
     );
     assert_eq!(

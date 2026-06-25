@@ -152,6 +152,25 @@ pub fn gemm_lt_pin_into_checked(
     }
 }
 
+/// Boot self-check: does the pinned `(rows, cols)` algo serve `n`? Host-side
+/// `cublasLtMatmulAlgoCheck` only — no GEMM launch, no buffers. `Ok(false)` = won't serve this N
+/// (including workspace-over-budget, exactly as production rejects it); bails if `(rows, cols)` was
+/// never pinned.
+pub fn gemm_lt_pin_check(rows: usize, n: usize, cols: usize) -> Result<bool> {
+    let status = unsafe { ffi::gemm_lt_pin_check_cuda(rows as i32, n as i32, cols as i32) };
+    match status {
+        0 => Ok(true),
+        GEMM_LT_PIN_UNSUPPORTED => Ok(false),
+        GEMM_LT_PIN_UNTUNED => bail!(
+            "gemm_lt_pin_check: (m={rows}, k={cols}) was never pinned — call gemm_lt_pin_warmup first"
+        ),
+        // No matmul is launched, so the only non-sentinel status is a cublas layout-create failure.
+        s => {
+            bail!("gemm_lt_pin_check: cublas layout error (status {s}), m={rows}, n={n}, k={cols}")
+        }
+    }
+}
+
 /// Diagnostics: the pinned algo's `[tile_id, stages_id, splitk_num, reduction_scheme]` for
 /// `(rows, cols)`, or `None` if never pinned.
 pub fn gemm_lt_pin_inspect(rows: usize, cols: usize) -> Option<[i32; 4]> {

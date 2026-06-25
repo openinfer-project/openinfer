@@ -545,10 +545,12 @@ int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
   return static_cast<int>(cudaSuccess);
 }
 
-// Run the pinned (M,K) algo at an arbitrary N (rebuilds only B/C). Returns PIN_UNTUNED (no plan)
-// or PIN_UNSUPPORTED (algo can't serve this N; caller falls back).
-int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
-                     int K, cudaStream_t stream) {
+// Run or check the pinned (M,K) algo at an arbitrary N (rebuilds only B/C). `check_only` skips the
+// matmul (W/X/Y/stream untouched) and returns 0 when the algo serves N. The serviceability tests
+// (AlgoCheck + workspace-over-budget) live here ONCE so the boot self-check is never more permissive
+// than production. Returns PIN_UNTUNED (no plan) or PIN_UNSUPPORTED (algo can't serve this N).
+static int lt_pin_run(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
+                      int K, cudaStream_t stream, bool check_only) {
   if (g_lt_handle == nullptr || g_lt_pin_workspace == nullptr) {
     return GEMM_LT_PIN_UNTUNED;
   }
@@ -574,6 +576,8 @@ int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat
       result = GEMM_LT_PIN_UNSUPPORTED;
     } else if (check.workspaceSize > LT_PIN_WORKSPACE_SIZE) {
       result = GEMM_LT_PIN_UNSUPPORTED;
+    } else if (check_only) {
+      result = 0;
     } else {
       const float h_alpha = 1.0f;
       const float h_beta = 0.0f;
@@ -587,6 +591,16 @@ int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat
   if (c != nullptr) cublasLtMatrixLayoutDestroy(c);
   if (b != nullptr) cublasLtMatrixLayoutDestroy(b);
   return result;
+}
+
+int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
+                     int K, cudaStream_t stream) {
+  return lt_pin_run(W, X, Y, M, N, K, stream, /*check_only=*/false);
+}
+
+// Boot self-check: thin check-only wrapper over lt_pin_run.
+int gemm_lt_pin_check_cuda(int M, int N, int K) {
+  return lt_pin_run(nullptr, nullptr, nullptr, M, N, K, /*stream=*/nullptr, /*check_only=*/true);
 }
 
 // Diagnostics: write [tile_id, stages_id, splitk_num, reduction_scheme] for (M,K) into out4;

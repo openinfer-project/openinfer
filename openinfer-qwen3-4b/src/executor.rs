@@ -545,8 +545,8 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
 /// Prepare decode GEMM algos before capture, per the active numeric policy: under `Pin`, eagerly pin
 /// one algo per projection {M,K} (reused for all N); otherwise tune the fastest cublasLt algo per
 /// decode shape (buckets up to `GEMM_LT_MAX_N`, every layer's weights in the L2-cold timing rotation).
-/// Adds a few seconds of startup per model thread.
-fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
+/// Adds a few seconds of startup per model thread (warmup + the Pin self-check).
+fn tune_decode_gemm_algos(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<()> {
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
     let vocab = model.config().vocab_size;
@@ -568,6 +568,7 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
             "Qwen3 split-KV decode chunk pinned: {} tokens (max_context_tokens={max_context})",
             crate::batch_decode_buffers::pin_chunk_size(max_context)
         );
+        verify_pin_envelope(model, max_prefill_tokens)?;
         return Ok(());
     }
 
@@ -604,6 +605,53 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
         ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
         ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
     }
+    Ok(())
+}
+
+/// Boot-time check that under `Pin` the pinned algo serves the FULL production N
+/// envelope — EVERY reachable N, not a sample — with zero per-token fallback. Each N is checked
+/// by the host-side `gemm_lt_pin_check`, so the dense full-N sweep is a startup-only cost. Runs post-warmup,
+/// pre-capture, on the GEMM thread (per TP rank via `bind`); `bail!`s naming the first unserved
+/// {M,N,K}. Each projection's N upper bound is set below.
+fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<()> {
+    use openinfer_kernels::ops::gemm_lt_pin_check;
+
+    let hidden = model.config().hidden_size;
+    let q_dim = model.local_q_dim();
+    let kv_dim = model.local_kv_dim();
+    let intermediate = model.local_intermediate_size();
+    // Unified-N peak: one prefill chunk (≤ max_prefill_tokens) + (max_bucket−1) concurrent decoders;
+    // rests on max_decode_batch_size == BATCH_BUCKETS.last().
+    let ceiling = max_prefill_tokens + (*BATCH_BUCKETS.last().unwrap()).saturating_sub(1);
+    // lm_head (vocab×hidden) runs on the sampled-position count, not the token count: decode-only
+    // pads to a bucket (≤ max_decode_batch_size) and unified gathers ≤ that many requests, while
+    // echo/all-position runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
+    let lm_head_max_n = max_prefill_tokens.max(*BATCH_BUCKETS.last().unwrap());
+    let shapes: [(usize, usize, usize); 6] = [
+        (q_dim, hidden, ceiling),
+        (kv_dim, hidden, ceiling),
+        (hidden, q_dim, ceiling),
+        (intermediate, hidden, ceiling),
+        (hidden, intermediate, ceiling),
+        (model.config().vocab_size, hidden, lm_head_max_n),
+    ];
+    let mut checks = 0usize;
+    for &(m, k, max_n) in &shapes {
+        for n in 1..=max_n {
+            if !gemm_lt_pin_check(m, n, k)? {
+                anyhow::bail!(
+                    "batch-invariant pin self-check FAILED: pinned cuBLASLt algo cannot serve \
+                     N={n} at projection {{M={m}, K={k}}} — this GPU/cuBLAS combo would fall back \
+                     to per-token at runtime, breaking batch invariance. Run without \
+                     --batch-invariant or report the {{M,N,K}}."
+                );
+            }
+            checks += 1;
+        }
+    }
+    log::info!(
+        "batch-invariant pin envelope verified: every N up to {ceiling} (lm_head to {lm_head_max_n}), {checks} checks, 0 fallback"
+    );
     Ok(())
 }
 
@@ -940,7 +988,13 @@ impl Qwen3Executor {
             request_kvs: HashMap::new(),
             primary: RankWorker::spawn(
                 0,
-                LocalQwen3Lane::new(model, kv_buffer, total_blocks, padding_block_id)?,
+                LocalQwen3Lane::new(
+                    model,
+                    kv_buffer,
+                    total_blocks,
+                    padding_block_id,
+                    max_prefill_tokens,
+                )?,
             )?,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
@@ -1152,6 +1206,7 @@ impl Qwen3Executor {
                 primary_buffer,
                 total_blocks,
                 padding_block_id,
+                max_prefill_tokens,
             )?,
         )?;
 
@@ -1160,7 +1215,13 @@ impl Qwen3Executor {
             .zip(extra_kv_buffers)
             .enumerate()
             .map(|(index, (model, buffer))| {
-                let lane = LocalQwen3Lane::new(model, buffer, total_blocks, padding_block_id)?;
+                let lane = LocalQwen3Lane::new(
+                    model,
+                    buffer,
+                    total_blocks,
+                    padding_block_id,
+                    max_prefill_tokens,
+                )?;
                 RankWorker::spawn(index + 1, lane)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1235,6 +1296,14 @@ impl Qwen3Executor {
     /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
     /// returning an error if the GPU/driver cannot honor the requested mode.
     pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
+        // Policy-driven backstop (like `load_dflash_draft_model`): a runtime caller could set Pin then
+        // enable overlap here; overlap's stream override sends the pinned GEMM to the per-token fallback.
+        anyhow::ensure!(
+            !(openinfer_kernels::ops::numeric_policy()
+                == openinfer_kernels::ops::NumericPolicy::Pin
+                && !matches!(overlap, crate::DecodeOverlap::Off)),
+            "--batch-invariant (NumericPolicy::Pin) is not compatible with decode-overlap: the stream override forces the pinned GEMM to the per-token fallback"
+        );
         let device_ordinal = 0; // single-GPU path
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
         Ok(())
@@ -1274,6 +1343,13 @@ impl Qwen3Executor {
     /// capture needs clean, uncached target hidden states for every prompt
     /// token, and a prefix-cache hit skips the forward that would produce them.
     pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
+        // Policy-driven backstop: closes the `runtime` escape hatch (set_numeric_policy(Pin) +
+        // from_runtime + this) that bypasses the engine-entry DFlash gate. The Pin warmup/self-check
+        // covers only the base projections, never the drafter's fc/MLP GEMMs.
+        anyhow::ensure!(
+            openinfer_kernels::ops::numeric_policy() != openinfer_kernels::ops::NumericPolicy::Pin,
+            "DFlash speculative decoding is not supported under --batch-invariant (NumericPolicy::Pin)"
+        );
         anyhow::ensure!(
             self.workers.is_empty(),
             "speculative decoding requires the single-GPU path (got {} extra ranks)",
@@ -1529,7 +1605,7 @@ fn profile_kv_budget_on_worker(
         .spawn(move || -> Result<(Qwen3Model, KvBudget)> {
             let _guard = {
                 bind_model_thread(&model)?;
-                tune_decode_gemm_algos(&model)?;
+                tune_decode_gemm_algos(&model, max_prefill_tokens)?;
                 CublasThreadGuard
             };
             let budget = model.profiled_kv_budget(
@@ -2383,6 +2459,8 @@ struct LocalQwen3Lane {
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
     sample_scratch: openinfer_sample::SampleScratch,
+    /// Prefill-chunk token cap; bounds the Pin self-check's unified-N envelope in `bind`.
+    max_prefill_tokens: usize,
     /// In-flight prefill from a previous SplitConcurrent step (not yet synced).
     inflight_prefill: Option<InflightPrefillState>,
     /// DFlash draft lane (the draft model + per-request draft state). `None`
@@ -2417,6 +2495,7 @@ impl LocalQwen3Lane {
         kv_buffer: KvBuffer,
         total_blocks: usize,
         padding_block_id: i32,
+        max_prefill_tokens: usize,
     ) -> Result<Self> {
         let buf_layout = kv_buffer.layout();
         let layout = KvLayout::new(
@@ -2450,6 +2529,7 @@ impl LocalQwen3Lane {
             layout,
             bufs,
             sample_scratch,
+            max_prefill_tokens,
             inflight_prefill: None,
             dflash: None,
             verify_bufs: None,
@@ -2483,7 +2563,7 @@ impl LocalQwen3Lane {
 
     fn bind(&self) -> Result<CublasThreadGuard> {
         bind_model_thread(&self.model)?;
-        tune_decode_gemm_algos(&self.model)?;
+        tune_decode_gemm_algos(&self.model, self.max_prefill_tokens)?;
         Ok(CublasThreadGuard)
     }
 
