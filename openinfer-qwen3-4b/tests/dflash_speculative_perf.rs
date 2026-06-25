@@ -66,6 +66,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
+        enable_kv_events: false,
     }
 }
 
