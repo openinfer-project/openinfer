@@ -2,9 +2,7 @@
 //! lengths (so the projection GEMM runs at different N) must give a bit-identical top-K under Pin.
 //! The pure-Decode-vs-Unified cross-path case drifts even under Pin and is the `#[ignore]` below.
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{
-    NumericPolicy, pin_counters, pin_fallback_shapes, reset_pin_counters, set_numeric_policy,
-};
+use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId, UnifiedPlan,
 };
@@ -46,7 +44,7 @@ fn unified_decode_row(
     cobatch: usize,
     id_dec: u64,
     id_pf: u64,
-) -> (Vec<(u32, f32)>, (u64, u64)) {
+) -> (Vec<(u32, f32)>, u64) {
     let id_a = RequestId::new(id_dec);
     let t0 = prefill_first(ex, id_a, p);
     let id_b = RequestId::new(id_pf);
@@ -71,10 +69,10 @@ fn unified_decode_row(
         .clone()
         .map(|l| l.top_logprobs)
         .unwrap_or_default();
-    let counters = pin_counters();
+    let served = pin_served();
     let _ = ex.drop_request(id_b);
     let _ = ex.drop_request(id_a);
-    (topk, counters)
+    (topk, served)
 }
 
 fn pure_decode_row(ex: &mut Qwen3Executor, p: &[u32], id_dec: u64) -> Vec<(u32, f32)> {
@@ -118,14 +116,11 @@ fn unified_within_path_gemm_n_invariant_under_pin() {
     let mut base: Option<Vec<(u32, f32)>> = None;
     for (i, &c) in COBATCH.iter().enumerate() {
         let n = c + 1;
-        let (topk, (served, fb)) =
+        let (topk, served) =
             unified_decode_row(&mut ex, &p, c, 100 + i as u64 * 2, 101 + i as u64 * 2);
+        // launch_gemm_pin bails on any can't-serve-N, so a completed run proves zero fallback;
+        // served>0 guards against a vacuous pass.
         assert!(served > 0, "Pin N={n}: served=0 — pin never ran (vacuous)");
-        assert!(
-            pin_fallback_shapes().is_empty(),
-            "Pin N={n}: {fb} per-token fallback(s), shapes {:?}",
-            pin_fallback_shapes()
-        );
         match &base {
             None => base = Some(topk),
             Some(b) => assert_eq!(
@@ -133,7 +128,7 @@ fn unified_within_path_gemm_n_invariant_under_pin() {
                 "Pin: Unified decode row drifted at N={n} vs N=101 — GEMM-N not invariant within Unified"
             ),
         }
-        eprintln!("[unified-gate] Pin N={n}: served={served} fb={fb} bit-eq-vs-N101=ok");
+        eprintln!("[unified-gate] Pin N={n}: served={served} bit-eq-vs-N101=ok");
     }
     drop(ex);
 

@@ -603,31 +603,6 @@ int gemm_lt_pin_check_cuda(int M, int N, int K) {
   return lt_pin_run(nullptr, nullptr, nullptr, M, N, K, /*stream=*/nullptr, /*check_only=*/true);
 }
 
-// Diagnostics: write [tile_id, stages_id, splitk_num, reduction_scheme] for (M,K) into out4;
-// GEMM_LT_PIN_UNTUNED if no pinned plan.
-int gemm_lt_pin_inspect_cuda(int M, int K, int *out4) {
-  if (out4 == nullptr) {
-    return static_cast<int>(cudaErrorInvalidValue);
-  }
-  auto it = g_lt_pin_plans.find(std::array<int, 2>{M, K});
-  if (it == g_lt_pin_plans.end()) {
-    return GEMM_LT_PIN_UNTUNED;
-  }
-  cublasLtMatmulAlgo_t &algo = it->second.algo;
-  int tile = -1, stages = -1, splitk = -1, reduction = -1;
-  size_t written = 0;
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile),
-                                       &written);
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages,
-                                       sizeof(stages), &written);
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk,
-                                       sizeof(splitk), &written);
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction,
-                                       sizeof(reduction), &written);
-  out4[0] = tile, out4[1] = stages, out4[2] = splitk, out4[3] = reduction;
-  return static_cast<int>(cudaSuccess);
-}
-
 // Batched per-token GEMM: each row is computed as the same N=1 GEMM used by
 // decode, preserving row-wise numerical parity while keeping a batch-shaped
 // Rust API.
@@ -660,16 +635,6 @@ int gemm_per_token_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
     }
   }
   return static_cast<int>(cudaPeekAtLastError());
-}
-
-// 1 if `stream` is mid graph-capture, 0 if not, <0 (negated cudaError_t) on query failure.
-int stream_is_capturing_cuda(cudaStream_t stream) {
-  cudaStreamCaptureStatus capture_status;
-  cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
-  if (err != cudaSuccess) {
-    return -static_cast<int>(err);
-  }
-  return capture_status == cudaStreamCaptureStatusNone ? 0 : 1;
 }
 
 } // extern "C"

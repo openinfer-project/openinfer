@@ -4,13 +4,14 @@
 //!
 //! prompt_a's top-K alone vs co-batched with a filler, under three policies: baseline (Tuned,
 //! drifts = the bug), pin (top-K bit-identical = the fix), per_token (oracle). Pass requires full
-//! ordered top-K equality + a baseline-drift guard + fallback=0 for total_N≤32.
+//! ordered top-K equality + a baseline-drift guard + served>0 (per-token fallback under Pin is
+//! impossible — `launch_gemm_pin` bails, surfacing as a prefill `.expect` panic).
 //!
 //!   OPENINFER_TEST_MODEL_PATH=<Qwen3-4B-base> cargo test --release \
 //!     -p openinfer-qwen3-4b --test batch_invariance_endtoend -- --nocapture
 
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, pin_counters, reset_pin_counters, set_numeric_policy};
+use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
 use openinfer_qwen3_4b::runtime::{PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId};
 
 const LOGPROBS: usize = 64;
@@ -65,9 +66,6 @@ fn batch_invariance_endtoend() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let mut ex = Qwen3Executor::from_runtime(&model_path, false, &[0]).expect("build executor");
-    ex.set_prefix_cache_enabled(false);
-
     let prompt_a: Vec<u32> = vec![9707];
     let nbs: [usize; 5] = [1, 7, 15, 31, 63]; // total_N = 2,8,16,32,64 — straddles GEMM_LT_MAX_N
     let id_a = RequestId::new(1);
@@ -79,7 +77,12 @@ fn batch_invariance_endtoend() {
         NumericPolicy::Pin,
         NumericPolicy::PerToken,
     ] {
+        // Fresh executor per policy: the pin warmup must run under Pin, as production sets the policy
+        // before construction. Switching policy on a live executor leaves base shapes unpinned, which
+        // launch_gemm_pin now bails on.
         set_numeric_policy(policy);
+        let mut ex = Qwen3Executor::from_runtime(&model_path, false, &[0]).expect("build executor");
+        ex.set_prefix_cache_enabled(false);
         let alone = dist_for_first(&mut ex, &[(id_a, prompt_a.clone())]);
         for &nb in &nbs {
             reset_pin_counters();
@@ -88,7 +91,6 @@ fn batch_invariance_endtoend() {
                 &mut ex,
                 &[(id_a, prompt_a.clone()), (id_b, vec![785u32; nb])],
             );
-            let (served, fallback) = pin_counters();
             let total_n = prompt_a.len() + nb;
             let topk_equal = alone == batched;
 
@@ -104,17 +106,13 @@ fn batch_invariance_endtoend() {
                         "PIN: prompt_a top-K changed when co-batched (+Nb={nb}, total_N={total_n}) \
                          — projection-GEMM reduction-order NOT invariant under the pin in this prefill path"
                     );
+                    // launch_gemm_pin bails on any can't-serve-N fallback, so a completed run proves
+                    // zero fallback — including the small-N (total_N<=32) case this loop exercises.
+                    // served>0 guards against a vacuous pass.
                     assert!(
-                        served > 0,
+                        pin_served() > 0,
                         "PIN: no GEMM ran the pinned algo (+Nb={nb}) — vacuous"
                     );
-                    if total_n <= 32 {
-                        assert_eq!(
-                            fallback, 0,
-                            "PIN: fell back to per-token at total_N={total_n}<=32 (+Nb={nb}) — \
-                             proving the fallback, not the pin"
-                        );
-                    }
                 }
                 NumericPolicy::PerToken => {
                     assert!(

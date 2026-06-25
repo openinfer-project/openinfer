@@ -641,9 +641,9 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
             if !gemm_lt_pin_check(m, n, k)? {
                 anyhow::bail!(
                     "batch-invariant pin self-check FAILED: pinned cuBLASLt algo cannot serve \
-                     N={n} at projection {{M={m}, K={k}}} — this GPU/cuBLAS combo would fall back \
-                     to per-token at runtime, breaking batch invariance. Run without \
-                     --batch-invariant or report the {{M,N,K}}."
+                     N={n} at projection {{M={m}, K={k}}} — this GPU/cuBLAS combo cannot serve the \
+                     full envelope, so the pinned GEMM would bail at runtime rather than serve it. \
+                     Run without --batch-invariant or report the {{M,N,K}}."
                 );
             }
             checks += 1;
@@ -1296,13 +1296,14 @@ impl Qwen3Executor {
     /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
     /// returning an error if the GPU/driver cannot honor the requested mode.
     pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
-        // Policy-driven backstop (like `load_dflash_draft_model`): a runtime caller could set Pin then
-        // enable overlap here; overlap's stream override sends the pinned GEMM to the per-token fallback.
+        // Pre-capture backstop: a runtime caller could set Pin then enable overlap here, bypassing the
+        // engine-entry guard. launch_gemm_pin also bails on the resulting stream override, but only mid
+        // graph-capture/replay (a hot-path failure) — rejecting here moves it to a safe point.
         anyhow::ensure!(
             !(openinfer_kernels::ops::numeric_policy()
                 == openinfer_kernels::ops::NumericPolicy::Pin
                 && !matches!(overlap, crate::DecodeOverlap::Off)),
-            "--batch-invariant (NumericPolicy::Pin) is not compatible with decode-overlap: the stream override forces the pinned GEMM to the per-token fallback"
+            "--batch-invariant (NumericPolicy::Pin) is not compatible with decode-overlap: the stream override would force the pinned GEMM to bail at runtime"
         );
         let device_ordinal = 0; // single-GPU path
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
@@ -1343,13 +1344,6 @@ impl Qwen3Executor {
     /// capture needs clean, uncached target hidden states for every prompt
     /// token, and a prefix-cache hit skips the forward that would produce them.
     pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
-        // Policy-driven backstop: closes the `runtime` escape hatch (set_numeric_policy(Pin) +
-        // from_runtime + this) that bypasses the engine-entry DFlash gate. The Pin warmup/self-check
-        // covers only the base projections, never the drafter's fc/MLP GEMMs.
-        anyhow::ensure!(
-            openinfer_kernels::ops::numeric_policy() != openinfer_kernels::ops::NumericPolicy::Pin,
-            "DFlash speculative decoding is not supported under --batch-invariant (NumericPolicy::Pin)"
-        );
         anyhow::ensure!(
             self.workers.is_empty(),
             "speculative decoding requires the single-GPU path (got {} extra ranks)",

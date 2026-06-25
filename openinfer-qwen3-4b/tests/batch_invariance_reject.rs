@@ -1,5 +1,5 @@
 //! `--batch-invariant` is rejected at the Qwen3 builder boundary for unsupported combos:
-//! stream overlap and the DFlash drafter would silently fall back to per-token, and LoRA shapes are not gated.
+//! stream overlap, the DFlash drafter, and LoRA each run GEMMs the base-projection pin does not cover; the builder rejects all three.
 
 use std::path::Path;
 use std::sync::Mutex;

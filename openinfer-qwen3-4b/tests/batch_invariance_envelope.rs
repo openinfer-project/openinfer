@@ -1,10 +1,8 @@
-//! Production-envelope fallback guard: under Pin the {M,K} algo is pinned and reused for every N;
-//! this asserts zero per-token fallback across the swept Qwen3-4B envelope — Unified at
-//! N=101/201/513/1024/1279 and pure-Decode at bs=256 (exactly these points, not all N).
+//! Production-envelope guard: under Pin the {M,K} algo is pinned and reused for every N; this
+//! verifies it serves the swept Qwen3-4B envelope — Unified at N=101/201/513/1024/1279 and
+//! pure-Decode at bs=256 (exactly these points, not all N) — a shape it can't serve would bail.
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{
-    NumericPolicy, pin_counters, pin_fallback_shapes, reset_pin_counters, set_numeric_policy,
-};
+use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId, UnifiedPlan,
 };
@@ -42,18 +40,15 @@ fn prefill_first(ex: &mut Qwen3Executor, id: RequestId, prompt: &[u32]) -> u32 {
         .first_token
 }
 
-fn assert_no_fallback(label: &str, n: usize) {
-    let (served, fb) = pin_counters();
-    let shapes = pin_fallback_shapes();
+/// `launch_gemm_pin` bails on any can't-serve-N / stream-override fallback, so a completed run
+/// already proves zero fallback; this only guards against a vacuous pass (the pin never ran).
+fn assert_pin_served(label: &str, n: usize) {
+    let served = pin_served();
     assert!(
         served > 0,
         "{label} N={n}: served=0 — pin never ran (vacuous)"
     );
-    assert!(
-        shapes.is_empty(),
-        "{label} N={n}: {fb} per-token fallback(s), shapes {shapes:?} — pin cannot serve this N"
-    );
-    eprintln!("[envelope] {label} N={n}: served={served} fallback={fb} ok");
+    eprintln!("[envelope] {label} N={n}: served={served} ok");
 }
 
 #[test]
@@ -83,8 +78,8 @@ fn pin_serves_production_envelope_without_fallback() {
                 decode_requests: &[DecodeStepItem::new(id_d, t, SamplingParams::default(), 64)],
                 sample_seed: 0,
             })
-            .expect("unified envelope");
-        assert_no_fallback("Unified", pf + 1);
+            .unwrap_or_else(|e| panic!("Unified N={} bailed: {e}", pf + 1));
+        assert_pin_served("Unified", pf + 1);
         let _ = ex.drop_request(id_p);
         let _ = ex.drop_request(id_d);
     }
@@ -106,8 +101,8 @@ fn pin_serves_production_envelope_without_fallback() {
             requests: &items,
             sample_seed: 0,
         })
-        .expect("decode bs=256");
-    assert_no_fallback("pure-Decode", 256);
+        .unwrap_or_else(|e| panic!("pure-Decode N=256 bailed: {e}"));
+    assert_pin_served("pure-Decode", 256);
     for (id, _) in &dec {
         let _ = ex.drop_request(*id);
     }
@@ -138,8 +133,8 @@ fn pin_serves_production_envelope_without_fallback() {
             decode_requests: &decode_items,
             sample_seed: 0,
         })
-        .expect("unified N=1279");
-    assert_no_fallback("Unified", 1279);
+        .unwrap_or_else(|e| panic!("Unified N=1279 bailed: {e}"));
+    assert_pin_served("Unified", 1279);
     let _ = ex.drop_request(id_big);
     for (id, _) in &decoders {
         let _ = ex.drop_request(*id);

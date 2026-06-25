@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, bail};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -88,8 +86,9 @@ pub fn gemm_lt_pin_tune(num_rows: usize, rep_n: usize, cols: usize) -> Result<()
     Ok(())
 }
 
-/// Run the pinned `(rows, cols)` algo at this N. `Ok(false)` = algo can't serve this N (caller
-/// falls back); bails if never pinned.
+/// Run the pinned `(rows, cols)` algo at this N. `Ok(false)` = algo can't serve this N; bails if
+/// never pinned. Used by the kernel serviceability test only — the production Pin path is
+/// `launch_gemm_pin`, which fails loud instead of returning `Ok(false)`.
 pub fn gemm_lt_pin_into_checked(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
@@ -169,15 +168,6 @@ pub fn gemm_lt_pin_check(rows: usize, n: usize, cols: usize) -> Result<bool> {
             bail!("gemm_lt_pin_check: cublas layout error (status {s}), m={rows}, n={n}, k={cols}")
         }
     }
-}
-
-/// Diagnostics: the pinned algo's `[tile_id, stages_id, splitk_num, reduction_scheme]` for
-/// `(rows, cols)`, or `None` if never pinned.
-pub fn gemm_lt_pin_inspect(rows: usize, cols: usize) -> Option<[i32; 4]> {
-    let mut out = [0i32; 4];
-    let status =
-        unsafe { ffi::gemm_lt_pin_inspect_cuda(rows as i32, cols as i32, out.as_mut_ptr()) };
-    if status == 0 { Some(out) } else { None }
 }
 
 /// GEMM on a row sub-range of a weight matrix: Y = W[row_offset..row_offset+M, :] @ X
@@ -470,8 +460,9 @@ fn gemm_ref_into_with_policy(
 
 /// Process-global numeric policy for projection GEMMs (atomics, not thread-local: set on the main
 /// thread before worker construction, read on the worker). `Tuned` (default) = production path;
-/// `Pin` = batch-invariant pinned algo (per-token fallback when it can't serve an N, or under a
-/// stream override); `PerToken` = N=1 oracle. Set via `set_numeric_policy` before executor
+/// `Pin` = batch-invariant pinned algo (one cuBLASLt algo per `(M,K)`; `launch_gemm_pin` bails — no
+/// per-token fallback — if it can't serve an N or under a stream override); `PerToken` = N=1 oracle.
+/// Set via `set_numeric_policy` before executor
 /// construction / graph capture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -483,14 +474,6 @@ pub enum NumericPolicy {
 
 static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(NumericPolicy::Tuned as u8);
 static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
-static PIN_FALLBACK: AtomicU64 = AtomicU64::new(0);
-type FallbackShapeMap = Mutex<BTreeMap<(usize, usize, usize), u64>>;
-/// Per-(m, n, k) fallback tally; only the fallback branch touches it (served path stays lock-free).
-static PIN_FALLBACK_SHAPES: OnceLock<FallbackShapeMap> = OnceLock::new();
-
-fn pin_fallback_shapes_map() -> &'static FallbackShapeMap {
-    PIN_FALLBACK_SHAPES.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
 
 /// Set the process-global policy. Must run before executor construction / graph capture (the
 /// captured algo is the one live at capture). Tests drive baseline/pin/per-token through it.
@@ -506,42 +489,16 @@ pub fn numeric_policy() -> NumericPolicy {
     }
 }
 
-/// `(pin_served, pin_fallback)` projection-GEMM counts: process-global, mixed across prefill +
-/// decode + unified and across TP ranks (not decode-specific). Decode counts the graph capture,
-/// not replays; read quiesced.
-pub fn pin_counters() -> (u64, u64) {
-    (
-        PIN_SERVED.load(Ordering::Relaxed),
-        PIN_FALLBACK.load(Ordering::Relaxed),
-    )
+/// Count of projection GEMMs served by the pinned algo: process-global, mixed across prefill +
+/// decode + unified and across TP ranks. Under `Pin` a GEMM either serves (counted here) or
+/// `launch_gemm_pin` bails — there is no silent per-token fallback. Decode counts the graph
+/// capture, not replays; read quiesced.
+pub fn pin_served() -> u64 {
+    PIN_SERVED.load(Ordering::Relaxed)
 }
 
 pub fn reset_pin_counters() {
     PIN_SERVED.store(0, Ordering::Relaxed);
-    PIN_FALLBACK.store(0, Ordering::Relaxed);
-    pin_fallback_shapes_map().lock().unwrap().clear();
-}
-
-/// `((m, n, k), count)` per shape that fell back to per-token. Quiesced and single-threaded, an
-/// empty list means no recorded fallback; under TP/concurrency the map and counter can momentarily
-/// disagree.
-pub fn pin_fallback_shapes() -> Vec<((usize, usize, usize), u64)> {
-    pin_fallback_shapes_map()
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(&shape, &count)| (shape, count))
-        .collect()
-}
-
-fn record_pin_fallback(m: usize, n: usize, k: usize, reason: &str) {
-    PIN_FALLBACK.fetch_add(1, Ordering::Relaxed);
-    let mut shapes = pin_fallback_shapes_map().lock().unwrap();
-    let count = shapes.entry((m, n, k)).or_insert(0);
-    if *count == 0 {
-        log::warn!("batch-invariant pin fell back to per-token at (m={m}, n={n}, k={k}): {reason}");
-    }
-    *count += 1;
 }
 
 /// Fixed representative N at which every (M,K) pin is resolved — one algo for ALL
@@ -553,7 +510,8 @@ pub fn gemm_lt_pin_warmup(num_rows: usize, cols: usize) -> Result<()> {
     gemm_lt_pin_tune(num_rows, PIN_REP_N as usize, cols)
 }
 
-/// `Pin` policy: lazily pin (m,k) at PIN_REP_N, run at live N, per-token fallback if it can't serve N.
+/// `Pin` policy: run the boot-warmed pinned (m,k) algo at live N; bails if (m,k) isn't pinned or the
+/// algo can't serve N (no lazy tune, no per-token fallback, which would break invariance).
 fn launch_gemm_pin(
     w_ptr: *const ffi::Half,
     x_ptr: *const ffi::Half,
@@ -563,30 +521,21 @@ fn launch_gemm_pin(
     k: usize,
     ctx: &DeviceContext,
 ) -> Result<()> {
-    // cuBLASLt (gemm_lt_pin) risks Xid 31 under a stream override; fall back to per-token.
+    // launch_gemm_pin runs only under Pin, so a per-token fallback here would silently break batch
+    // invariance — fail loud instead. decode-overlap (the only stream-override source) is rejected
+    // before capture, so reaching this is a misconfiguration, not a normal path.
     if crate::tensor::has_stream_override() {
-        record_pin_fallback(
-            m,
-            n,
-            k,
-            "stream override active (cuBLASLt would risk Xid 31)",
+        bail!(
+            "batch-invariant Pin GEMM cannot run under a stream override (m={m}, n={n}, k={k}): \
+             --batch-invariant is incompatible with --decode-overlap; run without one of them"
         );
-        return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx);
     }
-    // The eager warmup (gemm_lt_pin_warmup in tune_decode_gemm_algos) pins every decode shape before
-    // capture; a lazy tune here allocates, illegal mid-capture — so refuse under capture, don't 900.
-    if gemm_lt_pin_inspect(m, k).is_none() {
-        match unsafe { ffi::stream_is_capturing_cuda(crate::tensor::active_cu_stream(ctx)) } {
-            0 => gemm_lt_pin_tune(m, PIN_REP_N as usize, k)?,
-            s if s < 0 => bail!(
-                "cudaStreamIsCapturing query failed: status={}, m={m}, k={k}",
-                -s
-            ),
-            _ => bail!(
-                "batch-invariant pin: ({m},{k}) reached graph capture unpinned — the decode pin warmup must run before capture"
-            ),
-        }
-    }
+    // Only the boot-warmed base projections are pinned (gemm_lt_pin_warmup in tune_decode_gemm_algos,
+    // checked by verify_pin_envelope). Any other (m,k) routed through launch_gemm — a DFlash drafter
+    // GEMM, a LoRA prefill-delta GEMM, or a base projection when the policy was set after construction
+    // — is unverified: gemm_lt_pin_cuda returns GEMM_LT_PIN_UNTUNED and the match below bails. No lazy
+    // tune: it would run an unchecked shape, and allocate illegally mid-capture. (The LoRA decode
+    // delta runs in a custom per-token kernel, invariant by construction, and bypasses this path.)
     unsafe {
         let status = ffi::gemm_lt_pin_cuda(
             w_ptr,
@@ -602,22 +551,12 @@ fn launch_gemm_pin(
                 PIN_SERVED.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            GEMM_LT_PIN_UNSUPPORTED | GEMM_LT_PIN_UNTUNED => {
-                record_pin_fallback(m, n, k, "pinned algo cannot serve this N");
-                let st = ffi::gemm_per_token_cuda(
-                    w_ptr,
-                    x_ptr,
-                    y_ptr,
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    crate::tensor::active_cu_stream(ctx),
-                );
-                if st != 0 {
-                    bail!("pin per-token fallback failed: status={st}, m={m}, n={n}, k={k}");
-                }
-                Ok(())
-            }
+            GEMM_LT_PIN_UNSUPPORTED | GEMM_LT_PIN_UNTUNED => bail!(
+                "batch-invariant Pin GEMM cannot serve N={n} at (m={m}, k={k}): the boot envelope \
+                 self-check passed, so this is an out-of-envelope N, an unwarmed (M,K) such as a DFlash \
+                 drafter or LoRA prefill-delta shape, or the numeric policy was set after executor \
+                 construction. Run without --batch-invariant or report this shape"
+            ),
             s if s >= 100_000 => {
                 bail!(
                     "cuBLAS pin GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",

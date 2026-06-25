@@ -362,8 +362,8 @@ pub fn start_engine_with_lora_control(
     if batch_invariant {
         anyhow::bail!(
             "--batch-invariant is not supported with LoRA: the decode-GEMM pin warms and self-checks \
-             only the base projection {{M,K}}, so LoRA's rank-K adapter GEMMs would silently fall \
-             back to the non-invariant per-token path"
+             only the base projections, not the per-adapter rank-K shapes, so the combination is \
+             unverified"
         );
     }
     apply_batch_invariant_policy(batch_invariant);
@@ -399,14 +399,14 @@ fn ensure_batch_invariant_supported(
 ) -> Result<()> {
     if batch_invariant && !matches!(decode_overlap, DecodeOverlap::Off) {
         anyhow::bail!(
-            "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+            "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
         );
     }
     if batch_invariant && dflash {
         anyhow::bail!(
             "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
              pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
-             would silently fall back to the non-invariant per-token path"
+             are not pinned and would bail at the GEMM boundary under Pin"
         );
     }
     Ok(())

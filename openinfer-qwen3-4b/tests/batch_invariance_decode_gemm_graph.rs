@@ -9,7 +9,7 @@
 //!     -p openinfer-qwen3-4b --test batch_invariance_decode_gemm_graph -- --nocapture
 
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, pin_counters, reset_pin_counters, set_numeric_policy};
+use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
 };
@@ -99,7 +99,7 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
 }
 
 /// One fresh executor with `policy` active before first decode (graph captured under it).
-fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64, u64)> {
+fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64)> {
     set_numeric_policy(policy);
     let mut ex = Qwen3Executor::from_runtime(model_path, true, &[0]).expect("build executor");
     ex.set_prefix_cache_enabled(false);
@@ -108,12 +108,12 @@ fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64, 
         reset_pin_counters();
         let (ft_s, tk_s) = a_first_and_decode(&mut ex, small);
         let (ft_l, tk_l) = a_first_and_decode(&mut ex, large);
-        let (served, fallback) = pin_counters();
+        let served = pin_served();
         let ft_eq = ft_s == ft_l;
         let tk_eq = tk_s == tk_l;
         // served counts the CAPTURE step only (replay skips the closure). Under baseline/per_token,
-        // launch_gemm_pin is never called → served/fallback are structurally 0 (N/A).
-        out.push((ft_eq, tk_eq, served, fallback));
+        // launch_gemm_pin is never called → served is structurally 0 (N/A).
+        out.push((ft_eq, tk_eq, served));
     }
     out
 }
@@ -134,7 +134,7 @@ fn batch_invariance_decode_gemm_graph() {
         ("pin", &pin),
         ("per_token", &pertoken),
     ] {
-        for (i, (ft_eq, _, _, _)) in rows.iter().enumerate() {
+        for (i, (ft_eq, _, _)) in rows.iter().enumerate() {
             assert!(
                 *ft_eq,
                 "{name}: A's prefill first_token differs across batch on pair {} — decode \
@@ -145,16 +145,16 @@ fn batch_invariance_decode_gemm_graph() {
     }
 
     // Control: baseline must drift on at least one pair (else not reproduced here).
-    let baseline_drifted = baseline.iter().any(|(_, tk_eq, _, _)| !tk_eq);
+    let baseline_drifted = baseline.iter().any(|(_, tk_eq, _)| !tk_eq);
     assert!(
         baseline_drifted,
         "baseline did NOT drift on any pair — decode-GEMM coupling not reproduced; \
          the pin proof would be vacuous"
     );
 
-    // Pin: every pair invariant, served>0 (pin ran at capture), fallback==0 (per-token oracle
-    // did not cover for it).
-    for (i, (_, tk_eq, served, fallback)) in pin.iter().enumerate() {
+    // Pin: every pair invariant, served>0 (pin ran at capture). launch_gemm_pin bails on any
+    // can't-serve-N, so a completed capture already proves no per-token oracle covered for it.
+    for (i, (_, tk_eq, served)) in pin.iter().enumerate() {
         assert!(
             *tk_eq,
             "PIN: A's graph decode top-K changed on pair {} — pin did NOT make graph decode \
@@ -166,14 +166,8 @@ fn batch_invariance_decode_gemm_graph() {
             "PIN: pin did not run on pair {} (served=0) — vacuous",
             PAIRS[i].0.trim()
         );
-        assert!(
-            *fallback == 0,
-            "PIN: pair {} fell back to per-token (fallback={fallback}) — invariance carried by the \
-             fallback oracle, not the pinned algo (if a large bucket: check LT_WORKSPACE_SIZE)",
-            PAIRS[i].0.trim()
-        );
     }
-    for (i, (_, tk_eq, _, _)) in pertoken.iter().enumerate() {
+    for (i, (_, tk_eq, _)) in pertoken.iter().enumerate() {
         assert!(
             *tk_eq,
             "PER_TOKEN: A's graph decode top-K changed on pair {} — harness bug",

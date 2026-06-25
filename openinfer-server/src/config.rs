@@ -194,7 +194,7 @@ impl Args {
         }
         if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
             bail!(
-                "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+                "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
             );
         }
         if self.batch_invariant && self.dflash_draft_model_path.is_some() {
