@@ -43,6 +43,13 @@ pub(crate) const GLM52_INDEX_HEADS: usize = 32;
 const GLM52_INDEX_SKIP_TOPK_OFFSET: usize = 3;
 const GLM52_NEXTN_LAYERS: usize = 1;
 
+/// Fixed-shape decode bucket (max tokens per decode step) and the H200 SM count
+/// the paged-decode geometry plans against. These are model-runtime decode
+/// constants (formerly co-located with the dropped DeepEP shape); the bs=1 PP
+/// scheduler will revisit the bucket once the stage runtime lands.
+pub(crate) const GLM52_DECODE_BATCH_CAP: usize = 128;
+pub(crate) const GLM52_DECODE_DEVICE_SMS: usize = 132;
+
 const GLM52_ROPE_THETA: f64 = 8_000_000.0;
 
 pub fn probe_config_json(json: &Value) -> Result<()> {

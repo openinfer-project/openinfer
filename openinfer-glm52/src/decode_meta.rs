@@ -18,20 +18,9 @@ use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 
 use crate::{
-    deepep::{GLM52_DEEPEP_DECODE_BATCH_CAP, GLM52_DEEPEP_DEVICE_SMS},
+    config::{GLM52_DECODE_BATCH_CAP, GLM52_DECODE_DEVICE_SMS},
     weights::Glm52RankGpuContext,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Glm52DecodeMetadataSmokeReport {
-    pub(crate) rank: usize,
-    pub(crate) batch_capacity: usize,
-    pub(crate) active_rows: usize,
-    pub(crate) max_seq_len: usize,
-    pub(crate) total_active_blocks: usize,
-    pub(crate) block_table_entries: usize,
-    pub(crate) schedule_metadata_entries: usize,
-}
 
 /// One active decode row supplied by the scheduler.
 ///
@@ -75,12 +64,12 @@ impl Glm52DecodeBatchGeometry {
         padding_block_id: i32,
     ) -> Result<Self> {
         Self::new(
-            GLM52_DEEPEP_DECODE_BATCH_CAP,
+            GLM52_DECODE_BATCH_CAP,
             block_size,
             max_model_len,
             pool_blocks,
             padding_block_id,
-            GLM52_DEEPEP_DEVICE_SMS,
+            GLM52_DECODE_DEVICE_SMS,
         )
     }
 
@@ -93,8 +82,8 @@ impl Glm52DecodeBatchGeometry {
         num_sms: usize,
     ) -> Result<Self> {
         ensure!(
-            batch_capacity == GLM52_DEEPEP_DECODE_BATCH_CAP,
-            "GLM5.2 decode metadata is fixed at B={GLM52_DEEPEP_DECODE_BATCH_CAP}, got {batch_capacity}"
+            batch_capacity == GLM52_DECODE_BATCH_CAP,
+            "GLM5.2 decode metadata is fixed at B={GLM52_DECODE_BATCH_CAP}, got {batch_capacity}"
         );
         ensure!(block_size > 0, "GLM5.2 decode block_size must be positive");
         ensure!(
@@ -323,41 +312,10 @@ impl Glm52DecodeBatchMetadata {
             .memcpy_htod(schedule_metadata, &mut self.schedule_metadata)?;
         Ok(())
     }
-
-    fn report(&self, rank: usize) -> Glm52DecodeMetadataSmokeReport {
-        Glm52DecodeMetadataSmokeReport {
-            rank,
-            batch_capacity: self.geometry.batch_capacity,
-            active_rows: self.active_rows,
-            max_seq_len: self.max_seq_len,
-            total_active_blocks: self.total_active_blocks,
-            block_table_entries: self.block_table.len(),
-            schedule_metadata_entries: self.schedule_metadata.len(),
-        }
-    }
 }
 
 fn usize_to_i32(value: usize, name: &str) -> Result<i32> {
     i32::try_from(value).map_err(|_| anyhow::anyhow!("GLM5.2 decode {name} {value} exceeds i32"))
-}
-
-pub(crate) fn decode_metadata_smoke(
-    ctx: &Glm52RankGpuContext,
-    rank: usize,
-) -> Result<Glm52DecodeMetadataSmokeReport> {
-    let geometry = Glm52DecodeBatchGeometry::fixed_h200(64, 1024, 32, 31)?;
-    let mut metadata = Glm52DecodeBatchMetadata::new(ctx, geometry)?;
-    let row0_blocks = [3, 4];
-    let row1_blocks = [7];
-    let rows = [
-        Glm52DecodePageRow::new(65, &row0_blocks),
-        Glm52DecodePageRow::new(64, &row1_blocks),
-    ];
-    metadata.sync_from_rows(ctx, &rows)?;
-    let schedule_metadata = vec![0i32; geometry.schedule_metadata_len()];
-    metadata.upload_schedule_metadata(ctx, &schedule_metadata)?;
-    ctx.sync()?;
-    Ok(metadata.report(rank))
 }
 
 #[cfg(test)]
@@ -365,8 +323,7 @@ mod tests {
     use super::*;
 
     fn test_geometry() -> Glm52DecodeBatchGeometry {
-        Glm52DecodeBatchGeometry::new(GLM52_DEEPEP_DECODE_BATCH_CAP, 64, 1024, 100, 99, 132)
-            .unwrap()
+        Glm52DecodeBatchGeometry::new(GLM52_DECODE_BATCH_CAP, 64, 1024, 100, 99, 132).unwrap()
     }
 
     #[test]
@@ -419,8 +376,7 @@ mod tests {
     fn geometry_rejects_non_fixed_batch_and_bad_padding() {
         assert!(Glm52DecodeBatchGeometry::new(64, 64, 1024, 100, 99, 132).is_err());
         assert!(
-            Glm52DecodeBatchGeometry::new(GLM52_DEEPEP_DECODE_BATCH_CAP, 64, 1024, 100, 100, 132)
-                .is_err()
+            Glm52DecodeBatchGeometry::new(GLM52_DECODE_BATCH_CAP, 64, 1024, 100, 100, 132).is_err()
         );
     }
 }

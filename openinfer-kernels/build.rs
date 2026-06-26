@@ -403,17 +403,6 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
-/// GLM5.2 DeepEP elastic shim (csrc/glm52_deepep/): same DeepEP substrate as
-/// Kimi, but with GLM5.2's hidden/expert dimensions and separate C symbols.
-fn is_glm52_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "glm52_deepep"),
-        Err(_) => false,
-    }
-}
-
 /// GLM5.2 model-local kernels that are not DeepEP collectives.
 fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
@@ -1234,7 +1223,7 @@ fn main() {
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
     let glm52_enabled = cfg!(feature = "glm52");
-    let deepep_enabled = kimi_k2_enabled || glm52_enabled;
+    let deepep_enabled = kimi_k2_enabled;
     let qwen35_enabled = cfg!(feature = "qwen35-4b");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
@@ -1285,9 +1274,6 @@ fn main() {
                 return None;
             }
             if !kimi_k2_enabled && is_deepep_source(&csrc_dir, path) {
-                return None;
-            }
-            if !glm52_enabled && is_glm52_deepep_source(&csrc_dir, path) {
                 return None;
             }
             if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
@@ -1396,7 +1382,7 @@ fn main() {
 
         // DeepEP elastic shim: mirrors the upstream JIT compile flags
         // (DeepEP csrc/jit/compiler.hpp) minus the cubin plumbing.
-        if is_deepep_source(&csrc_dir, cu_file) || is_glm52_deepep_source(&csrc_dir, cu_file) {
+        if is_deepep_source(&csrc_dir, cu_file) {
             let nccl_root = deepep_nccl
                 .as_ref()
                 .expect("deepep sources are collected only with a DeepEP feature");
@@ -1520,10 +1506,7 @@ fn main() {
             ]);
         }
 
-        if stem.starts_with("glm52_")
-            && stem != "glm52_flashmla_sparse"
-            && !is_glm52_deepep_source(&csrc_dir, cu_file)
-        {
+        if stem.starts_with("glm52_") && stem != "glm52_flashmla_sparse" {
             nvcc_args.extend(["--std=c++17".to_string()]);
         }
 

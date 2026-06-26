@@ -4,20 +4,19 @@
 //! contract. Runtime execution will land behind the same API so the server
 //! already routes GLM5.2 through the normal Qwen-style `EngineHandle` path.
 
-mod arena;
 mod config;
+// Paged-KV decode geometry (vLLM-parity page table / slot mapping). It is
+// parallelism-agnostic and survives the DP8->PP8 pivot unchanged; the PP8
+// MLA/indexer/KV decode slice (Slice 3, docs/models/glm52/pp-decode.md) is its
+// first consumer, so it is unreferenced until then.
+#[allow(dead_code)]
 mod decode_meta;
-mod deepep;
-mod linear;
-mod moe_deepep;
-mod moe_gemm;
 mod runner;
 mod weights;
 
 use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
-use deepep::Glm52DeepEpShape;
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelInfo};
 use openinfer_core::parallel::ParallelConfig;
 use runner::{Glm52RankPlacement, Glm52RankWorker, run_rejecting_dp_coordinator};
@@ -84,7 +83,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
     let startup = validate_startup(model_path, &options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
     log::info!(
-        "GLM5.2 startup validated: shape={:?}, stop_tokens={:?}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}, rank0_header_bytes={}, nextn_tensors={}, deepep_decode_recv={}, deepep_decode_expanded={}, cuda_graph={}",
+        "GLM5.2 startup validated: shape={:?}, stop_tokens={:?}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}, rank0_header_bytes={}, nextn_tensors={}, cuda_graph={}",
         startup.shape,
         startup.stop_token_ids,
         startup.rank_tensor_counts,
@@ -92,8 +91,6 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         loaded.report.rank_bytes,
         startup.rank0_header_bytes,
         startup.nextn_tensor_count,
-        startup.deepep_decode_worst_recv_tokens,
-        startup.deepep_decode_worst_expanded_tokens,
         options.enable_cuda_graph
     );
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
@@ -113,8 +110,6 @@ struct StartupValidation {
     rank_tensor_counts: Vec<usize>,
     rank0_header_bytes: usize,
     nextn_tensor_count: usize,
-    deepep_decode_worst_recv_tokens: usize,
-    deepep_decode_worst_expanded_tokens: usize,
 }
 
 #[derive(Debug)]
@@ -145,10 +140,6 @@ fn validate_startup(model_path: &Path, options: &EngineLoadOptions) -> Result<St
         parallel.ep_world()
     );
     ensure!(
-        options.ep_backend == EpBackend::DeepEp,
-        "GLM5.2 TP1/DP8 requires --ep-backend=deepep"
-    );
-    ensure!(
         options.device_ordinals.len() == parallel.ep_world(),
         "GLM5.2 TP1/DP8/EP8 requires {} devices, got {:?}",
         parallel.ep_world(),
@@ -166,8 +157,6 @@ fn validate_startup(model_path: &Path, options: &EngineLoadOptions) -> Result<St
     );
     let manifest = Glm52WeightManifest::from_model_dir(model_path)?
         .with_parallel_shape(shape_from_parallel(parallel)?)?;
-    let deepep_shape = Glm52DeepEpShape::tp1_dp8_h200();
-    let deepep_decode = deepep_shape.decode_capacity()?;
     let rank_bundles = manifest.all_rank_load_bundles()?;
     let mut rank_tensor_counts = Vec::with_capacity(parallel.ep_world());
     let mut rank0_header_bytes = 0usize;
@@ -194,8 +183,6 @@ fn validate_startup(model_path: &Path, options: &EngineLoadOptions) -> Result<St
         rank_tensor_counts,
         rank0_header_bytes,
         nextn_tensor_count: manifest.nextn_tensor_count,
-        deepep_decode_worst_recv_tokens: deepep_decode.worst_recv_tokens,
-        deepep_decode_worst_expanded_tokens: deepep_decode.worst_expanded_tokens,
     })
 }
 
@@ -265,14 +252,6 @@ fn load_rank_weights_to_gpu(
             })
             .collect::<Vec<_>>()
     );
-    runner::smoke_non_expert_linear(&workers, deepep::GLM52_DEEPEP_DECODE_BATCH_CAP)?;
-    runner::install_deepep_backends(&workers)?;
-    runner::smoke_deepep_decode_roundtrip(&workers, GLM52_TOPK)?;
-    runner::smoke_moe_quant_decode(&workers, GLM52_TOPK)?;
-    runner::validate_moe_gemm_contracts(&workers)?;
-    runner::smoke_moe_gemm_decode_roundtrip(&workers, deepep::GLM52_DEEPEP_DECODE_BATCH_CAP)?;
-    runner::smoke_decode_graph_roundtrip(&workers, deepep::GLM52_DEEPEP_DECODE_BATCH_CAP)?;
-
     let rank_bytes = reports
         .iter()
         .map(|report| report.total_bytes)

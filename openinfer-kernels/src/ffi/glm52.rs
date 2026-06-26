@@ -1,10 +1,8 @@
 use super::Half;
 use cudarc::driver::sys::{CUresult, CUstream};
 
-mod deepep;
 mod flashmla_sparse;
 mod indexer;
-pub use deepep::*;
 pub use flashmla_sparse::*;
 pub use indexer::*;
 

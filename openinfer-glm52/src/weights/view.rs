@@ -374,50 +374,6 @@ impl Glm52RankGpuWeights {
         })
     }
 
-    pub(crate) fn first_moe_router<'a>(
-        &'a self,
-        names: &'a Glm52RankWeightNames,
-    ) -> Result<Glm52RouterGpuWeights<'a>> {
-        ensure!(
-            self.rank == names.rank,
-            "GLM5.2 GPU rank {} does not match typed names rank {}",
-            self.rank,
-            names.rank
-        );
-        for layer in &names.layers {
-            if let Glm52LayerWeightKindNames::Moe(moe) = &layer.kind {
-                return Ok(Glm52RouterGpuWeights {
-                    gate_weight: self.expect_tensor(&moe.router.gate_weight)?,
-                    e_score_correction_bias: self
-                        .expect_tensor(&moe.router.e_score_correction_bias)?,
-                });
-            }
-        }
-        anyhow::bail!("GLM5.2 typed rank weights have no MoE layer")
-    }
-
-    pub(crate) fn first_attention<'a>(
-        &'a self,
-        names: &'a Glm52RankWeightNames,
-    ) -> Result<Glm52AttentionGpuWeights<'a>> {
-        ensure!(
-            self.rank == names.rank,
-            "GLM5.2 GPU rank {} does not match typed names rank {}",
-            self.rank,
-            names.rank
-        );
-        let layer = names
-            .layers
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("GLM5.2 typed rank weights have no layers"))?;
-        ensure!(
-            layer.layer_idx == 0,
-            "GLM5.2 first attention smoke expects layer 0, got {}",
-            layer.layer_idx
-        );
-        self.attention_view(&layer.attention)
-    }
-
     fn attention_view<'a>(
         &'a self,
         names: &'a Glm52AttentionWeightNames,

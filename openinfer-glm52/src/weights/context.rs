@@ -56,6 +56,9 @@ impl Glm52RankGpuContext {
         })
     }
 
+    /// Bridge to the kernel-launch `DeviceContext`. Unreferenced until the PP8
+    /// forward (Slice 3+) starts issuing kernels; kept as the canonical accessor.
+    #[allow(dead_code)]
     pub(crate) fn as_device_context(&self) -> DeviceContext {
         DeviceContext {
             ctx: Arc::clone(&self.ctx),

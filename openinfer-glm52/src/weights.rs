@@ -32,13 +32,8 @@ mod view;
 
 pub(crate) use context::Glm52RankGpuContext;
 pub(crate) use load::{Glm52RankGpuWeights, load_rank_sliced_weights_to_gpu};
-pub(crate) use package::{
-    Glm52DeepGemmMGroupedFp8WeightPlan, Glm52MoeLayerExpertFp8Weights, Glm52RankExpertFp8Weights,
-};
-pub(crate) use view::{
-    Glm52AttentionGpuWeights, Glm52Fp8ProjectionGpuWeights, Glm52NonExpertWeightContractReport,
-    Glm52RouterGpuWeights,
-};
+pub(crate) use package::Glm52RankExpertFp8Weights;
+pub(crate) use view::Glm52NonExpertWeightContractReport;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TensorEntry {
