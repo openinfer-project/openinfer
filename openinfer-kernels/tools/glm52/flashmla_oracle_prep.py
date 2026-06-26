@@ -104,6 +104,10 @@ def main():
     # full-precision oracle + later-stage refs
     lat_oracle = z["latent"][0, :, T, :].astype(np.float32)
     lat_oracle.tofile(f"{OUT}/latent_expected.bin")
+    # attn = the attention OUTPUT for token T = latent @ W_UV (weighted sum of v),
+    # head-major [64*256=16384]. This (NOT value_states, which is the per-token v
+    # kv_c@W_UV) is the v_up target and the o_proj input.
+    z["attn"][0, T, :].astype(np.float32).tofile(f"{OUT}/attn_expected.bin")
     z["value_states"][0, :, T, :].astype(np.float32).tofile(f"{OUT}/value_expected.bin")
     z["o"][0, T, :].astype(np.float32).tofile(f"{OUT}/o_expected.bin")
 
