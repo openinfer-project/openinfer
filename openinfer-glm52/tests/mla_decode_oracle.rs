@@ -24,9 +24,9 @@ use memmap2::MmapOptions;
 use openinfer_kernels::ops::{
     Glm52DeepGemmScaleLayout, Glm52MoeQuantShape, Glm52TrtllmFp8LinearContract,
     gemm_strided_batched_bf16, glm52_deepgemm_mn_major_tma_aligned_f32_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_trtllm_fp8_linear_launch,
+    glm52_fp8_per_token_group_quant_bf16_launch, glm52_trtllm_fp8_linear_launch, rms_norm_into,
 };
-use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -276,4 +276,232 @@ fn mla_back_half_matches_oracle() {
     // fp8 floor; a wrong dequant/orientation/scale blows past 30%.
     assert!(rel_v < 0.10, "v_up rel max {rel_v} too large");
     assert!(rel_o < 0.10, "o_proj rel max {rel_o} too large");
+}
+
+/// One GLM fp8 projection (bs=1): quant(input) -> relayout activation scale to the
+/// TRTLLM col-major TMA layout -> blockscale linear. Host in/out (avoids naming
+/// cudarc types). `input` is [k] bf16; returns [n] f32.
+fn fp8_linear(
+    ctx: &DeviceContext,
+    model: &Path,
+    map: &HashMap<String, String>,
+    wname: &str,
+    n: usize,
+    k: usize,
+    input: &[bf16],
+) -> Vec<f32> {
+    assert_eq!(input.len(), k);
+    let (w, wsh) = load_tensor(model, map, &format!("{wname}.weight"));
+    let (ws, _) = load_tensor(model, map, &format!("{wname}.weight_scale_inv"));
+    assert_eq!(wsh, vec![n, k]);
+    let scale_cols = k / FP8_BLOCK;
+
+    let mut in_d = ctx.stream.alloc_zeros::<bf16>(k).unwrap();
+    let mut w_d = ctx.stream.alloc_zeros::<u8>(w.len()).unwrap();
+    let mut ws_d = ctx.stream.alloc_zeros::<u8>(ws.len()).unwrap();
+    ctx.stream.memcpy_htod(input, &mut in_d).unwrap();
+    ctx.stream.memcpy_htod(&w, &mut w_d).unwrap();
+    ctx.stream.memcpy_htod(&ws, &mut ws_d).unwrap();
+
+    let qshape = Glm52MoeQuantShape {
+        rows: 1,
+        width: k,
+        group_size: FP8_BLOCK,
+    };
+    let mut a_fp8 = ctx.stream.alloc_zeros::<u8>(k).unwrap();
+    let mut a_scale_plain = ctx.stream.alloc_zeros::<f32>(scale_cols).unwrap();
+    glm52_fp8_per_token_group_quant_bf16_launch(ctx, qshape, &in_d, &mut a_fp8, &mut a_scale_plain)
+        .unwrap();
+    let layout = Glm52DeepGemmScaleLayout::f32(1, scale_cols);
+    let mut a_scale = ctx
+        .stream
+        .alloc_zeros::<f32>(layout.output_len().unwrap())
+        .unwrap();
+    glm52_deepgemm_mn_major_tma_aligned_f32_launch(ctx, layout, &a_scale_plain, &mut a_scale)
+        .unwrap();
+
+    let contract = Glm52TrtllmFp8LinearContract {
+        m: 1,
+        n,
+        k,
+        weight_scale_rows: n.div_ceil(FP8_BLOCK),
+        weight_scale_cols: scale_cols,
+        activation_scale_cols: scale_cols,
+    };
+    let mut out = ctx.stream.alloc_zeros::<bf16>(n).unwrap();
+    glm52_trtllm_fp8_linear_launch(ctx, contract, &a_fp8, &a_scale, &w_d, &ws_d, &mut out).unwrap();
+    ctx.stream.synchronize().unwrap();
+    ctx.stream
+        .clone_dtoh(&out)
+        .unwrap()
+        .iter()
+        .map(|x| x.to_f32())
+        .collect()
+}
+
+/// GLM RMSNorm (eps=1e-5) on the GPU via the shared op; host in/out. `weight_bytes`
+/// is the raw bf16 layernorm gamma from the checkpoint.
+fn rms_gpu(ctx: &DeviceContext, x: &[f32], weight_bytes: &[u8]) -> Vec<f32> {
+    let x_bf: Vec<bf16> = x.iter().map(|&v| bf16::from_f32(v)).collect();
+    let x_dv = DeviceVec::from_host(ctx, &x_bf).unwrap();
+    let w_dv = DeviceVec::from_safetensors(ctx, weight_bytes).unwrap();
+    let mut out_dv = DeviceVec::zeros(ctx, x.len()).unwrap();
+    rms_norm_into(ctx, &x_dv, &w_dv, 1.0e-5, &mut out_dv).unwrap();
+    out_dv.to_host(ctx).unwrap()
+}
+
+/// Absorb back-projection: ql_nope[64,512] = q_pass @ W_UK, W_UK = kv_b nope-part
+/// [:,:192,:] host-dequant. `q_full` is the q_b output [64,256] head-major; q_pass
+/// is the first 192 of each head (read via stride 256 in the batched GEMM).
+fn absorb_ql_nope(
+    ctx: &DeviceContext,
+    model: &Path,
+    map: &HashMap<String, String>,
+    q_full: &[f32],
+) -> Vec<f32> {
+    let (kvb, _) = load_tensor(model, map, "model.layers.0.self_attn.kv_b_proj.weight");
+    let (kvbs, _) = load_tensor(
+        model,
+        map,
+        "model.layers.0.self_attn.kv_b_proj.weight_scale_inv",
+    );
+    let kvb_scale = bytes_to_f32(&kvbs);
+    let scale_cols = KV_LORA / FP8_BLOCK;
+    let mut w_uk = vec![bf16::from_f32(0.0); HEADS * QK_NOPE * KV_LORA];
+    for h in 0..HEADS {
+        for p in 0..QK_NOPE {
+            let row = h * KV_B_ROWS_PER_HEAD + p; // nope-part row
+            for j in 0..KV_LORA {
+                let s = kvb_scale[(row / FP8_BLOCK) * scale_cols + j / FP8_BLOCK];
+                w_uk[(h * QK_NOPE + p) * KV_LORA + j] =
+                    bf16::from_f32(e4m3_to_f32(kvb[row * KV_LORA + j]) * s);
+            }
+        }
+    }
+    let q_full_bf: Vec<bf16> = q_full.iter().map(|&x| bf16::from_f32(x)).collect();
+    let mut wuk_d = ctx.stream.alloc_zeros::<bf16>(w_uk.len()).unwrap();
+    let mut q_d = ctx.stream.alloc_zeros::<bf16>(q_full_bf.len()).unwrap();
+    let mut ql_d = ctx.stream.alloc_zeros::<bf16>(HEADS * KV_LORA).unwrap();
+    ctx.stream.memcpy_htod(&w_uk, &mut wuk_d).unwrap();
+    ctx.stream.memcpy_htod(&q_full_bf, &mut q_d).unwrap();
+    // ql_nope[h,l] = Σ_p W_UK[h,p,l] * q_pass[h,p]; no transpose, m=512,n=1,k=192.
+    // A=W_UK row-major [64,192,512] (lda=512, stride 192*512); B=q_full at head
+    // stride 256, k=192 reads only q_pass; C=ql[64,512].
+    gemm_strided_batched_bf16(
+        ctx,
+        false,
+        false,
+        KV_LORA,
+        1,
+        QK_NOPE,
+        &wuk_d,
+        KV_LORA,
+        QK_NOPE * KV_LORA,
+        &q_d,
+        QK_NOPE,
+        V_HEAD,
+        &mut ql_d,
+        KV_LORA,
+        KV_LORA,
+        HEADS,
+    )
+    .unwrap();
+    ctx.stream.synchronize().unwrap();
+    ctx.stream
+        .clone_dtoh(&ql_d)
+        .unwrap()
+        .iter()
+        .map(|x| x.to_f32())
+        .collect()
+}
+
+#[test]
+fn mla_front_half_matches_oracle() {
+    let Ok(ctx) = DeviceContext::new() else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let model = model_path();
+    if !model.join("model.safetensors.index.json").exists() {
+        eprintln!("no checkpoint at {model:?}; skipping");
+        return;
+    }
+    let probe = probe_dir();
+    if !probe.join("hidden_input.bin").exists() {
+        eprintln!("no front-half fixtures at {probe:?}; skipping");
+        return;
+    }
+    let map = read_weight_map(&model);
+    let p = "model.layers.0.self_attn.";
+
+    let hidden: Vec<bf16> = read_f32(&probe, "hidden_input.bin")
+        .iter()
+        .map(|&x| bf16::from_f32(x))
+        .collect();
+    assert_eq!(hidden.len(), HIDDEN);
+
+    // q path: q_a_proj -> q_a_layernorm -> q_b_proj -> q_pass
+    let q_a = fp8_linear(
+        &ctx,
+        &model,
+        &map,
+        &format!("{p}q_a_proj"),
+        2048,
+        HIDDEN,
+        &hidden,
+    );
+    let q_a_ln = load_tensor(&model, &map, &format!("{p}q_a_layernorm.weight")).0;
+    let q_resid = rms_gpu(&ctx, &q_a, &q_a_ln);
+    let r_qr = report(
+        "q_resid",
+        &q_resid,
+        &read_f32(&probe, "q_resid_expected.bin"),
+    );
+    let q_resid_bf: Vec<bf16> = q_resid.iter().map(|&x| bf16::from_f32(x)).collect();
+    let q_full = fp8_linear(
+        &ctx,
+        &model,
+        &map,
+        &format!("{p}q_b_proj"),
+        16384,
+        2048,
+        &q_resid_bf,
+    );
+    let mut q_pass = vec![0f32; HEADS * QK_NOPE];
+    for h in 0..HEADS {
+        for i in 0..QK_NOPE {
+            q_pass[h * QK_NOPE + i] = q_full[h * V_HEAD + i];
+        }
+    }
+    let r_qp = report("q_pass ", &q_pass, &read_f32(&probe, "q_pass_expected.bin"));
+
+    // kv path: kv_a_proj_with_mqa -> split -> kv_a_layernorm
+    let ckv = fp8_linear(
+        &ctx,
+        &model,
+        &map,
+        &format!("{p}kv_a_proj_with_mqa"),
+        576,
+        HIDDEN,
+        &hidden,
+    );
+    let kv_a_ln = load_tensor(&model, &map, &format!("{p}kv_a_layernorm.weight")).0;
+    let kv_c = rms_gpu(&ctx, &ckv[..KV_LORA], &kv_a_ln);
+    let r_kv = report("kv_c   ", &kv_c, &read_f32(&probe, "kv_c_expected.bin"));
+
+    // absorb: q_pass @ W_UK -> ql_nope
+    let ql_nope = absorb_ql_nope(&ctx, &model, &map, &q_full);
+    let r_ql = report(
+        "ql_nope",
+        &ql_nope,
+        &read_f32(&probe, "ql_nope_expected.bin"),
+    );
+
+    assert!(ql_nope.iter().all(|x| x.is_finite()) && kv_c.iter().all(|x| x.is_finite()));
+    // fp8-activation + fp8-weight projections vs the full-precision oracle: a couple
+    // % is the fp8 floor; a wrong layout/scale/orientation blows past 30%.
+    assert!(r_qr < 0.05, "q_resid rel max {r_qr}");
+    assert!(r_qp < 0.05, "q_pass rel max {r_qp}");
+    assert!(r_kv < 0.08, "kv_c rel max {r_kv}");
+    assert!(r_ql < 0.05, "ql_nope rel max {r_ql}");
 }

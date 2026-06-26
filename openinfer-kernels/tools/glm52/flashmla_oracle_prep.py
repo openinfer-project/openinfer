@@ -111,6 +111,13 @@ def main():
     z["value_states"][0, :, T, :].astype(np.float32).tofile(f"{OUT}/value_expected.bin")
     z["o"][0, T, :].astype(np.float32).tofile(f"{OUT}/o_expected.bin")
 
+    # front-half input + intermediate refs (hidden -> q_resid/q_pass/kv_c/ql_nope)
+    z["hidden"][0, T, :].astype(np.float32).tofile(f"{OUT}/hidden_input.bin")          # [6144]
+    z["q_resid"][0, T, :].astype(np.float32).tofile(f"{OUT}/q_resid_expected.bin")     # [2048]
+    z["q_pass"][0, :, T, :].astype(np.float32).tofile(f"{OUT}/q_pass_expected.bin")    # [64,192]
+    z["kv_c"][0, T, :].astype(np.float32).tofile(f"{OUT}/kv_c_expected.bin")           # [512]
+    z["ql_nope"][0, :, T, :].astype(np.float32).tofile(f"{OUT}/ql_nope_expected.bin")  # [64,512]
+
     d = np.abs(latent_fp8ref - lat_oracle)
     print(f"latent |max|={np.abs(lat_oracle).max():.5f} mean={np.abs(lat_oracle).mean():.5f}")
     print(f"fp8 noise floor (fp8ref vs oracle): max|d|={d.max():.6f} mean|d|={d.mean():.6f}")
