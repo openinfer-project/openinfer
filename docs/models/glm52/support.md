@@ -4,6 +4,8 @@
 >
 > **Last touched:** 2026-06
 
+> ⚠️ **Superseded / stale-checkpoint note (2026-06-27):** the direction is now **PP8 TP1 EP1 decode** (see `pp-decode.md`), not the `DP8 TP1 EP8` DeepEP topology this doc describes — the DeepEP substrate was dropped (Slice P). Also, every run below executed against `/data/models/GLM-5.2-0614-Provider-FP8`, which was later found **corrupt** (q_b/kv_b 4× oversized; see `mla-layout-probe.md`) and deleted. The correct checkpoint is `/data/models/GLM-5.2-FP8` (official `zai-org/GLM-5.2-FP8`). Treat the historical weight-load / smoke results below as run against a bad checkpoint — they do not validate numerics.
+
 ## Preparation
 
 - **Read**:

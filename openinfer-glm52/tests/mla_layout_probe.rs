@@ -8,7 +8,8 @@ use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors, tensor::TensorInfo};
 use serde_json::Value;
 
-const GLM52_MODEL_PATH: &str = "/data/models/GLM-5.2-0614-Provider-FP8";
+const GLM52_MODEL_PATH: &str = "/data/models/GLM-5.2-FP8";
+const HIDDEN_SIZE: usize = 6144;
 const CONFIG_HEADS: usize = 64;
 const Q_LORA_RANK: usize = 2048;
 const KV_LORA_RANK: usize = 512;
@@ -59,48 +60,44 @@ fn jiuzhang_checkpoint_mla_projection_layout_metadata() {
         "model.layers.0.self_attn.kv_b_proj.weight_scale_inv",
     );
 
-    assert_tensor(&q_b, Dtype::F8_E4M3, &[65_536, Q_LORA_RANK]);
+    // Standard 64-head DeepSeek-DSA MLA -- no packing/fold. Every projection is
+    // exactly `heads * per_head_dim`. (The earlier "factor-4" was a corrupt
+    // vendor repack; the official zai-org/GLM-5.2-FP8 is plain 64-head.)
+    let qk_head_dim = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
+    let q_b_out = CONFIG_HEADS * qk_head_dim;
+    let kv_b_out = CONFIG_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM);
+    let o_proj_in = CONFIG_HEADS * V_HEAD_DIM;
+    assert_eq!(q_b_out, 16_384);
+    assert_eq!(kv_b_out, 28_672);
+    assert_eq!(o_proj_in, 16_384);
+
+    assert_tensor(&q_b, Dtype::F8_E4M3, &[q_b_out, Q_LORA_RANK]);
     assert_tensor(
         &q_b_scale,
         Dtype::F32,
-        &[65_536 / FP8_BLOCK_SIZE, Q_LORA_RANK / FP8_BLOCK_SIZE],
+        &[q_b_out / FP8_BLOCK_SIZE, Q_LORA_RANK / FP8_BLOCK_SIZE],
     );
-    assert_tensor(&kv_b, Dtype::F8_E4M3, &[114_688, KV_LORA_RANK]);
+    assert_tensor(&kv_b, Dtype::F8_E4M3, &[kv_b_out, KV_LORA_RANK]);
     assert_tensor(
         &kv_b_scale,
         Dtype::F32,
-        &[114_688 / FP8_BLOCK_SIZE, KV_LORA_RANK / FP8_BLOCK_SIZE],
+        &[kv_b_out / FP8_BLOCK_SIZE, KV_LORA_RANK / FP8_BLOCK_SIZE],
     );
 
-    let q_b_rows_per_config_head = q_b.shape[0] / CONFIG_HEADS;
-    let q_b_rows_per_projection_head = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
-    let q_b_expansion = q_b_rows_per_config_head / q_b_rows_per_projection_head;
-    assert_eq!(q_b_rows_per_config_head, 1024);
-    assert_eq!(q_b_rows_per_projection_head, 256);
-    assert_eq!(q_b_expansion, 4);
-    assert_eq!(
-        q_b.shape[0],
-        CONFIG_HEADS * q_b_expansion * q_b_rows_per_projection_head
+    let o_proj = tensor_info(
+        model_path,
+        &weight_map,
+        "model.layers.0.self_attn.o_proj.weight",
     );
+    assert_tensor(&o_proj, Dtype::F8_E4M3, &[HIDDEN_SIZE, o_proj_in]);
 
-    let kv_b_rows_per_config_head = kv_b.shape[0] / CONFIG_HEADS;
-    let kv_b_rows_per_projection_head = QK_NOPE_HEAD_DIM + V_HEAD_DIM;
-    let kv_b_expansion = kv_b_rows_per_config_head / kv_b_rows_per_projection_head;
-    assert_eq!(kv_b_rows_per_config_head, 1792);
-    assert_eq!(kv_b_rows_per_projection_head, 448);
-    assert_eq!(kv_b_expansion, 4);
-    assert_eq!(q_b_expansion, kv_b_expansion);
-    assert_eq!(
-        kv_b.shape[0],
-        CONFIG_HEADS * kv_b_expansion * kv_b_rows_per_projection_head
-    );
-
+    // FlashMLA sparse FP8 decode contract (DeepSeek-V3.2 cache): absorbed query
+    // width 576 and 656-byte cache token (512 fp8 ckv + 16 f32 scale + 64 bf16 k_pe).
     let flashmla_query_dim = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
     let flashmla_fp8_cache_token_bytes =
         KV_LORA_RANK + (KV_LORA_RANK / FP8_BLOCK_SIZE) * 4 + QK_ROPE_HEAD_DIM * 2;
     assert_eq!(flashmla_query_dim, 576);
     assert_eq!(flashmla_fp8_cache_token_bytes, 656);
-    assert_eq!(CONFIG_HEADS * V_HEAD_DIM, 16_384);
 }
 
 fn read_json(path: &Path) -> Value {
