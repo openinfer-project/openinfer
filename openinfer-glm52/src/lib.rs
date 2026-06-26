@@ -11,6 +11,11 @@ mod config;
 // first consumer, so it is unreferenced until then.
 #[allow(dead_code)]
 mod decode_meta;
+// Single-layer MLA decode forward (Slice 3). Composes the oracle-validated GPU
+// ops into one `hidden -> o`; the PP stage executor (Slice 7) is its first
+// caller, so it is unreferenced until then.
+#[allow(dead_code)]
+mod mla_decode;
 mod pp;
 mod runner;
 mod weights;

@@ -216,7 +216,9 @@ unsafe extern "C" {
     // --- MLA decode assembly (projections -> FlashMLA glue) -------------------
     pub fn glm52_mla_query_assemble_cuda(
         ql_nope: *const Half,
-        q_pe: *const Half,
+        q_pe_base: *const Half,
+        q_pe_offset: i32,
+        q_pe_head_stride: i32,
         cos: *const Half,
         sin: *const Half,
         query: *mut Half,

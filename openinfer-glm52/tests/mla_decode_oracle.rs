@@ -564,7 +564,17 @@ fn mla_assemble_matches_oracle() {
     let mut query_d = ctx.stream.alloc_zeros::<bf16>(HEADS * QUERY_DIM).unwrap();
     ctx.stream.memcpy_htod(&ql_bf, &mut ql_d).unwrap();
     ctx.stream.memcpy_htod(&q_pe, &mut qpe_d).unwrap();
-    glm52_mla_query_assemble_launch(&ctx, &ql_d, &qpe_d, &cos_d, &sin_d, &mut query_d).unwrap();
+    glm52_mla_query_assemble_launch(
+        &ctx,
+        &ql_d,
+        &qpe_d,
+        0,
+        ROPE_DIM,
+        &cos_d,
+        &sin_d,
+        &mut query_d,
+    )
+    .unwrap();
     ctx.stream.synchronize().unwrap();
     let query_got: Vec<f32> = ctx
         .stream
@@ -613,6 +623,7 @@ fn mla_assemble_matches_oracle() {
         &cos_d,
         &sin_d,
         &mut token_d,
+        0,
     )
     .unwrap();
     ctx.stream.synchronize().unwrap();

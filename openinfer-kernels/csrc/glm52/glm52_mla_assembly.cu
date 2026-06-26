@@ -50,20 +50,25 @@ __device__ __forceinline__ __nv_bfloat16 rope_block(const __nv_bfloat16* x, int 
   return __float2bfloat16(v);
 }
 
+// q_pe lives at `q_pe_base[q_pe_offset + h*q_pe_head_stride + ...]`: contiguous
+// [H,64] (offset 0, stride 64) when split out, or embedded in the q_b output
+// [H,256] (offset 192, stride 256) in the fused forward.
 __global__ void glm52_mla_query_assemble_kernel(
-    const __nv_bfloat16* __restrict__ ql_nope,  // [H, 512]
-    const __nv_bfloat16* __restrict__ q_pe,      // [H, 64]
-    const __nv_bfloat16* __restrict__ cos,       // [32]
-    const __nv_bfloat16* __restrict__ sin,       // [32]
-    __nv_bfloat16* __restrict__ query) {         // [H, 576]
+    const __nv_bfloat16* __restrict__ ql_nope,    // [H, 512]
+    const __nv_bfloat16* __restrict__ q_pe_base,  // q_pe at offset/stride
+    int q_pe_offset, int q_pe_head_stride,
+    const __nv_bfloat16* __restrict__ cos,        // [32]
+    const __nv_bfloat16* __restrict__ sin,        // [32]
+    __nv_bfloat16* __restrict__ query) {          // [H, 576]
   const int h = blockIdx.x;
   if (h >= kHeads) return;
+  const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset + h * q_pe_head_stride;
   for (int i = threadIdx.x; i < kQueryDim; i += blockDim.x) {
     if (i < kQkNope) {
       query[h * kQueryDim + i] = ql_nope[h * kQkNope + i];
     } else {
       const int r = i - kQkNope;  // 0..63
-      query[h * kQueryDim + i] = rope_block(q_pe + h * kRopeDim, r, cos, sin);
+      query[h * kQueryDim + i] = rope_block(q_pe, r, cos, sin);
     }
   }
 }
@@ -104,16 +109,17 @@ CUresult consume_last_cuda_error() {
 extern "C" {
 
 CUresult glm52_mla_query_assemble_cuda(const __nv_bfloat16* ql_nope,
-                                       const __nv_bfloat16* q_pe,
+                                       const __nv_bfloat16* q_pe_base,
+                                       int q_pe_offset, int q_pe_head_stride,
                                        const __nv_bfloat16* cos,
                                        const __nv_bfloat16* sin,
                                        __nv_bfloat16* query, cudaStream_t stream) {
-  if (ql_nope == nullptr || q_pe == nullptr || cos == nullptr || sin == nullptr ||
-      query == nullptr) {
+  if (ql_nope == nullptr || q_pe_base == nullptr || cos == nullptr ||
+      sin == nullptr || query == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  glm52_mla_query_assemble_kernel<<<kHeads, 192, 0, stream>>>(ql_nope, q_pe, cos,
-                                                              sin, query);
+  glm52_mla_query_assemble_kernel<<<kHeads, 192, 0, stream>>>(
+      ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, cos, sin, query);
   return consume_last_cuda_error();
 }
 
