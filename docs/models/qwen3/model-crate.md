@@ -1,8 +1,8 @@
 # Qwen3-4B Model Crate
 
 **Created**: 2026-05-03
-**Status**: ready for diff review
-**TL;DR**: `crates/openinfer-qwen3-4b` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `openinfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode for `padded_bs<=2 && seq_len>=1024` and was retuned to `chunk_tokens=256,max_chunks=64`, cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
+**Last touched**: 2026-06
+**TL;DR**: `crates/openinfer-qwen3-4b` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `openinfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode on `padded_bs<=32` (the `seq_len>=1024` gate was dropped in #437) with a 64-token chunk floor (`Tuned` capped at 64 chunks; opt-in `--batch-invariant` pins a fixed 160-token split), cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
 
 ## Preparation
 
@@ -390,7 +390,9 @@ Representative cold-L2 sweep rows:
 | `bs2 ctx8192` | `54.637us` | `55.200us` | tied, 256/64 slightly ahead |
 | `bs2 ctx10000` | `62.417us` | `63.620us` | tied, 256/64 slightly ahead |
 
-Runtime change: `BatchDecodeBuffers` now uses `SPLIT_KV_CHUNK_TOKENS=256` with `SPLIT_KV_MAX_CHUNKS_PER_REQUEST=64`. This keeps the same graph-stable padded slot budget as the original `512/64` integration, while doubling active chunks for low-batch long-context decode.
+Current runtime config: `SPLIT_KV_CHUNK_TOKENS=64` (chunk-size floor), `SPLIT_KV_TUNED_MAX_CHUNKS=64` (default `Tuned` chunk-count cap and grid), `SPLIT_KV_MAX_CHUNKS_PER_REQUEST=256` (workspace bound + the `Pin`/`PerToken` fixed-split basis → 160 tokens). See decode-attention.md.
+
+Historical note (this section's retune): `BatchDecodeBuffers` used `SPLIT_KV_CHUNK_TOKENS=256` with `SPLIT_KV_MAX_CHUNKS_PER_REQUEST=64`, keeping the original `512/64` graph-stable padded budget while doubling active chunks for low-batch long-context decode. Later superseded by the 64-token chunk floor and the split-KV size/grid decouple.
 
 Production decode probe after retune:
 

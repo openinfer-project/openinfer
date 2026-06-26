@@ -570,7 +570,7 @@ fn tune_decode_gemm_algos(model: &Qwen3Model) -> Result<()> {
         let max_context = model.config().max_position_embeddings;
         log::info!(
             "Qwen3 split-KV decode chunk pinned: {} tokens (max_context_tokens={max_context})",
-            crate::batch_decode_buffers::split_chunk_size_for(max_context)
+            crate::batch_decode_buffers::pin_chunk_size(max_context)
         );
         return Ok(());
     }
