@@ -1,6 +1,6 @@
 # GLM5.2 PP8 Decode Exploration
 
-> **TL;DR:** PP8 TP1 EP1 decode is now the **committed** GLM5.2 low-latency path; DP8/EP8 DeepEP is being dropped. 8 stages, 1 H200/stage, each stage owns a contiguous layer slice + all 256 routed experts for its sparse layers; stage boundary = BF16 hidden `[1,6144]` over a **graph-internal NVLink P2P handoff** (device-flag serialized, no stream/event edges). **Target: bs=1, TPOT < 10 ms** — purely HBM-bound (~42-50 GiB active/token / ~4.0-4.8 TB/s of one H200), so the budget is per-stage FP8-GEMM HBM efficiency, not communication (7-hop handoff ~16 us = noise). The **Build Plan** below is authoritative and supersedes the older hypothesis sections; it sequences work as Slices P->0->7. Two governing facts: **(1) Slice 0 = the PP runtime spine** (novel, load-bearing, independent of forward math); **(2) #1 correctness blocker = the MLA `q_b`/`kv_b` head-count factorization** (input side N=256, o_proj side N=64 -- a 4:1 fold the contract mis-states) -- no attention code until a node38 vLLM dump resolves it (Slice 1). bs=1 collapses MoE to top-8 active experts (G=8 grouped GEMM, no 256-group permute / no alignment padding), so DP/EP's Risk 6 alignment-blowup vanishes.
+> **TL;DR:** PP8 TP1 EP1 decode is now the **committed** GLM5.2 low-latency path; DP8/EP8 DeepEP is being dropped. 8 stages, 1 H200/stage, each stage owns a contiguous layer slice + all 256 routed experts for its sparse layers; stage boundary = BF16 hidden `[1,6144]` over a **graph-internal NVLink P2P handoff** (device-flag serialized, no stream/event edges). **Target: bs=1, TPOT < 10 ms** — purely HBM-bound (~42-50 GiB active/token / ~4.0-4.8 TB/s of one H200), so the budget is per-stage FP8-GEMM HBM efficiency, not communication (7-hop handoff **measured ~5 µs RTT/hop on node38, ~19 µs one-way chain = 0.2% of budget = noise**; Slice 0 validated 2026-06-27). The **Build Plan** below is authoritative and supersedes the older hypothesis sections; it sequences work as Slices P->0->7. Two governing facts: **(1) Slice 0 = the PP runtime spine** (novel, load-bearing, independent of forward math); **(2) #1 correctness blocker = the MLA `q_b`/`kv_b` head-count factorization** (input side N=256, o_proj side N=64 -- a 4:1 fold the contract mis-states) -- no attention code until a node38 vLLM dump resolves it (Slice 1). bs=1 collapses MoE to top-8 active experts (G=8 grouped GEMM, no 256-group permute / no alignment padding), so DP/EP's Risk 6 alignment-blowup vanishes.
 >
 > **Last touched:** 2026-06
 
@@ -244,6 +244,23 @@ stage0: wait-on-(stage7 token-ready flag for `t`) → embed `TOKEN_OUT[t-1]` →
 **Sweep (mandatory cells):** pp_size {2,4,8} × payload {12KB(words=6144,bs1), 48KB(words=24576,bs4)} × dummy_burn {0,50,100,500 us} × store-width {64,128} × ring {R=1,R=2}.
 **Pass bar:** pp=8 7-hop 12KB ≈16us (per the doc roofline), p99 within a few % of p50, **zero >100us over ≥50k iters**, 500us-dummy handoff cost unchanged → `L_send` confirmed not the PP risk; next slice replaces `dummy_burn` with real layers.
 **Open in Slice 0:** (a) does one stage's `__trap` cleanly crash the coordinator vs leave 7 peers spinning to deadline — resolve by fault-injection (kill one flag, measure teardown); (b) B200/B300 re-measurement still required (NVLink gen + fence cost differ) — node38 H200 validates correctness + microsecond order only.
+
+#### MEASURED — node38 8×H200, 2026-06-27 (commits 576eac9 + 428f02e)
+
+Spine runs the full sweep green; the pp=8/12KB zero->100µs tail gate passes over 50k iters/cell. Forward-RTT per hop (`deltas`, producer globaltimer):
+
+| cell | hop0 p50/p99 | middle hop p50/p99 | chain_rtt p50 | >100µs |
+|---|---|---|---|---|
+| pp=8 / 12KB / burn=0 | 8.3 / 8.8 µs | ~5.1 / ~5.5 µs | 38.8 µs | 0 |
+| pp=8 / 48KB / burn=0 | 9.3 / 9.9 µs | ~6.8 / ~7.2 µs | 50.0 µs | 0 |
+
+- **One-way `L_send` ≈ RTT/2 ≈ 2.5 µs/hop (12KB); 7-hop chain ~19 µs one-way / ~39 µs RTT-sum.** p99 within ~6% of p50, zero >100µs. **Handoff = 0.2-0.4% of the 10 ms TPOT budget — confirmed noise.** Remaining budget is all per-stage compute: (10 ms − 19 µs)/8 ≈ **1.25 ms/stage**.
+- **`dummy_burn` sweep confirms the decomposition:** per-hop RTT is independent of burn (≈5 µs at burn 0/100/500 µs) while throughput tracks it (wall/iter 12 → 113 → 513 µs). Handoff and compute add independently — the architecture premise holds.
+- hop0 sits ~3 µs above the middle hops (the source has no inbound wait, so its send contends differently). Benign.
+
+**Two divergences from the plan above, now authoritative:**
+1. **Peer access is `cuMemPoolSetAccess`, NOT `cuCtxEnablePeerAccess`.** cudarc allocates the rings via `cuMemAllocAsync` (stream-ordered pool memory); `cuCtxEnablePeerAccess` governs only legacy `cuMemAlloc`, so a neighbour's remote store into a pool allocation faults with `Warp Illegal Address`. Grant the access descriptor (RW for both neighbour devices) on each device's **default mempool**, set **before** allocating the rings. Keyed on device ordinal, so the handshake no longer carries the neighbour CUcontext.
+2. **Slice 0 is an OPEN chain (0→…→7), not the closed ring.** Stage 0 `source_inject`s (no inbound wait); stage n-1 is a pure sink. The cycle edge `7→0` (token feedback) is deferred to Slice 7 — a closed ring where every stage waits-then-sends deadlocks without an injector.
 
 ---
 
