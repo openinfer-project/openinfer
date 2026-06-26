@@ -2,11 +2,92 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Result, bail};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use anyhow::{Result, bail, ensure};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::bf16;
 
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesRef};
+
+/// Generic strided-batched bf16 GEMM — one `cublasGemmStridedBatchedEx` on the
+/// graph-safe (workspace-free, decode/capture) cuBLAS handle. `lda`/`ldb`/`ldc`
+/// are cuBLAS column-major leading dims and `stride_*` are per-batch element
+/// strides; each buffer must hold at least `stride * batch` elements. This is
+/// the shared primitive for per-head batched GEMMs (MLA absorption
+/// `q_nope @ W_UK` and `latent @ W_UV`, batch = head count) so model crates do
+/// not hand-roll bespoke batched-GEMM kernels. `transpose_*` map to CUBLAS_OP_T.
+///
+/// Args use BLAS notation (a/b/c, m/n/k) to match the cuBLAS call it wraps.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+pub fn gemm_strided_batched_bf16(
+    ctx: &DeviceContext,
+    transpose_a: bool,
+    transpose_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &CudaSlice<bf16>,
+    lda: usize,
+    stride_a: usize,
+    b: &CudaSlice<bf16>,
+    ldb: usize,
+    stride_b: usize,
+    c: &mut CudaSlice<bf16>,
+    ldc: usize,
+    stride_c: usize,
+    batch: usize,
+) -> Result<()> {
+    ensure!(
+        m > 0 && n > 0 && k > 0 && batch > 0,
+        "gemm_strided_batched_bf16 empty dims: m={m} n={n} k={k} batch={batch}"
+    );
+    ensure!(
+        a.len() >= stride_a * batch,
+        "gemm_strided_batched_bf16 A too small: have {}, need {}",
+        a.len(),
+        stride_a * batch
+    );
+    ensure!(
+        b.len() >= stride_b * batch,
+        "gemm_strided_batched_bf16 B too small: have {}, need {}",
+        b.len(),
+        stride_b * batch
+    );
+    ensure!(
+        c.len() >= stride_c * batch,
+        "gemm_strided_batched_bf16 C too small: have {}, need {}",
+        c.len(),
+        stride_c * batch
+    );
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (c_ptr, _gc) = c.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::gemm_strided_batched_bf16_cuda(
+            i32::from(transpose_a),
+            i32::from(transpose_b),
+            m as i32,
+            n as i32,
+            k as i32,
+            a_ptr as *const ffi::Half,
+            lda as i32,
+            stride_a as i64,
+            b_ptr as *const ffi::Half,
+            ldb as i32,
+            stride_b as i64,
+            c_ptr as *mut ffi::Half,
+            ldc as i32,
+            stride_c as i64,
+            batch as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(
+        status == 0,
+        "gemm_strided_batched_bf16 failed: status={status} (m={m} n={n} k={k} batch={batch})"
+    );
+    Ok(())
+}
 
 /// GEMMs at or below this N consult the cublasLt plan cache. 32 covers the
 /// decode buckets where cuBLAS's GemmEx heuristic picks badly (worst at

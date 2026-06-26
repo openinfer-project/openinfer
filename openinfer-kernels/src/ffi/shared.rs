@@ -155,6 +155,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn gemm_strided_batched_bf16_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const Half,
+        lda: i32,
+        stride_a: i64,
+        b: *const Half,
+        ldb: i32,
+        stride_b: i64,
+        c: *mut Half,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn gemm_lt_cuda(
         W: *const Half,
         X: *const Half,
