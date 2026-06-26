@@ -2,14 +2,12 @@ use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
+use super::deepgemm_layout::glm52_trtllm_grouped_offset_padded_rows;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
 pub const GLM52_TRTLLM_GROUPED_W13_KIND: i32 = 1;
 pub const GLM52_TRTLLM_GROUPED_W2_KIND: i32 = 2;
-pub const GLM52_TRTLLM_GROUPED_LOCAL_EXPERTS: usize = 32;
-pub const GLM52_TRTLLM_GROUPED_M_CAPACITY: usize = 10240;
-pub const GLM52_TRTLLM_GROUPED_OFFSET_ROWS: usize = 11232;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Glm52TrtllmGroupedFp8Kind {
@@ -41,17 +39,16 @@ pub struct Glm52TrtllmGroupedFp8Contract {
 impl Glm52TrtllmGroupedFp8Contract {
     pub fn validate(self, kind: Glm52TrtllmGroupedFp8Kind) -> Result<()> {
         ensure!(
-            self.groups == GLM52_TRTLLM_GROUPED_LOCAL_EXPERTS,
-            "GLM5.2 TRTLLM grouped FP8 expects {} groups, got {}",
-            GLM52_TRTLLM_GROUPED_LOCAL_EXPERTS,
+            self.groups > 0,
+            "GLM5.2 TRTLLM grouped FP8 needs groups>0, got {}",
             self.groups
         );
+        let offset_rows = glm52_trtllm_grouped_offset_padded_rows(self.m_capacity, self.groups);
         ensure!(
-            self.m_capacity == GLM52_TRTLLM_GROUPED_M_CAPACITY
-                && self.activation_scale_trtllm_rows == GLM52_TRTLLM_GROUPED_OFFSET_ROWS,
-            "GLM5.2 TRTLLM grouped FP8 expects m_capacity={} and activation scale rows={}, got m_capacity={}, activation_scale_trtllm_rows={}",
-            GLM52_TRTLLM_GROUPED_M_CAPACITY,
-            GLM52_TRTLLM_GROUPED_OFFSET_ROWS,
+            self.m_capacity > 0 && self.activation_scale_trtllm_rows == offset_rows,
+            "GLM5.2 TRTLLM grouped FP8 needs m_capacity>0 and activation scale rows={offset_rows} (offset-padded for m_capacity={}, groups={}), got m_capacity={}, activation_scale_trtllm_rows={}",
+            self.m_capacity,
+            self.groups,
             self.m_capacity,
             self.activation_scale_trtllm_rows
         );

@@ -25,9 +25,10 @@ using Glm52TrtllmGroupedRunner =
 
 constexpr int kKindW13 = 1;
 constexpr int kKindW2 = 2;
-constexpr int kLocalExperts = 32;
-constexpr int kMCapacity = 10240;
-constexpr int kTrtllmOffsetScaleRows = 11232;
+// PP8 EP1: groups (all 256 local experts) and m_capacity (bs=1 = top_k*alignment)
+// are RUNTIME; the offset-scale row count is derived from them (mirrors the Rust
+// glm52_trtllm_grouped_offset_padded_rows helper). 32-row TMA offset alignment.
+constexpr int kOffsetAlignment = 32;
 constexpr int kW13N = 4096;
 constexpr int kW13K = 6144;
 constexpr int kW13WeightScaleRows = 32;
@@ -60,7 +61,7 @@ bool valid_w13(int n, int k) { return n == kW13N && k == kW13K; }
 bool valid_w2(int n, int k) { return n == kW2N && k == kW2K; }
 
 bool valid_shape(int operand_kind, int groups, int m_capacity, int n, int k) {
-  if (groups != kLocalExperts || m_capacity != kMCapacity) {
+  if (groups <= 0 || m_capacity <= 0) {
     return false;
   }
   if (operand_kind == kKindW13) return valid_w13(n, k);
@@ -70,6 +71,13 @@ bool valid_shape(int operand_kind, int groups, int m_capacity, int n, int k) {
 
 int div_up_int(int value, int divisor) {
   return (value + divisor - 1) / divisor;
+}
+
+// Padded row count of the offset-major activation-scale TMA layout for a runtime
+// (m_capacity, groups). Matches glm52_trtllm_grouped_offset_padded_rows (Rust).
+int trtllm_offset_padded_rows(int rows, int groups) {
+  return (rows + groups * (kOffsetAlignment - 1)) / kOffsetAlignment *
+         kOffsetAlignment;
 }
 
 bool valid_glm52_linear_shape(int n, int k) {
@@ -103,7 +111,8 @@ bool valid_contract(int operand_kind, int groups, int m_capacity, int n, int k,
                     int activation_scale_cols,
                     int activation_scale_trtllm_rows) {
   if (!valid_shape(operand_kind, groups, m_capacity, n, k) ||
-      activation_scale_trtllm_rows != kTrtllmOffsetScaleRows) {
+      activation_scale_trtllm_rows !=
+          trtllm_offset_padded_rows(m_capacity, groups)) {
     return false;
   }
   if (operand_kind == kKindW13) {

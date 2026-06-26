@@ -7,8 +7,9 @@ use crate::tensor::DeviceContext;
 
 pub const GLM52_DEEPGEMM_GROUPED_W13_KIND: i32 = 1;
 pub const GLM52_DEEPGEMM_GROUPED_W2_KIND: i32 = 2;
-pub const GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS: usize = 32;
-pub const GLM52_DEEPGEMM_GROUPED_M_CAPACITY: usize = 10240;
+/// Per-expert row alignment of the grouped layout (a fixed design constant; the
+/// group count and m_capacity are runtime — PP8 EP1 owns all 256 experts and
+/// bs=1 decode sizes m_capacity to top_k*alignment).
 pub const GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,18 +44,14 @@ pub struct Glm52DeepGemmGroupedFp8Contract {
 impl Glm52DeepGemmGroupedFp8Contract {
     pub fn validate(self, kind: Glm52DeepGemmGroupedFp8Kind) -> Result<()> {
         ensure!(
-            self.groups == GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS
-                && self.psum_entries == GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS,
-            "GLM5.2 DeepGEMM grouped FP8 expects {} groups/psum entries, got groups={}, psum_entries={}",
-            GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS,
+            self.groups > 0 && self.psum_entries == self.groups,
+            "GLM5.2 DeepGEMM grouped FP8 needs groups>0 with one psum entry per group, got groups={}, psum_entries={}",
             self.groups,
             self.psum_entries
         );
         ensure!(
-            self.m_capacity == GLM52_DEEPGEMM_GROUPED_M_CAPACITY
-                && self.activation_scale_tma_rows == GLM52_DEEPGEMM_GROUPED_M_CAPACITY,
-            "GLM5.2 DeepGEMM grouped FP8 expects m_capacity/activation scale rows {}, got m_capacity={}, activation_scale_tma_rows={}",
-            GLM52_DEEPGEMM_GROUPED_M_CAPACITY,
+            self.m_capacity > 0 && self.activation_scale_tma_rows == self.m_capacity,
+            "GLM5.2 DeepGEMM grouped FP8 needs m_capacity>0 == activation scale rows, got m_capacity={}, activation_scale_tma_rows={}",
             self.m_capacity,
             self.activation_scale_tma_rows
         );
@@ -122,17 +119,23 @@ pub fn glm52_deepgemm_grouped_fp8_contract_validate(
 
 pub fn glm52_deepgemm_grouped_fp8_metadata_launch(
     ctx: &DeviceContext,
+    groups: usize,
+    m_capacity: usize,
     psum_expert: &CudaSlice<i32>,
     expert_offsets: &mut CudaSlice<i64>,
     w13_problem_sizes: &mut CudaSlice<i32>,
     w2_problem_sizes: &mut CudaSlice<i32>,
 ) -> Result<()> {
     ensure!(
-        psum_expert.len() >= GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS
-            && expert_offsets.len() > GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS
-            && w13_problem_sizes.len() >= GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS * 3
-            && w2_problem_sizes.len() >= GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS * 3,
-        "GLM5.2 DeepGEMM grouped FP8 metadata buffers too small: psum={}, offsets={}, w13={}, w2={}",
+        groups > 0 && m_capacity > 0,
+        "GLM5.2 DeepGEMM grouped FP8 metadata needs groups>0 and m_capacity>0, got groups={groups}, m_capacity={m_capacity}"
+    );
+    ensure!(
+        psum_expert.len() >= groups
+            && expert_offsets.len() > groups
+            && w13_problem_sizes.len() >= groups * 3
+            && w2_problem_sizes.len() >= groups * 3,
+        "GLM5.2 DeepGEMM grouped FP8 metadata buffers too small for {groups} groups: psum={}, offsets={}, w13={}, w2={}",
         psum_expert.len(),
         expert_offsets.len(),
         w13_problem_sizes.len(),
@@ -148,8 +151,8 @@ pub fn glm52_deepgemm_grouped_fp8_metadata_launch(
             offsets_ptr as *mut i64,
             w13_ptr as *mut i32,
             w2_ptr as *mut i32,
-            GLM52_DEEPGEMM_GROUPED_LOCAL_EXPERTS as i32,
-            GLM52_DEEPGEMM_GROUPED_M_CAPACITY as i32,
+            groups as i32,
+            m_capacity as i32,
             GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT as i32,
             ctx.stream.cu_stream(),
         )

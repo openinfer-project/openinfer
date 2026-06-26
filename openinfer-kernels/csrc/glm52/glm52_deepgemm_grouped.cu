@@ -7,8 +7,9 @@ namespace {
 
 constexpr int kKindW13 = 1;
 constexpr int kKindW2 = 2;
-constexpr int kLocalExperts = 32;
-constexpr int kMCapacity = 10240;
+// PP8 EP1: groups (256 local experts) and m_capacity (bs=1 = top_k*alignment) are
+// RUNTIME args to the group-generic metadata kernel; only the 64-row expert
+// alignment is a fixed design constant.
 constexpr int kExpertAlignment = 64;
 constexpr int kW13N = 4096;
 constexpr int kW13K = 6144;
@@ -83,12 +84,15 @@ CUresult map_cuda_error(cudaError_t err) {
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
+// PP8 EP1: every stage owns all 256 routed experts, and bs=1 decode sizes
+// m_capacity to top_k*alignment, so groups/m_capacity are RUNTIME (the metadata
+// kernel is group-generic). Validate structural consistency, not the EP8-era
+// magic numbers. expert_alignment stays the fixed 64-row design constant.
 bool valid_common(int groups, int m_capacity, int psum_entries,
                   int expert_alignment, int activation_scale_tma_rows) {
-  return groups == kLocalExperts && m_capacity == kMCapacity &&
-         psum_entries == kLocalExperts &&
+  return groups > 0 && m_capacity > 0 && psum_entries == groups &&
          expert_alignment == kExpertAlignment &&
-         activation_scale_tma_rows == kMCapacity;
+         activation_scale_tma_rows == m_capacity;
 }
 
 bool valid_w13(int n, int k, int weight_scale_rows, int weight_scale_cols,
@@ -138,8 +142,7 @@ CUresult glm52_deepgemm_grouped_fp8_metadata_cuda(
       w13_problem_sizes == nullptr || w2_problem_sizes == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if (groups != kLocalExperts || m_capacity != kMCapacity ||
-      expert_alignment != kExpertAlignment) {
+  if (groups <= 0 || m_capacity <= 0 || expert_alignment != kExpertAlignment) {
     return CUDA_ERROR_INVALID_VALUE;
   }
 
