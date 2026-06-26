@@ -69,12 +69,6 @@ impl Glm52RankGpuContext {
         &self.stream
     }
 
-    /// Raw context handle, needed by the PP8 spine to enable NVLink P2P access
-    /// into this stage from a neighbour (`cuCtxEnablePeerAccess`).
-    pub(crate) fn cuda_context(&self) -> &Arc<CudaContext> {
-        &self.ctx
-    }
-
     fn set_current_device(device_ordinal: usize) -> Result<()> {
         let err = unsafe { ffi::cuda_set_device(device_ordinal as i32) };
         ensure!(

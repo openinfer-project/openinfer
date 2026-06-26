@@ -2,13 +2,16 @@
 //! resolved peer virtual-address table that each stage bakes into its captured
 //! graph.
 //!
-//! This is the first peer-access user in the repo. The driver-API protocol
-//! (`cuDeviceCanAccessPeer` + `cuCtxEnablePeerAccess`, peer pointers remote
-//! stored from a kernel) is lifted from `tilert_play/benchmarks/p2p_lsend`.
+//! This is the first peer-access user in the repo. cudarc allocates via
+//! `cuMemAllocAsync` (stream-ordered pool memory), so peer reach is granted with
+//! the pool access descriptor (`cuMemPoolSetAccess`), NOT the legacy
+//! `cuCtxEnablePeerAccess` -- which governs only `cuMemAlloc` memory and leaves a
+//! pool allocation faulting (`Warp Illegal Address`) on a neighbour's remote
+//! store. The remote-store protocol is lifted from `tilert_play/benchmarks/p2p_lsend`.
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use cudarc::driver::sys::{self, CUresult};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use half::bf16;
@@ -98,39 +101,43 @@ pub(crate) struct Glm52PeerEdge {
     pub(crate) up_ack: u64,
 }
 
-/// Enable NVLink P2P from the *current* context into the peer context. The
-/// caller must have its own context bound to the calling thread; `peer_ctx` is
-/// the neighbour's raw `CUcontext` (a handle, safe to pass across threads).
-/// Asserts the link exists and both ends use unified addressing, else bails: a
-/// silent fallback to staged copies would wreck the very latency budget this
-/// spine exists to prove.
-pub(crate) fn enable_peer_access(
-    my_ordinal: usize,
-    peer_ordinal: usize,
-    peer_ctx: sys::CUcontext,
-) -> Result<()> {
+/// Grant the given neighbour devices read/write access to THIS device's
+/// stream-ordered memory pool (the one cudarc's `cuMemAllocAsync` draws from).
+/// A stage's inbound `hidden`/`flag` rings are remote-written by its upstream and
+/// its `ack` ring by its downstream, so each stage grants both neighbours. Bails
+/// if the NVLink does not exist rather than silently staging copies through host,
+/// which would wreck the latency budget this spine exists to prove.
+pub(crate) fn grant_pool_peer_access(my_ordinal: usize, neighbor_ordinals: &[usize]) -> Result<()> {
     let my_dev = cu_device(my_ordinal)?;
-    let peer_dev = cu_device(peer_ordinal)?;
-
-    let mut can: i32 = 0;
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
     cu_ok(
-        unsafe { sys::cuDeviceCanAccessPeer(&raw mut can, my_dev, peer_dev) },
-        "cuDeviceCanAccessPeer",
+        unsafe { sys::cuDeviceGetDefaultMemPool(&raw mut pool, my_dev) },
+        "cuDeviceGetDefaultMemPool",
     )?;
-    ensure!(
-        can == 1,
-        "GPU {my_ordinal} cannot NVLink-P2P access GPU {peer_ordinal}"
-    );
-    ensure!(
-        unified_addressing(my_dev)? && unified_addressing(peer_dev)?,
-        "GPU {my_ordinal}/{peer_ordinal} lack unified addressing required for peer remote stores"
-    );
-
-    let r = unsafe { sys::cuCtxEnablePeerAccess(peer_ctx, 0) };
-    match r {
-        CUresult::CUDA_SUCCESS | CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => Ok(()),
-        other => bail!("cuCtxEnablePeerAccess GPU {my_ordinal}->{peer_ordinal} failed: {other:?}"),
+    for &peer_ordinal in neighbor_ordinals {
+        let peer_dev = cu_device(peer_ordinal)?;
+        let mut can: i32 = 0;
+        cu_ok(
+            unsafe { sys::cuDeviceCanAccessPeer(&raw mut can, peer_dev, my_dev) },
+            "cuDeviceCanAccessPeer",
+        )?;
+        ensure!(
+            can == 1,
+            "GPU {peer_ordinal} cannot NVLink-P2P access GPU {my_ordinal}'s memory pool"
+        );
+        let desc = sys::CUmemAccessDesc {
+            location: sys::CUmemLocation {
+                type_: sys::CUmemLocationType_enum::CU_MEM_LOCATION_TYPE_DEVICE,
+                id: peer_dev,
+            },
+            flags: sys::CUmemAccess_flags_enum::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        cu_ok(
+            unsafe { sys::cuMemPoolSetAccess(pool, &raw const desc, 1) },
+            "cuMemPoolSetAccess",
+        )?;
     }
+    Ok(())
 }
 
 fn cu_device(ordinal: usize) -> Result<sys::CUdevice> {
@@ -140,21 +147,6 @@ fn cu_device(ordinal: usize) -> Result<sys::CUdevice> {
         "cuDeviceGet",
     )?;
     Ok(dev)
-}
-
-fn unified_addressing(dev: sys::CUdevice) -> Result<bool> {
-    let mut v: i32 = 0;
-    cu_ok(
-        unsafe {
-            sys::cuDeviceGetAttribute(
-                &raw mut v,
-                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
-                dev,
-            )
-        },
-        "cuDeviceGetAttribute(UNIFIED_ADDRESSING)",
-    )?;
-    Ok(v == 1)
 }
 
 fn cu_ok(r: CUresult, what: &str) -> Result<()> {

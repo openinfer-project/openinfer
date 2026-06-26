@@ -5,9 +5,10 @@
 //! is driven serially here.
 //!
 //! Orchestration (all stages in parallel, two barriers):
-//!   1. each stage allocs its rings, publishes its buffer VAs + raw context;
-//!   2. [barrier] each stage builds its peer edge, enables NVLink P2P into its
-//!      neighbours, zeroes its control words, captures `wait/burn/send`;
+//!   1. each stage grants its neighbours access to its memory pool, allocs its
+//!      rings, and publishes their peer VAs;
+//!   2. [barrier] each stage resolves its peer edge from the neighbours' VAs,
+//!      zeroes its control words, and captures `wait/burn/send`;
 //!   3. [barrier] each stage enqueues `warmup+iters` async graph launches and
 //!      syncs -- the device flags serialize the chain across GPUs;
 //!   4. host gathers the producer `deltas` and reduces per-hop percentiles.
@@ -21,7 +22,7 @@ use openinfer_kernels::ops::{
     glm52_pp_source_inject_launch, glm52_pp_wait_hidden_launch,
 };
 
-use super::peer::{Glm52PeerEdge, Glm52StageBuffers, Glm52StageVas, enable_peer_access};
+use super::peer::{Glm52PeerEdge, Glm52StageBuffers, Glm52StageVas, grant_pool_peer_access};
 use super::stage_graph::Glm52StageGraph;
 use crate::weights::Glm52RankGpuContext;
 
@@ -79,16 +80,6 @@ enum StageRole {
     Sink,
 }
 
-/// Buffer VAs + raw context handle one stage publishes for its neighbours. The
-/// `CUcontext` is stored as `usize` so it crosses the thread boundary as plain
-/// data (the handle is reused only to enable peer access, never dereferenced).
-#[derive(Clone, Copy)]
-struct Glm52StageHandshake {
-    vas: Glm52StageVas,
-    cu_ctx_addr: usize,
-    ordinal: usize,
-}
-
 struct StageOutput {
     wall: Duration,
     deltas: Option<Vec<u64>>,
@@ -117,8 +108,7 @@ pub fn run_pp_p2p_spine(config: Glm52PpSpineConfig) -> Result<Glm52PpSpineReport
         );
     }
 
-    let handshakes: Vec<Mutex<Option<Glm52StageHandshake>>> =
-        (0..n).map(|_| Mutex::new(None)).collect();
+    let handshakes: Vec<Mutex<Option<Glm52StageVas>>> = (0..n).map(|_| Mutex::new(None)).collect();
     let barrier = Barrier::new(n);
     let cfg = &config;
     let hs = &handshakes;
@@ -145,7 +135,7 @@ fn run_stage(
     stage: usize,
     n: usize,
     cfg: &Glm52PpSpineConfig,
-    handshakes: &[Mutex<Option<Glm52StageHandshake>>],
+    handshakes: &[Mutex<Option<Glm52StageVas>>],
     barrier: &Barrier,
 ) -> Result<StageOutput> {
     let role = if stage == 0 {
@@ -161,35 +151,37 @@ fn run_stage(
     let gctx = Glm52RankGpuContext::new(ordinal)?;
     gctx.set_current()?;
     let dctx = gctx.as_device_context();
+
+    // Grant both neighbours access to this stage's memory pool BEFORE allocating
+    // from it -- the upstream remote-writes our hidden/flag rings, the downstream
+    // our ack ring. Neighbour ordinals come straight from the config; only the
+    // peer VAs need the post-barrier handshake.
+    let mut neighbors = Vec::new();
+    if stage > 0 {
+        neighbors.push(cfg.device_ordinals[stage - 1]);
+    }
+    if stage + 1 < n {
+        neighbors.push(cfg.device_ordinals[stage + 1]);
+    }
+    grant_pool_peer_access(ordinal, &neighbors)?;
+
     // `buffers` is declared before `graph` so the graph's handles are destroyed
     // before the rings they reference are freed.
     let mut buffers =
         Glm52StageBuffers::new(gctx.stream(), cfg.ring, cfg.words, cfg.iters as usize)?;
 
-    // Phase 1: publish this stage's peer targets + context handle.
-    let vas = buffers.peer_targets(gctx.stream());
-    *handshakes[stage].lock().unwrap() = Some(Glm52StageHandshake {
-        vas,
-        cu_ctx_addr: gctx.cuda_context().cu_ctx() as usize,
-        ordinal,
-    });
+    // Phase 1: publish this stage's peer target VAs.
+    *handshakes[stage].lock().unwrap() = Some(buffers.peer_targets(gctx.stream()));
     barrier.wait();
 
-    // Phase 2: resolve the peer edge and open NVLink P2P into the neighbours
-    // this stage remote-writes (downstream hidden/flag; upstream ack).
+    // Phase 2: resolve the peer edge from the neighbours' published VAs.
     let down = (stage + 1 < n).then(|| read_handshake(handshakes, stage + 1));
     let up = (stage > 0).then(|| read_handshake(handshakes, stage - 1));
     let edge = Glm52PeerEdge {
-        down_hidden: down.map(|h| h.vas.hidden_in_ring).unwrap_or(0),
-        down_flag: down.map(|h| h.vas.flag_ring).unwrap_or(0),
-        up_ack: up.map(|h| h.vas.ack_ring).unwrap_or(0),
+        down_hidden: down.map(|v| v.hidden_in_ring).unwrap_or(0),
+        down_flag: down.map(|v| v.flag_ring).unwrap_or(0),
+        up_ack: up.map(|v| v.ack_ring).unwrap_or(0),
     };
-    if let Some(h) = down {
-        enable_peer_access(ordinal, h.ordinal, h.cu_ctx_addr as _)?;
-    }
-    if let Some(h) = up {
-        enable_peer_access(ordinal, h.ordinal, h.cu_ctx_addr as _)?;
-    }
 
     buffers.reset_control(gctx.stream())?;
     gctx.sync()?;
@@ -255,14 +247,11 @@ fn run_stage(
     Ok(StageOutput { wall, deltas })
 }
 
-fn read_handshake(
-    handshakes: &[Mutex<Option<Glm52StageHandshake>>],
-    idx: usize,
-) -> Glm52StageHandshake {
+fn read_handshake(handshakes: &[Mutex<Option<Glm52StageVas>>], idx: usize) -> Glm52StageVas {
     handshakes[idx]
         .lock()
         .unwrap()
-        .expect("neighbour published its handshake before the barrier")
+        .expect("neighbour published its VAs before the barrier")
 }
 
 fn build_report(cfg: &Glm52PpSpineConfig, outputs: &[StageOutput]) -> Glm52PpSpineReport {
