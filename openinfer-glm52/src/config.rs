@@ -21,10 +21,9 @@ pub(crate) const GLM52_QK_NOPE_HEAD_DIM: usize = 192;
 pub(crate) const GLM52_QK_ROPE_HEAD_DIM: usize = 64;
 pub(crate) const GLM52_QK_HEAD_DIM: usize = GLM52_QK_NOPE_HEAD_DIM + GLM52_QK_ROPE_HEAD_DIM;
 pub(crate) const GLM52_V_HEAD_DIM: usize = 256;
-pub(crate) const GLM52_Q_B_OUT: usize = 65_536;
+pub(crate) const GLM52_Q_B_OUT: usize = GLM52_HEADS * GLM52_QK_HEAD_DIM;
 pub(crate) const GLM52_KV_A_OUT: usize = GLM52_KV_LORA_RANK + GLM52_QK_ROPE_HEAD_DIM;
-pub(crate) const GLM52_KV_B_OUT: usize =
-    GLM52_HEADS * (GLM52_QK_NOPE_HEAD_DIM + GLM52_V_HEAD_DIM) * 4;
+pub(crate) const GLM52_KV_B_OUT: usize = GLM52_HEADS * (GLM52_QK_NOPE_HEAD_DIM + GLM52_V_HEAD_DIM);
 pub(crate) const GLM52_O_PROJ_IN: usize = GLM52_HEADS * GLM52_V_HEAD_DIM;
 
 pub(crate) const GLM52_DENSE_INTERMEDIATE: usize = 12_288;

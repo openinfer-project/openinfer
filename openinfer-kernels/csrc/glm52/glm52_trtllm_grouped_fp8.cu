@@ -76,9 +76,9 @@ bool valid_glm52_linear_shape(int n, int k) {
   if (n <= 0 || k <= 0 || k % 128 != 0) return false;
   // Attention projections.
   if (n == 2048 && k == 6144) return true;    // q_a / shared gate/up
-  if (n == 65536 && k == 2048) return true;   // q_b
+  if (n == 16384 && k == 2048) return true;   // q_b
   if (n == 576 && k == 6144) return true;     // kv_a + rope
-  if (n == 114688 && k == 512) return true;   // kv_b
+  if (n == 28672 && k == 512) return true;    // kv_b
   if (n == 6144 && k == 16384) return true;   // o_proj
   if (n == 128 && k == 6144) return true;     // indexer wk
   if (n == 4096 && k == 2048) return true;    // indexer wq_b
