@@ -45,6 +45,10 @@ required-features = ["qwen35-4b"]
 name = "sampling_behavior"
 required-features = ["qwen35-4b"]
 
+[[test]]
+name = "chunked_prefill"
+required-features = ["qwen35-4b"]
+
 [[bench]]
 name = "qwen35_ops"
 harness = false
