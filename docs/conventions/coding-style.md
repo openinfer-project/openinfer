@@ -2,7 +2,7 @@
 
 ## Testing
 
-Don't test for the sake of testing. Prefer integration tests over unit tests — if the E2E test catches it, a unit test is ceremony. Unit tests earn their place for silent failures: GPU kernels, tricky data-structure invariants, edge-case-rich pure logic.
+Don't test for the sake of testing. Before keeping a test, ask: if this test is deleted, does confidence in correctness drop? If not, delete it. Prefer integration tests over unit tests — if the E2E test catches it, a unit test is ceremony. Unit tests earn their place for silent failures: GPU kernels, tricky data-structure invariants, edge-case-rich pure logic.
 
 ## Logging
 

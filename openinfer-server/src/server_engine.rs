@@ -12,6 +12,8 @@ pub enum ModelType {
     DeepSeekV2Lite,
     #[cfg(feature = "deepseek-v4")]
     DeepSeekV4,
+    #[cfg(feature = "glm52")]
+    Glm52,
     #[cfg(feature = "kimi-k2")]
     KimiK2,
     #[cfg(feature = "qwen3-4b")]
@@ -29,6 +31,8 @@ impl fmt::Display for ModelType {
             Self::DeepSeekV2Lite => write!(f, "DeepSeek-V2-Lite"),
             #[cfg(feature = "deepseek-v4")]
             Self::DeepSeekV4 => write!(f, "DeepSeek V4"),
+            #[cfg(feature = "glm52")]
+            Self::Glm52 => write!(f, "GLM5.2"),
             #[cfg(feature = "kimi-k2")]
             Self::KimiK2 => write!(f, "Kimi-K2.6"),
             #[cfg(feature = "qwen3-4b")]
@@ -75,6 +79,22 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
         #[cfg(not(feature = "deepseek-v4"))]
         anyhow::bail!(
             "DeepSeek V4 support is feature-gated; rebuild openinfer-server with --features deepseek-v4"
+        );
+    }
+
+    if json
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model_type| model_type == "glm_moe_dsa")
+    {
+        #[cfg(feature = "glm52")]
+        {
+            openinfer_glm52::probe_config_json(&json)?;
+            return Ok(ModelType::Glm52);
+        }
+        #[cfg(not(feature = "glm52"))]
+        anyhow::bail!(
+            "GLM5.2 support is feature-gated; rebuild openinfer-server with --features glm52"
         );
     }
 

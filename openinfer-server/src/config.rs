@@ -11,7 +11,7 @@ use openinfer_qwen3_4b::Qwen3LoraOptions;
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
 #[derive(Parser)]
-#[command(name = "openinfer", about = "Qwen3/3.5 GPU inference server")]
+#[command(name = "openinfer", about = "openinfer GPU inference server")]
 #[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
 pub(crate) struct Args {
     /// Model directory containing config, tokenizer, and safetensor shards
@@ -58,11 +58,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 1)]
     pub tp_size: usize,
 
-    /// Data-parallel world size for Kimi-K2
+    /// Data-parallel world size for MoE models such as Kimi-K2 and GLM5.2
     #[arg(long, default_value_t = 8)]
     pub dp_size: usize,
 
-    /// Expert-parallel backend for Kimi-K2 (TP1/DP8 requires deepep; TP8/DP1 requires nccl)
+    /// Expert-parallel backend for MoE models (GLM5.2 TP1/DP8 requires deepep; Kimi TP1/DP8 requires deepep; Kimi TP8/DP1 requires nccl)
     #[arg(long, default_value = "deepep")]
     pub ep_backend: CliEpBackend,
 
@@ -101,33 +101,40 @@ pub(crate) struct Args {
     /// under request bursts; prompts longer than the cap are split across steps
     /// so running decodes keep ticking. On Qwen3, echo requests are never
     /// split. Must be positive.
-    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
+    #[cfg(any(feature = "qwen3-4b", feature = "qwen35-4b"))]
+    #[cfg_attr(feature = "qwen3-4b", arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS))]
+    #[cfg_attr(all(not(feature = "qwen3-4b"), feature = "qwen35-4b"), arg(long, default_value_t = openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS))]
     pub max_prefill_tokens: usize,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, CUDA Graph capture, and margin.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_GPU_MEMORY_UTILIZATION)]
     pub gpu_memory_utilization: f64,
 
     /// Additional Qwen3 GPU memory to hold back after profile-based KV sizing,
     /// in MiB. Covers allocator fragmentation and small unprofiled drift.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, default_value_t = (openinfer_qwen3_4b::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
     pub kv_cache_memory_margin_mib: usize,
     /// How prefill and decode share the GPU (single-GPU Qwen3 only).
     /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
     /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green
     /// Context SM partition (lower decode ITL p99, higher TTFT).
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, value_enum, default_value_t = CliDecodeOverlap::Off)]
     pub decode_overlap: CliDecodeOverlap,
 
     /// Percent of SMs pinned to decode in `--decode-overlap green-ctx` (the rest
     /// go to prefill). Ignored in other modes.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, default_value_t = 20)]
     pub decode_sm_pct: u32,
 
     /// Enable Qwen3 projection-GEMM and split-KV chunk-count batch-invariant
     /// pinning. Off by default; does not cover path-selection residuals. Qwen3-only.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
 }
@@ -150,6 +157,7 @@ impl From<CliEpBackend> for EpBackend {
 
 /// CLI selector for prefill/decode overlap. Mapped to
 /// [`openinfer_qwen3_4b::DecodeOverlap`] together with `--decode-sm-pct`.
+#[cfg(feature = "qwen3-4b")]
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum CliDecodeOverlap {
     /// One stream; prefill and decode serialize.
@@ -161,6 +169,7 @@ pub(crate) enum CliDecodeOverlap {
     GreenCtx,
 }
 
+#[cfg(feature = "qwen3-4b")]
 impl CliDecodeOverlap {
     pub(crate) fn resolve(self, decode_sm_pct: u32) -> openinfer_qwen3_4b::DecodeOverlap {
         use openinfer_qwen3_4b::DecodeOverlap;
@@ -182,22 +191,27 @@ impl Args {
         #[cfg(feature = "qwen3-4b")]
         let is_qwen3 = matches!(model_type, ModelType::Qwen3);
         #[cfg(not(feature = "qwen3-4b"))]
+        let _ = model_type;
+        #[cfg(not(feature = "qwen3-4b"))]
         let is_qwen3 = false;
         if self.enable_lora && !is_qwen3 {
             bail!("--enable-lora is currently supported only for Qwen3");
         }
-        if self.batch_invariant && !is_qwen3 {
-            bail!("--batch-invariant is currently supported only for Qwen3");
-        }
-        if self.batch_invariant && self.enable_lora {
-            bail!(
-                "--batch-invariant is not yet validated with --enable-lora; enable one at a time"
-            );
-        }
-        if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
-            bail!(
-                "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
-            );
+        #[cfg(feature = "qwen3-4b")]
+        {
+            if self.batch_invariant && !is_qwen3 {
+                bail!("--batch-invariant is currently supported only for Qwen3");
+            }
+            if self.batch_invariant && self.enable_lora {
+                bail!(
+                    "--batch-invariant is not yet validated with --enable-lora; enable one at a time"
+                );
+            }
+            if self.batch_invariant && !matches!(self.decode_overlap, CliDecodeOverlap::Off) {
+                bail!(
+                    "--batch-invariant is not compatible with --decode-overlap; Pin falls back to per-token under a stream override"
+                );
+            }
         }
         Ok(())
     }

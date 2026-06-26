@@ -406,10 +406,11 @@ fn reduce_request(
                 terminated = true;
             }
             TokenEvent::Rejected { message, .. } => {
-                // Rejected means the request could not be admitted, not that it
-                // completed cleanly.
                 warn!("request {request_id} rejected: {message}");
-                finish_reason = Some(EngineCoreFinishReason::Error);
+                // vllm-server drops stop_reason when EngineCoreFinishReason::Error
+                // is converted to an OpenAI error. Use Stop for request-level
+                // rejections so the northbound body still carries the reason.
+                finish_reason = Some(EngineCoreFinishReason::Stop);
                 stop_reason = Some(StopReason::Text(message));
                 terminated = true;
             }

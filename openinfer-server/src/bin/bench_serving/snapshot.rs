@@ -29,6 +29,14 @@ pub(crate) fn snapshot_prefill_prompt_len(model_type: ModelType) -> usize {
         // prompt the serving shape admits.
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => 2_048,
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => 2_048,
+        #[cfg(any(
+            feature = "deepseek-v2-lite",
+            feature = "deepseek-v4",
+            feature = "qwen3-4b",
+            feature = "qwen35-4b"
+        ))]
         _ => 10_000,
     }
 }
@@ -195,6 +203,19 @@ pub(crate) fn run_snapshot(
             cli.dp_size,
             format!("{:?}", cli.ep_backend).to_lowercase()
         )),
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => Some(format!(
+            "tp{}-dp{}-{}",
+            cli.tp_size,
+            cli.dp_size,
+            format!("{:?}", cli.ep_backend).to_lowercase()
+        )),
+        #[cfg(any(
+            feature = "deepseek-v2-lite",
+            feature = "deepseek-v4",
+            feature = "qwen3-4b",
+            feature = "qwen35-4b"
+        ))]
         _ => None,
     };
     let report = SnapshotReport {

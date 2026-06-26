@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::Router;
-use log::warn;
+use log::{info, warn};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -180,6 +180,7 @@ where
         }
     });
 
+    let chat_template = chat_template_override(&model_id);
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
             input_address,
@@ -199,7 +200,7 @@ where
         tool_call_parser: ParserSelection::default(),
         reasoning_parser: ParserSelection::default(),
         renderer: RendererSelection::default(),
-        chat_template: None,
+        chat_template,
         default_chat_template_kwargs: None,
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
@@ -257,6 +258,39 @@ fn resolve_max_model_len(model_path: &Path, max_model_len: Option<u32>) -> u32 {
             FALLBACK_MAX_MODEL_LEN
         })
     })
+}
+
+fn chat_template_override(model_id: &str) -> Option<String> {
+    let model_path = Path::new(model_id);
+    if !is_glm52_model_dir(model_path) {
+        return None;
+    }
+    let template_path = model_path.join("chat_template.jinja");
+    let Ok(template) = std::fs::read_to_string(&template_path) else {
+        warn!(
+            "GLM5.2 model has no readable {}; falling back to frontend default chat template loading",
+            template_path.display()
+        );
+        return None;
+    };
+    let patched = template.replace("m.content.0.type", "m.content[0].type");
+    if patched != template {
+        info!(
+            "Using Minijinja-compatible GLM5.2 chat template override from {}",
+            template_path.display()
+        );
+    }
+    Some(patched)
+}
+
+fn is_glm52_model_dir(model_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(model_path.join("config.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    json.get("model_type").and_then(serde_json::Value::as_str) == Some("glm_moe_dsa")
 }
 
 /// Cancel `token` on the first CTRL+C. Installing the handler replaces the

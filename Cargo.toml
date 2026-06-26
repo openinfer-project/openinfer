@@ -14,6 +14,7 @@ members = [
     "openinfer-build",
     "openinfer-deepseek-v4",
     "openinfer-deepseek-v2-lite",
+    "openinfer-glm52",
     "openinfer-kimi-k2",
     "openinfer-qwen3-4b",
     "openinfer-qwen35-4b",
@@ -142,6 +143,7 @@ openinfer-kv-offload = { path = "openinfer-kv-offload" }
 openinfer-cupti = { path = "openinfer-cupti" }
 openinfer-deepseek-v4 = { path = "openinfer-deepseek-v4" }
 openinfer-engine = { path = "openinfer-engine" }
+openinfer-glm52 = { path = "openinfer-glm52" }
 openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
 openinfer-qwen3-4b = { path = "openinfer-qwen3-4b" }

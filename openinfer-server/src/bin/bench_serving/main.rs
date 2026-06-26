@@ -18,7 +18,13 @@ use log::debug;
 use openinfer::logging;
 use openinfer::scheduler::SchedulerHandle;
 use openinfer::server_engine::{ModelType, detect_model_type};
-use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+use openinfer_core::engine::EngineLoadOptions;
+#[cfg(any(
+    feature = "deepseek-v2-lite",
+    feature = "deepseek-v4",
+    feature = "qwen3-4b"
+))]
+use openinfer_core::engine::EpBackend;
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
 use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
@@ -155,6 +161,24 @@ fn main() -> Result<()> {
             )?;
             finish(handle, false)
         }
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => {
+            anyhow::ensure!(cli.tp_size > 0, "--tp-size must be positive");
+            anyhow::ensure!(cli.dp_size > 0, "--dp-size must be positive");
+            let parallel = openinfer_core::parallel::ParallelConfig::new(cli.tp_size, cli.dp_size);
+            let handle = openinfer_glm52::start_engine(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: cli.cuda_graph,
+                    enable_prefill_profile: false,
+                    device_ordinals: (0..parallel.ep_world()).collect(),
+                    parallel_config: Some(parallel),
+                    ep_backend: cli.ep_backend.into(),
+                    seed: command_seed(&cli),
+                },
+            )?;
+            finish(handle, cli.cuda_graph)
+        }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {
             let parallel = kimi_parallel_config(cli.tp_size, cli.dp_size)?;
@@ -193,6 +217,11 @@ fn main() -> Result<()> {
                 openinfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
                 false,
                 max_prefill_tokens,
+                openinfer_qwen3_4b::Qwen3MemoryOptions::default().validate()?,
+                openinfer_qwen3_4b::DecodeOverlap::Off,
+                false,
+                None,
+                false,
             )?;
             finish(handle, cli.cuda_graph)
         }

@@ -25,6 +25,7 @@ qwen35-4b = []
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
 deepseek-v2-lite = []
+glm52 = []
 kimi-k2 = []
 
 [[example]]

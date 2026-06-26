@@ -138,15 +138,15 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false)]
     pub(crate) cuda_profiler_capture: bool,
 
-    /// Tensor-parallel world size for Kimi-K2
+    /// Tensor-parallel world size for MoE models such as Kimi-K2 and GLM5.2
     #[arg(long, default_value_t = 1)]
     pub(crate) tp_size: usize,
 
-    /// Data-parallel world size for Kimi-K2
+    /// Data-parallel world size for MoE models such as Kimi-K2 and GLM5.2
     #[arg(long, default_value_t = 8)]
     pub(crate) dp_size: usize,
 
-    /// Expert-parallel backend for Kimi-K2 (TP1/DP8 requires deepep; TP8/DP1 requires nccl)
+    /// Expert-parallel backend for MoE models (GLM5.2 TP1/DP8 requires deepep; Kimi TP1/DP8 requires deepep; Kimi TP8/DP1 requires nccl)
     #[arg(long, default_value = "deepep")]
     pub(crate) ep_backend: CliEpBackend,
 

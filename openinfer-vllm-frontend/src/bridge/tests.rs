@@ -354,10 +354,11 @@ fn aborted_request_drops_late_tokens() {
 }
 
 /// A rejected request (could not be admitted, e.g. too large for the KV cache)
-/// surfaces to the client as an error with the rejection message, and its stream
-/// is retired.
+/// must preserve its message in the OpenAI-visible stop_reason; using the error
+/// finish reason currently makes vllm-server drop that text behind a generic
+/// internal-server-error payload.
 #[test]
-fn rejected_request_is_reported_as_error() {
+fn rejected_request_preserves_rejection_message() {
     let mut d = Demux::new();
     d.add("req-1");
     d.emit(
@@ -380,7 +381,7 @@ fn rejected_request_is_reported_as_error() {
     assert_eq!(outputs.outputs.len(), 1);
     let output = &outputs.outputs[0];
     assert_eq!(output.request_id, "req-1");
-    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
     assert_eq!(
         output.stop_reason,
         Some(StopReason::Text(

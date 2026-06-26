@@ -1,0 +1,258 @@
+#include "../common.cuh"
+
+#include <cfloat>
+#include <cuda.h>
+#include <cuda_fp8.h>
+#include <math_constants.h>
+
+namespace {
+
+constexpr int kHeadDim = 128;
+constexpr int kQuantBlockSize = 128;
+constexpr int kScaleBytesPerToken = 4;
+constexpr int kTopK = 2048;
+constexpr size_t kTopKWorkspaceBytes = 1024 * 1024;
+constexpr float kFp8ScaleDivisor = 448.0f;
+constexpr float kFp8ScaleEps = 1.0e-4f;
+
+__device__ __forceinline__ unsigned char quantize_e4m3(float value,
+                                                       float scale) {
+  float q = fminf(fmaxf(value / scale, -448.0f), 448.0f);
+  return __nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+}
+
+__global__ void indexer_k_quant_and_cache_kernel(
+    const __nv_bfloat16* __restrict__ k,
+    unsigned char* __restrict__ indexer_cache,
+    const int64_t* __restrict__ slot_mapping, int tokens, int cache_block_size,
+    int64_t cache_block_stride_bytes, bool use_ue8m0_scale) {
+  constexpr int kVecSize = 4;
+  const int64_t token_idx = blockIdx.x;
+  const int64_t head_dim_idx =
+      (blockIdx.y * blockDim.y * blockDim.x + threadIdx.y * blockDim.x +
+       threadIdx.x) *
+      kVecSize;
+  if (token_idx >= tokens || head_dim_idx >= kHeadDim) return;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;
+  const int64_t block_idx = slot_idx / cache_block_size;
+  const int64_t block_offset = slot_idx % cache_block_size;
+
+  float2 packed = reinterpret_cast<const float2*>(k)[(token_idx * kHeadDim +
+                                                      head_dim_idx) /
+                                                     kVecSize];
+  __nv_bfloat16* values = reinterpret_cast<__nv_bfloat16*>(&packed);
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) {
+    amax = fmaxf(amax, fabsf(__bfloat162float(values[i])));
+  }
+
+  for (int mask = 16; mask > 0; mask /= 2) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask));
+  }
+
+  float scale = fmaxf(amax, kFp8ScaleEps) / kFp8ScaleDivisor;
+  if (use_ue8m0_scale) {
+    scale = exp2f(ceilf(log2f(scale)));
+  }
+
+  // vLLM cache_kernels.cu::indexer_k_quant_and_cache_kernel stores a block as:
+  // [block_size * 128 fp8 values][block_size * 4 f32-scale bytes].
+  const int64_t value_offset =
+      block_idx * cache_block_stride_bytes + block_offset * kHeadDim +
+      head_dim_idx;
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) {
+    indexer_cache[value_offset + i] =
+        quantize_e4m3(__bfloat162float(values[i]), scale);
+  }
+
+  if (threadIdx.x == 0) {
+    const int64_t scale_offset =
+        block_idx * cache_block_stride_bytes + cache_block_size * kHeadDim +
+        (block_offset * kHeadDim + head_dim_idx) * kScaleBytesPerToken /
+            kQuantBlockSize;
+    reinterpret_cast<float*>(indexer_cache)[scale_offset / sizeof(float)] =
+        scale;
+  }
+}
+
+template <int BlockYSize>
+__global__ void gather_indexer_k_quant_cache_kernel(
+    const unsigned char* __restrict__ indexer_cache,
+    unsigned char* __restrict__ dst_k, unsigned char* __restrict__ dst_scale,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cu_seq_lens, int batch_size,
+    int num_blocks_per_seq, int tokens, int cache_block_size,
+    int64_t cache_block_stride_bytes) {
+  constexpr int kVecSize = sizeof(float4) / sizeof(unsigned char);
+  const int token_idx = blockIdx.x * blockDim.y + threadIdx.y;
+  const int head_idx = (blockIdx.y * blockDim.x + threadIdx.x) * kVecSize;
+
+  __shared__ int batch_idx[BlockYSize];
+  if (threadIdx.x == 0) {
+    batch_idx[threadIdx.y] = -1;
+  }
+  __syncthreads();
+
+  for (int iter = 0; iter < (batch_size + blockDim.x - 1) / blockDim.x;
+       ++iter) {
+    int candidate = iter * blockDim.x + threadIdx.x;
+    if (candidate < batch_size) {
+      const int seq_start = cu_seq_lens[candidate];
+      const int seq_end = cu_seq_lens[candidate + 1];
+      if (token_idx >= seq_start && token_idx < seq_end) {
+        batch_idx[threadIdx.y] = candidate;
+      }
+    }
+  }
+  __syncthreads();
+
+  const int batch = batch_idx[threadIdx.y];
+  if (token_idx >= tokens || head_idx >= kHeadDim || batch < 0) return;
+
+  const int inbatch_seq_idx = token_idx - cu_seq_lens[batch];
+  const int block_idx =
+      block_table[batch * num_blocks_per_seq + inbatch_seq_idx / cache_block_size];
+  const int64_t src_block_offset =
+      static_cast<int64_t>(block_idx) * cache_block_stride_bytes;
+  const int64_t cache_inblock_offset =
+      (inbatch_seq_idx % cache_block_size) * kHeadDim + head_idx;
+  const int64_t src_value_offset = src_block_offset + cache_inblock_offset;
+  const int64_t dst_value_offset =
+      static_cast<int64_t>(token_idx) * kHeadDim + head_idx;
+
+  reinterpret_cast<float4*>(dst_k)[dst_value_offset / kVecSize] =
+      reinterpret_cast<const float4*>(indexer_cache)[src_value_offset /
+                                                     kVecSize];
+
+  if (threadIdx.x == 0) {
+    const int64_t src_scale_offset =
+        src_block_offset + cache_block_size * kHeadDim +
+        cache_inblock_offset * kScaleBytesPerToken / kQuantBlockSize;
+    reinterpret_cast<float*>(dst_scale)[token_idx] =
+        reinterpret_cast<const float*>(indexer_cache)[src_scale_offset /
+                                                     sizeof(float)];
+  }
+}
+
+CUresult map_cuda_error(cudaError_t err) {
+  if (err == cudaSuccess) return CUDA_SUCCESS;
+  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
+  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
+  return CUDA_ERROR_LAUNCH_FAILED;
+}
+
+CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
+
+bool valid_cache_layout(int head_dim, int quant_block_size,
+                        int cache_block_size,
+                        int64_t cache_block_stride_bytes) {
+  return head_dim == kHeadDim && quant_block_size == kQuantBlockSize &&
+         cache_block_size > 0 &&
+         cache_block_stride_bytes >=
+             static_cast<int64_t>(cache_block_size) *
+                 (kHeadDim + kScaleBytesPerToken);
+}
+
+}  // namespace
+
+extern "C" {
+
+CUresult glm52_indexer_k_quant_and_cache_cuda(
+    const __nv_bfloat16* k, unsigned char* indexer_cache,
+    const int64_t* slot_mapping, int tokens, int head_dim, int quant_block_size,
+    int cache_block_size, int64_t cache_block_stride_bytes,
+    int use_ue8m0_scale, cudaStream_t stream) {
+  if (k == nullptr || indexer_cache == nullptr || slot_mapping == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (tokens <= 0 ||
+      !valid_cache_layout(head_dim, quant_block_size, cache_block_size,
+                          cache_block_stride_bytes)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  constexpr int kVecSize = 4;
+  dim3 grid(tokens,
+            (kHeadDim + kQuantBlockSize * kVecSize - 1) /
+                (kQuantBlockSize * kVecSize));
+  dim3 block(32, kVecSize);
+  indexer_k_quant_and_cache_kernel<<<grid, block, 0, stream>>>(
+      k, indexer_cache, slot_mapping, tokens, cache_block_size,
+      cache_block_stride_bytes, use_ue8m0_scale != 0);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_indexer_k_gather_quant_cache_cuda(
+    const unsigned char* indexer_cache, unsigned char* dst_k,
+    unsigned char* dst_scale, const int* block_table, const int* cu_seq_lens,
+    int batch_size, int num_blocks_per_seq, int tokens, int head_dim,
+    int quant_block_size, int cache_block_size,
+    int64_t cache_block_stride_bytes, cudaStream_t stream) {
+  if (indexer_cache == nullptr || dst_k == nullptr || dst_scale == nullptr ||
+      block_table == nullptr || cu_seq_lens == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (tokens <= 0 || batch_size <= 0 || num_blocks_per_seq <= 0 ||
+      !valid_cache_layout(head_dim, quant_block_size, cache_block_size,
+                          cache_block_stride_bytes)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  constexpr int kBlockYSize = 8;
+  constexpr int kVecSize = sizeof(float4) / sizeof(unsigned char);
+  dim3 grid((tokens + kBlockYSize - 1) / kBlockYSize,
+            (kHeadDim + 8 * kVecSize - 1) / (8 * kVecSize));
+  dim3 block(8, kBlockYSize);
+  gather_indexer_k_quant_cache_kernel<kBlockYSize>
+      <<<grid, block, 0, stream>>>(
+          indexer_cache, dst_k, dst_scale, block_table, cu_seq_lens,
+          batch_size, num_blocks_per_seq, tokens, cache_block_size,
+          cache_block_stride_bytes);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_indexer_topk_2048_contract_cuda(int rows, int stride,
+                                               int max_seq_len,
+                                               size_t* workspace_bytes) {
+  if (workspace_bytes == nullptr) return CUDA_ERROR_INVALID_VALUE;
+  if (rows <= 0 || stride < kTopK || max_seq_len < 0 || max_seq_len > stride) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  *workspace_bytes = kTopKWorkspaceBytes;
+  return CUDA_SUCCESS;
+}
+
+CUresult glm52_indexer_topk_2048_cuda(
+    const float* logits, const int* seq_lens, int* indices,
+    unsigned char* workspace, size_t workspace_bytes, int rows, int stride,
+    int max_seq_len, int next_n, int seq_lens_is_2d, cudaStream_t stream) {
+  (void)logits;
+  (void)seq_lens;
+  (void)indices;
+  (void)workspace;
+  (void)workspace_bytes;
+  (void)rows;
+  (void)stride;
+  (void)max_seq_len;
+  (void)next_n;
+  (void)seq_lens_is_2d;
+  (void)stream;
+
+  // ABI is source-backed by vLLM:
+  //   ../vllm/csrc/libtorch_stable/sampler.cu::top_k_per_row_decode
+  //   ../vllm/csrc/libtorch_stable/topk.cu::persistent_topk
+  //   ../vllm/csrc/libtorch_stable/cooperative_topk.cu::cooperative_topk
+  // The full kernel copy needs either the sampler radix subset plus aux
+  // workspace policy, or the persistent/cooperative headers. Fail closed until
+  // that source slice is ported.
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+}  // extern "C"

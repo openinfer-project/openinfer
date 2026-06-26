@@ -264,6 +264,88 @@ fn nvcc_arch_args(normalized_sms: &[String]) -> Vec<String> {
     args
 }
 
+fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
+    let stem = format!(
+        "openinfer_nvcc_probe_{}_compute_{compute}_sm_{sm}",
+        std::process::id()
+    );
+    let cu_path = std::env::temp_dir().join(format!("{stem}.cu"));
+    let obj_path = std::env::temp_dir().join(format!("{stem}.o"));
+    if let Err(err) = fs::write(
+        &cu_path,
+        "extern \"C\" __global__ void openinfer_nvcc_probe() {}\n",
+    ) {
+        println!(
+            "cargo:warning=Failed to write nvcc probe {}: {err}",
+            cu_path.display()
+        );
+        return false;
+    }
+
+    let output = Command::new(nvcc)
+        .args(["-c"])
+        .arg(&cu_path)
+        .arg("-o")
+        .arg(&obj_path)
+        .arg("-gencode")
+        .arg(format!("arch=compute_{compute},code=sm_{sm}"))
+        .output();
+    let _ = fs::remove_file(&cu_path);
+    let _ = fs::remove_file(&obj_path);
+
+    match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            println!(
+                "cargo:warning=nvcc rejected compute_{compute}/sm_{sm} probe: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(err) => {
+            println!("cargo:warning=Failed to run nvcc arch probe: {err}");
+            false
+        }
+    }
+}
+
+fn glm52_trtllm_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String> {
+    let sm90a_supported = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a")
+        && nvcc_accepts_gencode(nvcc, "90a", "90a");
+    let mut promoted_sms = Vec::new();
+    for sm in normalized_sms {
+        let promoted = if sm == "90" || sm == "90a" {
+            if sm90a_supported {
+                "90a"
+            } else {
+                println!(
+                    "cargo:warning=nvcc cannot compile compute_90a/sm_90a; GLM5.2 TRTLLM grouped FP8 will use sm_{sm}"
+                );
+                sm
+            }
+        } else {
+            sm
+        };
+
+        if !promoted_sms.iter().any(|existing| existing == promoted) {
+            promoted_sms.push(promoted.to_string());
+        }
+    }
+
+    if promoted_sms != normalized_sms {
+        println!(
+            "cargo:warning=Compiling GLM5.2 TRTLLM grouped FP8 for nvcc targets: {}",
+            promoted_sms
+                .iter()
+                .map(|sm| format!("sm_{sm}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    nvcc_arch_args(&promoted_sms)
+}
+
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("Failed to read {}: {err}", dir.display()))
@@ -321,6 +403,27 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
+/// GLM5.2 DeepEP elastic shim (csrc/glm52_deepep/): same DeepEP substrate as
+/// Kimi, but with GLM5.2's hidden/expert dimensions and separate C symbols.
+fn is_glm52_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "glm52_deepep"),
+        Err(_) => false,
+    }
+}
+
+/// GLM5.2 model-local kernels that are not DeepEP collectives.
+fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "glm52"),
+        Err(_) => false,
+    }
+}
+
 /// NCCL >= 2.30.4 root (include/nccl.h + lib/libnccl.so.2) for the DeepEP
 /// shim's device API (ncclDevComm / windows / GIN). cudarc dlopens whatever
 /// libnccl.so.2 it finds at runtime, so build and runtime must point at the
@@ -332,7 +435,7 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
 fn deepep_nccl_root() -> PathBuf {
     let Ok(root) = std::env::var("OPENINFER_NCCL_ROOT").map(PathBuf::from) else {
         panic!(
-            "The kimi-k2 feature builds the DeepEP shim, which needs NCCL >= 2.30.4. \
+            "This feature builds a DeepEP shim, which needs NCCL >= 2.30.4. \
              Set OPENINFER_NCCL_ROOT to an install with include/nccl.h and lib/libnccl.so.2 \
              (e.g. the unpacked nvidia-nccl-cu13 wheel)."
         )
@@ -1130,6 +1233,8 @@ fn main() {
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
+    let glm52_enabled = cfg!(feature = "glm52");
+    let deepep_enabled = kimi_k2_enabled || glm52_enabled;
     let qwen35_enabled = cfg!(feature = "qwen35-4b");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
@@ -1176,9 +1281,16 @@ fn main() {
             if !deepseek_v2_lite_enabled && is_deepseek_v2_lite_source(&csrc_dir, path) {
                 return None;
             }
-            if !kimi_k2_enabled
-                && (is_kimi_k2_source(&csrc_dir, path) || is_deepep_source(&csrc_dir, path))
-            {
+            if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
+                return None;
+            }
+            if !kimi_k2_enabled && is_deepep_source(&csrc_dir, path) {
+                return None;
+            }
+            if !glm52_enabled && is_glm52_deepep_source(&csrc_dir, path) {
+                return None;
+            }
+            if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
                 return None;
             }
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
@@ -1217,7 +1329,7 @@ fn main() {
         flashinfer.include.display()
     );
 
-    let deepep_nccl = kimi_k2_enabled.then(deepep_nccl_root);
+    let deepep_nccl = deepep_enabled.then(deepep_nccl_root);
 
     let mut nvcc_tasks = Vec::new();
     for cu_file in &cu_files {
@@ -1235,7 +1347,11 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        nvcc_args.extend(arch_args.clone());
+        if stem == "glm52_trtllm_grouped_fp8" || stem == "glm52_flashmla_sparse" {
+            nvcc_args.extend(glm52_trtllm_arch_args(&nvcc_sm_targets, &nvcc));
+        } else {
+            nvcc_args.extend(arch_args.clone());
+        }
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
         // Files that include FlashInfer headers (C++17, header-only)
@@ -1280,10 +1396,10 @@ fn main() {
 
         // DeepEP elastic shim: mirrors the upstream JIT compile flags
         // (DeepEP csrc/jit/compiler.hpp) minus the cubin plumbing.
-        if is_deepep_source(&csrc_dir, cu_file) {
+        if is_deepep_source(&csrc_dir, cu_file) || is_glm52_deepep_source(&csrc_dir, cu_file) {
             let nccl_root = deepep_nccl
                 .as_ref()
-                .expect("deepep sources are collected only with the kimi-k2 feature");
+                .expect("deepep sources are collected only with a DeepEP feature");
             nvcc_args.extend(
                 [
                     "--std=c++20",
@@ -1331,6 +1447,86 @@ fn main() {
             ]);
         }
 
+        if stem == "glm52_trtllm_grouped_fp8" {
+            for dir in &flashinfer.cccl {
+                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
+            }
+            nvcc_args.extend([
+                "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-DENABLE_FP8".to_string(),
+                "-DENABLE_BF16".to_string(),
+                "-DENABLE_FP8_BLOCK_SCALE".to_string(),
+                "-DCOMPILE_HOPPER_TMA_GEMMS".to_string(),
+                "-I".to_string(),
+                flashinfer.include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.csrc.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer
+                    .csrc
+                    .join("nv_internal")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashinfer
+                    .csrc
+                    .join("nv_internal/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashinfer
+                    .csrc
+                    .join("nv_internal/tensorrt_llm/cutlass_extensions/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.spdlog.to_string_lossy().to_string(),
+            ]);
+        }
+
+        if stem == "glm52_flashmla_sparse" {
+            let flashmla = root.join("third_party/FlashMLA/csrc");
+            nvcc_args.extend([
+                "--std=c++20".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-I".to_string(),
+                flashmla.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("cutlass/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("cutlass/tools/util/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("kerutils/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
+            ]);
+        }
+
+        if stem.starts_with("glm52_")
+            && stem != "glm52_flashmla_sparse"
+            && !is_glm52_deepep_source(&csrc_dir, cu_file)
+        {
+            nvcc_args.extend(["--std=c++17".to_string()]);
+        }
+
         nvcc_tasks.push(NvccTask {
             cu_file: cu_file.clone(),
             obj_file,
@@ -1346,6 +1542,11 @@ fn main() {
     if !kimi_k2_enabled {
         println!(
             "cargo:warning=Kimi-K2 CUDA kernels disabled; enable the openinfer-kernels `kimi-k2` feature to build them"
+        );
+    }
+    if !glm52_enabled {
+        println!(
+            "cargo:warning=GLM5.2 DeepEP shim disabled; enable the openinfer-kernels `glm52` feature to build it"
         );
     }
 
@@ -1509,6 +1710,9 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
+    if glm52_enabled {
+        println!("cargo:rustc-link-lib=cuda");
+    }
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");

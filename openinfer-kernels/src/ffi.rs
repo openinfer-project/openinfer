@@ -9,6 +9,8 @@ mod deepep;
 mod deepseek;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+#[cfg(feature = "glm52")]
+mod glm52;
 #[cfg(feature = "kimi-k2")]
 mod kimi;
 mod lora;
@@ -19,6 +21,8 @@ pub use deepep::*;
 pub use deepseek::*;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+#[cfg(feature = "glm52")]
+pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi::*;
 pub use lora::*;

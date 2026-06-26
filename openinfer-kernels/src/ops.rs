@@ -7,6 +7,8 @@ mod deepep;
 mod deepseek_v2_lite;
 mod elementwise;
 mod embedding;
+#[cfg(feature = "glm52")]
+mod glm52;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
 mod linear;
@@ -35,6 +37,8 @@ pub use elementwise::{
     silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
 };
 pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
+#[cfg(feature = "glm52")]
+pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{

@@ -132,6 +132,17 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
                 .context("failed to start DeepSeek V2 Lite engine")?
         }
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => openinfer_glm52::launch(
+            &args.model_path,
+            openinfer_glm52::Glm52LaunchOptions {
+                tp_size: args.tp_size,
+                dp_size: args.dp_size,
+                ep_backend: args.ep_backend.into(),
+                cuda_graph: args.cuda_graph,
+            },
+        )
+        .context("failed to start GLM5.2 engine")?,
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,
