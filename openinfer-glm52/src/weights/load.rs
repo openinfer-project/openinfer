@@ -9,9 +9,9 @@ use log::debug;
 use safetensors::Dtype;
 
 use super::{
-    GLM52_MOE_LAYERS, Glm52NonExpertWeightContractReport, Glm52RankExpertFp8Weights,
-    Glm52RankGpuContext, Glm52RankLoadBundle, Glm52TensorLoadSlice, expected_tensor_contract,
-    mmap_file,
+    GLM52_DENSE_LAYERS, Glm52NonExpertWeightContractReport, Glm52RankGpuContext,
+    Glm52StageExpertFp8Weights, Glm52StageLoadBundle, Glm52TensorLoadSlice,
+    expected_tensor_contract, mmap_file,
 };
 
 pub(crate) struct Glm52GpuRawTensor {
@@ -22,48 +22,59 @@ pub(crate) struct Glm52GpuRawTensor {
     pub(crate) data: CudaSlice<u8>,
 }
 
-pub(crate) struct Glm52RankGpuWeights {
-    pub(crate) rank: usize,
+pub(crate) struct Glm52StageGpuWeights {
+    pub(crate) stage: usize,
     pub(crate) tensors: BTreeMap<String, Glm52GpuRawTensor>,
     pub(crate) total_bytes: usize,
 }
 
-pub(crate) struct Glm52RankSlicedLoadOutput {
-    pub(crate) weights: Glm52RankGpuWeights,
-    pub(crate) expert_kernel_weights: Glm52RankExpertFp8Weights,
+pub(crate) struct Glm52StageSlicedLoadOutput {
+    pub(crate) weights: Glm52StageGpuWeights,
+    pub(crate) expert_kernel_weights: Glm52StageExpertFp8Weights,
     pub(crate) non_expert_weight_contract: Glm52NonExpertWeightContractReport,
     pub(crate) loaded_tensor_count: usize,
     pub(crate) loaded_total_bytes: usize,
 }
 
-pub(crate) fn load_rank_sliced_weights_to_gpu(
+pub(crate) fn load_stage_sliced_weights_to_gpu(
     ctx: &Glm52RankGpuContext,
     model_path: &Path,
-    bundle: &Glm52RankLoadBundle,
-) -> Result<Glm52RankSlicedLoadOutput> {
+    bundle: &Glm52StageLoadBundle,
+) -> Result<Glm52StageSlicedLoadOutput> {
     ctx.set_current()?;
     ensure!(
         bundle.plan.tensor_count == bundle.load_plan.tensor_count,
-        "GLM5.2 rank {} tensor plan {} disagrees with load plan {}",
-        bundle.load_plan.rank,
+        "GLM5.2 stage {} tensor plan {} disagrees with load plan {}",
+        bundle.load_plan.stage,
         bundle.plan.tensor_count,
         bundle.load_plan.tensor_count
     );
 
-    let mut weights = Glm52RankGpuWeights {
-        rank: bundle.load_plan.rank,
+    // Resident MoE layers are the MoE-kind suffix of the stage's contiguous
+    // layer range (dense layers are the global prefix [0, GLM52_DENSE_LAYERS)).
+    let moe_start = bundle
+        .plan
+        .layers
+        .start
+        .max(GLM52_DENSE_LAYERS)
+        .min(bundle.plan.layers.end);
+    let moe_layer_range = moe_start..bundle.plan.layers.end;
+    let expected_moe_layers = moe_layer_range.len();
+
+    let mut weights = Glm52StageGpuWeights {
+        stage: bundle.load_plan.stage,
         tensors: BTreeMap::new(),
         total_bytes: 0,
     };
     let mut packed_moe_layers = BTreeSet::new();
-    let mut expert_layers = Vec::with_capacity(GLM52_MOE_LAYERS);
+    let mut expert_layers = Vec::with_capacity(expected_moe_layers);
     let mut loaded_tensor_count = 0usize;
     let mut loaded_total_bytes = 0usize;
     let load_started = Instant::now();
     let mut slowest_shard: Option<(String, f64)> = None;
     debug!(
-        "GLM5.2 rank {} start weight load: tensors={}, shards={}",
-        bundle.load_plan.rank,
+        "GLM5.2 stage {} start weight load: tensors={}, shards={}",
+        bundle.load_plan.stage,
         bundle.load_plan.tensor_count,
         bundle.load_plan.shards.len()
     );
@@ -115,9 +126,9 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
             loaded_tensor_count += 1;
             ensure!(
                 weights.tensors.insert(spec.name.clone(), tensor).is_none(),
-                "duplicate GLM5.2 tensor {} in rank {} load plan",
+                "duplicate GLM5.2 tensor {} in stage {} load plan",
                 spec.name,
-                bundle.load_plan.rank
+                bundle.load_plan.stage
             );
         }
         weights.pack_loaded_expert_fp8_layers(
@@ -135,22 +146,23 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
 
     ensure!(
         loaded_tensor_count == bundle.load_plan.tensor_count,
-        "GLM5.2 rank {} loaded {} tensors but load plan has {}",
-        bundle.load_plan.rank,
+        "GLM5.2 stage {} loaded {} tensors but load plan has {}",
+        bundle.load_plan.stage,
         loaded_tensor_count,
         bundle.load_plan.tensor_count
     );
     ensure!(
-        expert_layers.len() == GLM52_MOE_LAYERS,
-        "GLM5.2 rank {} expected {GLM52_MOE_LAYERS} streamed MoE FP8 expert packages, got {}",
-        bundle.load_plan.rank,
+        expert_layers.len() == expected_moe_layers,
+        "GLM5.2 stage {} expected {expected_moe_layers} streamed MoE FP8 expert packages, got {}",
+        bundle.load_plan.stage,
         expert_layers.len()
     );
     expert_layers.sort_by_key(|layer| layer.layer_idx);
     let expert_kernel_total_bytes = expert_layers.iter().map(|layer| layer.total_bytes).sum();
-    let expert_kernel_weights = Glm52RankExpertFp8Weights {
-        rank: bundle.load_plan.rank,
-        local_expert_range: bundle.names.plan.local_expert_range.clone(),
+    let expert_kernel_weights = Glm52StageExpertFp8Weights {
+        stage: bundle.load_plan.stage,
+        local_expert_range: bundle.names.plan.expert_range.clone(),
+        moe_layer_range,
         layers: expert_layers,
         total_bytes: expert_kernel_total_bytes,
     };
@@ -158,15 +170,15 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
     let non_expert_weight_contract = weights.validate_non_expert_weight_contract(&bundle.names)?;
     ctx.sync().with_context(|| {
         format!(
-            "failed to finish GLM5.2 rank {} H2D tensor copies",
-            bundle.load_plan.rank
+            "failed to finish GLM5.2 stage {} H2D tensor copies",
+            bundle.load_plan.stage
         )
     })?;
 
     let (slowest_shard, slowest_secs) = slowest_shard.unwrap_or_else(|| ("none".to_owned(), 0.0));
     debug!(
-        "GLM5.2 rank {} weight load cost {:.2}s: loaded_tensors={}, loaded_bytes={}, resident_non_expert_raw_bytes={}, expert_package_bytes={}, non_expert_fp8_projections={}, packed_moe_layers={}, slowest_shard={} {:.2}s",
-        bundle.load_plan.rank,
+        "GLM5.2 stage {} weight load cost {:.2}s: loaded_tensors={}, loaded_bytes={}, resident_non_expert_raw_bytes={}, expert_package_bytes={}, non_expert_fp8_projections={}, packed_moe_layers={}, slowest_shard={} {:.2}s",
+        bundle.load_plan.stage,
         load_started.elapsed().as_secs_f64(),
         loaded_tensor_count,
         ByteSize(loaded_total_bytes as u64),
@@ -178,7 +190,7 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
         slowest_secs
     );
 
-    Ok(Glm52RankSlicedLoadOutput {
+    Ok(Glm52StageSlicedLoadOutput {
         weights,
         expert_kernel_weights,
         non_expert_weight_contract,

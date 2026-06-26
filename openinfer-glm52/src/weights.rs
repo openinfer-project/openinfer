@@ -16,9 +16,8 @@ use crate::config::{
     GLM52_INDEX_HEADS, GLM52_KV_A_OUT, GLM52_KV_B_OUT, GLM52_KV_LORA_RANK, GLM52_O_PROJ_IN,
     GLM52_Q_B_OUT, GLM52_Q_LORA_RANK, GLM52_VOCAB,
 };
-use crate::config::{
-    GLM52_DENSE_LAYERS, GLM52_LAYERS, GLM52_MOE_LAYERS, GLM52_ROUTED_EXPERTS, Glm52ParallelShape,
-};
+use crate::config::{GLM52_DENSE_LAYERS, GLM52_LAYERS, GLM52_MOE_LAYERS, GLM52_ROUTED_EXPERTS};
+use crate::pp::{Glm52StagePlan, glm52_pp_stage_plans};
 
 const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
 const NEXTN_LAYER_PREFIX: &str = "model.layers.78.";
@@ -31,8 +30,8 @@ mod package;
 mod view;
 
 pub(crate) use context::Glm52RankGpuContext;
-pub(crate) use load::{Glm52RankGpuWeights, load_rank_sliced_weights_to_gpu};
-pub(crate) use package::Glm52RankExpertFp8Weights;
+pub(crate) use load::{Glm52StageGpuWeights, load_stage_sliced_weights_to_gpu};
+pub(crate) use package::Glm52StageExpertFp8Weights;
 pub(crate) use view::Glm52NonExpertWeightContractReport;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,15 +126,18 @@ pub(crate) struct Glm52WeightManifest {
     pub(crate) final_norm: Glm52TensorEntry,
     pub(crate) lm_head: Glm52TensorEntry,
     pub(crate) layers: Vec<Glm52LayerManifest>,
-    pub(crate) parallel: Glm52ParallelShape,
 }
 
+/// One pipeline stage's weight residency plan: the contiguous layer range it
+/// owns, whether it carries the embedding / final-norm+lm_head bookends, and the
+/// routed-expert range — always all [`GLM52_ROUTED_EXPERTS`] under EP1.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Glm52RankWeightPlan {
-    pub(crate) tp_rank: usize,
-    pub(crate) ep_rank: usize,
-    pub(crate) vocab_range: Range<usize>,
-    pub(crate) local_expert_range: Range<usize>,
+pub(crate) struct Glm52StageWeightPlan {
+    pub(crate) stage: usize,
+    pub(crate) layers: Range<usize>,
+    pub(crate) owns_embed: bool,
+    pub(crate) owns_head: bool,
+    pub(crate) expert_range: Range<usize>,
     pub(crate) tensor_count: usize,
 }
 
@@ -158,21 +160,21 @@ pub(crate) struct Glm52ShardTensorLoadPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Glm52RankSlicedLoadPlan {
-    pub(crate) rank: usize,
+pub(crate) struct Glm52StageSlicedLoadPlan {
+    pub(crate) stage: usize,
     pub(crate) shards: Vec<Glm52ShardTensorLoadPlan>,
     pub(crate) tensor_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Glm52RankLoadBundle {
-    pub(crate) plan: Glm52RankWeightPlan,
-    pub(crate) names: view::Glm52RankWeightNames,
-    pub(crate) load_plan: Glm52RankSlicedLoadPlan,
+pub(crate) struct Glm52StageLoadBundle {
+    pub(crate) plan: Glm52StageWeightPlan,
+    pub(crate) names: view::Glm52StageWeightNames,
+    pub(crate) load_plan: Glm52StageSlicedLoadPlan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Glm52RankHeaderStats {
+pub(crate) struct Glm52StageHeaderStats {
     pub(crate) tensor_count: usize,
     pub(crate) total_bytes: usize,
 }
@@ -233,17 +235,10 @@ impl Glm52WeightManifest {
             final_norm,
             lm_head,
             layers,
-            parallel: Glm52ParallelShape::tp1_dp8(),
         };
         manifest.runtime_tensor_count = manifest.runtime_tensor_entries()?.len();
         manifest.validate()?;
         Ok(manifest)
-    }
-
-    pub(crate) fn with_parallel_shape(mut self, shape: Glm52ParallelShape) -> Result<Self> {
-        self.parallel = shape;
-        self.validate()?;
-        Ok(self)
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -277,47 +272,40 @@ impl Glm52WeightManifest {
             self.nextn_tensor_count,
             self.total_tensor_count
         );
-        ensure!(
-            self.parallel.ep_world > 0
-                && GLM52_ROUTED_EXPERTS.is_multiple_of(self.parallel.ep_world),
-            "GLM5.2 parallel shape TP{}/DP{}/EP{} does not evenly divide routed experts",
-            self.parallel.tp_world,
-            self.parallel.dp_world,
-            self.parallel.ep_world
-        );
         Ok(())
     }
 
-    pub(crate) fn rank_plan(&self, rank: usize) -> Result<Glm52RankWeightPlan> {
+    pub(crate) fn stage_plan(&self, stage: &Glm52StagePlan) -> Result<Glm52StageWeightPlan> {
         ensure!(
-            rank < self.parallel.ep_world,
-            "GLM5.2 rank {rank} outside EP{}",
-            self.parallel.ep_world
+            stage.layers.end <= GLM52_LAYERS,
+            "GLM5.2 stage {} layer range {:?} exceeds {GLM52_LAYERS} layers",
+            stage.stage,
+            stage.layers
         );
-        let parallel = self.parallel.parallel_config();
-        let tp_rank = parallel.tp_rank(rank);
-        let ep_rank = parallel.ep_rank(rank);
-        let vocab_range =
-            tp_rank * self.parallel.vocab_per_tp..(tp_rank + 1) * self.parallel.vocab_per_tp;
-        let local_expert_range =
-            ep_rank * self.parallel.local_experts..(ep_rank + 1) * self.parallel.local_experts;
-        let tensor_count = self.rank_tensor_names(rank)?.len();
-        Ok(Glm52RankWeightPlan {
-            tp_rank,
-            ep_rank,
-            vocab_range,
-            local_expert_range,
+        let tensor_count = self.stage_tensor_names(stage).len();
+        Ok(Glm52StageWeightPlan {
+            stage: stage.stage,
+            layers: stage.layers.clone(),
+            owns_embed: stage.owns_embed,
+            owns_head: stage.owns_head,
+            expert_range: 0..GLM52_ROUTED_EXPERTS,
             tensor_count,
         })
     }
 
-    pub(crate) fn rank_tensor_names(&self, rank: usize) -> Result<Vec<&Glm52TensorEntry>> {
-        let local_expert_range = self.rank_local_expert_range(rank)?;
+    pub(crate) fn stage_tensor_names(&self, stage: &Glm52StagePlan) -> Vec<&Glm52TensorEntry> {
         let mut names = Vec::new();
-        names.push(&self.token_embedding);
-        names.push(&self.final_norm);
-        names.push(&self.lm_head);
+        if stage.owns_embed {
+            names.push(&self.token_embedding);
+        }
+        if stage.owns_head {
+            names.push(&self.final_norm);
+            names.push(&self.lm_head);
+        }
         for layer in &self.layers {
+            if !stage.layers.contains(&layer.layer_idx) {
+                continue;
+            }
             push_attention(&mut names, &layer.attention);
             match &layer.kind {
                 Glm52LayerKindManifest::Dense(mlp) => push_dense_mlp(&mut names, mlp),
@@ -325,20 +313,22 @@ impl Glm52WeightManifest {
                     names.push(&moe.router.gate_weight);
                     names.push(&moe.router.e_score_correction_bias);
                     push_shared_expert(&mut names, &moe.shared_experts);
+                    // EP1: every stage holds all routed experts for its MoE layers.
                     for expert in &moe.routed_experts {
-                        if local_expert_range.contains(&expert.expert_idx) {
-                            push_routed_expert(&mut names, expert);
-                        }
+                        push_routed_expert(&mut names, expert);
                     }
                 }
             }
         }
-        Ok(names)
+        names
     }
 
-    pub(crate) fn rank_sliced_load_plan(&self, rank: usize) -> Result<Glm52RankSlicedLoadPlan> {
+    pub(crate) fn stage_sliced_load_plan(
+        &self,
+        stage: &Glm52StagePlan,
+    ) -> Glm52StageSlicedLoadPlan {
         let mut by_shard: BTreeMap<String, Vec<Glm52TensorLoadSpec>> = BTreeMap::new();
-        for entry in self.rank_tensor_names(rank)? {
+        for entry in self.stage_tensor_names(stage) {
             by_shard
                 .entry(entry.shard.clone())
                 .or_default()
@@ -353,49 +343,63 @@ impl Glm52WeightManifest {
             .into_iter()
             .map(|(shard, tensors)| Glm52ShardTensorLoadPlan { shard, tensors })
             .collect();
-        Ok(Glm52RankSlicedLoadPlan {
-            rank,
+        Glm52StageSlicedLoadPlan {
+            stage: stage.stage,
             shards,
             tensor_count,
-        })
+        }
     }
 
-    pub(crate) fn rank_load_bundle(&self, rank: usize) -> Result<Glm52RankLoadBundle> {
-        let plan = self.rank_plan(rank)?;
-        let names = self.rank_weight_names(rank)?;
-        let load_plan = self.rank_sliced_load_plan(rank)?;
+    pub(crate) fn stage_load_bundle(&self, stage: &Glm52StagePlan) -> Result<Glm52StageLoadBundle> {
+        let plan = self.stage_plan(stage)?;
+        let names = self.stage_weight_names(stage)?;
+        let load_plan = self.stage_sliced_load_plan(stage);
         ensure!(
             plan.tensor_count == load_plan.tensor_count,
-            "GLM5.2 rank {rank} tensor plan {} disagrees with load plan {}",
+            "GLM5.2 stage {} tensor plan {} disagrees with load plan {}",
+            stage.stage,
             plan.tensor_count,
             load_plan.tensor_count
         );
         ensure!(
             plan == names.plan,
-            "GLM5.2 rank {rank} tensor plan disagrees with typed weight names"
+            "GLM5.2 stage {} tensor plan disagrees with typed weight names",
+            stage.stage
         );
-        Ok(Glm52RankLoadBundle {
+        Ok(Glm52StageLoadBundle {
             plan,
             names,
             load_plan,
         })
     }
 
-    pub(crate) fn all_rank_load_bundles(&self) -> Result<Vec<Glm52RankLoadBundle>> {
-        let mut bundles: Vec<Glm52RankLoadBundle> = Vec::with_capacity(self.parallel.ep_world);
-        for rank in 0..self.parallel.ep_world {
-            let bundle = self.rank_load_bundle(rank)?;
-            if let Some(first) = bundles.first() {
-                ensure!(
-                    bundle.plan.tensor_count == first.plan.tensor_count,
-                    "GLM5.2 rank {rank} tensor count {} differs from rank0 {}",
-                    bundle.plan.tensor_count,
-                    first.plan.tensor_count
-                );
-            }
-            bundles.push(bundle);
+    pub(crate) fn all_stage_load_bundles(
+        &self,
+        pp_world: usize,
+    ) -> Result<Vec<Glm52StageLoadBundle>> {
+        let stage_plans = glm52_pp_stage_plans(pp_world);
+        // Crash-early: the stages must contiguously partition every layer exactly
+        // once (debug_assert inside the partitioner is a no-op in release).
+        let mut next = 0usize;
+        for stage in &stage_plans {
+            ensure!(
+                stage.layers.start == next,
+                "GLM5.2 PP{pp_world} stage {} layer range {:?} is not contiguous after layer {next}",
+                stage.stage,
+                stage.layers
+            );
+            next = stage.layers.end;
         }
-        Ok(bundles)
+        ensure!(
+            next == GLM52_LAYERS,
+            "GLM5.2 PP{pp_world} stage partition covers {next} layers, expected {GLM52_LAYERS}"
+        );
+        // Bookend stages carry fewer/more tensors than mid stages, so there is no
+        // equal-tensor-count cross-stage invariant to assert here.
+        stage_plans
+            .iter()
+            .map(|stage| self.stage_load_bundle(stage))
+            .collect()
     }
 
     fn runtime_tensor_entries(&self) -> Result<Vec<&Glm52TensorEntry>> {
@@ -427,22 +431,12 @@ impl Glm52WeightManifest {
         );
         Ok(entries)
     }
-
-    fn rank_local_expert_range(&self, rank: usize) -> Result<Range<usize>> {
-        let ep_rank = self.parallel.parallel_config().ep_rank(rank);
-        ensure!(
-            ep_rank < self.parallel.ep_world,
-            "GLM5.2 EP rank {ep_rank} outside EP{}",
-            self.parallel.ep_world
-        );
-        Ok(ep_rank * self.parallel.local_experts..(ep_rank + 1) * self.parallel.local_experts)
-    }
 }
 
-pub(crate) fn validate_rank_safetensor_headers(
+pub(crate) fn validate_stage_safetensor_headers(
     model_path: &Path,
-    load_plan: &Glm52RankSlicedLoadPlan,
-) -> Result<Glm52RankHeaderStats> {
+    load_plan: &Glm52StageSlicedLoadPlan,
+) -> Result<Glm52StageHeaderStats> {
     let mut tensor_count = 0usize;
     let mut total_bytes = 0usize;
     for shard in &load_plan.shards {
@@ -481,11 +475,11 @@ pub(crate) fn validate_rank_safetensor_headers(
     }
     ensure!(
         tensor_count == load_plan.tensor_count,
-        "GLM5.2 rank {} header validation visited {tensor_count} tensors, expected {}",
-        load_plan.rank,
+        "GLM5.2 stage {} header validation visited {tensor_count} tensors, expected {}",
+        load_plan.stage,
         load_plan.tensor_count
     );
-    Ok(Glm52RankHeaderStats {
+    Ok(Glm52StageHeaderStats {
         tensor_count,
         total_bytes,
     })

@@ -7,12 +7,10 @@ use safetensors::Dtype;
 use super::load::Glm52GpuRawTensor;
 use super::view::{
     Glm52Fp8ProjectionWeightNames, Glm52LayerWeightKindNames, Glm52MoeLayerWeightNames,
-    Glm52RankWeightNames, Glm52RoutedExpertWeightNames,
+    Glm52RoutedExpertWeightNames, Glm52StageWeightNames,
 };
-use super::{Glm52RankGpuContext, Glm52RankGpuWeights, expected_tensor_contract};
-use crate::config::{
-    GLM52_DENSE_LAYERS, GLM52_EXPERT_INTERMEDIATE, GLM52_HIDDEN, GLM52_MOE_LAYERS,
-};
+use super::{Glm52RankGpuContext, Glm52StageGpuWeights, expected_tensor_contract};
+use crate::config::{GLM52_EXPERT_INTERMEDIATE, GLM52_HIDDEN};
 
 const GLM52_FP8_BLOCK_SIZE: usize = 128;
 
@@ -170,9 +168,12 @@ pub(crate) struct Glm52MoeLayerExpertFp8Weights {
     pub(crate) total_bytes: usize,
 }
 
-pub(crate) struct Glm52RankExpertFp8Weights {
-    pub(crate) rank: usize,
+pub(crate) struct Glm52StageExpertFp8Weights {
+    pub(crate) stage: usize,
     pub(crate) local_expert_range: Range<usize>,
+    /// Resident MoE layer indices for this stage (the MoE-kind suffix of the
+    /// stage's contiguous layer range). Drives the per-layer order invariant.
+    pub(crate) moe_layer_range: Range<usize>,
     pub(crate) layers: Vec<Glm52MoeLayerExpertFp8Weights>,
     pub(crate) total_bytes: usize,
 }
@@ -182,19 +183,19 @@ struct Glm52Fp8ProjectionRaw<'a> {
     weight_scale_inv: &'a Glm52GpuRawTensor,
 }
 
-impl Glm52RankGpuWeights {
+impl Glm52StageGpuWeights {
     pub(crate) fn pack_loaded_expert_fp8_layers(
         &mut self,
         ctx: &Glm52RankGpuContext,
-        names: &Glm52RankWeightNames,
+        names: &Glm52StageWeightNames,
         packed_layers: &mut BTreeSet<usize>,
         out: &mut Vec<Glm52MoeLayerExpertFp8Weights>,
     ) -> Result<()> {
         ensure!(
-            self.rank == names.rank,
-            "GLM5.2 GPU rank {} does not match typed names rank {}",
-            self.rank,
-            names.rank
+            self.stage == names.stage,
+            "GLM5.2 GPU stage {} does not match typed names stage {}",
+            self.stage,
+            names.stage
         );
         ctx.set_current()?;
         for layer in &names.layers {
@@ -216,14 +217,14 @@ impl Glm52RankGpuWeights {
     fn pack_moe_layer_expert_fp8_weights(
         &self,
         ctx: &Glm52RankGpuContext,
-        names: &Glm52RankWeightNames,
+        names: &Glm52StageWeightNames,
         layer_idx: usize,
         moe: &Glm52MoeLayerWeightNames,
     ) -> Result<Glm52MoeLayerExpertFp8Weights> {
         validate_local_expert_name_order(
-            names.rank,
+            names.stage,
             layer_idx,
-            names.plan.local_expert_range.clone(),
+            names.plan.expert_range.clone(),
             &moe.routed_experts,
         )?;
 
@@ -314,8 +315,8 @@ impl Glm52RankGpuWeights {
         }
         ensure!(
             removed_bytes <= self.total_bytes,
-            "GLM5.2 rank {} package cleanup would remove {} bytes from {} total bytes",
-            self.rank,
+            "GLM5.2 stage {} package cleanup would remove {} bytes from {} total bytes",
+            self.stage,
             removed_bytes,
             self.total_bytes
         );
@@ -614,15 +615,15 @@ fn validate_raw_tensor(
 }
 
 fn validate_local_expert_name_order(
-    rank: usize,
+    stage: usize,
     layer_idx: usize,
     local_expert_range: Range<usize>,
     routed_experts: &[Glm52RoutedExpertWeightNames],
 ) -> Result<()> {
     ensure!(
         routed_experts.len() == local_expert_range.len(),
-        "GLM5.2 rank {} layer {} expected {} local routed expert names, got {}",
-        rank,
+        "GLM5.2 stage {} layer {} expected {} local routed expert names, got {}",
+        stage,
         layer_idx,
         local_expert_range.len(),
         routed_experts.len()
@@ -631,8 +632,8 @@ fn validate_local_expert_name_order(
         let expected = local_expert_range.start + offset;
         ensure!(
             expert.global_expert == expected,
-            "GLM5.2 rank {} layer {} local expert name offset {} expected global expert {}, got {}",
-            rank,
+            "GLM5.2 stage {} layer {} local expert name offset {} expected global expert {}, got {}",
+            stage,
             layer_idx,
             offset,
             expected,
@@ -642,19 +643,20 @@ fn validate_local_expert_name_order(
     Ok(())
 }
 
-impl Glm52RankExpertFp8Weights {
+impl Glm52StageExpertFp8Weights {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
-            self.layers.len() == GLM52_MOE_LAYERS,
-            "GLM5.2 rank {} expected {GLM52_MOE_LAYERS} FP8 expert packages, got {}",
-            self.rank,
+            self.layers.len() == self.moe_layer_range.len(),
+            "GLM5.2 stage {} expected {} FP8 expert packages, got {}",
+            self.stage,
+            self.moe_layer_range.len(),
             self.layers.len()
         );
         let summed: usize = self.layers.iter().map(|layer| layer.total_bytes).sum();
         ensure!(
             self.total_bytes == summed,
-            "GLM5.2 rank {} FP8 expert package bytes {} do not match summed layer bytes {}",
-            self.rank,
+            "GLM5.2 stage {} FP8 expert package bytes {} do not match summed layer bytes {}",
+            self.stage,
             self.total_bytes,
             summed
         );
@@ -666,11 +668,11 @@ impl Glm52RankExpertFp8Weights {
         let expected_down_weight_len = local_experts * GLM52_HIDDEN * GLM52_EXPERT_INTERMEDIATE;
         let expected_down_scale_len = local_experts * hidden_blocks * intermediate_blocks;
         for (offset, layer) in self.layers.iter().enumerate() {
-            let expected_layer_idx = GLM52_DENSE_LAYERS + offset;
+            let expected_layer_idx = self.moe_layer_range.start + offset;
             ensure!(
                 layer.layer_idx == expected_layer_idx,
-                "GLM5.2 rank {} FP8 expert package order drifted at offset {offset}: expected layer {}, got {}",
-                self.rank,
+                "GLM5.2 stage {} FP8 expert package order drifted at offset {offset}: expected layer {}, got {}",
+                self.stage,
                 expected_layer_idx,
                 layer.layer_idx
             );
@@ -689,15 +691,15 @@ impl Glm52RankExpertFp8Weights {
                             GLM52_HIDDEN,
                             GLM52_EXPERT_INTERMEDIATE,
                         )?,
-                "GLM5.2 rank {} layer {} DeepGEMM expert package plan drifted: W13={w13_deepgemm:?}, down={down_deepgemm:?}",
-                self.rank,
+                "GLM5.2 stage {} layer {} DeepGEMM expert package plan drifted: W13={w13_deepgemm:?}, down={down_deepgemm:?}",
+                self.stage,
                 layer.layer_idx
             );
             ensure!(
                 layer.w13.local_experts == local_experts
                     && layer.down.plan.local_experts == local_experts,
-                "GLM5.2 rank {} layer {} local expert count drifted",
-                self.rank,
+                "GLM5.2 stage {} layer {} local expert count drifted",
+                self.stage,
                 layer.layer_idx
             );
             ensure!(
@@ -705,15 +707,15 @@ impl Glm52RankExpertFp8Weights {
                     && layer.w13.intermediate_dim == GLM52_EXPERT_INTERMEDIATE
                     && layer.w13.block_size == GLM52_FP8_BLOCK_SIZE
                     && layer.w13.scale_layout == Glm52Fp8ExpertScaleLayout::CheckpointBlock128x128,
-                "GLM5.2 rank {} layer {} W13 package shape drifted",
-                self.rank,
+                "GLM5.2 stage {} layer {} W13 package shape drifted",
+                self.stage,
                 layer.layer_idx
             );
             ensure!(
                 layer.w13.weight_e4m3.len() == expected_w13_weight_len
                     && layer.w13.weight_scale_inv_f32.len() == expected_w13_scale_len,
-                "GLM5.2 rank {} layer {} W13 package length drifted: weight {}, scale {}, expected {}/{}",
-                self.rank,
+                "GLM5.2 stage {} layer {} W13 package length drifted: weight {}, scale {}, expected {}/{}",
+                self.stage,
                 layer.layer_idx,
                 layer.w13.weight_e4m3.len(),
                 layer.w13.weight_scale_inv_f32.len(),
@@ -726,8 +728,8 @@ impl Glm52RankExpertFp8Weights {
                     && layer.down.plan.in_dim == GLM52_EXPERT_INTERMEDIATE
                     && layer.down.plan.scale_layout
                         == Glm52Fp8ExpertScaleLayout::CheckpointBlock128x128,
-                "GLM5.2 rank {} layer {} down package shape drifted",
-                self.rank,
+                "GLM5.2 stage {} layer {} down package shape drifted",
+                self.stage,
                 layer.layer_idx
             );
             ensure!(
@@ -736,8 +738,8 @@ impl Glm52RankExpertFp8Weights {
                     && layer.down.plan.weight_bytes == expected_down_weight_len
                     && layer.down.plan.scale_bytes
                         == expected_down_scale_len * std::mem::size_of::<f32>(),
-                "GLM5.2 rank {} layer {} down package length drifted: weight {}, scale {}, plan bytes {}/{}, expected {}/{}/{}",
-                self.rank,
+                "GLM5.2 stage {} layer {} down package length drifted: weight {}, scale {}, plan bytes {}/{}, expected {}/{}/{}",
+                self.stage,
                 layer.layer_idx,
                 layer.down.weight_e4m3.len(),
                 layer.down.weight_scale_inv_f32.len(),

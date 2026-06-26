@@ -6,7 +6,7 @@ use openinfer_core::{
 };
 use openinfer_glm52::{Glm52LaunchOptions, launch};
 
-const JIUZHANG_GLM52_MODEL_PATH: &str = "/data/models/GLM-5.2-0614-Provider-FP8";
+const JIUZHANG_GLM52_MODEL_PATH: &str = "/data/models/GLM-5.2-FP8";
 
 #[test]
 #[ignore]

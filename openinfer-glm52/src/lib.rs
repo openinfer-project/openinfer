@@ -15,21 +15,22 @@ mod pp;
 mod runner;
 mod weights;
 
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{collections::BTreeSet, ops::Range, path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelInfo};
-use openinfer_core::parallel::ParallelConfig;
-use runner::{Glm52RankPlacement, Glm52RankWorker, run_rejecting_dp_coordinator};
+use runner::{Glm52StagePlacement, Glm52StageWorker, run_rejecting_pp_coordinator};
 use tokio::sync::mpsc;
 
 pub use config::{
     GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
-    GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, Glm52ParallelShape, load_stop_token_ids,
-    probe_config_json,
+    GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, load_stop_token_ids, probe_config_json,
 };
 pub use pp::{Glm52PpHopStats, Glm52PpSpineConfig, Glm52PpSpineReport, run_pp_p2p_spine};
 use weights::Glm52WeightManifest;
+
+/// GLM5.2 runs as 8 pipeline stages, one GPU each (PP8 TP1 EP1).
+const GLM52_PP_WORLD: usize = 8;
 
 pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
     let config_path = model_path.join("config.json");
@@ -54,6 +55,9 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
     }))
 }
 
+/// Launch surface kept stable for the server CLI. GLM5.2 is hardwired to PP8
+/// (8 pipeline stages, one GPU each), so `tp_size` / `dp_size` no longer steer
+/// the parallel layout — the stages always map to device ordinals `0..8`.
 #[derive(Clone, Debug)]
 pub struct Glm52LaunchOptions {
     pub tp_size: usize,
@@ -63,18 +67,13 @@ pub struct Glm52LaunchOptions {
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
-    ensure!(
-        options.tp_size > 0 && options.dp_size > 0,
-        "GLM5.2 --tp-size and --dp-size must be positive"
-    );
-    let parallel = ParallelConfig::new(options.tp_size, options.dp_size);
     start_engine(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: options.cuda_graph,
             enable_prefill_profile: false,
-            device_ordinals: (0..parallel.ep_world()).collect(),
-            parallel_config: Some(parallel),
+            device_ordinals: (0..GLM52_PP_WORLD).collect(),
+            parallel_config: None,
             ep_backend: options.ep_backend,
             seed: 42,
         },
@@ -83,45 +82,46 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, &options)?;
-    let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
+    let loaded = load_stage_weights_to_gpu(model_path, &startup)?;
     log::info!(
-        "GLM5.2 startup validated: shape={:?}, stop_tokens={:?}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}, rank0_header_bytes={}, nextn_tensors={}, cuda_graph={}",
-        startup.shape,
+        "GLM5.2 startup validated: stages={}, stop_tokens={:?}, stage_layer_ranges={:?}, stage_plan_tensors={:?}, stage_gpu_tensors={:?}, stage_gpu_bytes={:?}, stage0_header_bytes={}, nextn_tensors={}, cuda_graph={}",
+        startup.device_ordinals.len(),
         startup.stop_token_ids,
-        startup.rank_tensor_counts,
-        loaded.report.rank_tensor_counts,
-        loaded.report.rank_bytes,
-        startup.rank0_header_bytes,
+        startup.stage_layer_ranges,
+        startup.stage_tensor_counts,
+        loaded.report.stage_tensor_counts,
+        loaded.report.stage_bytes,
+        startup.stage0_header_bytes,
         startup.nextn_tensor_count,
         options.enable_cuda_graph
     );
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
-        .name("glm52-dp-coord".into())
-        .spawn(move || run_rejecting_dp_coordinator(submit_rx, loaded.workers))
-        .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 DP coordinator: {err}"))?;
+        .name("glm52-pp-coord".into())
+        .spawn(move || run_rejecting_pp_coordinator(submit_rx, loaded.workers))
+        .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 PP coordinator: {err}"))?;
     Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
 }
 
 #[derive(Debug)]
 struct StartupValidation {
-    shape: Glm52ParallelShape,
     stop_token_ids: Vec<u32>,
     device_ordinals: Vec<usize>,
-    rank_bundles: Vec<weights::Glm52RankLoadBundle>,
-    rank_tensor_counts: Vec<usize>,
-    rank0_header_bytes: usize,
+    stage_bundles: Vec<weights::Glm52StageLoadBundle>,
+    stage_layer_ranges: Vec<Range<usize>>,
+    stage_tensor_counts: Vec<usize>,
+    stage0_header_bytes: usize,
     nextn_tensor_count: usize,
 }
 
 #[derive(Debug)]
 struct GpuWeightLoadReport {
-    rank_bytes: Vec<usize>,
-    rank_tensor_counts: Vec<usize>,
+    stage_bytes: Vec<usize>,
+    stage_tensor_counts: Vec<usize>,
 }
 
 struct LoadedGlm52Runtime {
-    workers: Vec<Glm52RankWorker>,
+    workers: Vec<Glm52StageWorker>,
     report: GpuWeightLoadReport,
 }
 
@@ -131,20 +131,9 @@ fn validate_startup(model_path: &Path, options: &EngineLoadOptions) -> Result<St
     let json: serde_json::Value = serde_json::from_str(&content)?;
     probe_config_json(&json)?;
 
-    let parallel = options
-        .parallel_config
-        .unwrap_or_else(|| ParallelConfig::new(1, 8));
     ensure!(
-        parallel.tp_world() == 1 && parallel.dp_world() == 8,
-        "GLM5.2 first cut supports only TP1/DP8/EP8, got TP{}/DP{}/EP{}",
-        parallel.tp_world(),
-        parallel.dp_world(),
-        parallel.ep_world()
-    );
-    ensure!(
-        options.device_ordinals.len() == parallel.ep_world(),
-        "GLM5.2 TP1/DP8/EP8 requires {} devices, got {:?}",
-        parallel.ep_world(),
+        options.device_ordinals.len() == GLM52_PP_WORLD,
+        "GLM5.2 PP{GLM52_PP_WORLD} requires {GLM52_PP_WORLD} devices (one GPU per stage), got {:?}",
         options.device_ordinals
     );
     let unique_devices = options
@@ -157,77 +146,81 @@ fn validate_startup(model_path: &Path, options: &EngineLoadOptions) -> Result<St
         "GLM5.2 device ordinals must be unique, got {:?}",
         options.device_ordinals
     );
-    let manifest = Glm52WeightManifest::from_model_dir(model_path)?
-        .with_parallel_shape(shape_from_parallel(parallel)?)?;
-    let rank_bundles = manifest.all_rank_load_bundles()?;
-    let mut rank_tensor_counts = Vec::with_capacity(parallel.ep_world());
-    let mut rank0_header_bytes = 0usize;
-    for (rank, bundle) in rank_bundles.iter().enumerate() {
-        if rank == 0 {
+
+    let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
+    let stage_bundles = manifest.all_stage_load_bundles(GLM52_PP_WORLD)?;
+    let stage_layer_ranges = stage_bundles
+        .iter()
+        .map(|bundle| bundle.plan.layers.clone())
+        .collect::<Vec<_>>();
+    let mut stage_tensor_counts = Vec::with_capacity(stage_bundles.len());
+    let mut stage0_header_bytes = 0usize;
+    for (stage, bundle) in stage_bundles.iter().enumerate() {
+        if stage == 0 {
             let header_stats =
-                weights::validate_rank_safetensor_headers(model_path, &bundle.load_plan)?;
+                weights::validate_stage_safetensor_headers(model_path, &bundle.load_plan)?;
             ensure!(
                 header_stats.tensor_count == bundle.load_plan.tensor_count,
-                "GLM5.2 rank0 header tensor count {} disagrees with load plan {}",
+                "GLM5.2 stage0 header tensor count {} disagrees with load plan {}",
                 header_stats.tensor_count,
                 bundle.load_plan.tensor_count
             );
-            rank0_header_bytes = header_stats.total_bytes;
+            stage0_header_bytes = header_stats.total_bytes;
         }
-        rank_tensor_counts.push(bundle.plan.tensor_count);
+        stage_tensor_counts.push(bundle.plan.tensor_count);
     }
 
     Ok(StartupValidation {
-        shape: manifest.parallel,
         stop_token_ids: load_stop_token_ids(model_path)?,
         device_ordinals: options.device_ordinals.clone(),
-        rank_bundles,
-        rank_tensor_counts,
-        rank0_header_bytes,
+        stage_bundles,
+        stage_layer_ranges,
+        stage_tensor_counts,
+        stage0_header_bytes,
         nextn_tensor_count: manifest.nextn_tensor_count,
     })
 }
 
-fn load_rank_weights_to_gpu(
+fn load_stage_weights_to_gpu(
     model_path: &Path,
     startup: &StartupValidation,
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
-        "start spawn GLM5.2 rank workers: ranks={}",
-        startup.rank_bundles.len()
+        "start spawn GLM5.2 stage workers: stages={}",
+        startup.stage_bundles.len()
     );
-    let mut workers = Vec::with_capacity(startup.rank_bundles.len());
-    for (rank, bundle) in startup.rank_bundles.iter().enumerate() {
-        let placement = Glm52RankPlacement::new(rank, startup.device_ordinals[rank])?;
-        workers.push(Glm52RankWorker::spawn(placement, bundle.clone())?);
+    let mut workers = Vec::with_capacity(startup.stage_bundles.len());
+    for (stage, bundle) in startup.stage_bundles.iter().enumerate() {
+        let placement = Glm52StagePlacement::new(stage, startup.device_ordinals[stage])?;
+        workers.push(Glm52StageWorker::spawn(placement, bundle.clone())?);
     }
     log::info!(
-        "spawn GLM5.2 rank workers cost {:.2}s: ranks={}",
+        "spawn GLM5.2 stage workers cost {:.2}s: stages={}",
         spawn_started.elapsed().as_secs_f64(),
         workers.len()
     );
 
     let load_started = Instant::now();
-    log::info!("start load GLM5.2 rank weights: ranks={}", workers.len());
+    log::info!("start load GLM5.2 stage weights: stages={}", workers.len());
     let load_results = workers
         .iter()
         .map(|worker| worker.load_sliced_weights_async(model_path))
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(load_results.len());
-    for (rank, rx) in load_results.into_iter().enumerate() {
+    for (stage, rx) in load_results.into_iter().enumerate() {
         let report = rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} worker dropped load response"))??;
+            .map_err(|_| anyhow::anyhow!("GLM5.2 stage {stage} worker dropped load response"))??;
         ensure!(
-            report.rank == rank && report.loaded_to_gpu,
-            "GLM5.2 rank {rank} invalid weight-load report: {:?}",
+            report.stage == stage && report.loaded_to_gpu,
+            "GLM5.2 stage {stage} invalid weight-load report: {:?}",
             report
         );
         reports.push(report);
     }
     log::info!(
-        "GLM5.2 rank weight load cost {:.2}s: ranks={}, tensors={:?}, resident_bytes={:?}, non_expert_fp8_projections={:?}, attention/dense/shared={:?}",
+        "GLM5.2 stage weight load cost {:.2}s: stages={}, tensors={:?}, resident_bytes={:?}, non_expert_fp8_projections={:?}, attention/dense/shared={:?}",
         load_started.elapsed().as_secs_f64(),
         reports.len(),
         reports
@@ -254,30 +247,19 @@ fn load_rank_weights_to_gpu(
             })
             .collect::<Vec<_>>()
     );
-    let rank_bytes = reports
+    let stage_bytes = reports
         .iter()
         .map(|report| report.total_bytes)
         .collect::<Vec<_>>();
-    let rank_tensor_counts = reports
+    let stage_tensor_counts = reports
         .iter()
         .map(|report| report.tensor_count)
         .collect::<Vec<_>>();
     Ok(LoadedGlm52Runtime {
         workers,
         report: GpuWeightLoadReport {
-            rank_bytes,
-            rank_tensor_counts,
+            stage_bytes,
+            stage_tensor_counts,
         },
     })
-}
-
-fn shape_from_parallel(parallel: ParallelConfig) -> Result<Glm52ParallelShape> {
-    ensure!(
-        parallel.tp_world() == 1 && parallel.dp_world() == 8,
-        "GLM5.2 first cut supports only TP1/DP8/EP8, got TP{}/DP{}/EP{}",
-        parallel.tp_world(),
-        parallel.dp_world(),
-        parallel.ep_world()
-    );
-    Ok(Glm52ParallelShape::tp1_dp8())
 }

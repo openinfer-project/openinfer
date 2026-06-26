@@ -6,8 +6,10 @@
 //! replace `dummy_burn` with real per-stage layers. See
 //! `docs/models/glm52/pp-decode.md`.
 
+mod partition;
 mod peer;
 mod runtime;
 mod stage_graph;
 
+pub(crate) use partition::{Glm52StagePlan, glm52_pp_stage_plans};
 pub use runtime::{Glm52PpHopStats, Glm52PpSpineConfig, Glm52PpSpineReport, run_pp_p2p_spine};

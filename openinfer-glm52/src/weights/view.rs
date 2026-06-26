@@ -3,18 +3,21 @@ use safetensors::Dtype;
 
 use super::load::Glm52GpuRawTensor;
 use super::{
-    FP8_BLOCK_SIZE, FULL_INDEXER_LAYER_COUNT, GLM52_DENSE_LAYERS, GLM52_KV_B_OUT, GLM52_LAYERS,
-    GLM52_MOE_LAYERS, GLM52_O_PROJ_IN, Glm52AttentionManifest, Glm52DenseMlpManifest,
-    Glm52Fp8ProjectionManifest, Glm52IndexerManifest, Glm52LayerKindManifest, Glm52RankGpuWeights,
-    Glm52RankWeightPlan, Glm52RoutedExpertManifest, Glm52RouterManifest, Glm52SharedExpertManifest,
-    Glm52WeightManifest, expected_tensor_contract,
+    FP8_BLOCK_SIZE, GLM52_DENSE_LAYERS, GLM52_KV_B_OUT, GLM52_O_PROJ_IN, Glm52AttentionManifest,
+    Glm52DenseMlpManifest, Glm52Fp8ProjectionManifest, Glm52IndexerManifest,
+    Glm52LayerKindManifest, Glm52RoutedExpertManifest, Glm52RouterManifest,
+    Glm52SharedExpertManifest, Glm52StageGpuWeights, Glm52StageWeightPlan, Glm52WeightManifest,
+    expected_tensor_contract,
 };
+use crate::pp::Glm52StagePlan;
 
+/// Bookend tensor names. Each is present only on its owning stage: the token
+/// embedding on stage 0, the final norm + lm_head on the last stage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TopWeightNames {
-    token_embedding: String,
-    final_norm: String,
-    lm_head: String,
+    token_embedding: Option<String>,
+    final_norm: Option<String>,
+    lm_head: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,10 +97,12 @@ pub(crate) struct Glm52LayerWeightNames {
     pub(crate) kind: Glm52LayerWeightKindNames,
 }
 
+/// Typed tensor names for one pipeline stage. `layers` holds only the stage's
+/// own layers; bookends in `top` are present only on the owning stage.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Glm52RankWeightNames {
-    pub(crate) rank: usize,
-    pub(crate) plan: Glm52RankWeightPlan,
+pub(crate) struct Glm52StageWeightNames {
+    pub(crate) stage: usize,
+    pub(crate) plan: Glm52StageWeightPlan,
     pub(crate) top: Glm52TopWeightNames,
     pub(crate) layers: Vec<Glm52LayerWeightNames>,
 }
@@ -147,7 +152,7 @@ pub(crate) struct Glm52SharedExpertGpuWeights<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52NonExpertWeightContractReport {
-    pub(crate) rank: usize,
+    pub(crate) stage: usize,
     pub(crate) tensor_count: usize,
     pub(crate) total_bytes: usize,
     pub(crate) dense_layers: usize,
@@ -166,26 +171,31 @@ pub(crate) struct Glm52NonExpertWeightContractReport {
 }
 
 impl Glm52WeightManifest {
-    pub(crate) fn rank_weight_names(&self, rank: usize) -> Result<Glm52RankWeightNames> {
-        let plan = self.rank_plan(rank)?;
-        let local_expert_range = self.rank_local_expert_range(rank)?;
+    pub(crate) fn stage_weight_names(
+        &self,
+        stage: &Glm52StagePlan,
+    ) -> Result<Glm52StageWeightNames> {
+        let plan = self.stage_plan(stage)?;
         let top = Glm52TopWeightNames {
-            token_embedding: self.token_embedding.name.clone(),
-            final_norm: self.final_norm.name.clone(),
-            lm_head: self.lm_head.name.clone(),
+            token_embedding: stage.owns_embed.then(|| self.token_embedding.name.clone()),
+            final_norm: stage.owns_head.then(|| self.final_norm.name.clone()),
+            lm_head: stage.owns_head.then(|| self.lm_head.name.clone()),
         };
-        let mut layers = Vec::with_capacity(self.layers.len());
+        let mut layers = Vec::with_capacity(stage.layers.len());
         for layer in &self.layers {
+            if !stage.layers.contains(&layer.layer_idx) {
+                continue;
+            }
             let attention = Glm52AttentionWeightNames::from_manifest(&layer.attention);
             let kind = match &layer.kind {
                 Glm52LayerKindManifest::Dense(mlp) => {
                     Glm52LayerWeightKindNames::Dense(Glm52DenseMlpWeightNames::from_manifest(mlp))
                 }
                 Glm52LayerKindManifest::Moe(moe) => {
+                    // EP1: every stage holds all routed experts for its MoE layers.
                     let routed_experts = moe
                         .routed_experts
                         .iter()
-                        .filter(|expert| local_expert_range.contains(&expert.expert_idx))
                         .map(Glm52RoutedExpertWeightNames::from_manifest)
                         .collect::<Vec<_>>();
                     Glm52LayerWeightKindNames::Moe(Glm52MoeLayerWeightNames {
@@ -203,8 +213,8 @@ impl Glm52WeightManifest {
                 kind,
             });
         }
-        Ok(Glm52RankWeightNames {
-            rank,
+        Ok(Glm52StageWeightNames {
+            stage: stage.stage,
             plan,
             top,
             layers,
@@ -212,20 +222,22 @@ impl Glm52WeightManifest {
     }
 }
 
-impl Glm52RankGpuWeights {
+impl Glm52StageGpuWeights {
     pub(crate) fn validate_non_expert_weight_contract(
         &self,
-        names: &Glm52RankWeightNames,
+        names: &Glm52StageWeightNames,
     ) -> Result<Glm52NonExpertWeightContractReport> {
         ensure!(
-            self.rank == names.rank,
-            "GLM5.2 GPU rank {} does not match typed names rank {}",
-            self.rank,
-            names.rank
+            self.stage == names.stage,
+            "GLM5.2 GPU stage {} does not match typed names stage {}",
+            self.stage,
+            names.stage
         );
         ensure!(
-            names.layers.len() == GLM52_LAYERS,
-            "GLM5.2 typed names expected {GLM52_LAYERS} layers, got {}",
+            names.layers.len() == names.plan.layers.len(),
+            "GLM5.2 stage {} typed names expected {} resident layers, got {}",
+            self.stage,
+            names.plan.layers.len(),
             names.layers.len()
         );
 
@@ -236,12 +248,16 @@ impl Glm52RankGpuWeights {
         let mut attention_fp8_projections = 0usize;
         let mut dense_fp8_projections = 0usize;
         let mut shared_fp8_projections = 0usize;
-        for tensor in [
-            self.expect_tensor(&names.top.token_embedding)?,
-            self.expect_tensor(&names.top.final_norm)?,
-            self.expect_tensor(&names.top.lm_head)?,
-        ] {
-            summary.add(tensor);
+        // Bookends are resolved only on their owning stage.
+        for name in [
+            names.top.token_embedding.as_deref(),
+            names.top.final_norm.as_deref(),
+            names.top.lm_head.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            summary.add(self.expect_tensor(name)?);
         }
 
         for layer in &names.layers {
@@ -282,61 +298,69 @@ impl Glm52RankGpuWeights {
             }
         }
 
+        // Dense layers are the contiguous prefix [0, GLM52_DENSE_LAYERS); for a
+        // stage's contiguous layer range the expected dense/MoE split is exact.
+        let stage_layers = names.plan.layers.len();
+        let expected_dense = names
+            .plan
+            .layers
+            .clone()
+            .filter(|layer_idx| *layer_idx < GLM52_DENSE_LAYERS)
+            .count();
+        let expected_moe = stage_layers - expected_dense;
         ensure!(
-            dense_layers == GLM52_DENSE_LAYERS && moe_layers == GLM52_MOE_LAYERS,
-            "GLM5.2 rank {} non-expert weight contract has dense/moe layer counts {}/{}, expected {GLM52_DENSE_LAYERS}/{GLM52_MOE_LAYERS}",
-            self.rank,
+            dense_layers == expected_dense && moe_layers == expected_moe,
+            "GLM5.2 stage {} non-expert weight contract has dense/moe layer counts {}/{}, expected {expected_dense}/{expected_moe}",
+            self.stage,
             dense_layers,
             moe_layers
         );
-        ensure!(
-            full_indexer_layers == FULL_INDEXER_LAYER_COUNT,
-            "GLM5.2 rank {} non-expert weight contract has {} full-indexer layers, expected {FULL_INDEXER_LAYER_COUNT}",
-            self.rank,
-            full_indexer_layers
-        );
-        let expected_attention_fp8 = GLM52_LAYERS * 5 + FULL_INDEXER_LAYER_COUNT * 2;
-        let expected_dense_fp8 = GLM52_DENSE_LAYERS * 3;
-        let expected_shared_fp8 = GLM52_MOE_LAYERS * 3;
+        // Every resident layer carries attention (5 FP8 projections); indexer
+        // layers add wk + wq_b. Couple the GPU-resolved count to the indexer flag.
+        let expected_attention_fp8 = stage_layers * 5 + full_indexer_layers * 2;
+        let expected_dense_fp8 = dense_layers * 3;
+        let expected_shared_fp8 = moe_layers * 3;
         ensure!(
             attention_fp8_projections == expected_attention_fp8,
-            "GLM5.2 rank {} attention FP8 projection count {} != expected {}",
-            self.rank,
+            "GLM5.2 stage {} attention FP8 projection count {} != expected {} ({stage_layers} layers, {full_indexer_layers} indexer)",
+            self.stage,
             attention_fp8_projections,
             expected_attention_fp8
         );
         ensure!(
             dense_fp8_projections == expected_dense_fp8,
-            "GLM5.2 rank {} dense FP8 projection count {} != expected {}",
-            self.rank,
+            "GLM5.2 stage {} dense FP8 projection count {} != expected {}",
+            self.stage,
             dense_fp8_projections,
             expected_dense_fp8
         );
         ensure!(
             shared_fp8_projections == expected_shared_fp8,
-            "GLM5.2 rank {} shared-expert FP8 projection count {} != expected {}",
-            self.rank,
+            "GLM5.2 stage {} shared-expert FP8 projection count {} != expected {}",
+            self.stage,
             shared_fp8_projections,
             expected_shared_fp8
         );
         ensure!(
             summary.tensor_count == self.tensors.len(),
-            "GLM5.2 rank {} non-expert weight contract covers {} tensors, resident map has {}",
-            self.rank,
+            "GLM5.2 stage {} non-expert weight contract covers {} tensors, resident map has {}",
+            self.stage,
             summary.tensor_count,
             self.tensors.len()
         );
         ensure!(
             summary.total_bytes == self.total_bytes,
-            "GLM5.2 rank {} non-expert weight contract covers {} bytes, resident map has {}",
-            self.rank,
+            "GLM5.2 stage {} non-expert weight contract covers {} bytes, resident map has {}",
+            self.stage,
             summary.total_bytes,
             self.total_bytes
         );
+        // Attention's kv_b_proj / o_proj are the largest non-expert FP8
+        // projections and live on every stage, so these maxima hold per-stage.
         ensure!(
             summary.max_out_dim == GLM52_KV_B_OUT && summary.max_in_dim == GLM52_O_PROJ_IN,
-            "GLM5.2 rank {} non-expert FP8 projection max_out/max_in are {}/{}, expected {}/{}",
-            self.rank,
+            "GLM5.2 stage {} non-expert FP8 projection max_out/max_in are {}/{}, expected {}/{}",
+            self.stage,
             summary.max_out_dim,
             summary.max_in_dim,
             GLM52_KV_B_OUT,
@@ -345,8 +369,8 @@ impl Glm52RankGpuWeights {
         ensure!(
             summary.max_scale_rows == GLM52_KV_B_OUT.div_ceil(FP8_BLOCK_SIZE)
                 && summary.max_scale_cols == GLM52_O_PROJ_IN.div_ceil(FP8_BLOCK_SIZE),
-            "GLM5.2 rank {} non-expert FP8 scale max grid is {}x{}, expected {}x{}",
-            self.rank,
+            "GLM5.2 stage {} non-expert FP8 scale max grid is {}x{}, expected {}x{}",
+            self.stage,
             summary.max_scale_rows,
             summary.max_scale_cols,
             GLM52_KV_B_OUT.div_ceil(FP8_BLOCK_SIZE),
@@ -355,7 +379,7 @@ impl Glm52RankGpuWeights {
         let total_fp8_projections =
             attention_fp8_projections + dense_fp8_projections + shared_fp8_projections;
         Ok(Glm52NonExpertWeightContractReport {
-            rank: self.rank,
+            stage: self.stage,
             tensor_count: summary.tensor_count,
             total_bytes: summary.total_bytes,
             dense_layers,

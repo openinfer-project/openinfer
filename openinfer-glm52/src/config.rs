@@ -3,7 +3,6 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};
-use openinfer_core::parallel::ParallelConfig;
 use serde_json::Value;
 
 pub const GLM52_HIDDEN: usize = 6144;
@@ -328,43 +327,4 @@ fn ensure_float_close(actual: f64, expected: f64, tolerance: f64, label: &str) -
         "{label} mismatch: got {actual}, expected {expected}"
     );
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Glm52ParallelShape {
-    pub tp_world: usize,
-    pub dp_world: usize,
-    pub ep_world: usize,
-    pub heads_per_tp: usize,
-    pub local_experts: usize,
-    pub vocab_per_tp: usize,
-}
-
-impl Glm52ParallelShape {
-    #[must_use]
-    pub fn tp1_dp8() -> Self {
-        Self::new(1, 8)
-    }
-
-    #[must_use]
-    pub fn new(tp_world: usize, dp_world: usize) -> Self {
-        assert!(tp_world > 0 && dp_world > 0);
-        let ep_world = tp_world * dp_world;
-        assert_eq!(GLM52_HEADS % tp_world, 0);
-        assert_eq!(GLM52_ROUTED_EXPERTS % ep_world, 0);
-        assert_eq!(GLM52_VOCAB % tp_world, 0);
-        Self {
-            tp_world,
-            dp_world,
-            ep_world,
-            heads_per_tp: GLM52_HEADS / tp_world,
-            local_experts: GLM52_ROUTED_EXPERTS / ep_world,
-            vocab_per_tp: GLM52_VOCAB / tp_world,
-        }
-    }
-
-    #[must_use]
-    pub fn parallel_config(&self) -> ParallelConfig {
-        ParallelConfig::new(self.tp_world, self.dp_world)
-    }
 }
