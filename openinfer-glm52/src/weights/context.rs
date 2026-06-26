@@ -56,9 +56,7 @@ impl Glm52RankGpuContext {
         })
     }
 
-    /// Bridge to the kernel-launch `DeviceContext`. Unreferenced until the PP8
-    /// forward (Slice 3+) starts issuing kernels; kept as the canonical accessor.
-    #[allow(dead_code)]
+    /// Bridge to the kernel-launch `DeviceContext` used by every glm52 op.
     pub(crate) fn as_device_context(&self) -> DeviceContext {
         DeviceContext {
             ctx: Arc::clone(&self.ctx),
@@ -69,6 +67,12 @@ impl Glm52RankGpuContext {
 
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Raw context handle, needed by the PP8 spine to enable NVLink P2P access
+    /// into this stage from a neighbour (`cuCtxEnablePeerAccess`).
+    pub(crate) fn cuda_context(&self) -> &Arc<CudaContext> {
+        &self.ctx
     }
 
     fn set_current_device(device_ordinal: usize) -> Result<()> {

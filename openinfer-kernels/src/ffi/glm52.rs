@@ -7,6 +7,37 @@ pub use flashmla_sparse::*;
 pub use indexer::*;
 
 unsafe extern "C" {
+    // --- PP8 stage-boundary P2P spine (Slice 0) -------------------------------
+    pub fn glm52_pp_source_inject(epoch: *mut u64, stream: CUstream) -> CUresult;
+
+    pub fn glm52_pp_wait_hidden(
+        my_flag: *const u64,
+        epoch: *mut u64,
+        up_ack: *mut u64,
+        err_code: *mut u32,
+        deadline_ns: u64,
+        ring: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_pp_send_hidden(
+        src_hidden: *const core::ffi::c_void,
+        peer_hidden: *mut core::ffi::c_void,
+        peer_flag: *mut u64,
+        epoch: *const u64,
+        down_ack: *const u64,
+        deltas: *mut u64,
+        err_code: *mut u32,
+        words: i32,
+        ring: i32,
+        warmup: u64,
+        n_samples: u64,
+        deadline_ns: u64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_pp_dummy_burn(burn_ns: u64, stream: CUstream) -> CUresult;
+
     pub fn glm52_router_noaux_tc_cuda(
         hidden: *const Half,
         gate_weight: *const Half,

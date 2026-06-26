@@ -11,6 +11,7 @@ mod config;
 // first consumer, so it is unreferenced until then.
 #[allow(dead_code)]
 mod decode_meta;
+mod pp;
 mod runner;
 mod weights;
 
@@ -27,6 +28,7 @@ pub use config::{
     GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, Glm52ParallelShape, load_stop_token_ids,
     probe_config_json,
 };
+pub use pp::{Glm52PpHopStats, Glm52PpSpineConfig, Glm52PpSpineReport, run_pp_p2p_spine};
 use weights::Glm52WeightManifest;
 
 pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
