@@ -118,6 +118,25 @@ def main():
     z["kv_c"][0, T, :].astype(np.float32).tofile(f"{OUT}/kv_c_expected.bin")           # [512]
     z["ql_nope"][0, :, T, :].astype(np.float32).tofile(f"{OUT}/ql_nope_expected.bin")  # [64,512]
 
+    # assembly-kernel inputs (bf16): pre-rope q_pe/k_pe + the 32-len rope tables.
+    # The oracle dumps roped q_rot but not pre-rope q_pe, so recover it by the exact
+    # inverse rotation; k_pe is the already-pre-rope k_rot_raw. The kernel re-ropes
+    # them and must reproduce query.bin / cache.bin.
+    def bf16_bin(arr, name):
+        arr.astype(ml_dtypes.bfloat16).view(np.uint16).tofile(f"{OUT}/{name}")
+
+    cos64, sin64 = z["cos"][0, T, :], z["sin"][0, T, :]
+    q_rot = z["q_rot"][0, :, T, :].astype(np.float32)  # [64,64] roped
+    c, s = cos64[:32].astype(np.float32), sin64[:32].astype(np.float32)
+    lower, upper = q_rot[:, :32], q_rot[:, 32:]
+    q_pe_in = np.empty_like(q_rot)
+    q_pe_in[:, 0::2] = lower * c + upper * s  # even
+    q_pe_in[:, 1::2] = upper * c - lower * s  # odd
+    bf16_bin(q_pe_in, "q_pe_input.bin")                       # [64,64]
+    bf16_bin(z["k_rot_raw"][0, T, :].astype(np.float32), "k_pe_input.bin")  # [64]
+    bf16_bin(c, "cos32.bin")                                  # [32]
+    bf16_bin(s, "sin32.bin")                                  # [32]
+
     d = np.abs(latent_fp8ref - lat_oracle)
     print(f"latent |max|={np.abs(lat_oracle).max():.5f} mean={np.abs(lat_oracle).mean():.5f}")
     print(f"fp8 noise floor (fp8ref vs oracle): max|d|={d.max():.6f} mean|d|={d.mean():.6f}")

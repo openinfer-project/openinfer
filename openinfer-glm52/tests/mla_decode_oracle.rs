@@ -24,7 +24,8 @@ use memmap2::MmapOptions;
 use openinfer_kernels::ops::{
     Glm52DeepGemmScaleLayout, Glm52MoeQuantShape, Glm52TrtllmFp8LinearContract,
     gemm_strided_batched_bf16, glm52_deepgemm_mn_major_tma_aligned_f32_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_trtllm_fp8_linear_launch, rms_norm_into,
+    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
+    glm52_mla_query_assemble_launch, glm52_trtllm_fp8_linear_launch, rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 use serde_json::Value;
@@ -504,4 +505,146 @@ fn mla_front_half_matches_oracle() {
     assert!(r_qp < 0.05, "q_pass rel max {r_qp}");
     assert!(r_kv < 0.08, "kv_c rel max {r_kv}");
     assert!(r_ql < 0.05, "ql_nope rel max {r_ql}");
+}
+
+const ROPE_DIM: usize = 64;
+const QUERY_DIM: usize = KV_LORA + ROPE_DIM; // 576
+const CACHE_BYTES: usize = 656;
+
+fn read_bf16_raw(dir: &Path, name: &str) -> Vec<bf16> {
+    std::fs::read(dir.join(name))
+        .unwrap()
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+/// Dequant one fp8_ds_mla 656-byte token to (ckv[512] f32, k_pe[64] f32). Plain
+/// f32 group scale (both the produced and reference tokens store f32), so the
+/// comparison reflects the ckv values regardless of the kernel's later bf16
+/// scale down-cast.
+fn dequant_656(tok: &[u8]) -> (Vec<f32>, Vec<f32>) {
+    let scales = bytes_to_f32(&tok[KV_LORA..KV_LORA + 16]); // [4]
+    let ckv = (0..KV_LORA)
+        .map(|i| e4m3_to_f32(tok[i]) * scales[i / FP8_BLOCK])
+        .collect();
+    let kpe = tok[528..CACHE_BYTES]
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect();
+    (ckv, kpe)
+}
+
+#[test]
+fn mla_assemble_matches_oracle() {
+    let Ok(ctx) = DeviceContext::new() else {
+        eprintln!("no CUDA device; skipping");
+        return;
+    };
+    let probe = probe_dir();
+    if !probe.join("q_pe_input.bin").exists() {
+        eprintln!("no assembly fixtures at {probe:?}; skipping");
+        return;
+    }
+    let cos = read_bf16_raw(&probe, "cos32.bin");
+    let sin = read_bf16_raw(&probe, "sin32.bin");
+    let mut cos_d = ctx.stream.alloc_zeros::<bf16>(cos.len()).unwrap();
+    let mut sin_d = ctx.stream.alloc_zeros::<bf16>(sin.len()).unwrap();
+    ctx.stream.memcpy_htod(&cos, &mut cos_d).unwrap();
+    ctx.stream.memcpy_htod(&sin, &mut sin_d).unwrap();
+
+    // ---- query assemble: [ql_nope | rope(q_pe)] -> [64,576] vs query.bin ----
+    let ql_bf: Vec<bf16> = read_f32(&probe, "ql_nope_expected.bin")
+        .iter()
+        .map(|&x| bf16::from_f32(x))
+        .collect();
+    let q_pe = read_bf16_raw(&probe, "q_pe_input.bin");
+    let mut ql_d = ctx.stream.alloc_zeros::<bf16>(ql_bf.len()).unwrap();
+    let mut qpe_d = ctx.stream.alloc_zeros::<bf16>(q_pe.len()).unwrap();
+    let mut query_d = ctx.stream.alloc_zeros::<bf16>(HEADS * QUERY_DIM).unwrap();
+    ctx.stream.memcpy_htod(&ql_bf, &mut ql_d).unwrap();
+    ctx.stream.memcpy_htod(&q_pe, &mut qpe_d).unwrap();
+    glm52_mla_query_assemble_launch(&ctx, &ql_d, &qpe_d, &cos_d, &sin_d, &mut query_d).unwrap();
+    ctx.stream.synchronize().unwrap();
+    let query_got: Vec<f32> = ctx
+        .stream
+        .clone_dtoh(&query_d)
+        .unwrap()
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    let query_want: Vec<f32> = read_bf16_raw(&probe, "query.bin")
+        .iter()
+        .map(|x| x.to_f32())
+        .collect();
+    let rel_q = report("query  ", &query_got, &query_want);
+
+    // ---- cache pack: quant(kv_c) + rope(k_pe) -> 656 token vs cache.bin[T=7] ----
+    let kv_c_bf: Vec<bf16> = read_f32(&probe, "kv_c_expected.bin")
+        .iter()
+        .map(|&x| bf16::from_f32(x))
+        .collect();
+    let mut kvc_d = ctx.stream.alloc_zeros::<bf16>(kv_c_bf.len()).unwrap();
+    ctx.stream.memcpy_htod(&kv_c_bf, &mut kvc_d).unwrap();
+    let qshape = Glm52MoeQuantShape {
+        rows: 1,
+        width: KV_LORA,
+        group_size: FP8_BLOCK,
+    };
+    let mut ckv_fp8 = ctx.stream.alloc_zeros::<u8>(KV_LORA).unwrap();
+    let mut ckv_scales = ctx.stream.alloc_zeros::<f32>(KV_LORA / FP8_BLOCK).unwrap();
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        &ctx,
+        qshape,
+        &kvc_d,
+        &mut ckv_fp8,
+        &mut ckv_scales,
+    )
+    .unwrap();
+    let k_pe = read_bf16_raw(&probe, "k_pe_input.bin");
+    let mut kpe_d = ctx.stream.alloc_zeros::<bf16>(k_pe.len()).unwrap();
+    ctx.stream.memcpy_htod(&k_pe, &mut kpe_d).unwrap();
+    let mut token_d = ctx.stream.alloc_zeros::<u8>(CACHE_BYTES).unwrap();
+    glm52_mla_cache_pack_launch(
+        &ctx,
+        &ckv_fp8,
+        &ckv_scales,
+        &kpe_d,
+        &cos_d,
+        &sin_d,
+        &mut token_d,
+    )
+    .unwrap();
+    ctx.stream.synchronize().unwrap();
+    let token = ctx.stream.clone_dtoh(&token_d).unwrap();
+    let cache_ref = std::fs::read(probe.join("cache.bin")).unwrap();
+    let (ckv_got, kpe_got) = dequant_656(&token);
+    let (ckv_ref, kpe_ref) = dequant_656(&cache_ref[7 * CACHE_BYTES..8 * CACHE_BYTES]);
+    let rel_ckv = report("cache ckv", &ckv_got, &ckv_ref);
+    let rel_kpe = report("cache kpe", &kpe_got, &kpe_ref);
+
+    assert!(query_got.iter().all(|x| x.is_finite()));
+    // query nope half is an exact bf16 copy; the rope half round-trips q_rot
+    // through the inverse rotation + bf16 twice, so ~1 bf16 ULP. cache kpe is the
+    // GPU rope of the pre-rope key. Both are tight.
+    assert!(rel_q < 0.02, "query rel max {rel_q}");
+    assert!(rel_kpe < 0.02, "cache kpe rel max {rel_kpe}");
+    // cache ckv is fp8(bf16 kv_c) vs the numpy fp8(f32 kv_c) reference. On this
+    // 0.025-magnitude tensor a single small element's e4m3 step is ~10%, so the
+    // worst element lands ~3.5% while the bulk stays at the bf16+fp8 floor. The
+    // MEAN is the scale/layout invariant (a wrong scale or layout blows it, the
+    // query, and the kpe together); the max is bounded loosely as the fp8 floor.
+    let mean_ckv = ckv_got
+        .iter()
+        .zip(&ckv_ref)
+        .map(|(g, r)| (g - r).abs())
+        .sum::<f32>()
+        / ckv_got.len() as f32;
+    let sig_ckv = ckv_ref.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(
+        mean_ckv / sig_ckv < 0.005,
+        "cache ckv mean rel {}",
+        mean_ckv / sig_ckv
+    );
+    assert!(rel_ckv < 0.05, "cache ckv rel max {rel_ckv}");
 }

@@ -212,4 +212,24 @@ unsafe extern "C" {
         k: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    // --- MLA decode assembly (projections -> FlashMLA glue) -------------------
+    pub fn glm52_mla_query_assemble_cuda(
+        ql_nope: *const Half,
+        q_pe: *const Half,
+        cos: *const Half,
+        sin: *const Half,
+        query: *mut Half,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_mla_cache_pack_cuda(
+        ckv_fp8: *const u8,
+        ckv_scales: *const f32,
+        k_pe: *const Half,
+        cos: *const Half,
+        sin: *const Half,
+        cache_token: *mut u8,
+        stream: CUstream,
+    ) -> CUresult;
 }
