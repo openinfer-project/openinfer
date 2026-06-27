@@ -1,8 +1,8 @@
 # GLM5.2 PP8 Decode Exploration
 
-> **TL;DR:** PP8 TP1 EP1 decode is now the **committed** GLM5.2 low-latency path; DP8/EP8 DeepEP is being dropped. 8 stages, 1 H200/stage, each stage owns a contiguous layer slice + all 256 routed experts for its sparse layers; stage boundary = BF16 hidden `[1,6144]` over a **graph-internal NVLink P2P handoff** (device-flag serialized, no stream/event edges). **Target: bs=1, TPOT < 10 ms** — purely HBM-bound (~42-50 GiB active/token / ~4.0-4.8 TB/s of one H200), so the budget is per-stage FP8-GEMM HBM efficiency, not communication (7-hop handoff **measured ~5 µs RTT/hop on node38, ~19 µs one-way chain = 0.2% of budget = noise**; Slice 0 validated 2026-06-27). The **Build Plan** below is authoritative and supersedes the older hypothesis sections; it sequences work as Slices P->0->7. Two governing facts: **(1) Slice 0 = the PP runtime spine** (novel, load-bearing, independent of forward math); **(2) #1 correctness blocker = the MLA `q_b`/`kv_b` head-count factorization** (input side N=256, o_proj side N=64 -- a 4:1 fold the contract mis-states) -- no attention code until a node38 vLLM dump resolves it (Slice 1). bs=1 collapses MoE to top-8 active experts (G=8 grouped GEMM, no 256-group permute / no alignment padding), so DP/EP's Risk 6 alignment-blowup vanishes.
+> **TL;DR:** PP8 TP1 EP1 decode is now the **committed** GLM5.2 low-latency path; DP8/EP8 DeepEP is being dropped. 8 stages, 1 H200/stage, each stage owns a contiguous layer slice + all 256 routed experts for its sparse layers; stage boundary = BF16 hidden `[1,6144]` over a **graph-internal NVLink P2P handoff** (device-flag serialized, no stream/event edges). **Target: bs=1, TPOT < 10 ms** — purely HBM-bound (~42-50 GiB active/token / ~4.0-4.8 TB/s of one H200), so the budget is per-stage FP8-GEMM HBM efficiency, not communication (7-hop handoff **measured ~5 µs RTT/hop on node38, ~19 µs one-way chain = 0.2% of budget = noise**; Slice 0 validated 2026-06-27). The **Build Plan** below is authoritative and supersedes the older hypothesis sections; it sequences work as Slices P->0->7. Two governing facts: **(1) Slice 0 = the PP runtime spine** (novel, load-bearing, independent of forward math); **(2) #1 correctness blocker = the MLA `q_b`/`kv_b` head-count factorization** (input side N=256, o_proj side N=64 -- a 4:1 fold the contract mis-states) -- no attention code until a node38 vLLM dump resolves it (Slice 1). bs=1 collapses MoE to top-8 active experts (G=8 grouped GEMM, no 256-group permute / no alignment padding), so DP/EP's Risk 6 alignment-blowup vanishes. **STATUS (2026-06-27): the full forward path is built and proven correct end-to-end on node38 (loads the real checkpoint, greedily decodes fluent English). bs=1 TPOT = ~70 ms eager, and the per-op measurement overturns the plan: it is execution-bound (the per-stage CUDA graph is NOT the lever, ≤10%), the lever is bs=1 FP8-kernel efficiency (running at ~9% of the ~6.25 ms HBM floor). Handoff is host-staged, not the P2P spine. See "MEASURED — bs=1 forward complete" below for the breakdown + optimization order.**
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-06-27
 
 ## Preparation
 
@@ -261,6 +261,34 @@ Spine runs the full sweep green; the pp=8/12KB zero->100µs tail gate passes ove
 **Two divergences from the plan above, now authoritative:**
 1. **Peer access is `cuMemPoolSetAccess`, NOT `cuCtxEnablePeerAccess`.** cudarc allocates the rings via `cuMemAllocAsync` (stream-ordered pool memory); `cuCtxEnablePeerAccess` governs only legacy `cuMemAlloc`, so a neighbour's remote store into a pool allocation faults with `Warp Illegal Address`. Grant the access descriptor (RW for both neighbour devices) on each device's **default mempool**, set **before** allocating the rings. Keyed on device ordinal, so the handshake no longer carries the neighbour CUcontext.
 2. **Slice 0 is an OPEN chain (0→…→7), not the closed ring.** Stage 0 `source_inject`s (no inbound wait); stage n-1 is a pure sink. The cycle edge `7→0` (token feedback) is deferred to Slice 7 — a closed ring where every stage waits-then-sends deadlocks without an injector.
+
+---
+
+### MEASURED — bs=1 forward complete + correct, TPOT baseline (2026-06-27)
+
+**The whole forward path is built and proven correct end-to-end** (commits `9830bc5` weight-bridge, `27e252d` forward+coordinator, `69f7107` pool-retain). On node38 8×H200 the engine loads the real GLM-5.2-FP8 checkpoint (all 8 stages drain with zero leftover tensors — the strict-consume invariant holds), greedily decodes, and produces fluent English (*"…the importance of the film's authenticity, noting that the production team worked closely with…"*). Every brick composes: residuals, layer/stage order, rope positions, KV accumulation, expert routing, stage handoff. A wiring bug would give garbage/NaN/repetition — this is the integration gate.
+
+**Two deliberate simplifications vs the plan, now authoritative for bs=1:**
+- **Hidden handoff is host-staged (dtoh→htod), NOT the Slice-0 P2P graph spine.** For bs=1 the 8 stages are strictly serial (token t+1 needs t; stage k+1 needs stage k), so the 12 KiB handoff (~1 µs, and measured 0.2% of budget anyway) buys nothing from P2P. The spine stays validated infra for later microbatch/MTP; the bs=1 milestone does not wire it.
+- **Decode-style prefill:** one forward per prompt token (reuses the validated single-token kernel); KV caches reset at position 0; greedy argmax.
+
+**TPOT baseline (eager, eight stages serial): ~70 ms median — 11× over the 10 ms target.** Sync-bracketed per-op GPU time (position 8) re-prioritizes the entire optimization:
+
+| component | time/token | HBM floor | BW eff |
+|---|---|---|---|
+| MoE grouped FP8 GEMMs (W13+W2, 75 layers) | ~29 ms | ~5 ms | ~17% |
+| MoE glue + shared expert (75 layers) | ~20 ms | — | — |
+| MLA (10 fp8 projections + FlashMLA, 78 layers) | ~21 ms | ~4 ms | ~19% |
+| **total** | **~70 ms** | **~6.25 ms** | **~9%** |
+
+**The per-stage CUDA graph is NOT the lever — this overturns the Slice-7 plan.** The sync-bracketed per-op sum (~71 ms) *equals* the eager TPOT (~73 ms): the GPU is genuinely busy executing kernels, launches are already hidden behind execution. A graph removes per-launch CPU cost + inter-kernel idle gaps, but on an execution-bound workload that is ≤10%. The planned *arena + per-stage CUDA graph* (a large refactor: `cache_pack` position host-scalar→device-buffer kernel change + full pre-allocated arena) would **not move TPOT**. **Parked.** (The pool-retain fix `69f7107` is the one alloc-side win worth keeping: it removes the per-sync driver-release stall, tightening p99 95→68 ms; median unchanged because it is execution-bound.)
+
+**The real lever is bs=1 kernel efficiency — the kernels run at ~9% of the HBM floor.** Optimization order (largest headroom first):
+1. **MoE grouped FP8 GEMM (29 ms → ~5 ms).** `glm52_trtllm_grouped_fp8_launch` runs `groups=256, m_capacity=512` but only ~8 experts are active at bs=1 — compute-bound on the 64-row alignment padding (8 experts × 64 padded rows = 512, of which 8 are real; padding compute ~129 µs/layer ≈ 2× the 63 µs memory floor, and the kernel adds ~3× on top). Levers: a decode-specialized grouped GEMM (DeepGEMM masked/contiguous path is now vendored under `third_party/DeepGEMM`) and/or a smaller per-expert alignment for the M=1 case.
+2. **MLA fp8 projections (21 ms).** ~30 tiny kernels/layer — each projection is quant + scale-relayout + GEMM at M=1. Levers: fuse quant+relayout into the GEMM; fuse the Q / KV projections.
+3. **MoE glue + shared expert (20 ms).** router / quant / scatter / weighted-silu-quant / combine all run over the M_CAPACITY=512 padded rows; the shared expert is a per-layer dense fp8 MLP. Levers: size the glue to the ~8 active rows; fuse.
+
+**Validation harness:** `tests/checkpoint.rs::jiuzhang_checkpoint_decodes_bs1` (ignored) — loads, decodes 48 tokens, prints TTFT/TPOT p50/p99, asserts TPOT median < 10 ms (**red until the kernel work lands**) + out-of-vocab guard. A full HF golden-logits gate (mean + p99 |Δlogprob|, per the qwen3/kimi methodology) is still owed as the correctness gate beyond the coherence check.
 
 ---
 
