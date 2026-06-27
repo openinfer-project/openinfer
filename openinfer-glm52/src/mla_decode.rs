@@ -17,14 +17,14 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, Glm52DeepGemmScaleLayout, Glm52FlashMlaSparseDecode,
-    Glm52MoeQuantShape, Glm52TrtllmFp8LinearContract, gemm_strided_batched_bf16,
-    glm52_deepgemm_mn_major_tma_aligned_f32_launch, glm52_flashmla_sparse_decode_launch,
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, Glm52FlashMlaSparseDecode, Glm52MoeQuantShape,
+    gemm_strided_batched_bf16, glm52_flashmla_sparse_decode_launch,
     glm52_flashmla_sparse_decode_metadata_launch, glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_mla_cache_pack_launch, glm52_mla_query_assemble_launch, glm52_trtllm_fp8_linear_launch,
-    rms_norm_into,
+    glm52_mla_cache_pack_launch, glm52_mla_query_assemble_launch, rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+
+use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear};
 
 const HEADS: usize = 64;
 const HIDDEN: usize = 6144;
@@ -37,66 +37,7 @@ const KV_A_OUT: usize = 576; // compressed_kv(512) + k_pe(64)
 const V_HEAD: usize = 256;
 const KV_B_ROWS_PER_HEAD: usize = QK_NOPE + V_HEAD; // 448
 const QUERY_DIM: usize = KV_LORA + ROPE_DIM; // 576
-const FP8_BLOCK: usize = 128;
 const RMS_EPS: f32 = 1.0e-5;
-
-/// OCP `float8_e4m3fn` decode (bias 7, no inf; subnormals supported).
-fn e4m3_to_f32(b: u8) -> f32 {
-    let sign = if (b >> 7) & 1 == 1 { -1.0 } else { 1.0 };
-    let e = ((b >> 3) & 0xF) as i32;
-    let m = (b & 0x7) as f32;
-    let mag = if e == 0 {
-        2f32.powi(-6) * (m / 8.0)
-    } else {
-        2f32.powi(e - 7) * (1.0 + m / 8.0)
-    };
-    sign * mag
-}
-
-/// Raw fp8 block-scaled projection bytes (row-major weight `[n,k]` + per-128-block
-/// `weight_scale_inv` `[n/128, k/128]` f32).
-pub(crate) struct Glm52ProjBytes<'a> {
-    pub(crate) weight: &'a [u8],
-    pub(crate) scale: &'a [u8],
-    pub(crate) n: usize,
-    pub(crate) k: usize,
-}
-
-/// One fp8 projection resident on device.
-struct ProjWeight {
-    weight: CudaSlice<u8>,
-    scale: CudaSlice<u8>,
-    n: usize,
-    k: usize,
-}
-
-impl ProjWeight {
-    fn upload(ctx: &DeviceContext, b: &Glm52ProjBytes) -> Result<Self> {
-        ensure!(
-            b.weight.len() == b.n * b.k,
-            "GLM5.2 MLA proj weight bytes {} != n*k {}",
-            b.weight.len(),
-            b.n * b.k
-        );
-        ensure!(
-            b.scale.len() == b.n.div_ceil(FP8_BLOCK) * b.k.div_ceil(FP8_BLOCK) * 4,
-            "GLM5.2 MLA proj scale bytes {} unexpected for [{},{}]",
-            b.scale.len(),
-            b.n,
-            b.k
-        );
-        let mut weight = ctx.stream.alloc_zeros::<u8>(b.weight.len())?;
-        let mut scale = ctx.stream.alloc_zeros::<u8>(b.scale.len())?;
-        ctx.stream.memcpy_htod(b.weight, &mut weight)?;
-        ctx.stream.memcpy_htod(b.scale, &mut scale)?;
-        Ok(Self {
-            weight,
-            scale,
-            n: b.n,
-            k: b.k,
-        })
-    }
-}
 
 /// One MLA layer's attention weights, device-resident.
 pub(crate) struct Glm52MlaLayerWeights {
@@ -200,56 +141,6 @@ fn dequant_kv_b(
     ctx.stream.memcpy_htod(&w_uk, &mut uk)?;
     ctx.stream.memcpy_htod(&w_uv, &mut uv)?;
     Ok((uk, uv))
-}
-
-fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-/// One fp8 projection (bs=1): quant(input) -> activation-scale relayout to the
-/// TRTLLM col-major TMA layout -> blockscale linear. Returns `[n]` bf16.
-fn fp8_linear(
-    ctx: &DeviceContext,
-    w: &ProjWeight,
-    input: &CudaSlice<bf16>,
-) -> Result<CudaSlice<bf16>> {
-    let scale_cols = w.k / FP8_BLOCK;
-    let mut a_fp8 = ctx.stream.alloc_zeros::<u8>(w.k)?;
-    let mut a_scale_plain = ctx.stream.alloc_zeros::<f32>(scale_cols)?;
-    glm52_fp8_per_token_group_quant_bf16_launch(
-        ctx,
-        Glm52MoeQuantShape {
-            rows: 1,
-            width: w.k,
-            group_size: FP8_BLOCK,
-        },
-        input,
-        &mut a_fp8,
-        &mut a_scale_plain,
-    )?;
-    let layout = Glm52DeepGemmScaleLayout::f32(1, scale_cols);
-    let mut a_scale = ctx.stream.alloc_zeros::<f32>(layout.output_len()?)?;
-    glm52_deepgemm_mn_major_tma_aligned_f32_launch(ctx, layout, &a_scale_plain, &mut a_scale)?;
-    let mut out = ctx.stream.alloc_zeros::<bf16>(w.n)?;
-    glm52_trtllm_fp8_linear_launch(
-        ctx,
-        Glm52TrtllmFp8LinearContract {
-            m: 1,
-            n: w.n,
-            k: w.k,
-            weight_scale_rows: w.n.div_ceil(FP8_BLOCK),
-            weight_scale_cols: scale_cols,
-            activation_scale_cols: scale_cols,
-        },
-        &a_fp8,
-        &a_scale,
-        &w.weight,
-        &w.scale,
-        &mut out,
-    )?;
-    Ok(out)
 }
 
 /// RMSNorm (eps 1e-5) of `input[len]` into a fresh buffer.

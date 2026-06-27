@@ -234,4 +234,39 @@ unsafe extern "C" {
         cache_token: *mut u8,
         stream: CUstream,
     ) -> CUresult;
+
+    // --- MoE local route/scatter/combine glue (bs=1 decode, EP1) --------------
+    pub fn glm52_moe_route_offsets_cuda(
+        topk_idx: *const i32,
+        expert_offsets: *mut i64,
+        n_experts: i32,
+        topk: i32,
+        alignment: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_route_scatter_cuda(
+        hidden_fp8: *const u8,
+        hidden_scale: *const f32,
+        topk_idx: *const i32,
+        topk_weight: *const f32,
+        expert_offsets: *const i64,
+        act: *mut u8,
+        act_scale: *mut f32,
+        row_weight: *mut f32,
+        topk: i32,
+        k: i32,
+        scale_cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_combine_cuda(
+        w2_out: *const Half,
+        topk_idx: *const i32,
+        expert_offsets: *const i64,
+        routed: *mut Half,
+        n: i32,
+        topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

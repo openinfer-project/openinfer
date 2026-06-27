@@ -14,8 +14,16 @@ mod decode_meta;
 // Single-layer MLA decode forward (Slice 3). Composes the oracle-validated GPU
 // ops into one `hidden -> o`; the PP stage executor (Slice 7) is its first
 // caller, so it is unreferenced until then.
+// Shared fp8 block-scaled projection primitives (MLA, dense MLP, MoE shared expert).
+#[allow(dead_code)]
+mod fp8;
 #[allow(dead_code)]
 mod mla_decode;
+// Single-layer routed-MoE decode forward (Slice 5). Composes the grouped FP8
+// expert GEMM with the route/scatter/combine glue; the PP stage executor (Slice
+// 7) is its first caller, so it is unreferenced until then.
+#[allow(dead_code)]
+mod moe_decode;
 mod pp;
 mod runner;
 mod weights;
