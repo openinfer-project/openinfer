@@ -15,9 +15,9 @@ use crate::pp::Glm52StagePlan;
 /// embedding on stage 0, the final norm + lm_head on the last stage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TopWeightNames {
-    token_embedding: Option<String>,
-    final_norm: Option<String>,
-    lm_head: Option<String>,
+    pub(crate) token_embedding: Option<String>,
+    pub(crate) final_norm: Option<String>,
+    pub(crate) lm_head: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,45 +28,61 @@ pub(crate) struct Glm52Fp8ProjectionWeightNames {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52IndexerWeightNames {
-    k_norm_weight: String,
-    k_norm_bias: String,
-    weights_proj: String,
-    wk: Glm52Fp8ProjectionWeightNames,
-    wq_b: Glm52Fp8ProjectionWeightNames,
+    pub(crate) k_norm_weight: String,
+    pub(crate) k_norm_bias: String,
+    pub(crate) weights_proj: String,
+    pub(crate) wk: Glm52Fp8ProjectionWeightNames,
+    pub(crate) wq_b: Glm52Fp8ProjectionWeightNames,
+}
+
+impl Glm52IndexerWeightNames {
+    /// All resident tensor names for this indexer (k-norm gamma/beta, the score
+    /// projection, and the wk / wq_b fp8 projection weight+scale pairs).
+    pub(crate) fn tensor_names(&self) -> [&str; 7] {
+        [
+            &self.k_norm_weight,
+            &self.k_norm_bias,
+            &self.weights_proj,
+            &self.wk.weight,
+            &self.wk.weight_scale_inv,
+            &self.wq_b.weight,
+            &self.wq_b.weight_scale_inv,
+        ]
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52AttentionWeightNames {
-    input_layernorm: String,
-    q_a_proj: Glm52Fp8ProjectionWeightNames,
-    q_a_layernorm: String,
-    q_b_proj: Glm52Fp8ProjectionWeightNames,
-    kv_a_proj_with_mqa: Glm52Fp8ProjectionWeightNames,
-    kv_a_layernorm: String,
-    kv_b_proj: Glm52Fp8ProjectionWeightNames,
-    o_proj: Glm52Fp8ProjectionWeightNames,
-    post_attention_layernorm: String,
-    indexer: Option<Glm52IndexerWeightNames>,
+    pub(crate) input_layernorm: String,
+    pub(crate) q_a_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) q_a_layernorm: String,
+    pub(crate) q_b_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) kv_a_proj_with_mqa: Glm52Fp8ProjectionWeightNames,
+    pub(crate) kv_a_layernorm: String,
+    pub(crate) kv_b_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) o_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) post_attention_layernorm: String,
+    pub(crate) indexer: Option<Glm52IndexerWeightNames>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52DenseMlpWeightNames {
-    gate_proj: Glm52Fp8ProjectionWeightNames,
-    up_proj: Glm52Fp8ProjectionWeightNames,
-    down_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) gate_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) up_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) down_proj: Glm52Fp8ProjectionWeightNames,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52RouterWeightNames {
-    gate_weight: String,
-    e_score_correction_bias: String,
+    pub(crate) gate_weight: String,
+    pub(crate) e_score_correction_bias: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52SharedExpertWeightNames {
-    gate_proj: Glm52Fp8ProjectionWeightNames,
-    up_proj: Glm52Fp8ProjectionWeightNames,
-    down_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) gate_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) up_proj: Glm52Fp8ProjectionWeightNames,
+    pub(crate) down_proj: Glm52Fp8ProjectionWeightNames,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -27,6 +27,11 @@ mod decode_meta;
 mod fp8;
 #[allow(dead_code)]
 mod mla_decode;
+// Typed per-stage decode model: drains the raw loader output into the brick
+// weight structs the forward consumes (Slice 7). First caller is the stage
+// executor, so it is unreferenced until then.
+#[allow(dead_code)]
+mod model;
 // Single-layer routed-MoE decode forward (Slice 5). Composes the grouped FP8
 // expert GEMM with the route/scatter/combine glue; the PP stage executor (Slice
 // 7) is its first caller, so it is unreferenced until then.

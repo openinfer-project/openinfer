@@ -83,6 +83,35 @@ impl ProjWeight {
             k: b.k,
         })
     }
+
+    /// Wrap already-resident GPU buffers (the production loader path), moving them
+    /// in with no copy. `weight` is the fp8 `[n,k]` e4m3 bytes, `scale` the f32
+    /// `weight_scale_inv` (`[n/128, k/128]`) kept as raw `u8`. Same validation as
+    /// `upload`, so a packaging drift crashes here, not in the kernel.
+    pub(crate) fn from_device(
+        weight: CudaSlice<u8>,
+        scale: CudaSlice<u8>,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        ensure!(
+            weight.len() == n * k,
+            "GLM5.2 proj weight bytes {} != n*k {}",
+            weight.len(),
+            n * k
+        );
+        ensure!(
+            scale.len() == n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK) * 4,
+            "GLM5.2 proj scale bytes {} unexpected for [{n},{k}]",
+            scale.len()
+        );
+        Ok(Self {
+            weight,
+            scale,
+            n,
+            k,
+        })
+    }
 }
 
 /// One fp8 projection (bs=1): quant the bf16 activation, then the prequant linear.

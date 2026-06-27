@@ -8,9 +8,10 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
 
+use crate::model::Glm52StageModel;
 use crate::weights::{
-    Glm52NonExpertWeightContractReport, Glm52RankGpuContext, Glm52StageExpertFp8Weights,
-    Glm52StageGpuWeights, Glm52StageLoadBundle, load_stage_sliced_weights_to_gpu,
+    Glm52NonExpertWeightContractReport, Glm52RankGpuContext, Glm52StageLoadBundle,
+    load_stage_sliced_weights_to_gpu,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,14 +143,8 @@ struct Glm52StageThreadState {
 }
 
 struct Glm52StageLoadedState {
-    weights: Glm52StageGpuWeights,
-    expert_weights: Glm52StageExpertFp8Weights,
-}
-
-impl Glm52StageLoadedState {
-    fn total_bytes(&self) -> usize {
-        self.weights.total_bytes + self.expert_weights.total_bytes
-    }
+    #[allow(dead_code)] // consumed by the stage forward (Slice 7b), wired next.
+    model: Glm52StageModel,
 }
 
 impl Glm52StageThreadState {
@@ -168,20 +163,15 @@ impl Glm52StageThreadState {
 
     fn load_sliced_weights(&mut self, model_path: &Path) -> Result<Glm52StageWeightLoadReport> {
         let loaded = load_stage_sliced_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
+        let total_bytes = loaded.weights.total_bytes + loaded.expert_kernel_weights.total_bytes;
         ensure!(
-            loaded.loaded_total_bytes
-                == loaded.weights.total_bytes + loaded.expert_kernel_weights.total_bytes,
+            loaded.loaded_total_bytes == total_bytes,
             "GLM5.2 stage {} loaded bytes {} differ from resident raw {} + expert package {}",
             self.placement.stage,
             loaded.loaded_total_bytes,
             loaded.weights.total_bytes,
             loaded.expert_kernel_weights.total_bytes
         );
-        let loaded_state = Glm52StageLoadedState {
-            weights: loaded.weights,
-            expert_weights: loaded.expert_kernel_weights,
-        };
-        let total_bytes = loaded_state.total_bytes();
         let report = Glm52StageWeightLoadReport {
             stage: self.placement.stage,
             tensor_count: loaded.loaded_tensor_count,
@@ -189,7 +179,15 @@ impl Glm52StageThreadState {
             non_expert_weight_contract: loaded.non_expert_weight_contract,
             loaded_to_gpu: true,
         };
-        self.loaded = Some(loaded_state);
+        // Drain the raw loader output into the typed decode model (strict: every
+        // resident tensor + expert package must be consumed).
+        let model = Glm52StageModel::build(
+            &self.ctx.as_device_context(),
+            loaded.weights,
+            loaded.expert_kernel_weights,
+            &self.bundle.names,
+        )?;
+        self.loaded = Some(Glm52StageLoadedState { model });
         Ok(report)
     }
 }

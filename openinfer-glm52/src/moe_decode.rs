@@ -71,8 +71,8 @@ pub struct Glm52MoeLayerWeights {
 
 impl Glm52MoeLayerWeights {
     /// Wrap the pre-assembled grouped routed buffers + upload the shared expert
-    /// projections, validating every extent against the GLM5.2 MoE architecture
-    /// (crash-early on a packaging drift).
+    /// projections from host bytes (the oracle/test path), validating every extent
+    /// against the GLM5.2 MoE architecture (crash-early on a packaging drift).
     #[allow(clippy::too_many_arguments)]
     pub fn from_device(
         ctx: &DeviceContext,
@@ -85,6 +85,59 @@ impl Glm52MoeLayerWeights {
         shared_gate: &Glm52ProjBytes,
         shared_up: &Glm52ProjBytes,
         shared_down: &Glm52ProjBytes,
+    ) -> Result<Self> {
+        Self::new(
+            gate_weight,
+            e_score_bias,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+            ProjWeight::upload(ctx, shared_gate)?,
+            ProjWeight::upload(ctx, shared_up)?,
+            ProjWeight::upload(ctx, shared_down)?,
+        )
+    }
+
+    /// Wrap already-resident buffers (the production loader path): the grouped
+    /// routed buffers come from the expert packager, the shared expert from the
+    /// non-expert resident map. Everything is moved in, no copy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_resident(
+        gate_weight: CudaSlice<u8>,
+        e_score_bias: CudaSlice<u8>,
+        w13_weight: CudaSlice<u8>,
+        w13_scale: CudaSlice<f32>,
+        w2_weight: CudaSlice<u8>,
+        w2_scale: CudaSlice<f32>,
+        shared_gate: ProjWeight,
+        shared_up: ProjWeight,
+        shared_down: ProjWeight,
+    ) -> Result<Self> {
+        Self::new(
+            gate_weight,
+            e_score_bias,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+            shared_gate,
+            shared_up,
+            shared_down,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        gate_weight: CudaSlice<u8>,
+        e_score_bias: CudaSlice<u8>,
+        w13_weight: CudaSlice<u8>,
+        w13_scale: CudaSlice<f32>,
+        w2_weight: CudaSlice<u8>,
+        w2_scale: CudaSlice<f32>,
+        shared_gate: ProjWeight,
+        shared_up: ProjWeight,
+        shared_down: ProjWeight,
     ) -> Result<Self> {
         let check = |name: &str, have: usize, want: usize| -> Result<()> {
             ensure!(
@@ -107,7 +160,7 @@ impl Glm52MoeLayerWeights {
             w2_scale.len(),
             EXPERTS * W2_SCALE_ROWS * W2_SCALE_COLS,
         )?;
-        let shape = |label: &str, p: &Glm52ProjBytes, n: usize, k: usize| -> Result<()> {
+        let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
             ensure!(
                 p.n == n && p.k == k,
                 "GLM5.2 MoE shared {label} shape [{},{}] != [{n},{k}]",
@@ -116,9 +169,9 @@ impl Glm52MoeLayerWeights {
             );
             Ok(())
         };
-        shape("gate_proj", shared_gate, INTERMEDIATE, HIDDEN)?;
-        shape("up_proj", shared_up, INTERMEDIATE, HIDDEN)?;
-        shape("down_proj", shared_down, HIDDEN, INTERMEDIATE)?;
+        shape("gate_proj", &shared_gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", &shared_up, INTERMEDIATE, HIDDEN)?;
+        shape("down_proj", &shared_down, HIDDEN, INTERMEDIATE)?;
         Ok(Self {
             gate_weight,
             e_score_bias,
@@ -126,9 +179,9 @@ impl Glm52MoeLayerWeights {
             w13_scale,
             w2_weight,
             w2_scale,
-            shared_gate: ProjWeight::upload(ctx, shared_gate)?,
-            shared_up: ProjWeight::upload(ctx, shared_up)?,
-            shared_down: ProjWeight::upload(ctx, shared_down)?,
+            shared_gate,
+            shared_up,
+            shared_down,
         })
     }
 }

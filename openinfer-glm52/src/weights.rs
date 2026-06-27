@@ -30,9 +30,12 @@ mod package;
 mod view;
 
 pub(crate) use context::Glm52RankGpuContext;
-pub(crate) use load::{Glm52StageGpuWeights, load_stage_sliced_weights_to_gpu};
+pub(crate) use load::{Glm52GpuRawTensor, Glm52StageGpuWeights, load_stage_sliced_weights_to_gpu};
 pub(crate) use package::Glm52StageExpertFp8Weights;
-pub(crate) use view::Glm52NonExpertWeightContractReport;
+pub(crate) use view::{
+    Glm52AttentionWeightNames, Glm52Fp8ProjectionWeightNames, Glm52LayerWeightKindNames,
+    Glm52NonExpertWeightContractReport, Glm52StageWeightNames,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TensorEntry {

@@ -95,6 +95,65 @@ impl Glm52MlaLayerWeights {
             w_uv,
         })
     }
+
+    /// Build from already-resident weights (the production loader path). The fp8
+    /// projections + layernorm gammas are moved in; `kv_b` is consumed to derive
+    /// the bf16 absorb factors (its fp8 bytes are pulled back to host once for the
+    /// block-scaled dequant, then dropped — it is not stored). Same architecture
+    /// shape checks as `from_host`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_device(
+        ctx: &DeviceContext,
+        q_a: ProjWeight,
+        q_a_ln: DeviceVec,
+        q_b: ProjWeight,
+        kv_a: ProjWeight,
+        kv_a_ln: DeviceVec,
+        kv_b: ProjWeight,
+        o_proj: ProjWeight,
+    ) -> Result<Self> {
+        let check = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
+            ensure!(
+                p.n == n && p.k == k,
+                "GLM5.2 {label} shape [{},{}] != [{n},{k}]",
+                p.n,
+                p.k
+            );
+            Ok(())
+        };
+        check("q_a_proj", &q_a, Q_LORA, HIDDEN)?;
+        check("q_b_proj", &q_b, HEADS * Q_HEAD, Q_LORA)?;
+        check("kv_a_proj_with_mqa", &kv_a, KV_A_OUT, HIDDEN)?;
+        check("kv_b_proj", &kv_b, HEADS * KV_B_ROWS_PER_HEAD, KV_LORA)?;
+        check("o_proj", &o_proj, HIDDEN, HEADS * V_HEAD)?;
+        ensure!(
+            q_a_ln.len == Q_LORA && kv_a_ln.len == KV_LORA,
+            "GLM5.2 MLA layernorm lengths q_a_ln {} / kv_a_ln {} != {Q_LORA}/{KV_LORA}",
+            q_a_ln.len,
+            kv_a_ln.len
+        );
+        let kv_b_weight = ctx.stream.clone_dtoh(&kv_b.weight)?;
+        let kv_b_scale = ctx.stream.clone_dtoh(&kv_b.scale)?;
+        let (w_uk, w_uv) = dequant_kv_b(
+            ctx,
+            &Glm52ProjBytes {
+                weight: &kv_b_weight,
+                scale: &kv_b_scale,
+                n: kv_b.n,
+                k: kv_b.k,
+            },
+        )?;
+        Ok(Self {
+            q_a,
+            q_a_ln,
+            q_b,
+            kv_a,
+            kv_a_ln,
+            o_proj,
+            w_uk,
+            w_uv,
+        })
+    }
 }
 
 /// Host-dequant kv_b (fp8 e4m3 block-scaled) into bf16 W_UK [H,192,512] (nope) and
