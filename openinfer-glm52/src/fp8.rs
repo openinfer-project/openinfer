@@ -14,7 +14,7 @@ use half::bf16;
 use openinfer_kernels::ops::{
     Glm52DeepGemmScaleLayout, Glm52MoeQuantShape, Glm52TrtllmFp8LinearContract,
     glm52_deepgemm_mn_major_tma_aligned_f32_launch, glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_trtllm_fp8_linear_launch,
+    glm52_silu_and_mul_per_token_group_quant_bf16_launch, glm52_trtllm_fp8_linear_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -154,4 +154,58 @@ pub(crate) fn fp8_linear_prequant(
         &mut out,
     )?;
     Ok(out)
+}
+
+/// A plain fp8 SwiGLU MLP for one token (bs=1): `down(silu(gate(h)) * up(h))`, with
+/// SEPARATE gate/up projections (the GLM5.2 dense layer and the MoE shared expert
+/// both use this shape -- only the intermediate size differs, derived here from the
+/// weights). Returns `[down.n]` bf16 (= `[HIDDEN]`).
+pub(crate) fn fp8_mlp(
+    ctx: &DeviceContext,
+    gate: &ProjWeight,
+    up: &ProjWeight,
+    down: &ProjWeight,
+    input: &CudaSlice<bf16>,
+) -> Result<CudaSlice<bf16>> {
+    let intermediate = gate.n;
+    ensure!(
+        up.n == intermediate && down.k == intermediate && gate.k == up.k && gate.k == down.n,
+        "GLM5.2 fp8_mlp shape mismatch: gate [{},{}], up [{},{}], down [{},{}]",
+        gate.n,
+        gate.k,
+        up.n,
+        up.k,
+        down.n,
+        down.k
+    );
+    ensure!(
+        intermediate.is_multiple_of(FP8_BLOCK),
+        "GLM5.2 fp8_mlp intermediate {intermediate} not a multiple of {FP8_BLOCK}"
+    );
+    let gate_out = fp8_linear(ctx, gate, input)?; // [intermediate]
+    let up_out = fp8_linear(ctx, up, input)?; // [intermediate]
+
+    // Concatenate gate|up (gate first half) for the fused SwiGLU.
+    let mut gate_up = ctx.stream.alloc_zeros::<bf16>(2 * intermediate)?;
+    ctx.stream
+        .memcpy_dtod(&gate_out, &mut gate_up.slice_mut(0..intermediate))?;
+    ctx.stream.memcpy_dtod(
+        &up_out,
+        &mut gate_up.slice_mut(intermediate..2 * intermediate),
+    )?;
+
+    let mut w_act = ctx.stream.alloc_zeros::<u8>(intermediate)?;
+    let mut w_act_scale = ctx.stream.alloc_zeros::<f32>(intermediate / FP8_BLOCK)?;
+    glm52_silu_and_mul_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows: 1,
+            width: intermediate,
+            group_size: FP8_BLOCK,
+        },
+        &gate_up,
+        &mut w_act,
+        &mut w_act_scale,
+    )?;
+    fp8_linear_prequant(ctx, down, &w_act, &w_act_scale)
 }

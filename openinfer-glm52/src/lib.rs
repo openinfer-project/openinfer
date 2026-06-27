@@ -5,6 +5,14 @@
 //! already routes GLM5.2 through the normal Qwen-style `EngineHandle` path.
 
 mod config;
+// Decode bookends (Slice 6): token embedding + final RMSNorm + lm_head. The PP
+// stage executor (Slice 7) is its first caller, so it is unreferenced until then.
+#[allow(dead_code)]
+mod bookend;
+// Dense-MLP decode forward (Slice 6, layers 0..first_k_dense_replace). The PP
+// stage executor (Slice 7) is its first caller, so it is unreferenced until then.
+#[allow(dead_code)]
+mod dense;
 // Paged-KV decode geometry (vLLM-parity page table / slot mapping). It is
 // parallelism-agnostic and survives the DP8->PP8 pivot unchanged; the PP8
 // MLA/indexer/KV decode slice (Slice 3, docs/models/glm52/pp-decode.md) is its

@@ -27,12 +27,11 @@ use openinfer_kernels::ops::{
     glm52_deepgemm_grouped_offset_tma_aligned_f32_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_moe_combine_launch,
     glm52_moe_route_offsets_launch, glm52_moe_route_scatter_launch, glm52_router_noaux_tc_launch,
-    glm52_silu_and_mul_per_token_group_quant_bf16_launch,
     glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch, glm52_trtllm_grouped_fp8_launch,
 };
 use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
 
-use crate::fp8::{Glm52ProjBytes, ProjWeight, fp8_linear, fp8_linear_prequant};
+use crate::fp8::{Glm52ProjBytes, ProjWeight, fp8_mlp};
 
 const HIDDEN: usize = 6144;
 const EXPERTS: usize = 256;
@@ -284,41 +283,20 @@ pub fn glm52_moe_routed_forward(
     Ok(routed)
 }
 
-/// Shared-expert contribution for a single token: a plain fp8 MLP
-/// `down(silu(gate(h)) * up(h))`, intermediate 2048. Separate gate/up projections
-/// (unlike the dense MLP's fused gate_up), so their outputs are concatenated before
-/// the SwiGLU. Returns `[HIDDEN]` bf16.
+/// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP
+/// (intermediate 2048). Returns `[HIDDEN]` bf16.
 fn glm52_moe_shared_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,
     normed_hidden: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
-    let stream = &ctx.stream;
-    let gate_out = fp8_linear(ctx, &weights.shared_gate, normed_hidden)?; // [INTERMEDIATE]
-    let up_out = fp8_linear(ctx, &weights.shared_up, normed_hidden)?; // [INTERMEDIATE]
-
-    // Concatenate gate|up so the fused SwiGLU sees [gate; up] (gate first half).
-    let mut gate_up = stream.alloc_zeros::<bf16>(2 * INTERMEDIATE)?;
-    stream.memcpy_dtod(&gate_out, &mut gate_up.slice_mut(0..INTERMEDIATE))?;
-    stream.memcpy_dtod(
-        &up_out,
-        &mut gate_up.slice_mut(INTERMEDIATE..2 * INTERMEDIATE),
-    )?;
-
-    let mut w2_act = stream.alloc_zeros::<u8>(W2_K)?;
-    let mut w2_act_scale = stream.alloc_zeros::<f32>(W2_SCALE_COLS)?;
-    glm52_silu_and_mul_per_token_group_quant_bf16_launch(
+    fp8_mlp(
         ctx,
-        Glm52MoeQuantShape {
-            rows: 1,
-            width: W2_K,
-            group_size: QUANT_GROUP,
-        },
-        &gate_up,
-        &mut w2_act,
-        &mut w2_act_scale,
-    )?;
-    fp8_linear_prequant(ctx, &weights.shared_down, &w2_act, &w2_act_scale)
+        &weights.shared_gate,
+        &weights.shared_up,
+        &weights.shared_down,
+        normed_hidden,
+    )
 }
 
 /// Full MoE contribution for a single token: routed experts + shared expert. The
