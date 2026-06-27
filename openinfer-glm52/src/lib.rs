@@ -19,6 +19,9 @@ mod dense;
 // first consumer, so it is unreferenced until then.
 #[allow(dead_code)]
 mod decode_meta;
+// bs=1 PP-stage decode forward (Slice 7): composes the oracle-gated bricks into
+// the per-stage decode step; the coordinator drives the eight stages serially.
+mod decode;
 // Single-layer MLA decode forward (Slice 3). Composes the oracle-validated GPU
 // ops into one `hidden -> o`; the PP stage executor (Slice 7) is its first
 // caller, so it is unreferenced until then.
@@ -45,7 +48,7 @@ use std::{collections::BTreeSet, ops::Range, path::Path, time::Instant};
 
 use anyhow::{Result, ensure};
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelInfo};
-use runner::{Glm52StagePlacement, Glm52StageWorker, run_rejecting_pp_coordinator};
+use runner::{Glm52StagePlacement, Glm52StageWorker, run_pp_coordinator};
 use tokio::sync::mpsc;
 
 pub use config::{
@@ -121,10 +124,11 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         startup.nextn_tensor_count,
         options.enable_cuda_graph
     );
+    let stop_token_ids = startup.stop_token_ids.clone();
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-pp-coord".into())
-        .spawn(move || run_rejecting_pp_coordinator(submit_rx, loaded.workers))
+        .spawn(move || run_pp_coordinator(submit_rx, loaded.workers, stop_token_ids))
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 PP coordinator: {err}"))?;
     Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
 }
