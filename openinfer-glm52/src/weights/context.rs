@@ -23,6 +23,7 @@ impl Glm52RankGpuContext {
         let ctx = CudaContext::new(device_ordinal).with_context(|| {
             format!("failed to create GLM5.2 CUDA context for device {device_ordinal}")
         })?;
+        retain_async_alloc_pool(device_ordinal)?;
         unsafe {
             ctx.disable_event_tracking();
             ffi::cublas_init();
@@ -77,4 +78,44 @@ impl Glm52RankGpuContext {
         );
         Ok(())
     }
+}
+
+/// Make the device's default async-allocation pool RETAIN freed blocks rather
+/// than return them to the driver on every stream sync (the CUDA default release
+/// threshold is 0). cudarc allocates via `cuMemAllocAsync` on this pool, and the
+/// bs=1 PP decode does a host sync per stage per token — without retention every
+/// per-call `alloc_zeros` round-trips the driver, which dominates the per-token
+/// cost (~10x the memory-bound floor). Retention turns them into pool hits.
+fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
+    use cudarc::driver::sys;
+    unsafe {
+        let mut dev: sys::CUdevice = 0;
+        check_cu(
+            sys::cuDeviceGet(&mut dev, device_ordinal as i32),
+            "cuDeviceGet",
+        )?;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        check_cu(
+            sys::cuDeviceGetDefaultMemPool(&mut pool, dev),
+            "cuDeviceGetDefaultMemPool",
+        )?;
+        let mut threshold: u64 = u64::MAX;
+        check_cu(
+            sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                (&mut threshold as *mut u64).cast::<std::ffi::c_void>(),
+            ),
+            "cuMemPoolSetAttribute(RELEASE_THRESHOLD)",
+        )?;
+    }
+    Ok(())
+}
+
+fn check_cu(result: cudarc::driver::sys::CUresult, what: &str) -> Result<()> {
+    ensure!(
+        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "GLM5.2 {what} failed: {result:?}"
+    );
+    Ok(())
 }
