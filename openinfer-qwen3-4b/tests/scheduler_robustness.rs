@@ -148,8 +148,7 @@ fn scheduler_survives_consumer_drop() {
     eprintln!("[scheduler-robustness] pin served: prefill={prefill_served} full={full_served}");
 
     assert!(!text.is_empty(), "scheduler dead after consumer drop");
-    // launch_gemm_pin bails on any per-token fallback, so a completed serving run already proves
-    // zero fallback; this verifies the pin actually ran decode GEMMs beyond prefill.
+    // The pin ran decode GEMMs beyond prefill, not just prefill's.
     assert!(
         full_served > prefill_served,
         "pin served no decode GEMM beyond prefill (prefill={prefill_served} full={full_served}) — flag→builder→graph-capture may be broken"

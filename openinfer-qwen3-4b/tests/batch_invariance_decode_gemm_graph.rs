@@ -152,8 +152,7 @@ fn batch_invariance_decode_gemm_graph() {
          the pin proof would be vacuous"
     );
 
-    // Pin: every pair invariant, served>0 (pin ran at capture). launch_gemm_pin bails on any
-    // can't-serve-N, so a completed capture already proves no per-token oracle covered for it.
+    // Pin: every pair invariant, served>0 (pin ran at capture).
     for (i, (_, tk_eq, served)) in pin.iter().enumerate() {
         assert!(
             *tk_eq,

@@ -545,8 +545,13 @@ fn bind_model_thread(model: &Qwen3Model) -> Result<()> {
 /// Prepare decode GEMM algos before capture, per the active numeric policy: under `Pin`, eagerly pin
 /// one algo per projection {M,K} (reused for all N); otherwise tune the fastest cublasLt algo per
 /// decode shape (buckets up to `GEMM_LT_MAX_N`, every layer's weights in the L2-cold timing rotation).
-/// Adds a few seconds of startup per model thread (warmup + the Pin self-check).
-fn tune_decode_gemm_algos(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<()> {
+/// Adds startup cost per thread: warmup on every worker, plus the Pin self-check
+/// on the serving worker when `run_envelope_check` is true.
+fn tune_decode_gemm_algos(
+    model: &Qwen3Model,
+    max_prefill_tokens: usize,
+    run_envelope_check: bool,
+) -> Result<()> {
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
     let vocab = model.config().vocab_size;
@@ -568,7 +573,11 @@ fn tune_decode_gemm_algos(model: &Qwen3Model, max_prefill_tokens: usize) -> Resu
             "Qwen3 split-KV decode chunk pinned: {} tokens (max_context_tokens={max_context})",
             crate::batch_decode_buffers::pin_chunk_size(max_context)
         );
-        verify_pin_envelope(model, max_prefill_tokens)?;
+        // The profile worker skips the full sweep; the long-lived serving worker verifies its own
+        // (thread-local) warmed plans before capture, so the envelope is guaranteed pre-serving.
+        if run_envelope_check {
+            verify_pin_envelope(model, max_prefill_tokens)?;
+        }
         return Ok(());
     }
 
@@ -608,7 +617,7 @@ fn tune_decode_gemm_algos(model: &Qwen3Model, max_prefill_tokens: usize) -> Resu
     Ok(())
 }
 
-/// Boot-time check that under `Pin` the pinned algo serves the FULL production N
+/// Boot-time Pin envelope check: errors unless, under `Pin`, the pinned algo serves the FULL production N
 /// envelope — EVERY reachable N, not a sample — with zero per-token fallback. Each N is checked
 /// by the host-side `gemm_lt_pin_check`, so the dense full-N sweep is a startup-only cost. Runs post-warmup,
 /// pre-capture, on the GEMM thread (per TP rank via `bind`); `bail!`s naming the first unserved
@@ -1597,11 +1606,9 @@ fn profile_kv_budget_on_worker(
             model.device_ctx().device_ordinal
         ))
         .spawn(move || -> Result<(Qwen3Model, KvBudget)> {
-            let _guard = {
-                bind_model_thread(&model)?;
-                tune_decode_gemm_algos(&model, max_prefill_tokens)?;
-                CublasThreadGuard
-            };
+            bind_model_thread(&model)?;
+            let _guard = CublasThreadGuard;
+            tune_decode_gemm_algos(&model, max_prefill_tokens, false)?;
             let budget = model.profiled_kv_budget(
                 max_prefill_tokens,
                 *BATCH_BUCKETS.last().unwrap(),
@@ -2557,8 +2564,9 @@ impl LocalQwen3Lane {
 
     fn bind(&self) -> Result<CublasThreadGuard> {
         bind_model_thread(&self.model)?;
-        tune_decode_gemm_algos(&self.model, self.max_prefill_tokens)?;
-        Ok(CublasThreadGuard)
+        let guard = CublasThreadGuard;
+        tune_decode_gemm_algos(&self.model, self.max_prefill_tokens, true)?;
+        Ok(guard)
     }
 
     /// Sync the in-flight prefill stream and sample prefill tokens.

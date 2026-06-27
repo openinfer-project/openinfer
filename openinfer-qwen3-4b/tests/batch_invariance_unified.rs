@@ -118,8 +118,6 @@ fn unified_within_path_gemm_n_invariant_under_pin() {
         let n = c + 1;
         let (topk, served) =
             unified_decode_row(&mut ex, &p, c, 100 + i as u64 * 2, 101 + i as u64 * 2);
-        // launch_gemm_pin bails on any can't-serve-N, so a completed run proves zero fallback;
-        // served>0 guards against a vacuous pass.
         assert!(served > 0, "Pin N={n}: served=0 — pin never ran (vacuous)");
         match &base {
             None => base = Some(topk),

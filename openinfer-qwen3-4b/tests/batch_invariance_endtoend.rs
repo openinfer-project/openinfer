@@ -106,9 +106,7 @@ fn batch_invariance_endtoend() {
                         "PIN: prompt_a top-K changed when co-batched (+Nb={nb}, total_N={total_n}) \
                          — projection-GEMM reduction-order NOT invariant under the pin in this prefill path"
                     );
-                    // launch_gemm_pin bails on any can't-serve-N fallback, so a completed run proves
-                    // zero fallback — including the small-N (total_N<=32) case this loop exercises.
-                    // served>0 guards against a vacuous pass.
+                    // served>0 also covers the small-N (total_N<=32) case this loop exercises.
                     assert!(
                         pin_served() > 0,
                         "PIN: no GEMM ran the pinned algo (+Nb={nb}) — vacuous"

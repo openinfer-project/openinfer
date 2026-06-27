@@ -521,21 +521,17 @@ fn launch_gemm_pin(
     k: usize,
     ctx: &DeviceContext,
 ) -> Result<()> {
-    // launch_gemm_pin runs only under Pin, so a per-token fallback here would silently break batch
-    // invariance — fail loud instead. decode-overlap (the only stream-override source) is rejected
-    // before capture, so reaching this is a misconfiguration, not a normal path.
+    // decode-overlap (the only stream-override source) is rejected before capture, so a stream
+    // override here is misuse — bail rather than fall back to per-token.
     if crate::tensor::has_stream_override() {
         bail!(
             "batch-invariant Pin GEMM cannot run under a stream override (m={m}, n={n}, k={k}): \
              --batch-invariant is incompatible with --decode-overlap; run without one of them"
         );
     }
-    // Only the boot-warmed base projections are pinned (gemm_lt_pin_warmup in tune_decode_gemm_algos,
-    // checked by verify_pin_envelope). Any other (m,k) routed through launch_gemm — a DFlash drafter
-    // GEMM, a LoRA prefill-delta GEMM, or a base projection when the policy was set after construction
-    // — is unverified: gemm_lt_pin_cuda returns GEMM_LT_PIN_UNTUNED and the match below bails. No lazy
-    // tune: it would run an unchecked shape, and allocate illegally mid-capture. (The LoRA decode
-    // delta runs in a custom per-token kernel, invariant by construction, and bypasses this path.)
+    // Only the boot-warmed base projections are pinned; any other (m,k) is unverified —
+    // gemm_lt_pin_cuda returns GEMM_LT_PIN_UNTUNED and the match below bails. No lazy tune: it would
+    // run an unchecked shape and allocate illegally mid-capture.
     unsafe {
         let status = ffi::gemm_lt_pin_cuda(
             w_ptr,
@@ -552,9 +548,9 @@ fn launch_gemm_pin(
                 Ok(())
             }
             GEMM_LT_PIN_UNSUPPORTED | GEMM_LT_PIN_UNTUNED => bail!(
-                "batch-invariant Pin GEMM cannot serve N={n} at (m={m}, k={k}): the boot envelope \
-                 self-check passed, so this is an out-of-envelope N, an unwarmed (M,K) such as a DFlash \
-                 drafter or LoRA prefill-delta shape, or the numeric policy was set after executor \
+                "batch-invariant Pin GEMM cannot serve N={n} at (m={m}, k={k}): either this N is \
+                 outside the pinned envelope, or (M,K) was never warmed (e.g. a DFlash drafter or \
+                 LoRA prefill-delta shape), or the numeric policy was set after executor \
                  construction. Run without --batch-invariant or report this shape"
             ),
             s if s >= 100_000 => {
