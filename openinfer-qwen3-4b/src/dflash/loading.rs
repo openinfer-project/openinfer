@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use log::debug;
 
 use crate::config::DFlashConfig;
+use crate::dspark::{MARKOV_W1_TENSOR, MARKOV_W2_TENSOR, MarkovHead};
 use crate::weights::{Attention, MLP, Qwen3Model, TransformerBlock};
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix};
 use openinfer_core::weight_loader::{
@@ -125,6 +126,24 @@ impl DFlashDraftModel {
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
         let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
         let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
+
+        // DSpark Markov head (Phase 1). The confidence head and the tied
+        // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
+        // to the target's, which we reuse for the verify-equivalent logits.
+        let markov = if config.uses_markov_head() {
+            let w1 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W1_TENSOR)?;
+            let w2 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W2_TENSOR)?;
+            if config.enable_confidence_head {
+                log::info!(
+                    "DSpark confidence head present in {model_path} but unused in Phase 1 \
+                     (full-block verify, no confidence-scheduled truncation)"
+                );
+            }
+            Some(MarkovHead::new(config.markov_rank, w1, w2)?)
+        } else {
+            None
+        };
+
         let (cos_cache, sin_cache) = precompute_rope(
             ctx,
             config.head_dim,
@@ -141,6 +160,7 @@ impl DFlashDraftModel {
             fc,
             cos_cache,
             sin_cache,
+            markov,
         })
     }
 }

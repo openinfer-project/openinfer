@@ -253,7 +253,10 @@ impl LocalQwen3Lane {
             let mut state_refs: Vec<&mut DFlashRequestState> =
                 taken.iter_mut().map(|(_, state)| state).collect();
 
-            let sampled = {
+            // Backbone forward → base block logits in `scratch.logits`. Scoped so
+            // the returned borrow of `scratch` ends before the DSpark propose path
+            // re-borrows `scratch` mutably for its Markov sample loop.
+            let draft_len = {
                 let draft_logits = model.draft_logits_batched(
                     &self.model,
                     &mut state_refs,
@@ -268,9 +271,19 @@ impl LocalQwen3Lane {
                     requests.len(),
                     block_size
                 );
+                draft_len
+            };
+
+            // Propose tokens from the base logits. DFlash takes an independent
+            // greedy argmax per position; DSpark adds the Markov bias and samples
+            // the block left-to-right (anchor-first, all `block_size` positions).
+            let markov = model.uses_markov_head();
+            let sampled = if markov {
+                model.markov_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
+            } else {
                 let greedy = SamplingParams::default();
                 let params: Vec<&SamplingParams> = vec![&greedy; draft_len];
-                self.select_step_tokens(draft_logits, &params, 0)?
+                self.select_step_tokens(scratch.logits(), &params, 0)?
             };
 
             // Re-insert every request's state before splitting the result.
@@ -288,18 +301,24 @@ impl LocalQwen3Lane {
 
             // Split the batched samples per request: request `i` owns rows
             // `[i * block_size, (i + 1) * block_size)`. Verify span = [current
-            // dangling token, draft_1, …, draft_{K}].
+            // dangling token, draft_1, …]. DFlash discards block position 0 (the
+            // anchor slot; only the mask positions draft), giving `block_size - 1`
+            // drafts; DSpark is anchor-first (position 0 already predicts the first
+            // draft), giving all `block_size` drafts — a one-token-longer span.
+            let drafts_start = if markov { 0 } else { 1 };
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
                 let block = &sampled[i * block_size..(i + 1) * block_size];
+                let drafts = &block[drafts_start..];
                 anyhow::ensure!(
-                    block.len() >= 2,
-                    "DFlash draft block {} has fewer than 2 tokens",
-                    i
+                    !drafts.is_empty(),
+                    "draft block {} produced no draft tokens (block_size {})",
+                    i,
+                    block_size
                 );
-                let mut token_ids = Vec::with_capacity(block.len());
+                let mut token_ids = Vec::with_capacity(drafts.len() + 1);
                 token_ids.push(req.current_token);
-                token_ids.extend(block[1..].iter().copied());
+                token_ids.extend(drafts.iter().copied());
                 outputs.push(DraftRequestResult {
                     request_id: req.request_id,
                     token_ids,

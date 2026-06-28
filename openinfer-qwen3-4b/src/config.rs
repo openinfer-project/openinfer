@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
 
@@ -38,7 +38,14 @@ pub(crate) struct Config {
     pub(crate) stop_token_ids: Vec<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// Resolved drafter config, shared by DFlash and DSpark (DSpark = DFlash backbone
+/// + a Markov head + an optional confidence head). `markov_rank == 0` is plain
+/// DFlash. Two on-disk schemas are normalized into this in `from_file`:
+/// our `Qwen3-4B-DFlash-b16` nests `dflash_config: {mask_token_id,
+/// target_layer_ids}` and puts `rope_theta` at the top level; DeepSpec's
+/// `dflash_/dspark_*_block7` put those fields flat and nest `rope_theta` under
+/// `rope_parameters`.
+#[derive(Clone, Debug)]
 pub(crate) struct DFlashConfig {
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
@@ -52,13 +59,65 @@ pub(crate) struct DFlashConfig {
     pub(crate) rope_theta: f32,
     pub(crate) max_position_embeddings: usize,
     pub(crate) block_size: usize,
-    pub(crate) dflash_config: DFlashInnerConfig,
+    pub(crate) mask_token_id: u32,
+    pub(crate) target_layer_ids: Vec<usize>,
+    /// DSpark Markov head low-rank size; 0 disables the head (= plain DFlash).
+    pub(crate) markov_rank: usize,
+    pub(crate) markov_head_type: String,
+    /// Whether the checkpoint carries a confidence head. Phase 1 does not use it
+    /// (full-block verify, no confidence-scheduled truncation); surfaced at load
+    /// so the operator knows that capability is being ignored. See
+    /// docs/models/qwen3/dspark-integration.md (Phase 2).
+    pub(crate) enable_confidence_head: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct DFlashInnerConfig {
-    pub(crate) mask_token_id: u32,
-    pub(crate) target_layer_ids: Vec<usize>,
+struct DFlashInnerConfig {
+    mask_token_id: u32,
+    target_layer_ids: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RopeParameters {
+    rope_theta: f32,
+}
+
+fn default_markov_head_type() -> String {
+    "vanilla".to_string()
+}
+
+/// On-disk drafter config tolerant of both the nested (`b16`) and flat
+/// (DeepSpec) schemas; `from_file` resolves it into `DFlashConfig`.
+#[derive(Deserialize)]
+struct RawDFlashConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    num_target_layers: usize,
+    head_dim: usize,
+    vocab_size: usize,
+    rms_norm_eps: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default)]
+    rope_parameters: Option<RopeParameters>,
+    #[serde(default = "default_max_position_embeddings")]
+    max_position_embeddings: usize,
+    block_size: usize,
+    #[serde(default)]
+    dflash_config: Option<DFlashInnerConfig>,
+    #[serde(default)]
+    mask_token_id: Option<u32>,
+    #[serde(default)]
+    target_layer_ids: Option<Vec<usize>>,
+    #[serde(default)]
+    markov_rank: usize,
+    #[serde(default = "default_markov_head_type")]
+    markov_head_type: String,
+    #[serde(default)]
+    enable_confidence_head: bool,
 }
 
 fn default_max_position_embeddings() -> usize {
@@ -144,7 +203,50 @@ impl DFlashConfig {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
-        Ok(serde_json::from_str(&content)?)
+        let raw: RawDFlashConfig = serde_json::from_str(&content)?;
+
+        // rope_theta: flat (b16) or nested under rope_parameters (DeepSpec).
+        let rope_theta = raw
+            .rope_theta
+            .or(raw.rope_parameters.map(|r| r.rope_theta))
+            .context("drafter config missing rope_theta / rope_parameters.rope_theta")?;
+
+        // mask_token_id + target_layer_ids: nested dflash_config (b16) or flat (DeepSpec).
+        let (mask_token_id, target_layer_ids) = match raw.dflash_config {
+            Some(inner) => (inner.mask_token_id, inner.target_layer_ids),
+            None => (
+                raw.mask_token_id
+                    .context("drafter config missing mask_token_id (no dflash_config block)")?,
+                raw.target_layer_ids
+                    .context("drafter config missing target_layer_ids (no dflash_config block)")?,
+            ),
+        };
+
+        Ok(Self {
+            hidden_size: raw.hidden_size,
+            intermediate_size: raw.intermediate_size,
+            num_hidden_layers: raw.num_hidden_layers,
+            num_attention_heads: raw.num_attention_heads,
+            num_key_value_heads: raw.num_key_value_heads,
+            num_target_layers: raw.num_target_layers,
+            head_dim: raw.head_dim,
+            vocab_size: raw.vocab_size,
+            rms_norm_eps: raw.rms_norm_eps,
+            rope_theta,
+            max_position_embeddings: raw.max_position_embeddings,
+            block_size: raw.block_size,
+            mask_token_id,
+            target_layer_ids,
+            markov_rank: raw.markov_rank,
+            markov_head_type: raw.markov_head_type,
+            enable_confidence_head: raw.enable_confidence_head,
+        })
+    }
+
+    /// DSpark Markov head is active (`markov_rank > 0`); the draft uses the
+    /// semi-autoregressive sample loop instead of independent argmax.
+    pub(crate) fn uses_markov_head(&self) -> bool {
+        self.markov_rank > 0
     }
 
     pub(crate) fn validate_for_target(&self, target: &Config) -> Result<()> {
@@ -190,31 +292,42 @@ impl DFlashConfig {
             self.block_size
         );
         anyhow::ensure!(
-            self.dflash_config.mask_token_id < target.vocab_size as u32,
+            self.mask_token_id < target.vocab_size as u32,
             "DFlash mask_token_id {} is outside target vocab_size {}",
-            self.dflash_config.mask_token_id,
+            self.mask_token_id,
             target.vocab_size
         );
         anyhow::ensure!(
-            self.dflash_config.target_layer_ids.len() == self.num_hidden_layers,
+            self.target_layer_ids.len() == self.num_hidden_layers,
             "DFlash target_layer_ids length {} does not match draft layers {}",
-            self.dflash_config.target_layer_ids.len(),
+            self.target_layer_ids.len(),
             self.num_hidden_layers
         );
         anyhow::ensure!(
-            self.dflash_config
-                .target_layer_ids
+            self.target_layer_ids
                 .iter()
                 .all(|&layer| layer < target.num_hidden_layers),
             "DFlash target_layer_ids must be within target layer count"
         );
         anyhow::ensure!(
-            self.dflash_config
-                .target_layer_ids
+            self.target_layer_ids
                 .windows(2)
                 .all(|pair| pair[0] < pair[1]),
             "DFlash target_layer_ids must be strictly increasing"
         );
+
+        // DSpark Markov head: only the released `vanilla` low-rank head is
+        // implemented; reject the gated/rnn variants loudly rather than silently
+        // mis-drafting. The confidence head is intentionally ignored in Phase 1
+        // (full-block verify, no confidence-scheduled truncation) — its weights
+        // are simply not loaded; see docs/models/qwen3/dspark-integration.md.
+        if self.uses_markov_head() {
+            anyhow::ensure!(
+                self.markov_head_type == "vanilla",
+                "DSpark markov_head_type {:?} not supported (only \"vanilla\")",
+                self.markov_head_type
+            );
+        }
         Ok(())
     }
 }

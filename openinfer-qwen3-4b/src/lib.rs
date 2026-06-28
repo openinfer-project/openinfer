@@ -6,6 +6,7 @@ mod batch_decode_dag;
 pub mod batch_decode_trace;
 mod config;
 mod dflash;
+mod dspark;
 mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;

@@ -2691,19 +2691,21 @@ impl LocalQwen3Lane {
         let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
         })?;
-        let block_size = self
+        // Verify span = anchor + drafts: `block_size` for DFlash, `block_size + 1`
+        // for DSpark (anchor-first). The graph buffers + replay shape key off this.
+        let verify_span = self
             .dflash
             .as_ref()
             .expect("DFlash present when capture layers exist")
             .model
-            .block_size();
+            .verify_span();
 
         if self.verify_bufs.is_none() {
             let max_batch = *BATCH_BUCKETS.last().unwrap();
             self.verify_bufs = Some(VerifyGraphBuffers::new(
                 &self.model,
                 max_batch,
-                block_size,
+                verify_span,
                 capture_layer_ids.len(),
                 self.total_blocks,
             )?);
