@@ -335,12 +335,20 @@ impl DFlashDraftModel {
         self.markov.is_some()
     }
 
+    /// Anchor-first block layout (a checkpoint property, see
+    /// [`DFlashConfig::anchor_first`]) — drives both the verify span and the
+    /// draft-block slice start, independently of the markov head.
+    pub(crate) fn anchor_first(&self) -> bool {
+        self.config.anchor_first()
+    }
+
     /// Length of each request's verify span = anchor (1) + proposed drafts.
-    /// DFlash discards block position 0, proposing `block_size - 1` drafts (span
-    /// `block_size`); DSpark is anchor-first, proposing all `block_size` drafts
-    /// (span `block_size + 1`). The verify CUDA-graph buffers are sized to this.
+    /// Anchor-drop checkpoints discard block position 0, proposing
+    /// `block_size - 1` drafts (span `block_size`); anchor-first checkpoints
+    /// propose all `block_size` drafts (span `block_size + 1`). The verify
+    /// CUDA-graph buffers are sized to this.
     pub(crate) fn verify_span(&self) -> usize {
-        if self.uses_markov_head() {
+        if self.anchor_first() {
             self.block_size() + 1
         } else {
             self.block_size()
@@ -772,7 +780,13 @@ impl DFlashDraftModel {
         let markov_scratch = markov_scratch
             .as_mut()
             .context("Markov scratch was not allocated for a DSpark drafter")?;
-        markov.sample_block(ctx, logits, current_tokens, self.block_size(), markov_scratch)
+        markov.sample_block(
+            ctx,
+            logits,
+            current_tokens,
+            self.block_size(),
+            markov_scratch,
+        )
     }
 
     fn context_feature_dim(&self) -> usize {
@@ -861,10 +875,7 @@ mod tests {
 
         assert_eq!(dflash.block_size, 16);
         assert_eq!(dflash.mask_token_id, 151669);
-        assert_eq!(
-            dflash.target_layer_ids,
-            vec![1, 9, 17, 25, 33]
-        );
+        assert_eq!(dflash.target_layer_ids, vec![1, 9, 17, 25, 33]);
 
         // Pin the memory reservation the KV budget bills against. The per-token
         // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending

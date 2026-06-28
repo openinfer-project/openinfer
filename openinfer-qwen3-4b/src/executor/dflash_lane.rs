@@ -195,7 +195,7 @@ impl LocalQwen3Lane {
             } else {
                 dflash.accepted_draft_tokens as f64 / dflash.verified_draft_tokens as f64
             };
-            log::debug!(
+            log::info!(
                 "Qwen3 DFlash request={} accepted_draft={} committed_tokens={} cumulative_accept_rate={:.3}",
                 req.request_id.get(),
                 result.matched_draft_tokens,
@@ -301,11 +301,13 @@ impl LocalQwen3Lane {
 
             // Split the batched samples per request: request `i` owns rows
             // `[i * block_size, (i + 1) * block_size)`. Verify span = [current
-            // dangling token, draft_1, …]. DFlash discards block position 0 (the
-            // anchor slot; only the mask positions draft), giving `block_size - 1`
-            // drafts; DSpark is anchor-first (position 0 already predicts the first
-            // draft), giving all `block_size` drafts — a one-token-longer span.
-            let drafts_start = if markov { 0 } else { 1 };
+            // dangling token, draft_1, …]. Anchor-drop checkpoints discard block
+            // position 0 (the anchor slot; only the mask positions draft), giving
+            // `block_size - 1` drafts; anchor-first checkpoints have position 0
+            // already predict the first draft, giving all `block_size` drafts —
+            // a one-token-longer span. This is a checkpoint property, not a markov
+            // one: a `markov_rank == 0` DeepSpec checkpoint is still anchor-first.
+            let drafts_start = if model.anchor_first() { 0 } else { 1 };
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
                 let block = &sampled[i * block_size..(i + 1) * block_size];

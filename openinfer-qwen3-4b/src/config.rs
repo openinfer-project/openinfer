@@ -64,6 +64,15 @@ pub(crate) struct DFlashConfig {
     /// DSpark Markov head low-rank size; 0 disables the head (= plain DFlash).
     pub(crate) markov_rank: usize,
     pub(crate) markov_head_type: String,
+    /// Block draft layout. DeepSpec `Qwen3DSparkModel` checkpoints (both the
+    /// markov and the `markov_rank == 0` ones) are *anchor-first*: block position
+    /// 0 is already the first real prediction, so all `block_size` positions
+    /// draft (verify span `block_size + 1`). Our native `DFlashDraftModel` (b16)
+    /// is *anchor-drop*: position 0 is a throwaway anchor slot, so only positions
+    /// `1..block_size` draft (verify span `block_size`). This is a property of the
+    /// checkpoint, NOT of the markov head — keying it on the markov head silently
+    /// mis-drafts a no-markov DeepSpec checkpoint (accept rate collapses to ~0).
+    pub(crate) anchor_first: bool,
     /// Whether the checkpoint carries a confidence head. Phase 1 does not use it
     /// (full-block verify, no confidence-scheduled truncation); surfaced at load
     /// so the operator knows that capability is being ignored. See
@@ -118,6 +127,10 @@ struct RawDFlashConfig {
     markov_head_type: String,
     #[serde(default)]
     enable_confidence_head: bool,
+    /// DeepSpec `Qwen3DSparkModel` checkpoints declare this (anchor-first
+    /// drafting); native `DFlashDraftModel` checkpoints omit it (anchor-drop).
+    #[serde(default)]
+    num_anchors: Option<usize>,
 }
 
 fn default_max_position_embeddings() -> usize {
@@ -240,6 +253,11 @@ impl DFlashConfig {
             markov_rank: raw.markov_rank,
             markov_head_type: raw.markov_head_type,
             enable_confidence_head: raw.enable_confidence_head,
+            // A markov head only ever ships on a DeepSpec (anchor-first)
+            // checkpoint, so num_anchors is always present alongside it; treat
+            // markov as an independent corroborating signal so a future flat
+            // schema can't accidentally route a markov checkpoint anchor-drop.
+            anchor_first: raw.num_anchors.is_some() || raw.markov_rank > 0,
         })
     }
 
@@ -247,6 +265,12 @@ impl DFlashConfig {
     /// semi-autoregressive sample loop instead of independent argmax.
     pub(crate) fn uses_markov_head(&self) -> bool {
         self.markov_rank > 0
+    }
+
+    /// Anchor-first block layout (see [`DFlashConfig::anchor_first`]). The markov
+    /// head implies it, but a `markov_rank == 0` DeepSpec checkpoint needs it too.
+    pub(crate) fn anchor_first(&self) -> bool {
+        self.anchor_first
     }
 
     pub(crate) fn validate_for_target(&self, target: &Config) -> Result<()> {

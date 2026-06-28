@@ -1,11 +1,47 @@
 #include "common.cuh"
 
+#include <atomic>
+
 #define SAMPLE_BLOCK 256
 #define ARGMAX_BATCH_TILE_ELEMS 4096
 
 __device__ __forceinline__ bool argmax_better(float lhs_val, int lhs_idx,
                                               float rhs_val, int rhs_idx) {
   return lhs_val > rhs_val || (lhs_val == rhs_val && lhs_idx < rhs_idx);
+}
+
+__device__ __forceinline__ void markov_trigger_dependent_launch() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  __threadfence();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+__device__ __forceinline__ void markov_wait_on_dependent_launch() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cudaGridDependencySynchronize();
+#endif
+}
+
+inline bool markov_pdl_supported_on_current_device() {
+  static std::atomic<int> cached{-1};
+  int value = cached.load(std::memory_order_acquire);
+  if (value >= 0) return value != 0;
+
+  int device = 0;
+  int major = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    cached.store(0, std::memory_order_release);
+    return false;
+  }
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) !=
+      cudaSuccess) {
+    cached.store(0, std::memory_order_release);
+    return false;
+  }
+  value = major >= 9 ? 1 : 0;
+  cached.store(value, std::memory_order_release);
+  return value != 0;
 }
 
 __global__ void argmax_kernel(const __nv_bfloat16* __restrict__ x,
@@ -259,14 +295,20 @@ __global__ void markov_step_partial_kernel(
     partial_values[out] = shared_vals[0];
     partial_indices[out] = shared_idxs[0];
   }
+  markov_trigger_dependent_launch();
 }
 
 __global__ void markov_step_finalize_kernel(
     const float* __restrict__ partial_values,
     const int* __restrict__ partial_indices,
     unsigned int* __restrict__ out_tokens,
+    unsigned int* __restrict__ sampled_tokens,
+    int block_size,
+    int step,
     int rows,
     int tiles_per_row) {
+  markov_wait_on_dependent_launch();
+
   extern __shared__ char shared_mem[];
   float* shared_vals = reinterpret_cast<float*>(shared_mem);
   int* shared_idxs =
@@ -302,7 +344,9 @@ __global__ void markov_step_finalize_kernel(
   }
 
   if (tid == 0) {
-    out_tokens[row] = static_cast<unsigned int>(shared_idxs[0]);
+    unsigned int token = static_cast<unsigned int>(shared_idxs[0]);
+    out_tokens[row] = token;
+    sampled_tokens[row * block_size + step] = token;
   }
 }
 
@@ -350,13 +394,33 @@ void markov_step_argmax_cuda(const __nv_bfloat16* base,
                              const __nv_bfloat16* bias, int block_size, int step,
                              int rows, int n, float* partial_values,
                              int* partial_indices, unsigned int* out_tokens,
+                             unsigned int* sampled_tokens,
                              cudaStream_t stream) {
   int tiles_per_row = (n + ARGMAX_BATCH_TILE_ELEMS - 1) / ARGMAX_BATCH_TILE_ELEMS;
   size_t smem = SAMPLE_BLOCK * (sizeof(float) + sizeof(int));
   markov_step_partial_kernel<<<dim3(tiles_per_row, rows), SAMPLE_BLOCK, smem, stream>>>(
       base, bias, block_size, step, partial_values, partial_indices, rows, n,
       tiles_per_row);
-  markov_step_finalize_kernel<<<rows, SAMPLE_BLOCK, smem, stream>>>(
-      partial_values, partial_indices, out_tokens, rows, tiles_per_row);
+  if (!markov_pdl_supported_on_current_device()) {
+    markov_step_finalize_kernel<<<rows, SAMPLE_BLOCK, smem, stream>>>(
+        partial_values, partial_indices, out_tokens, sampled_tokens, block_size,
+        step, rows, tiles_per_row);
+    return;
+  }
+
+  cudaLaunchAttribute attr[1] = {};
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3(rows);
+  config.blockDim = dim3(SAMPLE_BLOCK);
+  config.dynamicSmemBytes = smem;
+  config.stream = stream;
+  config.attrs = attr;
+  config.numAttrs = 1;
+  cudaLaunchKernelEx(&config, markov_step_finalize_kernel, partial_values,
+                     partial_indices, out_tokens, sampled_tokens, block_size,
+                     step, rows, tiles_per_row);
 }
 }

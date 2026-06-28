@@ -359,6 +359,8 @@ pub fn argmax_batch_bf16_split_indexed_into(
 /// `base` is the request-major block logits `[rows*block_size, vocab]`; `bias`
 /// is the per-request Markov logit bias `[rows, vocab]` for this step. `partial_*`
 /// must hold `argmax_batch_bf16_split_partials_len(rows, vocab)` elements.
+/// `sampled_tokens` receives the request-major block token at
+/// `row * block_size + step`, allowing callers to D2H the finished block once.
 #[allow(clippy::too_many_arguments)]
 pub fn markov_step_argmax_into(
     ctx: &DeviceContext,
@@ -370,6 +372,7 @@ pub fn markov_step_argmax_into(
     partial_values: &mut CudaSlice<f32>,
     partial_indices: &mut CudaSlice<i32>,
     out_tokens: &mut CudaSlice<u32>,
+    sampled_tokens: &mut CudaSlice<u32>,
 ) -> Result<()> {
     if rows == 0 {
         return Err(anyhow!("markov step argmax requires at least one row"));
@@ -390,17 +393,20 @@ pub fn markov_step_argmax_into(
         ));
     }
     if bias.seq_len < rows {
-        return Err(anyhow!(
-            "markov step bias rows {} < {}",
-            bias.seq_len,
-            rows
-        ));
+        return Err(anyhow!("markov step bias rows {} < {}", bias.seq_len, rows));
     }
     if out_tokens.len() < rows {
         return Err(anyhow!(
             "markov step out too small: {} < {}",
             out_tokens.len(),
             rows
+        ));
+    }
+    if sampled_tokens.len() < rows * block_size {
+        return Err(anyhow!(
+            "markov sampled-token scratch too small: {} < {}",
+            sampled_tokens.len(),
+            rows * block_size
         ));
     }
     let needed = argmax_batch_bf16_split_partials_len(rows, vocab);
@@ -418,6 +424,7 @@ pub fn markov_step_argmax_into(
     let (pv_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
     let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
     let (out_ptr, _go) = out_tokens.device_ptr_mut(&ctx.stream);
+    let (sampled_ptr, _gs) = sampled_tokens.device_ptr_mut(&ctx.stream);
 
     unsafe {
         ffi::markov_step_argmax_cuda(
@@ -430,6 +437,7 @@ pub fn markov_step_argmax_into(
             pv_ptr as *mut f32,
             pi_ptr as *mut i32,
             out_ptr as *mut u32,
+            sampled_ptr as *mut u32,
             crate::tensor::active_cu_stream(ctx),
         );
     }

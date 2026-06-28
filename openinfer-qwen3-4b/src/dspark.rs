@@ -126,17 +126,12 @@ impl MarkovHead {
                 &mut scratch.partial_values,
                 &mut scratch.partial_indices,
                 &mut scratch.next_tokens,
+                &mut scratch.sampled_tokens,
             )?;
-
-            // Collect this step's tokens (request-major) and feed them back as the
-            // next step's prev. `next` stays on device for the next embedding
-            // lookup; the host copy is only for the returned draft list.
-            let next_h = ctx.stream.clone_dtoh(&scratch.next_tokens)?;
-            for (i, slot) in sampled.iter_mut().skip(step).step_by(block_size).enumerate() {
-                *slot = next_h[i];
-            }
             std::mem::swap(&mut scratch.prev_tokens, &mut scratch.next_tokens);
         }
+        let sampled_view = scratch.sampled_tokens.slice(..rows * block_size);
+        sampled.copy_from_slice(&ctx.stream.clone_dtoh(&sampled_view)?);
         Ok(sampled)
     }
 
@@ -150,14 +145,15 @@ impl MarkovHead {
         let vocab = config.vocab_size;
         let rank = config.markov_rank;
         let weights = 2 * vocab * rank * BF16;
-        let scratch = MarkovScratch::bytes(vocab, rank, max_decode_batch_size);
+        let scratch = MarkovScratch::bytes(vocab, rank, config.block_size, max_decode_batch_size);
         weights + scratch
     }
 }
 
 /// Scratch for the Markov sample loop, allocated once for the max decode batch.
 /// `bias` is the per-step `[rows, vocab]` logit bias; `partial_*` back the
-/// two-stage argmax; `prev`/`next` ping-pong the per-step token ids on device.
+/// two-stage argmax; `prev`/`next` ping-pong the per-step token ids on device;
+/// `sampled_tokens` stores the full request-major block so the host reads once.
 pub(crate) struct MarkovScratch {
     max_batch: usize,
     w1emb: HiddenStates,
@@ -166,6 +162,7 @@ pub(crate) struct MarkovScratch {
     partial_indices: CudaSlice<i32>,
     prev_tokens: CudaSlice<u32>,
     next_tokens: CudaSlice<u32>,
+    sampled_tokens: CudaSlice<u32>,
 }
 
 impl MarkovScratch {
@@ -181,6 +178,7 @@ impl MarkovScratch {
         let vocab = config.vocab_size;
         let rank = config.markov_rank;
         let partials = argmax_batch_bf16_split_partials_len(max_decode_batch_size, vocab);
+        let sampled = max_decode_batch_size * config.block_size;
         Ok(Self {
             max_batch: max_decode_batch_size,
             w1emb: HiddenStates::zeros(ctx, rank, max_decode_batch_size)?,
@@ -189,6 +187,7 @@ impl MarkovScratch {
             partial_indices: ctx.stream.alloc_zeros(partials)?,
             prev_tokens: ctx.stream.alloc_zeros(max_decode_batch_size)?,
             next_tokens: ctx.stream.alloc_zeros(max_decode_batch_size)?,
+            sampled_tokens: ctx.stream.alloc_zeros(sampled)?,
         })
     }
 
@@ -212,13 +211,14 @@ impl MarkovScratch {
         Ok(())
     }
 
-    fn bytes(vocab: usize, rank: usize, max_decode_batch_size: usize) -> usize {
+    fn bytes(vocab: usize, rank: usize, block_size: usize, max_decode_batch_size: usize) -> usize {
         const BF16: usize = 2;
         let partials = argmax_batch_bf16_split_partials_len(max_decode_batch_size, vocab);
         let w1emb = max_decode_batch_size * rank * BF16;
         let bias = max_decode_batch_size * vocab * BF16;
         let partial_bytes = partials * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>());
-        let tokens = 2 * max_decode_batch_size * std::mem::size_of::<u32>();
+        let tokens = (2 * max_decode_batch_size + max_decode_batch_size * block_size)
+            * std::mem::size_of::<u32>();
         w1emb + bias + partial_bytes + tokens
     }
 }

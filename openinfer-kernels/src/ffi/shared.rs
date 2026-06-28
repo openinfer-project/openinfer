@@ -515,6 +515,7 @@ unsafe extern "C" {
         partial_values: *mut f32,
         partial_indices: *mut i32,
         out_tokens: *mut u32,
+        sampled_tokens: *mut u32,
         stream: CUstream,
     );
 
