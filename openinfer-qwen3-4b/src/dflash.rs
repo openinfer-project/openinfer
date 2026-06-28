@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use cudarc::driver::CudaSlice;
 
 use crate::config::DFlashConfig;
+use crate::dspark::{MarkovHead, MarkovScratch};
 use crate::weights::{Qwen3Model, TransformerBlock};
 use openinfer_core::ops;
 use openinfer_core::tensor::HiddenStates;
@@ -20,6 +21,10 @@ pub(crate) struct DFlashDraftModel {
     fc: DeviceMatrix,
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
+    /// DSpark Markov head; `None` for plain DFlash drafters. When present, the
+    /// draft proposes via [`MarkovHead::sample_block`] (anchor-first, all
+    /// `block_size` positions) instead of an independent per-position argmax.
+    markov: Option<MarkovHead>,
 }
 
 pub(crate) struct DFlashRequestState {
@@ -83,6 +88,8 @@ pub(crate) struct DFlashBatchScratch {
     tail_input: HiddenStates,
     k_tail: HiddenStates,
     v_tail: HiddenStates,
+    // DSpark Markov sample-loop scratch; `None` for plain DFlash drafters.
+    markov: Option<MarkovScratch>,
 }
 
 impl DFlashRequestState {
@@ -228,7 +235,7 @@ impl DFlashBatchScratch {
         Ok(Self {
             max_batch_block_rows: batch_rows,
             max_tail_len: tail_capacity,
-            block_token_ids_h: vec![config.dflash_config.mask_token_id; batch_rows],
+            block_token_ids_h: vec![config.mask_token_id; batch_rows],
             token_ids_d: ctx.stream.alloc_zeros(batch_rows)?,
             hidden: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
             hidden_out: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
@@ -244,7 +251,17 @@ impl DFlashBatchScratch {
             tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
             k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
             v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
+            markov: config
+                .uses_markov_head()
+                .then(|| MarkovScratch::new(ctx, config, max_decode_batch_size))
+                .transpose()?,
         })
+    }
+
+    /// The batched backbone draft logits `[active_batch * block_size, vocab]`,
+    /// request-major, as produced by [`DFlashDraftModel::draft_logits_batched`].
+    pub(crate) fn logits(&self) -> &HiddenStates {
+        &self.logits
     }
 
     /// Point every dense buffer at the active `batch_block_rows = active_batch *
@@ -307,11 +324,35 @@ impl DFlashDraftModel {
     }
 
     pub(crate) fn mask_token_id(&self) -> u32 {
-        self.config.dflash_config.mask_token_id
+        self.config.mask_token_id
     }
 
     pub(crate) fn target_layer_ids(&self) -> &[usize] {
-        &self.config.dflash_config.target_layer_ids
+        &self.config.target_layer_ids
+    }
+
+    pub(crate) fn uses_markov_head(&self) -> bool {
+        self.markov.is_some()
+    }
+
+    /// Anchor-first block layout (a checkpoint property, see
+    /// [`DFlashConfig::anchor_first`]) — drives both the verify span and the
+    /// draft-block slice start, independently of the markov head.
+    pub(crate) fn anchor_first(&self) -> bool {
+        self.config.anchor_first()
+    }
+
+    /// Length of each request's verify span = anchor (1) + proposed drafts.
+    /// Anchor-drop checkpoints discard block position 0, proposing
+    /// `block_size - 1` drafts (span `block_size`); anchor-first checkpoints
+    /// propose all `block_size` drafts (span `block_size + 1`). The verify
+    /// CUDA-graph buffers are sized to this.
+    pub(crate) fn verify_span(&self) -> usize {
+        if self.anchor_first() {
+            self.block_size() + 1
+        } else {
+            self.block_size()
+        }
     }
 
     pub(crate) fn tune_gemm_algos(&self, target: &Qwen3Model) -> Result<()> {
@@ -715,6 +756,39 @@ impl DFlashDraftModel {
         Ok(&scratch.logits)
     }
 
+    /// DSpark propose: sample all `block_size` positions per request with the
+    /// Markov head (anchor-first), reading the backbone logits already produced
+    /// by [`Self::draft_logits_batched`] into `scratch.logits`. Returns the
+    /// `active_batch * block_size` request-major drafts.
+    pub(crate) fn markov_draft_tokens(
+        &self,
+        ctx: &DeviceContext,
+        current_tokens: &[u32],
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<Vec<u32>> {
+        let markov = self
+            .markov
+            .as_ref()
+            .context("markov_draft_tokens called on a non-DSpark drafter")?;
+        // Split-borrow: the backbone logits (read) and the Markov scratch (write)
+        // are disjoint fields of the same scratch.
+        let DFlashBatchScratch {
+            logits,
+            markov: markov_scratch,
+            ..
+        } = scratch;
+        let markov_scratch = markov_scratch
+            .as_mut()
+            .context("Markov scratch was not allocated for a DSpark drafter")?;
+        markov.sample_block(
+            ctx,
+            logits,
+            current_tokens,
+            self.block_size(),
+            markov_scratch,
+        )
+    }
+
     fn context_feature_dim(&self) -> usize {
         self.config.hidden_size * self.target_layer_ids().len()
     }
@@ -800,11 +874,8 @@ mod tests {
             .expect("DFlash config should match target");
 
         assert_eq!(dflash.block_size, 16);
-        assert_eq!(dflash.dflash_config.mask_token_id, 151669);
-        assert_eq!(
-            dflash.dflash_config.target_layer_ids,
-            vec![1, 9, 17, 25, 33]
-        );
+        assert_eq!(dflash.mask_token_id, 151669);
+        assert_eq!(dflash.target_layer_ids, vec![1, 9, 17, 25, 33]);
 
         // Pin the memory reservation the KV budget bills against. The per-token
         // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending

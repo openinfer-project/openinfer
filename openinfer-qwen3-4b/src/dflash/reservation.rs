@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::config::DFlashConfig;
+use crate::dspark::MarkovHead;
 
 /// GPU memory DFlash needs on top of the target KV pool, derived from the draft
 /// config so the KV budget can reserve it *before* the draft model loads (the
@@ -38,7 +39,7 @@ impl DFlashMemoryReservation {
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let q_dim = config.num_attention_heads * config.head_dim;
         let inter = config.intermediate_size;
-        let capture_layers = config.dflash_config.target_layer_ids.len();
+        let capture_layers = config.target_layer_ids.len();
 
         // Per-sequence-token, pool-scaling buffers.
         let draft_kv = config.num_hidden_layers * 2 * kv_dim * BF16; // DFlashLayerCache k+v
@@ -76,9 +77,13 @@ impl DFlashMemoryReservation {
         // keep the reservation an upper bound.
         let block_headroom = max_decode_batch_size * config.block_size * (draft_kv + tail_scratch);
 
+        // DSpark Markov head: weights (2 × vocab × rank) + sample scratch (the
+        // per-step bias is the dominant term). Zero for plain DFlash drafters.
+        let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size);
+
         Self {
             kv_bytes_per_token,
-            fixed_bytes: weights + scratch_total + block_headroom,
+            fixed_bytes: weights + scratch_total + block_headroom + markov,
         }
     }
 }

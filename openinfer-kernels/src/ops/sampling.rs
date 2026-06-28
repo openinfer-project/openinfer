@@ -353,6 +353,98 @@ pub fn argmax_batch_bf16_split_indexed_into(
     Ok(())
 }
 
+/// DSpark Markov-head step argmax. For each request `row`, argmax over
+/// `base[row*block_size + step] + bias[row]` and write the chosen token id as
+/// u32 (so it feeds straight back as the next step's prev-token lookup).
+/// `base` is the request-major block logits `[rows*block_size, vocab]`; `bias`
+/// is the per-request Markov logit bias `[rows, vocab]` for this step. `partial_*`
+/// must hold `argmax_batch_bf16_split_partials_len(rows, vocab)` elements.
+/// `sampled_tokens` receives the request-major block token at
+/// `row * block_size + step`, allowing callers to D2H the finished block once.
+#[allow(clippy::too_many_arguments)]
+pub fn markov_step_argmax_into(
+    ctx: &DeviceContext,
+    base: &HiddenStates,
+    bias: &HiddenStates,
+    block_size: usize,
+    step: usize,
+    rows: usize,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+    out_tokens: &mut CudaSlice<u32>,
+    sampled_tokens: &mut CudaSlice<u32>,
+) -> Result<()> {
+    if rows == 0 {
+        return Err(anyhow!("markov step argmax requires at least one row"));
+    }
+    let vocab = base.hidden_dim;
+    if bias.hidden_dim != vocab {
+        return Err(anyhow!(
+            "markov step bias vocab {} != base vocab {}",
+            bias.hidden_dim,
+            vocab
+        ));
+    }
+    if base.seq_len < rows * block_size {
+        return Err(anyhow!(
+            "markov step base rows {} < rows*block_size {}",
+            base.seq_len,
+            rows * block_size
+        ));
+    }
+    if bias.seq_len < rows {
+        return Err(anyhow!("markov step bias rows {} < {}", bias.seq_len, rows));
+    }
+    if out_tokens.len() < rows {
+        return Err(anyhow!(
+            "markov step out too small: {} < {}",
+            out_tokens.len(),
+            rows
+        ));
+    }
+    if sampled_tokens.len() < rows * block_size {
+        return Err(anyhow!(
+            "markov sampled-token scratch too small: {} < {}",
+            sampled_tokens.len(),
+            rows * block_size
+        ));
+    }
+    let needed = argmax_batch_bf16_split_partials_len(rows, vocab);
+    if partial_values.len() < needed || partial_indices.len() < needed {
+        return Err(anyhow!(
+            "markov step partials too small: {}/{} need {}",
+            partial_values.len(),
+            partial_indices.len(),
+            needed
+        ));
+    }
+
+    let (base_ptr, _gb) = base.data.device_ptr(&ctx.stream);
+    let (bias_ptr, _gbi) = bias.data.device_ptr(&ctx.stream);
+    let (pv_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _go) = out_tokens.device_ptr_mut(&ctx.stream);
+    let (sampled_ptr, _gs) = sampled_tokens.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::markov_step_argmax_cuda(
+            base_ptr as *const ffi::Half,
+            bias_ptr as *const ffi::Half,
+            block_size as i32,
+            step as i32,
+            rows as i32,
+            vocab as i32,
+            pv_ptr as *mut f32,
+            pi_ptr as *mut i32,
+            out_ptr as *mut u32,
+            sampled_ptr as *mut u32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+
+    Ok(())
+}
+
 pub fn flashinfer_top1_row_states_bytes() -> usize {
     unsafe { ffi::flashinfer_top1_row_states_bytes_cuda() }
 }

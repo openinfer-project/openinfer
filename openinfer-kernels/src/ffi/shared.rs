@@ -505,6 +505,20 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn markov_step_argmax_cuda(
+        base: *const Half,
+        bias: *const Half,
+        block_size: i32,
+        step: i32,
+        rows: i32,
+        n: i32,
+        partial_values: *mut f32,
+        partial_indices: *mut i32,
+        out_tokens: *mut u32,
+        sampled_tokens: *mut u32,
+        stream: CUstream,
+    );
+
     pub fn bf16_to_f32_cuda(
         input: *const Half,
         output: *mut f32,
