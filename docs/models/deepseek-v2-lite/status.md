@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite is a feature-gated EP2 correctness and serving-semantics target. HF / host-staged / NCCL exactness is guarded by a committed case set; #281 adds the first greedy mixed-request serving gate; #280 adds HTTP trace evidence, position-subgroup decode batching, and chunked NCCL collectives so 128-word and mixed 16/128-word HTTP runs complete. The subgroup fast-path lifts short-shape throughput, but CUDA Graph, direct batch, vLLM rows, and long-prompt latency remain diagnostic or unclaimed as production serving parity.
+> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The retained vLLM TP2/EP2 matrix adds reproducible HTTP pressure evidence and preserves stock vLLM setup failures on this SM120/CUDA 12.8 stack. It is a benchmark snapshot, not a vLLM parity or production serving claim.
 
 Last touched: 2026-06
 
@@ -22,7 +22,8 @@ Last touched: 2026-06
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
 | HTTP trace and position-subgroup decode batching | HTTP evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups while letting singleton or lagging positions decode independently. The 2026-06-24 2x RTX 5090 NCCL HTTP sweeps below complete short same-shape, 128-word smoke, and mixed 16/128-word cells with full trace coverage. |
-| vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 snapshot below is a runnable comparison from a documented validation environment, not serving parity or a stock-install claim. |
+| Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
+| vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
 
 ## Correctness Contract
 
@@ -34,13 +35,27 @@ The retained correctness gate is deliberately narrow:
 - generation mode: greedy;
 - backends: host-staged and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
 
-The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-24 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, no comparison warnings, token hash `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`, and text hash `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
+The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-28 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, no comparison warnings, token hash `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`, and text hash `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 
 The mixed-request serving E2E computes sequential greedy token-id oracles with `DeepSeekV2LiteEp2Generator::generate_greedy`, then submits concurrent requests through `start_engine`. The retained 2026-06-23 run covers same-length mixed prompts for same-position batch decode, different-length mixed prompts for single-row decode fallback, and a valid request submitted beside an invalid `logprobs` request to prove explicit rejection does not poison the valid stream. Host-staged and NCCL both passed the mixed-serving E2E.
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, because the same model snapshot has produced different exact greedy text on those hosts while still matching HF on each host. Do not use the static hash pair list as a substitute for the same-host HF comparison when changing accuracy-sensitive code.
 
 ## Benchmark Ledger
+
+### Retained vLLM TP2/EP2 Matrix
+
+The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2-2026-06.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for OpenInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `64/64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract.
+
+Latest 2026-06-28 result on 2x RTX 5090:
+
+| Bucket | Result | Claim boundary |
+| --- | --- | --- |
+| Correctness | HF dump, OpenInfer host-staged E2E, and OpenInfer NCCL E2E all passed; comparison classified `all_token_text_exact` with no warnings. | Correctness bucket only; no HTTP serving claim. |
+| Direct diagnostic batch | OpenInfer host-staged and NCCL batch `1/4/8` all passed with token hash `4fb4c8825fe4d2c4...`. | Direct same-prompt model-path evidence only; do not compare the backend TPOT rows as production performance. |
+| HTTP pressure | Clean OpenInfer host-staged and NCCL completed all `1/4/8` concurrency cells; host-staged c4, NCCL c4, and NCCL c8 were noisy. Clean vLLM TP2 and vLLM TP2+EP2 failed server startup on the target FlashInfer SM120 path. | `--max-concurrency` is client pressure, not true internal batch size by itself. |
+| Supplemental vLLM validation | A separate FlashInfer #3633-equivalent validation run completed vLLM TP2 and TP2+EP2 for all `1/4/8` concurrency cells. | Not a clean stock vLLM package-stack claim; it only shares the HTTP client/workload contract. |
+| Trace pass | OpenInfer host-staged showed `decode_batch_size_max=1/4/5` and NCCL showed `1/2/5` for concurrency `1/4/8`. | OpenInfer-only trace evidence; no vLLM internal claim. |
 
 ### Direct Same-Prompt Diagnostic Batch
 
@@ -119,41 +134,14 @@ Mixed-shape proof: `prompt_words=16,128`, `num_requests=8` per repeat, four shor
 
 Interpretation: the old long-prompt prefill failure is fixed for this HTTP contract, and the post-fastpath rerun lifts mixed 16/128 throughput a bit, but the row is still dominated by long-prompt prefill and admission queueing. The c4/c8 rows prove subgroup batching can happen with mixed prompt lengths (`decode_batch_size_max=2` here), yet the latency profile is not a production serving claim.
 
-### vLLM Repaired-Environment Comparison
-
-In response to issue #170's request for a vLLM TP2+EP2 or pure TP2 comparison, the 2026-06-15 2x RTX 5090 run now has a successful vLLM baseline for the same DeepSeek-V2-Lite model/tokenizer snapshot and short HTTP benchmark shape as the OpenInfer table above.
-
-This is a validation environment with documented package/toolchain fixes, not a stock vLLM install claim. The working run used vLLM `0.22.1`, Torch `2.11.0+cu130`, Transformers `5.12.0`, FlashInfer `0.6.12`, `FLASHINFER_CUDA_ARCH_LIST=12.0f`, CUDA 13.3-aligned Python CUDA packages, and FastAPI `0.115.14` / Starlette `0.46.2` / `prometheus-fastapi-instrumentator` `7.1.0`. Those fixes were needed after earlier SM120 FlashInfer JIT/linking and HTTP middleware failures.
-
-The server was launched eager bf16 with `--max-model-len 512`, `--gpu-memory-utilization 0.70`, `--tensor-parallel-size 2`; TP2+EP2 additionally used `--enable-expert-parallel`, and the server log confirmed expert parallelism with `32/64` local/global experts.
-
-Client shape: `vllm bench serve --backend openai --endpoint /v1/completions --model DeepSeek-V2-Lite --tokenizer models/DeepSeek-V2-Lite --dataset-name random --random-input-len 2 --random-output-len 16 --num-prompts 24 --temperature 0 --ignore-eos`, run separately with `--max-concurrency 1`, `4`, and `8`.
-
-| Runtime | conc | completed | output tok/s | mean TTFT ms | median TTFT ms | mean TPOT ms | median TPOT ms | mean ITL ms | median ITL ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| vLLM TP2 | 1 | 24/24 | 19.140 | 217.484 | 48.451 | 41.193 | 41.193 | 41.193 | 40.312 |
-| vLLM TP2 | 4 | 24/24 | 84.790 | 125.694 | 125.623 | 41.678 | 41.635 | 41.678 | 41.247 |
-| vLLM TP2 | 8 | 24/24 | 167.600 | 129.826 | 125.069 | 41.933 | 41.810 | 41.933 | 41.033 |
-| vLLM TP2+EP2 | 1 | 24/24 | 23.834 | 62.245 | 46.911 | 40.576 | 40.596 | 40.576 | 40.502 |
-| vLLM TP2+EP2 | 4 | 24/24 | 87.078 | 121.439 | 121.553 | 40.641 | 40.409 | 40.641 | 40.253 |
-| vLLM TP2+EP2 | 8 | 24/24 | 174.097 | 125.144 | 119.399 | 40.348 | 40.272 | 40.348 | 40.117 |
-
-Earlier failed vLLM attempts are still useful as environment-discovery evidence:
-
-| Environment | Modes tried | Result |
-| --- | --- | --- |
-| vLLM `0.9.2`, Torch `2.7.0+cu128`, Transformers `4.53.3` | TP2, TP2+EP2, V1/V0, default/eager fallback, plus one low-memory smoke | server never reached readiness; failures were `CUBLAS_STATUS_NOT_INITIALIZED` during worker profile plus one low-memory illegal-memory-access smoke |
-| vLLM `0.22.1`, Torch `2.11.0+cu130`, Transformers `5.12.0` | TP2 and TP2+EP2 default/eager fallback | server never reached readiness until FlashInfer SM120f, CUDA 13.3 headers/libs, unversioned CUDA linker names, and FastAPI middleware compatibility were repaired |
-| vLLM `0.22.1` controlled backend fallback | TP2 and TP2+EP2 with `--attention-backend TRITON_ATTN --moe-backend triton` | server never reached readiness; `TRITON_ATTN` is not valid for DeepSeek-V2 MLA (`MLA not supported`) |
-
-Interpretation:
+### Interpretation
 
 - direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
 - the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
-- vLLM TP2 and TP2+EP2 both show higher aggregate output tok/s under this short HTTP pressure shape than the current OpenInfer HTTP pressure rows;
-- TP2+EP2 is slightly ahead of TP2 in this short snapshot, but this is one workload and one documented validation environment;
-- standalone Torch bf16 GEMM passed on both GPUs in the failed and repaired vLLM environments, so the earlier failures were specific to the vLLM DeepSeek-V2 server/model startup and Python package/toolchain path rather than a blanket CUDA outage.
+- the 2026-06-28 clean matrix keeps stock vLLM startup failures visible because they are part of the reproducibility record;
+- the supplemental vLLM validation shows the HTTP contract can run after the FlashInfer SM120/CUDA 12.8 path is fixed, but it should stay separate from stock-package rows;
+- future performance claims should use the retained matrix contract, not older short-shape vLLM experiments.
 
 ## Claim Boundaries
 
@@ -167,7 +155,7 @@ Use these labels consistently:
 | `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows, and HTTP sweeps show non-1 `active_set_size` and `decode_batch_size_max`. | Fair vLLM parity, long-prompt latency readiness, or a before/after percentage unless a paired baseline run is recorded. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
-| `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 after target-environment package/toolchain fixes. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
+| `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 from the retained matrix or the separate FlashInfer-fixed validation. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
 
 Do not claim:
 

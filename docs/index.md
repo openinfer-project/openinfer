@@ -67,7 +67,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status and benchmark ledger: HF/host-staged/NCCL exactness, #281 mixed-request serving, and #280 HTTP trace evidence with position-subgroup decode batches plus chunked NCCL long-prompt completion; vLLM rows, direct batch, CUDA Graph, and long-prompt latency remain diagnostic, not production serving parity. |
+| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: HF/host-staged/NCCL exactness, mixed-request serving, HTTP trace evidence, and retained vLLM TP2/EP2 benchmark boundaries; no vLLM parity or production serving claim. |
 | `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150/#274: HF `generate(use_cache=true)`, host-staged EP2, and NCCL EP2 are compared across the committed small case set. |
 | `models/deepseek-v2-lite/decode-attribution-gate.md` | DeepSeek-V2-Lite EP2 decode attribution gate for `Hello`/16-token batch sizes 1/4/8: structured JSON with accuracy hashes, timing/counters, separated NCCL all-reduce smoke, and fail-closed full-decode graph probe evidence for the retained batch-1 shape. |
 | `models/deepseek-v2-lite/source-layout.md` | DeepSeek-V2-Lite runtime layout refactor: `runtime.rs` split by responsibility, HF/host-staged/NCCL EP2 E2E exact on 2x RTX 5090; NCCL CUDA Graph smoke remains a diagnostic blocker on that host, independent of the passed correctness gate. |
@@ -165,6 +165,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `benchmarks/qwen3-4b-serving-vllm-rtx5090.md` | Qwen3-4B TP1 vs vLLM 0.22.1 on RTX 5090 (2026-06-13, @`0b42ed3`), README source: footprint ~5× smaller (771 MB vs 3.8 GB) + ~3 s vs 70 s cold start; warm prefix-cache TTFT leads all lengths, 3.6× at 16k (26.3 vs 95.6 ms); QPS sweep comparable at low load, vLLM TPOT edge mid-load, openinfer edges ahead at saturation (1794 vs 1692) post-#362; pegaflow KV-offload host restore 2.6–9.1×. |
+| `benchmarks/deepseek-v2-lite-vllm-tp2-ep2-2026-06.md` | DeepSeek-V2-Lite EP2 2026-06-28 snapshot: OpenInfer host-staged/NCCL passed correctness, direct diagnostics, HTTP pressure, and trace rows; stock vLLM TP2/TP2+EP2 are retained as FlashInfer SM120/CUDA 12.8 setup failures, with a separate FlashInfer-fixed vLLM validation and no parity claim. |
 | `benchmarks/qwen35-4b-serving-vllm-rtx5090.md` | Qwen3.5-4B TP1 vs vLLM 0.23.0 on RTX 5090: latest direct OpenInfer A/B improves TPOT by 2-3%; HTTP `vllm bench serve` shows prompt-len-1 decode close, but vLLM still leads 1024/256 TPOT and high-concurrency output tok/s. Includes Nsight Systems direct/HTTP gap notes. |
 | `benchmarks/qwen-mixed-sampling-http.md` | Issue #412 HTTP mixed-sampling evidence: Qwen3-4B `/v1/completions` completed 64/64 with 32 greedy + 32 sampled requests, failed=0/timeouts=0, TTFT/TPOT/ITL/output tok/s retained; Qwen3.5-4B passed the same workload as supplemental evidence. |
 | `benchmarks/bs1-4k64-vllm-openinfer.md` | RTX 5090 single-concurrency probe: `input_len=4096`, `output_len=64`, no vLLM prefix cache. OpenInfer TTFT median `177ms` vs vLLM `198ms`; TPOT median `6.47ms` vs `6.36ms`; corrected output throughput `+6%` for OpenInfer. |
