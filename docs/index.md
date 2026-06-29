@@ -52,7 +52,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/model-crate.md` | `openinfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; feature-gated behind `qwen35-4b` (Triton AOT is the only Python build dependency); root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, historical Qwen3.5 e2e, and scheduler e2e records live here. |
 | `models/qwen35/kernel-plan.md` | Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3 module — enumerates every prefill/decode/unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites. Pure refactor (issue #256), no kernel behavior change. |
 | `models/qwen35/batched-step-tail.md` | Qwen3.5 issue #353 implementation record: final prefill tail is batched, decode/unified sample from batched logits, host full-vocab copies are logprobs-only, HF + scheduler e2e pass, and final serving A/B supports only the first-token/short-output TTFT claim. |
-| `models/qwen35/tp-design.md` | Qwen3.5 TP design: reuse Qwen3's controller/worker runtime, keep the partition contract degree-parametric with TP2 as the first validation target, and split dense TP from later linear/GDR sharding. |
+| `models/qwen35/tp-design.md` | Qwen3.5 TP design: Phase 1 is eager dense TP on Qwen3's controller/worker runtime; validate TP2 first, fail closed for indivisible degrees and TP+CUDA Graph, shard dense full-attention/MLP, and leave sharded linear/GDR state to follow-up. |
 
 ## models / glm52
 

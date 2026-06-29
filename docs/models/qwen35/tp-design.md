@@ -1,6 +1,6 @@
 # Qwen3.5 Tensor Parallelism Design
 
-> **TL;DR:** Qwen3.5 tensor parallelism should reuse Qwen3's controller/worker TP runtime and stay degree-parametric. Validate `TP=2` first, fail closed on indivisible degrees, shard dense full-attention/MLP before tackling linear-attention GDR state.
+> **TL;DR:** Qwen3.5 tensor parallelism should reuse Qwen3's controller/worker TP runtime and stay degree-parametric. Phase 1 is correctness-first eager dense TP: validate `TP=2` first, fail closed on indivisible degrees and `TP > 1` CUDA Graph, shard dense full-attention/MLP, and keep linear-attention/GDR state replicated per rank before tackling sharded GDR state.
 >
 > **Last touched:** 2026-06
 
@@ -29,6 +29,35 @@ Qwen3.5-specific design work should stay focused on model geometry and state own
 This design does not cover multi-node TP, data parallelism, pipeline parallelism, vocab-parallel embedding/lm_head, or Qwen3.5 prefix-cache/recurrent-state snapshots.
 
 Phase 1 does not shard linear attention or change GDR kernel shapes. Phase 2 does not change GDR math, does not all-reduce recurrent state, and does not move recurrent state ownership back into the scheduler.
+
+## Settled Phase 1 Contract
+
+These decisions are settled before implementation starts.
+
+- `TP=1` must preserve the current single-GPU behavior.
+- `TP=2` is the first correctness target. The implementation may stay degree-parametric, but unsupported or indivisible degrees must fail before model load.
+- `TP > 1` is eager-only in Phase 1. CUDA Graph under TP must fail closed instead of silently falling back or partially capturing.
+- Reuse the Qwen3 controller/worker broadcast execution model and avoid a second long-lived Qwen3.5-specific TP runtime shape.
+- Shard dense full-attention and MLP operators.
+- Replicate embedding and tied `lm_head`.
+- Replicate linear-attention/GDR weights in Phase 1.
+- Each rank worker owns and mutates its own full linear-attention conv state and GDR recurrent state copy.
+- The scheduler owns logical request lifecycle and logical KV/page lifecycle only.
+- Full-attention KV is physically rank-local and sharded by local KV heads, but one logical request/page assignment is mirrored across all ranks.
+- `DropRequest`, finish cleanup, cancellation cleanup, and slot reuse must release or reset the corresponding rank-local KV/recurrent/conv state on every rank.
+- Qwen3.5 gated `q_proj` slicing is an explicit acceptance gate: every rank must receive both q rows and gate rows for its local query heads.
+- MLP gate/up row sharding and down column sharding require explicit reconstruction or layout tests.
+
+## Still Open / Future Discussion
+
+These topics should not block Phase 1 eager dense TP, but they remain design work before any later implementation.
+
+- TP CUDA Graph support: graph state ownership per rank, synchronized capture/replay order, NCCL capture behavior, graph padding slots, and recurrent/conv D2D slot compaction under capture.
+- Sharded linear-attention/GDR execution: local GDR AOT kernel shapes, local recurrent-state layout, local conv state layout, and Phase 2 weight slicing.
+- TP-aware prefix cache or recurrent-state snapshots.
+- Vocab-parallel embedding or `lm_head`.
+- Multi-node TP, data parallelism, and pipeline parallelism.
+- Performance optimization claims. Phase 1 is a correctness/runtime milestone, not a throughput milestone.
 
 ## Why Dense First, GDR Second
 
@@ -131,13 +160,33 @@ Execution:
 - MLP: local gate/up + local activation + local `down_proj`, then all-reduce hidden
 - linear attention: every rank runs the full layer and updates a full local recurrent-state copy; do not all-reduce replicated linear-attention output
 
+State ownership:
+
+- scheduler owns request admission, request identity, logical page allocation, streaming handles, sampling params, generation counters, and finish bookkeeping
+- rank workers own rank-local model shards, rank-local physical KV buffers, rank-local decode buffers, and rank-local recurrent/conv state
+- rank 0 is not special for state mutation; it follows the same worker command protocol as other ranks
+- non-primary workers may return acknowledgement or step failure only, while the primary worker returns artifacts for scheduler-side result resolution
+- all workers must observe the same ordered `RunPrefillStep`, `RunDecodeStep`, `RunUnifiedStep`, `DropRequest`, and `Shutdown` commands
+
+CUDA Graph:
+
+- Phase 1 TP execution is eager-only
+- `tp_size > 1` with CUDA Graph enabled must return an explicit startup/configuration error before serving requests
+- TP graph capture is a follow-up because Qwen3.5 graph state includes recurrent slots, slot compaction, padding slots, and NCCL ordering questions
+
 Validation scope:
 
 - first validated degree: `TP=2`
 - Qwen3.5 HF logits gate
 - Qwen3.5 scheduler e2e
+- long prompt / chunked prefill path
+- slot-compaction replay
+- finish/drop followed by slot reuse without stale recurrent or conv state
+- gated `q_proj` head-local q/gate slicing test
+- MLP gate/up shard and down shard reconstruction/layout test
 - basic TP2 serving smoke
 - startup fails closed for unsupported or indivisible degrees
+- startup fails closed for `tp_size > 1` with CUDA Graph enabled
 
 ## Phase 2: Sharded Linear Attention / GDR
 
