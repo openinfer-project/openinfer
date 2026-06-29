@@ -29,6 +29,7 @@ fn batch_invariant_rejects_decode_overlap() {
         true,
         None,
         false,
+        false,
     )
     .err()
     .expect("--batch-invariant + --decode-overlap must be rejected");

@@ -163,6 +163,11 @@ impl VerifyGraphBuffers {
     pub(crate) fn captured_hidden(&self) -> &HiddenStates {
         &self.captured_hidden
     }
+
+    /// The fixed per-request span width these buffers were allocated for.
+    pub(crate) fn span(&self) -> usize {
+        self.span
+    }
 }
 
 impl Qwen3Model {

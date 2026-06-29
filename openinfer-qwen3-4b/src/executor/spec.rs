@@ -17,8 +17,8 @@ impl Qwen3Executor {
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
-            "speculative verification requested but no draft model is loaded"
+            self.speculative_method.is_some(),
+            "speculative verification requested but no speculative method is enabled"
         );
         for req in plan.requests {
             anyhow::ensure!(
@@ -30,11 +30,13 @@ impl Qwen3Executor {
                 req.params.is_greedy(),
                 "speculative verification currently supports greedy sampling only"
             );
-            anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative verification requested before DFlash state is ready for {:?}",
-                req.request_id
-            );
+            if self.dflash_meta().is_some() {
+                anyhow::ensure!(
+                    self.dflash_ready_requests.contains(&req.request_id),
+                    "speculative verification requested before DFlash state is ready for {:?}",
+                    req.request_id
+                );
+            }
             anyhow::ensure!(
                 self.request_kvs.contains_key(&req.request_id),
                 "missing RequestKv for {:?}",
@@ -134,6 +136,22 @@ impl Qwen3Executor {
             self.save_sealed_blocks(req_result.request_id);
         }
 
+        // Keep the n-gram running context in sync: append every committed token
+        // so the next draft scans the full history and continues from the new
+        // dangling token. DFlash keeps its own per-request hidden state instead.
+        // This verify forward ran because the gate was open, so also fold its
+        // mean accepted-draft-tokens into the gate (`result.requests` is the
+        // drafted subset, hence non-empty here).
+        if let Some(runtime) = self.ngram_runtime_mut() {
+            for req_result in &result.requests {
+                runtime.append_committed(req_result.request_id, &req_result.accepted_tokens);
+            }
+            if !result.requests.is_empty() {
+                let accepted: usize = result.requests.iter().map(|r| r.matched_draft_tokens).sum();
+                runtime.record_verified(accepted as f32 / result.requests.len() as f32);
+            }
+        }
+
         Ok(result)
     }
 
@@ -142,7 +160,7 @@ impl Qwen3Executor {
         plan: DraftPlan<'_>,
     ) -> Result<DraftResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
+            self.dflash_meta().is_some(),
             "speculative draft requested but no draft model is loaded"
         );
         for req in plan.requests {

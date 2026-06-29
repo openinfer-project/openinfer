@@ -106,6 +106,7 @@ fn scheduler_survives_consumer_drop() {
         true,
         None,
         false,
+        false,
     )
     .expect("failed to start engine");
     assert_eq!(

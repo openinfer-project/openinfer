@@ -501,7 +501,11 @@ fn execute_step_on_lane(
             // each span position) and captures the target hidden states (at the
             // DFlash layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(requests, kv_views)?;
+            let result = if lane.dflash.is_some() {
+                lane.execute_dflash_verify(requests, kv_views)?
+            } else {
+                lane.execute_ngram_verify(requests, kv_views)?
+            };
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
@@ -850,6 +854,18 @@ struct Qwen3ExecutorMetadata {
     config: Config,
 }
 
+/// The loaded speculative-decode method. Exactly one is ever active; the
+/// *propose* step is the only method-specific part (DFlash runs a draft-model
+/// forward on the worker; n-gram scans the request's token context host-side),
+/// while verify, greedy acceptance, and the KV transaction are shared.
+enum SpeculativeMethod {
+    /// DFlash draft model: worker-side draft forward with hidden-state capture.
+    Dflash(DFlashMeta),
+    /// Host-side n-gram / prompt-lookup proposer; needs no draft model. The
+    /// runtime owns the proposer, the acceptance gate, and per-request context.
+    Ngram(crate::ngram::NgramRuntime),
+}
+
 pub struct Qwen3Executor {
     metadata: Qwen3ExecutorMetadata,
     kv_mgr: KvCacheManager,
@@ -883,9 +899,12 @@ pub struct Qwen3Executor {
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
     async_prefill: Option<AsyncPrefillState>,
-    /// DFlash draft metadata; `Some` once a draft model is loaded into the
-    /// primary lane. Speculative decoding is enabled iff this is set.
-    speculative: Option<DFlashMeta>,
+    /// The active speculative-decode method and its loaded state — DFlash draft
+    /// metadata or the n-gram proposer — or `None` when speculation is off.
+    /// Exactly one method is ever loaded; this is the single source of truth for
+    /// whether speculation is on and which kind. Only the *propose* step varies
+    /// between methods; verify, accept, and the KV transaction are shared.
+    speculative_method: Option<SpeculativeMethod>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
@@ -1015,7 +1034,7 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             overlap: None,
             async_prefill: None,
-            speculative: None,
+            speculative_method: None,
             dflash_ready_requests: HashSet::new(),
             kv_events,
         })
@@ -1251,7 +1270,7 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             overlap: None,
             async_prefill: None,
-            speculative: None,
+            speculative_method: None,
             dflash_ready_requests: HashSet::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
@@ -1345,6 +1364,30 @@ impl Qwen3Executor {
         }
     }
 
+    /// The loaded DFlash draft metadata, or `None` under no/other method.
+    fn dflash_meta(&self) -> Option<&DFlashMeta> {
+        match &self.speculative_method {
+            Some(SpeculativeMethod::Dflash(meta)) => Some(meta),
+            _ => None,
+        }
+    }
+
+    /// The n-gram runtime (proposer + gate + per-request context), or `None`
+    /// under no/other method.
+    fn ngram_runtime(&self) -> Option<&crate::ngram::NgramRuntime> {
+        match &self.speculative_method {
+            Some(SpeculativeMethod::Ngram(runtime)) => Some(runtime),
+            _ => None,
+        }
+    }
+
+    fn ngram_runtime_mut(&mut self) -> Option<&mut crate::ngram::NgramRuntime> {
+        match &mut self.speculative_method {
+            Some(SpeculativeMethod::Ngram(runtime)) => Some(runtime),
+            _ => None,
+        }
+    }
+
     /// Enable speculative decoding by loading a DFlash draft model into the
     /// primary lane.
     ///
@@ -1368,7 +1411,34 @@ impl Qwen3Executor {
             meta.block_size
         );
         self.prefix_cache_enabled = false;
-        self.speculative = Some(meta);
+        self.speculative_method = Some(SpeculativeMethod::Dflash(meta));
+        Ok(())
+    }
+
+    /// Enable host-side n-gram (prompt-lookup) speculative decoding. Like DFlash
+    /// it is single-GPU greedy-only and forces the prefix cache off (the verify
+    /// forward writes each request's own speculative KV span); unlike DFlash it
+    /// loads no draft model — drafts come from scanning the request's own token
+    /// context on the executor thread.
+    pub fn load_ngram_drafter(&mut self, config: crate::ngram::NgramConfig) -> Result<()> {
+        anyhow::ensure!(
+            self.workers.is_empty(),
+            "speculative decoding requires the single-GPU path (got {} extra ranks)",
+            self.workers.len()
+        );
+        anyhow::ensure!(
+            self.offload.is_none(),
+            "speculative decoding is not supported together with KV offload"
+        );
+        anyhow::ensure!(
+            self.speculative_method.is_none(),
+            "n-gram speculative decoding cannot be combined with a DFlash draft model"
+        );
+        log::info!("Qwen3 n-gram speculative decoding enabled: {config}");
+        self.prefix_cache_enabled = false;
+        self.speculative_method = Some(SpeculativeMethod::Ngram(crate::ngram::NgramRuntime::new(
+            config,
+        )));
         Ok(())
     }
 
@@ -1684,12 +1754,18 @@ impl ModelExecutor for Qwen3Executor {
 
     fn max_context_tokens(&self) -> usize {
         let target = self.metadata.config.max_position_embeddings;
-        match &self.speculative {
+        match self.dflash_meta() {
             // The draft's fixed-width in-fill block writes `block_size` positions
             // past the committed length each step, so a request may use at most
             // `draft.max_pos - block_size` tokens before the draft cache would
             // overflow. Reject the rest at admission instead of crashing mid-prefill.
             Some(meta) => target.min(meta.max_position_embeddings.saturating_sub(meta.block_size)),
+            // n-gram (or no speculation): full window. n-gram has no separate
+            // draft cache, and its verify span is clamped to the request's
+            // remaining output budget (see `build_speculative_verify_items`), so
+            // the furthest KV position it writes is `prompt + generated + span <=
+            // prompt + max_tokens <= max_position_embeddings` — never past the
+            // window. No DFlash-style block_size reduction is needed.
             None => target,
         }
     }
@@ -1739,7 +1815,10 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         self.saved_cursor.remove(&request_id);
-        if self.speculative.is_some() {
+        if let Some(runtime) = self.ngram_runtime_mut() {
+            runtime.drop_request(request_id);
+        }
+        if self.dflash_meta().is_some() {
             self.dflash_ready_requests.remove(&request_id);
             self.primary.drop_dflash_request(request_id)?;
         }
@@ -1926,10 +2005,30 @@ impl ModelExecutor for Qwen3Executor {
         for req_result in &result.requests {
             self.apply_prefill_result(req_result)?;
         }
+        // Seed the n-gram running context for each freshly-completed prompt:
+        // the full prompt followed by the first sampled token (the request's
+        // current dangling token). Later committed tokens are appended at verify
+        // and decode time so the context always ends with the dangling token.
+        if let Some(runtime) = self.ngram_runtime_mut() {
+            for req_result in &result.requests {
+                if req_result.completed {
+                    if let Some(req) = plan
+                        .requests
+                        .iter()
+                        .find(|r| r.request_id == req_result.request_id)
+                    {
+                        let mut context = Vec::with_capacity(req.prompt_tokens.len() + 1);
+                        context.extend_from_slice(&req.prompt_tokens);
+                        context.push(req_result.first_token);
+                        runtime.seed(req_result.request_id, context);
+                    }
+                }
+            }
+        }
         // A request becomes draft-ready once its prompt is fully prefilled with
         // captured target context. Partial chunks stay pending; ineligible
         // requests drop any stale worker state.
-        if self.speculative.is_some() {
+        if self.dflash_meta().is_some() {
             for req_result in &result.requests {
                 let captured = result
                     .dflash_context_captured_requests
@@ -2000,9 +2099,16 @@ impl ModelExecutor for Qwen3Executor {
                 .expect("request must exist after decode");
             rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
         }
+        // A plain decode commits one token per request; keep the n-gram context
+        // in sync so it always ends with the request's dangling token.
+        if let Some(runtime) = self.ngram_runtime_mut() {
+            for req_result in &result.requests {
+                runtime.append_committed(req_result.request_id, &[req_result.token]);
+            }
+        }
         // A plain decode advances the sequence outside the speculative path, so
         // any captured draft context is now stale — drop it.
-        if self.speculative.is_some() {
+        if self.dflash_meta().is_some() {
             for req_result in &result.requests {
                 if self.dflash_ready_requests.remove(&req_result.request_id) {
                     self.primary.drop_dflash_request(req_result.request_id)?;
@@ -2018,6 +2124,14 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_speculative_draft(&mut self, plan: DraftPlan<'_>) -> Result<DraftResult> {
+        // N-gram drafts are produced host-side on the executor thread (no worker
+        // forward): the runtime scans each request's own token context for a
+        // prompt-lookup match, gated by recent acceptance. DFlash instead runs a
+        // draft-model forward on the lane.
+        if let Some(runtime) = self.ngram_runtime_mut() {
+            let requests = runtime.propose_step(plan.requests)?;
+            return Ok(DraftResult { requests });
+        }
         self.execute_speculative_draft_impl(plan)
     }
 
@@ -2026,11 +2140,17 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn speculative_enabled(&self) -> bool {
-        self.speculative.is_some()
+        self.speculative_method.is_some()
     }
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
-        self.dflash_ready_requests.contains(&request_id)
+        if let Some(runtime) = self.ngram_runtime() {
+            // Ready as soon as the prompt is prefilled and its context seeded;
+            // n-gram needs no captured hidden state.
+            runtime.is_ready(request_id)
+        } else {
+            self.dflash_ready_requests.contains(&request_id)
+        }
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
@@ -2099,12 +2219,23 @@ impl ModelExecutor for Qwen3Executor {
                         .expect("request must exist after unified decode");
                     rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
                 }
+                // A unified step commits one token per active request outside the
+                // speculative path; keep the n-gram context in sync (mirroring
+                // execute_decode) so it stays anchored on the dangling token when
+                // the batch returns to pure-greedy n-gram speculation. Reachable
+                // whenever a non-greedy request shares the batch and pushes the
+                // greedy ones onto the fused decode path.
+                if let Some(runtime) = self.ngram_runtime_mut() {
+                    for req_result in &result.decode_requests {
+                        runtime.append_committed(req_result.request_id, &[req_result.token]);
+                    }
+                }
                 // A plain decode via the fused unified step advances the sequence
                 // outside the speculative path, so any captured draft context is
                 // now stale — drop it, mirroring execute_decode. (Eligible pending
                 // are routed to a dedicated prefill step, so unified prefills never
                 // need DFlash mark-ready here.)
-                if self.speculative.is_some() {
+                if self.dflash_meta().is_some() {
                     for req_result in &result.decode_requests {
                         if self.dflash_ready_requests.remove(&req_result.request_id) {
                             self.primary.drop_dflash_request(req_result.request_id)?;
@@ -2131,6 +2262,15 @@ impl ModelExecutor for Qwen3Executor {
                         .get_mut(&req_result.request_id)
                         .expect("request must exist after split decode");
                     rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                }
+                // Defensive n-gram context sync (mirrors the Unified branch). The
+                // overlap path is unreachable under n-gram today (speculation forces
+                // decode-overlap off), but keep the context anchored if that
+                // mutual-exclusion is ever relaxed.
+                if let Some(runtime) = self.ngram_runtime_mut() {
+                    for req_result in &decode_result.requests {
+                        runtime.append_committed(req_result.request_id, &[req_result.token]);
+                    }
                 }
                 for req_result in &decode_result.requests {
                     self.save_sealed_blocks(req_result.request_id);
@@ -2736,6 +2876,65 @@ impl LocalQwen3Lane {
                 &request_results,
                 Some(bufs.captured_hidden()),
             )?;
+            Ok(VerifyResult {
+                requests: request_results,
+            })
+        })();
+        self.verify_bufs = Some(bufs);
+        result
+    }
+
+    /// Verify forward for host-side proposers (n-gram): one target forward over
+    /// each request's `K + 1` span with its speculative KV view, returning the
+    /// greedy argmax per position. Unlike [`Self::execute_dflash_verify`] it
+    /// captures no hidden states — a token-only proposer keeps no model state to
+    /// seed — so the verify graph runs with zero capture layers.
+    fn execute_ngram_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+    ) -> Result<VerifyResult> {
+        let span = requests
+            .iter()
+            .map(|req| req.as_slice().len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        // (Re)allocate the verify scratch if it is missing or too narrow for this
+        // step's widest span. The widest span grows from 1 (no match) up to K + 1
+        // as matches lengthen, so this may reallocate a few times early on before
+        // settling at the K + 1 ceiling — never per step in steady state.
+        let needs_alloc = self
+            .verify_bufs
+            .as_ref()
+            .map_or(true, |bufs| bufs.span() < span);
+        if needs_alloc {
+            let max_batch = *BATCH_BUCKETS.last().unwrap();
+            self.verify_bufs = Some(VerifyGraphBuffers::new(
+                &self.model,
+                max_batch,
+                span,
+                0,
+                self.total_blocks,
+            )?);
+        }
+
+        let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
+        let result = (|| -> Result<VerifyResult> {
+            let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
+            self.model.batch_prefill_into(
+                &spans,
+                kv_views,
+                self.kv_buffer.buffer(),
+                &self.layout,
+                &[],
+                &mut bufs,
+            )?;
+            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
+            let greedy = SamplingParams::default();
+            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
+            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
+            let request_results = build_verify_results(requests, &target_tokens)?;
             Ok(VerifyResult {
                 requests: request_results,
             })
