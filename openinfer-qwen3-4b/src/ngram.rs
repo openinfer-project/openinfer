@@ -352,7 +352,10 @@ mod tests {
         for _ in 0..NgramGate::WARMUP_STEPS {
             gate.record_drafted(0.0);
         }
-        assert!(!gate.should_draft(0.3), "closed after low-acceptance warmup");
+        assert!(
+            !gate.should_draft(0.3),
+            "closed after low-acceptance warmup"
+        );
         // Skipping for PROBE_INTERVAL steps re-opens it for one probe.
         for _ in 0..NgramGate::PROBE_INTERVAL {
             gate.record_skipped();

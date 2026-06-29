@@ -2061,7 +2061,9 @@ impl ModelExecutor for Qwen3Executor {
             // has a length-1 verify span and the scheduler routes the whole batch
             // to plain decode — no verify forward, no regression. The gate probes
             // periodically so a shift into repetitive text re-opens it.
-            let drafting = self.ngram_gate.should_draft(ngram.config().accept_threshold);
+            let drafting = self
+                .ngram_gate
+                .should_draft(ngram.config().accept_threshold);
             let mut any_drafted = false;
             let mut requests = Vec::with_capacity(plan.requests.len());
             for item in plan.requests {
