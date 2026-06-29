@@ -1,185 +1,132 @@
 # Qwen3-4B n-gram speculative decoding (design)
 
 **TL;DR**: Draft-model-free speculative decoding for Qwen3-4B. An n-gram
-(prompt-lookup) proposer suggests `K` continuation tokens from the running
-context; the target model verifies them in one forward pass and commits the
-longest greedy-agreed prefix plus one model token. Greedy verification is
-**lossless** — output is bit-for-bit identical to plain greedy decode, just
-fewer forward passes on repetitive / structured text (code, quoting, JSON).
-The KV layer (kvbm) already supports speculative scheduling natively, so
-rejected drafts need no manual rollback. An **acceptance gate** (`NgramGate`)
-closes speculation when recent draft acceptance is too low to pay for the verify
-forward, so low-acceptance traffic (prose) falls back to plain decode instead of
-regressing — see *Serving A/B* below.
+(prompt-lookup) proposer suggests up to `K` continuation tokens from the
+request's running context; the target model verifies them in one forward pass
+and commits the longest greedy-agreed prefix plus one model token. Greedy
+verification is **lossless** — output is bit-for-bit identical to plain greedy
+decode, just fewer forward passes on repetitive / structured text. It is a second
+*propose* implementation on the shared speculative core (#436/#442): verify,
+greedy acceptance, and the KV transaction are reused unchanged; only *propose*
+differs. An **acceptance gate** closes speculation when recent draft acceptance
+is too low to pay for the verify forward, so low-acceptance traffic (prose) falls
+back to plain decode instead of regressing — see *Serving A/B*.
 
-Last touched: 2026-06 · Enabled via `--ngram-speculative`; proposer, greedy
-acceptance, KV speculative pass-throughs, the verify forward, scheduler wiring,
-and the acceptance gate are all landed and GPU-validated lossless.
+Last touched: 2026-06 · Enabled with `--ngram-speculative` (off by default).
+Proposer, host-side propose, the shared verify/accept/KV transaction, scheduler
+wiring, and the acceptance gate are landed and GPU-validated lossless.
 
-## Why this is cheap to add here
+## Shape: one transaction, only *propose* varies
 
-Three of the four pieces already exist or are trivial:
+Speculative decoding is a single optimistic transaction; the only method-specific
+part is where the drafts come from. The loaded method is one enum on the
+executor (`openinfer-qwen3-4b/src/executor.rs`):
 
-- **Proposer** — `openinfer-qwen3-4b/src/ngram.rs` (`NgramProposer`). Done, unit-tested.
-- **Acceptance** — `openinfer-qwen3-4b/src/speculative.rs` (`accept_greedy`,
-  `SpeculativeConfig`). Done, unit-tested.
-- **KV scheduling / rollback** — kvbm's `SchedulableSequence` already implements
-  `schedule_speculative` / `apply_speculative` with **automatic LIFO release of
-  the blocks pre-allocated for rejected drafts**. Exposed on `RequestKv`
-  (`openinfer-kv-cache/src/pool.rs`). Done, unit-tested.
-- **GPU verify forward + orchestration** — the only remaining work (below).
-
-## Per-step data flow (single request, greedy)
-
-Layering mirrors vLLM V1 (proposer in the runner/scheduler layer that owns
-token history; the executor reserves KV, runs the target forward, and accepts):
-
-```
-scheduler owns the request's token history (prompt + generated)
-  1. drafts = NgramProposer.propose(history)        # K candidates; empty -> plain decode
-  2. verify_inputs = [d0, c0, .., c_{K-1}]           # d0 = last committed token (dangling)
-  3. RequestKv.schedule_speculative(K + 1)           # room for drafts + bonus token
-  4. argmax[0..K] = verify_forward(verify_inputs, prefill_view(1 + K))
-  5. committed = accept_greedy(drafts, argmax)        # m accepted drafts + 1 model token
-  6. RequestKv.apply_speculative(committed)           # kvbm releases rejected blocks
-  7. scheduler appends committed to history; applies stop / max_tokens;
-     committed.last() becomes the next step's d0
+```rust
+enum SpeculativeMethod {
+    Dflash(DFlashMeta),     // worker-side draft-model forward, captures hidden state
+    Ngram(NgramRuntime),    // host-side prompt-lookup, no draft model
+}
+// Qwen3Executor::speculative_method: Option<SpeculativeMethod>  — single source of truth
 ```
 
-### Token / KV accounting (matches kvbm's verified contract)
+This is the pre-trait consolidation #436 deferred. A full `SpeculativeProposer`
+trait object is **not** introduced: DFlash's propose is a worker RPC (needs
+`&mut executor` + lane), so it can't be a self-contained proposer without borrow
+gymnastics. Enum dispatch is the honest shape until a third method (EAGLE, #325)
+makes a shared trait pay off.
 
-- The verify forward computes KV for `1 + K` positions (`d0` + `K` drafts) at
-  `base_pos = kv_position`. Structurally this is a prefill of `1 + K` tokens at
-  the current position, so the `KvView` is `RequestKv::prefill_view(1 + K)` and
-  the forward reuses the existing paged-prefill attention path.
-- `argmax[i]` is the model's greedy token *after* consuming `verify_inputs[i]`:
-  `argmax[0]` follows `d0` (the true next token), `argmax[i]` follows `c_{i-1}`,
-  `argmax[K]` is the bonus continuation. This index convention is exactly what
-  `accept_greedy(proposed = drafts, target_argmax = argmax)` expects.
-- `apply_speculative(committed)` advances `kv_position` by `committed.len()`
-  (`m + 1`); kvbm LIFO-drops the over-allocated blocks. `committed.last()` (the
-  model token) becomes the new dangling token. `schedule_speculative(K + 1)`
-  guarantees `m + 1 <= K + 1`.
+Per step (`scheduler/plan.rs`, `ExecutionPlan::SpeculativeDecode`):
 
-### Why it is lossless
+1. **Propose** — produce up to `K` candidate tokens per request.
+2. **Verify** — one target forward over each request's `K + 1` span
+   `[current, draft_1..draft_K]`, argmax at every position.
+3. **Accept** — `accept_greedy` keeps the longest prefix matching the target
+   argmax, then appends the target's own token at the first mismatch (always
+   commits `1..=K + 1` tokens).
+4. **Commit / roll back** — accepted KV committed; the unused draft tail is
+   LIFO-released by kvbm (`RequestKv::apply_speculative`).
 
-`accept_greedy` only keeps the prefix where `draft[i] == argmax[i]` and then
-appends one of the model's own tokens, so the committed sequence is identical
-to what plain greedy decode would have produced one token at a time. This gives
-a free correctness oracle: **speculative-on must equal speculative-off** for the
-same prompt under greedy params.
+Because the draft↔verify boundary is a pure token span, `accept_greedy` /
+`build_verify_results`, the verify transaction
+(`executor/spec.rs::execute_speculative_verify_impl`), and the
+`schedule/apply/revert_speculative` KV lifecycle are **reused unchanged** from
+the DFlash core. Only two things are method-specific: where drafts come from, and
+whether verify captures hidden states.
 
-## Landed: GPU verify forward + executor step
+## What n-gram adds
 
-- **`LocalQwen3Lane::execute_verify(verify_tokens, kv_view, lora)`** — reuses
-  `batch_prefill(echo = true)` for per-position logits over the existing paged
-  KV, then a GPU argmax (`argmax_batch_bf16_into`) returns one token per verify
-  position. Only the position ids cross to host, never the `[vocab, n]` logits
-  (vLLM-style). Kept additive: `batch_prefill` / `batch_decode` are untouched.
-- **`StepCommand::SpeculativeVerify` + `Qwen3Executor::execute_speculative`** —
-  `schedule_speculative(K + 1)` → `prefill_view(1 + K)` → verify step → argmax →
-  `accept_greedy` → `apply_speculative`, returning the committed tokens. The
-  rank-worker channel carries it (TP-safe).
-
-## Validated
-
-- **Lossless on GPU** — `tests/ngram_speculative.rs` runs real Qwen3-4B and
-  asserts greedy n-gram speculative decode is token-identical to plain greedy
-  decode (prefix cache off; repetitive prompt). Confirms the full pipeline
-  (proposer → schedule_speculative → verify forward → accept_greedy →
-  apply_speculative) end-to-end.
-
-## Landed: scheduler serving-loop wiring
-
-- `ActiveRequestState` carries `token_history` (prompt + generated), maintained
-  on promote and each committed decode token.
-- `scheduler/speculative.rs::speculative_decode_step` proposes per active
-  request, runs `execute_speculative` (or a single decode when no draft), and
-  streams the committed tokens with stop / max-token handling — isolated from
-  the one-token-per-step plan/resolve/effects pipeline. `scheduler_loop` routes
-  pure-decode ticks through it when `SpeculativeConfig.enabled`.
-- Mock-tested (`FakeExecutor::execute_speculative`): streams every committed
-  token + advances state; commits past `max_tokens` truncate, finish, retire.
-
-## Proposer seam (closed-set, n-gram-sized)
-
-The proposer is factored out as the one piece meant to vary between methods:
-
-- `speculative::SpeculativeProposer` — `fn propose(&self, context: &[u32]) -> Vec<u32>`.
-- `SpeculativeConfig.method: SpeculativeMethod` (a *closed* enum, one variant per
-  method) + `build_proposer()` factory. `scheduler_loop` builds one boxed
-  `dyn SpeculativeProposer` at startup; `speculative_decode_step` takes
-  `&dyn SpeculativeProposer`. This is closed-set enum dispatch, not an open
-  plugin system — the idiomatic Rust choice for a small known set.
-
-This is a good **n-gram** seam, not yet a general proposer abstraction. The
-trait fits stateless, token-emitting proposers; a draft-model / EAGLE proposer
-would need a wider trait (`&mut self` + per-request create/drop lifecycle, the
-request id, and returning draft probabilities for rejection sampling) **and**
-changes to the scheduler step and verify path. Concretely, the parts below the
-proposer are **greedy-specific**, not method-agnostic:
-
-- the verify forward returns argmax (part of the greedy acceptance rule; sampling
-  acceptance needs distributions),
-- `accept_greedy` is greedy-only,
-- `speculative_decode_step` assumes a stateless proposer (no per-request
-  create/drop).
-
-Widening these is deferred until a second proposer actually lands, so the shapes
-are validated against a real implementation rather than guessed at now.
+- **Proposer** (`ngram.rs`, `NgramProposer`) — stateless longest-suffix
+  prompt-lookup over a request's own token history: tries the longest configured
+  suffix first, falls back to shorter. Unit-tested in isolation.
+- **`NgramRuntime`** (`ngram.rs`) — owns the method's entire state: the proposer,
+  the acceptance gate (`NgramGate`), and the per-request running context map. The
+  executor drives it through intent-level calls — `seed`, `append_committed`,
+  `drop_request`, `is_ready`, `propose_step`, `record_verified` — instead of
+  maintaining three parallel fields across every execution path.
+- **Host-side propose** — `Qwen3Executor::execute_speculative_draft` calls
+  `NgramRuntime::propose_step` on the executor thread: no worker forward, no draft
+  model, no readiness handshake. (DFlash instead dispatches
+  `StepCommand::SpeculativeDraft` to the lane.)
+- **No-capture verify** — `LocalQwen3Lane::execute_ngram_verify` reuses
+  `batch_prefill_into` with **zero capture layers** (a token-only proposer keeps
+  no model state to seed), then argmax + `build_verify_results`. The worker routes
+  verify by `lane.dflash.is_some()`; the methods are mutually exclusive.
+- **Running context** (`NgramRuntime.ctx`) — per-request token context, seeded at
+  prefill (`prompt + first_token`), appended at every commit path (verify / plain
+  decode / fused unified decode, plus a defensive overlap branch), dropped on
+  retire. Always ends with the request's dangling token so the next draft
+  continues from it.
 
 ## Enabling it
 
-`scheduler_loop` builds the config via `SpeculativeConfig::from_env()`
-(default-off). The generic switch lives on `SpeculativeConfig`; each method
-parses its own knobs (`NgramConfig::from_env`):
+`--ngram-speculative` (server flag) → `Qwen3LaunchOptions.ngram_speculative` →
+`scheduler::start_qwen3` → `Qwen3Executor::load_ngram_drafter(NgramConfig::from_env())`.
 
-- `OPENINFER_QWEN3_SPEC=1` — turn speculation on (generic).
-- `OPENINFER_QWEN3_NGRAM_TOKENS=K` — draft count (n-gram, default 4).
-- `OPENINFER_QWEN3_NGRAM_MAX_NGRAM=N` — longest matched suffix (n-gram, default 3).
+- Single-GPU greedy only; **requires `--tp-size=1`**; mutually exclusive with
+  `--dflash-draft-model-path`, `--enable-lora`, `--kv-offload`, and
+  `--decode-overlap` (validated in `lib.rs::launch` and `server/src/main.rs`).
+- Forces the prefix cache off — the verify forward writes each request's own
+  speculative KV span, so cross-request prefix reuse is unsafe here.
+
+Proposer knobs (`NgramConfig::from_env`):
+
+- `OPENINFER_QWEN3_NGRAM_TOKENS=K` — draft count (default 4).
+- `OPENINFER_QWEN3_NGRAM_MAX_NGRAM=N` — longest matched suffix (default 3).
 - `OPENINFER_QWEN3_NGRAM_ACCEPT_THRESHOLD=f` — acceptance gate threshold (mean
   accepted draft tokens/step below which speculation falls back to plain decode;
-  default 0.3, `0` disables the gate). See *Serving A/B* below.
+  default 0.3, `0` disables the gate). See *Serving A/B*.
 
-Only the non-LoRA `scheduler_loop` reads it; the unified prefill+decode tick
-still uses plain decode.
+**Per-request eligibility.** `should_speculative_decode` takes the speculative
+path only when *every* active request is greedy (`SamplingParams::is_greedy()`),
+asks for no decode logprobs (`logprobs == 0`), and is non-LoRA — a single
+ineligible request falls the whole batch back to plain decode for that step. So
+enabling speculation never changes a sampled request's output or strips requested
+logprobs. A miss (length-1 verify span) already degrades to a plain single-token
+decode in `build_verify_results`, so it needs no special fallback.
 
-**Per-request eligibility.** Even with the switch on, only requests that are
-greedy (`SamplingParams::is_greedy()`) **and** ask for no decode logprobs
-(`logprobs == 0`) take the speculative path. Speculation verifies with argmax
-and emits no per-token logprobs, so a sampled request would otherwise be forced
-to argmax and a logprobs request would silently lose them. Any ineligible
-request takes a normal sampled single-token decode (its own params, logprobs,
-and a fresh `random_val`) on that tick, so enabling speculation never changes a
-sampled request's output or strips requested logprobs.
+## Why it is lossless
 
-## Measured speedup (best case)
+`accept_greedy` keeps only the prefix where `draft[i] == target_argmax[i]`, then
+appends one of the target's own tokens, so the committed sequence is exactly what
+plain greedy decode would have produced one token at a time. This is a built-in
+oracle: **spec-on must equal spec-off** token-for-token under greedy params
+(modulo the benign prefill-vs-decode bf16 tie flip). The gate only changes
+*whether* we speculate, never the committed tokens, so it preserves this.
 
-`tests/ngram_speculative.rs::ngram_speculative_speedup` (ignored; needs GPU +
-weights) times greedy vs. speculative on Qwen3-4B (eager, single request, 192
-tokens). On the perfectly periodic synthetic prompt:
-
-| metric            | greedy   | speculative |
-| ----------------- | -------- | ----------- |
-| forward passes    | 191      | 39          |
-| ms / token        | 9.99     | 2.52        |
-| accepted / verify | —        | 5.00 (max with K=4) |
-| wall-clock        | 1908 ms  | 481 ms (**3.96x**) |
-
-This is the ceiling: the prompt is exactly periodic so every draft is accepted.
-Real prompts accept a fraction of drafts, so expect smaller wins; the benchmark
-exists to track acceptance-rate / TPOT as the proposer and verify path evolve.
-Run: `cargo test -p openinfer-qwen3-4b --release --test ngram_speculative \
-ngram_speculative_speedup -- --ignored --nocapture` (`OPENINFER_BENCH_TOKENS`
-overrides the 192-token default).
+GPU-validated by `tests/ngram_speculative_gate.rs` (3 tests, real Qwen3-4B):
+greedy-matches-plain (bs=1), concurrent heterogeneous (bs>1 verify-span path),
+and mixed greedy+sampling. The proposer and gate also have isolated unit tests in
+`ngram.rs`.
 
 ## Serving A/B (`vllm bench serve`) and the acceptance gate
 
-Synthetic best-case is the ceiling; serving throughput on real datasets is the
-contract. Single RTX 4090, Qwen3-4B, `temperature=0`, `--ignore-eos`,
-`--no-prefix-cache`, 12 prompts × 128 output tokens, sonnet (550/128, prefix 200)
-and random (550/128). `Δ` is n-gram vs plain decode on the **same** engine;
-vLLM (0.21 / 0.23, ngram `K=4`, `prompt_lookup_max=3`) is the reference.
+Greedy speculation can only win when enough drafts are accepted to offset the
+verify forward (which costs ~`K + 1`× a plain decode). Single RTX 4090, Qwen3-4B,
+`temperature=0`, `--ignore-eos`, `--no-prefix-cache`, 12 prompts × 128 output
+tokens, sonnet (550/128, prefix 200) and random (550/128). `Δ` is n-gram vs plain
+decode on the **same** engine; vLLM (0.21 / 0.23, ngram `K=4`,
+`prompt_lookup_max=3`) is the reference.
 
 | dataset / conc | acceptance | vLLM 0.23 Δ | openinfer (no gate) Δ | **openinfer (gate) Δ** |
 | --- | --- | --- | --- | --- |
@@ -201,60 +148,53 @@ Reading this:
   compute-idle, so the gate stays open and the ~33% acceptance is a free win.
 - **random c4 is the open gap**: vLLM **+17%** vs openinfer **−20%** at the *same*
   ~37% acceptance (proven by the matching c1 numbers). This is purely the verify
-  path — see below. The gate can't help here: acceptance is high, so it correctly
+  path — see below. The gate can't help: acceptance is high, so it correctly
   stays open; the loss is in *how* we verify, not *whether* we should.
 
 **Root cause of the random-c4 gap (nsys, `--cuda-graph-trace=node`).** At c4 the
 GPU is already ~92% busy on plain decode. Under n-gram the same 22 s window shows
-the attention running through the **prefill** kernel (`BatchPrefill`, ~23 µs)
-instead of the decode kernel (`BatchDecode`, ~15 µs), ~989 verify forwards **plus**
-~887 decode forwards (the batch splits two ways every mixed step), and ~43% more
-GEMM. vLLM instead runs **one fused forward**: draft tokens are extra rows in the
-same batch (a missed request is just `query_len=1`), verified by one rejection
-step — no second pass, no prefill-kernel penalty, no ragged-span CUDA-graph
-thrash. Folding our verify into that single unified forward is the way to turn
-random-c4 positive; it is tracked as the follow-up below, not in this PR.
+attention running through the **prefill** kernel (`BatchPrefill`, ~23 µs) instead
+of the decode kernel (`BatchDecode`, ~15 µs), ~989 verify forwards **plus** ~887
+decode forwards (the batch splits two ways every mixed step), and ~43% more GEMM.
+vLLM instead runs **one fused forward**: draft tokens are extra rows in the same
+batch (a missed request is just `query_len=1`), verified by one rejection step —
+no second pass, no prefill-kernel penalty, no ragged-span CUDA-graph thrash.
+Folding our verify into that single unified forward is the way to turn random-c4
+positive; tracked as the follow-up below, not in this PR.
 
 ## The acceptance gate (`NgramGate`)
 
-`openinfer-qwen3-4b/src/ngram.rs`. Engine-wide EWMA of accepted draft tokens per
-drafted step. `should_draft` opens while in warmup, while the EWMA clears
-`accept_threshold`, or on a periodic probe; otherwise the proposer returns
-nothing for the step and the existing draft/undraft partition routes the whole
-batch to plain decode (no verify forward). The probe (every `PROBE_INTERVAL`
-steps) re-opens it so a shift into repetitive text is picked back up. Lossless
-either way — gating only changes *whether* we speculate, never the committed
-tokens. Unit-tested (`gate_*` in `ngram.rs`); the engine-level losslessness gate
-(`tests/ngram_speculative_gate.rs`) still passes with the gate live.
+`ngram.rs`, owned by `NgramRuntime`. An engine-wide EWMA of accepted draft tokens
+per drafted step. `should_draft` opens while in warmup, while the EWMA clears
+`accept_threshold`, or on a periodic probe; otherwise `propose_step` produces no
+drafts for the step and the existing draft/undraft partition in `plan.rs` routes
+the whole batch to plain decode (no verify forward). The probe (every
+`PROBE_INTERVAL` steps) re-opens it so a shift into repetitive text is picked back
+up. `record_verified` (called from the verify transaction in `spec.rs`) feeds the
+step's mean acceptance back in. Lossless either way. Unit-tested (`gate_*` in
+`ngram.rs`); the engine-level losslessness gate still passes with the gate live.
 
 ## Remaining work / follow-up
 
 1. **Single fused verify forward** (the random-c4 fix, separate PR): fold the
    verify tokens into one unified batched forward (FlashInfer varlen) with a GPU
    rejection step — a missed request becomes a `query_len=1` row in the same
-   batch — instead of the current `batch_prefill`-based verify plus the second
-   plain-decode pass for undrafted requests. The *Serving A/B* above quantifies
-   the prize: closing the ~37-point random-c4 gap to vLLM (+17% vs −20%).
+   batch — instead of the current `batch_prefill_into`-based verify plus the
+   second plain-decode pass for undrafted requests. The *Serving A/B* above
+   quantifies the prize: closing the ~37-point random-c4 gap to vLLM
+   (+17% vs −20%).
 
 ## Scope / deferred
 
-First cut is **single-request, greedy, non-CUDA-graph**. Deferred: batched
-speculation (ragged verify across requests), sampling (non-greedy) acceptance,
-CUDA-graph-captured verify, interaction with the unified prefill+decode step,
-and pipelined ahead-of-time proposal.
-
-## Open questions for review
-
-1. `verify_forward` as a standalone model method (preferred) vs. reusing
-   `batch_prefill(echo = true)`.
-2. Confirm the GPU-side argmax via `select_batch_tokens_into` over the `K + 1`
-   verify positions is acceptable (vs. a dedicated argmax kernel later).
-3. Proposer placement in the scheduler layer (owns token history), matching
-   vLLM's runner / `request.spec_token_ids` split.
+Greedy, single-GPU, no LoRA. Deferred: sampling (non-greedy) acceptance (needs
+draft distributions + a rejection sampler, not argmax), the unified fused verify
+forward above, and a general `SpeculativeProposer` trait (revisit when EAGLE
+#325 lands a third method).
 
 ## Prior art
 
-- vLLM V1 n-gram / prompt-lookup spec decode (`NgramProposer` in the runner,
-  GPU rejection sampler, scheduler reserves KV for `k` draft tokens).
+- vLLM V1 n-gram / prompt-lookup spec decode (`NgramProposer` in the runner, GPU
+  rejection sampler, scheduler reserves KV for `k` draft tokens). Its single
+  fused forward is what the follow-up above borrows.
 - kvbm `SchedulableSequence` speculative lifecycle (`schedule_speculative` /
-  `apply_speculative`, LIFO block release).
+  `apply_speculative`, LIFO block release), reused unchanged here.
