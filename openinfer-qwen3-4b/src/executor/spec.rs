@@ -146,6 +146,18 @@ impl Qwen3Executor {
                     .or_default()
                     .extend_from_slice(&req_result.accepted_tokens);
             }
+            // Feed the acceptance gate: this verify forward ran because the gate
+            // was open, so fold its mean accepted-draft-tokens into the estimate.
+            // `result.requests` is the drafted subset, so it is non-empty here.
+            if !result.requests.is_empty() {
+                let accepted: usize = result
+                    .requests
+                    .iter()
+                    .map(|r| r.matched_draft_tokens)
+                    .sum();
+                let mean = accepted as f32 / result.requests.len() as f32;
+                self.ngram_gate.record_drafted(mean);
+            }
         }
 
         Ok(result)

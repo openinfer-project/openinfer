@@ -856,6 +856,11 @@ pub struct Qwen3Executor {
     /// prompt-lookup matches; it always ends with the request's current dangling
     /// token so the next draft continues from it.
     ngram_ctx: HashMap<RequestId, Vec<u32>>,
+    /// Engine-wide acceptance gate for the n-gram method. Closes speculation when
+    /// recent draft acceptance is too low to pay for the verify forward (e.g.
+    /// prose), so the batch falls back to plain decode instead of regressing —
+    /// most visibly at higher concurrency. Idle/`None` under DFlash.
+    ngram_gate: crate::ngram::NgramGate,
     /// Opt-in KV block-event feed for a cache-aware router (`Some` only when the
     /// engine was built with events on — single-GPU, no LoRA). `None` on the
     /// plain path, where the whole feed costs nothing.
@@ -978,6 +983,7 @@ impl Qwen3Executor {
             speculative_method: None,
             dflash_ready_requests: HashSet::new(),
             ngram_ctx: HashMap::new(),
+            ngram_gate: crate::ngram::NgramGate::new(),
             kv_events,
         })
     }
@@ -1208,6 +1214,7 @@ impl Qwen3Executor {
             speculative_method: None,
             dflash_ready_requests: HashSet::new(),
             ngram_ctx: HashMap::new(),
+            ngram_gate: crate::ngram::NgramGate::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
         })
@@ -2049,16 +2056,28 @@ impl ModelExecutor for Qwen3Executor {
         // forward): scan each request's own token context for a prompt-lookup
         // match. DFlash instead runs a draft-model forward on the lane.
         if let Some(ngram) = self.ngram_proposer() {
+            // One gate decision per step. When closed (recent acceptance too low
+            // to pay for the verify forward), propose nothing: every request then
+            // has a length-1 verify span and the scheduler routes the whole batch
+            // to plain decode — no verify forward, no regression. The gate probes
+            // periodically so a shift into repetitive text re-opens it.
+            let drafting = self.ngram_gate.should_draft(ngram.config().accept_threshold);
+            let mut any_drafted = false;
             let mut requests = Vec::with_capacity(plan.requests.len());
             for item in plan.requests {
                 anyhow::ensure!(
                     item.params.is_greedy(),
                     "n-gram speculative draft currently supports greedy sampling only"
                 );
-                let context = self.ngram_ctx.get(&item.request_id).ok_or_else(|| {
-                    anyhow::anyhow!("missing n-gram context for {:?}", item.request_id)
-                })?;
-                let drafts = ngram.propose(context);
+                let drafts = if drafting {
+                    let context = self.ngram_ctx.get(&item.request_id).ok_or_else(|| {
+                        anyhow::anyhow!("missing n-gram context for {:?}", item.request_id)
+                    })?;
+                    ngram.propose(context)
+                } else {
+                    Vec::new()
+                };
+                any_drafted |= !drafts.is_empty();
                 // Verify span = [current dangling token, draft_1, …, draft_K].
                 let mut token_ids = Vec::with_capacity(1 + drafts.len());
                 token_ids.push(item.current_token);
@@ -2067,6 +2086,13 @@ impl ModelExecutor for Qwen3Executor {
                     request_id: item.request_id,
                     token_ids,
                 });
+            }
+            // No draft produced (gate closed, or open but every request missed)
+            // means no verify forward runs this step, so advance the gate's probe
+            // clock toward the next re-check. A step that did draft updates the
+            // acceptance estimate from its verify result instead (see spec.rs).
+            if !any_drafted {
+                self.ngram_gate.record_skipped();
             }
             return Ok(DraftResult { requests });
         }

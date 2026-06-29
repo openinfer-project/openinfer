@@ -15,7 +15,7 @@
 //! module so the lookup logic can be unit-tested in isolation.
 
 /// Configuration for [`NgramProposer`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NgramConfig {
     /// Largest suffix length to match. Longer suffixes are tried first because
     /// they are more specific (a longer match is a stronger predictor).
@@ -24,6 +24,13 @@ pub struct NgramConfig {
     pub min_ngram: usize,
     /// Maximum number of speculative tokens proposed per step.
     pub num_speculative: usize,
+    /// Mean accepted-draft-tokens-per-step below which speculation is judged not
+    /// worth its verify forward, so the engine falls back to plain decode (see
+    /// [`NgramGate`]). On non-repetitive text (e.g. prose) prompt-lookup drafts
+    /// are almost never accepted, and at higher concurrency the wasted verify
+    /// compute is a net throughput loss; gating recovers it. `0.0` disables the
+    /// gate (always speculate).
+    pub accept_threshold: f32,
 }
 
 impl Default for NgramConfig {
@@ -32,6 +39,7 @@ impl Default for NgramConfig {
             max_ngram: 3,
             min_ngram: 1,
             num_speculative: 4,
+            accept_threshold: 0.3,
         }
     }
 }
@@ -40,8 +48,8 @@ impl std::fmt::Display for NgramConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "K={}, max_ngram={}",
-            self.num_speculative, self.max_ngram
+            "K={}, max_ngram={}, accept_threshold={}",
+            self.num_speculative, self.max_ngram, self.accept_threshold
         )
     }
 }
@@ -54,6 +62,7 @@ impl NgramConfig {
     ///
     /// * `OPENINFER_QWEN3_NGRAM_TOKENS` = draft count `K`.
     /// * `OPENINFER_QWEN3_NGRAM_MAX_NGRAM` = longest suffix to match.
+    /// * `OPENINFER_QWEN3_NGRAM_ACCEPT_THRESHOLD` = gate threshold (`0` disables).
     #[must_use]
     pub fn from_env() -> Self {
         let defaults = Self::default();
@@ -62,11 +71,17 @@ impl NgramConfig {
             min_ngram: defaults.min_ngram,
             num_speculative: env_usize("OPENINFER_QWEN3_NGRAM_TOKENS")
                 .unwrap_or(defaults.num_speculative),
+            accept_threshold: env_f32("OPENINFER_QWEN3_NGRAM_ACCEPT_THRESHOLD")
+                .unwrap_or(defaults.accept_threshold),
         }
     }
 }
 
 fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
@@ -91,9 +106,15 @@ impl NgramProposer {
             config: NgramConfig {
                 max_ngram,
                 min_ngram,
-                num_speculative: config.num_speculative,
+                ..config
             },
         }
+    }
+
+    /// The (clamped) configuration this proposer was built with.
+    #[must_use]
+    pub(crate) fn config(&self) -> NgramConfig {
+        self.config
     }
 
     /// Propose up to `num_speculative` continuation tokens for `context`
@@ -145,6 +166,75 @@ fn latest_earlier_match(context: &[u32], suffix: &[u32]) -> Option<usize> {
     (0..len - n).rev().find(|&i| &context[i..i + n] == suffix)
 }
 
+/// Engine-wide switch that decides whether n-gram speculation is currently
+/// paying for itself.
+///
+/// Speculation is only a win when enough drafted tokens are accepted to offset
+/// the verify forward (which costs ~`K + 1`× a plain decode). On repetitive text
+/// acceptance is high and this stays open; on prose it collapses to near zero, so
+/// the gate closes and decoding falls back to plain — recovering the throughput
+/// the wasted verify would otherwise burn, which matters most at the higher batch
+/// sizes where the GPU has no spare compute to hide it.
+///
+/// The estimate is a single EWMA of accepted draft tokens per step, updated only
+/// when we actually drafted. While closed the gate **probes** once every
+/// `PROBE_INTERVAL` steps so a shift into repetitive text re-opens it. An initial
+/// warmup keeps it open until there is enough data to judge.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NgramGate {
+    /// EWMA of accepted draft tokens per drafted step.
+    accept_ewma: f32,
+    /// Drafted steps observed so far (capped at `WARMUP_STEPS`).
+    warmup_left: u32,
+    /// Steps elapsed since the gate last allowed a draft (drives probing).
+    since_draft: u32,
+}
+
+impl NgramGate {
+    /// Smoothing for the acceptance EWMA: low enough to react within a handful
+    /// of steps when a request switches between repetitive and prose regions.
+    const EWMA_ALPHA: f32 = 0.2;
+    /// Always speculate for this many drafted steps before trusting the EWMA.
+    const WARMUP_STEPS: u32 = 8;
+    /// While closed, allow one probing draft every this many steps.
+    const PROBE_INTERVAL: u32 = 32;
+
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            accept_ewma: 0.0,
+            warmup_left: Self::WARMUP_STEPS,
+            since_draft: 0,
+        }
+    }
+
+    /// Whether this step should draft. Open during warmup, while recent
+    /// acceptance clears the threshold, or on a periodic probe. A non-positive
+    /// threshold disables gating (always open).
+    #[must_use]
+    pub(crate) fn should_draft(&self, threshold: f32) -> bool {
+        threshold <= 0.0
+            || self.warmup_left > 0
+            || self.accept_ewma >= threshold
+            || self.since_draft >= Self::PROBE_INTERVAL
+    }
+
+    /// Record the outcome of a step that drafted: `accepted` is the mean number
+    /// of draft tokens verify took across the step's drafted requests. Resets the
+    /// probe clock and folds the count into the EWMA.
+    pub(crate) fn record_drafted(&mut self, accepted: f32) {
+        self.since_draft = 0;
+        self.warmup_left = self.warmup_left.saturating_sub(1);
+        self.accept_ewma += Self::EWMA_ALPHA * (accepted - self.accept_ewma);
+    }
+
+    /// Record a step that did not draft (gate closed, or no match found), so the
+    /// probe clock advances toward the next re-check.
+    pub(crate) fn record_skipped(&mut self) {
+        self.since_draft = self.since_draft.saturating_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +244,7 @@ mod tests {
             max_ngram,
             min_ngram,
             num_speculative: k,
+            ..NgramConfig::default()
         })
     }
 
@@ -216,10 +307,59 @@ mod tests {
             max_ngram: 0,
             min_ngram: 5,
             num_speculative: 2,
+            ..NgramConfig::default()
         });
         // With max_ngram clamped to 1, a single-token recurrence still works:
         // suffix [3] recurs at index 0, so the follower [1, 3] is proposed.
         let ctx = [3u32, 1, 3];
         assert_eq!(p.propose(&ctx), vec![1, 3]);
+    }
+
+    #[test]
+    fn gate_disabled_with_nonpositive_threshold() {
+        let mut gate = NgramGate::new();
+        // Drive acceptance to zero; a zero threshold must keep speculating.
+        for _ in 0..50 {
+            gate.record_drafted(0.0);
+        }
+        assert!(gate.should_draft(0.0));
+    }
+
+    #[test]
+    fn gate_closes_after_warmup_on_low_acceptance() {
+        let mut gate = NgramGate::new();
+        // Warmup keeps it open even while acceptance reads zero.
+        for _ in 0..NgramGate::WARMUP_STEPS {
+            assert!(gate.should_draft(0.3));
+            gate.record_drafted(0.0);
+        }
+        // Warmup spent + EWMA below threshold -> closed.
+        assert!(!gate.should_draft(0.3));
+    }
+
+    #[test]
+    fn gate_stays_open_on_high_acceptance() {
+        let mut gate = NgramGate::new();
+        for _ in 0..20 {
+            gate.record_drafted(3.0);
+        }
+        assert!(gate.should_draft(0.3));
+    }
+
+    #[test]
+    fn gate_probes_after_cooldown_then_recovers() {
+        let mut gate = NgramGate::new();
+        for _ in 0..NgramGate::WARMUP_STEPS {
+            gate.record_drafted(0.0);
+        }
+        assert!(!gate.should_draft(0.3), "closed after low-acceptance warmup");
+        // Skipping for PROBE_INTERVAL steps re-opens it for one probe.
+        for _ in 0..NgramGate::PROBE_INTERVAL {
+            gate.record_skipped();
+        }
+        assert!(gate.should_draft(0.3), "probe re-opens the gate");
+        // A probe that finds repetitive text (high acceptance) keeps it open.
+        gate.record_drafted(4.0);
+        assert!(gate.should_draft(0.3));
     }
 }

@@ -7,14 +7,14 @@ longest greedy-agreed prefix plus one model token. Greedy verification is
 **lossless** — output is bit-for-bit identical to plain greedy decode, just
 fewer forward passes on repetitive / structured text (code, quoting, JSON).
 The KV layer (kvbm) already supports speculative scheduling natively, so
-rejected drafts need no manual rollback.
+rejected drafts need no manual rollback. An **acceptance gate** (`NgramGate`)
+closes speculation when recent draft acceptance is too low to pay for the verify
+forward, so low-acceptance traffic (prose) falls back to plain decode instead of
+regressing — see *Serving A/B* below.
 
-Last touched: 2026-06 · Status: **end-to-end implemented and gated behind a
-(default-off) `SpeculativeConfig`: proposer, greedy acceptance, KV speculative
-pass-throughs, the executor verify forward (`execute_speculative`,
-GPU-validated lossless), and the scheduler serving-loop wiring
-(`speculative_decode_step`, mock-tested). Remaining: a public config knob to
-turn it on, and a speedup measurement.**
+Last touched: 2026-06 · Enabled via `--ngram-speculative`; proposer, greedy
+acceptance, KV speculative pass-throughs, the verify forward, scheduler wiring,
+and the acceptance gate are all landed and GPU-validated lossless.
 
 ## Why this is cheap to add here
 
@@ -137,6 +137,9 @@ parses its own knobs (`NgramConfig::from_env`):
 - `OPENINFER_QWEN3_SPEC=1` — turn speculation on (generic).
 - `OPENINFER_QWEN3_NGRAM_TOKENS=K` — draft count (n-gram, default 4).
 - `OPENINFER_QWEN3_NGRAM_MAX_NGRAM=N` — longest matched suffix (n-gram, default 3).
+- `OPENINFER_QWEN3_NGRAM_ACCEPT_THRESHOLD=f` — acceptance gate threshold (mean
+  accepted draft tokens/step below which speculation falls back to plain decode;
+  default 0.3, `0` disables the gate). See *Serving A/B* below.
 
 Only the non-LoRA `scheduler_loop` reads it; the unified prefill+decode tick
 still uses plain decode.
@@ -149,17 +152,6 @@ to argmax and a logprobs request would silently lose them. Any ineligible
 request takes a normal sampled single-token decode (its own params, logprobs,
 and a fresh `random_val`) on that tick, so enabling speculation never changes a
 sampled request's output or strips requested logprobs.
-
-## Remaining work
-
-1. **First-class config knob**: env var is the current switch; thread a typed
-   knob through `start_qwen3*` / `start_engine*` (and a server flag) so it shows
-   up in the engine config rather than the environment.
-2. **Speedup measurement** (initial numbers below — generalize to realistic
-   prompts and the scheduler loop).
-3. **Batched / vLLM-style verify** (perf): fold the verify tokens into the
-   unified batched forward (FlashInfer varlen) with a GPU rejection step,
-   instead of the current per-request `batch_prefill`-based verify.
 
 ## Measured speedup (best case)
 
@@ -180,6 +172,69 @@ exists to track acceptance-rate / TPOT as the proposer and verify path evolve.
 Run: `cargo test -p openinfer-qwen3-4b --release --test ngram_speculative \
 ngram_speculative_speedup -- --ignored --nocapture` (`OPENINFER_BENCH_TOKENS`
 overrides the 192-token default).
+
+## Serving A/B (`vllm bench serve`) and the acceptance gate
+
+Synthetic best-case is the ceiling; serving throughput on real datasets is the
+contract. Single RTX 4090, Qwen3-4B, `temperature=0`, `--ignore-eos`,
+`--no-prefix-cache`, 12 prompts × 128 output tokens, sonnet (550/128, prefix 200)
+and random (550/128). `Δ` is n-gram vs plain decode on the **same** engine;
+vLLM (0.21 / 0.23, ngram `K=4`, `prompt_lookup_max=3`) is the reference.
+
+| dataset / conc | acceptance | vLLM 0.23 Δ | openinfer (no gate) Δ | **openinfer (gate) Δ** |
+| --- | --- | --- | --- | --- |
+| sonnet c1 | ~5% | −5.8% | −26.2% | **+0.6%** |
+| sonnet c4 | ~7% | −5.8% | −40.0% | **−2.2%** |
+| random c1 | ~33% | +19.3% | −10.3% | **+21.8%** |
+| random c4 | ~37% | +17.0% | −33.8% | **−20.0%** |
+
+Reading this:
+
+- **Prose (sonnet) acceptance is ~5–7%** — prompt-lookup drafts are almost never
+  the model's greedy continuation, so *every* engine loses here (vLLM included).
+  Without the gate the loss is severe (−40% at c4) because each step pays the
+  verify forward (a `K+1`-wide prefill-kernel pass) plus, when only some requests
+  matched, a second plain-decode pass — both wasted. The gate detects the low
+  acceptance and falls back to plain decode, recovering the regression to ≈0 and
+  **beating vLLM**, which keeps speculating and eats its −6%.
+- **random c1 matches vLLM** (+21.8% vs +19.3%): low concurrency leaves the GPU
+  compute-idle, so the gate stays open and the ~33% acceptance is a free win.
+- **random c4 is the open gap**: vLLM **+17%** vs openinfer **−20%** at the *same*
+  ~37% acceptance (proven by the matching c1 numbers). This is purely the verify
+  path — see below. The gate can't help here: acceptance is high, so it correctly
+  stays open; the loss is in *how* we verify, not *whether* we should.
+
+**Root cause of the random-c4 gap (nsys, `--cuda-graph-trace=node`).** At c4 the
+GPU is already ~92% busy on plain decode. Under n-gram the same 22 s window shows
+the attention running through the **prefill** kernel (`BatchPrefill`, ~23 µs)
+instead of the decode kernel (`BatchDecode`, ~15 µs), ~989 verify forwards **plus**
+~887 decode forwards (the batch splits two ways every mixed step), and ~43% more
+GEMM. vLLM instead runs **one fused forward**: draft tokens are extra rows in the
+same batch (a missed request is just `query_len=1`), verified by one rejection
+step — no second pass, no prefill-kernel penalty, no ragged-span CUDA-graph
+thrash. Folding our verify into that single unified forward is the way to turn
+random-c4 positive; it is tracked as the follow-up below, not in this PR.
+
+## The acceptance gate (`NgramGate`)
+
+`openinfer-qwen3-4b/src/ngram.rs`. Engine-wide EWMA of accepted draft tokens per
+drafted step. `should_draft` opens while in warmup, while the EWMA clears
+`accept_threshold`, or on a periodic probe; otherwise the proposer returns
+nothing for the step and the existing draft/undraft partition routes the whole
+batch to plain decode (no verify forward). The probe (every `PROBE_INTERVAL`
+steps) re-opens it so a shift into repetitive text is picked back up. Lossless
+either way — gating only changes *whether* we speculate, never the committed
+tokens. Unit-tested (`gate_*` in `ngram.rs`); the engine-level losslessness gate
+(`tests/ngram_speculative_gate.rs`) still passes with the gate live.
+
+## Remaining work / follow-up
+
+1. **Single fused verify forward** (the random-c4 fix, separate PR): fold the
+   verify tokens into one unified batched forward (FlashInfer varlen) with a GPU
+   rejection step — a missed request becomes a `query_len=1` row in the same
+   batch — instead of the current `batch_prefill`-based verify plus the second
+   plain-decode pass for undrafted requests. The *Serving A/B* above quantifies
+   the prize: closing the ~37-point random-c4 gap to vLLM (+17% vs −20%).
 
 ## Scope / deferred
 
