@@ -14,6 +14,13 @@
 //! handled by the decode path and are intentionally out of scope for this
 //! module so the lookup logic can be unit-tested in isolation.
 
+use std::collections::HashMap;
+
+use anyhow::Result;
+
+use crate::executor::RequestId;
+use crate::speculative::{DraftRequestResult, DraftStepItem};
+
 /// Configuration for [`NgramProposer`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NgramConfig {
@@ -232,6 +239,110 @@ impl NgramGate {
     /// probe clock advances toward the next re-check.
     pub(crate) fn record_skipped(&mut self) {
         self.since_draft = self.since_draft.saturating_add(1);
+    }
+}
+
+/// Owns all per-engine n-gram speculative state: the stateless [`NgramProposer`],
+/// the [`NgramGate`], and each request's running token context (prompt + every
+/// committed token, always ending on the dangling token the next draft continues
+/// from). This is the single home for the method's state so the executor drives
+/// it through intent-level calls (`seed` / `append_committed` / `drop_request` /
+/// `propose_step` / `record_verified`) instead of threading three fields through
+/// every execution path. Held inside [`crate::executor::SpeculativeMethod::Ngram`].
+pub(crate) struct NgramRuntime {
+    proposer: NgramProposer,
+    gate: NgramGate,
+    /// Per-request running context. Present once a request's prompt is prefilled
+    /// (see [`Self::seed`]); the proposer scans it for prompt-lookup matches.
+    ctx: HashMap<RequestId, Vec<u32>>,
+}
+
+impl NgramRuntime {
+    #[must_use]
+    pub(crate) fn new(config: NgramConfig) -> Self {
+        Self {
+            proposer: NgramProposer::new(config),
+            gate: NgramGate::new(),
+            ctx: HashMap::new(),
+        }
+    }
+
+    /// Seed a freshly-prefilled request's context (`prompt + first_token`). Later
+    /// commits extend it via [`Self::append_committed`].
+    pub(crate) fn seed(&mut self, request_id: RequestId, context: Vec<u32>) {
+        self.ctx.insert(request_id, context);
+    }
+
+    /// Append committed tokens to a request's context, keeping it anchored on the
+    /// new dangling token. No-op for an unseeded request (defensive).
+    pub(crate) fn append_committed(&mut self, request_id: RequestId, tokens: &[u32]) {
+        if let Some(context) = self.ctx.get_mut(&request_id) {
+            context.extend_from_slice(tokens);
+        }
+    }
+
+    /// Forget a retired request's context.
+    pub(crate) fn drop_request(&mut self, request_id: RequestId) {
+        self.ctx.remove(&request_id);
+    }
+
+    /// Whether a request can speculate: its prompt is prefilled and context
+    /// seeded (n-gram keeps no captured hidden state, so that is all it needs).
+    #[must_use]
+    pub(crate) fn is_ready(&self, request_id: RequestId) -> bool {
+        self.ctx.contains_key(&request_id)
+    }
+
+    /// Build the verify spans for one speculative step. The gate is consulted
+    /// once: when closed, no request drafts, so every span is just
+    /// `[current_token]` and the scheduler routes the whole batch to plain decode.
+    /// Advances the gate's probe clock when the step produced no draft.
+    pub(crate) fn propose_step(
+        &mut self,
+        items: &[DraftStepItem],
+    ) -> Result<Vec<DraftRequestResult>> {
+        let drafting = self
+            .gate
+            .should_draft(self.proposer.config().accept_threshold);
+        let mut any_drafted = false;
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            anyhow::ensure!(
+                item.params.is_greedy(),
+                "n-gram speculative draft currently supports greedy sampling only"
+            );
+            let drafts = if drafting {
+                let context = self.ctx.get(&item.request_id).ok_or_else(|| {
+                    anyhow::anyhow!("missing n-gram context for {:?}", item.request_id)
+                })?;
+                self.proposer.propose(context)
+            } else {
+                Vec::new()
+            };
+            any_drafted |= !drafts.is_empty();
+            // Verify span = [current dangling token, draft_1, …, draft_K].
+            let mut token_ids = Vec::with_capacity(1 + drafts.len());
+            token_ids.push(item.current_token);
+            token_ids.extend(drafts);
+            results.push(DraftRequestResult {
+                request_id: item.request_id,
+                token_ids,
+            });
+        }
+        // No draft produced (gate closed, or open but every request missed) means
+        // no verify forward runs this step, so advance the probe clock. A step
+        // that drafted updates the acceptance estimate via `record_verified`.
+        if !any_drafted {
+            self.gate.record_skipped();
+        }
+        Ok(results)
+    }
+
+    /// Fold a verify forward's mean accepted-draft-tokens into the gate. Called
+    /// only when a verify ran, i.e. the gate was open and at least one request
+    /// drafted.
+    pub(crate) fn record_verified(&mut self, mean_accepted: f32) {
+        self.gate.record_drafted(mean_accepted);
     }
 }
 

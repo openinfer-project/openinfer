@@ -139,20 +139,16 @@ impl Qwen3Executor {
         // Keep the n-gram running context in sync: append every committed token
         // so the next draft scans the full history and continues from the new
         // dangling token. DFlash keeps its own per-request hidden state instead.
-        if self.ngram_proposer().is_some() {
+        // This verify forward ran because the gate was open, so also fold its
+        // mean accepted-draft-tokens into the gate (`result.requests` is the
+        // drafted subset, hence non-empty here).
+        if let Some(runtime) = self.ngram_runtime_mut() {
             for req_result in &result.requests {
-                self.ngram_ctx
-                    .entry(req_result.request_id)
-                    .or_default()
-                    .extend_from_slice(&req_result.accepted_tokens);
+                runtime.append_committed(req_result.request_id, &req_result.accepted_tokens);
             }
-            // Feed the acceptance gate: this verify forward ran because the gate
-            // was open, so fold its mean accepted-draft-tokens into the estimate.
-            // `result.requests` is the drafted subset, so it is non-empty here.
             if !result.requests.is_empty() {
                 let accepted: usize = result.requests.iter().map(|r| r.matched_draft_tokens).sum();
-                let mean = accepted as f32 / result.requests.len() as f32;
-                self.ngram_gate.record_drafted(mean);
+                runtime.record_verified(accepted as f32 / result.requests.len() as f32);
             }
         }
 
