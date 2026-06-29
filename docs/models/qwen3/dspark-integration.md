@@ -210,7 +210,7 @@ Per-case mean accepted draft tokens:
 - **Method:** `run_sweep.sh` (session scratch, on the 5090 at `/data/dspark-bench/`) launches each server and runs `/root/.cargo/bin/vllm-bench` across chat / poem / rand / code × c1/c4/c8, parsing tok/s + `cumulative_accept_rate` from the server log. Raw artifacts were copied to `/tmp/openinfer-bench/dspark-sweep-20260629/` locally; `accept_distribution.csv` there has the per-case histograms.
 - **MTP metric note:** the Python `vllm bench serve --help=all` on this 5090 exposes a `spec_bench` dataset, but not direct MTP/spec accept metrics. The Rust `vllm-bench` result JSON also only contains standard serving metrics. For accepted length, use OpenInfer's `accepted_draft` / `committed_tokens` log lines until we add a structured metric.
 - **Invalid rows:** `low_entropy`/`high_entropy` are absent from the selected SPEED-Bench split in this harness, so their JSON files are missing and those rows are dropped.
-- **The accept log** (`cumulative_accept_rate`) is currently emitted at `info` once per request per decode step for measurement — **gate or aggregate it before shipping** (too noisy for production info).
+- **The accept trace** (`cumulative_accept_rate`) is `debug`-level only. It is useful for one-off DSpark/DFlash acceptance analysis, but production's default `info` logging must not emit one line per request per verify round; use a debug run or a structured metric for future acceptance studies.
 
 ## Integration delta — what's new on top of DFlash (Phase 1)
 

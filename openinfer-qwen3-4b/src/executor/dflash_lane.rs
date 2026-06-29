@@ -140,7 +140,7 @@ impl LocalQwen3Lane {
 
     /// Seed the next draft round from a verify step: append the target hidden
     /// states for the *accepted* span positions to each request's pending
-    /// context, and log the cumulative acceptance rate.
+    /// context, and keep the cumulative acceptance trace at debug level.
     pub(super) fn record_verify_dflash_context(
         &mut self,
         requests: &[VerifyStepItem],
@@ -195,7 +195,7 @@ impl LocalQwen3Lane {
             } else {
                 dflash.accepted_draft_tokens as f64 / dflash.verified_draft_tokens as f64
             };
-            log::info!(
+            log::debug!(
                 "Qwen3 DFlash request={} accepted_draft={} committed_tokens={} cumulative_accept_rate={:.3}",
                 req.request_id.get(),
                 result.matched_draft_tokens,
