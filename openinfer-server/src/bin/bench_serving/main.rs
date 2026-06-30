@@ -193,6 +193,11 @@ fn main() -> Result<()> {
                 openinfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
                 false,
                 max_prefill_tokens,
+                openinfer_qwen3_4b::Qwen3MemoryOptions::default(),
+                openinfer_qwen3_4b::DecodeOverlap::Off,
+                false,
+                None,
+                false,
             )?;
             finish(handle, cli.cuda_graph)
         }

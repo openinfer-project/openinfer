@@ -2,7 +2,8 @@
 
 **Created**: 2026-05-03
 **Status**: complete
-**TL;DR**: openinfer should evolve as reusable frontend/data-plane infrastructure plus per-model engines, not as one universal model abstraction. The first concrete step is extracting a kernels crate; kernels then become first-class assets through an index, ledger, simulator, and request tracing. PegaFlow remains the KV data plane instead of being folded into model internals.
+**Last touched**: 2026-06
+**TL;DR**: openinfer should evolve as reusable frontend/data-plane infrastructure plus per-model engines, not as one universal model abstraction. `openinfer-kernels` now separates shared MoE/MLA third-party substrate (`moe`: DeepEP/DeepGEMM/FlashMLA) from model-local surfaces (`glm52`: narrow DeepGEMM + FlashMLA sparse decode wrappers). PegaFlow remains the KV data plane instead of being folded into model internals.
 
 ## Preparation
 
@@ -66,6 +67,17 @@ LLM coding is cheap enough that maintaining clean model-local context can be mor
 ## Kernel Boundary
 
 Kernel performance and correctness dominate model quality. The first reusable code artifact should be a kernels crate, not a larger model trait. The first reusable knowledge artifact on top of that crate should be a compact kernel index and then a kernel ledger.
+
+The `openinfer-kernels` feature boundary separates model entry points from shared third-party substrates. Model features such as `kimi-k2` describe which model-local CUDA/Rust surface is built; the `moe` feature owns the MoE/MLA dependency substrate (`DeepEP`, `DeepGEMM`, `FlashMLA`) so future MoE model lines can reuse those repositories without making one model feature the build switch for another model's communication or attention backend.
+
+`glm52` builds on that substrate as a narrow model-local surface: it currently exposes DeepGEMM scale-layout/grouped-FP8 contracts plus FlashMLA sparse decode wrappers. The FlashMLA sparse wrapper is SM90-only, fixes V32 `topk=2048`, and does not expose dynamic `topk_length`; the grouped DeepGEMM compute entry is fail-closed with `CUDA_ERROR_NOT_SUPPORTED` until a real runner is wired. Router, indexer/top-k, PP P2P, TRTLLM fallbacks, and local route/scatter/combine kernels remain out of the shared surface until the GLM5.2 model crate proves it needs them as stable kernel contracts.
+
+## GLM5.2 MoE Substrate Work
+
+- **Read**: `docs/index.md`, this boundary doc, `openinfer-kernels/KERNELS.md`, GLM5.2 wrapper files under `openinfer-kernels/src/ops/glm52`, `openinfer-kernels/src/ffi/glm52`, and `openinfer-kernels/csrc/glm52`.
+- **Execution log**: added the `moe` substrate feature, made `glm52` depend on it, gated DeepEP on `moe`, added DeepGEMM/FlashMLA submodule checks, and exposed only the GLM5.2 DeepGEMM scale-layout/grouped-contract plus FlashMLA sparse-decode interfaces.
+- **Review follow-up**: removed `topk_length` from the FlashMLA sparse ABI because the V32 kernel requires it to be null, bounded `num_sm_parts` to FlashMLA's 160 split cap, converted C++ assertion exceptions at the FlashMLA FFI boundary to `CUresult`, and documented that upstream `CHECK_CUDA`/`FLASH_ASSERT` can still terminate the process on internal CUDA/launch failures.
+- **Debrief**: the shared surface is now intentionally narrow. Future GLM5.2 work should wire the real DeepGEMM grouped runner and add model-owned router/indexer/PP contracts only after the model crate has concrete callers.
 
 A kernel ledger should track:
 

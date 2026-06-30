@@ -100,6 +100,20 @@ AG/RS.
 | `kimi_k2.moe.marlin_align_block_size` | `openinfer-kimi-k2` | `ops::kimi_moe_marlin_align_block_size` | `kimi_moe_marlin_align_block_size_cuda` | `csrc/kimi_k2/kimi_experts.cu` | CUDA routing metadata | Device-resident vLLM Marlin/WNA16 alignment: `sorted_token_ids`, `expert_ids`, and `num_tokens_post_padded` for local EP experts. It ignores non-local experts like vLLM `ignore_invalid_experts=True`, pads each local expert to block size `8/16/32/48/64`, uses sentinel `active_tokens * topk`, and performs no D2H or allocation in the decode step. |
 | `kimi_k2.moe.int4_marlin_package` | `openinfer-kimi-k2` | `ops::kimi_marlin_int4_reorder_weight`, `ops::kimi_marlin_int4_reorder_scale`, `ops::kimi_marlin_int4_fuse_w13` | `kimi_marlin_int4_reorder_weight_cuda`, `kimi_marlin_int4_reorder_scale_cuda`, `kimi_marlin_int4_fuse_w13_cuda` | `csrc/kimi_k2/kimi_marlin_int4.cu` | CUDA load-time package helpers | Weight package preserves vLLM `uint4b8` bias=8 nibbles. Single projections repack checkpoint `[expert,out,K/8] int32` into Marlin no-actorder `[expert,K/16,N*2] int32`; scale package converts checkpoint `[expert,out,K/32]` into vLLM Marlin group-major+perm64 `[expert,K/32,out]`. Final runtime package fuses gate/up into W13 `[expert,K/16,4096*2]` and W13 scale `[expert,K/32,4096]`; W2 remains `[expert,2048/16,7168*2]` and `[expert,2048/32,7168]`. These are load/package helpers, not decode hot-path kernels. |
 
+## GLM5.2 MoE Bring-Up Surface
+
+GLM5.2 uses the `openinfer-kernels/glm52` feature, which depends on the shared
+`moe` substrate for DeepEP, DeepGEMM, and FlashMLA. The current surface is only
+the GLM5.2 decode substrate that has a stable caller shape; router/indexer,
+pipeline-parallel P2P, TRTLLM fallbacks, and local route/scatter/combine stay out
+until the model crate proves their contracts.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbols | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `glm52.deepgemm.scale_layout` | future GLM5.2 model crate | `ops::glm52_deepgemm_mn_major_tma_aligned_f32_launch` | `glm52_deepgemm_mn_major_tma_aligned_f32_cuda` | `csrc/glm52/glm52_deepgemm_layout.cu` | CUDA layout helper for DeepGEMM | Converts row-major f32 scales `[rows, scale_cols]` into MN-major/TMA-aligned storage with `aligned_rows` padded to 16-byte f32 row alignment. |
+| `glm52.deepgemm.grouped_fp8_contract` | future GLM5.2 model crate | `ops::glm52_deepgemm_grouped_fp8_contract_validate`, `ops::glm52_deepgemm_grouped_fp8_metadata_launch`, `ops::glm52_deepgemm_grouped_fp8_launch` | `glm52_deepgemm_grouped_fp8_contract_cuda`, `glm52_deepgemm_grouped_fp8_metadata_cuda`, `glm52_deepgemm_grouped_fp8_launch_cuda` | `csrc/glm52/glm52_deepgemm_grouped.cu` | CUDA metadata shim over DeepGEMM ABI | W13 contract is `N=4096,K=6144`, W2 contract is `N=6144,K=2048`; expert alignment is 64 rows. Metadata generation is real; grouped FP8 compute returns `CUDA_ERROR_NOT_SUPPORTED` until a real DeepGEMM runner is wired. |
+| `glm52.flashmla.sparse_decode` | future GLM5.2 model crate | `ops::glm52_flashmla_sparse_decode_num_sm_parts`, `ops::glm52_flashmla_sparse_decode_metadata_launch`, `ops::glm52_flashmla_sparse_decode_launch` | `glm52_flashmla_sparse_decode_num_sm_parts_cuda`, `glm52_flashmla_sparse_decode_metadata_cuda`, `glm52_flashmla_sparse_decode_launch_cuda` | `csrc/glm52/glm52_flashmla_sparse.cu` | FlashMLA SM90 sparse decode | SM90-only sparse decode for V32 layout: `batch<=128`, `heads=64`, `qk_dim=576`, `v_dim=512`, `page_size=64`, packed KV token stride `656`, fixed `topk=2048`, and `num_sm_parts<=160`. Dynamic `topk_length` is intentionally not exposed because this kernel asserts it must be null. |
+
 ## Non-Qwen3 Compatibility
 
 The crate still builds CUDA/Triton symbols needed by the current root binary:
@@ -112,8 +126,8 @@ These are preserved for build compatibility. They are not part of the Qwen3-4B P
 
 ## Editing Rule
 
-When adding or replacing a kernel used by Qwen3-4B or DeepSeek V4, update this
-routing table.
+When adding or replacing a kernel used by Qwen3-4B, DeepSeek V4, Kimi-K2, or
+GLM5.2, update this routing table.
 
 Do not add model-specific machine-readable manifests here. The kernels crate
 owns reusable operator implementations; model crates should own model DAG

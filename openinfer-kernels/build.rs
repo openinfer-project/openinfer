@@ -264,6 +264,88 @@ fn nvcc_arch_args(normalized_sms: &[String]) -> Vec<String> {
     args
 }
 
+fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
+    let stem = format!(
+        "openinfer_nvcc_probe_{}_compute_{compute}_sm_{sm}",
+        std::process::id()
+    );
+    let cu_path = std::env::temp_dir().join(format!("{stem}.cu"));
+    let obj_path = std::env::temp_dir().join(format!("{stem}.o"));
+    if let Err(err) = fs::write(
+        &cu_path,
+        "extern \"C\" __global__ void openinfer_nvcc_probe() {}\n",
+    ) {
+        println!(
+            "cargo:warning=Failed to write nvcc probe {}: {err}",
+            cu_path.display()
+        );
+        return false;
+    }
+
+    let output = Command::new(nvcc)
+        .args(["-c"])
+        .arg(&cu_path)
+        .arg("-o")
+        .arg(&obj_path)
+        .arg("-gencode")
+        .arg(format!("arch=compute_{compute},code=sm_{sm}"))
+        .output();
+    let _ = fs::remove_file(&cu_path);
+    let _ = fs::remove_file(&obj_path);
+
+    match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            println!(
+                "cargo:warning=nvcc rejected compute_{compute}/sm_{sm} probe: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(err) => {
+            println!("cargo:warning=Failed to run nvcc arch probe: {err}");
+            false
+        }
+    }
+}
+
+fn glm52_flashmla_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String> {
+    let sm90a_supported = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a")
+        && nvcc_accepts_gencode(nvcc, "90a", "90a");
+    let mut promoted_sms = Vec::new();
+    for sm in normalized_sms {
+        let promoted = if sm == "90" || sm == "90a" {
+            if sm90a_supported {
+                "90a"
+            } else {
+                println!(
+                    "cargo:warning=nvcc cannot compile compute_90a/sm_90a; GLM5.2 FlashMLA sparse decode will use sm_{sm}"
+                );
+                sm
+            }
+        } else {
+            sm
+        };
+
+        if !promoted_sms.iter().any(|existing| existing == promoted) {
+            promoted_sms.push(promoted.to_string());
+        }
+    }
+
+    if promoted_sms != normalized_sms {
+        println!(
+            "cargo:warning=Compiling GLM5.2 FlashMLA sparse decode for nvcc targets: {}",
+            promoted_sms
+                .iter()
+                .map(|sm| format!("sm_{sm}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    nvcc_arch_args(&promoted_sms)
+}
+
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("Failed to read {}: {err}", dir.display()))
@@ -310,8 +392,8 @@ fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
-/// DeepEP elastic shim (csrc/deepep/): Kimi-K2's EP all-to-all backend.
-/// Compiled only with the `kimi-k2` feature; needs NCCL >= 2.30.4 headers/lib.
+/// DeepEP elastic shim (csrc/deepep/): shared MoE EP all-to-all substrate.
+/// Compiled only with the `moe` feature; needs NCCL >= 2.30.4 headers/lib.
 fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
         Ok(relative) => relative
@@ -319,6 +401,46 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
             .any(|part| part.as_os_str() == "deepep"),
         Err(_) => false,
     }
+}
+
+/// GLM5.2 model-local CUDA shims over DeepGEMM/FlashMLA contracts.
+fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "glm52"),
+        Err(_) => false,
+    }
+}
+
+fn require_submodule_file(root: &Path, feature: &str, label: &str, relative: &str) {
+    let path = root.join(relative);
+    assert!(
+        path.exists(),
+        "The {feature} feature requires the {label} submodule. Missing {}. Run `git submodule update --init --recursive {}`.",
+        path.display(),
+        relative
+    );
+}
+
+fn require_moe_submodules(root: &Path) {
+    require_submodule_file(root, "moe", "DeepEP", "third_party/DeepEP/README.md");
+    require_submodule_file(root, "moe", "DeepGEMM", "third_party/DeepGEMM/README.md");
+    require_submodule_file(
+        root,
+        "moe",
+        "FlashMLA",
+        "third_party/FlashMLA/csrc/params.h",
+    );
+}
+
+fn require_glm52_submodules(root: &Path) {
+    require_submodule_file(
+        root,
+        "glm52",
+        "FlashMLA nested CUTLASS",
+        "third_party/FlashMLA/csrc/cutlass/include/cutlass/bfloat16.h",
+    );
 }
 
 /// NCCL >= 2.30.4 root (include/nccl.h + lib/libnccl.so.2) for the DeepEP
@@ -332,7 +454,7 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
 fn deepep_nccl_root() -> PathBuf {
     let Ok(root) = std::env::var("OPENINFER_NCCL_ROOT").map(PathBuf::from) else {
         panic!(
-            "The kimi-k2 feature builds the DeepEP shim, which needs NCCL >= 2.30.4. \
+            "The moe feature builds the DeepEP shim, which needs NCCL >= 2.30.4. \
              Set OPENINFER_NCCL_ROOT to an install with include/nccl.h and lib/libnccl.so.2 \
              (e.g. the unpacked nvidia-nccl-cu13 wheel)."
         )
@@ -1129,6 +1251,8 @@ fn main() {
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
+    let moe_enabled = cfg!(feature = "moe");
+    let glm52_enabled = cfg!(feature = "glm52");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
     let qwen35_enabled = cfg!(feature = "qwen35-4b");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
@@ -1163,6 +1287,12 @@ fn main() {
         BTreeSet::from(["activation.cu", "embedding.cu", "fused_attention.cu"]);
 
     let root = crate_root();
+    if moe_enabled {
+        require_moe_submodules(&root);
+    }
+    if glm52_enabled {
+        require_glm52_submodules(&root);
+    }
     let csrc_dir = root.join("csrc");
     let mut csrc_files = Vec::new();
     collect_files_recursively(&csrc_dir, &mut csrc_files);
@@ -1176,9 +1306,13 @@ fn main() {
             if !deepseek_v2_lite_enabled && is_deepseek_v2_lite_source(&csrc_dir, path) {
                 return None;
             }
-            if !kimi_k2_enabled
-                && (is_kimi_k2_source(&csrc_dir, path) || is_deepep_source(&csrc_dir, path))
-            {
+            if !moe_enabled && is_deepep_source(&csrc_dir, path) {
+                return None;
+            }
+            if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
+                return None;
+            }
+            if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
                 return None;
             }
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
@@ -1217,7 +1351,7 @@ fn main() {
         flashinfer.include.display()
     );
 
-    let deepep_nccl = kimi_k2_enabled.then(deepep_nccl_root);
+    let deepep_nccl = moe_enabled.then(deepep_nccl_root);
 
     let mut nvcc_tasks = Vec::new();
     for cu_file in &cu_files {
@@ -1235,7 +1369,11 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        nvcc_args.extend(arch_args.clone());
+        if stem == "glm52_flashmla_sparse" {
+            nvcc_args.extend(glm52_flashmla_arch_args(&nvcc_sm_targets, &nvcc));
+        } else {
+            nvcc_args.extend(arch_args.clone());
+        }
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
         // Files that include FlashInfer headers (C++17, header-only)
@@ -1283,7 +1421,7 @@ fn main() {
         if is_deepep_source(&csrc_dir, cu_file) {
             let nccl_root = deepep_nccl
                 .as_ref()
-                .expect("deepep sources are collected only with the kimi-k2 feature");
+                .expect("deepep sources are collected only with the moe feature");
             nvcc_args.extend(
                 [
                     "--std=c++20",
@@ -1331,6 +1469,38 @@ fn main() {
             ]);
         }
 
+        if stem == "glm52_flashmla_sparse" {
+            let flashmla = root.join("third_party/FlashMLA/csrc");
+            nvcc_args.extend([
+                "--std=c++20".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-I".to_string(),
+                flashmla.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("cutlass/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("cutlass/tools/util/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("kerutils/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
+            ]);
+        } else if stem.starts_with("glm52_") {
+            nvcc_args.extend(["--std=c++17".to_string()]);
+        }
+
         nvcc_tasks.push(NvccTask {
             cu_file: cu_file.clone(),
             obj_file,
@@ -1341,6 +1511,16 @@ fn main() {
     if !deepseek_enabled {
         println!(
             "cargo:warning=DeepSeek V4 CUDA/TileLang kernels disabled; enable the openinfer-kernels `deepseek-v4` feature to build them"
+        );
+    }
+    if !moe_enabled {
+        println!(
+            "cargo:warning=MoE third-party substrate disabled; enable the openinfer-kernels `moe` feature to build DeepEP-backed kernels"
+        );
+    }
+    if !glm52_enabled {
+        println!(
+            "cargo:warning=GLM5.2 DeepGEMM/FlashMLA interfaces disabled; enable the openinfer-kernels `glm52` feature to build them"
         );
     }
     if !kimi_k2_enabled {
@@ -1533,5 +1713,13 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         root.join("third_party/DeepEP/deep_ep/include").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("third_party/DeepGEMM").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("third_party/FlashMLA").display()
     );
 }

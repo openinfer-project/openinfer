@@ -1,12 +1,14 @@
 //! GPU operations on device tensors.
 
 mod attention;
-#[cfg(feature = "kimi-k2")]
+#[cfg(feature = "moe")]
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
 mod elementwise;
 mod embedding;
+#[cfg(feature = "glm52")]
+mod glm52;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
 mod linear;
@@ -20,7 +22,7 @@ pub use attention::{
     prefill_attention_paged_into, qk_norm_partial_rope_batched_decode_hd256_into,
     qk_norm_rope_batch_decode_into, single_prefill_nhd_noncausal_into,
 };
-#[cfg(feature = "kimi-k2")]
+#[cfg(feature = "moe")]
 pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
 };
@@ -35,6 +37,8 @@ pub use elementwise::{
     silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
 };
 pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
+#[cfg(feature = "glm52")]
+pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{

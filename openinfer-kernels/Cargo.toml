@@ -25,7 +25,10 @@ qwen35-4b = []
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
 deepseek-v2-lite = []
-kimi-k2 = []
+# Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
+moe = []
+glm52 = ["moe"]
+kimi-k2 = ["moe"]
 
 [[example]]
 name = "triton_cubin_tvm_ffi"
