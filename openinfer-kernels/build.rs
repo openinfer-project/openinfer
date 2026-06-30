@@ -1498,6 +1498,7 @@ fn main() {
                 flashinfer.cutlass_util.to_string_lossy().to_string(),
             ]);
         } else if stem == "glm52_trtllm_grouped_fp8" {
+            let flashmla = root.join("third_party/FlashMLA/csrc");
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
             }
@@ -1529,6 +1530,16 @@ fn main() {
                 flashinfer
                     .csrc
                     .join("nv_internal/tensorrt_llm/cutlass_extensions/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("cutlass/include")
+                    .to_string_lossy()
+                    .to_string(),
+                "-I".to_string(),
+                flashmla
+                    .join("cutlass/tools/util/include")
                     .to_string_lossy()
                     .to_string(),
                 "-I".to_string(),
