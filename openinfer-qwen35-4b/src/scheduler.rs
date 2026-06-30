@@ -20,8 +20,8 @@ use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
-    EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, TokenEvent,
-    TokenLogprob, TokenSink,
+    EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, KvCapacity,
+    TokenEvent, TokenLogprob, TokenSink,
 };
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
@@ -85,10 +85,12 @@ pub fn start_with_capacity(
     );
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
+    let total_blocks = model.kv_pool().capacity_pages().saturating_sub(1);
+    let block_size = model.kv_pool().layout().page_size;
     let servable = servable_len(
         model.config().max_position_embeddings,
-        model.kv_pool().capacity_pages().saturating_sub(1),
-        model.kv_pool().layout().page_size,
+        total_blocks,
+        block_size,
     );
     let graph_state = model.create_batch_decode_graph_state_with_capacity(max_batch)?;
 
@@ -115,7 +117,14 @@ pub fn start_with_capacity(
         let _ = join_handle.join();
         return Err(err);
     }
-    Ok(SchedulerHandle::new_with_join_handle(submit_tx, join_handle).with_servable_len(servable))
+    Ok(
+        SchedulerHandle::new_with_join_handle(submit_tx, join_handle)
+            .with_servable_len(servable)
+            .with_kv_capacity(KvCapacity {
+                total_blocks,
+                block_size,
+            }),
+    )
 }
 
 fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {

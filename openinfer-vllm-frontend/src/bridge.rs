@@ -58,21 +58,31 @@ impl LocalEngineBridge {
             )
         })?;
 
+        let kv_capacity = self.handle.kv_capacity();
         let ready = EngineCoreReadyResponse {
-            max_model_len: self.max_model_len as u64,
-            num_gpu_blocks: 0,
-            // TODO(#401): report the real paged-KV block size and capacity from the
-            // openinfer scheduler once the vLLM frontend consumes ready_response KV fields.
-            block_size: 16,
+            max_model_len: u64::from(self.max_model_len),
+            num_gpu_blocks: kv_capacity.map_or(0, |c| c.total_blocks as u64),
+            block_size: kv_capacity.map_or(16, |c| c.block_size as u64),
             dp_stats_address: None,
             dtype: ModelDtype::BFloat16,
             vllm_version: "openinfer-local-bridge".to_string(),
-            // The in-process bridge fronts a single engine instance.
             world_size: 1,
             data_parallel_size: 1,
-            kv_cache_size_tokens: None,
-            kv_cache_max_concurrency: None,
+            kv_cache_size_tokens: kv_capacity.map(|c| c.total_tokens() as u64),
+            // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
+            kv_cache_max_concurrency: kv_capacity.map(|c| {
+                let blocks_per_req = u64::from(self.max_model_len).div_ceil(c.block_size as u64);
+                c.total_blocks as f64 / blocks_per_req as f64
+            }),
         };
+        info!(
+            "local engine KV capacity: {kv_capacity:?} -> num_gpu_blocks={} \
+             block_size={} kv_cache_size_tokens={:?} kv_cache_max_concurrency={:?}",
+            ready.num_gpu_blocks,
+            ready.block_size,
+            ready.kv_cache_size_tokens,
+            ready.kv_cache_max_concurrency
+        );
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))
             .await
