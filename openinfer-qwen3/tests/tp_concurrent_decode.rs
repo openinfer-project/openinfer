@@ -67,6 +67,7 @@ fn tp2_concurrent_decode_completes() {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: None,
+        eagle3_draft_model_path: None,
         enable_kv_events: false,
     };
     // Dropping the handle joins the scheduler thread; on a panic the engine may be

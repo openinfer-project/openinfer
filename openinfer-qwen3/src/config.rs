@@ -133,6 +133,33 @@ struct RawDFlashConfig {
     num_anchors: Option<usize>,
 }
 
+/// EAGLE-3 drafter config (e.g. `AngelSlim/Qwen3-4B_eagle3`).
+///
+///  A single-layer (`midlayer`) head whose attention takes
+/// `2 * hidden_size` inputs (concatenated `[norm(embed), norm(fused_hidden)]`),
+/// has no QK-norm, reuses the target's `embed_tokens`, and predicts over a
+/// reduced `draft_vocab_size` remapped to the full vocab via `d2t`/`t2d`.
+// EAGLE3_TMP： `intermediate_size` / `rms_norm_eps` are consumed by the draft forward (not
+// yet wired); the loader only reads geometry. Drop this once the lane lands.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct Eagle3Config {
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) head_dim: usize,
+    /// Target's full vocabulary (logits are projected back into this space).
+    pub(crate) vocab_size: usize,
+    /// Reduced vocabulary the draft `lm_head` predicts over (rows of `d2t`).
+    pub(crate) draft_vocab_size: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    #[serde(default = "default_max_position_embeddings")]
+    pub(crate) max_position_embeddings: usize,
+}
+
 fn default_max_position_embeddings() -> usize {
     40960
 }
@@ -375,6 +402,59 @@ impl DFlashConfig {
                 self.markov_head_type
             );
         }
+        Ok(())
+    }
+}
+
+impl Eagle3Config {
+    pub(crate) fn from_file(model_path: &str) -> Result<Self> {
+        let config_path = format!("{}/config.json", model_path);
+        let content = fs::read_to_string(&config_path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    pub(crate) fn validate_for_target(&self, target: &Config) -> Result<()> {
+        anyhow::ensure!(
+            self.hidden_size == target.hidden_size,
+            "EAGLE-3 hidden_size {} does not match target {}",
+            self.hidden_size,
+            target.hidden_size
+        );
+        anyhow::ensure!(
+            self.num_hidden_layers == 1,
+            "EAGLE-3 drafter must have exactly one decoder layer (midlayer), got {}",
+            self.num_hidden_layers
+        );
+        anyhow::ensure!(
+            self.num_attention_heads == target.num_attention_heads
+                && self.num_key_value_heads == target.num_key_value_heads
+                && self.head_dim == target.head_dim,
+            "EAGLE-3 attention geometry does not match target"
+        );
+        anyhow::ensure!(
+            self.vocab_size == target.vocab_size,
+            "EAGLE-3 vocab_size {} does not match target {}",
+            self.vocab_size,
+            target.vocab_size
+        );
+        anyhow::ensure!(
+            self.draft_vocab_size > 0 && self.draft_vocab_size <= self.vocab_size,
+            "EAGLE-3 draft_vocab_size {} must be in 1..={}",
+            self.draft_vocab_size,
+            self.vocab_size
+        );
+        anyhow::ensure!(
+            self.rope_theta == target.rope_theta,
+            "EAGLE-3 rope_theta {} does not match target {}",
+            self.rope_theta,
+            target.rope_theta
+        );
+        anyhow::ensure!(
+            self.max_position_embeddings >= target.max_position_embeddings,
+            "EAGLE-3 max_position_embeddings {} is smaller than target {}",
+            self.max_position_embeddings,
+            target.max_position_embeddings
+        );
         Ok(())
     }
 }

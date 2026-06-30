@@ -323,6 +323,23 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // Plain RoPE (no QK-norm) for EAGLE-3 — no norm-weight / eps params.
+    pub fn eagle3_rope_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_len: i32,
+        k_len: i32,
+        q_start_pos: i32,
+        k_start_pos: i32,
+        cos_max_pos: i32,
+        stream: CUstream,
+    ) -> i32;
+
     // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
     pub fn paged_kv_scatter_cuda(
         kv_data: *const Half,
@@ -465,6 +482,22 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn single_prefill_nhd_noncausal_cuda_hd64(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Causal NHD single-sequence prefill (same layout, causal mask).
+    pub fn single_prefill_nhd_causal_cuda(
         q: *const Half,
         output: *mut Half,
         k_cache: *const Half,

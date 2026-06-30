@@ -121,6 +121,14 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
         args.dflash_draft_model_path.is_none() || wires_drafter,
         "--dflash-draft-model-path is only supported for Qwen3 and GLM5.2 (got {model_type:?})"
     );
+    anyhow::ensure!(
+        args.eagle3_draft_model_path.is_none() || is_qwen3,
+        "--eagle3-draft-model-path is only supported for Qwen3 (got {model_type:?})"
+    );
+    anyhow::ensure!(
+        !(args.dflash_draft_model_path.is_some() && args.eagle3_draft_model_path.is_some()),
+        "--dflash-draft-model-path and --eagle3-draft-model-path are mutually exclusive"
+    );
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => openinfer_deepseek_v4::launch(
@@ -227,6 +235,24 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 }
                 None => None,
             };
+            let eagle3_draft_model_path = match args.eagle3_draft_model_path.clone() {
+                Some(path) => {
+                    anyhow::ensure!(
+                        !args.enable_lora,
+                        "--eagle3-draft-model-path is not supported with --enable-lora"
+                    );
+                    anyhow::ensure!(
+                        !args.kv_offload,
+                        "--eagle3-draft-model-path is not supported with --kv-offload"
+                    );
+                    anyhow::ensure!(
+                        args.tp_size == 1,
+                        "--eagle3-draft-model-path currently requires --tp-size=1"
+                    );
+                    Some(path)
+                }
+                None => None,
+            };
             openinfer_qwen3::launch(
                 &args.model_path,
                 Qwen3LaunchOptions {
@@ -248,6 +274,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
                     batch_invariant: args.batch_invariant,
                     dflash_draft_model_path,
+                    eagle3_draft_model_path,
                     // KV block events are a Dynamo-backend concern; the plain
                     // server never publishes them.
                     enable_kv_events: false,

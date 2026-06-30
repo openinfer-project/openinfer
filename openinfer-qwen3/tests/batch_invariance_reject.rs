@@ -28,6 +28,7 @@ fn batch_invariant_rejects_decode_overlap() {
         DecodeOverlap::SharedSm,
         true,
         None,
+        None,
         false,
     )
     .err()
@@ -57,6 +58,7 @@ fn batch_invariant_rejects_dflash() {
         DecodeOverlap::Off,
         true,
         Some(Path::new("/nonexistent-draft")),
+        None,
         false,
     )
     .err()

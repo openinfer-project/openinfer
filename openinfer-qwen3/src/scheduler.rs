@@ -150,6 +150,7 @@ pub(crate) fn start_qwen3(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
     dflash_draft_model_path: Option<&str>,
+    eagle3_draft_model_path: Option<&str>,
     enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
@@ -160,6 +161,7 @@ pub(crate) fn start_qwen3(
         offload_options,
         max_prefill_tokens,
         dflash_draft_model_path,
+        eagle3_draft_model_path,
         memory_options,
         enable_kv_events,
     )?;
@@ -171,6 +173,9 @@ pub(crate) fn start_qwen3(
     // was already reserved during profiling from the draft path passed above.
     if let Some(draft_path) = dflash_draft_model_path {
         executor.load_dflash_draft_model(draft_path)?;
+    }
+    if let Some(draft_path) = eagle3_draft_model_path {
+        executor.load_eagle3_draft_model(draft_path)?;
     }
 
     Ok(start_with_executor(executor, seed, max_prefill_tokens))
@@ -195,6 +200,7 @@ pub(crate) fn start_qwen3_with_lora_control(
         lora_options,
         offload_options,
         max_prefill_tokens,
+        None,
         None,
         memory_options,
         // LoRA serving never emits KV events: the router-facing cache feed is

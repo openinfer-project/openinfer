@@ -139,6 +139,7 @@ fn live_gpu_and_cpu_prefix_hits() {
         Qwen3OffloadOptions::enabled(HOST_TIER_BYTES),
         openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS,
         None,
+        None,
         openinfer_qwen3::Qwen3MemoryOptions::default(),
         false,
     )
