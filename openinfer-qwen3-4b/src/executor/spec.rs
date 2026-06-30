@@ -17,7 +17,7 @@ impl Qwen3Executor {
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
+            self.speculative.is_some() || self.eagle3.is_some(),
             "speculative verification requested but no draft model is loaded"
         );
         for req in plan.requests {
@@ -31,8 +31,9 @@ impl Qwen3Executor {
                 "speculative verification currently supports greedy sampling only"
             );
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative verification requested before DFlash state is ready for {:?}",
+                self.dflash_ready_requests.contains(&req.request_id)
+                    || self.eagle3_ready_requests.contains(&req.request_id),
+                "speculative verification requested before draft state is ready for {:?}",
                 req.request_id
             );
             anyhow::ensure!(
@@ -142,7 +143,7 @@ impl Qwen3Executor {
         plan: DraftPlan<'_>,
     ) -> Result<DraftResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
+            self.speculative.is_some() || self.eagle3.is_some(),
             "speculative draft requested but no draft model is loaded"
         );
         for req in plan.requests {
@@ -151,8 +152,9 @@ impl Qwen3Executor {
                 "speculative draft currently supports greedy sampling only"
             );
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative draft requested before DFlash state is ready for {:?}",
+                self.dflash_ready_requests.contains(&req.request_id)
+                    || self.eagle3_ready_requests.contains(&req.request_id),
+                "speculative draft requested before draft state is ready for {:?}",
                 req.request_id
             );
         }

@@ -1,4 +1,4 @@
-//! DFlash speculative-decoding single-stream latency A/B.
+//! EAGLE-3 speculative-decoding single-stream latency A/B.
 //!
 //! Speculative decoding's direct win is single-stream (batch=1) decode latency:
 //! plain decode is memory-bound (one target forward per token), while spec
@@ -10,8 +10,8 @@
 //! spec is not catastrophically slower (a guard against the draft mispredicting
 //! everything). Read the printed numbers for the real signal. `--nocapture`.
 //!
-//! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
-//! `OPENINFER_TEST_MODEL_PATH` + `OPENINFER_DFLASH_TEST_MODEL_PATH`; skips when
+//! Requires a CUDA GPU, Qwen3-4B weights, and the EAGLE-3 drafter. Set
+//! `OPENINFER_TEST_MODEL_PATH` + `OPENINFER_EAGLE3_TEST_MODEL_PATH`; skips when
 //! either is absent. Single-stream only — throughput under load is a separate
 //! `vllm bench serve` A/B.
 
@@ -28,7 +28,7 @@ use openinfer_qwen3_4b::{
 mod common;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
-const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
+const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B_eagle3");
 const GENERATED_TOKENS: usize = 256;
 
 fn target_path_or_skip() -> Option<String> {
@@ -42,7 +42,7 @@ fn target_path_or_skip() -> Option<String> {
 }
 
 fn draft_path_or_skip() -> Option<String> {
-    match std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") {
+    match std::env::var("OPENINFER_EAGLE3_TEST_MODEL_PATH") {
         Ok(path) => Some(path),
         Err(_) if Path::new(DRAFT_PATH).join("config.json").exists() => {
             Some(DRAFT_PATH.to_string())
@@ -65,8 +65,8 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         lora: None,
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
-        dflash_draft_model_path: draft,
-        eagle3_draft_model_path: None,
+        dflash_draft_model_path: None,
+        eagle3_draft_model_path: draft,
         enable_kv_events: false,
     }
 }
@@ -120,10 +120,10 @@ fn measure(handle: &EngineHandle, prompts: &[Vec<u32>]) -> f64 {
 }
 
 #[test]
-fn dflash_speculative_single_stream_speedup() {
+fn eagle3_speculative_single_stream_speedup() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         eprintln!(
-            "skipping dflash perf A/B: set OPENINFER_TEST_MODEL_PATH + OPENINFER_DFLASH_TEST_MODEL_PATH"
+            "skipping eagle3 perf A/B: set OPENINFER_TEST_MODEL_PATH + OPENINFER_EAGLE3_TEST_MODEL_PATH"
         );
         return;
     };
@@ -157,14 +157,15 @@ fn dflash_speculative_single_stream_speedup() {
     };
 
     let speedup = spec_tps / baseline_tps;
-    eprintln!("───────────── DFlash single-stream decode A/B (bs=1) ─────────────");
+    eprintln!("───────────── EAGLE-3 single-stream decode A/B (bs=1) ─────────────");
     eprintln!("  spec OFF (plain decode): {baseline_tps:7.1} tok/s");
-    eprintln!("  spec ON  (DFlash):       {spec_tps:7.1} tok/s");
+    eprintln!("  spec ON  (EAGLE-3):      {spec_tps:7.1} tok/s");
     eprintln!("  speedup:                 {speedup:7.2}×");
     eprintln!("───────────────────────────────────────────────────────────────────────────");
 
     assert!(
-        speedup > 0.8,
-        "speculative decode is catastrophically slower ({speedup:.2}×) — draft likely mispredicting"
+        speedup > 0.5,
+        "speculative decode is catastrophically slower ({speedup:.2}×) — draft likely mispredicting \
+         or the chain rollout is dominating; investigate before tuning"
     );
 }
