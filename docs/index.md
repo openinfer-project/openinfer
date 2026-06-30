@@ -49,6 +49,14 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/kernel-plan.md` | Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3 module — enumerates every prefill/decode/unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites. Pure refactor (issue #256), no kernel behavior change. |
 | `models/qwen35/batched-step-tail.md` | Qwen3.5 issue #353 implementation record: final prefill tail is batched, decode/unified sample from batched logits, host full-vocab copies are logprobs-only, HF + scheduler e2e pass, and final serving A/B supports only the first-token/short-output TTFT claim. |
 
+## models / glm52
+
+| Path | TL;DR |
+| --- | --- |
+| `models/glm52/tokenspeed-kernel-gap.md` | 对照 TokenSpeed GLM5.2 kernel DAG，并标出后续搬运入口：OpenInfer 当前只暴露 DeepGEMM scale layout、grouped FP8 合约/metadata、FlashMLA sparse decode；仍缺 DSA indexer logits、Blackwell TRTLLM sparse MLA、deterministic top-k、FP8 token-group quant、index-K cache layout、Hadamard 和 MoE/router/expert 主路径。 |
+| `models/glm52/load-weights-dp1-ep8.md` | GLM5.2 load-weight-only slice from latest main: rank0 loads non-expert tensors plus experts 0..31, ranks1..7 load 32 routed experts each, optimized real-checkpoint load measured `63420ms` first run / `50803ms` repeat via rank-local slabs + coalesced H2D + CUDA-event mmap lifetime guard, and generation fails closed until forward lands. |
+| `models/glm52/dp1-ep8-decode-plan.md` | Five sub-PRs from the PR #476 load-weight scaffold to DP1/EP8 DSA decode serving: PR1 MLA projection/absorb/cache brick (full top-k, short-context DSA-equivalent), PR2 DSA indexer chain (DeepGEMM paged MQA logits + FlashInfer deterministic top-k=2048 + slot conversion), PR3 EP1 full forward (dense+MoE+bookends), PR4 DeepEP EP8 MoE all-to-all, PR5 scheduler+CUDA Graph. Flags `glm52_moe_quant.cu`, `glm52_mla_assembly.cu`, `glm52_indexer.cu` as hand-written perf debt. |
+
 ## models / deepseek-v4
 
 | Path | TL;DR |
@@ -92,12 +100,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/kimi-k2/tp1-dp8-ep8-performance.md` | TP1 DP8 EP8 性能优化 ledger：O1 prompt_len1 decode admission 过 vLLM bs64 gate；O2 落地 5 个 decode kernel cherry-pick（cuBLASLt fixed-shape GEMM、argmax split、router fusion），精度由 base-vs-opt prefill logits A/B 压在 bf16 ULP 底，PPLX Marlin small-N tile 因 `-inf`/SIGSEGV 被定性为原分支精度破坏点并拒绝；bs64 TPOT 噪声内持平（p50 `40.58→40.09ms`）。 |
 | `models/kimi-k2/source-layout.md` | Kimi-K2 source files over 1k lines were split by responsibility; the largest Rust file under `openinfer-kimi-k2/src` is now `layers/attention.rs` at 950 lines. |
 | `models/kimi-k2/dp-design.md` | TP×DP 可配置并行：每 DP rank 是独立 decode engine，EP all-to-all 天然 sync，轻量 load balancer 做 request 路由。首批 TP1×DP8 + TP8×DP1。 |
-
-## models / glm52
-
-| Path | TL;DR |
-| --- | --- |
-| `models/glm52/load-weights-dp1-ep8.md` | GLM5.2 load-weight-only slice from latest main: rank0 loads non-expert tensors plus experts 0..31, ranks1..7 load 32 routed experts each, optimized real-checkpoint load measured `63420ms` first run / `50803ms` repeat via rank-local slabs + coalesced H2D + CUDA-event mmap lifetime guard, and generation fails closed until forward lands. |
 
 ## subsystems / runtime
 
