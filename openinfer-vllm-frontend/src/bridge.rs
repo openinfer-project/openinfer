@@ -59,29 +59,37 @@ impl LocalEngineBridge {
         })?;
 
         let kv_capacity = self.handle.kv_capacity();
+        let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
+            match kv_capacity {
+                Some(c) => {
+                    // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
+                    let blocks_per_req =
+                        u64::from(self.max_model_len).div_ceil(c.block_size as u64);
+                    (
+                        c.total_blocks as u64,
+                        c.block_size as u64,
+                        Some(c.total_tokens() as u64),
+                        Some(c.total_blocks as f64 / blocks_per_req as f64),
+                    )
+                }
+                None => (0, 16, None, None),
+            };
         let ready = EngineCoreReadyResponse {
             max_model_len: u64::from(self.max_model_len),
-            num_gpu_blocks: kv_capacity.map_or(0, |c| c.total_blocks as u64),
-            block_size: kv_capacity.map_or(16, |c| c.block_size as u64),
+            num_gpu_blocks,
+            block_size,
             dp_stats_address: None,
             dtype: ModelDtype::BFloat16,
             vllm_version: "openinfer-local-bridge".to_string(),
             world_size: 1,
             data_parallel_size: 1,
-            kv_cache_size_tokens: kv_capacity.map(|c| c.total_tokens() as u64),
-            // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
-            kv_cache_max_concurrency: kv_capacity.map(|c| {
-                let blocks_per_req = u64::from(self.max_model_len).div_ceil(c.block_size as u64);
-                c.total_blocks as f64 / blocks_per_req as f64
-            }),
+            kv_cache_size_tokens,
+            kv_cache_max_concurrency,
         };
         info!(
-            "local engine KV capacity: {kv_capacity:?} -> num_gpu_blocks={} \
-             block_size={} kv_cache_size_tokens={:?} kv_cache_max_concurrency={:?}",
-            ready.num_gpu_blocks,
-            ready.block_size,
-            ready.kv_cache_size_tokens,
-            ready.kv_cache_max_concurrency
+            "local engine KV capacity: {kv_capacity:?} -> \
+             kv_cache_size_tokens={kv_cache_size_tokens:?} \
+             kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
         );
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))
