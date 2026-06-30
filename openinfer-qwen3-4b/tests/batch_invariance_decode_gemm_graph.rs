@@ -9,7 +9,9 @@
 //!     -p openinfer-qwen3-4b --test batch_invariance_decode_gemm_graph -- --nocapture
 
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
+use openinfer_kernels::ops::{
+    NumericPolicy, pin_served, reset_numeric_policy_counters, set_numeric_policy,
+};
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
 };
@@ -105,7 +107,7 @@ fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64)>
     ex.set_prefix_cache_enabled(false);
     let mut out = Vec::new();
     for (_, small, large) in PAIRS {
-        reset_pin_counters();
+        reset_numeric_policy_counters();
         let (ft_s, tk_s) = a_first_and_decode(&mut ex, small);
         let (ft_l, tk_l) = a_first_and_decode(&mut ex, large);
         let served = pin_served();

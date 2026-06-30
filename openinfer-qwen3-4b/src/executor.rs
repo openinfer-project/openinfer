@@ -559,15 +559,16 @@ fn tune_decode_gemm_algos(
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
 
-    use openinfer_kernels::ops::{NumericPolicy, gemm_lt_pin_warmup, numeric_policy};
+    use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
     if numeric_policy() == NumericPolicy::Pin {
         // Eager pin before capture: the lazy pin-workspace alloc is illegal mid-capture.
-        gemm_lt_pin_warmup(q_dim, hidden)?;
-        gemm_lt_pin_warmup(kv_dim, hidden)?;
-        gemm_lt_pin_warmup(hidden, q_dim)?;
-        gemm_lt_pin_warmup(intermediate, hidden)?;
-        gemm_lt_pin_warmup(hidden, intermediate)?;
-        gemm_lt_pin_warmup(vocab, hidden)?;
+        crate::batch_decode_buffers::warmup_decode_projection_pins(
+            hidden,
+            q_dim,
+            kv_dim,
+            intermediate,
+            vocab,
+        )?;
         let max_context = model.config().max_position_embeddings;
         log::info!(
             "Qwen3 split-KV decode chunk pinned: {} tokens (max_context_tokens={max_context})",
@@ -636,16 +637,18 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
     // pads to a bucket (≤ max_decode_batch_size) and unified gathers ≤ that many requests, while
     // echo/all-position runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
     let lm_head_max_n = max_prefill_tokens.max(*BATCH_BUCKETS.last().unwrap());
-    let shapes: [(usize, usize, usize); 6] = [
-        (q_dim, hidden, ceiling),
-        (kv_dim, hidden, ceiling),
-        (hidden, q_dim, ceiling),
-        (intermediate, hidden, ceiling),
-        (hidden, intermediate, ceiling),
-        (model.config().vocab_size, hidden, lm_head_max_n),
-    ];
+    let shapes = crate::batch_decode_buffers::decode_projection_pin_shapes(
+        hidden,
+        q_dim,
+        kv_dim,
+        intermediate,
+        model.config().vocab_size,
+    );
+    // Per-shape N upper bound, in the same lm_head-last order as `shapes`: the unified-N peak for
+    // every projection, the sampled-position count for lm_head.
+    let max_ns = [ceiling, ceiling, ceiling, ceiling, ceiling, lm_head_max_n];
     let mut checks = 0usize;
-    for &(m, k, max_n) in &shapes {
+    for (&(m, k), &max_n) in shapes.iter().zip(max_ns.iter()) {
         for n in 1..=max_n {
             if !gemm_lt_pin_check(m, n, k)? {
                 anyhow::bail!(

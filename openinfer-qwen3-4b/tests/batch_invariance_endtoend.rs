@@ -11,7 +11,9 @@
 //!     -p openinfer-qwen3-4b --test batch_invariance_endtoend -- --nocapture
 
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
+use openinfer_kernels::ops::{
+    NumericPolicy, pin_served, reset_numeric_policy_counters, set_numeric_policy,
+};
 use openinfer_qwen3_4b::runtime::{PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId};
 
 const LOGPROBS: usize = 64;
@@ -85,7 +87,7 @@ fn batch_invariance_endtoend() {
         ex.set_prefix_cache_enabled(false);
         let alone = dist_for_first(&mut ex, &[(id_a, prompt_a.clone())]);
         for &nb in &nbs {
-            reset_pin_counters();
+            reset_numeric_policy_counters();
             let id_b = RequestId::new(1000 + nb as u64);
             let batched = dist_for_first(
                 &mut ex,

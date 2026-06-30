@@ -2,7 +2,9 @@
 //! lengths (so the projection GEMM runs at different N) must give a bit-identical top-K under Pin.
 //! The pure-Decode-vs-Unified cross-path case drifts even under Pin and is the `#[ignore]` below.
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
+use openinfer_kernels::ops::{
+    NumericPolicy, pin_served, reset_numeric_policy_counters, set_numeric_policy,
+};
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId, UnifiedPlan,
 };
@@ -49,7 +51,7 @@ fn unified_decode_row(
     let t0 = prefill_first(ex, id_a, p);
     let id_b = RequestId::new(id_pf);
     let chunk: Vec<u32> = (0..cobatch as u32).map(|i| (i % 1000) + 10).collect();
-    reset_pin_counters();
+    reset_numeric_policy_counters();
     let ur = ex
         .execute_unified(UnifiedPlan {
             prefill_requests: &[PrefillStepItem::new(
@@ -78,7 +80,7 @@ fn unified_decode_row(
 fn pure_decode_row(ex: &mut Qwen3Executor, p: &[u32], id_dec: u64) -> Vec<(u32, f32)> {
     let id = RequestId::new(id_dec);
     let t0 = prefill_first(ex, id, p);
-    reset_pin_counters();
+    reset_numeric_policy_counters();
     let dr = ex
         .execute_decode(DecodePlan {
             requests: &[DecodeStepItem::new(id, t0, SamplingParams::default(), 64)],

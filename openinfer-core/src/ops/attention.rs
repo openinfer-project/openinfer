@@ -3,10 +3,6 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use super::PrefillPagedPlan;
-#[cfg(feature = "kernel-call-trace")]
-use super::call_trace;
-#[cfg(feature = "kernel-call-trace")]
-use super::traced;
 use crate::kv_pool::KvLayout;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -71,20 +67,6 @@ pub fn paged_attention_batch_decode_into(
     num_qo_heads: usize,
     batch_size: usize,
 ) -> Result<()> {
-    #[cfg(feature = "kernel-call-trace")]
-    if call_trace::is_enabled() {
-        let label = call_trace::current_label("paged_decode_attention");
-        call_trace::record_call(traced::paged_decode_call_spec(
-            label,
-            q,
-            k,
-            kv_buffer.len(),
-            layout,
-            num_qo_heads,
-            batch_size,
-            "non_partition",
-        ));
-    }
     openinfer_kernels::ops::paged_attention_batch_decode_into(
         ctx,
         q,
@@ -132,20 +114,6 @@ pub fn paged_attention_batch_decode_split_kv_into(
     num_qo_heads: usize,
     batch_size: usize,
 ) -> Result<()> {
-    #[cfg(feature = "kernel-call-trace")]
-    if call_trace::is_enabled() {
-        let label = call_trace::current_label("paged_decode_attention");
-        call_trace::record_call(traced::paged_decode_call_spec(
-            label,
-            q,
-            k,
-            kv_buffer.len(),
-            layout,
-            num_qo_heads,
-            batch_size,
-            "split_kv_256x64",
-        ));
-    }
     openinfer_kernels::ops::paged_attention_batch_decode_split_kv_into(
         ctx,
         q,

@@ -14,6 +14,7 @@ mod lora;
 mod prefill;
 mod scheduler;
 mod speculative;
+mod split_kv;
 mod unified_forward;
 mod verify_graph;
 mod weights;

@@ -21,7 +21,9 @@ use openinfer_core::engine::{
     EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy, pin_served, reset_pin_counters};
+use openinfer_kernels::ops::{
+    NumericPolicy, numeric_policy, pin_served, reset_numeric_policy_counters,
+};
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -138,11 +140,11 @@ fn scheduler_survives_consumer_drop() {
     // Barrier: drain the dropped orphan before the counted runs (else its prefill leaks into prefill_served).
     let _ = generate_text(&handle, &tokenizer, "Hello", 1);
 
-    reset_pin_counters();
+    reset_numeric_policy_counters();
     let _ = generate_text(&handle, &tokenizer, "Hello", 1);
     let prefill_served = pin_served();
 
-    reset_pin_counters();
+    reset_numeric_policy_counters();
     let text = generate_text(&handle, &tokenizer, "Hello", 5);
     let full_served = pin_served();
     eprintln!("[scheduler-robustness] pin served: prefill={prefill_served} full={full_served}");

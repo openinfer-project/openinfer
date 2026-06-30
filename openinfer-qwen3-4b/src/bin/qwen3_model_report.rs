@@ -14,16 +14,18 @@ use openinfer_bench::{
 };
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
+use openinfer_kernels::ops::{
+    NumericPolicy, per_token_served, pin_served, reset_numeric_policy_counters, set_numeric_policy,
+};
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates, KernelCall, TensorSpec};
 use openinfer_qwen3_4b::batch_decode_trace::{
     HEAD_DIM_VALUE, KV_DIM_VALUE, MODEL, NUM_KV_HEADS, NUM_LAYERS, NUM_Q_HEADS, PHASE_DECODE,
     RMS_NORM_EPS, normalize_call_site, trace_decode_kernel_calls,
 };
-use openinfer_qwen3_4b::kernel_bench::{L2CacheClear, SplitKvConfig};
+use openinfer_qwen3_4b::kernel_bench::{L2CacheClear, build_split_kv_csr};
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 32;
-const DEFAULT_SPLIT_KV: SplitKvConfig = SplitKvConfig::new(256, 64);
 
 #[derive(Parser)]
 #[command(about = "Qwen3-4B model-level operator report")]
@@ -42,6 +44,9 @@ struct Cli {
     iters: u64,
     #[arg(long, default_value = "models/Qwen3-4B")]
     model_path: String,
+    /// Numeric policy to trace + measure under, matching production: `tuned` | `pin` | `per-token`.
+    #[arg(long, default_value = "tuned")]
+    policy: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -54,6 +59,13 @@ struct ModelReport {
     schedule_source: String,
     total_measured_us: f64,
     total_p99_us: f64,
+    /// True when `total_measured_us` excludes an op (GEMM under Tuned): a partial total.
+    total_is_partial: bool,
+    /// Projection GEMMs served by the pinned cuBLASLt algo this run: >0 under Pin (every GEMM
+    /// serves or the run bails), 0 under Tuned/PerToken.
+    pin_served: u64,
+    /// Projection GEMMs served by the per-token oracle this run: >0 under PerToken, 0 otherwise.
+    per_token_served: u64,
     schedule: Vec<KernelCall>,
     by_op: Vec<RollupRow>,
     by_call_site: Vec<CallSiteRow>,
@@ -67,6 +79,7 @@ struct ReportConfig {
     layers: usize,
     tp_world_size: usize,
     iters: u64,
+    numeric_policy: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -79,10 +92,56 @@ struct CoverageRow {
     key: Option<String>,
 }
 
-#[derive(Clone)]
 struct BenchEntry {
     key: String,
-    stats: LatencyStats,
+    measure: Measure,
+}
+
+/// A measured op under this run's policy: `Faithful` carries the latency that feeds the rollup;
+/// `Excluded` carries only the reason, so no latency exists to leak into the totals or coverage.
+enum Measure {
+    Faithful(LatencyStats),
+    Excluded(ExcludeReason),
+}
+
+#[derive(Clone, Copy)]
+enum ExcludeReason {
+    /// Tuned projection GEMM: the report's untuned context would run plain GemmEx (not the
+    /// production gemm_lt-tuned algo) if measured, so it is classified excluded and skipped.
+    UnfaithfulGemmEx,
+}
+
+impl ExcludeReason {
+    fn status(self) -> &'static str {
+        match self {
+            ExcludeReason::UnfaithfulGemmEx => "unfaithful_gemmex",
+        }
+    }
+}
+
+fn classify(policy: NumericPolicy, op: &str) -> Option<ExcludeReason> {
+    if matches!(op, "gemm" | "gemm_rows") && matches!(policy, NumericPolicy::Tuned) {
+        Some(ExcludeReason::UnfaithfulGemmEx)
+    } else {
+        None
+    }
+}
+
+fn parse_policy(s: &str) -> Result<NumericPolicy> {
+    match s {
+        "tuned" => Ok(NumericPolicy::Tuned),
+        "pin" => Ok(NumericPolicy::Pin),
+        "per-token" => Ok(NumericPolicy::PerToken),
+        other => bail!("--policy must be tuned | pin | per-token, got `{other}`"),
+    }
+}
+
+fn policy_name(p: NumericPolicy) -> &'static str {
+    match p {
+        NumericPolicy::Tuned => "tuned",
+        NumericPolicy::Pin => "pin",
+        NumericPolicy::PerToken => "per-token",
+    }
 }
 
 fn main() -> Result<()> {
@@ -103,14 +162,48 @@ fn main() -> Result<()> {
         bail!("--format must be `text` or `json`");
     }
 
+    let policy = parse_policy(&cli.policy)?;
+    set_numeric_policy(policy);
+
     let schedule = trace_decode_kernel_calls(&cli.model_path, cli.batch_size, cli.kv_len)?;
-    let catalog = measure_catalog(&schedule, cli.iters)
+    reset_numeric_policy_counters();
+    let catalog = measure_catalog(&schedule, cli.iters, policy)
         .with_context(|| "failed to build strict measured catalog")?;
-    let report = compose_report(cli.batch_size, cli.kv_len, cli.iters, schedule, &catalog)?;
+    // launch_gemm_pin bails on an un-warmed shape, with no silent fallback.
+    let pin_served_count = pin_served();
+    if matches!(policy, NumericPolicy::Pin) {
+        anyhow::ensure!(
+            pin_served_count > 0,
+            "no projection GEMM served through the Pin path (served=0); policy didn't take effect or the pins weren't warmed"
+        );
+    }
+    // PerToken must route through the per-token oracle, not silently fall back to GemmEx
+    // (which would still report `measured`).
+    let per_token_served_count = per_token_served();
+    if matches!(policy, NumericPolicy::PerToken) {
+        anyhow::ensure!(
+            per_token_served_count > 0,
+            "no projection GEMM served through the PerToken oracle (served=0); policy didn't take effect"
+        );
+    }
+    let report = compose_report(
+        cli.batch_size,
+        cli.kv_len,
+        cli.iters,
+        schedule,
+        &catalog,
+        policy,
+        pin_served_count,
+        per_token_served_count,
+    )?;
     let out = cli.out.unwrap_or_else(|| {
+        // Key the default path on the policy too: pin/tuned/per-token runs differ, so without it a
+        // later run silently overwrites an earlier one's JSON/DOT.
         PathBuf::from(format!(
-            "target/model_reports/{MODEL}/decode-bs{}-kv{}.json",
-            cli.batch_size, cli.kv_len
+            "target/model_reports/{MODEL}/decode-{}-bs{}-kv{}.json",
+            policy_name(policy),
+            cli.batch_size,
+            cli.kv_len
         ))
     });
     write_json_report(&out, &report)?;
@@ -156,6 +249,9 @@ fn write_dot_report(path: &Path, report: &ModelReport) -> Result<()> {
         .iter()
         .map(|row| (row.call_site.as_str(), row))
         .collect::<HashMap<_, _>>();
+    // Drop sites with no rollup row (e.g. GEMM excluded under Tuned) so the edge chain skips them
+    // instead of leaving Graphviz to auto-create phantom nodes for the dangling endpoints.
+    site_order.retain(|site| rows.contains_key(site.as_str()));
     let mut dot = String::new();
     dot.push_str("digraph qwen3_decode_operator_report {\n");
     dot.push_str("  rankdir=LR;\n");
@@ -205,6 +301,9 @@ fn compose_report(
     iters: u64,
     schedule: Vec<KernelCall>,
     catalog: &HashMap<String, BenchEntry>,
+    policy: NumericPolicy,
+    pin_served_count: u64,
+    per_token_served_count: u64,
 ) -> Result<ModelReport> {
     let mut op_rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut site_rows: BTreeMap<String, (String, Accum)> = BTreeMap::new();
@@ -246,21 +345,29 @@ fn compose_report(
             continue;
         };
 
-        accumulate(op_rows.entry(call.op.clone()).or_default(), &entry.stats);
-        let (_, site_accum) = site_rows
-            .entry(site.clone())
-            .or_insert_with(|| (call.op.clone(), Accum::default()));
-        accumulate(site_accum, &entry.stats);
-
+        if let Measure::Faithful(stats) = &entry.measure {
+            accumulate(op_rows.entry(call.op.clone()).or_default(), stats);
+            let (_, site_accum) = site_rows
+                .entry(site.clone())
+                .or_insert_with(|| (call.op.clone(), Accum::default()));
+            accumulate(site_accum, stats);
+        }
         coverage_rows
             .entry((site.clone(), call.op.clone()))
             .and_modify(|row| row.calls += 1)
             .or_insert(CoverageRow {
                 call_site: site,
                 op: call.op.clone(),
-                status: "measured".to_string(),
+                status: match &entry.measure {
+                    Measure::Faithful(_) => "measured",
+                    Measure::Excluded(reason) => reason.status(),
+                }
+                .to_string(),
                 calls: 1,
-                latency: Some(entry.stats.clone()),
+                latency: match &entry.measure {
+                    Measure::Faithful(stats) => Some(stats.clone()),
+                    Measure::Excluded(_) => None,
+                },
                 key: Some(entry.key.clone()),
             });
     }
@@ -270,7 +377,7 @@ fn compose_report(
     }
 
     // Re-derived from the per-op accumulators (no-op all-reduce contributes 0),
-    // so totals are summed in op order rather than schedule order — a sub-ULP
+    // so totals are summed in op order rather than schedule order, a sub-ULP
     // reshuffle that only touches this untracked target/ report.
     let total = op_rows.values().map(|accum| accum.total_us).sum::<f64>();
     let total_p99 = op_rows
@@ -294,8 +401,12 @@ fn compose_report(
             .then(a.call_site.cmp(&b.call_site))
     });
 
+    let total_is_partial = catalog
+        .values()
+        .any(|entry| matches!(entry.measure, Measure::Excluded(_)));
+
     Ok(ModelReport {
-        schema: 2,
+        schema: 3,
         report_type: "model_operator_report".to_string(),
         model: MODEL.to_string(),
         phase: PHASE_DECODE.to_string(),
@@ -305,11 +416,15 @@ fn compose_report(
             layers: NUM_LAYERS,
             tp_world_size: 1,
             iters,
+            numeric_policy: policy_name(policy).to_string(),
         },
         schedule_source:
             "runtime trace: Qwen3Model::batch_decode eager DAG with CUDA Graph disabled".to_string(),
         total_measured_us: total,
         total_p99_us: total_p99,
+        total_is_partial,
+        pin_served: pin_served_count,
+        per_token_served: per_token_served_count,
         schedule,
         by_op,
         by_call_site,
@@ -317,7 +432,11 @@ fn compose_report(
     })
 }
 
-fn measure_catalog(calls: &[KernelCall], iters: u64) -> Result<HashMap<String, BenchEntry>> {
+fn measure_catalog(
+    calls: &[KernelCall],
+    iters: u64,
+    policy: NumericPolicy,
+) -> Result<HashMap<String, BenchEntry>> {
     let mut catalog = HashMap::new();
     for call in calls {
         if is_noop_all_reduce(call) {
@@ -327,21 +446,29 @@ fn measure_catalog(calls: &[KernelCall], iters: u64) -> Result<HashMap<String, B
         if catalog.contains_key(&key) {
             continue;
         }
-        let stats = measure_call(call, iters).with_context(|| {
-            format!("failed to measure {}\n{}", call.label, describe_call(call))
-        })?;
-        catalog.insert(key.clone(), BenchEntry { key, stats });
+        let measure = match classify(policy, &call.op) {
+            Some(reason) => Measure::Excluded(reason),
+            None => {
+                let stats = measure_call(call, iters).with_context(|| {
+                    format!("failed to measure {}\n{}", call.label, describe_call(call))
+                })?;
+                Measure::Faithful(stats)
+            }
+        };
+        catalog.insert(key.clone(), BenchEntry { key, measure });
     }
     Ok(catalog)
 }
 
 fn measure_call(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    if call.op == "paged_decode_attention" {
+        return measure_paged_decode_attention(call, iters);
+    }
     match call.op.as_str() {
         "embedding_batch" => measure_embedding(call, iters),
         "rms_norm_batch" => measure_rms_norm_batch(call, iters),
         "gemm_rows" => measure_gemm_rows(call, iters),
         "qk_norm_rope_batch_decode" => measure_qk_norm_rope(call, iters),
-        "paged_decode_attention" => measure_paged_decode_attention(call, iters),
         "gemm" => measure_gemm(call, iters),
         "fused_add_rms_norm_batch" => measure_fused_add_rms_norm(call, iters),
         "silu_mul_fused_batch" => measure_silu_mul_fused(call, iters),
@@ -523,37 +650,22 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
     let request_indices_d = ctx.stream.clone_htod(&request_indices)?;
     let variant = attr_string(call, "variant")?;
 
-    if variant == "split_kv_256x64" {
-        let split_chunk_size = DEFAULT_SPLIT_KV.actual_chunk_size(kv_len);
-        let chunks_per_request = DEFAULT_SPLIT_KV.active_chunks(kv_len);
-        let padded_slots = batch * DEFAULT_SPLIT_KV.max_chunks_per_request;
-        let mut split_request_indices = Vec::with_capacity(padded_slots);
-        let mut split_kv_tile_indices = Vec::with_capacity(padded_slots);
-        let mut split_o_indptr = Vec::with_capacity(batch + 1);
-        let mut split_block_valid_mask = Vec::with_capacity(padded_slots);
-        split_o_indptr.push(0);
-        for request_idx in 0..batch {
-            for chunk_idx in 0..chunks_per_request {
-                split_request_indices.push(request_idx as i32);
-                split_kv_tile_indices.push(chunk_idx as i32);
-                split_block_valid_mask.push(1_u8);
-            }
-            split_o_indptr.push(split_request_indices.len() as i32);
-        }
-        while split_request_indices.len() < padded_slots {
-            split_request_indices.push(0);
-            split_kv_tile_indices.push(0);
-            split_block_valid_mask.push(0);
-        }
+    // Replay the split-KV scalars from the recorded attrs; the Pin chunk is fixed off max_context,
+    // not the step's kv_len.
+    if variant == "split_kv" {
+        let split_chunk_size = attr_usize(call, "split_chunk_size")?;
+        let cap = attr_usize(call, "split_max_chunks")?;
+        let padded_slots = batch * cap;
+        let split_csr = build_split_kv_csr(split_chunk_size, cap, &vec![kv_len; batch], batch)?;
         let split_kv_chunk_size = [split_chunk_size as i32];
-        let split_request_indices_d = ctx.stream.clone_htod(&split_request_indices)?;
-        let split_kv_tile_indices_d = ctx.stream.clone_htod(&split_kv_tile_indices)?;
+        let split_request_indices_d = ctx.stream.clone_htod(&split_csr.request_indices)?;
+        let split_kv_tile_indices_d = ctx.stream.clone_htod(&split_csr.kv_tile_indices)?;
         let split_kv_chunk_size_d = ctx.stream.clone_htod(&split_kv_chunk_size)?;
-        let split_o_indptr_d = ctx.stream.clone_htod(&split_o_indptr)?;
-        let split_block_valid_mask_d = ctx.stream.clone_htod(&split_block_valid_mask)?;
+        let split_o_indptr_d = ctx.stream.clone_htod(&split_csr.o_indptr)?;
+        let split_block_valid_mask_d = ctx.stream.clone_htod(&split_csr.block_valid_mask)?;
         let mut split_tmp_v = ctx.stream.alloc_zeros(padded_slots * q_dim)?;
         let mut split_tmp_s = ctx.stream.alloc_zeros(padded_slots * NUM_Q_HEADS)?;
-        measure_loop(&ctx, iters, || {
+        let stats = measure_loop(&ctx, iters, || {
             ops::paged_attention_batch_decode_split_kv_into(
                 &ctx,
                 &q,
@@ -579,13 +691,14 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
                 NUM_Q_HEADS,
                 batch,
             )
-        })
+        })?;
+        Ok(stats)
     } else if variant == "non_partition" {
         let kv_tile_indices = vec![0_i32; batch];
         let kv_chunk_size = vec![kv_len as i32; batch];
         let kv_tile_indices_d = ctx.stream.clone_htod(&kv_tile_indices)?;
         let kv_chunk_size_d = ctx.stream.clone_htod(&kv_chunk_size)?;
-        measure_loop(&ctx, iters, || {
+        let stats = measure_loop(&ctx, iters, || {
             ops::paged_attention_batch_decode_into(
                 &ctx,
                 &q,
@@ -605,7 +718,8 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
                 NUM_Q_HEADS,
                 batch,
             )
-        })
+        })?;
+        Ok(stats)
     } else {
         bail!("unsupported decode attention variant `{variant}`")
     }
@@ -715,16 +829,34 @@ fn describe_call(call: &KernelCall) -> String {
 fn print_text_report(report: &ModelReport, out: &Path, dot_out: &Path) {
     println!("{MODEL} decode operator report");
     println!(
-        "config: bs={} kv_len={} layers={} tp={} iters={}",
+        "config: bs={} kv_len={} layers={} tp={} iters={} policy={}",
         report.config.batch_size,
         report.config.kv_len,
         report.config.layers,
         report.config.tp_world_size,
-        report.config.iters
+        report.config.iters,
+        report.config.numeric_policy
     );
     println!("json: {}", out.display());
     println!("dot:  {}", dot_out.display());
     println!("source: {}", report.schedule_source);
+    let gemm_excluded = report.total_is_partial;
+    println!(
+        "total measured: {}{}",
+        format_us(report.total_measured_us),
+        if gemm_excluded {
+            " (PARTIAL: projection GEMM excluded)"
+        } else {
+            ""
+        }
+    );
+    if gemm_excluded {
+        println!(
+            "warning: {} policy excludes projection GEMM; totals and %tot are partial. \
+             Run --policy pin for a faithful GEMM latency.",
+            report.config.numeric_policy
+        );
+    }
     println!();
 
     println!("By op");

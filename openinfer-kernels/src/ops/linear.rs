@@ -555,6 +555,7 @@ pub enum NumericPolicy {
 
 static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(NumericPolicy::Tuned as u8);
 static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
+static PER_TOKEN_SERVED: AtomicU64 = AtomicU64::new(0);
 
 /// Set the process-global policy. Must run before executor construction / graph capture (the
 /// captured algo is the one live at capture). Tests drive baseline/pin/per-token through it.
@@ -578,8 +579,16 @@ pub fn pin_served() -> u64 {
     PIN_SERVED.load(Ordering::Relaxed)
 }
 
-pub fn reset_pin_counters() {
+/// Count of projection GEMMs served by the PerToken policy path (`launch_gemm_pertoken`). Symmetric
+/// to `pin_served`: nonzero proves PerToken hit the oracle, not a silent fallback.
+pub fn per_token_served() -> u64 {
+    PER_TOKEN_SERVED.load(Ordering::Relaxed)
+}
+
+/// Resets the pin and per-token served counters.
+pub fn reset_numeric_policy_counters() {
     PIN_SERVED.store(0, Ordering::Relaxed);
+    PER_TOKEN_SERVED.store(0, Ordering::Relaxed);
 }
 
 /// Fixed representative N at which every (M,K) pin is resolved — one algo for ALL
@@ -675,6 +684,7 @@ fn launch_gemm_pertoken(
             bail!("CUDA per-token GEMM launch failed: cuda_status={status}, m={m}, n={n}, k={k}");
         }
     }
+    PER_TOKEN_SERVED.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 

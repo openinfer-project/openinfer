@@ -46,8 +46,8 @@ pub use linear::{
     gemm_graphsafe_ref_into_checked, gemm_into, gemm_into_checked, gemm_lt_pin_check,
     gemm_lt_pin_into_checked, gemm_lt_pin_tune, gemm_lt_pin_warmup, gemm_lt_tune, gemm_per_token,
     gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked, gemm_strided_batched_bf16,
-    gemm_token_range_into_checked, gemv, linear, numeric_policy, pin_served, reset_pin_counters,
-    set_numeric_policy,
+    gemm_token_range_into_checked, gemv, linear, numeric_policy, per_token_served, pin_served,
+    reset_numeric_policy_counters, set_numeric_policy,
 };
 pub use lora::{
     LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,

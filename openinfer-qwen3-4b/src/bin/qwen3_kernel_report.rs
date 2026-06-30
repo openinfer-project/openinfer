@@ -525,20 +525,10 @@ fn parse_decode_variant(raw: &str) -> Result<AttentionKernelVariant> {
     if raw == "non_partition" {
         return Ok(AttentionKernelVariant::NonPartition);
     }
-    let Some(rest) = raw.strip_prefix("split_kv_") else {
-        bail!("unknown variant `{raw}`");
-    };
-    let Some((chunk, max_chunks)) = rest.split_once('x') else {
-        bail!("split-K variant must look like split_kv_256x64");
-    };
-    Ok(AttentionKernelVariant::SplitKv(SplitKvConfig::new(
-        chunk
-            .parse::<usize>()
-            .with_context(|| format!("invalid chunk size in `{raw}`"))?,
-        max_chunks
-            .parse::<usize>()
-            .with_context(|| format!("invalid max chunks in `{raw}`"))?,
-    )))
+    match SplitKvConfig::parse(raw) {
+        Some(config) => Ok(AttentionKernelVariant::SplitKv(config)),
+        None => bail!("variant must be non_partition or split_kv_{{chunk}}x{{max}}, got `{raw}`"),
+    }
 }
 
 fn parse_prefill_variant(raw: &str) -> Result<PrefillAttentionVariant> {

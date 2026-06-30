@@ -10,8 +10,9 @@ use half::bf16;
 use openinfer_core::kv_pool::KvLayout;
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::ops::call_spec::{
-    self, PagedDecodeCallSpec, embedding_batch_call, fused_add_rms_norm_batch_call, gemm_call,
-    gemm_rows_call, qk_norm_rope_batch_decode_call, rms_norm_batch_call, silu_mul_fused_batch_call,
+    self, PagedDecodeCallSpec, PagedDecodePath, embedding_batch_call,
+    fused_add_rms_norm_batch_call, gemm_call, gemm_rows_call, qk_norm_rope_batch_decode_call,
+    rms_norm_batch_call, silu_mul_fused_batch_call,
 };
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::ops::call_trace;
@@ -226,9 +227,12 @@ impl<'a> BatchDecodeDag<'a> {
                 num_kv_heads: self.layout.num_kv_heads,
                 head_dim: self.layout.head_dim,
                 kv_len: call_trace::decode_kv_len().unwrap_or(0),
-                variant: match self.attention_path {
-                    DecodeAttentionPath::NonPartition => "non_partition",
-                    DecodeAttentionPath::SplitKv => "split_kv_256x64",
+                path: match self.attention_path {
+                    DecodeAttentionPath::NonPartition => PagedDecodePath::NonPartition,
+                    DecodeAttentionPath::SplitKv => {
+                        let (chunk_size, cap) = bufs.resolved_split_kv();
+                        PagedDecodePath::SplitKv { chunk_size, cap }
+                    }
                 },
             },
         ));

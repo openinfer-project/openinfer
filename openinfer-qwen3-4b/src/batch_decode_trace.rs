@@ -3,6 +3,8 @@ use anyhow::Result;
 #[cfg(feature = "kernel-call-trace")]
 use openinfer_core::ops::call_trace;
 #[cfg(feature = "kernel-call-trace")]
+use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+#[cfg(feature = "kernel-call-trace")]
 use openinfer_kernels::tensor::KernelCall;
 
 #[cfg(feature = "kernel-call-trace")]
@@ -90,6 +92,17 @@ pub fn trace_decode_kernel_calls(
         model.local_num_attention_heads(),
         model.config().max_position_embeddings,
     )?;
+    // This trace path bypasses the serving executor (which warms the pinned shapes at startup);
+    // warm here, outside `collect_result` below so it isn't recorded as a kernel call.
+    if numeric_policy() == NumericPolicy::Pin {
+        crate::batch_decode_buffers::warmup_decode_projection_pins(
+            model.config().hidden_size,
+            model.local_q_dim(),
+            model.local_kv_dim(),
+            model.local_intermediate_size(),
+            model.config().vocab_size,
+        )?;
+    }
     let token_ids = vec![0_u32; batch_size];
     let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
     let ((), calls) = call_trace::collect_result(|| {

@@ -2,7 +2,9 @@
 //! verifies it serves the swept Qwen3-4B envelope — Unified at N=101/201/513/1024/1279 and
 //! pure-Decode at bs=256 (exactly these points, not all N) — a shape it can't serve would bail.
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{NumericPolicy, pin_served, reset_pin_counters, set_numeric_policy};
+use openinfer_kernels::ops::{
+    NumericPolicy, pin_served, reset_numeric_policy_counters, set_numeric_policy,
+};
 use openinfer_qwen3_4b::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId, UnifiedPlan,
 };
@@ -64,7 +66,7 @@ fn pin_serves_production_envelope_without_fallback() {
         let id_d = RequestId::new(50000 + i as u64);
         let t = prefill_first(&mut ex, id_d, &synth(8, i as u64));
         let id_p = RequestId::new(51000 + i as u64);
-        reset_pin_counters();
+        reset_numeric_policy_counters();
         let _ = ex
             .execute_unified(UnifiedPlan {
                 prefill_requests: &[PrefillStepItem::new(
@@ -95,7 +97,7 @@ fn pin_serves_production_envelope_without_fallback() {
         .iter()
         .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), 0))
         .collect();
-    reset_pin_counters();
+    reset_numeric_policy_counters();
     let _ = ex
         .execute_decode(DecodePlan {
             requests: &items,
@@ -119,7 +121,7 @@ fn pin_serves_production_envelope_without_fallback() {
         .iter()
         .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), 0))
         .collect();
-    reset_pin_counters();
+    reset_numeric_policy_counters();
     let _ = ex
         .execute_unified(UnifiedPlan {
             prefill_requests: &[PrefillStepItem::new(

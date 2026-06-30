@@ -2,8 +2,8 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use crate::ops::call_spec::{
-    self, PagedDecodeCallSpec, embedding_batch_call, fused_add_rms_norm_batch_call, gemm_call,
-    gemm_rows_call, qk_norm_rope_batch_decode_call, rms_norm_batch_call, silu_mul_fused_batch_call,
+    embedding_batch_call, fused_add_rms_norm_batch_call, gemm_call, gemm_rows_call,
+    qk_norm_rope_batch_decode_call, rms_norm_batch_call, silu_mul_fused_batch_call,
 };
 use crate::ops::call_trace;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
@@ -184,32 +184,4 @@ pub fn silu_mul_fused_batch_into(
         ));
     }
     openinfer_kernels::ops::silu_mul_fused_batch_into(ctx, gate_up, out)
-}
-
-pub(crate) fn paged_decode_call_spec(
-    label: String,
-    q: &HiddenStates,
-    k: &HiddenStates,
-    kv_buffer_len: usize,
-    layout: &crate::kv_pool::KvLayout,
-    num_q_heads: usize,
-    batch_size: usize,
-    variant: &'static str,
-) -> openinfer_kernels::tensor::KernelCall {
-    call_spec::paged_decode_attention_call(
-        label,
-        PagedDecodeCallSpec {
-            batch_size,
-            total_pages: kv_buffer_len / layout.page_stride,
-            num_layers: layout.num_layers,
-            page_size: layout.page_size,
-            q_dim: q.hidden_dim,
-            kv_dim: k.hidden_dim,
-            num_q_heads,
-            num_kv_heads: layout.num_kv_heads,
-            head_dim: layout.head_dim,
-            kv_len: call_trace::decode_kv_len().unwrap_or(0),
-            variant,
-        },
-    )
 }

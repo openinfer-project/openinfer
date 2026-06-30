@@ -17,42 +17,18 @@ pub const NUM_KV_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 128;
 pub const PAGE_SIZE: usize = 16;
 pub const REPORT_ITERS: u64 = 128;
-pub const DEFAULT_SPLIT_KV_CHUNK_TOKENS: usize = 256;
-pub const DEFAULT_SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 64;
+// Mirror the default Tuned decode path (SPLIT_KV_TUNED_MAX_CHUNKS), not the opt-in
+// --batch-invariant Pin width (SPLIT_KV_MAX_CHUNKS_PER_REQUEST).
+pub const DEFAULT_SPLIT_KV_CHUNK_TOKENS: usize = crate::batch_decode_buffers::SPLIT_KV_CHUNK_TOKENS;
+pub const DEFAULT_SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize =
+    crate::batch_decode_buffers::SPLIT_KV_TUNED_MAX_CHUNKS;
 pub const MEMORY_TRANSFERS_PER_CLOCK: f64 = 2.0;
 pub const CACHE_CLEAR_L2_MULTIPLIER: usize = 2;
 pub const CACHE_CLEAR_MIN_BYTES: usize = 128 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SplitKvConfig {
-    pub chunk_tokens: usize,
-    pub max_chunks_per_request: usize,
-}
+pub use crate::split_kv::SplitKvConfig;
 
-impl SplitKvConfig {
-    pub const fn new(chunk_tokens: usize, max_chunks_per_request: usize) -> Self {
-        Self {
-            chunk_tokens,
-            max_chunks_per_request,
-        }
-    }
-
-    pub fn actual_chunk_size(self, kv_len: usize) -> usize {
-        self.chunk_tokens
-            .max(kv_len.div_ceil(self.max_chunks_per_request))
-    }
-
-    pub fn active_chunks(self, kv_len: usize) -> usize {
-        kv_len.div_ceil(self.actual_chunk_size(kv_len)).max(1)
-    }
-
-    pub fn label(self) -> String {
-        format!(
-            "split_kv_{}x{}",
-            self.chunk_tokens, self.max_chunks_per_request
-        )
-    }
-}
+pub use crate::batch_decode_buffers::{SplitKvCsr, build_split_kv_csr};
 
 pub const DEFAULT_SPLIT_KV_CONFIG: SplitKvConfig = SplitKvConfig::new(
     DEFAULT_SPLIT_KV_CHUNK_TOKENS,
@@ -309,10 +285,6 @@ pub struct AttentionDecodeCase {
 }
 
 impl AttentionDecodeCase {
-    pub fn new(batch_size: usize, kv_len: usize) -> Result<Self> {
-        Self::new_with_split_config(batch_size, kv_len, DEFAULT_SPLIT_KV_CONFIG)
-    }
-
     pub fn for_spec(spec: AttentionKernelSpec) -> Result<Self> {
         Self::new_with_split_config(
             spec.shape.batch_size,
@@ -362,31 +334,13 @@ impl AttentionDecodeCase {
         let kv_tile_indices = vec![0i32; batch_size];
         let kv_chunk_sizes = vec![kv_len as i32; batch_size];
         let split_chunk_size = split_config.actual_chunk_size(kv_len);
-        let split_chunks_per_request = split_config.active_chunks(kv_len);
         let split_padded_slots = batch_size * split_config.max_chunks_per_request;
-        anyhow::ensure!(
-            split_chunks_per_request <= split_config.max_chunks_per_request,
-            "split-K chunks/request exceeded padded slot budget"
-        );
-
-        let mut split_request_indices = Vec::with_capacity(split_padded_slots);
-        let mut split_kv_tile_indices = Vec::with_capacity(split_padded_slots);
-        let mut split_o_indptr = Vec::with_capacity(batch_size + 1);
-        let mut split_block_valid_mask = Vec::with_capacity(split_padded_slots);
-        split_o_indptr.push(0);
-        for request_idx in 0..batch_size {
-            for chunk_idx in 0..split_chunks_per_request {
-                split_request_indices.push(request_idx as i32);
-                split_kv_tile_indices.push(chunk_idx as i32);
-                split_block_valid_mask.push(1);
-            }
-            split_o_indptr.push(split_request_indices.len() as i32);
-        }
-        while split_request_indices.len() < split_padded_slots {
-            split_request_indices.push(0);
-            split_kv_tile_indices.push(0);
-            split_block_valid_mask.push(0);
-        }
+        let split_csr = build_split_kv_csr(
+            split_chunk_size,
+            split_config.max_chunks_per_request,
+            &vec![kv_len; batch_size],
+            batch_size,
+        )?;
         let split_kv_chunk_sizes = [split_chunk_size as i32];
 
         let start = ctx
@@ -402,11 +356,11 @@ impl AttentionDecodeCase {
         let request_indices_d = ctx.stream.clone_htod(&request_indices)?;
         let kv_tile_indices_d = ctx.stream.clone_htod(&kv_tile_indices)?;
         let kv_chunk_size_d = ctx.stream.clone_htod(&kv_chunk_sizes)?;
-        let split_request_indices_d = ctx.stream.clone_htod(&split_request_indices)?;
-        let split_kv_tile_indices_d = ctx.stream.clone_htod(&split_kv_tile_indices)?;
+        let split_request_indices_d = ctx.stream.clone_htod(&split_csr.request_indices)?;
+        let split_kv_tile_indices_d = ctx.stream.clone_htod(&split_csr.kv_tile_indices)?;
         let split_kv_chunk_size_d = ctx.stream.clone_htod(&split_kv_chunk_sizes)?;
-        let split_o_indptr_d = ctx.stream.clone_htod(&split_o_indptr)?;
-        let split_block_valid_mask_d = ctx.stream.clone_htod(&split_block_valid_mask)?;
+        let split_o_indptr_d = ctx.stream.clone_htod(&split_csr.o_indptr)?;
+        let split_block_valid_mask_d = ctx.stream.clone_htod(&split_csr.block_valid_mask)?;
         let split_tmp_v = ctx.stream.alloc_zeros(split_padded_slots * q_dim)?;
         let split_tmp_s = ctx.stream.alloc_zeros(split_padded_slots * NUM_QO_HEADS)?;
 

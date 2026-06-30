@@ -6,7 +6,9 @@ use cudarc::driver::CudaSlice;
 
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
-use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+
+use crate::split_kv::SplitKvConfig;
+use openinfer_kernels::ops::{NumericPolicy, gemm_lt_pin_warmup, numeric_policy};
 use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
@@ -31,28 +33,132 @@ const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // already saturate the SMs (bs<=8 wins big, ~bs16 even, bs32 within ~1%).
 // 64-token chunks measured fastest on RTX 5090 (128/256 are 1-7% slower, 32
 // past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
-const SPLIT_KV_CHUNK_TOKENS: usize = 64;
-const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
+pub(crate) const SPLIT_KV_CHUNK_TOKENS: usize = 64;
+pub(crate) const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // split-KV workspace/guard bound
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 
-/// Tuned chunk size: 64-token floor, coarsened to keep a `basis`-token request to <= SPLIT_KV_TUNED_MAX_CHUNKS chunks.
-pub fn split_chunk_size_for(basis: usize) -> usize {
-    SPLIT_KV_CHUNK_TOKENS.max(basis.div_ceil(SPLIT_KV_TUNED_MAX_CHUNKS))
+/// The split-KV config for `policy`: 64-token floor + per-policy cap (Tuned 64, Pin/PerToken 256).
+pub(crate) const fn split_kv_config(policy: NumericPolicy) -> SplitKvConfig {
+    let max_chunks = match policy {
+        NumericPolicy::Tuned => SPLIT_KV_TUNED_MAX_CHUNKS,
+        NumericPolicy::Pin | NumericPolicy::PerToken => SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
+    };
+    SplitKvConfig::new(SPLIT_KV_CHUNK_TOKENS, max_chunks)
 }
 
-/// Pin/PerToken fixed chunk size. The divisor `SPLIT_KV_MAX_CHUNKS_PER_REQUEST` is also the `Pin`
-/// chunk cap, so a request yields <= cap chunks and the `sync_split_kv_meta` guard stays tight.
+/// Tuned chunk size: 64-token floor, coarsened to keep a `basis`-token request within the cap.
+pub fn split_chunk_size_for(basis: usize) -> usize {
+    split_kv_config(NumericPolicy::Tuned).actual_chunk_size(basis)
+}
+
+/// Pin/PerToken fixed chunk size.
 pub(crate) fn pin_chunk_size(max_context_tokens: usize) -> usize {
-    SPLIT_KV_CHUNK_TOKENS.max(max_context_tokens.div_ceil(SPLIT_KV_MAX_CHUNKS_PER_REQUEST))
+    split_kv_config(NumericPolicy::Pin).actual_chunk_size(max_context_tokens)
+}
+
+/// The decode projection GEMM `(M, K)` shapes the Pin path serves, lm_head last.
+pub(crate) fn decode_projection_pin_shapes(
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    intermediate: usize,
+    vocab: usize,
+) -> [(usize, usize); 6] {
+    [
+        (q_dim, hidden),
+        (kv_dim, hidden),
+        (hidden, q_dim),
+        (intermediate, hidden),
+        (hidden, intermediate),
+        (vocab, hidden),
+    ]
+}
+
+/// Warm the pinned cuBLASLt algo for each `decode_projection_pin_shapes` `(M, K)`;
+/// under `Pin`, `launch_gemm_pin` bails on an un-warmed shape.
+pub(crate) fn warmup_decode_projection_pins(
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    intermediate: usize,
+    vocab: usize,
+) -> Result<()> {
+    for (m, k) in decode_projection_pin_shapes(hidden, q_dim, kv_dim, intermediate, vocab) {
+        gemm_lt_pin_warmup(m, k)?;
+    }
+    Ok(())
+}
+
+fn active_split_kv_config() -> SplitKvConfig {
+    split_kv_config(numeric_policy())
 }
 
 /// Per-request chunk cap (split-KV padded grid width + guard) for the active policy; Tuned stays at 64.
 fn max_split_chunks() -> usize {
-    match numeric_policy() {
-        NumericPolicy::Tuned => SPLIT_KV_TUNED_MAX_CHUNKS,
-        NumericPolicy::Pin | NumericPolicy::PerToken => SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
+    active_split_kv_config().max_chunks_per_request
+}
+
+/// Host-side CSR for the split-KV decode kernel: padded request/chunk indices, the
+/// per-slot validity mask, and the per-request chunk offsets.
+pub struct SplitKvCsr {
+    pub request_indices: Vec<i32>,
+    pub kv_tile_indices: Vec<i32>,
+    pub block_valid_mask: Vec<u8>,
+    pub o_indptr: Vec<i32>,
+}
+
+/// Build the split-KV CSR for `kv_lens` at a fixed `chunk_size`, padded to `padded_bs * cap` slots.
+/// Errors if a request needs more than `cap` chunks.
+pub fn build_split_kv_csr(
+    chunk_size: usize,
+    cap: usize,
+    kv_lens: &[usize],
+    padded_bs: usize,
+) -> Result<SplitKvCsr> {
+    anyhow::ensure!(chunk_size > 0, "split-KV chunk_size must be > 0");
+    anyhow::ensure!(cap > 0, "split-KV cap must be > 0");
+    anyhow::ensure!(
+        kv_lens.len() <= padded_bs,
+        "kv_lens length {} exceeds padded batch {padded_bs}",
+        kv_lens.len()
+    );
+    let padded_slots = padded_bs * cap;
+    let mut request_indices = Vec::with_capacity(padded_slots);
+    let mut kv_tile_indices = Vec::with_capacity(padded_slots);
+    let mut block_valid_mask = Vec::with_capacity(padded_slots);
+    let mut o_indptr = Vec::with_capacity(padded_bs + 1);
+    o_indptr.push(0);
+
+    for (request_idx, &kv_len) in kv_lens.iter().enumerate() {
+        let chunks = kv_len.div_ceil(chunk_size).max(1);
+        anyhow::ensure!(
+            chunks <= cap,
+            "split-KV chunk count {chunks} exceeds bound {cap} \
+             (kv_len={kv_len}, chunk_size={chunk_size}); context limit misconfigured"
+        );
+        for chunk_idx in 0..chunks {
+            request_indices.push(request_idx as i32);
+            kv_tile_indices.push(chunk_idx as i32);
+            block_valid_mask.push(1);
+        }
+        o_indptr.push(request_indices.len() as i32);
     }
+    for _ in kv_lens.len()..padded_bs {
+        o_indptr.push(request_indices.len() as i32);
+    }
+    while request_indices.len() < padded_slots {
+        request_indices.push(0);
+        kv_tile_indices.push(0);
+        block_valid_mask.push(0);
+    }
+
+    Ok(SplitKvCsr {
+        request_indices,
+        kv_tile_indices,
+        block_valid_mask,
+        o_indptr,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +236,10 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) split_tmp_v: CudaSlice<half::bf16>,
     pub(crate) split_tmp_s: CudaSlice<f32>,
     pub(crate) split_padded_slots: usize,
+    /// `(chunk_size, cap)` written by the latest SplitKv metadata sync;
+    /// `None` outside SplitKv steps.
+    #[cfg(feature = "kernel-call-trace")]
+    synced_split_kv: Option<(usize, usize)>,
     max_seq_len: usize,
     /// Model context limit (`max_position_embeddings`) — the `Pin` split-KV chunk basis (see
     /// `split_chunk_size`).
@@ -169,9 +279,11 @@ impl BatchDecodeBuffers {
         max_context_tokens: usize,
     ) -> Result<Self> {
         let bs = max_batch_size;
-        // Policy-sized: Tuned (default) ×64, Pin/PerToken ×256. Re-reading the global here is safe —
-        // the `batch_decode` entry assert pins policy immutable post-construction.
-        let max_split_slots = bs.min(SPLIT_KV_MAX_BATCH_SIZE) * max_split_chunks();
+        // One construction-time policy snapshot sizes the split-KV workspace and is recorded in
+        // `policy_at_construction`; the `batch_decode` entry assert holds the live policy to it.
+        let policy = numeric_policy();
+        let max_split_slots =
+            bs.min(SPLIT_KV_MAX_BATCH_SIZE) * split_kv_config(policy).max_chunks_per_request;
 
         Ok(Self {
             max_batch_size: bs,
@@ -206,9 +318,11 @@ impl BatchDecodeBuffers {
             split_tmp_v: ctx.stream.alloc_zeros(max_split_slots * q_dim)?,
             split_tmp_s: ctx.stream.alloc_zeros(max_split_slots * num_qo_heads)?,
             split_padded_slots: 0,
+            #[cfg(feature = "kernel-call-trace")]
+            synced_split_kv: None,
             max_seq_len: 0,
             max_context_tokens,
-            policy_at_construction: numeric_policy(),
+            policy_at_construction: policy,
             padding_page_id,
             graphs: BATCH_BUCKETS
                 .iter()
@@ -303,12 +417,24 @@ impl BatchDecodeBuffers {
         }
     }
 
+    /// Reads back `synced_split_kv`.
+    #[cfg(feature = "kernel-call-trace")]
+    pub(crate) fn resolved_split_kv(&self) -> (usize, usize) {
+        self.synced_split_kv
+            .expect("resolved_split_kv read off a SplitKv step / before sync_split_kv_meta")
+    }
+
     fn sync_split_kv_meta(
         &mut self,
         ctx: &DeviceContext,
         kv_views: &[&KvView],
         padded_bs: usize,
     ) -> Result<()> {
+        // Clear before the NonPartition early return so trace cannot reuse stale SplitKv metadata.
+        #[cfg(feature = "kernel-call-trace")]
+        {
+            self.synced_split_kv = None;
+        }
         // Past the batch cap the step always takes the non-partitioned path
         // (see attention_path), and the workspace has no slots for it anyway.
         if padded_bs > SPLIT_KV_MAX_BATCH_SIZE {
@@ -316,51 +442,25 @@ impl BatchDecodeBuffers {
         }
         let split_chunk_size = self.split_chunk_size();
         let cap = max_split_chunks();
-        let split_padded_slots = padded_bs * cap;
-        let mut split_request_indices = Vec::with_capacity(split_padded_slots);
-        let mut split_kv_tile_indices = Vec::with_capacity(split_padded_slots);
-        let mut split_o_indptr = Vec::with_capacity(padded_bs + 1);
-        let mut split_block_valid_mask = Vec::with_capacity(split_padded_slots);
-        split_o_indptr.push(0);
-
-        for (request_idx, kv) in kv_views.iter().enumerate() {
-            let chunks = kv.seq_len().div_ceil(split_chunk_size).max(1);
-            anyhow::ensure!(
-                chunks <= cap,
-                "split-KV chunk count {chunks} exceeds bound {cap} \
-                 (seq_len={}, split_chunk_size={split_chunk_size}) — context limit misconfigured",
-                kv.seq_len()
-            );
-            for chunk_idx in 0..chunks {
-                split_request_indices.push(request_idx as i32);
-                split_kv_tile_indices.push(chunk_idx as i32);
-                split_block_valid_mask.push(1);
-            }
-            split_o_indptr.push(split_request_indices.len() as i32);
+        #[cfg(feature = "kernel-call-trace")]
+        {
+            self.synced_split_kv = Some((split_chunk_size, cap));
         }
-
-        for _ in kv_views.len()..padded_bs {
-            split_o_indptr.push(split_request_indices.len() as i32);
-        }
-
-        while split_request_indices.len() < split_padded_slots {
-            split_request_indices.push(0);
-            split_kv_tile_indices.push(0);
-            split_block_valid_mask.push(0);
-        }
+        let kv_lens: Vec<usize> = kv_views.iter().map(|kv| kv.seq_len()).collect();
+        let csr = build_split_kv_csr(split_chunk_size, cap, &kv_lens, padded_bs)?;
 
         let split_kv_chunk_size = [split_chunk_size as i32];
         ctx.stream
-            .memcpy_htod(&split_request_indices, &mut self.split_request_indices_d)?;
+            .memcpy_htod(&csr.request_indices, &mut self.split_request_indices_d)?;
         ctx.stream
-            .memcpy_htod(&split_kv_tile_indices, &mut self.split_kv_tile_indices_d)?;
+            .memcpy_htod(&csr.kv_tile_indices, &mut self.split_kv_tile_indices_d)?;
         ctx.stream
             .memcpy_htod(&split_kv_chunk_size, &mut self.split_kv_chunk_size_d)?;
         ctx.stream
-            .memcpy_htod(&split_o_indptr, &mut self.split_o_indptr_d)?;
+            .memcpy_htod(&csr.o_indptr, &mut self.split_o_indptr_d)?;
         ctx.stream
-            .memcpy_htod(&split_block_valid_mask, &mut self.split_block_valid_mask_d)?;
-        self.split_padded_slots = split_padded_slots;
+            .memcpy_htod(&csr.block_valid_mask, &mut self.split_block_valid_mask_d)?;
+        self.split_padded_slots = padded_bs * cap;
 
         Ok(())
     }
@@ -375,5 +475,36 @@ impl BatchDecodeBuffers {
 
     pub(crate) fn graph_index(bucket_idx: usize, path: DecodeAttentionPath) -> usize {
         bucket_idx * DECODE_ATTENTION_PATH_COUNT + path.graph_slot()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_split_kv_csr;
+
+    #[test]
+    fn uniform_batch_csr() {
+        // 2 requests at kv_len=100, chunk_size=64 -> 2 chunks each; cap=64, padded_bs=2.
+        let csr = build_split_kv_csr(64, 64, &[100, 100], 2).unwrap();
+        assert_eq!(csr.o_indptr, vec![0, 2, 4]);
+        assert_eq!(csr.request_indices[..4].to_vec(), vec![0, 0, 1, 1]);
+        assert_eq!(csr.kv_tile_indices[..4].to_vec(), vec![0, 1, 0, 1]);
+        assert_eq!(csr.block_valid_mask[..4].to_vec(), vec![1u8, 1, 1, 1]);
+        assert_eq!(csr.request_indices.len(), 2 * 64);
+    }
+
+    #[test]
+    fn padding_requests_contribute_zero_chunks() {
+        // 2 real requests (1 and 2 chunks) padded to 3 slots; cap=4.
+        let csr = build_split_kv_csr(64, 4, &[40, 100], 3).unwrap();
+        assert_eq!(csr.o_indptr, vec![0, 1, 3, 3]);
+        assert_eq!(csr.request_indices[..3].to_vec(), vec![0, 1, 1]);
+        assert_eq!(csr.kv_tile_indices[..3].to_vec(), vec![0, 0, 1]);
+        assert_eq!(csr.request_indices.len(), 3 * 4);
+    }
+
+    #[test]
+    fn errors_when_a_request_exceeds_the_cap() {
+        assert!(build_split_kv_csr(64, 4, &[1000], 1).is_err());
     }
 }

@@ -5,6 +5,22 @@ use openinfer_kernels::tensor::{
     TensorSpec, Tile, Token, U32, Vocab,
 };
 
+/// A traced decode-attention call's kernel path; `SplitKv` carries its resolved chunk + cap.
+#[derive(Clone, Copy, Debug)]
+pub enum PagedDecodePath {
+    NonPartition,
+    SplitKv { chunk_size: usize, cap: usize },
+}
+
+impl PagedDecodePath {
+    pub fn label(self) -> String {
+        match self {
+            Self::NonPartition => "non_partition".to_string(),
+            Self::SplitKv { .. } => "split_kv".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PagedDecodeCallSpec {
     pub batch_size: usize,
@@ -17,7 +33,7 @@ pub struct PagedDecodeCallSpec {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub kv_len: usize,
-    pub variant: &'static str,
+    pub path: PagedDecodePath,
 }
 
 pub fn embedding_batch_call(
@@ -134,37 +150,42 @@ pub fn paged_decode_attention_call(
         .attr("head_dim", spec.head_dim.to_string())
         .attr("page_size", spec.page_size.to_string())
         .attr("kv_len", spec.kv_len.to_string())
-        .attr("variant", spec.variant.to_string());
+        .attr("variant", spec.path.label());
 
-    if spec.variant == "split_kv_256x64" {
-        let padded_slots = spec.batch_size * 64;
-        call = call
-            .input("split_request_indices", meta_i32::<PageSlot>(padded_slots))
-            .input("split_kv_tile_indices", meta_i32::<PageSlot>(padded_slots))
-            .input("split_kv_chunk_size", meta_i32::<Tile>(1))
-            .input(
-                "split_o_indptr",
-                meta_i32::<BatchPlusOne>(spec.batch_size + 1),
-            )
-            .input("split_block_valid_mask", meta_u8::<PageSlot>(padded_slots))
-            .input(
-                "split_tmp_v",
-                TensorSpec::new::<Bf16, Contiguous1D>([
-                    AxisSpec::new::<PageSlot>(padded_slots),
-                    AxisSpec::new::<QDim>(spec.q_dim),
-                ]),
-            )
-            .input(
-                "split_tmp_s",
-                TensorSpec::new::<F32, Contiguous1D>([
-                    AxisSpec::new::<PageSlot>(padded_slots),
-                    AxisSpec::new::<HeadDim>(spec.num_q_heads),
-                ]),
-            );
-    } else {
-        call = call
-            .input("kv_tile_indices", meta_i32::<Tile>(spec.batch_size))
-            .input("kv_chunk_size", meta_i32::<Batch>(spec.batch_size));
+    match spec.path {
+        PagedDecodePath::SplitKv { chunk_size, cap } => {
+            let padded_slots = spec.batch_size * cap;
+            call = call
+                .attr("split_chunk_size", chunk_size.to_string())
+                .attr("split_max_chunks", cap.to_string())
+                .input("split_request_indices", meta_i32::<PageSlot>(padded_slots))
+                .input("split_kv_tile_indices", meta_i32::<PageSlot>(padded_slots))
+                .input("split_kv_chunk_size", meta_i32::<Tile>(1))
+                .input(
+                    "split_o_indptr",
+                    meta_i32::<BatchPlusOne>(spec.batch_size + 1),
+                )
+                .input("split_block_valid_mask", meta_u8::<PageSlot>(padded_slots))
+                .input(
+                    "split_tmp_v",
+                    TensorSpec::new::<Bf16, Contiguous1D>([
+                        AxisSpec::new::<PageSlot>(padded_slots),
+                        AxisSpec::new::<QDim>(spec.q_dim),
+                    ]),
+                )
+                .input(
+                    "split_tmp_s",
+                    TensorSpec::new::<F32, Contiguous1D>([
+                        AxisSpec::new::<PageSlot>(padded_slots),
+                        AxisSpec::new::<HeadDim>(spec.num_q_heads),
+                    ]),
+                );
+        }
+        PagedDecodePath::NonPartition => {
+            call = call
+                .input("kv_tile_indices", meta_i32::<Tile>(spec.batch_size))
+                .input("kv_chunk_size", meta_i32::<Batch>(spec.batch_size));
+        }
     }
 
     call
