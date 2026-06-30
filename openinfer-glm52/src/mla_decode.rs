@@ -318,7 +318,6 @@ pub(crate) fn glm52_mla_decode_forward(
         ctx,
         contract.batch_size,
         contract.num_sm_parts,
-        None,
         &mut sched,
         &mut splits,
     )?;
@@ -332,7 +331,6 @@ pub(crate) fn glm52_mla_decode_forward(
         &query,
         cache,
         topk,
-        None,
         &sched,
         &splits,
         &mut latent,
