@@ -15,9 +15,11 @@ anyhow = { workspace = true }
 bytesize = { workspace = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true }
+half = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
 openinfer-core = { workspace = true }
+openinfer-kernels = { workspace = true, features = ["glm52"] }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

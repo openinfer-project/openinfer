@@ -347,6 +347,41 @@ int gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfl
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+// Generic strided-batched bf16 GEMM on the graph-safe (workspace-free, decode)
+// handle. Every dimension, leading dim, stride, and op is a runtime argument so
+// per-head batched GEMMs reuse ONE op instead of bespoke per-model kernels —
+// e.g. MLA absorption (q_nope @ W_UK -> ql_nope, latent @ W_UV -> v) where the
+// batch is the head count. Compute in f32, store bf16; op encoding 0 = N, else T.
+int gemm_strided_batched_bf16_cuda(int op_a, int op_b, int m, int n, int k,
+                                   const __nv_bfloat16 *A, int lda,
+                                   long long stride_a, const __nv_bfloat16 *B,
+                                   int ldb, long long stride_b,
+                                   __nv_bfloat16 *C, int ldc, long long stride_c,
+                                   int batch_count, cudaStream_t stream) {
+  if (g_cublas_handle == nullptr) {
+    return static_cast<int>(cudaErrorInvalidResourceHandle);
+  }
+  if (m <= 0 || n <= 0 || k <= 0 || batch_count <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const cublasOperation_t ta = op_a != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t tb = op_b != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const float h_alpha = 1.0f;
+  const float h_beta = 0.0f;
+  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cublas_status_to_error(status);
+  }
+  status = cublasGemmStridedBatchedEx(
+      g_cublas_handle, ta, tb, m, n, k, &h_alpha, A, CUDA_R_16BF, lda, stride_a,
+      B, CUDA_R_16BF, ldb, stride_b, &h_beta, C, CUDA_R_16BF, ldc, stride_c,
+      batch_count, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cublas_status_to_error(status);
+  }
+  return static_cast<int>(cudaPeekAtLastError());
+}
+
 // Decode GEMM through the cublasLt plan tuned by gemm_lt_tune_cuda. Returns
 // GEMM_LT_UNTUNED when this thread holds no plan for (M, N, K) — the tuned
 // kernel was already executed during tuning, so replaying it inside a CUDA

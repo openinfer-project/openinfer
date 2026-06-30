@@ -5,6 +5,10 @@
 //! memory, and returns a fail-closed engine handle until forward is introduced.
 
 mod config;
+#[allow(dead_code)]
+mod fp8;
+#[allow(dead_code)]
+mod mla_decode;
 mod runner;
 mod weights;
 
