@@ -132,12 +132,21 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             openinfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
                 .context("failed to start DeepSeek V2 Lite engine")?
         }
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => openinfer_glm52::launch(
+            &args.model_path,
+            openinfer_glm52::Glm52LaunchOptions {
+                tp_size: args.tp_size,
+                dp_size: args.dp_size.unwrap_or(1),
+            },
+        )
+        .context("failed to start GLM5.2 load-weight engine")?,
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,
             openinfer_kimi_k2::KimiLaunchOptions {
                 tp_size: args.tp_size,
-                dp_size: args.dp_size,
+                dp_size: args.dp_size.unwrap_or(8),
                 ep_backend: args.ep_backend.into(),
                 cuda_graph: args.cuda_graph,
             },
@@ -190,7 +199,9 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     cuda_graph: args.cuda_graph,
                     offload,
                     no_prefix_cache: args.no_prefix_cache,
-                    max_prefill_tokens: args.max_prefill_tokens,
+                    max_prefill_tokens: args
+                        .max_prefill_tokens
+                        .unwrap_or(openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS),
                     memory: openinfer_qwen3_4b::Qwen3MemoryOptions::new(
                         args.gpu_memory_utilization,
                         kv_cache_memory_margin_bytes,
@@ -212,7 +223,8 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             &args.model_path,
             args.device_ordinal,
             args.cuda_graph,
-            args.max_prefill_tokens,
+            args.max_prefill_tokens
+                .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
         )
         .context("failed to start Qwen3.5 engine")?,
     };

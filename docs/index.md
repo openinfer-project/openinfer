@@ -93,6 +93,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/kimi-k2/source-layout.md` | Kimi-K2 source files over 1k lines were split by responsibility; the largest Rust file under `openinfer-kimi-k2/src` is now `layers/attention.rs` at 950 lines. |
 | `models/kimi-k2/dp-design.md` | TP×DP 可配置并行：每 DP rank 是独立 decode engine，EP all-to-all 天然 sync，轻量 load balancer 做 request 路由。首批 TP1×DP8 + TP8×DP1。 |
 
+## models / glm52
+
+| Path | TL;DR |
+| --- | --- |
+| `models/glm52/load-weights-dp1-ep8.md` | GLM5.2 load-weight-only slice from latest main: rank0 loads non-expert tensors plus experts 0..31, ranks1..7 load 32 routed experts each, optimized real-checkpoint load measured `63420ms` first run / `50803ms` repeat via rank-local slabs + coalesced H2D + CUDA-event mmap lifetime guard, and generation fails closed until forward lands. |
+
 ## subsystems / runtime
 
 | Path | TL;DR |

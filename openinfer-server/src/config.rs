@@ -58,9 +58,10 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 1)]
     pub tp_size: usize,
 
-    /// Data-parallel world size for Kimi-K2
-    #[arg(long, default_value_t = 8)]
-    pub dp_size: usize,
+    /// Data-parallel world size. Defaults are model-specific: Kimi-K2 uses 8,
+    /// GLM5.2 load-weight uses 1.
+    #[arg(long)]
+    pub dp_size: Option<usize>,
 
     /// Expert-parallel backend for Kimi-K2 (TP1/DP8 requires deepep; TP8/DP1 requires nccl)
     #[arg(long, default_value = "deepep")]
@@ -95,23 +96,21 @@ pub(crate) struct Args {
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
-    /// Cap on total prompt tokens forwarded in one scheduler step (chunked
-    /// prefill), for both the Qwen3 and Qwen3.5 schedulers. Prefill activation
-    /// scratch scales with the step's prompt tokens, so this bounds peak VRAM
-    /// under request bursts; prompts longer than the cap are split across steps
-    /// so running decodes keep ticking. On Qwen3, echo requests are never
-    /// split. Must be positive.
-    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS)]
-    pub max_prefill_tokens: usize,
+    /// Cap on total prompt tokens forwarded in one scheduler step. When omitted,
+    /// Qwen3 and Qwen3.5 use their own crate defaults.
+    #[arg(long)]
+    pub max_prefill_tokens: Option<usize>,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, CUDA Graph capture, and margin.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_GPU_MEMORY_UTILIZATION)]
     pub gpu_memory_utilization: f64,
 
     /// Additional Qwen3 GPU memory to hold back after profile-based KV sizing,
     /// in MiB. Covers allocator fragmentation and small unprofiled drift.
+    #[cfg(feature = "qwen3-4b")]
     #[arg(long, default_value_t = (openinfer_qwen3_4b::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
     pub kv_cache_memory_margin_mib: usize,
     /// How prefill and decode share the GPU (single-GPU Qwen3 only).
@@ -162,6 +161,7 @@ pub(crate) enum CliDecodeOverlap {
 }
 
 impl CliDecodeOverlap {
+    #[cfg(feature = "qwen3-4b")]
     pub(crate) fn resolve(self, decode_sm_pct: u32) -> openinfer_qwen3_4b::DecodeOverlap {
         use openinfer_qwen3_4b::DecodeOverlap;
         match self {
@@ -201,6 +201,16 @@ impl Args {
             bail!(
                 "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time"
             );
+        }
+        #[cfg(feature = "glm52")]
+        if matches!(model_type, ModelType::Glm52) {
+            if let Some(dp_size) = self.dp_size {
+                if dp_size != 1 {
+                    bail!(
+                        "GLM5.2 load-weight branch requires --dp-size=1 when provided; omit --dp-size to use DP1/EP8"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -347,5 +357,25 @@ mod tests {
 
         assert!(error.contains("--max-lora-rank must be one of"));
         assert!(error.contains("16"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_accepts_omitted_dp_size() {
+        let args = Args::parse_from(["openinfer"]);
+
+        args.validate(ModelType::Glm52)
+            .expect("GLM5.2 should default to DP1/EP8 when --dp-size is omitted");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_rejects_non_dp1() {
+        let args = Args::parse_from(["openinfer", "--dp-size", "8"]);
+        let error = args
+            .validate(ModelType::Glm52)
+            .expect_err("GLM5.2 should reject explicit non-DP1");
+
+        assert!(error.to_string().contains("DP1/EP8"));
     }
 }

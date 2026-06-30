@@ -9,6 +9,17 @@
 //!   cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512 --output-lens 32,128
 //!   cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
 
+#![cfg_attr(
+    not(any(
+        feature = "deepseek-v2-lite",
+        feature = "deepseek-v4",
+        feature = "kimi-k2",
+        feature = "qwen3-4b",
+        feature = "qwen35-4b"
+    )),
+    allow(unused_imports, unused_variables, dead_code)
+)]
+
 use std::path::Path;
 use std::time::Instant;
 
@@ -154,6 +165,10 @@ fn main() -> Result<()> {
                 },
             )?;
             finish(handle, false)
+        }
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => {
+            anyhow::bail!("bench_serving is not supported for the GLM5.2 load-weight-only branch")
         }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => {

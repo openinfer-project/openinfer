@@ -3813,6 +3813,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-glm52"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytesize",
+ "crossbeam-channel",
+ "cudarc",
+ "log",
+ "memmap2",
+ "openinfer-core",
+ "safetensors",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openinfer-kernels"
 version = "0.1.0"
 dependencies = [
@@ -3960,6 +3976,7 @@ dependencies = [
  "openinfer-core",
  "openinfer-deepseek-v2-lite",
  "openinfer-deepseek-v4",
+ "openinfer-glm52",
  "openinfer-kimi-k2",
  "openinfer-qwen3-4b",
  "openinfer-qwen35-4b",
