@@ -1733,6 +1733,9 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");
+    // DeepGEMM JIT runtime calls cuLibraryLoadData etc. (CUDA 12.6+ driver API);
+    // libcuda.so lives in the system lib dir, not the toolkit dir.
+    println!("cargo:rustc-link-lib=cuda");
     if let Some(nccl_root) = &deepep_nccl {
         link_deepep_nccl(nccl_root, &out_dir);
     }
