@@ -53,9 +53,9 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/glm52/tokenspeed-kernel-gap.md` | 对照 TokenSpeed GLM5.2 kernel DAG，并标出后续搬运入口：OpenInfer 当前只暴露 DeepGEMM scale layout、grouped FP8 合约/metadata、FlashMLA sparse decode；仍缺 DSA indexer logits、Blackwell TRTLLM sparse MLA、deterministic top-k、FP8 token-group quant、index-K cache layout、Hadamard 和 MoE/router/expert 主路径。 |
 | `models/glm52/load-weights-dp1-ep8.md` | GLM5.2 load-weight-only slice from latest main: rank0 loads non-expert tensors plus experts 0..31, ranks1..7 load 32 routed experts each, optimized real-checkpoint load measured `63420ms` first run / `50803ms` repeat via rank-local slabs + coalesced H2D + CUDA-event mmap lifetime guard, and generation fails closed until forward lands. |
 | `models/glm52/dp1-ep8-decode-plan.md` | Five sub-PRs from the PR #476 load-weight scaffold to DP1/EP8 DSA decode serving: PR1 MLA projection/absorb/cache brick (full top-k, short-context DSA-equivalent), PR2 DSA indexer chain (DeepGEMM paged MQA logits + FlashInfer deterministic top-k=2048 + slot conversion), PR3 EP1 full forward (dense+MoE+bookends), PR4 DeepEP EP8 MoE all-to-all, PR5 scheduler+CUDA Graph. Flags `glm52_moe_quant.cu`, `glm52_mla_assembly.cu`, `glm52_indexer.cu` as hand-written perf debt. |
+| `models/glm52/mla-decode-brick.md` | PR1 dev doc: build instructions, kernel inventory, hand-written CUDA perf-debt flags. Oracle gate deferred — fixture pipeline was not self-contained. |
 
 ## models / deepseek-v4
 

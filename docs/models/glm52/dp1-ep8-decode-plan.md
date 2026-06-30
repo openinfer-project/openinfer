@@ -66,7 +66,7 @@ Single-layer MLA decode forward (`hidden[6144] -> o[6144]`), bs=1, full top-k (c
 - Dense MLP / MoE / bookends — PR3.
 - Server wiring — unchanged.
 
-**Test:** `tests/mla_decode_oracle.rs` — load layer-0 weights + 8-token validated fp8 cache fixture, decode token 7 with full top-k, compare `o[6144]` end-to-end vs HF oracle. At 8-token context, DSA top-k=2048 selects all tokens, so this is a valid DSA-equivalent gate. `#[ignore]` without GPU + `OPENINFER_TEST_MODEL_PATH` + probe fixtures. Mirrors the old branch oracle gate.
+**Test:** Oracle gate deferred — the prototype's fixture pipeline (HF forward dump → `layer0.npz` → probe bins → Rust test) was not self-contained (the dump script was never in the repo). A follow-up will design a reproducible oracle pipeline before claiming correctness. See `mla-decode-brick.md`.
 
 **Kernel inventory (cherry-pick from `feat/glm52-dp8-ep8`):**
 
@@ -82,7 +82,7 @@ Single-layer MLA decode forward (`hidden[6144] -> o[6144]`), bs=1, full top-k (c
 
 `glm52_moe_quant.cu` and `glm52_mla_assembly.cu` are hand-written CUDA. Both are memory-bound elementwise/reduce kernels (per-128-group amax -> e4m3 quant; query concat + interleave RoPE + cache pack), not GEMM/attention compute — the tile-schedule risk is low. `mla_assembly`'s RoPE device function mirrors `openinfer-kimi-k2`'s `rope_out` and was bit-for-bit oracle-validated in the old branch. `moe_quant` implements the standard DeepGEMM/FlashInfer per-token-group FP8 contract (group=128, f32 scale, e4m3, amax/448).
 
-**These two kernels are correct but not tuned.** They are single-issue-per-element launchers with no vectorized load/store, no shared-memory coalescing beyond the reduce tree, and no occupancy targeting. When decode TPOT is measured (PR5), they are the first candidates for an ncu pass. If a fused alternative appears in vendored FlashInfer/TRTLLM (e.g. `per_token_group_quant` with a C ABI), the hand-written version should be replaced, not optimized in place. See `docs/models/glm52/tokenspeed-kernel-gap.md` `DSA FP8 token-group quant` entry for the upstream contract reference.
+**These two kernels are correct but not tuned.** They are single-issue-per-element launchers with no vectorized load/store, no shared-memory coalescing beyond the reduce tree, and no occupancy targeting. When decode TPOT is measured (PR5), they are the first candidates for an ncu pass. If a fused alternative appears in vendored FlashInfer/TRTLLM (e.g. `per_token_group_quant` with a C ABI), the hand-written version should be replaced, not optimized in place. See the local `docs/private/glm52/tokenspeed-kernel-gap.md` `DSA FP8 token-group quant` entry for the upstream contract reference.
 
 **Gap-doc cross-reference:**
 
@@ -161,7 +161,7 @@ PR1 first because MLA projection/absorb/cache-pack is where layout and RoPE mist
 ## Preparation
 
 - **Read:**
-  - `docs/models/glm52/tokenspeed-kernel-gap.md` — full TokenSpeed GLM5.2 kernel DAG, hand-written-vs-vendored source tags, P0/P1/P2 priority index. This plan follows the gap-doc P0 order for the DSA indexer chain.
+  - `docs/private/glm52/tokenspeed-kernel-gap.md` — full TokenSpeed GLM5.2 kernel DAG, hand-written-vs-vendored source tags, P0/P1/P2 priority index. This plan follows the gap-doc P0 order for the DSA indexer chain. (Local-only, not in PR.)
   - `docs/models/glm52/load-weights-dp1-ep8.md` — PR #476 execution record; the EP8 slab layout PR4 will consume.
   - `openinfer-glm52/src/lib.rs`, `src/runner.rs`, `src/weights.rs` — current load-only surface.
   - `openinfer-kernels/src/ops/glm52/flashmla_sparse.rs` — the SM90 sparse decode wrapper already on main.
