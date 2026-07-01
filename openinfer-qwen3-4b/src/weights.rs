@@ -956,7 +956,7 @@ impl Qwen3Model {
             self.local_intermediate_size(),
             self.config.vocab_size,
             max_decode_batch_size,
-            profile_blocks,
+            geometry.block_size,
             0,
             self.local_num_attention_heads(),
             self.config.max_position_embeddings,

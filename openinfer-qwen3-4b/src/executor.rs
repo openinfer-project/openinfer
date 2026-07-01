@@ -2517,7 +2517,7 @@ impl LocalQwen3Lane {
             model.local_intermediate_size(),
             model.config().vocab_size,
             max_bucket,
-            total_blocks,
+            buf_layout.page_size,
             padding_block_id,
             model.local_num_attention_heads(),
             model.config().max_position_embeddings,

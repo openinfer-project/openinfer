@@ -273,7 +273,7 @@ impl BatchDecodeBuffers {
         intermediate_size: usize,
         vocab_size: usize,
         max_batch_size: usize,
-        max_total_pages: usize,
+        page_size: usize,
         padding_page_id: i32,
         num_qo_heads: usize,
         max_context_tokens: usize,
@@ -284,6 +284,15 @@ impl BatchDecodeBuffers {
         let policy = numeric_policy();
         let max_split_slots =
             bs.min(SPLIT_KV_MAX_BATCH_SIZE) * split_kv_config(policy).max_chunks_per_request;
+        // The concatenated page-index list is counted by reference, not by
+        // physical block: prefix-cached blocks are shared, so N views holding
+        // the same cached prefix each list those page ids again. Sizing this
+        // off the pool's physical block count therefore under-allocates under
+        // prefix sharing (#403); the honest bound is every row presenting a
+        // full-context view. Padding rows list 1 page each, so `bs *
+        // max_view_pages` covers them too (max_view_pages >= 1).
+        anyhow::ensure!(page_size > 0, "page_size must be > 0");
+        let max_view_pages = max_context_tokens.div_ceil(page_size).max(1);
 
         Ok(Self {
             max_batch_size: bs,
@@ -303,8 +312,7 @@ impl BatchDecodeBuffers {
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
             lora_token_slots_d: ctx.stream.alloc_zeros(bs)?,
-            // Paged attention: worst case all requests use max_total_pages + padding slots
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
+            page_indices_d: ctx.stream.alloc_zeros(bs * max_view_pages)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
             last_page_len_d: ctx.stream.alloc_zeros(bs)?,
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
@@ -392,6 +400,17 @@ impl BatchDecodeBuffers {
         let request_indices: Vec<i32> = (0..padded_bs as i32).collect();
         let kv_tile_indices = vec![0i32; padded_bs];
 
+        // Fail loud instead of tripping cudarc's copy assert (a panic here
+        // kills the worker thread and wedges the engine — #403). Reachable
+        // only if a view exceeds the context limit the buffer was sized for.
+        anyhow::ensure!(
+            all_page_indices.len() <= self.page_indices_d.len(),
+            "decode page-index overflow: {} view pages (bs={real_bs}, padded={padded_bs}) \
+             exceed buffer capacity {}; a view is larger than the context limit \
+             the buffers were sized for",
+            all_page_indices.len(),
+            self.page_indices_d.len()
+        );
         ctx.stream
             .memcpy_htod(&all_page_indices, &mut self.page_indices_d)?;
         ctx.stream.memcpy_htod(&indptr, &mut self.page_indptr_d)?;
@@ -480,7 +499,52 @@ impl BatchDecodeBuffers {
 
 #[cfg(test)]
 mod tests {
-    use super::build_split_kv_csr;
+    use super::{BatchDecodeBuffers, build_split_kv_csr};
+    use openinfer_core::tensor::DeviceContext;
+    use openinfer_kv_cache::KvView;
+
+    #[test]
+    fn shared_prefix_views_are_counted_by_reference() {
+        let ctx = DeviceContext::new().expect("CUDA context");
+        let page_size = 16;
+        let max_context_tokens = 64; // 4 pages per full-context view
+        let bs = 4;
+        let mut bufs = BatchDecodeBuffers::new(
+            &ctx,
+            8,
+            8,
+            8,
+            8,
+            16,
+            bs,
+            page_size,
+            0,
+            1,
+            max_context_tokens,
+        )
+        .expect("buffer alloc");
+
+        // Every view lists the SAME 4 physical pages (a shared cached prefix):
+        // 16 listed entries backed by only 4 physical blocks. A buffer sized
+        // off the physical pool count under-allocates exactly here (#403).
+        let views: Vec<KvView> = (0..bs)
+            .map(|_| KvView::new(vec![0, 1, 2, 3], 64, page_size))
+            .collect();
+        let refs: Vec<&KvView> = views.iter().collect();
+        bufs.sync_paged_meta(&ctx, &refs, bs)
+            .expect("shared views fit");
+
+        // A view past the context limit the buffers were sized for must error
+        // (fail loud), not trip cudarc's copy assert and kill the worker.
+        let oversized: Vec<KvView> = (0..bs)
+            .map(|_| KvView::new(vec![0, 1, 2, 3, 4], 80, page_size))
+            .collect();
+        let refs: Vec<&KvView> = oversized.iter().collect();
+        let err = bufs
+            .sync_paged_meta(&ctx, &refs, bs)
+            .expect_err("oversized views must fail loud");
+        assert!(err.to_string().contains("page-index overflow"), "{err}");
+    }
 
     #[test]
     fn uniform_batch_csr() {

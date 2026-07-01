@@ -87,7 +87,7 @@ pub fn trace_decode_kernel_calls(
         model.local_intermediate_size(),
         model.config().vocab_size,
         batch_size,
-        kv_mgr.pool().total_blocks(),
+        layout.page_size,
         kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
         model.config().max_position_embeddings,
