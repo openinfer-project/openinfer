@@ -2,7 +2,7 @@
 
 **TL;DR**: Prefix caching is on by default for Qwen3-4B. Full-block token-hash matching via the vendored kvbm radix tree, wired at the executor level. Repeated ~1900-token prompt: TTFT 141.8ms → 16.3ms p50 (8.7×); warm TTFT ≈ 1 decode TPOT (11.4ms) + ~5ms request-setup/eager-launch overhead. Accuracy gated by `hf_golden_gate` cached-replay surfaces (warm deltas at the cold bf16 floor).
 
-Last touched: 2026-06
+Last touched: 2026-07
 
 ## How it works
 
@@ -12,6 +12,7 @@ Last touched: 2026-06
 - **Echo requests skip matching** — prompt logprobs need every position forwarded.
 - **LoRA-scoped**: the active adapter name is folded into the block-hash chain as a salt (`compute_salt_hash`, upstream router-parity recipe), so KV computed under one adapter (or the base model) never matches a request running under another. Same tokens + same adapter still share.
 - Eviction safety: matched blocks are held as `ImmutableBlock` (strong Arc) in the sequence's assignments for the request lifetime; the inactive-pool LRU cannot reclaim them mid-request.
+- **Pages are counted by reference, not by physical block.** N views holding the same cached prefix each list those page ids again, so anything sized off the pool's *physical* block count under-allocates under sharing — admission won't catch it, it also charges physical blocks. `BatchDecodeBuffers::page_indices_d` hit exactly this (#403 fault 1: cudarc copy assert → dead worker → wedged engine; deterministic with N concurrent same-prompt requests once the prefix is sealed). It is now sized for `max_batch × full-context views` and `sync_paged_meta` fails loud instead of tripping the assert. Any future consumer of concatenated per-request page lists must use the by-reference bound.
 - Toggle: `Qwen3Executor::set_prefix_cache_enabled(false)` — used by tests that need cold determinism; there is no server flag.
 
 ## Numbers (RTX 5090, 2026-06, drained-stream measurement)
