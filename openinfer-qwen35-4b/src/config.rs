@@ -4,6 +4,21 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TensorParallelConfig {
+    pub(crate) rank: usize,
+    pub(crate) world_size: usize,
+}
+
+impl Default for TensorParallelConfig {
+    fn default() -> Self {
+        Self {
+            rank: 0,
+            world_size: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LayerType {
     FullAttention,
@@ -229,6 +244,216 @@ impl Config35 {
     /// Z projection output dimension for linear attention.
     pub(crate) fn linear_attn_z_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim
+    }
+
+    pub(crate) fn local_num_attention_heads(&self, tp: TensorParallelConfig) -> usize {
+        self.num_attention_heads / tp.world_size
+    }
+
+    pub(crate) fn local_num_key_value_heads(&self, tp: TensorParallelConfig) -> usize {
+        self.num_key_value_heads / tp.world_size
+    }
+
+    pub(crate) fn local_intermediate_size(&self, tp: TensorParallelConfig) -> usize {
+        self.intermediate_size / tp.world_size
+    }
+
+    pub(crate) fn local_full_attn_q_dim(&self, tp: TensorParallelConfig) -> usize {
+        self.local_num_attention_heads(tp) * self.head_dim
+    }
+
+    pub(crate) fn local_full_attn_kv_dim(&self, tp: TensorParallelConfig) -> usize {
+        self.local_num_key_value_heads(tp) * self.head_dim
+    }
+
+    /// Local gated full-attention q projection output dimension.
+    pub(crate) fn local_full_attn_gated_q_dim(&self, tp: TensorParallelConfig) -> usize {
+        self.local_full_attn_q_dim(tp) * 2
+    }
+}
+
+impl TensorParallelConfig {
+    pub(crate) fn validate_for(self, config: &Config35, enable_cuda_graph: bool) -> Result<()> {
+        if self.world_size == 0 {
+            return Err(anyhow::anyhow!("tensor_parallel.world_size must be >= 1"));
+        }
+        if self.rank >= self.world_size {
+            return Err(anyhow::anyhow!(
+                "tensor_parallel.rank {} must be < world_size {}",
+                self.rank,
+                self.world_size
+            ));
+        }
+        if self.is_sharded() && enable_cuda_graph {
+            return Err(anyhow::anyhow!(
+                "Qwen3.5 tensor parallelism is eager-only in Phase 1; disable CUDA Graph for tp world_size={}",
+                self.world_size
+            ));
+        }
+        if !config.num_attention_heads.is_multiple_of(self.world_size) {
+            return Err(anyhow::anyhow!(
+                "num_attention_heads={} not divisible by tp world_size={}",
+                config.num_attention_heads,
+                self.world_size
+            ));
+        }
+        if !config.num_key_value_heads.is_multiple_of(self.world_size) {
+            return Err(anyhow::anyhow!(
+                "num_key_value_heads={} not divisible by tp world_size={}",
+                config.num_key_value_heads,
+                self.world_size
+            ));
+        }
+        if !config.intermediate_size.is_multiple_of(self.world_size) {
+            return Err(anyhow::anyhow!(
+                "intermediate_size={} not divisible by tp world_size={}",
+                config.intermediate_size,
+                self.world_size
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shard_range(self, total: usize) -> (usize, usize) {
+        let shard_len = total / self.world_size;
+        (self.rank * shard_len, shard_len)
+    }
+
+    pub(crate) fn is_sharded(self) -> bool {
+        self.world_size > 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config35 {
+        Config35 {
+            hidden_size: 2560,
+            intermediate_size: 9216,
+            num_hidden_layers: 32,
+            vocab_size: 248320,
+            rms_norm_eps: 1e-6,
+            eos_token_id: 151645,
+            num_attention_heads: 16,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_num_value_heads: 32,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            max_position_embeddings: 262_144,
+            layer_types: vec![LayerType::LinearAttention; 32],
+        }
+    }
+
+    #[test]
+    fn default_tensor_parallel_is_tp1() {
+        let config = test_config();
+        let tp = TensorParallelConfig::default();
+
+        tp.validate_for(&config, true).unwrap();
+        assert!(!tp.is_sharded());
+        assert_eq!(tp.shard_range(config.full_attn_q_dim()), (0, 4096));
+        assert_eq!(config.local_num_attention_heads(tp), 16);
+        assert_eq!(config.local_num_key_value_heads(tp), 4);
+        assert_eq!(config.local_intermediate_size(tp), 9216);
+        assert_eq!(config.local_full_attn_q_dim(tp), 4096);
+        assert_eq!(config.local_full_attn_kv_dim(tp), 1024);
+        assert_eq!(config.local_full_attn_gated_q_dim(tp), 8192);
+    }
+
+    #[test]
+    fn computes_tp2_dense_local_dimensions() {
+        let config = test_config();
+        let tp = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
+
+        tp.validate_for(&config, false).unwrap();
+        assert!(tp.is_sharded());
+        assert_eq!(tp.shard_range(config.full_attn_q_dim()), (2048, 2048));
+        assert_eq!(config.local_num_attention_heads(tp), 8);
+        assert_eq!(config.local_num_key_value_heads(tp), 2);
+        assert_eq!(config.local_intermediate_size(tp), 4608);
+        assert_eq!(config.local_full_attn_q_dim(tp), 2048);
+        assert_eq!(config.local_full_attn_kv_dim(tp), 512);
+        assert_eq!(config.local_full_attn_gated_q_dim(tp), 4096);
+    }
+
+    #[test]
+    fn rejects_invalid_world_size_and_rank() {
+        let config = test_config();
+
+        let err = TensorParallelConfig {
+            rank: 0,
+            world_size: 0,
+        }
+        .validate_for(&config, false)
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("world_size must be >= 1"));
+
+        let err = TensorParallelConfig {
+            rank: 2,
+            world_size: 2,
+        }
+        .validate_for(&config, false)
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("rank 2 must be < world_size 2"));
+    }
+
+    #[test]
+    fn rejects_indivisible_dense_dimensions() {
+        let tp = TensorParallelConfig {
+            rank: 0,
+            world_size: 3,
+        };
+
+        let mut config = test_config();
+        let err = tp.validate_for(&config, false).unwrap_err().to_string();
+        assert!(err.contains("num_attention_heads=16 not divisible"));
+
+        config.num_attention_heads = 15;
+        config.num_key_value_heads = 4;
+        let err = tp.validate_for(&config, false).unwrap_err().to_string();
+        assert!(err.contains("num_key_value_heads=4 not divisible"));
+
+        config.num_key_value_heads = 3;
+        config.intermediate_size = 9217;
+        let err = tp.validate_for(&config, false).unwrap_err().to_string();
+        assert!(err.contains("intermediate_size=9217 not divisible"));
+    }
+
+    #[test]
+    fn rejects_tensor_parallel_cuda_graph_phase1() {
+        let config = test_config();
+        let tp = TensorParallelConfig {
+            rank: 0,
+            world_size: 2,
+        };
+
+        let err = tp.validate_for(&config, true).unwrap_err().to_string();
+        assert!(err.contains("eager-only in Phase 1"));
+    }
+
+    #[test]
+    fn phase1_does_not_require_linear_attention_divisibility() {
+        let mut config = test_config();
+        config.linear_num_key_heads = 17;
+        config.linear_num_value_heads = 31;
+        let tp = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
+
+        tp.validate_for(&config, false).unwrap();
     }
 }
 
