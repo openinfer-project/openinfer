@@ -8,13 +8,11 @@ edition = "2024"
 openinfer-kernels = { workspace = true }
 kvbm-logical = { workspace = true }
 dynamo-tokens = { workspace = true }
+dynamo-kv-hashing = { workspace = true }
 anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 tokio = { workspace = true }
-
-[dev-dependencies]
-dynamo-kv-hashing = { workspace = true }
 
 [lints]
 workspace = true

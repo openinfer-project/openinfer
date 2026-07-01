@@ -66,8 +66,8 @@ keywords = ["llm", "genai", "inference", "nvidia", "distributed"]
 # Keep every ai-dynamo/dynamo dep on the SAME rev: crates from the same git
 # checkout unify their shared internal deps (dynamo-tokens), mixing revs would
 # split type identity.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
-dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
+dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
 kvbm-logical = { path = "kvbm/kvbm-logical" }
 # ---- third-party ----
 anyhow = "1.0"
