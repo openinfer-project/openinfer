@@ -1,0 +1,348 @@
+use anyhow::{Result, anyhow, ensure};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::bf16;
+
+use crate::ffi;
+use crate::tensor::DeviceContext;
+
+pub const GLM52_INDEXER_HEAD_DIM: usize = 128;
+pub const GLM52_INDEXER_QUANT_BLOCK_SIZE: usize = 128;
+pub const GLM52_INDEXER_SCALE_BYTES_PER_TOKEN: usize = 4;
+pub const GLM52_INDEXER_TOPK: usize = 2048;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Glm52IndexerCacheLayout {
+    pub cache_blocks: usize,
+    pub cache_block_size: usize,
+    pub cache_block_stride_bytes: usize,
+}
+
+impl Glm52IndexerCacheLayout {
+    pub fn min_block_stride_bytes(self) -> usize {
+        self.cache_block_size * (GLM52_INDEXER_HEAD_DIM + GLM52_INDEXER_SCALE_BYTES_PER_TOKEN)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.cache_blocks > 0,
+            "GLM5.2 indexer cache_blocks must be positive"
+        );
+        ensure!(
+            self.cache_block_size > 0,
+            "GLM5.2 indexer cache_block_size must be positive"
+        );
+        ensure!(
+            self.cache_block_stride_bytes >= self.min_block_stride_bytes(),
+            "GLM5.2 indexer cache block stride too small: have {} bytes, need at least {}",
+            self.cache_block_stride_bytes,
+            self.min_block_stride_bytes()
+        );
+        Ok(())
+    }
+
+    pub fn min_cache_bytes(self) -> Result<usize> {
+        self.validate()?;
+        self.cache_blocks
+            .checked_mul(self.cache_block_stride_bytes)
+            .ok_or_else(|| anyhow!("GLM5.2 indexer cache byte size overflow: {self:?}"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Glm52IndexerScaleFormat {
+    F32,
+    Ue8m0RoundedF32,
+}
+
+impl Glm52IndexerScaleFormat {
+    fn as_ffi(self) -> i32 {
+        match self {
+            Self::F32 => 0,
+            Self::Ue8m0RoundedF32 => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Glm52IndexerCacheInsert {
+    pub tokens: usize,
+    pub layout: Glm52IndexerCacheLayout,
+    pub scale_format: Glm52IndexerScaleFormat,
+}
+
+impl Glm52IndexerCacheInsert {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.tokens > 0,
+            "GLM5.2 indexer cache insert tokens must be positive"
+        );
+        self.layout.validate()
+    }
+}
+
+pub fn glm52_indexer_k_quant_and_cache_launch(
+    ctx: &DeviceContext,
+    contract: Glm52IndexerCacheInsert,
+    k: &CudaSlice<bf16>,
+    indexer_cache: &mut CudaSlice<u8>,
+    slot_mapping: &CudaSlice<i64>,
+) -> Result<()> {
+    contract.validate()?;
+    ensure!(
+        k.len() >= contract.tokens * GLM52_INDEXER_HEAD_DIM,
+        "GLM5.2 indexer K buffer too small: have {}, need {}",
+        k.len(),
+        contract.tokens * GLM52_INDEXER_HEAD_DIM
+    );
+    ensure!(
+        slot_mapping.len() >= contract.tokens,
+        "GLM5.2 indexer slot_mapping too small: have {}, need {}",
+        slot_mapping.len(),
+        contract.tokens
+    );
+    let min_cache_bytes = contract.layout.min_cache_bytes()?;
+    ensure!(
+        indexer_cache.len() >= min_cache_bytes,
+        "GLM5.2 indexer cache buffer too small: have {}, need {}",
+        indexer_cache.len(),
+        min_cache_bytes
+    );
+
+    let (k_ptr, _k_guard) = k.device_ptr(&ctx.stream);
+    let (cache_ptr, _cache_guard) = indexer_cache.device_ptr_mut(&ctx.stream);
+    let (slot_ptr, _slot_guard) = slot_mapping.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_k_quant_and_cache_cuda(
+            k_ptr as *const ffi::Half,
+            cache_ptr as *mut u8,
+            slot_ptr as *const i64,
+            contract.tokens as i32,
+            GLM52_INDEXER_HEAD_DIM as i32,
+            GLM52_INDEXER_QUANT_BLOCK_SIZE as i32,
+            contract.layout.cache_block_size as i32,
+            contract.layout.cache_block_stride_bytes as i64,
+            contract.scale_format.as_ffi(),
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer K quant/cache launch failed: {err}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Glm52IndexerCacheGather {
+    pub tokens: usize,
+    pub batch_size: usize,
+    pub num_blocks_per_seq: usize,
+    pub layout: Glm52IndexerCacheLayout,
+}
+
+impl Glm52IndexerCacheGather {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.tokens > 0,
+            "GLM5.2 indexer gather tokens must be positive"
+        );
+        ensure!(
+            self.batch_size > 0,
+            "GLM5.2 indexer gather batch_size must be positive"
+        );
+        ensure!(
+            self.num_blocks_per_seq > 0,
+            "GLM5.2 indexer gather num_blocks_per_seq must be positive"
+        );
+        self.layout.validate()
+    }
+}
+
+pub fn glm52_indexer_k_gather_quant_cache_launch(
+    ctx: &DeviceContext,
+    contract: Glm52IndexerCacheGather,
+    indexer_cache: &CudaSlice<u8>,
+    dst_k: &mut CudaSlice<u8>,
+    dst_scale: &mut CudaSlice<u8>,
+    block_table: &CudaSlice<i32>,
+    cu_seq_lens: &CudaSlice<i32>,
+) -> Result<()> {
+    contract.validate()?;
+    let min_cache_bytes = contract.layout.min_cache_bytes()?;
+    ensure!(
+        indexer_cache.len() >= min_cache_bytes,
+        "GLM5.2 indexer cache buffer too small: have {}, need {}",
+        indexer_cache.len(),
+        min_cache_bytes
+    );
+    ensure!(
+        dst_k.len() >= contract.tokens * GLM52_INDEXER_HEAD_DIM,
+        "GLM5.2 indexer gather dst_k too small: have {}, need {}",
+        dst_k.len(),
+        contract.tokens * GLM52_INDEXER_HEAD_DIM
+    );
+    ensure!(
+        dst_scale.len() >= contract.tokens * GLM52_INDEXER_SCALE_BYTES_PER_TOKEN,
+        "GLM5.2 indexer gather dst_scale too small: have {}, need {}",
+        dst_scale.len(),
+        contract.tokens * GLM52_INDEXER_SCALE_BYTES_PER_TOKEN
+    );
+    ensure!(
+        block_table.len() >= contract.batch_size * contract.num_blocks_per_seq,
+        "GLM5.2 indexer gather block_table too small: have {}, need {}",
+        block_table.len(),
+        contract.batch_size * contract.num_blocks_per_seq
+    );
+    ensure!(
+        cu_seq_lens.len() >= contract.batch_size + 1,
+        "GLM5.2 indexer gather cu_seq_lens too small: have {}, need {}",
+        cu_seq_lens.len(),
+        contract.batch_size + 1
+    );
+
+    let (cache_ptr, _cache_guard) = indexer_cache.device_ptr(&ctx.stream);
+    let (dst_k_ptr, _dst_k_guard) = dst_k.device_ptr_mut(&ctx.stream);
+    let (dst_scale_ptr, _dst_scale_guard) = dst_scale.device_ptr_mut(&ctx.stream);
+    let (block_table_ptr, _block_table_guard) = block_table.device_ptr(&ctx.stream);
+    let (cu_seq_lens_ptr, _cu_seq_lens_guard) = cu_seq_lens.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_k_gather_quant_cache_cuda(
+            cache_ptr as *const u8,
+            dst_k_ptr as *mut u8,
+            dst_scale_ptr as *mut u8,
+            block_table_ptr as *const i32,
+            cu_seq_lens_ptr as *const i32,
+            contract.batch_size as i32,
+            contract.num_blocks_per_seq as i32,
+            contract.tokens as i32,
+            GLM52_INDEXER_HEAD_DIM as i32,
+            GLM52_INDEXER_QUANT_BLOCK_SIZE as i32,
+            contract.layout.cache_block_size as i32,
+            contract.layout.cache_block_stride_bytes as i64,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer K gather launch failed: {err}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Glm52IndexerLocalTopKToSlots {
+    pub num_tokens: usize,
+    pub topk: usize,
+    pub block_size: usize,
+    pub block_table_cols: usize,
+    pub has_seq_lens: bool,
+}
+
+impl Glm52IndexerLocalTopKToSlots {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.num_tokens > 0,
+            "GLM5.2 indexer local_topk_to_slots num_tokens must be positive"
+        );
+        ensure!(
+            self.topk > 0,
+            "GLM5.2 indexer local_topk_to_slots topk must be positive"
+        );
+        ensure!(
+            self.block_size > 0,
+            "GLM5.2 indexer local_topk_to_slots block_size must be positive"
+        );
+        ensure!(
+            self.block_table_cols > 0,
+            "GLM5.2 indexer local_topk_to_slots block_table_cols must be positive"
+        );
+        Ok(())
+    }
+}
+
+/// Convert local top-k offsets (within a sequence's KV cache) to global KV
+/// slot indices via the block table. Also writes `topk_lens` (valid slot
+/// count per token). Ported from TokenSpeed Triton `local_topk_to_global_slots`.
+///
+/// - `local_topk_offsets`: `[num_tokens, topk]` int32, row-major.
+/// - `seq_lens`: `[num_tokens]` int32. Required if `has_seq_lens` is true;
+///   if false, `block_table[:, 0]` is used as seq_len fallback (TokenSpeed
+///   contract: `seq_lens_arg = block_table[:, 0]` when seq_lens is None).
+/// - `block_table`: `[num_tokens, block_table_cols]` int32, row-major.
+/// - `global_slots`: `[num_tokens, topk]` int32 output, `-1` for invalid slots.
+/// - `topk_lens`: `[num_tokens]` int32 output, valid slot count per token.
+pub fn glm52_indexer_local_topk_to_slots_launch(
+    ctx: &DeviceContext,
+    contract: Glm52IndexerLocalTopKToSlots,
+    local_topk_offsets: &CudaSlice<i32>,
+    seq_lens: Option<&CudaSlice<i32>>,
+    block_table: &CudaSlice<i32>,
+    global_slots: &mut CudaSlice<i32>,
+    topk_lens: &mut CudaSlice<i32>,
+) -> Result<()> {
+    contract.validate()?;
+    ensure!(
+        local_topk_offsets.len() >= contract.num_tokens * contract.topk,
+        "GLM5.2 indexer local_topk_to_slots offsets too small: have {}, need {}",
+        local_topk_offsets.len(),
+        contract.num_tokens * contract.topk
+    );
+    ensure!(
+        block_table.len() >= contract.num_tokens * contract.block_table_cols,
+        "GLM5.2 indexer local_topk_to_slots block_table too small: have {}, need {}",
+        block_table.len(),
+        contract.num_tokens * contract.block_table_cols
+    );
+    ensure!(
+        global_slots.len() >= contract.num_tokens * contract.topk,
+        "GLM5.2 indexer local_topk_to_slots global_slots too small: have {}, need {}",
+        global_slots.len(),
+        contract.num_tokens * contract.topk
+    );
+    ensure!(
+        topk_lens.len() >= contract.num_tokens,
+        "GLM5.2 indexer local_topk_to_slots topk_lens too small: have {}, need {}",
+        topk_lens.len(),
+        contract.num_tokens
+    );
+    if contract.has_seq_lens {
+        ensure!(
+            seq_lens.is_some(),
+            "GLM5.2 indexer local_topk_to_slots has_seq_lens=true but seq_lens is None"
+        );
+        ensure!(
+            seq_lens.unwrap().len() >= contract.num_tokens,
+            "GLM5.2 indexer local_topk_to_slots seq_lens too small: have {}, need {}",
+            seq_lens.unwrap().len(),
+            contract.num_tokens
+        );
+    }
+
+    let (offsets_ptr, _offsets_guard) = local_topk_offsets.device_ptr(&ctx.stream);
+    let seq_lens_ptr = match seq_lens {
+        Some(sl) => {
+            let (ptr, _guard) = sl.device_ptr(&ctx.stream);
+            ptr as *const i32
+        }
+        None => std::ptr::null(),
+    };
+    let (block_table_ptr, _block_table_guard) = block_table.device_ptr(&ctx.stream);
+    let (global_slots_ptr, _global_slots_guard) = global_slots.device_ptr_mut(&ctx.stream);
+    let (topk_lens_ptr, _topk_lens_guard) = topk_lens.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_local_topk_to_slots_cuda(
+            global_slots_ptr as *mut i32,
+            topk_lens_ptr as *mut i32,
+            offsets_ptr as *const i32,
+            contract.topk as i32,
+            seq_lens_ptr,
+            block_table_ptr as *const i32,
+            contract.topk as i32,
+            contract.block_table_cols as i32,
+            contract.block_size as i32,
+            contract.topk as i32,
+            contract.num_tokens as i32,
+            if contract.has_seq_lens { 1 } else { 0 },
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer local_topk_to_slots launch failed: {err}"))
+}

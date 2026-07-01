@@ -1381,6 +1381,7 @@ fn main() {
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
+            || stem == "glm52_topk"
             || stem.starts_with("deepseek_")
         {
             for dir in &flashinfer.cccl {
