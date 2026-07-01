@@ -1468,7 +1468,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "dynamo-kv-hashing"
 version = "1.3.0"
-source = "git+https://github.com/ai-dynamo/dynamo?rev=2623ed7dac2dbd8314277bc2df49d1ebec89a884#2623ed7dac2dbd8314277bc2df49d1ebec89a884"
+source = "git+https://github.com/ai-dynamo/dynamo?rev=364cc8aa543d97f0563e17de3069d98ea051f33f#364cc8aa543d97f0563e17de3069d98ea051f33f"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -1480,7 +1480,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokens"
 version = "1.3.0"
-source = "git+https://github.com/ai-dynamo/dynamo?rev=2623ed7dac2dbd8314277bc2df49d1ebec89a884#2623ed7dac2dbd8314277bc2df49d1ebec89a884"
+source = "git+https://github.com/ai-dynamo/dynamo?rev=364cc8aa543d97f0563e17de3069d98ea051f33f#364cc8aa543d97f0563e17de3069d98ea051f33f"
 dependencies = [
  "bs58",
  "bytemuck",

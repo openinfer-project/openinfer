@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use dynamo_tokens::{CHAIN_XXH3_SEED, SaltHash, compute_hash_v2};
+use dynamo_kv_hashing::compute_salt_hash;
 use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
 use kvbm_logical::events::{EventsManager, KvCacheEvent};
 use kvbm_logical::integrations::{DecodeOutcome, SchedulableSequence, ScheduleError};
@@ -17,21 +17,6 @@ use crate::view::KvView;
 /// dropped event silently desyncs the router's prefix tree. Only allocated on
 /// the [`BlockPool::with_events`] path.
 const KV_EVENT_CHANNEL_CAPACITY: usize = 65_536;
-
-/// Prefix-cache salt for a LoRA adapter.
-///
-/// Replicates upstream dynamo's canonical derivation on the no-extra-salt path
-/// (`lib/kv-hashing/src/salt.rs`, `pub(crate)` there), which is also the seed
-/// `dynamo-kv-router` uses in `compute_block_hash_for_seq` — so our block-hash
-/// chain stays byte-comparable with a dynamo KV indexer. `Some("")` shares the
-/// cache with `None`, matching the router's `filter(|n| !n.is_empty())`.
-/// Parity with upstream is pinned by `lora_salt_matches_upstream_request_hashing`.
-fn lora_salt_hash(lora_name: Option<&str>) -> SaltHash {
-    match lora_name.filter(|n| !n.is_empty()) {
-        Some(name) => CHAIN_XXH3_SEED.wrapping_add(compute_hash_v2(name.as_bytes(), 0)),
-        None => CHAIN_XXH3_SEED,
-    }
-}
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
@@ -155,7 +140,8 @@ impl BlockPool {
         max_output_tokens: usize,
         lora_name: Option<&str>,
     ) -> RequestKv {
-        let salt_hash = lora_salt_hash(lora_name);
+        let salt_hash = compute_salt_hash(None, lora_name)
+            .expect("compute_salt_hash is infallible for (None, lora_name)");
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
@@ -620,28 +606,6 @@ fn sequence_hash_bytes(hash: &SequenceHash) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `lora_salt_hash` re-derives what upstream keeps `pub(crate)`. If upstream
-    /// ever changes the salt scheme, this is the test that catches the drift —
-    /// our hashes must equal `dynamo_kv_hashing::Request`'s for the same
-    /// (tokens, lora) so they stay comparable with a dynamo KV indexer.
-    #[test]
-    fn lora_salt_matches_upstream_request_hashing() {
-        let pool = BlockPool::new(16, 64).unwrap();
-        let tokens: Vec<u32> = (1..=64).collect(); // 4 full blocks
-        for lora in [None, Some("adapter-a")] {
-            let upstream = dynamo_kv_hashing::Request::builder()
-                .tokens(tokens.clone())
-                .lora_name(lora.map(String::from))
-                .build()
-                .unwrap()
-                .positional_lineage_hashes(16)
-                .unwrap();
-            let rkv = pool.new_request(tokens.clone(), 0, lora);
-            let ours = rkv.seq.inner().sequence().all_sequence_hashes();
-            assert_eq!(ours, upstream, "lora={lora:?}");
-        }
-    }
 
     /// The offload CPU-tier query keys are `prompt_block_hashes`. The whole
     /// load path is built on these being identical for any two requests that

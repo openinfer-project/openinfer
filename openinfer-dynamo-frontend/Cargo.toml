@@ -16,9 +16,9 @@ path = "src/main.rs"
 # never touches a GPU, so it stays a light CPU-only binary. Same dep shape the
 # Python binding uses for its no-GPU build, pinned to the SAME rev as the
 # openinfer-dynamo-backend deps so the shared git checkout / type identity hold.
-dynamo-llm = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884", default-features = false }
+dynamo-llm = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f", default-features = false }
 # Worker / Runtime / DistributedRuntime + RouterMode.
-dynamo-runtime = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
+dynamo-runtime = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

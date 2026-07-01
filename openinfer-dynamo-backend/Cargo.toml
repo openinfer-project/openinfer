@@ -23,11 +23,11 @@ openinfer-qwen3-4b = { path = "../openinfer-qwen3-4b" }
 # driver, and `run()`. Pinned to the SAME rev as the dynamo deps in the main
 # pegainfer workspace so the shared git checkout (and its internal type
 # identity) stay consistent.
-dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
+dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
 # KV-router event protocol types (KvCacheEvent / KvCacheStoreData / ...). Not
 # re-exported by backend-common, so depended on directly — same rev so the
 # `KvCacheEvent` we build is the exact type `KvEventPublisher::publish` accepts.
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884" }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -42,7 +42,7 @@ tracing = "0.1"
 # Same rev as the runtime dep above; the `testing` feature unlocks
 # `dynamo_backend_common::testing::run_conformance`, the official LLMEngine
 # conformance kit the GPU integration test in `engine.rs` drives.
-dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo", rev = "2623ed7dac2dbd8314277bc2df49d1ebec89a884", features = ["testing"] }
+dynamo-backend-common = { git = "https://github.com/ai-dynamo/dynamo", rev = "364cc8aa543d97f0563e17de3069d98ea051f33f", features = ["testing"] }
 
 # Separate workspace on purpose. This keeps dynamo-runtime / dynamo-llm and
 # their heavy transitive deps (tonic, kube, etcd, NATS) OUT of the main
