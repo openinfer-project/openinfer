@@ -403,7 +403,7 @@ fn execute_step_on_lane(
             decode_stream,
             sample_seed,
         } => {
-            use openinfer_kernels::tensor::{clear_stream_override, set_stream_override};
+            use openinfer_kernels::tensor::StreamOverrideGuard;
 
             // If there's still an inflight prefill from a previous step, sync it
             // now (shouldn't happen normally, but safety).
@@ -430,24 +430,26 @@ fn execute_step_on_lane(
             lane.model.device_ctx().sync()?;
 
             // Launch prefill on prefill partition stream.
-            unsafe { set_stream_override(prefill_stream.0) };
-            let (prefill_logits, _, _) = lane.execute_prefill(
-                &prefill_prompts,
-                prefill_kv_views,
-                &prefill_lora_adapters,
-                false,
-                None,
-            )?;
-            clear_stream_override();
+            let (prefill_logits, _, _) = {
+                let _prefill_override = unsafe { StreamOverrideGuard::activate(prefill_stream.0) };
+                lane.execute_prefill(
+                    &prefill_prompts,
+                    prefill_kv_views,
+                    &prefill_lora_adapters,
+                    false,
+                    None,
+                )?
+            };
 
             // Launch decode on the decode partition stream. CUDA graph stays
             // enabled: batch_decode captures into the split graph cache keyed on
             // the active stream override, so the replayed kernel nodes stay
             // pinned to the decode SM partition (CUDA PG §4.6.5 — capture stream
             // determines a node's execution context).
-            unsafe { set_stream_override(decode_stream.0) };
-            lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
-            clear_stream_override();
+            {
+                let _decode_override = unsafe { StreamOverrideGuard::activate(decode_stream.0) };
+                lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
+            }
 
             // Only sync decode stream — decode result is ready for sampling.
             // Prefill continues async on GPU; polled later via event.

@@ -16,20 +16,25 @@ thread_local! {
     static STREAM_OVERRIDE: Cell<Option<CUstream>> = const { Cell::new(None) };
 }
 
-/// Set a thread-local stream override. All subsequent kernel launches via
-/// [`DeviceContext::active_cu_stream`] will use this stream instead of the
-/// context's default stream. Call [`clear_stream_override`] to revert.
-///
-/// # Safety
-/// The caller must ensure the stream is valid for the lifetime of the override
-/// and belongs to the same CUDA device as the `DeviceContext`.
-pub unsafe fn set_stream_override(stream: CUstream) {
-    STREAM_OVERRIDE.with(|c| c.set(Some(stream)));
+/// Scoped stream override for [`active_cu_stream`]; drop restores the previous value.
+pub struct StreamOverrideGuard {
+    previous: Option<CUstream>,
 }
 
-/// Clear the thread-local stream override, reverting to the context's default.
-pub fn clear_stream_override() {
-    STREAM_OVERRIDE.with(|c| c.set(None));
+impl StreamOverrideGuard {
+    /// # Safety
+    /// The stream must be valid for the guard's lifetime and belong to the
+    /// same CUDA device as the `DeviceContext`.
+    pub unsafe fn activate(stream: CUstream) -> Self {
+        let previous = STREAM_OVERRIDE.with(|c| c.replace(Some(stream)));
+        Self { previous }
+    }
+}
+
+impl Drop for StreamOverrideGuard {
+    fn drop(&mut self) {
+        STREAM_OVERRIDE.with(|c| c.set(self.previous));
+    }
 }
 
 /// Returns true if a stream override is currently active on this thread.
@@ -674,6 +679,20 @@ pub struct DeviceMatrixRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_override_guard_restores_on_drop() {
+        let outer = 0x10usize as CUstream;
+        assert!(!has_stream_override());
+        {
+            let _outer_guard = unsafe { StreamOverrideGuard::activate(outer) };
+            {
+                let _inner_guard = unsafe { StreamOverrideGuard::activate(0x20usize as CUstream) };
+            }
+            assert_eq!(STREAM_OVERRIDE.with(Cell::get), Some(outer));
+        }
+        assert!(!has_stream_override());
+    }
 
     fn copy_matrix_to_host(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Vec<bf16> {
         let host = ctx
