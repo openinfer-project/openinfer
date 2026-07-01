@@ -7,6 +7,7 @@ pub mod batch_decode_trace;
 mod config;
 mod dflash;
 mod dspark;
+mod eagle3;
 mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
@@ -179,6 +180,9 @@ pub struct Qwen3LaunchOptions {
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
+    /// `Some` enables EAGLE-3 speculative decoding with this drafter model.
+    /// Same constraints as DFlash and mutually exclusive with it.
+    pub eagle3_draft_model_path: Option<PathBuf>,
     /// Publish KV block store/remove events for an out-of-band cache-aware
     /// router (e.g. a Dynamo KV router). Off for plain single-machine serving;
     /// single-GPU + base-model only (rejected with LoRA or tensor parallel).
@@ -218,13 +222,18 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         );
     }
     anyhow::ensure!(
-        !(options.dflash_draft_model_path.is_some() && options.lora.is_some()),
-        "DFlash speculative decoding cannot be combined with LoRA serving"
+        !(options.dflash_draft_model_path.is_some() && options.eagle3_draft_model_path.is_some()),
+        "DFlash and EAGLE-3 speculative decoding are mutually exclusive"
+    );
+    let spec_draft_path =
+        options.dflash_draft_model_path.is_some() || options.eagle3_draft_model_path.is_some();
+    anyhow::ensure!(
+        !(spec_draft_path && options.lora.is_some()),
+        "Speculative decoding (DFlash / EAGLE-3) cannot be combined with LoRA serving"
     );
     anyhow::ensure!(
-        !(options.dflash_draft_model_path.is_some()
-            && !matches!(options.decode_overlap, DecodeOverlap::Off)),
-        "DFlash speculative decoding cannot be combined with decode overlap \
+        !(spec_draft_path && !matches!(options.decode_overlap, DecodeOverlap::Off)),
+        "Speculative decoding (DFlash / EAGLE-3) cannot be combined with decode overlap \
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"
     );
@@ -259,6 +268,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.decode_overlap,
             options.batch_invariant,
             options.dflash_draft_model_path.as_deref(),
+            options.eagle3_draft_model_path.as_deref(),
             options.enable_kv_events,
         ),
     }
@@ -274,6 +284,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         Qwen3MemoryOptions::default(),
         DecodeOverlap::Off,
         false,
+        None,
         None,
         false,
     )
@@ -302,6 +313,7 @@ pub fn start_engine_with_offload(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
     dflash_draft_model_path: Option<&Path>,
+    eagle3_draft_model_path: Option<&Path>,
     enable_kv_events: bool,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
@@ -325,6 +337,12 @@ pub fn start_engine_with_offload(
                 .ok_or_else(|| anyhow::anyhow!("DFlash draft model path must be valid UTF-8"))
         })
         .transpose()?;
+    let eagle3_draft_model_path = eagle3_draft_model_path
+        .map(|path| {
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("EAGLE-3 draft model path must be valid UTF-8"))
+        })
+        .transpose()?;
     scheduler::start_qwen3(
         model_path,
         enable_cuda_graph,
@@ -336,6 +354,7 @@ pub fn start_engine_with_offload(
         memory_options,
         decode_overlap,
         dflash_draft_model_path,
+        eagle3_draft_model_path,
         enable_kv_events,
     )
 }

@@ -22,15 +22,18 @@ use tokio::sync::broadcast;
 
 mod dflash_lane;
 mod dflash_prefill;
+mod eagle3_lane;
 mod spec;
 
 use crate::dflash::DFlashDraftModel;
+use crate::eagle3::Eagle3DraftModel;
 use crate::speculative::{
     DraftPlan, DraftResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
     build_verify_results,
 };
 use dflash_lane::DFlashLaneState;
 use dflash_prefill::{DFlashPrefillAction, dflash_prefill_action};
+use eagle3_lane::Eagle3LaneState;
 
 use crate::verify_graph::VerifyGraphBuffers;
 
@@ -280,11 +283,15 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            // When DFlash is loaded, capture target hidden states for eligible
-            // requests so they can seed the draft model after prefill finishes.
-            let capture_requested = lane.should_capture_dflash_prefill_context(requests);
-            let capture_layer_ids = if capture_requested {
+            // When a speculative drafter (DFlash or EAGLE-3, mutually exclusive)
+            // is loaded, capture target hidden states for eligible requests so
+            // they can seed the draft after prefill finishes.
+            let dflash_capture = lane.should_capture_dflash_prefill_context(requests);
+            let eagle3_capture = lane.should_capture_eagle3_prefill_context(requests);
+            let capture_layer_ids = if dflash_capture {
                 lane.dflash_capture_layer_ids()
+            } else if eagle3_capture {
+                lane.eagle3_capture_layer_ids()
             } else {
                 None
             };
@@ -295,11 +302,19 @@ fn execute_step_on_lane(
                 *echo,
                 capture_layer_ids.as_deref(),
             )?;
-            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
-                requests,
-                capture_requested,
-                captured_hidden.as_ref(),
-            )?;
+            let spec_context_captured_requests = if eagle3_capture {
+                lane.record_prefill_eagle3_context(
+                    requests,
+                    eagle3_capture,
+                    captured_hidden.as_ref(),
+                )?
+            } else {
+                lane.record_prefill_dflash_context(
+                    requests,
+                    dflash_capture,
+                    captured_hidden.as_ref(),
+                )?
+            };
             if collect_result {
                 let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
@@ -312,7 +327,7 @@ fn execute_step_on_lane(
                         all_position_logits.as_ref(),
                         *echo,
                     )?,
-                    dflash_context_captured_requests,
+                    spec_context_captured_requests,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -499,14 +514,24 @@ fn execute_step_on_lane(
             // speculative KV view. The fixed-buffer verify path computes all-
             // position logits (accept_greedy needs the target's posterior at
             // each span position) and captures the target hidden states (at the
-            // DFlash layers) to seed the next draft — all into reused,
-            // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(requests, kv_views)?;
+            // drafter's layers) to seed the next draft — all into reused,
+            // pointer-stable scratch (`VerifyGraphBuffers`). Routes to whichever
+            // drafter is loaded (DFlash or EAGLE-3, mutually exclusive).
+            let result = if lane.eagle3.is_some() {
+                lane.execute_eagle3_verify(requests, kv_views)?
+            } else {
+                lane.execute_dflash_verify(requests, kv_views)?
+            };
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
-        StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
-            lane.execute_dflash_draft(requests)?,
-        )),
+        StepCommand::SpeculativeDraft { requests } => {
+            let result = if lane.eagle3.is_some() {
+                lane.execute_eagle3_draft(requests)?
+            } else {
+                lane.execute_dflash_draft(requests)?
+            };
+            Ok(WorkerStepOutcome::SpeculativeDraft(result))
+        }
     }
 }
 
@@ -709,10 +734,11 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
-    /// Requests whose DFlash target context was captured this prefill step.
-    /// Empty unless speculative decoding is enabled. The executor folds these
-    /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
-    pub dflash_context_captured_requests: Vec<RequestId>,
+    /// Requests whose speculative target context (DFlash or EAGLE-3) was captured
+    /// this prefill step. Empty unless speculative decoding is enabled. The
+    /// executor folds these into the active lane's ready set once the prompt is
+    /// fully prefilled.
+    pub spec_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -889,10 +915,17 @@ pub struct Qwen3Executor {
     /// DFlash draft metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DFlashMeta>,
+    /// EAGLE-3 draft metadata; `Some` once the drafter is loaded into the primary
+    /// lane. Mutually exclusive with `speculative` (DFlash). Speculative decoding
+    /// is enabled iff one of the two is set.
+    eagle3: Option<Eagle3Meta>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
     dflash_ready_requests: HashSet<RequestId>,
+    /// Requests whose EAGLE-3 context is captured and ready to draft (parallel to
+    /// `dflash_ready_requests`; only one lane is active at a time).
+    eagle3_ready_requests: HashSet<RequestId>,
     /// Opt-in KV block-event feed for a cache-aware router (`Some` only when the
     /// engine was built with events on — single-GPU, no LoRA). `None` on the
     /// plain path, where the whole feed costs nothing.
@@ -946,14 +979,14 @@ impl Qwen3Executor {
         model: Qwen3Model,
         offload_opts: &Qwen3OffloadOptions,
         max_prefill_tokens: usize,
-        dflash_kv_bytes_per_token: usize,
+        spec_kv_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
         enable_kv_events: bool,
     ) -> Result<Self> {
         let (model, budget) = profile_kv_budget_on_worker(
             model,
             max_prefill_tokens,
-            dflash_kv_bytes_per_token,
+            spec_kv_bytes_per_token,
             memory_options,
         )?;
         let (kv_mgr, kv_events) = if enable_kv_events {
@@ -1019,7 +1052,9 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            eagle3: None,
             dflash_ready_requests: HashSet::new(),
+            eagle3_ready_requests: HashSet::new(),
             kv_events,
         })
     }
@@ -1037,6 +1072,7 @@ impl Qwen3Executor {
             Qwen3OffloadOptions::disabled(),
             crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
             None,
+            None,
             Qwen3MemoryOptions::default(),
             false,
         )
@@ -1050,6 +1086,7 @@ impl Qwen3Executor {
         offload_options: Qwen3OffloadOptions,
         max_prefill_tokens: usize,
         dflash_draft_path: Option<&str>,
+        eagle3_draft_path: Option<&str>,
         memory_options: Qwen3MemoryOptions,
         enable_kv_events: bool,
     ) -> Result<Self> {
@@ -1093,26 +1130,38 @@ impl Qwen3Executor {
                     max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
-            // The DFlash draft model loads after profiling but lives outside the
-            // paged KV pool, so reserve its footprint up front from the draft
-            // config: fixed bytes (weights + block scratch) via the margin, and
-            // pool-scaling per-token bytes folded into the block budget.
-            let dflash_kv_bytes_per_token = match dflash_draft_path {
-                Some(path) => {
-                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+            // A speculative draft model (DFlash or EAGLE-3) loads after profiling
+            // but lives outside the paged KV pool, so reserve its footprint up front
+            // from the draft config: fixed bytes (weights + scratch) via the margin,
+            // and pool-scaling per-token bytes folded into the block budget. The two
+            // drafters are mutually exclusive.
+            let max_decode_batch = *BATCH_BUCKETS.last().unwrap();
+            let spec_kv_bytes_per_token = match (dflash_draft_path, eagle3_draft_path) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("DFlash and EAGLE-3 speculative decoding are mutually exclusive")
+                }
+                (Some(path), None) => {
+                    let reservation =
+                        crate::dflash::DFlashMemoryReservation::from_path(path, max_decode_batch)?;
+                    memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
+                    reservation.kv_bytes_per_token
+                }
+                (None, Some(path)) => {
+                    let reservation = crate::eagle3::Eagle3MemoryReservation::from_path(
                         path,
-                        *BATCH_BUCKETS.last().unwrap(),
+                        max_prefill_tokens,
+                        max_decode_batch,
                     )?;
                     memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
                     reservation.kv_bytes_per_token
                 }
-                None => 0,
+                (None, None) => 0,
             };
             let mut executor = Self::single(
                 model,
                 &offload_options,
                 max_prefill_tokens,
-                dflash_kv_bytes_per_token,
+                spec_kv_bytes_per_token,
                 memory_options,
                 enable_kv_events,
             )?;
@@ -1255,7 +1304,9 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            eagle3: None,
             dflash_ready_requests: HashSet::new(),
+            eagle3_ready_requests: HashSet::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
         })
@@ -1372,6 +1423,40 @@ impl Qwen3Executor {
         );
         self.prefix_cache_enabled = false;
         self.speculative = Some(meta);
+        Ok(())
+    }
+
+    /// Enable EAGLE-3 speculative decoding by loading the drafter into the primary
+    /// lane (same single-GPU / no-offload constraints as DFlash). The KV-budget
+    /// reservation for the drafter is already applied in
+    /// `from_runtime_with_lora_options` (via `Eagle3MemoryReservation`).
+    ///
+    /// Like DFlash, disables the prefix cache: the 3-layer capture needs clean,
+    /// uncached target hidden states for every prompt token, and a prefix-cache
+    /// hit skips the forward that would produce them.
+    pub fn load_eagle3_draft_model(&mut self, draft_path: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.workers.is_empty(),
+            "speculative decoding requires the single-GPU path (got {} extra ranks)",
+            self.workers.len()
+        );
+        anyhow::ensure!(
+            self.offload.is_none(),
+            "speculative decoding is not supported together with KV offload"
+        );
+        anyhow::ensure!(
+            self.speculative.is_none(),
+            "DFlash and EAGLE-3 speculative decoding are mutually exclusive"
+        );
+        let meta = self.primary.load_eagle3(draft_path.to_string())?;
+        log::info!(
+            "Qwen3 EAGLE-3 speculative decoding enabled: aux capture layers {:?}, \
+             draft max positions {}",
+            meta.aux_layer_ids,
+            meta.max_position_embeddings
+        );
+        self.prefix_cache_enabled = false;
+        self.eagle3 = Some(meta);
         Ok(())
     }
 
@@ -1600,7 +1685,7 @@ impl Qwen3Executor {
 fn profile_kv_budget_on_worker(
     model: Qwen3Model,
     max_prefill_tokens: usize,
-    dflash_kv_bytes_per_token: usize,
+    spec_kv_bytes_per_token: usize,
     memory_options: Qwen3MemoryOptions,
 ) -> Result<(Qwen3Model, KvBudget)> {
     let handle = thread::Builder::new()
@@ -1615,7 +1700,7 @@ fn profile_kv_budget_on_worker(
             let budget = model.profiled_kv_budget(
                 max_prefill_tokens,
                 *BATCH_BUCKETS.last().unwrap(),
-                dflash_kv_bytes_per_token,
+                spec_kv_bytes_per_token,
                 memory_options,
             )?;
             Ok((model, budget))
@@ -1745,6 +1830,9 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative.is_some() {
             self.dflash_ready_requests.remove(&request_id);
             self.primary.drop_dflash_request(request_id)?;
+        } else if self.eagle3.is_some() {
+            self.eagle3_ready_requests.remove(&request_id);
+            self.primary.drop_eagle3_request(request_id)?;
         }
         Ok(())
     }
@@ -1935,7 +2023,7 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative.is_some() {
             for req_result in &result.requests {
                 let captured = result
-                    .dflash_context_captured_requests
+                    .spec_context_captured_requests
                     .contains(&req_result.request_id);
                 match dflash_prefill_action(captured, req_result.completed) {
                     DFlashPrefillAction::MarkReady => {
@@ -1947,6 +2035,24 @@ impl ModelExecutor for Qwen3Executor {
                     DFlashPrefillAction::Drop => {
                         self.dflash_ready_requests.remove(&req_result.request_id);
                         self.primary.drop_dflash_request(req_result.request_id)?;
+                    }
+                }
+            }
+        } else if self.eagle3.is_some() {
+            for req_result in &result.requests {
+                let captured = result
+                    .spec_context_captured_requests
+                    .contains(&req_result.request_id);
+                match dflash_prefill_action(captured, req_result.completed) {
+                    DFlashPrefillAction::MarkReady => {
+                        self.eagle3_ready_requests.insert(req_result.request_id);
+                    }
+                    DFlashPrefillAction::KeepPending => {
+                        self.eagle3_ready_requests.remove(&req_result.request_id);
+                    }
+                    DFlashPrefillAction::Drop => {
+                        self.eagle3_ready_requests.remove(&req_result.request_id);
+                        self.primary.drop_eagle3_request(req_result.request_id)?;
                     }
                 }
             }
@@ -2011,6 +2117,12 @@ impl ModelExecutor for Qwen3Executor {
                     self.primary.drop_dflash_request(req_result.request_id)?;
                 }
             }
+        } else if self.eagle3.is_some() {
+            for req_result in &result.requests {
+                if self.eagle3_ready_requests.remove(&req_result.request_id) {
+                    self.primary.drop_eagle3_request(req_result.request_id)?;
+                }
+            }
         }
         // 5. Offload any block this decode step just sealed (post-step-sync).
         for req_result in &result.requests {
@@ -2029,11 +2141,13 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn speculative_enabled(&self) -> bool {
-        self.speculative.is_some()
+        // DFlash and EAGLE-3 are mutually exclusive; either enables the path.
+        self.speculative.is_some() || self.eagle3.is_some()
     }
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
         self.dflash_ready_requests.contains(&request_id)
+            || self.eagle3_ready_requests.contains(&request_id)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
@@ -2457,6 +2571,17 @@ struct DFlashMeta {
     target_layer_ids: Vec<usize>,
 }
 
+/// What the executor learns after loading the EAGLE-3 drafter on the worker: the
+/// drafter's max cacheable position (caps the spec-effective context) and which
+/// target layers the 3-layer capture reads (low/mid/high, derived from the
+/// target's layer count — the drafter config carries no explicit list).
+#[derive(Clone, Debug)]
+struct Eagle3Meta {
+    max_position_embeddings: usize,
+    #[allow(dead_code)]
+    aux_layer_ids: [usize; 3],
+}
+
 struct LocalQwen3Lane {
     model: Qwen3Model,
     kv_buffer: KvBuffer,
@@ -2470,6 +2595,10 @@ struct LocalQwen3Lane {
     /// DFlash draft lane (the draft model + per-request draft state). `None`
     /// unless speculative decoding is enabled; only the primary rank carries it.
     dflash: Option<DFlashLaneState>,
+    /// EAGLE-3 draft lane (the drafter + per-request draft state). `None` unless
+    /// EAGLE-3 speculative decoding is enabled; mutually exclusive with `dflash`.
+    /// Only the primary rank carries it.
+    eagle3: Option<Eagle3LaneState>,
     /// Fixed, pre-allocated scratch for the DFlash verify forward. Lazily built
     /// on the first verify step (its shape depends on the loaded draft model's
     /// block size and the target's capture layers). Pointer-stable for the
@@ -2536,6 +2665,7 @@ impl LocalQwen3Lane {
             max_prefill_tokens,
             inflight_prefill: None,
             dflash: None,
+            eagle3: None,
             verify_bufs: None,
             total_blocks,
         })
@@ -2561,6 +2691,30 @@ impl LocalQwen3Lane {
             self.model.device_ctx(),
             model,
             max_decode_batch_size,
+        )?);
+        Ok(meta)
+    }
+
+    /// Load the EAGLE-3 drafter into this lane (primary rank only). Built here on
+    /// the worker thread because it reuses the co-located target's `embed_tokens`.
+    /// The aux capture layers are derived from the target's layer count (the
+    /// drafter config carries no explicit list).
+    fn load_eagle3(&mut self, draft_path: &str) -> Result<Eagle3Meta> {
+        let model = Eagle3DraftModel::from_safetensors_for_target(
+            self.model.device_ctx(),
+            draft_path,
+            &self.model,
+        )?;
+        let aux_layer_ids =
+            crate::eagle3::aux_hidden_state_layers(self.model.config().num_hidden_layers)?;
+        let meta = Eagle3Meta {
+            max_position_embeddings: model.config.max_position_embeddings,
+            aux_layer_ids,
+        };
+        self.eagle3 = Some(Eagle3LaneState::new(
+            self.model.device_ctx(),
+            model,
+            aux_layer_ids,
         )?);
         Ok(meta)
     }
@@ -2604,11 +2758,11 @@ impl LocalQwen3Lane {
             false,
         )?;
 
-        // Split-concurrent prefill never runs with DFlash (capture needs the
-        // synchronous result), so no context is captured here.
+        // Split-concurrent prefill never runs with speculative decoding (capture
+        // needs the synchronous result), so no context is captured here.
         Ok(PrefillResult {
             requests: results,
-            dflash_context_captured_requests: Vec::new(),
+            spec_context_captured_requests: Vec::new(),
         })
     }
 
@@ -2739,6 +2893,59 @@ impl LocalQwen3Lane {
                 &request_results,
                 Some(bufs.captured_hidden()),
             )?;
+            Ok(VerifyResult {
+                requests: request_results,
+            })
+        })();
+        self.verify_bufs = Some(bufs);
+        result
+    }
+
+    /// EAGLE-3 verify forward: structurally identical to [`Self::execute_dflash_verify`]
+    /// (one target prefill over each request's span, all-position logits for
+    /// `accept_greedy`, capture of the target hidden at the EAGLE aux layers), but
+    /// the post-accept record re-seeds the autoregressive chain (teacher-forcing
+    /// the accepted prefix) instead of appending to a DFlash pending buffer.
+    fn execute_eagle3_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+    ) -> Result<VerifyResult> {
+        let capture_layer_ids = self
+            .eagle3_capture_layer_ids()
+            .ok_or_else(|| anyhow::anyhow!("EAGLE-3 verify requested but no drafter is loaded"))?;
+        // Verify span = current token + up to EAGLE3_CHAIN_LENGTH drafts.
+        let span = crate::eagle3::EAGLE3_CHAIN_LENGTH + 1;
+
+        if self.verify_bufs.is_none() {
+            let max_batch = *BATCH_BUCKETS.last().unwrap();
+            self.verify_bufs = Some(VerifyGraphBuffers::new(
+                &self.model,
+                max_batch,
+                span,
+                capture_layer_ids.len(),
+                self.total_blocks,
+            )?);
+        }
+
+        let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
+        let result = (|| -> Result<VerifyResult> {
+            let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
+            self.model.batch_prefill_into(
+                &spans,
+                kv_views,
+                self.kv_buffer.buffer(),
+                &self.layout,
+                &capture_layer_ids,
+                &mut bufs,
+            )?;
+
+            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
+            let greedy = SamplingParams::default();
+            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
+            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
+            let request_results = build_verify_results(requests, &target_tokens)?;
+            self.record_verify_eagle3_context(requests, &request_results, bufs.captured_hidden())?;
             Ok(VerifyResult {
                 requests: request_results,
             })
@@ -2892,9 +3099,20 @@ enum WorkerCommand {
         draft_path: String,
         resp: channel::Sender<Result<DFlashMeta>>,
     },
+    /// Load the EAGLE-3 drafter into the primary lane (built on the worker thread
+    /// because it reuses the co-located target's embeddings).
+    LoadEagle3 {
+        draft_path: String,
+        resp: channel::Sender<Result<Eagle3Meta>>,
+    },
     /// Drop a request's DFlash draft state (request retired, or it fell back to
     /// a plain decode that advanced the sequence outside the speculative path).
     DropDflash {
+        request_id: RequestId,
+        resp: channel::Sender<Result<()>>,
+    },
+    /// Drop a request's EAGLE-3 draft state (same triggers as `DropDflash`).
+    DropEagle3 {
         request_id: RequestId,
         resp: channel::Sender<Result<()>>,
     },
@@ -2986,8 +3204,16 @@ impl RankWorker {
                                     let result = lane.load_dflash(&draft_path);
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::LoadEagle3 { draft_path, resp } => {
+                                    let result = lane.load_eagle3(&draft_path);
+                                    let _ = resp.send(result);
+                                }
                                 WorkerCommand::DropDflash { request_id, resp } => {
                                     lane.drop_dflash_request(request_id);
+                                    let _ = resp.send(Ok(()));
+                                }
+                                WorkerCommand::DropEagle3 { request_id, resp } => {
+                                    lane.drop_eagle3_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
                                 WorkerCommand::Shutdown => break,
@@ -3049,6 +3275,21 @@ impl RankWorker {
             .map_err(|_| anyhow::anyhow!("worker dropped load_dflash response"))?
     }
 
+    /// Load the EAGLE-3 drafter into this worker's lane and return its metadata.
+    /// Blocks until the worker finishes loading.
+    fn load_eagle3(&self, draft_path: String) -> Result<Eagle3Meta> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::LoadEagle3 {
+                draft_path,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on load_eagle3"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped load_eagle3 response"))?
+    }
+
     /// Drop a request's DFlash state. Blocks until the worker acknowledges.
     fn drop_dflash_request(&self, request_id: RequestId) -> Result<()> {
         let (resp_tx, resp_rx) = channel::bounded(1);
@@ -3061,6 +3302,20 @@ impl RankWorker {
         resp_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("worker dropped drop_dflash response"))?
+    }
+
+    /// Drop a request's EAGLE-3 state. Blocks until the worker acknowledges.
+    fn drop_eagle3_request(&self, request_id: RequestId) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::DropEagle3 {
+                request_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_eagle3"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped drop_eagle3 response"))?
     }
 
     fn load_lora_adapter(

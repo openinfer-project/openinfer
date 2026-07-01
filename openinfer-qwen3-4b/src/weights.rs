@@ -897,7 +897,7 @@ impl Qwen3Model {
         &self,
         max_prefill_tokens: usize,
         max_decode_batch_size: usize,
-        dflash_kv_bytes_per_token: usize,
+        spec_kv_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
     ) -> Result<KvBudget> {
         let memory_options = memory_options.validate()?;
@@ -1020,7 +1020,7 @@ impl Qwen3Model {
         Ok(self.kv_budget_from_bytes(
             geometry,
             bytes_per_block,
-            dflash_kv_bytes_per_token,
+            spec_kv_bytes_per_token,
             kv_budget_bytes,
             initial_free_bytes,
             "profiled",
@@ -1053,17 +1053,17 @@ impl Qwen3Model {
         &self,
         mut geometry: KvBudget,
         bytes_per_block: usize,
-        dflash_kv_bytes_per_token: usize,
+        spec_kv_bytes_per_token: usize,
         kv_budget_bytes: usize,
         free_bytes: usize,
         source: &'static str,
     ) -> KvBudget {
-        // DFlash keeps its own per-request KV (plus prompt-scaling scratch) outside
-        // the paged pool, scaling with the same token count. Charge it as extra
-        // bytes per pool token so the target block count shrinks to leave room; the
-        // pool itself is still allocated at the target-only `bytes_per_block`.
+        // A speculative drafter (DFlash, EAGLE-3, …) keeps its own per-token KV
+        // outside the paged pool, scaling with the same token count. Charge it as
+        // extra bytes per pool token so the target block count shrinks to leave
+        // room; the pool itself is still allocated at the target-only `bytes_per_block`.
         let effective_bytes_per_block =
-            bytes_per_block + dflash_kv_bytes_per_token * geometry.block_size;
+            bytes_per_block + spec_kv_bytes_per_token * geometry.block_size;
         let num_blocks = (kv_budget_bytes / effective_bytes_per_block).max(64);
         let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
         log::info!(

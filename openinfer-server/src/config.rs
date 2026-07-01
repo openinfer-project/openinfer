@@ -96,6 +96,13 @@ pub(crate) struct Args {
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
+    /// Enable Qwen3 EAGLE-3 speculative decoding with this drafter model path
+    /// (e.g. AngelSlim/Qwen3-4B_eagle3). Same constraints as DFlash (single-GPU
+    /// greedy, no --enable-lora / --kv-offload, prefix cache off) and mutually
+    /// exclusive with --dflash-draft-model-path.
+    #[arg(long = "eagle3-draft-model-path")]
+    pub eagle3_draft_model_path: Option<PathBuf>,
+
     /// Cap on total prompt tokens forwarded in one scheduler step. When omitted,
     /// Qwen3 and Qwen3.5 use their own crate defaults.
     #[arg(long)]

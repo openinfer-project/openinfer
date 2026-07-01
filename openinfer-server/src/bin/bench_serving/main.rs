@@ -212,6 +212,7 @@ fn main() -> Result<()> {
                 openinfer_qwen3_4b::DecodeOverlap::Off,
                 false,
                 None,
+                None,
                 false,
             )?;
             finish(handle, cli.cuda_graph)
