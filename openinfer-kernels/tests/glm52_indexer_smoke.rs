@@ -32,14 +32,13 @@ unsafe extern "C" {
 
 struct DeviceBuf {
     ptr: *mut c_void,
-    bytes: usize,
 }
 
 impl DeviceBuf {
     fn alloc(bytes: usize) -> Result<Self> {
         let mut ptr = ptr::null_mut();
         cuda_check(unsafe { cudaMalloc(&mut ptr, bytes) })?;
-        Ok(Self { ptr, bytes })
+        Ok(Self { ptr })
     }
 
     fn from_host<T: Copy>(data: &[T]) -> Result<Self> {

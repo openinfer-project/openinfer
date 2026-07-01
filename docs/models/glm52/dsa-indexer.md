@@ -1,6 +1,6 @@
 # GLM5.2 DSA Indexer (PR2)
 
-> **TL;DR:** The DSA indexer chain that replaces PR1's full top-k with sparse top-k=2048 — the step that makes GLM5.2 attention actually DSA. Five kernel ops: two cherry-picked hand-written cache kernels (quant+pack / gather), one FlashInfer `TopKDispatch` K=2048 wrapper (vendored), one hand-written `local_topk_to_slots` (new, ported from TokenSpeed Triton), one hand-written naive Hadamard (new), and one DeepGEMM paged MQA logits C ABI wrapper (vendored JIT kernel, highest risk). Oracle gate deferred — same fixture-pipeline blocker as PR1.
+> **TL;DR:** DSA indexer chain kernels landed: 3 hand-written CUDA (cache insert+gather cherry-picked, local_topk_to_slots ported from TokenSpeed Triton, naive Hadamard), 1 FlashInfer `TopKDispatch` K=2048 wrapper (vendored). All 5 smoke tests pass on H200 (jz38). DeepGEMM paged MQA logits C ABI wrapper (highest risk — first DeepGEMM JIT call in the codebase) is the remaining piece.
 >
 > **Last touched:** 2026-07
 
@@ -80,7 +80,44 @@ Same blocker as PR1: the prototype's fixture pipeline (HF forward dump → `laye
 
 Same as PR1 — requires SM90a GPU (H200), CUDA 12.6+, NCCL 2.30.4+. Testing on `jz38` (Hopper dev box).
 
-## Preparation
+## Execution Log
+
+### Step 1: Cherry-pick cache kernels + new hand-written kernels
+- Cherry-picked `glm52_indexer.cu` cache insert + gather from `feat/glm52-dp8-ep8` (commit `7e4200a`). Dropped the old `glm52_indexer_topk_2048_cuda` stub (returned `NOT_SUPPORTED`).
+- Added hand-written `local_topk_to_global_slots_kernel` to the same file, ported from TokenSpeed Triton `_local_topk_to_global_slots_kernel` (`dsa_sparse_layout.py:205`). ~80 lines: int32 block-table lookup + `topk_lens` warp+block reduce.
+- Added `glm52_topk.cu`: FlashInfer `TopKDispatch` K=2048 wrapper (vendored, ~70 lines). Modeled on `csrc/shared/flashinfer_top1.cu` (K=1). Uses `deterministic=true`, `TopKTieBreak::Small`, `dsa_graph_safe=true`.
+- Added `glm52_hadamard.cu`: naive in-place radix Hadamard for head_dim=128 (~60 lines). O(n²) naive approach, not the Dao-AILab port.
+- Rust ops + FFI for all four new modules (`indexer`, `topk`, `hadamard`).
+- `build.rs`: added `glm52_topk` to FlashInfer include list.
+- Result: compiles clean on sm_90 (local cross-compile + jz38 H200).
+
+### Step 2: Smoke tests on jz38 (H200)
+- 5 tests, all pass:
+  - `indexer_cache_round_trip`: quant+pack → gather, 4 scales all positive ✅
+  - `local_topk_to_slots_basic`: `offsets=[0,1,2,3]` → `slots=[20,21,40,41]` ✅
+  - `local_topk_to_slots_invalid`: `-1` offset → `-1` slot, `topk_lens=1` ✅
+  - `hadamard_correctness`: all-ones input, `output[0]=11.3125` (expected √128≈11.3137), `output[1]=0.0` ✅
+  - `flashinfer_topk_basic`: K=4 from 2048 ascending logits → indices `[2044,2045,2046,2047]` ✅
+
+### Step 3: DeepGEMM paged MQA logits wrapper — NOT YET DONE
+- This is the remaining piece and the highest-risk item (first real DeepGEMM JIT kernel call in the codebase).
+- Two sub-risks identified: (a) TMA descriptor construction must move off `torch::Tensor` to raw `CUtensorMap` via `cuTensorMapEncode*Tiled`, (b) JIT compiler + `device_runtime` LazyInit globals trigger `cuLibraryLoadData` on first call.
+- If this blocks, PR2 can be split: current work lands as `feat/glm52-dsa-indexer-cache`, DeepGEMM wrapper lands separately as `feat/glm52-deepgemm-mqa`.
+
+## Debrief
+
+- **Outcome**: 5 of 6 PR2 kernel ops landed and smoke-tested on H200. DeepGEMM paged MQA logits wrapper (highest risk) remains.
+- **Pitfalls encountered**:
+  - Local machine (sm_120/RTX 5090) can't build the `glm52` feature because `glm52` → `moe` → DeepEP → NCCL ≥ 2.30.4, and the system NCCL was 2.28.9. Fixed by `uv pip install nvidia-nccl-cu13>=2.30.4` and setting `OPENINFER_NCCL_ROOT`.
+  - Pre-commit `clippy-kernels-kimi` hook triggers on any `openinfer-kernels/` file change and requires NCCL — must export `OPENINFER_NCCL_ROOT` before `git commit`.
+  - jz38 system NCCL is 2.29.7 (also < 2.30.4) — same pip NCCL workaround needed there.
+- **Lessons learned**:
+  - FlashInfer `TopKDispatch` with `dsa_graph_safe=true` forces `VEC_SIZE=1` and the `FilteredTopK` path — needs 128KB dynamic shared memory. H200 supports it (228KB per SM); verified by the passing test.
+  - The naive Hadamard (O(n²) per token, 128 threads per token) is fine for correctness but will likely show up on ncu as a bottleneck for long-context decode. The Dao-AILab `fast-hadamard-transform` port (`/tmp/fast-hadamard-transform`, 441-line launcher, O(n log n) butterfly) is the follow-up.
+- **Follow-ups**:
+  - DeepGEMM paged MQA logits C ABI wrapper (the remaining PR2 piece).
+  - Model crate `indexer.rs` forward wiring (depends on DeepGEMM wrapper).
+  - Oracle gate — deferred, same fixture-pipeline blocker as PR1.
 
 - **Read**:
   - `docs/models/glm52/dp1-ep8-decode-plan.md` — the 5-PR roadmap this PR belongs to.
