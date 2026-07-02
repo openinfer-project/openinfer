@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     error::Error,
     fmt,
     path::PathBuf,
@@ -552,13 +553,26 @@ impl EngineHandle {
     }
 }
 
+pub fn panic_message(payload: &dyn Any) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
 impl Drop for EngineInner {
     fn drop(&mut self) {
         let _ = self.submit_tx.take();
         let _ = self.command_tx.take();
         if let Some(join_handle) = self.join_handle.take() {
             if join_handle.thread().id() != thread::current().id() {
-                let _ = join_handle.join();
+                if let Err(panic) = join_handle.join() {
+                    log::warn!(
+                        "engine thread panicked during shutdown: {}",
+                        panic_message(panic.as_ref())
+                    );
+                }
             }
         }
     }

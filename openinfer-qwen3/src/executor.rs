@@ -8,7 +8,9 @@ use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
-use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest};
+use openinfer_core::engine::{
+    LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest, panic_message,
+};
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
@@ -3009,9 +3011,14 @@ impl RankWorker {
                 }
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn tensor-parallel worker {rank}: {e}"))?;
-        startup_rx.recv().map_err(|_| {
-            anyhow::anyhow!("tensor-parallel worker {rank} exited during startup")
-        })??;
+        let Ok(startup) = startup_rx.recv() else {
+            let panic_note = match handle.join() {
+                Err(panic) => format!(" (thread panicked: {})", panic_message(panic.as_ref())),
+                Ok(()) => String::new(),
+            };
+            anyhow::bail!("tensor-parallel worker {rank} exited during startup{panic_note}");
+        };
+        startup?;
         Ok(Self {
             tx,
             handle: Some(handle),
@@ -3117,7 +3124,12 @@ impl RankWorker {
     fn shutdown(&mut self) {
         let _ = self.tx.send(WorkerCommand::Shutdown);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if let Err(panic) = handle.join() {
+                log::warn!(
+                    "tensor-parallel worker thread panicked during shutdown: {}",
+                    panic_message(panic.as_ref())
+                );
+            }
         }
     }
 }

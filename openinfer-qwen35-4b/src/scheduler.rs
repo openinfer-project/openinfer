@@ -21,7 +21,7 @@ use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 use openinfer_core::engine::{
     EngineHandle as SchedulerHandle, FinishReason, GenerateRequest as SchedulerRequest, KvCapacity,
-    TokenEvent, TokenLogprob, TokenSink,
+    TokenEvent, TokenLogprob, TokenSink, panic_message,
 };
 use openinfer_core::kv_pool::KvState;
 use openinfer_core::sampler::SamplingParams;
@@ -110,9 +110,16 @@ pub fn start_with_capacity(
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
 
-    let startup = startup_rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("Qwen3.5 scheduler exited during startup"))?;
+    let startup = match startup_rx.recv() {
+        Ok(startup) => startup,
+        Err(_) => {
+            let panic_note = match join_handle.join() {
+                Err(panic) => format!(" (thread panicked: {})", panic_message(panic.as_ref())),
+                Ok(()) => String::new(),
+            };
+            anyhow::bail!("Qwen3.5 scheduler exited during startup{panic_note}");
+        }
+    };
     if let Err(err) = startup {
         let _ = join_handle.join();
         return Err(err);
