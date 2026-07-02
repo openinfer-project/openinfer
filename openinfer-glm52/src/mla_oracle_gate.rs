@@ -323,8 +323,10 @@ fn assert_probes(outputs: &[f32]) {
 }
 
 /// Whole-tensor diff against the harness's safetensors dump (`o` tap): a
-/// probes-pass/rest-garbage failure mode cannot hide from this. Debug aid,
-/// same tolerance contract as the probes.
+/// probes-pass/rest-garbage failure mode cannot hide from this. Asserts the
+/// coverage-stable statistics (diff RMS and p99) — the absolute max grows with
+/// element count (bf16 tail over 1.2M elements) so it is printed, not asserted;
+/// same lesson as the qwen3 golden gate.
 fn diff_against_dump(outputs: &[f32], dump: &Path) -> Result<()> {
     let mmap = crate::weights::mmap_file(dump)?;
     let st = safetensors::SafeTensors::deserialize(mmap.as_ref())?;
@@ -348,7 +350,11 @@ fn diff_against_dump(outputs: &[f32], dump: &Path) -> Result<()> {
         .collect();
     worst.sort_by(|a, b| b.1.total_cmp(&a.1));
     let diff_rms = (worst.iter().map(|(_, d)| d * d).sum::<f32>() / worst.len() as f32).sqrt();
-    println!("full-tensor diff vs dump: diff_rms={diff_rms:.6e}, top offenders:");
+    let p99 = worst[worst.len() / 100].1;
+    println!(
+        "full-tensor diff vs dump: diff_rms={diff_rms:.6e}, p99={p99:.6e}, max={:.6e} (printed, not asserted), top offenders:",
+        worst[0].1
+    );
     for (i, d) in worst.iter().take(10) {
         println!(
             "  o[{i}]: engine {:.6} oracle {:.6} (|d|={d:.6})",
@@ -357,9 +363,8 @@ fn diff_against_dump(outputs: &[f32], dump: &Path) -> Result<()> {
     }
     let tol = ORACLE_O_REL_TOL * ORACLE_O_RMS;
     ensure!(
-        worst[0].1 <= tol * 4.0,
-        "full-tensor max |diff| {} exceeds 4x probe tolerance {tol:.6e}",
-        worst[0].1
+        diff_rms <= tol && p99 <= tol,
+        "full-tensor diff stats out of tolerance: rms {diff_rms:.6e} / p99 {p99:.6e} vs tol {tol:.6e}"
     );
     Ok(())
 }
