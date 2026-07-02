@@ -1,6 +1,6 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: the decode-tuning refresh improves direct TPOT by `2.1-3.2%`, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Long-prompt HF logits and GSM8K gates cover the old 4096-position RoPE boundary. Remaining structural items are HND prefill staging, prefix-cache design, and the serving-level concurrency gap.
+> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: the decode-tuning refresh improves direct TPOT by `2.1-3.2%`, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Long-prompt HF logits and GSM8K gates cover the old 4096-position RoPE boundary. Remaining structural items are HND prefill staging, TP Phase 1 implementation, prefix-cache design, and the serving-level concurrency gap.
 >
 > **Last touched:** 2026-06
 
@@ -20,7 +20,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | Admission | ✓ existing full-lifetime KV admission and explicit `Rejected` events cover impossible KV requests; #253 adds the context-window rejection reason before prefill/decode | `scheduler.rs`, `src/scheduler/plan.rs`, `docs/models/qwen35/kv-admission.md` |
 | Scheduler tests | Partial: current plan selection, full-lifetime admission, context-window rejection, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
 | Step tail | Local branch verified: #353 batches the prefill final norm/lm_head tail, samples decode/unified rows from batched logits, and keeps host full-vocab copies only for requested logprobs; HF/e2e gates pass, short-output serving A/B shows TTFT benefit, long-decode TPOT remains a no-claim diagnostic | `docs/models/qwen35/batched-step-tail.md` |
-| TP | ✗ absent (single GPU only) | — |
+| TP | Design settled for Phase 1 eager dense TP: reuse Qwen3 controller/worker runtime, validate `TP=2` first, shard dense full-attention/MLP, replicate linear-attention/GDR state per rank, and fail closed for `TP > 1` CUDA Graph or indivisible shapes. Implementation still pending. | `docs/models/qwen35/tp-design.md` |
 | Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
 
 ## Roadmap
@@ -41,7 +41,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 ### Later
 
-- **TP** — no sharding design exists for the hybrid stack (GDR state sharding is the open question). Design-first, no driver today.
+- **TP Phase 2** — sharded linear attention / GDR recurrent state remains future design work after Phase 1 eager dense TP is correct.
 - **CUDA-graph prefill** — prefill is eager and serial; revisit after 6 changes the memory layout.
 
 ## Cleanup ledger
