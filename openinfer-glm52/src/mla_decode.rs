@@ -56,6 +56,22 @@ impl Glm52MlaLayerWeights {
     /// layernorm gammas, and host-dequant kv_b into the bf16 absorb factors
     /// W_UK = kv_b[:, :192, :], W_UV = kv_b[:, 192:, :].
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn q_a(&self) -> &ProjWeight {
+        &self.q_a
+    }
+
+    pub(crate) fn q_b(&self) -> &ProjWeight {
+        &self.q_b
+    }
+
+    pub(crate) fn kv_a(&self) -> &ProjWeight {
+        &self.kv_a
+    }
+
+    pub(crate) fn o_proj(&self) -> &ProjWeight {
+        &self.o_proj
+    }
+
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         q_a: &Glm52ProjBytes,

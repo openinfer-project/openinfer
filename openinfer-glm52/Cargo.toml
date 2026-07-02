@@ -10,6 +10,11 @@ autobins = false
 name = "glm52_load_weights"
 path = "src/bin/glm52_load_weights.rs"
 
+[[bin]]
+name = "glm52_kernel_bench"
+path = "src/bin/glm52_kernel_bench.rs"
+required-features = ["glm52"]
+
 [features]
 default = []
 glm52 = ["dep:openinfer-kernels", "openinfer-kernels/glm52"]

@@ -16,6 +16,8 @@ mod dense;
 #[cfg(feature = "glm52")]
 mod fp8;
 #[cfg(feature = "glm52")]
+pub mod kernel_bench;
+#[cfg(feature = "glm52")]
 mod indexer;
 #[cfg(all(test, feature = "glm52"))]
 mod indexer_oracle_gate;
