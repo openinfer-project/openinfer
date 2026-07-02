@@ -1074,6 +1074,13 @@ impl Qwen3Executor {
             "KV block events are only supported on the single-GPU path; got {} devices",
             device_ordinals.len()
         );
+        anyhow::ensure!(
+            !enable_cuda_graph || device_ordinals.len() == 1,
+            "CUDA Graph is not supported under tensor parallelism (the captured decode \
+             graph would record NCCL collectives with no cross-rank capture alignment); \
+             got {} devices",
+            device_ordinals.len()
+        );
         // The store cursor announces a block as cacheable the moment it is
         // registered, assuming GPU-resident reuse. With KV offload on, a block
         // can be evicted to the host tier and restored under a different lineage

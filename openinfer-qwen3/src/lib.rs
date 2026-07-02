@@ -156,16 +156,17 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 /// Server-facing launch knobs for the Qwen3 engine.
 ///
 /// The binary maps raw CLI flags into this struct; [`launch`] then owns the
-/// Qwen3 startup policy — the TP→device mapping and the LoRA↔CUDA-Graph
-/// exclusion — and dispatches to the right low-level entry. That policy lives
-/// with the model instead of leaking into the server.
+/// Qwen3 startup policy — the TP→device mapping and the LoRA↔CUDA-Graph and
+/// TP↔CUDA-Graph exclusions — and dispatches to the right low-level entry.
+/// That policy lives with the model instead of leaking into the server.
 #[derive(Clone, Debug)]
 pub struct Qwen3LaunchOptions {
     /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
     pub device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     pub tp_size: usize,
-    /// Whether the user requested CUDA Graph. LoRA serving forces it off.
+    /// Whether the user requested CUDA Graph. LoRA serving and tensor
+    /// parallelism force it off.
     pub cuda_graph: bool,
     pub offload: Qwen3OffloadOptions,
     pub no_prefix_cache: bool,
@@ -193,10 +194,16 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         (0..options.tp_size).collect()
     };
     // LoRA serving repoints adapter weights between steps, which a captured
-    // decode graph bakes in — the two cannot coexist, so LoRA wins.
+    // decode graph bakes in; under TP the graph would capture each layer's
+    // NCCL all-reduces with nothing aligning capture across ranks.
     let enable_cuda_graph = if options.lora.is_some() {
         if options.cuda_graph {
             warn!("Qwen3: CUDA Graph is disabled while LoRA serving is enabled");
+        }
+        false
+    } else if options.tp_size > 1 {
+        if options.cuda_graph {
+            warn!("Qwen3: CUDA Graph is disabled under tensor parallelism");
         }
         false
     } else {
