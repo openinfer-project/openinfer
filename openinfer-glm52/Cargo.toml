@@ -28,5 +28,9 @@ safetensors = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }
+
 [lints]
 workspace = true

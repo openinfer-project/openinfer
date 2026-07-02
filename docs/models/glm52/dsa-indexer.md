@@ -89,9 +89,9 @@ PR2 replaces it with the FlashInfer `TopKDispatch` K=2048 wrapper. Do not cherry
 - Blackwell TRTLLM sparse MLA (gap-doc P0 #6) — PR2 still uses the SM90 FlashMLA sparse path from PR1, now fed with real sparse top-k instead of full top-k.
 - Prefill indexer logits (contiguous MQA logits, `fp8_mqa_logits` non-paged) — decode-first; prefill rides the decode path token-by-token.
 
-## Oracle gate — deferred
+## Oracle gate
 
-Same blocker as PR1: the prototype's fixture pipeline (HF forward dump → `layer0.npz` → probe bins → Rust test) was not self-contained. The oracle gate is deferred to a follow-up that designs a self-contained fixture pipeline.
+The fixture-pipeline blocker is resolved: `oracle-harness.md` describes the self-contained probe pipeline, MLA gate already green. The indexer gate extends the same harness (`topk_indices` tap; slot comparison = set-overlap across implementations, sha256 pin for Rust-vs-Rust).
 
 ## Build
 

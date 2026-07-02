@@ -1,6 +1,6 @@
 # GLM5.2 MLA Decode Brick (PR1)
 
-> **TL;DR:** Single-layer GLM5.2 MLA decode forward (`hidden[6144] -> o[6144]`, bs=1, full top-k) — the attention correctness foundation for the DP1/EP8 decode path. Kernel ops + model crate only; runner remains fail-closed; oracle gate deferred to a follow-up that designs a reproducible fixture pipeline.
+> **TL;DR:** Single-layer GLM5.2 MLA decode forward (`hidden[6144] -> o[6144]`, bs=1, full top-k) — the attention correctness foundation for the DP1/EP8 decode path. Kernel ops + model crate only; runner remains fail-closed. Oracle gate DELIVERED: see `oracle-harness.md` (green on jz38 2026-07-02).
 >
 > **Last touched:** 2026-06
 
@@ -23,9 +23,9 @@ git submodule update --init --recursive
 cargo check --release -p openinfer-glm52
 ```
 
-## Oracle gate — deferred
+## Oracle gate
 
-This PR does **not** include an oracle test. The previous prototype had a fixture pipeline (HF forward dump → `layer0.npz` → probe bins → Rust test), but the dump script that generates `layer0.npz` was never in the repo, making the whole chain non-reproducible. Rather than ship a test nobody else can run, the oracle gate is deferred to a follow-up that designs a self-contained fixture pipeline (either a vendored dump script + small fixture, or a numpy reference implementation that generates expected outputs from the checkpoint at test time).
+Delivered in the follow-up `feat/glm52-oracle-harness`: `tools/accuracy/glm52_oracle.py` + `src/mla_oracle_gate.rs`. Design, verification (negative controls), and pitfalls in `oracle-harness.md`.
 
 ## Hand-written CUDA kernels
 

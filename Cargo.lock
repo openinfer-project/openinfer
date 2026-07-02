@@ -3821,12 +3821,14 @@ dependencies = [
  "crossbeam-channel",
  "cudarc",
  "half",
+ "hex",
  "log",
  "memmap2",
  "openinfer-core",
  "openinfer-kernels",
  "safetensors",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
 ]
 
