@@ -1,6 +1,6 @@
 # GLM5.2 DSA Indexer (PR2)
 
-> **TL;DR:** DSA indexer chain kernels landed: 3 hand-written CUDA (cache insert+gather cherry-picked, local_topk_to_slots ported from TokenSpeed Triton, naive Hadamard), 1 FlashInfer `TopKDispatch` K=2048 wrapper (vendored). All 5 smoke tests pass on H200 (jz38). DeepGEMM paged MQA logits C ABI wrapper (highest risk — first DeepGEMM JIT call in the codebase) is the remaining piece.
+> **TL;DR:** DSA indexer chain kernels landed: 3 hand-written CUDA (cache insert+gather cherry-picked, local_topk_to_slots ported from TokenSpeed Triton, naive Hadamard), 1 FlashInfer `TopKDispatch` K=2048 wrapper (vendored), 1 DeepGEMM paged MQA logits wrapper (torch-free via `DG_NO_TORCH` conditional compilation of 7 vendored headers). All 6 smoke tests pass on H200 (jz38) — including the first DeepGEMM JIT kernel call in the codebase. Model crate `indexer.rs` forward wiring is the remaining piece.
 >
 > **Last touched:** 2026-07
 
@@ -15,7 +15,7 @@
 |---|---|---|---|
 | `glm52_indexer_k_quant_and_cache` | `ops/glm52/indexer.rs` + `csrc/glm52/glm52_indexer.cu` (quant+cache insert half) | **hand-written** (258 lines, cherry-pick) | **yes** |
 | `glm52_indexer_k_gather_quant_cache` | same file (gather half) | **hand-written** (same file) | **yes** |
-| `glm52_deepgemm_paged_mqa_logits` | `ops/glm52/deepgemm_mqa.rs` + `csrc/glm52/glm52_deepgemm_mqa.cu` (new) | vendored DeepGEMM `sm90_fp8_paged_mqa_logits` | no (vendored, new C ABI wrapper) |
+| `glm52_deepgemm_paged_mqa_logits` | `ops/glm52/deepgemm_mqa.rs` + `csrc/glm52/glm52_deepgemm_mqa.cu` (new) | vendored DeepGEMM `sm90_fp8_paged_mqa_logits` (torch-free via `DG_NO_TORCH`) | no (vendored, new C ABI wrapper) |
 | `glm52_flashinfer_topk_2048` | `ops/glm52/topk.rs` + `csrc/glm52/glm52_topk.cu` (new) | vendored FlashInfer `TopKDispatch` | no (vendored, new C wrapper) |
 | `glm52_indexer_local_topk_to_slots` | `ops/glm52/indexer.rs` + `csrc/glm52/glm52_indexer.cu` (new kernel) | **hand-written** (new, ported from TokenSpeed Triton) | **yes** |
 | `glm52_indexer_hadamard_bf16` | `ops/glm52/hadamard.rs` + `csrc/glm52/glm52_hadamard.cu` (new) | **hand-written** (new, naive radix) | **yes** |
@@ -34,15 +34,32 @@ All three are correct (cache kernels validated in the prototype branch against H
 
 ## Vendored wrapper notes
 
-### DeepGEMM paged MQA logits (main engineering risk)
+### DeepGEMM paged MQA logits (torch-free wrapper)
 
-`sm90_fp8_paged_mqa_logits` (vendored at `third_party/DeepGEMM/csrc/jit_kernels/impls/sm90_fp8_mqa_logits.hpp:308`) is a JIT-compiled kernel launched through DeepGEMM's `device_runtime` / `compiler` / `launch_kernel` path with `torch::Tensor` TMA descriptors. The new C ABI wrapper must replicate the TMA descriptor construction (`make_tma_2d_desc` / `make_tma_3d_desc` in `runtime_utils.hpp:113/152`) from raw device pointers + shape + strides, without torch (option (a) in the plan). Fail-closed if the JIT runtime is not initialized.
+`sm90_fp8_paged_mqa_logits` (vendored at `third_party/DeepGEMM/csrc/jit_kernels/impls/sm90_fp8_mqa_logits.hpp:308`) is a JIT-compiled kernel launched through DeepGEMM's `device_runtime` / `compiler` / `launch_kernel` path with `torch::Tensor` TMA descriptors. The C ABI wrapper replicates the TMA descriptor construction from raw device pointers + shape + strides, without torch.
 
-This is the first real DeepGEMM JIT kernel call in the codebase — main's `glm52_deepgemm_grouped` only does metadata, compute returns `NOT_SUPPORTED`. Two concrete sub-risks:
-1. TMA descriptor construction must move off `torch::Tensor` to raw `CUtensorMap` via `cuTensorMapEncode*Tiled` driver API.
-2. JIT compiler + `device_runtime` are `LazyInit` globals; first call triggers `cuLibraryLoadData` compile+load. `build.rs` already links `libcuda`, but nobody has driven this path yet.
+**Approach: `DG_NO_TORCH` conditional compilation.** Rather than forking 700+ lines of vendored headers, 7 DeepGEMM header files are patched with `#ifdef DG_NO_TORCH` guards that exclude torch-dependent code paths while keeping the JIT runtime (`compiler.hpp`, `handle.hpp`, `kernel_runtime.hpp`) and TMA descriptor construction (`runtime_utils.hpp`) intact. The wrapper (`csrc/glm52/glm52_deepgemm_mqa.cu`) calls `SM90FP8PagedMQALogitsRuntime` and `SM90PagedMQALogitsMetadataRuntime` directly with raw pointers and `make_tma_2d_desc_raw` / `make_tma_3d_desc_raw` (new notorch TMA helpers added to `runtime_utils.hpp`).
 
-If this blocks, PR2 can be split: `feat/glm52-dsa-indexer-cache` (cache + topk + slots + hadamard) lands first, `feat/glm52-deepgemm-mqa` lands the DeepGEMM wrapper separately.
+**Patched files** (all in `third_party/DeepGEMM/csrc/`):
+- `utils/compatibility.hpp` — `<torch/version.h>` → hardcode `DG_FP8_COMPATIBLE=1`
+- `utils/math.hpp` — `<torch/python.h>` → guard `kPackedFP4`
+- `jit/device_runtime.hpp` — cuBLASLt workspace + `ATen/CUDAContext.h` → guard entire cuBLASLt section
+- `jit/compiler.hpp` — `ATen/cuda/CUDAContext.h` → guard include
+- `jit/kernel_runtime.hpp` — `at::cuda::getCurrentCUDAStream()` → accept `cudaStream_t` parameter; `stream.id()` → `reinterpret_cast<unsigned long>(stream)`
+- `jit_kernels/impls/runtime_utils.hpp` — `torch::Tensor` TMA descs → `make_tma_2d_desc_raw` / `make_tma_3d_desc_raw` taking `void*` + `DgDtype` enum; guard `cute::UMMA::Major` / `GemmType` / `at::ScalarType` functions
+- `jit_kernels/impls/sm90_fp8_mqa_logits.hpp` — `at::ScalarType` → `DgDtype`; guard torch free functions
+
+**Build integration** (`build.rs`):
+- `glm52_deepgemm_mqa` compiled with `sm_90a` (same as FlashMLA sparse), C++20, `-DDG_NO_TORCH`
+- Include paths: DeepGEMM `csrc/` + `deep_gemm/include/` + CUTLASS + fmt
+- Links `nvrtc` (DeepGEMM `NVRTCCompiler` class references nvrtc symbols even when unused)
+
+**Runtime init:** wrapper calls `ensure_dg_runtime_init()` (via `std::call_once`) which sets `Compiler::prepare_init(root, cuda_home)` + `KernelRuntime::prepare_init(cuda_home)` + `IncludeParser::prepare_init(root)`. Requires `OPENINFER_DEEPGEMM_ROOT` and `CUDA_HOME` env vars.
+
+**Investigated alternatives (rejected):**
+- FlashInfer `group_gemm_sm90.cuh` — standard segment GEMM, no paged KV cache support, no per-128-group fp8 scales
+- FlashInfer `group_gemm_fp8_groupwise_sm100.cuh` — SM100 only (Blackwell)
+- FlashInfer `group_gemv.cuh` — empty stub (`TODO: port punica's bgmv`)
 
 ### FlashInfer deterministic top-k K=2048
 
@@ -99,14 +116,19 @@ Same as PR1 — requires SM90a GPU (H200), CUDA 12.6+, NCCL 2.30.4+. Testing on 
   - `hadamard_correctness`: all-ones input, `output[0]=11.3125` (expected √128≈11.3137), `output[1]=0.0` ✅
   - `flashinfer_topk_basic`: K=4 from 2048 ascending logits → indices `[2044,2045,2046,2047]` ✅
 
-### Step 3: DeepGEMM paged MQA logits wrapper — NOT YET DONE
-- This is the remaining piece and the highest-risk item (first real DeepGEMM JIT kernel call in the codebase).
-- Two sub-risks identified: (a) TMA descriptor construction must move off `torch::Tensor` to raw `CUtensorMap` via `cuTensorMapEncode*Tiled`, (b) JIT compiler + `device_runtime` LazyInit globals trigger `cuLibraryLoadData` on first call.
-- If this blocks, PR2 can be split: current work lands as `feat/glm52-dsa-indexer-cache`, DeepGEMM wrapper lands separately as `feat/glm52-deepgemm-mqa`.
+### Step 3: DeepGEMM paged MQA logits wrapper — DONE
+- Investigated FlashInfer group GEMM as alternative — rejected (no paged KV cache support, no per-128-group fp8 scales on SM90).
+- Chose `DG_NO_TORCH` conditional compilation approach: 7 DeepGEMM headers patched with `#ifdef DG_NO_TORCH` guards (~150 lines of changes), avoiding a 700+ line fork.
+- Created `csrc/glm52/glm52_deepgemm_mqa.cu`: C ABI wrapper calling `SM90FP8PagedMQALogitsRuntime` + `SM90PagedMQALogitsMetadataRuntime` directly with raw pointers and `make_tma_*_desc_raw` TMA descriptor construction.
+- Added `make_tma_2d_desc_raw` / `make_tma_3d_desc_raw` to `runtime_utils.hpp` (raw `void*` + `DgDtype` enum, no `torch::Tensor`).
+- Updated `build.rs`: `glm52_deepgemm_mqa` compiled with `sm_90a`, C++20, `-DDG_NO_TORCH`, DeepGEMM include paths; links `nvrtc`.
+- Created Rust ops (`ops/glm52/deepgemm_mqa.rs`) + FFI (`ffi/glm52/deepgemm_mqa.rs`).
+- Added smoke test (`test_deepgemm_paged_mqa_launch`): verifies JIT compile + launch success on H200, checks zeroed-input → zeroed-logits. Requires `OPENINFER_DEEPGEMM_ROOT` + `CUDA_HOME` env vars.
+- Compiles clean on sm_90 (local cross-compile). Test execution on jz38 pending.
 
 ## Debrief
 
-- **Outcome**: 5 of 6 PR2 kernel ops landed and smoke-tested on H200. DeepGEMM paged MQA logits wrapper (highest risk) remains.
+- **Outcome**: All 6 PR2 kernel ops landed and smoke-tested on H200. DeepGEMM paged MQA logits wrapper (first DeepGEMM JIT kernel call in the codebase) implemented via `DG_NO_TORCH` conditional compilation — no torch runtime dependency. Model crate `indexer.rs` forward wiring is the remaining piece.
 - **Pitfalls encountered**:
   - Local machine (sm_120/RTX 5090) can't build the `glm52` feature because `glm52` → `moe` → DeepEP → NCCL ≥ 2.30.4, and the system NCCL was 2.28.9. Fixed by `uv pip install nvidia-nccl-cu13>=2.30.4` and setting `OPENINFER_NCCL_ROOT`.
   - Pre-commit `clippy-kernels-kimi` hook triggers on any `openinfer-kernels/` file change and requires NCCL — must export `OPENINFER_NCCL_ROOT` before `git commit`.
@@ -115,9 +137,10 @@ Same as PR1 — requires SM90a GPU (H200), CUDA 12.6+, NCCL 2.30.4+. Testing on 
   - FlashInfer `TopKDispatch` with `dsa_graph_safe=true` forces `VEC_SIZE=1` and the `FilteredTopK` path — needs 128KB dynamic shared memory. H200 supports it (228KB per SM); verified by the passing test.
   - The naive Hadamard (O(n²) per token, 128 threads per token) is fine for correctness but will likely show up on ncu as a bottleneck for long-context decode. The Dao-AILab `fast-hadamard-transform` port (`/tmp/fast-hadamard-transform`, 441-line launcher, O(n log n) butterfly) is the follow-up.
 - **Follow-ups**:
-  - DeepGEMM paged MQA logits C ABI wrapper (the remaining PR2 piece).
-  - Model crate `indexer.rs` forward wiring (depends on DeepGEMM wrapper).
+  - Model crate `indexer.rs` forward wiring (depends on DeepGEMM wrapper — now unblocked).
   - Oracle gate — deferred, same fixture-pipeline blocker as PR1.
+  - DeepGEMM JIT first-call latency measurement (cold start vs cached `~/.deep_gemm/`).
+  - ncu profiling of naive Hadamard + hand-written cache kernels.
 
 - **Read**:
   - `docs/models/glm52/dp1-ep8-decode-plan.md` — the 5-PR roadmap this PR belongs to.

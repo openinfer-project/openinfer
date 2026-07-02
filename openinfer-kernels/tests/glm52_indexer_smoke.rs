@@ -387,3 +387,134 @@ fn test_hadamard_correctness() {
 fn test_flashinfer_topk_basic() {
     flashinfer_topk_basic().expect("FlashInfer top-k");
 }
+
+// ─── DeepGEMM paged MQA logits: JIT compile + launch smoke test ────────────
+//
+// This is the first DeepGEMM JIT kernel call in the codebase. The test
+// verifies that the torch-free wrapper can:
+//   1. Initialize the JIT compiler (needs OPENINFER_DEEPGEMM_ROOT + CUDA_HOME)
+//   2. Compile the paged MQA logits kernel via nvcc JIT
+//   3. Launch both the metadata and logits kernels without crashing
+//
+// It does NOT validate logits correctness — that requires an oracle gate
+// with HF reference outputs. The smoke test only checks launch success.
+
+fn deepgemm_env_ready() -> bool {
+    std::env::var("OPENINFER_DEEPGEMM_ROOT").is_ok() && std::env::var("CUDA_HOME").is_ok()
+}
+
+fn deepgemm_paged_mqa_launch() -> Result<()> {
+    if !deepgemm_env_ready() {
+        eprintln!("skip: set OPENINFER_DEEPGEMM_ROOT + CUDA_HOME to run DeepGEMM MQA test");
+        return Ok(());
+    }
+
+    let batch_size = 1_i32;
+    let next_n = 1_i32;
+    let num_heads = 4_i32;
+    let head_dim = 128_i32;
+    let block_kv = 128_i32;
+    let num_kv_blocks = 16_i32; // 2048 tokens
+    let num_sms = 132_i32; // H200 has 132 SMs
+    let logits_stride = 256_i32; // split_kv=256
+    let block_table_stride = num_kv_blocks;
+
+    // context_lens: each batch has 2048 KV tokens
+    let context_lens_host = vec![2048_i32; batch_size as usize];
+    let context_lens = DeviceBuf::from_host(&context_lens_host)?;
+
+    // schedule_metadata: aligned_batch_size = 32 (batch=1 → align to 32)
+    let sched_meta_len = 32_i32 as usize; // non-varlen: aligned_batch_size
+    let schedule_metadata = DeviceBuf::zeroed(sched_meta_len * std::mem::size_of::<i32>())?;
+
+    // Metadata kernel launch
+    let r = unsafe {
+        ffi::glm52_deepgemm_paged_mqa_metadata_cuda(
+            context_lens.ptr as *mut i32,
+            schedule_metadata.ptr as *mut i32,
+            batch_size,
+            next_n,
+            block_kv,
+            num_sms,
+            false, // is_context_lens_2d
+            false, // is_varlen
+            std::ptr::null(),
+            STREAM,
+        )
+    };
+    cu_check(r)?;
+    cuda_check(unsafe { cudaDeviceSynchronize() })?;
+
+    // Logits kernel launch
+    // q: [batch_size, next_n, num_heads, head_dim] fp8 = 1*1*4*128 = 512 bytes
+    let q_bytes = (batch_size * next_n * num_heads * head_dim) as usize;
+    let q = DeviceBuf::zeroed(q_bytes)?;
+
+    // kv_cache: [num_kv_blocks, block_kv, head_dim] fp8 = 16*128*128 = 262144 bytes
+    let kv_bytes = (num_kv_blocks * block_kv * head_dim) as usize;
+    let kv_cache = DeviceBuf::zeroed(kv_bytes)?;
+
+    // kv_cache_scales: [num_kv_blocks, block_kv] f32 = 16*128*4 = 8192 bytes
+    let kv_scales_bytes = (num_kv_blocks * block_kv) as usize * std::mem::size_of::<f32>();
+    let kv_cache_scales = DeviceBuf::zeroed(kv_scales_bytes)?;
+
+    // weights: [batch_size * next_n, num_heads] fp8 = 1*4 = 4 bytes
+    let weights_bytes = (batch_size * next_n * num_heads) as usize;
+    let weights = DeviceBuf::zeroed(weights_bytes)?;
+
+    // logits: [batch_size, logits_stride] bf16 = 1*256*2 = 512 bytes
+    let logits_bytes = (batch_size * logits_stride) as usize * std::mem::size_of::<bf16>();
+    let logits = DeviceBuf::zeroed(logits_bytes)?;
+
+    // block_table: [batch_size, block_table_stride] i32
+    let bt_bytes = (batch_size * block_table_stride) as usize * std::mem::size_of::<i32>();
+    let block_table_host: Vec<i32> = (0..num_kv_blocks).collect();
+    let block_table = DeviceBuf::from_host(&block_table_host)?;
+
+    let r = unsafe {
+        ffi::glm52_deepgemm_paged_mqa_logits_cuda(
+            q.ptr,
+            kv_cache.ptr,
+            kv_cache_scales.ptr as *const f32,
+            weights.ptr,
+            context_lens.ptr as *const i32,
+            logits.ptr,
+            block_table.ptr as *const i32,
+            std::ptr::null(),
+            schedule_metadata.ptr as *mut i32,
+            batch_size,
+            next_n,
+            num_heads,
+            head_dim,
+            num_kv_blocks,
+            block_kv,
+            false, // is_context_lens_2d
+            false, // is_varlen
+            logits_stride,
+            block_table_stride,
+            num_sms,
+            1, // q_elem_size (fp8)
+            1, // kv_elem_size (fp8)
+            1, // weights_elem_size (fp8)
+            4, // kv_scales_elem_size (f32)
+            STREAM,
+        )
+    };
+    cu_check(r)?;
+    cuda_check(unsafe { cudaDeviceSynchronize() })?;
+
+    // Verify logits are all zero (since all inputs are zeroed)
+    let logits_host: Vec<bf16> = logits.to_host((batch_size * logits_stride) as usize)?;
+    let all_zero = logits_host.iter().all(|v| v.to_f32() == 0.0);
+    ensure!(
+        all_zero,
+        "DeepGEMM MQA logits should be all zero for zeroed inputs"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_deepgemm_paged_mqa_launch() {
+    deepgemm_paged_mqa_launch().expect("DeepGEMM paged MQA logits launch");
+}
