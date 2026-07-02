@@ -2,7 +2,7 @@ This file provides guidance to Coding Agent when working with code in this repos
 
 ## What is openinfer
 
-Pure Rust + CUDA LLM inference engine (~83K Rust, ~11K CUDA). No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` API.
+Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` API.
 
 **Supported models:**
 
@@ -12,9 +12,10 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 |-------|-------|-------------|-------------|
 | Qwen3-4B / 8B | `openinfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B | `openinfer-qwen35-4b` | `--features qwen35-4b` (needs build-time Python + Triton) | 24 linear + 8 full attention |
-| DeepSeek-V4 | `openinfer-deepseek-v4` | `--features deepseek-v4` | MoE + compressor + indexer, 8-GPU |
+| DeepSeek-V4 | `openinfer-deepseek-v4` | `--features deepseek-v4` (needs build-time Python + TileLang + CuTe DSL) | MoE + compressor + indexer, 8-GPU |
 | DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
 | Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
+| GLM5.2 | `openinfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
 
 ## Build & Run
 
@@ -28,11 +29,18 @@ cargo run --release -- --model-path models/Qwen3-4B
 cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
 cargo run --release --features kimi-k2 -- --model-path models/Kimi-K2
 cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
+cargo run --release --features deepseek-v2-lite -- --model-path models/DeepSeek-V2-Lite
+cargo run --release --features glm52 -- --model-path models/GLM5.2
 ```
 
 **Key env vars:**
 - `OPENINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
-- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35-4b` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`)
+- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35-4b` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
+- `OPENINFER_TILELANG_PYTHON` — Python with TileLang for `deepseek-v4` build-time AOT
+- `OPENINFER_CUTEDSL_PYTHON` — Python with CuTe DSL for `deepseek-v4` build-time AOT
+- `OPENINFER_CUTEDSL_CUTLASS_ROOT` — CUTLASS root override for CuTe DSL codegen
+- `OPENINFER_NCCL_ROOT` — NCCL root (>= 2.30.4) for DeepEP shim (`moe` feature)
+- `OPENINFER_FLASHINFER_INCLUDE` — FlashInfer include dir override
 - `OPENINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 - `OPENINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
 - `OPENINFER_NVCC_JOBS` — override parallel nvcc job count
@@ -44,12 +52,12 @@ cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
 cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
-OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
+cargo test --release -p openinfer-qwen3 --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
 
-# Single test
-cargo test --release embedding_variants -- --nocapture
+# Single test (filter by name)
+cargo test --release --workspace --lib prefix_cache -- --nocapture
 ```
 
 Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 exact-text JSON baselines are retired; keep `e2e_scheduler` for scheduler liveness and request-flow coverage.
@@ -59,36 +67,36 @@ Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 ex
 ```
 HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor → TokenEvent
                                                │
-              ┌──────────────┬─────────────────┼─────────────────┬──────────────┐
-              │              │                 │                 │              │
-       openinfer-     openinfer-      openinfer-       openinfer-    openinfer-
-       qwen3          qwen35-4b      deepseek-v4     deepseek-v2-   kimi-k2
-     (full attn)   (linear+full)   (MoE+indexer)    lite (MoE+EP)  (MLA+MoE)
-              │              │                 │                 │              │
-              └──────────────┴─────────────────┼─────────────────┴──────────────┘
+              ┌──────────┬─────────────┬───────┼───────────┬──────────────┬──────────┐
+              │          │             │       │           │              │          │
+        openinfer-  openinfer-   openinfer-  openinfer-  openinfer-   openinfer-  openinfer-
+        qwen3       qwen35-4b    deepseek-v4 dsv2-lite   kimi-k2      glm52      ...
+      (full attn) (linear+full) (MoE+index) (MoE+EP)   (MLA+MoE)   (MLA+MoE+FP8)
+              │          │             │       │           │              │          │
+              └──────────┴─────────────┴───────┼───────────┴──────────────┴──────────┘
                                                │
-                         openinfer-core runtime + openinfer-kernels
+                          openinfer-core runtime + openinfer-kernels
                                                │
-                              ┌────────────────┼────────────────┐
-                              │                │                │
-                      CUDA / cuBLAS    Triton AOT      FlashInfer
+                               ┌───────────────┼───────────────┐
+                               │               │               │
+                       CUDA / cuBLAS    Triton AOT      FlashInfer
                                                     (sampling, attention,
                                                      norm, MLA decode)
 ```
 
 **Key abstractions:**
 
-- **`openinfer-core::engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates.
+- **`openinfer-engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates. (`openinfer-core::engine` re-exports it.)
 - **Per-model crates** — each model owns config, weights, prefill/decode execution, scheduler, tests, and benches.
 - **`openinfer-core::ops`** — shared GPU operator wrappers used by model crates.
-- **`openinfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `deepseek_v4`).
+- **`openinfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `deepseek_v4`, `glm52`).
 - **`openinfer-comm`** — EP all-to-all communication (GDR, NCCL, IB verbs). Requires CUDA + RDMA hardware to compile.
 - **CUDA Graph** — decode path captured inside model executors with pre-allocated buffers to preserve pointer stability.
-- **KV state** — model schedulers own request state; shared paged-KV primitives live in `openinfer-core`.
+- **KV state** — model schedulers own request state; shared paged-KV primitives live in `openinfer-kv-cache`; host/SSD/RDMA offload bridge in `openinfer-kv-offload`.
 
 **Build system**: the virtual workspace root has no package build script. `openinfer-kernels/build.rs` owns CUDA/Triton compilation:
 1. Compiles `openinfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Feature-gated codegen: `qwen35-4b` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py` (the only step that needs Python); `deepseek-v4` triggers TileLang + CuTe DSL codegen; `kimi-k2` adds MLA/MoE/Marlin CUDA
+2. Feature-gated codegen: `qwen35-4b` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py` (the only step that needs Python); `deepseek-v4` triggers TileLang + CuTe DSL codegen; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA
 
 ---
 
@@ -167,7 +175,3 @@ When a session wraps up:
 # Git Conventions
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
-
-# Code Conventions
-
-Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`.
