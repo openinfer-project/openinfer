@@ -16,6 +16,7 @@
 #   GPU              CUDA device ordinal [default: 0]
 #   PORT             server port [default: 8000]
 #   RESULT_DIR       output directory [default: ./bench-results]
+#   DATASET          vllm-bench dataset: random | sharegpt | sonnet | speed-bench [default: random]
 #   QPS_LIST         space-separated QPS values [default: "1 2 4 8 10 12 16"]
 #   CONCURRENCY_LIST space-separated concurrency values for spec sweep [default: "1 4 8"]
 #   INPUT_LEN        input length [default: 1024]
@@ -46,6 +47,7 @@ DRAFT_MODEL=${DRAFT_MODEL:-}
 GPU=${GPU:-0}
 PORT=${PORT:-8000}
 RESULT_DIR=${RESULT_DIR:-./bench-results}
+DATASET=${DATASET:-random}
 QPS_LIST=${QPS_LIST-"1 2 4 8 10 12 16"}
 CONCURRENCY_LIST=${CONCURRENCY_LIST:-"1 4 8"}
 INPUT_LEN=${INPUT_LEN:-1024}
@@ -146,15 +148,18 @@ fi
 
 # ---- QPS sweep --------------------------------------------------------------
 if [[ -n "${QPS_LIST// /}" ]]; then
-  echo "=== QPS sweep: qps=[$QPS_LIST] in=$INPUT_LEN out=$OUTPUT_LEN ==="
+  echo "=== QPS sweep: qps=[$QPS_LIST] dataset=$DATASET ==="
+  DATASET_ARGS=(--dataset-name "$DATASET")
+  if [[ "$DATASET" == "random" ]]; then
+    DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
+  fi
   for QPS in $QPS_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($QPS * $SECONDS_PER_RUN))")
-    echo "--- $LABEL $MODEL_LABEL qps=$QPS num_prompts=$NUM_PROMPTS ---"
+    echo "--- $LABEL $MODEL_LABEL qps=$QPS num_prompts=$NUM_PROMPTS dataset=$DATASET ---"
     "$BENCH" \
       --backend openai --model "$MODEL" --port "$PORT" \
       --base-url "http://localhost:$PORT" \
-      --dataset-name random \
-      --random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN" \
+      "${DATASET_ARGS[@]}" \
       --num-prompts "$NUM_PROMPTS" \
       --request-rate "$QPS" \
       --seed "$SEED" \
@@ -162,23 +167,26 @@ if [[ -n "${QPS_LIST// /}" ]]; then
       --tokenizer "$MODEL" \
       --percentile-metrics ttft,tpot,itl,e2el \
       --save-result --result-dir "$RESULT_DIR" \
-      --result-filename "${LABEL}-${MODEL_LABEL}-in${INPUT_LEN}-out${OUTPUT_LEN}-qps${QPS}-seed${SEED}.json"
+      --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-qps${QPS}-seed${SEED}.json"
   done
 else
   echo "=== QPS sweep skipped (QPS_LIST is empty) ==="
 fi
 
-# ---- DSpark/DFlash concurrency sweep (openinfer only) -----------------------
-if [[ -n "$DRAFT_MODEL" && "$ENGINE" == "openinfer" ]]; then
-  echo "=== spec concurrency sweep: c=[$CONCURRENCY_LIST] in=$INPUT_LEN out=$OUTPUT_LEN ==="
+# ---- Concurrency sweep (openinfer only) ------------------------------------
+if [[ "${ENGINE}" == "openinfer" && -n "${CONCURRENCY_LIST// /}" ]]; then
+  echo "=== spec concurrency sweep: c=[$CONCURRENCY_LIST] dataset=$DATASET ==="
+  DATASET_ARGS=(--dataset-name "$DATASET")
+  if [[ "$DATASET" == "random" ]]; then
+    DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
+  fi
   for C in $CONCURRENCY_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($C * $SECONDS_PER_RUN))")
-    echo "--- $LABEL $MODEL_LABEL c=$C num_prompts=$NUM_PROMPTS ---"
+    echo "--- $LABEL $MODEL_LABEL c=$C num_prompts=$NUM_PROMPTS dataset=$DATASET ---"
     "$BENCH" \
       --backend openai --model "$MODEL" --port "$PORT" \
       --base-url "http://localhost:$PORT" \
-      --dataset-name random \
-      --random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN" \
+      "${DATASET_ARGS[@]}" \
       --num-prompts "$NUM_PROMPTS" \
       --max-concurrency "$C" \
       --seed "$SEED" \
@@ -186,7 +194,7 @@ if [[ -n "$DRAFT_MODEL" && "$ENGINE" == "openinfer" ]]; then
       --tokenizer "$MODEL" \
       --percentile-metrics ttft,tpot,itl,e2el \
       --save-result --result-dir "$RESULT_DIR" \
-      --result-filename "${LABEL}-${MODEL_LABEL}-in${INPUT_LEN}-out${OUTPUT_LEN}-c${C}-seed${SEED}.json"
+      --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-c${C}-seed${SEED}.json"
   done
 fi
 
