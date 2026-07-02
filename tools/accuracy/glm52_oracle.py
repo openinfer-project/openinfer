@@ -50,7 +50,7 @@ Usage (paste the emitted block into openinfer-glm52/tests/mla_decode_oracle.rs):
 
     # negative control: the gate MUST go red against fault-injected probes
     uv run tools/accuracy/glm52_oracle.py \
-        --model-path /data/models/GLM-5.2-FP8 --emit rust --inject-fault qb-weight-block
+        --model-path /data/models/GLM-5.2-FP8 --emit rust --inject-fault rope-swap
 """
 
 from __future__ import annotations
@@ -214,9 +214,12 @@ def build_attention(ckpt: Checkpoint, config, layer: int, precision: str, fault:
             ckpt.tensor(f"{prefix}.{stem}.weight"),
             ckpt.tensor(f"{prefix}.{stem}.weight_scale_inv"),
         )
-        if fault == "qb-weight-block" and stem == "q_b_proj":
-            w[1024 : 1024 + FP8_GROUP, 512 : 512 + FP8_GROUP] *= -1.0
-            print("// !!! FAULT INJECTED: q_b_proj block negated — DO NOT COMMIT", file=sys.stderr)
+        if fault == "qb-head-negate" and stem == "q_b_proj":
+            # Negate head 0's full q_b slice (rows 0..256). A single 128x128
+            # block is NOT enough: softmax smoothing + o_proj's 64-head mixing
+            # dilute it below the gate tolerance (measured 2026-07-02).
+            w[0:256, :] *= -1.0
+            print("// !!! FAULT INJECTED: q_b head-0 negated — DO NOT COMMIT", file=sys.stderr)
         return w
 
     linear_cls = Fp8SimLinear if precision == "fp8sim" else Bf16Linear
@@ -345,7 +348,7 @@ def main() -> int:
     p.add_argument("--out", type=Path, help="safetensors dump path")
     p.add_argument("--probes", type=int, default=64)
     p.add_argument("--rel-tol", type=float, default=0.05)
-    p.add_argument("--inject-fault", choices=["none", "qb-weight-block", "rope-swap"], default="none")
+    p.add_argument("--inject-fault", choices=["none", "qb-head-negate", "rope-swap"], default="none")
     args = p.parse_args()
 
     assert args.ctx <= 2048, "full top-k == DSA only holds at ctx <= 2048"
