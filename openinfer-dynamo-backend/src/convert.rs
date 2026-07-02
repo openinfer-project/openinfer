@@ -29,16 +29,19 @@ pub const DEFAULT_MAX_TOKENS: usize = 16_384;
 /// Map Dynamo `SamplingOptions` onto openinfer's `SamplingParams`.
 ///
 /// openinfer's sampler is deliberately small — temperature / top-k / top-p /
-/// ignore-eos. Penalties, min-p, seed, beam search and guided decoding have no
-/// engine-side knob yet, so they are dropped here rather than silently faked.
-/// `ignore_eos` lives on `StopConditions` in Dynamo but on `SamplingParams` in
-/// openinfer.
+/// min-p / ignore-eos. Penalties, beam search and guided decoding have no
+/// engine-side knob yet, so they are dropped here rather than silently faked;
+/// per-request seeds wait on the scheduler step wiring (sampling-parity
+/// tracking issue) and are dropped for the same reason. `ignore_eos` lives on
+/// `StopConditions` in Dynamo but on `SamplingParams` in openinfer.
 pub fn to_sampling_params(request: &PreprocessedRequest) -> SamplingParams {
     let s = &request.sampling_options;
     SamplingParams {
         temperature: s.temperature.unwrap_or(0.0),
         top_k: s.top_k.unwrap_or(-1),
         top_p: s.top_p.unwrap_or(1.0),
+        min_p: s.min_p.unwrap_or(0.0),
+        seed: None,
         ignore_eos: request.stop_conditions.ignore_eos.unwrap_or(false),
     }
 }

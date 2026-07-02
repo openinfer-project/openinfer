@@ -32,12 +32,7 @@ fn refs(params: &[SamplingParams]) -> Vec<&SamplingParams> {
 }
 
 fn greedy() -> SamplingParams {
-    SamplingParams {
-        temperature: 0.0,
-        top_k: -1,
-        top_p: 1.0,
-        ignore_eos: false,
-    }
+    SamplingParams::default()
 }
 
 fn sampling(temperature: f32, top_k: i32, top_p: f32) -> SamplingParams {
@@ -45,7 +40,7 @@ fn sampling(temperature: f32, top_k: i32, top_p: f32) -> SamplingParams {
         temperature,
         top_k,
         top_p,
-        ignore_eos: false,
+        ..SamplingParams::default()
     }
 }
 
@@ -66,7 +61,7 @@ fn greedy_batch_picks_each_rows_argmax() {
     let params = vec![greedy(); peaks.len()];
     let mut scratch = SampleScratch::new(&ctx, vocab, peaks.len()).unwrap();
 
-    let tokens = select_batch(&ctx, &arena, &refs(&params), 0, &mut scratch).unwrap();
+    let tokens = select_batch(&ctx, &arena, &refs(&params), &vec![0; params.len()], 0, &mut scratch).unwrap();
 
     assert_eq!(tokens, vec![3, 7, 0, 15]);
 }
@@ -80,7 +75,7 @@ fn top_k_one_routes_through_greedy_path() {
     let params = vec![sampling(1.0, 1, 1.0)];
     let mut scratch = SampleScratch::new(&ctx, vocab, 1).unwrap();
 
-    let tokens = select_batch(&ctx, &arena, &refs(&params), 123, &mut scratch).unwrap();
+    let tokens = select_batch(&ctx, &arena, &refs(&params), &[0], 123, &mut scratch).unwrap();
 
     assert_eq!(tokens, vec![5]);
 }
@@ -103,7 +98,7 @@ fn mixed_batch_routes_and_places_each_row() {
     let params = vec![greedy(), sampling(1.0, -1, 0.5), greedy()];
     let mut scratch = SampleScratch::new(&ctx, vocab, 3).unwrap();
 
-    let tokens = select_batch(&ctx, &arena, &refs(&params), 7, &mut scratch).unwrap();
+    let tokens = select_batch(&ctx, &arena, &refs(&params), &[0, 0, 0], 7, &mut scratch).unwrap();
 
     assert_eq!(tokens, vec![2, 9, 4]);
 }
@@ -119,13 +114,13 @@ fn sampling_is_seed_deterministic_and_actually_samples() {
     let params = vec![sampling(1.0, -1, 1.0)];
     let mut scratch = SampleScratch::new(&ctx, vocab, 1).unwrap();
 
-    let a = select_batch(&ctx, &arena, &refs(&params), 42, &mut scratch).unwrap();
-    let b = select_batch(&ctx, &arena, &refs(&params), 42, &mut scratch).unwrap();
+    let a = select_batch(&ctx, &arena, &refs(&params), &[0], 42, &mut scratch).unwrap();
+    let b = select_batch(&ctx, &arena, &refs(&params), &[0], 42, &mut scratch).unwrap();
     assert_eq!(a, b, "same seed must be deterministic");
 
     let mut seen = HashSet::new();
     for s in 0..64u64 {
-        seen.insert(select_batch(&ctx, &arena, &refs(&params), s, &mut scratch).unwrap()[0]);
+        seen.insert(select_batch(&ctx, &arena, &refs(&params), &[0], s, &mut scratch).unwrap()[0]);
     }
     assert!(
         seen.len() > 1,
@@ -154,7 +149,7 @@ fn tiny_top_p_routes_to_argmax_even_under_bf16_ties() {
     let arena = make_arena(&ctx, &[row]);
     let mut scratch = SampleScratch::new(&ctx, vocab, 1).unwrap();
 
-    let greedy_tok = select_batch(&ctx, &arena, &[&greedy()], 0, &mut scratch).unwrap();
+    let greedy_tok = select_batch(&ctx, &arena, &[&greedy()], &[0], 0, &mut scratch).unwrap();
     assert_eq!(
         greedy_tok,
         vec![lo as u32],
@@ -164,7 +159,7 @@ fn tiny_top_p_routes_to_argmax_even_under_bf16_ties() {
     let tiny = sampling(1.0, -1, 1e-6); // 1e-6 < 1/vocab (~6.6e-6)
     for s in 0..64u64 {
         assert_eq!(
-            select_batch(&ctx, &arena, &[&tiny], s, &mut scratch).unwrap(),
+            select_batch(&ctx, &arena, &[&tiny], &[0], s, &mut scratch).unwrap(),
             greedy_tok,
             "seed {s}: tiny top_p must match greedy, not sample the tied peer"
         );
@@ -179,5 +174,81 @@ fn batch_larger_than_scratch_is_rejected() {
     let params = vec![greedy(); 2];
     let mut scratch = SampleScratch::new(&ctx, vocab, 1).unwrap();
 
-    assert!(select_batch(&ctx, &arena, &refs(&params), 0, &mut scratch).is_err());
+    assert!(select_batch(&ctx, &arena, &refs(&params), &vec![0; params.len()], 0, &mut scratch).is_err());
+}
+
+#[test]
+fn min_p_row_takes_the_sampler_path_and_filters() {
+    // Two-token support: P(3) ~ 0.73, P(11) ~ 0.27. min_p = 0.5 thresholds at
+    // 0.5 * 0.73 = 0.37, masking token 11 — every draw must return token 3.
+    // With min_p = 0.0 the same row explores both (checked over many seeds),
+    // proving the row genuinely rides the sampler, not argmax.
+    let ctx = DeviceContext::new().unwrap();
+    let vocab = 16;
+    let mut row = vec![-60.0f32; vocab];
+    row[3] = 1.0;
+    row[11] = 0.0;
+    let arena = make_arena(&ctx, &[row]);
+    let mut scratch = SampleScratch::new(&ctx, vocab, 1).unwrap();
+
+    let mut filtered = sampling(1.0, -1, 1.0);
+    filtered.min_p = 0.5;
+    for s in 0..64u64 {
+        assert_eq!(
+            select_batch(&ctx, &arena, &[&filtered], &[0], s, &mut scratch).unwrap(),
+            vec![3],
+            "seed {s}: min_p=0.5 must mask the 0.27-prob token"
+        );
+    }
+
+    let open = sampling(1.0, -1, 1.0);
+    let mut seen = HashSet::new();
+    for s in 0..128u64 {
+        seen.insert(select_batch(&ctx, &arena, &[&open], &[0], s, &mut scratch).unwrap()[0]);
+    }
+    assert!(
+        seen.contains(&11),
+        "min_p=0 should reach the 0.27-prob token across 128 seeds, saw {seen:?}"
+    );
+}
+
+/// The per-request seed contract: a seeded row's token is a pure function of
+/// (seed, step, distribution) — independent of where the row sits in the
+/// batch, of its neighbors, and of the engine's per-step seed.
+#[test]
+fn seeded_rows_replay_independent_of_batch_position() {
+    let ctx = DeviceContext::new().unwrap();
+    let vocab = 32_768;
+    let flat = vec![0.0f32; vocab];
+    let arena = make_arena(&ctx, &[flat.clone(), flat.clone(), flat]);
+    let mut scratch = SampleScratch::new(&ctx, vocab, 3).unwrap();
+
+    let seeded = |seed: u64| SamplingParams {
+        temperature: 1.0,
+        seed: Some(seed),
+        ..SamplingParams::default()
+    };
+    let unseeded = sampling(1.0, -1, 1.0);
+
+    // Batch A: seeded row last; batch B: seeded row first, different
+    // neighbors and engine seed. Same request seed + step => same token.
+    let a = select_batch(
+        &ctx,
+        &arena,
+        &[&greedy(), &unseeded, &seeded(7)],
+        &[0, 0, 5],
+        99,
+        &mut scratch,
+    )
+    .unwrap();
+    let b = select_batch(&ctx, &arena, &[&seeded(7), &greedy()], &[5, 0], 1234, &mut scratch)
+        .unwrap();
+    assert_eq!(a[2], b[0], "seeded row must replay across batch layouts");
+
+    // Advancing the step or changing the seed moves the stream; on a flat
+    // 32k-token distribution an accidental collision is ~3e-5.
+    let c = select_batch(&ctx, &arena, &[&seeded(7)], &[6], 0, &mut scratch).unwrap();
+    let d = select_batch(&ctx, &arena, &[&seeded(8)], &[5], 0, &mut scratch).unwrap();
+    assert_ne!(a[2], c[0], "step must advance the seeded stream");
+    assert_ne!(a[2], d[0], "seed must select a distinct stream");
 }

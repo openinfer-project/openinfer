@@ -318,76 +318,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{SampleScratch, SamplingParams, select_batch, token_logprob_from_row};
+    use super::token_logprob_from_row;
     use half::bf16;
-    use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
-
-    const VOCAB: usize = 32768;
-
-    fn flat_arena(ctx: &DeviceContext, rows: usize) -> HiddenStates {
-        let host = vec![bf16::ZERO; rows * VOCAB];
-        HiddenStates {
-            data: ctx.stream.clone_htod(&host).expect("htod"),
-            hidden_dim: VOCAB,
-            seq_len: rows,
-        }
-    }
-
-    fn seeded(seed: u64) -> SamplingParams {
-        SamplingParams {
-            temperature: 1.0,
-            seed: Some(seed),
-            ..Default::default()
-        }
-    }
-
-    /// The per-request seed contract: a seeded row's token is a pure function
-    /// of (seed, step, distribution) — independent of where the row sits in
-    /// the batch and of what else is in flight.
-    #[test]
-    fn seeded_rows_replay_independent_of_batch_position() {
-        let ctx = DeviceContext::new().expect("CUDA context");
-        let logits = flat_arena(&ctx, 3);
-        let mut scratch = SampleScratch::new(&ctx, VOCAB, 3).expect("scratch");
-
-        let greedy = SamplingParams::default();
-        let unseeded = SamplingParams {
-            temperature: 1.0,
-            ..Default::default()
-        };
-
-        // Batch A: seeded row last; batch B: seeded row first, different
-        // neighbors. Same seed + step must produce the same token.
-        let a = select_batch(
-            &ctx,
-            &logits,
-            &[&greedy, &unseeded, &seeded(7)],
-            &[0, 0, 5],
-            99,
-            &mut scratch,
-        )
-        .expect("batch a");
-        let b = select_batch(
-            &ctx,
-            &logits,
-            &[&seeded(7), &greedy],
-            &[5, 0],
-            1234,
-            &mut scratch,
-        )
-        .expect("batch b");
-        assert_eq!(
-            a[2], b[0],
-            "seeded row must replay across batch layouts and engine seeds"
-        );
-
-        // Advancing the step or changing the seed moves the stream. On a flat
-        // 32k-token distribution an accidental collision is ~3e-5.
-        let c = select_batch(&ctx, &logits, &[&seeded(7)], &[6], 0, &mut scratch).expect("step 6");
-        let d = select_batch(&ctx, &logits, &[&seeded(8)], &[5], 0, &mut scratch).expect("seed 8");
-        assert_ne!(a[2], c[0], "step must advance the seeded stream");
-        assert_ne!(a[2], d[0], "seed must select a distinct stream");
-    }
 
     #[test]
     fn token_logprob_matches_exact_log_softmax() {
