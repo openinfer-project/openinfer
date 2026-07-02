@@ -1,6 +1,6 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: DFlash speculative decoding is now opt-in, default-off, and batched for multi-active decode. Same-host RTX 5090 A/B shows c4/c8/c16 gains for decode-heavy, medium, and long prompts, with exact token sanity gates and nsys profile evidence. Remaining structural items are HND prefill staging, prefix-cache design, serving-level HTTP pressure validation for DFlash, and broader non-greedy/TP feature coverage.
+> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: DFlash speculative decoding is now opt-in, default-off, and batched for multi-active decode. Same-host RTX 5090 A/B shows c4/c8/c16 gains for decode-heavy, medium, and long prompts; token sanity is exact where stable and covered by the DFlash regret oracle for bf16 near-tie cases. Remaining structural items are HND prefill staging, prefix-cache design, serving-level HTTP pressure validation for DFlash, and broader non-greedy/TP feature coverage.
 >
 > **Last touched:** 2026-07
 
@@ -20,7 +20,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | Admission | ✓ existing full-lifetime KV admission and explicit `Rejected` events cover impossible KV requests; #253 adds the context-window rejection reason before prefill/decode | `scheduler.rs`, `src/scheduler/plan.rs`, `docs/models/qwen35/kv-admission.md` |
 | Scheduler tests | Partial: current plan selection, full-lifetime admission, context-window rejection, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
 | Step tail | Local branch verified: #353 batches the prefill final norm/lm_head tail, samples decode/unified rows from batched logits, and keeps host full-vocab copies only for requested logprobs; HF/e2e gates pass, short-output serving A/B shows TTFT benefit, long-decode TPOT remains a no-claim diagnostic | `docs/models/qwen35/batched-step-tail.md` |
-| DFlash speculative decode | Opt-in batched path: hybrid-state verify/commit covers KV + recurrent + conv state; correctness and HTTP smoke gates pass. Same-host in-process A/B improves `prompt_len=1` c4/c8/c16 by `+15.4%/+19.8%/+12.7%`, `prompt_len=1024` by `+236.6%/+192.9%/+46.0%`, and `prompt_len=4096` by `+188.1%/+41.3%/+24.9%`. | `docs/models/qwen35/dflash-speculative-decoding.md` |
+| DFlash speculative decode | Opt-in batched path: hybrid-state verify/commit covers KV + recurrent + conv state; correctness and scheduler e2e gates pass. Same-host in-process A/B improves `prompt_len=1` c4/c8/c16 by `+16.7%/+15.4%/+14.0%`, `prompt_len=1024` by `+209.9%/+168.6%/+45.3%`, and `prompt_len=4096` by `+135.9%/+35.7%/+25.6%`. | `docs/models/qwen35/dflash-speculative-decoding.md` |
 | TP | ✗ absent (single GPU only) | — |
 | Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
 

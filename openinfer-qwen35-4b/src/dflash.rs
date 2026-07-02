@@ -1,17 +1,20 @@
 use anyhow::{Context, Result};
-use cudarc::driver::CudaSlice;
 
 use crate::dflash::config::{DFlashConfig, DFlashLayerType};
+use crate::dflash::state::DFlashContextScratch;
 use crate::weights::Qwen35Model;
 use openinfer_core::ops;
-use openinfer_core::tensor::HiddenStates;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 pub(crate) mod config;
 mod loading;
 mod reservation;
+mod scratch;
+mod state;
 
 pub(crate) use reservation::DFlashMemoryReservation;
+pub(crate) use scratch::DFlashBatchScratch;
+pub(crate) use state::DFlashRequestState;
 
 pub(crate) struct DFlashDraftModel {
     config: DFlashConfig,
@@ -41,276 +44,6 @@ pub(crate) struct DFlashBlock {
     pub(super) attention: DFlashAttention,
     pub(super) post_attention_layernorm: DeviceVec,
     pub(super) mlp: DFlashMlp,
-}
-
-pub(crate) struct DFlashRequestState {
-    layers: Vec<DFlashLayerCache>,
-    pending_context: DFlashPendingContext,
-    /// Projected target context for the current draft round. Computed once from
-    /// `pending_context` and read by every layer's tail concat, so it lives with
-    /// the request (the batched scratch only holds one request's varlen tail).
-    context: DFlashContextScratch,
-    committed_len: usize,
-    max_cache_len: usize,
-}
-
-struct DFlashLayerCache {
-    k: HiddenStates,
-    v: HiddenStates,
-}
-
-struct DFlashPendingContext {
-    buffer: HiddenStates,
-    len: usize,
-    capacity: usize,
-}
-
-/// Per-request projected context. The fc projection + hidden_norm turn the
-/// captured target hidden context into draft hidden space once per draft round;
-/// every layer's tail concat reads `context_hidden`, so it must persist across
-/// the layer loop and therefore lives in the request (not the shared scratch).
-struct DFlashContextScratch {
-    max_context_len: usize,
-    context_projected: HiddenStates,
-    context_hidden: HiddenStates,
-}
-
-/// Lane-level batched draft scratch, allocated once for the whole decode batch.
-///
-/// Dense buffers (`hidden`, `normed`, `q_batch`, `attn_output`, the MLP buffers,
-/// and `logits`) hold `max_batch * block_size` rows so the GEMM / rms_norm /
-/// silu / add / logits / embedding ops run ONCE over the batched buffer. The
-/// varlen tail buffers (`tail_input`, `k_tail`, `v_tail`) stay sized for a single
-/// request and are reused inside the per-request loop, because their ops (tail
-/// concat, k/v GEMMs, rope, KV copy, attention) still loop per request — Step 2
-/// will batch those via CUDA-kernel changes.
-pub(crate) struct DFlashBatchScratch {
-    max_batch_block_rows: usize,
-    max_tail_len: usize,
-    block_token_ids_h: Vec<u32>,
-    token_ids_d: CudaSlice<u32>,
-    hidden: HiddenStates,
-    hidden_out: HiddenStates,
-    normed: HiddenStates,
-    q_batch: HiddenStates,
-    attn_output: HiddenStates,
-    o_buf: HiddenStates,
-    gate_out: HiddenStates,
-    up_out: HiddenStates,
-    act_out: HiddenStates,
-    logits_normed: HiddenStates,
-    logits: HiddenStates,
-    // Shared single-request varlen tail scratch (reused inside the per-request loop).
-    tail_input: HiddenStates,
-    k_tail: HiddenStates,
-    v_tail: HiddenStates,
-}
-
-impl DFlashRequestState {
-    pub(crate) fn pending_context_len(&self) -> Option<usize> {
-        (self.pending_context.len > 0).then_some(self.pending_context.len)
-    }
-}
-
-impl DFlashPendingContext {
-    fn new(ctx: &DeviceContext, hidden_dim: usize, capacity: usize) -> Result<Self> {
-        anyhow::ensure!(
-            capacity > 0,
-            "DFlash pending context capacity must be non-zero"
-        );
-        let mut buffer = HiddenStates::zeros(ctx, hidden_dim, capacity)?;
-        buffer.seq_len = 0;
-        Ok(Self {
-            buffer,
-            len: 0,
-            capacity,
-        })
-    }
-
-    fn append_from(
-        &mut self,
-        ctx: &DeviceContext,
-        src: &HiddenStates,
-        src_token_offset: usize,
-        token_count: usize,
-        max_capacity: usize,
-    ) -> Result<()> {
-        let required_len = self
-            .len
-            .checked_add(token_count)
-            .context("DFlash pending context length overflow")?;
-        anyhow::ensure!(
-            required_len <= max_capacity,
-            "DFlash pending context length {} exceeds request capacity {}",
-            required_len,
-            max_capacity
-        );
-        self.ensure_capacity(ctx, required_len, max_capacity)?;
-        self.buffer.seq_len = self.capacity;
-        ops::copy_hidden_token_range_into(
-            ctx,
-            src,
-            src_token_offset,
-            &mut self.buffer,
-            self.len,
-            token_count,
-        )?;
-        self.len = required_len;
-        self.buffer.seq_len = self.len;
-        Ok(())
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        ctx: &DeviceContext,
-        required_len: usize,
-        max_capacity: usize,
-    ) -> Result<()> {
-        if required_len <= self.capacity {
-            return Ok(());
-        }
-        let doubled = self
-            .capacity
-            .checked_mul(2)
-            .context("DFlash pending context capacity overflow")?;
-        let new_capacity = required_len.max(doubled).min(max_capacity);
-        anyhow::ensure!(
-            new_capacity >= required_len,
-            "DFlash pending context capacity {} cannot fit {} tokens",
-            new_capacity,
-            required_len
-        );
-        let mut next = HiddenStates::zeros(ctx, self.buffer.hidden_dim, new_capacity)?;
-        if self.len > 0 {
-            self.buffer.seq_len = self.capacity;
-            ops::copy_hidden_token_range_into(ctx, &self.buffer, 0, &mut next, 0, self.len)?;
-        }
-        next.seq_len = self.len;
-        self.buffer = next;
-        self.capacity = new_capacity;
-        Ok(())
-    }
-
-    fn activate_for_read(&mut self) {
-        self.buffer.seq_len = self.len;
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-        self.buffer.seq_len = 0;
-    }
-}
-
-impl DFlashContextScratch {
-    fn new(ctx: &DeviceContext, hidden_size: usize, max_context_len: usize) -> Result<Self> {
-        Ok(Self {
-            max_context_len,
-            context_projected: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
-            context_hidden: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
-        })
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        ctx: &DeviceContext,
-        hidden_size: usize,
-        context_len: usize,
-    ) -> Result<()> {
-        if context_len > self.max_context_len {
-            *self = Self::new(ctx, hidden_size, context_len)?;
-        }
-        self.context_projected.seq_len = context_len;
-        self.context_hidden.seq_len = context_len;
-        Ok(())
-    }
-}
-
-impl DFlashBatchScratch {
-    fn new(
-        ctx: &DeviceContext,
-        config: &DFlashConfig,
-        max_decode_batch_size: usize,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            max_decode_batch_size > 0,
-            "DFlash batch scratch needs a non-zero batch size"
-        );
-        let block_size = config.block_size;
-        let hidden_size = config.hidden_size;
-        let q_dim = config.num_attention_heads * config.head_dim;
-        let kv_dim = config.num_key_value_heads * config.head_dim;
-        let inter_dim = config.intermediate_size;
-        // Dense buffers span the whole decode batch so the dense ops run once.
-        let batch_rows = block_size * max_decode_batch_size;
-        // The shared varlen tail starts at one block (no committed context yet)
-        // and grows on demand via `ensure_tail_capacity`.
-        let tail_capacity = block_size;
-        Ok(Self {
-            max_batch_block_rows: batch_rows,
-            max_tail_len: tail_capacity,
-            block_token_ids_h: vec![config.mask_token_id; batch_rows],
-            token_ids_d: ctx.stream.alloc_zeros(batch_rows)?,
-            hidden: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            hidden_out: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            q_batch: HiddenStates::zeros(ctx, q_dim, batch_rows)?,
-            attn_output: HiddenStates::zeros(ctx, q_dim, batch_rows)?,
-            o_buf: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            gate_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
-            up_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
-            act_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
-            logits_normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, batch_rows)?,
-            tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
-            k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
-            v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
-        })
-    }
-
-    /// Point every dense buffer at the active `batch_block_rows = active_batch *
-    /// block_size` prefix. Allocated for the max decode batch, so this only
-    /// shrinks `seq_len`; it never reallocates.
-    fn activate_dense(&mut self, batch_block_rows: usize) {
-        assert!(
-            batch_block_rows <= self.max_batch_block_rows,
-            "DFlash batched draft {} block rows exceeds scratch capacity {}",
-            batch_block_rows,
-            self.max_batch_block_rows
-        );
-        self.hidden.seq_len = batch_block_rows;
-        self.hidden_out.seq_len = batch_block_rows;
-        self.normed.seq_len = batch_block_rows;
-        self.q_batch.seq_len = batch_block_rows;
-        self.attn_output.seq_len = batch_block_rows;
-        self.o_buf.seq_len = batch_block_rows;
-        self.gate_out.seq_len = batch_block_rows;
-        self.up_out.seq_len = batch_block_rows;
-        self.act_out.seq_len = batch_block_rows;
-        self.logits_normed.seq_len = batch_block_rows;
-        self.logits.seq_len = batch_block_rows;
-    }
-
-    /// Size the shared varlen tail buffers for one request's `tail_len =
-    /// context_len + block_size`, growing the allocation if needed.
-    fn ensure_tail_capacity(
-        &mut self,
-        ctx: &DeviceContext,
-        config: &DFlashConfig,
-        tail_len: usize,
-    ) -> Result<()> {
-        if tail_len > self.max_tail_len {
-            let hidden_size = config.hidden_size;
-            let kv_dim = config.num_key_value_heads * config.head_dim;
-            self.tail_input = HiddenStates::zeros(ctx, hidden_size, tail_len)?;
-            self.k_tail = HiddenStates::zeros(ctx, kv_dim, tail_len)?;
-            self.v_tail = HiddenStates::zeros(ctx, kv_dim, tail_len)?;
-            self.max_tail_len = tail_len;
-        }
-        self.tail_input.seq_len = tail_len;
-        self.k_tail.seq_len = tail_len;
-        self.v_tail.seq_len = tail_len;
-        Ok(())
-    }
 }
 
 impl DFlashDraftModel {
@@ -413,28 +146,15 @@ impl DFlashDraftModel {
             self.config.max_position_embeddings
         );
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
-        let mut layers = Vec::with_capacity(self.layers.len());
-        for _ in 0..self.layers.len() {
-            layers.push(DFlashLayerCache {
-                k: HiddenStates::zeros(ctx, kv_dim, max_cache_len)?,
-                v: HiddenStates::zeros(ctx, kv_dim, max_cache_len)?,
-            });
-        }
-        Ok(DFlashRequestState {
-            layers,
-            pending_context: DFlashPendingContext::new(
-                ctx,
-                self.context_feature_dim(),
-                self.config.block_size.min(max_cache_len),
-            )?,
-            context: DFlashContextScratch::new(
-                ctx,
-                self.config.hidden_size,
-                self.config.block_size,
-            )?,
-            committed_len: 0,
+        DFlashRequestState::new(
+            ctx,
+            self.layers.len(),
+            kv_dim,
+            self.context_feature_dim(),
+            self.config.hidden_size,
+            self.config.block_size,
             max_cache_len,
-        })
+        )
     }
 
     pub(crate) fn append_pending_context(
@@ -836,20 +556,20 @@ pub(crate) fn validate_dflash_config_for_target(
 
 #[cfg(test)]
 mod tests {
-    use super::DFlashDraftModel;
     use super::validate_dflash_config_for_target;
     use crate::config::Config35;
-    use crate::recurrent_state::RecurrentState;
-    use crate::weights::Qwen35Model;
-    use openinfer_core::sampler::SamplingParams;
     use std::path::Path;
 
     #[test]
-    fn downloaded_dflash_config_matches_qwen35_4b() {
-        let target_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/data/models/Qwen3.5-4B".to_string());
-        let dflash_path = std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/data/models/Qwen3.5-4B-DFlash".to_string());
+    fn env_dflash_config_matches_qwen35_target() {
+        let Ok(target_path) = std::env::var("OPENINFER_TEST_MODEL_PATH") else {
+            eprintln!("skipping DFlash config test; set OPENINFER_TEST_MODEL_PATH");
+            return;
+        };
+        let Ok(dflash_path) = std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH") else {
+            eprintln!("skipping DFlash config test; set OPENINFER_DFLASH_TEST_MODEL_PATH");
+            return;
+        };
         if !Path::new(&target_path).join("config.json").exists()
             || !Path::new(&dflash_path).join("config.json").exists()
         {
@@ -872,152 +592,6 @@ mod tests {
         assert!(
             reservation.kv_bytes_per_token > 0 && reservation.fixed_bytes > 0,
             "DFlash reservation must reserve both per-token and fixed memory"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_dflash_first_block_against_reference() {
-        let target_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/data/models/Qwen3.5-4B".to_string());
-        let dflash_path = std::env::var("OPENINFER_DFLASH_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/data/models/Qwen3.5-4B-DFlash".to_string());
-        if !Path::new(&target_path).join("config.json").exists()
-            || !Path::new(&dflash_path).join("config.json").exists()
-        {
-            eprintln!(
-                "skipping DFlash first-block debug; set OPENINFER_TEST_MODEL_PATH and OPENINFER_DFLASH_TEST_MODEL_PATH"
-            );
-            return;
-        }
-
-        let target =
-            Qwen35Model::from_safetensors_with_device_options(&target_path, false, 0).unwrap();
-        let dflash = DFlashDraftModel::from_safetensors_for_target(
-            target.device_ctx(),
-            &dflash_path,
-            &target,
-        )
-        .unwrap();
-        let mut kv = target.alloc_kv();
-        let mut recurrent = RecurrentState::new(target.device_ctx(), target.config()).unwrap();
-        let (target_logits, captured) = target
-            .prefill_logits_all_with_capture(
-                &[9707],
-                &mut kv,
-                &mut recurrent,
-                Some(dflash.target_layer_ids()),
-            )
-            .unwrap();
-        let mut sample = openinfer_sample::SampleScratch::new(
-            target.device_ctx(),
-            target.config().vocab_size,
-            dflash.block_size(),
-        )
-        .unwrap();
-        let greedy = SamplingParams::default();
-        let first = openinfer_sample::select_batch(
-            target.device_ctx(),
-            &target_logits,
-            &[&greedy],
-            0,
-            &mut sample,
-        )
-        .unwrap()[0];
-        let captured = captured.expect("captured target hidden");
-        let captured_host = captured.to_host(target.device_ctx()).unwrap();
-        let mut state = dflash
-            .new_request_state(
-                target.device_ctx(),
-                dflash.max_position_embeddings().min(4096),
-            )
-            .unwrap();
-        dflash
-            .append_pending_context(target.device_ctx(), &mut state, &captured, 0, 1)
-            .unwrap();
-        let mut scratch = dflash.new_batch_scratch(target.device_ctx(), 1).unwrap();
-        let (sampled, logits_host, vocab) = {
-            let logits = dflash
-                .draft_logits_batched(&target, &mut [&mut state], &[first], &mut scratch)
-                .unwrap();
-            let params: Vec<&SamplingParams> = vec![&greedy; logits.seq_len];
-            let sampled = openinfer_sample::select_batch(
-                target.device_ctx(),
-                logits,
-                &params,
-                0,
-                &mut sample,
-            )
-            .unwrap();
-            (
-                sampled,
-                logits.to_host(target.device_ctx()).unwrap(),
-                logits.hidden_dim,
-            )
-        };
-        let hidden_host = scratch.hidden.to_host(target.device_ctx()).unwrap();
-        let normed_host = scratch.logits_normed.to_host(target.device_ctx()).unwrap();
-        let mut top: Vec<(usize, f32)> = logits_host[..vocab].iter().copied().enumerate().collect();
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("OPENINFER_DFLASH_DEBUG first={first}");
-        eprintln!(
-            "OPENINFER_DFLASH_DEBUG captured_shape=[{},{}] captured_sum={:.6} captured_first16={:?}",
-            captured.hidden_dim,
-            captured.seq_len,
-            captured_host.iter().sum::<f32>(),
-            &captured_host[..16.min(captured_host.len())]
-        );
-        eprintln!(
-            "OPENINFER_DFLASH_DEBUG sampled_head={:?}",
-            &sampled[..15.min(sampled.len())]
-        );
-        eprintln!(
-            "OPENINFER_DFLASH_DEBUG final_hidden_shape=[{},{}] sum={:.6} first16={:?}",
-            scratch.hidden.hidden_dim,
-            scratch.hidden.seq_len,
-            hidden_host.iter().sum::<f32>(),
-            &hidden_host[..16.min(hidden_host.len())]
-        );
-        eprintln!(
-            "OPENINFER_DFLASH_DEBUG logits_normed_shape=[{},{}] sum={:.6} first16={:?}",
-            scratch.logits_normed.hidden_dim,
-            scratch.logits_normed.seq_len,
-            normed_host.iter().sum::<f32>(),
-            &normed_host[..16.min(normed_host.len())]
-        );
-        eprintln!(
-            "OPENINFER_DFLASH_DEBUG top0={:?}",
-            &top[..10.min(top.len())]
-        );
-
-        let drafts_start = if dflash.anchor_first() { 0 } else { 1 };
-        let mut span = Vec::with_capacity(dflash.block_size());
-        span.push(first);
-        span.extend_from_slice(&sampled[drafts_start..dflash.block_size()]);
-
-        let mut verify_kv = kv;
-        let mut verify_recurrent = recurrent;
-        let (verify_logits, _verify_captured) = target
-            .prefill_logits_all_with_capture(
-                &span,
-                &mut verify_kv,
-                &mut verify_recurrent,
-                Some(dflash.target_layer_ids()),
-            )
-            .unwrap();
-        let verify_params: Vec<&SamplingParams> = vec![&greedy; verify_logits.seq_len];
-        let verify_sampled = openinfer_sample::select_batch(
-            target.device_ctx(),
-            &verify_logits,
-            &verify_params,
-            0,
-            &mut sample,
-        )
-        .unwrap();
-        eprintln!("OPENINFER_DFLASH_DEBUG span={:?}", span);
-        eprintln!(
-            "OPENINFER_DFLASH_DEBUG posterior_head={:?}",
-            &verify_sampled[..15.min(verify_sampled.len())]
         );
     }
 }

@@ -16,6 +16,8 @@ use openinfer_core::engine::{
     EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -25,6 +27,8 @@ const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5
 const LOGPROBS: usize = 20;
 const MARGIN_TOL: f32 = 0.20;
 const MAX_BATCH: usize = 16;
+const SYNTHETIC_TOKEN_LO: u32 = 100;
+const SYNTHETIC_TOKEN_HI: u32 = 100_000;
 
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -280,6 +284,14 @@ fn long_prompt(seed: &str) -> String {
     )
 }
 
+fn synthetic_random_prompt(len: usize, seed: u64, request_idx: usize) -> Vec<u32> {
+    let mut rng =
+        StdRng::seed_from_u64(seed ^ (request_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (0..len)
+        .map(|_| rng.random_range(SYNTHETIC_TOKEN_LO..SYNTHETIC_TOKEN_HI))
+        .collect()
+}
+
 #[test]
 fn qwen35_dflash_single_and_concurrent_greedy_are_lossless() {
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
@@ -368,6 +380,135 @@ fn qwen35_dflash_single_and_concurrent_greedy_are_lossless() {
     assert!(
         failures.is_empty(),
         "Qwen3.5 DFlash speculative decode is not lossless:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn qwen35_dflash_short_prompt_concurrent_random_is_within_oracle() {
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    let tokenizer = common::load_tokenizer(&model_path);
+    let output_len = 256;
+    let prompts: Vec<Vec<u32>> = (0..MAX_BATCH)
+        .map(|idx| synthetic_random_prompt(1, 0, idx))
+        .collect();
+
+    let baselines: Vec<Vec<Step>> = {
+        let handle = launch(&model_path, None);
+        let out = prompts
+            .iter()
+            .map(|tokens| generate(&handle, tokens.clone(), LOGPROBS, output_len))
+            .collect();
+        drop(handle);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+
+    let handle = launch(&model_path, Some(PathBuf::from(&draft_path)));
+    let specs = generate_concurrent(
+        &handle,
+        prompts
+            .iter()
+            .map(|tokens| (tokens.clone(), output_len))
+            .collect(),
+    );
+
+    let mut failures = Vec::new();
+    for (idx, spec) in specs.iter().enumerate() {
+        if let Err(err) = check_lossless(
+            &handle,
+            &tokenizer,
+            &format!("short-random-c{MAX_BATCH}-{idx}"),
+            &prompts[idx],
+            &baselines[idx],
+            spec,
+        ) {
+            failures.push(err);
+        }
+    }
+    drop(handle);
+
+    assert!(
+        failures.is_empty(),
+        "Qwen3.5 DFlash short-prompt concurrent decode is outside the oracle:\n{}",
+        failures.join("\n")
+    );
+}
+
+fn check_random_concurrent_case(
+    model_path: &str,
+    draft_path: &str,
+    tokenizer: &DynTokenizer,
+    prompt_len: usize,
+    concurrency: usize,
+) -> Vec<String> {
+    let output_len = 256;
+    let prompts: Vec<Vec<u32>> = (0..concurrency)
+        .map(|idx| synthetic_random_prompt(prompt_len, 42, idx))
+        .collect();
+
+    let baselines: Vec<Vec<Step>> = {
+        let handle = launch(model_path, None);
+        let out = prompts
+            .iter()
+            .map(|tokens| generate(&handle, tokens.clone(), LOGPROBS, output_len))
+            .collect();
+        drop(handle);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+
+    let handle = launch(model_path, Some(PathBuf::from(draft_path)));
+    let specs = generate_concurrent(
+        &handle,
+        prompts
+            .iter()
+            .map(|tokens| (tokens.clone(), output_len))
+            .collect(),
+    );
+
+    let mut failures = Vec::new();
+    for (idx, spec) in specs.iter().enumerate() {
+        if let Err(err) = check_lossless(
+            &handle,
+            tokenizer,
+            &format!("bench-random-p{prompt_len}-c{concurrency}-{idx}"),
+            &prompts[idx],
+            &baselines[idx],
+            spec,
+        ) {
+            failures.push(err);
+        }
+    }
+    drop(handle);
+    failures
+}
+
+#[test]
+fn qwen35_dflash_benchmark_random_concurrency_is_within_oracle() {
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    let tokenizer = common::load_tokenizer(&model_path);
+
+    let mut failures = Vec::new();
+    for (prompt_len, concurrency) in [(1024, 16), (4096, 8), (4096, 16)] {
+        failures.extend(check_random_concurrent_case(
+            &model_path,
+            &draft_path,
+            &tokenizer,
+            prompt_len,
+            concurrency,
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Qwen3.5 DFlash benchmark-shaped concurrent decode is outside the oracle:\n{}",
         failures.join("\n")
     );
 }

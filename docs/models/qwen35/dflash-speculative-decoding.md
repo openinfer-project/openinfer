@@ -1,6 +1,6 @@
 # DFlash Speculative Decoding (Qwen3.5-4B)
 
-> **TL;DR:** Qwen3.5-4B DFlash speculative decoding is implemented behind `--dflash-draft-model-path`, default-off, greedy-only, single-GPU only, and now supports multi-active decode batches with a fixed-buffer batched verifier. Same-host RTX 5090 A/B on `output_len=256` shows clear throughput wins at c4/c8/c16: decode-heavy `prompt_len=1` improves `+15.4%/+19.8%/+12.7%`, medium `prompt_len=1024` improves `+236.6%/+192.9%/+46.0%`, and long `prompt_len=4096` improves `+188.1%/+41.3%/+24.9%`.
+> **TL;DR:** Qwen3.5-4B DFlash speculative decoding is implemented behind `--dflash-draft-model-path`, default-off, greedy-only, single-GPU only, and now supports multi-active decode batches with a fixed-buffer batched verifier. Same-host RTX 5090 A/B on `output_len=256` shows clear throughput wins at c4/c8/c16: decode-heavy `prompt_len=1` improves `+16.7%/+15.4%/+14.0%`, medium `prompt_len=1024` improves `+209.9%/+168.6%/+45.3%`, and long `prompt_len=4096` improves `+135.9%/+35.7%/+25.6%`.
 
 Last touched: 2026-07
 
@@ -28,7 +28,7 @@ The flag is rejected for unsupported model lines. Qwen3.5 DFlash is incompatible
 
 ## Validation
 
-All commands below passed on an RTX 5090 validation host with driver `580.105.08`, CUDA 13.3, Nsight Systems 2026.1.3, Triton Python, and `OPENINFER_CUDA_SM=120`. The source snapshot was `8cd46cb`.
+Commands below passed on an RTX 5090 validation host with driver `580.105.08`, CUDA 13.3, Triton Python `3.7.1`, and `OPENINFER_CUDA_SM=120`. The source snapshot is the PR branch after the benchmark-shaped gate cleanup.
 
 ```bash
 cargo fmt --all --check
@@ -49,26 +49,26 @@ OPENINFER_TRITON_PYTHON=<triton-python> OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
   --test e2e_scheduler -- --nocapture
 ```
 
-The DFlash scheduler gate checks single request, multi-active batch, heterogeneous `max_tokens`, and mixed concurrent requests against plain greedy decode. The run reported exact generated-token parity for all checked requests, including `48/48`, `32/32`, `40/40`, and `24/24` token spans.
+The DFlash scheduler gates check single request, multi-active batch, heterogeneous `max_tokens`, mixed concurrent requests, and the benchmark-shaped synthetic cases that exposed hash differences in the raw sweep (`1024/c16`, `4096/c8`, `4096/c16`). The benchmark-shaped follow-up passed: `1024/c16` was exact for 16/16 requests; `4096/c8` and `4096/c16` were exact except for near-ties accepted by the regret oracle (`regret 0.000` and `0.125 <= 0.20`).
 
 ## Benchmark
 
-Same host, same source snapshot (`8cd46cb`), in-process `bench_serving request`, greedy synthetic distinct prompts, `output_len=256`, warmup `3`, iters `8`.
+Same host, same PR branch snapshot, in-process `bench_serving request`, greedy synthetic distinct prompts, `output_len=256`, warmup `3`, iters `8`.
 
 | Prompt | Concurrency | Baseline tok/s | DFlash tok/s | Delta | Baseline effective TPOT p50 | DFlash effective TPOT p50 | Baseline raw ITL p99 | DFlash raw ITL p99 | Baseline TTFT p50 | DFlash TTFT p50 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 152.225 | 150.792 | -0.94% | 6.569 ms | 6.632 ms | 6.642 ms | 6.663 ms | 9.126 ms | 9.223 ms |
-| 1 | 4 | 112.028 | 129.303 | +15.42% | 8.905 ms | 8.523 ms | 8.986 ms | 23.210 ms | 39.734 ms | 33.406 ms |
-| 1 | 8 | 92.073 | 110.319 | +19.82% | 10.836 ms | 8.996 ms | 10.908 ms | 34.054 ms | 71.238 ms | 64.958 ms |
-| 1 | 16 | 66.781 | 75.236 | +12.66% | 14.936 ms | 14.351 ms | 15.117 ms | 62.012 ms | 135.142 ms | 128.442 ms |
-| 1024 | 1 | 138.754 | 138.032 | -0.52% | 7.207 ms | 7.244 ms | 7.281 ms | 7.275 ms | 46.991 ms | 46.906 ms |
-| 1024 | 4 | 102.211 | 344.014 | +236.57% | 9.875 ms | 3.015 ms | 9.693 ms | 19.854 ms | 154.986 ms | 138.428 ms |
-| 1024 | 8 | 82.904 | 242.829 | +192.90% | 12.165 ms | 4.125 ms | 54.483 ms | 28.213 ms | 266.918 ms | 231.595 ms |
-| 1024 | 16 | 59.390 | 86.722 | +46.02% | 16.978 ms | 11.717 ms | 60.756 ms | 55.041 ms | 497.441 ms | 417.980 ms |
-| 4096 | 1 | 110.688 | 109.782 | -0.82% | 9.035 ms | 9.101 ms | 9.110 ms | 9.113 ms | 191.241 ms | 191.210 ms |
-| 4096 | 4 | 80.516 | 231.923 | +188.05% | 12.792 ms | 4.676 ms | 57.662 ms | 23.121 ms | 644.821 ms | 573.805 ms |
-| 4096 | 8 | 63.302 | 89.473 | +41.34% | 16.204 ms | 11.663 ms | 60.615 ms | 37.011 ms | 1113.506 ms | 951.100 ms |
-| 4096 | 16 | 44.292 | 55.315 | +24.89% | 23.181 ms | 17.808 ms | 65.180 ms | 66.158 ms | 2078.919 ms | 1708.289 ms |
+| 1 | 1 | 151.214 | 149.808 | -0.9% | 6.593 ms | 6.645 ms | 6.682 ms | 6.699 ms | 9.122 ms | 9.374 ms |
+| 1 | 4 | 110.906 | 129.388 | +16.7% | 8.907 ms | 8.682 ms | 8.988 ms | 21.412 ms | 39.045 ms | 32.756 ms |
+| 1 | 8 | 89.977 | 103.856 | +15.4% | 10.889 ms | 9.679 ms | 10.969 ms | 33.776 ms | 69.832 ms | 63.528 ms |
+| 1 | 16 | 64.930 | 73.990 | +14.0% | 14.925 ms | 13.851 ms | 15.054 ms | 57.610 ms | 131.570 ms | 125.421 ms |
+| 1024 | 1 | 135.543 | 134.699 | -0.6% | 7.220 ms | 7.270 ms | 7.295 ms | 7.297 ms | 46.715 ms | 46.797 ms |
+| 1024 | 4 | 97.293 | 301.482 | +209.9% | 9.911 ms | 2.980 ms | 9.695 ms | 19.231 ms | 153.577 ms | 137.400 ms |
+| 1024 | 8 | 76.916 | 206.606 | +168.6% | 12.217 ms | 4.062 ms | 54.032 ms | 27.162 ms | 263.906 ms | 229.206 ms |
+| 1024 | 16 | 53.404 | 77.602 | +45.3% | 16.963 ms | 11.597 ms | 60.353 ms | 52.408 ms | 492.746 ms | 414.550 ms |
+| 4096 | 1 | 102.477 | 101.745 | -0.7% | 9.039 ms | 9.122 ms | 9.139 ms | 9.134 ms | 189.535 ms | 189.955 ms |
+| 4096 | 4 | 68.916 | 162.581 | +135.9% | 12.830 ms | 4.635 ms | 57.351 ms | 22.665 ms | 640.507 ms | 567.550 ms |
+| 4096 | 8 | 50.473 | 68.502 | +35.7% | 16.238 ms | 11.677 ms | 61.075 ms | 35.653 ms | 1106.224 ms | 941.275 ms |
+| 4096 | 16 | 32.875 | 41.304 | +25.6% | 23.239 ms | 17.710 ms | 65.017 ms | 63.604 ms | 2070.313 ms | 1696.621 ms |
 
 `effective_tpot_ms` is the amortized per-request decode time. Raw token-event ITL can spike under speculative decode because accepted spans emit multiple tokens in one scheduler step; keep both metrics visible when reviewing tails.
 
@@ -84,7 +84,7 @@ Profiles used `nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node` and 
 
 ## Claim Boundaries
 
-- This is an opt-in Qwen3.5 DFlash path with real c4/c8/c16 in-process benchmark wins and exact token-hash sanity gates.
-- HTTP startup and mixed request smokes passed with DFlash enabled, but the performance table is in-process benchmark evidence.
+- This is an opt-in Qwen3.5 DFlash path with real c4/c8/c16 in-process benchmark wins. Token sanity is exact where stable; prompt-length-1 and a few long high-concurrency synthetic cases are covered by the same regret oracle used by the scheduler gate for bf16 near-tie / prefill-vs-decode boundary flips.
+- The performance table is in-process benchmark evidence. Do not read it as an HTTP serving pressure claim.
 - Single-concurrency random synthetic prompts remain flat to slightly slower. The multi-active path is the supported performance claim for this slice.
 - Multi-GPU, LoRA, KV offload, decode overlap, non-greedy sampling, and logprobs intentionally use normal decode or fail closed.
