@@ -17,6 +17,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `roadmap/roadmap-2026-h2.md` | 2026-H2 plan, supersedes issue #203. Now: website as product surface (recipes-style pages, no runtime Docker image), model maturity tiers (Qwen3-4B first Stable), observability wiring, GLM5.2 large-MoE mainline. Later: NIXL-compatible P/D, design-first. |
 | `roadmap/direction.md` | One size can't fit all. Shared infrastructure (frontend, runtime primitives, kernels, data plane) + per-model engines with their own scheduler/kernel DAG/state. Long-term loop: kernel ledger → simulator → request tracing. |
 | `roadmap/execution.md` | Current state and immediate next steps. No timeline — entries move through In progress → Next → Open. Covers cross-model infrastructure (kernel ledger, simulator, tracing, frontend polish) and per-model active work (DeepSeek V4, Qwen3.5, Qwen3). |
 
