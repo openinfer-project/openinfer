@@ -29,6 +29,12 @@ const WORLD_SIZE: usize = 1;
 /// bf16 KV cache: every layout stride is counted in elements, bytes are ×2.
 const ELEM_SIZE: usize = std::mem::size_of::<half::bf16>();
 
+/// Upper bound on [`OffloadEngine::flush_saves`]. Generous for the normal
+/// case (D2H drain + a few local RPCs complete in milliseconds); the cap only
+/// bites when the MetaServer connection stalls mid-RPC, where the alternative
+/// is freezing the scheduler thread for the TCP keepalive window.
+const FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Guard the `block_on` entry points: tokio panics with an opaque message if
 /// you block on a runtime from within any runtime. These methods are meant for
 /// the synchronous scheduler thread — fail loud and specific if that's violated.
@@ -52,10 +58,11 @@ fn assert_outside_runtime(op: &str) {
 pub struct P2pConfig {
     /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
     pub metaserver_addr: String,
-    /// This engine's routable `host:port` — peers dial it for RDMA handshakes
-    /// and block queries, and the MetaServer records it as the block owner.
-    /// Must match `listen_addr` (same port) and must not be 0.0.0.0/127.0.0.1
-    /// for cross-node use.
+    /// This engine's routable `IP:port` (a literal socket address — it doubles
+    /// as the embedded transfer service's bind address, so hostnames are
+    /// rejected at startup). Peers dial it for RDMA handshakes and block
+    /// queries, and the MetaServer records it as the block owner. Must not be
+    /// 0.0.0.0/127.0.0.1 for cross-node use.
     pub advertise_addr: String,
     /// RDMA NIC device names to register the pinned pool on (e.g. `mlx5_0`).
     pub rdma_nics: Vec<String>,
@@ -326,10 +333,16 @@ impl OffloadEngine {
                     .map_err(|_| EngineError::Storage("P2P serve task died at startup".into()))?
                     .map_err(EngineError::Storage)?;
 
-                // Expired-lock GC, mirroring pegaflow-server's background task:
-                // a crashed peer must not pin our blocks past the lock timeout.
+                // Background GC, mirroring pegaflow-server's task. Two sweeps:
+                // expired transfer locks (a crashed peer must not pin our
+                // blocks past the lock timeout) and stale prefetch state — an
+                // abandoned remote fetch (request dropped mid-RemoteFetch, or
+                // the executor's re-query deadline fired) leaves an orphaned
+                // entry whose completed task pins its fetched blocks in the
+                // pinned pool until this sweep drops it.
                 let gc_engine = Arc::clone(&engine);
                 runtime.spawn(async move {
+                    const STALE_MAX_AGE: std::time::Duration = std::time::Duration::from_mins(5);
                     let mut tick = tokio::time::interval(std::time::Duration::from_mins(1));
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
@@ -337,6 +350,15 @@ impl OffloadEngine {
                         let expired = gc_engine.gc_expired_transfer_locks();
                         if expired > 0 {
                             log::warn!("P2P GC released {expired} expired transfer locks");
+                        }
+                        let (stale, failed) = gc_engine
+                            .gc_stale_inflight(STALE_MAX_AGE, STALE_MAX_AGE)
+                            .await;
+                        if stale > 0 || failed > 0 {
+                            log::info!(
+                                "P2P GC dropped {stale} stale prefetch entries, \
+                                 {failed} failed-remote markers"
+                            );
                         }
                     }
                 });
@@ -589,19 +611,36 @@ impl OffloadEngine {
     /// copy + write-pipeline submit), then drains the write pipeline, then
     /// waits for the queued MetaServer registrations to be delivered (or
     /// dropped after a failed attempt — registration stays best-effort, the
-    /// barrier only bounds when). Without P2P the last step is a no-op.
+    /// barrier only bounds *when* delivery is attempted, never *whether* it
+    /// succeeds; a peer that misses a registration degrades to recompute).
+    /// Without P2P the last step is a no-op.
+    ///
+    /// Bounded: the whole barrier is capped at [`FLUSH_DEADLINE`]. This runs
+    /// on the scheduler thread (P/D prefill flushes before every finishing
+    /// step's `Finished` events), so a stalled MetaServer connection must
+    /// degrade to "registrations still in flight" — semantically the same as
+    /// a dropped registration — rather than freeze all serving.
     pub fn flush_saves(&self) {
         assert_outside_runtime("flush_saves");
         let handles: Vec<JoinHandle<()>> = {
             let mut pending = self.pending_saves.lock().expect("pending_saves poisoned");
             pending.drain(..).collect()
         };
-        self.runtime.block_on(async {
-            for handle in handles {
-                let _ = handle.await;
-            }
-            self.engine.flush_saves_and_registrations().await;
+        let flushed = self.runtime.block_on(async {
+            tokio::time::timeout(FLUSH_DEADLINE, async {
+                for handle in handles {
+                    let _ = handle.await;
+                }
+                self.engine.flush_saves_and_registrations().await;
+            })
+            .await
         });
+        if flushed.is_err() {
+            log::warn!(
+                "KV offload flush timed out after {FLUSH_DEADLINE:?}; \
+                 saves/registrations still in flight (peers may recompute)"
+            );
+        }
     }
 
     /// Drop all resident CPU-tier blocks (test/eviction helper). Saved data in

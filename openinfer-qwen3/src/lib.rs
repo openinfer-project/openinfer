@@ -101,8 +101,9 @@ pub struct Qwen3OffloadOptions {
 pub struct Qwen3P2pOptions {
     /// MetaServer gRPC address, e.g. `http://127.0.0.1:50056`.
     pub metaserver_addr: String,
-    /// This engine's routable `host:port`; peers dial it for RDMA handshakes
-    /// and block queries. Also the P2P gRPC listen address.
+    /// This engine's routable `IP:port` (literal socket address; also the
+    /// P2P gRPC listen address, so hostnames are rejected at startup). Peers
+    /// dial it for RDMA handshakes and block queries.
     pub advertise_addr: String,
     /// RDMA NIC device names (e.g. `mlx5_0`).
     pub rdma_nics: Vec<String>,

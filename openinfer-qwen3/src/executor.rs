@@ -805,14 +805,17 @@ pub(crate) trait ModelExecutor: Send {
     }
 
     /// Non-blocking sweep: request ids whose prefetch just settled (now
-    /// prefill-eligible).
-    fn drain_ready_prefetch(&mut self) -> Vec<RequestId> {
+    /// prefill-eligible). `reserve_floor` guards the remote-fetch re-query
+    /// path the same way it guards `begin_kv_prefetch`: a fetch that resolves
+    /// this tick must not reserve into blocks already promised to admitted
+    /// requests.
+    fn drain_ready_prefetch(&mut self, _reserve_floor: usize) -> Vec<RequestId> {
         Vec::new()
     }
 
     /// Block until at least one in-flight prefetch settles (idle-only), then
     /// sweep the rest.
-    fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
+    fn wait_ready_prefetch(&mut self, _reserve_floor: usize) -> Vec<RequestId> {
         Vec::new()
     }
 
@@ -1027,7 +1030,7 @@ impl Qwen3Executor {
         let kv_buffer = kv_mgr.buffer().clone();
         // Build the offload engine while the model's stream is still in hand
         // (it moves into the RankWorker below). Registers the fused KV buffer.
-        let offload = build_offload(offload_opts, &kv_mgr, model.device_ctx())?;
+        let offload = build_offload(offload_opts, &kv_mgr, model.config(), model.device_ctx())?;
         let total_blocks = kv_mgr.pool().total_blocks();
         let padding_block_id = kv_mgr.pool().padding_block_id();
         Ok(Self {
@@ -1468,8 +1471,8 @@ impl Qwen3Executor {
 
     /// Block until at least one in-flight prefetch settles, then sweep the
     /// rest; returns the settled request ids (now prefill-eligible).
-    pub fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
-        <Self as ModelExecutor>::wait_ready_prefetch(self)
+    pub fn wait_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
+        <Self as ModelExecutor>::wait_ready_prefetch(self, reserve_floor)
     }
 
     // ── KV-offload SAVE ────────────────────────────────────────────────
@@ -1612,7 +1615,7 @@ impl Qwen3Executor {
     /// answer either starts the H2D load (probe → Loading, still parked → and
     /// so returns `false`) or, on zero hit / reservation pressure / deadline,
     /// drops the prefetch so the request prefills from scratch.
-    fn poll_remote_fetch(&mut self, id: RequestId) -> bool {
+    fn poll_remote_fetch(&mut self, id: RequestId, reserve_floor: usize) -> bool {
         let Some(st) = self.prefetch.get(&id) else {
             return true;
         };
@@ -1637,7 +1640,28 @@ impl Qwen3Executor {
                     self.prefetch.remove(&id);
                     return true;
                 };
-                match self.start_prefetch_load(id, lease, num_blocks) {
+                // Same budget guard as begin_kv_prefetch: blocks promised to
+                // admitted requests are off-limits — reserving into them makes
+                // a later prefill chunk or decode growth fail allocation and
+                // errors out every touched request.
+                if self
+                    .kv_mgr
+                    .pool()
+                    .available_blocks()
+                    .saturating_sub(reserve_floor)
+                    < num_blocks
+                {
+                    let offload = self.offload.as_ref().expect("offload present in prefetch");
+                    offload.release_query_lease(lease);
+                    self.prefetch.remove(&id);
+                    return true;
+                }
+                let probe = self
+                    .prefetch
+                    .remove(&id)
+                    .expect("prefetch present in RemoteFetch")
+                    .probe;
+                match self.start_prefetch_load(id, probe, lease, num_blocks) {
                     Ok(()) => false,
                     Err(()) => true,
                 }
@@ -1650,13 +1674,15 @@ impl Qwen3Executor {
         }
     }
 
-    /// Reserve GPU destination blocks for a leased host-tier hit and submit the
-    /// H2D load, transitioning the prefetch to `Loading`. `Err(())` means the
-    /// prefetch was abandoned (lease released, state dropped) and the request
-    /// should prefill from scratch.
+    /// Reserve GPU destination blocks for a leased host-tier hit, submit the
+    /// H2D load, and park the request as a `Loading` prefetch (taking ownership
+    /// of `probe`, which keeps the GPU-hit prefix resident meanwhile).
+    /// `Err(())` means the prefetch was abandoned (lease released, no state
+    /// kept) and the request should prefill from scratch.
     fn start_prefetch_load(
         &mut self,
         id: RequestId,
+        probe: PrefixProbe,
         lease: openinfer_kv_offload::QueryLeaseId,
         num_blocks: usize,
     ) -> Result<(), ()> {
@@ -1666,17 +1692,21 @@ impl Qwen3Executor {
             // aren't held for the full lease TTL, and prefill from scratch
             // rather than stall.
             offload.release_query_lease(lease);
-            self.prefetch.remove(&id);
             return Err(());
         };
         let page_ids = reservation.page_ids();
         match offload.load(lease, page_ids) {
             Ok(handle) => {
-                let st = self.prefetch.get_mut(&id).expect("prefetch present");
-                st.phase = PrefetchPhase::Loading {
-                    reservation,
-                    handle,
-                };
+                self.prefetch.insert(
+                    id,
+                    PrefetchState {
+                        probe,
+                        phase: PrefetchPhase::Loading {
+                            reservation,
+                            handle,
+                        },
+                    },
+                );
                 Ok(())
             }
             Err(e) => {
@@ -1685,7 +1715,6 @@ impl Qwen3Executor {
                 // submit error may leave it pinned, so release it (no-op if it
                 // was already consumed).
                 offload.release_query_lease(lease);
-                self.prefetch.remove(&id);
                 Err(())
             }
         }
@@ -1762,6 +1791,7 @@ fn profile_kv_budget_on_worker(
 fn build_offload(
     opts: &Qwen3OffloadOptions,
     kv_mgr: &KvCacheManager,
+    config: &Config,
     ctx: &DeviceContext,
 ) -> Result<Option<OffloadEngine>> {
     if !opts.enabled {
@@ -1769,13 +1799,22 @@ fn build_offload(
     }
     let device_id = ctx.device_ordinal as i32;
     let layout = kv_mgr.buffer().layout();
-    // Content-addressing domain: hashes are only interchange-safe between
-    // engines whose KV bytes-per-block layout matches, so bind the namespace
-    // to the layout geometry. Two P2P peers serving the same model derive the
-    // same string; a different model/geometry can never cross-hit.
+    // Content-addressing domain: two engines may cross-hit only when the same
+    // token prefix produces interchangeable KV bytes. That needs the *model*
+    // to match, not just the KV geometry — Qwen3-4B and 8B share
+    // layers/heads/head_dim and a tokenizer, so geometry alone would let a
+    // mixed mesh silently feed one model the other's KV. hidden_size +
+    // intermediate_size + vocab_size discriminate the model line's sizes;
+    // the layout fields pin the block geometry the transfer relies on.
     let namespace = format!(
-        "openinfer-qwen3-l{}h{}d{}p{}",
-        layout.num_layers, layout.num_kv_heads, layout.head_dim, layout.page_size
+        "openinfer-qwen3-hs{}-is{}-v{}-l{}h{}d{}p{}",
+        config.hidden_size,
+        config.intermediate_size,
+        config.vocab_size,
+        layout.num_layers,
+        layout.num_kv_heads,
+        layout.head_dim,
+        layout.page_size
     );
     let mut config = OffloadConfig::new(
         format!("qwen3-dev{device_id}"),
@@ -1994,22 +2033,13 @@ impl ModelExecutor for Qwen3Executor {
             offload.release_query_lease(lease);
             return false;
         }
-        self.prefetch.insert(
-            request_id,
-            PrefetchState {
-                probe,
-                // Placeholder: start_prefetch_load replaces it with Loading, or
-                // removes the whole state on failure.
-                phase: PrefetchPhase::Committed,
-            },
-        );
-        match self.start_prefetch_load(request_id, lease, num_blocks) {
+        match self.start_prefetch_load(request_id, probe, lease, num_blocks) {
             Ok(()) => true,
             Err(()) => false,
         }
     }
 
-    fn drain_ready_prefetch(&mut self) -> Vec<RequestId> {
+    fn drain_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
         let ids: Vec<RequestId> = self.prefetch.keys().copied().collect();
         let mut done = Vec::new();
         for id in ids {
@@ -2026,7 +2056,7 @@ impl ModelExecutor for Qwen3Executor {
                     done.push(id);
                 }
                 Some(PrefetchPhase::RemoteFetch { .. }) => {
-                    if self.poll_remote_fetch(id) {
+                    if self.poll_remote_fetch(id, reserve_floor) {
                         done.push(id);
                     }
                 }
@@ -2036,7 +2066,7 @@ impl ModelExecutor for Qwen3Executor {
         done
     }
 
-    fn wait_ready_prefetch(&mut self) -> Vec<RequestId> {
+    fn wait_ready_prefetch(&mut self, reserve_floor: usize) -> Vec<RequestId> {
         let mut done = Vec::new();
         if let Some(id) = self
             .prefetch
@@ -2069,7 +2099,7 @@ impl ModelExecutor for Qwen3Executor {
             let _ = id;
         }
         // Sweep any others that completed concurrently.
-        for id in self.drain_ready_prefetch() {
+        for id in self.drain_ready_prefetch(reserve_floor) {
             if !done.contains(&id) {
                 done.push(id);
             }

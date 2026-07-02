@@ -177,7 +177,7 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
     // ── A GPU miss now: the prefetch must restore P from the CPU tier. ──
     let hit = ex.begin_kv_prefetch(RequestId::new(2), &p, None, 0);
     assert!(hit, "P must hit the CPU tier after GPU eviction");
-    let ready = ex.wait_ready_prefetch();
+    let ready = ex.wait_ready_prefetch(0);
     assert!(
         ready.contains(&RequestId::new(2)),
         "prefetch load must settle ready, got {ready:?}"
@@ -253,7 +253,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         hit,
         "blocks 3..6 must be fetched from the CPU tier beyond the GPU hit"
     );
-    let ready = ex.wait_ready_prefetch();
+    let ready = ex.wait_ready_prefetch(0);
     assert!(
         ready.contains(&RequestId::new(3)),
         "prefetch must settle, got {ready:?}"

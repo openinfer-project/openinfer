@@ -91,9 +91,10 @@ pub(crate) struct Args {
     #[arg(long, requires_all = ["kv_offload", "kv_p2p_advertise_addr", "kv_p2p_nics"])]
     pub kv_p2p_metaserver_addr: Option<String>,
 
-    /// This instance's routable host:port for KV P2P — peers dial it for RDMA
-    /// handshakes and block queries (also the embedded transfer-service listen
-    /// address). Must be reachable by every peer; not 0.0.0.0.
+    /// This instance's routable IP:port for KV P2P — a literal socket address
+    /// (it is also the embedded transfer-service bind address, so hostnames
+    /// are rejected at startup). Peers dial it for RDMA handshakes and block
+    /// queries. Must be reachable by every peer; not 0.0.0.0.
     #[arg(long, requires = "kv_p2p_metaserver_addr")]
     pub kv_p2p_advertise_addr: Option<String>,
 
