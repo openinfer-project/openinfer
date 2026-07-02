@@ -205,8 +205,10 @@ struct CompareArgs {
 
 #[derive(Args)]
 struct RankArgs {
-    /// Op-report snapshot JSONs (any mix of ops); selection winners are ranked.
-    #[arg(long = "input", required = true)]
+    /// Op-report snapshot JSONs (any mix of ops); selection winners are
+    /// ranked. Takes several paths per flag, so a shell glob works:
+    /// `rank --input reports/*.json`.
+    #[arg(long = "input", required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
     /// Peak dense bf16 tensor TFLOPS of the GPU, for the compute-side bound.
     /// Deliberately an explicit input — there is no reliable CUDA query for it
@@ -1736,7 +1738,10 @@ fn analytic_model(case: &CaseResult) -> Option<AnalyticModel> {
                 min_bytes: BF16_BYTES * (4.0 * hidden * rows + hidden),
                 flops: 0.0,
             },
-            // q and k are read and written in place; cos/sin read per row
+            // q and k are read and written in place; cos/sin read per row.
+            // The 2*head_dim cache term reflects the duplicated-half rope
+            // cache production ships; a compact cache could halve it, so this
+            // bound is ~2.5% above the theoretical floor for this op.
             DenseOpFamily::QkNormRope => AnalyticModel {
                 min_bytes: BF16_BYTES * rows * (2.0 * (q_dim + kv_dim) + 2.0 * head_dim),
                 flops: 0.0,
@@ -1829,14 +1834,25 @@ fn rank_snapshots(args: &RankArgs) -> Result<RankReport> {
         .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(!snapshots.is_empty(), "rank needs at least one snapshot");
     let peak_gb_s = snapshots[0].1.hardware.peak_gb_s;
+    let gpu_name = snapshots[0].1.hardware.gpu_name.as_str();
     for (path, snapshot) in &snapshots {
         anyhow::ensure!(
-            (snapshot.hardware.peak_gb_s - peak_gb_s).abs() < 1.0,
-            "snapshot {} was taken on different hardware (peak_gb_s {} vs {})",
+            snapshot.hardware.gpu_name == gpu_name,
+            "snapshot {} was taken on different hardware ({} vs {})",
             path.display(),
-            snapshot.hardware.peak_gb_s,
-            peak_gb_s
+            snapshot.hardware.gpu_name,
+            gpu_name
         );
+        // Old snapshots predate case_id/selector_key; ranking them would
+        // silently collapse whole sweeps into one bogus winner.
+        for case in &snapshot.cases {
+            anyhow::ensure!(
+                !case.case_id.is_empty() && !case.selector_key.is_null(),
+                "snapshot {} has cases without case_id/selector_key — \
+                 regenerate it with the current report tool before ranking",
+                path.display()
+            );
+        }
     }
 
     let mut kernels = Vec::new();
@@ -1854,8 +1870,11 @@ fn rank_snapshots(args: &RankArgs) -> Result<RankReport> {
             .collect();
         for selection in &selections {
             let Some(case) = by_id.get(selection.case_id.as_str()) else {
-                skipped.push(format!("{}: selection without case", selection.case_id));
-                continue;
+                bail!(
+                    "{}: selection {} has no matching case — corrupt snapshot",
+                    path.display(),
+                    selection.case_id
+                );
             };
             let Some(latency_us) = case.latency_us else {
                 skipped.push(format!("{}: no latency", case_key(case)));

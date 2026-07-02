@@ -45,7 +45,9 @@ variants = ["default"]
 # ── Dense forward ops (#456): GEMMs, norms, embedding, sampling ──
 # decode_* sweeps batch_size; prefill_* sweeps seq_len at batch 1.
 # Projection variants are the production (out_dim, in_dim) set that
-# decode_projection_pin_shapes warms; gate and up share a shape.
+# decode_projection_pin_shapes warms; gate and up share a shape. The bench
+# measures the default Tuned-policy kernels (tuned cuBLASLt at small N,
+# GemmEx above); the opt-in Pin policy's launch_gemm_pin path is not covered.
 
 [[ops]]
 name = "decode_projection_gemm"
