@@ -11,6 +11,8 @@ mod fp8;
 #[cfg(feature = "glm52")]
 #[allow(dead_code)]
 mod mla_decode;
+#[cfg(all(test, feature = "glm52"))]
+mod mla_oracle_gate;
 mod runner;
 mod weights;
 
