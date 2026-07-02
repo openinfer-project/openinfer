@@ -1,6 +1,7 @@
-//! TP=2 launch with CUDA Graph requested — guards the graph clamp in `launch`.
+//! TP=2 launch with CUDA Graph requested — guards `launch` disabling CUDA Graph under TP.
 //! The drain loop polls with a deadline so a deadlock fails instead of wedging the run.
 
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -64,8 +65,11 @@ fn tp2_concurrent_decode_completes() {
         dflash_draft_model_path: None,
         enable_kv_events: false,
     };
-    let handle =
-        openinfer_qwen3::launch(Path::new(&model_path), options).expect("launch tp2 engine");
+    // Dropping the handle joins the scheduler thread; on a panic the engine may be
+    // wedged and the join would hang, so panics leak it — only the happy path drops.
+    let handle = ManuallyDrop::new(
+        openinfer_qwen3::launch(Path::new(&model_path), options).expect("launch tp2 engine"),
+    );
 
     let tokenizer = common::load_tokenizer(&model_path);
     // Submit all up front so they coexist in the engine and form real decode batches.
@@ -119,7 +123,5 @@ fn tp2_concurrent_decode_completes() {
         }
         assert!(tokens > 0, "request {i} finished with zero decoded tokens");
     }
-    // Give the engine's asynchronous teardown time to finish before process exit.
-    drop(handle);
-    std::thread::sleep(Duration::from_secs(5));
+    drop(ManuallyDrop::into_inner(handle));
 }
