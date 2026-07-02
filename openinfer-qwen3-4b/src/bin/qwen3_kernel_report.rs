@@ -2032,3 +2032,75 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dense_case(op: &str, variant: &str, batch: usize, seq: Option<usize>) -> CaseResult {
+        let (gemm_out_dim, gemm_in_dim) = match variant {
+            "lm_head" => (Some(VOCAB_SIZE), Some(HIDDEN_SIZE)),
+            _ => (None, None),
+        };
+        CaseResult {
+            case_id: String::new(),
+            op: op.to_string(),
+            variant: variant.to_string(),
+            selector_key: Value::Null,
+            shape_source: String::new(),
+            shape: CaseShape {
+                batch_size: batch,
+                kv_len: None,
+                seq_len: seq,
+                num_qo_heads: NUM_QO_HEADS,
+                num_kv_heads: NUM_KV_HEADS,
+                head_dim: HEAD_DIM,
+                page_size: PAGE_SIZE,
+                dtype: "bf16".to_string(),
+            },
+            params: CaseParams {
+                chunk_tokens: None,
+                max_chunks_per_request: None,
+                actual_chunk_size: None,
+                active_chunks_per_request: None,
+                padded_slots: None,
+                cta_tile_q: None,
+                gemm_out_dim,
+                gemm_in_dim,
+            },
+            latency_us: Some(100.0),
+            cupti: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn analytic_model_matches_hand_math() {
+        // lm_head at bs=1: weights dominate — 2 * V * H bytes plus the
+        // activation column in and logits column out.
+        let case = dense_case("decode_projection_gemm", "lm_head", 1, None);
+        let model = analytic_model(&case).expect("gemm model");
+        let v = VOCAB_SIZE as f64;
+        let h = HIDDEN_SIZE as f64;
+        assert!((model.min_bytes - 2.0 * (v * h + h + v)).abs() < 1.0);
+        assert!((model.flops - 2.0 * v * h).abs() < 1.0);
+
+        // Decode attention at bs=2, kv=1024: the K and V histories dominate.
+        let mut attention = dense_case(DEFAULT_OP, "non_partition", 2, None);
+        attention.shape.kv_len = Some(1024);
+        let model = analytic_model(&attention).expect("attention model");
+        let q_dim = (NUM_QO_HEADS * HEAD_DIM) as f64;
+        let kv_dim = (NUM_KV_HEADS * HEAD_DIM) as f64;
+        let expected = 2.0 * 2.0 * (2.0 * q_dim + 2.0 * 1024.0 * kv_dim);
+        assert!((model.min_bytes - expected).abs() < 1.0);
+    }
+
+    #[test]
+    fn dense_op_parsing_rejects_prefill_lm_head() {
+        let (family, phase) = dense_op_for("prefill_projection_gemm").expect("dense op");
+        assert!(parse_dense_variant(family, phase, "lm_head").is_err());
+        assert!(parse_dense_variant(family, phase, "q_proj").is_ok());
+        assert!(dense_op_for("prefill_sampling").is_none());
+        assert!(dense_op_for("decode_qk_norm_rope").is_some());
+    }
+}
