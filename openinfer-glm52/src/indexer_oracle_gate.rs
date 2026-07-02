@@ -190,7 +190,7 @@ const ORACLE_TOPK_SET: &[i32] = &[
 const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;
 const INDEX_HEAD_DIM: usize = 128;
-const CACHE_BLOCK_SIZE: usize = 128;
+const CACHE_BLOCK_SIZE: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
 const NUM_SMS: usize = 132;
 
 fn bf16_digest(data: &[bf16]) -> String {

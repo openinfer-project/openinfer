@@ -21,7 +21,7 @@ const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;
 const INDEX_HEADS: usize = 32;
 const INDEX_HEAD_DIM: usize = 128;
-const CACHE_BLOCK_SIZE: usize = 128;
+const CACHE_BLOCK_SIZE: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
 const CACHE_BLOCKS: usize = 4;
 const MAX_MODEL_LEN: usize = 512;
 const NUM_SMS: usize = 132;
