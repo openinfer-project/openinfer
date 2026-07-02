@@ -107,8 +107,7 @@ mod tests {
         let embed_host: Vec<bf16> = (0..vocab * hidden_size)
             .map(|i| bf16::from_f32((((i % 509) as f32) - 254.0) * 0.01))
             .collect();
-        let embed =
-            DeviceMatrix::from_host(&ctx, &embed_host, vocab, hidden_size).expect("embed");
+        let embed = DeviceMatrix::from_host(&ctx, &embed_host, vocab, hidden_size).expect("embed");
         let ids: Vec<u32> = (0..seq_len).map(|i| ((i * 31) % vocab) as u32).collect();
         let token_ids = ctx.stream.clone_htod(&ids).expect("token ids");
         let mut out = HiddenStates::zeros(&ctx, hidden_size, seq_len).expect("out");
