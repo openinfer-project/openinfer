@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include <cstdint>
 #include <cuda.h>
 
 // ============================================================================
@@ -255,6 +256,33 @@ __global__ void embedding_batched_kernel(
   }
 }
 
+// Vectorized batched embedding lookup: grid.x indexes the token, grid.y
+// splits the row into block-wide segments of 16-byte vectors, token id
+// loaded once per block. The scalar kernel above moves 2 bytes per thread
+// per access with a div+mod and a token_ids reload per element, which caps
+// it near a quarter of DRAM bandwidth; the vectorized row copy streams at
+// full width, and the 2D grid keeps enough blocks in flight at small token
+// counts (decode) that the launch floor does not regress. Requires
+// hidden_size % 8 == 0 and 16-byte-aligned base pointers — the launcher
+// falls back to the scalar kernel otherwise.
+__global__ void embedding_batched_vec4_kernel(
+    const uint4 *__restrict__ embed,
+    const uint32_t *__restrict__ token_ids,
+    uint4 *__restrict__ out,
+    int hidden_vec, int seq_len) {
+  const int token = blockIdx.x;
+  if (token >= seq_len) {
+    return;
+  }
+  const uint32_t token_id = __ldg(&token_ids[token]);
+  const uint4 *__restrict__ src = embed + (size_t)token_id * hidden_vec;
+  uint4 *__restrict__ dst = out + (size_t)token * hidden_vec;
+  for (int v = blockIdx.y * blockDim.x + threadIdx.x; v < hidden_vec;
+       v += gridDim.y * blockDim.x) {
+    dst[v] = src[v];
+  }
+}
+
 // ============================================================================
 // Tensor-parallel vocab-sharded embedding lookup.
 //
@@ -282,6 +310,36 @@ __global__ void embedding_batched_vocab_shard_kernel(
       out[idx] = embed[(size_t)local_token_id * hidden_size + dim_offset];
     } else {
       out[idx] = __float2bfloat16(0.0f);
+    }
+  }
+}
+
+// Vectorized variant of the vocab-sharded lookup; same layout contract as
+// embedding_batched_vec4_kernel, with non-local tokens writing zero vectors.
+__global__ void embedding_batched_vocab_shard_vec4_kernel(
+    const uint4 *__restrict__ embed,
+    const uint32_t *__restrict__ token_ids,
+    uint4 *__restrict__ out,
+    int hidden_vec, int seq_len, uint32_t vocab_start,
+    uint32_t part_vocab_size) {
+  const int token = blockIdx.x;
+  if (token >= seq_len) {
+    return;
+  }
+  const uint32_t token_id = __ldg(&token_ids[token]);
+  uint4 *__restrict__ dst = out + (size_t)token * hidden_vec;
+  if (token_id >= vocab_start && token_id < vocab_start + part_vocab_size) {
+    const uint4 *__restrict__ src =
+        embed + (size_t)(token_id - vocab_start) * hidden_vec;
+    for (int v = blockIdx.y * blockDim.x + threadIdx.x; v < hidden_vec;
+         v += gridDim.y * blockDim.x) {
+      dst[v] = src[v];
+    }
+  } else {
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    for (int v = blockIdx.y * blockDim.x + threadIdx.x; v < hidden_vec;
+         v += gridDim.y * blockDim.x) {
+      dst[v] = zero;
     }
   }
 }
@@ -489,11 +547,36 @@ CUresult embedding_decode_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// Whether the vectorized row-copy embedding kernels can serve this call:
+// whole 16-byte vectors per row and 16-byte-aligned base pointers. Row
+// offsets stay aligned because every row is a whole number of vectors.
+static bool embedding_vec4_ok(
+    const void *embed, const void *out, int hidden_size) {
+  return hidden_size % 8 == 0 &&
+         ((reinterpret_cast<uintptr_t>(embed) |
+           reinterpret_cast<uintptr_t>(out)) & 15) == 0;
+}
+
+// Measured on H100 with the 2D grid (seq 128/2048/10000, bs 1/32): 128
+// threads edges out 256 by ~2% at 10k tokens and is level elsewhere — more
+// row segments per token hide the gather latency slightly better.
+static const int EMBEDDING_VEC4_BLOCK = 128;
+
 CUresult embedding_batched_cuda(
     const __nv_bfloat16 *embed, const uint32_t *token_ids,
     __nv_bfloat16 *out, int hidden_size, int seq_len, cudaStream_t stream) {
-  int total = hidden_size * seq_len;
+  if (embedding_vec4_ok(embed, out, hidden_size)) {
+    int hidden_vec = hidden_size / 8;
+    int row_segs =
+        (hidden_vec + EMBEDDING_VEC4_BLOCK - 1) / EMBEDDING_VEC4_BLOCK;
+    dim3 grid(seq_len, row_segs);
+    embedding_batched_vec4_kernel<<<grid, EMBEDDING_VEC4_BLOCK, 0, stream>>>(
+        reinterpret_cast<const uint4 *>(embed), token_ids,
+        reinterpret_cast<uint4 *>(out), hidden_vec, seq_len);
+    return (CUresult)cudaGetLastError();
+  }
   int block = 256;
+  int total = hidden_size * seq_len;
   int grid = (total + block - 1) / block;
   embedding_batched_kernel<<<grid, block, 0, stream>>>(embed, token_ids, out, hidden_size, seq_len);
   return (CUresult)cudaGetLastError();
@@ -503,8 +586,20 @@ CUresult embedding_batched_vocab_shard_cuda(
     const __nv_bfloat16 *embed, const uint32_t *token_ids,
     __nv_bfloat16 *out, int hidden_size, int seq_len,
     uint32_t vocab_start, uint32_t part_vocab_size, cudaStream_t stream) {
-  int total = hidden_size * seq_len;
+  if (embedding_vec4_ok(embed, out, hidden_size)) {
+    int hidden_vec = hidden_size / 8;
+    int row_segs =
+        (hidden_vec + EMBEDDING_VEC4_BLOCK - 1) / EMBEDDING_VEC4_BLOCK;
+    dim3 grid(seq_len, row_segs);
+    embedding_batched_vocab_shard_vec4_kernel<<<
+        grid, EMBEDDING_VEC4_BLOCK, 0, stream>>>(
+        reinterpret_cast<const uint4 *>(embed), token_ids,
+        reinterpret_cast<uint4 *>(out), hidden_vec, seq_len,
+        vocab_start, part_vocab_size);
+    return (CUresult)cudaGetLastError();
+  }
   int block = 256;
+  int total = hidden_size * seq_len;
   int grid = (total + block - 1) / block;
   embedding_batched_vocab_shard_kernel<<<grid, block, 0, stream>>>(
       embed, token_ids, out, hidden_size, seq_len, vocab_start, part_vocab_size);

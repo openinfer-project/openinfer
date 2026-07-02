@@ -96,6 +96,77 @@ mod tests {
 
     use super::*;
 
+    /// The vectorized row-copy path (hidden % 8 == 0) must be bit-exact
+    /// against a host-side gather — it is a pure copy.
+    #[test]
+    fn embedding_batch_vectorized_path_is_bit_exact() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        let hidden_size = 2560; // production Qwen3 width -> vec4 path
+        let vocab = 64;
+        let seq_len = 33; // not a multiple of the block count on purpose
+        let embed_host: Vec<bf16> = (0..vocab * hidden_size)
+            .map(|i| bf16::from_f32((((i % 509) as f32) - 254.0) * 0.01))
+            .collect();
+        let embed =
+            DeviceMatrix::from_host(&ctx, &embed_host, vocab, hidden_size).expect("embed");
+        let ids: Vec<u32> = (0..seq_len).map(|i| ((i * 31) % vocab) as u32).collect();
+        let token_ids = ctx.stream.clone_htod(&ids).expect("token ids");
+        let mut out = HiddenStates::zeros(&ctx, hidden_size, seq_len).expect("out");
+
+        embedding_batch(&ctx, &embed, &token_ids, &mut out).expect("embedding");
+        let got = ctx.stream.clone_dtoh(&out.data).expect("dtoh");
+        ctx.sync().expect("sync");
+
+        for (token, &id) in ids.iter().enumerate() {
+            let row = &embed_host[id as usize * hidden_size..(id as usize + 1) * hidden_size];
+            let col = &got[token * hidden_size..(token + 1) * hidden_size];
+            assert!(
+                row.iter().zip(col).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "token {token} (id {id}) differs from host gather"
+            );
+        }
+    }
+
+    /// Same contract for the vectorized vocab-shard path, including the
+    /// zero-fill of non-local tokens.
+    #[test]
+    fn embedding_batch_vocab_shard_vectorized_masks_nonlocal_tokens() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        let hidden_size = 16; // multiple of 8 -> vec4 path
+        let embed_host: Vec<bf16> = (0..2 * hidden_size)
+            .map(|i| bf16::from_f32(i as f32))
+            .collect();
+        let embed = DeviceMatrix::from_host(&ctx, &embed_host, 2, hidden_size).expect("embed");
+        let token_ids = ctx.stream.clone_htod(&[4_u32, 5, 6, 3]).expect("token ids");
+        let mut out = HiddenStates::zeros(&ctx, hidden_size, 4).expect("out");
+
+        embedding_batch_vocab_shard(&ctx, &embed, &token_ids, &mut out, 4, 2)
+            .expect("embedding shard");
+        let got = ctx.stream.clone_dtoh(&out.data).expect("dtoh");
+        ctx.sync().expect("sync");
+
+        assert!(
+            got[..hidden_size]
+                .iter()
+                .zip(&embed_host[..hidden_size])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "local token 4 must copy row 0"
+        );
+        assert!(
+            got[hidden_size..2 * hidden_size]
+                .iter()
+                .zip(&embed_host[hidden_size..])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "local token 5 must copy row 1"
+        );
+        assert!(
+            got[2 * hidden_size..]
+                .iter()
+                .all(|v| v.to_bits() == bf16::ZERO.to_bits()),
+            "non-local tokens 6 and 3 must be zero-filled"
+        );
+    }
+
     #[test]
     fn embedding_batch_vocab_shard_masks_nonlocal_tokens() {
         let ctx = DeviceContext::new().expect("create CUDA context");
