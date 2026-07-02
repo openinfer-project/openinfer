@@ -1,6 +1,6 @@
-# Qwen3-4B serving perf vs vLLM on RTX 5090
+# Qwen3-4B serving perf tuning record (RTX 5090)
 
-**TL;DR**: openinfer beats vLLM 0.22.1 at **every measured QPS point** (TPOT mean, in=1024/out=128: QPS1 6.51 vs 6.86, QPS8 10.70 vs 12.09, QPS10 13.82 vs 14.62, QPS12 19.65 vs 20.49, QPS16 61.7 vs 78.6) and TTFT everywhere. The mid-band gap closed with unified-step attention fusion: decode rows enter the prefill plan as qo_len=1 entries, one varlen attention call per layer, and the dispatch honors the plan's cta_tile_q (the kernel silently re-deriving its own tile size cost ~3ms/step). Earlier fixes: batched step tail (#345), chunked prefill (default now 1024), cuBLAS ≥ 13 (12.9 has a 50–100% GEMM cliff at N=1025 — build with `CUDA_HOME=/usr/local/cuda-13.x`), cublasLt per-shape algo tuning (which also re-enabled buckets 8/16), split-KV decode attention ≤bs32, two-stage argmax.
+**TL;DR**: Tuning history for the QPS sweep numbers in [serving-performance.md](serving-performance.md). The mid-band gap closed with unified-step attention fusion: decode rows enter the prefill plan as qo_len=1 entries, one varlen attention call per layer, and the dispatch honors the plan's cta_tile_q (the kernel silently re-deriving its own tile size cost ~3ms/step). Earlier fixes: batched step tail (#345), chunked prefill (default now 1024), cuBLAS ≥ 13 (12.9 has a 50–100% GEMM cliff at N=1025 — build with `CUDA_HOME=/usr/local/cuda-13.x`), cublasLt per-shape algo tuning (which also re-enabled buckets 8/16), split-KV decode attention ≤bs32, two-stage argmax.
 
 Last touched: 2026-06
 
