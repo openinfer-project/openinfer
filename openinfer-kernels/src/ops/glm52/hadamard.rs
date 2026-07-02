@@ -7,12 +7,14 @@ use crate::tensor::DeviceContext;
 
 pub const GLM52_INDEXER_HADAMARD_HEAD_DIM: usize = 128;
 
-/// Naive in-place radix Hadamard rotate for the DSA indexer (head_dim=128).
+/// Naive radix Hadamard rotate for the DSA indexer (head_dim=128).
 /// Applies scale = head_dim^-0.5. NOT the Dao-AILab fast-hadamard-transform
 /// port — correct but not tuned; first ncu candidate if decode TPOT is measured.
 ///
 /// `input` and `output` are `[tokens, head_dim]` bf16, row-major.
-/// `output` may alias `input` for in-place operation.
+/// Out-of-place only — the kernel reads all 128 elements per row before
+/// writing one output; aliasing `input` and `output` races and corrupts
+/// results.
 pub fn glm52_indexer_hadamard_bf16_launch(
     ctx: &DeviceContext,
     tokens: usize,
@@ -45,6 +47,10 @@ pub fn glm52_indexer_hadamard_bf16_launch(
 
     let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
     let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    ensure!(
+        input_ptr != output_ptr,
+        "GLM5.2 indexer Hadamard is out-of-place only; input and output must not alias"
+    );
     let result = unsafe {
         ffi::glm52_indexer_hadamard_bf16_cuda(
             input_ptr as *const ffi::Half,

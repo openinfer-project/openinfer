@@ -1,7 +1,12 @@
-// GLM5.2 DSA indexer Hadamard rotate, naive in-place radix implementation.
+// GLM5.2 DSA indexer Hadamard rotate, naive radix implementation.
 //
 // head_dim=128 -> 7 butterfly stages (log2(128)=7). Each stage applies the
 // Hadamard pattern with scale = head_dim^-0.5 applied once at the end.
+//
+// Out-of-place only: all 128 threads in a block read the full input row
+// before any thread writes its output element. If input and output alias,
+// a thread's write can corrupt another thread's read before the sum
+// completes. The Rust wrapper rejects aliasing.
 //
 // This is NOT the Dao-AILab fast-hadamard-transform port. It is a naive
 // correctness-first implementation. If ncu flags it as a decode TPOT

@@ -28,19 +28,22 @@ constexpr int kNumQStages = 3;
 constexpr int kNumKVStages = 3;
 
 std::once_flag g_dg_init_flag;
+CUresult g_dg_init_result = CUDA_SUCCESS;
 
-void ensure_dg_runtime_init() {
+CUresult ensure_dg_runtime_init() {
     std::call_once(g_dg_init_flag, []() {
         const char* dg_root = std::getenv("OPENINFER_DEEPGEMM_ROOT");
         const char* cuda_home = std::getenv("CUDA_HOME");
         if (!dg_root || !cuda_home) {
             fprintf(stderr, "glm52_deepgemm_mqa: OPENINFER_DEEPGEMM_ROOT and CUDA_HOME must be set\n");
-            abort();
+            g_dg_init_result = CUDA_ERROR_INVALID_VALUE;
+            return;
         }
         deep_gemm::Compiler::prepare_init(dg_root, cuda_home);
         deep_gemm::KernelRuntime::prepare_init(cuda_home);
         deep_gemm::IncludeParser::prepare_init(dg_root);
     });
+    return g_dg_init_result;
 }
 
 } // namespace anon
@@ -66,7 +69,10 @@ CUresult glm52_deepgemm_paged_mqa_metadata_cuda(
         return CUDA_ERROR_INVALID_VALUE;
     }
 
-    ensure_dg_runtime_init();
+    CUresult init_err = ensure_dg_runtime_init();
+    if (init_err != CUDA_SUCCESS) {
+        return init_err;
+    }
 
     constexpr int num_threads = 32;
     const int aligned_batch_size = deep_gemm::align(batch_size, 32);
@@ -150,7 +156,10 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     const int num_math_warp_groups = split_kv / kMmaM;
     const int num_math_threads = num_math_warp_groups * 128;
 
-    ensure_dg_runtime_init();
+    CUresult init_err = ensure_dg_runtime_init();
+    if (init_err != CUDA_SUCCESS) {
+        return init_err;
+    }
 
     try {
         const int next_n_atom = (is_varlen || next_n >= 2) ? 2 : 1;
