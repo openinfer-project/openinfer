@@ -24,7 +24,7 @@ use openinfer_kernels::ops::{
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
     glm52_mla_query_assemble_launch,
 };
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+use openinfer_kernels::tensor::DeviceContext;
 
 use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear};
 use crate::mla_decode::{
@@ -107,9 +107,7 @@ impl Glm52MlaDecodeBench {
             &proj(&o_w, &o_s, HIDDEN, HEADS * V_HEAD),
         )?;
 
-        let hidden = ctx
-            .stream
-            .clone_htod(&vec![bf16::from_f32(0.01); HIDDEN])?;
+        let hidden = ctx.stream.clone_htod(&vec![bf16::from_f32(0.01); HIDDEN])?;
         let rope: Vec<bf16> = (0..ROPE_HALF)
             .map(|i| bf16::from_f32(((i as f32) * 0.1).cos()))
             .collect();
@@ -393,8 +391,17 @@ impl Glm52MlaDecodeBench {
             &mut splits,
         )?;
         glm52_flashmla_sparse_decode_launch(
-            &self.ctx, c, &query, &self.cache, &self.topk, &sched, &splits, &mut latent, &mut lse,
-            &mut lse_accum, &mut o_accum,
+            &self.ctx,
+            c,
+            &query,
+            &self.cache,
+            &self.topk,
+            &sched,
+            &splits,
+            &mut latent,
+            &mut lse,
+            &mut lse_accum,
+            &mut o_accum,
         )?;
         self.ctx.sync()?;
         let wall = Instant::now();
@@ -407,8 +414,17 @@ impl Glm52MlaDecodeBench {
                 &mut splits,
             )?;
             glm52_flashmla_sparse_decode_launch(
-                &self.ctx, c, &query, &self.cache, &self.topk, &sched, &splits, &mut latent,
-                &mut lse, &mut lse_accum, &mut o_accum,
+                &self.ctx,
+                c,
+                &query,
+                &self.cache,
+                &self.topk,
+                &sched,
+                &splits,
+                &mut latent,
+                &mut lse,
+                &mut lse_accum,
+                &mut o_accum,
             )?;
         }
         self.ctx.sync()?;

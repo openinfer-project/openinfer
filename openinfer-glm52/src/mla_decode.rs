@@ -25,8 +25,8 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::fp8::{
-    FP8_BLOCK, Fp8LinearScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32,
-    fp8_linear, fp8_linear_into,
+    FP8_BLOCK, Fp8LinearScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear,
+    fp8_linear_into,
 };
 
 const HEADS: usize = 64;
@@ -55,10 +55,6 @@ pub(crate) struct Glm52MlaLayerWeights {
 }
 
 impl Glm52MlaLayerWeights {
-    /// Build from raw checkpoint bytes: upload the fp8 projections + bf16
-    /// layernorm gammas, and host-dequant kv_b into the bf16 absorb factors
-    /// W_UK = kv_b[:, :192, :], W_UV = kv_b[:, 192:, :].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn q_a(&self) -> &ProjWeight {
         &self.q_a
     }
@@ -75,6 +71,10 @@ impl Glm52MlaLayerWeights {
         &self.o_proj
     }
 
+    /// Build from raw checkpoint bytes: upload the fp8 projections + bf16
+    /// layernorm gammas, and host-dequant kv_b into the bf16 absorb factors
+    /// W_UK = kv_b[:, :192, :], W_UV = kv_b[:, 192:, :].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         q_a: &Glm52ProjBytes,
@@ -481,10 +481,7 @@ pub(crate) struct Glm52MlaDecodeScratch {
 }
 
 impl Glm52MlaDecodeScratch {
-    pub(crate) fn new(
-        ctx: &DeviceContext,
-        contract: Glm52FlashMlaSparseDecode,
-    ) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, contract: Glm52FlashMlaSparseDecode) -> Result<Self> {
         Ok(Self {
             fp8: Fp8LinearScratch::new(ctx, HEADS * V_HEAD)?,
             q_a: DeviceVec::zeros(ctx, Q_LORA)?,
@@ -568,8 +565,10 @@ pub(crate) fn glm52_mla_decode_forward_into(
         RMS_EPS,
         &mut scratch.kv_c,
     )?;
-    ctx.stream
-        .memcpy_dtod(&scratch.ckv.slice(KV_LORA..KV_LORA + ROPE_DIM), &mut scratch.k_pe)?;
+    ctx.stream.memcpy_dtod(
+        &scratch.ckv.slice(KV_LORA..KV_LORA + ROPE_DIM),
+        &mut scratch.k_pe,
+    )?;
 
     // ---- absorb: ql_nope[64,512] = q_pass @ W_UK ----
     gemm_strided_batched_bf16(
