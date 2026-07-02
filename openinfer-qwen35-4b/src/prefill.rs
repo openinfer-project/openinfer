@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 /// This is not an admission cap. Actual prompt admission is governed by the
 /// paged KV pool, RoPE cache coverage, and allocation success. Prompts longer
 /// than this are handled by chunking prefill at `PREFILL_CHUNK_LEN` rather than
-/// being rejected (see `prefill_last_hidden`).
+/// being rejected (see `prefill_chunk_forward_with_capture`).
 pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 
 /// Maximum number of tokens processed in a single prefill forward pass.
@@ -20,6 +20,7 @@ const HEAD_DIM: usize = 256;
 
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
+use super::verify_buffers::VerifyBuffers35;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
@@ -45,45 +46,6 @@ fn checked_prefill_end_pos(
 }
 
 impl Qwen35Model {
-    pub(super) fn prefill_last_hidden(
-        &self,
-        token_ids: &[u32],
-        kv_state: &mut KvState,
-        recurrent: &mut RecurrentState,
-    ) -> Result<DeviceVec> {
-        let seq_len = token_ids.len();
-        anyhow::ensure!(
-            seq_len > 0,
-            "Qwen3.5 prefill_last_hidden requires at least one token"
-        );
-        let c = &self.config;
-
-        // Validate the full target range up front (position overflow + RoPE cache
-        // coverage) so an out-of-range prompt is rejected before any chunk mutates
-        // the KV / recurrent state, rather than failing partway through.
-        let base_pos = kv_state.seq_len();
-        let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
-        self.ensure_rope_cache_covers(end_pos)?;
-
-        // Run prefill in serial chunks of at most `PREFILL_CHUNK_LEN` tokens. Each
-        // chunk advances the paged KV and linear-attention recurrent/conv state in
-        // place, so the next chunk continues from the previous one. This caps the
-        // per-pass GDR scratch (which grows with the pass length) at the budget
-        // reserved at startup, so prompts longer than one chunk prefill without OOM.
-        let mut hidden_batch: Option<HiddenStates> = None;
-        for chunk in token_ids.chunks(PREFILL_CHUNK_LEN) {
-            // Free the previous chunk's hidden states before allocating the next
-            // chunk's scratch so peak memory stays within one chunk's reservation.
-            drop(hidden_batch.take());
-            hidden_batch = Some(self.prefill_chunk_forward(chunk, kv_state, recurrent)?);
-        }
-        // `seq_len > 0` guarantees at least one chunk produced hidden states.
-        let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
-
-        // Last-token logic runs once, on the final chunk's output.
-        ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)
-    }
-
     pub(super) fn batch_last_hidden_logits(
         &self,
         last_hiddens: &[DeviceVec],
@@ -115,6 +77,62 @@ impl Qwen35Model {
         Ok(logits)
     }
 
+    pub(crate) fn hidden_logits(&self, hidden_batch: &HiddenStates) -> Result<HiddenStates> {
+        anyhow::ensure!(
+            hidden_batch.seq_len > 0,
+            "Qwen3.5 hidden_logits requires at least one row"
+        );
+        let mut normed =
+            HiddenStates::zeros(&self.ctx, hidden_batch.hidden_dim, hidden_batch.seq_len)?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            hidden_batch,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut normed,
+        )?;
+        ops::gemm(&self.ctx, &self.embed_tokens, &normed)
+    }
+
+    pub(crate) fn prefill_logits_all(
+        &self,
+        token_ids: &[u32],
+        kv_state: &mut KvState,
+        recurrent: &mut RecurrentState,
+    ) -> Result<HiddenStates> {
+        anyhow::ensure!(
+            token_ids.len() <= PREFILL_CHUNK_LEN,
+            "Qwen3.5 all-position prefill logits only supports one chunk: requested {}, max {}",
+            token_ids.len(),
+            PREFILL_CHUNK_LEN
+        );
+        let hidden = self.prefill_chunk_forward(token_ids, kv_state, recurrent)?;
+        self.hidden_logits(&hidden)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prefill_logits_all_with_capture(
+        &self,
+        token_ids: &[u32],
+        kv_state: &mut KvState,
+        recurrent: &mut RecurrentState,
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
+        anyhow::ensure!(
+            token_ids.len() <= PREFILL_CHUNK_LEN,
+            "Qwen3.5 all-position prefill logits only supports one chunk: requested {}, max {}",
+            token_ids.len(),
+            PREFILL_CHUNK_LEN
+        );
+        let (hidden, captured) = self.prefill_chunk_forward_with_capture(
+            token_ids,
+            kv_state,
+            recurrent,
+            capture_layer_ids,
+        )?;
+        Ok((self.hidden_logits(&hidden)?, captured))
+    }
+
     /// Forward one prefill chunk through all layers, advancing the paged KV state
     /// and the linear-attention recurrent/conv state in place.
     ///
@@ -127,6 +145,17 @@ impl Qwen35Model {
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
+        self.prefill_chunk_forward_with_capture(token_ids, kv_state, recurrent, None)
+            .map(|(hidden, _)| hidden)
+    }
+
+    pub(crate) fn prefill_chunk_forward_with_capture(
+        &self,
+        token_ids: &[u32],
+        kv_state: &mut KvState,
+        recurrent: &mut RecurrentState,
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
         let seq_len = token_ids.len();
         debug_assert!(
             seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
@@ -172,6 +201,28 @@ impl Qwen35Model {
             c.head_dim,
         )?;
 
+        let capture_layer_ids = capture_layer_ids.unwrap_or(&[]);
+        anyhow::ensure!(
+            capture_layer_ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "Qwen3.5 DFlash capture layer ids must be strictly increasing"
+        );
+        anyhow::ensure!(
+            capture_layer_ids
+                .iter()
+                .all(|&layer_idx| layer_idx < self.config.num_hidden_layers),
+            "Qwen3.5 DFlash capture layer id out of range"
+        );
+        let mut captured_hidden = if capture_layer_ids.is_empty() {
+            None
+        } else {
+            Some(HiddenStates::zeros(
+                &self.ctx,
+                c.hidden_size * capture_layer_ids.len(),
+                seq_len,
+            )?)
+        };
+        let mut next_capture = 0usize;
+
         // Process layers
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
@@ -188,13 +239,143 @@ impl Qwen35Model {
                 &prefill_plan,
                 recurrent,
             )?;
+            if capture_layer_ids.get(next_capture) == Some(&layer_idx) {
+                let out = captured_hidden
+                    .as_mut()
+                    .expect("capture buffer exists when ids are non-empty");
+                ops::copy_hidden_rows_into(
+                    &self.ctx,
+                    &hidden_batch,
+                    out,
+                    next_capture * c.hidden_size,
+                )?;
+                next_capture += 1;
+            }
         }
 
         // Advance recurrent token count for the next chunk / decode step; the
         // paged KV position is tracked by `kv_state` (advanced above).
         recurrent.seq_len += seq_len;
 
-        Ok(hidden_batch)
+        Ok((hidden_batch, captured_hidden))
+    }
+
+    pub(crate) fn prefill_verify_into(
+        &self,
+        spans: &[&[u32]],
+        kv_states: &mut [&mut KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+        capture_layer_ids: &[usize],
+        bufs: &mut VerifyBuffers35,
+    ) -> Result<()> {
+        anyhow::ensure!(!spans.is_empty(), "Qwen3.5 verify needs at least one span");
+        anyhow::ensure!(
+            spans.len() == kv_states.len() && spans.len() == recurrent_states.len(),
+            "Qwen3.5 verify spans/KV/recurrent mismatch: spans={}, kv={}, recurrent={}",
+            spans.len(),
+            kv_states.len(),
+            recurrent_states.len()
+        );
+        anyhow::ensure!(
+            spans.len() <= bufs.max_batch(),
+            "Qwen3.5 verify batch {} exceeds buffer capacity {}",
+            spans.len(),
+            bufs.max_batch()
+        );
+        anyhow::ensure!(
+            capture_layer_ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "Qwen3.5 verify capture layer ids must be strictly increasing"
+        );
+        anyhow::ensure!(
+            capture_layer_ids
+                .iter()
+                .all(|&layer_idx| layer_idx < self.config.num_hidden_layers),
+            "Qwen3.5 verify capture layer id out of range"
+        );
+        anyhow::ensure!(
+            bufs.captured_hidden.hidden_dim
+                == self.config.hidden_size * capture_layer_ids.len().max(1),
+            "Qwen3.5 verify capture buffer dimension mismatch"
+        );
+        for span in spans {
+            anyhow::ensure!(
+                !span.is_empty() && span.len() <= PREFILL_CHUNK_LEN,
+                "Qwen3.5 verify span len {} out of range",
+                span.len()
+            );
+        }
+
+        let total_rows = bufs.stage_tokens(&self.ctx, spans)?;
+        let seq_lens: Vec<usize> = spans.iter().map(|span| span.len()).collect();
+        let start_positions: Vec<usize> = kv_states.iter().map(|kv| kv.seq_len()).collect();
+        for (kv, (&base_pos, &seq_len)) in kv_states
+            .iter_mut()
+            .zip(start_positions.iter().zip(seq_lens.iter()))
+        {
+            let end_pos =
+                checked_prefill_end_pos(base_pos, seq_len, self.config.max_position_embeddings)?;
+            self.ensure_rope_cache_covers(end_pos)?;
+            kv.ensure_capacity(end_pos)?;
+            kv.advance(seq_len);
+        }
+
+        let page_indices: Vec<Vec<i32>> =
+            kv_states.iter().map(|kv| kv.page_indices_i32()).collect();
+        let last_page_lens: Vec<usize> = kv_states.iter().map(|kv| kv.last_page_len()).collect();
+        bufs.plan.update_batch_with_cta_tile_q(
+            &self.ctx,
+            &page_indices,
+            &last_page_lens,
+            &start_positions,
+            &seq_lens,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            0,
+        )?;
+
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.token_ids_d,
+            &mut bufs.hidden,
+        )?;
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            self.prefill_verify_layer_into(
+                layer_idx,
+                layer,
+                &seq_lens,
+                kv_states,
+                recurrent_states,
+                &mut linear_idx,
+                &mut full_idx,
+                capture_layer_ids,
+                bufs,
+            )?;
+        }
+
+        for (recurrent, &seq_len) in recurrent_states.iter_mut().zip(seq_lens.iter()) {
+            recurrent.seq_len += seq_len;
+        }
+
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut bufs.logits_normed,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.logits_normed,
+            &mut bufs.logits,
+        );
+        debug_assert_eq!(bufs.logits.seq_len, total_rows);
+        Ok(())
     }
 
     /// Process one layer during prefill. Returns updated hidden_batch.
@@ -263,6 +444,321 @@ impl Qwen35Model {
 
         // 5. Residual
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_verify_layer_into(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock35,
+        seq_lens: &[usize],
+        kv_states: &[&mut KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+        linear_idx: &mut usize,
+        full_idx: &mut usize,
+        capture_layer_ids: &[usize],
+        bufs: &mut VerifyBuffers35,
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden,
+            &layer.input_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
+
+        match &layer.attn {
+            LayerKind::FullAttention(attn) => {
+                self.prefill_verify_full_attention_into(
+                    attn, seq_lens, kv_states, *full_idx, bufs,
+                )?;
+                *full_idx += 1;
+            }
+            LayerKind::LinearAttention(attn) => {
+                self.prefill_verify_linear_attention_into(
+                    attn,
+                    seq_lens,
+                    recurrent_states,
+                    *linear_idx,
+                    bufs,
+                )?;
+                *linear_idx += 1;
+            }
+        }
+
+        ops::add_batch_into(
+            &self.ctx,
+            &bufs.hidden,
+            &bufs.attn_results,
+            &mut bufs.hidden_mid,
+        )?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden_mid,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.gate_up_proj,
+            &bufs.normed,
+            &mut bufs.gate_up_out,
+        );
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.down_proj,
+            &bufs.act_out,
+            &mut bufs.mlp_out,
+        );
+        ops::add_batch_into(
+            &self.ctx,
+            &bufs.hidden_mid,
+            &bufs.mlp_out,
+            &mut bufs.hidden_next,
+        )?;
+        std::mem::swap(&mut bufs.hidden, &mut bufs.hidden_next);
+
+        if let Some(slot) = capture_layer_ids.iter().position(|&idx| idx == layer_idx) {
+            ops::copy_hidden_rows_into(
+                &self.ctx,
+                &bufs.hidden,
+                &mut bufs.captured_hidden,
+                slot * self.config.hidden_size,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_verify_full_attention_into(
+        &self,
+        attn: &FullAttentionLayer,
+        _seq_lens: &[usize],
+        kv_states: &[&mut KvState],
+        full_idx: usize,
+        bufs: &mut VerifyBuffers35,
+    ) -> Result<()> {
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+        ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
+        ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_full);
+        ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_full);
+
+        let layout = kv_states[0].layout();
+        let layer_k_off = (full_idx * layout.layer_stride) as i64;
+        let layer_v_off = layer_k_off + layout.kv_block_len as i64;
+        let stride_page = layout.page_stride as i64;
+        unsafe {
+            let (qf_ptr, _) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (k_ptr, _) = bufs.k_full.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _) = bufs.v_full.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (qp_ptr, _) = bufs.q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (buf_ptr, _) = kv_states[0].buffer().device_ptr(&self.ctx.stream);
+            let (pi_ptr, _) = bufs.plan.page_indices_d().device_ptr(&self.ctx.stream);
+            let (pip_ptr, _) = bufs.plan.page_indptr_d().device_ptr(&self.ctx.stream);
+            let (qi_ptr, _) = bufs.plan.q_indptr_d().device_ptr(&self.ctx.stream);
+            let (pos_ptr, _) = bufs.plan.positions_d().device_ptr(&self.ctx.stream);
+            ffi::prefill_attention_hd256_prep_paged_batch_cuda(
+                qf_ptr as *const ffi::Half,
+                k_ptr as *const ffi::Half,
+                v_ptr as *const ffi::Half,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                qp_ptr as *mut ffi::Half,
+                buf_ptr as *mut ffi::Half,
+                layer_k_off,
+                layer_v_off,
+                pi_ptr as *const i32,
+                pip_ptr as *const i32,
+                qi_ptr as *const i32,
+                pos_ptr as *const i32,
+                c.num_attention_heads as i32,
+                c.num_key_value_heads as i32,
+                bufs.q_prepped.seq_len as i32,
+                kv_states.len() as i32,
+                c.rotary_dim as i32,
+                eps,
+                layout.page_size as i32,
+                stride_page,
+                self.ctx.stream.cu_stream(),
+            );
+        }
+
+        let sm_scale = 1.0f32 / f32::sqrt(HEAD_DIM as f32);
+        {
+            let (buf_ptr, _gbuf) = kv_states[0].buffer().device_ptr(&self.ctx.stream);
+            let (qp_ptr, _gqp) = bufs.q_prepped.data.device_ptr(&self.ctx.stream);
+            let (out_ptr, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            let (pi_ptr, _gpi) = bufs.plan.page_indices_d().device_ptr(&self.ctx.stream);
+            let (pip_ptr, _gpip) = bufs.plan.page_indptr_d().device_ptr(&self.ctx.stream);
+            let (lpl_ptr, _glpl) = bufs.plan.last_page_len_d().device_ptr(&self.ctx.stream);
+            let (qi_ptr, _gqi) = bufs.plan.q_indptr_d().device_ptr(&self.ctx.stream);
+            let (ri_ptr, _gri) = bufs.plan.request_indices_d().device_ptr(&self.ctx.stream);
+            let (qti_ptr, _gqti) = bufs.plan.qo_tile_indices_d().device_ptr(&self.ctx.stream);
+            let (kti_ptr, _gkti) = bufs.plan.kv_tile_indices_d().device_ptr(&self.ctx.stream);
+            let (kcs_ptr, _gkcs) = bufs.plan.kv_chunk_size_d().device_ptr(&self.ctx.stream);
+            let (tnr_ptr, _gtnr) = bufs.plan.total_num_rows_d().device_ptr(&self.ctx.stream);
+            let result = unsafe {
+                ffi::batch_prefill_paged_cuda_hd256(
+                    qp_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    buf_ptr as *const ffi::Half,
+                    layer_k_off,
+                    layer_v_off,
+                    pi_ptr as *const i32,
+                    pip_ptr as *const i32,
+                    lpl_ptr as *const i32,
+                    qi_ptr as *const i32,
+                    ri_ptr as *const i32,
+                    qti_ptr as *const i32,
+                    kti_ptr as *const i32,
+                    kcs_ptr as *const i32,
+                    tnr_ptr as *const u32,
+                    c.num_attention_heads as i32,
+                    c.num_key_value_heads as i32,
+                    HEAD_DIM as i32,
+                    layout.page_size as i32,
+                    bufs.q_prepped.seq_len as i32,
+                    bufs.plan.batch_size(),
+                    bufs.plan.num_tiles(),
+                    stride_page,
+                    sm_scale,
+                    self.ctx.stream.cu_stream(),
+                )
+            };
+            anyhow::ensure!(
+                result == 0,
+                "Qwen3.5 verify batch_prefill_paged_cuda_hd256 failed: {result}"
+            );
+        }
+
+        unsafe {
+            let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (out_ptr, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            ffi::attention_gate_batch_hd256_cuda(
+                qf_ptr as *const ffi::Half,
+                out_ptr as *mut ffi::Half,
+                c.num_attention_heads as i32,
+                bufs.logits.seq_len as i32,
+                self.ctx.stream.cu_stream(),
+            );
+        }
+        ops::gemm_into(
+            &self.ctx,
+            &attn.o_proj,
+            &bufs.attn_out_full,
+            &mut bufs.attn_results,
+        );
+        Ok(())
+    }
+
+    fn prefill_verify_linear_attention_into(
+        &self,
+        attn: &LinearAttentionLayer,
+        seq_lens: &[usize],
+        recurrent_states: &mut [&mut RecurrentState],
+        linear_idx: usize,
+        bufs: &mut VerifyBuffers35,
+    ) -> Result<()> {
+        let c = &self.config;
+        ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
+        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
+        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
+        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
+
+        let mut row_offset = 0usize;
+        for (recurrent, &seq_len) in recurrent_states.iter_mut().zip(seq_lens.iter()) {
+            let layer_state = &mut recurrent.layers[linear_idx];
+            bufs.set_compact_rows(seq_len);
+
+            ops::copy_hidden_token_range_into(
+                &self.ctx,
+                &bufs.qkv,
+                row_offset,
+                &mut bufs.compact_qkv,
+                0,
+                seq_len,
+            )?;
+
+            ops::conv1d_prefill_batch_into(
+                &self.ctx,
+                &bufs.compact_qkv,
+                &attn.conv1d_weight,
+                &mut layer_state.conv_state,
+                &mut bufs.compact_qkv_conv,
+                c.linear_conv_kernel_dim,
+            );
+
+            ops::copy_hidden_token_range_into(
+                &self.ctx,
+                &bufs.b_proj,
+                row_offset,
+                &mut bufs.compact_b,
+                0,
+                seq_len,
+            )?;
+            ops::copy_hidden_token_range_into(
+                &self.ctx,
+                &bufs.a_proj,
+                row_offset,
+                &mut bufs.compact_a,
+                0,
+                seq_len,
+            )?;
+
+            ops::gated_delta_rule_prefill_chunkwise_into(
+                &self.ctx,
+                &bufs.compact_qkv_conv,
+                &bufs.compact_b,
+                &bufs.compact_a,
+                &attn.dt_bias,
+                &attn.a_log,
+                &mut layer_state.state,
+                &mut bufs.gdr_scratch,
+                &mut bufs.compact_gdr,
+                c.linear_num_key_heads,
+                c.linear_num_value_heads,
+                c.linear_key_head_dim,
+                c.linear_value_head_dim,
+            )?;
+            ops::copy_hidden_token_range_into(
+                &self.ctx,
+                &bufs.compact_gdr,
+                0,
+                &mut bufs.gdr_out,
+                row_offset,
+                seq_len,
+            )?;
+            row_offset += seq_len;
+        }
+        bufs.gdr_scratch.set_rows(bufs.qkv.seq_len);
+
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            &bufs.gdr_out,
+            &attn.norm_weight,
+            &bufs.z,
+            &mut bufs.normed_gated,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &attn.out_proj,
+            &bufs.normed_gated,
+            &mut bufs.attn_results,
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

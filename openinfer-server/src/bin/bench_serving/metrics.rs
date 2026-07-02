@@ -66,9 +66,13 @@ pub(crate) fn generated_token_hash(tokens: &[u32]) -> String {
 }
 
 pub(crate) fn generated_token_trace(tokens: &[u32]) -> GeneratedTokenTrace {
+    let full = std::env::var_os("OPENINFER_BENCH_FULL_TOKEN_TRACE")
+        .is_some()
+        .then(|| tokens.to_vec());
     GeneratedTokenTrace {
         hash: generated_token_hash(tokens),
         prefix: tokens.iter().copied().take(16).collect(),
+        full,
         len: tokens.len(),
     }
 }

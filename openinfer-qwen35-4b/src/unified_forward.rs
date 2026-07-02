@@ -14,6 +14,7 @@ use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
 use openinfer_core::kv_pool::KvState;
+use openinfer_core::ops;
 use openinfer_core::tensor::HiddenStates;
 
 pub(crate) struct UnifiedStepOutput {
@@ -32,6 +33,17 @@ impl Qwen35Model {
         kv_states: &mut [KvState],
         recurrent_states: &mut [&mut RecurrentState],
     ) -> Result<HiddenStates> {
+        self.batch_prefill_logits_with_capture(prompts, kv_states, recurrent_states, None)
+            .map(|(logits, _)| logits)
+    }
+
+    pub(crate) fn batch_prefill_logits_with_capture(
+        &self,
+        prompts: &[&[u32]],
+        kv_states: &mut [KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
         let n = prompts.len();
         anyhow::ensure!(n > 0, "batch_prefill requires at least one prompt");
         anyhow::ensure!(n == kv_states.len(), "prompts / kv_states len mismatch");
@@ -41,16 +53,46 @@ impl Qwen35Model {
         );
 
         let mut last_hiddens = Vec::with_capacity(n);
+        let capture_hidden_dim = capture_layer_ids
+            .map(|ids| ids.len() * self.config.hidden_size)
+            .unwrap_or(0);
+        let capture_tokens: usize = prompts.iter().map(|prompt| prompt.len()).sum();
+        let mut captured_all = if capture_layer_ids.is_some() {
+            Some(HiddenStates::zeros(
+                &self.ctx,
+                capture_hidden_dim,
+                capture_tokens,
+            )?)
+        } else {
+            None
+        };
+        let mut token_offset = 0usize;
         for i in 0..n {
-            let last_hidden =
-                self.prefill_last_hidden(prompts[i], &mut kv_states[i], recurrent_states[i])?;
+            let (hidden, captured) = self.prefill_chunk_forward_with_capture(
+                prompts[i],
+                &mut kv_states[i],
+                recurrent_states[i],
+                capture_layer_ids,
+            )?;
+            let last_hidden = ops::extract_vec(&self.ctx, &hidden, hidden.seq_len - 1)?;
             debug_assert_eq!(
                 last_hidden.len, self.config.hidden_size,
                 "Qwen3.5 prefill last hidden row must match request {i}"
             );
             last_hiddens.push(last_hidden);
+            if let (Some(captured), Some(out)) = (captured.as_ref(), captured_all.as_mut()) {
+                ops::copy_hidden_token_range_into(
+                    &self.ctx,
+                    captured,
+                    0,
+                    out,
+                    token_offset,
+                    prompts[i].len(),
+                )?;
+                token_offset += prompts[i].len();
+            }
         }
-        self.batch_last_hidden_logits(&last_hiddens)
+        Ok((self.batch_last_hidden_logits(&last_hiddens)?, captured_all))
     }
 
     /// Unified step: prefill new requests and decode existing requests in one call.

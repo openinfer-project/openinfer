@@ -168,6 +168,160 @@ __global__ void prefill_v_cache_write_hd256_paged_kernel(
     kv_data[dst] = v_batch[src];
 }
 
+__device__ __forceinline__ int request_for_token_hd256(
+    int token,
+    const int* __restrict__ q_indptr,
+    int batch_size) {
+    for (int i = 0; i < batch_size; ++i) {
+        if (token < q_indptr[i + 1]) return i;
+    }
+    return batch_size - 1;
+}
+
+__global__ void prefill_qk_norm_rope_hd256_paged_batch_kernel(
+    const __nv_bfloat16* __restrict__ q_full_batch,
+    const __nv_bfloat16* __restrict__ k_batch,
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    __nv_bfloat16* __restrict__ q_batch_out,
+    __nv_bfloat16* __restrict__ kv_data,
+    int64_t k_offset_elems,
+    const int* __restrict__ page_indices,
+    const int* __restrict__ page_indptr,
+    const int* __restrict__ q_indptr,
+    const int* __restrict__ positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int total_tokens,
+    int batch_size,
+    int rotary_dim,
+    float rms_eps,
+    int page_size,
+    int64_t stride_page
+) {
+    int token = blockIdx.x;
+    int head_global = blockIdx.y;
+    int d = threadIdx.x;
+    if (token >= total_tokens) return;
+
+    bool is_q = head_global < num_q_heads;
+    int head_local = is_q ? head_global : (head_global - num_q_heads);
+    int q_full_dim = num_q_heads * HD256 * 2;
+    int q_dim = num_q_heads * HD256;
+    int kv_dim = num_kv_heads * HD256;
+
+    int src_offset = is_q
+        ? token * q_full_dim + head_local * 2 * HD256 + d
+        : token * kv_dim + head_local * HD256 + d;
+    __nv_bfloat16 x = is_q ? q_full_batch[src_offset] : k_batch[src_offset];
+    const __nv_bfloat16* norm_w = is_q ? q_norm_weight : k_norm_weight;
+
+    float sq = __bfloat162float(x);
+    sq *= sq;
+    float sq_sum = warp_reduce_sum(sq);
+
+    int warp_id = d / WARP_SIZE;
+    int lane_id = d % WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS_HD256];
+    __shared__ float inv_rms;
+    __shared__ __nv_bfloat16 smem[HD256];
+
+    if (lane_id == 0) warp_sums[warp_id] = sq_sum;
+    __syncthreads();
+
+    if (d == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < NUM_WARPS_HD256; i++) total += warp_sums[i];
+        inv_rms = 1.0f / sqrtf(total / HD256 + rms_eps);
+    }
+    __syncthreads();
+
+    smem[d] = rms_norm_elem_offset_hd256(x, inv_rms, norm_w[d]);
+    __syncthreads();
+
+    int pos = positions[token];
+    int half_rotary = rotary_dim / 2;
+    int req = request_for_token_hd256(token, q_indptr, batch_size);
+    int local_pos = pos % page_size;
+    int page_list_start = page_indptr[req];
+    int page_id = page_indices[page_list_start + pos / page_size];
+
+    if (d < half_rotary) {
+        __nv_bfloat16 lo = smem[d];
+        __nv_bfloat16 hi = smem[d + half_rotary];
+        apply_rope_pair_hd256(
+            lo,
+            hi,
+            cos_cache[pos * rotary_dim + d],
+            sin_cache[pos * rotary_dim + d]
+        );
+
+        if (is_q) {
+            int dst = token * q_dim + head_local * HD256;
+            q_batch_out[dst + d] = lo;
+            q_batch_out[dst + d + half_rotary] = hi;
+        } else {
+            int64_t dst = static_cast<int64_t>(page_id) * stride_page
+                + k_offset_elems
+                + static_cast<int64_t>(local_pos) * num_kv_heads * HD256
+                + static_cast<int64_t>(head_local) * HD256
+                + d;
+            kv_data[dst] = lo;
+            kv_data[dst + half_rotary] = hi;
+        }
+    }
+
+    if (d >= rotary_dim) {
+        if (is_q) {
+            int dst = token * q_dim + head_local * HD256;
+            q_batch_out[dst + d] = smem[d];
+        } else {
+            int64_t dst = static_cast<int64_t>(page_id) * stride_page
+                + k_offset_elems
+                + static_cast<int64_t>(local_pos) * num_kv_heads * HD256
+                + static_cast<int64_t>(head_local) * HD256
+                + d;
+            kv_data[dst] = smem[d];
+        }
+    }
+}
+
+__global__ void prefill_v_cache_write_hd256_paged_batch_kernel(
+    const __nv_bfloat16* __restrict__ v_batch,
+    __nv_bfloat16* __restrict__ kv_data,
+    int64_t v_offset_elems,
+    const int* __restrict__ page_indices,
+    const int* __restrict__ page_indptr,
+    const int* __restrict__ q_indptr,
+    const int* __restrict__ positions,
+    int num_kv_heads,
+    int total_tokens,
+    int batch_size,
+    int page_size,
+    int64_t stride_page
+) {
+    int token = blockIdx.x;
+    int kv_head = blockIdx.y;
+    int d = threadIdx.x;
+    if (token >= total_tokens) return;
+
+    int pos = positions[token];
+    int req = request_for_token_hd256(token, q_indptr, batch_size);
+    int page_list_start = page_indptr[req];
+    int page_id = page_indices[page_list_start + pos / page_size];
+    int local_pos = pos % page_size;
+    int kv_dim = num_kv_heads * HD256;
+    int src = token * kv_dim + kv_head * HD256 + d;
+    int64_t dst = static_cast<int64_t>(page_id) * stride_page
+        + v_offset_elems
+        + static_cast<int64_t>(local_pos) * num_kv_heads * HD256
+        + static_cast<int64_t>(kv_head) * HD256
+        + d;
+    kv_data[dst] = v_batch[src];
+}
+
 __global__ void attention_gate_batch_hd256_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,  // [q_full_dim, seq_len]
     __nv_bfloat16* __restrict__ attn_out,            // [q_dim, seq_len]
@@ -379,6 +533,74 @@ void prefill_attention_hd256_prep_paged_cuda(
         num_kv_heads,
         seq_len,
         start_pos_ptr,
+        page_size,
+        stride_page
+    );
+}
+
+void prefill_attention_hd256_prep_paged_batch_cuda(
+    const __nv_bfloat16* q_full_batch,
+    const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out,
+    __nv_bfloat16* kv_data,
+    int64_t k_offset_elems,
+    int64_t v_offset_elems,
+    const int* page_indices,
+    const int* page_indptr,
+    const int* q_indptr,
+    const int* positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int total_tokens,
+    int batch_size,
+    int rotary_dim,
+    float rms_eps,
+    int page_size,
+    int64_t stride_page,
+    cudaStream_t stream
+) {
+    dim3 prep_grid(total_tokens, num_q_heads + num_kv_heads);
+    prefill_qk_norm_rope_hd256_paged_batch_kernel<<<prep_grid, THREADS_HD256, 0, stream>>>(
+        q_full_batch,
+        k_batch,
+        q_norm_weight,
+        k_norm_weight,
+        cos_cache,
+        sin_cache,
+        q_batch_out,
+        kv_data,
+        k_offset_elems,
+        page_indices,
+        page_indptr,
+        q_indptr,
+        positions,
+        num_q_heads,
+        num_kv_heads,
+        total_tokens,
+        batch_size,
+        rotary_dim,
+        rms_eps,
+        page_size,
+        stride_page
+    );
+
+    dim3 v_grid(total_tokens, num_kv_heads);
+    prefill_v_cache_write_hd256_paged_batch_kernel<<<v_grid, THREADS_HD256, 0, stream>>>(
+        v_batch,
+        kv_data,
+        v_offset_elems,
+        page_indices,
+        page_indptr,
+        q_indptr,
+        positions,
+        num_kv_heads,
+        total_tokens,
+        batch_size,
         page_size,
         stride_page
     );

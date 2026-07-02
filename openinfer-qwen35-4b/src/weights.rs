@@ -95,6 +95,20 @@ impl Qwen35Model {
         enable_cuda_graph: bool,
         device_ordinal: usize,
     ) -> Result<Self> {
+        Self::from_safetensors_with_device_options_and_reservation(
+            model_path,
+            enable_cuda_graph,
+            device_ordinal,
+            None,
+        )
+    }
+
+    pub(crate) fn from_safetensors_with_device_options_and_reservation(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinal: usize,
+        dflash_reservation: Option<&crate::dflash::DFlashMemoryReservation>,
+    ) -> Result<Self> {
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU");
         let ctx = DeviceContext::new_with_device(device_ordinal)?;
@@ -333,13 +347,20 @@ impl Qwen35Model {
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
         let scratch_reserve =
             super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
-        let available = free_bytes.saturating_sub(scratch_reserve);
+        let dflash_fixed_reserve = dflash_reservation.map_or(0, |r| r.fixed_bytes);
+        let dflash_per_page =
+            dflash_reservation.map_or(0, |r| r.kv_bytes_per_token.saturating_mul(page_size));
+        let effective_bytes_per_page = bytes_per_page.saturating_add(dflash_per_page);
+        let available = free_bytes
+            .saturating_sub(scratch_reserve)
+            .saturating_sub(dflash_fixed_reserve);
         let kv_budget = (available as f64 * 0.85) as usize;
-        let num_pages = (kv_budget / bytes_per_page).max(64);
+        let num_pages = (kv_budget / effective_bytes_per_page).max(64);
         let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
         let scratch_mb = scratch_reserve / (1024 * 1024);
+        let dflash_fixed_mb = dflash_fixed_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, DFlash fixed reserve: {dflash_fixed_mb} MB, {:.0}% of {:.0} MB free",
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
@@ -380,6 +401,18 @@ impl Qwen35Model {
 
     pub(crate) fn device_ctx(&self) -> &DeviceContext {
         &self.ctx
+    }
+
+    pub(crate) fn output_projection_tied(&self) -> &DeviceMatrix {
+        &self.embed_tokens
+    }
+
+    pub(crate) fn get_embeddings_batch_into(
+        &self,
+        token_ids_gpu: &CudaSlice<u32>,
+        out: &mut openinfer_core::tensor::HiddenStates,
+    ) -> Result<()> {
+        crate::ops::embedding_batch(&self.ctx, &self.embed_tokens, token_ids_gpu, out)
     }
 
     pub(crate) fn alloc_kv(&self) -> openinfer_core::kv_pool::KvState {

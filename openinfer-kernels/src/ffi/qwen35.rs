@@ -31,6 +31,33 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn prefill_attention_hd256_prep_paged_batch_cuda(
+        q_full_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        q_indptr: *const i32,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        total_tokens: i32,
+        batch_size: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        stride_page: i64,
+        stream: CUstream,
+    );
+
     // Apply sigmoid(gate) from interleaved q_full onto attention output in-place.
     pub fn attention_gate_batch_hd256_cuda(
         q_full_batch: *const Half,

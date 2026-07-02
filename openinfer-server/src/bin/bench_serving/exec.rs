@@ -9,6 +9,7 @@ use rand::rngs::StdRng;
 
 use openinfer::sampler::SamplingParams;
 use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
+use openinfer_core::engine::TokenStreamReceiver;
 
 pub(crate) struct GenTimings {
     pub(crate) ttft: Duration,
@@ -155,6 +156,57 @@ pub(crate) fn run_scheduler_stream(
     }
 }
 
+fn drain_timed_scheduler_stream(
+    mut token_rx: TokenStreamReceiver,
+    start: Instant,
+    max_new_tokens: usize,
+) -> Result<GenTimings> {
+    let mut first_at: Option<Instant> = None;
+    let mut prev_at: Option<Instant> = None;
+    let mut emitted_tokens = 0usize;
+    let mut tbt = Vec::with_capacity(max_new_tokens.saturating_sub(1));
+    let mut generated_tokens = Vec::with_capacity(max_new_tokens);
+
+    loop {
+        match token_rx.blocking_recv().map(|(_, event)| event) {
+            Some(TokenEvent::Token { id, .. }) => {
+                let now = Instant::now();
+                emitted_tokens += 1;
+                generated_tokens.push(id);
+                if first_at.is_none() {
+                    first_at = Some(now);
+                } else if let Some(prev) = prev_at {
+                    tbt.push(now - prev);
+                }
+                prev_at = Some(now);
+            }
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(TokenEvent::Finished { .. }) => {
+                let total = start.elapsed();
+                let ttft = first_at.map_or(total, |t| t - start);
+                let decode_tokens_for_rate = emitted_tokens.saturating_sub(1);
+                let decode_time_for_rate = tbt.iter().copied().sum();
+                return Ok(GenTimings {
+                    ttft,
+                    tbt,
+                    total,
+                    emitted_tokens,
+                    generated_tokens,
+                    decode_tokens_for_rate,
+                    decode_time_for_rate,
+                });
+            }
+            Some(TokenEvent::Error { message, .. }) => {
+                anyhow::bail!("scheduler request failed: {message}");
+            }
+            Some(TokenEvent::Rejected { message, .. }) => {
+                anyhow::bail!("scheduler request rejected: {message}");
+            }
+            None => anyhow::bail!("scheduler channel closed"),
+        }
+    }
+}
+
 pub(crate) struct SchedulerBenchModel {
     pub(crate) handle: SchedulerHandle,
 }
@@ -186,27 +238,31 @@ impl BenchModel for SchedulerBenchModel {
     ) -> Vec<GenTimings> {
         let mut workers = Vec::with_capacity(prompts.len());
         for (idx, prompt) in prompts.iter().enumerate() {
-            let handle = self.handle.clone();
-            let prompt_tokens = prompt.clone();
-            let sampling = *sampling;
-            workers.push(thread::spawn(move || {
-                run_timed(&prompt_tokens, max_new_tokens, |toks, n, cb| {
-                    run_scheduler_stream(
-                        &handle,
-                        Some(format!("bench-serving-{idx}")),
-                        toks.to_vec(),
-                        sampling,
-                        n,
-                        |id| cb(id),
-                    )?;
-                    Ok(())
+            let (token_tx, token_rx) = TokenSink::standalone();
+            let start = Instant::now();
+            let worker = thread::spawn(move || {
+                drain_timed_scheduler_stream(token_rx, start, max_new_tokens)
+                    .expect("generation failed")
+            });
+            self.handle
+                .submit(SchedulerRequest {
+                    request_id: Some(format!("bench-serving-{idx}")),
+                    queued_at_unix_s: None,
+                    prompt_tokens: prompt.clone(),
+                    params: *sampling,
+                    max_tokens: max_new_tokens,
+                    lora_adapter: None,
+                    token_tx,
+                    logprobs: 0,
+                    echo: false,
                 })
-            }));
+                .expect("scheduler submit failed");
+            workers.push(worker);
         }
 
         workers
             .into_iter()
-            .map(|worker| worker.join().expect("bench request worker panicked"))
+            .map(|worker| worker.join().expect("bench drain worker panicked"))
             .collect()
     }
 }

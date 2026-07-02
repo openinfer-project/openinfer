@@ -59,6 +59,9 @@ pub(crate) struct BatchDecodeGraphState {
     pub(crate) slot_states: Vec<RecurrentState>,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
+    /// One capture-enabled decode graph per bucket. DFlash hidden capture adds
+    /// copy kernels to the decode body, so it must not reuse the plain graph.
+    pub(crate) capture_graphs: Vec<CudaGraphState>,
 }
 
 impl BatchDecodeGraphState {
@@ -88,11 +91,16 @@ impl BatchDecodeGraphState {
             .iter()
             .map(|_| CudaGraphState::new())
             .collect();
+        let capture_graphs = BATCH_BUCKETS
+            .iter()
+            .map(|_| CudaGraphState::new())
+            .collect();
 
         Ok(Self {
             buffers,
             slot_states,
             graphs,
+            capture_graphs,
         })
     }
 
@@ -107,17 +115,67 @@ impl BatchDecodeGraphState {
         src: &RecurrentState,
         slot_idx: usize,
     ) -> Result<()> {
-        debug_assert!(slot_idx < MAX_BATCH, "slot_idx {slot_idx} out of range");
+        anyhow::ensure!(
+            slot_idx < self.slot_states.len(),
+            "Qwen3.5 graph slot {slot_idx} exceeds capacity {}",
+            self.slot_states.len()
+        );
         let dst = &mut self.slot_states[slot_idx];
-        for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
-            ctx.stream
-                .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
-                .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))?;
-            ctx.stream
-                .memcpy_dtod(&src_layer.conv_state.data, &mut dst_layer.conv_state.data)
-                .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
-        }
-        dst.seq_len = src.seq_len;
+        dst.copy_from(ctx, src)
+            .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))?;
         Ok(())
+    }
+
+    /// D2D copy slot `slot_idx` recurrent state into a standalone state.
+    pub(crate) fn copy_slot_to_state(
+        &self,
+        ctx: &DeviceContext,
+        slot_idx: usize,
+        dst: &mut RecurrentState,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            slot_idx < self.slot_states.len(),
+            "Qwen3.5 graph slot {slot_idx} exceeds capacity {}",
+            self.slot_states.len()
+        );
+        dst.copy_from(ctx, &self.slot_states[slot_idx])
+            .map_err(|e| anyhow::anyhow!("copy recurrent slot {slot_idx} to state: {e}"))?;
+        Ok(())
+    }
+
+    /// D2D copy one graph slot's recurrent/conv state into another slot.
+    pub(crate) fn copy_slot_to_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        src_slot_idx: usize,
+        dst_slot_idx: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            src_slot_idx < self.slot_states.len(),
+            "Qwen3.5 recurrent source slot {src_slot_idx} out of range {}",
+            self.slot_states.len()
+        );
+        anyhow::ensure!(
+            dst_slot_idx < self.slot_states.len(),
+            "Qwen3.5 recurrent destination slot {dst_slot_idx} out of range {}",
+            self.slot_states.len()
+        );
+        if src_slot_idx == dst_slot_idx {
+            return Ok(());
+        }
+        if src_slot_idx < dst_slot_idx {
+            let (left, right) = self.slot_states.split_at_mut(dst_slot_idx);
+            let src = &left[src_slot_idx];
+            let dst = &mut right[0];
+            dst.copy_from(ctx, src)
+        } else {
+            let (left, right) = self.slot_states.split_at_mut(src_slot_idx);
+            let dst = &mut left[dst_slot_idx];
+            let src = &right[0];
+            dst.copy_from(ctx, src)
+        }
+        .map_err(|e| {
+            anyhow::anyhow!("copy Qwen3.5 recurrent slot {src_slot_idx} to {dst_slot_idx}: {e}")
+        })
     }
 }

@@ -21,6 +21,7 @@
 )]
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -195,6 +196,7 @@ fn main() -> Result<()> {
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
                 .unwrap_or(openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS);
+            let dflash_draft_model_path = cli.dflash_draft_model_path.as_ref().map(PathBuf::from);
             let handle = openinfer_qwen3::start_engine_with_offload(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
@@ -211,7 +213,7 @@ fn main() -> Result<()> {
                 openinfer_qwen3::Qwen3MemoryOptions::default(),
                 openinfer_qwen3::DecodeOverlap::Off,
                 false,
-                None,
+                dflash_draft_model_path.as_deref(),
                 false,
             )?;
             finish(handle, cli.cuda_graph)
@@ -224,7 +226,8 @@ fn main() -> Result<()> {
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
                 .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen35_4b::start_engine_with_capacity(
+            let dflash_draft_model_path = cli.dflash_draft_model_path.as_ref().map(PathBuf::from);
+            let handle = openinfer_qwen35_4b::start_engine_with_capacity_and_dflash(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
@@ -234,8 +237,9 @@ fn main() -> Result<()> {
                     ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
-                4,
+                openinfer_qwen35_4b::runtime::MAX_BATCH,
                 max_prefill_tokens,
+                dflash_draft_model_path,
             )?;
             finish(handle, cli.cuda_graph)
         }
@@ -330,6 +334,7 @@ mod tests {
 
         let metrics = build_request_metrics(&timings);
         assert_eq!(metrics.steady_tpot_ms.unwrap().p50_ms, 18.0);
+        assert_eq!(metrics.effective_tpot_ms.unwrap().p50_ms, 9.25);
         assert!(
             metrics.decode_tok_s.unwrap() > 100.0,
             "batched decode tok/s should use one shared step duration instead of duplicating it per row"

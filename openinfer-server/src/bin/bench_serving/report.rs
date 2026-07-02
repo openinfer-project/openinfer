@@ -41,6 +41,8 @@ pub(crate) struct CountStats {
 pub(crate) struct GeneratedTokenTrace {
     pub(crate) hash: String,
     pub(crate) prefix: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) full: Option<Vec<u32>>,
     pub(crate) len: usize,
 }
 
@@ -58,6 +60,11 @@ pub(crate) struct RequestWorkload {
 pub(crate) struct RequestMetrics {
     pub(crate) ttft_ms: DurationStats,
     pub(crate) first_decode_step_ms: Option<DurationStats>,
+    /// Per-request decode elapsed time divided by generated decode tokens.
+    /// This complements raw token-event intervals for speculative decoding,
+    /// where accepted spans can be emitted as a burst from one verify round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effective_tpot_ms: Option<DurationStats>,
     pub(crate) steady_tpot_ms: Option<DurationStats>,
     pub(crate) e2e_ms: DurationStats,
     pub(crate) generated_tokens: CountStats,
@@ -72,6 +79,8 @@ pub(crate) struct RequestIterationTiming {
     pub(crate) index: usize,
     pub(crate) ttft_ms: f64,
     pub(crate) first_decode_step_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effective_tpot_ms: Option<f64>,
     pub(crate) steady_tpot_ms: Option<DurationStats>,
     pub(crate) e2e_ms: f64,
     pub(crate) generated_tokens: usize,
@@ -204,6 +213,8 @@ pub(crate) struct MatrixCell {
     pub(crate) ttft_ms: DurationStats,
     pub(crate) e2e_ms: DurationStats,
     pub(crate) first_decode_step_ms: Option<DurationStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effective_tpot_ms: Option<DurationStats>,
     pub(crate) steady_tpot_ms: Option<DurationStats>,
     pub(crate) generated_tokens: CountStats,
     pub(crate) request_tok_s: Option<f64>,

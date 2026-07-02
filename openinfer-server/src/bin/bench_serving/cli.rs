@@ -154,6 +154,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) max_prefill_tokens: Option<usize>,
 
+    /// Enable Qwen3/Qwen3.5 DFlash speculative decoding with this drafter model path.
+    #[arg(long = "dflash-draft-model-path")]
+    pub(crate) dflash_draft_model_path: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

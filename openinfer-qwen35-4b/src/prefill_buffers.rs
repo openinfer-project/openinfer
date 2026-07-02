@@ -44,6 +44,10 @@ pub struct GdrChunkwiseScratch35 {
 
     /// Per-chunk recurrent state snapshots, fp32: [num_chunks, num_value_heads, key_dim, value_dim]
     pub chunk_state: CudaSlice<f32>,
+    max_seq_len: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
 }
 
 impl GdrChunkwiseScratch35 {
@@ -103,7 +107,37 @@ impl GdrChunkwiseScratch35 {
             u: HiddenStates::zeros(ctx, vv_hidden_dim, seq_len)?,
             v_new: HiddenStates::zeros(ctx, vv_hidden_dim, seq_len)?,
             chunk_state,
+            max_seq_len: seq_len,
+            num_value_heads,
+            key_dim,
+            value_dim,
         })
+    }
+
+    pub(crate) fn set_rows(&mut self, seq_len: usize) {
+        assert!(
+            seq_len <= self.max_seq_len,
+            "Qwen3.5 GDR scratch rows {seq_len} exceeds capacity {}",
+            self.max_seq_len
+        );
+        self.q_expanded.seq_len = seq_len;
+        self.k_expanded.seq_len = seq_len;
+        self.v_raw.seq_len = seq_len;
+        self.w.seq_len = seq_len;
+        self.u.seq_len = seq_len;
+        self.v_new.seq_len = seq_len;
+    }
+
+    pub(crate) fn gate_capacity(&self) -> usize {
+        self.max_seq_len * self.num_value_heads
+    }
+
+    pub(crate) fn chunk_a_capacity(&self) -> usize {
+        self.max_seq_len * self.num_value_heads * Self::CHUNK_SIZE
+    }
+
+    pub(crate) fn chunk_state_capacity(&self) -> usize {
+        Self::num_chunks(self.max_seq_len) * self.num_value_heads * self.value_dim * self.key_dim
     }
 
     pub fn num_chunks(seq_len: usize) -> usize {

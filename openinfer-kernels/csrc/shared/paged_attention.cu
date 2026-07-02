@@ -671,6 +671,71 @@ int single_prefill_nhd_noncausal_cuda(
             reinterpret_cast<cudaStream_t>(stream)));
 }
 
+int single_prefill_nhd_causal_window_cuda(
+    // Q and output (HiddenStates token-major: [seq_len, q_dim])
+    void*    q,
+    void*    output,
+    // Contiguous KV cache (HiddenStates token-major: [max_seq_len, kv_dim])
+    void*    k_cache,
+    void*    v_cache,
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  seq_len,
+    int32_t  kv_len,
+    int32_t  max_seq_len,
+    int32_t  window_left,
+    float    sm_scale,
+    void*    stream)
+{
+    if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
+        num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
+        seq_len <= 0 || kv_len <= 0 || max_seq_len < kv_len || window_left < 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    uint32_t q_stride_n  = num_qo_heads * head_dim;
+    uint32_t q_stride_h  = head_dim;
+    uint32_t kv_stride_n = num_kv_heads * head_dim;
+    uint32_t kv_stride_h = head_dim;
+
+    PrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k_cache),
+        reinterpret_cast<DType*>(v_cache),
+        /*maybe_custom_mask=*/nullptr,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        static_cast<uint32_t>(seq_len),
+        static_cast<uint32_t>(kv_len),
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        static_cast<uint32_t>(head_dim),
+        window_left,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SinglePrefillWithKVCacheDispatched<
+            /*HEAD_DIM_QK=*/128,
+            /*HEAD_DIM_VO=*/128,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kCausal,
+            Variant,
+            PrefillParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+}
+
 // ---------------------------------------------------------------------------
 // Single-request prefill for HEAD_DIM=256 — wraps FlashInfer SinglePrefillWithKVCache.
 //
