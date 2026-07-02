@@ -323,7 +323,6 @@ def emit_rust(taps, args, versions: str) -> str:
 // {versions}
 const ORACLE_SEED: u64 = {args.seed:#x};
 const ORACLE_CTX: usize = {args.ctx};
-const ORACLE_LAYER: usize = {args.layer};
 // sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
 const ORACLE_HIDDEN_DIGEST: &str = "{bf16_digest(hidden)}";
 // tap `o` [{args.ctx}, 6144] bf16 digest={bf16_digest(o)} (provenance only, never assert)
