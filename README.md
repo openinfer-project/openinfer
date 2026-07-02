@@ -9,6 +9,9 @@
 </p>
 
 <p align="center">
+  <a href="https://open-infer.org/">
+    <img src="https://img.shields.io/badge/Docs%20%26%20Blog-open--infer.org-2ea44f" alt="Docs & Blog at open-infer.org">
+  </a>
   <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-41scnc53a-d0McNJDjK2lVqFGoSLUgXA">
     <img src="https://img.shields.io/badge/Slack-join%20the%20community-4A154B?logo=slack&logoColor=white" alt="Join the openinfer Slack">
   </a>
@@ -19,7 +22,8 @@
   <a href="#supported-models">Models</a> &middot;
   <a href="#api">API</a> &middot;
   <a href="#performance">Performance</a> &middot;
-  <a href="#architecture">Architecture</a>
+  <a href="#architecture">Architecture</a> &middot;
+  <a href="https://open-infer.org/blog/">Blog</a>
 </p>
 
 ---
@@ -27,6 +31,10 @@
 openinfer is an LLM inference engine built entirely in Rust and CUDA — no PyTorch, no ONNX, no framework runtime, every kernel and scheduler hand-written.
 
 It serves frontier-scale models, from Qwen3 to the trillion-parameter Kimi-K2, and already holds its own against the best open-source inference frameworks.
+
+Docs, guides, and engineering deep-dives live at [open-infer.org](https://open-infer.org/) — start with
+[OpenInfer 0.1.0: Writing a Production-Grade Inference Engine in Rust](https://open-infer.org/blog/openinfer-010/)
+and [Co-locating Prefill and Decode on One GPU](https://open-infer.org/blog/green-ctx/).
 
 ## Quickstart
 
@@ -148,7 +156,9 @@ Sampling and logprob support is model-dependent. Qwen models support the samplin
 
 Single RTX 5090 (32 GB), Qwen3-4B, BF16, TP1 — openinfer @ `0b42ed3`, vLLM 0.22.1, both driven
 by the same `vllm bench serve` client (prefix cache on, seed 42, 1k-in / 128-out). Full tables
-and method are in the [benchmark report](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md).
+and method are in the [benchmark report](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md);
+the story behind these numbers is in the
+[0.1.0 release blog](https://open-infer.org/blog/openinfer-010/).
 
 ### Footprint
 
