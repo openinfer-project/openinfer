@@ -12,9 +12,10 @@ use openinfer_cupti::profile_range_with_prepare;
 use openinfer_kernels::tensor::DeviceContext;
 use openinfer_qwen3_4b::kernel_bench::{
     AttentionDecodeCase, AttentionKernelShape, AttentionKernelSpec, AttentionKernelVariant,
-    AttentionPrefillCase, DecodePath, DevicePeakBandwidth, HEAD_DIM, L2CacheClear, NUM_KV_HEADS,
+    AttentionPrefillCase, DecodePath, DenseCase, DenseKernelKind, DevicePeakBandwidth,
+    GemmProjection, HEAD_DIM, HIDDEN_SIZE, INTERMEDIATE_SIZE, L2CacheClear, NUM_KV_HEADS,
     NUM_QO_HEADS, PAGE_SIZE, PrefillAttentionShape, PrefillAttentionSpec, PrefillAttentionVariant,
-    PrefillStage, REPORT_ITERS, SinglePrefillCase, SplitKvConfig, cache_clear_bytes,
+    PrefillStage, REPORT_ITERS, SinglePrefillCase, SplitKvConfig, VOCAB_SIZE, cache_clear_bytes,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,6 +31,84 @@ const PREFILL_QK_NORM_ROPE_OP: &str = "prefill_qk_norm_rope";
 const PREFILL_KV_SCATTER_OP: &str = "prefill_kv_scatter";
 const PREFILL_ATTENTION_CORE_OP: &str = "prefill_attention_core";
 const SINGLE_PREFILL_ATTENTION_CORE_OP: &str = "single_prefill_attention_core";
+
+/// Dense (non-attention) forward ops. `decode_*` sweeps batch_size, `prefill_*`
+/// sweeps seq_len at batch_size=1 — `rows` is the step's token/row count either
+/// way. lm_head is decode-only: production gathers last-token columns before
+/// the logits GEMM, so its N is the request count, never the prefill token count.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DensePhase {
+    Decode,
+    Prefill,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DenseOpFamily {
+    ProjectionGemm,
+    RmsNorm,
+    FusedAddRmsNorm,
+    QkNormRope,
+    SiluMul,
+    Embedding,
+    Sampling,
+}
+
+fn dense_op_for(op_name: &str) -> Option<(DenseOpFamily, DensePhase)> {
+    let (phase, rest) = if let Some(rest) = op_name.strip_prefix("decode_") {
+        (DensePhase::Decode, rest)
+    } else {
+        (DensePhase::Prefill, op_name.strip_prefix("prefill_")?)
+    };
+    let family = match rest {
+        "projection_gemm" => DenseOpFamily::ProjectionGemm,
+        "rms_norm" => DenseOpFamily::RmsNorm,
+        "fused_add_rms_norm" => DenseOpFamily::FusedAddRmsNorm,
+        "qk_norm_rope" if phase == DensePhase::Decode => DenseOpFamily::QkNormRope,
+        "silu_mul" => DenseOpFamily::SiluMul,
+        "embedding" => DenseOpFamily::Embedding,
+        "sampling" if phase == DensePhase::Decode => DenseOpFamily::Sampling,
+        _ => return None,
+    };
+    Some((family, phase))
+}
+
+fn parse_dense_variant(
+    family: DenseOpFamily,
+    phase: DensePhase,
+    raw: &str,
+) -> Result<DenseKernelKind> {
+    match family {
+        DenseOpFamily::ProjectionGemm => {
+            let projection = GemmProjection::parse(raw)
+                .ok_or_else(|| anyhow!("unknown projection gemm variant `{raw}`"))?;
+            anyhow::ensure!(
+                !(phase == DensePhase::Prefill && projection == GemmProjection::LmHead),
+                "lm_head is decode-only: prefill gathers last-token columns first, \
+                 so its logits GEMM never sees the prefill token count"
+            );
+            Ok(DenseKernelKind::ProjectionGemm(projection))
+        }
+        DenseOpFamily::Sampling => match raw {
+            "argmax" => Ok(DenseKernelKind::Sampling { greedy: true }),
+            "sampling" => Ok(DenseKernelKind::Sampling { greedy: false }),
+            _ => bail!("sampling variants are `argmax` or `sampling`; got `{raw}`"),
+        },
+        _ => {
+            anyhow::ensure!(
+                raw == "default",
+                "this dense op only supports variant `default`; got `{raw}`"
+            );
+            Ok(match family {
+                DenseOpFamily::RmsNorm => DenseKernelKind::RmsNorm,
+                DenseOpFamily::FusedAddRmsNorm => DenseKernelKind::FusedAddRmsNorm,
+                DenseOpFamily::QkNormRope => DenseKernelKind::QkNormRopeDecode,
+                DenseOpFamily::SiluMul => DenseKernelKind::SiluMul,
+                DenseOpFamily::Embedding => DenseKernelKind::Embedding,
+                DenseOpFamily::ProjectionGemm | DenseOpFamily::Sampling => unreachable!(),
+            })
+        }
+    }
+}
 const DEFAULT_COMPOSITION: &str = "decode_attention_only";
 const PARALLEL_STRATEGY: &str = "tp1_pp1";
 const SHAPE_SOURCE: &str = "static";
@@ -69,6 +148,13 @@ enum Command {
     Compare(CompareArgs),
     /// Compose one or more per-op reports into a phase contribution report.
     Compose(ComposeArgs),
+    /// Rank op-report snapshots against their roofline: analytic
+    /// speed-of-light (minimum traffic / FLOPs at the op's semantics vs device
+    /// peaks) per selected variant, sorted most-headroom-first. Raw CUPTI
+    /// metrics, when present in the snapshot, add achieved-DRAM and
+    /// tensor-pipe columns for diagnosis. Interpretation lives here, not in
+    /// `run` — snapshots stay raw.
+    Rank(RankArgs),
 }
 
 #[derive(Args)]
@@ -115,6 +201,24 @@ struct CompareArgs {
     base: PathBuf,
     #[arg(long)]
     new: PathBuf,
+}
+
+#[derive(Args)]
+struct RankArgs {
+    /// Op-report snapshot JSONs (any mix of ops); selection winners are ranked.
+    #[arg(long = "input", required = true)]
+    inputs: Vec<PathBuf>,
+    /// Peak dense bf16 tensor TFLOPS of the GPU, for the compute-side bound.
+    /// Deliberately an explicit input — there is no reliable CUDA query for it
+    /// and a baked-in per-arch table would rot. Without it, compute-bound ops
+    /// only get the DRAM bound plus their arithmetic intensity for context.
+    #[arg(long = "peak-bf16-tflops")]
+    peak_bf16_tflops: Option<f64>,
+    /// Only print kernels below this % of their speed-of-light bound.
+    #[arg(long)]
+    below: Option<f64>,
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -184,6 +288,11 @@ enum KernelSpec {
         stage: PrefillStage,
     },
     SinglePrefill(PrefillAttentionSpec),
+    Dense {
+        kind: DenseKernelKind,
+        rows: usize,
+        phase: DensePhase,
+    },
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -310,6 +419,12 @@ struct CaseParams {
     active_chunks_per_request: Option<usize>,
     padded_slots: Option<usize>,
     cta_tile_q: Option<usize>,
+    /// Projection GEMM (out_dim, in_dim); the `rank` pass reads these to build
+    /// the analytic traffic/FLOP model. Absent on non-GEMM cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gemm_out_dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gemm_in_dim: Option<usize>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -408,6 +523,50 @@ fn build_run_args(manifest: &KernelManifest, cli: RunCli) -> Result<RunArgs> {
         cli.variants.clone()
     };
     validate_variants(op, &variants)?;
+    if let Some((_, phase)) = dense_op_for(&op.name) {
+        let rows = match phase {
+            DensePhase::Decode => {
+                anyhow::ensure!(
+                    cli.seq_lens.is_empty() && cli.contexts.is_empty(),
+                    "decode dense ops sweep --batch-sizes only"
+                );
+                if cli.batch_sizes.is_empty() {
+                    op.batch_size.clone()
+                } else {
+                    ensure_positive_list("--batch-sizes", &cli.batch_sizes)?;
+                    cli.batch_sizes.clone()
+                }
+            }
+            DensePhase::Prefill => {
+                anyhow::ensure!(
+                    cli.batch_sizes.is_empty() && cli.contexts.is_empty(),
+                    "prefill dense ops sweep --seq-lens only"
+                );
+                if cli.seq_lens.is_empty() {
+                    op.seq_len.clone()
+                } else {
+                    ensure_positive_list("--seq-lens", &cli.seq_lens)?;
+                    cli.seq_lens.clone()
+                }
+            }
+        };
+        let iters = cli.iters.unwrap_or(REPORT_ITERS);
+        anyhow::ensure!(iters > 0, "--iters must be greater than zero");
+        let (batch_sizes, seq_lens) = match phase {
+            DensePhase::Decode => (rows, Vec::new()),
+            DensePhase::Prefill => (vec![1], rows),
+        };
+        return Ok(RunArgs {
+            out: cli.out,
+            op: cli.op,
+            cupti: cli.cupti || !cli.no_cupti,
+            iters,
+            contexts: Vec::new(),
+            seq_lens,
+            batch_sizes,
+            variants,
+        });
+    }
     let contexts = if op.name == DEFAULT_OP {
         if cli.contexts.is_empty() {
             op.kv_len.clone()
@@ -467,11 +626,27 @@ fn ensure_positive_list(name: &str, values: &[usize]) -> Result<()> {
 }
 
 fn validate_op_manifest(op: &OpManifest) -> Result<()> {
+    if let Some((_, phase)) = dense_op_for(&op.name) {
+        match phase {
+            DensePhase::Decode => anyhow::ensure!(
+                !op.batch_size.is_empty(),
+                "`{}` needs non-empty batch_size",
+                op.name
+            ),
+            DensePhase::Prefill => anyhow::ensure!(
+                !op.seq_len.is_empty(),
+                "`{}` needs non-empty seq_len",
+                op.name
+            ),
+        }
+        anyhow::ensure!(!op.variants.is_empty(), "`{}` needs variants", op.name);
+        return Ok(());
+    }
     anyhow::ensure!(
         op.name == DEFAULT_OP
             || prefill_stage_for_op(&op.name).is_some()
             || is_single_prefill_op(&op.name),
-        "only `{DEFAULT_OP}` and prefill attention ops have providers in this report tool; got `{}`",
+        "no provider for op `{}` in this report tool",
         op.name
     );
     anyhow::ensure!(
@@ -497,6 +672,12 @@ fn validate_op_manifest(op: &OpManifest) -> Result<()> {
 
 fn validate_variants(op: &OpManifest, variants: &[String]) -> Result<()> {
     anyhow::ensure!(!variants.is_empty(), "at least one variant is required");
+    if let Some((family, phase)) = dense_op_for(&op.name) {
+        for variant in variants {
+            parse_dense_variant(family, phase, variant)?;
+        }
+        return Ok(());
+    }
     match op.name.as_str() {
         DEFAULT_OP => {
             for variant in variants {
@@ -549,6 +730,26 @@ fn parse_prefill_variant(raw: &str) -> Result<PrefillAttentionVariant> {
 }
 
 fn selected_specs(args: &RunArgs) -> Result<Vec<KernelSpec>> {
+    if let Some((family, phase)) = dense_op_for(&args.op) {
+        let kinds = args
+            .variants
+            .iter()
+            .map(|variant| parse_dense_variant(family, phase, variant))
+            .collect::<Result<Vec<_>>>()?;
+        let rows: &[usize] = match phase {
+            DensePhase::Decode => &args.batch_sizes,
+            DensePhase::Prefill => &args.seq_lens,
+        };
+        return Ok(kinds
+            .iter()
+            .copied()
+            .flat_map(|kind| {
+                rows.iter()
+                    .copied()
+                    .map(move |rows| KernelSpec::Dense { kind, rows, phase })
+            })
+            .collect());
+    }
     match args.op.as_str() {
         DEFAULT_OP => {
             let variants = args
@@ -662,6 +863,15 @@ fn run_snapshot(loaded: &LoadedManifest, args: &RunArgs) -> Result<KernelSnapsho
                 "case op={} variant=default bs={} seq={}",
                 args.op, spec.shape.batch_size, spec.shape.seq_len
             ),
+            KernelSpec::Dense { kind, rows, phase } => eprintln!(
+                "case op={} variant={} {}={rows}",
+                args.op,
+                kind.label(),
+                match phase {
+                    DensePhase::Decode => "bs",
+                    DensePhase::Prefill => "seq",
+                },
+            ),
         }
         cases.push(measure_case(spec, args, &loaded.manifest, op));
     }
@@ -722,7 +932,151 @@ fn measure_case(
             measure_prefill_case(spec, stage, args, manifest, op)
         }
         KernelSpec::SinglePrefill(spec) => measure_single_prefill_case(spec, args, manifest, op),
+        KernelSpec::Dense { kind, rows, phase } => {
+            measure_dense_case(kind, rows, phase, args, manifest, op)
+        }
     }
+}
+
+fn measure_dense_case(
+    kind: DenseKernelKind,
+    rows: usize,
+    phase: DensePhase,
+    args: &RunArgs,
+    manifest: &KernelManifest,
+    op: &OpManifest,
+) -> CaseResult {
+    let mut result = empty_dense_case_result(kind, rows, phase, manifest, op);
+    let case_result = (|| -> Result<()> {
+        if args.cupti {
+            result.cupti = Some(measure_cupti_dense(kind, rows, op)?);
+        }
+        {
+            let mut case = DenseCase::new(kind, rows)?;
+            case.pre_measure()?;
+            let mut cache_clear = L2CacheClear::new(&case.ctx)?;
+            let elapsed = case.measure_cold_l2(args.iters, &mut cache_clear)?;
+            result.latency_us = Some(elapsed.as_secs_f64() * 1.0e6 / args.iters as f64);
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = case_result {
+        result.error = Some(format!("{err:#}"));
+        eprintln!(
+            "case failed op={} variant={} rows={rows}: {err:#}",
+            op.name,
+            kind.label()
+        );
+    }
+    result
+}
+
+fn empty_dense_case_result(
+    kind: DenseKernelKind,
+    rows: usize,
+    phase: DensePhase,
+    manifest: &KernelManifest,
+    op: &OpManifest,
+) -> CaseResult {
+    let (batch_size, seq_len) = match phase {
+        DensePhase::Decode => (rows, None),
+        DensePhase::Prefill => (1, Some(rows)),
+    };
+    let variant = kind.label();
+    // Unlike attention, projection/sampling variants are distinct kernels
+    // (different shapes / different samplers), not competing implementations
+    // of one workload — fold them into the selector so `build_selections`
+    // never picks the cheapest shape as "the winner" and drops the rest.
+    let mut selector = match phase {
+        DensePhase::Decode => json!({ "dtype": "bf16", "batch_size": batch_size }),
+        DensePhase::Prefill => prefill_selector_key("bf16", 1, rows),
+    };
+    if matches!(
+        kind,
+        DenseKernelKind::ProjectionGemm(_) | DenseKernelKind::Sampling { .. }
+    ) {
+        selector["kernel"] = json!(variant);
+    }
+    let selector_key = selector;
+    let case_id_payload = format!(
+        "{}|{}|{}|{}|{}",
+        manifest.model, PARALLEL_STRATEGY, op.name, selector_key, variant
+    );
+    let (gemm_out_dim, gemm_in_dim) = match kind {
+        DenseKernelKind::ProjectionGemm(projection) => {
+            let (out_dim, in_dim) = projection.out_in();
+            (Some(out_dim), Some(in_dim))
+        }
+        _ => (None, None),
+    };
+    CaseResult {
+        case_id: format!("sha256:{}", sha256_short(case_id_payload.as_bytes())),
+        op: op.name.clone(),
+        variant,
+        selector_key,
+        shape_source: SHAPE_SOURCE.to_string(),
+        shape: CaseShape {
+            batch_size,
+            kv_len: None,
+            seq_len,
+            num_qo_heads: NUM_QO_HEADS,
+            num_kv_heads: NUM_KV_HEADS,
+            head_dim: HEAD_DIM,
+            page_size: PAGE_SIZE,
+            dtype: "bf16".to_string(),
+        },
+        params: CaseParams {
+            chunk_tokens: None,
+            max_chunks_per_request: None,
+            actual_chunk_size: None,
+            active_chunks_per_request: None,
+            padded_slots: None,
+            cta_tile_q: None,
+            gemm_out_dim,
+            gemm_in_dim,
+        },
+        latency_us: None,
+        cupti: None,
+        error: None,
+    }
+}
+
+fn measure_cupti_dense(
+    kind: DenseKernelKind,
+    rows: usize,
+    op: &OpManifest,
+) -> Result<BTreeMap<String, f64>> {
+    let case = RefCell::new(DenseCase::new(kind, rows)?);
+    case.borrow_mut().pre_measure()?;
+
+    let mut cache_clear = L2CacheClear::new(&case.borrow().ctx)?;
+    let context = case.borrow().cu_context_ptr();
+    let device_ordinal = case.borrow().ctx.device_ordinal;
+    let clear_ctx = case.borrow().ctx.clone();
+    let range_name = format!("qd/{}-{}/r{rows}", op.name, kind.label());
+
+    let mut prepare = || {
+        cache_clear
+            .clear(&clear_ctx)
+            .map_err(|err| format!("{err:#}"))
+    };
+    let mut launch = || {
+        case.borrow_mut()
+            .launch_once()
+            .map_err(|err| format!("{err:#}"))
+    };
+    let values = unsafe {
+        profile_range_with_prepare(
+            context,
+            device_ordinal,
+            &range_name,
+            CUPTI_METRICS,
+            Some(&mut prepare),
+            &mut launch,
+        )?
+    };
+    Ok(cupti_metric_map(&values))
 }
 
 fn measure_decode_case(
@@ -841,6 +1195,8 @@ fn empty_decode_case_result(
             active_chunks_per_request: None,
             padded_slots: None,
             cta_tile_q: None,
+            gemm_out_dim: None,
+            gemm_in_dim: None,
         },
         AttentionKernelVariant::SplitKv(config) => CaseParams {
             chunk_tokens: Some(config.chunk_tokens),
@@ -849,6 +1205,8 @@ fn empty_decode_case_result(
             active_chunks_per_request: Some(config.active_chunks(spec.shape.kv_len)),
             padded_slots: Some(spec.shape.batch_size * config.max_chunks_per_request),
             cta_tile_q: None,
+            gemm_out_dim: None,
+            gemm_in_dim: None,
         },
     };
     let selector_key = decode_selector_key("bf16", spec.shape.batch_size, spec.shape.kv_len);
@@ -917,6 +1275,8 @@ fn empty_prefill_case_result(
                 PrefillAttentionVariant::Default => None,
                 PrefillAttentionVariant::CtaTileQ(tile_q) => Some(tile_q),
             },
+            gemm_out_dim: None,
+            gemm_in_dim: None,
         },
         latency_us: None,
         cupti: None,
@@ -1331,6 +1691,288 @@ fn compose_report(loaded: &LoadedManifest, args: &ComposeArgs) -> Result<Composi
     })
 }
 
+const BF16_BYTES: f64 = 2.0;
+
+/// Minimum DRAM traffic and FLOPs the op must perform at its semantics —
+/// the classic roofline inputs. Any real kernel moves at least these bytes,
+/// so `sol_pct` is a true upper bound on remaining headroom regardless of how
+/// the kernel is written.
+struct AnalyticModel {
+    min_bytes: f64,
+    flops: f64,
+}
+
+fn analytic_model(case: &CaseResult) -> Option<AnalyticModel> {
+    let shape = &case.shape;
+    let q_dim = (shape.num_qo_heads * shape.head_dim) as f64;
+    let kv_dim = (shape.num_kv_heads * shape.head_dim) as f64;
+    let head_dim = shape.head_dim as f64;
+    let bs = shape.batch_size as f64;
+    let hidden = HIDDEN_SIZE as f64;
+    let inter = INTERMEDIATE_SIZE as f64;
+    let vocab = VOCAB_SIZE as f64;
+
+    if let Some((family, phase)) = dense_op_for(&case.op) {
+        let rows = match phase {
+            DensePhase::Decode => bs,
+            DensePhase::Prefill => shape.seq_len? as f64,
+        };
+        let model = match family {
+            DenseOpFamily::ProjectionGemm => {
+                let m = case.params.gemm_out_dim? as f64;
+                let k = case.params.gemm_in_dim? as f64;
+                AnalyticModel {
+                    min_bytes: BF16_BYTES * (m * k + k * rows + m * rows),
+                    flops: 2.0 * m * k * rows,
+                }
+            }
+            DenseOpFamily::RmsNorm => AnalyticModel {
+                min_bytes: BF16_BYTES * (2.0 * hidden * rows + hidden),
+                flops: 0.0,
+            },
+            // reads hidden + residual, writes the rounded residual sum back
+            // into hidden and the normed result into out
+            DenseOpFamily::FusedAddRmsNorm => AnalyticModel {
+                min_bytes: BF16_BYTES * (4.0 * hidden * rows + hidden),
+                flops: 0.0,
+            },
+            // q and k are read and written in place; cos/sin read per row
+            DenseOpFamily::QkNormRope => AnalyticModel {
+                min_bytes: BF16_BYTES * rows * (2.0 * (q_dim + kv_dim) + 2.0 * head_dim),
+                flops: 0.0,
+            },
+            DenseOpFamily::SiluMul => AnalyticModel {
+                min_bytes: BF16_BYTES * 3.0 * inter * rows,
+                flops: 0.0,
+            },
+            DenseOpFamily::Embedding => AnalyticModel {
+                min_bytes: BF16_BYTES * 2.0 * hidden * rows + 4.0 * rows,
+                flops: 0.0,
+            },
+            DenseOpFamily::Sampling => AnalyticModel {
+                min_bytes: BF16_BYTES * vocab * rows,
+                flops: 0.0,
+            },
+        };
+        return Some(model);
+    }
+
+    match case.op.as_str() {
+        DEFAULT_OP => {
+            let kv_len = shape.kv_len? as f64;
+            Some(AnalyticModel {
+                // q read + out write, plus the K and V history each request scans
+                min_bytes: BF16_BYTES * bs * (2.0 * q_dim + 2.0 * kv_len * kv_dim),
+                flops: 4.0 * q_dim * kv_len * bs,
+            })
+        }
+        PREFILL_QK_NORM_ROPE_OP => {
+            let tokens = bs * shape.seq_len? as f64;
+            Some(AnalyticModel {
+                min_bytes: BF16_BYTES * tokens * (2.0 * (q_dim + kv_dim) + 2.0 * head_dim),
+                flops: 0.0,
+            })
+        }
+        PREFILL_KV_SCATTER_OP => {
+            let tokens = bs * shape.seq_len? as f64;
+            Some(AnalyticModel {
+                min_bytes: BF16_BYTES * 4.0 * kv_dim * tokens,
+                flops: 0.0,
+            })
+        }
+        PREFILL_OP | PREFILL_ATTENTION_CORE_OP | SINGLE_PREFILL_ATTENTION_CORE_OP => {
+            let seq = shape.seq_len? as f64;
+            let tokens = bs * seq;
+            Some(AnalyticModel {
+                min_bytes: BF16_BYTES * tokens * 2.0 * (q_dim + kv_dim),
+                // causal QK^T + PV: 2 GEMM-like passes over ~seq/2 keys per query
+                flops: 2.0 * q_dim * seq * tokens,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Serialize)]
+struct RankedKernel {
+    op: String,
+    variant: String,
+    selector_key: Value,
+    latency_us: f64,
+    min_gb: f64,
+    gflops: f64,
+    arithmetic_intensity: Option<f64>,
+    sol_time_us: f64,
+    sol_pct: f64,
+    binding_bound: String,
+    achieved_dram_gb_s: Option<f64>,
+    achieved_dram_pct: Option<f64>,
+    tensor_pipe_pct: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct RankReport {
+    schema: u32,
+    report_type: String,
+    peak_gb_s: f64,
+    peak_bf16_tflops: Option<f64>,
+    source_op_reports: Vec<String>,
+    kernels: Vec<RankedKernel>,
+    skipped: Vec<String>,
+}
+
+fn rank_snapshots(args: &RankArgs) -> Result<RankReport> {
+    let snapshots = args
+        .inputs
+        .iter()
+        .map(|path| read_snapshot(path).map(|snapshot| (path, snapshot)))
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(!snapshots.is_empty(), "rank needs at least one snapshot");
+    let peak_gb_s = snapshots[0].1.hardware.peak_gb_s;
+    for (path, snapshot) in &snapshots {
+        anyhow::ensure!(
+            (snapshot.hardware.peak_gb_s - peak_gb_s).abs() < 1.0,
+            "snapshot {} was taken on different hardware (peak_gb_s {} vs {})",
+            path.display(),
+            snapshot.hardware.peak_gb_s,
+            peak_gb_s
+        );
+    }
+
+    let mut kernels = Vec::new();
+    let mut skipped = Vec::new();
+    for (path, snapshot) in &snapshots {
+        let selections = if snapshot.selections.is_empty() {
+            build_selections(&snapshot.cases)
+        } else {
+            snapshot.selections.clone()
+        };
+        let by_id: HashMap<&str, &CaseResult> = snapshot
+            .cases
+            .iter()
+            .map(|case| (case.case_id.as_str(), case))
+            .collect();
+        for selection in &selections {
+            let Some(case) = by_id.get(selection.case_id.as_str()) else {
+                skipped.push(format!("{}: selection without case", selection.case_id));
+                continue;
+            };
+            let Some(latency_us) = case.latency_us else {
+                skipped.push(format!("{}: no latency", case_key(case)));
+                continue;
+            };
+            let Some(model) = analytic_model(case) else {
+                skipped.push(format!(
+                    "{}: no analytic model for op `{}` ({})",
+                    case_key(case),
+                    case.op,
+                    path.display()
+                ));
+                continue;
+            };
+            let dram_time_s = model.min_bytes / (peak_gb_s * 1.0e9);
+            let flop_time_s = args
+                .peak_bf16_tflops
+                .filter(|_| model.flops > 0.0)
+                .map(|tflops| model.flops / (tflops * 1.0e12));
+            let sol_time_s = flop_time_s.map_or(dram_time_s, |flop| dram_time_s.max(flop));
+            let sol_time_us = sol_time_s * 1.0e6;
+            let sol_pct = sol_time_us / latency_us * 100.0;
+            let binding_bound = match flop_time_s {
+                Some(flop) if flop > dram_time_s => "tensor".to_string(),
+                None if model.flops > 0.0 => {
+                    "dram (compute bound unknown: pass --peak-bf16-tflops)".to_string()
+                }
+                _ => "dram".to_string(),
+            };
+
+            let cupti = case.cupti.as_ref();
+            let duration_s = cupti
+                .and_then(|m| m.get("gpu__time_duration.sum"))
+                .map(|ns| ns * 1.0e-9)
+                .filter(|s| *s > 0.0);
+            let achieved_dram_gb_s = cupti
+                .and_then(|m| m.get("dram__bytes.sum"))
+                .zip(duration_s)
+                .map(|(bytes, s)| bytes / s / 1.0e9);
+            let achieved_dram_pct = achieved_dram_gb_s.map(|gb| gb / peak_gb_s * 100.0);
+            let tensor_pipe_pct = cupti
+                .and_then(|m| {
+                    m.get(
+                        "sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed",
+                    )
+                })
+                .copied();
+
+            kernels.push(RankedKernel {
+                op: case.op.clone(),
+                variant: case.variant.clone(),
+                selector_key: case.selector_key.clone(),
+                latency_us,
+                min_gb: model.min_bytes / 1.0e9,
+                gflops: model.flops / 1.0e9,
+                arithmetic_intensity: (model.min_bytes > 0.0 && model.flops > 0.0)
+                    .then(|| model.flops / model.min_bytes),
+                sol_time_us,
+                sol_pct,
+                binding_bound,
+                achieved_dram_gb_s,
+                achieved_dram_pct,
+                tensor_pipe_pct,
+            });
+        }
+    }
+
+    kernels.sort_by(|left, right| left.sol_pct.total_cmp(&right.sol_pct));
+    if let Some(below) = args.below {
+        kernels.retain(|kernel| kernel.sol_pct < below);
+    }
+
+    Ok(RankReport {
+        schema: 1,
+        report_type: "rank_report".to_string(),
+        peak_gb_s,
+        peak_bf16_tflops: args.peak_bf16_tflops,
+        source_op_reports: snapshots
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect(),
+        kernels,
+        skipped,
+    })
+}
+
+fn print_rank_table(report: &RankReport) {
+    println!(
+        "{:<28} {:<14} {:<30} {:>11} {:>10} {:>8} {:>9} {:>9} {:>8}  bound",
+        "op", "variant", "selector", "latency_us", "sol_us", "sol%", "dram_gb/s", "dram%", "hmma%"
+    );
+    for kernel in &report.kernels {
+        let fmt_opt = |value: Option<f64>| {
+            value.map_or_else(|| "-".to_string(), |value| format!("{value:.1}"))
+        };
+        println!(
+            "{:<28} {:<14} {:<30} {:>11.2} {:>10.2} {:>7.1}% {:>9} {:>9} {:>8}  {}",
+            kernel.op,
+            kernel.variant,
+            selector_key_string(&kernel.selector_key),
+            kernel.latency_us,
+            kernel.sol_time_us,
+            kernel.sol_pct,
+            fmt_opt(kernel.achieved_dram_gb_s),
+            fmt_opt(kernel.achieved_dram_pct),
+            fmt_opt(kernel.tensor_pipe_pct),
+            kernel.binding_bound,
+        );
+    }
+    if !report.skipped.is_empty() {
+        eprintln!("skipped {} entries:", report.skipped.len());
+        for entry in &report.skipped {
+            eprintln!("  {entry}");
+        }
+    }
+}
+
 fn sum_optional(values: Vec<Option<f64>>) -> Option<f64> {
     values
         .into_iter()
@@ -1379,6 +2021,13 @@ fn main() -> Result<()> {
         Command::Compose(args) => {
             let report = compose_report(&loaded, &args)?;
             write_json(&report, args.out.as_deref())?;
+        }
+        Command::Rank(args) => {
+            let report = rank_snapshots(&args)?;
+            print_rank_table(&report);
+            if args.out.is_some() {
+                write_json(&report, args.out.as_deref())?;
+            }
         }
     }
     Ok(())

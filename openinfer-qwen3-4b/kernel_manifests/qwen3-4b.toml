@@ -41,3 +41,86 @@ phase = "prefill"
 batch_size = [1]
 seq_len = [10000]
 variants = ["default"]
+
+# ── Dense forward ops (#456): GEMMs, norms, embedding, sampling ──
+# decode_* sweeps batch_size; prefill_* sweeps seq_len at batch 1.
+# Projection variants are the production (out_dim, in_dim) set that
+# decode_projection_pin_shapes warms; gate and up share a shape.
+
+[[ops]]
+name = "decode_projection_gemm"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["q_proj", "kv_proj", "o_proj", "gate_up_half", "down_proj", "lm_head"]
+
+[[ops]]
+name = "prefill_projection_gemm"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+# lm_head is decode-only: prefill gathers last-token columns first.
+variants = ["q_proj", "kv_proj", "o_proj", "gate_up_half", "down_proj"]
+
+[[ops]]
+name = "decode_rms_norm"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["default"]
+
+[[ops]]
+name = "prefill_rms_norm"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default"]
+
+[[ops]]
+name = "decode_fused_add_rms_norm"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["default"]
+
+[[ops]]
+name = "prefill_fused_add_rms_norm"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default"]
+
+[[ops]]
+name = "decode_qk_norm_rope"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["default"]
+
+[[ops]]
+name = "decode_silu_mul"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["default"]
+
+[[ops]]
+name = "prefill_silu_mul"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default"]
+
+[[ops]]
+name = "decode_embedding"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["default"]
+
+[[ops]]
+name = "prefill_embedding"
+phase = "prefill"
+batch_size = [1]
+seq_len = [128, 512, 1024, 2048, 4096, 8192, 10000]
+variants = ["default"]
+
+[[ops]]
+name = "decode_sampling"
+phase = "decode"
+batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+variants = ["argmax", "sampling"]

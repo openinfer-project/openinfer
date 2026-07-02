@@ -8,7 +8,7 @@ use half::bf16;
 use openinfer_kernels::ffi;
 use openinfer_kernels::ops::{PrefillPagedPlan, prefill_attention_paged_into};
 use openinfer_kernels::paged_kv::PagedKvLayout;
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use serde::{Deserialize, Serialize};
 
 pub const NUM_LAYERS: usize = 1;
@@ -1039,6 +1039,353 @@ impl SinglePrefillCase {
 
         Ok(Duration::from_secs_f64(elapsed_ms / 1_000.0))
     }
+}
+
+/// Qwen3-4B dense-op dimensions. The dense benches are weight-free (synthetic
+/// buffers at production shapes), so the model facts live here as constants —
+/// same convention as the attention constants above.
+pub const HIDDEN_SIZE: usize = 2560;
+pub const INTERMEDIATE_SIZE: usize = 9728;
+pub const VOCAB_SIZE: usize = 151_936;
+pub const Q_DIM: usize = NUM_QO_HEADS * HEAD_DIM;
+pub const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM;
+/// Position span for the decode qk-norm-rope bench: mid-context decode is the
+/// common case, and the cache read is position-indexed, so the span only has
+/// to be large enough that positions don't all hit one cache line.
+pub const DENSE_ROPE_CACHE_TOKENS: usize = 8192;
+
+/// The projection GEMM (out_dim, in_dim) shapes production launches — the same
+/// set `decode_projection_pin_shapes` warms for the Pin policy. Gate and up
+/// share a shape, so one variant covers both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GemmProjection {
+    QProj,
+    KvProj,
+    OProj,
+    GateUpHalf,
+    DownProj,
+    LmHead,
+}
+
+impl GemmProjection {
+    pub const ALL: [Self; 6] = [
+        Self::QProj,
+        Self::KvProj,
+        Self::OProj,
+        Self::GateUpHalf,
+        Self::DownProj,
+        Self::LmHead,
+    ];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "q_proj" => Self::QProj,
+            "kv_proj" => Self::KvProj,
+            "o_proj" => Self::OProj,
+            "gate_up_half" => Self::GateUpHalf,
+            "down_proj" => Self::DownProj,
+            "lm_head" => Self::LmHead,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QProj => "q_proj",
+            Self::KvProj => "kv_proj",
+            Self::OProj => "o_proj",
+            Self::GateUpHalf => "gate_up_half",
+            Self::DownProj => "down_proj",
+            Self::LmHead => "lm_head",
+        }
+    }
+
+    /// (out_dim, in_dim) — cuBLAS N is the token/row count of the step.
+    pub const fn out_in(self) -> (usize, usize) {
+        match self {
+            Self::QProj => (Q_DIM, HIDDEN_SIZE),
+            Self::KvProj => (KV_DIM, HIDDEN_SIZE),
+            Self::OProj => (HIDDEN_SIZE, Q_DIM),
+            Self::GateUpHalf => (INTERMEDIATE_SIZE, HIDDEN_SIZE),
+            Self::DownProj => (HIDDEN_SIZE, INTERMEDIATE_SIZE),
+            Self::LmHead => (VOCAB_SIZE, HIDDEN_SIZE),
+        }
+    }
+}
+
+/// One dense (non-attention) forward op at production shape. `rows` is the
+/// step's token/row count: decode batch size, or prefill token count.
+#[derive(Clone, Copy, Debug)]
+pub enum DenseKernelKind {
+    ProjectionGemm(GemmProjection),
+    RmsNorm,
+    FusedAddRmsNorm,
+    QkNormRopeDecode,
+    SiluMul,
+    Embedding,
+    Sampling { greedy: bool },
+}
+
+impl DenseKernelKind {
+    pub fn label(self) -> String {
+        match self {
+            Self::ProjectionGemm(projection) => projection.label().to_string(),
+            Self::Sampling { greedy: true } => "argmax".to_string(),
+            Self::Sampling { greedy: false } => "sampling".to_string(),
+            _ => "default".to_string(),
+        }
+    }
+}
+
+/// Bench harness for the dense forward ops, mirroring the attention cases:
+/// synthetic buffers at production shapes, one launch per measured iteration,
+/// cold L2 via the streaming sweep. Launches go through the same
+/// `openinfer_kernels::ops` entry points as `BatchDecodeDag` / the prefill
+/// path, so cuBLAS algo selection matches production steady state after the
+/// pre-measure launch.
+pub struct DenseCase {
+    pub ctx: DeviceContext,
+    kind: DenseKernelKind,
+    rows: usize,
+    weight: Option<DeviceMatrix>,
+    norm_weight: Option<DeviceVec>,
+    x: HiddenStates,
+    x2: Option<HiddenStates>,
+    out: HiddenStates,
+    token_ids: Option<CudaSlice<u32>>,
+    positions: Option<CudaSlice<i32>>,
+    q_norm: Option<DeviceVec>,
+    k_norm: Option<DeviceVec>,
+    cos_cache: Option<DeviceVec>,
+    sin_cache: Option<DeviceVec>,
+    sample_scratch: Option<openinfer_sample::SampleScratch>,
+    sample_params: Vec<openinfer_core::sampler::SamplingParams>,
+    sample_seed: u64,
+    start: CudaEvent,
+    end: CudaEvent,
+}
+
+impl DenseCase {
+    pub fn new(kind: DenseKernelKind, rows: usize) -> Result<Self> {
+        anyhow::ensure!(rows > 0, "dense case rows must be greater than zero");
+        let ctx = DeviceContext::new()?;
+        let start = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let end = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+
+        let mut case = Self {
+            kind,
+            rows,
+            weight: None,
+            norm_weight: None,
+            x: hidden_of(&ctx, HIDDEN_SIZE, rows, 0.01)?,
+            x2: None,
+            out: HiddenStates::zeros(&ctx, HIDDEN_SIZE, rows)?,
+            token_ids: None,
+            positions: None,
+            q_norm: None,
+            k_norm: None,
+            cos_cache: None,
+            sin_cache: None,
+            sample_scratch: None,
+            sample_params: Vec::new(),
+            sample_seed: 0x5eed,
+            start,
+            end,
+            ctx,
+        };
+        let ctx = &case.ctx;
+
+        match kind {
+            DenseKernelKind::ProjectionGemm(projection) => {
+                let (out_dim, in_dim) = projection.out_in();
+                // Zero weights: cuBLAS HMMA does no zero-skipping, and the
+                // lm_head table is too large to build patterned on the host.
+                case.weight = Some(DeviceMatrix {
+                    data: ctx.stream.alloc_zeros(out_dim * in_dim)?,
+                    rows: out_dim,
+                    cols: in_dim,
+                });
+                case.x = hidden_of(ctx, in_dim, rows, 0.01)?;
+                case.out = HiddenStates::zeros(ctx, out_dim, rows)?;
+            }
+            DenseKernelKind::RmsNorm => {
+                case.norm_weight = Some(DeviceVec::from_host(ctx, &vec![bf16::ONE; HIDDEN_SIZE])?);
+            }
+            DenseKernelKind::FusedAddRmsNorm => {
+                case.norm_weight = Some(DeviceVec::from_host(ctx, &vec![bf16::ONE; HIDDEN_SIZE])?);
+                case.x2 = Some(hidden_of(ctx, HIDDEN_SIZE, rows, 0.02)?);
+            }
+            DenseKernelKind::QkNormRopeDecode => {
+                case.x = hidden_of(ctx, Q_DIM, rows, 0.01)?;
+                case.x2 = Some(hidden_of(ctx, KV_DIM, rows, 0.01)?);
+                case.q_norm = Some(DeviceVec::from_host(ctx, &vec![bf16::ONE; HEAD_DIM])?);
+                case.k_norm = Some(DeviceVec::from_host(ctx, &vec![bf16::ONE; HEAD_DIM])?);
+                case.cos_cache = Some(DeviceVec::from_host(
+                    ctx,
+                    &rope_cache_bf16(DENSE_ROPE_CACHE_TOKENS, true),
+                )?);
+                case.sin_cache = Some(DeviceVec::from_host(
+                    ctx,
+                    &rope_cache_bf16(DENSE_ROPE_CACHE_TOKENS, false),
+                )?);
+                let positions: Vec<i32> = (0..rows)
+                    .map(|i| ((i * 997) % DENSE_ROPE_CACHE_TOKENS) as i32)
+                    .collect();
+                case.positions = Some(ctx.stream.clone_htod(&positions)?);
+            }
+            DenseKernelKind::SiluMul => {
+                case.x = hidden_of(ctx, INTERMEDIATE_SIZE, rows, 0.01)?;
+                case.x2 = Some(hidden_of(ctx, INTERMEDIATE_SIZE, rows, 0.02)?);
+                case.out = HiddenStates::zeros(ctx, INTERMEDIATE_SIZE, rows)?;
+            }
+            DenseKernelKind::Embedding => {
+                case.weight = Some(DeviceMatrix {
+                    data: ctx.stream.alloc_zeros(VOCAB_SIZE * HIDDEN_SIZE)?,
+                    rows: VOCAB_SIZE,
+                    cols: HIDDEN_SIZE,
+                });
+                let token_ids: Vec<u32> = (0..rows)
+                    .map(|i| ((i * 7919) % VOCAB_SIZE) as u32)
+                    .collect();
+                case.token_ids = Some(ctx.stream.clone_htod(&token_ids)?);
+            }
+            DenseKernelKind::Sampling { greedy } => {
+                case.x = hidden_of(ctx, VOCAB_SIZE, rows, 0.01)?;
+                case.sample_scratch =
+                    Some(openinfer_sample::SampleScratch::new(ctx, VOCAB_SIZE, rows)?);
+                let params = if greedy {
+                    openinfer_core::sampler::SamplingParams::default()
+                } else {
+                    openinfer_core::sampler::SamplingParams {
+                        temperature: 0.8,
+                        top_k: 50,
+                        top_p: 0.9,
+                        ignore_eos: true,
+                    }
+                };
+                case.sample_params = vec![params; rows];
+            }
+        }
+        case.ctx.sync()?;
+        Ok(case)
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cu_context_ptr(&self) -> *mut c_void {
+        self.ctx.ctx.cu_ctx().cast::<c_void>()
+    }
+
+    pub fn pre_measure(&mut self) -> Result<()> {
+        self.launch_once()?;
+        self.ctx.sync()
+    }
+
+    pub fn launch_once(&mut self) -> Result<()> {
+        use openinfer_kernels::ops as kops;
+        match self.kind {
+            DenseKernelKind::ProjectionGemm(_) => {
+                let weight = self.weight.as_ref().expect("gemm weight");
+                kops::gemm_into(&self.ctx, weight, &self.x, &mut self.out);
+                Ok(())
+            }
+            DenseKernelKind::RmsNorm => {
+                let weight = self.norm_weight.as_ref().expect("norm weight");
+                kops::rms_norm_batch_into(&self.ctx, &self.x, weight, 1.0e-6, &mut self.out);
+                Ok(())
+            }
+            DenseKernelKind::FusedAddRmsNorm => {
+                let weight = self.norm_weight.as_ref().expect("norm weight");
+                let residual = self.x2.as_ref().expect("residual");
+                kops::fused_add_rms_norm_round_batch_into(
+                    &self.ctx,
+                    &mut self.x,
+                    residual,
+                    weight,
+                    1.0e-6,
+                    &mut self.out,
+                )
+            }
+            DenseKernelKind::QkNormRopeDecode => {
+                let k = self.x2.as_mut().expect("k");
+                kops::qk_norm_rope_batch_decode_into(
+                    &self.ctx,
+                    &mut self.x,
+                    k,
+                    self.q_norm.as_ref().expect("q_norm"),
+                    self.k_norm.as_ref().expect("k_norm"),
+                    self.cos_cache.as_ref().expect("cos"),
+                    self.sin_cache.as_ref().expect("sin"),
+                    self.positions.as_ref().expect("positions"),
+                    NUM_QO_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    1.0e-6,
+                );
+                Ok(())
+            }
+            DenseKernelKind::SiluMul => {
+                let up = self.x2.as_ref().expect("up");
+                kops::silu_mul_batch_into(&self.ctx, &self.x, up, &mut self.out)
+            }
+            DenseKernelKind::Embedding => {
+                let weight = self.weight.as_ref().expect("embed table");
+                kops::embedding_batch(
+                    &self.ctx,
+                    weight,
+                    self.token_ids.as_ref().expect("token ids"),
+                    &mut self.out,
+                )
+            }
+            DenseKernelKind::Sampling { .. } => {
+                let scratch = self.sample_scratch.as_mut().expect("sample scratch");
+                let param_refs: Vec<&openinfer_core::sampler::SamplingParams> =
+                    self.sample_params.iter().collect();
+                self.sample_seed = self.sample_seed.wrapping_add(1);
+                openinfer_sample::select_batch(
+                    &self.ctx,
+                    &self.x,
+                    &param_refs,
+                    self.sample_seed,
+                    scratch,
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Cold-L2 latency, same protocol as the attention cases. The sampling
+    /// case's measured span includes its device-to-host token readback and
+    /// stream sync — that is the production step-tail cost, not overhead.
+    pub fn measure_cold_l2(
+        &mut self,
+        criterion_iters: u64,
+        cache_clear: &mut L2CacheClear,
+    ) -> Result<Duration> {
+        let mut elapsed_ms = 0.0f64;
+        for _ in 0..criterion_iters {
+            cache_clear.clear(&self.ctx)?;
+            self.start.record(&self.ctx.stream)?;
+            self.launch_once()?;
+            self.end.record(&self.ctx.stream)?;
+            elapsed_ms += f64::from(self.start.elapsed_ms(&self.end)?);
+        }
+        Ok(Duration::from_secs_f64(elapsed_ms / 1_000.0))
+    }
+}
+
+fn hidden_of(ctx: &DeviceContext, dim: usize, rows: usize, scale: f32) -> Result<HiddenStates> {
+    Ok(HiddenStates {
+        data: ctx.stream.clone_htod(&patterned_bf16(dim * rows, scale))?,
+        hidden_dim: dim,
+        seq_len: rows,
+    })
 }
 
 fn patterned_bf16(len: usize, scale: f32) -> Vec<bf16> {
