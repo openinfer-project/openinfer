@@ -110,7 +110,7 @@ CUresult glm52_deepgemm_paged_mqa_metadata_cuda(
 CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     const void* q,
     const void* kv_cache,
-    const float* kv_cache_scales,
+    int64_t kv_cache_stride_bytes,
     const void* weights,
     const int* context_lens,
     void* logits,
@@ -134,7 +134,7 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     int kv_scales_elem_size,
     cudaStream_t stream
 ) {
-    if (!q || !kv_cache || !kv_cache_scales || !weights || !context_lens ||
+    if (!q || !kv_cache || !weights || !context_lens ||
         !logits || !block_table || !schedule_meta || batch_size <= 0) {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -145,6 +145,12 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
         return CUDA_ERROR_INVALID_VALUE;
     }
     if (next_n != 1 && next_n != 2) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Indexer cache layout: [block_kv * head_dim fp8 | block_kv * 4 f32] per block.
+    // The stride must accommodate both regions.
+    const int64_t min_stride = static_cast<int64_t>(block_kv) * (head_dim + 4);
+    if (kv_cache_stride_bytes < min_stride) {
         return CUDA_ERROR_INVALID_VALUE;
     }
 
@@ -176,47 +182,40 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
             head_dim,
             head_dim);
 
-        // TMA descriptor for kv_cache: [num_kv_blocks, block_kv, head_dim] (3D)
-        // gmem: dim0=head_dim, dim1=block_kv, dim2=num_kv_blocks
-        // smem: dim0=head_dim (overwritten by swizzle), dim1=block_kv, dim2=1
-        // gmem_stride_0 = block_kv (stride of dim 1 in elements)
-        // gmem_stride_1 = block_kv * head_dim (stride of dim 0... wait, stride of dim 2)
-        // Actually, for a contiguous [num_kv_blocks, block_kv, head_dim] tensor:
-        //   stride(0) = block_kv * head_dim (stride along num_kv_blocks dim)
-        //   stride(1) = head_dim (stride along block_kv dim)
-        // make_tma_3d_desc takes: (t, gdim0, gdim1, gdim2, sdim0, sdim1, sdim2, gstride0, gstride1, swizzle, base)
-        // where gstride0 is the stride of dim1 in elements, gstride1 is the stride of dim0 in elements
-        // Wait, looking at make_tma_3d_desc more carefully:
-        //   gmem_strides[0] = gmem_stride_0 * elem_size  (stride of the second dimension)
-        //   gmem_strides[1] = gmem_stride_1 * elem_size  (stride of the first dimension)
-        // The original call:
-        //   make_tma_3d_desc(kv_cache, head_dim, block_kv, num_kv_blocks,
-        //                    head_dim, block_kv, 1,
-        //                    static_cast<int>(kv_cache.stride(1)),  // = head_dim
-        //                    static_cast<int>(kv_cache.stride(0)),  // = block_kv * head_dim
-        //                    head_dim);
-        // So gmem_stride_0 = kv_cache.stride(1) = head_dim
-        //    gmem_stride_1 = kv_cache.stride(0) = block_kv * head_dim
+        // Indexer cache layout (from glm52_indexer.cu::indexer_k_quant_and_cache_kernel):
+        // Each block is [block_kv * head_dim fp8 values][block_kv * 4 f32 scales],
+        // blocks strided by kv_cache_stride_bytes. The scales region starts at
+        // byte offset block_kv * head_dim within each block. We compute the
+        // scales pointer from the kv_cache base + that offset — no separate
+        // scales buffer needed (matches vllm's decode-path API).
+        const float* kv_cache_scales = reinterpret_cast<const float*>(
+            reinterpret_cast<const char*>(kv_cache) +
+            static_cast<size_t>(block_kv) * head_dim);
+
+        // TMA descriptor for kv_cache: [head_dim, block_kv, num_kv_blocks] (3D)
+        // gstride0 = head_dim (token stride within a block — fp8 values are
+        //   packed as [block_kv, head_dim] contiguous)
+        // gstride1 = kv_cache_stride_bytes / kv_elem_size (block stride —
+        //   jumps over the trailing scales region of each block)
         const auto tensor_map_kv = deep_gemm::make_tma_3d_desc_raw(
             const_cast<void*>(kv_cache), kv_elem_size, deep_gemm::DgDtype::Float8_e4m3,
             head_dim, block_kv, num_kv_blocks,
             head_dim, block_kv, 1,
             head_dim,
-            block_kv * head_dim,
+            static_cast<int>(kv_cache_stride_bytes / kv_elem_size),
             head_dim);
 
-        // TMA descriptor for kv_cache_scales: [num_kv_blocks, block_kv] (2D, f32)
-        // gmem: inner=block_kv, outer=num_kv_blocks
-        // smem: inner=block_kv, outer=1
-        // gmem_outer_stride = kv_cache_scales.stride(0) = block_kv (contiguous)
-        // swizzle_mode = 0 (no swizzle for scales)
-        // Note: the original code uses get_tma_aligned_size for the gmem_inner_dim
+        // TMA descriptor for kv_cache_scales: [block_kv, num_kv_blocks] (2D, f32)
+        // The scales pointer is an offset into kv_cache (start of scale region
+        // in block 0). Within each block, scales are [block_kv] f32 contiguous.
+        // gstride0 = kv_cache_stride_bytes / kv_scales_elem_size (block stride)
         const int aligned_block_kv = deep_gemm::get_tma_aligned_size(block_kv, kv_scales_elem_size);
         const auto tensor_map_kv_scales = deep_gemm::make_tma_2d_desc_raw(
-            const_cast<void*>(static_cast<const void*>(kv_cache_scales)), kv_scales_elem_size, deep_gemm::DgDtype::Float,
+            const_cast<void*>(static_cast<const void*>(kv_cache_scales)),
+            kv_scales_elem_size, deep_gemm::DgDtype::Float,
             aligned_block_kv, num_kv_blocks,
             block_kv, 1,
-            block_kv,
+            static_cast<int>(kv_cache_stride_bytes / kv_scales_elem_size),
             0);
 
         // TMA descriptor for weights: [batch_size * next_n, num_heads] (2D)
@@ -224,8 +223,9 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
         // smem: inner=num_heads (overwritten by swizzle=0, so stays), outer=next_n_atom
         // gmem_outer_stride = weights.stride(0) = num_heads
         // swizzle_mode = 0
+        // weights are f32 (per-head scaling factors folded with q_scale).
         const auto tensor_map_weights = deep_gemm::make_tma_2d_desc_raw(
-            const_cast<void*>(weights), weights_elem_size, deep_gemm::DgDtype::Float8_e4m3,
+            const_cast<void*>(weights), weights_elem_size, deep_gemm::DgDtype::Float,
             num_heads, batch_size * next_n,
             num_heads, next_n_atom,
             num_heads,

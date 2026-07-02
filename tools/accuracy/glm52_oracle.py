@@ -3,16 +3,17 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "torch>=2.6",
-#   "transformers==5.12.1",
+#   "transformers @ file:///data/code/workspace-rustllm/transformers",
 #   "safetensors>=0.4",
 #   "numpy",
 # ]
 # ///
 """GLM5.2 layer-0 oracle harness: emit hardcodable probes for the Rust gate.
 
-The ground-truth math is transformers' own `glm_moe_dsa` module (pinned
-==5.12.1) — this script writes NO model math of its own. It reads the layer-0
-attention weights straight from the FP8 checkpoint, instantiates the official
+The ground-truth math is transformers' own `glm_moe_dsa` module (local dev
+checkout at 5.13.0.dev0, PR #46842 — fixes indexer RoPE interleave) — this
+script writes NO model math of its own. It reads the layer-0 attention weights
+straight from the FP8 checkpoint, instantiates the official
 `GlmMoeDsaAttention` (which includes the DSA indexer), feeds it a seeded input,
 and captures intermediate tensors ("taps") via forward hooks.
 
@@ -337,6 +338,52 @@ const ORACLE_O_PROBES: &[(usize, f32)] = &[
 // ---- END GENERATED ----"""
 
 
+def emit_rust_indexer(taps, args, versions: str) -> str:
+    """Emit topk_indices as a sorted set for the Rust overlap gate.
+
+    The indexer gate asserts set-overlap >= 2047/2048 (allow 1 tie-break
+    divergence between FlashInfer top-k and torch.topk).
+    Also emits q_resid, cos, sin, hidden digests so the Rust side can
+    verify input fidelity before running the indexer forward.
+    """
+    hidden = taps["hidden"]
+    topk = taps["topk_indices"]  # [ctx, 2048] or [2048] for bs=1
+    if topk.dim() == 2:
+        topk = topk[0]  # bs=1 → [2048]
+    topk_set = sorted(int(v) for v in topk.tolist() if v >= 0)
+    q_resid = taps.get("q_resid")
+    cos = taps.get("cos")
+    sin = taps.get("sin")
+
+    fault_banner = (
+        f"// !!! FAULT-INJECTED ({args.inject_fault}) — negative control only, DO NOT COMMIT\n"
+        if args.inject_fault != "none"
+        else ""
+    )
+    q_digest = bf16_digest(q_resid) if q_resid is not None else "N/A"
+    cos_digest = bf16_digest(cos) if cos is not None else "N/A"
+    sin_digest = bf16_digest(sin) if sin is not None else "N/A"
+    hidden_digest = bf16_digest(hidden)
+    topk_digest = i32_digest(topk)
+
+    return f"""\
+{fault_banner}// ---- BEGIN GENERATED: glm52_oracle indexer probes ----
+// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+//     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision} --stage indexer
+// {versions}
+const ORACLE_SEED: u64 = {args.seed:#x};
+const ORACLE_CTX: usize = {args.ctx};
+// Input digests — verify before running the indexer forward.
+const ORACLE_HIDDEN_DIGEST: &str = "{hidden_digest}";
+const ORACLE_Q_RESID_DIGEST: &str = "{q_digest}";
+const ORACLE_COS_DIGEST: &str = "{cos_digest}";
+const ORACLE_SIN_DIGEST: &str = "{sin_digest}";
+// topk_indices [2048] i32 (provenance only — the gate asserts set-overlap, not bit-equality)
+const ORACLE_TOPK_DIGEST: &str = "{topk_digest}";
+const ORACLE_TOPK_SET: &[i32] = &{topk_set};
+// ---- END GENERATED ----"""
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-path", type=Path, required=True)
@@ -349,9 +396,11 @@ def main() -> int:
     p.add_argument("--probes", type=int, default=64)
     p.add_argument("--rel-tol", type=float, default=0.05)
     p.add_argument("--inject-fault", choices=["none", "qb-head-negate", "rope-swap"], default="none")
+    p.add_argument("--stage", choices=["mla", "indexer"], default="mla",
+                   help="mla: emit MLA o-probes. indexer: emit topk_indices set for overlap gate.")
     args = p.parse_args()
 
-    assert args.ctx <= 2048, "full top-k == DSA only holds at ctx <= 2048"
+    assert args.ctx <= 2048 or args.stage != "mla", "full top-k == DSA only holds at ctx <= 2048"
 
     import transformers
 
@@ -368,7 +417,10 @@ def main() -> int:
         print(f"// tap {name:<12} shape={tuple(t.shape)} rms={rms:.6f} digest={digest}", file=sys.stderr)
 
     if args.emit in ("rust", "both"):
-        print(emit_rust(taps, args, versions))
+        if args.stage == "indexer":
+            print(emit_rust_indexer(taps, args, versions))
+        else:
+            print(emit_rust(taps, args, versions))
     if args.emit in ("safetensors", "both"):
         assert args.out, "--out required for safetensors emission"
         from safetensors.torch import save_file

@@ -10,6 +10,13 @@ mod config;
 mod fp8;
 #[cfg(feature = "glm52")]
 #[allow(dead_code)]
+mod indexer;
+#[cfg(all(test, feature = "glm52"))]
+mod indexer_oracle_gate;
+#[cfg(all(test, feature = "glm52"))]
+mod indexer_smoke;
+#[cfg(feature = "glm52")]
+#[allow(dead_code)]
 mod mla_decode;
 #[cfg(all(test, feature = "glm52"))]
 mod mla_oracle_gate;

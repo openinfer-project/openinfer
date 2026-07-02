@@ -7,6 +7,8 @@ mod hadamard;
 pub use hadamard::*;
 mod indexer;
 pub use indexer::*;
+mod indexer_rope;
+pub use indexer_rope::*;
 mod topk;
 pub use topk::*;
 mod deepgemm_mqa;

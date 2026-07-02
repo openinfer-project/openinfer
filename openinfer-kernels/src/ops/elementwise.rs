@@ -349,6 +349,35 @@ pub fn bf16_hidden_to_f32_into(
     Ok(())
 }
 
+/// Cast bf16 logits (as raw `CudaSlice<u8>`) to f32.
+/// Used by the indexer forward to convert DeepGEMM's bf16 logits output
+/// before FlashInfer top-k (which expects f32).
+pub fn bf16_bytes_to_f32_into(
+    ctx: &DeviceContext,
+    input: &CudaSlice<u8>,
+    output: &mut CudaSlice<f32>,
+) -> Result<()> {
+    let n = input.len() / 2;
+    anyhow::ensure!(
+        output.len() >= n,
+        "f32 output len {} < bf16 input len {}",
+        output.len(),
+        n
+    );
+    let (input_ptr, _gi) = input.device_ptr(&ctx.stream);
+    let (output_ptr, _go) = output.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::bf16_to_f32_cuda(
+            input_ptr as *const ffi::Half,
+            output_ptr as *mut f32,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 pub fn f32_to_bf16_hidden_into(
     ctx: &DeviceContext,
     input: &CudaSlice<f32>,

@@ -17,7 +17,7 @@ unsafe extern "C" {
     pub fn glm52_deepgemm_paged_mqa_logits_cuda(
         q: *const std::ffi::c_void,
         kv_cache: *const std::ffi::c_void,
-        kv_cache_scales: *const f32,
+        kv_cache_stride_bytes: i64,
         weights: *const std::ffi::c_void,
         context_lens: *const i32,
         logits: *mut std::ffi::c_void,

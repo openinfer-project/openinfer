@@ -63,6 +63,16 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn layer_norm_cuda(
+        x: *const Half,
+        gamma: *const f32,
+        beta: *const f32,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn fused_add_rms_norm_batched_cuda(
         hidden: *mut Half,
         residual: *const Half,

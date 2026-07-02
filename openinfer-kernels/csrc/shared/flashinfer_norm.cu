@@ -293,6 +293,70 @@ void rms_norm_batched_offset_cuda(const DType *x, const DType *weight, DType *ou
 }
 
 // ============================================================================
+// LayerNorm (with bias) — GLM5.2 DSA indexer k_norm.
+// HAND-WRITTEN: FlashInfer's generalLayerNorm template depends on
+// tensorrt_llm::common::packed_as / num_elems traits that are not available in
+// this build's include path. This kernel is a simple single-token LayerNorm
+// (mean + variance + affine with bias), memory-bound elementwise — same
+// pattern as the hand-written rms_norm_batched_serial_kernel above.
+// eps=1e-6, with bias (unlike RMSNorm which has no bias).
+// Aligned to vllm DeepseekV32Indexer: nn.LayerNorm(head_dim, eps=1e-6).
+// ============================================================================
+__global__ void layer_norm_kernel(const DType *x, const float *gamma, const float *beta,
+                                   DType *out, int n, float eps) {
+    int tid = threadIdx.x;
+    // Phase 1: compute mean (single block, shared memory reduction).
+    extern __shared__ float smem[];
+    float val = 0.0f;
+    if (tid < n) {
+        val = __bfloat162float(x[tid]);
+    }
+    smem[tid] = val;
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum += smem[i];
+    }
+    float mean = sum / n;
+
+    // Phase 2: compute variance.
+    float diff_sum = 0.0f;
+    if (tid < n) {
+        float diff = smem[tid] - mean;
+        diff_sum = diff * diff;
+    }
+    smem[tid] = diff_sum;
+    __syncthreads();
+
+    float var_sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        var_sum += smem[i];
+    }
+    float rstd = rsqrtf(var_sum / n + eps);
+
+    // Phase 3: output = (x - mean) * rstd * gamma + beta.
+    if (tid < n) {
+        float normalized = (val - mean) * rstd;
+        out[tid] = __float2bfloat16(normalized * gamma[tid] + beta[tid]);
+    }
+}
+
+CUresult layer_norm_cuda(const DType *x, const float *gamma, const float *beta,
+                         DType *out, int n, float eps, cudaStream_t stream) {
+    if (x == nullptr || gamma == nullptr || beta == nullptr || out == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    int block_size = std::min(n, 1024);
+    // Round up to multiple of 32 for warp reductions.
+    block_size = 32 * ((block_size + 31) / 32);
+    size_t shmem_size = n * sizeof(float);
+    layer_norm_kernel<<<1, block_size, shmem_size, stream>>>(x, gamma, beta, out, n, eps);
+    cudaError_t err = cudaGetLastError();
+    return static_cast<CUresult>(err);
+}
+
+// ============================================================================
 // Fused Add + (1+weight) RMSNorm — Qwen3.5 / Gemma style
 // ============================================================================
 void fused_add_rms_norm_offset_cuda(DType *hidden, const DType *residual,

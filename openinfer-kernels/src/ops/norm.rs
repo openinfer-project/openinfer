@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::bf16;
 
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
@@ -39,6 +40,42 @@ pub fn rms_norm(
     let mut out = DeviceVec::zeros(ctx, x.len)?;
     rms_norm_into(ctx, x, weight, eps, &mut out)?;
     Ok(out)
+}
+
+/// LayerNorm (with bias) of a single bf16 vector `[dim]` — GLM5.2 DSA indexer
+/// k_norm (eps=1e-6, has bias). Wraps `flashinfer::norm::LayerNorm` (same
+/// vendored template that `rms_norm_cuda` wraps). Unlike RMSNorm, LayerNorm
+/// subtracts the mean and applies a per-element bias. gamma/beta are f32
+/// (FlashInfer's LayerNorm template requires f32 weight types).
+pub fn layer_norm_into(
+    ctx: &DeviceContext,
+    x: &CudaSlice<bf16>,
+    gamma: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    eps: f32,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(x.len() == out.len(), "layer_norm x/out length mismatch");
+    ensure!(gamma.len() >= x.len(), "layer_norm gamma too small");
+    ensure!(beta.len() >= x.len(), "layer_norm beta too small");
+    let (x_ptr, _gx) = x.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = gamma.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = beta.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::layer_norm_cuda(
+            x_ptr as *const ffi::Half,
+            g_ptr as *const f32,
+            b_ptr as *const f32,
+            o_ptr as *mut ffi::Half,
+            x.len() as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow::anyhow!("GLM5.2 LayerNorm launch failed: {err}"))
 }
 
 /// Fused add + RMSNorm: hidden += residual; out = rms_norm(hidden, weight)

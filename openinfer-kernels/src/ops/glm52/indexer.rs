@@ -192,7 +192,7 @@ pub fn glm52_indexer_k_gather_quant_cache_launch(
         contract.batch_size * contract.num_blocks_per_seq
     );
     ensure!(
-        cu_seq_lens.len() >= contract.batch_size + 1,
+        cu_seq_lens.len() > contract.batch_size,
         "GLM5.2 indexer gather cu_seq_lens too small: have {}, need {}",
         cu_seq_lens.len(),
         contract.batch_size + 1
