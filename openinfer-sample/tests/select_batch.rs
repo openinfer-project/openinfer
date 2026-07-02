@@ -230,9 +230,6 @@ fn min_p_row_takes_the_sampler_path_and_filters() {
     );
 }
 
-/// The per-request seed contract: a seeded row's token is a pure function of
-/// (seed, step, distribution) — independent of where the row sits in the
-/// batch, of its neighbors, and of the engine's per-step seed.
 #[test]
 fn mixed_batch_keeps_plain_rows_on_the_fast_path() {
     // A min_p neighbor must not perturb plain sampling rows: select_batch
@@ -281,6 +278,9 @@ fn mixed_batch_keeps_plain_rows_on_the_fast_path() {
     }
 }
 
+/// The per-request seed contract: a seeded row's token is a pure function of
+/// (seed, step, distribution) — independent of where the row sits in the
+/// batch, of its neighbors, and of the engine's per-step seed.
 #[test]
 fn seeded_rows_replay_independent_of_batch_position() {
     let ctx = DeviceContext::new().unwrap();

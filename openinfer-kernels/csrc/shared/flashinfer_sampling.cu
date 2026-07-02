@@ -1,7 +1,6 @@
 #include "common.cuh"
 #include "flashinfer_radix_scratch.cuh"
 
-#include <algorithm>
 #include <cuda_bf16.h>
 #include <stdint.h>
 

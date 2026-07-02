@@ -86,7 +86,8 @@ impl BatchSamplingScratch {
 /// differ from the fused fast path — a min_p == 0 row could then sample a
 /// different token than it would alone. Partitioning here (not in callers)
 /// keeps "min_p == 0 rows take the original path" true for every caller, at
-/// one extra launch + sync only when a batch actually mixes.
+/// the cost of a second full pass (gather + softmax + sample, own sync) only
+/// when a batch actually mixes.
 pub fn gpu_sample_batch_into(
     ctx: &DeviceContext,
     logits: HiddenStatesRef<'_>,
@@ -94,7 +95,6 @@ pub fn gpu_sample_batch_into(
     seed: u64,
     scratch: &mut BatchSamplingScratch,
 ) -> Result<Vec<u32>> {
-    ensure!(!rows.is_empty(), "batch sampling requires at least one row");
     if rows.iter().all(|r| r.min_p > 0.0) || rows.iter().all(|r| r.min_p <= 0.0) {
         return sample_uniform_batch_into(ctx, logits, rows, seed, scratch);
     }

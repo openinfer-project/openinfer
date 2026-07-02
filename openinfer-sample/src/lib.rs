@@ -4,9 +4,11 @@
 //! Two model-agnostic jobs live here:
 //!
 //! * [`select_batch`] — turn one logits arena into one next-token id per row.
-//!   Greedy rows take a batched indexed argmax; the rest take one FlashInfer
-//!   temperature/top-k/top-p pass. There is no per-row escape hatch, so a caller
-//!   cannot regress to `for i { sample(i) }`.
+//!   Greedy rows take a batched indexed argmax; the rest take batched
+//!   FlashInfer temperature/top-k/top-p/min_p passes (min_p rows partitioned
+//!   off the fused fast path, seeded rows as single-row replayable calls).
+//!   There is no per-row escape hatch, so a caller cannot regress to
+//!   `for i { sample(i) }`.
 //! * [`token_logprob_from_row`] — host-side log-softmax + top-k over one logits
 //!   row into a [`TokenLogprob`]. Generic over the row element so a caller can
 //!   feed `f32` (Qwen) or `bf16` (Kimi) without a widening copy.

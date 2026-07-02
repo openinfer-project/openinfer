@@ -1,8 +1,6 @@
 #include "common.cuh"
 #include "flashinfer_radix_scratch.cuh"
 
-#include <algorithm>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 
