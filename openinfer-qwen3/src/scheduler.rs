@@ -262,7 +262,7 @@ where
         None => (None, None),
     };
 
-    thread::Builder::new()
+    let join_handle = thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
             scheduler_loop(
@@ -277,7 +277,7 @@ where
         })
         .expect("failed to spawn scheduler thread");
 
-    let handle = EngineHandle::new(submit_tx)
+    let handle = EngineHandle::new_with_join_handle(submit_tx, join_handle)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
         .with_load_watch(load_rx);
@@ -318,7 +318,7 @@ where
         kv_total_blocks: kv_total,
     });
 
-    thread::Builder::new()
+    let join_handle = thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
             scheduler_loop_with_lora_control(
@@ -332,7 +332,7 @@ where
         })
         .expect("failed to spawn scheduler thread");
 
-    EngineHandle::new_with_command_channel(command_tx)
+    EngineHandle::new_with_command_channel_and_join_handle(command_tx, join_handle)
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
         .with_load_watch(load_rx)
