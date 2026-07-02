@@ -14,21 +14,65 @@ use crate::lora::DeviceLoraTokenGroup;
 use crate::lora::build_lora_token_ranges;
 use crate::lora::prepare_lora_token_groups;
 
-// Thread-local deferred-drop queue for decode-overlap mode. Buffers pushed here
-// during prefill (under stream override) are dropped later when
-// `drain_deferred_drops()` runs after the prefill stream is synchronized.
+// Prefill temporaries free on ctx.stream but are consumed by override-stream
+// kernels; `park()` defers them into the open parking window until that
+// stream syncs. No window open (non-overlap) → drops in place.
 thread_local! {
-    static DEFERRED_DROPS: std::cell::RefCell<Vec<Box<dyn Any>>> = std::cell::RefCell::new(Vec::new());
+    static PREFILL_TEMP_WINDOW: std::cell::RefCell<Option<Vec<Box<dyn Any>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Defer an object's drop until `drain_deferred_drops()` is called.
-fn defer_drop<T: 'static>(val: T) {
-    DEFERRED_DROPS.with(|q| q.borrow_mut().push(Box::new(val)));
+fn park<T: 'static>(val: T) {
+    PREFILL_TEMP_WINDOW.with(|w| {
+        if let Some(items) = w.borrow_mut().as_mut() {
+            items.push(Box::new(val));
+        }
+    });
 }
 
-/// Drop all deferred objects. Call after prefill stream sync.
-pub(crate) fn drain_deferred_drops() {
-    DEFERRED_DROPS.with(|q| q.borrow_mut().clear());
+/// Owns parked prefill temporaries until the override stream is synchronized.
+pub(crate) struct PrefillTempBin {
+    stream: Option<cudarc::driver::sys::CUstream>,
+    items: Vec<Box<dyn Any>>,
+}
+
+impl PrefillTempBin {
+    pub(crate) fn armed(stream: cudarc::driver::sys::CUstream) -> Self {
+        PREFILL_TEMP_WINDOW.with(|w| *w.borrow_mut() = Some(Vec::new()));
+        Self {
+            stream: Some(stream),
+            items: Vec::new(),
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        if let Some(mut captured) = PREFILL_TEMP_WINDOW.with(|w| w.borrow_mut().take()) {
+            self.items.append(&mut captured);
+        }
+    }
+
+    /// Drains the prefill stream; aborts if synchronization fails.
+    pub(crate) fn synchronize(&mut self) {
+        self.close();
+        if let Some(stream) = self.stream {
+            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(stream) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                log::error!(
+                    "FATAL: cuStreamSynchronize(prefill) failed ({r:?}); aborting rather than \
+                     free buffers the prefill stream may still be reading"
+                );
+                std::process::abort();
+            }
+            self.stream = None;
+            self.items.clear();
+        }
+    }
+}
+
+impl Drop for PrefillTempBin {
+    fn drop(&mut self) {
+        self.synchronize();
+    }
 }
 use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::HiddenStates;
@@ -102,7 +146,6 @@ impl Qwen3Model {
         let seq_len = token_ids.len();
         let hidden_dim = self.config.hidden_size;
 
-        // Copy token IDs to GPU
         let token_ids_gpu = self
             .ctx
             .stream
@@ -110,12 +153,13 @@ impl Qwen3Model {
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
-        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out)?;
-
-        // Defer drop of token_ids_gpu in SM-partition mode to prevent
-        // use-after-free (allocated on ctx.stream, kernel on green stream).
-        if openinfer_kernels::tensor::has_stream_override() {
-            defer_drop(token_ids_gpu);
+        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        let launched =
+            ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out);
+        park(token_ids_gpu);
+        if let Err(e) = launched {
+            park(out);
+            return Err(e);
         }
 
         Ok(out)
@@ -180,14 +224,14 @@ impl Qwen3Model {
         // 2. QKV projections from fused qkv_proj
         let q_dim = layer.attention.q_dim;
         let kv_dim = layer.attention.kv_dim;
-        ops::gemm_rows_into(
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &layer.attention.qkv_proj,
             0,
             q_dim,
             &bufs.normed,
             &mut bufs.q_batch,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -196,14 +240,14 @@ impl Qwen3Model {
             &mut bufs.q_batch,
             0,
         )?;
-        ops::gemm_rows_into(
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &layer.attention.qkv_proj,
             q_dim,
             kv_dim,
             &bufs.normed,
             &mut bufs.k_batch,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -212,14 +256,14 @@ impl Qwen3Model {
             &mut bufs.k_batch,
             0,
         )?;
-        ops::gemm_rows_into(
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &layer.attention.qkv_proj,
             q_dim + kv_dim,
             kv_dim,
             &bufs.normed,
             &mut bufs.v_batch,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -285,12 +329,12 @@ impl Qwen3Model {
         bufs: &mut PrefillBuffers,
     ) -> Result<()> {
         // 4. O projection → bufs.o_buf (as o_batch)
-        ops::gemm_into(
+        ops::gemm_into_checked(
             &self.ctx,
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -313,22 +357,22 @@ impl Qwen3Model {
 
         // 7. MLP: split gate/up GEMMs → silu_mul → down → bufs.o_buf
         let inter_dim = self.local_intermediate_size();
-        ops::gemm_rows_into(
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &layer.mlp.gate_up_proj,
             0,
             inter_dim,
             &bufs.normed,
             &mut bufs.gate_out,
-        );
-        ops::gemm_rows_into(
+        )?;
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &layer.mlp.gate_up_proj,
             inter_dim,
             inter_dim,
             &bufs.normed,
             &mut bufs.up_out,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -346,12 +390,12 @@ impl Qwen3Model {
             0,
         )?;
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
+        ops::gemm_into_checked(
             &self.ctx,
             &layer.mlp.down_proj,
             &bufs.act_out,
             &mut bufs.o_buf,
-        );
+        )?;
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -400,10 +444,21 @@ impl Qwen3Model {
         token_indices: &[i32],
     ) -> Result<HiddenStates> {
         let n = token_indices.len();
+        // Allocate all buffers up front so one producer fence orders them ahead
+        // of the override-stream gather/norm/GEMM.
         let indices_d = self.ctx.stream.clone_htod(token_indices)?;
         let mut gathered = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
-        ops::gather_hidden_tokens_into(&self.ctx, hidden, &indices_d, n, &mut gathered)?;
         let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
+        let mut logits = HiddenStates::zeros(&self.ctx, self.output_projection().rows, n)?;
+        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+
+        let gather =
+            ops::gather_hidden_tokens_into(&self.ctx, hidden, &indices_d, n, &mut gathered);
+        park(indices_d);
+        if let Err(e) = gather {
+            park(gathered);
+            return Err(e);
+        }
         ops::rms_norm_batch_into(
             &self.ctx,
             &gathered,
@@ -411,7 +466,15 @@ impl Qwen3Model {
             self.config.rms_norm_eps,
             &mut normed,
         );
-        ops::gemm(&self.ctx, self.output_projection(), &normed)
+        let gemm =
+            ops::gemm_into_checked(&self.ctx, self.output_projection(), &normed, &mut logits);
+        park(gathered);
+        park(normed);
+        if let Err(e) = gemm {
+            park(logits);
+            return Err(e);
+        }
+        Ok(logits)
     }
 
     /// Concatenates all prompts' tokens, runs one GEMM per layer for the
@@ -445,18 +508,15 @@ impl Qwen3Model {
         let seq_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
         let lora_ranges =
             build_lora_token_ranges(seq_lens.iter().copied(), lora_adapters.iter().copied());
-        let lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
+        let mut lora_groups = prepare_lora_token_groups(&self.ctx, &lora_ranges)?;
         let start_positions: Vec<usize> = kv_views
             .iter()
             .zip(prompts.iter())
             .map(|(v, p)| v.seq_len() - p.len())
             .collect();
 
-        // Concatenate all tokens
-        let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
-        let hidden = self.get_embeddings_batch(&all_tokens)?;
-
-        // Build batch plan from views
+        // Build the paged plan before launching embedding, so a plan-build
+        // failure can't strand an in-flight embedding the early return would skip.
         let page_indices: Vec<Vec<i32>> =
             kv_views.iter().map(|v| v.page_indices().to_vec()).collect();
         let last_page_lens: Vec<usize> = kv_views
@@ -475,52 +535,56 @@ impl Qwen3Model {
             PREFILL_ATTENTION_CTA_TILE_Q,
         )?;
 
-        // Forward through all layers
-        let (hidden, captured_hidden) = self.process_all_layers_batch_multi(
-            hidden,
-            layout,
-            kv_buffer,
-            &plan,
-            &lora_groups,
-            capture_layer_ids,
-        )?;
+        let all_tokens: Vec<u32> = prompts.iter().flat_map(|p| p.iter().copied()).collect();
+        let mut hidden = self.get_embeddings_batch(&all_tokens)?;
 
-        // All-position logits for echo (before we extract last-token logits)
-        let all_logits = if echo {
-            Some(self.compute_all_position_logits(&hidden)?)
-        } else {
-            None
-        };
+        // Failed launches may still leave kernels reading these inputs.
+        let result = self
+            .process_all_layers_batch_multi(
+                &mut hidden,
+                layout,
+                kv_buffer,
+                &plan,
+                &lora_groups,
+                capture_layer_ids,
+            )
+            .and_then(|captured_hidden| {
+                let all_logits = if echo {
+                    Some(self.compute_all_position_logits(&hidden)?)
+                } else {
+                    None
+                };
 
-        // Batched last-token logits (one lm_head GEMM for the whole batch)
-        let mut last_indices = Vec::with_capacity(batch_size);
-        let mut offset = 0usize;
-        for &seq_len in &seq_lens {
-            last_indices.push((offset + seq_len - 1) as i32);
-            offset += seq_len;
+                let mut last_indices = Vec::with_capacity(batch_size);
+                let mut offset = 0usize;
+                for &seq_len in &seq_lens {
+                    last_indices.push((offset + seq_len - 1) as i32);
+                    offset += seq_len;
+                }
+                let logits = self.batch_token_logits(&hidden, &last_indices)?;
+                Ok((logits, all_logits, captured_hidden))
+            });
+
+        for group in &mut lora_groups {
+            if let Some(indices) = group.token_indices_d.take() {
+                park(indices);
+            }
         }
-        let logits = self.batch_token_logits(&hidden, &last_indices)?;
+        park(hidden);
+        park(plan);
 
-        // In SM-partition mode (stream override active), defer dropping
-        // GPU-backed temp buffers until after the prefill stream is synced.
-        // Otherwise cuMemFreeAsync on ctx.stream races with green-stream kernels.
-        if openinfer_kernels::tensor::has_stream_override() {
-            defer_drop(hidden);
-            defer_drop(plan);
-        }
-
-        Ok((logits, all_logits, captured_hidden))
+        result
     }
 
     fn process_all_layers_batch_multi(
         &self,
-        mut hidden: HiddenStates,
+        hidden: &mut HiddenStates,
         layout: &KvLayout,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         plan: &PrefillPagedPlan,
         lora_groups: &[DeviceLoraTokenGroup<'_>],
         capture_layer_ids: Option<&[usize]>,
-    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
+    ) -> Result<Option<HiddenStates>> {
         let total_tokens = hidden.seq_len;
         let inter_dim = self.local_intermediate_size();
         let q_dim = self.local_q_dim();
@@ -557,36 +621,38 @@ impl Qwen3Model {
             total_tokens,
         )?;
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.forward_layer_batch_paged(
-                layer_idx,
-                layer,
-                &mut hidden,
-                kv_buffer,
-                layout,
-                plan,
-                lora_groups,
-                &mut bufs,
-            )?;
-            if capture_layer_ids.get(next_capture) == Some(&layer_idx) {
-                let out = captured_hidden
-                    .as_mut()
-                    .expect("capture buffer exists when ids are non-empty");
-                ops::copy_hidden_rows_into(
-                    &self.ctx,
-                    &hidden,
-                    out,
-                    next_capture * self.config.hidden_size,
+        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+
+        let run = (|| -> Result<()> {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                self.forward_layer_batch_paged(
+                    layer_idx,
+                    layer,
+                    hidden,
+                    kv_buffer,
+                    layout,
+                    plan,
+                    lora_groups,
+                    &mut bufs,
                 )?;
-                next_capture += 1;
+                if capture_layer_ids.get(next_capture) == Some(&layer_idx) {
+                    let out = captured_hidden
+                        .as_mut()
+                        .expect("capture buffer exists when ids are non-empty");
+                    ops::copy_hidden_rows_into(
+                        &self.ctx,
+                        hidden,
+                        out,
+                        next_capture * self.config.hidden_size,
+                    )?;
+                    next_capture += 1;
+                }
             }
-        }
+            Ok(())
+        })();
+        park(bufs);
+        run?;
 
-        // Defer drop of PrefillBuffers in SM-partition mode.
-        if openinfer_kernels::tensor::has_stream_override() {
-            defer_drop(bufs);
-        }
-
-        Ok((hidden, captured_hidden))
+        Ok(captured_hidden)
     }
 }

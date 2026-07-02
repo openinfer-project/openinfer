@@ -43,6 +43,7 @@ pub use openinfer_kernels::ops::gemm_graphsafe_into_checked;
 pub use openinfer_kernels::ops::gemm_graphsafe_ref_into_checked;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use openinfer_kernels::ops::gemm_into;
+#[cfg(not(feature = "kernel-call-trace"))]
 pub use openinfer_kernels::ops::gemm_into_checked;
 pub use openinfer_kernels::ops::gemm_lt_tune;
 pub use openinfer_kernels::ops::gemm_per_token;
@@ -87,6 +88,8 @@ pub use traced::embedding_batch;
 pub use traced::fused_add_rms_norm_batch_into;
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::gemm_into;
+#[cfg(feature = "kernel-call-trace")]
+pub use traced::gemm_into_checked;
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::gemm_rows_into;
 #[cfg(feature = "kernel-call-trace")]

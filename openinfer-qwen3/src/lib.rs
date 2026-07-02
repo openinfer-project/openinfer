@@ -487,6 +487,10 @@ pub fn start_engine_with_lora_control(
              unverified"
         );
     }
+    anyhow::ensure!(
+        matches!(decode_overlap, DecodeOverlap::Off),
+        "LoRA serving does not support --decode-overlap"
+    );
     apply_batch_invariant_policy(batch_invariant);
     scheduler::start_qwen3_with_lora_control(
         model_path,
@@ -498,7 +502,6 @@ pub fn start_engine_with_lora_control(
         no_prefix_cache,
         max_prefill_tokens,
         memory_options,
-        decode_overlap,
     )
 }
 

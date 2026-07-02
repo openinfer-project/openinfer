@@ -46,6 +46,39 @@ pub(crate) struct SendStream(pub CUstream);
 unsafe impl Send for SendStream {}
 unsafe impl Sync for SendStream {}
 
+/// Order `ctx.stream` producers (alloc/H2D/memset) before the override stream
+/// consumes them. No-op without an override.
+pub(crate) fn fence_producers_before_override(
+    ctx: &openinfer_core::tensor::DeviceContext,
+) -> Result<()> {
+    if !openinfer_kernels::tensor::has_stream_override() {
+        return Ok(());
+    }
+    let override_stream = openinfer_kernels::tensor::active_cu_stream(ctx);
+    let producer = ctx.stream.cu_stream();
+    unsafe {
+        let mut event: sys::CUevent = ptr::null_mut();
+        check_cu(
+            sys::cuEventCreate(
+                &raw mut event,
+                sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+            ),
+            "cuEventCreate (producer fence)",
+        )?;
+        let record = sys::cuEventRecord(event, producer);
+        let wait = if record == sys::CUresult::CUDA_SUCCESS {
+            sys::cuStreamWaitEvent(override_stream, event, 0)
+        } else {
+            record
+        };
+        let destroy = sys::cuEventDestroy_v2(event);
+        check_cu(record, "cuEventRecord (producer fence)")?;
+        check_cu(wait, "cuStreamWaitEvent (producer fence)")?;
+        check_cu(destroy, "cuEventDestroy (producer fence)")?;
+    }
+    Ok(())
+}
+
 /// Two CUDA streams used to overlap prefill and decode within one scheduler
 /// step. In [`DecodeOverlap::GreenCtx`] mode they are pinned to disjoint SM
 /// partitions via Green Contexts; in [`DecodeOverlap::SharedSm`] mode they are
@@ -248,10 +281,7 @@ impl OverlapStreams {
         // SM-pinned streams. If cuGreenCtxStreamCreate fails we do NOT silently
         // fall back to shared streams: the caller asked for an SM partition, so
         // failing loudly keeps benchmarks honest (use `--decode-overlap stream`
-        // for the partition-free two-stream path). The cross-stream buffer
-        // use-after-free that once surfaced as Xid 31/43 here is handled
-        // elsewhere — prefill temp buffers are kept alive until the prefill
-        // stream syncs (see `prefill::DEFERRED_DROPS`), not by avoiding this call.
+        // for the partition-free two-stream path).
         let mut decode_stream: CUstream = ptr::null_mut();
         let mut prefill_stream: CUstream = ptr::null_mut();
         let r1 = unsafe {

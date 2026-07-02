@@ -94,6 +94,15 @@ pub fn gemm_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) {
+    gemm_into_checked(ctx, weight, x, out).expect("GEMM launch failed");
+}
+
+pub fn gemm_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     if call_trace::is_enabled() {
         let label = call_trace::current_label("gemm");
         call_trace::record_call(gemm_call::<OutDim, InDim>(
@@ -103,7 +112,7 @@ pub fn gemm_into(
             x.seq_len,
         ));
     }
-    openinfer_kernels::ops::gemm_into(ctx, weight, x, out);
+    openinfer_kernels::ops::gemm_into_checked(ctx, weight, x, out)
 }
 
 pub fn gemm_token_range_into_checked(

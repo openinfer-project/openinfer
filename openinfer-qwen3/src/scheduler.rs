@@ -223,7 +223,6 @@ pub(crate) fn start_qwen3_with_lora_control(
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
-    decode_overlap: crate::DecodeOverlap,
 ) -> Result<EngineHandle> {
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
@@ -239,7 +238,6 @@ pub(crate) fn start_qwen3_with_lora_control(
         false,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-    executor.enable_decode_overlap(decode_overlap)?;
     Ok(start_with_executor_with_lora_control(
         executor,
         seed,
