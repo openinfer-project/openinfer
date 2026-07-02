@@ -8,15 +8,17 @@ import sys
 for path in sorted(
     sys.argv[1:],
     key=lambda p: (
-        p.split("/")[-1].split("-qps")[0],
-        float(re.search(r"qps([0-9.]+)", p).group(1)),
+        p.split("/")[-1].split("-")[0],
+        float(re.search(r"(?:qps|c)([0-9.]+)", p).group(1)),
     ),
 ):
     d = json.load(open(path))
-    qps = re.search(r"qps([0-9.]+)", path).group(1)
+    m = re.search(r"(?:qps|c)([0-9.]+)", path)
     name = path.split("/")[-1].split("-")[0]
+    label = "qps" if "qps" in path else "c"
+    val = m.group(1)
     print(
-        f"{name:>9} qps={qps:>4} dur={d['duration']:6.1f}s "
+        f"{name:>12} {label}={val:>4} dur={d['duration']:6.1f}s "
         f"completed={d['completed']} req/s={d['request_throughput']:.2f} "
         f"out_tok/s={d['output_throughput']:7.1f} "
         f"ttft p50={d['median_ttft_ms']:7.1f} p99={d['p99_ttft_ms']:8.1f} "
