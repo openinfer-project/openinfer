@@ -43,6 +43,7 @@ fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
     for &context in &args.contexts {
         let mut bench = Glm52MlaDecodeBench::new(context)?;
+        bench.verify_scratch_parity()?;
         let (gpu, wall) = bench.measure_forward(args.iters)?;
         let per = |d: std::time::Duration| d.as_secs_f64() * 1.0e6 / args.iters as f64;
         println!("== context {context} (iters {}) ==", args.iters);

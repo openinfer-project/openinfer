@@ -233,6 +233,50 @@ impl Glm52MlaDecodeBench {
         Ok((Duration::from_secs_f64(gpu_ms / 1_000.0), wall))
     }
 
+    /// Bitwise parity between the as-is forward and the scratch forward.
+    /// Weights and inputs are deterministic, and the scratch path runs the
+    /// exact same op sequence, so any mismatch is a real bug, not noise.
+    pub fn verify_scratch_parity(&mut self) -> Result<()> {
+        let expected = glm52_mla_decode_forward(
+            &self.ctx,
+            &self.weights,
+            &self.hidden,
+            &self.cos,
+            &self.sin,
+            &mut self.cache,
+            self.position,
+            &self.topk,
+            self.contract,
+        )?;
+        let expected = self.ctx.stream.clone_dtoh(&expected)?;
+        let mut scratch = Glm52MlaDecodeScratch::new(&self.ctx, self.contract)?;
+        glm52_mla_decode_forward_into(
+            &self.ctx,
+            &self.weights,
+            &self.hidden,
+            &self.cos,
+            &self.sin,
+            &mut self.cache,
+            self.position,
+            &self.topk,
+            self.contract,
+            &mut scratch,
+        )?;
+        let actual = self.ctx.stream.clone_dtoh(scratch.output())?;
+        self.ctx.sync()?;
+        let mismatches = expected
+            .iter()
+            .zip(&actual)
+            .filter(|(e, a)| e.to_bits() != a.to_bits())
+            .count();
+        anyhow::ensure!(
+            mismatches == 0,
+            "scratch forward diverges from as-is forward: {mismatches}/{} elements differ",
+            expected.len()
+        );
+        Ok(())
+    }
+
     /// One fp8 projection in isolation (its own quant + layout + GEMM chain,
     /// allocations included — exactly what the forward pays per projection).
     pub fn measure_projection(&mut self, which: &str, iters: u64) -> Result<Duration> {
