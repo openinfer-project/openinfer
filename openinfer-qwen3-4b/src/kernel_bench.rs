@@ -1053,6 +1053,11 @@ pub const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM;
 /// common case, and the cache read is position-indexed, so the span only has
 /// to be large enough that positions don't all hit one cache line.
 pub const DENSE_ROPE_CACHE_TOKENS: usize = 8192;
+/// Device-memory budget for the `gemm_lt_tune` weight-rotation copies of a
+/// projection-GEMM dense case — enough copies to keep the tuner's timing loop
+/// L2-cold (mirroring the executor's per-layer rotation) without exceeding
+/// small-VRAM cards for the lm_head shape.
+const TUNE_ROTATION_BUDGET_BYTES: usize = 2 << 30;
 
 /// The projection GEMM (out_dim, in_dim) shapes production launches — the same
 /// set `decode_projection_pin_shapes` warms for the Pin policy. Gate and up
@@ -1211,6 +1216,31 @@ impl DenseCase {
                 });
                 case.x = hidden_of(ctx, in_dim, rows, 0.01)?;
                 case.out = HiddenStates::zeros(ctx, out_dim, rows)?;
+                // Production decode GEMMs at N <= GEMM_LT_MAX_N run the
+                // cublasLt algo `gemm_lt_tune` selected at startup; an
+                // untuned context falls back to GemmEx and mis-ranks the
+                // small-N projections. Tune this shape on this thread the
+                // way the executor does — rotating enough weight copies to
+                // keep the timing loop L2-cold — then drop the copies (the
+                // tuned plan is keyed by shape, not pointer).
+                if rows <= openinfer_kernels::ops::GEMM_LT_MAX_N {
+                    let weight_bytes = out_dim * in_dim * size_of::<bf16>();
+                    let extra_copies = (TUNE_ROTATION_BUDGET_BYTES / weight_bytes).clamp(1, 8) - 1;
+                    let rotation: Vec<DeviceMatrix> = (0..extra_copies)
+                        .map(|_| {
+                            Ok(DeviceMatrix {
+                                data: ctx.stream.alloc_zeros(out_dim * in_dim)?,
+                                rows: out_dim,
+                                cols: in_dim,
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    let samples: Vec<(&DeviceMatrix, usize)> =
+                        std::iter::once((case.weight.as_ref().expect("gemm weight"), 0))
+                            .chain(rotation.iter().map(|weight| (weight, 0)))
+                            .collect();
+                    openinfer_kernels::ops::gemm_lt_tune(ctx, &samples, out_dim, rows)?;
+                }
             }
             DenseKernelKind::RmsNorm => {
                 case.norm_weight = Some(DeviceVec::from_host(ctx, &vec![bf16::ONE; HIDDEN_SIZE])?);
