@@ -83,6 +83,31 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 8.0)]
     pub kv_offload_host_gib: f64,
 
+    /// Join the cross-instance KV P2P mesh: pegaflow MetaServer gRPC address
+    /// (e.g. `http://127.0.0.1:50056`). Saved block hashes register there and
+    /// missing prefixes are pulled from peer instances over RDMA — the P/D
+    /// disaggregation data plane. Requires --kv-offload, --kv-p2p-advertise-addr
+    /// and --kv-p2p-nics.
+    #[arg(long, requires_all = ["kv_offload", "kv_p2p_advertise_addr", "kv_p2p_nics"])]
+    pub kv_p2p_metaserver_addr: Option<String>,
+
+    /// This instance's routable host:port for KV P2P — peers dial it for RDMA
+    /// handshakes and block queries (also the embedded transfer-service listen
+    /// address). Must be reachable by every peer; not 0.0.0.0.
+    #[arg(long, requires = "kv_p2p_metaserver_addr")]
+    pub kv_p2p_advertise_addr: Option<String>,
+
+    /// RDMA NIC device names for KV P2P (e.g. `mlx5_0`), comma-separated.
+    #[arg(long, value_delimiter = ',', requires = "kv_p2p_metaserver_addr")]
+    pub kv_p2p_nics: Vec<String>,
+
+    /// P/D prefill role: barrier each request's KV saves (host tier +
+    /// MetaServer registration) before its final token event, so this
+    /// instance's HTTP response doubles as the KV-ready signal a router can
+    /// act on. Leave off on decode instances.
+    #[arg(long, default_value_t = false, requires = "kv_p2p_metaserver_addr")]
+    pub kv_p2p_flush_on_finish: bool,
+
     /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
     /// matching outright (every prefill recomputes the full prompt). With
     /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every

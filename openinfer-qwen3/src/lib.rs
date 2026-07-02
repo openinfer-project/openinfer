@@ -85,11 +85,33 @@ pub use green_ctx::DecodeOverlap;
 /// and prefetches CPU-resident prefixes back into HBM before prefill, so a
 /// prompt that has fallen out of the GPU cache still skips recompute. Only the
 /// single-GPU topology is supported (tensor parallel shards KV per rank).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3OffloadOptions {
     pub enabled: bool,
     /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
     pub pinned_pool_bytes: usize,
+    /// `Some` joins the cross-instance P2P mesh: block hashes register with a
+    /// MetaServer, peers pull missing prefixes over RDMA, and this engine
+    /// serves theirs. The P/D disaggregation data plane.
+    pub p2p: Option<Qwen3P2pOptions>,
+}
+
+/// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen3P2pOptions {
+    /// MetaServer gRPC address, e.g. `http://127.0.0.1:50056`.
+    pub metaserver_addr: String,
+    /// This engine's routable `host:port`; peers dial it for RDMA handshakes
+    /// and block queries. Also the P2P gRPC listen address.
+    pub advertise_addr: String,
+    /// RDMA NIC device names (e.g. `mlx5_0`).
+    pub rdma_nics: Vec<String>,
+    /// Barrier a request's KV saves (host tier + MetaServer registration)
+    /// before its `Finished` event is emitted. The prefill role in a P/D
+    /// deployment turns this on so its HTTP response *is* the KV-ready signal;
+    /// costs one write-pipeline + registration drain per finishing step, so
+    /// leave it off on decode/serving instances.
+    pub flush_on_finish: bool,
 }
 
 impl Qwen3OffloadOptions {
@@ -100,6 +122,7 @@ impl Qwen3OffloadOptions {
         Self {
             enabled: false,
             pinned_pool_bytes: 0,
+            p2p: None,
         }
     }
 
@@ -107,7 +130,14 @@ impl Qwen3OffloadOptions {
         Self {
             enabled: true,
             pinned_pool_bytes,
+            p2p: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_p2p(mut self, p2p: Qwen3P2pOptions) -> Self {
+        self.p2p = Some(p2p);
+        self
     }
 }
 

@@ -15,7 +15,7 @@
 
 mod engine;
 
-pub use engine::{LoadHandle, OffloadConfig, OffloadEngine, QueryHit};
+pub use engine::{LoadHandle, OffloadConfig, OffloadEngine, P2pConfig, QueryHit, QueryOutcome};
 
 // Re-exported so callers name pegaflow's engine types through this bridge.
 pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};

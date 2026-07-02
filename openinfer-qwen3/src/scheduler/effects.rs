@@ -109,6 +109,22 @@ pub(super) fn apply_effects(
     prefilling: &mut Vec<PendingRequest>,
     effects: StepEffects,
 ) {
+    // P/D prefill role: make this step's KV saves query-visible (host tier +
+    // MetaServer) before any `Finished` event leaves — the client treats the
+    // HTTP response as the KV-ready signal. One barrier covers the whole step.
+    // No-op unless the executor opted in (`flush_on_finish`).
+    let step_finishes = effects
+        .decode
+        .iter()
+        .any(|e| !matches!(e, DecodeEffect::EmitAndContinue { .. } | DecodeEffect::EmitManyAndContinue { .. }))
+        || effects
+            .pending
+            .iter()
+            .any(|e| !matches!(e, PendingEffect::ContinuePrefill { .. } | PendingEffect::Promote { .. }));
+    if step_finishes {
+        executor.flush_offload_for_handoff();
+    }
+
     for scheduled in effects.scheduled {
         let _ = scheduled.token_tx.send(TokenEvent::Scheduled {
             queued_at_unix_s: scheduled
