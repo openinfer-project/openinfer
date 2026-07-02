@@ -14,16 +14,8 @@ pub(crate) struct Eagle3RequestState {
     v: HiddenStates,
     cached_len: usize,
     max_cache_len: usize,
-    /// The **target** fused feature `[3 * hidden, 1]` at the last committed
-    /// position — the EAGLE-3 boundary feature. The chain seeds from `fc(this)`;
-    /// the re-seed also reuses it as the boundary column. Stored *pre-`fc`* (the
-    /// raw 3-layer concat) so the re-seed can teacher-force it uniformly with the
-    /// verify capture. `Some` once a prompt is captured.
-    ///
-    /// EAGLE pairs feature `f_p` with the *next* token's embedding `e_{p+1}` to
-    /// predict `t_{p+2}`; this is the feature at the position just before the
-    /// current token, which the target already computed (vs the current token's
-    /// own feature, which needs another target forward).
+    /// Boundary target feature `[3 * hidden, 1]` at the last committed position
+    /// For target injection
     seed_feature: Option<HiddenStates>,
 }
 
@@ -39,13 +31,11 @@ impl Eagle3RequestState {
 }
 
 /// Single-token draft scratch (`seq_len == 1` everywhere). v1 runs one request,
-/// one token at a time — batching the draft chain is a follow-up (mirrors DFlash's
-/// batched lane). The residual stream is `hidden`-dim; the `2 * hidden` width is
-/// only the attention input (`attn_input`).
+/// one token at a time — batching the draft chain is a follow-up
 pub(crate) struct Eagle3Scratch {
     token_id_d: CudaSlice<u32>,
     embed: HiddenStates,         // [hidden, 1]
-    hidden: HiddenStates,        // [hidden, 1] residual stream, carried across steps
+    hidden: HiddenStates,        // [hidden, 1] residual stream
     normed_embed: HiddenStates,  // [hidden, 1]
     normed_hidden: HiddenStates, // [hidden, 1]
     attn_input: HiddenStates,    // [2 * hidden, 1]
@@ -86,8 +76,6 @@ impl Eagle3DraftModel {
             self.config.max_position_embeddings
         );
         let kv_dim = self.kv_dim();
-        // seq_len stays at the full cache length: writes target a token range and
-        // attention reads a `kv_len` prefix, both within this allocation.
         let k = HiddenStates::zeros(ctx, kv_dim, max_cache_len)?;
         let v = HiddenStates::zeros(ctx, kv_dim, max_cache_len)?;
         Ok(Eagle3RequestState {
@@ -127,10 +115,7 @@ impl Eagle3DraftModel {
         })
     }
 
-    /// Seed the residual stream for the first draft step from the captured target
-    /// features. `context_features` is `[3 * hidden, 1]` — the concatenated
-    /// low/mid/high target hidden state for one position. `fc` fuses it to
-    /// `[hidden, 1]`; `hidden_norm` is applied later, inside the step.
+    /// hidden state fuser for test
     pub(crate) fn seed_hidden_from_context(
         &self,
         ctx: &DeviceContext,
@@ -153,7 +138,7 @@ impl Eagle3DraftModel {
     }
 
     fn fc_input_dim(&self) -> usize {
-        // fc: [hidden, 3 * hidden] — its input columns define the captured-feature dim.
+        // fc: [hidden, 3 * hidden] , 3 * hidden for fuser input
         self.fc.cols
     }
 
@@ -264,13 +249,11 @@ impl Eagle3DraftModel {
         ops::copy_hidden_token_range_into(ctx, &scratch.v, 0, &mut state.v, position, 1)?;
         let kv_len = position + 1;
 
-        // 7. Attention: the single query attends the whole [0, kv_len) prefix.
-        // For one query, non-causal over the prefix is exactly causal.
-        ops::single_prefill_nhd_noncausal_into(
+        // 7. Attention: single-query decode — the one draft query attends the whole
+        // [0, kv_len) prefix of the draft's contiguous KV.
+        ops::single_decode_nhd_into(
             ctx,
             &scratch.q,
-            0,
-            1,
             &state.k,
             &state.v,
             &mut scratch.attn_out,
@@ -323,8 +306,7 @@ impl Eagle3DraftModel {
             &mut scratch.mlp_out,
         );
 
-        // 11. Residual + final norm. `hidden` now carries the decoder output (the
-        // recurrence input for the next step); `normed_final` feeds the draft head.
+        // 11. Residual + final norm.
         openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
             &mut scratch.hidden,
@@ -346,15 +328,8 @@ impl Eagle3DraftModel {
         Ok(&scratch.logits)
     }
 
-    /// Batched teacher-forced prefill: the whole chain runs over all
-    /// `N = tokens.len()` positions in one forward, with a **single causal
-    /// attention** (`single_prefill_nhd_causal_into`). Each position is fc-seeded
-    /// from its own captured target feature (`features` column `i`), so this is
-    /// numerically equivalent to a per-token `draft_step` loop (both teacher-forced
-    /// and causal) but one batched pass. Returns `(logits [draft_vocab, N],
-    /// last_hidden [hidden, 1])` — the per-position draft logits and the last
-    /// position's decoder output, which seeds the autoregressive draft chain.
-    ///
+    /// Teacher-forced prefil for EAGLE Draft
+    /// Returns `(logits [draft_vocab, N], last_hidden [hidden, 1])`
     /// Buffers are allocated inline (prefill is one-shot, `N` varies). Does not use
     /// the single-token `Eagle3Scratch`. `tokens[i]` sits at `start_position + i`.
     pub(crate) fn prefill_batched(
@@ -990,6 +965,126 @@ mod tests {
             state.cached_len(),
             n + k,
             "chain appends one KV position per drafted token"
+        );
+    }
+
+    /// EAGLE-3 drafter **golden gate**: replay a seed-pinned batched prefill and
+    /// compare per-position draft logits against the OFFICIAL SafeAILab/EAGLE
+    /// drafter's reference (fixture from `tools/accuracy/dump_qwen3_4b_eagle3_golden.py`).
+    ///
+    /// This is the real correctness check — it validates the whole drafter forward
+    /// (fc fusion, `eagle3_rope`, the NHD attention kernels, mlp, head) against an
+    /// INDEPENDENT implementation. A numeric bug that only degrades acceptance is
+    /// invisible to the losslessness gate (verify is drafter-agnostic) and to a
+    /// kernel-vs-kernel consistency check (a shared bug cancels); it is caught here.
+    #[test]
+    #[ignore = "requires GPU + Qwen3-4B target, EAGLE-3 drafter, and the golden fixture"]
+    fn eagle3_drafter_golden_gate() {
+        const GOLDEN: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_data/qwen3-4b-eagle3-golden.safetensors"
+        );
+        if !std::path::Path::new(GOLDEN).exists() {
+            eprintln!(
+                "skipping eagle3 drafter golden gate: {GOLDEN} missing \
+                 (regenerate with tools/accuracy/dump_qwen3_4b_eagle3_golden.py)"
+            );
+            return;
+        }
+        let Some((target, drafter)) = load_or_skip() else {
+            return;
+        };
+        let ctx = target.device_ctx();
+
+        let bytes = std::fs::read(GOLDEN).expect("read golden");
+        let st = safetensors::SafeTensors::deserialize(&bytes).expect("parse golden");
+        let read_i32 = |name: &str| -> Vec<i32> {
+            st.tensor(name)
+                .unwrap_or_else(|_| panic!("golden missing {name}"))
+                .data()
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        let read_f32 = |name: &str| -> (Vec<f32>, Vec<usize>) {
+            let t = st
+                .tensor(name)
+                .unwrap_or_else(|_| panic!("golden missing {name}"));
+            let v = t
+                .data()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            (v, t.shape().to_vec())
+        };
+        let read_bf16 = |name: &str| -> Vec<half::bf16> {
+            st.tensor(name)
+                .unwrap_or_else(|_| panic!("golden missing {name}"))
+                .data()
+                .chunks_exact(2)
+                .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .collect()
+        };
+
+        let tokens: Vec<u32> = read_i32("tokens").iter().map(|&t| t as u32).collect();
+        let features_host = read_bf16("features"); // [N, 3h] token-major flat == HiddenStates layout
+        let (ref_logits, ref_shape) = read_f32("logits"); // [N, dvoc]
+        let n = tokens.len();
+        let dvoc = drafter.config.draft_vocab_size;
+        let feat_dim = 3 * drafter.config.hidden_size; // fc input = 3 aux layers
+        assert_eq!(ref_shape, vec![n, dvoc], "golden logits shape");
+        assert_eq!(features_host.len(), n * feat_dim, "golden features size");
+
+        let features = HiddenStates::from_host(ctx, &features_host, feat_dim, n).expect("features");
+        let mut state = drafter
+            .new_request_state(ctx, (n + 4).max(8))
+            .expect("request state");
+        let (logits, _last) = drafter
+            .prefill_batched(&target, &mut state, &features, &tokens, 0)
+            .expect("prefill");
+        let host = logits.to_host(ctx).expect("logits host"); // [dvoc, N] token-major
+        assert_eq!(host.len(), n * dvoc);
+
+        // Per position, score the Rust drafter's argmax pick *in the reference
+        // distribution* — its regret below the reference's own top logit. regret==0
+        // is an exact argmax match; a tiny regret is a benign bf16 tie the two
+        // implementations resolve differently (robust where strict argmax equality
+        // would be brittle). Also track the worst full-vector logit deviation.
+        let mut max_regret_rel = 0f32;
+        let mut max_rel = 0f32;
+        for s in 0..n {
+            let rust = &host[s * dvoc..(s + 1) * dvoc];
+            let refl = &ref_logits[s * dvoc..(s + 1) * dvoc];
+            let (a_rust, a_ref) = (argmax(rust), argmax(refl));
+            let ref_top = refl[a_ref];
+            let scale = refl.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            let regret_rel = (ref_top - refl[a_rust]).max(0.0) / scale;
+            let d = rust
+                .iter()
+                .zip(refl)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            max_regret_rel = max_regret_rel.max(regret_rel);
+            max_rel = max_rel.max(d / scale);
+            eprintln!(
+                "pos {s}: rust argmax={a_rust} ref argmax={a_ref} regret/scale={regret_rel:.4} \
+                 max|Δ|/scale={:.4}",
+                d / scale
+            );
+        }
+        eprintln!(
+            "eagle3 drafter golden: max argmax-regret={max_regret_rel:.4}, max rel logit Δ={max_rel:.4}"
+        );
+        // Acceptance-relevant invariant: the Rust drafter's pick is the reference's
+        // own top (or a bf16 tie with it).
+        assert!(
+            max_regret_rel < 0.02,
+            "drafter argmax diverged from the official EAGLE reference: max regret/scale={max_regret_rel}"
+        );
+        // Full-vector logits differ only by bf16 accumulation across two implementations.
+        assert!(
+            max_rel < 0.15,
+            "drafter logits diverge from the official EAGLE reference: max rel Δ={max_rel}"
         );
     }
 }

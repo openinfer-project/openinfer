@@ -49,6 +49,7 @@ openinfer-qwen3 = { workspace = true, features = ["test-fixtures"] }
 openinfer-vllm-support = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-subscriber = { workspace = true }
 vllm-text = { workspace = true }
 
 [[bin]]

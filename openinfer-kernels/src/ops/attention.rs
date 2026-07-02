@@ -917,6 +917,67 @@ pub fn single_prefill_nhd_noncausal_into(
     Ok(())
 }
 
+/// Single-query **decode** over a contiguous NHD KV cache — the draft chain's
+/// per-step attention. One query (`q.seq_len == 1`) attends the whole `[0, kv_len)`
+/// prefix. Numerically identical to [`single_prefill_nhd_noncausal_into`] with
+/// `q_seq_len == 1` (for one query, non-causal over the prefix *is* causal), but
+/// backed by FlashInfer's dedicated single-query decode path, which is
+/// structurally single-query — the `assert_eq!(q.seq_len, 1)` here makes that a
+/// hard contract so it can't be misused for a multi-query batch.
+///
+/// `q`/`output` are `[q_dim, 1]` and the k/v caches are the request's own whole
+/// buffers `[kv_dim, max_seq_len]` (NHD token-major). No RoPE inside — the caller
+/// applies [`eagle3_rope_into`] first.
+#[allow(clippy::too_many_arguments)]
+pub fn single_decode_nhd_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(
+        q.seq_len, 1,
+        "single_decode_nhd is single-query; got q.seq_len {}",
+        q.seq_len
+    );
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, 1);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::single_decode_nhd_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("single_decode_nhd_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
 /// Causal NHD single-sequence prefill. Same contract as
 /// [`single_prefill_nhd_noncausal_into`] but with a causal mask: the `q_seq_len`
 /// query rows are the tail of the cache (positions `kv_len - q_seq_len ..kv_len`),

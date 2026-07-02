@@ -3614,6 +3614,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing-subscriber",
  "vllm-text",
 ]
 

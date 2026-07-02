@@ -512,6 +512,22 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // Single-query NHD decode over a contiguous KV cache (FlashInfer SingleDecode,
+    // no partition-KV). Structurally one query, so there is no `seq_len` parameter.
+    pub fn single_decode_nhd_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
     pub fn paged_attention_decode_cuda(
         q: *const Half,

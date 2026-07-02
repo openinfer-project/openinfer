@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_core::sampler::SamplingParams;
 use openinfer_qwen3::{
-    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap,
-    Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
+    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE, DEFAULT_MAX_PREFILL_TOKENS,
+    DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
 };
 
 mod common;
@@ -59,9 +59,16 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         offload: Qwen3OffloadOptions::disabled(),
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
-        memory: Qwen3MemoryOptions::new(0.85, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES)
-            .validate()
-            .expect("valid memory options"),
+        memory: Qwen3MemoryOptions::new(
+            std::env::var("OPENINFER_TEST_MEM_UTIL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.85),
+            DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+            DEFAULT_KV_PAGE_SIZE,
+        )
+        .validate()
+        .expect("valid memory options"),
         lora: None,
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
@@ -121,6 +128,11 @@ fn measure(handle: &EngineHandle, prompts: &[Vec<u32>]) -> f64 {
 
 #[test]
 fn eagle3_speculative_single_stream_speedup() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         eprintln!(
             "skipping eagle3 perf A/B: set OPENINFER_TEST_MODEL_PATH + OPENINFER_EAGLE3_TEST_MODEL_PATH"

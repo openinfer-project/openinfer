@@ -60,7 +60,10 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
         memory: Qwen3MemoryOptions::new(
-            0.85,
+            std::env::var("OPENINFER_TEST_MEM_UTIL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.85),
             DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
             DEFAULT_KV_PAGE_SIZE,
         )
@@ -125,6 +128,13 @@ fn measure(handle: &EngineHandle, prompts: &[Vec<u32>]) -> f64 {
 
 #[test]
 fn dflash_speculative_single_stream_speedup() {
+    // Route the DFlash lane's `cumulative_accept_rate` debug trace to stderr so
+    // `RUST_LOG=openinfer_qwen3_4b=debug` surfaces acceptance alongside speedup.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         eprintln!(
             "skipping dflash perf A/B: set OPENINFER_TEST_MODEL_PATH + OPENINFER_DFLASH_TEST_MODEL_PATH"
