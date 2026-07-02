@@ -138,6 +138,66 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
 ) -> Result<()> {
     shape.validate()?;
 
+    let q_need = shape.batch_size
+        * shape.next_n
+        * shape.num_heads
+        * shape.head_dim
+        * GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE;
+    ensure!(
+        q.len() >= q_need,
+        "GLM5.2 DeepGEMM MQA q too small: have {}, need {q_need}",
+        q.len()
+    );
+    let kv_need =
+        shape.num_kv_blocks * shape.block_kv * shape.head_dim * GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE;
+    ensure!(
+        kv_cache.len() >= kv_need,
+        "GLM5.2 DeepGEMM MQA kv_cache too small: have {}, need {kv_need}",
+        kv_cache.len()
+    );
+    ensure!(
+        kv_cache_scales.len() >= shape.num_kv_blocks * shape.block_kv,
+        "GLM5.2 DeepGEMM MQA kv_cache_scales too small: have {}, need {}",
+        kv_cache_scales.len(),
+        shape.num_kv_blocks * shape.block_kv
+    );
+    let w_need =
+        shape.batch_size * shape.next_n * shape.num_heads * GLM52_DEEPGEMM_MQA_FP8_ELEM_SIZE;
+    ensure!(
+        weights.len() >= w_need,
+        "GLM5.2 DeepGEMM MQA weights too small: have {}, need {w_need}",
+        weights.len()
+    );
+    let cl_need = if shape.is_context_lens_2d {
+        shape.batch_size * 2
+    } else {
+        shape.batch_size
+    };
+    ensure!(
+        context_lens.len() >= cl_need,
+        "GLM5.2 DeepGEMM MQA context_lens too small: have {}, need {cl_need}",
+        context_lens.len()
+    );
+    let logits_need =
+        shape.batch_size * shape.next_n * shape.logits_stride * GLM52_DEEPGEMM_MQA_BF16_ELEM_SIZE;
+    ensure!(
+        logits.len() >= logits_need,
+        "GLM5.2 DeepGEMM MQA logits too small: have {}, need {logits_need}",
+        logits.len()
+    );
+    ensure!(
+        block_table.len() >= shape.batch_size * shape.block_table_stride,
+        "GLM5.2 DeepGEMM MQA block_table too small: have {}, need {}",
+        block_table.len(),
+        shape.batch_size * shape.block_table_stride
+    );
+    ensure!(
+        schedule_meta.len() >= shape.schedule_metadata_len(),
+        "GLM5.2 DeepGEMM MQA schedule_meta too small: have {}, need {}",
+        schedule_meta.len(),
+        shape.schedule_metadata_len()
+    );
+
     let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
     let (kv_ptr, _kv_guard) = kv_cache.device_ptr(&ctx.stream);
     let (kvs_ptr, _kvs_guard) = kv_cache_scales.device_ptr(&ctx.stream);
