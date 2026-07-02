@@ -99,10 +99,12 @@ impl Qwen3Model {
         let total_reqs = num_prefill_reqs + profile_decode_rows;
         let params = vec![SamplingParams::default(); total_reqs];
         let param_refs: Vec<&SamplingParams> = params.iter().collect();
+        let steps = vec![0u64; param_refs.len()];
         let _ = openinfer_sample::select_batch(
             self.device_ctx(),
             &logits,
             &param_refs,
+            &steps,
             0,
             sample_scratch,
         )?;

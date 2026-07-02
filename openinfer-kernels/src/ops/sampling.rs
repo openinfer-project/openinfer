@@ -8,7 +8,9 @@ use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
 ///
 /// `temperature` must be > 0 and `top_p` in (0, 1] — greedy rows
 /// (`temperature <= 0` or `top_k == 1`) belong on the argmax path.
-/// `top_k <= 0` means disabled.
+/// `top_k <= 0` means disabled. `min_p` in [0, 1); `0.0` means disabled —
+/// `gpu_sample_batch_into` partitions min_p rows into their own pass, so
+/// callers may mix freely.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchSamplingRow {
     /// Row index into the logits arena.
@@ -16,6 +18,7 @@ pub struct BatchSamplingRow {
     pub temperature: f32,
     pub top_k: i32,
     pub top_p: f32,
+    pub min_p: f32,
 }
 
 /// Device buffers for `gpu_sample_batch_into`, sized for `max_rows` x `vocab`.
@@ -25,6 +28,8 @@ pub struct BatchSamplingScratch {
     temperature: CudaSlice<f32>,
     top_k: CudaSlice<i32>,
     top_p: CudaSlice<f32>,
+    min_p: CudaSlice<f32>,
+    topk_row_states: CudaSlice<u8>,
     valid: CudaSlice<u8>,
     out: CudaSlice<i32>,
     softmax_workspace: CudaSlice<u8>,
@@ -41,6 +46,7 @@ impl BatchSamplingScratch {
         // OnlineSoftmax vocab-splitting path: batch x ceil(vocab / 8192)
         // partials of {f32 max, f32 denominator}, plus alignment slack.
         let softmax_workspace_bytes = max_rows * vocab.div_ceil(8192) * 8 + 256;
+        let topk_row_states_bytes = unsafe { ffi::gpu_sample_topk_renorm_row_states_bytes_cuda() };
         let alloc = |n: usize| -> Result<CudaSlice<f32>> {
             ctx.stream
                 .alloc_zeros(n)
@@ -52,6 +58,8 @@ impl BatchSamplingScratch {
             temperature: alloc(max_rows)?,
             top_k: ctx.stream.alloc_zeros(max_rows)?,
             top_p: alloc(max_rows)?,
+            min_p: alloc(max_rows)?,
+            topk_row_states: ctx.stream.alloc_zeros(topk_row_states_bytes)?,
             valid: ctx.stream.alloc_zeros(max_rows)?,
             out: ctx.stream.alloc_zeros(max_rows)?,
             softmax_workspace: ctx.stream.alloc_zeros(softmax_workspace_bytes)?,
@@ -72,7 +80,48 @@ impl BatchSamplingScratch {
 /// `seed` must be fresh per decode step (one philox seed per call; rows
 /// decorrelate through the philox subsequence). Returns one token per row, in
 /// `rows` order.
+///
+/// min_p rows run as their own pass: if they shared a call, every row would
+/// ride the min_p kernel, whose u-scaling (`u * q`) and survivor predicate
+/// differ from the fused fast path — a min_p == 0 row could then sample a
+/// different token than it would alone. Partitioning here (not in callers)
+/// keeps "min_p == 0 rows take the original path" true for every caller, at
+/// the cost of a second full pass (gather + softmax + sample, own sync) only
+/// when a batch actually mixes.
 pub fn gpu_sample_batch_into(
+    ctx: &DeviceContext,
+    logits: HiddenStatesRef<'_>,
+    rows: &[BatchSamplingRow],
+    seed: u64,
+    scratch: &mut BatchSamplingScratch,
+) -> Result<Vec<u32>> {
+    if rows.iter().all(|r| r.min_p > 0.0) || rows.iter().all(|r| r.min_p <= 0.0) {
+        return sample_uniform_batch_into(ctx, logits, rows, seed, scratch);
+    }
+    let (minp, plain): (Vec<BatchSamplingRow>, Vec<BatchSamplingRow>) =
+        rows.iter().copied().partition(|r| r.min_p > 0.0);
+    let plain_tokens = sample_uniform_batch_into(ctx, logits, &plain, seed, scratch)?;
+    // Distinct philox key for the second pass: both passes restart their
+    // subsequences at 0, so reusing `seed` would hand minp row i the same
+    // uniform stream as plain row i and correlate their tokens.
+    let minp_seed = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let minp_tokens = sample_uniform_batch_into(ctx, logits, &minp, minp_seed, scratch)?;
+    let mut plain_it = plain_tokens.into_iter();
+    let mut minp_it = minp_tokens.into_iter();
+    Ok(rows
+        .iter()
+        .map(|r| {
+            if r.min_p > 0.0 {
+                minp_it.next().expect("minp token per minp row")
+            } else {
+                plain_it.next().expect("plain token per plain row")
+            }
+        })
+        .collect())
+}
+
+/// One homogeneous FlashInfer pass (rows are all-min_p or all-plain).
+fn sample_uniform_batch_into(
     ctx: &DeviceContext,
     logits: HiddenStatesRef<'_>,
     rows: &[BatchSamplingRow],
@@ -97,8 +146,10 @@ pub fn gpu_sample_batch_into(
     let mut temperature = Vec::with_capacity(n);
     let mut top_k = Vec::with_capacity(n);
     let mut top_p = Vec::with_capacity(n);
+    let mut min_p = Vec::with_capacity(n);
     let mut has_top_k_filter = false;
     let mut has_top_p_filter = false;
+    let mut has_min_p_filter = false;
     for r in rows {
         ensure!(
             r.row < logits.seq_len,
@@ -116,6 +167,11 @@ pub fn gpu_sample_batch_into(
             "batch sampling top_p {} must be in (0, 1]",
             r.top_p
         );
+        ensure!(
+            (0.0..1.0).contains(&r.min_p) && r.min_p.is_finite(),
+            "batch sampling min_p {} must be in [0, 1)",
+            r.min_p
+        );
         row_indices.push(i32::try_from(r.row)?);
         temperature.push(r.temperature);
         // FlashInfer reads top_k as u32; "disabled" is any k >= vocab.
@@ -131,6 +187,10 @@ pub fn gpu_sample_batch_into(
             has_top_p_filter = true;
         }
         top_p.push(r.top_p);
+        if r.min_p > 0.0 {
+            has_min_p_filter = true;
+        }
+        min_p.push(r.min_p);
     }
     ctx.stream
         .memcpy_htod(&row_indices, &mut scratch.row_indices)?;
@@ -138,6 +198,9 @@ pub fn gpu_sample_batch_into(
         .memcpy_htod(&temperature, &mut scratch.temperature)?;
     ctx.stream.memcpy_htod(&top_k, &mut scratch.top_k)?;
     ctx.stream.memcpy_htod(&top_p, &mut scratch.top_p)?;
+    if has_min_p_filter {
+        ctx.stream.memcpy_htod(&min_p, &mut scratch.min_p)?;
+    }
 
     {
         let softmax_workspace_bytes = scratch.softmax_workspace.len();
@@ -147,6 +210,15 @@ pub fn gpu_sample_batch_into(
         let (temp_ptr, _gt) = scratch.temperature.device_ptr(&ctx.stream);
         let (top_k_ptr, _gk) = scratch.top_k.device_ptr(&ctx.stream);
         let (top_p_ptr, _gtp) = scratch.top_p.device_ptr(&ctx.stream);
+        let (min_p_ptr, _gmp) = scratch.min_p.device_ptr(&ctx.stream);
+        // topk_row_states is only read on the min_p pipeline; the fast path
+        // hands the kernel a null instead of borrowing the buffer.
+        let row_states = if has_min_p_filter {
+            Some(scratch.topk_row_states.device_ptr_mut(&ctx.stream))
+        } else {
+            None
+        };
+        let row_states_ptr = row_states.as_ref().map_or(0, |(ptr, _guard)| *ptr);
         let (valid_ptr, _gv) = scratch.valid.device_ptr_mut(&ctx.stream);
         let (out_ptr, _go) = scratch.out.device_ptr_mut(&ctx.stream);
         let (ws_ptr, _gw) = scratch.softmax_workspace.device_ptr_mut(&ctx.stream);
@@ -159,6 +231,12 @@ pub fn gpu_sample_batch_into(
                 temp_ptr as *const f32,
                 top_k_ptr as *const i32,
                 top_p_ptr as *const f32,
+                if has_min_p_filter {
+                    min_p_ptr as *const f32
+                } else {
+                    std::ptr::null()
+                },
+                row_states_ptr as *mut u8,
                 valid_ptr as *mut u8,
                 out_ptr as *mut i32,
                 ws_ptr as *mut u8,
@@ -566,18 +644,21 @@ mod tests {
                 temperature: 1.0,
                 top_k: 5,
                 top_p: 1.0,
+                min_p: 0.0,
             },
             BatchSamplingRow {
                 row: 4,
                 temperature: 1.0,
                 top_k: -1,
                 top_p: 0.5,
+                min_p: 0.0,
             },
             BatchSamplingRow {
                 row: 6,
                 temperature: 0.05,
                 top_k: -1,
                 top_p: 1.0,
+                min_p: 0.0,
             },
         ];
 
@@ -614,6 +695,7 @@ mod tests {
             temperature: 1.0,
             top_k: -1,
             top_p: 1e-6,
+            min_p: 0.0,
         }];
         let tokens =
             gpu_sample_batch_into(&ctx, logits.as_ref(), &rows, 17, &mut scratch).expect("sample");
@@ -633,12 +715,14 @@ mod tests {
                 temperature: 1.0,
                 top_k: -1,
                 top_p: 1.0,
+                min_p: 0.0,
             },
             BatchSamplingRow {
                 row: 5,
                 temperature: 1.0,
                 top_k: -1,
                 top_p: 1.0,
+                min_p: 0.0,
             },
         ];
 
@@ -672,12 +756,14 @@ mod tests {
                 temperature: 1.0,
                 top_k: -1,
                 top_p: 1.0,
+                min_p: 0.0,
             },
             BatchSamplingRow {
                 row: 7,
                 temperature: 4.0,
                 top_k: -1,
                 top_p: 1.0,
+                min_p: 0.0,
             },
         ];
 
@@ -710,6 +796,89 @@ mod tests {
     }
 
     #[test]
+    fn batch_sampling_min_p_masks_below_threshold() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        // Two-token support: P(100) ≈ 0.7, P(200) ≈ 0.28, tail ≈ 0 (logits
+        // ln(0.7/0.28) apart, rest at -120). min_p thresholds against the max
+        // prob: 0.5 * 0.7 = 0.35 keeps only token 100; 0.2 * 0.7 = 0.14 keeps
+        // both.
+        let mut row = flat_row(-120.0);
+        row[100] = (0.7f32 / 0.28).ln();
+        row[200] = 0.0;
+        let logits = arena_with_rows(&ctx, &[(1, row.clone()), (3, row)]);
+        let mut scratch = BatchSamplingScratch::new(&ctx, ARENA_ROWS, VOCAB).expect("scratch");
+
+        let strict = [BatchSamplingRow {
+            row: 1,
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1.0,
+            min_p: 0.5,
+        }];
+        for seed in 0..64u64 {
+            let tokens = gpu_sample_batch_into(&ctx, logits.as_ref(), &strict, seed, &mut scratch)
+                .expect("sample");
+            assert_eq!(
+                tokens[0], 100,
+                "seed {seed}: min_p=0.5 must mask the 0.28-prob token"
+            );
+        }
+
+        let loose = [BatchSamplingRow {
+            row: 3,
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1.0,
+            min_p: 0.2,
+        }];
+        let mut saw_minor = false;
+        for seed in 0..128u64 {
+            let tokens = gpu_sample_batch_into(&ctx, logits.as_ref(), &loose, seed, &mut scratch)
+                .expect("sample");
+            assert!(
+                tokens[0] == 100 || tokens[0] == 200,
+                "seed {seed}: min_p=0.2 sampled {} outside the surviving pair",
+                tokens[0]
+            );
+            saw_minor |= tokens[0] == 200;
+        }
+        assert!(
+            saw_minor,
+            "min_p=0.2 never sampled the 0.28-prob token in 128 draws (~1e-19 if unmasked)"
+        );
+    }
+
+    #[test]
+    fn batch_sampling_min_p_composes_with_top_k_and_top_p() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        // Five spaced tokens; top_k=3 keeps {11, 503, 1024}, then the top-p /
+        // min_p stages cut deeper. With min_p=0.6 after top-k renorm the
+        // survivor set is exactly the argmax.
+        let picks: Vec<usize> = vec![11, 503, 1024, 9000, 32000];
+        let mut row = flat_row(-120.0);
+        for (i, &t) in picks.iter().enumerate() {
+            row[t] = 8.0 - 1.0 * i as f32;
+        }
+        let logits = arena_with_rows(&ctx, &[(2, row)]);
+        let mut scratch = BatchSamplingScratch::new(&ctx, ARENA_ROWS, VOCAB).expect("scratch");
+        let rows = [BatchSamplingRow {
+            row: 2,
+            temperature: 1.0,
+            top_k: 3,
+            top_p: 0.99,
+            min_p: 0.6,
+        }];
+        for seed in 0..64u64 {
+            let tokens = gpu_sample_batch_into(&ctx, logits.as_ref(), &rows, seed, &mut scratch)
+                .expect("sample");
+            assert_eq!(
+                tokens[0], 11,
+                "seed {seed}: top_k=3 + min_p=0.6 must collapse to the argmax"
+            );
+        }
+    }
+
+    #[test]
     fn batch_sampling_rejects_greedy_rows() {
         let ctx = DeviceContext::new().expect("create CUDA context");
         let logits = arena_with_rows(&ctx, &[]);
@@ -719,6 +888,7 @@ mod tests {
             temperature: 0.0,
             top_k: -1,
             top_p: 1.0,
+            min_p: 0.0,
         }];
         assert!(
             gpu_sample_batch_into(&ctx, logits.as_ref(), &rows, 1, &mut scratch).is_err(),

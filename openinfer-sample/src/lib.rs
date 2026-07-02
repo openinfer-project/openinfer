@@ -4,9 +4,11 @@
 //! Two model-agnostic jobs live here:
 //!
 //! * [`select_batch`] — turn one logits arena into one next-token id per row.
-//!   Greedy rows take a batched indexed argmax; the rest take one FlashInfer
-//!   temperature/top-k/top-p pass. There is no per-row escape hatch, so a caller
-//!   cannot regress to `for i { sample(i) }`.
+//!   Greedy rows take a batched indexed argmax; the rest take batched
+//!   FlashInfer temperature/top-k/top-p/min_p passes (min_p rows partitioned
+//!   off the fused fast path, seeded rows as single-row replayable calls).
+//!   There is no per-row escape hatch, so a caller cannot regress to
+//!   `for i { sample(i) }`.
 //! * [`token_logprob_from_row`] — host-side log-softmax + top-k over one logits
 //!   row into a [`TokenLogprob`]. Generic over the row element so a caller can
 //!   feed `f32` (Qwen) or `bf16` (Kimi) without a widening copy.
@@ -99,8 +101,10 @@ impl SampleScratch {
 ///
 /// `params[i]` governs arena row `i`. Argmax rows are resolved together with a
 /// batched indexed argmax; the remaining rows are resolved together with one
-/// FlashInfer temperature/top-k/top-p pass seeded by `seed`. Returns one token
-/// id per row, in row order.
+/// FlashInfer temperature/top-k/top-p pass seeded by `seed` (min_p rows are
+/// partitioned into their own pass inside `gpu_sample_batch_into`, so
+/// min_p-free rows always take the fused fast path). Returns one token id per
+/// row, in row order.
 ///
 /// A row takes the argmax path when [`effectively_greedy`] holds: explicit
 /// greedy params, or a `top_p` nucleus so tight (`<= 1/vocab`) that only the
@@ -109,12 +113,20 @@ impl SampleScratch {
 /// arbitrary member of a bf16-tied top — and skips a softmax it does not need.
 ///
 /// `seed` must be fresh per decode step (one engine seed at startup, advanced
-/// per step); rows decorrelate through the philox subsequence. There is
-/// deliberately no per-row RNG.
+/// per step); unseeded rows decorrelate through the philox subsequence.
+///
+/// `steps[i]` is row `i`'s request-local decode step. It only matters for
+/// rows whose params carry a `seed`: a seeded row is sampled as its own
+/// single-row call with `mix_seed(request_seed, step)` as the philox seed, so
+/// its tokens are a pure function of (seed, step, distribution) — FlashInfer's
+/// kernels fold the batch position into the philox subsequence, so seeded rows
+/// cannot ride the batched call without their stream changing with batch
+/// composition.
 pub fn select_batch(
     ctx: &DeviceContext,
     logits: &HiddenStates,
     params: &[&SamplingParams],
+    steps: &[u64],
     seed: u64,
     scratch: &mut SampleScratch,
 ) -> Result<Vec<u32>> {
@@ -122,6 +134,11 @@ pub fn select_batch(
     if n == 0 {
         return Ok(Vec::new());
     }
+    ensure!(
+        steps.len() == n,
+        "select_batch: {} steps for {n} rows",
+        steps.len()
+    );
     ensure!(
         n <= scratch.max_rows,
         "select_batch: {n} rows exceeds scratch capacity {}",
@@ -172,16 +189,19 @@ pub fn select_batch(
         }
     }
 
-    // The rest -> one batched FlashInfer sampling pass.
+    // Unseeded sampling rows -> batched FlashInfer sampling. min_p rows may
+    // mix freely: `gpu_sample_batch_into` partitions them into their own pass
+    // so min_p-free rows always ride the fused fast path.
     let sampling_rows: Vec<BatchSamplingRow> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| !is_argmax(p))
+        .filter(|(_, p)| !is_argmax(p) && p.seed.is_none())
         .map(|(i, p)| BatchSamplingRow {
             row: i,
             temperature: p.temperature,
             top_k: p.top_k,
             top_p: p.top_p,
+            min_p: p.min_p,
         })
         .collect();
     if !sampling_rows.is_empty() {
@@ -197,7 +217,43 @@ pub fn select_batch(
         }
     }
 
+    // Seeded rows -> one single-row call each, philox seed mixed from the
+    // request seed and step so replay is independent of batch composition
+    // (blockIdx is always 0 in an n=1 call).
+    for (i, p) in params.iter().enumerate() {
+        let Some(request_seed) = p.seed else {
+            continue;
+        };
+        if is_argmax(p) {
+            continue;
+        }
+        let row = [BatchSamplingRow {
+            row: i,
+            temperature: p.temperature,
+            top_k: p.top_k,
+            top_p: p.top_p,
+            min_p: p.min_p,
+        }];
+        let sampled = gpu_sample_batch_into(
+            ctx,
+            logits.as_ref(),
+            &row,
+            mix_seed(request_seed, steps[i]),
+            &mut scratch.sampling,
+        )?;
+        tokens[i] = sampled[0];
+    }
+
     Ok(tokens)
+}
+
+/// SplitMix64 over (seed, step): a distinct, well-mixed philox seed per
+/// request step, deterministic across runs and batch layouts.
+fn mix_seed(seed: u64, step: u64) -> u64 {
+    let mut z = seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Whether a row can take the argmax path without changing sampling semantics.

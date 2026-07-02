@@ -23,6 +23,8 @@ fn p(temperature: f32, top_k: i32, top_p: f32) -> SamplingParams {
         temperature,
         top_k,
         top_p,
+        min_p: 0.0,
+        seed: None,
         ignore_eos: false,
     }
 }
@@ -54,9 +56,10 @@ fn bench_select_batch(c: &mut Criterion) {
             let param_refs: Vec<&SamplingParams> = params.iter().collect();
             group.bench_with_input(BenchmarkId::new(*name, batch), &batch, |b, _| {
                 let mut seed = 0u64;
+                let steps = vec![0u64; param_refs.len()];
                 b.iter(|| {
                     seed = seed.wrapping_add(1);
-                    select_batch(&ctx, &a, &param_refs, seed, &mut scratch).unwrap()
+                    select_batch(&ctx, &a, &param_refs, &steps, seed, &mut scratch).unwrap()
                 });
             });
         }

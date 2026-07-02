@@ -821,6 +821,8 @@ mod tests {
             temperature: 0.8,
             top_k: -1,
             top_p: 0.9,
+            min_p: 0.0,
+            seed: None,
             ignore_eos: false,
         };
 

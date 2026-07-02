@@ -126,6 +126,8 @@ pub fn trace_runtime_decode_kernel_calls(
                     temperature: 0.0,
                     top_k: 1,
                     top_p: 1.0,
+                    min_p: 0.0,
+                    seed: None,
                     ignore_eos: true,
                 },
                 max_tokens: 2,

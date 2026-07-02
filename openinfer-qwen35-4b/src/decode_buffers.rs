@@ -56,6 +56,10 @@ pub(crate) struct BatchDecodeBuffers35 {
 
     // Sampling scratch
     pub(crate) sample: openinfer_sample::SampleScratch,
+    /// Request-local decode steps handed to `select_batch`, reused across
+    /// steps to keep the sampling hot path allocation-free. All zeros until
+    /// the scheduler wires generated counts through (sampling-parity 1b).
+    pub(crate) steps: Vec<u64>,
 
     /// Page index reserved for CUDA Graph padding slots. Padding entries point
     /// here with seq_len=1 so FlashInfer accesses valid (but discarded) memory.
@@ -121,6 +125,7 @@ impl BatchDecodeBuffers35 {
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
 
             sample: openinfer_sample::SampleScratch::new(ctx, config.vocab_size, bs)?,
+            steps: Vec::new(),
 
             padding_page_id,
         })

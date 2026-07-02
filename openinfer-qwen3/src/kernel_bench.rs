@@ -1349,6 +1349,8 @@ impl DenseCase {
                         temperature: 0.8,
                         top_k: 50,
                         top_p: 0.9,
+                        min_p: 0.0,
+                        seed: None,
                         ignore_eos: true,
                     }
                 };
@@ -1456,8 +1458,16 @@ impl DenseCase {
             } => {
                 let param_refs: Vec<&openinfer_core::sampler::SamplingParams> =
                     params.iter().collect();
+                let steps = vec![0u64; param_refs.len()];
                 *seed = seed.wrapping_add(1);
-                openinfer_sample::select_batch(&self.ctx, logits, &param_refs, *seed, scratch)?;
+                openinfer_sample::select_batch(
+                    &self.ctx,
+                    logits,
+                    &param_refs,
+                    &steps,
+                    *seed,
+                    scratch,
+                )?;
                 Ok(())
             }
         }
