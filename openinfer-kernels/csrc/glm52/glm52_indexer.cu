@@ -154,15 +154,11 @@ __global__ void local_topk_to_global_slots_kernel(
     const int* __restrict__ local_topk_offsets,
     int local_topk_stride, const int* __restrict__ seq_lens,
     const int* __restrict__ block_table, int block_table_stride,
-    int block_table_cols, int block_size, int topk,
-    bool has_seq_lens) {
+    int block_table_cols, int block_size, int topk) {
   const int token_idx = blockIdx.x;
   const int tid = threadIdx.x;
 
-  int seq_len = block_table_cols * block_size;
-  if (has_seq_lens) {
-    seq_len = seq_lens[token_idx];
-  }
+  const int seq_len = seq_lens[token_idx];
 
   int count = 0;
   for (int start = 0; start < topk; start += blockDim.x) {
@@ -293,16 +289,14 @@ CUresult glm52_indexer_local_topk_to_slots_cuda(
     int* global_slots, int* topk_lens, const int* local_topk_offsets,
     int local_topk_stride, const int* seq_lens, const int* block_table,
     int block_table_stride, int block_table_cols, int block_size, int topk,
-    int num_tokens, int has_seq_lens, cudaStream_t stream) {
+    int num_tokens, cudaStream_t stream) {
   if (global_slots == nullptr || topk_lens == nullptr ||
-      local_topk_offsets == nullptr || block_table == nullptr) {
+      local_topk_offsets == nullptr || seq_lens == nullptr ||
+      block_table == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (num_tokens <= 0 || topk <= 0 || block_size <= 0 ||
       block_table_cols <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (has_seq_lens && seq_lens == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
 
@@ -312,7 +306,7 @@ CUresult glm52_indexer_local_topk_to_slots_cuda(
   local_topk_to_global_slots_kernel<<<grid, block, 0, stream>>>(
       global_slots, topk_lens, local_topk_offsets, local_topk_stride,
       seq_lens, block_table, block_table_stride, block_table_cols,
-      block_size, topk, has_seq_lens != 0);
+      block_size, topk);
   return consume_last_cuda_error();
 }
 

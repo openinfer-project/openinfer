@@ -231,7 +231,6 @@ pub struct Glm52IndexerLocalTopKToSlots {
     pub topk: usize,
     pub block_size: usize,
     pub block_table_cols: usize,
-    pub has_seq_lens: bool,
 }
 
 impl Glm52IndexerLocalTopKToSlots {
@@ -261,9 +260,9 @@ impl Glm52IndexerLocalTopKToSlots {
 /// count per token). Ported from TokenSpeed Triton `local_topk_to_global_slots`.
 ///
 /// - `local_topk_offsets`: `[num_tokens, topk]` int32, row-major.
-/// - `seq_lens`: `[num_tokens]` int32. Required if `has_seq_lens` is true;
-///   if false, `block_table[:, 0]` is used as seq_len fallback (TokenSpeed
-///   contract: `seq_lens_arg = block_table[:, 0]` when seq_lens is None).
+/// - `seq_lens`: `[num_tokens]` int32, valid KV length per token (required,
+///   matches vLLM `sparse_attn_indexer` which always passes `seq_lens` as
+///   the top-k `lengths`).
 /// - `block_table`: `[num_tokens, block_table_cols]` int32, row-major.
 /// - `global_slots`: `[num_tokens, topk]` int32 output, `-1` for invalid slots.
 /// - `topk_lens`: `[num_tokens]` int32 output, valid slot count per token.
@@ -271,7 +270,7 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
     ctx: &DeviceContext,
     contract: Glm52IndexerLocalTopKToSlots,
     local_topk_offsets: &CudaSlice<i32>,
-    seq_lens: Option<&CudaSlice<i32>>,
+    seq_lens: &CudaSlice<i32>,
     block_table: &CudaSlice<i32>,
     global_slots: &mut CudaSlice<i32>,
     topk_lens: &mut CudaSlice<i32>,
@@ -282,6 +281,12 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
         "GLM5.2 indexer local_topk_to_slots offsets too small: have {}, need {}",
         local_topk_offsets.len(),
         contract.num_tokens * contract.topk
+    );
+    ensure!(
+        seq_lens.len() >= contract.num_tokens,
+        "GLM5.2 indexer local_topk_to_slots seq_lens too small: have {}, need {}",
+        seq_lens.len(),
+        contract.num_tokens
     );
     ensure!(
         block_table.len() >= contract.num_tokens * contract.block_table_cols,
@@ -301,27 +306,9 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
         topk_lens.len(),
         contract.num_tokens
     );
-    if contract.has_seq_lens {
-        ensure!(
-            seq_lens.is_some(),
-            "GLM5.2 indexer local_topk_to_slots has_seq_lens=true but seq_lens is None"
-        );
-        ensure!(
-            seq_lens.unwrap().len() >= contract.num_tokens,
-            "GLM5.2 indexer local_topk_to_slots seq_lens too small: have {}, need {}",
-            seq_lens.unwrap().len(),
-            contract.num_tokens
-        );
-    }
 
     let (offsets_ptr, _offsets_guard) = local_topk_offsets.device_ptr(&ctx.stream);
-    let seq_lens_ptr = match seq_lens {
-        Some(sl) => {
-            let (ptr, _guard) = sl.device_ptr(&ctx.stream);
-            ptr as *const i32
-        }
-        None => std::ptr::null(),
-    };
+    let (seq_lens_ptr, _seq_lens_guard) = seq_lens.device_ptr(&ctx.stream);
     let (block_table_ptr, _block_table_guard) = block_table.device_ptr(&ctx.stream);
     let (global_slots_ptr, _global_slots_guard) = global_slots.device_ptr_mut(&ctx.stream);
     let (topk_lens_ptr, _topk_lens_guard) = topk_lens.device_ptr_mut(&ctx.stream);
@@ -331,14 +318,13 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
             topk_lens_ptr as *mut i32,
             offsets_ptr as *const i32,
             contract.topk as i32,
-            seq_lens_ptr,
+            seq_lens_ptr as *const i32,
             block_table_ptr as *const i32,
-            contract.topk as i32,
+            contract.block_table_cols as i32,
             contract.block_table_cols as i32,
             contract.block_size as i32,
             contract.topk as i32,
             contract.num_tokens as i32,
-            if contract.has_seq_lens { 1 } else { 0 },
             ctx.stream.cu_stream(),
         )
     };

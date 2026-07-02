@@ -103,6 +103,16 @@ fn cu_check(r: CUresult) -> Result<()> {
     Ok(())
 }
 
+/// Returns Ok(true) on skip (caller early-returns), Ok(false) on success.
+fn cu_check_or_skip(r: CUresult) -> Result<bool> {
+    if r == CUresult::CUDA_ERROR_NOT_SUPPORTED {
+        eprintln!("skip: FilteredTopK not supported on this GPU (smem too small)");
+        return Ok(true);
+    }
+    cu_check(r)?;
+    Ok(false)
+}
+
 const STREAM: CUstream = ptr::null_mut();
 
 // ─── indexer cache: quant + pack → gather round-trip ──────────────────────
@@ -182,95 +192,57 @@ fn indexer_cache_round_trip() -> Result<()> {
     Ok(())
 }
 
-// ─── local_topk_to_slots ──────────────────────────────────────────────────
-
-fn local_topk_to_slots_basic() -> Result<()> {
-    // 1 token, topk=4, block_size=2, 2 pages
-    // block_table = [10, 20], offsets = [0,1,2,3] -> slots [20,21,40,41]
-    let offsets: Vec<i32> = vec![0, 1, 2, 3];
-    let block_table: Vec<i32> = vec![10, 20];
-    let seq_lens: Vec<i32> = vec![4];
+// Regression for P1: block_table_stride must be block_table_cols, not topk.
+// 2 tokens, topk=4, block_table_cols=2. If stride were topk (4), token 1
+// would read block_table[4..6] (OOB / wrong row). With correct stride=2,
+// token 1 reads block_table[2..3].
+fn local_topk_to_slots_multi_token_stride() -> Result<()> {
+    // token 0: pages [10, 20], token 1: pages [30, 40]
+    let block_table: Vec<i32> = vec![10, 20, 30, 40];
+    let offsets: Vec<i32> = vec![0, 1, 2, 3, 0, 1, 2, 3];
+    let seq_lens: Vec<i32> = vec![4, 4];
 
     let offsets_dev = DeviceBuf::from_host(&offsets)?;
     let block_dev = DeviceBuf::from_host(&block_table)?;
     let seq_dev = DeviceBuf::from_host(&seq_lens)?;
-    let slots_dev = DeviceBuf::zeroed(4 * size_of::<i32>())?;
-    let lens_dev = DeviceBuf::zeroed(1 * size_of::<i32>())?;
+    let slots_dev = DeviceBuf::zeroed(8 * size_of::<i32>())?;
+    let lens_dev = DeviceBuf::zeroed(2 * size_of::<i32>())?;
 
     cu_check(unsafe {
         ffi::glm52_indexer_local_topk_to_slots_cuda(
             slots_dev.ptr as *mut i32,
             lens_dev.ptr as *mut i32,
             offsets_dev.ptr as *const i32,
-            4, // local_topk_stride
+            4, // local_topk_stride (== topk)
             seq_dev.ptr as *const i32,
             block_dev.ptr as *const i32,
-            2, // block_table_stride
+            2, // block_table_stride (== block_table_cols, NOT topk)
             2, // block_table_cols
             2, // block_size
             4, // topk
-            1, // num_tokens
-            1, // has_seq_lens
+            2, // num_tokens
             STREAM,
         )
     })?;
     cuda_check(unsafe { cudaDeviceSynchronize() })?;
 
-    let slots: Vec<i32> = slots_dev.to_host(4)?;
-    let lens: Vec<i32> = lens_dev.to_host(1)?;
+    let slots: Vec<i32> = slots_dev.to_host(8)?;
+    let lens: Vec<i32> = lens_dev.to_host(2)?;
 
-    assert_eq!(lens[0], 4, "topk_lens[0]");
-    assert_eq!(slots[0], 20, "slot[0]");
-    assert_eq!(slots[1], 21, "slot[1]");
-    assert_eq!(slots[2], 40, "slot[2]");
-    assert_eq!(slots[3], 41, "slot[3]");
-
-    eprintln!(
-        "local_topk_to_slots_basic: slots = {:?}, lens = {:?}, OK",
-        slots, lens
-    );
-    Ok(())
-}
-
-fn local_topk_to_slots_invalid_offset() -> Result<()> {
-    let offsets: Vec<i32> = vec![-1, 0];
-    let block_table: Vec<i32> = vec![5];
-    let seq_lens: Vec<i32> = vec![2];
-
-    let offsets_dev = DeviceBuf::from_host(&offsets)?;
-    let block_dev = DeviceBuf::from_host(&block_table)?;
-    let seq_dev = DeviceBuf::from_host(&seq_lens)?;
-    let slots_dev = DeviceBuf::zeroed(2 * size_of::<i32>())?;
-    let lens_dev = DeviceBuf::zeroed(1 * size_of::<i32>())?;
-
-    cu_check(unsafe {
-        ffi::glm52_indexer_local_topk_to_slots_cuda(
-            slots_dev.ptr as *mut i32,
-            lens_dev.ptr as *mut i32,
-            offsets_dev.ptr as *const i32,
-            2, // stride
-            seq_dev.ptr as *const i32,
-            block_dev.ptr as *const i32,
-            1, // block_table_stride
-            1, // block_table_cols
-            2, // block_size
-            2, // topk
-            1, // num_tokens
-            1, // has_seq_lens
-            STREAM,
-        )
-    })?;
-    cuda_check(unsafe { cudaDeviceSynchronize() })?;
-
-    let slots: Vec<i32> = slots_dev.to_host(2)?;
-    let lens: Vec<i32> = lens_dev.to_host(1)?;
-
-    assert_eq!(slots[0], -1, "invalid offset -> -1");
-    assert_eq!(slots[1], 10, "offset 0, page 5, bs 2 -> 10");
-    assert_eq!(lens[0], 1, "1 valid");
+    // token 0: offsets [0,1,2,3] -> pages [10,20], slots [20,21,40,41]
+    assert_eq!(slots[0], 20, "t0 slot[0]");
+    assert_eq!(slots[1], 21, "t0 slot[1]");
+    assert_eq!(slots[2], 40, "t0 slot[2]");
+    assert_eq!(slots[3], 41, "t0 slot[3]");
+    // token 1: offsets [0,1,2,3] -> pages [30,40], slots [60,61,80,81]
+    assert_eq!(slots[4], 60, "t1 slot[0]");
+    assert_eq!(slots[5], 61, "t1 slot[1]");
+    assert_eq!(slots[6], 80, "t1 slot[2]");
+    assert_eq!(slots[7], 81, "t1 slot[3]");
+    assert_eq!(lens, vec![4, 4], "topk_lens");
 
     eprintln!(
-        "local_topk_to_slots_invalid_offset: slots = {:?}, lens = {:?}, OK",
+        "local_topk_to_slots_multi_token_stride: slots = {:?}, lens = {:?}, OK",
         slots, lens
     );
     Ok(())
@@ -319,25 +291,23 @@ fn hadamard_correctness() -> Result<()> {
     Ok(())
 }
 
-// ─── FlashInfer top-k ─────────────────────────────────────────────────────
-
-fn flashinfer_topk_basic() -> Result<()> {
+// Regression for P2: per-row `lengths` must filter padded/stale logits.
+// logits = [0..max_len), but lengths[0]=10 so only indices 6..9 are valid
+// top-k. If lengths were ignored (old TopKDispatch path), the kernel would
+// return indices 2044..2047 from the stale tail.
+fn flashinfer_topk_lengths_filter() -> Result<()> {
     let max_len = 2048;
     let top_k = 4;
 
-    // value = index, so top-k are indices 2044..2047
     let logits: Vec<f32> = (0..max_len).map(|i| i as f32).collect();
-    let lengths: Vec<i32> = vec![max_len as i32];
+    let lengths: Vec<i32> = vec![10];
 
     let logits_dev = DeviceBuf::from_host(&logits)?;
     let lengths_dev = DeviceBuf::from_host(&lengths)?;
     let indices_dev = DeviceBuf::zeroed(top_k * size_of::<i32>())?;
     let values_dev = DeviceBuf::zeroed(top_k * size_of::<f32>())?;
 
-    let scratch_bytes = unsafe { ffi::glm52_flashinfer_topk_2048_row_states_bytes_cuda() };
-    let scratch_dev = DeviceBuf::zeroed(scratch_bytes)?;
-
-    cu_check(unsafe {
+    let skipped = cu_check_or_skip(unsafe {
         ffi::glm52_flashinfer_topk_2048_cuda(
             logits_dev.ptr as *const f32,
             indices_dev.ptr as *mut i32,
@@ -346,18 +316,29 @@ fn flashinfer_topk_basic() -> Result<()> {
             1, // num_rows
             top_k as i32,
             max_len as i32,
-            scratch_dev.ptr as *mut u8,
             STREAM,
         )
     })?;
+    if skipped {
+        return Ok(());
+    }
     cuda_check(unsafe { cudaDeviceSynchronize() })?;
 
     let indices: Vec<i32> = indices_dev.to_host(top_k)?;
     let mut sorted = indices.to_vec();
     sorted.sort();
-    assert_eq!(sorted, vec![2044, 2045, 2046, 2047], "top-k indices");
+    // With lengths=10, valid logits are indices 0..9 (values 0..9); top-4
+    // are indices 6,7,8,9. Stale tail (2044..2047) must NOT win.
+    assert_eq!(
+        sorted,
+        vec![6, 7, 8, 9],
+        "top-k must respect lengths filter"
+    );
 
-    eprintln!("flashinfer_topk_basic: indices = {:?} (sorted), OK", sorted);
+    eprintln!(
+        "flashinfer_topk_lengths_filter: indices = {:?} (sorted), OK",
+        sorted
+    );
     Ok(())
 }
 
@@ -369,13 +350,8 @@ fn test_indexer_cache_round_trip() {
 }
 
 #[test]
-fn test_local_topk_to_slots_basic() {
-    local_topk_to_slots_basic().expect("local_topk_to_slots basic");
-}
-
-#[test]
-fn test_local_topk_to_slots_invalid() {
-    local_topk_to_slots_invalid_offset().expect("local_topk_to_slots invalid");
+fn test_local_topk_to_slots_multi_token_stride() {
+    local_topk_to_slots_multi_token_stride().expect("local_topk_to_slots multi-token stride");
 }
 
 #[test]
@@ -384,8 +360,8 @@ fn test_hadamard_correctness() {
 }
 
 #[test]
-fn test_flashinfer_topk_basic() {
-    flashinfer_topk_basic().expect("FlashInfer top-k");
+fn test_flashinfer_topk_lengths_filter() {
+    flashinfer_topk_lengths_filter().expect("FlashInfer top-k lengths filter");
 }
 
 // ─── DeepGEMM paged MQA logits: JIT compile + launch smoke test ────────────

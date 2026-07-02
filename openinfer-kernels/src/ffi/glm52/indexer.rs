@@ -43,7 +43,6 @@ unsafe extern "C" {
         block_size: i32,
         topk: i32,
         num_tokens: i32,
-        has_seq_lens: i32,
         stream: CUstream,
     ) -> CUresult;
 }

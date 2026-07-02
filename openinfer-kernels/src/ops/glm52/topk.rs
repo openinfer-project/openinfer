@@ -6,10 +6,6 @@ use crate::tensor::DeviceContext;
 
 pub const GLM52_INDEXER_TOPK_MAX_K: usize = 2048;
 
-pub fn glm52_flashinfer_topk_2048_row_states_bytes() -> usize {
-    unsafe { ffi::glm52_flashinfer_topk_2048_row_states_bytes_cuda() }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52IndexerTopK {
     pub num_rows: usize,
@@ -44,8 +40,10 @@ impl Glm52IndexerTopK {
 /// - `lengths`: `[num_rows]` i32, valid logits count per row.
 /// - `output_indices`: `[num_rows, top_k]` i32 output.
 /// - `output_values`: `[num_rows, top_k]` f32 output (may be null/dummy).
-/// - `row_states_scratch`: scratch buffer from
-///   `glm52_flashinfer_topk_2048_row_states_bytes`.
+///
+/// `FilteredTopK` uses dynamic shared memory internally; no external scratch
+/// buffer is needed (unlike the `RadixTopKMultiCTA` path which the old
+/// `TopKDispatch` wrapper used to fall back to).
 pub fn glm52_flashinfer_topk_2048_launch(
     ctx: &DeviceContext,
     contract: Glm52IndexerTopK,
@@ -53,7 +51,6 @@ pub fn glm52_flashinfer_topk_2048_launch(
     lengths: &CudaSlice<i32>,
     output_indices: &mut CudaSlice<i32>,
     output_values: &mut CudaSlice<f32>,
-    row_states_scratch: &mut CudaSlice<u8>,
 ) -> Result<()> {
     contract.validate()?;
     ensure!(
@@ -80,19 +77,11 @@ pub fn glm52_flashinfer_topk_2048_launch(
         output_values.len(),
         contract.num_rows * contract.top_k
     );
-    let required_scratch = glm52_flashinfer_topk_2048_row_states_bytes();
-    ensure!(
-        row_states_scratch.len() >= required_scratch,
-        "GLM5.2 indexer top-k row_states_scratch too small: have {}, need {}",
-        row_states_scratch.len(),
-        required_scratch
-    );
 
     let (logits_ptr, _logits_guard) = logits.device_ptr(&ctx.stream);
     let (lengths_ptr, _lengths_guard) = lengths.device_ptr(&ctx.stream);
     let (output_indices_ptr, _output_indices_guard) = output_indices.device_ptr_mut(&ctx.stream);
     let (output_values_ptr, _output_values_guard) = output_values.device_ptr_mut(&ctx.stream);
-    let (scratch_ptr, _scratch_guard) = row_states_scratch.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_flashinfer_topk_2048_cuda(
             logits_ptr as *const f32,
@@ -102,7 +91,6 @@ pub fn glm52_flashinfer_topk_2048_launch(
             contract.num_rows as i32,
             contract.top_k as i32,
             contract.max_len as i32,
-            scratch_ptr as *mut u8,
             ctx.stream.cu_stream(),
         )
     };
