@@ -9,4 +9,4 @@
 	url = https://github.com/deepseek-ai/FlashMLA
 [submodule "openinfer-kernels/third_party/DeepGEMM"]
 	path = openinfer-kernels/third_party/DeepGEMM
-	url = https://github.com/deepseek-ai/DeepGEMM
+	url = https://github.com/openinfer-project/DeepGEMM
