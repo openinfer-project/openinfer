@@ -61,7 +61,15 @@ fn greedy_batch_picks_each_rows_argmax() {
     let params = vec![greedy(); peaks.len()];
     let mut scratch = SampleScratch::new(&ctx, vocab, peaks.len()).unwrap();
 
-    let tokens = select_batch(&ctx, &arena, &refs(&params), &vec![0; params.len()], 0, &mut scratch).unwrap();
+    let tokens = select_batch(
+        &ctx,
+        &arena,
+        &refs(&params),
+        &vec![0; params.len()],
+        0,
+        &mut scratch,
+    )
+    .unwrap();
 
     assert_eq!(tokens, vec![3, 7, 0, 15]);
 }
@@ -174,7 +182,17 @@ fn batch_larger_than_scratch_is_rejected() {
     let params = vec![greedy(); 2];
     let mut scratch = SampleScratch::new(&ctx, vocab, 1).unwrap();
 
-    assert!(select_batch(&ctx, &arena, &refs(&params), &vec![0; params.len()], 0, &mut scratch).is_err());
+    assert!(
+        select_batch(
+            &ctx,
+            &arena,
+            &refs(&params),
+            &vec![0; params.len()],
+            0,
+            &mut scratch
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -241,8 +259,15 @@ fn seeded_rows_replay_independent_of_batch_position() {
         &mut scratch,
     )
     .unwrap();
-    let b = select_batch(&ctx, &arena, &[&seeded(7), &greedy()], &[5, 0], 1234, &mut scratch)
-        .unwrap();
+    let b = select_batch(
+        &ctx,
+        &arena,
+        &[&seeded(7), &greedy()],
+        &[5, 0],
+        1234,
+        &mut scratch,
+    )
+    .unwrap();
     assert_eq!(a[2], b[0], "seeded row must replay across batch layouts");
 
     // Advancing the step or changing the seed moves the stream; on a flat
