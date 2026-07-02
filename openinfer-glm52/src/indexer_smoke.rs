@@ -56,12 +56,14 @@ fn indexer_smoke() -> Result<()> {
     // ---- synthetic weights (all zeros, scale=1.0) ----
     let wq_b = synthetic_proj(INDEX_HEADS * INDEX_HEAD_DIM, Q_LORA);
     let wk = synthetic_proj(INDEX_HEAD_DIM, HIDDEN);
-    let weights_proj = synthetic_proj(INDEX_HEADS, HIDDEN);
+    // weights_proj is bf16 [32, 6144] (not fp8 in checkpoint)
+    let weights_proj_bf16 = vec![0u8; INDEX_HEADS * HIDDEN * 2];
     let k_norm_w = vec![0u8; INDEX_HEAD_DIM * 2]; // bf16
     let k_norm_b = vec![0u8; INDEX_HEAD_DIM * 2]; // bf16
 
-    let w =
-        Glm52IndexerLayerWeights::from_host(&ctx, &wq_b, &wk, &weights_proj, &k_norm_w, &k_norm_b)?;
+    let w = Glm52IndexerLayerWeights::from_host(
+        &ctx, &wq_b, &wk, &weights_proj_bf16, &k_norm_w, &k_norm_b,
+    )?;
 
     // ---- inputs ----
     let hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
