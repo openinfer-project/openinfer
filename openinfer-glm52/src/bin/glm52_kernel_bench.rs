@@ -52,6 +52,17 @@ fn main() -> Result<()> {
             per(wall),
             per(wall) - per(gpu)
         );
+        let (gpu_s, wall_s) = bench.measure_forward_scratch(args.iters)?;
+        println!(
+            "layer fwd scratch  gpu {:>9.1}us  wall {:>9.1}us  host-side gap {:>9.1}us",
+            per(gpu_s),
+            per(wall_s),
+            per(wall_s) - per(gpu_s)
+        );
+        println!(
+            "-> alloc bill (as-is wall - scratch wall): {:>9.1}us/layer",
+            per(wall) - per(wall_s)
+        );
         for proj in ["q_a", "q_b", "kv_a", "o_proj"] {
             let d = bench.measure_projection(proj, args.iters)?;
             println!(

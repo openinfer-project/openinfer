@@ -24,7 +24,10 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
-use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear};
+use crate::fp8::{
+    FP8_BLOCK, Fp8LinearScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32,
+    fp8_linear, fp8_linear_into,
+};
 
 const HEADS: usize = 64;
 const HIDDEN: usize = 6144;
@@ -447,4 +450,223 @@ pub(crate) fn glm52_mla_attend(
     )?;
     let o = fp8_linear(ctx, &w.o_proj, &v)?; // [6144]
     Ok(o)
+}
+
+/// Every intermediate of one MLA decode forward, allocated once. The plain
+/// `glm52_mla_decode_forward` allocates ~20 device buffers per call — each a
+/// synchronous `cudaMalloc` — which is the dominant host-side cost per layer
+/// per token; this scratch plus `glm52_mla_decode_forward_into` is the
+/// zero-allocation variant (same ops, same math, buffers reused).
+pub(crate) struct Glm52MlaDecodeScratch {
+    fp8: Fp8LinearScratch,
+    q_a: DeviceVec,
+    q_resid: DeviceVec,
+    q_full: CudaSlice<bf16>,
+    ckv: CudaSlice<bf16>,
+    compressed_kv: DeviceVec,
+    kv_c: DeviceVec,
+    k_pe: CudaSlice<bf16>,
+    ql_nope: CudaSlice<bf16>,
+    query: CudaSlice<bf16>,
+    ckv_fp8: CudaSlice<u8>,
+    ckv_scales: CudaSlice<f32>,
+    sched: CudaSlice<i32>,
+    splits: CudaSlice<i32>,
+    latent: CudaSlice<bf16>,
+    lse: CudaSlice<f32>,
+    lse_accum: CudaSlice<f32>,
+    o_accum: CudaSlice<f32>,
+    v: CudaSlice<bf16>,
+    o: CudaSlice<bf16>,
+}
+
+impl Glm52MlaDecodeScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        contract: Glm52FlashMlaSparseDecode,
+    ) -> Result<Self> {
+        Ok(Self {
+            fp8: Fp8LinearScratch::new(ctx, HEADS * V_HEAD)?,
+            q_a: DeviceVec::zeros(ctx, Q_LORA)?,
+            q_resid: DeviceVec::zeros(ctx, Q_LORA)?,
+            q_full: ctx.stream.alloc_zeros::<bf16>(HEADS * Q_HEAD)?,
+            ckv: ctx.stream.alloc_zeros::<bf16>(KV_A_OUT)?,
+            compressed_kv: DeviceVec::zeros(ctx, KV_LORA)?,
+            kv_c: DeviceVec::zeros(ctx, KV_LORA)?,
+            k_pe: ctx.stream.alloc_zeros::<bf16>(ROPE_DIM)?,
+            ql_nope: ctx.stream.alloc_zeros::<bf16>(HEADS * KV_LORA)?,
+            query: ctx.stream.alloc_zeros::<bf16>(HEADS * QUERY_DIM)?,
+            ckv_fp8: ctx.stream.alloc_zeros::<u8>(KV_LORA)?,
+            ckv_scales: ctx.stream.alloc_zeros::<f32>(KV_LORA / FP8_BLOCK)?,
+            sched: ctx
+                .stream
+                .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?,
+            splits: ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?,
+            latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
+            lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
+            lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
+            o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
+            v: ctx.stream.alloc_zeros::<bf16>(HEADS * V_HEAD)?,
+            o: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+        })
+    }
+
+    /// The layer output written by the last `forward_into`.
+    pub(crate) fn output(&self) -> &CudaSlice<bf16> {
+        &self.o
+    }
+}
+
+/// [`glm52_mla_decode_forward`] with all intermediates in `scratch`: the same
+/// op sequence with zero per-call allocations. The scratch's FlashMLA buffers
+/// are sized by the `contract` it was built with, so the same contract must be
+/// passed here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glm52_mla_decode_forward_into(
+    ctx: &DeviceContext,
+    w: &Glm52MlaLayerWeights,
+    hidden: &CudaSlice<bf16>,
+    cos: &CudaSlice<bf16>,
+    sin: &CudaSlice<bf16>,
+    cache: &mut CudaSlice<u8>,
+    position: usize,
+    topk: &CudaSlice<i32>,
+    contract: Glm52FlashMlaSparseDecode,
+    scratch: &mut Glm52MlaDecodeScratch,
+) -> Result<()> {
+    ensure!(hidden.len() >= HIDDEN, "GLM5.2 MLA hidden too small");
+    ensure!(
+        position < contract.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+        "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
+        contract.num_blocks
+    );
+    ensure!(
+        scratch.sched.len() >= contract.tile_scheduler_metadata_len()
+            && scratch.latent.len() >= contract.latent_len(),
+        "GLM5.2 MLA scratch was built for a different FlashMLA contract"
+    );
+
+    // ---- front projections ----
+    fp8_linear_into(ctx, &w.q_a, hidden, &mut scratch.fp8, &mut scratch.q_a.data)?;
+    rms_norm_into(ctx, &scratch.q_a, &w.q_a_ln, RMS_EPS, &mut scratch.q_resid)?;
+    fp8_linear_into(
+        ctx,
+        &w.q_b,
+        &scratch.q_resid.data,
+        &mut scratch.fp8,
+        &mut scratch.q_full,
+    )?;
+    fp8_linear_into(ctx, &w.kv_a, hidden, &mut scratch.fp8, &mut scratch.ckv)?;
+    ctx.stream.memcpy_dtod(
+        &scratch.ckv.slice(0..KV_LORA),
+        &mut scratch.compressed_kv.data,
+    )?;
+    rms_norm_into(
+        ctx,
+        &scratch.compressed_kv,
+        &w.kv_a_ln,
+        RMS_EPS,
+        &mut scratch.kv_c,
+    )?;
+    ctx.stream
+        .memcpy_dtod(&scratch.ckv.slice(KV_LORA..KV_LORA + ROPE_DIM), &mut scratch.k_pe)?;
+
+    // ---- absorb: ql_nope[64,512] = q_pass @ W_UK ----
+    gemm_strided_batched_bf16(
+        ctx,
+        false,
+        false,
+        KV_LORA,
+        1,
+        QK_NOPE,
+        &w.w_uk,
+        KV_LORA,
+        QK_NOPE * KV_LORA,
+        &scratch.q_full,
+        QK_NOPE,
+        Q_HEAD,
+        &mut scratch.ql_nope,
+        KV_LORA,
+        KV_LORA,
+        HEADS,
+    )?;
+
+    // ---- assemble query ----
+    glm52_mla_query_assemble_launch(
+        ctx,
+        &scratch.ql_nope,
+        &scratch.q_full,
+        QK_NOPE,
+        Q_HEAD,
+        cos,
+        sin,
+        &mut scratch.query,
+    )?;
+
+    // ---- pack the new token into the cache ----
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows: 1,
+            width: KV_LORA,
+            group_size: FP8_BLOCK,
+        },
+        &scratch.kv_c.data,
+        &mut scratch.ckv_fp8,
+        &mut scratch.ckv_scales,
+    )?;
+    glm52_mla_cache_pack_launch(
+        ctx,
+        &scratch.ckv_fp8,
+        &scratch.ckv_scales,
+        &scratch.k_pe,
+        cos,
+        sin,
+        cache,
+        position,
+    )?;
+
+    // ---- FlashMLA sparse decode ----
+    glm52_flashmla_sparse_decode_metadata_launch(
+        ctx,
+        contract.batch_size,
+        contract.num_sm_parts,
+        &mut scratch.sched,
+        &mut scratch.splits,
+    )?;
+    glm52_flashmla_sparse_decode_launch(
+        ctx,
+        contract,
+        &scratch.query,
+        cache,
+        topk,
+        &scratch.sched,
+        &scratch.splits,
+        &mut scratch.latent,
+        &mut scratch.lse,
+        &mut scratch.lse_accum,
+        &mut scratch.o_accum,
+    )?;
+
+    // ---- back: v = latent @ W_UV, then o_proj ----
+    gemm_strided_batched_bf16(
+        ctx,
+        true,
+        false,
+        V_HEAD,
+        1,
+        KV_LORA,
+        &w.w_uv,
+        KV_LORA,
+        V_HEAD * KV_LORA,
+        &scratch.latent,
+        KV_LORA,
+        KV_LORA,
+        &mut scratch.v,
+        V_HEAD,
+        V_HEAD,
+        HEADS,
+    )?;
+    fp8_linear_into(ctx, &w.o_proj, &scratch.v, &mut scratch.fp8, &mut scratch.o)?;
+    Ok(())
 }

@@ -27,7 +27,10 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear};
-use crate::mla_decode::{Glm52MlaLayerWeights, glm52_mla_decode_forward};
+use crate::mla_decode::{
+    Glm52MlaDecodeScratch, Glm52MlaLayerWeights, glm52_mla_decode_forward,
+    glm52_mla_decode_forward_into,
+};
 
 const HEADS: usize = 64;
 const HIDDEN: usize = 6144;
@@ -181,6 +184,47 @@ impl Glm52MlaDecodeBench {
         for _ in 0..iters {
             self.start.record(&self.ctx.stream)?;
             self.forward_once()?;
+            self.end.record(&self.ctx.stream)?;
+            gpu_ms += f64::from(self.start.elapsed_ms(&self.end)?);
+        }
+        self.ctx.sync()?;
+        let wall = wall_start.elapsed();
+        Ok((Duration::from_secs_f64(gpu_ms / 1_000.0), wall))
+    }
+
+    /// Whole-layer forward through the zero-allocation scratch variant —
+    /// the as-is vs scratch delta is the per-layer cudaMalloc bill.
+    pub fn measure_forward_scratch(&mut self, iters: u64) -> Result<(Duration, Duration)> {
+        let mut scratch = Glm52MlaDecodeScratch::new(&self.ctx, self.contract)?;
+        glm52_mla_decode_forward_into(
+            &self.ctx,
+            &self.weights,
+            &self.hidden,
+            &self.cos,
+            &self.sin,
+            &mut self.cache,
+            self.position,
+            &self.topk,
+            self.contract,
+            &mut scratch,
+        )?;
+        self.ctx.sync()?;
+        let wall_start = Instant::now();
+        let mut gpu_ms = 0.0f64;
+        for _ in 0..iters {
+            self.start.record(&self.ctx.stream)?;
+            glm52_mla_decode_forward_into(
+                &self.ctx,
+                &self.weights,
+                &self.hidden,
+                &self.cos,
+                &self.sin,
+                &mut self.cache,
+                self.position,
+                &self.topk,
+                self.contract,
+                &mut scratch,
+            )?;
             self.end.record(&self.ctx.stream)?;
             gpu_ms += f64::from(self.start.elapsed_ms(&self.end)?);
         }

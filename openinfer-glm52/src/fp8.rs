@@ -114,6 +114,98 @@ impl ProjWeight {
     }
 }
 
+/// Reusable quant-side buffers for [`fp8_linear_into`], sized once for the
+/// largest `k` any projection uses. The per-call `fp8_linear` allocates these
+/// (plus its output) fresh on every projection — ~4 synchronous `cudaMalloc`s
+/// per projection per token — which the scratch variant exists to eliminate.
+pub(crate) struct Fp8LinearScratch {
+    a_fp8: CudaSlice<u8>,
+    a_scale_plain: CudaSlice<f32>,
+    a_scale_tma: CudaSlice<f32>,
+    max_k: usize,
+}
+
+impl Fp8LinearScratch {
+    pub(crate) fn new(ctx: &DeviceContext, max_k: usize) -> Result<Self> {
+        ensure!(
+            max_k > 0 && max_k.is_multiple_of(FP8_BLOCK),
+            "GLM5.2 fp8 scratch max_k {max_k} must be a positive multiple of {FP8_BLOCK}"
+        );
+        let layout = Glm52DeepGemmScaleLayout::f32(1, max_k / FP8_BLOCK);
+        Ok(Self {
+            a_fp8: ctx.stream.alloc_zeros::<u8>(max_k)?,
+            a_scale_plain: ctx.stream.alloc_zeros::<f32>(max_k / FP8_BLOCK)?,
+            a_scale_tma: ctx.stream.alloc_zeros::<f32>(layout.output_len()?)?,
+            max_k,
+        })
+    }
+}
+
+/// [`fp8_linear`] with every intermediate (and the output) caller-provided:
+/// the same quant -> TMA-relayout -> blockscale-GEMM chain, zero allocations.
+/// `out` must hold at least `w.n` elements; only the first `w.n` are written.
+pub(crate) fn fp8_linear_into(
+    ctx: &DeviceContext,
+    w: &ProjWeight,
+    input: &CudaSlice<bf16>,
+    scratch: &mut Fp8LinearScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        input.len() >= w.k,
+        "GLM5.2 fp8_linear_into input {} < k {}",
+        input.len(),
+        w.k
+    );
+    ensure!(
+        w.k <= scratch.max_k,
+        "GLM5.2 fp8_linear_into k {} > scratch max_k {}",
+        w.k,
+        scratch.max_k
+    );
+    ensure!(
+        out.len() >= w.n,
+        "GLM5.2 fp8_linear_into out {} < n {}",
+        out.len(),
+        w.n
+    );
+    let scale_cols = w.k / FP8_BLOCK;
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows: 1,
+            width: w.k,
+            group_size: FP8_BLOCK,
+        },
+        input,
+        &mut scratch.a_fp8,
+        &mut scratch.a_scale_plain,
+    )?;
+    let layout = Glm52DeepGemmScaleLayout::f32(1, scale_cols);
+    glm52_deepgemm_mn_major_tma_aligned_f32_launch(
+        ctx,
+        layout,
+        &scratch.a_scale_plain,
+        &mut scratch.a_scale_tma,
+    )?;
+    glm52_trtllm_fp8_linear_launch(
+        ctx,
+        Glm52TrtllmFp8LinearContract {
+            m: 1,
+            n: w.n,
+            k: w.k,
+            weight_scale_rows: w.n.div_ceil(FP8_BLOCK),
+            weight_scale_cols: scale_cols,
+            activation_scale_cols: scale_cols,
+        },
+        &scratch.a_fp8,
+        &scratch.a_scale_tma,
+        &w.weight,
+        &w.scale,
+        out,
+    )
+}
+
 /// One fp8 projection (bs=1): quant the bf16 activation, then the prequant linear.
 /// Returns `[n]` bf16.
 pub(crate) fn fp8_linear(
