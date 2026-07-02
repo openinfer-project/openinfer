@@ -166,8 +166,7 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
         "GLM5.2 DeepGEMM MQA kv_cache too small: have {}, need {kv_need}",
         kv_cache.len()
     );
-    let w_need =
-        shape.batch_size * shape.next_n * shape.num_heads * GLM52_DEEPGEMM_MQA_F32_ELEM_SIZE;
+    let w_need = shape.batch_size * shape.next_n * shape.num_heads;
     ensure!(
         weights.len() >= w_need,
         "GLM5.2 DeepGEMM MQA weights too small: have {}, need {w_need}",
