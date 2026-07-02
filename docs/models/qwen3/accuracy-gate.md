@@ -59,7 +59,7 @@ uv run --no-project python tools/accuracy/dump_qwen3_4b_hf_golden.py \
     --model-path /data/models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
 
 OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
-    cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate -- --nocapture
+    cargo test --release -p openinfer-qwen3 --test hf_golden_gate -- --nocapture
 ```
 
 ## Diagnosing a red gate

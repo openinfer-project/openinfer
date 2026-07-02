@@ -16,7 +16,7 @@ members = [
     "openinfer-deepseek-v2-lite",
     "openinfer-glm52",
     "openinfer-kimi-k2",
-    "openinfer-qwen3-4b",
+    "openinfer-qwen3",
     "openinfer-qwen35-4b",
     "openinfer-sample",
     "openinfer-kv-cache",
@@ -146,7 +146,7 @@ openinfer-glm52 = { path = "openinfer-glm52" }
 openinfer-engine = { path = "openinfer-engine" }
 openinfer-kernels = { path = "openinfer-kernels" }
 openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
-openinfer-qwen3-4b = { path = "openinfer-qwen3-4b" }
+openinfer-qwen3 = { path = "openinfer-qwen3" }
 openinfer-qwen35-4b = { path = "openinfer-qwen35-4b" }
 openinfer-sample = { path = "openinfer-sample" }
 openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }

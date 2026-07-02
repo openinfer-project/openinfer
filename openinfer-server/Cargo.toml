@@ -24,7 +24,7 @@ openinfer-deepseek-v2-lite = { workspace = true, optional = true }
 openinfer-deepseek-v4 = { workspace = true, optional = true }
 openinfer-glm52 = { workspace = true, optional = true }
 openinfer-kimi-k2 = { workspace = true, optional = true }
-openinfer-qwen3-4b = { workspace = true, optional = true }
+openinfer-qwen3 = { workspace = true, optional = true }
 openinfer-qwen35-4b = { workspace = true, optional = true }
 openinfer-vllm-frontend = { workspace = true }
 openinfer-vllm-support = { workspace = true }
@@ -49,8 +49,8 @@ tikv-jemallocator = "0.6"
 
 [features]
 # Qwen3-4B is the default model line: pure Rust + CUDA, no Python at build time.
-default = ["qwen3-4b"]
-qwen3-4b = ["dep:openinfer-qwen3-4b"]
+default = ["qwen3"]
+qwen3 = ["dep:openinfer-qwen3"]
 # Qwen3.5 pulls in the Triton AOT kernels (Python + Triton at build time).
 qwen35-4b = ["dep:openinfer-qwen35-4b", "openinfer-qwen35-4b/qwen35-4b"]
 deepseek-v4 = ["dep:openinfer-deepseek-v4", "openinfer-deepseek-v4/deepseek-v4"]

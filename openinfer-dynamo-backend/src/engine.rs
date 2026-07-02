@@ -29,7 +29,7 @@ use futures::stream::BoxStream;
 use openinfer_engine::engine::{
     EngineHandle, GenerateRequest, KvBlockEvent, LoadSnapshot, TokenSink, TokenStreamReceiver,
 };
-use openinfer_qwen3_4b::{
+use openinfer_qwen3::{
     DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
     DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions,
     Qwen3OffloadOptions,
@@ -205,7 +205,7 @@ impl LLMEngine for OpeninferBackend {
         // intact for the `enable_kv_events` check below.
         let launch = self.launch.clone();
         let handle =
-            tokio::task::spawn_blocking(move || openinfer_qwen3_4b::launch(&model_path, launch))
+            tokio::task::spawn_blocking(move || openinfer_qwen3::launch(&model_path, launch))
                 .await
                 .map_err(|e| convert::backend_error(format!("engine loader thread panicked: {e}")))?
                 .map_err(|e| convert::backend_error(format!("Qwen3 engine load failed: {e:#}")))?;
@@ -552,7 +552,7 @@ mod tests {
                 "--model-path",
                 "/m",
                 "--served-model-name",
-                "qwen3-4b",
+                "qwen3",
                 "--namespace",
                 "prod",
                 "--component",
@@ -561,7 +561,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(config.served_model_name.as_deref(), Some("qwen3-4b"));
+        assert_eq!(config.served_model_name.as_deref(), Some("qwen3"));
         assert_eq!(config.namespace, "prod");
         assert_eq!(config.component, "worker");
     }

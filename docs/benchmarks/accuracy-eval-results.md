@@ -121,7 +121,7 @@ OPENINFER_TRITON_PYTHON=.venv/bin/python \
 .venv/bin/lm_eval run --model local-completions \
   --model_args "model=Qwen3-4B,base_url=http://localhost:8000/v1/completions,tokenizer_backend=huggingface,tokenizer=models/Qwen3-4B,tokenized_requests=False" \
   --tasks gsm8k --num_fewshot 8 --batch_size 1 \
-  --output_path results/openinfer-qwen3-4b
+  --output_path results/openinfer-qwen3
 ```
 
 **Note:** `local-completions` requires `tokenized_requests=False` and `base_url` pointing to the full `/v1/completions` endpoint.

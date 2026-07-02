@@ -6,11 +6,11 @@ Pure Rust + CUDA LLM inference engine (~83K Rust, ~11K CUDA). No PyTorch, no fra
 
 **Supported models:**
 
-Every model line is behind a cargo feature; only `qwen3-4b` is a default feature, so the stock build is pure Rust + CUDA with no Python.
+Every model line is behind a cargo feature; only `qwen3` is a default feature, so the stock build is pure Rust + CUDA with no Python.
 
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
-| Qwen3-4B / 8B | `openinfer-qwen3-4b` | `qwen3-4b` (default) | Full attention, TP support |
+| Qwen3-4B / 8B | `openinfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B | `openinfer-qwen35-4b` | `--features qwen35-4b` (needs build-time Python + Triton) | 24 linear + 8 full attention |
 | DeepSeek-V4 | `openinfer-deepseek-v4` | `--features deepseek-v4` | MoE + compressor + indexer, 8-GPU |
 | DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
@@ -44,7 +44,7 @@ cargo run --release --features deepseek-v4 -- --model-path models/DeepSeek-V4
 cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
-OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
 OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
 
@@ -62,7 +62,7 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
               ┌──────────────┬─────────────────┼─────────────────┬──────────────┐
               │              │                 │                 │              │
        openinfer-     openinfer-      openinfer-       openinfer-    openinfer-
-       qwen3-4b      qwen35-4b      deepseek-v4     deepseek-v2-   kimi-k2
+       qwen3          qwen35-4b      deepseek-v4     deepseek-v2-   kimi-k2
      (full attn)   (linear+full)   (MoE+indexer)    lite (MoE+EP)  (MLA+MoE)
               │              │                 │                 │              │
               └──────────────┴─────────────────┼─────────────────┴──────────────┘

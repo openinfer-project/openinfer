@@ -14,7 +14,7 @@
         feature = "deepseek-v2-lite",
         feature = "deepseek-v4",
         feature = "kimi-k2",
-        feature = "qwen3-4b",
+        feature = "qwen3",
         feature = "qwen35-4b"
     )),
     allow(unused_imports, unused_variables, dead_code)
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
             )?;
             finish(handle, cli.cuda_graph)
         }
-        #[cfg(feature = "qwen3-4b")]
+        #[cfg(feature = "qwen3")]
         ModelType::Qwen3 => {
             // Chunked-prefill budget from --max-prefill-tokens (a huge value
             // forwards the whole prompt in one step, i.e. chunking off, for the
@@ -194,8 +194,8 @@ fn main() -> Result<()> {
             let max_prefill_tokens = cli
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
-                .unwrap_or(openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen3_4b::start_engine_with_offload(
+                .unwrap_or(openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS);
+            let handle = openinfer_qwen3::start_engine_with_offload(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
@@ -205,11 +205,11 @@ fn main() -> Result<()> {
                     ep_backend: EpBackend::Nccl,
                     seed: command_seed(&cli),
                 },
-                openinfer_qwen3_4b::Qwen3OffloadOptions::disabled(),
+                openinfer_qwen3::Qwen3OffloadOptions::disabled(),
                 false,
                 max_prefill_tokens,
-                openinfer_qwen3_4b::Qwen3MemoryOptions::default(),
-                openinfer_qwen3_4b::DecodeOverlap::Off,
+                openinfer_qwen3::Qwen3MemoryOptions::default(),
+                openinfer_qwen3::DecodeOverlap::Off,
                 false,
                 None,
                 false,

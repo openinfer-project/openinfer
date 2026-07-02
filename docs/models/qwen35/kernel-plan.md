@@ -1,6 +1,6 @@
 # Qwen3.5 Kernel Plan
 
-> **TL;DR:** Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3-4b module — enumerates every prefill / decode / unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites.
+> **TL;DR:** Qwen3.5-4B has a `openinfer_qwen35_4b::kernel_plan()` static descriptor mirroring the qwen3 module — enumerates every prefill / decode / unified op with its Rust call site, backend, and notes, so you can dump the active kernel mix without reading call sites.
 >
 > **Last touched:** 2026-06
 
@@ -41,7 +41,7 @@ Or, for JSON, walk the structure and serialize. (No built-in JSON helper; the da
 
 ## What's NOT in scope (yet)
 
-- **No `qwen35_kernel_report.rs` bin.** The qwen3 counterpart (`openinfer-qwen3-4b/src/bin/qwen3_kernel_report.rs`) is a CUPTI-driven per-op microbench with manifest-driven variant sweeps. That's a much larger piece of work — out of scope for the "pure refactor, no kernel behavior change" boundary in #256.
+- **No `qwen35_kernel_report.rs` bin.** The qwen3 counterpart (`openinfer-qwen3/src/bin/qwen3_kernel_report.rs`) is a CUPTI-driven per-op microbench with manifest-driven variant sweeps. That's a much larger piece of work — out of scope for the "pure refactor, no kernel behavior change" boundary in #256.
 - **No `kernel_manifests/qwen35-4b.toml` either**, since no kernel_report bin consumes it.
 - **No actual selection logic.** Like qwen3, the plan is descriptive only — it documents the call sites, it doesn't dispatch between them. If/when a kernel variant choice depends on shape (e.g., CTA size for prefill attention), that decision still happens at the call site. The plan is the **observability** layer, not a policy engine.
 
@@ -53,7 +53,7 @@ Or, for JSON, walk the structure and serialize. (No built-in JSON helper; the da
 
 ## See also
 
-- `openinfer-qwen3-4b/src/kernel_plan.rs` — the reference implementation this is modeled on.
-- `openinfer-qwen3-4b/src/bin/qwen3_kernel_report.rs` — full CUPTI kernel report runner (future work, not in this refactor).
-- `openinfer-qwen3-4b/kernel_manifests/qwen3-4b.toml` — manifest consumed by the qwen3 report runner.
+- `openinfer-qwen3/src/kernel_plan.rs` — the reference implementation this is modeled on.
+- `openinfer-qwen3/src/bin/qwen3_kernel_report.rs` — full CUPTI kernel report runner (future work, not in this refactor).
+- `openinfer-qwen3/kernel_manifests/qwen3.toml` — manifest consumed by the qwen3 report runner.
 - Issue #256 — "qwen35: no kernel_plan — decode kernel picks are hardwired".

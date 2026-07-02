@@ -52,7 +52,7 @@ First build takes ~30s. Compiles CUDA kernels (`openinfer-kernels/csrc/*.cu`); w
 
 ```bash
 cargo test -r --workspace --lib   # unit tests (~9s)
-cargo test -r -p openinfer-qwen3-4b --test hf_golden_gate   # Qwen3-4B logits vs HF golden (~7s, needs GPU + model)
+cargo test -r -p openinfer-qwen3 --test hf_golden_gate   # Qwen3-4B logits vs HF golden (~7s, needs GPU + model)
 ```
 
 > **Always use `--release`**. Debug builds are extremely slow for GPU code and will timeout.
@@ -115,7 +115,7 @@ cargo run -r --bin bench_serving -- --model-path models/Qwen3.5-4B request
 Accuracy tests live in each model crate:
 
 ```bash
-cargo test -r -p openinfer-qwen3-4b  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
+cargo test -r -p openinfer-qwen3  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
 cargo test -r -p openinfer-qwen35-4b --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
 cargo test -r -p openinfer-qwen35-4b --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
 ```

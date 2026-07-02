@@ -49,12 +49,12 @@
 - Local static gates passed: `cargo fmt --all --check`, `git diff --check`, and the old-symbol grep for `gpu_sample_flashinfer_cuda`, `logits_to_probs_kernel`, `u64::from(...to_bits)`, and `FLASHINFER_TOPK_ROW_STATES_BYTES`.
 - Validation machine gates passed:
   - `cargo check --release --offline -p openinfer-core -p openinfer-kernels`
-  - `cargo check --release --offline -p openinfer-qwen3-4b`
+  - `cargo check --release --offline -p openinfer-qwen3`
   - `cargo check --release --offline -p openinfer-qwen35-4b --features qwen35-4b`
   - `cargo test --release --offline -p openinfer-kernels batch_sampling_top_p_only_small_nucleus_collapses_to_argmax -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen3-4b --tests --no-run`
-  - `cargo test --release --offline -p openinfer-qwen3-4b --test hf_golden_gate -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen3-4b --test sampling_behavior -- --nocapture`
+  - `cargo test --release --offline -p openinfer-qwen3 --tests --no-run`
+  - `cargo test --release --offline -p openinfer-qwen3 --test hf_golden_gate -- --nocapture`
+  - `cargo test --release --offline -p openinfer-qwen3 --test sampling_behavior -- --nocapture`
   - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture`
   - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test sampling_behavior -- --nocapture`
   - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b unified_step_decode_matches_graph_decode -- --nocapture`

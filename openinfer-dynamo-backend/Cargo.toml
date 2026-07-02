@@ -11,13 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 # Engine request/event contract (lean: depends only on tokio). The types here
-# are *identical* to what `openinfer_qwen3_4b::launch` returns — openinfer-core
+# are *identical* to what `openinfer_qwen3::launch` returns — openinfer-core
 # re-exports this very module (`pub use openinfer_engine::engine::*`), so the
 # EngineHandle flows through without a translation layer.
 openinfer-engine = { path = "../openinfer-engine" }
 # Qwen3 model load. Pulls the CUDA/cuBLAS/kernels stack — this binary is a real
 # GPU serving worker, not a stub.
-openinfer-qwen3-4b = { path = "../openinfer-qwen3-4b" }
+openinfer-qwen3 = { path = "../openinfer-qwen3" }
 
 # Dynamo backend-worker framework: the LLMEngine trait, the Worker lifecycle
 # driver, and `run()`. Pinned to the SAME rev as the dynamo deps in the main

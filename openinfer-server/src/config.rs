@@ -5,8 +5,8 @@ use clap::{Parser, ValueEnum};
 use openinfer::server_engine::ModelType;
 use openinfer::vllm_frontend::LoraModule;
 use openinfer_core::engine::EpBackend;
-#[cfg(feature = "qwen3-4b")]
-use openinfer_qwen3_4b::Qwen3LoraOptions;
+#[cfg(feature = "qwen3")]
+use openinfer_qwen3::Qwen3LoraOptions;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
@@ -41,12 +41,12 @@ pub(crate) struct Args {
     pub lora_modules: Vec<LoraModule>,
 
     /// Maximum number of resident LoRA adapters in Qwen3 LoRA mode.
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     #[arg(long = "max-loras", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORAS)]
     pub max_loras: usize,
 
     /// Maximum supported LoRA rank in Qwen3 LoRA mode.
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     #[arg(long = "max-lora-rank", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK, value_parser = parse_max_lora_rank_arg)]
     pub max_lora_rank: usize,
 
@@ -104,14 +104,14 @@ pub(crate) struct Args {
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, CUDA Graph capture, and margin.
-    #[cfg(feature = "qwen3-4b")]
-    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_GPU_MEMORY_UTILIZATION)]
+    #[cfg(feature = "qwen3")]
+    #[arg(long, default_value_t = openinfer_qwen3::DEFAULT_GPU_MEMORY_UTILIZATION)]
     pub gpu_memory_utilization: f64,
 
     /// Additional Qwen3 GPU memory to hold back after profile-based KV sizing,
     /// in MiB. Covers allocator fragmentation and small unprofiled drift.
-    #[cfg(feature = "qwen3-4b")]
-    #[arg(long, default_value_t = (openinfer_qwen3_4b::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
+    #[cfg(feature = "qwen3")]
+    #[arg(long, default_value_t = (openinfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
     pub kv_cache_memory_margin_mib: usize,
     /// How prefill and decode share the GPU (single-GPU Qwen3 only).
     /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
@@ -148,7 +148,7 @@ impl From<CliEpBackend> for EpBackend {
 }
 
 /// CLI selector for prefill/decode overlap. Mapped to
-/// [`openinfer_qwen3_4b::DecodeOverlap`] together with `--decode-sm-pct`.
+/// [`openinfer_qwen3::DecodeOverlap`] together with `--decode-sm-pct`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum CliDecodeOverlap {
     /// One stream; prefill and decode serialize.
@@ -161,9 +161,9 @@ pub(crate) enum CliDecodeOverlap {
 }
 
 impl CliDecodeOverlap {
-    #[cfg(feature = "qwen3-4b")]
-    pub(crate) fn resolve(self, decode_sm_pct: u32) -> openinfer_qwen3_4b::DecodeOverlap {
-        use openinfer_qwen3_4b::DecodeOverlap;
+    #[cfg(feature = "qwen3")]
+    pub(crate) fn resolve(self, decode_sm_pct: u32) -> openinfer_qwen3::DecodeOverlap {
+        use openinfer_qwen3::DecodeOverlap;
         match self {
             Self::Off => DecodeOverlap::Off,
             Self::Stream => DecodeOverlap::SharedSm,
@@ -179,9 +179,9 @@ impl Args {
         if !self.enable_lora && !self.lora_modules.is_empty() {
             bail!("--lora-modules requires --enable-lora");
         }
-        #[cfg(feature = "qwen3-4b")]
+        #[cfg(feature = "qwen3")]
         let is_qwen3 = matches!(model_type, ModelType::Qwen3);
-        #[cfg(not(feature = "qwen3-4b"))]
+        #[cfg(not(feature = "qwen3"))]
         let is_qwen3 = false;
         if self.enable_lora && !is_qwen3 {
             bail!("--enable-lora is currently supported only for Qwen3");
@@ -270,7 +270,7 @@ pub(crate) fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> 
     }
 }
 
-#[cfg(feature = "qwen3-4b")]
+#[cfg(feature = "qwen3")]
 pub(crate) fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
     let rank = value
         .parse::<usize>()
@@ -337,20 +337,20 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     #[test]
     fn parses_supported_max_lora_rank() {
         assert_eq!(parse_max_lora_rank_arg("16").expect("parse rank"), 16);
         assert_eq!(parse_max_lora_rank_arg("320").expect("parse rank"), 320);
     }
 
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     #[test]
     fn qwen3_lora_default_rank_is_64() {
         assert_eq!(Qwen3LoraOptions::default().max_lora_rank, 64);
     }
 
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     #[test]
     fn rejects_unsupported_max_lora_rank() {
         let error = parse_max_lora_rank_arg("7").expect_err("rank should be unsupported");
