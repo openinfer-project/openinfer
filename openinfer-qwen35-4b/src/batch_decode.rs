@@ -33,7 +33,15 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        openinfer_sample::select_batch(&self.ctx, logits, params, sample_seed, &mut bufs.sample)
+        let steps = vec![0u64; params.len()];
+        openinfer_sample::select_batch(
+            &self.ctx,
+            logits,
+            params,
+            &steps,
+            sample_seed,
+            &mut bufs.sample,
+        )
     }
 
     pub(crate) fn select_tokens_batch_varied(
@@ -58,10 +66,12 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
+        let steps = vec![0u64; params.len()];
         openinfer_sample::select_batch(
             &self.ctx,
             &bufs.logits,
             params,
+            &steps,
             sample_seed,
             &mut bufs.sample,
         )

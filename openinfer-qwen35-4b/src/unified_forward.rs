@@ -134,7 +134,9 @@ mod tests {
         let mut scratch =
             openinfer_sample::SampleScratch::new(&model.ctx, model.config.vocab_size, rows)
                 .unwrap();
-        openinfer_sample::select_batch(&model.ctx, logits, &params_refs, 0, &mut scratch).unwrap()
+        let steps = vec![0u64; params_refs.len()];
+        openinfer_sample::select_batch(&model.ctx, logits, &params_refs, &steps, 0, &mut scratch)
+            .unwrap()
     }
 
     /// Verify that unified_step decode output matches batch_decode_graph standalone.

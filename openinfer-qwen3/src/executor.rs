@@ -237,10 +237,15 @@ fn build_batch_decode_request_results(
     sample_seed: u64,
 ) -> Result<Vec<DecodeRequestResult>> {
     let params: Vec<&SamplingParams> = requests.iter().map(|req| &req.params).collect();
+    // Request-local sampling steps: zeros until the scheduler wires
+    // generated counts through (seeded requests are rejected at the
+    // frontend until then — see the sampling-parity tracking issue).
+    let steps = vec![0u64; params.len()];
     let tokens = openinfer_sample::select_batch(
         lane.model.device_ctx(),
         &lane.bufs.logits,
         &params,
+        &steps,
         sample_seed,
         &mut lane.sample_scratch,
     )?;
@@ -2637,10 +2642,13 @@ impl LocalQwen3Lane {
                 params.len(),
             )?;
         }
+        // Zero steps until scheduler wiring lands; see select_batch docs.
+        let steps = vec![0u64; params.len()];
         openinfer_sample::select_batch(
             self.model.device_ctx(),
             logits,
             params,
+            &steps,
             sample_seed,
             &mut self.sample_scratch,
         )

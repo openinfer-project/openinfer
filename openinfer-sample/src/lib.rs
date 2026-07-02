@@ -109,12 +109,20 @@ impl SampleScratch {
 /// arbitrary member of a bf16-tied top — and skips a softmax it does not need.
 ///
 /// `seed` must be fresh per decode step (one engine seed at startup, advanced
-/// per step); rows decorrelate through the philox subsequence. There is
-/// deliberately no per-row RNG.
+/// per step); unseeded rows decorrelate through the philox subsequence.
+///
+/// `steps[i]` is row `i`'s request-local decode step. It only matters for
+/// rows whose params carry a `seed`: a seeded row is sampled as its own
+/// single-row call with `mix_seed(request_seed, step)` as the philox seed, so
+/// its tokens are a pure function of (seed, step, distribution) — FlashInfer's
+/// kernels fold the batch position into the philox subsequence, so seeded rows
+/// cannot ride the batched call without their stream changing with batch
+/// composition.
 pub fn select_batch(
     ctx: &DeviceContext,
     logits: &HiddenStates,
     params: &[&SamplingParams],
+    steps: &[u64],
     seed: u64,
     scratch: &mut SampleScratch,
 ) -> Result<Vec<u32>> {
@@ -122,6 +130,11 @@ pub fn select_batch(
     if n == 0 {
         return Ok(Vec::new());
     }
+    ensure!(
+        steps.len() == n,
+        "select_batch: {} steps for {n} rows",
+        steps.len()
+    );
     ensure!(
         n <= scratch.max_rows,
         "select_batch: {n} rows exceeds scratch capacity {}",
@@ -172,16 +185,17 @@ pub fn select_batch(
         }
     }
 
-    // The rest -> one batched FlashInfer sampling pass.
+    // Unseeded sampling rows -> one batched FlashInfer sampling pass.
     let sampling_rows: Vec<BatchSamplingRow> = params
         .iter()
         .enumerate()
-        .filter(|(_, p)| !is_argmax(p))
+        .filter(|(_, p)| !is_argmax(p) && p.seed.is_none())
         .map(|(i, p)| BatchSamplingRow {
             row: i,
             temperature: p.temperature,
             top_k: p.top_k,
             top_p: p.top_p,
+            min_p: p.min_p,
         })
         .collect();
     if !sampling_rows.is_empty() {
@@ -197,7 +211,43 @@ pub fn select_batch(
         }
     }
 
+    // Seeded rows -> one single-row call each, philox seed mixed from the
+    // request seed and step so replay is independent of batch composition
+    // (blockIdx is always 0 in an n=1 call).
+    for (i, p) in params.iter().enumerate() {
+        let Some(request_seed) = p.seed else {
+            continue;
+        };
+        if is_argmax(p) {
+            continue;
+        }
+        let row = [BatchSamplingRow {
+            row: i,
+            temperature: p.temperature,
+            top_k: p.top_k,
+            top_p: p.top_p,
+            min_p: p.min_p,
+        }];
+        let sampled = gpu_sample_batch_into(
+            ctx,
+            logits.as_ref(),
+            &row,
+            mix_seed(request_seed, steps[i]),
+            &mut scratch.sampling,
+        )?;
+        tokens[i] = sampled[0];
+    }
+
     Ok(tokens)
+}
+
+/// SplitMix64 over (seed, step): a distinct, well-mixed philox seed per
+/// request step, deterministic across runs and batch layouts.
+fn mix_seed(seed: u64, step: u64) -> u64 {
+    let mut z = seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Whether a row can take the argmax path without changing sampling semantics.
@@ -268,8 +318,76 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::token_logprob_from_row;
+    use super::{SampleScratch, SamplingParams, select_batch, token_logprob_from_row};
     use half::bf16;
+    use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
+
+    const VOCAB: usize = 32768;
+
+    fn flat_arena(ctx: &DeviceContext, rows: usize) -> HiddenStates {
+        let host = vec![bf16::ZERO; rows * VOCAB];
+        HiddenStates {
+            data: ctx.stream.clone_htod(&host).expect("htod"),
+            hidden_dim: VOCAB,
+            seq_len: rows,
+        }
+    }
+
+    fn seeded(seed: u64) -> SamplingParams {
+        SamplingParams {
+            temperature: 1.0,
+            seed: Some(seed),
+            ..Default::default()
+        }
+    }
+
+    /// The per-request seed contract: a seeded row's token is a pure function
+    /// of (seed, step, distribution) — independent of where the row sits in
+    /// the batch and of what else is in flight.
+    #[test]
+    fn seeded_rows_replay_independent_of_batch_position() {
+        let ctx = DeviceContext::new().expect("CUDA context");
+        let logits = flat_arena(&ctx, 3);
+        let mut scratch = SampleScratch::new(&ctx, VOCAB, 3).expect("scratch");
+
+        let greedy = SamplingParams::default();
+        let unseeded = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+
+        // Batch A: seeded row last; batch B: seeded row first, different
+        // neighbors. Same seed + step must produce the same token.
+        let a = select_batch(
+            &ctx,
+            &logits,
+            &[&greedy, &unseeded, &seeded(7)],
+            &[0, 0, 5],
+            99,
+            &mut scratch,
+        )
+        .expect("batch a");
+        let b = select_batch(
+            &ctx,
+            &logits,
+            &[&seeded(7), &greedy],
+            &[5, 0],
+            1234,
+            &mut scratch,
+        )
+        .expect("batch b");
+        assert_eq!(
+            a[2], b[0],
+            "seeded row must replay across batch layouts and engine seeds"
+        );
+
+        // Advancing the step or changing the seed moves the stream. On a flat
+        // 32k-token distribution an accidental collision is ~3e-5.
+        let c = select_batch(&ctx, &logits, &[&seeded(7)], &[6], 0, &mut scratch).expect("step 6");
+        let d = select_batch(&ctx, &logits, &[&seeded(8)], &[5], 0, &mut scratch).expect("seed 8");
+        assert_ne!(a[2], c[0], "step must advance the seeded stream");
+        assert_ne!(a[2], d[0], "seed must select a distinct stream");
+    }
 
     #[test]
     fn token_logprob_matches_exact_log_softmax() {

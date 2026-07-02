@@ -50,6 +50,8 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
             temperature: 0.0,
             top_k: -1,
             top_p: 1.0,
+            min_p: 0.0,
+            seed: None,
             ignore_eos,
         };
     }
@@ -62,8 +64,49 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
             i32::try_from(params.top_k).unwrap_or(i32::MAX)
         },
         top_p: params.top_p,
+        min_p: params.min_p,
+        // Per-request seeds need the scheduler to feed request-local step
+        // counts into select_batch; until that lands, seeded requests are
+        // rejected in the bridge instead of silently ignored. See the
+        // sampling-parity tracking issue.
+        seed: None,
         ignore_eos,
     }
+}
+
+/// Reject sampling parameters the engine would otherwise silently ignore.
+/// Returns the offending description; `None` means the request is servable.
+///
+/// The float comparisons are exact on purpose: they detect "the client sent
+/// anything other than the wire default", not numeric closeness — a request
+/// carrying 1.0000001 wants a penalty and must be rejected, not rounded away.
+#[allow(clippy::float_cmp)]
+pub(crate) fn unsupported_sampling(params: &EngineCoreSamplingParams) -> Option<String> {
+    if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
+        return Some(format!("min_p {} outside [0, 1)", params.min_p));
+    }
+    if params.temperature > 0.0 && params.seed.is_some() {
+        return Some("per-request seed is not supported yet".to_string());
+    }
+    if params.frequency_penalty != 0.0 {
+        return Some(format!(
+            "frequency_penalty {} is not supported yet",
+            params.frequency_penalty
+        ));
+    }
+    if params.presence_penalty != 0.0 {
+        return Some(format!(
+            "presence_penalty {} is not supported yet",
+            params.presence_penalty
+        ));
+    }
+    if params.repetition_penalty != 1.0 {
+        return Some(format!(
+            "repetition_penalty {} is not supported yet",
+            params.repetition_penalty
+        ));
+    }
+    None
 }
 
 pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> usize {
@@ -129,6 +172,54 @@ mod tests {
         params.eos_token_id = None;
         params.stop_token_ids = vec![42];
         assert!(!convert_sampling(&params).ignore_eos);
+    }
+
+    #[test]
+    fn convert_sampling_passes_min_p_and_never_seed() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.eos_token_id = Some(1);
+        params.temperature = 0.8;
+        params.min_p = 0.15;
+        params.seed = Some(42);
+        let converted = convert_sampling(&params);
+        assert!((converted.min_p - 0.15).abs() < f32::EPSILON);
+        // Seeds are rejected upstream until scheduler step wiring lands;
+        // convert must never smuggle one through.
+        assert_eq!(converted.seed, None);
+
+        // Greedy lowering zeroes min_p along with the rest.
+        params.temperature = 0.0;
+        assert_eq!(convert_sampling(&params).min_p, 0.0);
+    }
+
+    #[test]
+    fn unsupported_sampling_rejects_what_the_engine_would_ignore() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.repetition_penalty = 1.0;
+        assert_eq!(unsupported_sampling(&params), None);
+
+        params.min_p = 0.2;
+        assert_eq!(unsupported_sampling(&params), None);
+        params.min_p = 1.5;
+        assert!(unsupported_sampling(&params).is_some());
+        params.min_p = 0.0;
+
+        params.temperature = 0.8;
+        params.seed = Some(7);
+        assert!(unsupported_sampling(&params).is_some());
+        // A greedy request's seed is a no-op, not a lie — allowed.
+        params.temperature = 0.0;
+        assert_eq!(unsupported_sampling(&params), None);
+        params.seed = None;
+
+        params.frequency_penalty = 0.5;
+        assert!(unsupported_sampling(&params).is_some());
+        params.frequency_penalty = 0.0;
+        params.presence_penalty = -0.5;
+        assert!(unsupported_sampling(&params).is_some());
+        params.presence_penalty = 0.0;
+        params.repetition_penalty = 1.2;
+        assert!(unsupported_sampling(&params).is_some());
     }
 
     #[test]

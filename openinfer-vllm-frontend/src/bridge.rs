@@ -245,6 +245,22 @@ impl LocalEngineBridge {
             return Ok(());
         };
 
+        // Fail loud on sampling parameters the engine cannot honor yet —
+        // silently ignoring a requested seed or penalty changes outputs
+        // without telling the client.
+        if let Some(unsupported) = crate::wire::unsupported_sampling(&sampling_params) {
+            warn!("request {request_id} rejected: unsupported sampling params: {unsupported}");
+            send_terminal_output(
+                output_tx,
+                request_id,
+                EngineCoreFinishReason::Error,
+                None,
+                None,
+                None,
+            )?;
+            return Ok(());
+        }
+
         let tag: RequestTag = Arc::from(request_id.as_str());
         let cancelled = Arc::new(AtomicBool::new(false));
         let token_tx = TokenSink::new(tag.clone(), event_tx.clone(), Arc::clone(&cancelled));

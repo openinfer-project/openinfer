@@ -115,6 +115,8 @@ unsafe extern "C" {
 
     pub fn flashinfer_top1_row_states_bytes_cuda() -> usize;
 
+    pub fn gpu_sample_topk_renorm_row_states_bytes_cuda() -> usize;
+
     pub fn gpu_sample_batch_flashinfer_cuda(
         logits: *const Half,
         row_indices: *const i32,
@@ -122,6 +124,8 @@ unsafe extern "C" {
         temperature_arr: *const f32,
         top_k_arr: *const i32,
         top_p_arr: *const f32,
+        min_p_arr: *const f32,
+        topk_row_states_scratch: *mut u8,
         valid_scratch: *mut u8,
         output: *mut i32,
         softmax_workspace: *mut u8,

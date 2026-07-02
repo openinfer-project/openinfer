@@ -358,6 +358,7 @@ impl KimiRankThreadState {
                 temperature: r.sampling.temperature,
                 top_k: r.sampling.top_k,
                 top_p: r.sampling.top_p,
+                min_p: 0.0,
             })
             .collect();
         let sampled = if sampling_rows.is_empty() {
@@ -631,6 +632,7 @@ impl KimiRankThreadState {
                 temperature: row.sampling.temperature,
                 top_k: row.sampling.top_k,
                 top_p: row.sampling.top_p,
+                min_p: 0.0,
             }];
             let scratch = decode_arena.scratch.sampling.batch_sampling(&device_ctx)?;
             let sampled = openinfer_sample::gpu_sample_batch_into(
