@@ -37,7 +37,10 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::fp8::Glm52ProjBytes;
-use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::mla_decode::{
+    Glm52MlaDecodeScratch, Glm52MlaLayerWeights, Glm52MlaSchedMetadata,
+    glm52_mla_decode_forward, glm52_mla_decode_forward_into,
+};
 
 // ---- BEGIN GENERATED: glm52_oracle probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
@@ -258,6 +261,11 @@ fn mla_oracle_gate() -> Result<()> {
 
     // Prefill via decode: position p writes its token into the cache, then
     // attends over the full prefix [0..=p] via a -1-padded top-k list.
+    // Each position also replays through the zero-alloc scratch forward and
+    // must match the plain forward bitwise — real-checkpoint parity for the
+    // buffer-reuse path (the cache re-pack writes identical bytes, so the
+    // replay is idempotent).
+    let mut scratch = Glm52MlaDecodeScratch::new(&ctx, contract)?;
     let mut outputs = Vec::with_capacity(ORACLE_CTX * HIDDEN);
     for position in 0..ORACLE_CTX {
         let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
@@ -282,6 +290,30 @@ fn mla_oracle_gate() -> Result<()> {
             &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk, &mla_sched,
         )?;
         let o_host = ctx.stream.clone_dtoh(&o)?;
+
+        glm52_mla_decode_forward_into(
+            &ctx,
+            &w,
+            &hidden,
+            &cos,
+            &sin,
+            &mut cache,
+            position,
+            &topk,
+            contract,
+            &mut scratch,
+        )?;
+        let o_scratch = ctx.stream.clone_dtoh(scratch.output())?;
+        let mismatches = o_host
+            .iter()
+            .zip(&o_scratch)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        ensure!(
+            mismatches == 0,
+            "position {position}: scratch forward diverges from plain forward              on {mismatches}/{HIDDEN} elements"
+        );
+
         outputs.extend(o_host.iter().map(|v| v.to_f32()));
     }
 
