@@ -411,10 +411,10 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
 
     let batch_size = 1_i32;
     let next_n = 1_i32;
-    let num_heads = 4_i32;
+    let num_heads = 16_i32; // 128 % 16 == 0; stride=16B (≥16B TMA align); smem=125KB (<232KB)
     let head_dim = 128_i32;
-    let block_kv = 128_i32;
-    let num_kv_blocks = 16_i32; // 2048 tokens
+    let block_kv = 64_i32; // DeepGEMM paged MQA logits requires BLOCK_KV=64
+    let num_kv_blocks = 32_i32; // 2048 tokens / 64 per block
     let num_sms = 132_i32; // H200 has 132 SMs
     let logits_stride = 256_i32; // split_kv=256
     let block_table_stride = num_kv_blocks;
