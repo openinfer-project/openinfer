@@ -46,7 +46,7 @@ DRAFT_MODEL=${DRAFT_MODEL:-}
 GPU=${GPU:-0}
 PORT=${PORT:-8000}
 RESULT_DIR=${RESULT_DIR:-./bench-results}
-QPS_LIST=${QPS_LIST:-"1 2 4 8 10 12 16"}
+QPS_LIST=${QPS_LIST-"1 2 4 8 10 12 16"}
 CONCURRENCY_LIST=${CONCURRENCY_LIST:-"1 4 8"}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
@@ -54,6 +54,7 @@ SEED=${SEED:-42}
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-60}
 BENCH=${BENCH:-vllm-bench}
 LABEL=${LABEL:-$ENGINE}
+SKIP_BUILD=${SKIP_BUILD:-0}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -65,6 +66,10 @@ mkdir -p "$RESULT_DIR"
 case "$ENGINE" in
   openinfer)
     BINARY="$REPO_ROOT/target/release/openinfer"
+    if [[ "$SKIP_BUILD" != "1" ]]; then
+      echo "=== building openinfer (SKIP_BUILD=1 to skip) ==="
+      (cd "$REPO_ROOT" && CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} cargo build --release -p openinfer-server)
+    fi
     SERVER_EXTRA_ARGS=()
     if [[ -n "$DRAFT_MODEL" ]]; then
       SERVER_EXTRA_ARGS+=(--dflash-draft-model-path "$DRAFT_MODEL")
@@ -115,17 +120,23 @@ trap cleanup EXIT
 # ---- wait for readiness -----------------------------------------------------
 echo "=== waiting for server readiness (timeout ${READY_TIMEOUT}s) ==="
 for i in $(seq 1 "$READY_TIMEOUT"); do
-  if curl -sf "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
-    echo "=== server ready (after ${i}s) ==="
-    break
-  fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "FATAL: server process died. Server log:" >&2
     cat "$RESULT_DIR/server-${ENGINE}-${MODEL_LABEL}.log" >&2
     exit 1
   fi
+  if curl -sf "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
+    echo "=== server ready (after ${i}s) ==="
+    break
+  fi
   sleep 1
 done
+
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "FATAL: server process died during readiness wait" >&2
+  cat "$RESULT_DIR/server-${ENGINE}-${MODEL_LABEL}.log" >&2
+  exit 1
+fi
 
 if ! curl -sf "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
   echo "FATAL: server not ready after ${READY_TIMEOUT}s" >&2
