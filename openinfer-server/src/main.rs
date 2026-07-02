@@ -109,15 +109,19 @@ async fn main() -> anyhow::Result<()> {
 // defaults, capability constraints, cross-arg validation). The server only
 // picks the crate by detected model type and forwards the relevant CLI knobs.
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
-    // Only Qwen3 wires the DFlash drafter; fail loud rather than silently
-    // ignoring the flag for another model line.
+    // Only model lines with a wired drafter may accept DFlash; fail loud rather
+    // than silently ignoring the flag for another model line.
     #[cfg(feature = "qwen3")]
     let is_qwen3 = matches!(model_type, ModelType::Qwen3);
     #[cfg(not(feature = "qwen3"))]
     let is_qwen3 = false;
+    #[cfg(feature = "qwen35-4b")]
+    let is_qwen35 = matches!(model_type, ModelType::Qwen35);
+    #[cfg(not(feature = "qwen35-4b"))]
+    let is_qwen35 = false;
     anyhow::ensure!(
-        args.dflash_draft_model_path.is_none() || is_qwen3,
-        "--dflash-draft-model-path is only supported for Qwen3 (got {model_type:?})"
+        args.dflash_draft_model_path.is_none() || is_qwen3 || is_qwen35,
+        "--dflash-draft-model-path is only supported for Qwen3/Qwen3.5 (got {model_type:?})"
     );
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
@@ -219,14 +223,39 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             .context("failed to start Qwen3 engine")?
         }
         #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => openinfer_qwen35_4b::launch(
-            &args.model_path,
-            args.device_ordinal,
-            args.cuda_graph,
-            args.max_prefill_tokens
-                .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
-        )
-        .context("failed to start Qwen3.5 engine")?,
+        ModelType::Qwen35 => {
+            let dflash_draft_model_path = match args.dflash_draft_model_path.clone() {
+                Some(path) => {
+                    anyhow::ensure!(
+                        !args.enable_lora,
+                        "--dflash-draft-model-path is not supported with --enable-lora"
+                    );
+                    anyhow::ensure!(
+                        !args.kv_offload,
+                        "--dflash-draft-model-path is not supported with --kv-offload"
+                    );
+                    anyhow::ensure!(
+                        args.tp_size == 1,
+                        "--dflash-draft-model-path currently requires --tp-size=1"
+                    );
+                    anyhow::ensure!(
+                        matches!(args.decode_overlap, config::CliDecodeOverlap::Off),
+                        "--dflash-draft-model-path is not supported with --decode-overlap"
+                    );
+                    Some(path)
+                }
+                None => None,
+            };
+            openinfer_qwen35_4b::launch(
+                &args.model_path,
+                args.device_ordinal,
+                args.cuda_graph,
+                args.max_prefill_tokens
+                    .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
+                dflash_draft_model_path,
+            )
+            .context("failed to start Qwen3.5 engine")?
+        }
     };
 
     Ok(handle)

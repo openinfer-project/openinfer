@@ -57,7 +57,7 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 // shared prefill prologue
                 KernelOp {
                     id: "embedding_prefill",
-                    rust: "prefill::prefill_last_hidden -> ops::embedding_batch",
+                    rust: "prefill::prefill_chunk_forward_with_capture -> ops::embedding_batch",
                     backend: "CUDA",
                     notes: "prompt tokens to hidden states",
                 },

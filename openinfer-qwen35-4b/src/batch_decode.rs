@@ -158,6 +158,16 @@ impl Qwen35Model {
         kv_states: &mut [&mut KvState],
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<()> {
+        self.batch_decode_graph_with_capture(token_ids, kv_states, graph_state, None)
+    }
+
+    pub(crate) fn batch_decode_graph_with_capture(
+        &self,
+        token_ids: &[u32],
+        kv_states: &mut [&mut KvState],
+        graph_state: &mut BatchDecodeGraphState,
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<()> {
         let bs = token_ids.len();
         anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
         anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
@@ -166,6 +176,16 @@ impl Qwen35Model {
             "batch size {bs} exceeds MAX_BATCH={}",
             super::batch_decode_graph::MAX_BATCH
         );
+        if let Some(ids) = capture_layer_ids {
+            anyhow::ensure!(
+                ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "Qwen3.5 decode capture layer ids must be strictly increasing"
+            );
+            anyhow::ensure!(
+                ids.iter().all(|&idx| idx < self.config.num_hidden_layers),
+                "Qwen3.5 decode capture layer id out of range"
+            );
+        }
 
         let padded_bs = bucket_for(bs);
 
@@ -182,6 +202,9 @@ impl Qwen35Model {
         }
 
         graph_state.buffers.set_batch_size(padded_bs);
+        if let Some(ids) = capture_layer_ids {
+            graph_state.buffers.captured_hidden.hidden_dim = self.config.hidden_size * ids.len();
+        }
 
         // H2D: token_ids and positions — zero-padded to bucket size.
         let mut token_ids_padded = token_ids.to_vec();
@@ -204,18 +227,35 @@ impl Qwen35Model {
         let layout = *kv_states[0].layout();
         let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
 
-        // Take graphs out of graph_state to avoid split-borrow in the closure.
-        let mut graphs = std::mem::take(&mut graph_state.graphs);
-        let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
-            self.batch_decode_kernels_graph(
-                kv_buffer,
-                &layout,
-                padded_bs,
-                &mut graph_state.slot_states,
-                &mut graph_state.buffers,
-            )
-        });
-        graph_state.graphs = graphs;
+        let result = if let Some(capture_layer_ids) = capture_layer_ids {
+            let mut capture_graphs = std::mem::take(&mut graph_state.capture_graphs);
+            let result = capture_graphs[bucket_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    &mut graph_state.slot_states,
+                    &mut graph_state.buffers,
+                    Some(capture_layer_ids),
+                )
+            });
+            graph_state.capture_graphs = capture_graphs;
+            result
+        } else {
+            let mut graphs = std::mem::take(&mut graph_state.graphs);
+            let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    &mut graph_state.slot_states,
+                    &mut graph_state.buffers,
+                    None,
+                )
+            });
+            graph_state.graphs = graphs;
+            result
+        };
         result
     }
 
@@ -226,8 +266,10 @@ impl Qwen35Model {
         padded_bs: usize,
         slot_states: &mut [RecurrentState],
         bufs: &mut BatchDecodeBuffers35,
+        capture_layer_ids: Option<&[usize]>,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let capture_layer_ids = capture_layer_ids.unwrap_or(&[]);
 
         ops::embedding_batch(
             &self.ctx,
@@ -238,7 +280,7 @@ impl Qwen35Model {
 
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
-        for layer in &self.layers {
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
             ops::rms_norm_batch_offset_into(
                 &self.ctx,
                 &bufs.hidden,
@@ -296,6 +338,15 @@ impl Qwen35Model {
             );
 
             ops::add_batch_into(&self.ctx, &bufs.hidden_mid, &bufs.mlp_out, &mut bufs.hidden)?;
+
+            if let Some(capture_slot) = capture_layer_ids.iter().position(|&idx| idx == layer_idx) {
+                ops::copy_hidden_rows_into(
+                    &self.ctx,
+                    &bufs.hidden,
+                    &mut bufs.captured_hidden,
+                    capture_slot * self.config.hidden_size,
+                )?;
+            }
         }
 
         ops::rms_norm_batch_offset_into(

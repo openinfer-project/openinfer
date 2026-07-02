@@ -91,6 +91,13 @@ pub(crate) fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
         .iter()
         .flat_map(|t| t.tbt.iter().skip(1).copied())
         .collect();
+    let effective_tpot: Vec<Duration> = timings
+        .iter()
+        .filter_map(|timing| {
+            (timing.decode_tokens_for_rate > 0)
+                .then(|| timing.decode_time_for_rate / timing.decode_tokens_for_rate as u32)
+        })
+        .collect();
     let generated: Vec<usize> = timings.iter().map(|t| t.emitted_tokens).collect();
     let generated_token_traces: Vec<GeneratedTokenTrace> = timings
         .iter()
@@ -105,6 +112,8 @@ pub(crate) fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
     RequestMetrics {
         ttft_ms: summarize_durations(&ttfts),
         first_decode_step_ms: (!first_steps.is_empty()).then(|| summarize_durations(&first_steps)),
+        effective_tpot_ms: (!effective_tpot.is_empty())
+            .then(|| summarize_durations(&effective_tpot)),
         steady_tpot_ms: (!steady.is_empty()).then(|| summarize_durations(&steady)),
         e2e_ms: summarize_durations(&e2e),
         generated_tokens: summarize_counts(&generated),
@@ -124,6 +133,9 @@ pub(crate) fn build_request_iterations(timings: &[GenTimings]) -> Vec<RequestIte
                 index,
                 ttft_ms: dur_ms(timing.ttft),
                 first_decode_step_ms: timing.tbt.first().copied().map(dur_ms),
+                effective_tpot_ms: (timing.decode_tokens_for_rate > 0).then(|| {
+                    dur_ms(timing.decode_time_for_rate) / timing.decode_tokens_for_rate as f64
+                }),
                 steady_tpot_ms: (!steady.is_empty()).then(|| summarize_durations(&steady)),
                 e2e_ms: dur_ms(timing.total),
                 generated_tokens: timing.emitted_tokens,
@@ -258,6 +270,7 @@ pub(crate) fn bench_matrix(
                 ttft_ms: metrics.ttft_ms,
                 e2e_ms: metrics.e2e_ms,
                 first_decode_step_ms: metrics.first_decode_step_ms,
+                effective_tpot_ms: metrics.effective_tpot_ms,
                 steady_tpot_ms: metrics.steady_tpot_ms,
                 generated_tokens: metrics.generated_tokens,
                 request_tok_s: metrics.request_tok_s,
@@ -377,6 +390,14 @@ pub(crate) fn render_text(report: &BenchReport) -> String {
                                 .clone()
                                 .into_iter()
                                 .map(|stats| ("first_decode_step_ms".to_string(), stats)),
+                        )
+                        .chain(
+                            report
+                                .metrics
+                                .effective_tpot_ms
+                                .clone()
+                                .into_iter()
+                                .map(|stats| ("effective_tpot_ms".to_string(), stats)),
                         )
                         .chain(
                             report

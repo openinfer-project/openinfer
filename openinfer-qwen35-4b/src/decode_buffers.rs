@@ -21,6 +21,7 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) act_out: HiddenStates,
     pub(crate) mlp_out: HiddenStates,
     pub(crate) logits: HiddenStates,
+    pub(crate) captured_hidden: HiddenStates,
 
     // Full attention [dim, batch]
     pub(crate) q_full: HiddenStates,
@@ -90,6 +91,7 @@ impl BatchDecodeBuffers35 {
             act_out: HiddenStates::zeros(ctx, config.intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, h, bs)?,
             logits: HiddenStates::zeros(ctx, config.vocab_size, bs)?,
+            captured_hidden: HiddenStates::zeros(ctx, h * config.num_hidden_layers, bs)?,
 
             q_full: HiddenStates::zeros(ctx, q_proj_dim, bs)?,
             q_attn: HiddenStates::zeros(ctx, q_dim, bs)?,
@@ -136,6 +138,7 @@ impl BatchDecodeBuffers35 {
         self.act_out.seq_len = bs;
         self.mlp_out.seq_len = bs;
         self.logits.seq_len = bs;
+        self.captured_hidden.seq_len = bs;
 
         self.q_full.seq_len = bs;
         self.q_attn.seq_len = bs;

@@ -25,7 +25,7 @@ pub use openinfer_kernels::ops::{
     rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into, scale_f32_in_place,
     scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
     scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into,
-    single_prefill_nhd_noncausal_into, write_vec_into,
+    single_prefill_nhd_causal_window_into, single_prefill_nhd_noncausal_into, write_vec_into,
 };
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use openinfer_kernels::ops::{

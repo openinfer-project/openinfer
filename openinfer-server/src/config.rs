@@ -90,9 +90,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub no_prefix_cache: bool,
 
-    /// Enable Qwen3 DFlash speculative decoding with this drafter model path.
-    /// Single-GPU greedy only; incompatible with --enable-lora and --kv-offload,
-    /// and forces the prefix cache off (it needs clean target hidden states).
+    /// Enable Qwen3/Qwen3.5 DFlash speculative decoding with this drafter model path.
+    /// Single-GPU greedy only; incompatible with --enable-lora, --kv-offload,
+    /// tensor parallelism, and decode overlap.
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
@@ -149,7 +149,7 @@ impl From<CliEpBackend> for EpBackend {
 
 /// CLI selector for prefill/decode overlap. Mapped to
 /// [`openinfer_qwen3::DecodeOverlap`] together with `--decode-sm-pct`.
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum CliDecodeOverlap {
     /// One stream; prefill and decode serialize.
     Off,
@@ -183,8 +183,15 @@ impl Args {
         let is_qwen3 = matches!(model_type, ModelType::Qwen3);
         #[cfg(not(feature = "qwen3"))]
         let is_qwen3 = false;
+        #[cfg(feature = "qwen35-4b")]
+        let is_qwen35 = matches!(model_type, ModelType::Qwen35);
+        #[cfg(not(feature = "qwen35-4b"))]
+        let is_qwen35 = false;
         if self.enable_lora && !is_qwen3 {
             bail!("--enable-lora is currently supported only for Qwen3");
+        }
+        if self.dflash_draft_model_path.is_some() && !(is_qwen3 || is_qwen35) {
+            bail!("--dflash-draft-model-path is currently supported only for Qwen3/Qwen3.5");
         }
         if self.batch_invariant && !is_qwen3 {
             bail!("--batch-invariant is currently supported only for Qwen3");

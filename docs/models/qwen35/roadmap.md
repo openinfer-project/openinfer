@@ -1,8 +1,8 @@
 # Qwen3.5-4B Roadmap
 
-> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: the decode-tuning refresh improves direct TPOT by `2.1-3.2%`, while vLLM still leads 1024/256 HTTP decode and high-concurrency throughput. Long-prompt HF logits and GSM8K gates cover the old 4096-position RoPE boundary. Remaining structural items are HND prefill staging, prefix-cache design, and the serving-level concurrency gap.
+> **TL;DR:** Qwen3.5-4B is decode-correct and still improving: DFlash speculative decoding is now opt-in, default-off, and batched for multi-active decode. Same-host RTX 5090 A/B shows c4/c8/c16 gains for decode-heavy, medium, and long prompts; token sanity is exact where stable and covered by the DFlash regret oracle for bf16 near-tie cases. Remaining structural items are HND prefill staging, prefix-cache design, serving-level HTTP pressure validation for DFlash, and broader non-greedy/TP feature coverage.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
 Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: `docs/models/qwen3/roadmap.md` — batched sampling is shared and #284 now routes Qwen3.5 decode through the same compact batched sampler; Qwen3.5 now has its own model-level non-greedy behavior gate, while qwen3 keeps the sibling gate on its side.
 
@@ -20,6 +20,7 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 | Admission | ✓ existing full-lifetime KV admission and explicit `Rejected` events cover impossible KV requests; #253 adds the context-window rejection reason before prefill/decode | `scheduler.rs`, `src/scheduler/plan.rs`, `docs/models/qwen35/kv-admission.md` |
 | Scheduler tests | Partial: current plan selection, full-lifetime admission, context-window rejection, slot assignment, and slot-compaction decisions are CPU-tested; GPU execution remains coupled to the production scheduler | `src/scheduler/plan.rs` |
 | Step tail | Local branch verified: #353 batches the prefill final norm/lm_head tail, samples decode/unified rows from batched logits, and keeps host full-vocab copies only for requested logprobs; HF/e2e gates pass, short-output serving A/B shows TTFT benefit, long-decode TPOT remains a no-claim diagnostic | `docs/models/qwen35/batched-step-tail.md` |
+| DFlash speculative decode | Opt-in batched path: hybrid-state verify/commit covers KV + recurrent + conv state; correctness and scheduler e2e gates pass. Same-host in-process A/B improves `prompt_len=1` c4/c8/c16 by `+16.7%/+15.4%/+14.0%`, `prompt_len=1024` by `+209.9%/+168.6%/+45.3%`, and `prompt_len=4096` by `+135.9%/+35.7%/+25.6%`. | `docs/models/qwen35/dflash-speculative-decoding.md` |
 | TP | ✗ absent (single GPU only) | — |
 | Prefix cache | ✗ absent; recurrent GDR state (~48MB per boundary snapshot) makes "prefix hit" itself a design question | — |
 
@@ -34,10 +35,11 @@ Tracking issue: see the `[Model] Qwen3.5-4B roadmap` GitHub issue. Sibling doc: 
 
 ### Next
 
-5. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → RoPE/context-window invariants → opens the door to prefix-cache design.
-6. **Serving-level concurrency profiling.** Add a measured-only server-side range, then split the 1024/256 concurrency-16 gap across scheduler wait, event sync, request dispatch, and model execution. Also teach the Qwen3.5 direct decode bench to prove cached-token exclusion before it reports pure decode TPOT.
-7. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
-8. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 5.
+5. **DFlash serving pressure validation.** The batched in-process DFlash path is now positive for c4/c8/c16. Next evidence step is HTTP/OpenAI-compatible pressure with the same baseline-vs-DFlash contract, including completed/failed counts, TTFT, effective TPOT, raw ITL, and token hash sanity.
+6. **Prefill full-paged migration.** Replace the HND staging copy with direct paged writes: removes the ~640MB transient and the extra D2D pass. Chain dependency: paged-direct prefill → per-token position plumbing → RoPE/context-window invariants → opens the door to prefix-cache design.
+7. **Serving-level concurrency profiling.** Add a measured-only server-side range, then split the 1024/256 concurrency-16 gap across scheduler wait, event sync, request dispatch, and model execution. Also teach the Qwen3.5 direct decode bench to prove cached-token exclusion before it reports pure decode TPOT.
+8. **Scheduler logic seam follow-through.** The current admission/slot/compaction decisions have a CPU-tested seam. Keep future admission and rejection changes in that seam instead of re-embedding them in GPU execution.
+9. **Prefix-cache design note.** Linear-attention layers carry recurrent state, not KV blocks — a "prefix hit" must restore both the full-attention KV *and* a recurrent-state snapshot at a block boundary (~48MB per boundary at bf16). Whether to snapshot per block, per N blocks, or only at request end is an open trade; write the design note before any code. Depends on 6.
 
 ### Later
 
