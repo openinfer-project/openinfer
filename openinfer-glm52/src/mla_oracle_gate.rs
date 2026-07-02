@@ -124,9 +124,10 @@ const ROPE_THETA: f32 = 8_000_000.0;
 // qk_head_dim(256)^-0.5; rope_type "default" means no yarn mscale correction.
 const SM_SCALE: f32 = 0.0625;
 
-/// splitmix64 -> 53-bit uniform -> (u - 0.5) * 4.0 -> bf16. Mirror of the
-/// Python generator; every step is exact in f64, so the bf16 stream is
-/// bit-identical across languages.
+/// splitmix64 -> 53-bit uniform -> (u - 0.5) * 4.0 -> f32 -> bf16. Mirror of
+/// the Python generator, including the f64 -> f32 -> bf16 double rounding
+/// (numpy `.astype(np.float32)` then torch's bf16 cast); a direct f64 -> bf16
+/// rounds a handful of values differently and fails the digest.
 fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
     (0..count)
         .map(|i| {
@@ -135,7 +136,7 @@ fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
             let u = (z >> 11) as f64 / (1u64 << 53) as f64;
-            bf16::from_f64((u - 0.5) * 4.0)
+            bf16::from_f32(((u - 0.5) * 4.0) as f32)
         })
         .collect()
 }
