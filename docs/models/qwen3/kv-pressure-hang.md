@@ -15,10 +15,10 @@
   - `.codex/harness/README.md` - confirms the verification ladder and safety boundaries.
   - `.codex/harness/commands.md` - provides Qwen3 e2e, server, and benchmark commands.
   - `.codex/harness/verification.md` - classifies this as serving/scheduler behavior needing a narrow repro plus HTTP/benchmark evidence.
-  - `openinfer-qwen3-4b/src/scheduler.rs` - admission control currently defers requests under KV pressure.
-  - `openinfer-qwen3-4b/src/scheduler/plan.rs` - execution plans currently consume pending requests before failures are handled.
-  - `openinfer-qwen3-4b/src/scheduler/effects.rs` - successful finishes drop request state; scheduler execution errors do not.
-  - `openinfer-qwen3-4b/src/executor.rs` - `drop_request` is the existing owner API for releasing per-request KV state.
+  - `openinfer-qwen3/src/scheduler.rs` - admission control currently defers requests under KV pressure.
+  - `openinfer-qwen3/src/scheduler/plan.rs` - execution plans currently consume pending requests before failures are handled.
+  - `openinfer-qwen3/src/scheduler/effects.rs` - successful finishes drop request state; scheduler execution errors do not.
+  - `openinfer-qwen3/src/executor.rs` - `drop_request` is the existing owner API for releasing per-request KV state.
   - `openinfer-core/src/kv_pool.rs` and `openinfer-core/src/page_pool.rs` - KV pages are RAII-returned only when request state is dropped.
   - GitHub issue #85 - observed server stays alive but completions hang after QPS=2 KV pressure.
 - **Relevant history**:
@@ -45,7 +45,7 @@
   - decode errors surfacing as `TokenEvent::Error`, dropping request state, and allowing recovery;
   - client/receiver drop releasing request state.
 - Changed `DecodeEffect::EmitAndContinue` send-failure handling to call `drop_request` before retiring the active request.
-- Result: remote RTX 5090 `cargo test --release -p openinfer-qwen3-4b --lib scheduler -- --nocapture` passed, `4 passed`.
+- Result: remote RTX 5090 `cargo test --release -p openinfer-qwen3 --lib scheduler -- --nocapture` passed, `4 passed`.
 
 ### Step 2: Maintainer feedback refinement
 - The maintainer clarified that the basic fix should keep requests that cannot get KV allocation in the waiting queue; preemption can be deferred.
@@ -64,8 +64,8 @@
   - Model: `models/Qwen3-4B`, HF revision metadata `1cfa9a7208912126459214e8b04321603b3df60c`.
 - Commands:
   - `cargo fmt --check` — passed.
-  - `cargo test --release -p openinfer-qwen3-4b --lib scheduler -- --nocapture` — passed, `4 passed`.
-  - `cargo clippy --release -p openinfer-qwen3-4b --lib -- -D warnings` — passed.
+  - `cargo test --release -p openinfer-qwen3 --lib scheduler -- --nocapture` — passed, `4 passed`.
+  - `cargo clippy --release -p openinfer-qwen3 --lib -- -D warnings` — passed.
   - `cargo build --release -p openinfer-server` — passed.
 - Local command:
   - `~/.cargo/bin/cargo fmt --check` — passed.
@@ -73,7 +73,7 @@
 ### Step 4: E2E and serving pressure validation
 - Installed `vllm 0.21.0` in the validation venv to run the issue's real `vllm bench serve` client.
 - Ran a host-local exact e2e check against the validation model snapshot:
-  - `OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test e2e -- --nocapture`
+  - `OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture`
   - Result after local fixture regeneration for that model snapshot: passed, `1 passed`.
   - PR review later found the regenerated fixture was not portable to the standard local model snapshot, so the repository `test_data/Qwen3-4B.json` change was reverted and this e2e result is not used as a merge gate.
 - Ran a small issue-shaped benchmark first:

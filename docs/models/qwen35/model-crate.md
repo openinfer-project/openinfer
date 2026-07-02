@@ -16,7 +16,7 @@ the crate is feature-gated end to end:
   feature (crate-root `#![cfg]`), so `cargo test --workspace --lib` stays
   Python-free; its tests/benches carry `required-features` and fail with an
   actionable message instead of a link error.
-- `openinfer-server` defaults to `qwen3-4b` only; serve Qwen3.5 with
+- `openinfer-server` defaults to `qwen3` only; serve Qwen3.5 with
   `cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B`.
 
 The unused Triton HD256 prefill kernel (replaced by the native paged
@@ -30,7 +30,7 @@ The unused Triton HD256 prefill kernel (replaced by the native paged
   - `docs/models/qwen35/accuracy.md` - at the time of this migration, Qwen3.5 e2e tests were regression guards against `test_data/Qwen3.5-4B.json`; current accuracy coverage is the HF logits gate recorded there.
   - `docs/models/qwen35/optimization.md` - Qwen3.5 should keep its hybrid linear/full-attention scheduler/state architecture.
   - GitHub issue #79 - acceptance criteria require `openinfer-qwen35-4b`, removal of root `openinfer::model::Qwen35Model` and `openinfer::scheduler_qwen35`, generic root `bench_serving`, and CUDA validation.
-  - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `openinfer-qwen3-4b/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
+  - `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/ops.rs`, `src/scheduler.rs`, `src/model/qwen35.rs`, and `openinfer-qwen3/src/lib.rs` - mapped the current root Qwen3.5 surface and the Qwen3 crate interface to copy.
 - **Relevant history**:
   - `docs/models/qwen3/model-crate.md` - root should load model crates through `EngineHandle`; model-owned execution details should move behind crate-local modules.
 - **Plan**:

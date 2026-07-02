@@ -84,7 +84,7 @@ The `batch_invariance_decode_splitkv_graph` gate covers this: co-batching a requ
 Reproduce a curve:
 
 ```bash
-OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3-4b --test hf_golden_gate
+OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
 # tpot sweep against a running server:
 vllm bench serve --backend openai --base-url http://localhost:8001 --endpoint /v1/completions \
   --model models/Qwen3-4B --dataset-name random --random-input-len 800 --random-output-len 64 \

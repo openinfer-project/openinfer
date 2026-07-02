@@ -16,7 +16,7 @@ pub enum ModelType {
     Glm52,
     #[cfg(feature = "kimi-k2")]
     KimiK2,
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     Qwen3,
     #[cfg(feature = "qwen35-4b")]
     Qwen35,
@@ -35,7 +35,7 @@ impl fmt::Display for ModelType {
             Self::Glm52 => write!(f, "GLM5.2"),
             #[cfg(feature = "kimi-k2")]
             Self::KimiK2 => write!(f, "Kimi-K2.6"),
-            #[cfg(feature = "qwen3-4b")]
+            #[cfg(feature = "qwen3")]
             Self::Qwen3 => write!(f, "Qwen3"),
             #[cfg(feature = "qwen35-4b")]
             Self::Qwen35 => write!(f, "Qwen3.5"),
@@ -128,9 +128,9 @@ pub fn detect_model_type(model_path: impl AsRef<Path>) -> Result<ModelType> {
         );
     }
 
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     return Ok(ModelType::Qwen3);
-    #[cfg(not(feature = "qwen3-4b"))]
+    #[cfg(not(feature = "qwen3"))]
     anyhow::bail!(
         "Qwen3 support is feature-gated; rebuild openinfer-server with --features qwen3-4b"
     );

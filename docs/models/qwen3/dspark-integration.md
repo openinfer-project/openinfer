@@ -11,12 +11,12 @@ Last touched: 2026-06
 ```
 OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
 OPENINFER_DFLASH_TEST_MODEL_PATH=/data/models/dspark_qwen3_4b_block7 \
-cargo test --release -p openinfer-qwen3-4b --test dflash_speculative_gate
+cargo test --release -p openinfer-qwen3 --test dflash_speculative_gate
 # → 4 passed; all prompts 100% lossless. (The "kernel-gap flip … Not a spec bug"
 #   diagnostics are the pre-existing DFlash prefill/decode numeric gap, unrelated.)
 ```
 
-What was actually built (the new DSpark code lives in its own module `openinfer-qwen3-4b/src/dspark.rs`):
+What was actually built (the new DSpark code lives in its own module `openinfer-qwen3/src/dspark.rs`):
 
 - **`dspark.rs`** — `MarkovHead { w1, w2 }` + `MarkovScratch` + `sample_block()` (the sequential semi-autoregressive loop, batched across requests) + `reservation_bytes()`. This is the home of all DSpark-specific logic; `dflash.rs` only holds an `Option<MarkovHead>` and an `Option<MarkovScratch>` and exposes `uses_markov_head()` / `markov_draft_tokens()` / `verify_span()`.
 - **Custom CUDA kernel** `markov_step_argmax` (`openinfer-kernels/csrc/shared/argmax.cu` + FFI + `ops::markov_step_argmax_into`). **We chose to add one kernel** — the earlier "no new kernel needed" prediction below was revised: the base block logits are request-major `[N·block, V]`, so step `k` needs a *strided* argmax over row `i·block+k` plus a *per-request* bias row `i`. Composing that from existing ops would mean slicing/re-batching one column per step (messier and slower than a single strided argmax-with-bias kernel). The kernel reads `base[(i·block+k)·V+v] + bias[i·V+v]` and writes the chosen token id as `u32` so it feeds straight back as the next step's prev-token lookup. Two-stage (partial+finalize), reusing the existing batched-argmax tiling.
@@ -89,7 +89,7 @@ Verifying the *whole* block wastes target batch capacity on tokens that will be 
 
 ## How DSpark maps onto our DFlash
 
-Our DFlash drafter (`openinfer-qwen3-4b/src/dflash.rs`, lane in `executor/dflash_lane.rs`) already **is** the DSpark parallel backbone. Side-by-side of the released `dspark_qwen3_4b_block7` config vs our `Qwen3-4B-DFlash-b16`:
+Our DFlash drafter (`openinfer-qwen3/src/dflash.rs`, lane in `executor/dflash_lane.rs`) already **is** the DSpark parallel backbone. Side-by-side of the released `dspark_qwen3_4b_block7` config vs our `Qwen3-4B-DFlash-b16`:
 
 | | DFlash-b16 (ours) | DSpark-block7 (released) |
 | --- | --- | --- |

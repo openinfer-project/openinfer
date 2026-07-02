@@ -8,8 +8,8 @@ use log::info;
 use openinfer::logging;
 use openinfer::server_engine::{ModelType, detect_model_type};
 use openinfer_core::engine::EngineHandle;
-#[cfg(feature = "qwen3-4b")]
-use openinfer_qwen3_4b::{Qwen3LaunchOptions, Qwen3LoraOptions, Qwen3OffloadOptions};
+#[cfg(feature = "qwen3")]
+use openinfer_qwen3::{Qwen3LaunchOptions, Qwen3LoraOptions, Qwen3OffloadOptions};
 
 use config::Args;
 
@@ -111,9 +111,9 @@ async fn main() -> anyhow::Result<()> {
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
     // Only Qwen3 wires the DFlash drafter; fail loud rather than silently
     // ignoring the flag for another model line.
-    #[cfg(feature = "qwen3-4b")]
+    #[cfg(feature = "qwen3")]
     let is_qwen3 = matches!(model_type, ModelType::Qwen3);
-    #[cfg(not(feature = "qwen3-4b"))]
+    #[cfg(not(feature = "qwen3"))]
     let is_qwen3 = false;
     anyhow::ensure!(
         args.dflash_draft_model_path.is_none() || is_qwen3,
@@ -152,7 +152,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             },
         )
         .context("failed to start Kimi-K2.6 text engine")?,
-        #[cfg(feature = "qwen3-4b")]
+        #[cfg(feature = "qwen3")]
         ModelType::Qwen3 => {
             let offload = if args.kv_offload {
                 let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
@@ -191,7 +191,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 }
                 None => None,
             };
-            openinfer_qwen3_4b::launch(
+            openinfer_qwen3::launch(
                 &args.model_path,
                 Qwen3LaunchOptions {
                     device_ordinal: args.device_ordinal,
@@ -201,8 +201,8 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     no_prefix_cache: args.no_prefix_cache,
                     max_prefill_tokens: args
                         .max_prefill_tokens
-                        .unwrap_or(openinfer_qwen3_4b::DEFAULT_MAX_PREFILL_TOKENS),
-                    memory: openinfer_qwen3_4b::Qwen3MemoryOptions::new(
+                        .unwrap_or(openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS),
+                    memory: openinfer_qwen3::Qwen3MemoryOptions::new(
                         args.gpu_memory_utilization,
                         kv_cache_memory_margin_bytes,
                     )
