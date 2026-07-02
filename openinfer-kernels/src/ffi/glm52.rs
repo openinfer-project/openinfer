@@ -3,6 +3,14 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 mod flashmla_sparse;
 pub use flashmla_sparse::*;
+mod hadamard;
+pub use hadamard::*;
+mod indexer;
+pub use indexer::*;
+mod topk;
+pub use topk::*;
+mod deepgemm_mqa;
+pub use deepgemm_mqa::*;
 
 unsafe extern "C" {
     pub fn glm52_deepgemm_mn_major_tma_aligned_f32_cuda(

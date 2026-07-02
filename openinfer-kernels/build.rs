@@ -1369,7 +1369,10 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        if stem == "glm52_flashmla_sparse" || stem == "glm52_trtllm_grouped_fp8" {
+        if stem == "glm52_flashmla_sparse"
+            || stem == "glm52_trtllm_grouped_fp8"
+            || stem == "glm52_deepgemm_mqa"
+        {
             nvcc_args.extend(glm52_flashmla_arch_args(&nvcc_sm_targets, &nvcc));
         } else {
             nvcc_args.extend(arch_args.clone());
@@ -1381,6 +1384,7 @@ fn main() {
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
+            || stem == "glm52_topk"
             || stem.starts_with("deepseek_")
         {
             for dir in &flashinfer.cccl {
@@ -1548,6 +1552,31 @@ fn main() {
                 flashinfer.cutlass_util.to_string_lossy().to_string(),
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
+            ]);
+        } else if stem == "glm52_deepgemm_mqa" {
+            // DeepGEMM paged MQA logits wrapper (torch-free via DG_NO_TORCH).
+            // Needs DeepGEMM csrc headers + CUTLASS + fmt, C++20.
+            let deepgemm_root = root.join("third_party/DeepGEMM");
+            let deepgemm_csrc = deepgemm_root.join("csrc");
+            let deepgemm_include = deepgemm_root.join("deep_gemm/include");
+            let cutlass_include = deepgemm_root.join("third-party/cutlass/include");
+            let cutlass_util = deepgemm_root.join("third-party/cutlass/tools/util/include");
+            let fmt_include = deepgemm_root.join("third-party/fmt/include");
+            nvcc_args.extend([
+                "--std=c++20".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-DDG_NO_TORCH".to_string(),
+                "-I".to_string(),
+                deepgemm_csrc.to_string_lossy().to_string(),
+                "-I".to_string(),
+                deepgemm_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                cutlass_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                cutlass_util.to_string_lossy().to_string(),
+                "-I".to_string(),
+                fmt_include.to_string_lossy().to_string(),
             ]);
         } else if stem.starts_with("glm52_") {
             nvcc_args.extend(["--std=c++17".to_string()]);
@@ -1747,6 +1776,8 @@ fn main() {
     // DeepGEMM JIT runtime calls cuLibraryLoadData etc. (CUDA 12.6+ driver API);
     // libcuda.so lives in the system lib dir, not the toolkit dir.
     println!("cargo:rustc-link-lib=cuda");
+    // DeepGEMM compiler.hpp references nvrtc symbols (NVRTCCompiler class).
+    println!("cargo:rustc-link-lib=nvrtc");
     if let Some(nccl_root) = &deepep_nccl {
         link_deepep_nccl(nccl_root, &out_dir);
     }
