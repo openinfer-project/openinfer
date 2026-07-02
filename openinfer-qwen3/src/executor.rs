@@ -237,15 +237,13 @@ fn build_batch_decode_request_results(
     sample_seed: u64,
 ) -> Result<Vec<DecodeRequestResult>> {
     let params: Vec<&SamplingParams> = requests.iter().map(|req| &req.params).collect();
-    // Request-local sampling steps: zeros until the scheduler wires
-    // generated counts through (seeded requests are rejected at the
-    // frontend until then — see the sampling-parity tracking issue).
-    let steps = vec![0u64; params.len()];
+    lane.steps_buf.clear();
+    lane.steps_buf.resize(params.len(), 0);
     let tokens = openinfer_sample::select_batch(
         lane.model.device_ctx(),
         &lane.bufs.logits,
         &params,
-        &steps,
+        &lane.steps_buf,
         sample_seed,
         &mut lane.sample_scratch,
     )?;
@@ -2477,6 +2475,10 @@ struct LocalQwen3Lane {
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
     sample_scratch: openinfer_sample::SampleScratch,
+    /// Request-local decode steps handed to `select_batch`, reused across
+    /// steps to keep the sampling hot path allocation-free. All zeros until
+    /// the scheduler wires generated counts through (sampling-parity 1b).
+    steps_buf: Vec<u64>,
     /// Prefill-chunk token cap; bounds the Pin self-check's unified-N envelope in `bind`.
     max_prefill_tokens: usize,
     /// In-flight prefill from a previous SplitConcurrent step (not yet synced).
@@ -2547,6 +2549,7 @@ impl LocalQwen3Lane {
             layout,
             bufs,
             sample_scratch,
+            steps_buf: Vec::new(),
             max_prefill_tokens,
             inflight_prefill: None,
             dflash: None,
@@ -2642,13 +2645,13 @@ impl LocalQwen3Lane {
                 params.len(),
             )?;
         }
-        // Zero steps until scheduler wiring lands; see select_batch docs.
-        let steps = vec![0u64; params.len()];
+        self.steps_buf.clear();
+        self.steps_buf.resize(params.len(), 0);
         openinfer_sample::select_batch(
             self.model.device_ctx(),
             logits,
             params,
-            &steps,
+            &self.steps_buf,
             sample_seed,
             &mut self.sample_scratch,
         )

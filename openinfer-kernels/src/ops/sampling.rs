@@ -9,9 +9,8 @@ use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
 /// `temperature` must be > 0 and `top_p` in (0, 1] — greedy rows
 /// (`temperature <= 0` or `top_k == 1`) belong on the argmax path.
 /// `top_k <= 0` means disabled. `min_p` in [0, 1); `0.0` means disabled —
-/// any enabled `min_p` row routes the whole call onto the renorm + min_p
-/// pipeline, so callers should batch min_p rows separately when they want
-/// the fused fast path for the rest.
+/// `gpu_sample_batch_into` partitions min_p rows into their own pass, so
+/// callers may mix freely.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchSamplingRow {
     /// Row index into the logits arena.
@@ -81,7 +80,48 @@ impl BatchSamplingScratch {
 /// `seed` must be fresh per decode step (one philox seed per call; rows
 /// decorrelate through the philox subsequence). Returns one token per row, in
 /// `rows` order.
+///
+/// min_p rows run as their own pass: if they shared a call, every row would
+/// ride the min_p kernel, whose u-scaling (`u * q`) and survivor predicate
+/// differ from the fused fast path — a min_p == 0 row could then sample a
+/// different token than it would alone. Partitioning here (not in callers)
+/// keeps "min_p == 0 rows take the original path" true for every caller, at
+/// one extra launch + sync only when a batch actually mixes.
 pub fn gpu_sample_batch_into(
+    ctx: &DeviceContext,
+    logits: HiddenStatesRef<'_>,
+    rows: &[BatchSamplingRow],
+    seed: u64,
+    scratch: &mut BatchSamplingScratch,
+) -> Result<Vec<u32>> {
+    ensure!(!rows.is_empty(), "batch sampling requires at least one row");
+    if rows.iter().all(|r| r.min_p > 0.0) || rows.iter().all(|r| r.min_p <= 0.0) {
+        return sample_uniform_batch_into(ctx, logits, rows, seed, scratch);
+    }
+    let (minp, plain): (Vec<BatchSamplingRow>, Vec<BatchSamplingRow>) =
+        rows.iter().copied().partition(|r| r.min_p > 0.0);
+    let plain_tokens = sample_uniform_batch_into(ctx, logits, &plain, seed, scratch)?;
+    // Distinct philox key for the second pass: both passes restart their
+    // subsequences at 0, so reusing `seed` would hand minp row i the same
+    // uniform stream as plain row i and correlate their tokens.
+    let minp_seed = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let minp_tokens = sample_uniform_batch_into(ctx, logits, &minp, minp_seed, scratch)?;
+    let mut plain_it = plain_tokens.into_iter();
+    let mut minp_it = minp_tokens.into_iter();
+    Ok(rows
+        .iter()
+        .map(|r| {
+            if r.min_p > 0.0 {
+                minp_it.next().expect("minp token per minp row")
+            } else {
+                plain_it.next().expect("plain token per plain row")
+            }
+        })
+        .collect())
+}
+
+/// One homogeneous FlashInfer pass (rows are all-min_p or all-plain).
+fn sample_uniform_batch_into(
     ctx: &DeviceContext,
     logits: HiddenStatesRef<'_>,
     rows: &[BatchSamplingRow],
@@ -171,7 +211,14 @@ pub fn gpu_sample_batch_into(
         let (top_k_ptr, _gk) = scratch.top_k.device_ptr(&ctx.stream);
         let (top_p_ptr, _gtp) = scratch.top_p.device_ptr(&ctx.stream);
         let (min_p_ptr, _gmp) = scratch.min_p.device_ptr(&ctx.stream);
-        let (row_states_ptr, _grs) = scratch.topk_row_states.device_ptr_mut(&ctx.stream);
+        // topk_row_states is only read on the min_p pipeline; the fast path
+        // hands the kernel a null instead of borrowing the buffer.
+        let row_states = if has_min_p_filter {
+            Some(scratch.topk_row_states.device_ptr_mut(&ctx.stream))
+        } else {
+            None
+        };
+        let row_states_ptr = row_states.as_ref().map_or(0, |(ptr, _guard)| *ptr);
         let (valid_ptr, _gv) = scratch.valid.device_ptr_mut(&ctx.stream);
         let (out_ptr, _go) = scratch.out.device_ptr_mut(&ctx.stream);
         let (ws_ptr, _gw) = scratch.softmax_workspace.device_ptr_mut(&ctx.stream);

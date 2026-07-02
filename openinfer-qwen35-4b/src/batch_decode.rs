@@ -33,12 +33,13 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        let steps = vec![0u64; params.len()];
+        bufs.steps.clear();
+        bufs.steps.resize(params.len(), 0);
         openinfer_sample::select_batch(
             &self.ctx,
             logits,
             params,
-            &steps,
+            &bufs.steps,
             sample_seed,
             &mut bufs.sample,
         )
@@ -66,12 +67,13 @@ impl Qwen35Model {
             params.len(),
             bufs.max_batch_size
         );
-        let steps = vec![0u64; params.len()];
+        bufs.steps.clear();
+        bufs.steps.resize(params.len(), 0);
         openinfer_sample::select_batch(
             &self.ctx,
             &bufs.logits,
             params,
-            &steps,
+            &bufs.steps,
             sample_seed,
             &mut bufs.sample,
         )

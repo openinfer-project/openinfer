@@ -99,8 +99,10 @@ impl SampleScratch {
 ///
 /// `params[i]` governs arena row `i`. Argmax rows are resolved together with a
 /// batched indexed argmax; the remaining rows are resolved together with one
-/// FlashInfer temperature/top-k/top-p pass seeded by `seed`. Returns one token
-/// id per row, in row order.
+/// FlashInfer temperature/top-k/top-p pass seeded by `seed` (min_p rows are
+/// partitioned into their own pass inside `gpu_sample_batch_into`, so
+/// min_p-free rows always take the fused fast path). Returns one token id per
+/// row, in row order.
 ///
 /// A row takes the argmax path when [`effectively_greedy`] holds: explicit
 /// greedy params, or a `top_p` nucleus so tight (`<= 1/vocab`) that only the
@@ -185,7 +187,9 @@ pub fn select_batch(
         }
     }
 
-    // Unseeded sampling rows -> one batched FlashInfer sampling pass.
+    // Unseeded sampling rows -> batched FlashInfer sampling. min_p rows may
+    // mix freely: `gpu_sample_batch_into` partitions them into their own pass
+    // so min_p-free rows always ride the fused fast path.
     let sampling_rows: Vec<BatchSamplingRow> = params
         .iter()
         .enumerate()

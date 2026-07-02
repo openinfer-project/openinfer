@@ -234,6 +234,54 @@ fn min_p_row_takes_the_sampler_path_and_filters() {
 /// (seed, step, distribution) — independent of where the row sits in the
 /// batch, of its neighbors, and of the engine's per-step seed.
 #[test]
+fn mixed_batch_keeps_plain_rows_on_the_fast_path() {
+    // A min_p neighbor must not perturb plain sampling rows: select_batch
+    // batches min_p rows separately, so a plain row's philox subsequence is
+    // its index among plain rows and its tokens match a min_p-free batch
+    // exactly. The plain rows carry top_k+top_p on a spread distribution so
+    // the fused fast path (rejection sampling, several uniform draws) and the
+    // min_p pipeline (renorm + one draw) genuinely diverge — riding the wrong
+    // path shows up as different tokens, not a 1-ulp coin flip.
+    let ctx = DeviceContext::new().unwrap();
+    let vocab = 16;
+    let spread: Vec<f32> = (0..vocab).map(|i| i as f32 * 0.3).collect();
+    let rows: Vec<Vec<f32>> = vec![spread.clone(), spread.clone(), spread.clone()];
+    let arena_mixed = make_arena(&ctx, &rows);
+    let arena_plain = make_arena(&ctx, &rows[..2]);
+    let mut scratch = SampleScratch::new(&ctx, vocab, rows.len()).unwrap();
+
+    let plain = sampling(1.0, 4, 0.9);
+    let mut minp = sampling(1.0, 0, 1.0);
+    minp.min_p = 0.5;
+
+    for seed in 0..64u64 {
+        let mixed = select_batch(
+            &ctx,
+            &arena_mixed,
+            &[&plain, &minp, &plain],
+            &[0, 0, 0],
+            seed,
+            &mut scratch,
+        )
+        .unwrap();
+        let alone = select_batch(
+            &ctx,
+            &arena_plain,
+            &[&plain, &plain],
+            &[0, 0],
+            seed,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            [mixed[0], mixed[2]],
+            [alone[0], alone[1]],
+            "seed {seed}: plain rows changed tokens because a min_p row joined the batch"
+        );
+    }
+}
+
+#[test]
 fn seeded_rows_replay_independent_of_batch_position() {
     let ctx = DeviceContext::new().unwrap();
     let vocab = 32_768;
