@@ -268,6 +268,7 @@ mod tests {
             top_k: -1,
             top_p: 0.95,
             ignore_eos: true,
+            ..SamplingParams::default()
         };
 
         assert_dsv2_lite_sampling_contract(&sampling);
