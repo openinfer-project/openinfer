@@ -81,11 +81,15 @@ pub fn glm52_deepgemm_paged_mqa_metadata_launch(
         "GLM5.2 DeepGEMM MQA schedule_metadata too small: have {}, need {need}",
         schedule_metadata.len()
     );
-    ensure!(
-        context_lens.len() >= shape.batch_size,
-        "GLM5.2 DeepGEMM MQA context_lens too small: have {}, need {}",
-        context_lens.len(),
+    let cl_need = if shape.is_context_lens_2d {
+        shape.batch_size * 2
+    } else {
         shape.batch_size
+    };
+    ensure!(
+        context_lens.len() >= cl_need,
+        "GLM5.2 DeepGEMM MQA context_lens too small: have {}, need {cl_need}",
+        context_lens.len()
     );
 
     let (cl_ptr, _cl_guard) = context_lens.device_ptr_mut(&ctx.stream);
