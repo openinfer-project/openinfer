@@ -128,6 +128,39 @@ unsafe extern "C" {
 
     pub fn gpu_sample_topk_renorm_row_states_bytes_cuda() -> usize;
 
+    pub fn gpu_chain_speculative_sampling_cuda(
+        draft_probs: *mut f32,
+        draft_token_ids: *const i32,
+        target_probs: *mut f32,
+        output_token_ids: *mut i32,
+        output_accepted_num: *mut i32,
+        output_emitted_num: *mut i32,
+        batch_size: i32,
+        num_speculative_tokens: i32,
+        vocab_size: i32,
+        onehot_draft: i32,
+        seed: u64,
+        offset: u64,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gpu_verify_probs_flashinfer_cuda(
+        logits: *const Half,
+        row_indices: *const i32,
+        probs_out: *mut f32,
+        temperature_arr: *const f32,
+        top_k_arr: *const i32,
+        top_p_arr: *const f32,
+        topk_row_states_scratch: *mut u8,
+        softmax_workspace: *mut u8,
+        softmax_workspace_bytes: usize,
+        n_rows: i32,
+        vocab_size: i32,
+        has_top_k_filter: i32,
+        has_top_p_filter: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn gpu_sample_batch_flashinfer_cuda(
         logits: *const Half,
         row_indices: *const i32,

@@ -120,6 +120,216 @@ pub fn gpu_sample_batch_into(
         .collect())
 }
 
+/// The target distribution at each requested arena row: gather + softmax +
+/// top-k/top-p renorm, written to `probs_out` as `n_rows x vocab` f32 —
+/// filtered tokens are exact zeros. This is the verify-side input to
+/// speculative rejection sampling; it is distribution-equivalent to the
+/// sampling fast path (the fused sampler filters at draw time, this filters
+/// then draws).
+///
+/// `min_p` rows are rejected: the min_p mask is applied inside the sampling
+/// kernel, not as a renorm, so a min_p target distribution is not
+/// representable here yet — callers must keep such requests off the
+/// speculative path.
+pub fn gpu_verify_probs_into(
+    ctx: &DeviceContext,
+    logits: HiddenStatesRef<'_>,
+    rows: &[BatchSamplingRow],
+    probs_out: &mut CudaSlice<f32>,
+    scratch: &mut BatchSamplingScratch,
+) -> Result<()> {
+    let n = rows.len();
+    ensure!(n > 0, "verify probs requires at least one row");
+    ensure!(
+        n <= scratch.max_rows,
+        "verify probs scratch too small: {n} rows > capacity {}",
+        scratch.max_rows
+    );
+    ensure!(
+        logits.hidden_dim == scratch.vocab,
+        "verify probs vocab mismatch: logits {} vs scratch {}",
+        logits.hidden_dim,
+        scratch.vocab
+    );
+    ensure!(
+        probs_out.len() >= n * scratch.vocab,
+        "verify probs output {} < {n} x {}",
+        probs_out.len(),
+        scratch.vocab
+    );
+
+    let mut row_indices = Vec::with_capacity(n);
+    let mut temperature = Vec::with_capacity(n);
+    let mut top_k = Vec::with_capacity(n);
+    let mut top_p = Vec::with_capacity(n);
+    let mut has_top_k_filter = false;
+    let mut has_top_p_filter = false;
+    for r in rows {
+        ensure!(
+            r.row < logits.seq_len,
+            "verify probs row {} out of arena range {}",
+            r.row,
+            logits.seq_len
+        );
+        ensure!(
+            r.temperature > 0.0 && r.temperature.is_finite(),
+            "verify probs temperature {} must be finite and > 0",
+            r.temperature
+        );
+        ensure!(
+            r.top_p > 0.0 && r.top_p <= 1.0,
+            "verify probs top_p {} must be in (0, 1]",
+            r.top_p
+        );
+        ensure!(
+            r.min_p == 0.0,
+            "verify probs cannot represent a min_p target distribution (min_p {})",
+            r.min_p
+        );
+        row_indices.push(i32::try_from(r.row)?);
+        temperature.push(r.temperature);
+        let vocab = i32::try_from(scratch.vocab)?;
+        let clamped_top_k = if r.top_k > 0 && r.top_k < vocab {
+            has_top_k_filter = true;
+            r.top_k
+        } else {
+            vocab
+        };
+        top_k.push(clamped_top_k);
+        if r.top_p < 1.0 {
+            has_top_p_filter = true;
+        }
+        top_p.push(r.top_p);
+    }
+    ctx.stream
+        .memcpy_htod(&row_indices, &mut scratch.row_indices)?;
+    ctx.stream
+        .memcpy_htod(&temperature, &mut scratch.temperature)?;
+    ctx.stream.memcpy_htod(&top_k, &mut scratch.top_k)?;
+    ctx.stream.memcpy_htod(&top_p, &mut scratch.top_p)?;
+
+    let softmax_workspace_bytes = scratch.softmax_workspace.len();
+    let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (indices_ptr, _gi) = scratch.row_indices.device_ptr(&ctx.stream);
+    let (probs_ptr, _gp) = probs_out.device_ptr_mut(&ctx.stream);
+    let (temp_ptr, _gt) = scratch.temperature.device_ptr(&ctx.stream);
+    let (top_k_ptr, _gk) = scratch.top_k.device_ptr(&ctx.stream);
+    let (top_p_ptr, _gtp) = scratch.top_p.device_ptr(&ctx.stream);
+    let row_states = if has_top_k_filter {
+        Some(scratch.topk_row_states.device_ptr_mut(&ctx.stream))
+    } else {
+        None
+    };
+    let row_states_ptr = row_states.as_ref().map_or(0, |(ptr, _guard)| *ptr);
+    let (ws_ptr, _gw) = scratch.softmax_workspace.device_ptr_mut(&ctx.stream);
+    let err = unsafe {
+        ffi::gpu_verify_probs_flashinfer_cuda(
+            logits_ptr as *const ffi::Half,
+            indices_ptr as *const i32,
+            probs_ptr as *mut f32,
+            temp_ptr as *const f32,
+            top_k_ptr as *const i32,
+            top_p_ptr as *const f32,
+            row_states_ptr as *mut u8,
+            ws_ptr as *mut u8,
+            softmax_workspace_bytes,
+            n as i32,
+            scratch.vocab as i32,
+            i32::from(has_top_k_filter),
+            i32::from(has_top_p_filter),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(err == 0, "verify probs kernel failed: cudaError {err}");
+    Ok(())
+}
+
+/// Chain speculative (rejection) sampling over per-row verify spans.
+///
+/// For each of the `batch` rows: accept draft token `i` with probability
+/// `min(1, p_target(x_i) / q_draft(x_i))`; the first rejection resamples from
+/// `relu(target − draft)` renormalized and stops; full acceptance emits the
+/// bonus token sampled from the target at position K. Output row layout is
+/// `K+1` token ids, `-1`-filled after the stop — exactly the "longest
+/// accepted prefix + one model token" contract `accept_greedy` has.
+///
+/// With `onehot_draft` (a greedy/argmax proposer), `draft_probs` is derived
+/// on-device from `draft_token_ids` — the degenerate proposal
+/// `q(x) = δ(x − draft)`, under which acceptance is `min(1, p_target(draft))`
+/// and the residual is the target with the draft token's mass removed:
+/// rejection sampling stays distribution-exact for a deterministic proposer.
+///
+/// `target_probs` must be post-filter probabilities (`gpu_verify_probs_into`),
+/// `batch x (K+1) x vocab`; `draft_probs` is `batch x K x vocab` scratch.
+/// One philox draw sequence per row; pass a fresh `seed`/`offset` per step
+/// (same discipline as the batched sampler).
+///
+/// Returns `(accepted, emitted)` per row. **`emitted` is the accepted-prefix
+/// length** (what the commit logic consumes); `accepted` keeps counting
+/// hypothetical acceptances *past* the first rejection — it is FlashInfer's
+/// acceptance-rate telemetry, not a commit signal.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_spec_accept_into(
+    ctx: &DeviceContext,
+    draft_probs: &mut CudaSlice<f32>,
+    draft_token_ids: &CudaSlice<i32>,
+    target_probs: &mut CudaSlice<f32>,
+    output_token_ids: &mut CudaSlice<i32>,
+    batch: usize,
+    num_spec_tokens: usize,
+    vocab: usize,
+    seed: u64,
+    offset: u64,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    ensure!(
+        batch > 0 && num_spec_tokens > 0,
+        "spec accept requires batch > 0 and K > 0"
+    );
+    ensure!(
+        draft_probs.len() >= batch * num_spec_tokens * vocab
+            && target_probs.len() >= batch * (num_spec_tokens + 1) * vocab
+            && draft_token_ids.len() >= batch * num_spec_tokens
+            && output_token_ids.len() >= batch * (num_spec_tokens + 1),
+        "spec accept buffer too small for batch {batch} x K {num_spec_tokens} x vocab {vocab}"
+    );
+    // The kernel accumulates into the counters, so they start at zero.
+    let mut accepted: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
+    let mut emitted: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
+    {
+        let (dp, _g1) = draft_probs.device_ptr_mut(&ctx.stream);
+        let (ids, _g2) = draft_token_ids.device_ptr(&ctx.stream);
+        let (tp, _g3) = target_probs.device_ptr_mut(&ctx.stream);
+        let (out, _g4) = output_token_ids.device_ptr_mut(&ctx.stream);
+        let (acc, _g5) = accepted.device_ptr_mut(&ctx.stream);
+        let (emi, _g6) = emitted.device_ptr_mut(&ctx.stream);
+        let err = unsafe {
+            ffi::gpu_chain_speculative_sampling_cuda(
+                dp as *mut f32,
+                ids as *const i32,
+                tp as *mut f32,
+                out as *mut i32,
+                acc as *mut i32,
+                emi as *mut i32,
+                batch as i32,
+                num_spec_tokens as i32,
+                vocab as i32,
+                1,
+                seed,
+                offset,
+                crate::tensor::active_cu_stream(ctx),
+            )
+        };
+        ensure!(
+            err == 0,
+            "chain speculative sampling failed: cudaError {err}"
+        );
+    }
+    let accepted_h = ctx.stream.clone_dtoh(&accepted)?;
+    let emitted_h = ctx.stream.clone_dtoh(&emitted)?;
+    ctx.sync()?;
+    Ok((accepted_h, emitted_h))
+}
+
 /// One homogeneous FlashInfer pass (rows are all-min_p or all-plain).
 fn sample_uniform_batch_into(
     ctx: &DeviceContext,
@@ -845,6 +1055,132 @@ mod tests {
             gpu_sample_batch_into(&ctx, logits.as_ref(), &rows, 43, &mut scratch).expect("sample");
         assert_eq!(a, b, "same seed must reproduce the same tokens");
         assert_ne!(a, c, "different seeds must diverge on flat rows");
+    }
+
+    #[test]
+    fn verify_probs_renorm_matches_the_sampling_law() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        // Row with a known 3-token support: P = {0.6652, 0.2447, 0.0900}
+        // (softmax of {2, 1, 0} with the rest at -120), plus top_k=2 on a
+        // second view of the same row so the renorm must zero token 300 and
+        // renormalize the survivors to {0.7311, 0.2689}.
+        let mut row = flat_row(-120.0);
+        row[100] = 2.0;
+        row[200] = 1.0;
+        row[300] = 0.0;
+        let logits = arena_with_rows(&ctx, &[(1, row.clone()), (5, row)]);
+        let mut scratch = BatchSamplingScratch::new(&ctx, ARENA_ROWS, VOCAB).expect("scratch");
+        let rows = [
+            BatchSamplingRow {
+                row: 1,
+                temperature: 1.0,
+                top_k: -1,
+                top_p: 1.0,
+                min_p: 0.0,
+            },
+            BatchSamplingRow {
+                row: 5,
+                temperature: 1.0,
+                top_k: 2,
+                top_p: 1.0,
+                min_p: 0.0,
+            },
+        ];
+        let mut probs: CudaSlice<f32> = ctx.stream.alloc_zeros(2 * VOCAB).expect("probs");
+        gpu_verify_probs_into(&ctx, logits.as_ref(), &rows, &mut probs, &mut scratch)
+            .expect("verify probs");
+        let host = ctx.stream.clone_dtoh(&probs).expect("D2H");
+        ctx.sync().expect("sync");
+
+        // Unfiltered row: sums to 1, matches the closed-form softmax.
+        let r0 = &host[..VOCAB];
+        let sum0: f32 = r0.iter().sum();
+        assert!((sum0 - 1.0).abs() < 1e-3, "row0 sum {sum0}");
+        assert!((r0[100] - 0.6652).abs() < 5e-3, "P(100) {}", r0[100]);
+        assert!((r0[200] - 0.2447).abs() < 5e-3, "P(200) {}", r0[200]);
+        assert!((r0[300] - 0.0900).abs() < 5e-3, "P(300) {}", r0[300]);
+
+        // top_k=2 row: token 300 is an exact zero (renorm, not epsilon), the
+        // survivors renormalize, and the sum is 1 again.
+        let r1 = &host[VOCAB..2 * VOCAB];
+        assert_eq!(r1[300], 0.0, "top-k filtered token must be exactly zero");
+        assert!((r1[100] - 0.7311).abs() < 5e-3, "renorm P(100) {}", r1[100]);
+        assert!((r1[200] - 0.2689).abs() < 5e-3, "renorm P(200) {}", r1[200]);
+        let sum1: f32 = r1.iter().sum();
+        assert!((sum1 - 1.0).abs() < 1e-3, "row1 sum {sum1}");
+    }
+
+    #[test]
+    fn verify_probs_rejects_min_p_rows() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        let logits = arena_with_rows(&ctx, &[(0, flat_row(0.0))]);
+        let mut scratch = BatchSamplingScratch::new(&ctx, ARENA_ROWS, VOCAB).expect("scratch");
+        let rows = [BatchSamplingRow {
+            row: 0,
+            temperature: 1.0,
+            top_k: -1,
+            top_p: 1.0,
+            min_p: 0.1,
+        }];
+        let mut probs: CudaSlice<f32> = ctx.stream.alloc_zeros(VOCAB).expect("probs");
+        let err = gpu_verify_probs_into(&ctx, logits.as_ref(), &rows, &mut probs, &mut scratch)
+            .expect_err("min_p rows must be rejected");
+        assert!(err.to_string().contains("min_p"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn spec_accept_full_acceptance_and_certain_rejection() {
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        let k = 2usize;
+        // Hand-built target probs, batch=2, K+1=3 positions each.
+        // Row 0: target puts prob 1.0 on the draft token at every position →
+        // certain acceptance; bonus position puts 1.0 on token 777.
+        // Row 1: target puts 0.0 on the draft at position 0 (prob 1.0 on 555)
+        // → certain first-step rejection; the residual is exactly {555: 1.0}.
+        let mut target = vec![0.0f32; 2 * (k + 1) * VOCAB];
+        target[100] = 1.0; // row0 pos0 -> 100
+        target[VOCAB + 200] = 1.0; // row0 pos1 -> 200
+        target[2 * VOCAB + 777] = 1.0; // row0 bonus -> 777
+        let r1 = 3 * VOCAB;
+        target[r1 + 555] = 1.0; // row1 pos0: all mass on 555, draft is 100
+        target[r1 + VOCAB + 200] = 1.0; // never reached
+        target[r1 + 2 * VOCAB + 300] = 1.0; // never reached
+        let mut target_d: CudaSlice<f32> =
+            ctx.stream.clone_htod(&target).expect("target probs H2D");
+        let drafts: Vec<i32> = vec![100, 200, /* row1 */ 100, 200];
+        let drafts_d = ctx.stream.clone_htod(&drafts).expect("draft ids H2D");
+        let mut draft_probs: CudaSlice<f32> =
+            ctx.stream.alloc_zeros(2 * k * VOCAB).expect("draft probs");
+        let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(2 * (k + 1)).expect("out");
+
+        let (accepted, emitted) = gpu_spec_accept_into(
+            &ctx,
+            &mut draft_probs,
+            &drafts_d,
+            &mut target_d,
+            &mut out,
+            2,
+            k,
+            VOCAB,
+            0x5eed,
+            0,
+        )
+        .expect("spec accept");
+        let out_h = ctx.stream.clone_dtoh(&out).expect("D2H");
+        ctx.sync().expect("sync");
+
+        // Row 0: both drafts accepted (p_target = 1), bonus token 777 emitted.
+        assert_eq!(&out_h[..3], &[100, 200, 777], "row0 {:?}", &out_h[..3]);
+        assert_eq!(emitted[0], 2, "row0 emitted prefix");
+        assert_eq!(accepted[0], 2, "row0 acceptance telemetry");
+        // Row 1: draft rejected at pos 0 (p_target = 0); the residual
+        // relu(target - onehot(100)) is exactly {555: 1.0}, so the resample is
+        // deterministic; the tail is -1-filled. `emitted` is the commit
+        // signal; `accepted` may exceed it (it keeps counting hypothetical
+        // acceptances past the rejection - telemetry, asserted only >= 0).
+        assert_eq!(&out_h[3..], &[555, -1, -1], "row1 {:?}", &out_h[3..]);
+        assert_eq!(emitted[1], 0, "row1 emitted prefix");
+        assert!(accepted[1] >= 0, "row1 telemetry sane");
     }
 
     #[test]
