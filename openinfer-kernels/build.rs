@@ -346,6 +346,17 @@ fn glm52_flashmla_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String
     nvcc_arch_args(&promoted_sms)
 }
 
+/// Arch args for TUs whose device code is raw Hopper wgmma (the
+/// AOT-instantiated DeepGEMM MQA kernels): sm_90a ONLY — the instantiation
+/// cannot even be ptxas-assembled for other targets. Returns `None` when no
+/// sm_90 target is present (or nvcc lacks 90a); the TU then compiles its
+/// NOT_SUPPORTED stub for the requested targets instead.
+fn glm52_sm90a_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    let has_sm90 = normalized_sms.iter().any(|sm| sm == "90" || sm == "90a");
+    (has_sm90 && nvcc_accepts_gencode(nvcc, "90a", "90a"))
+        .then(|| nvcc_arch_args(&["90a".to_string()]))
+}
+
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("Failed to read {}: {err}", dir.display()))
@@ -1374,11 +1385,18 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        if stem == "glm52_flashmla_sparse"
-            || stem == "glm52_trtllm_grouped_fp8"
-            || stem == "glm52_deepgemm_mqa"
-        {
+        if stem == "glm52_flashmla_sparse" || stem == "glm52_trtllm_grouped_fp8" {
             nvcc_args.extend(glm52_flashmla_arch_args(&nvcc_sm_targets, &nvcc));
+        } else if stem == "glm52_deepgemm_mqa" {
+            if let Some(sm90a_args) = glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(sm90a_args);
+                nvcc_args.push("-DGLM52_DEEPGEMM_MQA_SM90A".to_string());
+            } else {
+                println!(
+                    "cargo:warning=No sm_90a target; GLM5.2 DeepGEMM MQA kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
         } else {
             nvcc_args.extend(arch_args.clone());
         }
@@ -1559,14 +1577,9 @@ fn main() {
                 flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
         } else if stem == "glm52_deepgemm_mqa" {
-            // DeepGEMM paged MQA logits wrapper (torch-free via DG_NO_TORCH).
+            // DeepGEMM paged MQA kernels, AOT-instantiated from the vendored
+            // device headers (torch-free via DG_NO_TORCH, no runtime JIT).
             // Needs DeepGEMM csrc headers + CUTLASS + fmt, C++20.
-            // DG_JIT_USE_RUNTIME_API selects DeepGEMM's CUDA 12.8+
-            // library-management handles (cudaKernel_t, context-independent):
-            // the default driver branch caches a per-context CUfunction, and
-            // under the DP8 coordinator the rank that JIT-compiles first would
-            // hand the other 7 rank threads a handle that is invalid in their
-            // contexts (CUDA_ERROR_INVALID_HANDLE at first indexer layer).
             let deepgemm_root = root.join("third_party/DeepGEMM");
             let deepgemm_csrc = deepgemm_root.join("csrc");
             let deepgemm_include = deepgemm_root.join("deep_gemm/include");
@@ -1578,7 +1591,6 @@ fn main() {
                 "--expt-relaxed-constexpr".to_string(),
                 "--expt-extended-lambda".to_string(),
                 "-DDG_NO_TORCH".to_string(),
-                "-DDG_JIT_USE_RUNTIME_API".to_string(),
                 "-I".to_string(),
                 deepgemm_csrc.to_string_lossy().to_string(),
                 "-I".to_string(),
