@@ -49,6 +49,23 @@ impl Glm52DenseMlpWeights {
             down: ProjWeight::upload(ctx, down)?,
         })
     }
+
+    /// Build from already-resident projections (the production loader path).
+    pub(crate) fn from_device(gate: ProjWeight, up: ProjWeight, down: ProjWeight) -> Result<Self> {
+        let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
+            anyhow::ensure!(
+                p.n == n && p.k == k,
+                "GLM5.2 dense MLP {label} shape [{},{}] != [{n},{k}]",
+                p.n,
+                p.k
+            );
+            Ok(())
+        };
+        shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
+        shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
+        Ok(Self { gate, up, down })
+    }
 }
 
 /// Dense MLP contribution for a single token. `normed_hidden` is the

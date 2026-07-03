@@ -1,41 +1,42 @@
-//! GLM5.2 load-weight bring-up surface.
+//! GLM5.2 DP1/EP8 engine surface.
 //!
-//! This crate intentionally stops at startup weight residency. It validates the
-//! official GLM5.2 FP8 checkpoint layout, loads DP1/EP8 rank slices to GPU
-//! memory, and returns a fail-closed engine handle until forward is introduced.
+//! Startup validates the official GLM5.2 FP8 checkpoint layout, loads rank
+//! slices to GPU memory (experts placed into their packed layout at H2D
+//! time), builds the resident model, and serves bs=1 greedy generation: rank
+//! 0 runs the full non-expert path, all 8 ranks enter the per-MoE-layer
+//! DeepEP collectives.
 
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
 mod bookend;
 #[cfg(all(test, feature = "glm52"))]
 mod bookend_oracle_gate;
 mod config;
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
 mod dense;
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
 mod fp8;
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
 mod indexer;
 #[cfg(all(test, feature = "glm52"))]
 mod indexer_oracle_gate;
 #[cfg(all(test, feature = "glm52"))]
 mod indexer_smoke;
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
 mod layer;
+#[cfg(all(test, feature = "glm52"))]
+mod layer_ep8_oracle_gate;
 #[cfg(all(test, feature = "glm52"))]
 mod layer_oracle_gate;
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
 mod mla_decode;
 #[cfg(all(test, feature = "glm52"))]
 mod mla_oracle_gate;
 #[cfg(feature = "glm52")]
-#[allow(dead_code)]
+mod model;
+#[cfg(feature = "glm52")]
 mod moe_decode;
+#[cfg(feature = "glm52")]
+mod moe_ep8;
 mod runner;
 mod weights;
 
@@ -44,7 +45,9 @@ use std::{collections::BTreeSet, path::Path, time::Instant};
 use anyhow::{Result, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::EngineHandle;
-use runner::{Glm52RankPlacement, Glm52RankWorker, run_rejecting_load_only_coordinator};
+#[cfg(not(feature = "glm52"))]
+use runner::run_rejecting_load_only_coordinator;
+use runner::{Glm52RankPlacement, Glm52RankWorker};
 use tokio::sync::mpsc;
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
 
@@ -121,12 +124,80 @@ fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHa
         format_bytes(&loaded.report.rank_bytes),
     );
 
-    let (submit_tx, submit_rx) = mpsc::unbounded_channel();
-    let coord_handle = std::thread::Builder::new()
-        .name("glm52-load-coord".into())
-        .spawn(move || run_rejecting_load_only_coordinator(submit_rx, loaded.workers))
-        .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 load-only coordinator: {err}"))?;
-    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
+    #[cfg(feature = "glm52")]
+    {
+        let eos_token_ids = read_eos_token_ids(model_path)?;
+        build_rank_models(&loaded.workers)?;
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let coord_handle = std::thread::Builder::new()
+            .name("glm52-coord".into())
+            .spawn(move || runner::run_bs1_coordinator(submit_rx, loaded.workers, eos_token_ids))
+            .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
+        Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
+    }
+
+    #[cfg(not(feature = "glm52"))]
+    {
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let coord_handle = std::thread::Builder::new()
+            .name("glm52-load-coord".into())
+            .spawn(move || run_rejecting_load_only_coordinator(submit_rx, loaded.workers))
+            .map_err(|err| {
+                anyhow::anyhow!("failed to spawn GLM5.2 load-only coordinator: {err}")
+            })?;
+        Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
+    }
+}
+
+/// Build every rank's resident model + DeepEP context. The build command is
+/// collective (context creation barriers), so it is issued to all ranks
+/// before any response is awaited.
+#[cfg(feature = "glm52")]
+fn build_rank_models(workers: &[Glm52RankWorker]) -> Result<()> {
+    let build_started = Instant::now();
+    let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
+    let responses = workers
+        .iter()
+        .map(|worker| worker.build_model_async(unique_id))
+        .collect::<Result<Vec<_>>>()?;
+    for (rank, response) in responses.into_iter().enumerate() {
+        response
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??;
+    }
+    log::info!(
+        "GLM5.2 rank models built in {:.2}s (weights adopted in place + DeepEP contexts up)",
+        build_started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
+/// number or an array of numbers).
+#[cfg(feature = "glm52")]
+fn read_eos_token_ids(model_path: &Path) -> Result<Vec<u32>> {
+    let path = model_path.join("generation_config.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
+    let field = json
+        .get("eos_token_id")
+        .ok_or_else(|| anyhow::anyhow!("{} missing eos_token_id", path.display()))?;
+    let as_u32 = |value: &serde_json::Value| -> Result<u32> {
+        value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("eos_token_id entry {value} is not a u32"))
+    };
+    let ids = match field {
+        serde_json::Value::Array(entries) => {
+            entries.iter().map(as_u32).collect::<Result<Vec<_>>>()?
+        }
+        other => vec![as_u32(other)?],
+    };
+    ensure!(!ids.is_empty(), "eos_token_id list is empty");
+    Ok(ids)
 }
 
 fn validate_startup(model_path: &Path, options: &Glm52LoadOptions) -> Result<StartupValidation> {

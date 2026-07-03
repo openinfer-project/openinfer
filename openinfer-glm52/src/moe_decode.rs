@@ -48,15 +48,15 @@ const TOPK: usize = 8;
 const INTERMEDIATE: usize = 2048;
 const QUANT_GROUP: usize = 128;
 
-const W13_N: usize = 2 * INTERMEDIATE; // 4096 (gate|up)
-const W13_K: usize = HIDDEN; // 6144
-const W2_N: usize = HIDDEN; // 6144
-const W2_K: usize = INTERMEDIATE; // 2048
+pub(crate) const W13_N: usize = 2 * INTERMEDIATE; // 4096 (gate|up)
+pub(crate) const W13_K: usize = HIDDEN; // 6144
+pub(crate) const W2_N: usize = HIDDEN; // 6144
+pub(crate) const W2_K: usize = INTERMEDIATE; // 2048
 
-const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_GROUP; // 48
-const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
-const W2_SCALE_COLS: usize = W2_K / QUANT_GROUP; // 16
-const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
+pub(crate) const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_GROUP; // 48
+pub(crate) const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
+pub(crate) const W2_SCALE_COLS: usize = W2_K / QUANT_GROUP; // 16
+pub(crate) const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
 
 /// bs=1 expert-major row capacity for the grouped path: each of the top-k distinct
 /// experts owns at most one row, padded to the 64-row alignment, so
@@ -82,49 +82,123 @@ pub(crate) struct Glm52MoeRoutedExpertBytes<'a> {
     pub(crate) down: Glm52ProjBytes<'a>, // [HIDDEN, INTERMEDIATE]
 }
 
-/// All weights for one MoE layer: the 256 routed experts as expert-major fp8
-/// `[EXPERTS, n, k]` + f32 block scales `[EXPERTS, n/128, k/128]` (the layout both
-/// the grouped GEMM and the GEMV index directly by expert id), plus the router
-/// gate/bias and the single shared expert. Built once on device; borrowed by every
-/// decode step.
-pub(crate) struct Glm52MoeLayerWeights {
+/// Router weights: the bf16 gate GEMM and the f32 selection-bias.
+pub(crate) struct Glm52MoeRouterWeights {
     gate_weight: CudaSlice<u8>,  // bf16 [EXPERTS, HIDDEN]
     e_score_bias: CudaSlice<u8>, // f32  [EXPERTS]
-    w13_weight: CudaSlice<u8>,   // fp8  [EXPERTS, W13_N, W13_K]
-    w13_scale: CudaSlice<f32>,   // f32  [EXPERTS, W13_SCALE_ROWS, HIDDEN_SCALE_COLS]
-    w2_weight: CudaSlice<u8>,    // fp8  [EXPERTS, W2_N, W2_K]
-    w2_scale: CudaSlice<f32>,    // f32  [EXPERTS, W2_SCALE_ROWS, W2_SCALE_COLS]
-    shared_gate: ProjWeight,     // fp8  [INTERMEDIATE, HIDDEN]
-    shared_up: ProjWeight,       // fp8  [INTERMEDIATE, HIDDEN]
-    shared_down: ProjWeight,     // fp8  [HIDDEN, INTERMEDIATE]
 }
 
-impl Glm52MoeLayerWeights {
-    /// Pack the 256 per-expert checkpoint tensors into the expert-major grouped
-    /// buffers and upload everything (the oracle/test path). W13 = per-expert
-    /// `[gate; up]` rows with scales concatenated likewise; W2 = down. The
-    /// production `from_device` path against the resident EP8 slab lands in PR4
-    /// and must reuse this exact layout.
-    pub(crate) fn from_host(
-        ctx: &DeviceContext,
-        gate_weight: &[u8],
-        e_score_bias: &[u8],
-        experts: &[Glm52MoeRoutedExpertBytes<'_>],
-        shared_gate: &Glm52ProjBytes<'_>,
-        shared_up: &Glm52ProjBytes<'_>,
-        shared_down: &Glm52ProjBytes<'_>,
-    ) -> Result<Self> {
+impl Glm52MoeRouterWeights {
+    pub(crate) fn new(gate_weight: CudaSlice<u8>, e_score_bias: CudaSlice<u8>) -> Result<Self> {
         ensure!(
-            experts.len() == EXPERTS,
-            "GLM5.2 MoE from_host expects {EXPERTS} routed experts, got {}",
-            experts.len()
+            gate_weight.len() == EXPERTS * HIDDEN * 2 && e_score_bias.len() == EXPERTS * 4,
+            "GLM5.2 MoE router weight bytes unexpected: gate {}, bias {}",
+            gate_weight.len(),
+            e_score_bias.len()
         );
-        let mut w13_host: Vec<u8> = Vec::with_capacity(EXPERTS * W13_N * W13_K);
+        Ok(Self {
+            gate_weight,
+            e_score_bias,
+        })
+    }
+}
+
+/// The single shared expert (a plain fp8 SwiGLU MLP at intermediate 2048).
+pub(crate) struct Glm52MoeSharedExpert {
+    gate: ProjWeight, // fp8 [INTERMEDIATE, HIDDEN]
+    up: ProjWeight,   // fp8 [INTERMEDIATE, HIDDEN]
+    down: ProjWeight, // fp8 [HIDDEN, INTERMEDIATE]
+}
+
+impl Glm52MoeSharedExpert {
+    pub(crate) fn new(gate: ProjWeight, up: ProjWeight, down: ProjWeight) -> Result<Self> {
+        let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
+            ensure!(
+                p.n == n && p.k == k,
+                "GLM5.2 MoE shared {label} shape [{},{}] != [{n},{k}]",
+                p.n,
+                p.k
+            );
+            Ok(())
+        };
+        shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
+        shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
+        Ok(Self { gate, up, down })
+    }
+
+    /// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP.
+    pub(crate) fn forward(
+        &self,
+        ctx: &DeviceContext,
+        normed_hidden: &CudaSlice<bf16>,
+    ) -> Result<CudaSlice<bf16>> {
+        fp8_mlp(ctx, &self.gate, &self.up, &self.down, normed_hidden)
+    }
+}
+
+/// A bank of routed experts in the expert-major packed layout: fp8 weights
+/// `[n_experts, n, k]` + f32 block scales `[n_experts, n/128, k/128]`, per
+/// expert W13 = `[gate; up]`. EP1 holds all 256; an EP8 rank holds its 32
+/// local experts (indexed by LOCAL id — the dispatch delivers local segments).
+pub(crate) struct Glm52MoeExpertBank {
+    n_experts: usize,
+    pub(crate) w13_weight: CudaSlice<u8>, // fp8  [n_experts, W13_N, W13_K]
+    pub(crate) w13_scale: CudaSlice<f32>, // f32  [n_experts, W13_SCALE_ROWS, HIDDEN_SCALE_COLS]
+    pub(crate) w2_weight: CudaSlice<u8>,  // fp8  [n_experts, W2_N, W2_K]
+    pub(crate) w2_scale: CudaSlice<f32>,  // f32  [n_experts, W2_SCALE_ROWS, W2_SCALE_COLS]
+}
+
+impl Glm52MoeExpertBank {
+    pub(crate) fn new(
+        n_experts: usize,
+        w13_weight: CudaSlice<u8>,
+        w13_scale: CudaSlice<f32>,
+        w2_weight: CudaSlice<u8>,
+        w2_scale: CudaSlice<f32>,
+    ) -> Result<Self> {
+        let check = |name: &str, have: usize, want: usize| -> Result<()> {
+            ensure!(
+                have == want,
+                "GLM5.2 MoE expert bank {name} length {have} != expected {want}"
+            );
+            Ok(())
+        };
+        check("w13_weight", w13_weight.len(), n_experts * W13_N * W13_K)?;
+        check(
+            "w13_scale",
+            w13_scale.len(),
+            n_experts * W13_SCALE_ROWS * HIDDEN_SCALE_COLS,
+        )?;
+        check("w2_weight", w2_weight.len(), n_experts * W2_N * W2_K)?;
+        check(
+            "w2_scale",
+            w2_scale.len(),
+            n_experts * W2_SCALE_ROWS * W2_SCALE_COLS,
+        )?;
+        Ok(Self {
+            n_experts,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+        })
+    }
+
+    /// Pack per-expert checkpoint bytes expert-major and upload (test path;
+    /// works for any expert count — 256 at EP1, a 32-expert rank slice for
+    /// the EP8 gate).
+    pub(crate) fn pack_from_host(
+        ctx: &DeviceContext,
+        experts: &[Glm52MoeRoutedExpertBytes<'_>],
+    ) -> Result<Self> {
+        let n_experts = experts.len();
+        let mut w13_host: Vec<u8> = Vec::with_capacity(n_experts * W13_N * W13_K);
         let mut w13_scale_host: Vec<f32> =
-            Vec::with_capacity(EXPERTS * W13_SCALE_ROWS * HIDDEN_SCALE_COLS);
-        let mut w2_host: Vec<u8> = Vec::with_capacity(EXPERTS * W2_N * W2_K);
+            Vec::with_capacity(n_experts * W13_SCALE_ROWS * HIDDEN_SCALE_COLS);
+        let mut w2_host: Vec<u8> = Vec::with_capacity(n_experts * W2_N * W2_K);
         let mut w2_scale_host: Vec<f32> =
-            Vec::with_capacity(EXPERTS * W2_SCALE_ROWS * W2_SCALE_COLS);
+            Vec::with_capacity(n_experts * W2_SCALE_ROWS * W2_SCALE_COLS);
         for (idx, expert) in experts.iter().enumerate() {
             let proj = |label: &str, p: &Glm52ProjBytes<'_>, n: usize, k: usize| -> Result<()> {
                 ensure!(
@@ -162,87 +236,93 @@ impl Glm52MoeLayerWeights {
             Ok(dev)
         };
         Self::new(
-            upload_u8(gate_weight)?,
-            upload_u8(e_score_bias)?,
+            n_experts,
             upload_u8(&w13_host)?,
             upload_f32(&w13_scale_host)?,
             upload_u8(&w2_host)?,
             upload_f32(&w2_scale_host)?,
-            ProjWeight::upload(ctx, shared_gate)?,
-            ProjWeight::upload(ctx, shared_up)?,
-            ProjWeight::upload(ctx, shared_down)?,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        gate_weight: CudaSlice<u8>,
-        e_score_bias: CudaSlice<u8>,
-        w13_weight: CudaSlice<u8>,
-        w13_scale: CudaSlice<f32>,
-        w2_weight: CudaSlice<u8>,
-        w2_scale: CudaSlice<f32>,
-        shared_gate: ProjWeight,
-        shared_up: ProjWeight,
-        shared_down: ProjWeight,
+    /// Adopt one layer's loader-packed regions (this rank's 32 local experts)
+    /// — a pure retype, no copies. The loader wrote the regions in exactly
+    /// the `from_host` packing (proven by `expert_placement_matches_from_host_packing`).
+    pub(crate) fn from_regions(
+        ctx: &DeviceContext,
+        regions: crate::weights::Glm52ExpertLayerRegions,
     ) -> Result<Self> {
-        let check = |name: &str, have: usize, want: usize| -> Result<()> {
-            ensure!(
-                have == want,
-                "GLM5.2 MoE layer weight {name} length {have} != expected {want}"
-            );
-            Ok(())
+        Self::new(
+            crate::weights::GLM52_LOCAL_EXPERTS,
+            regions.w13_weight,
+            crate::weights::retype_owned::<f32>(&ctx.stream, regions.w13_scale)?,
+            regions.w2_weight,
+            crate::weights::retype_owned::<f32>(&ctx.stream, regions.w2_scale)?,
+        )
+    }
+
+    pub(crate) fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+}
+
+/// All weights for one MoE layer at EP1 (all 256 routed experts local), plus
+/// the router and the single shared expert. Built once on device; borrowed by
+/// every decode step.
+pub(crate) struct Glm52MoeLayerWeights {
+    pub(crate) router: Glm52MoeRouterWeights,
+    pub(crate) bank: Glm52MoeExpertBank,
+    pub(crate) shared: Glm52MoeSharedExpert,
+}
+
+impl Glm52MoeLayerWeights {
+    /// Pack per-expert checkpoint tensors into the expert-major grouped
+    /// buffers and upload everything (the oracle/test path). W13 = per-expert
+    /// `[gate; up]` rows with scales concatenated likewise; W2 = down. The
+    /// production path adopts loader-packed regions with the same layout
+    /// ([`Glm52MoeExpertBank::from_regions`]).
+    pub(crate) fn from_host(
+        ctx: &DeviceContext,
+        gate_weight: &[u8],
+        e_score_bias: &[u8],
+        experts: &[Glm52MoeRoutedExpertBytes<'_>],
+        shared_gate: &Glm52ProjBytes<'_>,
+        shared_up: &Glm52ProjBytes<'_>,
+        shared_down: &Glm52ProjBytes<'_>,
+    ) -> Result<Self> {
+        ensure!(
+            experts.len() == EXPERTS,
+            "GLM5.2 MoE from_host expects {EXPERTS} routed experts, got {}",
+            experts.len()
+        );
+        let stream = &ctx.stream;
+        let upload_u8 = |host: &[u8]| -> Result<CudaSlice<u8>> {
+            let mut dev = stream.alloc_zeros::<u8>(host.len())?;
+            stream.memcpy_htod(host, &mut dev)?;
+            Ok(dev)
         };
-        check("gate_weight", gate_weight.len(), EXPERTS * HIDDEN * 2)?;
-        check("e_score_bias", e_score_bias.len(), EXPERTS * 4)?;
-        check("w13_weight", w13_weight.len(), EXPERTS * W13_N * W13_K)?;
-        check(
-            "w13_scale",
-            w13_scale.len(),
-            EXPERTS * W13_SCALE_ROWS * HIDDEN_SCALE_COLS,
-        )?;
-        check("w2_weight", w2_weight.len(), EXPERTS * W2_N * W2_K)?;
-        check(
-            "w2_scale",
-            w2_scale.len(),
-            EXPERTS * W2_SCALE_ROWS * W2_SCALE_COLS,
-        )?;
-        let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
-            ensure!(
-                p.n == n && p.k == k,
-                "GLM5.2 MoE shared {label} shape [{},{}] != [{n},{k}]",
-                p.n,
-                p.k
-            );
-            Ok(())
-        };
-        shape("gate_proj", &shared_gate, INTERMEDIATE, HIDDEN)?;
-        shape("up_proj", &shared_up, INTERMEDIATE, HIDDEN)?;
-        shape("down_proj", &shared_down, HIDDEN, INTERMEDIATE)?;
         Ok(Self {
-            gate_weight,
-            e_score_bias,
-            w13_weight,
-            w13_scale,
-            w2_weight,
-            w2_scale,
-            shared_gate,
-            shared_up,
-            shared_down,
+            router: Glm52MoeRouterWeights::new(upload_u8(gate_weight)?, upload_u8(e_score_bias)?)?,
+            bank: Glm52MoeExpertBank::pack_from_host(ctx, experts)?,
+            shared: Glm52MoeSharedExpert::new(
+                ProjWeight::upload(ctx, shared_gate)?,
+                ProjWeight::upload(ctx, shared_up)?,
+                ProjWeight::upload(ctx, shared_down)?,
+            )?,
         })
     }
 }
 
-/// Router output for one token: the top-8 expert ids and their normalized,
-/// x2.5-scaled weights, both device-resident (never read back to host).
-struct RoutedTopk {
-    topk_idx: CudaSlice<i32>,
-    topk_weight: CudaSlice<f32>,
+/// Router output for one token: the top-8 GLOBAL expert ids and their
+/// normalized, x2.5-scaled weights, both device-resident (never read back to
+/// host).
+pub(crate) struct RoutedTopk {
+    pub(crate) topk_idx: CudaSlice<i32>,
+    pub(crate) topk_weight: CudaSlice<f32>,
 }
 
-fn run_router(
+pub(crate) fn run_router(
     ctx: &DeviceContext,
-    weights: &Glm52MoeLayerWeights,
+    router: &Glm52MoeRouterWeights,
     normed_hidden: &CudaSlice<bf16>,
 ) -> Result<RoutedTopk> {
     let stream = &ctx.stream;
@@ -261,8 +341,8 @@ fn run_router(
             padded_tokens: 1,
         },
         normed_hidden,
-        &weights.gate_weight,
-        &weights.e_score_bias,
+        &router.gate_weight,
+        &router.e_score_bias,
         &mut logits,
         &mut router_out,
     )?;
@@ -275,7 +355,7 @@ fn run_router(
 /// Routed contribution via the DeepEP-shaped grouped FP8 GEMM chain.
 fn routed_forward_grouped(
     ctx: &DeviceContext,
-    weights: &Glm52MoeLayerWeights,
+    bank: &Glm52MoeExpertBank,
     normed_hidden: &CudaSlice<bf16>,
     route: &RoutedTopk,
 ) -> Result<CudaSlice<bf16>> {
@@ -332,14 +412,16 @@ fn routed_forward_grouped(
     let w13_out = grouped_gemm(
         ctx,
         Glm52TrtllmGroupedFp8Kind::W13,
+        EXPERTS,
+        M_CAPACITY,
         W13_N,
         W13_K,
         HIDDEN_SCALE_COLS,
         W13_SCALE_ROWS,
         &w13_act,
         &w13_act_scale,
-        &weights.w13_weight,
-        &weights.w13_scale,
+        &bank.w13_weight,
+        &bank.w13_scale,
         &expert_offsets,
     )?;
 
@@ -363,14 +445,16 @@ fn routed_forward_grouped(
     let w2_out = grouped_gemm(
         ctx,
         Glm52TrtllmGroupedFp8Kind::W2,
+        EXPERTS,
+        M_CAPACITY,
         W2_N,
         W2_K,
         W2_SCALE_COLS,
         W2_SCALE_ROWS,
         &w2_act,
         &w2_act_scale,
-        &weights.w2_weight,
-        &weights.w2_scale,
+        &bank.w2_weight,
+        &bank.w2_scale,
         &expert_offsets,
     )?;
 
@@ -393,7 +477,7 @@ fn routed_forward_grouped(
 /// Routed contribution via the bs=1 weight-only fp8 GEMV chain.
 fn routed_forward_gemv(
     ctx: &DeviceContext,
-    weights: &Glm52MoeLayerWeights,
+    bank: &Glm52MoeExpertBank,
     normed_hidden: &CudaSlice<bf16>,
     route: &RoutedTopk,
 ) -> Result<CudaSlice<bf16>> {
@@ -411,8 +495,8 @@ fn routed_forward_gemv(
         0, // broadcast one activation row across every slot
         normed_hidden,
         &route.topk_idx,
-        &weights.w13_weight,
-        &weights.w13_scale,
+        &bank.w13_weight,
+        &bank.w13_scale,
         &mut w13_out,
     )?;
 
@@ -438,8 +522,8 @@ fn routed_forward_gemv(
         W2_K, // per-slot activation row stride
         &w2_act,
         &route.topk_idx,
-        &weights.w2_weight,
-        &weights.w2_scale,
+        &bank.w2_weight,
+        &bank.w2_scale,
         &mut w2_out,
     )?;
 
@@ -464,10 +548,17 @@ pub(crate) fn glm52_moe_routed_forward(
         "GLM5.2 MoE routed forward hidden too small: have {}, need {HIDDEN}",
         normed_hidden.len()
     );
-    let route = run_router(ctx, weights, normed_hidden)?;
+    ensure!(
+        weights.bank.n_experts == EXPERTS,
+        "GLM5.2 EP1 MoE forward needs the full {EXPERTS}-expert bank (topk ids are global), got {}",
+        weights.bank.n_experts
+    );
+    let route = run_router(ctx, &weights.router, normed_hidden)?;
     match path {
-        Glm52MoeExpertPath::Grouped => routed_forward_grouped(ctx, weights, normed_hidden, &route),
-        Glm52MoeExpertPath::Gemv => routed_forward_gemv(ctx, weights, normed_hidden, &route),
+        Glm52MoeExpertPath::Grouped => {
+            routed_forward_grouped(ctx, &weights.bank, normed_hidden, &route)
+        }
+        Glm52MoeExpertPath::Gemv => routed_forward_gemv(ctx, &weights.bank, normed_hidden, &route),
     }
 }
 
@@ -478,13 +569,7 @@ pub(crate) fn glm52_moe_shared_forward(
     weights: &Glm52MoeLayerWeights,
     normed_hidden: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
-    fp8_mlp(
-        ctx,
-        &weights.shared_gate,
-        &weights.shared_up,
-        &weights.shared_down,
-        normed_hidden,
-    )
+    weights.shared.forward(ctx, normed_hidden)
 }
 
 /// Full MoE contribution for a single token: routed experts + shared expert. The
@@ -511,11 +596,15 @@ pub(crate) fn glm52_moe_forward(
 }
 
 /// Relayout the plain per-row activation scale into the offset-major TMA layout,
-/// then run one grouped FP8 GEMM. Returns the bf16 output `[M_CAPACITY, n]`.
+/// then run one grouped FP8 GEMM. Returns the bf16 output `[m_capacity, n]`.
+/// `groups`/`m_capacity` are runtime: 256/512 at EP1 (bs=1), 32/worst-expanded
+/// at EP8 (moe_ep8 drives this over the DeepEP recv layout).
 #[allow(clippy::too_many_arguments)]
-fn grouped_gemm(
+pub(crate) fn grouped_gemm(
     ctx: &DeviceContext,
     kind: Glm52TrtllmGroupedFp8Kind,
+    groups: usize,
+    m_capacity: usize,
     n: usize,
     k: usize,
     scale_cols: usize,
@@ -527,7 +616,7 @@ fn grouped_gemm(
     expert_offsets: &CudaSlice<i64>,
 ) -> Result<CudaSlice<bf16>> {
     let stream = &ctx.stream;
-    let scale_layout = Glm52TrtllmGroupedOffsetScaleLayout::f32(M_CAPACITY, scale_cols, EXPERTS);
+    let scale_layout = Glm52TrtllmGroupedOffsetScaleLayout::f32(m_capacity, scale_cols, groups);
     let mut activation_scale_tma = stream.alloc_zeros::<f32>(scale_layout.output_len()?)?;
     glm52_deepgemm_grouped_offset_tma_aligned_f32_launch(
         ctx,
@@ -538,8 +627,8 @@ fn grouped_gemm(
     )?;
 
     let contract = Glm52TrtllmGroupedFp8Contract {
-        groups: EXPERTS,
-        m_capacity: M_CAPACITY,
+        groups,
+        m_capacity,
         n,
         k,
         weight_scale_rows,
@@ -547,7 +636,7 @@ fn grouped_gemm(
         activation_scale_cols: scale_cols,
         activation_scale_trtllm_rows: scale_layout.padded_rows,
     };
-    let mut out = stream.alloc_zeros::<bf16>(M_CAPACITY * n)?;
+    let mut out = stream.alloc_zeros::<bf16>(m_capacity * n)?;
     glm52_trtllm_grouped_fp8_launch(
         ctx,
         kind,
