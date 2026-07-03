@@ -432,8 +432,8 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
     let kv_bytes = (num_kv_blocks * kv_stride_bytes as usize) as usize;
     let kv_cache = DeviceBuf::zeroed(kv_bytes)?;
 
-    // weights: [batch_size * next_n, num_heads] fp8 = 1*4 = 4 bytes
-    let weights_bytes = (batch_size * next_n * num_heads) as usize;
+    // weights: [batch_size * next_n, num_heads] f32 = 1*4*4 = 16 bytes
+    let weights_bytes = (batch_size * next_n * num_heads) as usize * std::mem::size_of::<f32>();
     let weights = DeviceBuf::zeroed(weights_bytes)?;
 
     // logits: [batch_size, logits_stride] bf16 = 1*256*2 = 512 bytes
@@ -469,7 +469,7 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
             num_sms,
             1, // q_elem_size (fp8)
             1, // kv_elem_size (fp8)
-            1, // weights_elem_size (fp8)
+            4, // weights_elem_size (f32)
             4, // kv_scales_elem_size (f32)
             STREAM,
         )

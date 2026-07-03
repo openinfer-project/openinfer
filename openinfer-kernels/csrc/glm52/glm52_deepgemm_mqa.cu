@@ -153,6 +153,10 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     if (kv_cache_stride_bytes < min_stride) {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Weights are f32 (per-head scaling factors folded with q_scale).
+    if (weights_elem_size != static_cast<int>(sizeof(float))) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
 
     const int split_kv = kSplitKv;
     if (split_kv % kMmaM != 0 || logits_stride % split_kv != 0) {
