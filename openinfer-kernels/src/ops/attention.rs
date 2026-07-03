@@ -6,6 +6,10 @@ use crate::ffi;
 use crate::paged_kv::PagedKvLayout;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
+/// GQA group sizes (query heads / KV heads) instantiated by FlashInfer's
+/// `DISPATCH_GQA_GROUP_SIZE`; any other ratio throws at dispatch time.
+pub const SUPPORTED_GQA_GROUP_SIZES: &[usize] = &[1, 2, 3, 4, 8];
+
 // ============================================================================
 // Paged prefill (FlashInfer BatchPrefillWithPagedKVCache)
 // ============================================================================
@@ -607,7 +611,10 @@ pub fn prefill_attention_paged_into(
             stream,
         );
         if result != 0 {
-            anyhow::bail!("paged_kv_scatter_cuda failed for layer {layer} with error {result}");
+            anyhow::bail!(
+                "paged_kv_scatter_cuda failed for layer {layer} with error {result}{}",
+                crate::ops::ffi_exception_message(result)
+            );
         }
 
         let result = ffi::batch_prefill_paged_cuda_with_cta_tile_q(
@@ -638,7 +645,10 @@ pub fn prefill_attention_paged_into(
             stream,
         );
         if result != 0 {
-            anyhow::bail!("batch_prefill_paged_cuda failed for layer {layer} with error {result}");
+            anyhow::bail!(
+                "batch_prefill_paged_cuda failed for layer {layer} with error {result}{}",
+                crate::ops::ffi_exception_message(result)
+            );
         }
     }
 
@@ -831,7 +841,10 @@ pub fn single_prefill_nhd_noncausal_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("single_prefill_nhd_noncausal_cuda failed with error {result}");
+        anyhow::bail!(
+            "single_prefill_nhd_noncausal_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
     Ok(())
 }
@@ -963,7 +976,10 @@ pub fn paged_attention_batch_decode_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_kv_scatter_cuda (batch decode) failed with error {result}");
+        anyhow::bail!(
+            "paged_kv_scatter_cuda (batch decode) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
 
     // Step 2: Paged attention decode (batched)
@@ -992,7 +1008,10 @@ pub fn paged_attention_batch_decode_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_attention_decode_cuda (batch) failed with error {result}");
+        anyhow::bail!(
+            "paged_attention_decode_cuda (batch) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
 
     Ok(())
@@ -1081,7 +1100,10 @@ pub fn paged_attention_batch_decode_split_kv_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_kv_scatter_cuda (batch split-K decode) failed with error {result}");
+        anyhow::bail!(
+            "paged_kv_scatter_cuda (batch split-K decode) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1114,7 +1136,10 @@ pub fn paged_attention_batch_decode_split_kv_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_attention_decode_split_kv_cuda (batch) failed with error {result}");
+        anyhow::bail!(
+            "paged_attention_decode_split_kv_cuda (batch) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
 
     Ok(())
@@ -1189,7 +1214,10 @@ pub fn paged_attention_batch_decode_hd256_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_kv_scatter_cuda (batch hd256 decode) failed with error {result}");
+        anyhow::bail!(
+            "paged_kv_scatter_cuda (batch hd256 decode) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
 
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1217,7 +1245,10 @@ pub fn paged_attention_batch_decode_hd256_into(
         )
     };
     if result != 0 {
-        anyhow::bail!("paged_attention_decode_cuda_hd256 (batch) failed with error {result}");
+        anyhow::bail!(
+            "paged_attention_decode_cuda_hd256 (batch) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
 
     Ok(())

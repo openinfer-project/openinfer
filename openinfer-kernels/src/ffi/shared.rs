@@ -668,3 +668,7 @@ unsafe extern "C" {
     );
 
 }
+
+unsafe extern "C" {
+    pub fn openinfer_kernels_last_error() -> *const std::os::raw::c_char;
+}

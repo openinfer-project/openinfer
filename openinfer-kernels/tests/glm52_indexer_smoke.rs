@@ -104,15 +104,6 @@ fn cu_check(r: CUresult) -> Result<()> {
 }
 
 /// Returns Ok(true) on skip (caller early-returns), Ok(false) on success.
-fn cu_check_or_skip(r: CUresult) -> Result<bool> {
-    if r == CUresult::CUDA_ERROR_NOT_SUPPORTED {
-        eprintln!("skip: FilteredTopK not supported on this GPU (smem too small)");
-        return Ok(true);
-    }
-    cu_check(r)?;
-    Ok(false)
-}
-
 const STREAM: CUstream = ptr::null_mut();
 
 // ─── indexer cache: quant + pack → gather round-trip ──────────────────────
@@ -307,7 +298,7 @@ fn flashinfer_topk_lengths_filter() -> Result<()> {
     let indices_dev = DeviceBuf::zeroed(top_k * size_of::<i32>())?;
     let values_dev = DeviceBuf::zeroed(top_k * size_of::<f32>())?;
 
-    let skipped = cu_check_or_skip(unsafe {
+    let result = unsafe {
         ffi::glm52_flashinfer_topk_2048_cuda(
             logits_dev.ptr as *const f32,
             indices_dev.ptr as *mut i32,
@@ -318,10 +309,16 @@ fn flashinfer_topk_lengths_filter() -> Result<()> {
             max_len as i32,
             STREAM,
         )
-    })?;
-    if skipped {
+    };
+    if result == CUresult::CUDA_ERROR_NOT_SUPPORTED as i32 {
+        eprintln!("skip: FilteredTopK not supported on this GPU (smem too small)");
         return Ok(());
     }
+    anyhow::ensure!(
+        result == 0,
+        "glm52_flashinfer_topk_2048_cuda failed with error {result}{}",
+        openinfer_kernels::ops::ffi_exception_message(result)
+    );
     cuda_check(unsafe { cudaDeviceSynchronize() })?;
 
     let indices: Vec<i32> = indices_dev.to_host(top_k)?;

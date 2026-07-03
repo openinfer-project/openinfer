@@ -332,7 +332,10 @@ pub fn kimi_mla_paged_kv_append(
         )
     };
     if result != 0 {
-        bail!("kimi_mla_paged_kv_append_cuda failed with cudaError={result}");
+        bail!(
+            "kimi_mla_paged_kv_append_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
     Ok(())
 }

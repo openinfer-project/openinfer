@@ -7,6 +7,8 @@
 // TopKTieBreak::Small, dsa_graph_safe=true, K=2048. Mirrors vLLM
 // `sparse_attn_indexer` which always passes `seq_lens` as lengths.
 
+#include "../shared/ffi_guard.cuh"
+
 #include <cstddef>
 #include <cstdio>
 
@@ -17,6 +19,7 @@ extern "C" int glm52_flashinfer_topk_2048_cuda(
     const float* logits, int* output_indices, float* output_values,
     const int* lengths, int num_rows, int top_k, int max_len,
     cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   if (logits == nullptr || output_indices == nullptr || lengths == nullptr) {
     return static_cast<int>(CUDA_ERROR_INVALID_VALUE);
   }
@@ -57,4 +60,5 @@ extern "C" int glm52_flashinfer_topk_2048_cuda(
     return static_cast<int>(CUDA_ERROR_LAUNCH_FAILED);
   }
   return static_cast<int>(CUDA_SUCCESS);
+  OPENINFER_FFI_GUARD_END(-1)
 }

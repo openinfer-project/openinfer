@@ -6,6 +6,8 @@
 // FlashInfer's dispatchers internally instantiate multiple GQA group sizes
 // (1,2,3,4,8) — this covers both Qwen3-4B (GQA=4) and Qwen3.5-4B (GQA=8).
 
+#include "ffi_guard.cuh"
+
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -101,6 +103,7 @@ int paged_attention_decode_cuda(
     // Stream
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -142,6 +145,7 @@ int paged_attention_decode_cuda(
             /*tmp_s=*/nullptr,
             /*enable_pdl=*/false,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +192,7 @@ int paged_attention_decode_split_kv_cuda(
     // Stream
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -227,6 +232,7 @@ int paged_attention_decode_split_kv_cuda(
             tmp_s,
             /*enable_pdl=*/false,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +257,7 @@ int paged_kv_append_cuda(
     int64_t  stride_page,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -261,6 +268,7 @@ int paged_kv_append_cuda(
         reinterpret_cast<DType*>(key),
         reinterpret_cast<DType*>(value),
         reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +299,7 @@ int paged_kv_scatter_cuda(
     int64_t  src_stride_h,         // = max_seq_len * head_dim
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -308,6 +317,7 @@ int paged_kv_scatter_cuda(
         static_cast<size_t>(src_stride_n),   // V has same layout as K
         static_cast<size_t>(src_stride_h),
         reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +374,7 @@ int32_t batch_prefill_paged_num_tiles_with_cta_tile_q(
     uint32_t cta_tile_q = resolve_prefill_cta_tile_q(
         packed_qo_len, head_dim, cta_tile_q_override);
     if (cta_tile_q == 0) {
+        openinfer_ffi_set_last_error("invalid cta_tile_q override");
         return -1;
     }
     return static_cast<int32_t>((packed_qo_len + cta_tile_q - 1) / cta_tile_q);
@@ -429,6 +440,7 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
     // Stream
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -474,6 +486,7 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
     uint32_t cta_tile_q = resolve_prefill_cta_tile_q(
         packed_qo_len, head_dim, cta_tile_q_override);
     if (cta_tile_q == 0) {
+        openinfer_ffi_set_last_error("invalid cta_tile_q override");
         return -1;
     }
 
@@ -497,6 +510,7 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
                 s));
     });
     return result;
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 int batch_prefill_paged_cuda(
@@ -525,6 +539,7 @@ int batch_prefill_paged_cuda(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     return batch_prefill_paged_cuda_with_cta_tile_q(
         q, output, kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d, q_indptr,
@@ -532,6 +547,7 @@ int batch_prefill_paged_cuda(
         kv_chunk_size_ptr, total_num_rows, num_qo_heads, num_kv_heads,
         head_dim, page_size, seq_len, batch_size, padded_batch_size,
         stride_page, sm_scale, /*cta_tile_q_override=*/0, stream);
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +578,7 @@ int single_prefill_cuda(
     // Stream
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     // Q/O strides: col-major [q_dim, seq_len]
     uint32_t q_stride_n  = num_qo_heads * head_dim;   // stride between tokens
     uint32_t q_stride_h  = head_dim;                   // stride between heads
@@ -605,6 +622,7 @@ int single_prefill_cuda(
             params,
             /*tmp=*/nullptr,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 int single_prefill_nhd_noncausal_cuda(
@@ -623,6 +641,7 @@ int single_prefill_nhd_noncausal_cuda(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
         num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
         seq_len <= 0 || kv_len <= 0 || max_seq_len < kv_len) {
@@ -669,6 +688,7 @@ int single_prefill_nhd_noncausal_cuda(
             params,
             /*tmp=*/nullptr,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +716,7 @@ int single_prefill_cuda_hd256(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     uint32_t q_stride_n  = num_qo_heads * 256;
     uint32_t q_stride_h  = 256;
 
@@ -737,6 +758,7 @@ int single_prefill_cuda_hd256(
             params,
             /*tmp=*/nullptr,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +786,7 @@ int paged_attention_decode_cuda_hd256(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -804,6 +827,7 @@ int paged_attention_decode_cuda_hd256(
             /*tmp_s=*/nullptr,
             /*enable_pdl=*/false,
             reinterpret_cast<cudaStream_t>(stream)));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -836,6 +860,7 @@ int batch_prefill_paged_cuda_hd256(
     float    sm_scale,
     void*    stream)
 {
+  OPENINFER_FFI_GUARD_BEGIN
     auto paged_kv = make_paged_kv(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
@@ -899,6 +924,7 @@ int batch_prefill_paged_cuda_hd256(
                 s));
     });
     return result;
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 } // extern "C"

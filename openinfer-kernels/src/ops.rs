@@ -17,10 +17,11 @@ mod norm;
 mod sampling;
 
 pub use attention::{
-    PrefillPagedPlan, dflash_qk_norm_rope_into, paged_attention_batch_decode_hd256_into,
-    paged_attention_batch_decode_into, paged_attention_batch_decode_split_kv_into,
-    prefill_attention_paged_into, qk_norm_partial_rope_batched_decode_hd256_into,
-    qk_norm_rope_batch_decode_into, single_prefill_nhd_noncausal_into,
+    PrefillPagedPlan, SUPPORTED_GQA_GROUP_SIZES, dflash_qk_norm_rope_into,
+    paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
+    paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
+    qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
+    single_prefill_nhd_noncausal_into,
 };
 #[cfg(feature = "moe")]
 pub use deepep::{
@@ -67,3 +68,22 @@ pub use sampling::{
     flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes, gpu_sample_batch_into,
     markov_step_argmax_into,
 };
+
+/// Calling thread's last FFI exception message, ready to append to an error;
+/// empty unless `result` is the -1 sentinel set by the C++ guard. Public for
+/// crates that call guarded FFI entries directly instead of through a wrapper.
+pub fn ffi_exception_message(result: i32) -> String {
+    if result != -1 {
+        return String::new();
+    }
+    let ptr = unsafe { crate::ffi::openinfer_kernels_last_error() };
+    if ptr.is_null() {
+        return String::new();
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(": {text}")
+    }
+}

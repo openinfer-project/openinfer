@@ -250,7 +250,11 @@ fn sample_uniform_batch_into(
                 crate::tensor::active_cu_stream(ctx),
             )
         };
-        ensure!(err == 0, "batch sampling kernel failed: cudaError {err}");
+        ensure!(
+            err == 0,
+            "batch sampling kernel failed with error {err}{}",
+            crate::ops::ffi_exception_message(err)
+        );
     }
 
     let out = ctx

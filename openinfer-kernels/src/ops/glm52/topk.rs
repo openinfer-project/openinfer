@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
@@ -94,7 +94,10 @@ pub fn glm52_flashinfer_topk_2048_launch(
             ctx.stream.cu_stream(),
         )
     };
-    result
-        .result()
-        .map_err(|err| anyhow!("GLM5.2 FlashInfer top-k 2048 launch failed: {err}"))
+    ensure!(
+        result == 0,
+        "GLM5.2 FlashInfer top-k 2048 launch failed with error {result}{}",
+        crate::ops::ffi_exception_message(result)
+    );
+    Ok(())
 }
