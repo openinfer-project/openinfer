@@ -165,16 +165,29 @@ impl Config {
         let mut config: Config = serde_json::from_str(&content)?;
         anyhow::ensure!(
             config.num_key_value_heads > 0
-                && config.num_attention_heads % config.num_key_value_heads == 0
-                && openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
-                    .contains(&(config.num_attention_heads / config.num_key_value_heads)),
-            "unsupported GQA group size {}/{}; the attention kernels instantiate {:?}",
+                && config
+                    .num_attention_heads
+                    .is_multiple_of(config.num_key_value_heads),
+            "num_attention_heads ({}) must be a positive multiple of num_key_value_heads ({})",
             config.num_attention_heads,
             config.num_key_value_heads,
-            openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES,
         );
+        if !config.decode_group_is_compiled() {
+            log::warn!(
+                "Qwen3 GQA group {}/{} has no compiled decode kernel; decode runs eager \
+                 through the prefill path (CUDA-graph decode disabled, --decode-overlap unavailable)",
+                config.num_attention_heads,
+                config.num_key_value_heads,
+            );
+        }
         config.stop_token_ids = Self::load_stop_token_ids(model_path, config.eos_token_id)?;
         Ok(config)
+    }
+
+    /// GQA ratio is TP-invariant, so the global head counts match the per-rank ones.
+    pub(crate) fn decode_group_is_compiled(&self) -> bool {
+        openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
+            .contains(&(self.num_attention_heads / self.num_key_value_heads))
     }
 
     pub(crate) fn lm_head_tensor_name(&self) -> &'static str {

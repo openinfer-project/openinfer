@@ -58,16 +58,19 @@ impl Qwen3Model {
 
         // Force the decode CUDA-Graph/buffer path before the unified peak
         // sample. The synthetic views are short, but the pre-allocated decode
-        // arena and graph state are the same serving objects used later.
-        self.batch_decode(
-            &decode_tokens,
-            &decode_views,
-            &decode_adapters,
-            kv_buffer.buffer(),
-            &layout,
-            decode_bufs,
-        )?;
-        mark_peak()?;
+        // arena and graph state are the same serving objects used later. Skip it
+        // for uncompiled-group models: the unified sample below bounds their KV.
+        if self.config.decode_group_is_compiled() {
+            self.batch_decode(
+                &decode_tokens,
+                &decode_views,
+                &decode_adapters,
+                kv_buffer.buffer(),
+                &layout,
+                decode_bufs,
+            )?;
+            mark_peak()?;
+        }
 
         // Reachable worst-case unified profile: admission caps
         // active decode rows + admitted/prefilling rows at the decode batch
@@ -160,7 +163,9 @@ impl Qwen3Model {
         assert_eq!(num_prefill_reqs, prefill_lora_adapters.len());
         assert_eq!(num_decode_reqs, decode_views.len());
         assert_eq!(num_decode_reqs, decode_lora_adapters.len());
-        assert!(num_prefill_reqs > 0 && num_decode_reqs > 0);
+        // Decode-only (empty prefill) is the fallback for GQA groups with no
+        // compiled decode kernel.
+        assert!(num_prefill_reqs > 0 || num_decode_reqs > 0);
 
         let prefill_seq_lens: Vec<usize> = prefill_prompts.iter().map(|p| p.len()).collect();
         let total_prefill: usize = prefill_seq_lens.iter().sum();
