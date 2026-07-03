@@ -44,6 +44,7 @@ pegaflow #381 已合入 master（squash 为 `d46fd16`，含 router `max_completi
 
 - **router 必须同时钳 `max_tokens` 和 `max_completion_tokens`**（pegaflow `283c451` 修复）。chat 客户端（vllm-bench openai-chat、新版 OpenAI SDK）发的是 `max_completion_tokens`，engine 两者并存时优先后者——漏掉它 P 会做完整 decode，多轮 TTFT 从 ~110ms 劣化到 ~1.5s/turn，且症状极具迷惑性（GPU 满载、看似 prefill 慢/缓存失效）。诊断路径：P 日志 `output_tokens` 分布一眼定罪。
 - **RemoteFetch 状态机缺单测**（超时 / drop-during-fetch / zero-hit 三用例)——需 GPU 环境，欠账在此记录。
+- **P2P/RDMA 依赖未做 feature gate**（openinfer #523）：`rdma` feature 无条件开，默认构建也拉 pegaflow-transfer + vendored rdma-core；运行时无影响（不带 `--kv-p2p-*` 不激活），是打包卫生欠账。
 - P 侧冷 prompt 多付一轮 RemoteFetch 往返（本地全 miss 先 `Loading` 再空手 prefill）——设计使然。
 - 单机验证 ≠ 跨机：跨机需确认 dma-buf/GID/路由；目标集群 GPU↔NIC 同构（8×400G 1:1 PIX）预期直接成立。
 - 多 P 多 D 纯 router 事务（内容寻址保证任意 D 发现任意 P 的 KV），M2 架构无障碍。
