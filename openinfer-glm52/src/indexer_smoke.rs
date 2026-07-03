@@ -3,7 +3,7 @@
 //!
 //! Run (H200 + DeepGEMM env):
 //! ```text
-//! OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM \
+//! OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM/deep_gemm \
 //! CUDA_HOME=/usr/local/cuda \
 //!   cargo test --release -p openinfer-glm52 --features glm52 --lib indexer_smoke -- --nocapture
 //! ```

@@ -1,6 +1,6 @@
 # GLM5.2 EP1 Decode Forward (PR3)
 
-> **TL;DR:** PR3 composes the merged MLA brick (#477) and DSA indexer forward (#521) with MoE / dense / bookend bricks — **mostly cherry-picked from the abandoned `feat/glm52-pp8-decode` branch, re-gated through the self-contained #499 harness** — into a full oracle-gated decoder layer, EP1 (all 256 experts local, single H200, layer-brick scale). Two hard design constraints from the start: (1) **every op is host-quiet with fixed-capacity buffers** — the decode step must be CUDA-graph-capturable as-is (进图 is the acceptance bar, not a PR5 retrofit); (2) **the MoE kernel chain follows the in-tree DeepEP v2 (elastic) shim contract** (expert-major aligned segments + device psum → grouped-GEMM metadata → in-place grouped GEMM), so PR4 swaps a local scatter/combine pair for `decode_dispatch`/`decode_combine` and changes nothing else. Full-model e2e generation moves to PR4 — the model does not fit on one GPU.
+> **TL;DR:** **BUILT + ALL GATES GREEN on jz-38 H200 (2026-07-03), branch `feat/glm52-ep1-forward`.** PR3 composes the merged MLA brick (#477) and DSA indexer forward (#521) with MoE / dense / bookend bricks — mostly cherry-picked from the abandoned `feat/glm52-pp8-decode` branch, re-gated through the self-contained #499 harness — into a full oracle-gated decoder layer, EP1 (all 256 experts local, single H200, layer-brick scale). Gate results: bookend embed/argmax exact + 64/64 logits; layer-0 dense 64/64; layer-6 MoE 62/64 on BOTH expert paths (identical outliers = measured router near-ties, bounded allowance); MLA regression 64/64 after the front/attend split. See Execution log below. Two hard design constraints from the start: (1) **every op is host-quiet with fixed-capacity buffers** — the decode step must be CUDA-graph-capturable as-is (进图 is the acceptance bar, not a PR5 retrofit); (2) **the MoE kernel chain follows the in-tree DeepEP v2 (elastic) shim contract** (expert-major aligned segments + device psum → grouped-GEMM metadata → in-place grouped GEMM), so PR4 swaps a local scatter/combine pair for `decode_dispatch`/`decode_combine` and changes nothing else. Full-model e2e generation moves to PR4 — the model does not fit on one GPU.
 >
 > **Last touched:** 2026-07
 
@@ -119,6 +119,24 @@ Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harn
 - **Grouped vs GEMV fork risk**: keeping two expert paths is only acceptable behind one forward signature with one packer and one oracle gate. If the GEMV path starts demanding its own weight layout, drop it — DeepEP alignment wins.
 - **Router tie-break / renorm epsilon** vs torch: assert `topk_ids` exactly first; if tie flake appears, relax to set-overlap like the indexer gate.
 - **Combine dtype**: `moeGemm` writes half-precision out; confirm bf16 (not fp16) end-to-end through combine — the oracle's `moe_out` tap will catch a mix-up immediately.
+
+## Execution log (2026-07-03, jz-38 8×H200)
+
+- **Cherry-picks landed as planned** with only mechanical adaptation; main's `glm52_trtllm_grouped_fp8.cu` / `glm52_moe_quant.cu` were already byte-identical to the branch (the runtime-groups refactor is on main), and only the `deepgemm_layout` grouped-offset relayout diff needed porting. `GLM52_ROUTER_WEIGHT_SCALE=1.0` placeholder deleted; `Glm52RouterConfig::glm52()` now defaults to the real 2.5.
+- **`glm52_mla_decode_forward` split into `glm52_mla_front` / `glm52_mla_attend`** so the indexer consumes `q_resid` and produces the sparse top-k between the halves (the vllm structure). MLA gate re-run green (64/64) — no regression.
+- **Gate design corrections found while wiring** (both are now in the harness):
+  1. *Residual-passthrough tolerance*: `layer_out`'s rms is dominated by the unchanged residual, so tolerance must scale with `rms(layer_out - hidden)`.
+  2. *bf16 ulp floor*: `layer_out` is stored bf16 at the hidden's magnitude; at input scale 1 the ulp (~0.4% of |hidden|) exceeds the whole layer delta. The layer stage seeds its input at `--input-scale 0.02` (rms_norm makes the delta scale-invariant) and the emitted tol is `max(rel_tol × delta_rms, 3 × ulp)`.
+- **Gate results**:
+  - bookend: embed rows digest exact, argmax exact ×8, logits 64/64.
+  - layer 0 (dense + full indexer): **64/64**.
+  - layer 6 (MoE + full indexer): **62/64 on BOTH Grouped and Gemv paths, failing the SAME two probes with the SAME values** — the deviation is upstream of the expert GEMMs. Measured cause: the divergent positions sit on 8th-vs-9th biased-score margins of 1.0–1.7e-4 (median 1.8e-3); the engine's fp8 router logits legitimately flip those near-tied picks vs the fp8sim oracle. The gate allows ≤4/64 outliers capped at 8×tol (dense: zero allowance). Analysis artifacts: `/tmp/layer6_taps.safetensors` + `/tmp/layer6_engine.f32` on jz-38 (`OPENINFER_GLM52_LAYER_DUMP`).
+  - TRTLLM grouped `moeGemm` executed correctly on this branch path (its first run outside the PP8 branch).
+- **Environment pitfalls (jz-38)**:
+  - `OPENINFER_DEEPGEMM_ROOT` must point at **`.../DeepGEMM/deep_gemm`** (the python-package dir that contains `include/`), not the submodule root — the JIT `IncludeParser` resolves `$ROOT/include/deep_gemm/...`; the wrong root fails as an opaque `CUDA_ERROR_LAUNCH_FAILED` at the MQA metadata launch. Docs and gate comments corrected.
+  - The repo venv's `nvidia/nccl` is back to 2.29.7 (a torch reinstall downgraded it); the `moe`-feature DeepEP shim needs ≥ 2.30.4 → `OPENINFER_NCCL_ROOT=/root/develop/xingming/nccl-latest/nvidia/nccl` (nvidia-nccl-cu12 2.30.7 wheel).
+  - transformers 5.13.0.dev0 is not on PyPI; run the harness with the repo venv python (`.venv/bin/python tools/accuracy/glm52_oracle.py ...`), not `uv run`.
+- **Pre-existing breakage fixed en passant**: `tests/checkpoint.rs` used `{event:?}` but `TokenEvent` has no `Debug` — `--tests` compile of the crate was red on main.
 
 ## Read
 
