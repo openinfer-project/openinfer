@@ -387,7 +387,8 @@ impl Qwen35Model {
             };
             anyhow::ensure!(
                 result == 0,
-                "batch_prefill_paged_cuda_hd256 failed: {result}"
+                "batch_prefill_paged_cuda_hd256 failed: {result}{}",
+                openinfer_kernels::ops::ffi_exception_message(result)
             );
         }
 
