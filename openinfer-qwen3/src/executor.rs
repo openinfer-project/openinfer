@@ -1742,7 +1742,15 @@ impl Qwen3Executor {
         if !timed_out && now.duration_since(*last_query) < REMOTE_REQUERY_INTERVAL {
             return false; // stay parked; too soon for another MetaServer RPC
         }
-        let wait_on_miss = self.vllm_compat.is_some() && now <= *miss_deadline;
+        // The breaker cuts already-parked waiters short too: a request can
+        // enter this phase past the breaker via a transient Loading answer,
+        // and "the peer is evidently not publishing" applies to it as well.
+        let wait_on_miss = self
+            .vllm_compat
+            .as_ref()
+            .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD)
+            && now <= *miss_deadline;
+        let miss_deadline = *miss_deadline;
         let parked_for = now.duration_since(*parked_at);
         let queried_blocks = query_hashes.len();
         let query_hashes = query_hashes.clone();
@@ -1779,7 +1787,14 @@ impl Qwen3Executor {
                 // A vLLM-compat request that waited out the whole miss window
                 // is the sole symptom of every P/D misconfiguration (seed,
                 // namespace, block size, peer down) — never degrade silently.
-                if !timed_out && !query_errored && self.vllm_compat.is_some() {
+                // Requests cut short by an open breaker (now before the
+                // deadline) scratch quietly: the breaker warning already
+                // announced the mode.
+                if !timed_out
+                    && !query_errored
+                    && self.vllm_compat.is_some()
+                    && now > miss_deadline
+                {
                     log::warn!(
                         "expected remote KV never appeared for {id:?} \
                          ({queried_blocks} blocks, waited {parked_for:?}); prefill from \
