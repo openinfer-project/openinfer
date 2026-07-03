@@ -10,16 +10,17 @@ use super::indexer::GLM52_INDEXER_HEAD_DIM;
 pub const GLM52_INDEXER_ROPE_DIM: usize = 64;
 pub const GLM52_INDEXER_ROPE_HALF: usize = 32;
 
-/// Interleaved RoPE for the DSA indexer q `[n_heads, head_dim]` and k
-/// `[head_dim]` (in-place). Applies RoPE to the first `GLM52_INDEXER_ROPE_DIM`
-/// (=64) elements of each q head and of k; the remaining 64 pass-through
-/// dimensions are left unchanged. `cos`/`sin` are `[32]` (rope_dim / 2).
+/// Non-interleaved (half-split / NeoX-style) RoPE for the DSA indexer
+/// q `[n_heads, head_dim]` and k `[head_dim]` (in-place). Applies RoPE
+/// to the first `GLM52_INDEXER_ROPE_DIM` (=64) elements of each q head and
+/// of k; the remaining 64 pass-through dimensions are left unchanged.
+/// `cos`/`sin` are `[32]` (rope_dim / 2).
 ///
-/// Reuses the `rope_block` device function from `glm52_mla_assembly.cu` —
-/// identical RoPE convention (interleave-in / block-out), oracle-validated in
-/// PR1 (#477). Aligned to vllm `DeepseekV32Indexer` which uses
-/// `is_neox_style=not indexer_rope_interleave`; GLM5.2 config has
-/// `indexer_rope_interleave=true` → interleaved.
+/// Aligned to the transformers reference (GlmMoeDsaIndexer.forward) which
+/// uses `apply_rotary_pos_emb` (half-split / rotate_half convention). The
+/// config flag `indexer_rope_interleave=true` is consumed by vllm but NOT
+/// by transformers; the oracle runs on transformers, so we match its
+/// non-interleaved convention.
 pub fn glm52_indexer_rope_launch(
     ctx: &DeviceContext,
     q: &mut CudaSlice<bf16>,
