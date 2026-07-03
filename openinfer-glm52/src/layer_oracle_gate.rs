@@ -48,31 +48,179 @@ use crate::mla_decode::Glm52MlaLayerWeights;
 use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, Glm52MoeRoutedExpertBytes};
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (dense, layer 0) ----
-// UNGENERATED PLACEHOLDER — run on the H200 node and paste:
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
-//     --ctx 200 --seed 0x5eed604d --layer 0 --precision fp8sim --stage layer
-const DENSE_ORACLE_SEED: u64 = 0x5eed_604d;
+//     --ctx 200 --seed 0x5eed604d --layer 0 --precision fp8sim \
+//     --stage layer --input-scale 0.02
+// transformers=5.13.0.dev0 torch=2.12.1+cu130
+const DENSE_ORACLE_SEED: u64 = 0x5eed604d;
 const DENSE_ORACLE_CTX: usize = 200;
 const DENSE_ORACLE_LAYER: usize = 0;
 const DENSE_ORACLE_INPUT_SCALE: f64 = 0.02;
-const DENSE_ORACLE_HIDDEN_DIGEST: &str = "UNGENERATED";
-const DENSE_ORACLE_LAYER_TOL: f32 = 0.0;
-const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
+// sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
+const DENSE_ORACLE_HIDDEN_DIGEST: &str = "d39daa8ba2c7f939";
+// tap `layer_out` [200, 6144] bf16 digest=de40fb52df0cc8bf (provenance only)
+// tol = max(rel_tol 0.05 x delta_rms 8.122e-04, 3 x bf16-ulp 9.021e-05) — see emit_rust_layer.
+const DENSE_ORACLE_LAYER_TOL: f32 = 2.706195228e-04;
+const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
+    (7504, 3.906250000e-02),
+    (10832, 3.100585938e-02),
+    (30355, 3.515625000e-02),
+    (33148, -3.015136719e-02),
+    (69206, 2.600097656e-02),
+    (146761, 3.369140625e-02),
+    (156574, 3.930664062e-02),
+    (161844, 2.490234375e-02),
+    (240978, -1.855468750e-02),
+    (307757, -2.136230469e-02),
+    (319510, -2.941894531e-02),
+    (333821, 2.868652344e-02),
+    (337363, 6.408691406e-04),
+    (345826, 1.330566406e-02),
+    (368340, -3.588867188e-02),
+    (377565, -2.777099609e-03),
+    (387659, 2.099609375e-02),
+    (432017, 3.662109375e-03),
+    (442664, 3.466796875e-02),
+    (446114, 2.587890625e-02),
+    (468571, 1.733398438e-02),
+    (471935, 1.214599609e-02),
+    (488799, 8.544921875e-03),
+    (520950, -3.759765625e-02),
+    (530739, -2.636718750e-02),
+    (534505, -3.662109375e-02),
+    (534971, 3.906250000e-02),
+    (577397, 1.251220703e-03),
+    (604084, -3.198242188e-02),
+    (636056, -2.258300781e-02),
+    (668274, 2.014160156e-02),
+    (672858, -3.295898438e-02),
+    (714313, -6.408691406e-03),
+    (743834, -2.587890625e-02),
+    (791113, 1.300048828e-02),
+    (802252, -1.635742188e-02),
+    (807243, 1.843261719e-02),
+    (818652, -1.745605469e-02),
+    (878485, 1.611328125e-02),
+    (879770, 3.369140625e-02),
+    (880514, -3.125000000e-02),
+    (903613, 3.930664062e-02),
+    (915339, -3.768920898e-03),
+    (931272, -2.697753906e-02),
+    (943182, 1.501464844e-02),
+    (949584, -1.693725586e-03),
+    (980538, 1.818847656e-02),
+    (980931, -2.197265625e-03),
+    (1022303, -2.075195312e-02),
+    (1023279, -8.483886719e-03),
+    (1091288, 3.015136719e-02),
+    (1092832, -5.554199219e-03),
+    (1094227, 2.331542969e-02),
+    (1094427, 6.347656250e-03),
+    (1102135, -2.856445312e-02),
+    (1104580, -2.709960938e-02),
+    (1120355, 1.831054688e-02),
+    (1158451, -1.708984375e-02),
+    (1167014, -3.857421875e-02),
+    (1176953, 3.125000000e-02),
+    (1181822, 2.502441406e-03),
+    (1209754, 3.967285156e-03),
+    (1216021, 3.979492188e-02),
+    (1218315, 3.271484375e-02),
+];
 // ---- END GENERATED ----
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (moe, layer 6) ----
-// UNGENERATED PLACEHOLDER — run on the H200 node and paste:
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
-//     --ctx 200 --seed 0x5eed604d --layer 6 --precision fp8sim --stage layer
-const MOE_ORACLE_SEED: u64 = 0x5eed_604d;
+//     --ctx 200 --seed 0x5eed604d --layer 6 --precision fp8sim \
+//     --stage layer --input-scale 0.02
+// transformers=5.13.0.dev0 torch=2.12.1+cu130
+const MOE_ORACLE_SEED: u64 = 0x5eed604d;
 const MOE_ORACLE_CTX: usize = 200;
 const MOE_ORACLE_LAYER: usize = 6;
 const MOE_ORACLE_INPUT_SCALE: f64 = 0.02;
-const MOE_ORACLE_HIDDEN_DIGEST: &str = "UNGENERATED";
-const MOE_ORACLE_LAYER_TOL: f32 = 0.0;
-const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
-// Router selection of the LAST position (debugging reference when probes fail).
-const MOE_ORACLE_ROUTER_LAST: &[(i32, f32)] = &[];
+// sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
+const MOE_ORACLE_HIDDEN_DIGEST: &str = "d39daa8ba2c7f939";
+// tap `layer_out` [200, 6144] bf16 digest=5ee66e7dc80d957e (provenance only)
+// tol = max(rel_tol 0.05 x delta_rms 1.946e-03, 3 x bf16-ulp 9.021e-05) — see emit_rust_layer.
+const MOE_ORACLE_LAYER_TOL: f32 = 2.706195228e-04;
+const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
+    (7504, 3.393554688e-02),
+    (10832, 1.940917969e-02),
+    (30355, 4.028320312e-02),
+    (33148, -2.648925781e-02),
+    (69206, 2.050781250e-02),
+    (146761, 3.125000000e-02),
+    (156574, 4.028320312e-02),
+    (161844, 2.600097656e-02),
+    (240978, -1.843261719e-02),
+    (307757, -2.380371094e-02),
+    (319510, -2.893066406e-02),
+    (333821, 2.722167969e-02),
+    (337363, -8.544921875e-04),
+    (345826, 1.135253906e-02),
+    (368340, -3.540039062e-02),
+    (377565, -2.227783203e-03),
+    (387659, 1.953125000e-02),
+    (432017, 3.280639648e-03),
+    (442664, 3.808593750e-02),
+    (446114, 2.514648438e-02),
+    (468571, 2.172851562e-02),
+    (471935, 1.257324219e-02),
+    (488799, 9.887695312e-03),
+    (520950, -3.784179688e-02),
+    (530739, -2.685546875e-02),
+    (534505, -3.564453125e-02),
+    (534971, 3.710937500e-02),
+    (577397, 2.365112305e-03),
+    (604084, -3.369140625e-02),
+    (636056, -2.453613281e-02),
+    (668274, 1.953125000e-02),
+    (672858, -3.442382812e-02),
+    (714313, -8.178710938e-03),
+    (743834, -2.636718750e-02),
+    (791113, 1.226806641e-02),
+    (802252, -1.397705078e-02),
+    (807243, 1.611328125e-02),
+    (818652, -1.843261719e-02),
+    (878485, 1.556396484e-02),
+    (879770, 3.320312500e-02),
+    (880514, -3.344726562e-02),
+    (903613, 3.784179688e-02),
+    (915339, -1.876831055e-03),
+    (931272, -2.758789062e-02),
+    (943182, 1.684570312e-02),
+    (949584, -3.326416016e-03),
+    (980538, 2.038574219e-02),
+    (980931, -3.845214844e-03),
+    (1022303, -1.855468750e-02),
+    (1023279, -8.605957031e-03),
+    (1091288, 3.063964844e-02),
+    (1092832, -3.875732422e-03),
+    (1094227, 1.989746094e-02),
+    (1094427, 1.422119141e-02),
+    (1102135, -2.795410156e-02),
+    (1104580, -2.648925781e-02),
+    (1120355, 1.977539062e-02),
+    (1158451, -1.599121094e-02),
+    (1167014, -3.710937500e-02),
+    (1176953, 3.271484375e-02),
+    (1181822, -5.569458008e-04),
+    (1209754, 3.082275391e-03),
+    (1216021, 4.052734375e-02),
+    (1218315, 3.173828125e-02),
+];
+// Router selection of the LAST position: (expert_id, normalized x2.5 weight),
+// sorted by expert id. Ids assert exactly; weights within REL_TOL of their max.
+const MOE_ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
+    (20, 3.342877328e-01),
+    (30, 3.071641624e-01),
+    (46, 2.911965847e-01),
+    (71, 3.105072975e-01),
+    (73, 3.114154637e-01),
+    (75, 3.002892137e-01),
+    (169, 3.048956990e-01),
+    (216, 3.402439058e-01),
+];
 // ---- END GENERATED ----
 
 const HIDDEN: usize = 6144;
