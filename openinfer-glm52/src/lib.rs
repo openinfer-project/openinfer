@@ -149,21 +149,33 @@ fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHa
     }
 }
 
-/// Build every rank's resident model + DeepEP context. The build command is
-/// collective (context creation barriers), so it is issued to all ranks
-/// before any response is awaited.
+/// Build every rank's resident model, then create the DeepEP contexts. Two
+/// phases on purpose: the build is per-rank and can fail (OOM, packaging
+/// drift) — every rank must report success BEFORE anyone enters the
+/// collective context creation, or a single failure strands the other seven
+/// ranks in NCCL init with no timeout.
 #[cfg(feature = "glm52")]
 fn build_rank_models(workers: &[Glm52RankWorker]) -> Result<()> {
     let build_started = Instant::now();
-    let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
     let responses = workers
         .iter()
-        .map(|worker| worker.build_model_async(unique_id))
+        .map(Glm52RankWorker::build_model_async)
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
             .recv()
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??;
+    }
+
+    let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
+    let responses = workers
+        .iter()
+        .map(|worker| worker.setup_comm_async(unique_id))
+        .collect::<Result<Vec<_>>>()?;
+    for (rank, response) in responses.into_iter().enumerate() {
+        response
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its comm-setup response"))??;
     }
     log::info!(
         "GLM5.2 rank models built in {:.2}s (weights adopted in place + DeepEP contexts up)",

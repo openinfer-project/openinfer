@@ -55,10 +55,17 @@ enum Glm52RankCommand {
         model_path: PathBuf,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
-    /// Collective: the coordinator issues this to every rank concurrently
-    /// (DeepEP context creation barriers across ranks).
+    /// Non-collective: adopt the resident weights into the rank's model.
+    /// Every rank must report success BEFORE anyone enters SetupComm — a
+    /// build failure on one rank must never strand the others in NCCL init.
     #[cfg(feature = "glm52")]
     BuildModel {
+        resp: Sender<Result<()>>,
+    },
+    /// Collective: create the DeepEP context (barriers across ranks). Issued
+    /// to every rank concurrently, only after all builds succeeded.
+    #[cfg(feature = "glm52")]
+    SetupComm {
         unique_id: Box<[u8; 128]>,
         resp: Sender<Result<()>>,
     },
@@ -133,10 +140,19 @@ impl Glm52RankWorker {
     }
 
     #[cfg(feature = "glm52")]
-    pub(crate) fn build_model_async(&self, unique_id: [u8; 128]) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn build_model_async(&self) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
-            .send(Glm52RankCommand::BuildModel {
+            .send(Glm52RankCommand::BuildModel { resp: resp_tx })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    #[cfg(feature = "glm52")]
+    pub(crate) fn setup_comm_async(&self, unique_id: [u8; 128]) -> Result<Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::SetupComm {
                 unique_id: Box::new(unique_id),
                 resp: resp_tx,
             })
@@ -204,7 +220,8 @@ enum Glm52RankModel {
 #[cfg(feature = "glm52")]
 struct Glm52RankRuntime {
     model: Glm52RankModel,
-    ep8: Glm52MoeEp8State,
+    /// Populated by SetupComm (collective), after every rank's build succeeded.
+    ep8: Option<Glm52MoeEp8State>,
 }
 
 struct Glm52RankThreadState {
@@ -253,7 +270,7 @@ impl Glm52RankThreadState {
     }
 
     #[cfg(feature = "glm52")]
-    fn build_model(&mut self, unique_id: &[u8; 128]) -> Result<()> {
+    fn build_model(&mut self) -> Result<()> {
         let mut weights = self
             .loaded
             .take()
@@ -273,9 +290,29 @@ impl Glm52RankThreadState {
         // Non-expert leftovers are the MTP-layer tensors (out of scope) —
         // dropped with `weights` here.
         drop(weights);
+        self.runtime = Some(Glm52RankRuntime { model, ep8: None });
+        Ok(())
+    }
+
+    #[cfg(feature = "glm52")]
+    fn setup_comm(&mut self, unique_id: &[u8; 128]) -> Result<()> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 setup_comm before build_model")?;
+        ensure!(
+            runtime.ep8.is_none(),
+            "GLM5.2 rank {} DeepEP context already created",
+            self.placement.rank
+        );
         // Collective: every rank calls this concurrently.
-        let ep8 = Glm52MoeEp8State::new(&dev_ctx, unique_id, GLM52_EP_RANKS, self.placement.rank)?;
-        self.runtime = Some(Glm52RankRuntime { model, ep8 });
+        runtime.ep8 = Some(Glm52MoeEp8State::new(
+            &dev_ctx,
+            unique_id,
+            GLM52_EP_RANKS,
+            self.placement.rank,
+        )?);
         Ok(())
     }
 
@@ -286,10 +323,12 @@ impl Glm52RankThreadState {
             .runtime
             .as_mut()
             .context("GLM5.2 step before build_model")?;
+        let ep8 = runtime
+            .ep8
+            .as_mut()
+            .context("GLM5.2 step before setup_comm")?;
         match &mut runtime.model {
-            Glm52RankModel::Rank0(model) => {
-                model.decode_step(&dev_ctx, &mut runtime.ep8, token, position)
-            }
+            Glm52RankModel::Rank0(model) => model.decode_step(&dev_ctx, ep8, token, position),
             Glm52RankModel::Expert(_) => {
                 anyhow::bail!(
                     "GLM5.2 Rank0Step sent to expert rank {}",
@@ -306,8 +345,12 @@ impl Glm52RankThreadState {
             .runtime
             .as_mut()
             .context("GLM5.2 step before build_model")?;
+        let ep8 = runtime
+            .ep8
+            .as_mut()
+            .context("GLM5.2 step before setup_comm")?;
         match &mut runtime.model {
-            Glm52RankModel::Expert(model) => model.expert_step(&dev_ctx, &mut runtime.ep8),
+            Glm52RankModel::Expert(model) => model.expert_step(&dev_ctx, ep8),
             Glm52RankModel::Rank0(_) => {
                 anyhow::bail!("GLM5.2 ExpertStep sent to rank 0")
             }
@@ -322,8 +365,12 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
                 let _ = resp.send(state.load_weights(&model_path));
             }
             #[cfg(feature = "glm52")]
-            Glm52RankCommand::BuildModel { unique_id, resp } => {
-                let _ = resp.send(state.build_model(&unique_id));
+            Glm52RankCommand::BuildModel { resp } => {
+                let _ = resp.send(state.build_model());
+            }
+            #[cfg(feature = "glm52")]
+            Glm52RankCommand::SetupComm { unique_id, resp } => {
+                let _ = resp.send(state.setup_comm(&unique_id));
             }
             #[cfg(feature = "glm52")]
             Glm52RankCommand::Rank0Step {
@@ -407,6 +454,16 @@ pub(crate) fn run_bs1_coordinator(
                     prompt_tokens,
                     completion_tokens,
                 });
+                // A failed step leaves the ranks permanently out of lockstep:
+                // whichever collective the survivors are spinning in would
+                // pair with the NEXT request's first dispatch and every layer
+                // after it would run against the wrong expert bank — byte-
+                // deterministic garbage, no crash. The group cannot be
+                // re-synced; tear the engine down instead of serving from it.
+                log::error!(
+                    "GLM5.2 step failed; shutting the engine down (the EP8 collective group cannot recover): {err:#}"
+                );
+                break;
             }
         }
     }
@@ -429,7 +486,9 @@ fn validate_request(req: &GenerateRequest) -> std::result::Result<(), String> {
     if req.max_tokens == 0 {
         return Err("GLM5.2 requires max_tokens > 0".to_owned());
     }
-    // Position of the last generated token's forward step.
+    // Highest position any forward step can touch: the (max_tokens-1)-th
+    // generated token is fed at position prompt+max_tokens-2, so requiring
+    // prompt+max_tokens-1 <= cap keeps every step strictly below the cap.
     let last_position = req.prompt_tokens.len() + req.max_tokens - 1;
     if last_position > GLM52_MAX_MODEL_LEN {
         return Err(format!(
@@ -467,13 +526,15 @@ fn run_request(
 
     loop {
         completion += 1;
+        // EOS counts toward the completion length but is suppressed from
+        // emission (the engine-wide contract; qwen3 asserts it in tests).
+        if !req.params.ignore_eos && eos_token_ids.contains(&next) {
+            return Ok((completion, FinishReason::Stop));
+        }
         let _ = req.token_tx.send(TokenEvent::Token {
             id: next,
             logprob: None,
         });
-        if !req.params.ignore_eos && eos_token_ids.contains(&next) {
-            return Ok((completion, FinishReason::Stop));
-        }
         if completion >= req.max_tokens {
             return Ok((completion, FinishReason::Length));
         }

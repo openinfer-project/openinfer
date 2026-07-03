@@ -42,11 +42,11 @@ use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
 
 use crate::fp8::{Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp};
 
-const HIDDEN: usize = 6144;
-const EXPERTS: usize = 256;
-const TOPK: usize = 8;
+pub(crate) const HIDDEN: usize = 6144;
+pub(crate) const EXPERTS: usize = 256;
+pub(crate) const TOPK: usize = 8;
 const INTERMEDIATE: usize = 2048;
-const QUANT_GROUP: usize = 128;
+pub(crate) const QUANT_GROUP: usize = 128;
 
 pub(crate) const W13_N: usize = 2 * INTERMEDIATE; // 4096 (gate|up)
 pub(crate) const W13_K: usize = HIDDEN; // 6144

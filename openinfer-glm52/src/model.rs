@@ -38,14 +38,14 @@ use crate::weights::{Glm52RankGpuWeights, retype_owned};
 /// Sizes the per-layer MLA and index-K caches at build time.
 pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
 
-const ROPE_HALF: usize = 32;
+pub(crate) const ROPE_HALF: usize = 32;
 const ROPE_THETA: f32 = 8_000_000.0;
 /// 1/sqrt(qk_head_dim = 192 + 64).
-const SM_SCALE: f32 = 0.0625;
-const INDEX_HEAD_DIM: usize = 128;
+pub(crate) const SM_SCALE: f32 = 0.0625;
+pub(crate) const INDEX_HEAD_DIM: usize = 128;
 /// DeepGEMM paged MQA requires BLOCK_KV=64.
-const INDEX_CACHE_BLOCK: usize = 64;
-const NUM_SMS: usize = 132;
+pub(crate) const INDEX_CACHE_BLOCK: usize = 64;
+pub(crate) const NUM_SMS: usize = 132;
 
 /// `indexer_types[layer]` per the transformers derivation
 /// (`index_topk_freq=4`, `index_skip_topk_offset=3`): full iff
@@ -54,7 +54,7 @@ pub(crate) fn glm52_layer_has_full_indexer(layer: usize) -> bool {
     layer.saturating_sub(2).is_multiple_of(4)
 }
 
-fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
+pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
     (0..ROPE_HALF)
         .map(|j| {
             let inv_freq = 1.0 / ROPE_THETA.powf(j as f32 / ROPE_HALF as f32);

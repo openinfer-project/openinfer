@@ -33,14 +33,10 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::moe_decode::{
-    Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, HIDDEN_SCALE_COLS, RoutedTopk,
-    W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS, W13_K, W13_N, W13_SCALE_ROWS, grouped_gemm,
+    EXPERTS, Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, HIDDEN,
+    HIDDEN_SCALE_COLS, QUANT_GROUP, RoutedTopk, TOPK, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS,
+    W13_K, W13_N, W13_SCALE_ROWS, grouped_gemm,
 };
-
-const HIDDEN: usize = 6144;
-const EXPERTS: usize = 256;
-const TOPK: usize = 8;
-const QUANT_GROUP: usize = 128;
 
 /// Rank-0's weights for one EP8 MoE layer: the router and shared expert run
 /// only where the token lives; the bank holds this rank's 32 local experts.
@@ -232,7 +228,7 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     )?;
 
     // Collective combine: weighted expert outputs → per-source-token sums.
-    let mut combined = stream.alloc_zeros::<bf16>(HIDDEN.max(num_tokens * HIDDEN))?;
+    let mut combined = stream.alloc_zeros::<bf16>(num_tokens.max(1) * HIDDEN)?;
     let topk_idx = match token {
         Some((_, route)) => &route.topk_idx,
         None => &state.zero_topk_idx,

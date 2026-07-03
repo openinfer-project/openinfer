@@ -29,17 +29,11 @@ use crate::layer_oracle_gate::{
     GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
     MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
     assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
-    rope_tables,
 };
-use crate::moe_decode::{Glm52MoeExpertPath, run_router};
+use crate::model::{INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE, rope_tables};
+use crate::moe_decode::{Glm52MoeExpertPath, HIDDEN, run_router};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
-const HIDDEN: usize = 6144;
-const ROPE_HALF: usize = 32;
-const SM_SCALE: f32 = 0.0625;
-const INDEX_HEAD_DIM: usize = 128;
-const INDEX_CACHE_BLOCK: usize = 64;
-const NUM_SMS: usize = 132;
 const EP_RANKS: usize = 8;
 
 #[test]
