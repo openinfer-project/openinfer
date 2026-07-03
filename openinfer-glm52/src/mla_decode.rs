@@ -237,9 +237,11 @@ impl Glm52MlaFront {
     }
 }
 
-/// MLA front half (bs=1): fp8 projections + norms from `hidden` into the
-/// persistent front scratch.
-pub(crate) fn glm52_mla_front_into(
+/// The q-phase of the MLA front (bs=1): `q_a` projection + q_a_layernorm.
+/// Split out because `q_resid` is everything the DSA indexer needs — the
+/// caller can fork the indexer onto an aux stream right after this and run
+/// [`glm52_mla_front_rest_into`] concurrently.
+pub(crate) fn glm52_mla_front_q_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
     hidden: &CudaSlice<bf16>,
@@ -247,7 +249,17 @@ pub(crate) fn glm52_mla_front_into(
 ) -> Result<()> {
     ensure!(hidden.len() >= HIDDEN, "GLM5.2 MLA hidden too small");
     fp8_linear_into(ctx, &w.q_a, hidden, &mut front.q_a.data)?; // [2048]
-    rms_norm_into(ctx, &front.q_a, &w.q_a_ln, RMS_EPS, &mut front.q_resid)?;
+    rms_norm_into(ctx, &front.q_a, &w.q_a_ln, RMS_EPS, &mut front.q_resid)
+}
+
+/// The remainder of the MLA front (bs=1): q_b + kv_a projections and the
+/// kv_c/k_pe unpacking. Independent of the indexer.
+pub(crate) fn glm52_mla_front_rest_into(
+    ctx: &DeviceContext,
+    w: &Glm52MlaLayerWeights,
+    hidden: &CudaSlice<bf16>,
+    front: &mut Glm52MlaFront,
+) -> Result<()> {
     fp8_linear_into(ctx, &w.q_b, &front.q_resid.data, &mut front.q_full)?; // [64,256]
     fp8_linear_into(ctx, &w.kv_a, hidden, &mut front.ckv)?; // [576]
     ctx.stream
@@ -256,6 +268,18 @@ pub(crate) fn glm52_mla_front_into(
     ctx.stream
         .memcpy_dtod(&front.ckv.slice(KV_LORA..KV_A_OUT), &mut front.k_pe)?;
     Ok(())
+}
+
+/// MLA front half (bs=1): fp8 projections + norms from `hidden` into the
+/// persistent front scratch.
+pub(crate) fn glm52_mla_front_into(
+    ctx: &DeviceContext,
+    w: &Glm52MlaLayerWeights,
+    hidden: &CudaSlice<bf16>,
+    front: &mut Glm52MlaFront,
+) -> Result<()> {
+    glm52_mla_front_q_into(ctx, w, hidden, front)?;
+    glm52_mla_front_rest_into(ctx, w, hidden, front)
 }
 
 /// Persistent scratch for the MLA attend half: absorb/query-assemble/cache-

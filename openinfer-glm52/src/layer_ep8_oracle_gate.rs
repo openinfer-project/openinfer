@@ -200,6 +200,7 @@ fn run_layer_prefill_ep8(
         )?;
         glm52_layer_attention_half(
             ctx,
+            None,
             w,
             &mut caches,
             &step,

@@ -34,7 +34,8 @@ use crate::dense::Glm52DenseMlpWeights;
 use crate::dense::glm52_dense_mlp_forward_into;
 use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward_into};
 use crate::mla_decode::{
-    Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend_into, glm52_mla_front_into,
+    Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend_into, glm52_mla_front_q_into,
+    glm52_mla_front_rest_into,
 };
 use crate::moe_decode::Glm52MoeLayerWeights;
 #[cfg(test)]
@@ -150,6 +151,7 @@ impl Glm52LayerScratch {
 /// at a `Shared` layer).
 pub(crate) fn glm52_layer_attention_half(
     ctx: &DeviceContext,
+    aux: Option<&DeviceContext>,
     w: &Glm52DecoderLayerWeights,
     caches: &mut Glm52LayerCaches,
     step: &Glm52DecodeStep<'_>,
@@ -161,15 +163,29 @@ pub(crate) fn glm52_layer_attention_half(
     // `s.layer.normed` (this layer's input_layernorm output) is already
     // populated: by the previous layer's closing fused add+norm, or — for
     // the first layer — by the caller's standalone norm of the embedding.
-    glm52_mla_front_into(ctx, &w.mla, &s.layer.normed.data, &mut s.mla_front)?;
+    //
+    // On full-indexer layers with an aux stream, the DSA indexer chain runs
+    // concurrently with the rest of the MLA front: the indexer only needs
+    // `normed` + `q_resid` (the q-phase), while q_b/kv_a are independent of
+    // it. Same kernels either way — byte-identical; the fork/join events
+    // become graph edges at capture.
+    glm52_mla_front_q_into(ctx, &w.mla, &s.layer.normed.data, &mut s.mla_front)?;
+    let mut topk_ready = None;
     match &w.indexer {
         Glm52LayerIndexer::Full(indexer) => {
             let index_k_cache = caches
                 .index_k_cache
                 .as_mut()
                 .context("GLM5.2 full-indexer layer is missing its index-K cache")?;
+            let idx_ctx = if let Some(aux) = aux {
+                let q_ready = ctx.stream.record_event(None)?;
+                aux.stream.wait(&q_ready)?;
+                aux
+            } else {
+                ctx
+            };
             glm52_indexer_forward_into(
-                ctx,
+                idx_ctx,
                 indexer,
                 &s.layer.normed.data,
                 &s.mla_front.q_resid.data,
@@ -182,6 +198,9 @@ pub(crate) fn glm52_layer_attention_half(
                 step.seq_lens,
                 &mut s.idx,
             )?;
+            if let Some(aux) = aux {
+                topk_ready = Some(aux.stream.record_event(None)?);
+            }
             *carry_ready = true;
         }
         Glm52LayerIndexer::Shared => {
@@ -195,6 +214,11 @@ pub(crate) fn glm52_layer_attention_half(
         *carry_ready,
         "GLM5.2 shared-indexer layer reached before any full indexer ran"
     );
+    glm52_mla_front_rest_into(ctx, &w.mla, &s.layer.normed.data, &mut s.mla_front)?;
+    if let Some(topk_ready) = &topk_ready {
+        // Join before the attend consumes `s.idx.global_slots`.
+        ctx.stream.wait(topk_ready)?;
+    }
     let (attn_lo, attn_hi) = s.layer.attn.split_at_mut(1);
     let (attn_out, attn_other) = if parity == 0 {
         (&mut attn_lo[0], &attn_hi[0])
@@ -295,7 +319,7 @@ pub(crate) fn glm52_decoder_layer_forward(
     // Oracle-gate walk: one layer per call, stream in `s.hidden` — standalone
     // input norm + fixed parity 0 (no cross-layer fusion in this unit).
     rms_norm_into(ctx, &s.hidden, &w.input_ln, RMS_EPS, &mut s.layer.normed)?;
-    glm52_layer_attention_half(ctx, w, caches, step, s, carry_ready, 0, true)?;
+    glm52_layer_attention_half(ctx, None, w, caches, step, s, carry_ready, 0, true)?;
     match &w.mlp {
         Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
             ctx,

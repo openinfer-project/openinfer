@@ -411,6 +411,7 @@ impl Glm52RankModel {
                 let parity = layer % 2;
                 glm52_layer_attention_half(
                     ctx,
+                    Some(aux),
                     weights,
                     cache,
                     &step,
