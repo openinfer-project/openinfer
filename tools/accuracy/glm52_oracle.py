@@ -574,9 +574,16 @@ def sampled_probes(tap: torch.Tensor, args, salt: str) -> tuple[float, str]:
 def emit_rust_layer(taps, args, versions: str) -> str:
     """Full decoder-layer probes (+ router top-k of the last position on MoE
     layers). The Rust gate replays the same input through
-    `glm52_decoder_layer_forward` position by position and asserts `layer_out`."""
+    `glm52_decoder_layer_forward` position by position and asserts `layer_out`.
+
+    Tolerance is scaled by the rms of the LAYER DELTA (layer_out - hidden), not
+    of layer_out itself: the residual stream passes through unchanged and
+    dominates layer_out's rms, so a delta-blind tolerance would let a broken
+    attn/MLP contribution hide under the residual passthrough."""
     hidden = taps["hidden"]
-    rms, probes = sampled_probes(taps["layer_out"], args, "layer_out")
+    _, probes = sampled_probes(taps["layer_out"], args, "layer_out")
+    delta = taps["layer_out"].to(torch.float32) - hidden.to(torch.float32)
+    rms = float(delta.square().mean().sqrt())
     fault_banner = (
         f"// !!! FAULT-INJECTED ({args.inject_fault}) — negative control only, DO NOT COMMIT\n"
         if args.inject_fault != "none"
@@ -605,6 +612,7 @@ const ORACLE_LAYER: usize = {args.layer};
 // sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
 const ORACLE_HIDDEN_DIGEST: &str = "{bf16_digest(hidden)}";
 // tap `layer_out` [{args.ctx}, 6144] bf16 digest={bf16_digest(taps["layer_out"])} (provenance only)
+// RMS below is of the layer DELTA (layer_out - hidden) — see emit_rust_layer.
 const ORACLE_LAYER_RMS: f32 = {rms:.9e};
 const ORACLE_LAYER_REL_TOL: f32 = {args.rel_tol};
 const ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
