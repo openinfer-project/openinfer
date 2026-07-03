@@ -17,13 +17,7 @@ inline constexpr int kNumExperts = 256;
 inline constexpr int kNumLocalExperts = kNumExperts / kNumRanks;  // 32
 inline constexpr int kNumTopk = 8;
 inline constexpr int kHidden = 6144;
-// FP8 dispatch payload: the token is per-128-group quantized on the SOURCE
-// rank (identical math to the retired recv-side re-quant — dispatch is
-// byte-preserving, so quant commutes and the recv bytes are bit-identical),
-// halving the NVLink payload and letting the copy epilogue emit the grouped
-// GEMM's act_fp8/act_scale buffers directly.
-inline constexpr int kHiddenBytes = kHidden;                 // fp8 e4m3 payload
-inline constexpr int kNumSFPacks = kHidden / 128;            // 48 f32 group scales
+inline constexpr int kHiddenBytes = kHidden * 2;  // bf16 payload, no FP8 SF
 inline constexpr int kExpertAlignment = 64;       // TRTLLM grouped-GEMM M-tile
 
 // Comm tuning and device facts: identical to the Kimi config (same H200

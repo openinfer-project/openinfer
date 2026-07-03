@@ -24,9 +24,9 @@
 use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
-#[cfg(test)]
-use openinfer_kernels::ops::rms_norm_into;
-use openinfer_kernels::ops::{Glm52IndexerCacheLayout, add_into, fused_add_rms_norm_round_into};
+use openinfer_kernels::ops::{
+    Glm52IndexerCacheLayout, add_into, fused_add_rms_norm_round_into, rms_norm_into,
+};
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::dense::Glm52DenseMlpWeights;

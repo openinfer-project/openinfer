@@ -79,7 +79,6 @@ int deepep_ctx_destroy(DeepEpCtx* ctx);
 int deepep_decode_dispatch(
     DeepEpCtx* ctx, void* stream,
     const void* x,                // [num_tokens, hidden] bf16
-    const float* x_sf,            // FP8-SF configs only; null for bf16 payload
     const int32_t* topk_idx,      // [num_tokens, num_topk] global expert ids
     const float* topk_weights,    // [num_tokens, num_topk]
     int32_t num_tokens,           // <= decode_max_tokens_per_rank (0 allowed)
@@ -88,7 +87,6 @@ int deepep_decode_dispatch(
     int32_t* psum_rank,           // out [num_ranks]
     int32_t* psum_expert,         // out [num_local_experts + 1]
     void* recv_x,                 // out [decode_worst_expanded_tokens, hidden] bf16
-    float* recv_x_sf,             // FP8-SF configs only; null for bf16 payload
     float* recv_topk_weights,     // out [decode_worst_expanded_tokens]
     int32_t* recv_src_metadata);  // out [decode_worst_recv_tokens, num_topk + 2]
 

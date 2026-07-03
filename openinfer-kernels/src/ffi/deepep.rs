@@ -50,7 +50,6 @@ unsafe extern "C" {
         ctx: *mut DeepEpCtx,
         stream: *mut c_void,
         x: *const c_void,
-        x_sf: *const f32,
         topk_idx: *const i32,
         topk_weights: *const f32,
         num_tokens: i32,
@@ -59,7 +58,6 @@ unsafe extern "C" {
         psum_rank: *mut i32,
         psum_expert: *mut i32,
         recv_x: *mut c_void,
-        recv_x_sf: *mut f32,
         recv_topk_weights: *mut f32,
         recv_src_metadata: *mut i32,
     ) -> c_int;
@@ -147,7 +145,6 @@ unsafe extern "C" {
         ctx: *mut Glm52DeepEpCtx,
         stream: *mut c_void,
         x: *const c_void,
-        x_sf: *const f32,
         topk_idx: *const i32,
         topk_weights: *const f32,
         num_tokens: i32,
@@ -156,7 +153,6 @@ unsafe extern "C" {
         psum_rank: *mut i32,
         psum_expert: *mut i32,
         recv_x: *mut c_void,
-        recv_x_sf: *mut f32,
         recv_topk_weights: *mut f32,
         recv_src_metadata: *mut i32,
     ) -> c_int;

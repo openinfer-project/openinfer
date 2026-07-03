@@ -34,8 +34,6 @@ inline constexpr int kSmemBytes = 232448;  // sharedMemPerBlockOptin
 // allocated at actual size. Prefill max tokens matches the retired PPLX cap
 // (PPLX_MAX_DISPATCH_TOKENS = 2048).
 inline constexpr int kDecodeMaxTokens = 128;
-// bf16 dispatch payload (no FP8 scale factors) — the Kimi shim's contract.
-inline constexpr int kNumSFPacks = 0;
 inline constexpr int kDecodeNumSms = 32;
 inline constexpr int kPrefillMaxTokens = 2048;
 inline constexpr int kPrefillNumSms = 64;

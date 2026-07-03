@@ -158,7 +158,7 @@ struct PathKernels {
         return reinterpret_cast<const void*>(
             &dispatch_impl</*kIsScaleupNVLink=*/true, kCpuSync, /*kReuseSlotIndices=*/true,
                            kNumSms, cfg::kNumNotifyWarps, kDispatchWarps, cfg::kNumRanks,
-                           cfg::kHiddenBytes, cfg::kNumSFPacks, kMaxTokens,
+                           cfg::kHiddenBytes, /*kNumSFPacks=*/0, kMaxTokens,
                            cfg::kNumExperts, cfg::kNumTopk, cfg::kExpertAlignment,
                            cfg::kKernelQPs, cfg::kTimeoutCycles>);
     }
@@ -169,7 +169,7 @@ struct PathKernels {
                                          cfg::kDeviceSms, /*kNumChannels=*/1,
                                          cfg::kCopyEpilogueWarps,
                                          /*kNumScaleoutRanks=*/1, cfg::kNumRanks,
-                                         cfg::kHiddenBytes, cfg::kNumSFPacks, kMaxTokens,
+                                         cfg::kHiddenBytes, /*kNumSFPacks=*/0, kMaxTokens,
                                          cfg::kNumExperts, cfg::kNumTopk>);
     }
 
@@ -282,14 +282,12 @@ layout::WorkspaceLayout host_workspace_layout(DEEPEP_SHIM_CTX* ctx) {
 // and prefill (after the CPU count sync), so it is not part of this.
 template <typename Path>
 void dispatch_send_impl(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream, const void* x,
-                        const float* x_sf, const int32_t* topk_idx,
-                        const float* topk_weights, int32_t num_tokens,
-                        int32_t* rank_count_scratch, int32_t* dst_slot_scratch,
-                        int32_t* psum_rank, int32_t* psum_expert, int max_tokens) {
+                        const int32_t* topk_idx, const float* topk_weights,
+                        int32_t num_tokens, int32_t* rank_count_scratch,
+                        int32_t* dst_slot_scratch, int32_t* psum_rank,
+                        int32_t* psum_expert, int max_tokens) {
     require(num_tokens >= 0 && num_tokens <= max_tokens,
             "dispatch: num_tokens out of range for this path");
-    require(cfg::kNumSFPacks == 0 || x_sf != nullptr,
-            "dispatch: this config carries FP8 scale factors but x_sf is null");
 
     // Deterministic prologue: assign destination buffer slots in source order.
     {
@@ -303,12 +301,12 @@ void dispatch_send_impl(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream, const void* x
     // Dispatch kernel (direct mode argument order, dispatch.hpp launch_impl).
     {
         void* px = const_cast<void*>(x);
-        auto* sf = reinterpret_cast<sf_pack_t*>(const_cast<float*>(x_sf));
+        sf_pack_t* sf = nullptr;
         auto* tk = const_cast<int32_t*>(topk_idx);
         auto* tw = const_cast<float*>(topk_weights);
         topk_idx_t* copied_topk_idx = nullptr;
         int* cumulative_stats = nullptr;
-        int sf_token_stride = cfg::kNumSFPacks, sf_hidden_stride = 1;
+        int sf_token_stride = 0, sf_hidden_stride = 0;
         int rank_idx = ctx->rank_idx;
         void* args[] = {&px,
                         &sf,
@@ -336,16 +334,13 @@ void dispatch_send_impl(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream, const void* x
 template <typename Path>
 void copy_epilogue_impl(DEEPEP_SHIM_CTX* ctx, cudaStream_t stream, int32_t num_recv_tokens,
                         const int32_t* psum_rank, const int32_t* psum_expert, void* recv_x,
-                        float* recv_x_sf, float* recv_topk_weights,
-                        int32_t* recv_src_metadata) {
-    require(cfg::kNumSFPacks == 0 || recv_x_sf != nullptr,
-            "dispatch recv: this config carries FP8 scale factors but recv_x_sf is null");
+                        float* recv_topk_weights, int32_t* recv_src_metadata) {
     auto* pr = const_cast<int32_t*>(psum_rank);
     auto* pe = const_cast<int32_t*>(psum_expert);
-    auto* recv_sf = reinterpret_cast<sf_pack_t*>(recv_x_sf);
+    sf_pack_t* recv_sf = nullptr;
     topk_idx_t* recv_topk_idx = nullptr;  // expand mode: no per-slot topk idx
     int* channel_linked_list = nullptr;
-    int recv_sf_token_stride = cfg::kNumSFPacks, recv_sf_hidden_stride = 1;
+    int recv_sf_token_stride = 0, recv_sf_hidden_stride = 0;
     int scaleout_rank_idx = 0;
     int scaleup_rank_idx = ctx->rank_idx;
     void* args[] = {&ctx->buffer,
@@ -574,19 +569,18 @@ int DEEPEP_SHIM_FN(ctx_destroy)(DEEPEP_SHIM_CTX* ctx) {
 }
 
 int DEEPEP_SHIM_FN(decode_dispatch)(DEEPEP_SHIM_CTX* ctx, void* stream, const void* x,
-                                    const float* x_sf, const int32_t* topk_idx,
-                                    const float* topk_weights, int32_t num_tokens,
-                                    int32_t* rank_count_scratch, int32_t* dst_slot_scratch,
-                                    int32_t* psum_rank, int32_t* psum_expert, void* recv_x,
-                                    float* recv_x_sf, float* recv_topk_weights,
-                                    int32_t* recv_src_metadata) {
+                                    const int32_t* topk_idx, const float* topk_weights,
+                                    int32_t num_tokens, int32_t* rank_count_scratch,
+                                    int32_t* dst_slot_scratch, int32_t* psum_rank,
+                                    int32_t* psum_expert, void* recv_x,
+                                    float* recv_topk_weights, int32_t* recv_src_metadata) {
     SHIM_API_BEGIN
     auto s = static_cast<cudaStream_t>(stream);
-    dispatch_send_impl<Decode>(ctx, s, x, x_sf, topk_idx, topk_weights, num_tokens,
+    dispatch_send_impl<Decode>(ctx, s, x, topk_idx, topk_weights, num_tokens,
                                rank_count_scratch, dst_slot_scratch, psum_rank, psum_expert,
                                cfg::kDecodeMaxTokens);
     copy_epilogue_impl<Decode>(ctx, s, cfg::kDecodeWorstRecvTokens, psum_rank, psum_expert,
-                               recv_x, recv_x_sf, recv_topk_weights, recv_src_metadata);
+                               recv_x, recv_topk_weights, recv_src_metadata);
     SHIM_API_END
 }
 
@@ -616,8 +610,7 @@ int DEEPEP_SHIM_FN(prefill_dispatch_send)(DEEPEP_SHIM_CTX* ctx, void* stream, co
                 cfg::kNumRanks + cfg::kNumLocalExperts, 0);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
-    dispatch_send_impl<Prefill>(ctx, static_cast<cudaStream_t>(stream), x, /*x_sf=*/nullptr,
-                                topk_idx,
+    dispatch_send_impl<Prefill>(ctx, static_cast<cudaStream_t>(stream), x, topk_idx,
                                 topk_weights, num_tokens, rank_count_scratch,
                                 dst_slot_scratch, psum_rank, psum_expert,
                                 cfg::kPrefillMaxTokens);
@@ -671,8 +664,8 @@ int DEEPEP_SHIM_FN(prefill_dispatch_recv)(DEEPEP_SHIM_CTX* ctx, void* stream,
     require(num_recv_tokens >= 0 && num_recv_tokens <= cfg::kPrefillWorstRecvTokens,
             "prefill_dispatch_recv: num_recv_tokens out of range");
     copy_epilogue_impl<Prefill>(ctx, static_cast<cudaStream_t>(stream), num_recv_tokens,
-                                psum_rank, psum_expert, recv_x, /*recv_x_sf=*/nullptr,
-                                recv_topk_weights, recv_src_metadata);
+                                psum_rank, psum_expert, recv_x, recv_topk_weights,
+                                recv_src_metadata);
     SHIM_API_END
 }
 

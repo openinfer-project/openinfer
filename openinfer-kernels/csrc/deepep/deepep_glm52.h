@@ -27,7 +27,6 @@ int glm52_deepep_ctx_destroy(Glm52DeepEpCtx* ctx);
 int glm52_deepep_decode_dispatch(
     Glm52DeepEpCtx* ctx, void* stream,
     const void* x,
-    const float* x_sf,
     const int32_t* topk_idx,
     const float* topk_weights,
     int32_t num_tokens,
@@ -36,7 +35,6 @@ int glm52_deepep_decode_dispatch(
     int32_t* psum_rank,
     int32_t* psum_expert,
     void* recv_x,
-    float* recv_x_sf,
     float* recv_topk_weights,
     int32_t* recv_src_metadata);
 

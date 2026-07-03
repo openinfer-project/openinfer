@@ -44,7 +44,6 @@ pub trait DeepEpAbi {
         ctx: *mut Self::RawCtx,
         stream: *mut c_void,
         x: *const c_void,
-        x_sf: *const f32,
         topk_idx: *const i32,
         topk_weights: *const f32,
         num_tokens: i32,
@@ -53,7 +52,6 @@ pub trait DeepEpAbi {
         psum_rank: *mut i32,
         psum_expert: *mut i32,
         recv_x: *mut c_void,
-        recv_x_sf: *mut f32,
         recv_topk_weights: *mut f32,
         recv_src_metadata: *mut i32,
     ) -> c_int;
@@ -157,7 +155,6 @@ macro_rules! deepep_abi {
                 ctx: *mut Self::RawCtx,
                 stream: *mut c_void,
                 x: *const c_void,
-                x_sf: *const f32,
                 topk_idx: *const i32,
                 topk_weights: *const f32,
                 num_tokens: i32,
@@ -166,7 +163,6 @@ macro_rules! deepep_abi {
                 psum_rank: *mut i32,
                 psum_expert: *mut i32,
                 recv_x: *mut c_void,
-                recv_x_sf: *mut f32,
                 recv_topk_weights: *mut f32,
                 recv_src_metadata: *mut i32,
             ) -> c_int {
@@ -175,7 +171,6 @@ macro_rules! deepep_abi {
                         ctx,
                         stream,
                         x,
-                        x_sf,
                         topk_idx,
                         topk_weights,
                         num_tokens,
@@ -184,7 +179,6 @@ macro_rules! deepep_abi {
                         psum_rank,
                         psum_expert,
                         recv_x,
-                        recv_x_sf,
                         recv_topk_weights,
                         recv_src_metadata,
                     )
@@ -531,7 +525,6 @@ impl<A: DeepEpAbi> DeepEpBase<A> {
                 self.ctx.as_ptr(),
                 stream.cu_stream().cast(),
                 x_ptr as *const _,
-                core::ptr::null(),
                 idx_ptr as *const i32,
                 w_ptr as *const f32,
                 num_tokens as i32,
@@ -540,91 +533,6 @@ impl<A: DeepEpAbi> DeepEpBase<A> {
                 pr_ptr as *mut i32,
                 pe_ptr as *mut i32,
                 rx_ptr as *mut _,
-                core::ptr::null_mut(),
-                rw_ptr as *mut f32,
-                rm_ptr as *mut i32,
-            )
-        });
-        Ok(())
-    }
-
-    /// Decode dispatch for an FP8-payload shim config (`kNumSFPacks > 0`,
-    /// the GLM5.2 contract): the token is per-128-group quantized on the
-    /// SOURCE rank — dispatch is byte-preserving, so this commutes with the
-    /// retired recv-side re-quant bit for bit — and the copy epilogue emits
-    /// the grouped-GEMM operands directly (`recv_x` fp8 rows + `recv_x_sf`
-    /// plain `[rows, hidden/128]` f32 scales).
-    #[allow(clippy::too_many_arguments)]
-    pub fn decode_dispatch_fp8(
-        &self,
-        ctx: &DeviceContext,
-        x_fp8: &CudaSlice<u8>,
-        x_sf: &CudaSlice<f32>,
-        topk_idx: &CudaSlice<i32>,
-        topk_weights: &CudaSlice<f32>,
-        num_tokens: usize,
-        scratch: &mut DeepEpDispatchScratch,
-        recv_x: &mut CudaSlice<u8>,
-        recv_x_sf: &mut CudaSlice<f32>,
-        recv_topk_weights: &mut CudaSlice<f32>,
-        recv_src_metadata: &mut CudaSlice<i32>,
-    ) -> Result<()> {
-        let info = &self.info;
-        let hidden = info.hidden as usize;
-        let sf_packs = hidden / 128;
-        ensure!(
-            num_tokens <= info.decode_max_tokens_per_rank as usize,
-            "decode dispatch: {num_tokens} tokens exceeds the baked cap {}",
-            info.decode_max_tokens_per_rank
-        );
-        ensure!(
-            x_fp8.len() >= num_tokens.max(1) * hidden
-                && x_sf.len() >= num_tokens.max(1) * sf_packs
-                && topk_idx.len() >= num_tokens.max(1) * info.num_topk as usize
-                && topk_weights.len() >= num_tokens.max(1) * info.num_topk as usize,
-            "decode dispatch: fp8 send buffers below the token count"
-        );
-        let expanded = info.decode_worst_expanded_tokens as usize;
-        ensure!(
-            recv_x.len() >= expanded * hidden
-                && recv_x_sf.len() >= expanded * sf_packs
-                && recv_topk_weights.len() >= expanded
-                && recv_src_metadata.len()
-                    >= info.decode_worst_recv_tokens as usize * (info.num_topk as usize + 2),
-            "decode dispatch: recv buffers below the published worst case"
-        );
-
-        let stream = &ctx.stream;
-        let (x_ptr, _xg) = x_fp8.device_ptr(stream);
-        let (sf_ptr, _sfg) = x_sf.device_ptr(stream);
-        let (idx_ptr, _ig) = topk_idx.device_ptr(stream);
-        let (w_ptr, _wg) = topk_weights.device_ptr(stream);
-        let (rc_ptr, _rcg) = scratch.rank_count.device_ptr_mut(stream);
-        let (slot_ptr, _sg) = scratch.dst_slot.device_ptr_mut(stream);
-        let (pr_ptr, _prg) = scratch.psum_rank.device_ptr_mut(stream);
-        let (pe_ptr, _peg) = scratch.psum_expert.device_ptr_mut(stream);
-        let (rx_ptr, _rxg) = recv_x.device_ptr_mut(stream);
-        let (rsf_ptr, _rsfg) = recv_x_sf.device_ptr_mut(stream);
-        let (rw_ptr, _rwg) = recv_topk_weights.device_ptr_mut(stream);
-        let (rm_ptr, _rmg) = recv_src_metadata.device_ptr_mut(stream);
-
-        // Safety: all pointers are live device allocations sized per the
-        // shim's published capacities (validated above / at construction).
-        shim_call!(A, "deepep_decode_dispatch", unsafe {
-            A::decode_dispatch(
-                self.ctx.as_ptr(),
-                stream.cu_stream().cast(),
-                x_ptr as *const _,
-                sf_ptr as *const f32,
-                idx_ptr as *const i32,
-                w_ptr as *const f32,
-                num_tokens as i32,
-                rc_ptr as *mut i32,
-                slot_ptr as *mut i32,
-                pr_ptr as *mut i32,
-                pe_ptr as *mut i32,
-                rx_ptr as *mut _,
-                rsf_ptr as *mut f32,
                 rw_ptr as *mut f32,
                 rm_ptr as *mut i32,
             )
