@@ -427,9 +427,9 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
     let q = DeviceBuf::zeroed(q_bytes)?;
 
     // kv_cache: interleaved [block_kv * head_dim fp8 | block_kv * 4 f32 scale] per block.
-    // stride = block_kv * (head_dim + 4) = 64 * 132 = 8448 bytes per block
-    let kv_stride_bytes = (num_kv_blocks as i64) * (block_kv as i64) * ((head_dim as i64) + 4);
-    let kv_bytes = kv_stride_bytes as usize;
+    // Per-block stride = block_kv * (head_dim + 4) = 64 * 132 = 8448 bytes
+    let kv_stride_bytes = (block_kv as i64) * ((head_dim as i64) + 4);
+    let kv_bytes = (num_kv_blocks * kv_stride_bytes as usize) as usize;
     let kv_cache = DeviceBuf::zeroed(kv_bytes)?;
 
     // weights: [batch_size * next_n, num_heads] fp8 = 1*4 = 4 bytes

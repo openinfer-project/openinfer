@@ -22,8 +22,8 @@
 //!   +-- weights_proj (bf16 GEMM) -> weights[32]
 //!   +-- k quant + cache write (glm52_indexer_k_quant_and_cache)
 //!   |
-//!   +-- DeepGEMM paged MQA logits (per-head weighting)
-//!   +-- fused bf16→f32 cast + ReLU
+//!   +-- DeepGEMM paged MQA logits (fuses per-head ReLU + weighting)
+//!   +-- bf16→f32 cast
 //!   +-- FlashInfer deterministic top-k K=2048
 //!   +-- local top-k offsets -> global KV slots
 //! ```
@@ -35,7 +35,7 @@ use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK, Glm52DeepGemmMqaLogitsShape,
     Glm52IndexerCacheInsert, Glm52IndexerCacheLayout, Glm52IndexerLocalTopKToSlots,
-    Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_relu_into,
+    Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_into,
     gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
     glm52_deepgemm_paged_mqa_metadata_launch, glm52_flashinfer_topk_2048_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_indexer_k_quant_and_cache_launch,
@@ -351,10 +351,10 @@ pub(crate) fn glm52_indexer_forward(
     )?;
 
     // DeepGEMM outputs bf16 logits; FlashInfer top-k expects f32.
-    // Fused bf16→f32 cast + ReLU: transformers applies F.relu(scores) before
-    // topk. sm100 DeepGEMM fuses this via cvt.relu, but sm90 does not.
+    // The sm90 kernel already fuses per-head ReLU (fmaxf(score, 0) * weight)
+    // matching transformers' F.relu(scores) — no extra ReLU needed here.
     let mut logits_f32 = ctx.stream.alloc_zeros::<f32>(logits_elems)?;
-    bf16_bytes_to_f32_relu_into(ctx, &logits, &mut logits_f32)?;
+    bf16_bytes_to_f32_into(ctx, &logits, &mut logits_f32)?;
 
     let mut topk_offsets = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
     let mut topk_values = ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?;
