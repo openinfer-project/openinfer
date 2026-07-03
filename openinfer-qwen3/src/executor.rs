@@ -20,11 +20,13 @@ use openinfer_kv_cache::{
     KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
     RegisteredBlock,
 };
-use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine, QueryOutcome};
+use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
 use tokio::sync::broadcast;
 
 mod dflash_lane;
 mod dflash_prefill;
+mod remote_fetch;
+use remote_fetch::{QueryView, RemoteFetchAction, remote_fetch_action};
 mod spec;
 
 use crate::dflash::DFlashDraftModel;
@@ -1639,36 +1641,43 @@ impl Qwen3Executor {
         else {
             return false;
         };
-        if std::time::Instant::now() > *deadline {
+        let timed_out = std::time::Instant::now() > *deadline;
+        if timed_out {
             log::warn!("remote KV fetch timed out for {id:?}; prefill from scratch");
-            self.prefetch.remove(&id);
-            return true;
         }
         let query_hashes = query_hashes.clone();
-        let offload = self.offload.as_ref().expect("offload present in prefetch");
-        match offload.query(&id.0.to_string(), &query_hashes) {
-            Ok(QueryOutcome::Loading) => false,
-            Ok(QueryOutcome::Ready(hit)) => {
-                let (Some(lease), num_blocks) = (hit.lease, hit.num_blocks) else {
-                    self.prefetch.remove(&id);
-                    return true;
-                };
-                // Same budget guard as begin_kv_prefetch: blocks promised to
-                // admitted requests are off-limits — reserving into them makes
-                // a later prefill chunk or decode growth fail allocation and
-                // errors out every touched request.
-                if self
-                    .kv_mgr
-                    .pool()
-                    .available_blocks()
-                    .saturating_sub(reserve_floor)
-                    < num_blocks
-                {
-                    let offload = self.offload.as_ref().expect("offload present in prefetch");
-                    offload.release_query_lease(lease);
-                    self.prefetch.remove(&id);
-                    return true;
-                }
+        let available_blocks = self.kv_mgr.pool().available_blocks();
+        let action = {
+            let offload = self.offload.as_ref().expect("offload present in prefetch");
+            remote_fetch_action(
+                timed_out,
+                || {
+                    offload
+                        .query(&id.0.to_string(), &query_hashes)
+                        .map(QueryView::from)
+                        .map_err(|e| {
+                            log::warn!(
+                                "remote KV re-query failed for {id:?} (prefill from scratch): {e}"
+                            );
+                        })
+                },
+                available_blocks,
+                reserve_floor,
+            )
+        };
+        match action {
+            RemoteFetchAction::Wait => false,
+            RemoteFetchAction::Scratch => {
+                self.prefetch.remove(&id);
+                true
+            }
+            RemoteFetchAction::Release(lease) => {
+                let offload = self.offload.as_ref().expect("offload present in prefetch");
+                offload.release_query_lease(lease);
+                self.prefetch.remove(&id);
+                true
+            }
+            RemoteFetchAction::Load(lease, num_blocks) => {
                 let probe = self
                     .prefetch
                     .remove(&id)
@@ -1678,11 +1687,6 @@ impl Qwen3Executor {
                     Ok(()) => false,
                     Err(()) => true,
                 }
-            }
-            Err(e) => {
-                log::warn!("remote KV re-query failed for {id:?} (prefill from scratch): {e}");
-                self.prefetch.remove(&id);
-                true
             }
         }
     }
@@ -2012,15 +2016,22 @@ impl ModelExecutor for Qwen3Executor {
         if query_hashes.is_empty() {
             return false;
         }
-        let outcome = match offload.query(&request_id.0.to_string(), &query_hashes) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");
-                return false;
-            }
-        };
-        let hit = match outcome {
-            QueryOutcome::Loading => {
+        let available_blocks = self.kv_mgr.pool().available_blocks();
+        let action = remote_fetch_action(
+            false,
+            || {
+                offload
+                    .query(&request_id.0.to_string(), &query_hashes)
+                    .map(QueryView::from)
+                    .map_err(|e| {
+                        log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");
+                    })
+            },
+            available_blocks,
+            reserve_floor,
+        );
+        match action {
+            RemoteFetchAction::Wait => {
                 // pegaflow is pulling the missing prefix from a P2P peer (or
                 // SSD) into the local host tier. Park the request and re-query
                 // each tick; the probe keeps the GPU-hit prefix resident.
@@ -2034,28 +2045,19 @@ impl ModelExecutor for Qwen3Executor {
                         },
                     },
                 );
-                return true;
+                true
             }
-            QueryOutcome::Ready(hit) => hit,
-        };
-        let (Some(lease), num_blocks) = (hit.lease, hit.num_blocks) else {
-            return false; // miss
-        };
-        // Blocks promised to admitted requests are off-limits: reserving into
-        // them makes a later prefill chunk or decode growth fail allocation.
-        if self
-            .kv_mgr
-            .pool()
-            .available_blocks()
-            .saturating_sub(reserve_floor)
-            < num_blocks
-        {
-            offload.release_query_lease(lease);
-            return false;
-        }
-        match self.start_prefetch_load(request_id, probe, lease, num_blocks) {
-            Ok(()) => true,
-            Err(()) => false,
+            RemoteFetchAction::Scratch => false, // miss or query error
+            RemoteFetchAction::Release(lease) => {
+                offload.release_query_lease(lease);
+                false
+            }
+            RemoteFetchAction::Load(lease, num_blocks) => {
+                match self.start_prefetch_load(request_id, probe, lease, num_blocks) {
+                    Ok(()) => true,
+                    Err(()) => false,
+                }
+            }
         }
     }
 
