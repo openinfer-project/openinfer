@@ -485,6 +485,12 @@ fn run_layer_prefill(
         let out_host = ctx.stream.clone_dtoh(&out)?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
+    // Debugging aid: dump the engine outputs (f32 LE) for offline diffing
+    // against the harness's safetensors taps.
+    if let Some(dump) = std::env::var_os("OPENINFER_GLM52_LAYER_DUMP") {
+        let bytes: Vec<u8> = outputs.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&dump, bytes)?;
+    }
     Ok(outputs)
 }
 
