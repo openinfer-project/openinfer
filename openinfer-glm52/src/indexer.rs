@@ -58,7 +58,6 @@ const K_NORM_EPS: f32 = 1.0e-6;
 pub(crate) struct Glm52IndexerLayerWeights {
     wq_b: ProjWeight,         // [32*128, 2048]
     wk: ProjWeight,           // [128, 6144]
-    weights_proj: ProjWeight, // [128, 6144] — padded from [32, 6144] (TRTLLM rejects n=32)
     weights_proj_bf16: Vec<bf16>, // host-side [32, 6144] — f32 matmul for oracle parity
     k_norm_w: CudaSlice<f32>, // [128] — LayerNorm gamma (f32 for FlashInfer)
     k_norm_b: CudaSlice<f32>, // [128] — LayerNorm beta  (f32 for FlashInfer)
@@ -111,7 +110,6 @@ impl Glm52IndexerLayerWeights {
 
         let w = ProjWeight::upload(ctx, wq_b)?;
         let k = ProjWeight::upload(ctx, wk)?;
-        let proj = quant_and_pad_weights_proj(ctx, weights_proj_bf16)?;
         let proj_bf16: Vec<bf16> = unsafe {
             std::slice::from_raw_parts(
                 weights_proj_bf16.as_ptr().cast::<bf16>(),
@@ -124,100 +122,11 @@ impl Glm52IndexerLayerWeights {
         Ok(Self {
             wq_b: w,
             wk: k,
-            weights_proj: proj,
             weights_proj_bf16: proj_bf16,
             k_norm_w: norm_w,
             k_norm_b: norm_b,
         })
     }
-}
-
-/// Quantize bf16 `weights_proj` [32, 6144] to fp8 per-128-block, then pad to
-/// [128, 6144] (TRTLLM rejects n=32). The extra 96 rows are zero-padded;
-/// the forward slices the first 32 outputs. This matches the checkpoint's
-/// fp8 quant contract: scale = group_amax / 448, fp8 e4m3.
-fn quant_and_pad_weights_proj(ctx: &DeviceContext, bf16_bytes: &[u8]) -> Result<ProjWeight> {
-    let n_orig = INDEX_HEADS; // 32
-    let n = INDEX_HEAD_DIM; // 128 (padded)
-    let k = HIDDEN;
-    let bf16_vals: &[bf16] =
-        unsafe { std::slice::from_raw_parts(bf16_bytes.as_ptr().cast::<bf16>(), n_orig * k) };
-
-    let mut fp8_weights = vec![0u8; n * k];
-    let scale_rows = n.div_ceil(FP8_BLOCK); // 1
-    let scale_cols = k.div_ceil(FP8_BLOCK); // 48
-    let mut scales = vec![0.0f32; scale_rows * scale_cols];
-
-    // The TRTLLM fp8 format has scale shape [n/128, k/128] = [1, 48].
-    // All 32 original rows must share a single scale per 128-element column
-    // group. Use the max amax across all rows to avoid clipping.
-    for col_group in 0..scale_cols {
-        let start = col_group * FP8_BLOCK;
-        let end = (start + FP8_BLOCK).min(k);
-        let mut amax = 0.0f32;
-        for row in 0..n_orig {
-            for j in start..end {
-                amax = amax.max(bf16_vals[row * k + j].to_f32().abs());
-            }
-        }
-        let scale = amax.max(1e-4) / 448.0;
-        scales[col_group] = scale;
-        for row in 0..n_orig {
-            for j in start..end {
-                let val = bf16_vals[row * k + j].to_f32();
-                let q = (val / scale).clamp(-448.0, 448.0);
-                fp8_weights[row * k + j] = float_to_fp8_e4m3(q);
-            }
-        }
-    }
-
-    let scale_bytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
-
-    let mut weight_dev = ctx.stream.alloc_zeros::<u8>(n * k)?;
-    let mut scale_dev = ctx.stream.alloc_zeros::<u8>(scale_bytes.len())?;
-    ctx.stream.memcpy_htod(&fp8_weights, &mut weight_dev)?;
-    ctx.stream.memcpy_htod(&scale_bytes, &mut scale_dev)?;
-    Ok(ProjWeight {
-        weight: weight_dev,
-        scale: scale_dev,
-        n,
-        k,
-    })
-}
-
-/// Convert a float to fp8 e4m3 (saturating). Mirrors __nv_cvt_float_to_fp8
-/// with SV_INF_NAN_MODE_OVERFLOW and __NV_E4M3.
-fn float_to_fp8_e4m3(val: f32) -> u8 {
-    let clamped = val.clamp(-448.0, 448.0);
-    let bits = clamped.to_bits();
-    let sign = (bits >> 31) & 1;
-    let abs = bits & 0x7FFF_FFFF;
-    // f32 to e4m3: exponent bias 7 (f32) vs 7 (e4m3), but e4m3 has 3 mantissa bits
-    let f32_exp = (abs >> 23) as i32;
-    let f32_man = abs & 0x7F_FFFF;
-    if f32_exp == 0 {
-        // subnormal or zero
-        if f32_man == 0 {
-            return (sign << 7) as u8;
-        }
-        // subnormal: value = 2^-6 * (man / 2^23)
-        let val = f32::from_bits(abs);
-        let scaled = val * (1u32 << 6) as f32 * 8.0 / 448.0 * 448.0;
-        let q = scaled.round() as i32;
-        let q = q.clamp(0, 7);
-        return ((sign << 7) | q as u32) as u8;
-    }
-    if f32_exp >= 128 + 8 {
-        // overflow → saturate to max (448.0 = 0b0_1110_111)
-        return ((sign << 7) | 0b1110_111) as u8;
-    }
-    let e4m3_exp = f32_exp - 127 + 7;
-    if e4m3_exp < 0 {
-        // underflow → zero
-        return (sign << 7) as u8;
-    }
-    let e4m3_man = (f32_man >> 20) & 0x7;
-    ((sign << 7) | ((e4m3_exp as u32) << 3) | e4m3_man) as u8
 }
 
 /// Copy bf16 bytes from a checkpoint tensor and upcast to f32 on host, then
