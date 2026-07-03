@@ -11,7 +11,7 @@
 //! Run (H200 + checkpoint + probes):
 //! ```text
 //! OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
-//! OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM \
+//! OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM/deep_gemm \
 //! CUDA_HOME=/usr/local/cuda \
 //!   cargo test --release -p openinfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
 //! ```

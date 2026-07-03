@@ -1,16 +1,16 @@
 # GLM5.2 DP1 EP8 Decode Plan
 
-> **TL;DR:** Five sub-PRs on top of the merged load-weight scaffold (PR #476) to reach a DP1/EP8 DSA decode serving path. GLM5.2 attention is DSA (DeepSeek Sparse Attention) — the indexer chain that selects sparse top-k is not optional. PR1 lands the MLA projection/absorb/cache substrate with full top-k (valid at short context). PR2 lands the DSA indexer chain (DeepGEMM MQA logits + FlashInfer deterministic top-k + slot conversion) that replaces full top-k with sparse top-k. PR3 adds dense MLP + MoE + bookends for full EP1 forward. PR4 swaps EP1 MoE for DeepEP EP8 all-to-all. PR5 wires the real scheduler + CUDA Graph. Prefill rides decode kernels token-by-token until a dedicated prefill path is justified by measurement.
+> **TL;DR:** Five sub-PRs on top of the merged load-weight scaffold (PR #476) to reach a DP1/EP8 DSA decode serving path. **PR1 and PR2 are merged** (#477 MLA brick, #489+#521 DSA indexer, #499 oracle harness). PR3 (dense MLP + MoE + bookends + layer composition) is planned in `ep1-forward.md`, which supersedes this doc's PR3 section — key corrections there: no single-GPU full-model e2e (experts ≈ 700 GiB; e2e gate moves to PR4), cross-layer top-k sharing (21/78 layers run the indexer), and the MoE chain is designed against the DeepEP v2 elastic shim contract with CUDA-graph capturability as the acceptance bar. PR4 swaps EP1 MoE for DeepEP EP8 all-to-all. PR5 wires the real scheduler + CUDA Graph capture. Prefill rides decode kernels token-by-token until a dedicated prefill path is justified by measurement.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
 ## Current state on main
 
-PR #476 (`feat(glm52): add dp1 ep8 load-weight slice`) landed:
-
-- `openinfer-glm52` crate: config probing, EP8 rank-sliced weight manifest, coalesced H2D into rank-local slabs, fail-closed rejecting coordinator.
-- `openinfer-kernels` `glm52` feature: 3 substrate ops — `deepgemm_layout`, `deepgemm_grouped` (metadata only, compute returns `NOT_SUPPORTED`), `flashmla_sparse` (SM90 V32, fixed topk=2048).
-- No forward, no executor, no scheduler.
+- PR #476 load-weight scaffold (+ #478 feature gating): EP8 rank-sliced manifest, coalesced H2D into rank-local slabs, fail-closed rejecting coordinator.
+- PR #477 (PR1): MLA decode brick — projection/absorb/cache-pack/FlashMLA sparse decode, full top-k.
+- PR #499: self-contained accuracy oracle harness (`tools/accuracy/glm52_oracle.py` + probe gates); MLA gate green on jz38 H200.
+- PR #489 + #521 (PR2): DSA indexer kernel ops + `glm52_indexer_forward`; indexer oracle gate green (2013/2048 slot overlap).
+- Still missing: dense/MoE/bookend forward, layer composition, executor, scheduler. `glm52_trtllm_grouped_fp8` CUDA compute is compiled but has no safe Rust wrapper; `deepgemm_grouped` GEMM entry is a `NOT_SUPPORTED` stub (metadata kernel is real).
 
 The old `feat/glm52-dp8-ep8` remote branch (27 commits, PP8 pivot) is retained as a cherry-pick source for per-layer bricks that are PP-independent. The PP spine, stage coordinator, and stage-sliced weight loading are discarded — EP8 needs rank-axis expert slicing, which main already has.
 
@@ -137,6 +137,8 @@ The old branch's `glm52_indexer_topk_2048_cuda` was a **stub** returning `NOT_SU
 **Test:** `tests/indexer_oracle.rs` — load layer-0 indexer weights + index-K cache fixture, run indexer forward at a context where sparse top-k != full top-k (e.g. context=4096, top-k=2048), compare the selected slot indices against HF oracle. Also a short-context regression: at context <= 2048 the indexer top-k must equal full top-k (validates PR1 compatibility).
 
 ### PR3 — `feat/glm52-ep1-forward`
+
+**Superseded by `ep1-forward.md`** (corrections: brick-level oracle gates instead of full-model e2e — the model doesn't fit on one GPU; cross-layer top-k sharing threads through the layer loop; MoE chain shaped to the DeepEP v2 elastic shim contract with graph capturability as the bar). Original scope kept below for history.
 
 Dense MLP (first 3 layers) + bookends (embed / final RMSNorm / lm_head) + routed/shared MoE decode (EP1, local experts). Full EP1 decode forward with DSA attention, e2e bs=1 generation gate. Prefill rides decode kernels token-by-token.
 

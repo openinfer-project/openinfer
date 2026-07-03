@@ -4,7 +4,15 @@
 //! official GLM5.2 FP8 checkpoint layout, loads DP1/EP8 rank slices to GPU
 //! memory, and returns a fail-closed engine handle until forward is introduced.
 
+#[cfg(feature = "glm52")]
+#[allow(dead_code)]
+mod bookend;
+#[cfg(all(test, feature = "glm52"))]
+mod bookend_oracle_gate;
 mod config;
+#[cfg(feature = "glm52")]
+#[allow(dead_code)]
+mod dense;
 #[cfg(feature = "glm52")]
 #[allow(dead_code)]
 mod fp8;
@@ -17,9 +25,17 @@ mod indexer_oracle_gate;
 mod indexer_smoke;
 #[cfg(feature = "glm52")]
 #[allow(dead_code)]
+mod layer;
+#[cfg(all(test, feature = "glm52"))]
+mod layer_oracle_gate;
+#[cfg(feature = "glm52")]
+#[allow(dead_code)]
 mod mla_decode;
 #[cfg(all(test, feature = "glm52"))]
 mod mla_oracle_gate;
+#[cfg(feature = "glm52")]
+#[allow(dead_code)]
+mod moe_decode;
 mod runner;
 mod weights;
 

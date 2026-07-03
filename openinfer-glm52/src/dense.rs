@@ -1,0 +1,69 @@
+//! GLM5.2 dense-MLP decode forward for bs=1 (layers 0..first_k_dense_replace).
+//!
+//! The dense layers replace the MoE block with a plain fp8 SwiGLU MLP
+//! `down(silu(gate(x)) * up(x))` -- the same shape as the MoE shared expert, only
+//! the intermediate is wider (12288 vs 2048). It reuses the shared `fp8_mlp`
+//! helper, so this module is just the weight bundle + a thin forward.
+
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use half::bf16;
+use openinfer_kernels::tensor::DeviceContext;
+
+use crate::fp8::{Glm52ProjBytes, ProjWeight, fp8_mlp};
+
+const HIDDEN: usize = 6144;
+const INTERMEDIATE: usize = 12288;
+
+/// The three fp8 projections of one dense MLP layer, resident on device.
+pub(crate) struct Glm52DenseMlpWeights {
+    gate: ProjWeight, // fp8 [INTERMEDIATE, HIDDEN]
+    up: ProjWeight,   // fp8 [INTERMEDIATE, HIDDEN]
+    down: ProjWeight, // fp8 [HIDDEN, INTERMEDIATE]
+}
+
+impl Glm52DenseMlpWeights {
+    /// Upload the dense MLP projections, validating every extent against the
+    /// GLM5.2 dense-layer architecture (crash-early on a packaging drift).
+    pub(crate) fn from_host(
+        ctx: &DeviceContext,
+        gate: &Glm52ProjBytes<'_>,
+        up: &Glm52ProjBytes<'_>,
+        down: &Glm52ProjBytes<'_>,
+    ) -> Result<Self> {
+        let shape = |label: &str, p: &Glm52ProjBytes<'_>, n: usize, k: usize| -> Result<()> {
+            anyhow::ensure!(
+                p.n == n && p.k == k,
+                "GLM5.2 dense MLP {label} shape [{},{}] != [{n},{k}]",
+                p.n,
+                p.k
+            );
+            Ok(())
+        };
+        shape("gate_proj", gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", up, INTERMEDIATE, HIDDEN)?;
+        shape("down_proj", down, HIDDEN, INTERMEDIATE)?;
+        Ok(Self {
+            gate: ProjWeight::upload(ctx, gate)?,
+            up: ProjWeight::upload(ctx, up)?,
+            down: ProjWeight::upload(ctx, down)?,
+        })
+    }
+}
+
+/// Dense MLP contribution for a single token. `normed_hidden` is the
+/// post-attention-layernorm hidden `[HIDDEN]`; returns the MLP output `[HIDDEN]`
+/// (the caller adds it to the post-attention residual).
+pub(crate) fn glm52_dense_mlp_forward(
+    ctx: &DeviceContext,
+    weights: &Glm52DenseMlpWeights,
+    normed_hidden: &CudaSlice<bf16>,
+) -> Result<CudaSlice<bf16>> {
+    fp8_mlp(
+        ctx,
+        &weights.gate,
+        &weights.up,
+        &weights.down,
+        normed_hidden,
+    )
+}

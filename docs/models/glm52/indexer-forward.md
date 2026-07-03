@@ -132,7 +132,7 @@ Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `mla_orac
 
 ```bash
 # Build (SM90a, H200)
-export OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM
+export OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM/deep_gemm
 export CUDA_HOME=/usr/local/cuda
 export OPENINFER_NCCL_ROOT=<path>
 cargo check --release -p openinfer-glm52 --features glm52
