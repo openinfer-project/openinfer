@@ -417,16 +417,6 @@ pub(crate) fn glm52_indexer_forward(
     let mut logits_f32 = ctx.stream.alloc_zeros::<f32>(logits_elems)?;
     bf16_bytes_to_f32_into(ctx, &logits, &mut logits_f32)?;
 
-    // Debug: dump intermediate values
-    let q_dbg = ctx.stream.clone_dtoh(&q_fp8.slice(0..8))?;
-    let q_scale_dbg = ctx.stream.clone_dtoh(&q_scale.slice(0..4))?;
-    let logits_dbg = ctx.stream.clone_dtoh(&logits_f32.slice(0..8))?;
-    let logits_end = ctx.stream.clone_dtoh(&logits_f32.slice(4088..4096))?;
-    eprintln!("q_fp8[0..8]: {:?}", &q_dbg);
-    eprintln!("q_scale[0..4]: {:?}", &q_scale_dbg);
-    eprintln!("weights_folded[0..4]: {:?}", &weights_folded[..4]);
-    eprintln!("logits_f32[0..8]: {:?}", &logits_dbg);
-    eprintln!("logits_f32[4088..4096]: {:?}", &logits_end);
     let mut topk_offsets = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
     let mut topk_values = ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?;
     glm52_flashinfer_topk_2048_launch(
