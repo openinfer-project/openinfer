@@ -33,8 +33,8 @@ use openinfer_kernels::ops::{
     DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, Glm52DeepEp,
     Glm52MoeQuantShape, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
     glm52_deepep_info, glm52_deepgemm_grouped_fp8_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch,
+    glm52_fp8_per_token_group_quant_bf16_bounded_launch,
+    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -215,11 +215,27 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         )?;
     }
 
-    // Re-quant the received bf16 rows to fp8. Only rows below `bound_rows`
-    // can sit inside an aligned expert segment the grouped GEMMs read; rows
-    // between a segment's real end and its aligned end are garbage but
+    // psum_expert (i32 aligned running ends) → expert_offsets (i64 segment
+    // starts) for the grouped GEMMs. Passing `bound_rows` as the capacity
+    // makes the kernel device-trap if the ranks disagreed about
+    // `global_tokens` — the only place in the chain that sees the real psum.
+    // Runs BEFORE the re-quant so `expert_offsets[n_local]` (the real aligned
+    // end) can bound the row-proportional kernels below on-device.
+    glm52_deepgemm_grouped_fp8_metadata_launch(
+        ctx,
+        n_local,
+        bound_rows,
+        &state.scratch.psum_expert,
+        &mut state.expert_offsets,
+    )?;
+
+    // Re-quant the received bf16 rows to fp8. The grid covers `bound_rows`
+    // (the host-known worst case — CUDA-graph shape stability), but blocks at
+    // or past the device-side aligned end retire immediately: only rows
+    // inside an aligned expert segment are ever read by the grouped GEMMs;
+    // rows between a segment's real end and its aligned end are garbage but
     // row-isolated (the PR3 invariant).
-    glm52_fp8_per_token_group_quant_bf16_launch(
+    glm52_fp8_per_token_group_quant_bf16_bounded_launch(
         ctx,
         Glm52MoeQuantShape {
             rows: bound_rows,
@@ -229,18 +245,8 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         &state.recv_x,
         &mut state.act_fp8,
         &mut state.act_scale,
-    )?;
-
-    // psum_expert (i32 aligned running ends) → expert_offsets (i64 segment
-    // starts) for the grouped GEMMs. Passing `bound_rows` as the capacity
-    // makes the kernel device-trap if the ranks disagreed about
-    // `global_tokens` — the only place in the chain that sees the real psum.
-    glm52_deepgemm_grouped_fp8_metadata_launch(
-        ctx,
+        &state.expert_offsets,
         n_local,
-        bound_rows,
-        &state.scratch.psum_expert,
-        &mut state.expert_offsets,
     )?;
 
     // W13 grouped FP8 GEMM (gate|up) over the local expert segments. The
@@ -266,7 +272,7 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
 
     // Weighted SwiGLU quant: silu(gate)*up*route_weight → fp8 W2 input. The
     // per-slot weight is exactly what dispatch delivered per expanded row.
-    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch(
+    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_launch(
         ctx,
         Glm52MoeQuantShape {
             rows: bound_rows,
@@ -277,6 +283,8 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         &state.recv_topk_weight,
         &mut state.w2_act,
         &mut state.w2_act_scale,
+        &state.expert_offsets,
+        n_local,
     )?;
 
     // W2 grouped FP8 GEMM (down).

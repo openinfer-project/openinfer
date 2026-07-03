@@ -177,6 +177,29 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn glm52_fp8_per_token_group_quant_bf16_bounded_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        row_bound: *const i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_cuda(
+        input: *const Half,
+        topk_weights: *const f32,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_size: i32,
+        group_size: i32,
+        row_bound: *const i64,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_silu_and_mul_per_token_group_quant_bf16_cuda(
         input: *const Half,
         output: *mut u8,

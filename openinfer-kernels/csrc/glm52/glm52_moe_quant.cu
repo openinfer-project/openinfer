@@ -21,8 +21,13 @@ __device__ __forceinline__ unsigned char quantize_e4m3(float value,
 __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
     const __nv_bfloat16* __restrict__ input,
     unsigned char* __restrict__ output, float* __restrict__ scales, int rows,
-    int hidden_dim) {
+    int hidden_dim, const long long* __restrict__ row_bound) {
   const int row = blockIdx.x;
+  // Optional device-side row bound (the grouped-GEMM aligned segment end):
+  // the grid is capacity-sized for CUDA-graph pointer/shape stability, but
+  // rows past the real aligned end are never read by any consumer — retire
+  // their blocks immediately instead of quantizing garbage.
+  if (row_bound != nullptr && row >= *row_bound) return;
   const int group = blockIdx.y;
   const int tid = threadIdx.x;
   const int group_start = group * kGroupSize;
@@ -59,8 +64,10 @@ __global__ void fp8_per_token_group_quant_bf16_k128_kernel(
 __global__ void silu_and_mul_per_token_group_quant_bf16_k128_kernel(
     const __nv_bfloat16* __restrict__ input,
     const float* __restrict__ topk_weights, unsigned char* __restrict__ output,
-    float* __restrict__ scales, int rows, int hidden_size) {
+    float* __restrict__ scales, int rows, int hidden_size,
+    const long long* __restrict__ row_bound) {
   const int row = blockIdx.x;
+  if (row_bound != nullptr && row >= *row_bound) return;  // see quant kernel note
   const int group = blockIdx.y;
   const int tid = threadIdx.x;
   const int group_start = group * kGroupSize;
@@ -135,7 +142,24 @@ CUresult glm52_fp8_per_token_group_quant_bf16_cuda(
 
   dim3 grid(rows, hidden_dim / kGroupSize, 1);
   fp8_per_token_group_quant_bf16_k128_kernel<<<grid, kGroupSize, 0, stream>>>(
-      input, output, scales, rows, hidden_dim);
+      input, output, scales, rows, hidden_dim, nullptr);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_fp8_per_token_group_quant_bf16_bounded_cuda(
+    const __nv_bfloat16* input, unsigned char* output, float* scales, int rows,
+    int hidden_dim, int group_size, const long long* row_bound,
+    cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || scales == nullptr ||
+      row_bound == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (!valid_quant_shape(rows, hidden_dim, group_size)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dim3 grid(rows, hidden_dim / kGroupSize, 1);
+  fp8_per_token_group_quant_bf16_k128_kernel<<<grid, kGroupSize, 0, stream>>>(
+      input, output, scales, rows, hidden_dim, row_bound);
   return consume_last_cuda_error();
 }
 
@@ -152,7 +176,7 @@ CUresult glm52_silu_and_mul_per_token_group_quant_bf16_cuda(
   dim3 grid(rows, hidden_size / kGroupSize, 1);
   silu_and_mul_per_token_group_quant_bf16_k128_kernel<<<grid, kGroupSize, 0,
                                                         stream>>>(
-      input, nullptr, output, scales, rows, hidden_size);
+      input, nullptr, output, scales, rows, hidden_size, nullptr);
   return consume_last_cuda_error();
 }
 
@@ -173,7 +197,25 @@ CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_cuda(
   dim3 grid(rows, hidden_size / kGroupSize, 1);
   silu_and_mul_per_token_group_quant_bf16_k128_kernel<<<grid, kGroupSize, 0,
                                                         stream>>>(
-      input, topk_weights, output, scales, rows, hidden_size);
+      input, topk_weights, output, scales, rows, hidden_size, nullptr);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_cuda(
+    const __nv_bfloat16* input, const float* topk_weights,
+    unsigned char* output, float* scales, int rows, int hidden_size,
+    int group_size, const long long* row_bound, cudaStream_t stream) {
+  if (input == nullptr || topk_weights == nullptr || output == nullptr ||
+      scales == nullptr || row_bound == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (!valid_quant_shape(rows, hidden_size, group_size)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dim3 grid(rows, hidden_size / kGroupSize, 1);
+  silu_and_mul_per_token_group_quant_bf16_k128_kernel<<<grid, kGroupSize, 0,
+                                                        stream>>>(
+      input, topk_weights, output, scales, rows, hidden_size, row_bound);
   return consume_last_cuda_error();
 }
 
