@@ -1,9 +1,10 @@
 //! GLM5.2 EP8 routed-MoE decode: the PR3 grouped FP8 chain with DeepEP
 //! dispatch/combine substituted for the local scatter/combine stand-ins.
 //!
-//! Every rank runs the same collective per MoE layer. Rank 0 (the only DP
-//! rank) dispatches its token; ranks 1..7 dispatch zero tokens and only
-//! compute their 32 local experts over whatever the all-to-all delivered:
+//! Every rank runs the same collective per MoE layer: a rank with an active
+//! request dispatches its token (under the DP8 coordinator that is every
+//! rank, padding tokens included) and computes its 32 local experts over
+//! whatever the all-to-all delivered:
 //!
 //! ```text
 //! dispatch(x bf16, global topk)          # collective; recv = expert-major
@@ -16,7 +17,8 @@
 //! The dispatch payload is bf16 (the shim's wire format); each rank re-quants
 //! its received rows before the grouped GEMMs. Re-quant / SiLU / grouped GEMM
 //! cover `bound_rows` — the host-derived aligned-segment bound for the step's
-//! global token count (512 at bs=1 vs the 10240-row capacity); the metadata
+//! global token count (2080 at the DP8 protocol's 8 tokens/step vs the
+//! 10240-row capacity); the metadata
 //! kernel device-traps if a real segment ends past it. Rows past the bound
 //! hold stale bytes, but every kernel is row-independent and combine only
 //! reads slots addressed by the dispatch metadata — the PR3 row-isolation
@@ -42,9 +44,9 @@ use crate::moe_decode::{
     W13_K, W13_N, W13_SCALE_ROWS, grouped_gemm_into,
 };
 
-/// Rank-0's weights for one EP8 MoE layer: the router and shared expert run
-/// only where the token lives; the bank holds this rank's 32 local experts.
-/// Expert ranks (1..7) hold only a bank per layer.
+/// One rank's weights for one EP8 MoE layer: router and shared expert run
+/// where the token lives (every rank, under the DP8 coordinator); the bank
+/// holds this rank's 32 local experts.
 pub(crate) struct Glm52MoeEp8LayerWeights {
     pub(crate) router: Glm52MoeRouterWeights,
     pub(crate) shared: Glm52MoeSharedExpert,
@@ -140,9 +142,12 @@ impl Glm52MoeEp8State {
 }
 
 /// One EP8 MoE layer's routed contribution — a collective every rank must
-/// enter simultaneously per layer. Rank 0 passes its post-attention normed
-/// hidden + router output and gets back `Some(routed[HIDDEN])` (route weight
-/// and ×2.5 scaling already folded); expert ranks pass `None` and get `None`.
+/// enter simultaneously per layer. A rank with a token passes its
+/// post-attention normed hidden + router output and gets back
+/// `Some(routed[HIDDEN])` (route weight and ×2.5 scaling already folded); a
+/// token-less rank passes `None` and gets `None`. The DP8 production path
+/// always passes `Some` (idle ranks step a padding token); `None` survives
+/// for the EP8 layer oracle gate's single-dispatcher replay.
 ///
 /// `global_tokens` is the total token count dispatched across ALL ranks this
 /// step — every rank must pass the same value (a protocol constant of the
@@ -152,7 +157,8 @@ impl Glm52MoeEp8State {
 /// on this rank, and each non-empty local expert segment pads to the
 /// `GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT` boundary, so the last aligned
 /// segment end is at most `min(expanded, g*TOPK + (ALIGN-1)*min(g*TOPK,
-/// n_local))`. At bs=1 that is 512 rows vs the 10240-row capacity.
+/// n_local))`. At the DP8 protocol's 8 tokens/step that is 2080 rows vs the
+/// 10240-row capacity.
 pub(crate) fn glm52_moe_ep8_routed_forward(
     ctx: &DeviceContext,
     state: &mut Glm52MoeEp8State,

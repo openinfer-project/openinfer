@@ -1,6 +1,6 @@
 # GLM5.2 DP1 EP8 Decode Plan
 
-> **TL;DR:** Five sub-PRs on top of the merged load-weight scaffold (PR #476) to reach a DP1/EP8 DSA decode serving path. **PR1–PR3 are merged** (#477 MLA brick, #489+#521 DSA indexer, #499 oracle harness, #530 EP1 decoder-layer forward). **PR4 (DeepEP EP8 MoE + full-model DP1 forward) is built and gated** — see `ep8-deepep-moe.md`, which supersedes this doc's PR4 section: GLM-baked DeepEP shim instantiation, load-time packed expert placement, rank-0 78-layer spine + bs=1 greedy coordinator. PR5 wires the real scheduler + CUDA Graph capture. Prefill rides decode kernels token-by-token until a dedicated prefill path is justified by measurement.
+> **TL;DR:** Five sub-PRs on top of the merged load-weight scaffold (PR #476) to reach an EP8 DSA decode serving path. **PR1–PR4 are merged** (#477 MLA brick, #489+#521 DSA indexer, #499 oracle harness, #530 EP1 decoder-layer forward, #531 DeepEP EP8 MoE + first e2e generation — see `ep8-deepep-moe.md`), plus the **PR5a perf pass (#535)**: 101 → 46–50 ms/step, byte-identical — see `bs1-decode-serial-overhead.md`. PR5 split into **PR5b (DP8 scheduler — one request per rank, lock-step steps, see `dp8-scheduler.md`)** and **PR5c (whole-step decode CUDA-graph capture)**. Prefill rides decode kernels token-by-token until a dedicated prefill path is justified by measurement.
 >
 > **Last touched:** 2026-07
 

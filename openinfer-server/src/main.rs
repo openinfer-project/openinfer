@@ -137,10 +137,10 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             &args.model_path,
             openinfer_glm52::Glm52LaunchOptions {
                 tp_size: args.tp_size,
-                dp_size: args.dp_size.unwrap_or(1),
+                dp_size: args.dp_size.unwrap_or(8),
             },
         )
-        .context("failed to start GLM5.2 load-weight engine")?,
+        .context("failed to start GLM5.2 engine")?,
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,

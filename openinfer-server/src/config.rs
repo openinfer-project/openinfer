@@ -231,9 +231,9 @@ impl Args {
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
             if let Some(dp_size) = self.dp_size {
-                if dp_size != 1 {
+                if dp_size != 8 {
                     bail!(
-                        "GLM5.2 load-weight branch requires --dp-size=1 when provided; omit --dp-size to use DP1/EP8"
+                        "GLM5.2 requires --dp-size=8 when provided; omit --dp-size to use DP8/EP8"
                     );
                 }
             }
@@ -391,17 +391,17 @@ mod tests {
         let args = Args::parse_from(["openinfer"]);
 
         args.validate(ModelType::Glm52)
-            .expect("GLM5.2 should default to DP1/EP8 when --dp-size is omitted");
+            .expect("GLM5.2 should default to DP8/EP8 when --dp-size is omitted");
     }
 
     #[cfg(feature = "glm52")]
     #[test]
-    fn glm52_rejects_non_dp1() {
-        let args = Args::parse_from(["openinfer", "--dp-size", "8"]);
+    fn glm52_rejects_non_dp8() {
+        let args = Args::parse_from(["openinfer", "--dp-size", "1"]);
         let error = args
             .validate(ModelType::Glm52)
-            .expect_err("GLM5.2 should reject explicit non-DP1");
+            .expect_err("GLM5.2 should reject explicit non-DP8");
 
-        assert!(error.to_string().contains("DP1/EP8"));
+        assert!(error.to_string().contains("DP8/EP8"));
     }
 }
