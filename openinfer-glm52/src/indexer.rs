@@ -59,6 +59,7 @@ pub(crate) struct Glm52IndexerLayerWeights {
     wq_b: ProjWeight,         // [32*128, 2048]
     wk: ProjWeight,           // [128, 6144]
     weights_proj: ProjWeight, // [128, 6144] — padded from [32, 6144] (TRTLLM rejects n=32)
+    weights_proj_bf16: Vec<bf16>, // host-side [32, 6144] — f32 matmul for oracle parity
     k_norm_w: CudaSlice<f32>, // [128] — LayerNorm gamma (f32 for FlashInfer)
     k_norm_b: CudaSlice<f32>, // [128] — LayerNorm beta  (f32 for FlashInfer)
 }
@@ -111,12 +112,20 @@ impl Glm52IndexerLayerWeights {
         let w = ProjWeight::upload(ctx, wq_b)?;
         let k = ProjWeight::upload(ctx, wk)?;
         let proj = quant_and_pad_weights_proj(ctx, weights_proj_bf16)?;
+        let proj_bf16: Vec<bf16> = unsafe {
+            std::slice::from_raw_parts(
+                weights_proj_bf16.as_ptr().cast::<bf16>(),
+                INDEX_HEADS * HIDDEN,
+            )
+        }
+        .to_vec();
         let norm_w = upcast_bf16_to_f32(ctx, k_norm_w)?;
         let norm_b = upcast_bf16_to_f32(ctx, k_norm_b)?;
         Ok(Self {
             wq_b: w,
             wk: k,
             weights_proj: proj,
+            weights_proj_bf16: proj_bf16,
             k_norm_w: norm_w,
             k_norm_b: norm_b,
         })
@@ -303,11 +312,19 @@ pub(crate) fn glm52_indexer_forward(
     // ---- projections ----
     let q = fp8_linear(ctx, &w.wq_b, q_resid)?; // [32*128 = 4096]
     let k_raw = fp8_linear(ctx, &w.wk, hidden)?; // [128]
-    // weights_proj is padded to [128, 6144]; slice the first 32 outputs.
-    let weights_padded = fp8_linear(ctx, &w.weights_proj, hidden)?; // [128]
-    let weights_raw = ctx
-        .stream
-        .clone_dtoh(&weights_padded.slice(0..INDEX_HEADS))?;
+    // weights_proj: f32 host matmul (matches oracle precision — transformers
+    // keeps weights_proj in fp32 via _keep_in_fp32_modules).
+    let hidden_host = ctx.stream.clone_dtoh(&hidden.slice(0..HIDDEN))?;
+    let weights_raw: Vec<f32> = (0..INDEX_HEADS)
+        .map(|h| {
+            let mut dot = 0.0f32;
+            let row = &w.weights_proj_bf16[h * HIDDEN..(h + 1) * HIDDEN];
+            for j in 0..HIDDEN {
+                dot += hidden_host[j].to_f32() * row[j].to_f32();
+            }
+            dot
+        })
+        .collect();
 
     // ---- k LayerNorm (eps=1e-6, with bias) ----
     let mut k = ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?;
@@ -336,11 +353,10 @@ pub(crate) fn glm52_indexer_forward(
     // ---- weights fold: weights * q_scale * softmax_scale * n_heads^-0.5 ----
     // 32 elements — host-side math is cheaper than a kernel launch.
     let q_scale_host = ctx.stream.clone_dtoh(&q_scale)?;
-    // weights_raw is already on host from the fused GEMM split.
     let mut weights_folded = vec![0.0f32; INDEX_HEADS];
     for h in 0..INDEX_HEADS {
         weights_folded[h] =
-            weights_raw[h].to_f32() * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
+            weights_raw[h] * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
     }
     let mut weights_out = ctx.stream.alloc_zeros::<f32>(INDEX_HEADS)?;
     ctx.stream.memcpy_htod(&weights_folded, &mut weights_out)?;
@@ -416,6 +432,12 @@ pub(crate) fn glm52_indexer_forward(
     // Cast bf16 logits buffer → f32 before top-k.
     let mut logits_f32 = ctx.stream.alloc_zeros::<f32>(logits_elems)?;
     bf16_bytes_to_f32_into(ctx, &logits, &mut logits_f32)?;
+
+    // Debug: dump logits for Python comparison
+    let logits_host = ctx.stream.clone_dtoh(&logits_f32)?;
+    let logits_bytes: Vec<u8> = logits_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write("/tmp/glm52_rust_logits.f32", &logits_bytes).ok();
+    eprintln!("dumped {} logits to /tmp/glm52_rust_logits.f32", logits_host.len());
 
     let mut topk_offsets = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
     let mut topk_values = ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?;
