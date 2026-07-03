@@ -1796,16 +1796,20 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPENINFER_BUILD_TIMING");
     println!("cargo:rerun-if-env-changed=OPENINFER_NVCC_JOBS");
     println!("cargo:rerun-if-env-changed=OPENINFER_NCCL_ROOT");
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("third_party/DeepEP/deep_ep/include").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("third_party/DeepGEMM").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("third_party/FlashMLA").display()
-    );
+    let mut tracked_dirs = vec![
+        flashinfer.include.clone(),
+        flashinfer.csrc.clone(),
+        flashinfer.cutlass.clone(),
+        flashinfer.cutlass_util.clone(),
+        flashinfer.spdlog.clone(),
+    ];
+    tracked_dirs.extend(flashinfer.cccl.iter().cloned());
+    tracked_dirs.push(root.join("third_party/DeepEP/deep_ep/include"));
+    tracked_dirs.push(root.join("third_party/DeepGEMM"));
+    tracked_dirs.push(root.join("third_party/FlashMLA"));
+    for dir in tracked_dirs {
+        if dir.exists() {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+    }
 }
