@@ -29,15 +29,9 @@ __device__ __forceinline__ int clamp_nonnegative(int value) {
   return value < 0 ? 0 : value;
 }
 
-__device__ __forceinline__ int min_int(int lhs, int rhs) {
-  return lhs < rhs ? lhs : rhs;
-}
-
 __global__ void deepgemm_grouped_fp8_metadata_kernel(
     const int* __restrict__ psum_expert,
-    int64_t* __restrict__ expert_offsets,
-    int* __restrict__ w13_problem_sizes,
-    int* __restrict__ w2_problem_sizes, int groups, int m_capacity,
+    int64_t* __restrict__ expert_offsets, int groups, int m_capacity,
     int expert_alignment) {
   int expert = blockIdx.x * blockDim.x + threadIdx.x;
   if (expert >= groups) {
@@ -48,27 +42,20 @@ __global__ void deepgemm_grouped_fp8_metadata_kernel(
       expert == 0 ? 0 : clamp_nonnegative(psum_expert[expert - 1]);
   int end = clamp_nonnegative(psum_expert[expert]);
   int start = expert == 0 ? 0 : align_up_int(previous_end, expert_alignment);
-  int m = end >= start ? end - start : 0;
-  if (start > m_capacity || end > m_capacity) {
-    m = 0;
+
+  // m_capacity is the host-derived row bound (from the coordinator's global
+  // token count): the quant/relayout kernels covered exactly [0, m_capacity).
+  // A segment past it means the ranks disagreed about the token count — the
+  // grouped GEMM would multiply stale activations from the previous layer
+  // into real outputs with no error anywhere downstream. Crash instead.
+  if (start > m_capacity || align_up_int(end, expert_alignment) > m_capacity) {
+    __trap();
   }
 
   expert_offsets[expert] = static_cast<int64_t>(start);
-
-  int* w13 = w13_problem_sizes + expert * 3;
-  w13[0] = m;
-  w13[1] = kW13N;
-  w13[2] = kW13K;
-
-  int* w2 = w2_problem_sizes + expert * 3;
-  w2[0] = m;
-  w2[1] = kW2N;
-  w2[2] = kW2K;
-
   if (expert == groups - 1) {
-    int expanded_rows = align_up_int(end, expert_alignment);
     expert_offsets[groups] =
-        static_cast<int64_t>(min_int(expanded_rows, m_capacity));
+        static_cast<int64_t>(align_up_int(end, expert_alignment));
   }
 }
 
@@ -135,11 +122,9 @@ CUresult glm52_deepgemm_grouped_fp8_contract_cuda(
 }
 
 CUresult glm52_deepgemm_grouped_fp8_metadata_cuda(
-    const int* psum_expert, int64_t* expert_offsets, int* w13_problem_sizes,
-    int* w2_problem_sizes, int groups, int m_capacity, int expert_alignment,
-    cudaStream_t stream) {
-  if (psum_expert == nullptr || expert_offsets == nullptr ||
-      w13_problem_sizes == nullptr || w2_problem_sizes == nullptr) {
+    const int* psum_expert, int64_t* expert_offsets, int groups,
+    int m_capacity, int expert_alignment, cudaStream_t stream) {
+  if (psum_expert == nullptr || expert_offsets == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (groups <= 0 || m_capacity <= 0 || expert_alignment != kExpertAlignment) {
@@ -148,8 +133,7 @@ CUresult glm52_deepgemm_grouped_fp8_metadata_cuda(
 
   int blocks = (groups + kMetadataThreads - 1) / kMetadataThreads;
   deepgemm_grouped_fp8_metadata_kernel<<<blocks, kMetadataThreads, 0, stream>>>(
-      psum_expert, expert_offsets, w13_problem_sizes, w2_problem_sizes, groups,
-      m_capacity, expert_alignment);
+      psum_expert, expert_offsets, groups, m_capacity, expert_alignment);
   return consume_last_cuda_error();
 }
 

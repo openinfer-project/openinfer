@@ -279,7 +279,7 @@ fn mla_oracle_gate() -> Result<()> {
         ctx.stream.memcpy_htod(&topk_host, &mut topk)?;
 
         let o = glm52_mla_decode_forward(
-            &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk, contract, &mla_sched,
+            &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk, &mla_sched,
         )?;
         let o_host = ctx.stream.clone_dtoh(&o)?;
         outputs.extend(o_host.iter().map(|v| v.to_f32()));

@@ -41,8 +41,6 @@ unsafe extern "C" {
     pub fn glm52_deepgemm_grouped_fp8_metadata_cuda(
         psum_expert: *const i32,
         expert_offsets: *mut i64,
-        w13_problem_sizes: *mut i32,
-        w2_problem_sizes: *mut i32,
         groups: i32,
         m_capacity: i32,
         expert_alignment: i32,

@@ -14,11 +14,14 @@
 //! ```
 //!
 //! The dispatch payload is bf16 (the shim's wire format); each rank re-quants
-//! its received rows before the grouped GEMMs. Re-quant / SiLU launch at the
-//! fixed worst-case row capacity: pad rows hold stale bytes, but every kernel
-//! is row-independent and combine only reads slots addressed by the dispatch
-//! metadata — the PR3 row-isolation invariant. The whole layer is host-quiet
-//! (no D2H, fixed shapes) — CUDA-graph capturable, same bar as PR3.
+//! its received rows before the grouped GEMMs. Re-quant / SiLU / grouped GEMM
+//! cover `bound_rows` — the host-derived aligned-segment bound for the step's
+//! global token count (512 at bs=1 vs the 10240-row capacity); the metadata
+//! kernel device-traps if a real segment ends past it. Rows past the bound
+//! hold stale bytes, but every kernel is row-independent and combine only
+//! reads slots addressed by the dispatch metadata — the PR3 row-isolation
+//! invariant. The whole layer is host-quiet (no D2H, shapes fixed per batch
+//! size) — CUDA-graph capturable, same bar as PR3.
 
 use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
@@ -71,8 +74,6 @@ pub(crate) struct Glm52MoeEp8State {
     act_fp8: CudaSlice<u8>,
     act_scale: CudaSlice<f32>,
     expert_offsets: CudaSlice<i64>,
-    w13_problem_sizes: CudaSlice<i32>,
-    w2_problem_sizes: CudaSlice<i32>,
     w13_scale_tma: CudaSlice<f32>,
     w13_out: CudaSlice<bf16>,
     w2_act: CudaSlice<u8>,
@@ -128,8 +129,6 @@ impl Glm52MoeEp8State {
             act_fp8: ctx.stream.alloc_zeros(expanded * W13_K)?,
             act_scale: ctx.stream.alloc_zeros(expanded * HIDDEN_SCALE_COLS)?,
             expert_offsets: ctx.stream.alloc_zeros(n_local + 1)?,
-            w13_problem_sizes: ctx.stream.alloc_zeros(n_local * 3)?,
-            w2_problem_sizes: ctx.stream.alloc_zeros(n_local * 3)?,
             w13_scale_tma: ctx.stream.alloc_zeros(w13_scale_tma_len)?,
             w13_out: ctx.stream.alloc_zeros(expanded * W13_N)?,
             w2_act: ctx.stream.alloc_zeros(expanded * W2_K)?,
@@ -215,15 +214,15 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     )?;
 
     // psum_expert (i32 aligned running ends) → expert_offsets (i64 segment
-    // starts) for the grouped GEMMs.
+    // starts) for the grouped GEMMs. Passing `bound_rows` as the capacity
+    // makes the kernel device-trap if the ranks disagreed about
+    // `global_tokens` — the only place in the chain that sees the real psum.
     glm52_deepgemm_grouped_fp8_metadata_launch(
         ctx,
         n_local,
-        expanded,
+        bound_rows,
         &state.scratch.psum_expert,
         &mut state.expert_offsets,
-        &mut state.w13_problem_sizes,
-        &mut state.w2_problem_sizes,
     )?;
 
     // W13 grouped FP8 GEMM (gate|up) over the local expert segments. The

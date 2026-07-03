@@ -25,8 +25,7 @@ use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout, add_batch,
-    fused_add_rms_norm_round_batch_into, rms_norm_into,
+    Glm52IndexerCacheLayout, add_batch, fused_add_rms_norm_round_batch_into, rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -88,8 +87,7 @@ pub(crate) struct Glm52DecodeStep<'a> {
     pub(crate) mla_sin: &'a CudaSlice<bf16>,
     pub(crate) idx_cos: &'a CudaSlice<bf16>,
     pub(crate) idx_sin: &'a CudaSlice<bf16>,
-    pub(crate) contract: Glm52FlashMlaSparseDecode,
-    /// FlashMLA tile-scheduler plan for `contract` — computed once (it only
+    /// FlashMLA contract + tile-scheduler plan — computed once (the plan only
     /// depends on batch size / SM parts), shared by every layer.
     pub(crate) mla_sched: &'a Glm52MlaSchedMetadata,
     pub(crate) index_cache_layout: Glm52IndexerCacheLayout,
@@ -205,7 +203,6 @@ pub(crate) fn glm52_layer_attention_half(
         &mut caches.mla_cache,
         step.position,
         topk,
-        step.contract,
         step.mla_sched,
     )?;
 

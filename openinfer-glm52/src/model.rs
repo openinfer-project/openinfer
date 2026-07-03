@@ -38,6 +38,14 @@ use crate::weights::{Glm52RankGpuWeights, retype_owned};
 /// Sizes the per-layer MLA and index-K caches at build time.
 pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
 
+/// The bs=1 coordinator's protocol constant: every rank enters each MoE
+/// collective having agreed on this many dispatched tokens per step. Rank 0's
+/// `decode_step` and the expert ranks' `expert_step` must derive their
+/// `global_tokens` from this single definition — a disagreement makes the
+/// grouped-GEMM row bound wrong on some rank, which the metadata kernel
+/// answers with a device trap.
+pub(crate) const GLM52_DECODE_GLOBAL_TOKENS: usize = 1;
+
 pub(crate) const ROPE_HALF: usize = 32;
 const ROPE_THETA: f32 = 8_000_000.0;
 /// 1/sqrt(qk_head_dim = 192 + 64).
@@ -199,7 +207,6 @@ pub(crate) struct Glm52Rank0Model {
     embed: DeviceMatrix,
     final_norm: DeviceVec,
     lm_head: DeviceMatrix,
-    contract: Glm52FlashMlaSparseDecode,
     mla_sched: Glm52MlaSchedMetadata,
     index_cache_layout: Glm52IndexerCacheLayout,
     block_table: CudaSlice<i32>,
@@ -303,7 +310,6 @@ impl Glm52Rank0Model {
             final_norm,
             lm_head,
             mla_sched: Glm52MlaSchedMetadata::new(ctx, contract)?,
-            contract,
             index_cache_layout,
             block_table,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(1)?,
@@ -347,7 +353,6 @@ impl Glm52Rank0Model {
             mla_sin: &self.sin,
             idx_cos: &self.cos,
             idx_sin: &self.sin,
-            contract: self.contract,
             mla_sched: &self.mla_sched,
             index_cache_layout: self.index_cache_layout,
             slot_mapping: &self.slot_mapping,
@@ -371,14 +376,12 @@ impl Glm52Rank0Model {
                 }
                 Glm52LayerMlp::MoeEp8(moe) => {
                     let route = run_router(ctx, &moe.router, &boundary.normed)?;
-                    // global_tokens = 1: the bs=1 coordinator steps one token
-                    // across the whole EP8 group (expert_step matches).
                     let routed = glm52_moe_ep8_routed_forward(
                         ctx,
                         ep8,
                         &moe.bank,
                         Some((&boundary.normed, &route)),
-                        1,
+                        GLM52_DECODE_GLOBAL_TOKENS,
                     )
                     .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?
                     .context("rank-0 EP8 MoE returned no combined output")?;
@@ -460,9 +463,10 @@ impl Glm52ExpertRankModel {
     ) -> Result<()> {
         for (idx, bank) in self.banks.iter().enumerate() {
             let combined =
-                glm52_moe_ep8_routed_forward(ctx, ep8, bank, None, 1).with_context(|| {
-                    format!("GLM5.2 expert rank MoE layer {}", idx + GLM52_DENSE_LAYERS)
-                })?;
+                glm52_moe_ep8_routed_forward(ctx, ep8, bank, None, GLM52_DECODE_GLOBAL_TOKENS)
+                    .with_context(|| {
+                        format!("GLM5.2 expert rank MoE layer {}", idx + GLM52_DENSE_LAYERS)
+                    })?;
             ensure!(
                 combined.is_none(),
                 "GLM5.2 expert rank unexpectedly produced a combined output"

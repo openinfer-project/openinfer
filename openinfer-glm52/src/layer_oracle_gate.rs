@@ -548,7 +548,6 @@ fn run_layer_prefill(
             mla_sin: &sin,
             idx_cos: &cos,
             idx_sin: &sin,
-            contract,
             mla_sched: &mla_sched,
             index_cache_layout,
             slot_mapping: &slot_mapping,

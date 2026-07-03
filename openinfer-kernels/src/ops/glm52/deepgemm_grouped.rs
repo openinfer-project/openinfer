@@ -117,40 +117,33 @@ pub fn glm52_deepgemm_grouped_fp8_contract_validate(
         .map_err(|err| anyhow!("GLM5.2 DeepGEMM grouped FP8 ABI contract check failed: {err}"))
 }
 
+/// `m_capacity` is the row bound the caller's quant/relayout kernels covered;
+/// the kernel device-traps if any aligned expert segment ends past it (a
+/// cross-rank token-count disagreement — silently computing on uncovered rows
+/// would mix stale activations into real outputs).
 pub fn glm52_deepgemm_grouped_fp8_metadata_launch(
     ctx: &DeviceContext,
     groups: usize,
     m_capacity: usize,
     psum_expert: &CudaSlice<i32>,
     expert_offsets: &mut CudaSlice<i64>,
-    w13_problem_sizes: &mut CudaSlice<i32>,
-    w2_problem_sizes: &mut CudaSlice<i32>,
 ) -> Result<()> {
     ensure!(
         groups > 0 && m_capacity > 0,
         "GLM5.2 DeepGEMM grouped FP8 metadata needs groups>0 and m_capacity>0, got groups={groups}, m_capacity={m_capacity}"
     );
     ensure!(
-        psum_expert.len() >= groups
-            && expert_offsets.len() > groups
-            && w13_problem_sizes.len() >= groups * 3
-            && w2_problem_sizes.len() >= groups * 3,
-        "GLM5.2 DeepGEMM grouped FP8 metadata buffers too small for {groups} groups: psum={}, offsets={}, w13={}, w2={}",
+        psum_expert.len() >= groups && expert_offsets.len() > groups,
+        "GLM5.2 DeepGEMM grouped FP8 metadata buffers too small for {groups} groups: psum={}, offsets={}",
         psum_expert.len(),
-        expert_offsets.len(),
-        w13_problem_sizes.len(),
-        w2_problem_sizes.len()
+        expert_offsets.len()
     );
     let (psum_ptr, _psum_guard) = psum_expert.device_ptr(&ctx.stream);
     let (offsets_ptr, _offsets_guard) = expert_offsets.device_ptr_mut(&ctx.stream);
-    let (w13_ptr, _w13_guard) = w13_problem_sizes.device_ptr_mut(&ctx.stream);
-    let (w2_ptr, _w2_guard) = w2_problem_sizes.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_deepgemm_grouped_fp8_metadata_cuda(
             psum_ptr as *const i32,
             offsets_ptr as *mut i64,
-            w13_ptr as *mut i32,
-            w2_ptr as *mut i32,
             groups as i32,
             m_capacity as i32,
             GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT as i32,

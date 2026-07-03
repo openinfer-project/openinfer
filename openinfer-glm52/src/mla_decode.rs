@@ -267,7 +267,8 @@ pub(crate) fn glm52_mla_front(
 ///
 /// `cache` is the fp8_ds_mla paged cache (656 bytes/token); `cos`/`sin` are the
 /// position's rotary table first half (`[32]`); `topk` is the (fixed-2048,
-/// -1-padded) sparse index list; `contract` carries the FlashMLA launch sizing.
+/// -1-padded) sparse index list; `sched` carries the FlashMLA launch sizing
+/// (its contract) plus the precomputed tile-scheduler plan.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm52_mla_decode_forward(
     ctx: &DeviceContext,
@@ -278,20 +279,20 @@ pub(crate) fn glm52_mla_decode_forward(
     cache: &mut CudaSlice<u8>,
     position: usize,
     topk: &CudaSlice<i32>,
-    contract: Glm52FlashMlaSparseDecode,
     sched: &Glm52MlaSchedMetadata,
 ) -> Result<CudaSlice<bf16>> {
     let front = glm52_mla_front(ctx, w, hidden)?;
-    glm52_mla_attend(
-        ctx, w, &front, cos, sin, cache, position, topk, contract, sched,
-    )
+    glm52_mla_attend(ctx, w, &front, cos, sin, cache, position, topk, sched)
 }
 
-/// FlashMLA sparse tile-scheduler plan. It depends only on `batch_size` and
-/// `num_sm_parts` — not on position, sequence length, or layer — so it is
-/// computed once per contract (model build time) instead of per layer per
-/// step (78 × ~25 µs/step at bs=1).
+/// A FlashMLA sparse decode contract paired with its tile-scheduler plan. The
+/// plan depends only on `batch_size` and `num_sm_parts` — not on position,
+/// sequence length, or layer — so it is computed once (model build time)
+/// instead of per layer per step (78 × ~25 µs/step at bs=1). Owning the
+/// contract makes a plan/contract mismatch unrepresentable: every consumer
+/// reads both from the same object.
 pub(crate) struct Glm52MlaSchedMetadata {
+    contract: Glm52FlashMlaSparseDecode,
     tile_scheduler_metadata: CudaSlice<i32>,
     num_splits: CudaSlice<i32>,
 }
@@ -310,6 +311,7 @@ impl Glm52MlaSchedMetadata {
             &mut num_splits,
         )?;
         Ok(Self {
+            contract,
             tile_scheduler_metadata,
             num_splits,
         })
@@ -329,9 +331,9 @@ pub(crate) fn glm52_mla_attend(
     cache: &mut CudaSlice<u8>,
     position: usize,
     topk: &CudaSlice<i32>,
-    contract: Glm52FlashMlaSparseDecode,
     sched: &Glm52MlaSchedMetadata,
 ) -> Result<CudaSlice<bf16>> {
+    let contract = sched.contract;
     // The new token is written to cache slot `position`; the FlashMLA paging then
     // attends over `num_blocks` pages of `PAGE_SIZE` tokens. Couple them so a
     // position past the paged window errors here, not as a silent cache stomp.
