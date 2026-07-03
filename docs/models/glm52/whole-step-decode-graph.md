@@ -30,22 +30,38 @@ Remaining after #535's MoE workspace: MLA attend scratch (`ql_nope/query/ckv_fp8
 
 **Already capture-clean (verified):** DeepGEMM MQA AOT (PDL-only `cudaLaunchKernelExC`), FlashMLA sparse (caller-preallocated scratch, no sync), FlashInfer topk (`dsa_graph_safe=true`), all decode cuBLAS through the workspace-free `g_cublas_handle` (`csrc/shared/linear.cu:323-348`). No host branch depends on runtime state inside the loop — dense-vs-MoE and full-vs-shared-indexer are static per layer index.
 
-## Plan
+## Execution (all measured on jz-38 8×H200, 133-step greedy request)
 
-| stage | content | gate |
+| stage | ms/step | notes |
 |---|---|---|
-| 1. arena | `Glm52DecodeScratch` owned by the rank model: every §4 buffer allocated once at build; `fp8_linear`/`fp8_mlp` take caller scratch | local build + jz-38 byte-parity vs PR5b record; ms/step A/B (expect ~5 ms back) |
-| 2. host-quiet | indexer fold kernel (kills both D2H), cache-pack slot from device pointer, bounds checks hoisted, device top-1 egress | byte-parity again (top-1 tie-break must match host argmax on the record) |
-| 3. capture | `CudaGraphState::run_or_capture` around embed→argmax per rank; prologue (input uploads + rope row copy) stays eager | full PR5b gate suite rerun (byte-parity, 8-way concurrent, slot reuse, disconnect, SIGTERM) + ms/step A/B vs the 200 ms baseline |
+| PR5b baseline (#537) | ~200 | 8 rank threads × ~4155 launches/step through one driver |
+| whole-step graph (arena + host-quiet + capture) | **37.5** | byte-identical to the PR5b/PR5a record; capture on each rank's first step, warm+capture 493 ms |
+| + weight-only fp8 GEMV for every m=1 projection | **31.3** | numerics change (activation quant removed) — re-gated via #499 oracle in `--precision gemv` mode |
+| + device-bounded, grid-strided MoE recv quant/SiLU | **~30** | bit-preserving (pad rows never read; per-row math unchanged) |
 
-Stages are commits within one PR (`feat/glm52-decode-graph`); each stage must hold byte-parity on its own so a regression bisects to one stage.
+8-way concurrency stays free throughout (same per-step wall as bs=1; ~258 tok/s aggregate at 128-tok requests). All e2e gates green each stage: determinism ×2, 8-way identical, mixed concurrency, disconnect, slot reuse, SIGTERM teardown ≤4 s.
 
-## Open questions / risks
+Three latent findings shaken out on the way:
 
-- **Cooperative launch under capture:** proven by kimi on H200 driver-wise, but GLM's shim instantiation differs (parameterized `impl.cuh`); stage 3's first jz-38 run answers it definitively. If capture of the cooperative dispatch fails, fallback = graph the per-layer compute and leave dispatch/combine eager (still removes ~95% of launches).
-- **Top-1 tie-break:** host `greedy_argmax` and FlashInfer top-1 selection must agree on ties for byte-parity; verify on the recorded outputs before swapping (near-tie positions exist in these gates' history).
-- **Capture-step inputs:** the first step per rank may be padding `(0,0)` — the graph shape is input-independent so this is fine, but the capture must not be conditional on "real request" anywhere.
+- **DeepEP cooperative+cluster launches replay fine under stream capture** — the kimi precedent held for the GLM-baked shim; no fallback path needed.
+- **Block scheduling, not arithmetic, dominated the capacity-sized quant/SiLU launches** (2080×48 ≈ 100k 128-thread blocks ≈ 60 µs/layer): a device-bound early-return recovers nothing because retired blocks still get scheduled — the kernels are now grid-strided (row grid capped at 256, loop bounded by `expert_offsets[n_local]` on device).
+- **The HF `glm_moe_dsa` indexer reference is a moving target** (#541): the 5.13.0 release regressed the RoPE-interleave fix (the oracle script now refuses such builds), and `5.13.0.dev0` drifted between snapshots — the indexer oracle gate needs a pinned or vllm-derived reference before its overlap threshold means anything. Not introduced by this branch (main scores the same ~1585/2048 against any freshly generated oracle).
+
+## Where the remaining ~30 ms sits (nsys, node-granularity trace — proportions only)
+
+Per rank per step, inflated ~15-20% by tracing:
+
+| bucket | ms | assessment |
+|---|---|---|
+| dispatch_impl (75×) | ~6.7 | med 12.5 µs — mostly rank-arrival wait: per-layer straggler jitter (expert-count varies per rank per layer) + inter-step launch stagger; the tail (max 24 ms) sits at request/step boundaries |
+| weight-only GEMV (588×) | ~6.6 | near the weight-BW floor (o_proj 100 MB → ~25 µs); little headroom |
+| quant chain | ~4.7 → ~1 | grid-stride fix above |
+| grouped expert GEMM (150×) | ~3.4 | ~8 hit experts/rank × 37.5 MB weights ≈ physics floor shared with vLLM |
+| combine_impl (75×) | ~3.3 | loops the compile-time `kDecodeWorstRecvTokens` worst case — same grid-oversizing story as the quant kernels, fix lives in the DeepEP shim |
+| FlashMLA + cuBLAS absorb + norms + router + bookends | ~5 | near floor |
+
+Path to the ~22 ms vLLM DP8/EP8 reference: (1) bound the shim combine/dispatch inner loops by the device row count (~2-2.5 ms), (2) shave the inter-step rank stagger the layer-3 dispatch absorbs (single D2H egress packet, tighter coordinator fan-out) (~1-2 ms). Both are contained follow-ups with the nsys evidence above.
 
 ## Next action
 
-Stage 1 (arena) in progress on `feat/glm52-decode-graph`.
+Follow-ups: shim combine/dispatch device-bounded loops; inter-step stagger reduction; #541 indexer reference re-pin.
