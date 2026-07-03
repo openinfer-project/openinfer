@@ -73,10 +73,10 @@ pub(crate) struct Config35 {
     pub(crate) layer_types: Vec<LayerType>,
 }
 
-/// GDN dims the Triton-AOT kernels are built for; a mismatched model is rejected at load.
+/// Head dims baked into the kernels; head counts are runtime parameters.
 const GDN_AOT_KEY_HEAD_DIM: usize = 128;
 const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
-const GDN_AOT_NUM_VALUE_HEADS: usize = 32;
+const FULL_ATTN_HEAD_DIM: usize = 256;
 
 impl Config35 {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
@@ -116,16 +116,28 @@ impl Config35 {
 
         anyhow::ensure!(
             t.linear_key_head_dim == GDN_AOT_KEY_HEAD_DIM
-                && t.linear_value_head_dim == GDN_AOT_VALUE_HEAD_DIM
-                && t.linear_num_value_heads == GDN_AOT_NUM_VALUE_HEADS,
-            "Qwen3.5 GDN Triton-AOT kernels are baked for key/value head dim {}/{}, \
-             {} value heads; config has {}/{}, {}. Rebuild openinfer-kernels to match.",
+                && t.linear_value_head_dim == GDN_AOT_VALUE_HEAD_DIM,
+            "Qwen3.5 GDN Triton-AOT kernels are baked for key/value head dim {}/{}; \
+             config has {}/{} (dims are baked into the AOT signatures in openinfer-kernels/build.rs).",
             GDN_AOT_KEY_HEAD_DIM,
             GDN_AOT_VALUE_HEAD_DIM,
-            GDN_AOT_NUM_VALUE_HEADS,
             t.linear_key_head_dim,
             t.linear_value_head_dim,
+        );
+        anyhow::ensure!(
+            t.head_dim == FULL_ATTN_HEAD_DIM,
+            "Qwen3.5 full-attention kernels are baked for head_dim {}; config has {}.",
+            FULL_ATTN_HEAD_DIM,
+            t.head_dim,
+        );
+        anyhow::ensure!(
+            t.linear_num_key_heads > 0
+                && t.linear_num_value_heads
+                    .is_multiple_of(t.linear_num_key_heads),
+            "Qwen3.5 GDN kernels require linear_num_value_heads ({}) divisible by \
+             linear_num_key_heads ({})",
             t.linear_num_value_heads,
+            t.linear_num_key_heads,
         );
 
         Ok(Self {
@@ -184,5 +196,40 @@ impl Config35 {
     /// Z projection output dimension for linear attention.
     pub(crate) fn linear_attn_z_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config35;
+
+    #[test]
+    fn guard_accepts_48_value_heads() {
+        let dir = std::env::temp_dir().join(format!("qwen35-config-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{
+  "max_position_embeddings": 4096,
+  "tie_word_embeddings": true,
+  "text_config": {
+    "hidden_size": 512,
+    "intermediate_size": 1024,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "vocab_size": 1000,
+    "rms_norm_eps": 1e-6,
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_value_head_dim": 128,
+    "rope_parameters": { "rope_theta": 10000.0, "partial_rotary_factor": 0.25 },
+    "eos_token_id": 0
+  }
+}"#;
+        std::fs::write(dir.join("config.json"), json).unwrap();
+        Config35::from_file(dir.to_str().unwrap()).expect("48 value heads must load");
     }
 }

@@ -12,14 +12,13 @@ import triton.language as tl
 # - fla/ops/gated_delta_rule/wy_fast.py
 #
 # openinfer-specific changes:
-# - fixed Qwen3.5 shapes (batch=1, H=32, K=128, V=128, chunk_size=64)
+# - fixed Qwen3.5 dims (batch=1, K=128, V=128, chunk_size=64); head count is a runtime arg
 # - Triton AOT-friendly surface and wrapper contracts
 # - no backward / varlen / generic autotune surface
 # - decode-compatible final-state layout contract [H, V, K]
 # - fused prepare stage for q/k expansion, q/k normalization, and g/beta generation
 
 
-QWEN35_GDR_HEADS = 32
 QWEN35_GDR_CHUNK_SIZE = 64
 QWEN35_GDR_KEY_DIM = 128
 QWEN35_GDR_VALUE_DIM = 128
