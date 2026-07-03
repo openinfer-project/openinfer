@@ -86,6 +86,11 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, 0)?;
     let outputs = run_layer_prefill_ep8(&ctx, &w, &mut ep8, &hidden_host, MOE_ORACLE_CTX);
 
+    // The DeepEP context drop is collective: the expert threads drop theirs
+    // right after their last collective and spin in the destroy barrier, so
+    // rank 0 must drop BEFORE joining them (join-then-drop deadlocks until
+    // the ~100 s device timeout traps every rank).
+    drop(ep8);
     for (rank, handle) in handles.into_iter().enumerate() {
         handle
             .join()

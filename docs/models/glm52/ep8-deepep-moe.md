@@ -56,7 +56,7 @@ Pad/garbage rows: recv rows beyond the real count hold stale bytes; re-quant of 
 ## Gates (jz-38, 8×H200)
 
 1. **EP8 layer-6 MoE oracle** — the PR3 layer gate re-run with the MoE half going through the real 8-GPU dispatch/combine (from_host weights split per rank). Same probe constants, same tolerance, same ≤4/64 tie-flip allowance; expected 62/64 with the *same* outlier positions as EP1 (the deviation is upstream of the expert path).
-2. **Packed-placement pins** — from_device layer-6 packed regions hashed against `from_host` packing of the same checkpoint bytes.
+2. **Packed-placement pins** — proven piecewise instead of a GPU digest (which would need a full ~85 GiB rank load per run): a pure layout-parity unit test walks every expert tensor and asserts the placement offsets reproduce `from_host`'s packing gap-free, and the loader's per-region coverage counters fail the load if any packed byte is left unwritten. A placement bug that slipped both would scramble expert weights and fail gate 3 catastrophically.
 3. **Full-model e2e generation** — first time the whole model runs: greedy decode on a short English prompt; assert determinism (two runs, identical token ids), finite logits, and eyeball fluency (the PP8 branch's bar). Full-model teacher-forced HF comparison is infeasible (~700 GiB bf16 reference) — per-layer oracles carry the numeric burden.
 
 ## Not in PR4

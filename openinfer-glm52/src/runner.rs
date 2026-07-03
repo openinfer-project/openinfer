@@ -410,6 +410,15 @@ pub(crate) fn run_bs1_coordinator(
             }
         }
     }
+
+    // The DeepEP context drop is collective: broadcast Shutdown to every rank
+    // BEFORE the workers' Drop joins them one by one — a sequential
+    // shutdown-then-join would leave rank 0 spinning in the destroy barrier
+    // for ranks that never got the command (until the ~100 s device timeout).
+    for worker in &workers {
+        let _ = worker.request_shutdown();
+    }
+    drop(workers);
 }
 
 #[cfg(feature = "glm52")]
