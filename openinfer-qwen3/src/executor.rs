@@ -1069,7 +1069,12 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
-            flush_offload_on_finish: false,
+            // Derived here, not via a post-construction setter, so every
+            // launch path (plain and LoRA alike) honors the P/D contract.
+            flush_offload_on_finish: offload_opts
+                .p2p
+                .as_ref()
+                .is_some_and(|p2p| p2p.flush_on_finish),
             overlap: None,
             async_prefill: None,
             speculative: None,
@@ -1440,12 +1445,6 @@ impl Qwen3Executor {
     /// Whether KV offload is active on this executor.
     pub fn offload_enabled(&self) -> bool {
         self.offload.is_some()
-    }
-
-    /// Enable the P/D prefill-role barrier: flush offload saves + MetaServer
-    /// registrations before each step's `Finished` events reach clients.
-    pub(crate) fn set_flush_offload_on_finish(&mut self, on: bool) {
-        self.flush_offload_on_finish = on;
     }
 
     /// Flush pending offload saves into the host read cache so a following

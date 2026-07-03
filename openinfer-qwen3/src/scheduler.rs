@@ -152,10 +152,6 @@ pub(crate) fn start_qwen3(
     dflash_draft_model_path: Option<&str>,
     enable_kv_events: bool,
 ) -> Result<EngineHandle> {
-    let flush_on_finish = offload_options
-        .p2p
-        .as_ref()
-        .is_some_and(|p2p| p2p.flush_on_finish);
     let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
         enable_cuda_graph,
@@ -168,7 +164,6 @@ pub(crate) fn start_qwen3(
         enable_kv_events,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
-    executor.set_flush_offload_on_finish(flush_on_finish);
     executor.enable_decode_overlap(decode_overlap)?;
     // Speculative decoding loads its draft model after the target is up (the
     // draft is built against the target's embeddings/head) and forces the
