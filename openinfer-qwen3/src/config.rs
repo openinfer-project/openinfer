@@ -163,6 +163,16 @@ impl Config {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        anyhow::ensure!(
+            config.num_key_value_heads > 0
+                && config.num_attention_heads % config.num_key_value_heads == 0
+                && openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
+                    .contains(&(config.num_attention_heads / config.num_key_value_heads)),
+            "unsupported GQA group size {}/{}; the attention kernels instantiate {:?}",
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES,
+        );
         config.stop_token_ids = Self::load_stop_token_ids(model_path, config.eos_token_id)?;
         Ok(config)
     }
