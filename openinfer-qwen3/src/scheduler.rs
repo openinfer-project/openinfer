@@ -346,8 +346,15 @@ fn reclaim_ready_prefetch<E: ModelExecutor>(
     executor: &mut E,
     deferred: &mut Vec<PendingRequest>,
     loading: &mut Vec<PendingRequest>,
+    // Free blocks already promised to admitted requests; a remote fetch that
+    // resolves during this sweep must not reserve into them.
+    reserve_floor: usize,
 ) {
-    promote_ready(executor.drain_ready_prefetch(), deferred, loading);
+    promote_ready(
+        executor.drain_ready_prefetch(reserve_floor),
+        deferred,
+        loading,
+    );
 }
 
 /// Offer each not-yet-offered `deferred` request to async CPU-tier prefetch,
@@ -395,8 +402,13 @@ fn block_on_loading<E: ModelExecutor>(
     executor: &mut E,
     deferred: &mut Vec<PendingRequest>,
     loading: &mut Vec<PendingRequest>,
+    reserve_floor: usize,
 ) {
-    promote_ready(executor.wait_ready_prefetch(), deferred, loading);
+    promote_ready(
+        executor.wait_ready_prefetch(reserve_floor),
+        deferred,
+        loading,
+    );
 }
 
 fn promote_ready(
@@ -517,8 +529,8 @@ fn scheduler_loop<E>(
         }
 
         // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
-        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
         let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
 
         // 3. Nothing active and nothing admittable → block. Prefer blocking on
@@ -526,7 +538,8 @@ fn scheduler_loop<E>(
         // only truly idle (no loads either) do we block on the channel.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             if !loading.is_empty() {
-                block_on_loading(&mut executor, &mut deferred, &mut loading);
+                let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+                block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
                 continue;
             }
             if let Some(req) = submit_rx.blocking_recv() {
@@ -689,9 +702,9 @@ fn scheduler_loop_with_lora_control<E>(
         // 1b. Reclaim settled prefetches and offer fresh requests. Control
         // commands gate generation, so only offer once no control is pending
         // (a prefetch must not race ahead of an adapter load it depends on).
-        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
+        let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         if pending_control.is_empty() {
-            let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
             offer_prefetch(&mut executor, &mut deferred, &mut loading, reserve_floor);
         }
 
@@ -708,7 +721,8 @@ fn scheduler_loop_with_lora_control<E>(
         // load takes priority over waiting on a new command.
         if active.is_empty() && deferred.is_empty() && prefilling.is_empty() {
             if !loading.is_empty() {
-                block_on_loading(&mut executor, &mut deferred, &mut loading);
+                let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+                block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
                 continue;
             }
             if let Some(command) = command_rx.blocking_recv() {
@@ -769,7 +783,8 @@ fn scheduler_loop_with_lora_control<E>(
         if active.is_empty() && pending.is_empty() {
             // A parked load must still be polled to completion before we block.
             if !loading.is_empty() {
-                block_on_loading(&mut executor, &mut deferred, &mut loading);
+                let reserve_floor = admitted_future_blocks(&executor, &active, &prefilling);
+                block_on_loading(&mut executor, &mut deferred, &mut loading, reserve_floor);
                 continue;
             }
             if let Some(command) = command_rx.blocking_recv() {

@@ -109,6 +109,14 @@ pub(super) fn apply_effects(
     prefilling: &mut Vec<PendingRequest>,
     effects: StepEffects,
 ) {
+    // `Finished` events are not sent inline: they are collected here and
+    // handed to the executor at the end of the step. On the plain path the
+    // executor sends them immediately; a P/D prefill executor withholds them
+    // until this step's KV saves are peer-visible (`flush_on_finish`), off
+    // the scheduler thread. Per-request ordering is safe either way — a
+    // finished request emits nothing after its `Finished`.
+    let mut finishes: Vec<(TokenSink, TokenEvent)> = Vec::new();
+
     for scheduled in effects.scheduled {
         let _ = scheduled.token_tx.send(TokenEvent::Scheduled {
             queued_at_unix_s: scheduled
@@ -143,11 +151,14 @@ pub(super) fn apply_effects(
                     "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
                     request_id, req.prompt_len, completion_tokens, finish_reason
                 );
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason,
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens,
-                });
+                finishes.push((
+                    req.token_tx.clone(),
+                    TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens: req.prompt_len,
+                        completion_tokens,
+                    },
+                ));
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
             }
@@ -171,11 +182,14 @@ pub(super) fn apply_effects(
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_ok()
                 {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens,
-                    });
+                    finishes.push((
+                        req.token_tx.clone(),
+                        TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens: req.prompt_len,
+                            completion_tokens,
+                        },
+                    ));
                 }
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
@@ -272,11 +286,14 @@ pub(super) fn apply_effects(
                     }
                 }
                 if sent {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens,
-                    });
+                    finishes.push((
+                        req.token_tx.clone(),
+                        TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens: req.prompt_len,
+                            completion_tokens,
+                        },
+                    ));
                 }
                 let _ = executor.drop_request(request_id);
                 to_retire.push(index);
@@ -314,11 +331,14 @@ pub(super) fn apply_effects(
                     "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
                     request_id, prompt_tokens, completion_tokens, finish_reason
                 );
-                let _ = token_tx.send(TokenEvent::Finished {
-                    finish_reason,
-                    prompt_tokens,
-                    completion_tokens,
-                });
+                finishes.push((
+                    token_tx,
+                    TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                    },
+                ));
                 let _ = executor.drop_request(request_id);
             }
             PendingEffect::EmitAndFinish {
@@ -338,11 +358,14 @@ pub(super) fn apply_effects(
                     .send(TokenEvent::Token { id: token, logprob })
                     .is_ok()
                 {
-                    let _ = token_tx.send(TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens,
-                        completion_tokens,
-                    });
+                    finishes.push((
+                        token_tx,
+                        TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens,
+                            completion_tokens,
+                        },
+                    ));
                 }
                 let _ = executor.drop_request(request_id);
             }
@@ -367,4 +390,8 @@ pub(super) fn apply_effects(
         }
     }
     prefilling.splice(0..0, continued);
+
+    if !finishes.is_empty() {
+        executor.release_finished_events(finishes);
+    }
 }

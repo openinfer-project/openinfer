@@ -156,7 +156,19 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
         ModelType::Qwen3 => {
             let offload = if args.kv_offload {
                 let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
-                Qwen3OffloadOptions::enabled(bytes)
+                let mut offload = Qwen3OffloadOptions::enabled(bytes);
+                if let (Some(metaserver_addr), Some(advertise_addr)) = (
+                    args.kv_p2p_metaserver_addr.clone(),
+                    args.kv_p2p_advertise_addr.clone(),
+                ) {
+                    offload = offload.with_p2p(openinfer_qwen3::Qwen3P2pOptions {
+                        metaserver_addr,
+                        advertise_addr,
+                        rdma_nics: args.kv_p2p_nics.clone(),
+                        flush_on_finish: args.kv_p2p_flush_on_finish,
+                    });
+                }
+                offload
             } else {
                 Qwen3OffloadOptions::disabled()
             };
