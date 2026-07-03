@@ -1787,19 +1787,21 @@ impl Qwen3Executor {
                 // A vLLM-compat request that waited out the whole miss window
                 // is the sole symptom of every P/D misconfiguration (seed,
                 // namespace, block size, peer down) — never degrade silently.
+                // The 15s hard timeout (a Loading-stuck peer) counts toward
+                // the breaker too, with its own warning already emitted.
                 // Requests cut short by an open breaker (now before the
                 // deadline) scratch quietly: the breaker warning already
                 // announced the mode.
-                if !timed_out
-                    && !query_errored
-                    && self.vllm_compat.is_some()
-                    && now > miss_deadline
-                {
-                    log::warn!(
-                        "expected remote KV never appeared for {id:?} \
-                         ({queried_blocks} blocks, waited {parked_for:?}); prefill from \
-                         scratch — check P/D seed/namespace/block-size alignment"
-                    );
+                let window_exhausted = self.vllm_compat.is_some()
+                    && (timed_out || (!query_errored && now > miss_deadline));
+                if window_exhausted {
+                    if !timed_out {
+                        log::warn!(
+                            "expected remote KV never appeared for {id:?} \
+                             ({queried_blocks} blocks, waited {parked_for:?}); prefill from \
+                             scratch — check P/D seed/namespace/block-size alignment"
+                        );
+                    }
                     self.note_miss_window_exhausted();
                 }
                 self.prefetch.remove(&id);
