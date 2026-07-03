@@ -26,6 +26,8 @@ pub use attention::{
 pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
 };
+#[cfg(feature = "glm52")]
+pub use deepep::{Glm52DeepEp, glm52_deepep_info, glm52_deepep_unique_id};
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
 pub use elementwise::{

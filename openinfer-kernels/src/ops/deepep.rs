@@ -1,16 +1,19 @@
 //! Safe wrapper over the DeepEP elastic shim (csrc/deepep/).
 //!
-//! One [`DeepEp`] per rank, used from that rank's worker thread. All kernel
-//! launches are stream-ordered on the caller's [`DeviceContext`] stream; the
-//! decode path has fixed worst-case shapes and is CUDA-graph capturable.
+//! The shim is instantiated once per baked model config (Kimi-K2 `deepep_*`
+//! symbols, GLM5.2 `glm52_deepep_*`); [`DeepEpAbi`] maps one instantiation's C
+//! table into the shared wrapper [`DeepEpBase`]. One context per rank, used
+//! from that rank's worker thread. All kernel launches are stream-ordered on
+//! the caller's [`DeviceContext`] stream; the decode path has fixed worst-case
+//! shapes and is CUDA-graph capturable.
 //!
 //! Layout contract (expanded mode): `recv.x` rows are per-(expert, token)
 //! slots; each local expert's segment is contiguous and aligned to
 //! [`DeepEpInfo::expert_alignment`]; `psum_expert` holds the running aligned
 //! offsets (exclusive form). Combine never applies router weights — the
-//! caller weights expert outputs before [`DeepEp::decode_combine`].
+//! caller weights expert outputs before `decode_combine`.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr::NonNull;
 
 use anyhow::{Result, anyhow, ensure};
@@ -20,33 +23,349 @@ use half::bf16;
 use crate::ffi::{self, DeepEpInfo};
 use crate::tensor::DeviceContext;
 
-fn shim_error(what: &str) -> anyhow::Error {
-    // Safety: deepep_last_error returns a valid thread-local C string.
-    let message = unsafe { CStr::from_ptr(ffi::deepep_last_error()) };
+/// The C table of one shim instantiation. Every method forwards to the
+/// matching `<prefix>_deepep_*` symbol; see csrc/deepep/deepep.h for the
+/// contract.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+pub trait DeepEpAbi {
+    type RawCtx;
+
+    unsafe fn last_error() -> *const c_char;
+    fn info() -> DeepEpInfo;
+    unsafe fn unique_id(out: *mut u8) -> c_int;
+    unsafe fn ctx_create(
+        unique_id: *const u8,
+        num_ranks: i32,
+        rank_idx: i32,
+        out: *mut *mut Self::RawCtx,
+    ) -> c_int;
+    unsafe fn ctx_destroy(ctx: *mut Self::RawCtx) -> c_int;
+    unsafe fn decode_dispatch(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        topk_idx: *const i32,
+        topk_weights: *const f32,
+        num_tokens: i32,
+        rank_count_scratch: *mut i32,
+        dst_slot_scratch: *mut i32,
+        psum_rank: *mut i32,
+        psum_expert: *mut i32,
+        recv_x: *mut c_void,
+        recv_topk_weights: *mut f32,
+        recv_src_metadata: *mut i32,
+    ) -> c_int;
+    unsafe fn decode_combine(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        src_metadata: *const i32,
+        psum_rank: *const i32,
+        combined_topk_idx: *const i32,
+        num_tokens: i32,
+        combined_x: *mut c_void,
+    ) -> c_int;
+    unsafe fn prefill_dispatch_send(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        topk_idx: *const i32,
+        topk_weights: *const f32,
+        num_tokens: i32,
+        rank_count_scratch: *mut i32,
+        dst_slot_scratch: *mut i32,
+        psum_rank: *mut i32,
+        psum_expert: *mut i32,
+    ) -> c_int;
+    unsafe fn prefill_wait_counts(
+        ctx: *mut Self::RawCtx,
+        num_recv_tokens: *mut i32,
+        num_expanded_tokens: *mut i32,
+    ) -> c_int;
+    unsafe fn prefill_dispatch_recv(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        num_recv_tokens: i32,
+        psum_rank: *const i32,
+        psum_expert: *const i32,
+        recv_x: *mut c_void,
+        recv_topk_weights: *mut f32,
+        recv_src_metadata: *mut i32,
+    ) -> c_int;
+    unsafe fn prefill_combine(
+        ctx: *mut Self::RawCtx,
+        stream: *mut c_void,
+        x: *const c_void,
+        src_metadata: *const i32,
+        psum_rank: *const i32,
+        num_recv_tokens: i32,
+        combined_topk_idx: *const i32,
+        num_tokens: i32,
+        combined_x: *mut c_void,
+    ) -> c_int;
+}
+
+/// Stamps a [`DeepEpAbi`] impl by delegating each trait method to the given
+/// ffi path (no ident pasting in expression position, so the mapping is
+/// spelled out per method).
+macro_rules! deepep_abi {
+    (
+        $abi:ident, $ctx:ty,
+        last_error => $last_error:path,
+        info => $info:path,
+        unique_id => $unique_id:path,
+        ctx_create => $ctx_create:path,
+        ctx_destroy => $ctx_destroy:path,
+        decode_dispatch => $decode_dispatch:path,
+        decode_combine => $decode_combine:path,
+        prefill_dispatch_send => $prefill_dispatch_send:path,
+        prefill_wait_counts => $prefill_wait_counts:path,
+        prefill_dispatch_recv => $prefill_dispatch_recv:path,
+        prefill_combine => $prefill_combine:path,
+    ) => {
+        pub struct $abi;
+
+        impl DeepEpAbi for $abi {
+            type RawCtx = $ctx;
+
+            unsafe fn last_error() -> *const c_char {
+                unsafe { $last_error() }
+            }
+            fn info() -> DeepEpInfo {
+                let mut info = DeepEpInfo::default();
+                // Safety: plain struct fill, no preconditions.
+                unsafe { $info(&raw mut info) };
+                info
+            }
+            unsafe fn unique_id(out: *mut u8) -> c_int {
+                unsafe { $unique_id(out) }
+            }
+            unsafe fn ctx_create(
+                unique_id: *const u8,
+                num_ranks: i32,
+                rank_idx: i32,
+                out: *mut *mut Self::RawCtx,
+            ) -> c_int {
+                unsafe { $ctx_create(unique_id, num_ranks, rank_idx, out) }
+            }
+            unsafe fn ctx_destroy(ctx: *mut Self::RawCtx) -> c_int {
+                unsafe { $ctx_destroy(ctx) }
+            }
+            unsafe fn decode_dispatch(
+                ctx: *mut Self::RawCtx,
+                stream: *mut c_void,
+                x: *const c_void,
+                topk_idx: *const i32,
+                topk_weights: *const f32,
+                num_tokens: i32,
+                rank_count_scratch: *mut i32,
+                dst_slot_scratch: *mut i32,
+                psum_rank: *mut i32,
+                psum_expert: *mut i32,
+                recv_x: *mut c_void,
+                recv_topk_weights: *mut f32,
+                recv_src_metadata: *mut i32,
+            ) -> c_int {
+                unsafe {
+                    $decode_dispatch(
+                        ctx,
+                        stream,
+                        x,
+                        topk_idx,
+                        topk_weights,
+                        num_tokens,
+                        rank_count_scratch,
+                        dst_slot_scratch,
+                        psum_rank,
+                        psum_expert,
+                        recv_x,
+                        recv_topk_weights,
+                        recv_src_metadata,
+                    )
+                }
+            }
+            unsafe fn decode_combine(
+                ctx: *mut Self::RawCtx,
+                stream: *mut c_void,
+                x: *const c_void,
+                src_metadata: *const i32,
+                psum_rank: *const i32,
+                combined_topk_idx: *const i32,
+                num_tokens: i32,
+                combined_x: *mut c_void,
+            ) -> c_int {
+                unsafe {
+                    $decode_combine(
+                        ctx,
+                        stream,
+                        x,
+                        src_metadata,
+                        psum_rank,
+                        combined_topk_idx,
+                        num_tokens,
+                        combined_x,
+                    )
+                }
+            }
+            unsafe fn prefill_dispatch_send(
+                ctx: *mut Self::RawCtx,
+                stream: *mut c_void,
+                x: *const c_void,
+                topk_idx: *const i32,
+                topk_weights: *const f32,
+                num_tokens: i32,
+                rank_count_scratch: *mut i32,
+                dst_slot_scratch: *mut i32,
+                psum_rank: *mut i32,
+                psum_expert: *mut i32,
+            ) -> c_int {
+                unsafe {
+                    $prefill_dispatch_send(
+                        ctx,
+                        stream,
+                        x,
+                        topk_idx,
+                        topk_weights,
+                        num_tokens,
+                        rank_count_scratch,
+                        dst_slot_scratch,
+                        psum_rank,
+                        psum_expert,
+                    )
+                }
+            }
+            unsafe fn prefill_wait_counts(
+                ctx: *mut Self::RawCtx,
+                num_recv_tokens: *mut i32,
+                num_expanded_tokens: *mut i32,
+            ) -> c_int {
+                unsafe { $prefill_wait_counts(ctx, num_recv_tokens, num_expanded_tokens) }
+            }
+            unsafe fn prefill_dispatch_recv(
+                ctx: *mut Self::RawCtx,
+                stream: *mut c_void,
+                num_recv_tokens: i32,
+                psum_rank: *const i32,
+                psum_expert: *const i32,
+                recv_x: *mut c_void,
+                recv_topk_weights: *mut f32,
+                recv_src_metadata: *mut i32,
+            ) -> c_int {
+                unsafe {
+                    $prefill_dispatch_recv(
+                        ctx,
+                        stream,
+                        num_recv_tokens,
+                        psum_rank,
+                        psum_expert,
+                        recv_x,
+                        recv_topk_weights,
+                        recv_src_metadata,
+                    )
+                }
+            }
+            unsafe fn prefill_combine(
+                ctx: *mut Self::RawCtx,
+                stream: *mut c_void,
+                x: *const c_void,
+                src_metadata: *const i32,
+                psum_rank: *const i32,
+                num_recv_tokens: i32,
+                combined_topk_idx: *const i32,
+                num_tokens: i32,
+                combined_x: *mut c_void,
+            ) -> c_int {
+                unsafe {
+                    $prefill_combine(
+                        ctx,
+                        stream,
+                        x,
+                        src_metadata,
+                        psum_rank,
+                        num_recv_tokens,
+                        combined_topk_idx,
+                        num_tokens,
+                        combined_x,
+                    )
+                }
+            }
+        }
+    };
+}
+
+deepep_abi!(
+    KimiDeepEpAbi,
+    ffi::DeepEpCtx,
+    last_error => ffi::deepep_last_error,
+    info => ffi::deepep_info,
+    unique_id => ffi::deepep_unique_id,
+    ctx_create => ffi::deepep_ctx_create,
+    ctx_destroy => ffi::deepep_ctx_destroy,
+    decode_dispatch => ffi::deepep_decode_dispatch,
+    decode_combine => ffi::deepep_decode_combine,
+    prefill_dispatch_send => ffi::deepep_prefill_dispatch_send,
+    prefill_wait_counts => ffi::deepep_prefill_wait_counts,
+    prefill_dispatch_recv => ffi::deepep_prefill_dispatch_recv,
+    prefill_combine => ffi::deepep_prefill_combine,
+);
+
+#[cfg(feature = "glm52")]
+deepep_abi!(
+    Glm52DeepEpAbi,
+    ffi::Glm52DeepEpCtx,
+    last_error => ffi::glm52_deepep_last_error,
+    info => ffi::glm52_deepep_info,
+    unique_id => ffi::glm52_deepep_unique_id,
+    ctx_create => ffi::glm52_deepep_ctx_create,
+    ctx_destroy => ffi::glm52_deepep_ctx_destroy,
+    decode_dispatch => ffi::glm52_deepep_decode_dispatch,
+    decode_combine => ffi::glm52_deepep_decode_combine,
+    prefill_dispatch_send => ffi::glm52_deepep_prefill_dispatch_send,
+    prefill_wait_counts => ffi::glm52_deepep_prefill_wait_counts,
+    prefill_dispatch_recv => ffi::glm52_deepep_prefill_dispatch_recv,
+    prefill_combine => ffi::glm52_deepep_prefill_combine,
+);
+
+fn shim_error<A: DeepEpAbi>(what: &str) -> anyhow::Error {
+    // Safety: last_error returns a valid thread-local C string.
+    let message = unsafe { CStr::from_ptr(A::last_error()) };
     anyhow!("{what}: {}", message.to_string_lossy())
 }
 
 macro_rules! shim_call {
-    ($what:literal, $call:expr) => {{
+    ($abi:ty, $what:literal, $call:expr) => {{
         let rc = $call;
-        ensure!(rc == 0, shim_error($what));
+        ensure!(rc == 0, shim_error::<$abi>($what));
     }};
 }
 
-/// Baked shim capacities (Kimi-K2 single-node 8-rank config).
+/// Baked shim capacities of the Kimi-K2 single-node 8-rank config.
 pub fn deepep_info() -> DeepEpInfo {
-    let mut info = DeepEpInfo::default();
-    // Safety: plain struct fill, no preconditions.
-    unsafe { ffi::deepep_info(&raw mut info) };
-    info
+    KimiDeepEpAbi::info()
+}
+
+/// Baked shim capacities of the GLM5.2 DP1/EP8 config.
+#[cfg(feature = "glm52")]
+pub fn glm52_deepep_info() -> DeepEpInfo {
+    Glm52DeepEpAbi::info()
 }
 
 /// NCCL unique id, generated on rank 0 and shared with all ranks.
 pub fn deepep_unique_id() -> Result<[u8; 128]> {
+    deepep_unique_id_for::<KimiDeepEpAbi>()
+}
+
+/// NCCL unique id via the GLM5.2 shim instantiation.
+#[cfg(feature = "glm52")]
+pub fn glm52_deepep_unique_id() -> Result<[u8; 128]> {
+    deepep_unique_id_for::<Glm52DeepEpAbi>()
+}
+
+fn deepep_unique_id_for<A: DeepEpAbi>() -> Result<[u8; 128]> {
     let mut id = [0u8; 128];
     // Safety: out buffer is 128 bytes as required.
-    let rc = unsafe { ffi::deepep_unique_id(id.as_mut_ptr()) };
-    ensure!(rc == 0, shim_error("deepep_unique_id"));
+    let rc = unsafe { A::unique_id(id.as_mut_ptr()) };
+    ensure!(rc == 0, shim_error::<A>("deepep_unique_id"));
     Ok(id)
 }
 
@@ -65,8 +384,7 @@ pub struct DeepEpDispatchScratch {
 }
 
 impl DeepEpDispatchScratch {
-    fn new(ctx: &DeviceContext, max_tokens: usize) -> Result<Self> {
-        let info = deepep_info();
+    fn new(ctx: &DeviceContext, info: &DeepEpInfo, max_tokens: usize) -> Result<Self> {
         Ok(Self {
             rank_count: ctx
                 .stream
@@ -81,12 +399,24 @@ impl DeepEpDispatchScratch {
         })
     }
 
+    /// Decode-path scratch for the Kimi shim config.
     pub fn new_decode(ctx: &DeviceContext) -> Result<Self> {
-        Self::new(ctx, deepep_info().decode_max_tokens_per_rank as usize)
+        Self::new_decode_with(ctx, &deepep_info())
     }
 
+    /// Prefill-path scratch for the Kimi shim config.
     pub fn new_prefill(ctx: &DeviceContext) -> Result<Self> {
-        Self::new(ctx, deepep_info().prefill_max_tokens_per_rank as usize)
+        Self::new_prefill_with(ctx, &deepep_info())
+    }
+
+    /// Decode-path scratch sized from an explicit shim config.
+    pub fn new_decode_with(ctx: &DeviceContext, info: &DeepEpInfo) -> Result<Self> {
+        Self::new(ctx, info, info.decode_max_tokens_per_rank as usize)
+    }
+
+    /// Prefill-path scratch sized from an explicit shim config.
+    pub fn new_prefill_with(ctx: &DeviceContext, info: &DeepEpInfo) -> Result<Self> {
+        Self::new(ctx, info, info.prefill_max_tokens_per_rank as usize)
     }
 }
 
@@ -99,35 +429,48 @@ pub struct DeepEpPrefillCounts {
     pub num_expanded_tokens: usize,
 }
 
-/// Per-rank DeepEP context. Creation and destruction are collective — every
-/// rank's worker thread must call them together, device set.
-pub struct DeepEp {
-    ctx: NonNull<ffi::DeepEpCtx>,
+/// Per-rank DeepEP context over one shim instantiation. Creation and
+/// destruction are collective — every rank's worker thread must call them
+/// together, device set.
+pub struct DeepEpBase<A: DeepEpAbi> {
+    ctx: NonNull<A::RawCtx>,
     info: DeepEpInfo,
 }
 
+/// The Kimi-K2 shim instantiation (deepep_* symbols).
+pub type DeepEp = DeepEpBase<KimiDeepEpAbi>;
+
+/// The GLM5.2 shim instantiation (glm52_deepep_* symbols).
+#[cfg(feature = "glm52")]
+pub type Glm52DeepEp = DeepEpBase<Glm52DeepEpAbi>;
+
 // One context per rank thread; the shim has no thread-affine state beyond
 // the thread-local error string.
-unsafe impl Send for DeepEp {}
+unsafe impl<A: DeepEpAbi> Send for DeepEpBase<A> {}
 
-impl DeepEp {
+impl<A: DeepEpAbi> DeepEpBase<A> {
     /// Collective: all ranks must call concurrently with the same unique id.
     pub fn new(unique_id: &[u8; 128], num_ranks: usize, rank_idx: usize) -> Result<Self> {
         let mut ctx = std::ptr::null_mut();
         // Safety: unique_id is 128 bytes; out pointer is valid.
         let rc = unsafe {
-            ffi::deepep_ctx_create(
+            A::ctx_create(
                 unique_id.as_ptr(),
                 i32::try_from(num_ranks)?,
                 i32::try_from(rank_idx)?,
                 &raw mut ctx,
             )
         };
-        ensure!(rc == 0, shim_error("deepep_ctx_create"));
+        ensure!(rc == 0, shim_error::<A>("deepep_ctx_create"));
         Ok(Self {
             ctx: NonNull::new(ctx).ok_or_else(|| anyhow!("deepep_ctx_create returned null"))?,
-            info: deepep_info(),
+            info: A::info(),
         })
+    }
+
+    /// The baked capacities of this instance's shim config.
+    pub fn info(&self) -> &DeepEpInfo {
+        &self.info
     }
 
     /// Decode dispatch: deterministic prologue + dispatch + copy epilogue in
@@ -177,8 +520,8 @@ impl DeepEp {
 
         // Safety: all pointers are live device allocations sized per the
         // shim's published capacities (validated above / at construction).
-        shim_call!("deepep_decode_dispatch", unsafe {
-            ffi::deepep_decode_dispatch(
+        shim_call!(A, "deepep_decode_dispatch", unsafe {
+            A::decode_dispatch(
                 self.ctx.as_ptr(),
                 stream.cu_stream().cast(),
                 x_ptr as *const _,
@@ -234,8 +577,8 @@ impl DeepEp {
         let (out_ptr, _og) = combined_x.device_ptr_mut(stream);
 
         // Safety: pointers are live; shapes validated above.
-        shim_call!("deepep_decode_combine", unsafe {
-            ffi::deepep_decode_combine(
+        shim_call!(A, "deepep_decode_combine", unsafe {
+            A::decode_combine(
                 self.ctx.as_ptr(),
                 stream.cu_stream().cast(),
                 x_ptr as *const _,
@@ -278,8 +621,8 @@ impl DeepEp {
         let (pe_ptr, _peg) = scratch.psum_expert.device_ptr_mut(stream);
 
         // Safety: pointers are live; shapes validated above.
-        shim_call!("deepep_prefill_dispatch_send", unsafe {
-            ffi::deepep_prefill_dispatch_send(
+        shim_call!(A, "deepep_prefill_dispatch_send", unsafe {
+            A::prefill_dispatch_send(
                 self.ctx.as_ptr(),
                 stream.cu_stream().cast(),
                 x_ptr as *const _,
@@ -301,8 +644,8 @@ impl DeepEp {
         let mut num_recv_tokens = 0i32;
         let mut num_expanded_tokens = 0i32;
         // Safety: out pointers are valid.
-        shim_call!("deepep_prefill_wait_counts", unsafe {
-            ffi::deepep_prefill_wait_counts(
+        shim_call!(A, "deepep_prefill_wait_counts", unsafe {
+            A::prefill_wait_counts(
                 self.ctx.as_ptr(),
                 &raw mut num_recv_tokens,
                 &raw mut num_expanded_tokens,
@@ -340,8 +683,8 @@ impl DeepEp {
         let (rm_ptr, _rmg) = recv_src_metadata.device_ptr_mut(stream);
 
         // Safety: pointers are live; capacities validated above.
-        shim_call!("deepep_prefill_dispatch_recv", unsafe {
-            ffi::deepep_prefill_dispatch_recv(
+        shim_call!(A, "deepep_prefill_dispatch_recv", unsafe {
+            A::prefill_dispatch_recv(
                 self.ctx.as_ptr(),
                 stream.cu_stream().cast(),
                 counts.num_recv_tokens as i32,
@@ -388,8 +731,8 @@ impl DeepEp {
         let (out_ptr, _og) = combined_x.device_ptr_mut(stream);
 
         // Safety: pointers are live; shapes validated above.
-        shim_call!("deepep_prefill_combine", unsafe {
-            ffi::deepep_prefill_combine(
+        shim_call!(A, "deepep_prefill_combine", unsafe {
+            A::prefill_combine(
                 self.ctx.as_ptr(),
                 stream.cu_stream().cast(),
                 x_ptr as *const _,
@@ -425,14 +768,14 @@ impl DeepEp {
     }
 }
 
-impl Drop for DeepEp {
+impl<A: DeepEpAbi> Drop for DeepEpBase<A> {
     /// Collective: all ranks must drop together (the shim synchronizes the
     /// device and barriers before releasing NCCL resources).
     fn drop(&mut self) {
         // Safety: ctx is live and owned.
-        let rc = unsafe { ffi::deepep_ctx_destroy(self.ctx.as_ptr()) };
+        let rc = unsafe { A::ctx_destroy(self.ctx.as_ptr()) };
         if rc != 0 {
-            eprintln!("{}", shim_error("deepep_ctx_destroy"));
+            eprintln!("{}", shim_error::<A>("deepep_ctx_destroy"));
         }
     }
 }
