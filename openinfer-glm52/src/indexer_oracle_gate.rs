@@ -341,6 +341,9 @@ fn indexer_oracle_gate() -> Result<()> {
 
     // ---- generate inputs ----
     let hidden_host = seeded_hidden(ORACLE_SEED, ORACLE_CTX * HIDDEN);
+    // Debug: dump hidden states for Python reference
+    let hidden_bytes: Vec<u8> = hidden_host.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+    std::fs::write("/tmp/glm52_hidden.bf16", &hidden_bytes).ok();
     let hidden_digest = bf16_digest(&hidden_host);
     ensure!(
         hidden_digest == ORACLE_HIDDEN_DIGEST,
