@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! dispatch(x bf16, global topk)          # collective; recv = expert-major
-//!   → re-quant recv rows to fp8          #   aligned segments + psum_expert
+//!   → recv IS fp8+scales (source-quantized) #   aligned segments + psum_expert
 //!   → metadata: psum i32 → offsets i64
 //!   → TRTLLM grouped W13 (32 groups) → weighted SiLU·quant (recv weights)
 //!   → TRTLLM grouped W2 → combine        # collective; sums slots per token
@@ -33,7 +33,7 @@ use openinfer_kernels::ops::{
     DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, Glm52DeepEp,
     Glm52MoeQuantShape, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
     glm52_deepep_info, glm52_deepgemm_grouped_fp8_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_bounded_launch,
+    glm52_fp8_per_token_group_quant_bf16_launch,
     glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
@@ -61,12 +61,18 @@ pub(crate) struct Glm52MoeEp8State {
     ep: Glm52DeepEp,
     scratch: DeepEpDispatchScratch,
     info: DeepEpInfo,
-    recv_x: CudaSlice<bf16>,
+    /// FP8-dispatch send operands for this rank's (single) token: the
+    /// per-128-group quantized activation + scales, produced on the SOURCE
+    /// rank (bit-identical to the retired recv-side re-quant — dispatch is
+    /// byte-preserving, so quant commutes).
+    x_fp8: CudaSlice<u8>,
+    x_sf: CudaSlice<f32>,
     recv_topk_weight: CudaSlice<f32>,
     recv_src_metadata: CudaSlice<i32>,
     /// Dispatch inputs for token-less expert ranks (num_tokens = 0 still
     /// requires valid pointers).
-    zero_x: CudaSlice<bf16>,
+    zero_x_fp8: CudaSlice<u8>,
+    zero_x_sf: CudaSlice<f32>,
     zero_topk_idx: CudaSlice<i32>,
     zero_topk_weight: CudaSlice<f32>,
     /// Grouped-GEMM chain workspace. Rows past a launch's `bound_rows` hold
@@ -122,14 +128,37 @@ impl Glm52MoeEp8State {
         let w2_scale_tma_len =
             Glm52TrtllmGroupedOffsetScaleLayout::f32(expanded, W2_SCALE_COLS, n_local)
                 .output_len()?;
+        // Padding-rank dispatch operands: the quant of a zero token, produced
+        // by the same kernel so the bytes match what the retired recv-side
+        // re-quant emitted for dispatched zero rows (fp8 zeros + eps-floored
+        // scales).
+        let zero_x_fp8 = {
+            let zeros = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+            let mut z_fp8 = ctx.stream.alloc_zeros::<u8>(HIDDEN)?;
+            let mut z_sf = ctx.stream.alloc_zeros::<f32>(HIDDEN_SCALE_COLS)?;
+            glm52_fp8_per_token_group_quant_bf16_launch(
+                ctx,
+                Glm52MoeQuantShape {
+                    rows: 1,
+                    width: HIDDEN,
+                    group_size: QUANT_GROUP,
+                },
+                &zeros,
+                &mut z_fp8,
+                &mut z_sf,
+            )?;
+            (z_fp8, z_sf)
+        };
         Ok(Self {
             ep,
             scratch: DeepEpDispatchScratch::new_decode_with(ctx, &info)?,
             info,
-            recv_x: ctx.stream.alloc_zeros(expanded * HIDDEN)?,
+            x_fp8: ctx.stream.alloc_zeros(HIDDEN)?,
+            x_sf: ctx.stream.alloc_zeros(HIDDEN_SCALE_COLS)?,
             recv_topk_weight: ctx.stream.alloc_zeros(expanded)?,
             recv_src_metadata: ctx.stream.alloc_zeros(recv_tokens * (TOPK + 2))?,
-            zero_x: ctx.stream.alloc_zeros(HIDDEN)?,
+            zero_x_fp8: zero_x_fp8.0,
+            zero_x_sf: zero_x_fp8.1,
             zero_topk_idx: ctx.stream.alloc_zeros(TOPK)?,
             zero_topk_weight: ctx.stream.alloc_zeros(TOPK)?,
             act_fp8: ctx.stream.alloc_zeros(expanded * W13_K)?,
@@ -196,20 +225,49 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         expanded_rows + (GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT - 1) * expanded_rows.min(n_local),
     );
 
-    // Collective dispatch: bf16 token rows → expert-major aligned recv slots.
+    // Collective FP8 dispatch: quantize this rank's token on the source
+    // side (identical math to the retired recv-side re-quant — dispatch is
+    // byte-preserving, so the recv bytes are bit-identical), then send fp8 +
+    // per-group scales; the copy epilogue emits the grouped-GEMM operands
+    // (`act_fp8` + plain `[rows, 48]` `act_scale`) directly.
     {
-        let (x, topk_idx, topk_weight) = match token {
-            Some((normed, route)) => (normed, &route.topk_idx, &route.topk_weight),
-            None => (&state.zero_x, &state.zero_topk_idx, &state.zero_topk_weight),
+        if let Some((normed, _)) = token {
+            glm52_fp8_per_token_group_quant_bf16_launch(
+                ctx,
+                Glm52MoeQuantShape {
+                    rows: 1,
+                    width: HIDDEN,
+                    group_size: QUANT_GROUP,
+                },
+                normed,
+                &mut state.x_fp8,
+                &mut state.x_sf,
+            )?;
+        }
+        let (x_fp8, x_sf, topk_idx, topk_weight) = match token {
+            Some((_, route)) => (
+                &state.x_fp8,
+                &state.x_sf,
+                &route.topk_idx,
+                &route.topk_weight,
+            ),
+            None => (
+                &state.zero_x_fp8,
+                &state.zero_x_sf,
+                &state.zero_topk_idx,
+                &state.zero_topk_weight,
+            ),
         };
-        state.ep.decode_dispatch(
+        state.ep.decode_dispatch_fp8(
             ctx,
-            x,
+            x_fp8,
+            x_sf,
             topk_idx,
             topk_weight,
             num_tokens,
             &mut state.scratch,
-            &mut state.recv_x,
+            &mut state.act_fp8,
+            &mut state.act_scale,
             &mut state.recv_topk_weight,
             &mut state.recv_src_metadata,
         )?;
@@ -227,26 +285,6 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         bound_rows,
         &state.scratch.psum_expert,
         &mut state.expert_offsets,
-    )?;
-
-    // Re-quant the received bf16 rows to fp8. The grid covers `bound_rows`
-    // (the host-known worst case — CUDA-graph shape stability), but blocks at
-    // or past the device-side aligned end retire immediately: only rows
-    // inside an aligned expert segment are ever read by the grouped GEMMs;
-    // rows between a segment's real end and its aligned end are garbage but
-    // row-isolated (the PR3 invariant).
-    glm52_fp8_per_token_group_quant_bf16_bounded_launch(
-        ctx,
-        Glm52MoeQuantShape {
-            rows: bound_rows,
-            width: W13_K,
-            group_size: QUANT_GROUP,
-        },
-        &state.recv_x,
-        &mut state.act_fp8,
-        &mut state.act_scale,
-        &state.expert_offsets,
-        n_local,
     )?;
 
     // W13 grouped FP8 GEMM (gate|up) over the local expert segments. The
