@@ -310,12 +310,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_l2_prefetch_cuda(
-        data: *const core::ffi::c_void,
-        bytes: usize,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn glm52_silu_and_mul_weighted_bf16_cuda(
         input: *const Half,
         topk_weights: *const f32,

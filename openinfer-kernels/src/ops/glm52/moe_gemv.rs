@@ -221,25 +221,3 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     .result()
     .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed: {err}"))
 }
-
-/// Warm the L2 with a weight buffer (pure streaming reads, no side effects —
-/// byte-parity safe). Launch on an aux stream while the main stream is inside
-/// a collective whose HBM traffic is idle (the MoE combine pushes over
-/// NVLink), so the next consumer finds the buffer L2-resident.
-pub fn glm52_l2_prefetch_launch(ctx: &DeviceContext, data: &CudaSlice<u8>) -> Result<()> {
-    ensure!(!data.is_empty(), "GLM5.2 L2 prefetch on an empty buffer");
-    let bytes = data.len() & !15usize; // trim to the 16-byte vector granule
-    if bytes == 0 {
-        return Ok(());
-    }
-    let (ptr, _g) = data.device_ptr(&ctx.stream);
-    unsafe {
-        ffi::glm52_l2_prefetch_cuda(
-            ptr as *const core::ffi::c_void,
-            bytes,
-            ctx.stream.cu_stream(),
-        )
-    }
-    .result()
-    .map_err(|err| anyhow!("GLM5.2 L2 prefetch launch failed: {err}"))
-}

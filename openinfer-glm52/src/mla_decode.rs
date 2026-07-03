@@ -160,15 +160,6 @@ impl Glm52MlaLayerWeights {
     }
 }
 
-impl Glm52MlaLayerWeights {
-    /// The projection weights worth warming into L2 while the previous
-    /// layer's MoE combine holds the main stream: q_b + q_a (~46 MB fp8 —
-    /// fits H200's L2; o_proj at 100 MB does not).
-    pub(crate) fn l2_prefetch_targets(&self) -> [&CudaSlice<u8>; 2] {
-        [&self.q_b.weight, &self.q_a.weight]
-    }
-}
-
 /// Host-dequant kv_b (fp8 e4m3 block-scaled) into bf16 W_UK [H,192,512] (nope) and
 /// W_UV [H,256,512] (v) absorb factors, head-major, uploaded to device.
 fn dequant_kv_b(
