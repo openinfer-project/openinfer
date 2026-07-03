@@ -32,6 +32,7 @@ struct TextConfig {
     linear_value_head_dim: usize,
     rope_parameters: RopeParameters,
     max_position_embeddings: Option<usize>,
+    tie_word_embeddings: Option<bool>,
     eos_token_id: u32,
 }
 
@@ -39,6 +40,7 @@ struct TextConfig {
 struct RawConfig {
     text_config: TextConfig,
     max_position_embeddings: Option<usize>,
+    tie_word_embeddings: Option<bool>,
 }
 
 /// Qwen3.5 model configuration (text-only).
@@ -71,6 +73,9 @@ pub(crate) struct Config35 {
 
     // Layer layout
     pub(crate) layer_types: Vec<LayerType>,
+
+    /// `false` requires a top-level `lm_head.weight`; `true` reuses `embed_tokens`.
+    pub(crate) tie_word_embeddings: bool,
 }
 
 /// GDN dims the Triton-AOT kernels are built for; a mismatched model is rejected at load.
@@ -84,7 +89,13 @@ impl Config35 {
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
         let root_max_position_embeddings = raw.max_position_embeddings;
+        let root_tie_word_embeddings = raw.tie_word_embeddings;
         let t = raw.text_config;
+
+        let tie_word_embeddings = t
+            .tie_word_embeddings
+            .or(root_tie_word_embeddings)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 config missing tie_word_embeddings"))?;
 
         let layer_types: Vec<LayerType> = t
             .layer_types
@@ -147,6 +158,7 @@ impl Config35 {
             rotary_dim,
             max_position_embeddings,
             layer_types,
+            tie_word_embeddings,
         })
     }
 

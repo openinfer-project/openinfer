@@ -92,7 +92,7 @@ Reference — Qwen3-4B on same GPU: TTFT(2048,1)=213ms, TPOT(1,128)≈10.6ms.
 - hidden_dim: 2560
 - MLP intermediate_size: 9216
 - RMSNorm: (1 + weight) offset variant, eps=1e-6
-- Tied word embeddings (embed_tokens = lm_head)
+- Word embeddings: 4B ties them (embed_tokens doubles as the LM head); 9B/27B are untied with a top-level `lm_head.weight`
 - Vocab size: 248,320
 
 **Full attention (8 layers):**
