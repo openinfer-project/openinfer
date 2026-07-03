@@ -1561,6 +1561,12 @@ fn main() {
         } else if stem == "glm52_deepgemm_mqa" {
             // DeepGEMM paged MQA logits wrapper (torch-free via DG_NO_TORCH).
             // Needs DeepGEMM csrc headers + CUTLASS + fmt, C++20.
+            // DG_JIT_USE_RUNTIME_API selects DeepGEMM's CUDA 12.8+
+            // library-management handles (cudaKernel_t, context-independent):
+            // the default driver branch caches a per-context CUfunction, and
+            // under the DP8 coordinator the rank that JIT-compiles first would
+            // hand the other 7 rank threads a handle that is invalid in their
+            // contexts (CUDA_ERROR_INVALID_HANDLE at first indexer layer).
             let deepgemm_root = root.join("third_party/DeepGEMM");
             let deepgemm_csrc = deepgemm_root.join("csrc");
             let deepgemm_include = deepgemm_root.join("deep_gemm/include");
@@ -1572,6 +1578,7 @@ fn main() {
                 "--expt-relaxed-constexpr".to_string(),
                 "--expt-extended-lambda".to_string(),
                 "-DDG_NO_TORCH".to_string(),
+                "-DDG_JIT_USE_RUNTIME_API".to_string(),
                 "-I".to_string(),
                 deepgemm_csrc.to_string_lossy().to_string(),
                 "-I".to_string(),
