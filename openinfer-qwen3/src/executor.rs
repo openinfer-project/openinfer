@@ -9,7 +9,8 @@ use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
-    LoadLoraAdapterRequest, TokenLogprob, UnloadLoraAdapterRequest, panic_message,
+    LoadLoraAdapterRequest, TokenEvent, TokenLogprob, TokenSink, UnloadLoraAdapterRequest,
+    panic_message,
 };
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
@@ -828,12 +829,17 @@ pub(crate) trait ModelExecutor: Send {
         0
     }
 
-    // ── Decode-overlap async prefill ─────────────────────────────────────
+    /// Deliver this step's withheld `Finished` events. The default sends them
+    /// inline. A P/D prefill executor (`flush_on_finish`) instead delivers
+    /// them from the offload runtime once this step's KV saves + MetaServer
+    /// registrations are query-visible to peers — the client treats the HTTP
+    /// response as the KV-ready signal — so the scheduler thread never waits
+    /// on the flush barrier.
+    fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
+        send_finished_events(finishes);
+    }
 
-    /// Barrier the offload write pipeline (host tier + MetaServer
-    /// registration) so a P/D peer's query observes every block this executor
-    /// saved. No-op unless the executor is a flush-on-finish P2P participant.
-    fn flush_offload_for_handoff(&self) {}
+    // ── Decode-overlap async prefill ─────────────────────────────────────
 
     /// Whether prefill/decode overlap is enabled (async prefill supported).
     fn has_decode_overlap(&self) -> bool {
@@ -859,6 +865,14 @@ pub(crate) trait ModelExecutor: Send {
     /// Empty unless the feed is on.
     fn take_kv_store_events(&mut self) -> Vec<Vec<RegisteredBlock>> {
         Vec::new()
+    }
+}
+
+/// Deliver withheld `Finished` events; failed sends mean the client is gone,
+/// which needs no handling this late in a request's life.
+fn send_finished_events(finishes: Vec<(TokenSink, TokenEvent)>) {
+    for (token_tx, event) in finishes {
+        let _ = token_tx.send(event);
     }
 }
 
@@ -895,9 +909,9 @@ pub struct Qwen3Executor {
     /// so prefix matching itself stays enabled). Set via
     /// [`Self::set_no_prefix_cache`].
     l1_retention_disabled: bool,
-    /// P/D prefill role: barrier offload saves + MetaServer registrations
-    /// before each step's `Finished` events, so the HTTP response doubles as
-    /// the KV-ready signal (see `Qwen3P2pOptions::flush_on_finish`).
+    /// P/D prefill role: withhold each step's `Finished` events until offload
+    /// saves + MetaServer registrations are peer-visible, so the HTTP response
+    /// doubles as the KV-ready signal (see `Qwen3P2pOptions::flush_on_finish`).
     flush_offload_on_finish: bool,
     /// Green Context SM partition for concurrent prefill/decode. `None` when
     /// disabled (default) or when the GPU does not support Green Contexts.
@@ -1901,9 +1915,16 @@ impl ModelExecutor for Qwen3Executor {
             .map_or(0, |st| st.probe.held_blocks())
     }
 
-    fn flush_offload_for_handoff(&self) {
-        if self.flush_offload_on_finish {
-            self.flush_offload_saves();
+    fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
+        match &self.offload {
+            // P/D prefill role: the peer treats our HTTP response as the
+            // KV-ready signal, so `Finished` may leave only after this step's
+            // saves + MetaServer registrations are peer-visible. The barrier
+            // runs on the offload runtime; the scheduler thread never waits.
+            Some(offload) if self.flush_offload_on_finish => {
+                offload.flush_saves_then(move || send_finished_events(finishes));
+            }
+            _ => send_finished_events(finishes),
         }
     }
 

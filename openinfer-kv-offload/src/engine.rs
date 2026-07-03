@@ -29,10 +29,11 @@ const WORLD_SIZE: usize = 1;
 /// bf16 KV cache: every layout stride is counted in elements, bytes are ×2.
 const ELEM_SIZE: usize = std::mem::size_of::<half::bf16>();
 
-/// Upper bound on [`OffloadEngine::flush_saves`]. Generous for the normal
-/// case (D2H drain + a few local RPCs complete in milliseconds); the cap only
-/// bites when the MetaServer connection stalls mid-RPC, where the alternative
-/// is freezing the scheduler thread for the TCP keepalive window.
+/// Upper bound on the [`OffloadEngine::flush_saves_then`] barrier. Generous
+/// for the normal case (D2H drain + a few local RPCs complete in
+/// milliseconds); the cap only bites when the MetaServer connection stalls
+/// mid-RPC, where the alternative is withholding finished requests' responses
+/// for the TCP keepalive window.
 const FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Guard the `block_on` entry points: tokio panics with an opaque message if
@@ -232,7 +233,11 @@ impl Registration {
 /// cache, so a lost save only forfeits a future hit, never inference
 /// correctness. Saves that must survive a handoff (eviction) use the synchronous
 /// [`Self::save_blocking`] instead. The P2P serving tasks (if any) stop with
-/// the runtime as well; peers degrade to their own local prefill.
+/// the runtime as well; peers degrade to their own local prefill. In-flight
+/// [`Self::flush_saves_then`] barriers are cancelled too, dropping their
+/// `then` callbacks unrun — a P/D prefill node shutting down mid-flush never
+/// delivers those requests' withheld `Finished` events; clients see the
+/// stream close instead, the same as any teardown mid-request.
 pub struct OffloadEngine {
     engine: Arc<PegaEngine>,
     runtime: Runtime,
@@ -240,14 +245,24 @@ pub struct OffloadEngine {
     device_id: i32,
     /// Owned per-layer names; load borrows these as `&[&str]`.
     layer_names: Vec<String>,
-    /// In-flight fire-and-forget save tasks. [`Self::flush_saves`] awaits these
-    /// before draining the write pipeline, so a flush is a true barrier — the
-    /// detached D2H may not even have started when the caller flushes.
-    /// Finished handles are pruned on each [`Self::save`].
-    pending_saves: Mutex<Vec<JoinHandle<()>>>,
+    /// In-flight fire-and-forget save tasks plus the completion signal of the
+    /// latest flush barrier. One lock so a barrier's "drain handles + chain
+    /// behind the previous barrier" is atomic — two racing barriers can never
+    /// each take half the coverage (see [`Self::flush_saves_then`]).
+    write_barrier: Mutex<WriteBarrierState>,
     /// `Some` when P2P is on: resolves the P2P serving tasks (gRPC transfer
     /// service + transfer-lock GC) on drop.
     p2p_shutdown: Option<oneshot::Sender<()>>,
+}
+
+/// Save handles and barrier chain behind [`OffloadEngine::write_barrier`].
+struct WriteBarrierState {
+    /// In-flight fire-and-forget save tasks; finished handles are pruned on
+    /// each [`OffloadEngine::save`].
+    pending_saves: Vec<JoinHandle<()>>,
+    /// Completion signal of the latest spawned flush barrier (fires on
+    /// success and deadline alike). `None` before the first barrier.
+    prev_flush_done: Option<oneshot::Receiver<()>>,
 }
 
 impl OffloadEngine {
@@ -407,7 +422,10 @@ impl OffloadEngine {
             instance_id: config.instance_id,
             device_id: config.device_id,
             layer_names: reg.layer_names,
-            pending_saves: Mutex::new(Vec::new()),
+            write_barrier: Mutex::new(WriteBarrierState {
+                pending_saves: Vec::new(),
+                prev_flush_done: None,
+            }),
             p2p_shutdown,
         })
     }
@@ -476,11 +494,11 @@ impl OffloadEngine {
             // this point the blocks must not be reused (see REUSE CONTRACT).
             drop(keep_alive);
         });
-        // Track for `flush_saves`; prune the ones that already settled so the
-        // list stays bounded by the genuinely in-flight saves.
-        let mut pending = self.pending_saves.lock().expect("pending_saves poisoned");
-        pending.retain(|h| !h.is_finished());
-        pending.push(handle);
+        // Track for the flush barrier; prune the ones that already settled so
+        // the list stays bounded by the genuinely in-flight saves.
+        let mut barrier = self.write_barrier.lock().expect("write_barrier poisoned");
+        barrier.pending_saves.retain(|h| !h.is_finished());
+        barrier.pending_saves.push(handle);
     }
 
     /// Save the named GPU blocks and block until the GPU→CPU copy has captured
@@ -602,45 +620,81 @@ impl OffloadEngine {
         self.engine.release_query_lease(&lease);
     }
 
-    /// Flush pending saves into the read cache so a following [`Self::query`]
-    /// can see them — and, with P2P on, so the MetaServer knows this engine
-    /// owns the saved hashes. A correctness barrier for tests, eviction
-    /// handoff, and the P/D KV-ready signal; not a steady-state call.
-    ///
-    /// First awaits every in-flight fire-and-forget [`Self::save`] (their D2H
-    /// copy + write-pipeline submit), then drains the write pipeline, then
-    /// waits for the queued MetaServer registrations to be delivered (or
-    /// dropped after a failed attempt — registration stays best-effort, the
-    /// barrier only bounds *when* delivery is attempted, never *whether* it
-    /// succeeds; a peer that misses a registration degrades to recompute).
-    /// Without P2P the last step is a no-op.
-    ///
-    /// Bounded: the whole barrier is capped at [`FLUSH_DEADLINE`]. This runs
-    /// on the scheduler thread (P/D prefill flushes before every finishing
-    /// step's `Finished` events), so a stalled MetaServer connection must
-    /// degrade to "registrations still in flight" — semantically the same as
-    /// a dropped registration — rather than freeze all serving.
+    /// Blocking form of [`Self::flush_saves_then`], for tests and eviction
+    /// handoff on synchronous threads. Bounded by the same [`FLUSH_DEADLINE`]
+    /// chain.
     pub fn flush_saves(&self) {
         assert_outside_runtime("flush_saves");
-        let handles: Vec<JoinHandle<()>> = {
-            let mut pending = self.pending_saves.lock().expect("pending_saves poisoned");
-            pending.drain(..).collect()
+        let (tx, rx) = oneshot::channel();
+        self.flush_saves_then(move || {
+            let _ = tx.send(());
+        });
+        // block_on (not a bare channel wait) keeps the call-from-a-runtime
+        // misuse a loud tokio panic instead of a silently deadlocked worker.
+        let _ = self.runtime.block_on(rx);
+    }
+
+    /// Barrier the save pipeline, then call `then` — without blocking the
+    /// caller. Once `then` runs, a following [`Self::query`] (local or from a
+    /// P2P peer) observes every block saved before this call: this is the P/D
+    /// KV-ready signal, where the prefill node withholds a request's
+    /// `Finished` event until its KV is peer-visible.
+    ///
+    /// The barrier first awaits every in-flight fire-and-forget [`Self::save`]
+    /// (their D2H copy + write-pipeline submit), then drains the write
+    /// pipeline, then waits for the queued MetaServer registrations to be
+    /// delivered (or dropped after a failed attempt — registration stays
+    /// best-effort, the barrier only bounds *when* delivery is attempted,
+    /// never *whether* it succeeds; a peer that misses a registration
+    /// degrades to recompute). Without P2P the last step is a no-op.
+    ///
+    /// Barriers chain: each first awaits the previous barrier's completion,
+    /// so — as long as no barrier in the chain hit its deadline — it
+    /// transitively covers every save submitted before its own call,
+    /// including handles an earlier barrier drained whose D2H had not yet
+    /// submitted into the write pipeline (e.g. a chunked prefill's early
+    /// chunks flushed by another request's finish). Without the chain, the
+    /// pipeline drain cannot see such saves and the barrier would falsely
+    /// report them visible. A predecessor that timed out may leave its
+    /// drained handles permanently uncovered; that is the same accepted
+    /// degradation as the deadline itself — peers recompute.
+    ///
+    /// Each barrier is capped at [`FLUSH_DEADLINE`] (the wait on the
+    /// predecessor counts against it, and the predecessor is itself capped,
+    /// so delays never accumulate): a stalled MetaServer connection degrades
+    /// to "registrations still in flight" — semantically the same as a
+    /// dropped registration — and `then` still runs.
+    pub fn flush_saves_then(&self, then: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = oneshot::channel();
+        let (handles, prev_done) = {
+            let mut barrier = self.write_barrier.lock().expect("write_barrier poisoned");
+            let handles: Vec<JoinHandle<()>> = barrier.pending_saves.drain(..).collect();
+            let prev_done = barrier.prev_flush_done.replace(done_rx);
+            (handles, prev_done)
         };
-        let flushed = self.runtime.block_on(async {
-            tokio::time::timeout(FLUSH_DEADLINE, async {
+        let engine = Arc::clone(&self.engine);
+        self.runtime.spawn(async move {
+            let flushed = tokio::time::timeout(FLUSH_DEADLINE, async {
+                if let Some(prev) = prev_done {
+                    // A cancelled predecessor (runtime teardown) resolves as
+                    // an error immediately — don't let it stall the chain.
+                    let _ = prev.await;
+                }
                 for handle in handles {
                     let _ = handle.await;
                 }
-                self.engine.flush_saves_and_registrations().await;
+                engine.flush_saves_and_registrations().await;
             })
-            .await
+            .await;
+            if flushed.is_err() {
+                log::warn!(
+                    "KV offload flush timed out after {FLUSH_DEADLINE:?}; \
+                     saves/registrations still in flight (peers may recompute)"
+                );
+            }
+            let _ = done_tx.send(());
+            then();
         });
-        if flushed.is_err() {
-            log::warn!(
-                "KV offload flush timed out after {FLUSH_DEADLINE:?}; \
-                 saves/registrations still in flight (peers may recompute)"
-            );
-        }
     }
 
     /// Drop all resident CPU-tier blocks (test/eviction helper). Saved data in
