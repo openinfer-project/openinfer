@@ -139,8 +139,6 @@ struct RawDFlashConfig {
 /// `2 * hidden_size` inputs (concatenated `[norm(embed), norm(fused_hidden)]`),
 /// has no QK-norm, reuses the target's `embed_tokens`, and predicts over a
 /// reduced `draft_vocab_size` remapped to the full vocab via `d2t`/`t2d`.
-// EAGLE3_TMP： `intermediate_size` / `rms_norm_eps` are consumed by the draft forward (not
-// yet wired); the loader only reads geometry. Drop this once the lane lands.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Eagle3Config {

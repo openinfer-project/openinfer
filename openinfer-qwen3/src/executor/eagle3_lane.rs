@@ -1,25 +1,23 @@
 //! Worker-side EAGLE-3 draft lane: the drafter plus per-request draft state.
 //!
 //! Parallels [`super::dflash_lane::DFlashLaneState`] but for the EAGLE-3 chain
-//! drafter. Lives on the worker thread next to the target model because the
-//! draft rollout reuses the target's `embed_tokens` and reads its captured
-//! low/mid/high hidden states. The draft/verify boundary stays a pure token
-//! span — the captured features are private to this lane.
+//! drafter. Lives on the worker thread next to the target model because the draft
+//! rollout reuses the target's `embed_tokens` and reads its captured low/mid/high
+//! hidden states; the draft/verify boundary stays a pure token span, with the
+//! captured features private to this lane.
 //!
-//! The prefill capture hook folds the target's 3-layer hidden states into each
-//! eligible request's [`Eagle3RequestState`] (draft KV + chain seed) as the
-//! prompt prefills; `execute_eagle3_draft` then rolls the top-1 chain forward per
-//! speculative round, and `record_verify_eagle3_context` re-seeds it from the
-//! verify step's captured target hidden. Verify/accept/commit is the shared,
-//! drafter-agnostic path — losslessness comes from there, not from this lane.
+//! Flow: the prefill capture hook seeds each eligible [`Eagle3RequestState`],
+//! `execute_eagle3_draft` rolls the top-1 chain forward, `record_verify_eagle3_context`
+//! re-seeds from verify. Verify/accept/commit is the shared, drafter-agnostic path —
+//! losslessness comes from there, not here.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use openinfer_core::tensor::{DeviceContext, HiddenStates};
 
-// The prefill-cleanliness predicates and the post-step action are spec-agnostic
-// (greedy, no LoRA, no prefix hit, …), so EAGLE-3 reuses DFlash's.
+// Prefill-cleanliness predicates are spec-agnostic (greedy, no LoRA, no prefix
+// hit, …), so EAGLE-3 reuses DFlash's.
 use super::dflash_prefill::{dflash_prefill_can_capture, should_capture_dflash_prefill_context};
 use super::{LocalQwen3Lane, PrefillStepItem, RequestId};
 use crate::eagle3::{Eagle3DraftModel, Eagle3RequestState, Eagle3Scratch};
@@ -35,9 +33,7 @@ pub(super) struct Eagle3LaneState {
     /// Single-token draft scratch, reused across steps. v1 drafts one request at
     /// a time (`seq_len == 1`); batching the chain is a follow-up.
     pub(super) scratch: Eagle3Scratch,
-    /// Target layers whose hidden states feed the drafter (low/mid/high). Derived
-    /// from the target's layer count at load time; the drafter config carries no
-    /// explicit list.
+    /// Target layers whose hidden states feed the drafter (low/mid/high).
     pub(super) aux_layer_ids: [usize; 3],
     /// Cumulative drafted tokens offered to verify (denominator of the acceptance
     /// rate) — a diagnostic for chain quality / speedup headroom.
@@ -66,8 +62,7 @@ impl Eagle3LaneState {
 }
 
 impl LocalQwen3Lane {
-    /// Target layers whose hidden states the drafter consumes (None when EAGLE-3
-    /// is not loaded).
+    /// Target layers whose hidden states the drafter consumes
     pub(super) fn eagle3_capture_layer_ids(&self) -> Option<Vec<usize>> {
         self.eagle3
             .as_ref()
@@ -134,9 +129,6 @@ impl LocalQwen3Lane {
                 && req.prompt_tokens.len() >= 2
             {
                 // Prompt + decode + one chain's worth of in-flight draft KV
-                // (`draft_chain` transiently writes `k` slots past the committed
-                // length before the round is rewound), capped at the drafter's
-                // max positions.
                 let max_cache_len = (req.prompt_tokens.len()
                     + req.max_output_tokens
                     + crate::eagle3::EAGLE3_CHAIN_LENGTH)
@@ -267,9 +259,11 @@ impl LocalQwen3Lane {
                 &req.token_ids,
                 result.matched_draft_tokens,
             )?;
-            // Acceptance bookkeeping: drafts offered this round = span len - 1
-            // (the current token isn't a draft); accepted = matched drafts. The
-            // cumulative rate bounds the achievable speculative speedup.
+            // Acceptance bookkeeping (greedy argmax match): drafts offered this
+            // round = span len - 1 (span[0] is `current_token`, the confirmed last
+            // token, not a draft); accepted = the matched-draft prefix. The extra
+            // committed token is the target's bonus argmax, not a draft, so it stays
+            // out of the rate. The cumulative rate bounds the achievable speculative speedup.
             *verified_draft_tokens += req.token_ids.len().saturating_sub(1);
             *accepted_draft_tokens += result.matched_draft_tokens;
             let rate = if *verified_draft_tokens == 0 {

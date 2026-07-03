@@ -1,6 +1,4 @@
 // EAGLE-3 drafter (e.g. `AngelSlim/Qwen3-4B_eagle3`).
-// EAGLE3_TMP：: Only the loader is wired so far; the draft/verify execution path is not yet built, hence the blanket
-// dead-code allow (drop it once the executor lane references these).
 #![allow(dead_code)]
 
 use anyhow::Result;
@@ -17,27 +15,11 @@ pub(crate) use reservation::Eagle3MemoryReservation;
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify
 /// span is `EAGLE3_CHAIN_LENGTH + 1`: the current token plus γ drafts). v1 is a
-/// fixed top-1 **chain** — *not* a tree.
-///
-/// γ=3 is the measured chain optimum on a Qwen3-4B GSM8K A/B (RTX 5070 Ti): the
-/// chain's per-draft acceptance decays geometrically (d₁≈62% → d₂≈45% → d₃≈30%
-/// → …), so the mean accepted length saturates at τ≈2.0 by γ≈3, while each extra
-/// draft step costs a full (host-synced) forward. Sweep — 2: 1.30×, **3: 1.32×**,
-/// 4: 1.26×, 7: 1.13×. The standard EAGLE-3 γ=7 is a *tree* budget (7 nodes
-/// fanned out, verified in one target pass); on a linear chain it is pure
-/// overhead. Raising the ceiling needs the tree and/or a device-side chain
-/// (the per-step `to_host` argmax is the dominant per-round cost).
+/// fixed top-1 **chain** — *not* a tree. γ=3 is the measured chain optimum on a Qwen3-4B GSM8K A/B (RTX 5070 Ti)
 pub(crate) const EAGLE3_CHAIN_LENGTH: usize = 3;
 
-/// The three *target* layers whose hidden states EAGLE-3 captures (low/mid/high),
-/// concatenated and fused by `fc`. EAGLE-3 drafters don't carry an explicit layer
-/// list in their config (the AngelSlim/Qwen3-4B_eagle3 `config.json` has none), so
-/// we use the vLLM ecosystem default `(2, N/2, N-3)` over the *target's* layer
-/// count `N` — the convention the checkpoint was trained against. (Wrong layers
-/// only cost acceptance rate, not correctness: verify keeps spec decoding lossless.)
-///
-/// Returned indices are 0-based and address the residual stream *after* each layer,
-/// matching the existing DFlash capture path (`capture_layer_ids` in `prefill.rs`).
+/// The three *target* layers (low/mid/high) whose post-layer hidden states EAGLE-3
+/// captures and fuses via `fc`.
 pub(crate) fn aux_hidden_state_layers(target_num_layers: usize) -> Result<[usize; 3]> {
     let low = 2;
     let mid = target_num_layers / 2;
@@ -56,7 +38,7 @@ mod tests {
 
     #[test]
     fn aux_layers_qwen3_4b() {
-        // Qwen3-4B target = 36 layers -> vLLM default (2, N/2, N-3).
+        // Qwen3-4B target = 36 layers ->  (2, N/2, N-3).
         assert_eq!(aux_hidden_state_layers(36).unwrap(), [2, 18, 33]);
     }
 
