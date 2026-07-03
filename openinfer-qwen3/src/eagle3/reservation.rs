@@ -3,17 +3,15 @@ use anyhow::Result;
 use crate::config::Eagle3Config;
 
 /// GPU memory the EAGLE-3 draft needs on top of the target KV pool, derived from
-/// the draft config so the KV budget can reserve it *before* the draft loads (the
-/// draft buffers live outside the paged `KvCacheManager`). Mirrors
-/// [`crate::dflash::DFlashMemoryReservation`], split by how each part scales:
+/// the draft config so the KV budget can reserve it *before* the draft loads.
 ///
-/// - `kv_bytes_per_token` scales with the KV pool (billed by shrinking the target
-///   block count): the draft's single-layer K/V cache, and nothing else. EAGLE-3
-///   keeps a standard autoregressive KV cache and consumes the captured 3-layer
-///   target features at the fusion step (they are forward *inputs*, not persisted),
-///   so — unlike DFlash, which re-projects a context tail every round — no scratch
-///   scales per pool token.
-/// - `fixed_bytes` does not scale with the pool (billed via the memory margin): the
+/// Split by how it's billed against the KV budget:
+///
+/// - `kv_bytes_per_token` — scales with the pool, billed by shrinking the target
+///   block count. This is *only* the draft's single-layer autoregressive K/V cache.
+///   The captured 3-layer target features are forward inputs consumed at the fusion
+///   step, not persisted, so nothing else scales per pool token.
+/// - `fixed_bytes` — does not scale with the pool, billed via the memory margin: the
 ///   draft weights, the batched-prefill / per-request-decode dense scratch, and the
 ///   captured-feature buffer (`[3*hidden, N]`) that feeds prefill. These are bounded
 ///   by the prefill span / decode batch, not the sequence length.
@@ -23,9 +21,7 @@ pub(crate) struct Eagle3MemoryReservation {
 }
 
 impl Eagle3MemoryReservation {
-    /// Load the draft config from `model_path` and compute the reservation, without
-    /// loading the draft weights — the KV budget reserves this footprint before the
-    /// drafter loads (mirrors `DFlashMemoryReservation::from_path`).
+    /// Load the draft config from `model_path` and compute the reservation
     pub(crate) fn from_path(
         model_path: &str,
         max_prefill_tokens: usize,
@@ -53,13 +49,11 @@ impl Eagle3MemoryReservation {
         let fc_in = 3 * hidden;
 
         // Per-pool-token, pool-scaling: the single-layer draft K/V (k + v).
-        // `num_hidden_layers == 1`; captured features do not persist (see above).
         let kv_bytes_per_token = config.num_hidden_layers * 2 * kv_dim * BF16;
 
-        // Draft weights: the `midlayer` block + `fc` + draft head + norms. The
-        // embedding is reused from the target (the checkpoint ships none), and the
-        // `d2t`/`t2d` tables are host-resident, so neither is counted here. +10%
-        // slack for the rope caches and allocator alignment.
+        // Draft weights: the `midlayer` block + `fc` + draft head + norms.
+        // The embedding is reused from the target (the checkpoint ships none), and the
+        // `d2t`/`t2d` tables are host-resident(CPU-side lookup at sample time)
         let midlayer = BF16
             * ((q_dim + 2 * kv_dim) * (2 * hidden) // qkv_proj (2*hidden input cols)
                 + q_dim * hidden                    // o_proj
@@ -85,9 +79,6 @@ impl Eagle3MemoryReservation {
         let decode_scratch = dense_per_token * max_decode_batch_size;
 
         // Captured 3-layer target features `[3*hidden, N]` that feed `prefill_batched`.
-        // The draft owns this buffer (the target writes its captured hidden into it,
-        // as DFlash does with `pending_context`); it is consumed by prefill and
-        // bounded by the prefill span, so it's a fixed term, not per pool token.
         let capture_scratch = fc_in * BF16 * max_prefill_tokens;
 
         Self {

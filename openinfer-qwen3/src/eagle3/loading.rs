@@ -14,11 +14,6 @@ use super::{Eagle3DraftModel, Eagle3Layer};
 impl Eagle3DraftModel {
     /// Load an EAGLE-3 drafter from a HF safetensors directory, validating its
     /// geometry against the already-loaded Qwen3 `target`.
-    ///
-    /// Tensor names follow the `Eagle3LlamaForCausalLM` layout: a single
-    /// `midlayer.*` decoder block, a `fc` fusion projection, `norm`, a draft
-    /// `lm_head`, and the `d2t`/`t2d` vocab-remap tables. There is no
-    /// `embed_tokens` — the draft reuses the target's embedding at runtime.
     pub(crate) fn from_safetensors_for_target(
         ctx: &DeviceContext,
         model_path: &str,
@@ -99,10 +94,7 @@ impl Eagle3DraftModel {
         // ---- fusion, final norm, draft head, vocab-remap tables ----
         let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
         // Capture-compatibility invariant: EAGLE-3 fuses exactly THREE captured
-        // target layers (low/mid/high) — `fc` maps `[3 * hidden] -> [hidden]`. This
-        // is what the capture path provides (`aux_hidden_state_layers` returns 3,
-        // concatenated to `3 * hidden`); a mismatch here means the drafter expects a
-        // different number of captured layers than we feed it.
+        // target layers (low/mid/high) — `fc` maps `[3 * hidden] -> [hidden]`.
         anyhow::ensure!(
             fc.rows == config.hidden_size && fc.cols == 3 * config.hidden_size,
             "EAGLE-3 fc must be [hidden {}, 3*hidden {}] (fuses 3 captured layers), got [{}, {}]",

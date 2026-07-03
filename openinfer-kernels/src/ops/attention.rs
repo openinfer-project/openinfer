@@ -779,11 +779,8 @@ pub fn dflash_qk_norm_rope_into(
     Ok(())
 }
 
-/// Plain RoPE (no QK-norm) for one EAGLE-3 draft step.
-///
-/// Same row-slicing contract as [`dflash_qk_norm_rope_into`] — `q` may be a row
-/// sub-range of a batched buffer, `k` is the request's own buffer — but EAGLE-3
-/// has no per-head q/k norm, so there are no norm-weight / eps params.
+/// Plain RoPE (no QK-norm) for one EAGLE-3 draft step, because EAGLE-3 has no per-head q/k norm
+/// we implement a new kernel for EAGLE-3
 #[allow(clippy::too_many_arguments)]
 pub fn eagle3_rope_into(
     ctx: &DeviceContext,
@@ -919,11 +916,7 @@ pub fn single_prefill_nhd_noncausal_into(
 
 /// Single-query **decode** over a contiguous NHD KV cache — the draft chain's
 /// per-step attention. One query (`q.seq_len == 1`) attends the whole `[0, kv_len)`
-/// prefix. Numerically identical to [`single_prefill_nhd_noncausal_into`] with
-/// `q_seq_len == 1` (for one query, non-causal over the prefix *is* causal), but
-/// backed by FlashInfer's dedicated single-query decode path, which is
-/// structurally single-query — the `assert_eq!(q.seq_len, 1)` here makes that a
-/// hard contract so it can't be misused for a multi-query batch.
+/// prefix.
 ///
 /// `q`/`output` are `[q_dim, 1]` and the k/v caches are the request's own whole
 /// buffers `[kv_dim, max_seq_len]` (NHD token-major). No RoPE inside — the caller
@@ -978,10 +971,7 @@ pub fn single_decode_nhd_into(
     Ok(())
 }
 
-/// Causal NHD single-sequence prefill. Same contract as
-/// [`single_prefill_nhd_noncausal_into`] but with a causal mask: the `q_seq_len`
-/// query rows are the tail of the cache (positions `kv_len - q_seq_len ..kv_len`),
-/// and query `i` attends only keys `0..=kv_len - q_seq_len + i`. Used for EAGLE-3's
+/// Causal NHD single-sequence prefill. Used for EAGLE-3's
 /// teacher-forced prefill in a single batched forward.
 #[allow(clippy::too_many_arguments)]
 pub fn single_prefill_nhd_causal_into(
