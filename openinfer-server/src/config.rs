@@ -115,18 +115,21 @@ pub(crate) struct Args {
     /// --prefix-caching-hash-algo xxhash_cbor) and makes a cold request wait
     /// out the producer's registration tail instead of prefilling locally.
     /// Requires --kv-pd-vllm-namespace and the P2P mesh flags.
-    #[arg(long, requires_all = ["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"])]
+    #[arg(long, value_parser = parse_pythonhashseed, requires_all = ["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"])]
     pub kv_pd_vllm_seed: Option<String>,
 
     /// The vLLM prefill peer's pegaflow-connector namespace (an 8-hex digest
     /// the connector logs at startup as `namespace=...`). Both sides must
-    /// address the same content domain.
-    #[arg(long, requires = "kv_pd_vllm_seed")]
+    /// address the same content domain. The digest carries no model identity:
+    /// pointing a decode node at a different model's namespace (same
+    /// tokenizer, same geometry class) silently cross-loads foreign KV.
+    #[arg(long, value_parser = parse_pegaflow_namespace, requires = "kv_pd_vllm_seed")]
     pub kv_pd_vllm_namespace: Option<String>,
 
     /// Zero-hit wait window for --kv-pd-vllm-seed mode, in milliseconds: how
     /// long a cold request keeps re-querying before giving up on the expected
-    /// remote KV and prefilling locally.
+    /// remote KV and prefilling locally. Must stay below the executor's 15s
+    /// remote-fetch deadline (enforced at engine startup).
     #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
     pub kv_pd_miss_wait_ms: u64,
 
@@ -330,6 +333,26 @@ pub(crate) fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
             Qwen3LoraOptions::supported_max_lora_ranks_display()
         ))
     }
+}
+
+/// PYTHONHASHSEED as vLLM accepts it: a decimal integer in [0, 4294967295].
+/// An empty or malformed seed would derive a well-formed key space that can
+/// never match the peer — a config error must fail here, not as slow requests.
+fn parse_pythonhashseed(s: &str) -> Result<String, String> {
+    if s.parse::<u32>().is_err() || s.starts_with('+') {
+        return Err(format!(
+            "PYTHONHASHSEED must be a decimal integer in [0, 4294967295], got {s:?}"
+        ));
+    }
+    Ok(s.to_string())
+}
+
+/// A pegaflow namespace digest: exactly 8 lowercase hex chars.
+fn parse_pegaflow_namespace(s: &str) -> Result<String, String> {
+    if s.len() != 8 || !s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err(format!("namespace must be an 8-char lowercase hex digest, got {s:?}"));
+    }
+    Ok(s.to_string())
 }
 
 fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String> {

@@ -253,6 +253,13 @@ impl PrefixProbe {
             .map(|h| sequence_hash_bytes(h).to_vec())
             .collect()
     }
+
+    /// Number of blocks [`Self::cpu_query_hashes`] covers, without
+    /// materializing the hash bytes. Callers substituting their own key
+    /// scheme (vLLM-compat P/D) slice their chain to exactly this window.
+    pub fn cpu_query_window(&self) -> usize {
+        self.cacheable.saturating_sub(self.gpu_hit)
+    }
 }
 
 /// An opaque strong pin on one registered KV block. While held it keeps the

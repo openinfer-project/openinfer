@@ -69,23 +69,25 @@ impl VllmBlockHasher {
         xxh3_128(&buf).to_be_bytes()
     }
 
-    /// Key chain for a token sequence: one key per full block, plus — when
-    /// `include_tail` and a non-empty partial tail exists — one tail key (the
-    /// P/D tail-block extension; vLLM itself never emits it).
-    pub fn key_chain(&self, token_ids: &[u32], include_tail: bool) -> Vec<Vec<u8>> {
+    /// Key chain for a token sequence: one key per full block. vLLM never
+    /// hashes the partial tail block; when the P/D tail extension lands it
+    /// derives the extra key via [`Self::hash_block`] on the tail slice.
+    pub fn key_chain(&self, token_ids: &[u32]) -> Vec<Vec<u8>> {
         let full = token_ids.len() / self.block_size;
-        let tail = token_ids.len() % self.block_size;
-        let mut keys = Vec::with_capacity(full + usize::from(include_tail && tail > 0));
+        let mut keys = Vec::with_capacity(full);
         let mut parent: Option<[u8; VLLM_HASH_BYTES]> = None;
-        for chunk in token_ids.chunks(self.block_size) {
-            if chunk.len() < self.block_size && !include_tail {
-                break;
-            }
+        for chunk in token_ids.chunks_exact(self.block_size) {
             let h = self.hash_block(parent.as_ref(), chunk);
             keys.push(h.to_vec());
             parent = Some(h);
         }
         keys
+    }
+
+    /// The chain root (`xxh3_128(cbor(seed_string))`), for startup-time
+    /// fingerprint logging: the P and D values must match byte-for-byte.
+    pub fn none_hash(&self) -> [u8; VLLM_HASH_BYTES] {
+        self.none_hash
     }
 }
 
@@ -196,22 +198,15 @@ mod tests {
     }
 
     #[test]
-    fn key_chain_full_blocks_and_tail() {
+    fn key_chain_covers_full_blocks_only() {
         let h = VllmBlockHasher::new("0", 4);
         let tokens: Vec<u32> = (1..=10).collect();
-        let with_tail = h.key_chain(&tokens, true);
-        assert_eq!(with_tail.len(), 3);
-        assert_eq!(hex(&with_tail[0]), "0a8577df5ee3430515a8cc1f6e3ac52e");
-        assert_eq!(hex(&with_tail[1]), "d152782cb4d753bde718a811a3b75e23");
-        assert_eq!(hex(&with_tail[2]), "7157acec76700e416a50d67e2334f6f6");
+        let keys = h.key_chain(&tokens);
+        assert_eq!(keys.len(), 2, "partial tail block must not be keyed");
+        assert_eq!(hex(&keys[0]), "0a8577df5ee3430515a8cc1f6e3ac52e");
+        assert_eq!(hex(&keys[1]), "d152782cb4d753bde718a811a3b75e23");
 
-        let full_only = h.key_chain(&tokens, false);
-        assert_eq!(full_only.len(), 2);
-        assert_eq!(full_only[..], with_tail[..2]);
-
-        // Aligned length: tail flag is a no-op.
         let aligned: Vec<u32> = (1..=8).collect();
-        assert_eq!(h.key_chain(&aligned, true).len(), 2);
-        assert_eq!(h.key_chain(&aligned, true), h.key_chain(&aligned, false));
+        assert_eq!(h.key_chain(&aligned), keys[..2]);
     }
 }

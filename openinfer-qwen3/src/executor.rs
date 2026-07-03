@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use crossbeam_channel as channel;
 
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
@@ -989,6 +989,12 @@ enum PrefetchPhase {
         /// landed yet) instead of degrading to prefill-from-scratch. Set to
         /// the park time (i.e. already expired) outside vLLM-compat mode.
         miss_deadline: std::time::Instant,
+        /// When the request was parked — for the degradation warning.
+        parked_at: std::time::Instant,
+        /// Last re-query instant: ticks inside [`REMOTE_REQUERY_INTERVAL`]
+        /// skip the RPC so N parked requests cannot turn every scheduler
+        /// tick into N serial MetaServer round-trips.
+        last_query: std::time::Instant,
     },
     /// Host→GPU DMA into reserved local blocks is in flight.
     Loading {
@@ -1006,6 +1012,17 @@ enum PrefetchPhase {
 /// pegaflow's own fetch timeout into a plain local hit count well before this.
 const REMOTE_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Minimum spacing between re-query RPCs for one parked request. The idle
+/// scheduler loop already throttles at ~5ms; this bounds the busy path too,
+/// where decode ticks can come faster than the RPC is worth repeating.
+const REMOTE_REQUERY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// vLLM-compat miss breaker: after this many consecutive requests each
+/// exhausted the whole zero-hit wait window, new requests skip the wait (the
+/// prefill peer is evidently not publishing — misconfig or down) instead of
+/// taxing every cold request the full window. Any remote hit re-arms waiting.
+const MISS_BREAKER_THRESHOLD: u32 = 3;
+
 /// vLLM-compat P/D mode, derived from [`crate::Qwen3VllmCompatOptions`] at
 /// executor build time (the hasher needs the resolved KV block size).
 struct VllmCompatState {
@@ -1013,6 +1030,10 @@ struct VllmCompatState {
     /// Zero-hit wait window: how long a cold request re-queries before
     /// giving up on the expected remote KV (see `RemoteFetch::miss_deadline`).
     miss_wait: std::time::Duration,
+    /// Requests in a row that exhausted the whole wait window with zero hits.
+    /// At [`MISS_BREAKER_THRESHOLD`] the breaker opens and new requests skip
+    /// the wait; any remote hit resets it.
+    consecutive_miss_windows: u32,
 }
 
 impl Qwen3Executor {
@@ -1068,6 +1089,47 @@ impl Qwen3Executor {
         let offload = build_offload(offload_opts, &kv_mgr, model.config(), model.device_ctx())?;
         let total_blocks = kv_mgr.pool().total_blocks();
         let padding_block_id = kv_mgr.pool().padding_block_id();
+        let vllm_compat = match offload_opts.vllm_compat.as_ref() {
+            None => None,
+            Some(c) => {
+                ensure!(
+                    c.miss_wait < REMOTE_FETCH_DEADLINE,
+                    "kv-pd miss wait ({:?}) must stay below the {:?} remote-fetch \
+                     deadline, which would otherwise silently cap it",
+                    c.miss_wait,
+                    REMOTE_FETCH_DEADLINE,
+                );
+                let hasher = openinfer_kv_offload::VllmBlockHasher::new(
+                    &c.python_hash_seed,
+                    budget.block_size,
+                );
+                // Cross-engine fingerprint. Every P/D mismatch (seed,
+                // namespace, block size, geometry) otherwise presents as
+                // nothing but slow cold requests — this line is what an
+                // operator diffs against the vLLM peer's startup config.
+                log::info!(
+                    "vLLM-compat P/D active: seed={} namespace={} block_size={} \
+                     none_hash={} layers={} kv_heads={} head_dim={} miss_wait={:?}",
+                    c.python_hash_seed,
+                    c.namespace,
+                    budget.block_size,
+                    hasher
+                        .none_hash()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    budget.num_layers,
+                    budget.num_kv_heads,
+                    budget.head_dim,
+                    c.miss_wait,
+                );
+                Some(VllmCompatState {
+                    hasher,
+                    miss_wait: c.miss_wait,
+                    consecutive_miss_windows: 0,
+                })
+            }
+        };
         Ok(Self {
             metadata,
             kv_mgr,
@@ -1096,13 +1158,7 @@ impl Qwen3Executor {
                 .p2p
                 .as_ref()
                 .is_some_and(|p2p| p2p.flush_on_finish),
-            vllm_compat: offload_opts.vllm_compat.as_ref().map(|c| VllmCompatState {
-                hasher: openinfer_kv_offload::VllmBlockHasher::new(
-                    &c.python_hash_seed,
-                    budget.block_size,
-                ),
-                miss_wait: c.miss_wait,
-            }),
+            vllm_compat,
             overlap: None,
             async_prefill: None,
             speculative: None,
@@ -1672,6 +1728,8 @@ impl Qwen3Executor {
             query_hashes,
             deadline,
             miss_deadline,
+            parked_at,
+            last_query,
         } = &st.phase
         else {
             return false;
@@ -1681,9 +1739,20 @@ impl Qwen3Executor {
         if timed_out {
             log::warn!("remote KV fetch timed out for {id:?}; prefill from scratch");
         }
+        if !timed_out && now.duration_since(*last_query) < REMOTE_REQUERY_INTERVAL {
+            return false; // stay parked; too soon for another MetaServer RPC
+        }
         let wait_on_miss = self.vllm_compat.is_some() && now <= *miss_deadline;
+        let parked_for = now.duration_since(*parked_at);
+        let queried_blocks = query_hashes.len();
         let query_hashes = query_hashes.clone();
+        if let Some(st) = self.prefetch.get_mut(&id)
+            && let PrefetchPhase::RemoteFetch { last_query, .. } = &mut st.phase
+        {
+            *last_query = now;
+        }
         let available_blocks = self.kv_mgr.pool().available_blocks();
+        let mut query_errored = false;
         let action = {
             let offload = self.offload.as_ref().expect("offload present in prefetch");
             remote_fetch_action(
@@ -1694,6 +1763,7 @@ impl Qwen3Executor {
                         .query(&id.0.to_string(), &query_hashes)
                         .map(QueryView::from)
                         .map_err(|e| {
+                            query_errored = true;
                             log::warn!(
                                 "remote KV re-query failed for {id:?} (prefill from scratch): {e}"
                             );
@@ -1706,16 +1776,29 @@ impl Qwen3Executor {
         match action {
             RemoteFetchAction::Wait => false,
             RemoteFetchAction::Scratch => {
+                // A vLLM-compat request that waited out the whole miss window
+                // is the sole symptom of every P/D misconfiguration (seed,
+                // namespace, block size, peer down) — never degrade silently.
+                if !timed_out && !query_errored && self.vllm_compat.is_some() {
+                    log::warn!(
+                        "expected remote KV never appeared for {id:?} \
+                         ({queried_blocks} blocks, waited {parked_for:?}); prefill from \
+                         scratch — check P/D seed/namespace/block-size alignment"
+                    );
+                    self.note_miss_window_exhausted();
+                }
                 self.prefetch.remove(&id);
                 true
             }
             RemoteFetchAction::Release(lease) => {
+                self.note_remote_hit();
                 let offload = self.offload.as_ref().expect("offload present in prefetch");
                 offload.release_query_lease(lease);
                 self.prefetch.remove(&id);
                 true
             }
             RemoteFetchAction::Load(lease, num_blocks) => {
+                self.note_remote_hit();
                 let probe = self
                     .prefetch
                     .remove(&id)
@@ -1726,6 +1809,31 @@ impl Qwen3Executor {
                     Err(()) => true,
                 }
             }
+        }
+    }
+
+    /// Miss-breaker bookkeeping: one more request exhausted the whole
+    /// zero-hit wait window. At the threshold the breaker opens and
+    /// [`Self::begin_kv_prefetch`] stops parking new requests.
+    fn note_miss_window_exhausted(&mut self) {
+        let Some(compat) = self.vllm_compat.as_mut() else {
+            return;
+        };
+        compat.consecutive_miss_windows = compat.consecutive_miss_windows.saturating_add(1);
+        if compat.consecutive_miss_windows == MISS_BREAKER_THRESHOLD {
+            log::warn!(
+                "P/D miss breaker open: {MISS_BREAKER_THRESHOLD} consecutive requests \
+                 exhausted the remote-KV wait window; new requests prefill from scratch \
+                 immediately until a remote hit lands"
+            );
+        }
+    }
+
+    /// Miss-breaker bookkeeping: remote content is visible again (leased
+    /// hit), so cold requests may wait on the P/D handoff race once more.
+    fn note_remote_hit(&mut self) {
+        if let Some(compat) = self.vllm_compat.as_mut() {
+            compat.consecutive_miss_windows = 0;
         }
     }
 
@@ -2069,20 +2177,29 @@ impl ModelExecutor for Qwen3Executor {
             // vLLM prefill peer registered. Local GPU-tier naming stays kvbm:
             // the loaded bytes are committed under the probe's own hashes.
             Some(compat) => {
-                let window = probe.cpu_query_hashes().len();
+                let window = probe.cpu_query_window();
                 let start = probe.gpu_hit_blocks();
-                let chain = compat.hasher.key_chain(prompt_tokens, false);
-                debug_assert!(start + window <= chain.len());
+                // In bounds by construction: the probe's reuse cap leaves the
+                // prompt's final token out, so start + window ≤ ⌊len/bs⌋ =
+                // chain.len() even for block-aligned prompts.
+                let chain = compat.hasher.key_chain(prompt_tokens);
                 chain[start..start + window].to_vec()
             }
         };
         if query_hashes.is_empty() {
             return false;
         }
+        // Breaker open: the peer demonstrably isn't publishing, so treat a
+        // zero hit as a plain miss instead of parking for the whole window.
+        // The first-shot query below still runs — a hit re-arms waiting.
+        let expect_remote = self
+            .vllm_compat
+            .as_ref()
+            .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
         let available_blocks = self.kv_mgr.pool().available_blocks();
         let action = remote_fetch_action(
             false,
-            self.vllm_compat.is_some(),
+            expect_remote,
             || {
                 offload
                     .query(&request_id.0.to_string(), &query_hashes)
@@ -2114,6 +2231,8 @@ impl ModelExecutor for Qwen3Executor {
                             query_hashes,
                             deadline: now + REMOTE_FETCH_DEADLINE,
                             miss_deadline: now + miss_wait,
+                            parked_at: now,
+                            last_query: now,
                         },
                     },
                 );
@@ -2121,10 +2240,13 @@ impl ModelExecutor for Qwen3Executor {
             }
             RemoteFetchAction::Scratch => false, // miss or query error
             RemoteFetchAction::Release(lease) => {
+                self.note_remote_hit();
+                let offload = self.offload.as_ref().expect("offload checked above");
                 offload.release_query_lease(lease);
                 false
             }
             RemoteFetchAction::Load(lease, num_blocks) => {
+                self.note_remote_hit();
                 match self.start_prefetch_load(request_id, probe, lease, num_blocks) {
                     Ok(()) => true,
                     Err(()) => false,
