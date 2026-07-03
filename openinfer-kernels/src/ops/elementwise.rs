@@ -378,36 +378,6 @@ pub fn bf16_bytes_to_f32_into(
     Ok(())
 }
 
-/// Cast bf16 (as raw `CudaSlice<u8>`) to f32 and apply ReLU in one kernel.
-/// Used by the indexer forward: DeepGEMM outputs bf16 logits, FlashInfer top-k
-/// expects f32, and transformers applies `F.relu(scores)` before topk.
-/// sm90 DeepGEMM lacks the fused cvt.relu that sm100 has.
-pub fn bf16_bytes_to_f32_relu_into(
-    ctx: &DeviceContext,
-    input: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
-) -> Result<()> {
-    let n = input.len() / 2;
-    anyhow::ensure!(
-        output.len() >= n,
-        "f32 output len {} < bf16 input len {}",
-        output.len(),
-        n
-    );
-    let (input_ptr, _gi) = input.device_ptr(&ctx.stream);
-    let (output_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::bf16_to_f32_relu_cuda(
-            input_ptr as *const ffi::Half,
-            output_ptr as *mut f32,
-            n as i32,
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
 pub fn f32_to_bf16_hidden_into(
     ctx: &DeviceContext,
     input: &CudaSlice<f32>,

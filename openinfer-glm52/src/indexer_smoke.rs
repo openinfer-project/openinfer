@@ -31,13 +31,20 @@ fn deepgemm_env_ready() -> bool {
 }
 
 fn synthetic_proj(n: usize, k: usize) -> Glm52ProjBytes<'static> {
-    let weight = vec![0u8; n * k];
-    // scale_inv must be non-zero (TRTLLM rejects denormals). Use 1.0f32 = [0x3f800000].
+    fn zeroed_static(len: usize) -> &'static [u8] {
+        Box::leak(vec![0u8; len].into_boxed_slice())
+    }
+    let weight = zeroed_static(n * k);
     let scale_len = n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK);
-    let scale: Vec<u8> = (0..scale_len).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+    let scale: &'static [u8] = Box::leak(
+        (0..scale_len)
+            .flat_map(|_| 1.0f32.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .into_boxed_slice(),
+    );
     Glm52ProjBytes {
-        weight: weight.leak(),
-        scale: scale.leak(),
+        weight,
+        scale,
         n,
         k,
     }

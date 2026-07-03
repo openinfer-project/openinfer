@@ -30,12 +30,12 @@ pub use deepep::{
 pub use deepseek_v2_lite::*;
 pub use elementwise::{
     accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, bf16_bytes_to_f32_into,
-    bf16_bytes_to_f32_relu_into, bf16_hidden_to_f32_into, copy_hidden_rows_into,
-    copy_hidden_token_range_into, extract_vec, extract_vec_into, extract_vec_ref,
-    extract_vec_ref_into, f32_to_bf16_hidden_into, gather_hidden_tokens_into,
-    repeat_f32_for_reduce_scatter_into, scale_f32_in_place, scaled_add_batch_into,
-    scaled_add_rows_indexed_into, scaled_add_rows_into, scaled_add_rows_token_range_into,
-    silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
+    bf16_hidden_to_f32_into, copy_hidden_rows_into, copy_hidden_token_range_into, extract_vec,
+    extract_vec_into, extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into,
+    gather_hidden_tokens_into, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
+    scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
+    scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into,
+    silu_mul_fused_batch_into, write_vec_into,
 };
 pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
 #[cfg(feature = "glm52")]

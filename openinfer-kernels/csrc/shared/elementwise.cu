@@ -145,18 +145,6 @@ __global__ void bf16_to_f32_kernel(
   }
 }
 
-__global__ void bf16_to_f32_relu_kernel(
-    const __nv_bfloat16 *__restrict__ input,
-    float *__restrict__ output,
-    int n) {
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-       idx < n;
-       idx += gridDim.x * blockDim.x) {
-    float v = __bfloat162float(input[idx]);
-    output[idx] = v > 0.0f ? v : 0.0f;
-  }
-}
-
 __global__ void f32_to_bf16_kernel(
     const float *__restrict__ input,
     __nv_bfloat16 *__restrict__ output,
@@ -493,14 +481,6 @@ CUresult bf16_to_f32_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   bf16_to_f32_kernel<<<grid, block, 0, stream>>>(input, output, n);
-  return (CUresult)cudaGetLastError();
-}
-
-CUresult bf16_to_f32_relu_cuda(
-    const __nv_bfloat16 *input, float *output, int n, cudaStream_t stream) {
-  int block = 256;
-  int grid = (n + block - 1) / block;
-  bf16_to_f32_relu_kernel<<<grid, block, 0, stream>>>(input, output, n);
   return (CUresult)cudaGetLastError();
 }
 
