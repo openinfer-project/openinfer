@@ -124,9 +124,21 @@ impl LocalQwen3Lane {
             // (or too short to draft) simply isn't captured and falls back to plain
             // decode — still correct, just not accelerated.
             let single_chunk = req.chunk_start == 0 && req.chunk_tokens == req.prompt_tokens.len();
+            // The chain writes EAGLE3_CHAIN_LENGTH transient draft positions past the
+            // committed length each round (rewound afterwards); those must stay under
+            // the drafter's position limit `max_pos`. A request that could generate to
+            // within a chain of `max_pos` can't be drafted for its final positions —
+            // `draft_step` would bail and turn a valid length-capped generation into an
+            // error — so skip EAGLE for it entirely (plain decode) rather than admit it
+            // with the clamp silently eating the chain headroom.
+            let fits_position_budget = req.prompt_tokens.len()
+                + req.max_output_tokens
+                + crate::eagle3::EAGLE3_CHAIN_LENGTH
+                <= max_pos;
             if dflash_prefill_can_capture(req, false)
                 && single_chunk
                 && req.prompt_tokens.len() >= 2
+                && fits_position_budget
             {
                 // Prompt + decode + one chain's worth of in-flight draft KV
                 let max_cache_len = (req.prompt_tokens.len()
