@@ -205,6 +205,28 @@ LINEAR_CLS = {"fp8sim": Fp8SimLinear, "gemv": GemvSimLinear, "bf16": Bf16Linear}
 # ---------------------------------------------------------------------------
 
 
+def assert_indexer_rope_interleave():
+    """Crash-early verifier of the verifier: GLM5.2's config sets
+    `indexer_rope_interleave=true` and the engine implements interleaved
+    indexer RoPE (validated against transformers 5.13.0.dev0 with PR #46842).
+    The transformers 5.13.0 RELEASE regressed the fix back to non-interleaved
+    (`apply_rotary_pos_emb`), which shifts ~450/2048 top-k slots at ctx 4096 —
+    probes generated with it would gate the engine against the wrong
+    convention. Use a build with the fix (e.g. the repo `.venv`'s
+    5.13.0.dev0: `.venv/bin/python tools/accuracy/glm52_oracle.py ...`)."""
+    import inspect
+
+    from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as m
+
+    src = inspect.getsource(m.GlmMoeDsaIndexer.forward)
+    assert "apply_rotary_pos_emb_interleave" in src, (
+        "this transformers build applies NON-interleaved RoPE in the "
+        "GLM-MoE-DSA indexer (5.13.0-release regression of PR #46842); "
+        "regenerating probes with it would mis-gate the engine — use a build "
+        "with the interleave fix (repo .venv has 5.13.0.dev0)"
+    )
+
+
 def load_config(model_path: Path):
     from transformers.models.glm_moe_dsa import GlmMoeDsaConfig
 
@@ -717,6 +739,7 @@ def main() -> int:
     import transformers
 
     versions = f"transformers={transformers.__version__} torch={torch.__version__}"
+    assert_indexer_rope_interleave()
     config = load_config(args.model_path)
     ckpt = Checkpoint(args.model_path)
     if args.input_scale is None:
