@@ -433,11 +433,11 @@ pub(crate) fn glm52_indexer_forward(
     let mut logits_f32 = ctx.stream.alloc_zeros::<f32>(logits_elems)?;
     bf16_bytes_to_f32_into(ctx, &logits, &mut logits_f32)?;
 
-    // Debug: dump logits for Python comparison
+    // Apply ReLU: transformers applies F.relu(scores) before topk.
+    // sm100 DeepGEMM fuses this via cvt.relu, but sm90 does not.
     let logits_host = ctx.stream.clone_dtoh(&logits_f32)?;
-    let logits_bytes: Vec<u8> = logits_host.iter().flat_map(|v| v.to_le_bytes()).collect();
-    std::fs::write("/tmp/glm52_rust_logits.f32", &logits_bytes).ok();
-    eprintln!("dumped {} logits to /tmp/glm52_rust_logits.f32", logits_host.len());
+    let relu_host: Vec<f32> = logits_host.iter().map(|&v| v.max(0.0)).collect();
+    ctx.stream.memcpy_htod(&relu_host, &mut logits_f32)?;
 
     let mut topk_offsets = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
     let mut topk_values = ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?;
