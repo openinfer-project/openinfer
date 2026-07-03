@@ -189,7 +189,25 @@ fn run_layer_prefill_ep8(
             seq_lens: &seq_lens,
         };
         let mut carry_ready = false;
-        glm52_layer_attention_half(ctx, w, &mut caches, &step, &mut scratch, &mut carry_ready)?;
+        // Gate walk: standalone input norm + fixed parity 0 (one layer per
+        // call, stream in scratch.hidden — same shape as the EP1 gate).
+        openinfer_kernels::ops::rms_norm_into(
+            ctx,
+            &scratch.hidden,
+            &w.input_ln,
+            crate::layer::GLM52_RMS_EPS,
+            &mut scratch.layer.normed,
+        )?;
+        glm52_layer_attention_half(
+            ctx,
+            w,
+            &mut caches,
+            &step,
+            &mut scratch,
+            &mut carry_ready,
+            0,
+            true,
+        )?;
         let route = run_router(ctx, &moe.router, &scratch.layer.normed2)?;
         let dispatched = glm52_moe_ep8_routed_forward(
             ctx,
@@ -207,7 +225,7 @@ fn run_layer_prefill_ep8(
             HIDDEN,
             &mut scratch.layer.mlp_out,
         )?;
-        glm52_layer_finish(ctx, &mut scratch)?;
+        glm52_layer_finish(ctx, &mut scratch, 0)?;
         let out_host = ctx.stream.clone_dtoh(&scratch.hidden.data)?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }

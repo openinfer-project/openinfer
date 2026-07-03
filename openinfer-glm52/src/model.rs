@@ -15,6 +15,7 @@ use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
     Glm52IndexerCacheLayout, add_into, argmax_bf16_into, glm52_flashmla_sparse_decode_num_sm_parts,
+    rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -24,8 +25,8 @@ use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward_into};
 use crate::fp8::ProjWeight;
 use crate::indexer::{Glm52IndexerLayerWeights, Glm52IndexerScratch};
 use crate::layer::{
-    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
-    glm52_layer_attention_half, glm52_layer_finish,
+    GLM52_RMS_EPS, Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer,
+    Glm52LayerMlp, glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
 };
 use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
 use crate::moe_decode::{
@@ -393,12 +394,32 @@ impl Glm52RankModel {
         let result = graph.run_or_capture(ctx, || {
             let s = &mut self.scratch;
             glm52_embed_into(ctx, &self.embed, &self.token_id, &mut s.hidden)?;
+            // Layer 0's input norm is standalone (the embedding is the
+            // residual); every later layer's input norm is fused into the
+            // previous layer's closing add (`glm52_layer_finish_fused`).
+            rms_norm_into(
+                ctx,
+                &s.hidden,
+                &self.layers[0].input_ln,
+                GLM52_RMS_EPS,
+                &mut s.layer.normed,
+            )?;
             let mut carry_ready = false;
             for (layer, (weights, cache)) in
                 self.layers.iter().zip(self.caches.iter_mut()).enumerate()
             {
-                glm52_layer_attention_half(ctx, weights, cache, &step, s, &mut carry_ready)
-                    .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
+                let parity = layer % 2;
+                glm52_layer_attention_half(
+                    ctx,
+                    weights,
+                    cache,
+                    &step,
+                    s,
+                    &mut carry_ready,
+                    parity,
+                    layer == 0,
+                )
+                .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
                 match &weights.mlp {
                     Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
                         ctx,
@@ -453,7 +474,11 @@ impl Glm52RankModel {
                         anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
                     }
                 };
-                glm52_layer_finish(ctx, s)?;
+                if layer + 1 < self.layers.len() {
+                    glm52_layer_finish_fused(ctx, s, parity, &self.layers[layer + 1].input_ln)?;
+                } else {
+                    glm52_layer_finish(ctx, s, parity)?;
+                }
             }
 
             glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, &mut s.final_normed)?;
