@@ -2065,7 +2065,9 @@ impl ModelExecutor for Qwen3Executor {
         for id in ids {
             match self.prefetch.get_mut(&id).map(|st| &mut st.phase) {
                 Some(PrefetchPhase::Loading { handle, .. }) => {
-                    let Some(result) = handle.poll() else { continue };
+                    let Some(result) = handle.poll() else {
+                        continue;
+                    };
                     let st = self.prefetch.get_mut(&id).expect("prefetch present");
                     let PrefetchPhase::Loading { reservation, .. } =
                         std::mem::replace(&mut st.phase, PrefetchPhase::Committed)
