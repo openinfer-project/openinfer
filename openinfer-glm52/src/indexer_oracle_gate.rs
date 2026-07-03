@@ -275,6 +275,14 @@ fn indexer_oracle_gate() -> Result<()> {
     let max_allowed = rust_set.len().max(oracle_set.len());
     let min_required = max_allowed.saturating_sub(1); // allow 1 tie-break divergence
 
+    // Debug: show mismatched positions
+    let rust_only: Vec<i32> = rust_set.difference(&oracle_set).copied().collect();
+    let oracle_only: Vec<i32> = oracle_set.difference(&rust_set).copied().collect();
+    eprintln!("rust-only (in topk but not oracle): {} positions", rust_only.len());
+    eprintln!("rust-only first 20: {:?}", &rust_only.iter().take(20).copied().collect::<Vec<_>>());
+    eprintln!("oracle-only (in oracle but not topk): {} positions", oracle_only.len());
+    eprintln!("oracle-only first 20: {:?}", &oracle_only.iter().take(20).copied().collect::<Vec<_>>());
+
     ensure!(
         overlap >= min_required,
         "indexer topk set-overlap {overlap} < required {min_required} \
