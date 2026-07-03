@@ -38,6 +38,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen3/kernels-crate.md` | Phase 1 split implemented and 5090-verified: Qwen3-4B kernel surface lives in `openinfer-kernels`; release build, test-target compile, accuracy gate, and bench snapshot pass. |
 | `models/qwen3/tp-design.md` | Qwen3 tensor-parallel design: `TP=2` milestone scope plus the controller/worker broadcast execution model, request identity, and coarse-grained step protocol for future TP/MoE work. |
 | `models/qwen3/kv-pressure-hang.md` | Issue #85 Qwen3-4B KV pressure hang fixed by full-lifetime scheduler KV admission, waiting-queue deferral, cleanup on disconnect/error, impossible-request errors, scheduler/bridge gates, and real `vllm bench serve` QPS=2 `500/500` pass with post-pressure completion healthy. |
+| `models/qwen3/pd-disaggregation-m2.md` | P/D 分离 M2 **已端到端验证**（单机 2×H200 + 400G IB）：Qwen3-8B 1P+1D，KV 经 pegaflow metaserver P2P（RDMA READ）流转，greedy 输出与单实例逐 token 一致，杀 metaserver/P 优雅退化。openinfer `feat/pd-pegaflow-p2p` + pegaflow PR #381。RemoteFetch 状态机单测欠账；M3 layer-wise push 延后。 |
 
 ## models / qwen35
 
