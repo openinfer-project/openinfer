@@ -84,6 +84,10 @@ CUresult map_cuda_error(cudaError_t err) {
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
+// PP8 EP1: every stage owns all 256 routed experts, and bs=1 decode sizes
+// m_capacity to top_k*alignment, so groups/m_capacity are RUNTIME (the metadata
+// kernel is group-generic). Validate structural consistency, not the EP8-era
+// magic numbers. expert_alignment stays the fixed 64-row design constant.
 bool valid_common(int groups, int m_capacity, int psum_entries,
                   int expert_alignment, int activation_scale_tma_rows) {
   return groups > 0 && m_capacity > 0 && psum_entries == groups &&

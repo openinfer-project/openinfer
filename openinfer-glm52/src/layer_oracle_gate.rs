@@ -1,0 +1,441 @@
+//! HF-oracle gates for the full decoder-layer composition.
+//!
+//! The oracle side is `tools/accuracy/glm52_oracle.py --stage layer` (official
+//! `GlmMoeDsaDecoderLayer`, fp8sim precision): it runs one whole decoder layer
+//! (norms + MLA/DSA attention + residuals + dense-or-MoE MLP) on a seeded input
+//! and emits `layer_out` probe constants. These tests replay the same input
+//! through `glm52_decoder_layer_forward` position by position (prefill-via-
+//! decode, real DSA indexer — at ctx <= 2048 its top-k equals full top-k) and
+//! assert the outputs land on the probes.
+//!
+//! Two layers, chosen by what they exercise:
+//! - layer 0: dense MLP + full indexer (the residual/norm wiring around the
+//!   already-gated MLA brick, plus `fp8_mlp` at intermediate 12288).
+//! - layer 6: routed+shared MoE + full indexer (router, expert-major grouped
+//!   FP8 GEMM chain, weighted-SwiGLU fold, combine). The MoE gate runs BOTH
+//!   expert paths (Grouped and Gemv) against the same probes.
+//!
+//! Run (H200 + checkpoint + DeepGEMM env):
+//! ```text
+//! OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
+//! OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM \
+//! CUDA_HOME=/usr/local/cuda \
+//!   cargo test --release -p openinfer-glm52 --features glm52 --lib layer_oracle -- --ignored --nocapture
+//! ```
+
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, ensure};
+use half::bf16;
+use sha2::{Digest, Sha256};
+
+use openinfer_kernels::ops::{
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
+    Glm52IndexerCacheLayout, glm52_flashmla_sparse_decode_num_sm_parts,
+};
+use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+
+use crate::fp8::Glm52ProjBytes;
+use crate::indexer::Glm52IndexerLayerWeights;
+use crate::layer::{
+    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
+    glm52_decoder_layer_forward,
+};
+use crate::mla_decode::Glm52MlaLayerWeights;
+use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, Glm52MoeRoutedExpertBytes};
+
+// ---- BEGIN GENERATED: glm52_oracle layer probes (dense, layer 0) ----
+// UNGENERATED PLACEHOLDER — run on the H200 node and paste:
+// uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
+//     --ctx 200 --seed 0x5eed604d --layer 0 --precision fp8sim --stage layer
+const DENSE_ORACLE_SEED: u64 = 0x5eed_604d;
+const DENSE_ORACLE_CTX: usize = 200;
+const DENSE_ORACLE_LAYER: usize = 0;
+const DENSE_ORACLE_HIDDEN_DIGEST: &str = "UNGENERATED";
+const DENSE_ORACLE_LAYER_RMS: f32 = 0.0;
+const DENSE_ORACLE_LAYER_REL_TOL: f32 = 0.05;
+const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
+// ---- END GENERATED ----
+
+// ---- BEGIN GENERATED: glm52_oracle layer probes (moe, layer 6) ----
+// UNGENERATED PLACEHOLDER — run on the H200 node and paste:
+// uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
+//     --ctx 200 --seed 0x5eed604d --layer 6 --precision fp8sim --stage layer
+const MOE_ORACLE_SEED: u64 = 0x5eed_604d;
+const MOE_ORACLE_CTX: usize = 200;
+const MOE_ORACLE_LAYER: usize = 6;
+const MOE_ORACLE_HIDDEN_DIGEST: &str = "UNGENERATED";
+const MOE_ORACLE_LAYER_RMS: f32 = 0.0;
+const MOE_ORACLE_LAYER_REL_TOL: f32 = 0.05;
+const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
+// Router selection of the LAST position (debugging reference when probes fail).
+const MOE_ORACLE_ROUTER_LAST: &[(i32, f32)] = &[];
+// ---- END GENERATED ----
+
+const HIDDEN: usize = 6144;
+const Q_LORA: usize = 2048;
+const DENSE_INTERMEDIATE: usize = 12288;
+const MOE_INTERMEDIATE: usize = 2048;
+const EXPERTS: usize = 256;
+const ROPE_HALF: usize = 32;
+const ROPE_THETA: f32 = 8_000_000.0;
+const SM_SCALE: f32 = 0.0625;
+const INDEX_HEAD_DIM: usize = 128;
+const INDEX_CACHE_BLOCK: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
+const NUM_SMS: usize = 132;
+
+/// Mirror of the Python splitmix64 generator (see `mla_oracle_gate`).
+fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
+    (0..count)
+        .map(|i| {
+            let mut z = seed.wrapping_add((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let u = (z >> 11) as f64 / (1u64 << 53) as f64;
+            bf16::from_f32(((u - 0.5) * 4.0) as f32)
+        })
+        .collect()
+}
+
+fn bf16_digest(data: &[bf16]) -> String {
+    let mut hasher = Sha256::new();
+    for v in data {
+        hasher.update(v.to_bits().to_le_bytes());
+    }
+    hex::encode(&hasher.finalize()[..8])
+}
+
+fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
+    (0..ROPE_HALF)
+        .map(|j| {
+            let inv_freq = 1.0 / ROPE_THETA.powf(j as f32 / ROPE_HALF as f32);
+            let angle = position as f32 * inv_freq;
+            (bf16::from_f32(angle.cos()), bf16::from_f32(angle.sin()))
+        })
+        .unzip()
+}
+
+/// Owned copies of every `model.layers.{L}.` tensor (attention + indexer +
+/// layernorms + MLP/MoE). For the MoE layer this is ~10 GB of host copies — a
+/// test-only cost that keeps the borrow story trivial.
+struct LayerTensors {
+    by_name: BTreeMap<String, Vec<u8>>,
+}
+
+impl LayerTensors {
+    fn load(model_path: &Path, layer: usize) -> Result<Self> {
+        let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            model_path.join("model.safetensors.index.json"),
+        )?)?;
+        let weight_map = index["weight_map"]
+            .as_object()
+            .context("weight_map missing")?;
+        let prefix = format!("model.layers.{layer}.");
+        let mut by_shard: BTreeMap<String, Vec<String>> = BTreeMap::default();
+        for (name, shard) in weight_map {
+            if name.starts_with(&prefix) {
+                by_shard
+                    .entry(shard.as_str().context("shard not a string")?.to_owned())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+        let mut by_name = BTreeMap::new();
+        for (shard, names) in by_shard {
+            let mmap = crate::weights::mmap_file(&model_path.join(&shard))?;
+            let st = safetensors::SafeTensors::deserialize(mmap.as_ref())?;
+            for name in names {
+                by_name.insert(name.clone(), st.tensor(&name)?.data().to_vec());
+            }
+        }
+        Ok(Self { by_name })
+    }
+
+    fn bytes(&self, name: &str) -> Result<&[u8]> {
+        self.by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .with_context(|| format!("layer tensor {name} not loaded"))
+    }
+
+    fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
+        Ok(Glm52ProjBytes {
+            weight: self.bytes(&format!("{stem}.weight"))?,
+            scale: self.bytes(&format!("{stem}.weight_scale_inv"))?,
+            n,
+            k,
+        })
+    }
+}
+
+fn load_decoder_layer(
+    ctx: &DeviceContext,
+    model_path: &Path,
+    layer: usize,
+    dense: bool,
+) -> Result<Glm52DecoderLayerWeights> {
+    let t = LayerTensors::load(model_path, layer)?;
+    let p = format!("model.layers.{layer}");
+
+    let mla = Glm52MlaLayerWeights::from_host(
+        ctx,
+        &t.proj(&format!("{p}.self_attn.q_a_proj"), Q_LORA, HIDDEN)?,
+        t.bytes(&format!("{p}.self_attn.q_a_layernorm.weight"))?,
+        &t.proj(&format!("{p}.self_attn.q_b_proj"), 16384, Q_LORA)?,
+        &t.proj(&format!("{p}.self_attn.kv_a_proj_with_mqa"), 576, HIDDEN)?,
+        t.bytes(&format!("{p}.self_attn.kv_a_layernorm.weight"))?,
+        &t.proj(&format!("{p}.self_attn.kv_b_proj"), 28672, 512)?,
+        &t.proj(&format!("{p}.self_attn.o_proj"), HIDDEN, 16384)?,
+    )?;
+
+    let ip = format!("{p}.self_attn.indexer");
+    let indexer = Glm52IndexerLayerWeights::from_host(
+        ctx,
+        &t.proj(&format!("{ip}.wq_b"), 32 * INDEX_HEAD_DIM, Q_LORA)?,
+        &t.proj(&format!("{ip}.wk"), INDEX_HEAD_DIM, HIDDEN)?,
+        t.bytes(&format!("{ip}.weights_proj.weight"))?,
+        t.bytes(&format!("{ip}.k_norm.weight"))?,
+        t.bytes(&format!("{ip}.k_norm.bias"))?,
+    )?;
+
+    let mlp = if dense {
+        let mp = format!("{p}.mlp");
+        Glm52LayerMlp::Dense(Box::new(crate::dense::Glm52DenseMlpWeights::from_host(
+            ctx,
+            &t.proj(&format!("{mp}.gate_proj"), DENSE_INTERMEDIATE, HIDDEN)?,
+            &t.proj(&format!("{mp}.up_proj"), DENSE_INTERMEDIATE, HIDDEN)?,
+            &t.proj(&format!("{mp}.down_proj"), HIDDEN, DENSE_INTERMEDIATE)?,
+        )?))
+    } else {
+        let mp = format!("{p}.mlp");
+        let experts: Vec<Glm52MoeRoutedExpertBytes<'_>> = (0..EXPERTS)
+            .map(|e| {
+                let ep = format!("{mp}.experts.{e}");
+                Ok(Glm52MoeRoutedExpertBytes {
+                    gate: t.proj(&format!("{ep}.gate_proj"), MOE_INTERMEDIATE, HIDDEN)?,
+                    up: t.proj(&format!("{ep}.up_proj"), MOE_INTERMEDIATE, HIDDEN)?,
+                    down: t.proj(&format!("{ep}.down_proj"), HIDDEN, MOE_INTERMEDIATE)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Glm52LayerMlp::Moe(Box::new(Glm52MoeLayerWeights::from_host(
+            ctx,
+            t.bytes(&format!("{mp}.gate.weight"))?,
+            t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?,
+            &experts,
+            &t.proj(
+                &format!("{mp}.shared_experts.gate_proj"),
+                MOE_INTERMEDIATE,
+                HIDDEN,
+            )?,
+            &t.proj(
+                &format!("{mp}.shared_experts.up_proj"),
+                MOE_INTERMEDIATE,
+                HIDDEN,
+            )?,
+            &t.proj(
+                &format!("{mp}.shared_experts.down_proj"),
+                HIDDEN,
+                MOE_INTERMEDIATE,
+            )?,
+        )?))
+    };
+
+    Ok(Glm52DecoderLayerWeights {
+        input_ln: DeviceVec::from_safetensors(
+            ctx,
+            t.bytes(&format!("{p}.input_layernorm.weight"))?,
+        )?,
+        post_attn_ln: DeviceVec::from_safetensors(
+            ctx,
+            t.bytes(&format!("{p}.post_attention_layernorm.weight"))?,
+        )?,
+        mla,
+        indexer: Glm52LayerIndexer::Full(Box::new(indexer)),
+        mlp,
+    })
+}
+
+/// Drive one full prefill-via-decode pass through the layer; returns the
+/// concatenated f32 outputs `[ctx * HIDDEN]`.
+fn run_layer_prefill(
+    ctx: &DeviceContext,
+    w: &Glm52DecoderLayerWeights,
+    hidden_host: &[bf16],
+    oracle_ctx: usize,
+    moe_path: Glm52MoeExpertPath,
+) -> Result<Vec<f32>> {
+    let contract = Glm52FlashMlaSparseDecode {
+        batch_size: 1,
+        num_blocks: oracle_ctx.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+        topk: GLM52_FLASHMLA_SPARSE_TOPK,
+        num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
+        sm_scale: SM_SCALE,
+    };
+    let index_blocks = oracle_ctx.div_ceil(INDEX_CACHE_BLOCK);
+    let index_cache_layout = Glm52IndexerCacheLayout {
+        cache_blocks: index_blocks,
+        cache_block_size: INDEX_CACHE_BLOCK,
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (INDEX_HEAD_DIM + 4),
+    };
+    let mut caches = Glm52LayerCaches {
+        mla_cache: ctx
+            .stream
+            .alloc_zeros::<u8>(contract.packed_kv_cache_len())?,
+        index_k_cache: Some(
+            ctx.stream
+                .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)?,
+        ),
+    };
+
+    let block_table_host: Vec<i32> = (0..index_blocks as i32).collect();
+    let mut block_table = ctx.stream.alloc_zeros::<i32>(index_blocks)?;
+    ctx.stream
+        .memcpy_htod(&block_table_host, &mut block_table)?;
+    let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
+    let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
+    let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+    let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+
+    let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
+    for position in 0..oracle_ctx {
+        let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+        ctx.stream.memcpy_htod(
+            &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
+            &mut hidden,
+        )?;
+        let (cos_host, sin_host) = rope_tables(position);
+        ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
+        ctx.stream.memcpy_htod(&sin_host, &mut sin)?;
+        ctx.stream
+            .memcpy_htod(&[position as i64], &mut slot_mapping)?;
+        ctx.stream
+            .memcpy_htod(&[(position + 1) as i32], &mut seq_lens)?;
+
+        let step = Glm52DecodeStep {
+            position,
+            mla_cos: &cos,
+            mla_sin: &sin,
+            idx_cos: &cos,
+            idx_sin: &sin,
+            contract,
+            index_cache_layout,
+            slot_mapping: &slot_mapping,
+            block_table: &block_table,
+            seq_lens: &seq_lens,
+            num_sms: NUM_SMS,
+            max_model_len: oracle_ctx,
+            moe_path,
+        };
+        let mut topk_carry = None;
+        let out = glm52_decoder_layer_forward(ctx, w, &mut caches, hidden, &step, &mut topk_carry)?;
+        let out_host = ctx.stream.clone_dtoh(&out)?;
+        outputs.extend(out_host.iter().map(|v| v.to_f32()));
+    }
+    Ok(outputs)
+}
+
+fn assert_layer_probes(label: &str, outputs: &[f32], probes: &[(usize, f32)], rms: f32, tol: f32) {
+    assert!(
+        !probes.is_empty(),
+        "{label}: probe block is the ungenerated placeholder — run the harness and paste"
+    );
+    let tol = tol * rms;
+    let failures: Vec<_> = probes
+        .iter()
+        .filter(|&&(idx, expected)| (outputs[idx] - expected).abs() > tol)
+        .collect();
+    println!(
+        "{label}: {}/{} probes within tol={tol:.6e}",
+        probes.len() - failures.len(),
+        probes.len()
+    );
+    for &&(idx, expected) in failures.iter().take(10) {
+        println!(
+            "  probe[{idx}]: oracle {expected:.6} vs engine {:.6}",
+            outputs[idx]
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "{label}: {} probes out of tolerance",
+        failures.len()
+    );
+}
+
+fn model_path() -> PathBuf {
+    std::env::var_os("OPENINFER_TEST_MODEL_PATH")
+        .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from)
+}
+
+fn checked_hidden(seed: u64, ctxlen: usize, digest: &str) -> Result<Vec<bf16>> {
+    let hidden = seeded_hidden(seed, ctxlen * HIDDEN);
+    let got = bf16_digest(&hidden);
+    ensure!(
+        got == digest,
+        "input digest {got} != oracle {digest}: PRNG drift or stale probes — regenerate"
+    );
+    Ok(hidden)
+}
+
+#[test]
+#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
+fn layer_dense_oracle_gate() -> Result<()> {
+    let hidden_host = checked_hidden(
+        DENSE_ORACLE_SEED,
+        DENSE_ORACLE_CTX,
+        DENSE_ORACLE_HIDDEN_DIGEST,
+    )?;
+    let ctx = DeviceContext::new()?;
+    let w = load_decoder_layer(&ctx, &model_path(), DENSE_ORACLE_LAYER, true)?;
+    let outputs = run_layer_prefill(
+        &ctx,
+        &w,
+        &hidden_host,
+        DENSE_ORACLE_CTX,
+        Glm52MoeExpertPath::Grouped,
+    )?;
+    assert_layer_probes(
+        "layer0/dense",
+        &outputs,
+        DENSE_ORACLE_LAYER_PROBES,
+        DENSE_ORACLE_LAYER_RMS,
+        DENSE_ORACLE_LAYER_REL_TOL,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
+fn layer_moe_oracle_gate() -> Result<()> {
+    let hidden_host = checked_hidden(MOE_ORACLE_SEED, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST)?;
+    let ctx = DeviceContext::new()?;
+    let w = load_decoder_layer(&ctx, &model_path(), MOE_ORACLE_LAYER, false)?;
+
+    // Grouped is the DeepEP-shaped spine; Gemv is the measured bs=1 alternative.
+    // Both must land on the same oracle probes.
+    for (label, path) in [
+        ("layer6/moe/grouped", Glm52MoeExpertPath::Grouped),
+        ("layer6/moe/gemv", Glm52MoeExpertPath::Gemv),
+    ] {
+        let outputs = run_layer_prefill(&ctx, &w, &hidden_host, MOE_ORACLE_CTX, path)?;
+        assert_layer_probes(
+            label,
+            &outputs,
+            MOE_ORACLE_LAYER_PROBES,
+            MOE_ORACLE_LAYER_RMS,
+            MOE_ORACLE_LAYER_REL_TOL,
+        );
+    }
+    if !MOE_ORACLE_ROUTER_LAST.is_empty() {
+        println!(
+            "router reference (last position, debugging aid): {} experts",
+            MOE_ORACLE_ROUTER_LAST.len()
+        );
+    }
+    Ok(())
+}

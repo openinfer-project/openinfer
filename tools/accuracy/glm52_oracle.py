@@ -201,13 +201,10 @@ def load_config(model_path: Path):
     return config
 
 
-def build_attention(ckpt: Checkpoint, config, layer: int, precision: str, fault: str):
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaAttention
-
-    assert config.indexer_types[layer] == "full", (
-        f"layer {layer} is a shared-indexer layer; pick a 'full' layer for the oracle"
-    )
-    attn = GlmMoeDsaAttention(config, layer_idx=layer).to(torch.bfloat16).eval()
+def patch_attention(attn, ckpt: Checkpoint, layer: int, precision: str, fault: str):
+    """Swap an official `GlmMoeDsaAttention`'s linears for checkpoint-loaded,
+    precision-emulated ones. Shared by the bare-attention and decoder-layer
+    builders."""
     prefix = f"model.layers.{layer}.self_attn"
 
     def proj(stem: str) -> torch.Tensor:
@@ -234,16 +231,121 @@ def build_attention(ckpt: Checkpoint, config, layer: int, precision: str, fault:
     attn.q_a_layernorm.weight.data = ckpt.tensor(f"{prefix}.q_a_layernorm.weight").to(torch.bfloat16)
     attn.kv_a_layernorm.weight.data = ckpt.tensor(f"{prefix}.kv_a_layernorm.weight").to(torch.bfloat16)
 
-    attn.indexer.wq_b = linear_cls(proj("indexer.wq_b"))
-    attn.indexer.wk = linear_cls(proj("indexer.wk"))
-    attn.indexer.k_norm.weight.data = ckpt.tensor(f"{prefix}.indexer.k_norm.weight").to(torch.bfloat16)
-    attn.indexer.k_norm.bias.data = ckpt.tensor(f"{prefix}.indexer.k_norm.bias").to(torch.bfloat16)
-    # transformers keeps indexer.weights_proj in fp32 (_keep_in_fp32_modules).
-    attn.indexer.weights_proj.weight.data = ckpt.tensor(
-        f"{prefix}.indexer.weights_proj.weight"
-    ).to(torch.float32)
-    attn.indexer.weights_proj = attn.indexer.weights_proj.to(torch.float32)
+    if attn.indexer is not None:
+        attn.indexer.wq_b = linear_cls(proj("indexer.wq_b"))
+        attn.indexer.wk = linear_cls(proj("indexer.wk"))
+        attn.indexer.k_norm.weight.data = ckpt.tensor(f"{prefix}.indexer.k_norm.weight").to(torch.bfloat16)
+        attn.indexer.k_norm.bias.data = ckpt.tensor(f"{prefix}.indexer.k_norm.bias").to(torch.bfloat16)
+        # transformers keeps indexer.weights_proj in fp32 (_keep_in_fp32_modules).
+        attn.indexer.weights_proj.weight.data = ckpt.tensor(
+            f"{prefix}.indexer.weights_proj.weight"
+        ).to(torch.float32)
+        attn.indexer.weights_proj = attn.indexer.weights_proj.to(torch.float32)
     return attn
+
+
+def build_attention(ckpt: Checkpoint, config, layer: int, precision: str, fault: str):
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaAttention
+
+    assert config.indexer_types[layer] == "full", (
+        f"layer {layer} is a shared-indexer layer; pick a 'full' layer for the oracle"
+    )
+    attn = GlmMoeDsaAttention(config, layer_idx=layer).to(torch.bfloat16).eval()
+    return patch_attention(attn, ckpt, layer, precision, fault)
+
+
+class Fp8SimExperts(torch.nn.Module):
+    """Routed-experts forward with the engine's fp8 precision regime: the token
+    activation is quant-dequanted per 128-group before the gate|up GEMM, and the
+    SwiGLU product before the down GEMM (the engine's W2-input re-quant; the
+    route weight commutes with the per-group dynamic scale, so applying it after
+    down as the official code does is equivalent up to f32 scale rounding).
+
+    The loop itself mirrors `GlmMoeDsaExperts.forward` (transport, no new math);
+    expert weights stay fp8 in memory and are block-dequanted lazily per hit
+    expert, so the 256-expert layer never materializes ~19 GB of f32 weights.
+    """
+
+    def __init__(self, ckpt: Checkpoint, layer: int, num_experts: int, precision: str):
+        super().__init__()
+        self.ckpt = ckpt
+        self.prefix = f"model.layers.{layer}.mlp.experts"
+        self.num_experts = num_experts
+        self.precision = precision
+        self._cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _expert(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if idx not in self._cache:
+            def dq(stem: str) -> torch.Tensor:
+                return dequant_fp8_block(
+                    self.ckpt.tensor(f"{self.prefix}.{idx}.{stem}.weight"),
+                    self.ckpt.tensor(f"{self.prefix}.{idx}.{stem}.weight_scale_inv"),
+                )
+
+            gate_up = torch.cat([dq("gate_proj"), dq("up_proj")], dim=0)  # [2I, H]
+            self._cache[idx] = (gate_up, dq("down_proj"))
+        return self._cache[idx]
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        final = torch.zeros_like(hidden_states)
+        if self.precision == "fp8sim":
+            hidden_states = quant_dequant_groups(hidden_states)
+        act = hidden_states.to(torch.float32)
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        for expert_idx in expert_mask.sum(dim=(-1, -2)).nonzero()[:, 0].tolist():
+            gate_up, down = self._expert(expert_idx)
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            gate, up = torch.nn.functional.linear(act[token_idx], gate_up).chunk(2, dim=-1)
+            prod = torch.nn.functional.silu(gate) * up
+            if self.precision == "fp8sim":
+                prod = quant_dequant_groups(prod.to(torch.bfloat16)).to(torch.float32)
+            out = torch.nn.functional.linear(prod, down)
+            out = out * top_k_weights[token_idx, top_k_pos, None].to(torch.float32)
+            final.index_add_(0, token_idx, out.to(final.dtype))
+        return final
+
+
+def build_decoder_layer(ckpt: Checkpoint, config, layer: int, precision: str, fault: str):
+    """Official `GlmMoeDsaDecoderLayer` with checkpoint weights + fp8sim linears:
+    the full-layer oracle (attention + norms + residuals + dense-or-MoE MLP)."""
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+        GlmMoeDsaDecoderLayer,
+        GlmMoeDsaMLP,
+        GlmMoeDsaMoE,
+    )
+
+    assert config.indexer_types[layer] == "full", (
+        f"layer {layer} is a shared-indexer layer; pick a 'full' layer for the oracle"
+    )
+    dl = GlmMoeDsaDecoderLayer(config, layer_idx=layer).to(torch.bfloat16).eval()
+    patch_attention(dl.self_attn, ckpt, layer, precision, fault)
+    prefix = f"model.layers.{layer}"
+    dl.input_layernorm.weight.data = ckpt.tensor(f"{prefix}.input_layernorm.weight").to(torch.bfloat16)
+    dl.post_attention_layernorm.weight.data = ckpt.tensor(
+        f"{prefix}.post_attention_layernorm.weight"
+    ).to(torch.bfloat16)
+
+    linear_cls = Fp8SimLinear if precision == "fp8sim" else Bf16Linear
+
+    def mlp_proj(module: GlmMoeDsaMLP, stem_prefix: str):
+        for stem in ("gate_proj", "up_proj", "down_proj"):
+            w = dequant_fp8_block(
+                ckpt.tensor(f"{stem_prefix}.{stem}.weight"),
+                ckpt.tensor(f"{stem_prefix}.{stem}.weight_scale_inv"),
+            )
+            setattr(module, stem, linear_cls(w))
+
+    if isinstance(dl.mlp, GlmMoeDsaMoE):
+        dl.mlp.gate.weight.data = ckpt.tensor(f"{prefix}.mlp.gate.weight").to(torch.bfloat16)
+        dl.mlp.gate.e_score_correction_bias.data = ckpt.tensor(
+            f"{prefix}.mlp.gate.e_score_correction_bias"
+        ).to(torch.float32)
+        dl.mlp.experts = Fp8SimExperts(ckpt, layer, config.n_routed_experts, precision)
+        mlp_proj(dl.mlp.shared_experts, f"{prefix}.mlp.shared_experts")
+    else:
+        mlp_proj(dl.mlp, f"{prefix}.mlp")
+    return dl
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +402,81 @@ def run(attn, config, hidden: torch.Tensor, precision: str, fault: str) -> dict[
         )
     taps["o"] = o.squeeze(0)
     taps["topk_indices"] = topk.squeeze(0)
+    return taps
+
+
+def run_layer(dl, config, hidden: torch.Tensor, fault: str) -> dict[str, torch.Tensor]:
+    """Full decoder-layer forward (norms + attention + residuals + MLP/MoE)."""
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+        GlmMoeDsaMoE,
+        GlmMoeDsaRotaryEmbedding,
+    )
+
+    taps: dict[str, torch.Tensor] = {"hidden": hidden}
+    ctx = hidden.shape[0]
+    hidden_b = hidden.unsqueeze(0)
+    position_ids = torch.arange(ctx).unsqueeze(0)
+
+    rope = GlmMoeDsaRotaryEmbedding(config)
+    cos, sin = rope(hidden_b, position_ids)
+    if fault == "rope-swap":
+        cos, sin = sin, cos
+        print("// !!! FAULT INJECTED: cos/sin swapped — DO NOT COMMIT", file=sys.stderr)
+    taps["cos"], taps["sin"] = cos.squeeze(0), sin.squeeze(0)
+
+    if isinstance(dl.mlp, GlmMoeDsaMoE):
+        def gate_hook(_mod, _args, out):
+            router_logits, topk_weights, topk_indices = out
+            taps["router_logits"] = router_logits.detach()
+            taps["router_topk_weights"] = topk_weights.detach()
+            taps["router_topk_indices"] = topk_indices.detach().to(torch.int32)
+
+        dl.mlp.gate.register_forward_hook(gate_hook)
+
+    with torch.no_grad():
+        out, dsa_topk = dl(
+            hidden_states=hidden_b,
+            attention_mask=None,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+            position_embeddings=(cos, sin),
+        )
+    taps["layer_out"] = out.squeeze(0)
+    taps["topk_indices"] = dsa_topk.squeeze(0)
+    return taps
+
+
+def seeded_token_ids(seed: int, ctx: int, vocab: int) -> torch.Tensor:
+    """splitmix64-derived token ids (integer-only, bit-identical across languages)."""
+    u = splitmix64_uniform(seed ^ 0xB00C, ctx)
+    ids = (u * vocab).astype(np.int64).clip(0, vocab - 1)
+    return torch.from_numpy(ids)
+
+
+def run_bookend(ckpt: Checkpoint, config, hidden: torch.Tensor, seed: int) -> dict[str, torch.Tensor]:
+    """Bookends: embed gather (exact), final RMSNorm + lm_head logits + argmax.
+    The norm math is the official `GlmMoeDsaRMSNorm`; embed/lm_head are plain
+    bf16 gather/linear (no fp8 anywhere in the bookends)."""
+    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaRMSNorm
+
+    ctx = hidden.shape[0]
+    taps: dict[str, torch.Tensor] = {"hidden": hidden}
+
+    embed = ckpt.tensor("model.embed_tokens.weight")  # bf16 [V, H]
+    token_ids = seeded_token_ids(seed, ctx, config.vocab_size)
+    taps["token_ids"] = token_ids.to(torch.int32)
+    taps["embed_rows"] = embed[token_ids]  # exact gather, digest-assertable
+
+    norm = GlmMoeDsaRMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(torch.bfloat16).eval()
+    norm.weight.data = ckpt.tensor("model.norm.weight").to(torch.bfloat16)
+    lm_head = ckpt.tensor("lm_head.weight")  # bf16 [V, H]
+    with torch.no_grad():
+        normed = norm(hidden.unsqueeze(0)).squeeze(0)
+        logits = torch.nn.functional.linear(normed.to(torch.float32), lm_head.to(torch.float32))
+    taps["normed"] = normed
+    taps["logits"] = logits.to(torch.bfloat16)
+    taps["argmax"] = logits.argmax(dim=-1).to(torch.int32)
     return taps
 
 
@@ -384,6 +561,84 @@ const ORACLE_TOPK_SET: &[i32] = &{topk_set};
 // ---- END GENERATED ----"""
 
 
+def sampled_probes(tap: torch.Tensor, args, salt: str) -> tuple[float, str]:
+    """Sample `args.probes` flat indices from a float tap; returns (rms, rust rows)."""
+    flat = tap.to(torch.float32).flatten()
+    rms = float(flat.square().mean().sqrt())
+    rng = random.Random(f"{args.seed}:{salt}")
+    idxs = sorted(rng.sample(range(flat.numel()), args.probes))
+    rows = ",\n".join(f"    ({i}, {flat[i].item():.9e})" for i in idxs)
+    return rms, rows
+
+
+def emit_rust_layer(taps, args, versions: str) -> str:
+    """Full decoder-layer probes (+ router top-k of the last position on MoE
+    layers). The Rust gate replays the same input through
+    `glm52_decoder_layer_forward` position by position and asserts `layer_out`."""
+    hidden = taps["hidden"]
+    rms, probes = sampled_probes(taps["layer_out"], args, "layer_out")
+    fault_banner = (
+        f"// !!! FAULT-INJECTED ({args.inject_fault}) — negative control only, DO NOT COMMIT\n"
+        if args.inject_fault != "none"
+        else ""
+    )
+    router_block = ""
+    if "router_topk_indices" in taps:
+        ids = taps["router_topk_indices"][-1]
+        weights = taps["router_topk_weights"][-1].to(torch.float32)
+        pairs = sorted(zip(ids.tolist(), weights.tolist()))
+        rows = ",\n".join(f"    ({i}, {w:.9e})" for i, w in pairs)
+        router_block = f"""
+// Router selection of the LAST position: (expert_id, normalized x2.5 weight),
+// sorted by expert id. Ids assert exactly; weights within REL_TOL of their max.
+const ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
+{rows},
+];"""
+    return f"""\
+{fault_banner}// ---- BEGIN GENERATED: glm52_oracle layer probes ----
+// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+//     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision} --stage layer
+// {versions}
+const ORACLE_SEED: u64 = {args.seed:#x};
+const ORACLE_CTX: usize = {args.ctx};
+const ORACLE_LAYER: usize = {args.layer};
+// sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
+const ORACLE_HIDDEN_DIGEST: &str = "{bf16_digest(hidden)}";
+// tap `layer_out` [{args.ctx}, 6144] bf16 digest={bf16_digest(taps["layer_out"])} (provenance only)
+const ORACLE_LAYER_RMS: f32 = {rms:.9e};
+const ORACLE_LAYER_REL_TOL: f32 = {args.rel_tol};
+const ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
+{probes},
+];{router_block}
+// ---- END GENERATED ----"""
+
+
+def emit_rust_bookend(taps, args, versions: str) -> str:
+    """Bookend probes: embed rows digest (exact — a bf16 gather), logits probes,
+    and the per-position argmax (exact — the thing greedy decode consumes)."""
+    rms, probes = sampled_probes(taps["logits"], args, "logits")
+    argmax = ", ".join(str(int(v)) for v in taps["argmax"].tolist())
+    return f"""\
+// ---- BEGIN GENERATED: glm52_oracle bookend probes ----
+// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+//     --ctx {args.ctx} --seed {args.seed:#x} --precision {args.precision} --stage bookend
+// {versions}
+const ORACLE_SEED: u64 = {args.seed:#x};
+const ORACLE_CTX: usize = {args.ctx};
+// sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
+const ORACLE_HIDDEN_DIGEST: &str = "{bf16_digest(taps["hidden"])}";
+// Token-id gather is exact: assert the embed-rows digest bit-for-bit.
+const ORACLE_EMBED_ROWS_DIGEST: &str = "{bf16_digest(taps["embed_rows"])}";
+const ORACLE_LOGITS_RMS: f32 = {rms:.9e};
+const ORACLE_LOGITS_REL_TOL: f32 = {args.rel_tol};
+const ORACLE_LOGITS_PROBES: &[(usize, f32)] = &[
+{probes},
+];
+// Greedy argmax per position — exact.
+const ORACLE_ARGMAX: &[u32] = &[{argmax}];
+// ---- END GENERATED ----"""
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-path", type=Path, required=True)
@@ -396,20 +651,29 @@ def main() -> int:
     p.add_argument("--probes", type=int, default=64)
     p.add_argument("--rel-tol", type=float, default=0.05)
     p.add_argument("--inject-fault", choices=["none", "qb-head-negate", "rope-swap"], default="none")
-    p.add_argument("--stage", choices=["mla", "indexer"], default="mla",
-                   help="mla: emit MLA o-probes. indexer: emit topk_indices set for overlap gate.")
+    p.add_argument("--stage", choices=["mla", "indexer", "layer", "bookend"], default="mla",
+                   help="mla: MLA o-probes. indexer: topk set for the overlap gate. "
+                   "layer: full decoder-layer probes (dense layer 0 / MoE layer 6). "
+                   "bookend: embed/final-norm/lm_head probes.")
     args = p.parse_args()
 
-    assert args.ctx <= 2048 or args.stage != "mla", "full top-k == DSA only holds at ctx <= 2048"
+    assert args.ctx <= 2048 or args.stage in ("indexer",), "full top-k == DSA only holds at ctx <= 2048"
 
     import transformers
 
     versions = f"transformers={transformers.__version__} torch={torch.__version__}"
     config = load_config(args.model_path)
     ckpt = Checkpoint(args.model_path)
-    attn = build_attention(ckpt, config, args.layer, args.precision, args.inject_fault)
     hidden = seeded_hidden(args.seed, args.ctx, config.hidden_size)
-    taps = run(attn, config, hidden, args.precision, args.inject_fault)
+
+    if args.stage == "layer":
+        dl = build_decoder_layer(ckpt, config, args.layer, args.precision, args.inject_fault)
+        taps = run_layer(dl, config, hidden, args.inject_fault)
+    elif args.stage == "bookend":
+        taps = run_bookend(ckpt, config, hidden, args.seed)
+    else:
+        attn = build_attention(ckpt, config, args.layer, args.precision, args.inject_fault)
+        taps = run(attn, config, hidden, args.precision, args.inject_fault)
 
     for name, t in taps.items():
         digest = i32_digest(t) if t.dtype == torch.int32 else bf16_digest(t.to(torch.bfloat16))
@@ -419,6 +683,10 @@ def main() -> int:
     if args.emit in ("rust", "both"):
         if args.stage == "indexer":
             print(emit_rust_indexer(taps, args, versions))
+        elif args.stage == "layer":
+            print(emit_rust_layer(taps, args, versions))
+        elif args.stage == "bookend":
+            print(emit_rust_bookend(taps, args, versions))
         else:
             print(emit_rust(taps, args, versions))
     if args.emit in ("safetensors", "both"):
