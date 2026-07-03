@@ -443,21 +443,14 @@ fn indexer_oracle_gate() -> Result<()> {
     eprintln!("rust topk digest: {topk_digest}");
     eprintln!("oracle topk digest: {ORACLE_TOPK_DIGEST}");
 
-    // Debug: dump logits statistics
-    let logits_f32_host = ctx.stream.clone_dtoh(&logits_f32)?;
-    let n = context_lens_host[0] as usize;
-    let first_half: Vec<f32> = logits_f32_host[1..n/2].to_vec();
-    let second_half: Vec<f32> = logits_f32_host[n/2..n].to_vec();
-    let fh_mean = first_half.iter().sum::<f32>() / first_half.len() as f32;
-    let sh_mean = second_half.iter().sum::<f32>() / second_half.len() as f32;
-    let fh_max = first_half.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let sh_max = second_half.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let fh_nonzero = first_half.iter().filter(|v| **v > 0.0).count();
-    let sh_nonzero = second_half.iter().filter(|v| **v > 0.0).count();
-    eprintln!("logits first half [1..{}]: mean={fh_mean:.4} max={fh_max:.4} nonzero={fh_nonzero}/{}", n/2, n/2-1);
-    eprintln!("logits second half [{}..{}]: mean={sh_mean:.4} max={sh_max:.4} nonzero={sh_nonzero}/{}", n/2, n, n/2);
-    eprintln!("logits[0]={:.6} logits[2048]={:.6} logits[2049]={:.6} logits[4095]={:.6}",
-        logits_f32_host[0], logits_f32_host[2048], logits_f32_host[2049], logits_f32_host[4095]);
+    // Debug: topk statistics
+    let mut sorted_topk: Vec<i32> = topk_host.iter().copied().filter(|&v| v >= 0).collect();
+    sorted_topk.sort();
+    let in_first_half = sorted_topk.iter().filter(|&&v| v < 2048).count();
+    let in_second_half = sorted_topk.iter().filter(|&&v| v >= 2048).count();
+    eprintln!("topk in first half [0..2048): {in_first_half}, in second half [2048..4096): {in_second_half}");
+    eprintln!("topk smallest 5: {:?}", &sorted_topk[..5.min(sorted_topk.len())]);
+    eprintln!("topk largest 5: {:?}", &sorted_topk[sorted_topk.len().saturating_sub(5)..]);
 
     let rust_set: HashSet<i32> = topk_host.iter().copied().filter(|&v| v >= 0).collect();
     let oracle_set: HashSet<i32> = ORACLE_TOPK_SET.iter().copied().collect();
