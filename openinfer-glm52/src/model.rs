@@ -13,24 +13,25 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_batch, glm52_flashmla_sparse_decode_num_sm_parts,
+    Glm52IndexerCacheLayout, add_into, glm52_flashmla_sparse_decode_num_sm_parts,
 };
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
-use crate::bookend::{glm52_embed, glm52_final_norm, glm52_lm_head};
+use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
 use crate::config::{GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_LAYERS, GLM52_VOCAB};
-use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward};
+use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward_into};
 use crate::fp8::ProjWeight;
-use crate::indexer::Glm52IndexerLayerWeights;
+use crate::indexer::{Glm52IndexerLayerWeights, Glm52IndexerScratch};
 use crate::layer::{
     Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
     glm52_layer_attention_half, glm52_layer_finish,
 };
 use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
 use crate::moe_decode::{
-    Glm52MoeExpertBank, Glm52MoeExpertPath, Glm52MoeRouterWeights, Glm52MoeSharedExpert, run_router,
+    Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, run_router_into,
 };
 use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
 
 /// bs=1 bring-up context cap: `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
@@ -219,6 +220,7 @@ pub(crate) struct Glm52RankModel {
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
     token_id: CudaSlice<u32>,
+    scratch: Glm52DecodeScratch,
 }
 
 impl Glm52RankModel {
@@ -302,6 +304,12 @@ impl Glm52RankModel {
         ctx.stream.memcpy_htod(&cos_host, &mut cos_table)?;
         ctx.stream.memcpy_htod(&sin_host, &mut sin_table)?;
 
+        let mqa_shape = Glm52IndexerScratch::decode_shape(
+            index_cache_layout,
+            index_blocks,
+            NUM_SMS,
+            GLM52_MAX_MODEL_LEN,
+        );
         Ok(Self {
             layers,
             caches,
@@ -318,6 +326,7 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
             token_id: ctx.stream.alloc_zeros::<u32>(1)?,
+            scratch: Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?,
         })
     }
 
@@ -357,60 +366,63 @@ impl Glm52RankModel {
             slot_mapping: &self.slot_mapping,
             block_table: &self.block_table,
             seq_lens: &self.seq_lens,
-            num_sms: NUM_SMS,
-            max_model_len: GLM52_MAX_MODEL_LEN,
-            moe_path: Glm52MoeExpertPath::Grouped,
         };
 
-        let mut hidden = glm52_embed(ctx, &self.embed, &self.token_id)?.data;
-        let mut topk_carry: Option<CudaSlice<i32>> = None;
+        let s = &mut self.scratch;
+        glm52_embed_into(ctx, &self.embed, &self.token_id, &mut s.hidden)?;
+        let mut carry_ready = false;
         for (layer, (weights, cache)) in self.layers.iter().zip(self.caches.iter_mut()).enumerate()
         {
-            let boundary =
-                glm52_layer_attention_half(ctx, weights, cache, hidden, &step, &mut topk_carry)
-                    .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
-            let mlp = match &weights.mlp {
-                Glm52LayerMlp::Dense(dense) => {
-                    glm52_dense_mlp_forward(ctx, dense, &boundary.normed)?
-                }
+            glm52_layer_attention_half(ctx, weights, cache, &step, s, &mut carry_ready)
+                .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
+            match &weights.mlp {
+                Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
+                    ctx,
+                    dense,
+                    &s.layer.normed2,
+                    &mut s.proj,
+                    &mut s.dense_mlp,
+                    &mut s.layer.mlp_out,
+                )?,
                 Glm52LayerMlp::MoeEp8(moe) => {
-                    let route = run_router(ctx, &moe.router, &boundary.normed)?;
-                    let routed = glm52_moe_ep8_routed_forward(
+                    run_router_into(ctx, &moe.router, &s.layer.normed2, &mut s.router)?;
+                    let dispatched = glm52_moe_ep8_routed_forward(
                         ctx,
                         ep8,
                         &moe.bank,
-                        Some((&boundary.normed, &route)),
+                        Some((&s.layer.normed2, &s.router.route)),
                         GLM52_DECODE_GLOBAL_TOKENS,
                     )
-                    .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?
-                    .context("EP8 MoE returned no combined output for a dispatched token")?;
-                    let shared = moe.shared.forward(ctx, &boundary.normed)?;
-                    let routed_hs = HiddenStates {
-                        data: routed,
-                        hidden_dim: GLM52_HIDDEN,
-                        seq_len: 1,
-                    };
-                    let shared_hs = HiddenStates {
-                        data: shared,
-                        hidden_dim: GLM52_HIDDEN,
-                        seq_len: 1,
-                    };
-                    add_batch(ctx, &routed_hs, &shared_hs)?.data
+                    .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
+                    ensure!(
+                        dispatched,
+                        "EP8 MoE returned no combined output for a dispatched token"
+                    );
+                    moe.shared.forward_into(
+                        ctx,
+                        &s.layer.normed2,
+                        &mut s.proj,
+                        &mut s.shared_mlp,
+                        &mut s.layer.shared_out,
+                    )?;
+                    add_into(
+                        ctx,
+                        ep8.combined(),
+                        &s.layer.shared_out,
+                        GLM52_HIDDEN,
+                        &mut s.layer.mlp_out,
+                    )?;
                 }
                 Glm52LayerMlp::Moe(_) => {
                     anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
                 }
             };
-            hidden = glm52_layer_finish(ctx, boundary.residual, mlp)?;
+            glm52_layer_finish(ctx, s)?;
         }
 
-        let hidden_vec = DeviceVec {
-            data: hidden,
-            len: GLM52_HIDDEN,
-        };
-        let normed = glm52_final_norm(ctx, &hidden_vec, &self.final_norm)?;
-        let logits = glm52_lm_head(ctx, &normed, &self.lm_head)?;
-        let logits_host = ctx.stream.clone_dtoh(&logits.data)?;
+        glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, &mut s.final_normed)?;
+        glm52_lm_head_into(ctx, &s.final_normed, &self.lm_head, &mut s.logits)?;
+        let logits_host = ctx.stream.clone_dtoh(&s.logits.data)?;
         greedy_argmax(&logits_host)
     }
 }

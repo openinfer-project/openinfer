@@ -43,7 +43,9 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear};
+#[cfg(test)]
+use crate::fp8::fp8_linear;
+use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, fp8_linear_into};
 
 const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;
@@ -192,6 +194,7 @@ fn upcast_bf16_to_f32(ctx: &DeviceContext, src: &[u8]) -> Result<CudaSlice<f32>>
 /// topk query. Does NOT compute logits or topk — only wk + LayerNorm + RoPE(k)
 /// + quant + cache-write.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn glm52_indexer_cache_fill(
     ctx: &DeviceContext,
     w: &Glm52IndexerLayerWeights,
@@ -231,8 +234,84 @@ pub(crate) fn glm52_indexer_cache_fill(
     Ok(())
 }
 
+/// Persistent scratch for the DSA indexer forward: every intermediate plus
+/// the DeepGEMM MQA logits shape (fixed at build — batch 1, fixed paged
+/// layout and logits stride). `global_slots` doubles as the cross-layer
+/// top-k carry: a full-indexer layer writes it, the following shared layers
+/// read it until the next full layer overwrites it.
+pub(crate) struct Glm52IndexerScratch {
+    shape: Glm52DeepGemmMqaLogitsShape,
+    q: CudaSlice<bf16>,
+    k_raw: CudaSlice<bf16>,
+    k: CudaSlice<bf16>,
+    weights_bf16: CudaSlice<bf16>,
+    q_fp8: CudaSlice<u8>,
+    q_scale: CudaSlice<f32>,
+    weights_folded: CudaSlice<f32>,
+    schedule_meta: CudaSlice<i32>,
+    context_lens: CudaSlice<i32>,
+    logits: CudaSlice<u8>,
+    logits_f32: CudaSlice<f32>,
+    topk_offsets: CudaSlice<i32>,
+    topk_values: CudaSlice<f32>,
+    pub(crate) global_slots: CudaSlice<i32>,
+    topk_lens: CudaSlice<i32>,
+}
+
+impl Glm52IndexerScratch {
+    pub(crate) fn new(ctx: &DeviceContext, shape: Glm52DeepGemmMqaLogitsShape) -> Result<Self> {
+        let logits_elems = shape.batch_size * shape.next_n * shape.logits_stride;
+        Ok(Self {
+            q: ctx
+                .stream
+                .alloc_zeros::<bf16>(INDEX_HEADS * INDEX_HEAD_DIM)?,
+            k_raw: ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?,
+            k: ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?,
+            weights_bf16: ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS)?,
+            q_fp8: ctx.stream.alloc_zeros::<u8>(INDEX_HEADS * INDEX_HEAD_DIM)?,
+            q_scale: ctx.stream.alloc_zeros::<f32>(INDEX_HEADS)?,
+            weights_folded: ctx.stream.alloc_zeros::<f32>(INDEX_HEADS)?,
+            schedule_meta: ctx
+                .stream
+                .alloc_zeros::<i32>(shape.schedule_metadata_len())?,
+            context_lens: ctx.stream.alloc_zeros::<i32>(1)?,
+            logits: ctx.stream.alloc_zeros::<u8>(logits_elems * 2)?, // bf16
+            logits_f32: ctx.stream.alloc_zeros::<f32>(logits_elems)?,
+            topk_offsets: ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?,
+            topk_values: ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?,
+            global_slots: ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?,
+            topk_lens: ctx.stream.alloc_zeros::<i32>(1)?,
+            shape,
+        })
+    }
+
+    /// The build-time MQA logits shape for a decode step: bs=1, next_n=1,
+    /// the paged index-K cache layout, and the fixed logits stride.
+    pub(crate) fn decode_shape(
+        cache_layout: Glm52IndexerCacheLayout,
+        block_table_stride: usize,
+        num_sms: usize,
+        max_model_len: usize,
+    ) -> Glm52DeepGemmMqaLogitsShape {
+        Glm52DeepGemmMqaLogitsShape {
+            batch_size: 1,
+            next_n: 1,
+            num_heads: INDEX_HEADS,
+            head_dim: GLM52_INDEXER_HEAD_DIM,
+            num_kv_blocks: cache_layout.cache_blocks,
+            block_kv: cache_layout.cache_block_size,
+            kv_cache_stride_bytes: cache_layout.cache_block_stride_bytes,
+            is_context_lens_2d: false,
+            is_varlen: false,
+            logits_stride: max_model_len.next_multiple_of(256),
+            block_table_stride,
+            num_sms,
+        }
+    }
+}
+
 /// DSA indexer decode forward for one token (bs=1): computes sparse top-k
-/// slot indices for the FlashMLA sparse decode.
+/// slot indices for the FlashMLA sparse decode into `s.global_slots`.
 ///
 /// - `q_resid` is the MLA layer's q_a_layernorm output (`[2048]`).
 /// - `hidden` is the current token's hidden state (`[6144]`).
@@ -240,10 +319,190 @@ pub(crate) fn glm52_indexer_cache_fill(
 /// - `index_k_cache` is the paged fp8 indexer key cache (mutable — the new
 ///   token's k is quantized and written into it at `slot_mapping[0]`).
 /// - `block_table` / `seq_lens` describe the paged KV layout for logits +
-///   slot conversion.
+///   slot conversion; they must match the shape the scratch was built with.
 ///
-/// Returns `topk_indices[2048]` (i32, `-1`-padded for short context).
+/// `s.global_slots` ends as `topk_indices[2048]` (i32, `-1`-padded for short
+/// context).
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn glm52_indexer_forward_into(
+    ctx: &DeviceContext,
+    w: &Glm52IndexerLayerWeights,
+    hidden: &CudaSlice<bf16>,
+    q_resid: &CudaSlice<bf16>,
+    cos: &CudaSlice<bf16>,
+    sin: &CudaSlice<bf16>,
+    index_k_cache: &mut CudaSlice<u8>,
+    cache_layout: Glm52IndexerCacheLayout,
+    slot_mapping: &CudaSlice<i64>,
+    block_table: &CudaSlice<i32>,
+    seq_lens: &CudaSlice<i32>,
+    proj: &mut Glm52ProjScratch,
+    s: &mut Glm52IndexerScratch,
+) -> Result<()> {
+    ensure!(hidden.len() >= HIDDEN, "GLM5.2 indexer hidden too small");
+    ensure!(q_resid.len() >= Q_LORA, "GLM5.2 indexer q_resid too small");
+    let shape = s.shape;
+    ensure!(
+        shape.num_kv_blocks == cache_layout.cache_blocks
+            && shape.block_kv == cache_layout.cache_block_size
+            && shape.kv_cache_stride_bytes == cache_layout.cache_block_stride_bytes
+            && shape.block_table_stride == block_table.len(),
+        "GLM5.2 indexer scratch shape drifted from the step's cache layout"
+    );
+
+    // ---- projections ----
+    fp8_linear_into(ctx, &w.wq_b, q_resid, proj, &mut s.q)?; // [32*128 = 4096]
+    fp8_linear_into(ctx, &w.wk, hidden, proj, &mut s.k_raw)?; // [128]
+    // weights_proj: bf16 GEMM (transformers keeps weights_proj in fp32 via
+    // _keep_in_fp32_modules; checkpoint stores bf16, so bf16 GEMM is the
+    // closest match without a dedicated f32 GEMM path).
+    // cuBLAS column-major: weights [32, 6144] row-major = [6144, 32]^T,
+    // hidden [6144] = [6144, 1]. So m=32, n=1, k=6144, op_a=T, op_b=N.
+    gemm_strided_batched_bf16(
+        ctx,
+        true,        // transpose_a: weights [32, 6144] row-major → col-major
+        false,       // transpose_b: hidden [6144, 1] col-major
+        INDEX_HEADS, // m = 32
+        1,           // n = 1 (bs=1)
+        HIDDEN,      // k = 6144
+        &w.weights_proj,
+        HIDDEN, // lda = k (row stride of transposed weights)
+        0,      // stride_a (batch=1, unused)
+        hidden,
+        HIDDEN, // ldb = k
+        0,      // stride_b
+        &mut s.weights_bf16,
+        INDEX_HEADS, // ldc = m
+        0,           // stride_c
+        1,           // batch
+    )?;
+    let weights_raw = ctx.stream.clone_dtoh(&s.weights_bf16)?;
+
+    // ---- k LayerNorm (eps=1e-6, with bias) ----
+    layer_norm_into(
+        ctx,
+        &s.k_raw,
+        &w.k_norm_w,
+        &w.k_norm_b,
+        K_NORM_EPS,
+        &mut s.k,
+    )?;
+
+    // ---- interleave RoPE (q[:64] per head, k[:64]) ----
+    glm52_indexer_rope_launch(ctx, &mut s.q, &mut s.k, INDEX_HEADS, cos, sin)?;
+
+    // ---- q per-token-group fp8 quant ----
+    // q is [32, 128] flattened; quant per 128-group (one group per head).
+    glm52_fp8_per_token_group_quant_bf16_launch(
+        ctx,
+        Glm52MoeQuantShape {
+            rows: INDEX_HEADS,
+            width: INDEX_HEAD_DIM,
+            group_size: FP8_BLOCK,
+        },
+        &s.q,
+        &mut s.q_fp8,
+        &mut s.q_scale,
+    )?;
+
+    // ---- weights fold: weights * q_scale * softmax_scale * n_heads^-0.5 ----
+    // 32 elements — host-side math is cheaper than a kernel launch.
+    let q_scale_host = ctx.stream.clone_dtoh(&s.q_scale)?;
+    let mut weights_folded = vec![0.0f32; INDEX_HEADS];
+    for h in 0..INDEX_HEADS {
+        weights_folded[h] =
+            weights_raw[h].to_f32() * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
+    }
+    ctx.stream
+        .memcpy_htod(&weights_folded, &mut s.weights_folded)?;
+
+    // ---- k quant + cache write ----
+    glm52_indexer_k_quant_and_cache_launch(
+        ctx,
+        Glm52IndexerCacheInsert {
+            tokens: 1,
+            layout: cache_layout,
+            scale_format: Glm52IndexerScaleFormat::F32,
+        },
+        &s.k,
+        index_k_cache,
+        slot_mapping,
+    )?;
+
+    // ---- DeepGEMM paged MQA logits ----
+    // The indexer cache layout interleaves fp8 keys and f32 scales per block:
+    //   [block_size * 128 fp8][block_size * 4 f32 scale] per block.
+    // DeepGEMM reads both from this single buffer — the TMA descriptors
+    // use kv_cache_stride_bytes to jump over the scale region between blocks,
+    // and the scales pointer is computed as kv_cache + block_kv * head_dim.
+    // (Matches vllm's decode-path API — no separate scales buffer needed.)
+    ctx.stream
+        .memcpy_dtod(&seq_lens.slice(0..1), &mut s.context_lens)?;
+    glm52_deepgemm_paged_mqa_metadata_launch(
+        ctx,
+        shape,
+        &mut s.context_lens,
+        &mut s.schedule_meta,
+        None,
+    )?;
+
+    // kv_cache_scales are embedded in the interleaved cache buffer — the CUDA
+    // wrapper computes the scales pointer internally from kv_cache + offset.
+    // No separate scales allocation needed.
+    glm52_deepgemm_paged_mqa_logits_launch(
+        ctx,
+        shape,
+        &s.q_fp8,
+        index_k_cache,
+        &s.weights_folded,
+        &s.context_lens,
+        &mut s.logits,
+        block_table,
+        None,
+        &mut s.schedule_meta,
+    )?;
+
+    // DeepGEMM outputs bf16 logits; FlashInfer top-k expects f32.
+    // The sm90 kernel already fuses per-head ReLU (fmaxf(score, 0) * weight)
+    // matching transformers' F.relu(scores) — no extra ReLU needed here.
+    bf16_bytes_to_f32_into(ctx, &s.logits, &mut s.logits_f32)?;
+
+    glm52_flashinfer_topk_2048_launch(
+        ctx,
+        Glm52IndexerTopK {
+            num_rows: 1,
+            top_k: GLM52_INDEXER_TOPK,
+            max_len: shape.logits_stride,
+        },
+        &s.logits_f32,
+        &s.context_lens,
+        &mut s.topk_offsets,
+        &mut s.topk_values,
+    )?;
+
+    // ---- local top-k offsets -> global KV slots ----
+    glm52_indexer_local_topk_to_slots_launch(
+        ctx,
+        Glm52IndexerLocalTopKToSlots {
+            num_tokens: 1,
+            topk: GLM52_INDEXER_TOPK,
+            block_size: cache_layout.cache_block_size,
+            block_table_cols: block_table.len(),
+        },
+        &s.topk_offsets,
+        &s.context_lens,
+        block_table,
+        &mut s.global_slots,
+        &mut s.topk_lens,
+    )?;
+
+    Ok(())
+}
+
+/// Allocating convenience over [`glm52_indexer_forward_into`] for the
+/// oracle-gate/test paths. Returns `topk_indices[2048]` (i32, `-1`-padded).
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn glm52_indexer_forward(
     ctx: &DeviceContext,
     w: &Glm52IndexerLayerWeights,
@@ -259,178 +518,24 @@ pub(crate) fn glm52_indexer_forward(
     num_sms: usize,
     max_model_len: usize,
 ) -> Result<CudaSlice<i32>> {
-    ensure!(hidden.len() >= HIDDEN, "GLM5.2 indexer hidden too small");
-    ensure!(q_resid.len() >= Q_LORA, "GLM5.2 indexer q_resid too small");
-
-    // ---- projections ----
-    let q = fp8_linear(ctx, &w.wq_b, q_resid)?; // [32*128 = 4096]
-    let k_raw = fp8_linear(ctx, &w.wk, hidden)?; // [128]
-    // weights_proj: bf16 GEMM (transformers keeps weights_proj in fp32 via
-    // _keep_in_fp32_modules; checkpoint stores bf16, so bf16 GEMM is the
-    // closest match without a dedicated f32 GEMM path).
-    // cuBLAS column-major: weights [32, 6144] row-major = [6144, 32]^T,
-    // hidden [6144] = [6144, 1]. So m=32, n=1, k=6144, op_a=T, op_b=N.
-    let mut weights_out_bf16 = ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS)?;
-    gemm_strided_batched_bf16(
+    let shape =
+        Glm52IndexerScratch::decode_shape(cache_layout, block_table.len(), num_sms, max_model_len);
+    let mut proj = Glm52ProjScratch::new(ctx, HIDDEN)?;
+    let mut s = Glm52IndexerScratch::new(ctx, shape)?;
+    glm52_indexer_forward_into(
         ctx,
-        true,        // transpose_a: weights [32, 6144] row-major → col-major
-        false,       // transpose_b: hidden [6144, 1] col-major
-        INDEX_HEADS, // m = 32
-        1,           // n = 1 (bs=1)
-        HIDDEN,      // k = 6144
-        &w.weights_proj,
-        HIDDEN, // lda = k (row stride of transposed weights)
-        0,      // stride_a (batch=1, unused)
+        w,
         hidden,
-        HIDDEN, // ldb = k
-        0,      // stride_b
-        &mut weights_out_bf16,
-        INDEX_HEADS, // ldc = m
-        0,           // stride_c
-        1,           // batch
-    )?;
-    let weights_raw = ctx.stream.clone_dtoh(&weights_out_bf16)?;
-
-    // ---- k LayerNorm (eps=1e-6, with bias) ----
-    let mut k = ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?;
-    layer_norm_into(ctx, &k_raw, &w.k_norm_w, &w.k_norm_b, K_NORM_EPS, &mut k)?;
-
-    // ---- interleave RoPE (q[:64] per head, k[:64]) ----
-    let mut q = q; // mut for in-place RoPE
-    glm52_indexer_rope_launch(ctx, &mut q, &mut k, INDEX_HEADS, cos, sin)?;
-
-    // ---- q per-token-group fp8 quant ----
-    // q is [32, 128] flattened; quant per 128-group (one group per head).
-    let mut q_fp8 = ctx.stream.alloc_zeros::<u8>(INDEX_HEADS * INDEX_HEAD_DIM)?;
-    let mut q_scale = ctx.stream.alloc_zeros::<f32>(INDEX_HEADS)?;
-    glm52_fp8_per_token_group_quant_bf16_launch(
-        ctx,
-        Glm52MoeQuantShape {
-            rows: INDEX_HEADS,
-            width: INDEX_HEAD_DIM,
-            group_size: FP8_BLOCK,
-        },
-        &q,
-        &mut q_fp8,
-        &mut q_scale,
-    )?;
-
-    // ---- weights fold: weights * q_scale * softmax_scale * n_heads^-0.5 ----
-    // 32 elements — host-side math is cheaper than a kernel launch.
-    let q_scale_host = ctx.stream.clone_dtoh(&q_scale)?;
-    let mut weights_folded = vec![0.0f32; INDEX_HEADS];
-    for h in 0..INDEX_HEADS {
-        weights_folded[h] =
-            weights_raw[h].to_f32() * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
-    }
-    let mut weights_out = ctx.stream.alloc_zeros::<f32>(INDEX_HEADS)?;
-    ctx.stream.memcpy_htod(&weights_folded, &mut weights_out)?;
-
-    // ---- k quant + cache write ----
-    glm52_indexer_k_quant_and_cache_launch(
-        ctx,
-        Glm52IndexerCacheInsert {
-            tokens: 1,
-            layout: cache_layout,
-            scale_format: Glm52IndexerScaleFormat::F32,
-        },
-        &k,
+        q_resid,
+        cos,
+        sin,
         index_k_cache,
+        cache_layout,
         slot_mapping,
-    )?;
-
-    // ---- DeepGEMM paged MQA logits ----
-    // The indexer cache layout interleaves fp8 keys and f32 scales per block:
-    //   [block_size * 128 fp8][block_size * 4 f32 scale] per block.
-    // DeepGEMM reads both from this single buffer — the TMA descriptors
-    // use kv_cache_stride_bytes to jump over the scale region between blocks,
-    // and the scales pointer is computed as kv_cache + block_kv * head_dim.
-    // (Matches vllm's decode-path API — no separate scales buffer needed.)
-    let shape = Glm52DeepGemmMqaLogitsShape {
-        batch_size: 1,
-        next_n: 1,
-        num_heads: INDEX_HEADS,
-        head_dim: GLM52_INDEXER_HEAD_DIM,
-        num_kv_blocks: cache_layout.cache_blocks,
-        block_kv: cache_layout.cache_block_size,
-        kv_cache_stride_bytes: cache_layout.cache_block_stride_bytes,
-        is_context_lens_2d: false,
-        is_varlen: false,
-        logits_stride: max_model_len.next_multiple_of(256),
-        block_table_stride: block_table.len(),
-        num_sms,
-    };
-    let mut schedule_meta = ctx
-        .stream
-        .alloc_zeros::<i32>(shape.schedule_metadata_len())?;
-    let mut context_lens = ctx.stream.alloc_zeros::<i32>(1)?;
-    ctx.stream
-        .memcpy_dtod(&seq_lens.slice(0..1), &mut context_lens)?;
-    glm52_deepgemm_paged_mqa_metadata_launch(
-        ctx,
-        shape,
-        &mut context_lens,
-        &mut schedule_meta,
-        None,
-    )?;
-
-    // kv_cache_scales are embedded in the interleaved cache buffer — the CUDA
-    // wrapper computes the scales pointer internally from kv_cache + offset.
-    // No separate scales allocation needed.
-
-    let logits_elems = shape.batch_size * shape.next_n * shape.logits_stride;
-    let mut logits = ctx.stream.alloc_zeros::<u8>(logits_elems * 2)?; // bf16
-    glm52_deepgemm_paged_mqa_logits_launch(
-        ctx,
-        shape,
-        &q_fp8,
-        index_k_cache,
-        &weights_out,
-        &context_lens,
-        &mut logits,
         block_table,
-        None,
-        &mut schedule_meta,
+        seq_lens,
+        &mut proj,
+        &mut s,
     )?;
-
-    // DeepGEMM outputs bf16 logits; FlashInfer top-k expects f32.
-    // The sm90 kernel already fuses per-head ReLU (fmaxf(score, 0) * weight)
-    // matching transformers' F.relu(scores) — no extra ReLU needed here.
-    let mut logits_f32 = ctx.stream.alloc_zeros::<f32>(logits_elems)?;
-    bf16_bytes_to_f32_into(ctx, &logits, &mut logits_f32)?;
-
-    let mut topk_offsets = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
-    let mut topk_values = ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?;
-    glm52_flashinfer_topk_2048_launch(
-        ctx,
-        Glm52IndexerTopK {
-            num_rows: 1,
-            top_k: GLM52_INDEXER_TOPK,
-            max_len: shape.logits_stride,
-        },
-        &logits_f32,
-        &context_lens,
-        &mut topk_offsets,
-        &mut topk_values,
-    )?;
-
-    // ---- local top-k offsets -> global KV slots ----
-    let mut global_slots = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
-    let mut topk_lens = ctx.stream.alloc_zeros::<i32>(1)?;
-    glm52_indexer_local_topk_to_slots_launch(
-        ctx,
-        Glm52IndexerLocalTopKToSlots {
-            num_tokens: 1,
-            topk: GLM52_INDEXER_TOPK,
-            block_size: cache_layout.cache_block_size,
-            block_table_cols: block_table.len(),
-        },
-        &topk_offsets,
-        &context_lens,
-        block_table,
-        &mut global_slots,
-        &mut topk_lens,
-    )?;
-
-    Ok(global_slots)
+    Ok(s.global_slots)
 }

@@ -42,6 +42,41 @@ pub fn add_batch_into(
     Ok(())
 }
 
+/// Element-wise add of `n` bf16 elements into a pre-allocated output
+/// (`out = a + b`). Slice-level twin of [`add_batch_into`] — same kernel —
+/// for callers whose buffers live in a persistent decode arena rather than
+/// owned `HiddenStates`.
+pub fn add_into(
+    ctx: &DeviceContext,
+    a: &CudaSlice<half::bf16>,
+    b: &CudaSlice<half::bf16>,
+    n: usize,
+    out: &mut CudaSlice<half::bf16>,
+) -> Result<()> {
+    if a.len() < n || b.len() < n || out.len() < n {
+        return Err(anyhow!(
+            "add_into buffers too small for n={n}: a {}, b {}, out {}",
+            a.len(),
+            b.len(),
+            out.len()
+        ));
+    }
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::add_cuda(
+            a_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// In-place scaled add into a row range of `out`: out[row_offset..] += scale * delta.
 pub fn scaled_add_rows_into(
     ctx: &DeviceContext,

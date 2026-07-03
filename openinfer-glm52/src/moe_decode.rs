@@ -27,20 +27,28 @@
 use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
+#[cfg(test)]
+use openinfer_kernels::ops::add_batch;
 use openinfer_kernels::ops::{
     GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, GLM52_GEMV_KIND_W2, GLM52_GEMV_KIND_W13,
     Glm52MoeQuantShape, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
     Glm52TrtllmGroupedFp8Contract, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
-    add_batch, glm52_deepgemm_grouped_offset_tma_aligned_f32_launch,
+    glm52_deepgemm_grouped_offset_tma_aligned_f32_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_moe_combine_launch,
     glm52_moe_combine_slots_launch, glm52_moe_fp8_weight_only_gemv_launch,
     glm52_moe_route_offsets_launch, glm52_moe_route_scatter_launch, glm52_router_noaux_tc_launch,
     glm52_silu_and_mul_weighted_bf16_launch,
     glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch, glm52_trtllm_grouped_fp8_launch,
 };
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
+use openinfer_kernels::tensor::DeviceContext;
+#[cfg(test)]
+use openinfer_kernels::tensor::HiddenStates;
 
-use crate::fp8::{Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp};
+#[cfg(test)]
+use crate::fp8::fp8_mlp;
+use crate::fp8::{
+    Glm52MlpScratch, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, bytes_to_f32, fp8_mlp_into,
+};
 
 pub(crate) const HIDDEN: usize = 6144;
 pub(crate) const EXPERTS: usize = 256;
@@ -128,6 +136,7 @@ impl Glm52MoeSharedExpert {
     }
 
     /// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP.
+    #[cfg(test)]
     pub(crate) fn forward(
         &self,
         ctx: &DeviceContext,
@@ -135,7 +144,33 @@ impl Glm52MoeSharedExpert {
     ) -> Result<CudaSlice<bf16>> {
         fp8_mlp(ctx, &self.gate, &self.up, &self.down, normed_hidden)
     }
+
+    /// [`Self::forward`] into a pre-allocated output through persistent
+    /// scratch (the decode path). `mlp` must be sized for the shared-expert
+    /// intermediate (2048).
+    pub(crate) fn forward_into(
+        &self,
+        ctx: &DeviceContext,
+        normed_hidden: &CudaSlice<bf16>,
+        proj: &mut Glm52ProjScratch,
+        mlp: &mut Glm52MlpScratch,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        fp8_mlp_into(
+            ctx,
+            &self.gate,
+            &self.up,
+            &self.down,
+            normed_hidden,
+            proj,
+            mlp,
+            out,
+        )
+    }
 }
+
+/// The shared-expert intermediate width (sizes the decode mlp scratch).
+pub(crate) const GLM52_SHARED_EXPERT_INTERMEDIATE: usize = INTERMEDIATE;
 
 /// A bank of routed experts in the expert-major packed layout: fp8 weights
 /// `[n_experts, n, k]` + f32 block scales `[n_experts, n/128, k/128]`, per
@@ -320,18 +355,36 @@ pub(crate) struct RoutedTopk {
     pub(crate) topk_weight: CudaSlice<f32>,
 }
 
-pub(crate) fn run_router(
+/// Persistent router scratch for the decode path: the expert logits plus the
+/// top-k output the MoE dispatch consumes, written in place every MoE layer.
+pub(crate) struct Glm52RouterScratch {
+    logits: CudaSlice<f32>,
+    pub(crate) route: RoutedTopk,
+}
+
+impl Glm52RouterScratch {
+    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+        Ok(Self {
+            logits: ctx.stream.alloc_zeros::<f32>(EXPERTS)?,
+            route: RoutedTopk {
+                topk_idx: ctx.stream.alloc_zeros::<i32>(TOPK)?,
+                topk_weight: ctx.stream.alloc_zeros::<f32>(TOPK)?,
+            },
+        })
+    }
+}
+
+/// Router for one token into the persistent scratch (`s.route` holds the
+/// result).
+pub(crate) fn run_router_into(
     ctx: &DeviceContext,
     router: &Glm52MoeRouterWeights,
     normed_hidden: &CudaSlice<bf16>,
-) -> Result<RoutedTopk> {
-    let stream = &ctx.stream;
-    let mut logits = stream.alloc_zeros::<f32>(EXPERTS)?;
-    let mut topk_idx = stream.alloc_zeros::<i32>(TOPK)?;
-    let mut topk_weight = stream.alloc_zeros::<f32>(TOPK)?;
+    s: &mut Glm52RouterScratch,
+) -> Result<()> {
     let mut router_out = Glm52RouterOutput {
-        topk_weight: &mut topk_weight,
-        topk_idx: &mut topk_idx,
+        topk_weight: &mut s.route.topk_weight,
+        topk_idx: &mut s.route.topk_idx,
     };
     glm52_router_noaux_tc_launch(
         ctx,
@@ -343,13 +396,23 @@ pub(crate) fn run_router(
         normed_hidden,
         &router.gate_weight,
         &router.e_score_bias,
-        &mut logits,
+        &mut s.logits,
         &mut router_out,
     )?;
-    Ok(RoutedTopk {
-        topk_idx,
-        topk_weight,
-    })
+    Ok(())
+}
+
+/// Allocating convenience over [`run_router_into`] for the oracle-gate/test
+/// paths.
+#[cfg(test)]
+pub(crate) fn run_router(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+) -> Result<RoutedTopk> {
+    let mut s = Glm52RouterScratch::new(ctx)?;
+    run_router_into(ctx, router, normed_hidden, &mut s)?;
+    Ok(s.route)
 }
 
 /// Routed contribution via the DeepEP-shaped grouped FP8 GEMM chain.
@@ -537,6 +600,7 @@ fn routed_forward_gemv(
 /// post-attention-layernorm hidden `[HIDDEN]`; returns the routed output
 /// `[HIDDEN]` (route weight + routed_scaling already folded in). The shared
 /// expert is added by `glm52_moe_forward`.
+#[cfg(test)]
 pub(crate) fn glm52_moe_routed_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,
@@ -564,6 +628,7 @@ pub(crate) fn glm52_moe_routed_forward(
 
 /// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP
 /// (intermediate 2048). Returns `[HIDDEN]` bf16.
+#[cfg(test)]
 pub(crate) fn glm52_moe_shared_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,
@@ -574,6 +639,7 @@ pub(crate) fn glm52_moe_shared_forward(
 
 /// Full MoE contribution for a single token: routed experts + shared expert. The
 /// caller adds this to the post-attention residual. Returns `[HIDDEN]` bf16.
+#[cfg(test)]
 pub(crate) fn glm52_moe_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,

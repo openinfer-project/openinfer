@@ -82,6 +82,10 @@ pub(crate) struct Glm52MoeEp8State {
     w2_act_scale: CudaSlice<f32>,
     w2_scale_tma: CudaSlice<f32>,
     expert_out: CudaSlice<bf16>,
+    /// The combined routed output for this rank's (single) source token,
+    /// rewritten by every `glm52_moe_ep8_routed_forward` call. Persistent so
+    /// the whole chain is allocation-free (pointer-stable for graph capture).
+    combined: CudaSlice<bf16>,
 }
 
 impl Glm52MoeEp8State {
@@ -137,17 +141,26 @@ impl Glm52MoeEp8State {
             w2_act_scale: ctx.stream.alloc_zeros(expanded * W2_SCALE_COLS)?,
             w2_scale_tma: ctx.stream.alloc_zeros(w2_scale_tma_len)?,
             expert_out: ctx.stream.alloc_zeros(expanded * W2_N)?,
+            combined: ctx.stream.alloc_zeros(HIDDEN)?,
         })
+    }
+
+    /// The routed output written by the last `glm52_moe_ep8_routed_forward`
+    /// call that dispatched a token (valid only when that call returned
+    /// `true`).
+    pub(crate) fn combined(&self) -> &CudaSlice<bf16> {
+        &self.combined
     }
 }
 
 /// One EP8 MoE layer's routed contribution — a collective every rank must
 /// enter simultaneously per layer. A rank with a token passes its
-/// post-attention normed hidden + router output and gets back
-/// `Some(routed[HIDDEN])` (route weight and ×2.5 scaling already folded); a
-/// token-less rank passes `None` and gets `None`. The DP8 production path
-/// always passes `Some` (idle ranks step a padding token); `None` survives
-/// for the EP8 layer oracle gate's single-dispatcher replay.
+/// post-attention normed hidden + router output; on `Ok(true)` the routed
+/// output `[HIDDEN]` (route weight and ×2.5 scaling already folded) is in
+/// `state.combined()`. A token-less rank passes `None` and gets `Ok(false)`.
+/// The DP8 production path always passes `Some` (idle ranks step a padding
+/// token); `None` survives for the EP8 layer oracle gate's single-dispatcher
+/// replay.
 ///
 /// `global_tokens` is the total token count dispatched across ALL ranks this
 /// step — every rank must pass the same value (a protocol constant of the
@@ -165,14 +178,13 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     bank: &Glm52MoeExpertBank,
     token: Option<(&CudaSlice<bf16>, &RoutedTopk)>,
     global_tokens: usize,
-) -> Result<Option<CudaSlice<bf16>>> {
+) -> Result<bool> {
     let n_local = state.info.num_local_experts as usize;
     ensure!(
         bank.n_experts() == n_local,
         "GLM5.2 EP8 MoE needs the {n_local}-expert rank-local bank, got {}",
         bank.n_experts()
     );
-    let stream = &ctx.stream;
     let expanded = state.info.decode_worst_expanded_tokens as usize;
     let num_tokens = usize::from(token.is_some());
     ensure!(
@@ -286,10 +298,9 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         &mut state.expert_out,
     )?;
 
-    // Collective combine: weighted expert outputs → per-source-token sums.
-    // `combined` is the one per-call allocation left: it is returned by value
-    // to the caller (12 KiB at bs=1 — not worth an ownership dance).
-    let mut combined = stream.alloc_zeros::<bf16>(num_tokens.max(1) * HIDDEN)?;
+    // Collective combine: weighted expert outputs → per-source-token sums,
+    // into the persistent `combined` buffer (`num_tokens` is 0 or 1, and the
+    // buffer holds one HIDDEN row).
     let topk_idx = match token {
         Some((_, route)) => &route.topk_idx,
         None => &state.zero_topk_idx,
@@ -301,8 +312,8 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         &state.recv_src_metadata,
         topk_idx,
         num_tokens,
-        &mut combined,
+        &mut state.combined,
     )?;
 
-    Ok(token.map(|_| combined))
+    Ok(token.is_some())
 }

@@ -10,10 +10,13 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{Glm52ProjBytes, ProjWeight, fp8_mlp};
+use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, fp8_mlp_into};
 
 const HIDDEN: usize = 6144;
 const INTERMEDIATE: usize = 12288;
+
+/// The dense-layer intermediate width (sizes the shared decode mlp scratch).
+pub(crate) const GLM52_DENSE_INTERMEDIATE: usize = INTERMEDIATE;
 
 /// The three fp8 projections of one dense MLP layer, resident on device.
 pub(crate) struct Glm52DenseMlpWeights {
@@ -68,19 +71,26 @@ impl Glm52DenseMlpWeights {
     }
 }
 
-/// Dense MLP contribution for a single token. `normed_hidden` is the
-/// post-attention-layernorm hidden `[HIDDEN]`; returns the MLP output `[HIDDEN]`
-/// (the caller adds it to the post-attention residual).
-pub(crate) fn glm52_dense_mlp_forward(
+/// Dense MLP contribution for a single token into a pre-allocated output.
+/// `normed_hidden` is the post-attention-layernorm hidden `[HIDDEN]`; `out`
+/// gets the MLP output `[HIDDEN]` (the caller adds it to the post-attention
+/// residual). `mlp` must be sized for the dense intermediate (12288).
+pub(crate) fn glm52_dense_mlp_forward_into(
     ctx: &DeviceContext,
     weights: &Glm52DenseMlpWeights,
     normed_hidden: &CudaSlice<bf16>,
-) -> Result<CudaSlice<bf16>> {
-    fp8_mlp(
+    proj: &mut Glm52ProjScratch,
+    mlp: &mut Glm52MlpScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    fp8_mlp_into(
         ctx,
         &weights.gate,
         &weights.up,
         &weights.down,
         normed_hidden,
+        proj,
+        mlp,
+        out,
     )
 }

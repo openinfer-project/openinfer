@@ -114,22 +114,57 @@ impl ProjWeight {
     }
 }
 
-/// One fp8 projection (bs=1): quant the bf16 activation, then the prequant linear.
-/// Returns `[n]` bf16.
-pub(crate) fn fp8_linear(
+/// Persistent per-projection scratch (bs=1): the fp8 activation, its plain
+/// per-group scale, and the TRTLLM col-major relaid scale. One instance is
+/// shared by EVERY `fp8_linear_into` call site in a decode step — safe because
+/// each consumer reads exactly the prefix its own producer wrote in the same
+/// call, and the relayout pad rows (never written by any call) keep their
+/// zero initialization.
+pub(crate) struct Glm52ProjScratch {
+    a_fp8: CudaSlice<u8>,
+    a_scale_plain: CudaSlice<f32>,
+    a_scale: CudaSlice<f32>,
+    max_k: usize,
+}
+
+impl Glm52ProjScratch {
+    pub(crate) fn new(ctx: &DeviceContext, max_k: usize) -> Result<Self> {
+        ensure!(
+            max_k.is_multiple_of(FP8_BLOCK),
+            "GLM5.2 proj scratch max_k {max_k} not a multiple of {FP8_BLOCK}"
+        );
+        let scale_cols = max_k / FP8_BLOCK;
+        let layout = Glm52DeepGemmScaleLayout::f32(1, scale_cols);
+        Ok(Self {
+            a_fp8: ctx.stream.alloc_zeros::<u8>(max_k)?,
+            a_scale_plain: ctx.stream.alloc_zeros::<f32>(scale_cols)?,
+            a_scale: ctx.stream.alloc_zeros::<f32>(layout.output_len()?)?,
+            max_k,
+        })
+    }
+}
+
+/// One fp8 projection (bs=1) into a pre-allocated output: quant the bf16
+/// activation into the scratch, then the prequant linear.
+pub(crate) fn fp8_linear_into(
     ctx: &DeviceContext,
     w: &ProjWeight,
     input: &CudaSlice<bf16>,
-) -> Result<CudaSlice<bf16>> {
+    s: &mut Glm52ProjScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
     ensure!(
         input.len() >= w.k,
         "GLM5.2 fp8_linear input {} < k {}",
         input.len(),
         w.k
     );
-    let scale_cols = w.k / FP8_BLOCK;
-    let mut a_fp8 = ctx.stream.alloc_zeros::<u8>(w.k)?;
-    let mut a_scale_plain = ctx.stream.alloc_zeros::<f32>(scale_cols)?;
+    ensure!(
+        w.k <= s.max_k,
+        "GLM5.2 proj scratch sized for k <= {} but projection has k {}",
+        s.max_k,
+        w.k
+    );
     glm52_fp8_per_token_group_quant_bf16_launch(
         ctx,
         Glm52MoeQuantShape {
@@ -138,22 +173,24 @@ pub(crate) fn fp8_linear(
             group_size: FP8_BLOCK,
         },
         input,
-        &mut a_fp8,
-        &mut a_scale_plain,
+        &mut s.a_fp8,
+        &mut s.a_scale_plain,
     )?;
-    fp8_linear_prequant(ctx, w, &a_fp8, &a_scale_plain)
+    fp8_linear_prequant_into(ctx, w, &s.a_fp8, &s.a_scale_plain, &mut s.a_scale, out)
 }
 
 /// One fp8 projection (bs=1) from a pre-quantized activation: relay the plain
-/// per-group activation scale into the TRTLLM col-major TMA layout, then the
-/// blockscale linear. Used when the input is already fp8 (e.g. the SwiGLU output
-/// feeding a down projection). Returns `[n]` bf16.
-pub(crate) fn fp8_linear_prequant(
+/// per-group activation scale into the TRTLLM col-major TMA layout (via the
+/// `a_scale` scratch), then the blockscale linear. Used when the input is
+/// already fp8 (e.g. the SwiGLU output feeding a down projection).
+pub(crate) fn fp8_linear_prequant_into(
     ctx: &DeviceContext,
     w: &ProjWeight,
     a_fp8: &CudaSlice<u8>,
     a_scale_plain: &CudaSlice<f32>,
-) -> Result<CudaSlice<bf16>> {
+    a_scale: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
     let scale_cols = w.k / FP8_BLOCK;
     ensure!(
         a_fp8.len() >= w.k && a_scale_plain.len() >= scale_cols,
@@ -162,10 +199,20 @@ pub(crate) fn fp8_linear_prequant(
         w.k,
         a_scale_plain.len()
     );
+    ensure!(
+        out.len() >= w.n,
+        "GLM5.2 fp8_linear output {} < n {}",
+        out.len(),
+        w.n
+    );
     let layout = Glm52DeepGemmScaleLayout::f32(1, scale_cols);
-    let mut a_scale = ctx.stream.alloc_zeros::<f32>(layout.output_len()?)?;
-    glm52_deepgemm_mn_major_tma_aligned_f32_launch(ctx, layout, a_scale_plain, &mut a_scale)?;
-    let mut out = ctx.stream.alloc_zeros::<bf16>(w.n)?;
+    ensure!(
+        a_scale.len() >= layout.output_len()?,
+        "GLM5.2 fp8_linear a_scale scratch {} < relaid layout {}",
+        a_scale.len(),
+        layout.output_len()?
+    );
+    glm52_deepgemm_mn_major_tma_aligned_f32_launch(ctx, layout, a_scale_plain, a_scale)?;
     glm52_trtllm_fp8_linear_launch(
         ctx,
         Glm52TrtllmFp8LinearContract {
@@ -177,25 +224,71 @@ pub(crate) fn fp8_linear_prequant(
             activation_scale_cols: scale_cols,
         },
         a_fp8,
-        &a_scale,
+        a_scale,
         &w.weight,
         &w.scale,
-        &mut out,
+        out,
     )?;
+    Ok(())
+}
+
+/// Allocating convenience over [`fp8_linear_into`] for the oracle-gate/test
+/// paths. Returns `[n]` bf16.
+#[cfg(test)]
+pub(crate) fn fp8_linear(
+    ctx: &DeviceContext,
+    w: &ProjWeight,
+    input: &CudaSlice<bf16>,
+) -> Result<CudaSlice<bf16>> {
+    let mut s = Glm52ProjScratch::new(ctx, w.k)?;
+    let mut out = ctx.stream.alloc_zeros::<bf16>(w.n)?;
+    fp8_linear_into(ctx, w, input, &mut s, &mut out)?;
     Ok(out)
 }
 
-/// A plain fp8 SwiGLU MLP for one token (bs=1): `down(silu(gate(h)) * up(h))`, with
-/// SEPARATE gate/up projections (the GLM5.2 dense layer and the MoE shared expert
-/// both use this shape -- only the intermediate size differs, derived here from the
-/// weights). Returns `[down.n]` bf16 (= `[HIDDEN]`).
-pub(crate) fn fp8_mlp(
+/// Persistent scratch for one fp8 SwiGLU MLP shape. Sized to an exact
+/// `intermediate` (the dense MLP and the MoE shared expert differ — 12288 vs
+/// 2048 — and each gets its own instance so a cross-wiring crashes here).
+pub(crate) struct Glm52MlpScratch {
+    intermediate: usize,
+    gate_out: CudaSlice<bf16>,
+    up_out: CudaSlice<bf16>,
+    gate_up: CudaSlice<bf16>,
+    w_act: CudaSlice<u8>,
+    w_act_scale: CudaSlice<f32>,
+}
+
+impl Glm52MlpScratch {
+    pub(crate) fn new(ctx: &DeviceContext, intermediate: usize) -> Result<Self> {
+        ensure!(
+            intermediate.is_multiple_of(FP8_BLOCK),
+            "GLM5.2 fp8_mlp intermediate {intermediate} not a multiple of {FP8_BLOCK}"
+        );
+        Ok(Self {
+            intermediate,
+            gate_out: ctx.stream.alloc_zeros::<bf16>(intermediate)?,
+            up_out: ctx.stream.alloc_zeros::<bf16>(intermediate)?,
+            gate_up: ctx.stream.alloc_zeros::<bf16>(2 * intermediate)?,
+            w_act: ctx.stream.alloc_zeros::<u8>(intermediate)?,
+            w_act_scale: ctx.stream.alloc_zeros::<f32>(intermediate / FP8_BLOCK)?,
+        })
+    }
+}
+
+/// A plain fp8 SwiGLU MLP for one token (bs=1) into a pre-allocated output:
+/// `down(silu(gate(h)) * up(h))`, with SEPARATE gate/up projections (the
+/// GLM5.2 dense layer and the MoE shared expert both use this shape -- only
+/// the intermediate size differs). `out` is `[down.n]` bf16 (= `[HIDDEN]`).
+pub(crate) fn fp8_mlp_into(
     ctx: &DeviceContext,
     gate: &ProjWeight,
     up: &ProjWeight,
     down: &ProjWeight,
     input: &CudaSlice<bf16>,
-) -> Result<CudaSlice<bf16>> {
+    proj: &mut Glm52ProjScratch,
+    s: &mut Glm52MlpScratch,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
     let intermediate = gate.n;
     ensure!(
         up.n == intermediate && down.k == intermediate && gate.k == up.k && gate.k == down.n,
@@ -208,23 +301,21 @@ pub(crate) fn fp8_mlp(
         down.k
     );
     ensure!(
-        intermediate.is_multiple_of(FP8_BLOCK),
-        "GLM5.2 fp8_mlp intermediate {intermediate} not a multiple of {FP8_BLOCK}"
+        s.intermediate == intermediate,
+        "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
+        s.intermediate
     );
-    let gate_out = fp8_linear(ctx, gate, input)?; // [intermediate]
-    let up_out = fp8_linear(ctx, up, input)?; // [intermediate]
+    fp8_linear_into(ctx, gate, input, proj, &mut s.gate_out)?;
+    fp8_linear_into(ctx, up, input, proj, &mut s.up_out)?;
 
     // Concatenate gate|up (gate first half) for the fused SwiGLU.
-    let mut gate_up = ctx.stream.alloc_zeros::<bf16>(2 * intermediate)?;
     ctx.stream
-        .memcpy_dtod(&gate_out, &mut gate_up.slice_mut(0..intermediate))?;
+        .memcpy_dtod(&s.gate_out, &mut s.gate_up.slice_mut(0..intermediate))?;
     ctx.stream.memcpy_dtod(
-        &up_out,
-        &mut gate_up.slice_mut(intermediate..2 * intermediate),
+        &s.up_out,
+        &mut s.gate_up.slice_mut(intermediate..2 * intermediate),
     )?;
 
-    let mut w_act = ctx.stream.alloc_zeros::<u8>(intermediate)?;
-    let mut w_act_scale = ctx.stream.alloc_zeros::<f32>(intermediate / FP8_BLOCK)?;
     glm52_silu_and_mul_per_token_group_quant_bf16_launch(
         ctx,
         Glm52MoeQuantShape {
@@ -232,9 +323,26 @@ pub(crate) fn fp8_mlp(
             width: intermediate,
             group_size: FP8_BLOCK,
         },
-        &gate_up,
-        &mut w_act,
-        &mut w_act_scale,
+        &s.gate_up,
+        &mut s.w_act,
+        &mut s.w_act_scale,
     )?;
-    fp8_linear_prequant(ctx, down, &w_act, &w_act_scale)
+    fp8_linear_prequant_into(ctx, down, &s.w_act, &s.w_act_scale, &mut proj.a_scale, out)
+}
+
+/// Allocating convenience over [`fp8_mlp_into`] for the oracle-gate/test
+/// paths. Returns `[down.n]` bf16 (= `[HIDDEN]`).
+#[cfg(test)]
+pub(crate) fn fp8_mlp(
+    ctx: &DeviceContext,
+    gate: &ProjWeight,
+    up: &ProjWeight,
+    down: &ProjWeight,
+    input: &CudaSlice<bf16>,
+) -> Result<CudaSlice<bf16>> {
+    let mut proj = Glm52ProjScratch::new(ctx, gate.k.max(down.k))?;
+    let mut s = Glm52MlpScratch::new(ctx, gate.n)?;
+    let mut out = ctx.stream.alloc_zeros::<bf16>(down.n)?;
+    fp8_mlp_into(ctx, gate, up, down, input, &mut proj, &mut s, &mut out)?;
+    Ok(out)
 }

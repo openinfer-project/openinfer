@@ -25,17 +25,22 @@ use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    Glm52IndexerCacheLayout, add_batch, fused_add_rms_norm_round_batch_into, rms_norm_into,
+    Glm52IndexerCacheLayout, add_into, fused_add_rms_norm_round_into, rms_norm_into,
 };
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
-use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward};
-use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward};
+use crate::dense::Glm52DenseMlpWeights;
+#[cfg(test)]
+use crate::dense::glm52_dense_mlp_forward_into;
+use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward_into};
 use crate::mla_decode::{
-    Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend, glm52_mla_front,
+    Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend_into, glm52_mla_front_into,
 };
-use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, glm52_moe_forward};
+use crate::moe_decode::Glm52MoeLayerWeights;
+#[cfg(test)]
+use crate::moe_decode::{Glm52MoeExpertPath, glm52_moe_forward};
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
+use crate::scratch::Glm52DecodeScratch;
 
 const HIDDEN: usize = 6144;
 const RMS_EPS: f32 = 1.0e-5;
@@ -94,84 +99,76 @@ pub(crate) struct Glm52DecodeStep<'a> {
     pub(crate) slot_mapping: &'a CudaSlice<i64>,
     pub(crate) block_table: &'a CudaSlice<i32>,
     pub(crate) seq_lens: &'a CudaSlice<i32>,
-    pub(crate) num_sms: usize,
-    pub(crate) max_model_len: usize,
-    pub(crate) moe_path: Glm52MoeExpertPath,
 }
 
-/// `rms_norm(residual, gamma)` without consuming the residual stream.
-fn rms(ctx: &DeviceContext, residual: &DeviceVec, gamma: &DeviceVec) -> Result<CudaSlice<bf16>> {
-    let mut out = DeviceVec::zeros(ctx, HIDDEN)?;
-    rms_norm_into(ctx, residual, gamma, RMS_EPS, &mut out)?;
-    Ok(out.data)
+/// Persistent per-layer composition scratch: the residual-stream boundary
+/// buffers shared by all 78 layers (layer N's values are dead once layer N's
+/// closing add consumed them).
+pub(crate) struct Glm52LayerScratch {
+    /// input_layernorm output — the MLA/indexer input.
+    pub(crate) normed: DeviceVec,
+    /// attention output; after the fused post-attention add it carries the
+    /// residual stream for the MLP half.
+    pub(crate) attn: CudaSlice<bf16>,
+    /// post_attention_layernorm output — the MLP input.
+    pub(crate) normed2: CudaSlice<bf16>,
+    /// the MLP half's final contribution (dense out, or routed+shared sum).
+    pub(crate) mlp_out: CudaSlice<bf16>,
+    /// MoE shared-expert contribution.
+    pub(crate) shared_out: CudaSlice<bf16>,
 }
 
-/// `residual + delta`, consuming both (the residual stream moves forward).
-fn residual_add(
-    ctx: &DeviceContext,
-    residual: DeviceVec,
-    delta: CudaSlice<bf16>,
-) -> Result<DeviceVec> {
-    let a = HiddenStates {
-        data: residual.data,
-        hidden_dim: HIDDEN,
-        seq_len: 1,
-    };
-    let b = HiddenStates {
-        data: delta,
-        hidden_dim: HIDDEN,
-        seq_len: 1,
-    };
-    Ok(DeviceVec {
-        data: add_batch(ctx, &a, &b)?.data,
-        len: HIDDEN,
-    })
-}
-
-/// The post-attention layer boundary: the carried residual stream and the
-/// post-attention-layernorm output the MLP half consumes.
-pub(crate) struct Glm52PostAttnBoundary {
-    pub(crate) residual: DeviceVec,
-    pub(crate) normed: CudaSlice<bf16>,
+impl Glm52LayerScratch {
+    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+        Ok(Self {
+            normed: DeviceVec::zeros(ctx, HIDDEN)?,
+            attn: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+            normed2: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+            mlp_out: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+            shared_out: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+        })
+    }
 }
 
 /// The attention half of one decoder layer for one token: input norm → MLA
 /// front → DSA indexer (or shared top-k carry) → MLA attend → fused
-/// add+post-attention-norm. `hidden` is the residual-stream input `[HIDDEN]`
-/// (consumed). `topk_carry` threads the cross-layer top-k: a `Full` layer
-/// replaces it, a `Shared` layer requires it.
+/// add+post-attention-norm. The residual-stream input is `s.hidden`; the
+/// results land in `s.layer.attn` (the carried residual) and `s.layer.normed2`
+/// (the MLP input).
 ///
-/// The carry is only meaningful WITHIN one decode step: callers must pass a
-/// fresh `None` per step (layer 0 is always `Full`, so an in-order full-stack
-/// walk refreshes it before any read — but a `Some` left over from a previous
-/// step would be silently accepted if a walk started at a `Shared` layer).
+/// The cross-layer top-k carry lives in `s.idx.global_slots`: a `Full` layer
+/// overwrites it, a `Shared` layer reuses it. `carry_ready` guards the read —
+/// callers must pass a fresh `false` per step (layer 0 is always `Full`, so an
+/// in-order full-stack walk refreshes the carry before any read, but a stale
+/// buffer from a previous step must not be silently accepted if a walk started
+/// at a `Shared` layer).
 pub(crate) fn glm52_layer_attention_half(
     ctx: &DeviceContext,
     w: &Glm52DecoderLayerWeights,
     caches: &mut Glm52LayerCaches,
-    hidden: CudaSlice<bf16>,
     step: &Glm52DecodeStep<'_>,
-    topk_carry: &mut Option<CudaSlice<i32>>,
-) -> Result<Glm52PostAttnBoundary> {
-    ensure!(hidden.len() >= HIDDEN, "GLM5.2 layer hidden too small");
-    let residual = DeviceVec {
-        data: hidden,
-        len: HIDDEN,
-    };
-
-    let normed = rms(ctx, &residual, &w.input_ln)?;
-    let front = glm52_mla_front(ctx, &w.mla, &normed)?;
+    s: &mut Glm52DecodeScratch,
+    carry_ready: &mut bool,
+) -> Result<()> {
+    rms_norm_into(ctx, &s.hidden, &w.input_ln, RMS_EPS, &mut s.layer.normed)?;
+    glm52_mla_front_into(
+        ctx,
+        &w.mla,
+        &s.layer.normed.data,
+        &mut s.proj,
+        &mut s.mla_front,
+    )?;
     match &w.indexer {
         Glm52LayerIndexer::Full(indexer) => {
             let index_k_cache = caches
                 .index_k_cache
                 .as_mut()
                 .context("GLM5.2 full-indexer layer is missing its index-K cache")?;
-            let topk = glm52_indexer_forward(
+            glm52_indexer_forward_into(
                 ctx,
                 indexer,
-                &normed,
-                &front.q_resid,
+                &s.layer.normed.data,
+                &s.mla_front.q_resid.data,
                 step.idx_cos,
                 step.idx_sin,
                 index_k_cache,
@@ -179,10 +176,10 @@ pub(crate) fn glm52_layer_attention_half(
                 step.slot_mapping,
                 step.block_table,
                 step.seq_lens,
-                step.num_sms,
-                step.max_model_len,
+                &mut s.proj,
+                &mut s.idx,
             )?;
-            *topk_carry = Some(topk);
+            *carry_ready = true;
         }
         Glm52LayerIndexer::Shared => {
             ensure!(
@@ -191,84 +188,88 @@ pub(crate) fn glm52_layer_attention_half(
             );
         }
     }
-    let topk = topk_carry
-        .as_ref()
-        .context("GLM5.2 shared-indexer layer reached before any full indexer ran")?;
-    let attn = glm52_mla_attend(
+    ensure!(
+        *carry_ready,
+        "GLM5.2 shared-indexer layer reached before any full indexer ran"
+    );
+    glm52_mla_attend_into(
         ctx,
         &w.mla,
-        &front,
+        &s.mla_front,
         step.mla_cos,
         step.mla_sin,
         &mut caches.mla_cache,
         step.position,
-        topk,
+        &s.idx.global_slots,
         step.mla_sched,
+        &mut s.proj,
+        &mut s.mla_attend,
+        &mut s.layer.attn,
     )?;
 
     // Fused add+norm at the post-attention boundary (bit-identical to separate
     // add + rms_norm — the `_round` variant rounds the sum to bf16 before the
-    // variance, exactly like add_batch would). The input_layernorm boundary
+    // variance, exactly like the plain add would). The input_layernorm boundary
     // spans layers and stays unfused in this single-layer unit.
-    let mut attn_hs = HiddenStates {
-        data: attn,
-        hidden_dim: HIDDEN,
-        seq_len: 1,
-    };
-    let residual_hs = HiddenStates {
-        data: residual.data,
-        hidden_dim: HIDDEN,
-        seq_len: 1,
-    };
-    let mut normed_hs = HiddenStates {
-        data: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
-        hidden_dim: HIDDEN,
-        seq_len: 1,
-    };
-    fused_add_rms_norm_round_batch_into(
+    fused_add_rms_norm_round_into(
         ctx,
-        &mut attn_hs,
-        &residual_hs,
+        &mut s.layer.attn,
+        &s.hidden.data,
         &w.post_attn_ln,
         RMS_EPS,
-        &mut normed_hs,
+        HIDDEN,
+        1,
+        &mut s.layer.normed2,
     )?;
-    Ok(Glm52PostAttnBoundary {
-        residual: DeviceVec {
-            data: attn_hs.data,
-            len: HIDDEN,
-        },
-        normed: normed_hs.data,
-    })
+    Ok(())
 }
 
-/// The layer's closing residual add: `residual + mlp_out`, both consumed.
-pub(crate) fn glm52_layer_finish(
-    ctx: &DeviceContext,
-    residual: DeviceVec,
-    mlp: CudaSlice<bf16>,
-) -> Result<CudaSlice<bf16>> {
-    Ok(residual_add(ctx, residual, mlp)?.data)
+/// The layer's closing residual add: `s.hidden = s.layer.attn + s.layer.mlp_out`
+/// — the residual stream moves forward into the next layer's input.
+pub(crate) fn glm52_layer_finish(ctx: &DeviceContext, s: &mut Glm52DecodeScratch) -> Result<()> {
+    add_into(
+        ctx,
+        &s.layer.attn,
+        &s.layer.mlp_out,
+        HIDDEN,
+        &mut s.hidden.data,
+    )
 }
 
-/// One full decoder layer for one token (attention half + local MLP half).
-/// EP8 rank-0 MoE layers must go through the collective driver in `moe_ep8`
-/// instead — this single-layer path fails closed on them.
+/// One full decoder layer for one token (attention half + local MLP half),
+/// `s.hidden` → `s.hidden`. EP8 rank MoE layers must go through the
+/// collective driver in `moe_ep8` instead — this single-layer path fails
+/// closed on them. Oracle-gate path (the production spine drives the halves
+/// directly in `model.rs`).
+#[cfg(test)]
 pub(crate) fn glm52_decoder_layer_forward(
     ctx: &DeviceContext,
     w: &Glm52DecoderLayerWeights,
     caches: &mut Glm52LayerCaches,
-    hidden: CudaSlice<bf16>,
     step: &Glm52DecodeStep<'_>,
-    topk_carry: &mut Option<CudaSlice<i32>>,
-) -> Result<CudaSlice<bf16>> {
-    let boundary = glm52_layer_attention_half(ctx, w, caches, hidden, step, topk_carry)?;
-    let mlp = match &w.mlp {
-        Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward(ctx, dense, &boundary.normed)?,
-        Glm52LayerMlp::Moe(moe) => glm52_moe_forward(ctx, moe, &boundary.normed, step.moe_path)?,
+    moe_path: Glm52MoeExpertPath,
+    s: &mut Glm52DecodeScratch,
+    carry_ready: &mut bool,
+) -> Result<()> {
+    glm52_layer_attention_half(ctx, w, caches, step, s, carry_ready)?;
+    match &w.mlp {
+        Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
+            ctx,
+            dense,
+            &s.layer.normed2,
+            &mut s.proj,
+            &mut s.dense_mlp,
+            &mut s.layer.mlp_out,
+        )?,
+        Glm52LayerMlp::Moe(moe) => {
+            // EP1 oracle path: the all-256-expert forward allocates internally;
+            // relay its output into the layer scratch.
+            let mlp = glm52_moe_forward(ctx, moe, &s.layer.normed2, moe_path)?;
+            ctx.stream.memcpy_dtod(&mlp, &mut s.layer.mlp_out)?;
+        }
         Glm52LayerMlp::MoeEp8(_) => anyhow::bail!(
             "GLM5.2 EP8 MoE layers require the collective driver (moe_ep8), not the single-layer forward"
         ),
     };
-    glm52_layer_finish(ctx, boundary.residual, mlp)
+    glm52_layer_finish(ctx, s)
 }
