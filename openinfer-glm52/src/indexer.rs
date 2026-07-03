@@ -139,16 +139,21 @@ fn quant_and_pad_weights_proj(ctx: &DeviceContext, bf16_bytes: &[u8]) -> Result<
     let scale_cols = k.div_ceil(FP8_BLOCK); // 48
     let mut scales = vec![0.0f32; scale_rows * scale_cols];
 
-    for row in 0..n_orig {
-        for col_group in 0..scale_cols {
-            let start = col_group * FP8_BLOCK;
-            let end = (start + FP8_BLOCK).min(k);
-            let mut amax = 0.0f32;
+    // The TRTLLM fp8 format has scale shape [n/128, k/128] = [1, 48].
+    // All 32 original rows must share a single scale per 128-element column
+    // group. Use the max amax across all rows to avoid clipping.
+    for col_group in 0..scale_cols {
+        let start = col_group * FP8_BLOCK;
+        let end = (start + FP8_BLOCK).min(k);
+        let mut amax = 0.0f32;
+        for row in 0..n_orig {
             for j in start..end {
                 amax = amax.max(bf16_vals[row * k + j].to_f32().abs());
             }
-            let scale = amax.max(1e-4) / 448.0;
-            scales[col_group] = scale;
+        }
+        let scale = amax.max(1e-4) / 448.0;
+        scales[col_group] = scale;
+        for row in 0..n_orig {
             for j in start..end {
                 let val = bf16_vals[row * k + j].to_f32();
                 let q = (val / scale).clamp(-448.0, 448.0);
