@@ -28,7 +28,7 @@
 | pegaflow | PR #381 | `MetaServerClient::flush()` 屏障（送达或丢弃语义）+ `PegaEngine::flush_saves_and_registrations` + `P2pTransferService`（3 个 P2P RPC + Health 的最小嵌入服务面）+ `logging::init` 改 `try_apply`（宿主已装 logger 时不再 panic——库嵌入形态才触发）+ cudarc 0.19.7 floor |
 | openinfer | `feat/pd-pegaflow-p2p` | kv-offload：`P2pConfig` + 嵌入 tonic 服务（bind 先行 fail-fast）+ 60s GC（transfer lock + stale prefetch 双清扫）+ `QueryOutcome::Loading` + flush 5s deadline（`flush_saves_then` 异步屏障，`Finished` 延迟释放，scheduler 不阻塞）；qwen3：prefetch 三相状态机（`RemoteFetch`/`Loading`/`Committed`，15s 超时退化）+ `reserve_floor` 穿透重查询路径 + `flush_on_finish`；server：`--kv-p2p-{metaserver-addr,advertise-addr,nics,flush-on-finish}` |
 
-pegaflow-core 暂为 path dep（`../../pegaflow/pegaflow-core`），#381 合入后按 §5.2 惯例 re-pin git rev。
+pegaflow #381 已合入 master（squash 为 `d46fd16`，含 router `max_completion_tokens` 修复），`pegaflow-core` 已按 §5.2 惯例 pin 到该 git rev。
 
 ## 3. 验收数据（单机 2×H200，2026-07）
 

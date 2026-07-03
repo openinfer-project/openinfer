@@ -6,17 +6,15 @@ edition = "2024"
 
 [dependencies]
 # Embedded in-process: pegaflow-core is the host/SSD/RDMA KV offload tier.
-# TEMPORARY path dep for P/D P2P co-development: the metaserver flush barrier
-# and the embeddable P2pTransferService live on pegaflow branch
-# feat/metaserver-flush-barrier. Re-pin to a git rev once that lands on
-# pegaflow master (workflow documented in
-# docs/subsystems/runtime/pegaflow-offload-integration.md §5.2).
-# default-features=false drops its `cuda-12` (which would pull a clashing
-# cudarc/cuda-12080 selector); the workspace cudarc already provides
+# Pinned to the upstream master rev that landed PR #381 (metaserver flush
+# barrier + embeddable P2pTransferService + router max_completion_tokens cap)
+# per the workflow in docs/subsystems/runtime/pegaflow-offload-integration.md
+# §5.2. default-features=false drops its `cuda-12` (which would pull a
+# clashing cudarc/cuda-12080 selector); the workspace cudarc already provides
 # cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
 # pegaflow-transfer. `rdma` enables pegaflow-transfer: cross-node block fetch
 # (RDMA READ) + MetaServer discovery — the P/D disaggregation data plane.
-pegaflow-core = { path = "../../pegaflow/pegaflow-core", default-features = false, features = ["rdma"] }
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "d46fd1653154f3f895ff23e995b6efbf4e3e1e9a", default-features = false, features = ["rdma"] }
 openinfer-kv-cache = { workspace = true }
 cudarc = { workspace = true }
 anyhow = { workspace = true }
