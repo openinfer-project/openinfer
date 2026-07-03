@@ -57,11 +57,11 @@ const K_NORM_EPS: f32 = 1.0e-6;
 
 /// One DSA indexer layer's weights, device-resident.
 pub(crate) struct Glm52IndexerLayerWeights {
-    wq_b: ProjWeight,             // [32*128, 2048]
-    wk: ProjWeight,               // [128, 6144]
+    wq_b: ProjWeight,              // [32*128, 2048]
+    wk: ProjWeight,                // [128, 6144]
     weights_proj: CudaSlice<bf16>, // [32, 6144] — bf16 GEMM (transformers _keep_in_fp32_modules)
-    k_norm_w: CudaSlice<f32>,     // [128] — LayerNorm gamma (f32 for FlashInfer)
-    k_norm_b: CudaSlice<f32>,     // [128] — LayerNorm beta  (f32 for FlashInfer)
+    k_norm_w: CudaSlice<f32>,      // [128] — LayerNorm gamma (f32 for FlashInfer)
+    k_norm_b: CudaSlice<f32>,      // [128] — LayerNorm beta  (f32 for FlashInfer)
 }
 
 impl Glm52IndexerLayerWeights {
@@ -164,14 +164,19 @@ pub(crate) fn glm52_indexer_cache_fill(
     cache_layout: Glm52IndexerCacheLayout,
     slot_mapping: &CudaSlice<i64>,
 ) -> Result<()> {
-    ensure!(hidden.len() >= HIDDEN, "GLM5.2 indexer cache_fill hidden too small");
+    ensure!(
+        hidden.len() >= HIDDEN,
+        "GLM5.2 indexer cache_fill hidden too small"
+    );
 
     let k_raw = fp8_linear(ctx, &w.wk, hidden)?; // [128]
     let mut k = ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?;
     layer_norm_into(ctx, &k_raw, &w.k_norm_w, &w.k_norm_b, K_NORM_EPS, &mut k)?;
 
     // RoPE: the kernel applies to both q and k; use a dummy q buffer.
-    let mut q_dummy = ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS * INDEX_HEAD_DIM)?;
+    let mut q_dummy = ctx
+        .stream
+        .alloc_zeros::<bf16>(INDEX_HEADS * INDEX_HEAD_DIM)?;
     glm52_indexer_rope_launch(ctx, &mut q_dummy, &mut k, INDEX_HEADS, cos, sin)?;
 
     glm52_indexer_k_quant_and_cache_launch(
@@ -230,17 +235,17 @@ pub(crate) fn glm52_indexer_forward(
     let mut weights_out_bf16 = ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS)?;
     gemm_strided_batched_bf16(
         ctx,
-        true,  // transpose_a: weights [32, 6144] row-major → col-major
-        false, // transpose_b: hidden [6144, 1] col-major
+        true,        // transpose_a: weights [32, 6144] row-major → col-major
+        false,       // transpose_b: hidden [6144, 1] col-major
         INDEX_HEADS, // m = 32
         1,           // n = 1 (bs=1)
-        HIDDEN,     // k = 6144
+        HIDDEN,      // k = 6144
         &w.weights_proj,
-        HIDDEN,     // lda = k (row stride of transposed weights)
-        0,           // stride_a (batch=1, unused)
+        HIDDEN, // lda = k (row stride of transposed weights)
+        0,      // stride_a (batch=1, unused)
         hidden,
-        HIDDEN,     // ldb = k
-        0,           // stride_b
+        HIDDEN, // ldb = k
+        0,      // stride_b
         &mut weights_out_bf16,
         INDEX_HEADS, // ldc = m
         0,           // stride_c

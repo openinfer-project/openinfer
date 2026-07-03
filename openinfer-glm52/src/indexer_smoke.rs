@@ -62,7 +62,12 @@ fn indexer_smoke() -> Result<()> {
     let k_norm_b = vec![0u8; INDEX_HEAD_DIM * 2]; // bf16
 
     let w = Glm52IndexerLayerWeights::from_host(
-        &ctx, &wq_b, &wk, &weights_proj_bf16, &k_norm_w, &k_norm_b,
+        &ctx,
+        &wq_b,
+        &wk,
+        &weights_proj_bf16,
+        &k_norm_w,
+        &k_norm_b,
     )?;
 
     // ---- inputs ----
