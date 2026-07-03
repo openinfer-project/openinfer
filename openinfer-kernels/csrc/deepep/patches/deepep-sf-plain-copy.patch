@@ -1,0 +1,47 @@
+diff --git a/deep_ep/include/deep_ep/impls/dispatch.cuh b/deep_ep/include/deep_ep/impls/dispatch.cuh
+index cf21a18..0aa55c4 100644
+--- a/deep_ep/include/deep_ep/impls/dispatch.cuh
++++ b/deep_ep/include/deep_ep/impls/dispatch.cuh
+@@ -285,23 +285,18 @@ dispatch_impl(
+             }
+             __syncwarp();
+ 
+-            // Issue SF TMA or cp.async
++            // Issue SF copy. Local patch (openinfer): plain per-lane
++            // loads/stores instead of cp.async — the cp.async/mbarrier
++            // arrival accounting hangs on this vendored snapshot (the send
++            // warp never observes the phase flip), and at ~192 B per token
++            // the SF segment does not need async staging. The `__syncwarp`
++            // orders the smem writes before the later `tma_store_fence`.
+             if constexpr (kNumSFPacks > 0) {
+                 EP_STATIC_ASSERT(sizeof(sf_pack_t) % 4 == 0, "Unaligned SF element type");
+                 const auto gmem_src_ptr = math::advance_ptr<sf_pack_t>(sf, token_i64_idx * sf_token_stride * sizeof(sf_pack_t));
+                 const auto smem_dst_ptr = tma_buffer.get_sf_ptr();
+-
+-                constexpr auto kNumFullIters = kNumSFPacks / 32;
+-                #pragma unroll
+-                for (int k = 0; k < kNumFullIters; ++ k) {
+-                    ptx::cp_async_ca(gmem_src_ptr + (k * 32 + lane_idx) * sf_hidden_stride,
+-                                     smem_dst_ptr + k * 32 + lane_idx);
+-                }
+-                if (kNumFullIters * 32 + lane_idx < kNumSFPacks) {
+-                    ptx::cp_async_ca(gmem_src_ptr + (kNumFullIters * 32 + lane_idx) * sf_hidden_stride,
+-                                     smem_dst_ptr + kNumFullIters * 32 + lane_idx);
+-                }
+-                ptx::cp_async_mbarrier_arrive(mbarrier_ptr);
++                for (int k = lane_idx; k < kNumSFPacks; k += 32)
++                    smem_dst_ptr[k] = gmem_src_ptr[k * sf_hidden_stride];
+                 __syncwarp();
+             }
+ 
+@@ -348,8 +343,10 @@ dispatch_impl(
+             // Wait TMA load arrival
+             // NOTES: this arrive must be after the `ptx::cp_async_mbarrier_arrive`
+             if (ptx::elect_one_sync()) {
++                printf("DBG r%d w%d t%d pre-arrive\n", rank_idx, dispatch_warp_idx, token_idx);
+                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
+                 ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
++                printf("DBG r%d w%d t%d post-wait\n", rank_idx, dispatch_warp_idx, token_idx);
+             }
+             __syncwarp();
+ 
