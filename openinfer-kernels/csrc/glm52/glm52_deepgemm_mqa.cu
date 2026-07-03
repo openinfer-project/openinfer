@@ -170,15 +170,16 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     try {
         const int next_n_atom = (is_varlen || next_n >= 2) ? 2 : 1;
 
-        // TMA descriptor for q: [batch_size * next_n * num_heads, head_dim]
+        // TMA descriptor for q: [batch_size * next_n * num_heads, head_dim] (2D)
         // gmem: inner=head_dim, outer=batch_size*next_n*num_heads
-        // smem: inner=next_n_atom*num_heads (overwritten by swizzle), outer=...
+        // smem: inner=head_dim, outer=next_n_atom*num_heads (must cover the
+        //   [kHeadDim, kNextN*kNumHeads] tile that tma::copy loads)
         // gmem_outer_stride = head_dim (row stride of q in elements)
         // swizzle_mode = head_dim (128)
         const auto tensor_map_q = deep_gemm::make_tma_2d_desc_raw(
             const_cast<void*>(q), q_elem_size, deep_gemm::DgDtype::Float8_e4m3,
             head_dim, batch_size * next_n * num_heads,
-            next_n_atom * num_heads, 1,
+            head_dim, next_n_atom * num_heads,
             head_dim,
             head_dim);
 

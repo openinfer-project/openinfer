@@ -66,13 +66,11 @@ impl Glm52DeepGemmMqaLogitsShape {
         Ok(())
     }
 
+    /// Size required by the SM90 metadata kernel: it writes
+    /// `[q_atom_idx, kv_split_idx]` for each SM (0..num_sms-1)
+    /// plus a sentinel `[end_q_atom_idx, 0]` at index `num_sms`.
     pub fn schedule_metadata_len(self) -> usize {
-        let aligned_bs = self.batch_size.div_ceil(32) * 32;
-        if self.is_varlen {
-            3 * aligned_bs + 1
-        } else {
-            aligned_bs
-        }
+        (self.num_sms + 1) * 2
     }
 }
 
