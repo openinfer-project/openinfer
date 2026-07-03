@@ -472,6 +472,7 @@ fn scheduler_loop(
                     &mut prefilling,
                     &mut graph_state,
                     &mut rng,
+                    dflash.as_mut(),
                 ),
                 ExecutionPlan::Prefill { pending } => prefill_batch(
                     &model,
@@ -709,6 +710,7 @@ fn unified_step_sched(
     prefilling: &mut Vec<PrefillingRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
+    mut dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let mut chunk = ScheduledChunk::from(scheduled);
     // Scope the borrows of `chunk` / `active` to the executor call so the error
@@ -747,7 +749,16 @@ fn unified_step_sched(
     // Process decode results FIRST (it may retire requests and free graph slots
     // that promotion then fills densely).
     if output.decoded {
-        process_decode_logits(model, active, graph_state, rng);
+        // Unified decode currently reuses the normal graph decode path, which does
+        // not capture hidden context for DFlash. Drop any active DFlash state before
+        // dispatch so a mixed prefill/decode step cannot leave a one-token gap in
+        // the drafter context.
+        if let Some(dflash) = dflash.as_mut() {
+            for req in active.iter() {
+                dflash.drop_request(req.local_id);
+            }
+        }
+        process_decode_logits(model, active, graph_state, rng, dflash);
     }
 
     let prefill_logits = output
@@ -903,7 +914,10 @@ fn decode_step_speculative(
     // Multi-active Qwen3.5 DFlash is enabled for greedy/logprobs-free rows once
     // each row has enough captured hidden context for the drafter.
     if active.iter().any(|req| {
-        req.logprobs != 0 || !req.params.is_greedy() || !dflash.ready_for_draft(req.local_id)
+        req.logprobs != 0
+            || !req.params.is_greedy()
+            || req.max_tokens.saturating_sub(req.generated_count) <= 1
+            || !dflash.ready_for_draft(req.local_id)
     }) {
         return false;
     }
@@ -1015,8 +1029,16 @@ fn execute_dflash_draft(
             }
             let block = &sampled[i * block_size..(i + 1) * block_size];
             let drafts = &block[drafts_start..];
+            // `accept_greedy` can commit one target bonus token beyond accepted
+            // drafts. Keep speculative verify disabled for the final output token
+            // so KV/recurrent state cannot advance past the completion budget.
+            let draft_budget = remaining.saturating_sub(1);
+            if draft_budget == 0 {
+                spans.push(vec![req.last_token]);
+                continue;
+            }
             let draft_limit =
-                dflash_verify_draft_limit(dflash, req.local_id, drafts.len()).min(remaining);
+                dflash_verify_draft_limit(dflash, req.local_id, drafts.len()).min(draft_budget);
             let mut span = Vec::with_capacity(drafts.len() + 1);
             span.push(req.last_token);
             span.extend(drafts.iter().take(draft_limit).copied());
@@ -1432,6 +1454,7 @@ fn process_decode_logits(
     active: &mut Vec<ActiveRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
+    dflash: Option<&mut DFlashSchedulerState>,
 ) {
     let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
     let cpu_logits = match snapshot_requested_logprobs(
@@ -1484,7 +1507,7 @@ fn process_decode_logits(
         })
         .collect();
 
-    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state, None);
+    dispatch_decode_tokens(model, active, &tokens, &logprobs_vec, graph_state, dflash);
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.

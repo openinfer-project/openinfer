@@ -88,3 +88,13 @@ Profiles used `nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node` and 
 - The performance table is in-process benchmark evidence. Do not read it as an HTTP serving pressure claim.
 - Single-concurrency random synthetic prompts remain flat to slightly slower. The multi-active path is the supported performance claim for this slice.
 - Multi-GPU, LoRA, KV offload, decode overlap, non-greedy sampling, and logprobs intentionally use normal decode or fail closed.
+
+## Remaining Risks And Follow-ups
+
+- No blocker-level implementation risk is known from the current local, GPU, benchmark, and profile evidence. Keep CI state and new reviewer comments as the final merge gate because they can change after the local evidence snapshot.
+- Single-request `c1` runs are flat to slightly slower (`-0.6%` to `-0.9%` in the benchmark table). DFlash should be described as a multi-active throughput path, not as an all-shape latency win.
+- Raw token-event ITL p99 can increase under short-prompt speculative decode because accepted spans emit multiple tokens in one scheduler step. Keep raw ITL visible next to effective TPOT and output throughput when reviewing tail latency.
+- The benchmark table is in-process serving evidence. A production-style HTTP pressure sweep remains useful before making broader OpenAI-compatible serving claims.
+- A few synthetic high-concurrency shapes are validated by the regret oracle or prefill-vs-decode boundary check instead of exact raw hash equality. This is covered by scheduler gates, but reviewer discussion should keep the oracle boundary explicit.
+- DFlash reserves extra memory for draft weights, draft KV/cache, verify buffers, and batch scratch. Near-window or near-memory requests may be admitted by baseline decode and rejected with DFlash enabled.
+- Unsupported modes remain intentional scope boundaries: tensor parallelism, LoRA, KV offload, decode overlap, non-greedy sampling, and logprobs use normal decode or fail closed.
