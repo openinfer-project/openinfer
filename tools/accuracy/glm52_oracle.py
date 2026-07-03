@@ -96,9 +96,9 @@ def splitmix64_uniform(seed: int, count: int) -> np.ndarray:
     return out
 
 
-def seeded_hidden(seed: int, ctx: int, hidden: int) -> torch.Tensor:
+def seeded_hidden(seed: int, ctx: int, hidden: int, scale: float = 1.0) -> torch.Tensor:
     u = splitmix64_uniform(seed, ctx * hidden)
-    x = ((u - 0.5) * 4.0).astype(np.float32)
+    x = ((u - 0.5) * 4.0 * scale).astype(np.float32)
     return torch.from_numpy(x).reshape(ctx, hidden).to(torch.bfloat16)
 
 
@@ -576,14 +576,24 @@ def emit_rust_layer(taps, args, versions: str) -> str:
     layers). The Rust gate replays the same input through
     `glm52_decoder_layer_forward` position by position and asserts `layer_out`.
 
-    Tolerance is scaled by the rms of the LAYER DELTA (layer_out - hidden), not
-    of layer_out itself: the residual stream passes through unchanged and
-    dominates layer_out's rms, so a delta-blind tolerance would let a broken
-    attn/MLP contribution hide under the residual passthrough."""
+    Two tolerance subtleties, both about the residual stream passing through
+    layer_out unchanged:
+    - the tolerance scales with the rms of the LAYER DELTA (layer_out -
+      hidden), not layer_out itself — otherwise a broken attn/MLP hides under
+      the residual passthrough;
+    - the input is scaled DOWN (`--input-scale`, ~0.02 for this stage) because
+      layer_out is stored bf16 at the *hidden's* magnitude: at scale 1 the
+      bf16 ulp (~0.4% of |hidden|) exceeds the entire layer delta and the
+      probes would be either flaky or toothless. rms_norm makes the delta
+      scale-invariant, so shrinking the input only improves the delta/ulp
+      ratio. The emitted tolerance is max(rel_tol * delta_rms, 3 * ulp)."""
     hidden = taps["hidden"]
     _, probes = sampled_probes(taps["layer_out"], args, "layer_out")
     delta = taps["layer_out"].to(torch.float32) - hidden.to(torch.float32)
     rms = float(delta.square().mean().sqrt())
+    hidden_rms = float(hidden.to(torch.float32).square().mean().sqrt())
+    ulp = hidden_rms * 2.0**-8
+    tol = max(args.rel_tol * rms, 3.0 * ulp)
     fault_banner = (
         f"// !!! FAULT-INJECTED ({args.inject_fault}) — negative control only, DO NOT COMMIT\n"
         if args.inject_fault != "none"
@@ -604,17 +614,18 @@ const ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
     return f"""\
 {fault_banner}// ---- BEGIN GENERATED: glm52_oracle layer probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
-//     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision} --stage layer
+//     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision} \\
+//     --stage layer --input-scale {args.input_scale}
 // {versions}
 const ORACLE_SEED: u64 = {args.seed:#x};
 const ORACLE_CTX: usize = {args.ctx};
 const ORACLE_LAYER: usize = {args.layer};
+const ORACLE_INPUT_SCALE: f64 = {args.input_scale};
 // sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
 const ORACLE_HIDDEN_DIGEST: &str = "{bf16_digest(hidden)}";
 // tap `layer_out` [{args.ctx}, 6144] bf16 digest={bf16_digest(taps["layer_out"])} (provenance only)
-// RMS below is of the layer DELTA (layer_out - hidden) — see emit_rust_layer.
-const ORACLE_LAYER_RMS: f32 = {rms:.9e};
-const ORACLE_LAYER_REL_TOL: f32 = {args.rel_tol};
+// tol = max(rel_tol {args.rel_tol} x delta_rms {rms:.3e}, 3 x bf16-ulp {ulp:.3e}) — see emit_rust_layer.
+const ORACLE_LAYER_TOL: f32 = {tol:.9e};
 const ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
 {probes},
 ];{router_block}
@@ -658,6 +669,9 @@ def main() -> int:
     p.add_argument("--out", type=Path, help="safetensors dump path")
     p.add_argument("--probes", type=int, default=64)
     p.add_argument("--rel-tol", type=float, default=0.05)
+    p.add_argument("--input-scale", type=float, default=None,
+                   help="seeded-input scale; defaults to 0.02 for --stage layer (see "
+                   "emit_rust_layer), 1.0 otherwise")
     p.add_argument("--inject-fault", choices=["none", "qb-head-negate", "rope-swap"], default="none")
     p.add_argument("--stage", choices=["mla", "indexer", "layer", "bookend"], default="mla",
                    help="mla: MLA o-probes. indexer: topk set for the overlap gate. "
@@ -672,7 +686,9 @@ def main() -> int:
     versions = f"transformers={transformers.__version__} torch={torch.__version__}"
     config = load_config(args.model_path)
     ckpt = Checkpoint(args.model_path)
-    hidden = seeded_hidden(args.seed, args.ctx, config.hidden_size)
+    if args.input_scale is None:
+        args.input_scale = 0.02 if args.stage == "layer" else 1.0
+    hidden = seeded_hidden(args.seed, args.ctx, config.hidden_size, args.input_scale)
 
     if args.stage == "layer":
         dl = build_decoder_layer(ckpt, config, args.layer, args.precision, args.inject_fault)

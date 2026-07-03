@@ -67,7 +67,7 @@ fn checkpoint_loads_dp1_ep8_weights() {
             Some((_, TokenEvent::Error { message, .. })) => {
                 panic!("GLM5.2 load-only engine returned error: {message}");
             }
-            Some((_, event)) => panic!("unexpected GLM5.2 load-only event: {event:?}"),
+            Some((_, _event)) => panic!("unexpected GLM5.2 load-only event kind"),
             None => panic!("GLM5.2 token channel closed before rejection"),
         }
     }

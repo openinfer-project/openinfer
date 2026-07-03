@@ -54,9 +54,9 @@ use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, Glm52MoeRouted
 const DENSE_ORACLE_SEED: u64 = 0x5eed_604d;
 const DENSE_ORACLE_CTX: usize = 200;
 const DENSE_ORACLE_LAYER: usize = 0;
+const DENSE_ORACLE_INPUT_SCALE: f64 = 0.02;
 const DENSE_ORACLE_HIDDEN_DIGEST: &str = "UNGENERATED";
-const DENSE_ORACLE_LAYER_RMS: f32 = 0.0;
-const DENSE_ORACLE_LAYER_REL_TOL: f32 = 0.05;
+const DENSE_ORACLE_LAYER_TOL: f32 = 0.0;
 const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
 // ---- END GENERATED ----
 
@@ -67,9 +67,9 @@ const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
 const MOE_ORACLE_SEED: u64 = 0x5eed_604d;
 const MOE_ORACLE_CTX: usize = 200;
 const MOE_ORACLE_LAYER: usize = 6;
+const MOE_ORACLE_INPUT_SCALE: f64 = 0.02;
 const MOE_ORACLE_HIDDEN_DIGEST: &str = "UNGENERATED";
-const MOE_ORACLE_LAYER_RMS: f32 = 0.0;
-const MOE_ORACLE_LAYER_REL_TOL: f32 = 0.05;
+const MOE_ORACLE_LAYER_TOL: f32 = 0.0;
 const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[];
 // Router selection of the LAST position (debugging reference when probes fail).
 const MOE_ORACLE_ROUTER_LAST: &[(i32, f32)] = &[];
@@ -87,8 +87,9 @@ const INDEX_HEAD_DIM: usize = 128;
 const INDEX_CACHE_BLOCK: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
 const NUM_SMS: usize = 132;
 
-/// Mirror of the Python splitmix64 generator (see `mla_oracle_gate`).
-fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
+/// Mirror of the Python splitmix64 generator (see `mla_oracle_gate`), with the
+/// layer stage's input scale applied in f64 exactly like the harness.
+fn seeded_hidden(seed: u64, count: usize, scale: f64) -> Vec<bf16> {
     (0..count)
         .map(|i| {
             let mut z = seed.wrapping_add((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -96,7 +97,7 @@ fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
             let u = (z >> 11) as f64 / (1u64 << 53) as f64;
-            bf16::from_f32(((u - 0.5) * 4.0) as f32)
+            bf16::from_f32(((u - 0.5) * 4.0 * scale) as f32)
         })
         .collect()
 }
@@ -339,12 +340,11 @@ fn run_layer_prefill(
     Ok(outputs)
 }
 
-fn assert_layer_probes(label: &str, outputs: &[f32], probes: &[(usize, f32)], rms: f32, tol: f32) {
+fn assert_layer_probes(label: &str, outputs: &[f32], probes: &[(usize, f32)], tol: f32) {
     assert!(
         !probes.is_empty(),
         "{label}: probe block is the ungenerated placeholder — run the harness and paste"
     );
-    let tol = tol * rms;
     let failures: Vec<_> = probes
         .iter()
         .filter(|&&(idx, expected)| (outputs[idx] - expected).abs() > tol)
@@ -372,8 +372,8 @@ fn model_path() -> PathBuf {
         .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from)
 }
 
-fn checked_hidden(seed: u64, ctxlen: usize, digest: &str) -> Result<Vec<bf16>> {
-    let hidden = seeded_hidden(seed, ctxlen * HIDDEN);
+fn checked_hidden(seed: u64, ctxlen: usize, scale: f64, digest: &str) -> Result<Vec<bf16>> {
+    let hidden = seeded_hidden(seed, ctxlen * HIDDEN, scale);
     let got = bf16_digest(&hidden);
     ensure!(
         got == digest,
@@ -388,6 +388,7 @@ fn layer_dense_oracle_gate() -> Result<()> {
     let hidden_host = checked_hidden(
         DENSE_ORACLE_SEED,
         DENSE_ORACLE_CTX,
+        DENSE_ORACLE_INPUT_SCALE,
         DENSE_ORACLE_HIDDEN_DIGEST,
     )?;
     let ctx = DeviceContext::new()?;
@@ -403,8 +404,7 @@ fn layer_dense_oracle_gate() -> Result<()> {
         "layer0/dense",
         &outputs,
         DENSE_ORACLE_LAYER_PROBES,
-        DENSE_ORACLE_LAYER_RMS,
-        DENSE_ORACLE_LAYER_REL_TOL,
+        DENSE_ORACLE_LAYER_TOL,
     );
     Ok(())
 }
@@ -412,7 +412,12 @@ fn layer_dense_oracle_gate() -> Result<()> {
 #[test]
 #[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
 fn layer_moe_oracle_gate() -> Result<()> {
-    let hidden_host = checked_hidden(MOE_ORACLE_SEED, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST)?;
+    let hidden_host = checked_hidden(
+        MOE_ORACLE_SEED,
+        MOE_ORACLE_CTX,
+        MOE_ORACLE_INPUT_SCALE,
+        MOE_ORACLE_HIDDEN_DIGEST,
+    )?;
     let ctx = DeviceContext::new()?;
     let w = load_decoder_layer(&ctx, &model_path(), MOE_ORACLE_LAYER, false)?;
 
@@ -427,8 +432,7 @@ fn layer_moe_oracle_gate() -> Result<()> {
             label,
             &outputs,
             MOE_ORACLE_LAYER_PROBES,
-            MOE_ORACLE_LAYER_RMS,
-            MOE_ORACLE_LAYER_REL_TOL,
+            MOE_ORACLE_LAYER_TOL,
         );
     }
     if !MOE_ORACLE_ROUTER_LAST.is_empty() {
