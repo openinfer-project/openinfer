@@ -30,6 +30,17 @@ constexpr int kNumKVStages = 3;
 std::once_flag g_dg_init_flag;
 CUresult g_dg_init_result = CUDA_SUCCESS;
 
+// DeepGEMM's JIT path keeps unsynchronized global state end to end:
+// `LaunchRuntime::generate` lazily initializes a static include hash through
+// the include parser's global visited set ("Circular include may occur"
+// assertions when raced), `Compiler::build` caches runtimes in an unlocked
+// map, and `construct_launch_config` fills a shared static attrs array on
+// every launch. Under DP8 all 8 rank threads run this path concurrently, so
+// the whole generate→build→launch sequence must hold one process-wide lock.
+// (The kernels themselves are cudaLibrary_t-based — context-independent — so
+// sharing the cached runtime across rank devices is legal.)
+std::mutex g_dg_build_mutex;
+
 CUresult ensure_dg_runtime_init() {
     std::call_once(g_dg_init_flag, []() {
         const char* dg_root = std::getenv("OPENINFER_DEEPGEMM_ROOT");
@@ -97,6 +108,7 @@ CUresult glm52_deepgemm_paged_mqa_metadata_cuda(
     };
 
     try {
+        std::lock_guard<std::mutex> lock(g_dg_build_mutex);
         const auto code = deep_gemm::SM90PagedMQALogitsMetadataRuntime::generate(args);
         const auto runtime = deep_gemm::compiler->build("sm90_paged_mqa_logits_metadata", code);
         deep_gemm::SM90PagedMQALogitsMetadataRuntime::launch(runtime, args, stream);
@@ -286,6 +298,7 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
                                                   smem_size)
         };
 
+        std::lock_guard<std::mutex> lock(g_dg_build_mutex);
         const auto code = deep_gemm::SM90FP8PagedMQALogitsRuntime::generate(args);
         const auto runtime = deep_gemm::compiler->build("sm90_fp8_paged_mqa_logits", code);
         deep_gemm::SM90FP8PagedMQALogitsRuntime::launch(runtime, args, stream);
