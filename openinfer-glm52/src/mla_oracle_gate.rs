@@ -42,7 +42,7 @@ use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_d
 // ---- BEGIN GENERATED: glm52_oracle probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
 //     --ctx 200 --seed 0x5eed604d --layer 0 --precision gemv
-// transformers=5.13.0 torch=2.12.1+cu130
+// transformers=5.13.0.dev0 torch=2.12.1+cu130
 const ORACLE_SEED: u64 = 0x5eed604d;
 const ORACLE_CTX: usize = 200;
 // sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
