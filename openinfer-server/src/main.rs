@@ -168,6 +168,19 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                         flush_on_finish: args.kv_p2p_flush_on_finish,
                     });
                 }
+                if let Some(seed) = args.kv_pd_vllm_seed.clone() {
+                    offload =
+                        offload.with_vllm_compat(openinfer_qwen3::Qwen3VllmCompatOptions {
+                            python_hash_seed: seed,
+                            namespace: args
+                                .kv_pd_vllm_namespace
+                                .clone()
+                                .expect("clap requires kv_pd_vllm_namespace"),
+                            miss_wait: std::time::Duration::from_millis(
+                                args.kv_pd_miss_wait_ms,
+                            ),
+                        });
+                }
                 offload
             } else {
                 Qwen3OffloadOptions::disabled()

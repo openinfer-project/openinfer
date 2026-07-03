@@ -109,6 +109,27 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false, requires = "kv_p2p_metaserver_addr")]
     pub kv_p2p_flush_on_finish: bool,
 
+    /// P/D decode role with a vLLM prefill peer: the shared PYTHONHASHSEED
+    /// value set on every vLLM prefill process. Switches offload query keys to
+    /// vLLM's prefix-cache hash scheme (requires the P side to run
+    /// --prefix-caching-hash-algo xxhash_cbor) and makes a cold request wait
+    /// out the producer's registration tail instead of prefilling locally.
+    /// Requires --kv-pd-vllm-namespace and the P2P mesh flags.
+    #[arg(long, requires_all = ["kv_p2p_metaserver_addr", "kv_pd_vllm_namespace"])]
+    pub kv_pd_vllm_seed: Option<String>,
+
+    /// The vLLM prefill peer's pegaflow-connector namespace (an 8-hex digest
+    /// the connector logs at startup as `namespace=...`). Both sides must
+    /// address the same content domain.
+    #[arg(long, requires = "kv_pd_vllm_seed")]
+    pub kv_pd_vllm_namespace: Option<String>,
+
+    /// Zero-hit wait window for --kv-pd-vllm-seed mode, in milliseconds: how
+    /// long a cold request keeps re-querying before giving up on the expected
+    /// remote KV and prefilling locally.
+    #[arg(long, default_value_t = 5000, requires = "kv_pd_vllm_seed")]
+    pub kv_pd_miss_wait_ms: u64,
+
     /// vLLM-style no-prefix-cache. Without --kv-offload it disables prefix
     /// matching outright (every prefill recomputes the full prompt). With
     /// --kv-offload it is the pure-L2 mode: no cross-request HBM reuse, so every

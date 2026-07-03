@@ -915,6 +915,11 @@ pub struct Qwen3Executor {
     /// saves + MetaServer registrations are peer-visible, so the HTTP response
     /// doubles as the KV-ready signal (see `Qwen3P2pOptions::flush_on_finish`).
     flush_offload_on_finish: bool,
+    /// P/D decode role with a vLLM prefill peer: offload query keys derive
+    /// with vLLM's hash scheme, a zero hit waits out the producer's
+    /// registration tail, and self-saves are skipped (this node's kvbm keys
+    /// would be unfindable in the vLLM-keyed content domain).
+    vllm_compat: Option<VllmCompatState>,
     /// Green Context SM partition for concurrent prefill/decode. `None` when
     /// disabled (default) or when the GPU does not support Green Contexts.
     overlap: Option<crate::green_ctx::OverlapStreams>,
@@ -979,6 +984,11 @@ enum PrefetchPhase {
     RemoteFetch {
         query_hashes: Vec<Vec<u8>>,
         deadline: std::time::Instant,
+        /// vLLM-compat P/D handoff race guard: until this instant a zero hit
+        /// keeps the request parked (the producer's registration hasn't
+        /// landed yet) instead of degrading to prefill-from-scratch. Set to
+        /// the park time (i.e. already expired) outside vLLM-compat mode.
+        miss_deadline: std::time::Instant,
     },
     /// Host→GPU DMA into reserved local blocks is in flight.
     Loading {
@@ -995,6 +1005,15 @@ enum PrefetchPhase {
 /// normal failure path (peer evicted the blocks, RDMA error) resolves through
 /// pegaflow's own fetch timeout into a plain local hit count well before this.
 const REMOTE_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// vLLM-compat P/D mode, derived from [`crate::Qwen3VllmCompatOptions`] at
+/// executor build time (the hasher needs the resolved KV block size).
+struct VllmCompatState {
+    hasher: openinfer_kv_offload::VllmBlockHasher,
+    /// Zero-hit wait window: how long a cold request re-queries before
+    /// giving up on the expected remote KV (see `RemoteFetch::miss_deadline`).
+    miss_wait: std::time::Duration,
+}
 
 impl Qwen3Executor {
     pub(crate) fn single(
@@ -1077,6 +1096,13 @@ impl Qwen3Executor {
                 .p2p
                 .as_ref()
                 .is_some_and(|p2p| p2p.flush_on_finish),
+            vllm_compat: offload_opts.vllm_compat.as_ref().map(|c| VllmCompatState {
+                hasher: openinfer_kv_offload::VllmBlockHasher::new(
+                    &c.python_hash_seed,
+                    budget.block_size,
+                ),
+                miss_wait: c.miss_wait,
+            }),
             overlap: None,
             async_prefill: None,
             speculative: None,
@@ -1321,6 +1347,7 @@ impl Qwen3Executor {
             prefetch: HashMap::new(),
             l1_retention_disabled: false,
             flush_offload_on_finish: false,
+            vllm_compat: None,
             overlap: None,
             async_prefill: None,
             speculative: None,
@@ -1500,6 +1527,13 @@ impl Qwen3Executor {
         if self.offload.is_none() {
             return;
         }
+        if self.vllm_compat.is_some() {
+            // The content domain is keyed with vLLM's hash scheme; this node's
+            // kvbm-keyed self-saves would be unfindable there. Remote blocks
+            // it fetched are already host-cached (under the vLLM keys) by
+            // pegaflow's read path, so multi-turn reuse doesn't need them.
+            return;
+        }
         let Some(rkv) = self.request_kvs.get(&request_id) else {
             return;
         };
@@ -1637,20 +1671,24 @@ impl Qwen3Executor {
         let PrefetchPhase::RemoteFetch {
             query_hashes,
             deadline,
+            miss_deadline,
         } = &st.phase
         else {
             return false;
         };
-        let timed_out = std::time::Instant::now() > *deadline;
+        let now = std::time::Instant::now();
+        let timed_out = now > *deadline;
         if timed_out {
             log::warn!("remote KV fetch timed out for {id:?}; prefill from scratch");
         }
+        let wait_on_miss = self.vllm_compat.is_some() && now <= *miss_deadline;
         let query_hashes = query_hashes.clone();
         let available_blocks = self.kv_mgr.pool().available_blocks();
         let action = {
             let offload = self.offload.as_ref().expect("offload present in prefetch");
             remote_fetch_action(
                 timed_out,
+                wait_on_miss,
                 || {
                     offload
                         .query(&id.0.to_string(), &query_hashes)
@@ -1823,16 +1861,23 @@ fn build_offload(
     // mixed mesh silently feed one model the other's KV. hidden_size +
     // intermediate_size + vocab_size discriminate the model line's sizes;
     // the layout fields pin the block geometry the transfer relies on.
-    let namespace = format!(
-        "openinfer-qwen3-hs{}-is{}-v{}-l{}h{}d{}p{}",
-        config.hidden_size,
-        config.intermediate_size,
-        config.vocab_size,
-        layout.num_layers,
-        layout.num_kv_heads,
-        layout.head_dim,
-        layout.page_size
-    );
+    // vLLM-compat mode joins the *P side's* content domain instead: the
+    // pegaflow connector derives an 8-hex namespace from vLLM config (and logs
+    // it at startup); reproducing that derivation would mean chasing Python
+    // repr of vLLM internals, so the operator passes it through explicitly.
+    let namespace = match &opts.vllm_compat {
+        Some(compat) => compat.namespace.clone(),
+        None => format!(
+            "openinfer-qwen3-hs{}-is{}-v{}-l{}h{}d{}p{}",
+            config.hidden_size,
+            config.intermediate_size,
+            config.vocab_size,
+            layout.num_layers,
+            layout.num_kv_heads,
+            layout.head_dim,
+            layout.page_size
+        ),
+    };
     let mut config = OffloadConfig::new(
         format!("qwen3-dev{device_id}"),
         device_id,
@@ -2008,17 +2053,36 @@ impl ModelExecutor for Qwen3Executor {
             // keep their reserved blocks, so this never touches live KV.
             self.kv_mgr.pool().evict_inactive();
         }
+        if self.vllm_compat.is_some() && lora_adapter.is_some() {
+            // vLLM salts LoRA block hashes via extra_keys; that derivation is
+            // not replicated, so LoRA requests skip the cross-engine lookup.
+            return false;
+        }
         let probe = self
             .kv_mgr
             .pool()
             .probe_prefix(prompt_tokens.to_vec(), lora_adapter);
-        let query_hashes = probe.cpu_query_hashes();
+        let query_hashes = match &self.vllm_compat {
+            None => probe.cpu_query_hashes(),
+            // Same query window ([gpu_hit .. cacheable) blocks of the prompt),
+            // keyed with vLLM's hash scheme so the lookup can find what the
+            // vLLM prefill peer registered. Local GPU-tier naming stays kvbm:
+            // the loaded bytes are committed under the probe's own hashes.
+            Some(compat) => {
+                let window = probe.cpu_query_hashes().len();
+                let start = probe.gpu_hit_blocks();
+                let chain = compat.hasher.key_chain(prompt_tokens, false);
+                debug_assert!(start + window <= chain.len());
+                chain[start..start + window].to_vec()
+            }
+        };
         if query_hashes.is_empty() {
             return false;
         }
         let available_blocks = self.kv_mgr.pool().available_blocks();
         let action = remote_fetch_action(
             false,
+            self.vllm_compat.is_some(),
             || {
                 offload
                     .query(&request_id.0.to_string(), &query_hashes)
@@ -2033,15 +2097,23 @@ impl ModelExecutor for Qwen3Executor {
         match action {
             RemoteFetchAction::Wait => {
                 // pegaflow is pulling the missing prefix from a P2P peer (or
-                // SSD) into the local host tier. Park the request and re-query
-                // each tick; the probe keeps the GPU-hit prefix resident.
+                // SSD) into the local host tier — or, in vLLM-compat mode, the
+                // producer's registration hasn't landed yet. Park the request
+                // and re-query each tick; the probe keeps the GPU-hit prefix
+                // resident.
+                let now = std::time::Instant::now();
+                let miss_wait = self
+                    .vllm_compat
+                    .as_ref()
+                    .map_or(std::time::Duration::ZERO, |c| c.miss_wait);
                 self.prefetch.insert(
                     request_id,
                     PrefetchState {
                         probe,
                         phase: PrefetchPhase::RemoteFetch {
                             query_hashes,
-                            deadline: std::time::Instant::now() + REMOTE_FETCH_DEADLINE,
+                            deadline: now + REMOTE_FETCH_DEADLINE,
+                            miss_deadline: now + miss_wait,
                         },
                     },
                 );
