@@ -87,7 +87,6 @@ pub(crate) struct Glm52LayerCaches {
 /// same `[32]` cos/sin extent), and the paging plumbing common to every layer's
 /// caches.
 pub(crate) struct Glm52DecodeStep<'a> {
-    pub(crate) position: usize,
     pub(crate) mla_cos: &'a CudaSlice<bf16>,
     pub(crate) mla_sin: &'a CudaSlice<bf16>,
     pub(crate) idx_cos: &'a CudaSlice<bf16>,
@@ -199,7 +198,7 @@ pub(crate) fn glm52_layer_attention_half(
         step.mla_cos,
         step.mla_sin,
         &mut caches.mla_cache,
-        step.position,
+        step.slot_mapping,
         &s.idx.global_slots,
         step.mla_sched,
         &mut s.proj,

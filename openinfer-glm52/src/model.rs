@@ -13,7 +13,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, glm52_flashmla_sparse_decode_num_sm_parts,
+    Glm52IndexerCacheLayout, add_into, argmax_bf16_into, glm52_flashmla_sparse_decode_num_sm_parts,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -356,7 +356,6 @@ impl Glm52RankModel {
         ctx.stream.memcpy_htod(&[token], &mut self.token_id)?;
 
         let step = Glm52DecodeStep {
-            position,
             mla_cos: &self.cos,
             mla_sin: &self.sin,
             idx_cos: &self.cos,
@@ -422,27 +421,27 @@ impl Glm52RankModel {
 
         glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, &mut s.final_normed)?;
         glm52_lm_head_into(ctx, &s.final_normed, &self.lm_head, &mut s.logits)?;
-        let logits_host = ctx.stream.clone_dtoh(&s.logits.data)?;
-        greedy_argmax(&logits_host)
+        // Device greedy argmax (same semantics as a host scan: lowest index
+        // wins ties, NaN never wins) — the step's egress shrinks from the
+        // full vocab row to 6 bytes, and the kernel chain ends on-device
+        // (the graph boundary for PR5c stage 3).
+        argmax_bf16_into(
+            ctx,
+            &s.logits.data,
+            GLM52_VOCAB,
+            &mut s.argmax_value,
+            &mut s.argmax_index,
+        )?;
+        let top_value = ctx.stream.clone_dtoh(&s.argmax_value)?[0].to_f32();
+        let top_index = ctx.stream.clone_dtoh(&s.argmax_index)?[0];
+        ensure!(
+            top_value.is_finite(),
+            "GLM5.2 greedy argmax found no finite logit (top = {top_value})"
+        );
+        ensure!(
+            (0..GLM52_VOCAB as i32).contains(&top_index),
+            "GLM5.2 greedy argmax index {top_index} outside the vocab"
+        );
+        Ok(top_index as u32)
     }
-}
-
-/// Host greedy argmax over the bf16 logits (bs=1 bring-up; device sampling is
-/// the PR5 scheduler's job). Fails loudly on a non-finite top logit.
-fn greedy_argmax(logits: &[bf16]) -> Result<u32> {
-    ensure!(logits.len() == GLM52_VOCAB, "GLM5.2 logits length drifted");
-    let mut best = f32::NEG_INFINITY;
-    let mut best_idx = 0usize;
-    for (idx, v) in logits.iter().enumerate() {
-        let v = v.to_f32();
-        if v > best {
-            best = v;
-            best_idx = idx;
-        }
-    }
-    ensure!(
-        best.is_finite(),
-        "GLM5.2 greedy argmax found no finite logit (top = {best})"
-    );
-    Ok(best_idx as u32)
 }

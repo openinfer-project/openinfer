@@ -548,7 +548,6 @@ fn run_layer_prefill(
             .memcpy_htod(&[(position + 1) as i32], &mut seq_lens)?;
 
         let step = Glm52DecodeStep {
-            position,
             mla_cos: &cos,
             mla_sin: &sin,
             idx_cos: &cos,

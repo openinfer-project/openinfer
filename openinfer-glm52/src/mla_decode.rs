@@ -312,9 +312,17 @@ pub(crate) fn glm52_mla_decode_forward(
     topk: &CudaSlice<i32>,
     sched: &Glm52MlaSchedMetadata,
 ) -> Result<CudaSlice<bf16>> {
+    ensure!(
+        position < sched.contract.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+        "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
+        sched.contract.num_blocks
+    );
     let mut proj = Glm52ProjScratch::new(ctx, HEADS * V_HEAD)?;
     let mut front = Glm52MlaFront::new(ctx)?;
     let mut attend = Glm52MlaAttendScratch::new(ctx, &sched.contract)?;
+    let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
+    ctx.stream
+        .memcpy_htod(&[position as i64], &mut slot_mapping)?;
     let mut o = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
     glm52_mla_front_into(ctx, w, hidden, &mut proj, &mut front)?;
     glm52_mla_attend_into(
@@ -324,7 +332,7 @@ pub(crate) fn glm52_mla_decode_forward(
         cos,
         sin,
         cache,
-        position,
+        &slot_mapping,
         topk,
         sched,
         &mut proj,
@@ -379,7 +387,7 @@ pub(crate) fn glm52_mla_attend_into(
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     cache: &mut CudaSlice<u8>,
-    position: usize,
+    slot_mapping: &CudaSlice<i64>,
     topk: &CudaSlice<i32>,
     sched: &Glm52MlaSchedMetadata,
     proj: &mut Glm52ProjScratch,
@@ -387,14 +395,11 @@ pub(crate) fn glm52_mla_attend_into(
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let contract = sched.contract;
-    // The new token is written to cache slot `position`; the FlashMLA paging then
-    // attends over `num_blocks` pages of `PAGE_SIZE` tokens. Couple them so a
-    // position past the paged window errors here, not as a silent cache stomp.
-    ensure!(
-        position < contract.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
-        "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
-        contract.num_blocks
-    );
+    // The new token is written to cache slot `slot_mapping[0]` (device data,
+    // so the launch replays under CUDA graph capture); the cache-pack kernel
+    // traps on a slot outside the paged window. The every-step host guard is
+    // the caller's position bound (`decode_step` prologue: position <
+    // GLM52_MAX_MODEL_LEN <= num_blocks * PAGE_SIZE by construction).
 
     // ---- absorb: ql_nope[64,512] = q_pass @ W_UK ----
     gemm_strided_batched_bf16(
@@ -448,7 +453,7 @@ pub(crate) fn glm52_mla_attend_into(
         cos,
         sin,
         cache,
-        position,
+        slot_mapping,
     )?;
 
     // ---- FlashMLA sparse decode -> latent[64,512] ----

@@ -22,6 +22,8 @@
 //! overwrite it, shared layers reuse it — exactly the DSA contract.
 
 use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use half::bf16;
 
 use openinfer_kernels::ops::{Glm52DeepGemmMqaLogitsShape, Glm52FlashMlaSparseDecode};
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
@@ -53,6 +55,11 @@ pub(crate) struct Glm52DecodeScratch {
     pub(crate) hidden: DeviceVec,
     pub(crate) final_normed: DeviceVec,
     pub(crate) logits: DeviceVec,
+    /// Device greedy argmax outputs: the top logit's bf16 value (for the
+    /// crash-early non-finite guard) and its index — the step's 6-byte D2H
+    /// egress.
+    pub(crate) argmax_value: CudaSlice<bf16>,
+    pub(crate) argmax_index: CudaSlice<i32>,
 }
 
 impl Glm52DecodeScratch {
@@ -73,6 +80,8 @@ impl Glm52DecodeScratch {
             hidden: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
             final_normed: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
             logits: DeviceVec::zeros(ctx, GLM52_VOCAB)?,
+            argmax_value: ctx.stream.alloc_zeros::<bf16>(1)?,
+            argmax_index: ctx.stream.alloc_zeros::<i32>(1)?,
         })
     }
 }

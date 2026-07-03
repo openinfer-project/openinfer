@@ -39,7 +39,8 @@ use openinfer_kernels::ops::{
     gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
     glm52_deepgemm_paged_mqa_metadata_launch, glm52_flashinfer_topk_2048_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_indexer_k_quant_and_cache_launch,
-    glm52_indexer_local_topk_to_slots_launch, glm52_indexer_rope_launch, layer_norm_into,
+    glm52_indexer_local_topk_to_slots_launch, glm52_indexer_rope_launch,
+    glm52_indexer_weights_fold_launch, layer_norm_into,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -376,8 +377,6 @@ pub(crate) fn glm52_indexer_forward_into(
         0,           // stride_c
         1,           // batch
     )?;
-    let weights_raw = ctx.stream.clone_dtoh(&s.weights_bf16)?;
-
     // ---- k LayerNorm (eps=1e-6, with bias) ----
     layer_norm_into(
         ctx,
@@ -406,15 +405,17 @@ pub(crate) fn glm52_indexer_forward_into(
     )?;
 
     // ---- weights fold: weights * q_scale * softmax_scale * n_heads^-0.5 ----
-    // 32 elements — host-side math is cheaper than a kernel launch.
-    let q_scale_host = ctx.stream.clone_dtoh(&s.q_scale)?;
-    let mut weights_folded = vec![0.0f32; INDEX_HEADS];
-    for h in 0..INDEX_HEADS {
-        weights_folded[h] =
-            weights_raw[h].to_f32() * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
-    }
-    ctx.stream
-        .memcpy_htod(&weights_folded, &mut s.weights_folded)?;
+    // On-device (bit-identical multiply order to the retired host fold): the
+    // two D2H readbacks + H2D here were the only mid-step stream syncs, and a
+    // captured graph cannot contain them.
+    glm52_indexer_weights_fold_launch(
+        ctx,
+        &s.weights_bf16,
+        &s.q_scale,
+        SOFTMAX_SCALE,
+        N_HEADS_SCALE,
+        &mut s.weights_folded,
+    )?;
 
     // ---- k quant + cache write ----
     glm52_indexer_k_quant_and_cache_launch(

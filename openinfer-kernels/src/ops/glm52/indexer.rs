@@ -332,3 +332,47 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
         .result()
         .map_err(|err| anyhow!("GLM5.2 indexer local_topk_to_slots launch failed: {err}"))
 }
+
+/// Fold the per-head `weights_proj` output (bf16) with the per-head q quant
+/// scale and the two attention scale constants into f32 weights for the
+/// DeepGEMM MQA logits kernel: `out[h] = weights[h] * q_scale[h] *
+/// softmax_scale * n_heads_scale` (left-to-right f32, bit-identical to the
+/// retired host-side fold). Replaces two mid-step D2H readbacks + an H2D —
+/// the DSA indexer chain stays on-device (CUDA-graph capturable).
+pub fn glm52_indexer_weights_fold_launch(
+    ctx: &DeviceContext,
+    weights: &CudaSlice<bf16>,
+    q_scale: &CudaSlice<f32>,
+    softmax_scale: f32,
+    n_heads_scale: f32,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    let heads = out.len();
+    ensure!(
+        heads > 0 && heads <= 1024,
+        "GLM5.2 indexer weights fold heads {heads} outside 1..=1024"
+    );
+    ensure!(
+        weights.len() >= heads && q_scale.len() >= heads,
+        "GLM5.2 indexer weights fold inputs too small: weights {}, q_scale {} (need {heads})",
+        weights.len(),
+        q_scale.len()
+    );
+    let (w_ptr, _g0) = weights.device_ptr(&ctx.stream);
+    let (q_ptr, _g1) = q_scale.device_ptr(&ctx.stream);
+    let (out_ptr, _g2) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_weights_fold_cuda(
+            w_ptr as *const ffi::Half,
+            q_ptr as *const f32,
+            softmax_scale,
+            n_heads_scale,
+            out_ptr as *mut f32,
+            heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer weights fold launch failed: {err}"))
+}

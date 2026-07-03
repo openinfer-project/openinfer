@@ -150,7 +150,19 @@ unsafe extern "C" {
         k_pe: *const Half,
         cos: *const Half,
         sin: *const Half,
-        cache_token: *mut u8,
+        cache: *mut u8,
+        slot_mapping: *const i64,
+        max_slots: i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_indexer_weights_fold_cuda(
+        weights: *const Half,
+        q_scale: *const f32,
+        softmax_scale: f32,
+        n_heads_scale: f32,
+        out: *mut f32,
+        heads: i32,
         stream: CUstream,
     ) -> CUresult;
 

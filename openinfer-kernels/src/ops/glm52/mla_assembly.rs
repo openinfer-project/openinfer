@@ -81,6 +81,7 @@ pub fn glm52_mla_query_assemble_launch(
 /// `ckv_fp8` + `ckv_scales` come straight from `glm52_fp8_per_token_group_quant`
 /// (amax/448, the cache's own scale convention); `k_pe` is the pre-rope shared
 /// rope-key. Slot starts are 4-byte aligned since 656 % 4 == 0.
+#[allow(clippy::too_many_arguments)]
 pub fn glm52_mla_cache_pack_launch(
     ctx: &DeviceContext,
     ckv_fp8: &CudaSlice<u8>,
@@ -89,7 +90,7 @@ pub fn glm52_mla_cache_pack_launch(
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     cache: &mut CudaSlice<u8>,
-    slot: usize,
+    slot_mapping: &CudaSlice<i64>,
 ) -> Result<()> {
     ensure!(
         ckv_fp8.len() >= GLM52_MLA_KV_LORA,
@@ -111,9 +112,15 @@ pub fn glm52_mla_cache_pack_launch(
         "GLM5.2 MLA cache pack cos/sin must be >= {GLM52_MLA_ROPE_HALF}"
     );
     ensure!(
-        cache.len() >= (slot + 1) * GLM52_MLA_CACHE_BYTES,
-        "GLM5.2 MLA cache pack slot {slot} overruns cache of {} bytes",
-        cache.len()
+        !slot_mapping.is_empty(),
+        "GLM5.2 MLA cache pack slot_mapping is empty"
+    );
+    // The slot itself is device data (graph-replayable); the kernel traps on
+    // an out-of-window slot. Host-side we can only pin the window size.
+    let max_slots = cache.len() / GLM52_MLA_CACHE_BYTES;
+    ensure!(
+        max_slots > 0,
+        "GLM5.2 MLA cache pack cache smaller than one {GLM52_MLA_CACHE_BYTES}-byte token"
     );
     let (fp8_ptr, _g0) = ckv_fp8.device_ptr(&ctx.stream);
     let (scale_ptr, _g1) = ckv_scales.device_ptr(&ctx.stream);
@@ -121,7 +128,7 @@ pub fn glm52_mla_cache_pack_launch(
     let (cos_ptr, _g3) = cos.device_ptr(&ctx.stream);
     let (sin_ptr, _g4) = sin.device_ptr(&ctx.stream);
     let (cache_ptr, _g5) = cache.device_ptr_mut(&ctx.stream);
-    let slot_ptr = cache_ptr + (slot * GLM52_MLA_CACHE_BYTES) as u64;
+    let (slot_ptr, _g6) = slot_mapping.device_ptr(&ctx.stream);
     let result = unsafe {
         ffi::glm52_mla_cache_pack_cuda(
             fp8_ptr as *const u8,
@@ -129,7 +136,9 @@ pub fn glm52_mla_cache_pack_launch(
             kpe_ptr as *const ffi::Half,
             cos_ptr as *const ffi::Half,
             sin_ptr as *const ffi::Half,
-            slot_ptr as *mut u8,
+            cache_ptr as *mut u8,
+            slot_ptr as *const i64,
+            max_slots as i64,
             ctx.stream.cu_stream(),
         )
     };
