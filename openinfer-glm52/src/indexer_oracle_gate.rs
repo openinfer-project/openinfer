@@ -446,6 +446,13 @@ fn indexer_oracle_gate() -> Result<()> {
     let rust_set: HashSet<i32> = topk_host.iter().copied().filter(|&v| v >= 0).collect();
     let oracle_set: HashSet<i32> = ORACLE_TOPK_SET.iter().copied().collect();
 
+    // Debug: show overlap breakdown
+    let in_oracle: Vec<i32> = rust_set.intersection(&oracle_set).copied().collect();
+    let not_in_oracle: Vec<i32> = rust_set.difference(&oracle_set).copied().collect();
+    eprintln!("rust topk in oracle: {} values", in_oracle.len());
+    eprintln!("rust topk NOT in oracle (first 20): {:?}", &not_in_oracle.iter().take(20).copied().collect::<Vec<_>>());
+    eprintln!("rust topk range: {}..{}", topk_host.iter().copied().filter(|&v| v >= 0).min().unwrap_or(-1), topk_host.iter().copied().filter(|&v| v >= 0).max().unwrap_or(-1));
+
     let overlap = rust_set.intersection(&oracle_set).count();
     let max_allowed = rust_set.len().max(oracle_set.len());
     let min_required = max_allowed.saturating_sub(1); // allow 1 tie-break divergence
