@@ -106,7 +106,12 @@ fn main() -> Result<()> {
         // faster than it costs partial parallelism.
         let default_parts = bench.default_num_sm_parts();
         print!("flashmla sweep     ");
-        for parts in [1usize, 8, 16, 32, 64, 96, default_parts] {
+        for parts in [1usize, 8, 16, 32, 64, 96]
+            .iter()
+            .copied()
+            .filter(|&p| p != default_parts)
+            .chain(std::iter::once(default_parts))
+        {
             if let Some(t) = bench.measure_flashmla_at(parts, args.iters)? {
                 let tag = if parts == default_parts { "*" } else { "" };
                 print!("p{parts}{tag}={:.1}us ", per(t));

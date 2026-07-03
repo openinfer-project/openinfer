@@ -1,17 +1,18 @@
 # GLM5.2 decode kernel performance — measured baseline and optimization ladder
 
-**TL;DR**: One GLM5.2 MLA decode layer costs ~288 µs GPU / 298 µs wall at bs=1 on H100 (measured, parity-verified). Step 0 — three stacked, implemented, parity-verified optimizations — cuts it to **165 µs GPU / 175 µs wall (−41%)**: **(0a) an allocation arena** removes ~68 µs (synchronous `cudaMalloc`s serialize against the stream, so eliminating them drops GPU time, not just host time); **(0b) hoisting the data-independent FlashMLA tile-schedule** out of the per-token path removes ~28 µs; **(0c) capturing the forward into a CUDA Graph** removes ~23 µs more — and it drops *GPU* time, because graph replay launches the ~18 kernels back-to-back and removes the inter-kernel bubbles where the GPU idled waiting for the next host launch. Next design lever: **(step 1) fusing the FlashMLA sparse-decode partial+combine kernels** (ThunderMLA-style) removes the ~10 µs `o_accum` HBM round-trip + one launch. Everything below is from `glm52_kernel_bench` on a real H100, parity-verified against the alloc-heavy forward.
+**TL;DR**: After #535 hoisted the FlashMLA tile schedule for every path, one GLM5.2 MLA decode layer costs ~268 µs GPU / 278 µs wall at bs=1 on H100 (measured, parity-verified). Two stacked, implemented optimizations cut it to **168 µs GPU / 178 µs wall (−36%)**: **(0a) an MLA-layer allocation arena** removes ~73 µs — the bring-up forward still does ~20 synchronous `cudaMalloc`s per layer per token (#535's persistent workspace covered the MoE chain, not MLA), and they serialize the decode stream, so eliminating them drops GPU time, not just host time; **(0c) capturing the forward into a CUDA Graph** removes ~27 µs more — graph replay launches the ~18 kernels back-to-back and removes the inter-kernel bubbles where the GPU idled between host launches (this is the "PR5c graph target" the #535 doc names). The scratch's schedule handling reuses #535's `Glm52MlaSchedMetadata` (one plan type, no duplicate). Next design lever assessment unchanged: partial+combine fusion is deprioritized by measurement. Everything below is from `glm52_kernel_bench` on a real H100, parity-verified against the bring-up forward.
 
 Last touched: 2026-07
 
 ## Measured baseline (`glm52_kernel_bench`, bs=1, synthetic weights, iters=64)
 
-| stage (ctx 2048) | gpu | wall | cumulative saved |
+| stage (ctx 2048, on top of #535) | gpu | wall | cumulative saved |
 |---|---|---|---|
-| as-is forward | 287.9 µs | 298.1 µs | — |
-| 0a arena | 218 µs | ~228 µs | −68 µs |
-| 0b + tile-schedule hoist | 189.1 µs | 199.6 µs | −98 µs |
-| **0c + CUDA Graph** | **165.0 µs** | **175.3 µs** | **−123 µs (−41%)** |
+| as-is forward (incl. #535's hoisted schedule) | 267.6 µs | 278.0 µs | — |
+| 0a MLA arena (`Glm52MlaDecodeScratch`) | 194.7 µs | 205.1 µs | −73 µs |
+| **0c + CUDA Graph** | **167.9 µs** | **178.3 µs** | **−100 µs (−36%)** |
+
+ctx 512 tracks it (graph 168.6 / 178.8 µs). Parity-verified bitwise against the bring-up forward. History: pre-#535 this ladder read 288 → 218 (arena) → 190 (schedule hoist) → 166 µs (−42%); #535 landed the schedule hoist for every path (as-is dropped 288 → 268), so this branch's remaining contribution is the arena + the graph.
 
 ctx 512 tracks it (graph 165.6 / 175.8 µs). All three are parity-verified against the alloc-heavy forward. Projected 75-MoE-layer attention share: 22.3 ms/token → **~13.1 ms/token**.
 

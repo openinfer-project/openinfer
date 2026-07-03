@@ -30,7 +30,7 @@ use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear};
 use openinfer_core::cuda_graph::CudaGraphState;
 
 use crate::mla_decode::{
-    Glm52MlaDecodeScratch, Glm52MlaLayerWeights, glm52_mla_decode_forward,
+    Glm52MlaDecodeScratch, Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward,
     glm52_mla_decode_forward_into,
 };
 
@@ -67,6 +67,10 @@ fn bf16_ones_bytes(len: usize) -> Vec<u8> {
 /// One synthetic MLA layer plus every forward input, device-resident.
 pub struct Glm52MlaDecodeBench {
     pub ctx: DeviceContext,
+    /// The split count the device query picked, kept separate from
+    /// `contract.num_sm_parts` so `--sm-parts` overrides don't masquerade
+    /// as the default in the sweep label or the cross-split diff baseline.
+    device_default_parts: usize,
     weights: Glm52MlaLayerWeights,
     hidden: CudaSlice<bf16>,
     cos: CudaSlice<bf16>,
@@ -74,6 +78,10 @@ pub struct Glm52MlaDecodeBench {
     cache: CudaSlice<u8>,
     topk: CudaSlice<i32>,
     contract: Glm52FlashMlaSparseDecode,
+    /// Contract + precomputed tile plan for the as-is forward (the scratch
+    /// forward owns its own copy inside `Glm52MlaDecodeScratch`). Rebuilt by
+    /// `set_num_sm_parts`, since the plan is split-count-specific.
+    sched: Glm52MlaSchedMetadata,
     position: usize,
     start: CudaEvent,
     end: CudaEvent,
@@ -138,6 +146,7 @@ impl Glm52MlaDecodeBench {
             sm_scale: 1.0 / (QUERY_DIM as f32).sqrt(),
         };
         contract.validate()?;
+        let sched = Glm52MlaSchedMetadata::new(&ctx, contract)?;
 
         let start = ctx
             .ctx
@@ -145,8 +154,10 @@ impl Glm52MlaDecodeBench {
         let end = ctx
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let device_default_parts = contract.num_sm_parts;
         let bench = Self {
             ctx,
+            device_default_parts,
             weights,
             hidden,
             cos,
@@ -154,6 +165,7 @@ impl Glm52MlaDecodeBench {
             cache,
             topk,
             contract,
+            sched,
             position,
             start,
             end,
@@ -172,7 +184,7 @@ impl Glm52MlaDecodeBench {
             &mut self.cache,
             self.position,
             &self.topk,
-            self.contract,
+            &self.sched,
         )?;
         Ok(())
     }
@@ -209,7 +221,6 @@ impl Glm52MlaDecodeBench {
             &mut self.cache,
             self.position,
             &self.topk,
-            self.contract,
             &mut scratch,
         )?;
         self.ctx.sync()?;
@@ -226,7 +237,6 @@ impl Glm52MlaDecodeBench {
                 &mut self.cache,
                 self.position,
                 &self.topk,
-                self.contract,
                 &mut scratch,
             )?;
             self.end.record(&self.ctx.stream)?;
@@ -244,6 +254,21 @@ impl Glm52MlaDecodeBench {
     /// pure kernel sequence (no alloc, no sync), which capture requires.
     pub fn measure_forward_graph(&mut self, iters: u64) -> Result<(Duration, Duration)> {
         let mut scratch = Glm52MlaDecodeScratch::new(&self.ctx, self.contract)?;
+        // Warm every kernel un-captured first: stream capture aborts on any
+        // lazy first-touch allocation (cuBLAS workspace, module load), so the
+        // capture must not be the first execution of this sequence.
+        glm52_mla_decode_forward_into(
+            &self.ctx,
+            &self.weights,
+            &self.hidden,
+            &self.cos,
+            &self.sin,
+            &mut self.cache,
+            self.position,
+            &self.topk,
+            &mut scratch,
+        )?;
+        self.ctx.sync()?;
         let mut graph = CudaGraphState::new();
         // First call captures the graph from the real kernel closure.
         graph.run_or_capture(&self.ctx, || {
@@ -256,7 +281,6 @@ impl Glm52MlaDecodeBench {
                 &mut self.cache,
                 self.position,
                 &self.topk,
-                self.contract,
                 &mut scratch,
             )
         })?;
@@ -291,7 +315,7 @@ impl Glm52MlaDecodeBench {
             &mut self.cache,
             self.position,
             &self.topk,
-            self.contract,
+            &self.sched,
         )?;
         let expected = self.ctx.stream.clone_dtoh(&expected)?;
         let mut scratch = Glm52MlaDecodeScratch::new(&self.ctx, self.contract)?;
@@ -304,7 +328,6 @@ impl Glm52MlaDecodeBench {
             &mut self.cache,
             self.position,
             &self.topk,
-            self.contract,
             &mut scratch,
         )?;
         let actual = self.ctx.stream.clone_dtoh(scratch.output())?;
@@ -554,9 +577,10 @@ impl Glm52MlaDecodeBench {
         Ok(Some(wall.elapsed()))
     }
 
-    /// The default `num_sm_parts` the device query picks (the over-split point).
+    /// The default `num_sm_parts` the device query picked (the over-split
+    /// point), unaffected by `set_num_sm_parts` overrides.
     pub fn default_num_sm_parts(&self) -> usize {
-        self.contract.num_sm_parts
+        self.device_default_parts
     }
 
     /// Override the split count for every subsequent measurement (validated).
@@ -566,6 +590,7 @@ impl Glm52MlaDecodeBench {
         let mut c = self.contract;
         c.num_sm_parts = parts;
         c.validate()?;
+        self.sched = Glm52MlaSchedMetadata::new(&self.ctx, c)?;
         self.contract = c;
         Ok(())
     }
@@ -616,7 +641,7 @@ impl Glm52MlaDecodeBench {
             )?;
             Ok(b.ctx.stream.clone_dtoh(&out)?)
         };
-        let a = latent(self, self.contract.num_sm_parts)?;
+        let a = latent(self, self.device_default_parts)?;
         let b = latent(self, parts)?;
         self.ctx.sync()?;
         Ok(a.iter()

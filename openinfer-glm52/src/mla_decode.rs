@@ -458,6 +458,12 @@ pub(crate) fn glm52_mla_attend(
 /// per token; this scratch plus `glm52_mla_decode_forward_into` is the
 /// zero-allocation variant (same ops, same math, buffers reused).
 pub(crate) struct Glm52MlaDecodeScratch {
+    /// The FlashMLA contract paired with its pre-computed tile-scheduler plan
+    /// ([`Glm52MlaSchedMetadata`], #535). Owning it here means a forward can
+    /// never pair this scratch's buffers with a different split count — the
+    /// plan is only meaningful under the exact `batch_size` + `num_sm_parts`
+    /// it was generated with.
+    sched: Glm52MlaSchedMetadata,
     fp8: Fp8LinearScratch,
     q_a: DeviceVec,
     q_resid: DeviceVec,
@@ -470,8 +476,6 @@ pub(crate) struct Glm52MlaDecodeScratch {
     query: CudaSlice<bf16>,
     ckv_fp8: CudaSlice<u8>,
     ckv_scales: CudaSlice<f32>,
-    sched: CudaSlice<i32>,
-    splits: CudaSlice<i32>,
     latent: CudaSlice<bf16>,
     lse: CudaSlice<f32>,
     lse_accum: CudaSlice<f32>,
@@ -482,22 +486,8 @@ pub(crate) struct Glm52MlaDecodeScratch {
 
 impl Glm52MlaDecodeScratch {
     pub(crate) fn new(ctx: &DeviceContext, contract: Glm52FlashMlaSparseDecode) -> Result<Self> {
-        // The FlashMLA tile schedule (sched/splits) is a pure function of
-        // batch_size + num_sm_parts — both fixed by the contract, independent
-        // of the per-token query/KV data. Compute it once here so the decode
-        // path drops one launch per layer per token (see forward_into).
-        let mut sched = ctx
-            .stream
-            .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?;
-        let mut splits = ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?;
-        glm52_flashmla_sparse_decode_metadata_launch(
-            ctx,
-            contract.batch_size,
-            contract.num_sm_parts,
-            &mut sched,
-            &mut splits,
-        )?;
         Ok(Self {
+            sched: Glm52MlaSchedMetadata::new(ctx, contract)?,
             fp8: Fp8LinearScratch::new(ctx, HEADS * V_HEAD)?,
             q_a: DeviceVec::zeros(ctx, Q_LORA)?,
             q_resid: DeviceVec::zeros(ctx, Q_LORA)?,
@@ -510,8 +500,6 @@ impl Glm52MlaDecodeScratch {
             query: ctx.stream.alloc_zeros::<bf16>(HEADS * QUERY_DIM)?,
             ckv_fp8: ctx.stream.alloc_zeros::<u8>(KV_LORA)?,
             ckv_scales: ctx.stream.alloc_zeros::<f32>(KV_LORA / FP8_BLOCK)?,
-            sched,
-            splits,
             latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
             lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
             lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
@@ -528,9 +516,9 @@ impl Glm52MlaDecodeScratch {
 }
 
 /// [`glm52_mla_decode_forward`] with all intermediates in `scratch`: the same
-/// op sequence with zero per-call allocations. The scratch's FlashMLA buffers
-/// are sized by the `contract` it was built with, so the same contract must be
-/// passed here.
+/// op sequence with zero per-call allocations. The FlashMLA contract lives in
+/// the scratch (buffers and the pre-computed tile schedule were built for it),
+/// so a mismatched contract is unrepresentable at this call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm52_mla_decode_forward_into(
     ctx: &DeviceContext,
@@ -541,19 +529,14 @@ pub(crate) fn glm52_mla_decode_forward_into(
     cache: &mut CudaSlice<u8>,
     position: usize,
     topk: &CudaSlice<i32>,
-    contract: Glm52FlashMlaSparseDecode,
     scratch: &mut Glm52MlaDecodeScratch,
 ) -> Result<()> {
+    let contract = scratch.sched.contract;
     ensure!(hidden.len() >= HIDDEN, "GLM5.2 MLA hidden too small");
     ensure!(
         position < contract.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
         "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
         contract.num_blocks
-    );
-    ensure!(
-        scratch.sched.len() >= contract.tile_scheduler_metadata_len()
-            && scratch.latent.len() >= contract.latent_len(),
-        "GLM5.2 MLA scratch was built for a different FlashMLA contract"
     );
 
     // ---- front projections ----
@@ -647,8 +630,8 @@ pub(crate) fn glm52_mla_decode_forward_into(
         &scratch.query,
         cache,
         topk,
-        &scratch.sched,
-        &scratch.splits,
+        &scratch.sched.tile_scheduler_metadata,
+        &scratch.sched.num_splits,
         &mut scratch.latent,
         &mut scratch.lse,
         &mut scratch.lse_accum,

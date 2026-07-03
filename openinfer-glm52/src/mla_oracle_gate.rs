@@ -38,8 +38,8 @@ use openinfer_kernels::tensor::DeviceContext;
 
 use crate::fp8::Glm52ProjBytes;
 use crate::mla_decode::{
-    Glm52MlaDecodeScratch, Glm52MlaLayerWeights, Glm52MlaSchedMetadata,
-    glm52_mla_decode_forward, glm52_mla_decode_forward_into,
+    Glm52MlaDecodeScratch, Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward,
+    glm52_mla_decode_forward_into,
 };
 
 // ---- BEGIN GENERATED: glm52_oracle probes ----
@@ -300,7 +300,6 @@ fn mla_oracle_gate() -> Result<()> {
             &mut cache,
             position,
             &topk,
-            contract,
             &mut scratch,
         )?;
         let o_scratch = ctx.stream.clone_dtoh(scratch.output())?;
