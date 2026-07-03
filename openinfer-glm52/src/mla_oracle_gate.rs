@@ -37,7 +37,7 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::fp8::Glm52ProjBytes;
-use crate::mla_decode::{Glm52MlaLayerWeights, glm52_mla_decode_forward};
+use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward};
 
 // ---- BEGIN GENERATED: glm52_oracle probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
@@ -254,6 +254,7 @@ fn mla_oracle_gate() -> Result<()> {
     let mut cache = ctx
         .stream
         .alloc_zeros::<u8>(contract.packed_kv_cache_len())?;
+    let mla_sched = Glm52MlaSchedMetadata::new(&ctx, contract)?;
 
     // Prefill via decode: position p writes its token into the cache, then
     // attends over the full prefix [0..=p] via a -1-padded top-k list.
@@ -278,7 +279,7 @@ fn mla_oracle_gate() -> Result<()> {
         ctx.stream.memcpy_htod(&topk_host, &mut topk)?;
 
         let o = glm52_mla_decode_forward(
-            &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk, contract,
+            &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk, contract, &mla_sched,
         )?;
         let o_host = ctx.stream.clone_dtoh(&o)?;
         outputs.extend(o_host.iter().map(|v| v.to_f32()));

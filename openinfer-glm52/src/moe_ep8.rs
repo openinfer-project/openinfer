@@ -26,8 +26,9 @@ use half::bf16;
 use openinfer_kernels::ffi::DeepEpInfo;
 use openinfer_kernels::ops::{
     DeepEpDispatchScratch, GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, Glm52DeepEp,
-    Glm52MoeQuantShape, Glm52TrtllmGroupedFp8Kind, glm52_deepep_info,
-    glm52_deepgemm_grouped_fp8_metadata_launch, glm52_fp8_per_token_group_quant_bf16_launch,
+    Glm52MoeQuantShape, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
+    glm52_deepep_info, glm52_deepgemm_grouped_fp8_metadata_launch,
+    glm52_fp8_per_token_group_quant_bf16_launch,
     glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
@@ -35,7 +36,7 @@ use openinfer_kernels::tensor::DeviceContext;
 use crate::moe_decode::{
     EXPERTS, Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, HIDDEN,
     HIDDEN_SCALE_COLS, QUANT_GROUP, RoutedTopk, TOPK, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS,
-    W13_K, W13_N, W13_SCALE_ROWS, grouped_gemm,
+    W13_K, W13_N, W13_SCALE_ROWS, grouped_gemm_into,
 };
 
 /// Rank-0's weights for one EP8 MoE layer: the router and shared expert run
@@ -47,10 +48,10 @@ pub(crate) struct Glm52MoeEp8LayerWeights {
     pub(crate) bank: Glm52MoeExpertBank,
 }
 
-/// Per-rank DeepEP context plus the dispatch-side buffers, allocated once at
-/// startup (fixed worst case → crash early on OOM; pointer-stable for future
-/// graph capture). Compute scratch downstream of dispatch allocates per call
-/// through the stream-ordered pool (PR3-proven capture-safe).
+/// Per-rank DeepEP context plus every buffer the MoE chain touches, allocated
+/// once at startup at worst-case capacity (crash early on OOM; pointer-stable
+/// for future graph capture; no per-layer allocator traffic — the per-call
+/// alloc/free/memset churn was ~35% of decode CUDA API time at bs=1).
 pub(crate) struct Glm52MoeEp8State {
     ep: Glm52DeepEp,
     scratch: DeepEpDispatchScratch,
@@ -63,6 +64,21 @@ pub(crate) struct Glm52MoeEp8State {
     zero_x: CudaSlice<bf16>,
     zero_topk_idx: CudaSlice<i32>,
     zero_topk_weight: CudaSlice<f32>,
+    /// Grouped-GEMM chain workspace. Rows past a launch's `bound_rows` hold
+    /// stale bytes from earlier layers — row-isolated by construction (every
+    /// consumer addresses rows through the dispatch metadata / expert
+    /// offsets, never past the last aligned segment end).
+    act_fp8: CudaSlice<u8>,
+    act_scale: CudaSlice<f32>,
+    expert_offsets: CudaSlice<i64>,
+    w13_problem_sizes: CudaSlice<i32>,
+    w2_problem_sizes: CudaSlice<i32>,
+    w13_scale_tma: CudaSlice<f32>,
+    w13_out: CudaSlice<bf16>,
+    w2_act: CudaSlice<u8>,
+    w2_act_scale: CudaSlice<f32>,
+    w2_scale_tma: CudaSlice<f32>,
+    expert_out: CudaSlice<bf16>,
 }
 
 impl Glm52MoeEp8State {
@@ -92,6 +108,13 @@ impl Glm52MoeEp8State {
             .with_context(|| format!("GLM5.2 rank {rank_idx} DeepEP context create"))?;
         let expanded = info.decode_worst_expanded_tokens as usize;
         let recv_tokens = info.decode_worst_recv_tokens as usize;
+        let n_local = info.num_local_experts as usize;
+        let w13_scale_tma_len =
+            Glm52TrtllmGroupedOffsetScaleLayout::f32(expanded, HIDDEN_SCALE_COLS, n_local)
+                .output_len()?;
+        let w2_scale_tma_len =
+            Glm52TrtllmGroupedOffsetScaleLayout::f32(expanded, W2_SCALE_COLS, n_local)
+                .output_len()?;
         Ok(Self {
             ep,
             scratch: DeepEpDispatchScratch::new_decode_with(ctx, &info)?,
@@ -102,6 +125,17 @@ impl Glm52MoeEp8State {
             zero_x: ctx.stream.alloc_zeros(HIDDEN)?,
             zero_topk_idx: ctx.stream.alloc_zeros(TOPK)?,
             zero_topk_weight: ctx.stream.alloc_zeros(TOPK)?,
+            act_fp8: ctx.stream.alloc_zeros(expanded * W13_K)?,
+            act_scale: ctx.stream.alloc_zeros(expanded * HIDDEN_SCALE_COLS)?,
+            expert_offsets: ctx.stream.alloc_zeros(n_local + 1)?,
+            w13_problem_sizes: ctx.stream.alloc_zeros(n_local * 3)?,
+            w2_problem_sizes: ctx.stream.alloc_zeros(n_local * 3)?,
+            w13_scale_tma: ctx.stream.alloc_zeros(w13_scale_tma_len)?,
+            w13_out: ctx.stream.alloc_zeros(expanded * W13_N)?,
+            w2_act: ctx.stream.alloc_zeros(expanded * W2_K)?,
+            w2_act_scale: ctx.stream.alloc_zeros(expanded * W2_SCALE_COLS)?,
+            w2_scale_tma: ctx.stream.alloc_zeros(w2_scale_tma_len)?,
+            expert_out: ctx.stream.alloc_zeros(expanded * W2_N)?,
         })
     }
 }
@@ -110,11 +144,22 @@ impl Glm52MoeEp8State {
 /// enter simultaneously per layer. Rank 0 passes its post-attention normed
 /// hidden + router output and gets back `Some(routed[HIDDEN])` (route weight
 /// and ×2.5 scaling already folded); expert ranks pass `None` and get `None`.
+///
+/// `global_tokens` is the total token count dispatched across ALL ranks this
+/// step — every rank must pass the same value (a protocol constant of the
+/// coordinator, not derived from device data, so the chain stays host-quiet).
+/// It bounds how many recv rows the re-quant/SiLU kernels must cover instead
+/// of the fixed worst case: each source token expands to at most `TOPK` rows
+/// on this rank, and each non-empty local expert segment pads to the
+/// `GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT` boundary, so the last aligned
+/// segment end is at most `min(expanded, g*TOPK + (ALIGN-1)*min(g*TOPK,
+/// n_local))`. At bs=1 that is 512 rows vs the 10240-row capacity.
 pub(crate) fn glm52_moe_ep8_routed_forward(
     ctx: &DeviceContext,
     state: &mut Glm52MoeEp8State,
     bank: &Glm52MoeExpertBank,
     token: Option<(&CudaSlice<bf16>, &RoutedTopk)>,
+    global_tokens: usize,
 ) -> Result<Option<CudaSlice<bf16>>> {
     let n_local = state.info.num_local_experts as usize;
     ensure!(
@@ -125,6 +170,14 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     let stream = &ctx.stream;
     let expanded = state.info.decode_worst_expanded_tokens as usize;
     let num_tokens = usize::from(token.is_some());
+    ensure!(
+        global_tokens >= num_tokens,
+        "GLM5.2 EP8 MoE global_tokens {global_tokens} < local tokens {num_tokens}"
+    );
+    let expanded_rows = global_tokens * TOPK;
+    let bound_rows = expanded.min(
+        expanded_rows + (GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT - 1) * expanded_rows.min(n_local),
+    );
 
     // Collective dispatch: bf16 token rows → expert-major aligned recv slots.
     {
@@ -145,89 +198,92 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         )?;
     }
 
-    // Re-quant the received bf16 rows to fp8 (worst-case rows; pad rows are
-    // garbage but row-isolated).
-    let mut act_fp8 = stream.alloc_zeros::<u8>(expanded * W13_K)?;
-    let mut act_scale = stream.alloc_zeros::<f32>(expanded * HIDDEN_SCALE_COLS)?;
+    // Re-quant the received bf16 rows to fp8. Only rows below `bound_rows`
+    // can sit inside an aligned expert segment the grouped GEMMs read; rows
+    // between a segment's real end and its aligned end are garbage but
+    // row-isolated (the PR3 invariant).
     glm52_fp8_per_token_group_quant_bf16_launch(
         ctx,
         Glm52MoeQuantShape {
-            rows: expanded,
+            rows: bound_rows,
             width: W13_K,
             group_size: QUANT_GROUP,
         },
         &state.recv_x,
-        &mut act_fp8,
-        &mut act_scale,
+        &mut state.act_fp8,
+        &mut state.act_scale,
     )?;
 
     // psum_expert (i32 aligned running ends) → expert_offsets (i64 segment
     // starts) for the grouped GEMMs.
-    let mut expert_offsets = stream.alloc_zeros::<i64>(n_local + 1)?;
-    let mut w13_problem_sizes = stream.alloc_zeros::<i32>(n_local * 3)?;
-    let mut w2_problem_sizes = stream.alloc_zeros::<i32>(n_local * 3)?;
     glm52_deepgemm_grouped_fp8_metadata_launch(
         ctx,
         n_local,
         expanded,
         &state.scratch.psum_expert,
-        &mut expert_offsets,
-        &mut w13_problem_sizes,
-        &mut w2_problem_sizes,
+        &mut state.expert_offsets,
+        &mut state.w13_problem_sizes,
+        &mut state.w2_problem_sizes,
     )?;
 
-    // W13 grouped FP8 GEMM (gate|up) over the local expert segments.
-    let w13_out = grouped_gemm(
+    // W13 grouped FP8 GEMM (gate|up) over the local expert segments. The
+    // GEMM's row capacity is `bound_rows` too: the scale relayout and grid
+    // are capacity-proportional, and every real segment ends below the bound.
+    grouped_gemm_into(
         ctx,
         Glm52TrtllmGroupedFp8Kind::W13,
         n_local,
-        expanded,
+        bound_rows,
         W13_N,
         W13_K,
         HIDDEN_SCALE_COLS,
         W13_SCALE_ROWS,
-        &act_fp8,
-        &act_scale,
+        &state.act_fp8,
+        &state.act_scale,
         &bank.w13_weight,
         &bank.w13_scale,
-        &expert_offsets,
+        &state.expert_offsets,
+        &mut state.w13_scale_tma,
+        &mut state.w13_out,
     )?;
 
     // Weighted SwiGLU quant: silu(gate)*up*route_weight → fp8 W2 input. The
     // per-slot weight is exactly what dispatch delivered per expanded row.
-    let mut w2_act = stream.alloc_zeros::<u8>(expanded * W2_K)?;
-    let mut w2_act_scale = stream.alloc_zeros::<f32>(expanded * W2_SCALE_COLS)?;
     glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch(
         ctx,
         Glm52MoeQuantShape {
-            rows: expanded,
+            rows: bound_rows,
             width: W2_K,
             group_size: QUANT_GROUP,
         },
-        &w13_out,
+        &state.w13_out,
         &state.recv_topk_weight,
-        &mut w2_act,
-        &mut w2_act_scale,
+        &mut state.w2_act,
+        &mut state.w2_act_scale,
     )?;
 
     // W2 grouped FP8 GEMM (down).
-    let expert_out = grouped_gemm(
+    grouped_gemm_into(
         ctx,
         Glm52TrtllmGroupedFp8Kind::W2,
         n_local,
-        expanded,
+        bound_rows,
         W2_N,
         W2_K,
         W2_SCALE_COLS,
         W2_SCALE_ROWS,
-        &w2_act,
-        &w2_act_scale,
+        &state.w2_act,
+        &state.w2_act_scale,
         &bank.w2_weight,
         &bank.w2_scale,
-        &expert_offsets,
+        &state.expert_offsets,
+        &mut state.w2_scale_tma,
+        &mut state.expert_out,
     )?;
 
     // Collective combine: weighted expert outputs → per-source-token sums.
+    // `combined` is the one per-call allocation left: it is returned by value
+    // to the caller (12 KiB at bs=1 — not worth an ownership dance).
     let mut combined = stream.alloc_zeros::<bf16>(num_tokens.max(1) * HIDDEN)?;
     let topk_idx = match token {
         Some((_, route)) => &route.topk_idx,
@@ -235,7 +291,7 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     };
     state.ep.decode_combine(
         ctx,
-        &expert_out,
+        &state.expert_out,
         &state.scratch,
         &state.recv_src_metadata,
         topk_idx,

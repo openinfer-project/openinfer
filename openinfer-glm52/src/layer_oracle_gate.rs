@@ -44,7 +44,7 @@ use crate::layer::{
     Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
     glm52_decoder_layer_forward,
 };
-use crate::mla_decode::Glm52MlaLayerWeights;
+use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
 use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, Glm52MoeRoutedExpertBytes};
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (dense, layer 0) ----
@@ -525,6 +525,7 @@ fn run_layer_prefill(
     let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
     let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
     let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+    let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
@@ -548,6 +549,7 @@ fn run_layer_prefill(
             idx_cos: &cos,
             idx_sin: &sin,
             contract,
+            mla_sched: &mla_sched,
             index_cache_layout,
             slot_mapping: &slot_mapping,
             block_table: &block_table,

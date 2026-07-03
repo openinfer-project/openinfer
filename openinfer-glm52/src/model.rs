@@ -27,7 +27,7 @@ use crate::layer::{
     Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
     glm52_layer_attention_half, glm52_layer_finish,
 };
-use crate::mla_decode::Glm52MlaLayerWeights;
+use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
 use crate::moe_decode::{
     Glm52MoeExpertBank, Glm52MoeExpertPath, Glm52MoeRouterWeights, Glm52MoeSharedExpert, run_router,
 };
@@ -200,10 +200,16 @@ pub(crate) struct Glm52Rank0Model {
     final_norm: DeviceVec,
     lm_head: DeviceMatrix,
     contract: Glm52FlashMlaSparseDecode,
+    mla_sched: Glm52MlaSchedMetadata,
     index_cache_layout: Glm52IndexerCacheLayout,
     block_table: CudaSlice<i32>,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
+    /// Device-resident rope tables for every position (`[GLM52_MAX_MODEL_LEN,
+    /// ROPE_HALF]`); a step slices its position's row instead of recomputing
+    /// on the host and copying up.
+    cos_table: CudaSlice<bf16>,
+    sin_table: CudaSlice<bf16>,
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
     token_id: CudaSlice<u32>,
@@ -274,17 +280,36 @@ impl Glm52Rank0Model {
         ctx.stream
             .memcpy_htod(&block_table_host, &mut block_table)?;
 
+        let mut cos_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * ROPE_HALF);
+        let mut sin_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * ROPE_HALF);
+        for position in 0..GLM52_MAX_MODEL_LEN {
+            let (cos_row, sin_row) = rope_tables(position);
+            cos_host.extend_from_slice(&cos_row);
+            sin_host.extend_from_slice(&sin_row);
+        }
+        let mut cos_table = ctx
+            .stream
+            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * ROPE_HALF)?;
+        let mut sin_table = ctx
+            .stream
+            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * ROPE_HALF)?;
+        ctx.stream.memcpy_htod(&cos_host, &mut cos_table)?;
+        ctx.stream.memcpy_htod(&sin_host, &mut sin_table)?;
+
         Ok(Self {
             layers,
             caches,
             embed,
             final_norm,
             lm_head,
+            mla_sched: Glm52MlaSchedMetadata::new(ctx, contract)?,
             contract,
             index_cache_layout,
             block_table,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(1)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(1)?,
+            cos_table,
+            sin_table,
             cos: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
             token_id: ctx.stream.alloc_zeros::<u32>(1)?,
@@ -305,9 +330,11 @@ impl Glm52Rank0Model {
             position < GLM52_MAX_MODEL_LEN,
             "GLM5.2 position {position} exceeds the model-length cap {GLM52_MAX_MODEL_LEN}"
         );
-        let (cos_host, sin_host) = rope_tables(position);
-        ctx.stream.memcpy_htod(&cos_host, &mut self.cos)?;
-        ctx.stream.memcpy_htod(&sin_host, &mut self.sin)?;
+        let rope = position * ROPE_HALF..(position + 1) * ROPE_HALF;
+        ctx.stream
+            .memcpy_dtod(&self.cos_table.slice(rope.clone()), &mut self.cos)?;
+        ctx.stream
+            .memcpy_dtod(&self.sin_table.slice(rope), &mut self.sin)?;
         ctx.stream
             .memcpy_htod(&[position as i64], &mut self.slot_mapping)?;
         ctx.stream
@@ -321,6 +348,7 @@ impl Glm52Rank0Model {
             idx_cos: &self.cos,
             idx_sin: &self.sin,
             contract: self.contract,
+            mla_sched: &self.mla_sched,
             index_cache_layout: self.index_cache_layout,
             slot_mapping: &self.slot_mapping,
             block_table: &self.block_table,
@@ -343,11 +371,14 @@ impl Glm52Rank0Model {
                 }
                 Glm52LayerMlp::MoeEp8(moe) => {
                     let route = run_router(ctx, &moe.router, &boundary.normed)?;
+                    // global_tokens = 1: the bs=1 coordinator steps one token
+                    // across the whole EP8 group (expert_step matches).
                     let routed = glm52_moe_ep8_routed_forward(
                         ctx,
                         ep8,
                         &moe.bank,
                         Some((&boundary.normed, &route)),
+                        1,
                     )
                     .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?
                     .context("rank-0 EP8 MoE returned no combined output")?;
@@ -429,7 +460,7 @@ impl Glm52ExpertRankModel {
     ) -> Result<()> {
         for (idx, bank) in self.banks.iter().enumerate() {
             let combined =
-                glm52_moe_ep8_routed_forward(ctx, ep8, bank, None).with_context(|| {
+                glm52_moe_ep8_routed_forward(ctx, ep8, bank, None, 1).with_context(|| {
                     format!("GLM5.2 expert rank MoE layer {}", idx + GLM52_DENSE_LAYERS)
                 })?;
             ensure!(

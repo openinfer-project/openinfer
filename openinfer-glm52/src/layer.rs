@@ -32,7 +32,9 @@ use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward};
 use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward};
-use crate::mla_decode::{Glm52MlaLayerWeights, glm52_mla_attend, glm52_mla_front};
+use crate::mla_decode::{
+    Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend, glm52_mla_front,
+};
 use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, glm52_moe_forward};
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 
@@ -87,6 +89,9 @@ pub(crate) struct Glm52DecodeStep<'a> {
     pub(crate) idx_cos: &'a CudaSlice<bf16>,
     pub(crate) idx_sin: &'a CudaSlice<bf16>,
     pub(crate) contract: Glm52FlashMlaSparseDecode,
+    /// FlashMLA tile-scheduler plan for `contract` — computed once (it only
+    /// depends on batch size / SM parts), shared by every layer.
+    pub(crate) mla_sched: &'a Glm52MlaSchedMetadata,
     pub(crate) index_cache_layout: Glm52IndexerCacheLayout,
     pub(crate) slot_mapping: &'a CudaSlice<i64>,
     pub(crate) block_table: &'a CudaSlice<i32>,
@@ -201,6 +206,7 @@ pub(crate) fn glm52_layer_attention_half(
         step.position,
         topk,
         step.contract,
+        step.mla_sched,
     )?;
 
     // Fused add+norm at the post-attention boundary (bit-identical to separate

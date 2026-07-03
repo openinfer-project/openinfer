@@ -25,6 +25,8 @@ use crate::layer::{
     Glm52DecodeStep, Glm52LayerCaches, Glm52LayerMlp, glm52_layer_attention_half,
     glm52_layer_finish,
 };
+use crate::mla_decode::Glm52MlaSchedMetadata;
+
 use crate::layer_oracle_gate::{
     GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
     MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
@@ -60,7 +62,8 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
                     let bank = load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank)?;
                     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, rank)?;
                     for _position in 0..MOE_ORACLE_CTX {
-                        let combined = glm52_moe_ep8_routed_forward(&ctx, &mut ep8, &bank, None)?;
+                        let combined =
+                            glm52_moe_ep8_routed_forward(&ctx, &mut ep8, &bank, None, 1)?;
                         ensure!(combined.is_none(), "expert rank produced a combined output");
                     }
                     Ok(())
@@ -145,6 +148,7 @@ fn run_layer_prefill_ep8(
     let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
     let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
     let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+    let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
@@ -168,6 +172,7 @@ fn run_layer_prefill_ep8(
             idx_cos: &cos,
             idx_sin: &sin,
             contract,
+            mla_sched: &mla_sched,
             index_cache_layout,
             slot_mapping: &slot_mapping,
             block_table: &block_table,
@@ -181,7 +186,7 @@ fn run_layer_prefill_ep8(
             glm52_layer_attention_half(ctx, w, &mut caches, hidden, &step, &mut topk_carry)?;
         let route = run_router(ctx, &moe.router, &boundary.normed)?;
         let routed =
-            glm52_moe_ep8_routed_forward(ctx, ep8, &moe.bank, Some((&boundary.normed, &route)))?
+            glm52_moe_ep8_routed_forward(ctx, ep8, &moe.bank, Some((&boundary.normed, &route)), 1)?
                 .context("rank-0 EP8 MoE returned no combined output")?;
         let shared = moe.shared.forward(ctx, &boundary.normed)?;
         let routed_hs = HiddenStates {
