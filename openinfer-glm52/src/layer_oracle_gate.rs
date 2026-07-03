@@ -409,6 +409,7 @@ pub(crate) fn load_decoder_layer(
                     upload_u8(ctx, t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?)?,
                 )?,
                 shared: crate::moe_decode::Glm52MoeSharedExpert::new(
+                    ctx,
                     crate::fp8::ProjWeight::upload(
                         ctx,
                         &t.proj(

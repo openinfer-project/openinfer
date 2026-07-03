@@ -10,7 +10,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, ProjWeight, fp8_mlp_into};
+use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, ProjWeight, fp8_mlp_into, pack_proj_pair};
 
 const HIDDEN: usize = 6144;
 const INTERMEDIATE: usize = 12288;
@@ -18,11 +18,12 @@ const INTERMEDIATE: usize = 12288;
 /// The dense-layer intermediate width (sizes the shared decode mlp scratch).
 pub(crate) const GLM52_DENSE_INTERMEDIATE: usize = INTERMEDIATE;
 
-/// The three fp8 projections of one dense MLP layer, resident on device.
+/// The fp8 projections of one dense MLP layer, resident on device. gate|up
+/// are packed into one `[2*INTERMEDIATE, HIDDEN]` projection at build (one
+/// GEMV + SwiGLU + one GEMV at decode).
 pub(crate) struct Glm52DenseMlpWeights {
-    gate: ProjWeight, // fp8 [INTERMEDIATE, HIDDEN]
-    up: ProjWeight,   // fp8 [INTERMEDIATE, HIDDEN]
-    down: ProjWeight, // fp8 [HIDDEN, INTERMEDIATE]
+    gate_up: ProjWeight, // fp8 [2*INTERMEDIATE, HIDDEN] (gate | up)
+    down: ProjWeight,    // fp8 [HIDDEN, INTERMEDIATE]
 }
 
 impl Glm52DenseMlpWeights {
@@ -47,14 +48,22 @@ impl Glm52DenseMlpWeights {
         shape("up_proj", up, INTERMEDIATE, HIDDEN)?;
         shape("down_proj", down, HIDDEN, INTERMEDIATE)?;
         Ok(Self {
-            gate: ProjWeight::upload(ctx, gate)?,
-            up: ProjWeight::upload(ctx, up)?,
+            gate_up: pack_proj_pair(
+                ctx,
+                &ProjWeight::upload(ctx, gate)?,
+                &ProjWeight::upload(ctx, up)?,
+            )?,
             down: ProjWeight::upload(ctx, down)?,
         })
     }
 
     /// Build from already-resident projections (the production loader path).
-    pub(crate) fn from_device(gate: ProjWeight, up: ProjWeight, down: ProjWeight) -> Result<Self> {
+    pub(crate) fn from_device(
+        ctx: &DeviceContext,
+        gate: ProjWeight,
+        up: ProjWeight,
+        down: ProjWeight,
+    ) -> Result<Self> {
         let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
             anyhow::ensure!(
                 p.n == n && p.k == k,
@@ -67,7 +76,10 @@ impl Glm52DenseMlpWeights {
         shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
         shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
         shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
-        Ok(Self { gate, up, down })
+        Ok(Self {
+            gate_up: pack_proj_pair(ctx, &gate, &up)?,
+            down,
+        })
     }
 }
 
@@ -84,8 +96,7 @@ pub(crate) fn glm52_dense_mlp_forward_into(
 ) -> Result<()> {
     fp8_mlp_into(
         ctx,
-        &weights.gate,
-        &weights.up,
+        &weights.gate_up,
         &weights.down,
         normed_hidden,
         mlp,

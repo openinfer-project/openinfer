@@ -46,7 +46,9 @@ use openinfer_kernels::tensor::HiddenStates;
 
 #[cfg(test)]
 use crate::fp8::fp8_mlp;
-use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp_into};
+use crate::fp8::{
+    Glm52MlpScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp_into, pack_proj_pair,
+};
 
 pub(crate) const HIDDEN: usize = 6144;
 pub(crate) const EXPERTS: usize = 256;
@@ -110,14 +112,20 @@ impl Glm52MoeRouterWeights {
 }
 
 /// The single shared expert (a plain fp8 SwiGLU MLP at intermediate 2048).
+/// gate|up are packed into one `[2*INTERMEDIATE, HIDDEN]` projection at build
+/// so the decode path is one GEMV + SwiGLU + one GEMV.
 pub(crate) struct Glm52MoeSharedExpert {
-    gate: ProjWeight, // fp8 [INTERMEDIATE, HIDDEN]
-    up: ProjWeight,   // fp8 [INTERMEDIATE, HIDDEN]
-    down: ProjWeight, // fp8 [HIDDEN, INTERMEDIATE]
+    gate_up: ProjWeight, // fp8 [2*INTERMEDIATE, HIDDEN] (gate | up)
+    down: ProjWeight,    // fp8 [HIDDEN, INTERMEDIATE]
 }
 
 impl Glm52MoeSharedExpert {
-    pub(crate) fn new(gate: ProjWeight, up: ProjWeight, down: ProjWeight) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        gate: ProjWeight,
+        up: ProjWeight,
+        down: ProjWeight,
+    ) -> Result<Self> {
         let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
             ensure!(
                 p.n == n && p.k == k,
@@ -130,7 +138,10 @@ impl Glm52MoeSharedExpert {
         shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
         shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
         shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
-        Ok(Self { gate, up, down })
+        Ok(Self {
+            gate_up: pack_proj_pair(ctx, &gate, &up)?,
+            down,
+        })
     }
 
     /// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP.
@@ -140,7 +151,7 @@ impl Glm52MoeSharedExpert {
         ctx: &DeviceContext,
         normed_hidden: &CudaSlice<bf16>,
     ) -> Result<CudaSlice<bf16>> {
-        fp8_mlp(ctx, &self.gate, &self.up, &self.down, normed_hidden)
+        fp8_mlp(ctx, &self.gate_up, &self.down, normed_hidden)
     }
 
     /// [`Self::forward`] into a pre-allocated output through persistent
@@ -153,15 +164,7 @@ impl Glm52MoeSharedExpert {
         mlp: &mut Glm52MlpScratch,
         out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
-        fp8_mlp_into(
-            ctx,
-            &self.gate,
-            &self.up,
-            &self.down,
-            normed_hidden,
-            mlp,
-            out,
-        )
+        fp8_mlp_into(ctx, &self.gate_up, &self.down, normed_hidden, mlp, out)
     }
 }
 
@@ -335,6 +338,7 @@ impl Glm52MoeLayerWeights {
             router: Glm52MoeRouterWeights::new(upload_u8(gate_weight)?, upload_u8(e_score_bias)?)?,
             bank: Glm52MoeExpertBank::pack_from_host(ctx, experts)?,
             shared: Glm52MoeSharedExpert::new(
+                ctx,
                 ProjWeight::upload(ctx, shared_gate)?,
                 ProjWeight::upload(ctx, shared_up)?,
                 ProjWeight::upload(ctx, shared_down)?,

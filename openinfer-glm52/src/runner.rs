@@ -203,6 +203,9 @@ impl Drop for Glm52RankWorker {
 #[cfg(feature = "glm52")]
 struct Glm52RankRuntime {
     model: Box<Glm52RankModel>,
+    /// Second stream on the same device: the shared expert overlaps the MoE
+    /// collectives on it (fork/join via events inside the decode graph).
+    aux_ctx: openinfer_kernels::tensor::DeviceContext,
     /// Populated by SetupComm (collective), after every rank's build succeeded.
     ep8: Option<Glm52MoeEp8State>,
 }
@@ -269,7 +272,12 @@ impl Glm52RankThreadState {
         // Non-expert leftovers are the MTP-layer tensors (out of scope) —
         // dropped with `weights` here.
         drop(weights);
-        self.runtime = Some(Glm52RankRuntime { model, ep8: None });
+        let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
+        self.runtime = Some(Glm52RankRuntime {
+            model,
+            aux_ctx,
+            ep8: None,
+        });
         Ok(())
     }
 
@@ -306,7 +314,9 @@ impl Glm52RankThreadState {
             .ep8
             .as_mut()
             .context("GLM5.2 step before setup_comm")?;
-        runtime.model.decode_step(&dev_ctx, ep8, token, position)
+        runtime
+            .model
+            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, token, position)
     }
 }
 

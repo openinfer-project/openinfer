@@ -77,6 +77,28 @@ impl Glm52RankGpuContext {
             device_ordinal: self.device_ordinal,
         })
     }
+
+    /// A second stream on the same context, for work that overlaps the main
+    /// stream inside the decode step (fork/join via events — the shared
+    /// expert runs concurrently with the MoE collectives).
+    #[cfg(feature = "glm52")]
+    pub(crate) fn auxiliary_device_context(
+        &self,
+        role: &str,
+    ) -> Result<openinfer_kernels::tensor::DeviceContext> {
+        use anyhow::Context as _;
+        let stream = self.ctx.new_stream().with_context(|| {
+            format!(
+                "failed to create GLM5.2 {role} stream for device {}",
+                self.device_ordinal
+            )
+        })?;
+        Ok(openinfer_kernels::tensor::DeviceContext {
+            ctx: self.ctx.clone(),
+            stream,
+            device_ordinal: self.device_ordinal,
+        })
+    }
 }
 
 fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {

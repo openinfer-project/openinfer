@@ -114,6 +114,46 @@ impl ProjWeight {
     }
 }
 
+/// Pack two fp8 projections that share the same input into one `[a.n + b.n, k]`
+/// projection (weight bytes and per-128-block scale rows concatenated along n).
+/// Requires `a.n` to be a multiple of 128 so `b`'s scale rows stay aligned to
+/// the packed row/128 grid. Used to fuse gate|up into a single GEMV whose
+/// output is exactly the `[gate | up]` layout the SwiGLU consumes.
+pub(crate) fn pack_proj_pair(
+    ctx: &DeviceContext,
+    a: &ProjWeight,
+    b: &ProjWeight,
+) -> Result<ProjWeight> {
+    ensure!(
+        a.k == b.k,
+        "GLM5.2 proj pack k mismatch: {} vs {}",
+        a.k,
+        b.k
+    );
+    ensure!(
+        a.n.is_multiple_of(FP8_BLOCK),
+        "GLM5.2 proj pack first n {} not a multiple of {FP8_BLOCK}",
+        a.n
+    );
+    let n = a.n + b.n;
+    let mut weight = ctx.stream.alloc_zeros::<u8>(n * a.k)?;
+    ctx.stream
+        .memcpy_dtod(&a.weight, &mut weight.slice_mut(0..a.n * a.k))?;
+    ctx.stream
+        .memcpy_dtod(&b.weight, &mut weight.slice_mut(a.n * a.k..n * a.k))?;
+    let scale_cols = a.k.div_ceil(FP8_BLOCK);
+    let a_scale_len = (a.n / FP8_BLOCK) * scale_cols * 4;
+    let b_scale_len = b.n.div_ceil(FP8_BLOCK) * scale_cols * 4;
+    let mut scale = ctx.stream.alloc_zeros::<u8>(a_scale_len + b_scale_len)?;
+    ctx.stream
+        .memcpy_dtod(&a.scale, &mut scale.slice_mut(0..a_scale_len))?;
+    ctx.stream.memcpy_dtod(
+        &b.scale,
+        &mut scale.slice_mut(a_scale_len..a_scale_len + b_scale_len),
+    )?;
+    ProjWeight::from_device(weight, scale, n, a.k)
+}
+
 /// One fp8 projection (bs=1) into a pre-allocated output: weight-only GEMV of
 /// the bf16 activation against the fp8 `[n,k]` weight, block scale dequanted
 /// on the fly.
@@ -150,8 +190,6 @@ pub(crate) fn fp8_linear(
 /// 2048 — and each gets its own instance so a cross-wiring crashes here).
 pub(crate) struct Glm52MlpScratch {
     intermediate: usize,
-    gate_out: CudaSlice<bf16>,
-    up_out: CudaSlice<bf16>,
     gate_up: CudaSlice<bf16>,
     silu_out: CudaSlice<bf16>,
 }
@@ -164,8 +202,6 @@ impl Glm52MlpScratch {
         );
         Ok(Self {
             intermediate,
-            gate_out: ctx.stream.alloc_zeros::<bf16>(intermediate)?,
-            up_out: ctx.stream.alloc_zeros::<bf16>(intermediate)?,
             gate_up: ctx.stream.alloc_zeros::<bf16>(2 * intermediate)?,
             silu_out: ctx.stream.alloc_zeros::<bf16>(intermediate)?,
         })
@@ -173,26 +209,29 @@ impl Glm52MlpScratch {
 }
 
 /// A plain fp8 SwiGLU MLP for one token (bs=1) into a pre-allocated output:
-/// `down(silu(gate(h)) * up(h))`, with SEPARATE gate/up projections (the
-/// GLM5.2 dense layer and the MoE shared expert both use this shape -- only
-/// the intermediate size differs). `out` is `[down.n]` bf16 (= `[HIDDEN]`).
+/// `down(silu(gate(h)) * up(h))` with the gate|up projections PACKED into one
+/// `[2*intermediate, k]` weight (see [`pack_proj_pair`]) — a single GEMV
+/// writes the `[gate | up]` layout the SwiGLU consumes, no concat copies.
+/// `out` is `[down.n]` bf16 (= `[HIDDEN]`).
 pub(crate) fn fp8_mlp_into(
     ctx: &DeviceContext,
-    gate: &ProjWeight,
-    up: &ProjWeight,
+    gate_up: &ProjWeight,
     down: &ProjWeight,
     input: &CudaSlice<bf16>,
     s: &mut Glm52MlpScratch,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
-    let intermediate = gate.n;
     ensure!(
-        up.n == intermediate && down.k == intermediate && gate.k == up.k && gate.k == down.n,
-        "GLM5.2 fp8_mlp shape mismatch: gate [{},{}], up [{},{}], down [{},{}]",
-        gate.n,
-        gate.k,
-        up.n,
-        up.k,
+        gate_up.n.is_multiple_of(2),
+        "GLM5.2 fp8_mlp packed gate|up n {} is odd",
+        gate_up.n
+    );
+    let intermediate = gate_up.n / 2;
+    ensure!(
+        down.k == intermediate && gate_up.k == down.n,
+        "GLM5.2 fp8_mlp shape mismatch: gate_up [{},{}], down [{},{}]",
+        gate_up.n,
+        gate_up.k,
         down.n,
         down.k
     );
@@ -201,17 +240,7 @@ pub(crate) fn fp8_mlp_into(
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
         s.intermediate
     );
-    fp8_linear_into(ctx, gate, input, &mut s.gate_out)?;
-    fp8_linear_into(ctx, up, input, &mut s.up_out)?;
-
-    // Concatenate gate|up (gate first half) for the fused SwiGLU.
-    ctx.stream
-        .memcpy_dtod(&s.gate_out, &mut s.gate_up.slice_mut(0..intermediate))?;
-    ctx.stream.memcpy_dtod(
-        &s.up_out,
-        &mut s.gate_up.slice_mut(intermediate..2 * intermediate),
-    )?;
-
+    fp8_linear_into(ctx, gate_up, input, &mut s.gate_up)?;
     // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
     glm52_silu_and_mul_weighted_bf16_launch(
         ctx,
@@ -229,13 +258,12 @@ pub(crate) fn fp8_mlp_into(
 #[cfg(test)]
 pub(crate) fn fp8_mlp(
     ctx: &DeviceContext,
-    gate: &ProjWeight,
-    up: &ProjWeight,
+    gate_up: &ProjWeight,
     down: &ProjWeight,
     input: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
-    let mut s = Glm52MlpScratch::new(ctx, gate.n)?;
+    let mut s = Glm52MlpScratch::new(ctx, gate_up.n / 2)?;
     let mut out = ctx.stream.alloc_zeros::<bf16>(down.n)?;
-    fp8_mlp_into(ctx, gate, up, down, input, &mut s, &mut out)?;
+    fp8_mlp_into(ctx, gate_up, down, input, &mut s, &mut out)?;
     Ok(out)
 }

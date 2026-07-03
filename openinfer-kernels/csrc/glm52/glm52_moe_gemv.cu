@@ -243,8 +243,9 @@ bool valid_linear_shape(int n, int k) {
   if (n == 16384 && k == 2048)  return true;  // q_b
   if (n == 576   && k == 6144)  return true;  // kv_a + rope (partial-N: 576%128!=0)
   if (n == 6144  && k == 16384) return true;  // o_proj
-  if (n == 12288 && k == 6144)  return true;  // dense gate,up
+  if (n == 24576 && k == 6144)  return true;  // dense gate|up (packed)
   if (n == 6144  && k == 12288) return true;  // dense down
+  if (n == 4096  && k == 6144)  return true;  // shared gate|up (packed)
   if (n == 6144  && k == 2048)  return true;  // shared down
   if (n == 4096  && k == 2048)  return true;  // indexer wq_b
   if (n == 128   && k == 6144)  return true;  // indexer wk

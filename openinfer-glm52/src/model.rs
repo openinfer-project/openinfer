@@ -153,6 +153,7 @@ fn build_decoder_layer(
     let mp = format!("{p}.mlp");
     let mlp = if layer < GLM52_DENSE_LAYERS {
         Glm52LayerMlp::Dense(Box::new(Glm52DenseMlpWeights::from_device(
+            ctx,
             take_proj(w, &format!("{mp}.gate_proj"), 12_288, GLM52_HIDDEN)?,
             take_proj(w, &format!("{mp}.up_proj"), 12_288, GLM52_HIDDEN)?,
             take_proj(w, &format!("{mp}.down_proj"), GLM52_HIDDEN, 12_288)?,
@@ -164,6 +165,7 @@ fn build_decoder_layer(
                 w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
             )?,
             shared: Glm52MoeSharedExpert::new(
+                ctx,
                 take_proj(
                     w,
                     &format!("{mp}.shared_experts.gate_proj"),
@@ -355,6 +357,7 @@ impl Glm52RankModel {
     pub(crate) fn decode_step(
         &mut self,
         ctx: &DeviceContext,
+        aux: &DeviceContext,
         ep8: &mut Glm52MoeEp8State,
         token: u32,
         position: usize,
@@ -405,6 +408,24 @@ impl Glm52RankModel {
                         &mut s.layer.mlp_out,
                     )?,
                     Glm52LayerMlp::MoeEp8(moe) => {
+                        // Fork: the shared expert only needs `normed2`, so it
+                        // runs on the aux stream concurrently with the routed
+                        // path's dispatch/grouped-GEMM/combine — the
+                        // cooperative collectives occupy a fixed SM slice and
+                        // mostly wait on peers, leaving the rest of the GPU
+                        // free. The events recorded here during capture
+                        // become graph edges; replay keeps the parallel
+                        // branches.
+                        let normed_ready = ctx.stream.record_event(None)?;
+                        aux.stream.wait(&normed_ready)?;
+                        moe.shared.forward_into(
+                            aux,
+                            &s.layer.normed2,
+                            &mut s.shared_mlp,
+                            &mut s.layer.shared_out,
+                        )?;
+                        let shared_done = aux.stream.record_event(None)?;
+
                         run_router_into(ctx, &moe.router, &s.layer.normed2, &mut s.router)?;
                         let dispatched = glm52_moe_ep8_routed_forward(
                             ctx,
@@ -418,12 +439,8 @@ impl Glm52RankModel {
                             dispatched,
                             "EP8 MoE returned no combined output for a dispatched token"
                         );
-                        moe.shared.forward_into(
-                            ctx,
-                            &s.layer.normed2,
-                            &mut s.shared_mlp,
-                            &mut s.layer.shared_out,
-                        )?;
+                        // Join: the closing add consumes both branches.
+                        ctx.stream.wait(&shared_done)?;
                         add_into(
                             ctx,
                             ep8.combined(),
