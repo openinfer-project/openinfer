@@ -3,16 +3,16 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "torch>=2.6",
-#   "transformers @ file:///data/code/workspace-rustllm/transformers",
+#   "transformers>=5.13.0.dev0",
 #   "safetensors>=0.4",
 #   "numpy",
 # ]
 # ///
 """GLM5.2 layer-0 oracle harness: emit hardcodable probes for the Rust gate.
 
-The ground-truth math is transformers' own `glm_moe_dsa` module (local dev
-checkout at 5.13.0.dev0, PR #46842 — fixes indexer RoPE interleave) — this
-script writes NO model math of its own. It reads the layer-0 attention weights
+The ground-truth math is transformers' own `glm_moe_dsa` module (5.13.0.dev0+,
+PR #46842 — fixes indexer RoPE interleave) — this script writes NO model math
+of its own. It reads the layer-0 attention weights
 straight from the FP8 checkpoint, instantiates the official
 `GlmMoeDsaAttention` (which includes the DSA indexer), feeds it a seeded input,
 and captures intermediate tensors ("taps") via forward hooks.
@@ -349,7 +349,7 @@ def emit_rust_indexer(taps, args, versions: str) -> str:
     hidden = taps["hidden"]
     topk = taps["topk_indices"]  # [ctx, 2048] or [2048] for bs=1
     if topk.dim() == 2:
-        topk = topk[0]  # bs=1 → [2048]
+        topk = topk[-1]  # bs=1 → last position [2048]
     topk_set = sorted(int(v) for v in topk.tolist() if v >= 0)
     q_resid = taps.get("q_resid")
     cos = taps.get("cos")
