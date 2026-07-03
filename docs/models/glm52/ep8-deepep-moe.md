@@ -1,6 +1,6 @@
 # GLM5.2 EP8 DeepEP MoE + full-model forward (PR4)
 
-> **TL;DR:** PR4 turns the oracle-gated single-layer bricks (PR1–PR3) into a running 8×H200 model: a GLM-baked instantiation of the DeepEP v2 elastic shim replaces PR3's local scatter/combine stand-ins, the weight loader places expert tensors into their **final packed layout at H2D time** (post-load repacking cannot fit: 2×85.5 GiB > 141 GiB), `from_device` constructors hand the resident buffers to the PR3 weight structs zero-copy, and a DP1 executor walks all 78 layers on rank 0 while ranks 1–7 run their 32 local experts through the collective dispatch/combine. Gates: 8-GPU layer-6 MoE oracle (same probes/allowance as PR3), packed-placement digest pins, and the campaign's first full-model e2e greedy generation.
+> **TL;DR:** **BUILT + ALL GATES GREEN on jz-38 8×H200 (2026-07-03), branch `feat/glm52-ep8-deepep-moe` — the campaign's first full-model generation.** PR4 turns the oracle-gated single-layer bricks (PR1–PR3) into a running 8×H200 model: a GLM-baked instantiation of the DeepEP v2 elastic shim replaces PR3's local scatter/combine stand-ins, the weight loader places expert tensors into their **final packed layout at H2D time** (post-load repacking cannot fit: 2×85.5 GiB > 141 GiB), `from_device` constructors hand the resident buffers to the PR3 weight structs zero-copy, and a DP1 executor walks all 78 layers on rank 0 while ranks 1–7 run their 32 local experts through the collective dispatch/combine. Gate results: EP8 layer-6 oracle **62/64 with the outlier probes bit-identical to EP1** (the collective chain computes exactly the local chain's output); all PR1–PR3 gates re-run green; e2e greedy generation is fluent, factually correct, and byte-deterministic across runs (~109 ms/step bs=1 bring-up, unmeasured levers listed below). See Execution log.
 >
 > **Last touched:** 2026-07
 
@@ -64,6 +64,18 @@ Pad/garbage rows: recv rows beyond the real count hold stale bytes; re-quant of 
 - Scheduler, batching, CUDA-graph capture, device-side sampling — PR5.
 - fp8 dispatch payload, GEMV-at-EP8, re-quant cost reduction — PR5 measurement items.
 - MTP layer 78 — out of campaign scope (weights resident, unused).
+
+## Execution log (2026-07-03, jz-38 8×H200)
+
+- **Gate results:**
+  - All PR1–PR3 gates re-run green after the refactors (MLA 64/64, dense 64/64, EP1 MoE 62/64 both paths, bookend exact, indexer smoke).
+  - **EP8 layer-6 oracle: 62/64, and the two outlier probes' engine values are bit-identical to the EP1 Grouped/Gemv runs** (0.021606 / 0.019165) — dispatch → re-quant → metadata → grouped GEMMs → combine reproduces the local chain exactly; the outliers stay the PR3-measured router near-ties.
+  - **e2e generation** (openinfer-server, `/v1/completions`, greedy): "The capital of France is" → " Paris. Distance from Paris to Lyon is 391 km, …" — two runs byte-identical; "Why is the sky blue?" → 96 tokens of correct Rayleigh-scattering prose; 中文 prompt answers 北京. Startup: 700 GiB across 8 ranks loads in ~122 s (placement coverage checks green on the real checkpoint), `from_device` build + DeepEP contexts ~25 s. Decode ≈ 109 ms/step at bs=1 (29 steps in 3.17 s) — bring-up number; the known levers (worst-case-capacity re-quant/SiLU rows, host argmax D2H, per-step rope H2D) are PR5 measurement items.
+- **Fixed during bring-up:**
+  1. *Collective teardown deadlock*: the DeepEP context drop barriers across ranks; join-then-drop (gate) / sequential worker shutdown (coordinator Drop order) left early ranks spinning in the destroy barrier until the ~100 s device timeout trapped every rank ("unspecified launch failure" ×3, EP8 gate 124 s → 20 s). Fix: rank 0 drops before joining; the coordinator broadcasts Shutdown to all ranks before any join.
+  2. *Thread-local cuBLAS handle*: the kernels crate's handle is thread-local per device and initialized by `DeviceContext::new` — which the oracle gates use, masking that the rank workers (own `CudaContext`) never initialized one. First server request died with `CUBLAS_STATUS_NOT_INITIALIZED` in the layer-0 absorb GEMM. `device_context()` now does the idempotent per-thread setup.
+  3. *Gate env*: the DeepGEMM JIT needs `CUDA_HOME` in addition to `OPENINFER_DEEPGEMM_ROOT` — without it the MQA metadata launch fails as an opaque `CUDA_ERROR_INVALID_VALUE`.
+- **Known frontend limitation (not this PR):** the GLM5.2 checkpoint's `chat_template.jinja` uses `m.content.0.type` — minijinja lexes `.0` as a float and the vllm frontend fails startup while building the chat backend. e2e ran with a shadow model dir (symlinks to `/data/models/GLM-5.2-FP8` + a trivial chat template); `/v1/completions` never renders the template. Needs a frontend-side fix (template preprocessing or lazy chat-backend construction) — filed as follow-up work for the serving PR.
 
 ## Read
 
