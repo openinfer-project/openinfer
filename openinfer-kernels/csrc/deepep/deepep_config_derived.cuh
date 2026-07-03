@@ -17,17 +17,25 @@ constexpr int align_up(int a, int b) { return (a + b - 1) / b * b; }
 constexpr int min_i(int a, int b) { return a < b ? a : b; }
 
 // layout::TokenLayout::get_num_bytes<kWithMBarrier>() for our shapes
-// (sf bytes are always 0; mbarrier is 8 bytes aligned up to 32).
-constexpr int token_smem_bytes(int hidden_bytes, int topk, bool with_metadata,
-                               bool with_mbarrier) {
+// (mbarrier is 8 bytes aligned up to 32). The dispatch payload may carry FP8
+// scale factors (kNumSFPacks > 0) — a separate TMA-aligned segment; the
+// combine payload is ALWAYS bf16 expert outputs (the combine kernel derives
+// its bytes from the ELEMENT count: kNumHiddenBytes = kHidden *
+// sizeof(nv_bfloat16)), independent of the dispatch payload dtype.
+constexpr int token_smem_bytes(int hidden_bytes, int sf_bytes, int topk,
+                               bool with_metadata, bool with_mbarrier) {
     const int metadata_bytes = topk * 8 + (with_metadata ? (1 + topk) * 4 : 0);
-    return align_up(hidden_bytes, kTMAAlign) + align_up(metadata_bytes, kTMAAlign) +
-           (with_mbarrier ? kTMAAlign : 0);
+    return align_up(hidden_bytes, kTMAAlign) + align_up(sf_bytes, kTMAAlign) +
+           align_up(metadata_bytes, kTMAAlign) + (with_mbarrier ? kTMAAlign : 0);
 }
 
-inline constexpr int kDispatchTokenSmem = token_smem_bytes(kHiddenBytes, kNumTopk, true, true);
-inline constexpr int kCombineTokenSmem = token_smem_bytes(kHiddenBytes, kNumTopk, false, true);
-inline constexpr int kReduceTokenSmem = align_up(kHiddenBytes, kTMAAlign);
+inline constexpr int kDispatchSFBytes = kNumSFPacks * 4;  // sf_pack_t is 4 bytes
+inline constexpr int kCombineHiddenBytes = kHidden * 2;   // bf16 expert outputs
+inline constexpr int kDispatchTokenSmem =
+    token_smem_bytes(kHiddenBytes, kDispatchSFBytes, kNumTopk, true, true);
+inline constexpr int kCombineTokenSmem =
+    token_smem_bytes(kCombineHiddenBytes, 0, kNumTopk, false, true);
+inline constexpr int kReduceTokenSmem = align_up(kCombineHiddenBytes, kTMAAlign);
 
 // get_num_notify_smem_bytes(num_ranks, num_experts) with kNumNotifyWarps = 4.
 inline constexpr int kNumNotifyWarps = 4;

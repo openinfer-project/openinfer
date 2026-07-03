@@ -207,8 +207,8 @@ const void* barrier_kernel() {
 // ---------------------------------------------------------------------------
 
 int64_t dispatch_buffer_bytes(int max_tokens) {
-    const auto token_layout =
-        layout::TokenLayout(cfg::kHiddenBytes, 0, cfg::kNumTopk, /*with_metadata=*/true);
+    const auto token_layout = layout::TokenLayout(
+        cfg::kHiddenBytes, cfg::kDispatchSFBytes, cfg::kNumTopk, /*with_metadata=*/true);
     // NVLink scaleup: no send buffer (0 ranks).
     const auto send = layout::BufferLayout<false>(token_layout, 0, max_tokens);
     const auto recv = layout::BufferLayout<false>(token_layout, cfg::kNumRanks, max_tokens);
@@ -216,8 +216,10 @@ int64_t dispatch_buffer_bytes(int max_tokens) {
 }
 
 int64_t combine_buffer_bytes(int max_tokens) {
-    const auto token_layout =
-        layout::TokenLayout(cfg::kHiddenBytes, 0, cfg::kNumTopk, /*with_metadata=*/false);
+    // The combine payload is bf16 expert outputs — bytes come from the
+    // ELEMENT count, not the (possibly fp8) dispatch payload constant.
+    const auto token_layout = layout::TokenLayout(
+        cfg::kCombineHiddenBytes, 0, cfg::kNumTopk, /*with_metadata=*/false);
     const auto send = layout::BufferLayout<false>(token_layout, 0, max_tokens);
     const auto recv = layout::BufferLayout<false>(
         token_layout, cfg::min_i(cfg::kNumRanks, cfg::kNumTopk), max_tokens);
@@ -473,10 +475,10 @@ int DEEPEP_SHIM_FN(ctx_create)(const uint8_t unique_id[128], int32_t num_ranks,
 
     // Pin the constexpr token-layout mirrors to the real layout classes.
     {
-        const auto dispatch_tl =
-            layout::TokenLayout(cfg::kHiddenBytes, 0, cfg::kNumTopk, /*with_metadata=*/true);
-        const auto combine_tl =
-            layout::TokenLayout(cfg::kHiddenBytes, 0, cfg::kNumTopk, /*with_metadata=*/false);
+        const auto dispatch_tl = layout::TokenLayout(
+            cfg::kHiddenBytes, cfg::kDispatchSFBytes, cfg::kNumTopk, /*with_metadata=*/true);
+        const auto combine_tl = layout::TokenLayout(
+            cfg::kCombineHiddenBytes, 0, cfg::kNumTopk, /*with_metadata=*/false);
         require(dispatch_tl.get_num_bytes<true>() == cfg::kDispatchTokenSmem,
                 "ctx_create: dispatch token layout drifted from constexpr mirror");
         require(combine_tl.get_num_bytes<true>() == cfg::kCombineTokenSmem,
