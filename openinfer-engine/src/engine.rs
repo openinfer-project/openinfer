@@ -135,7 +135,6 @@ impl Error for EngineControlError {}
 
 pub type EngineControlResult<T> = std::result::Result<T, EngineControlError>;
 
-#[derive(Debug)]
 pub enum TokenEvent {
     Scheduled {
         queued_at_unix_s: f64,

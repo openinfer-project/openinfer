@@ -44,7 +44,6 @@ use crate::indexer::{
 const ORACLE_CTX: usize = 4096;
 const ORACLE_HIDDEN_DIGEST: &str = "7f1235f1bf66b263";
 // topk_indices[4095] digest: 9516c827dcf88140 (provenance only — loaded from safetensors at runtime)
-const PROBES_PATH: &str = "/tmp/glm52_oracle_probes.safetensors";
 
 const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;
@@ -129,10 +128,12 @@ fn load_indexer_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52In
 fn indexer_oracle_gate() -> Result<()> {
     let model_path = std::env::var_os("OPENINFER_TEST_MODEL_PATH")
         .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from);
+    let probes_path = std::env::var_os("OPENINFER_ORACLE_PROBES_PATH")
+        .map_or_else(|| PathBuf::from("/tmp/glm52_oracle_probes.safetensors"), PathBuf::from);
     let position = ORACLE_CTX - 1;
 
     // ---- load oracle probes from safetensors ----
-    let mmap = crate::weights::mmap_file(Path::new(PROBES_PATH))?;
+    let mmap = crate::weights::mmap_file(&probes_path)?;
     let st = safetensors::SafeTensors::deserialize(mmap.as_ref())?;
 
     let hidden_data = st.tensor("hidden")?.data();

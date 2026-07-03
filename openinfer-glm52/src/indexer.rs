@@ -13,16 +13,17 @@
 //!   |
 //!   +-- wq_b (fp8 linear) -> q[32, 128]
 //!   |     +-- layer_norm (FlashInfer, eps=1e-6, has bias) -> k[128]
-//!   |     +-- interleave RoPE (q[:64], k[:64], cos/sin[32])
+//!   |     +-- RoPE (non-interleaved/half-split, q[:64], k[:64], cos/sin[32])
 //!   |     +-- q per-token-group fp8 quant -> q_fp8[32*128], q_scale[32]
 //!   |     +-- weights fold: weights * q_scale * softmax_scale * n_heads^-0.5
 //!   |
 //! hidden[6144]
 //!   +-- wk (fp8 linear) -> k_raw[128]
-//!   +-- weights_proj (fp8 linear) -> weights[32]
+//!   +-- weights_proj (bf16 GEMM) -> weights[32]
 //!   +-- k quant + cache write (glm52_indexer_k_quant_and_cache)
 //!   |
-//!   +-- DeepGEMM paged MQA logits (fuses ReLU + per-head weighting)
+//!   +-- DeepGEMM paged MQA logits (per-head weighting)
+//!   +-- fused bf16→f32 cast + ReLU
 //!   +-- FlashInfer deterministic top-k K=2048
 //!   +-- local top-k offsets -> global KV slots
 //! ```
@@ -34,11 +35,11 @@ use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK, Glm52DeepGemmMqaLogitsShape,
     Glm52IndexerCacheInsert, Glm52IndexerCacheLayout, Glm52IndexerLocalTopKToSlots,
-    Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_into,
-    glm52_deepgemm_paged_mqa_logits_launch, glm52_deepgemm_paged_mqa_metadata_launch,
-    glm52_flashinfer_topk_2048_launch, glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_indexer_k_quant_and_cache_launch, glm52_indexer_local_topk_to_slots_launch,
-    glm52_indexer_rope_launch, layer_norm_into,
+    Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_relu_into,
+    gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
+    glm52_deepgemm_paged_mqa_metadata_launch, glm52_flashinfer_topk_2048_launch,
+    glm52_fp8_per_token_group_quant_bf16_launch, glm52_indexer_k_quant_and_cache_launch,
+    glm52_indexer_local_topk_to_slots_launch, glm52_indexer_rope_launch, layer_norm_into,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -56,19 +57,18 @@ const K_NORM_EPS: f32 = 1.0e-6;
 
 /// One DSA indexer layer's weights, device-resident.
 pub(crate) struct Glm52IndexerLayerWeights {
-    wq_b: ProjWeight,         // [32*128, 2048]
-    wk: ProjWeight,           // [128, 6144]
-    weights_proj_bf16: Vec<bf16>, // host-side [32, 6144] — f32 matmul for oracle parity
-    k_norm_w: CudaSlice<f32>, // [128] — LayerNorm gamma (f32 for FlashInfer)
-    k_norm_b: CudaSlice<f32>, // [128] — LayerNorm beta  (f32 for FlashInfer)
+    wq_b: ProjWeight,             // [32*128, 2048]
+    wk: ProjWeight,               // [128, 6144]
+    weights_proj: CudaSlice<bf16>, // [32, 6144] — bf16 GEMM (transformers _keep_in_fp32_modules)
+    k_norm_w: CudaSlice<f32>,     // [128] — LayerNorm gamma (f32 for FlashInfer)
+    k_norm_b: CudaSlice<f32>,     // [128] — LayerNorm beta  (f32 for FlashInfer)
 }
 
 impl Glm52IndexerLayerWeights {
     /// Build from raw checkpoint bytes (the test path). Same pattern as
     /// `Glm52MlaLayerWeights::from_host`. `weights_proj` is a bf16 `[32, 6144]`
-    /// tensor (transformers keeps it in fp32/bf16, NOT fp8 block-scaled). It
-    /// is host-side quantized to fp8 per-128-block and padded to [128, 6144]
-    /// because TRTLLM rejects n=32.
+    /// tensor (transformers keeps it in fp32 via `_keep_in_fp32_modules`, but
+    /// the checkpoint stores bf16).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
@@ -110,19 +110,20 @@ impl Glm52IndexerLayerWeights {
 
         let w = ProjWeight::upload(ctx, wq_b)?;
         let k = ProjWeight::upload(ctx, wk)?;
-        let proj_bf16: Vec<bf16> = unsafe {
+        let proj_bf16: &[bf16] = unsafe {
             std::slice::from_raw_parts(
                 weights_proj_bf16.as_ptr().cast::<bf16>(),
                 INDEX_HEADS * HIDDEN,
             )
-        }
-        .to_vec();
+        };
+        let mut weights_proj = ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS * HIDDEN)?;
+        ctx.stream.memcpy_htod(proj_bf16, &mut weights_proj)?;
         let norm_w = upcast_bf16_to_f32(ctx, k_norm_w)?;
         let norm_b = upcast_bf16_to_f32(ctx, k_norm_b)?;
         Ok(Self {
             wq_b: w,
             wk: k,
-            weights_proj_bf16: proj_bf16,
+            weights_proj,
             k_norm_w: norm_w,
             k_norm_b: norm_b,
         })
@@ -221,19 +222,31 @@ pub(crate) fn glm52_indexer_forward(
     // ---- projections ----
     let q = fp8_linear(ctx, &w.wq_b, q_resid)?; // [32*128 = 4096]
     let k_raw = fp8_linear(ctx, &w.wk, hidden)?; // [128]
-    // weights_proj: f32 host matmul (matches oracle precision — transformers
-    // keeps weights_proj in fp32 via _keep_in_fp32_modules).
-    let hidden_host = ctx.stream.clone_dtoh(&hidden.slice(0..HIDDEN))?;
-    let weights_raw: Vec<f32> = (0..INDEX_HEADS)
-        .map(|h| {
-            let mut dot = 0.0f32;
-            let row = &w.weights_proj_bf16[h * HIDDEN..(h + 1) * HIDDEN];
-            for j in 0..HIDDEN {
-                dot += hidden_host[j].to_f32() * row[j].to_f32();
-            }
-            dot
-        })
-        .collect();
+    // weights_proj: bf16 GEMM (transformers keeps weights_proj in fp32 via
+    // _keep_in_fp32_modules; checkpoint stores bf16, so bf16 GEMM is the
+    // closest match without a dedicated f32 GEMM path).
+    // cuBLAS column-major: weights [32, 6144] row-major = [6144, 32]^T,
+    // hidden [6144] = [6144, 1]. So m=32, n=1, k=6144, op_a=T, op_b=N.
+    let mut weights_out_bf16 = ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS)?;
+    gemm_strided_batched_bf16(
+        ctx,
+        true,  // transpose_a: weights [32, 6144] row-major → col-major
+        false, // transpose_b: hidden [6144, 1] col-major
+        INDEX_HEADS, // m = 32
+        1,           // n = 1 (bs=1)
+        HIDDEN,     // k = 6144
+        &w.weights_proj,
+        HIDDEN,     // lda = k (row stride of transposed weights)
+        0,           // stride_a (batch=1, unused)
+        hidden,
+        HIDDEN,     // ldb = k
+        0,           // stride_b
+        &mut weights_out_bf16,
+        INDEX_HEADS, // ldc = m
+        0,           // stride_c
+        1,           // batch
+    )?;
+    let weights_raw = ctx.stream.clone_dtoh(&weights_out_bf16)?;
 
     // ---- k LayerNorm (eps=1e-6, with bias) ----
     let mut k = ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?;
@@ -265,7 +278,7 @@ pub(crate) fn glm52_indexer_forward(
     let mut weights_folded = vec![0.0f32; INDEX_HEADS];
     for h in 0..INDEX_HEADS {
         weights_folded[h] =
-            weights_raw[h] * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
+            weights_raw[h].to_f32() * q_scale_host[h] * SOFTMAX_SCALE * N_HEADS_SCALE;
     }
     let mut weights_out = ctx.stream.alloc_zeros::<f32>(INDEX_HEADS)?;
     ctx.stream.memcpy_htod(&weights_folded, &mut weights_out)?;
@@ -338,15 +351,10 @@ pub(crate) fn glm52_indexer_forward(
     )?;
 
     // DeepGEMM outputs bf16 logits; FlashInfer top-k expects f32.
-    // Cast bf16 logits buffer → f32 before top-k.
+    // Fused bf16→f32 cast + ReLU: transformers applies F.relu(scores) before
+    // topk. sm100 DeepGEMM fuses this via cvt.relu, but sm90 does not.
     let mut logits_f32 = ctx.stream.alloc_zeros::<f32>(logits_elems)?;
-    bf16_bytes_to_f32_into(ctx, &logits, &mut logits_f32)?;
-
-    // Apply ReLU: transformers applies F.relu(scores) before topk.
-    // sm100 DeepGEMM fuses this via cvt.relu, but sm90 does not.
-    let logits_host = ctx.stream.clone_dtoh(&logits_f32)?;
-    let relu_host: Vec<f32> = logits_host.iter().map(|&v| v.max(0.0)).collect();
-    ctx.stream.memcpy_htod(&relu_host, &mut logits_f32)?;
+    bf16_bytes_to_f32_relu_into(ctx, &logits, &mut logits_f32)?;
 
     let mut topk_offsets = ctx.stream.alloc_zeros::<i32>(GLM52_INDEXER_TOPK)?;
     let mut topk_values = ctx.stream.alloc_zeros::<f32>(GLM52_INDEXER_TOPK)?;

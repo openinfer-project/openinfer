@@ -556,6 +556,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn bf16_to_f32_relu_cuda(
+        input: *const Half,
+        output: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn f32_to_bf16_cuda(
         input: *const f32,
         output: *mut Half,
