@@ -103,11 +103,14 @@ CUresult glm52_router_logits_gemm(const __nv_bfloat16* hidden,
   const float beta = 0.0f;
   cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
   if (status != CUBLAS_STATUS_SUCCESS) return CUDA_ERROR_INVALID_HANDLE;
+  // CUBLAS_COMPUTE_32F (NOT _PEDANTIC): the kimi router shipped PEDANTIC and
+  // measured 60x off roofline (kimi_router.cu:139 post-mortem). Tensor-op f32
+  // accumulation is the intended mode; bf16 inputs already bound the precision.
   status = cublasGemmEx(
       g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, n_experts, padded_tokens,
       hidden_dim, &alpha, gate_weight, CUDA_R_16BF, hidden_dim, hidden,
       CUDA_R_16BF, hidden_dim, &beta, logits, CUDA_R_32F, n_experts,
-      CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return status == CUBLAS_STATUS_SUCCESS ? CUDA_SUCCESS
                                          : CUDA_ERROR_LAUNCH_FAILED;
 }

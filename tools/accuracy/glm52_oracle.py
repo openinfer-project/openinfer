@@ -261,9 +261,16 @@ class Fp8SimExperts(torch.nn.Module):
     route weight commutes with the per-group dynamic scale, so applying it after
     down as the official code does is equivalent up to f32 scale rounding).
 
-    The loop itself mirrors `GlmMoeDsaExperts.forward` (transport, no new math);
-    expert weights stay fp8 in memory and are block-dequanted lazily per hit
-    expert, so the 256-expert layer never materializes ~19 GB of f32 weights.
+    The loop itself mirrors `GlmMoeDsaExperts.forward` (transport, no new math).
+    Expert weights are block-dequanted lazily per hit expert and cached WITHOUT
+    eviction — a long run that touches all 256 experts holds ~39 GB of f32
+    weights (fine on the H200 build node; do not run this on a small box).
+
+    One deliberate asymmetry vs the engine: the SwiGLU product is rounded to
+    bf16 before the W2-input quant-dequant (the engine's kernel quantizes its
+    f32 silu product directly from the bf16 GEMM output). Under e4m3's 3-bit
+    mantissa the pre-round is almost always absorbed; it is below the gate
+    tolerance by construction.
     """
 
     def __init__(self, ckpt: Checkpoint, layer: int, num_experts: int, precision: str):
@@ -607,7 +614,8 @@ def emit_rust_layer(taps, args, versions: str) -> str:
         rows = ",\n".join(f"    ({i}, {w:.9e})" for i, w in pairs)
         router_block = f"""
 // Router selection of the LAST position: (expert_id, normalized x2.5 weight),
-// sorted by expert id. Ids assert exactly; weights within REL_TOL of their max.
+// sorted by expert id. NOT asserted — the engine does not expose its router
+// picks to the gate; this is a hand-comparison aid when layer probes fail.
 const ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
 {rows},
 ];"""

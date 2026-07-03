@@ -210,7 +210,8 @@ const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
     (1218315, 3.173828125e-02),
 ];
 // Router selection of the LAST position: (expert_id, normalized x2.5 weight),
-// sorted by expert id. Ids assert exactly; weights within REL_TOL of their max.
+// sorted by expert id. NOT asserted — the engine does not expose its router
+// picks to the gate; this is a hand-comparison aid when layer probes fail.
 const MOE_ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
     (20, 3.342877328e-01),
     (30, 3.071641624e-01),

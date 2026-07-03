@@ -25,7 +25,8 @@ use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout, add_batch, rms_norm_into,
+    Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout, add_batch,
+    fused_add_rms_norm_round_batch_into, rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -122,6 +123,13 @@ fn residual_add(
 /// `[HIDDEN]` (consumed); returns the residual-stream output. `topk_carry`
 /// threads the cross-layer top-k: a `Full` layer replaces it, a `Shared` layer
 /// requires it.
+///
+/// The carry is only meaningful WITHIN one decode step: callers must pass a
+/// fresh `None` per step (layer 0 is always `Full`, so an in-order full-stack
+/// walk refreshes it before any read — but a `Some` left over from a previous
+/// step would be silently accepted if a walk started at a `Shared` layer).
+/// PR4's 78-layer spine should hold the carry in a step-scoped struct so that
+/// misuse is unrepresentable.
 pub(crate) fn glm52_decoder_layer_forward(
     ctx: &DeviceContext,
     w: &Glm52DecoderLayerWeights,
@@ -183,10 +191,41 @@ pub(crate) fn glm52_decoder_layer_forward(
         topk,
         step.contract,
     )?;
-    let residual = residual_add(ctx, residual, attn)?;
 
     // ---- MLP half ----
-    let normed = rms(ctx, &residual, &w.post_attn_ln)?;
+    // Fused add+norm at the post-attention boundary (bit-identical to separate
+    // add + rms_norm — the `_round` variant rounds the sum to bf16 before the
+    // variance, exactly like add_batch would). The input_layernorm boundary
+    // spans layers and stays unfused in this single-layer unit.
+    let mut attn_hs = HiddenStates {
+        data: attn,
+        hidden_dim: HIDDEN,
+        seq_len: 1,
+    };
+    let residual_hs = HiddenStates {
+        data: residual.data,
+        hidden_dim: HIDDEN,
+        seq_len: 1,
+    };
+    let mut normed_hs = HiddenStates {
+        data: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+        hidden_dim: HIDDEN,
+        seq_len: 1,
+    };
+    fused_add_rms_norm_round_batch_into(
+        ctx,
+        &mut attn_hs,
+        &residual_hs,
+        &w.post_attn_ln,
+        RMS_EPS,
+        &mut normed_hs,
+    )?;
+    let residual = DeviceVec {
+        data: attn_hs.data,
+        len: HIDDEN,
+    };
+    let normed = normed_hs.data;
+
     let mlp = match &w.mlp {
         Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward(ctx, dense, &normed)?,
         Glm52LayerMlp::Moe(moe) => glm52_moe_forward(ctx, moe, &normed, step.moe_path)?,

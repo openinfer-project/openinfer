@@ -86,56 +86,6 @@ pub fn glm52_moe_fp8_weight_only_gemv_launch(
     .map_err(|err| anyhow!("GLM5.2 grouped GEMV launch failed: {err}"))
 }
 
-/// Plain weight-only FP8 GEMV: bf16 activation x one fp8 linear/expert weight `[n,k]`,
-/// scale dequant on the fly. `scale_bytes` is the `ProjWeight` `weight_scale_inv` kept
-/// as raw `u8` f32-bytes (reinterpreted here as f32). `n` need not be a multiple of 128
-/// (e.g. MLA kv_a n=576): the scale buffer is sized `div_ceil(n,128) * div_ceil(k,128)`
-/// f32 and the kernel's 32-row blocks never straddle a /128 scale boundary.
-pub fn glm52_fp8_weight_only_gemv_launch(
-    ctx: &DeviceContext,
-    n: usize,
-    k: usize,
-    activation: &CudaSlice<bf16>,
-    weight: &CudaSlice<u8>,
-    scale_bytes: &CudaSlice<u8>,
-    out: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    ensure!(
-        n > 0 && k > 0,
-        "GLM5.2 linear GEMV needs positive n/k, got {n}/{k}"
-    );
-    let scale_len = n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK) * 4;
-    ensure!(
-        weight.len() >= n * k
-            && scale_bytes.len() >= scale_len
-            && activation.len() >= k
-            && out.len() >= n,
-        "GLM5.2 linear GEMV buffers too small: w {} (need {}), scale {} (need {scale_len}), act {} (need {k}), out {} (need {n})",
-        weight.len(),
-        n * k,
-        scale_bytes.len(),
-        activation.len(),
-        out.len()
-    );
-    let (act_ptr, _a) = activation.device_ptr(&ctx.stream);
-    let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
-    let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
-    let (out_ptr, _o) = out.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::glm52_fp8_weight_only_gemv_cuda(
-            act_ptr as *const ffi::Half,
-            w_ptr as *const u8,
-            s_ptr as *const f32,
-            out_ptr as *mut ffi::Half,
-            n as i32,
-            k as i32,
-            ctx.stream.cu_stream(),
-        )
-    }
-    .result()
-    .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed: {err}"))
-}
-
 /// SiLU(gate)*up -> bf16. `input` is `[rows, 2*inter]` (gate|up); `output` is
 /// `[rows, inter]`. `topk_weights` (per-row route weight) is folded in when `Some`;
 /// `None` is the plain MLP SwiGLU (no route weight).

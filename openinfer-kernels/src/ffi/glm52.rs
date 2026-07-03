@@ -267,16 +267,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_fp8_weight_only_gemv_cuda(
-        activation: *const Half,
-        weight: *const u8,
-        weight_scale: *const f32,
-        out: *mut Half,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn glm52_silu_and_mul_weighted_bf16_cuda(
         input: *const Half,
         topk_weights: *const f32,

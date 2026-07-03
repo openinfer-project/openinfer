@@ -314,6 +314,7 @@ fn routed_forward_grouped(
     glm52_moe_route_scatter_launch(
         ctx,
         M_CAPACITY,
+        EXPERTS,
         TOPK,
         W13_K,
         HIDDEN_SCALE_COLS,
@@ -378,6 +379,7 @@ fn routed_forward_grouped(
     glm52_moe_combine_launch(
         ctx,
         M_CAPACITY,
+        EXPERTS,
         HIDDEN,
         TOPK,
         &w2_out,

@@ -46,8 +46,6 @@ constexpr int kStep         = kWarpSize * kVec;               // 512 k per warp 
 // mapping changes, never a row's dot or its accumulation order.
 constexpr int kRowsGrouped         = 4;
 constexpr int kRowsPerBlockGrouped = kWarpsPerBlk * kRowsGrouped;  // 32
-constexpr int kRowsPlainShortK     = 4;   // k <= 2048
-constexpr int kRowsPlainLongK      = 1;   // k  > 2048
 
 constexpr int kKindW13 = 1, kKindW13N = 4096, kKindW13K = 6144;
 constexpr int kKindW2  = 2, kKindW2N  = 6144, kKindW2K  = 2048;
@@ -167,18 +165,6 @@ __global__ void glm52_moe_fp8_weight_only_gemv_kernel(
                               n, k);
 }
 
-// Plain linear GEMV: single weight matrix, broadcast activation (groups=1). ROWS is
-// dispatched on k by the launcher (short-K 4, long-K 1).
-template <int ROWS>
-__global__ void glm52_fp8_weight_only_gemv_kernel(
-    const __nv_bfloat16* __restrict__ activation,  // [k]
-    const unsigned char* __restrict__ weight,      // [n, k] e4m3
-    const float* __restrict__ weight_scale,        // [n/128, k/128]
-    __nv_bfloat16* __restrict__ out,               // [n]
-    int n, int k) {
-  gemv_row_tile<ROWS>(activation, weight, weight_scale, out, n, k);  // x straight from L2
-}
-
 // Weighted SiLU(gate)*up -> bf16, route weight folded per slot. Consumes the W13
 // GEMV output [rows, 2*inter] (gate|up) and emits the bf16 W2 GEMV input
 // [rows, inter]. bf16 companion of silu_and_mul_per_token_group_quant_bf16 with the
@@ -230,24 +216,6 @@ bool valid_tiling(int n, int k, int rpb) {
   return n > 0 && k > 0 && k % kFp8Block == 0 && n % rpb == 0 && k % kStep == 0;
 }
 
-// rows/warp the plain launcher will use for this k (see kRowsPlainShortK/LongK).
-int plain_rows_per_warp(int k) {
-  return k <= 2048 ? kRowsPlainShortK : kRowsPlainLongK;
-}
-
-// Plain-linear shapes (mirror glm52_trtllm_grouped_fp8.cu valid_glm52_linear_shape).
-bool valid_linear_shape(int n, int k) {
-  if (!valid_tiling(n, k, kWarpsPerBlk * plain_rows_per_warp(k))) return false;
-  if (n == 2048  && k == 6144)  return true;   // q_a / shared gate,up
-  if (n == 16384 && k == 2048)  return true;   // q_b
-  if (n == 576   && k == 6144)  return true;   // kv_a + rope (partial-N: 576%128!=0)
-  if (n == 6144  && k == 16384) return true;   // o_proj
-  if (n == 12288 && k == 6144)  return true;   // dense gate,up
-  if (n == 6144  && k == 12288) return true;   // dense down
-  if (n == 6144  && k == 2048)  return true;   // shared down
-  return false;
-}
-
 }  // namespace
 
 extern "C" {
@@ -265,26 +233,6 @@ CUresult glm52_moe_fp8_weight_only_gemv_cuda(
   const dim3 grid(topk, n / kRowsPerBlockGrouped, 1);
   glm52_moe_fp8_weight_only_gemv_kernel<<<grid, kBlockThreads, 0, stream>>>(
       activation, act_row_stride, topk_idx, weight, weight_scale, out, n, k);
-  return consume_last_cuda_error();
-}
-
-CUresult glm52_fp8_weight_only_gemv_cuda(
-    const __nv_bfloat16* activation, const unsigned char* weight,
-    const float* weight_scale, __nv_bfloat16* out, int n, int k,
-    cudaStream_t stream) {
-  if (activation == nullptr || weight == nullptr || weight_scale == nullptr ||
-      out == nullptr || !aligned16(activation) || !valid_linear_shape(n, k)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  const int rows = plain_rows_per_warp(k);
-  const dim3 grid(1, n / (kWarpsPerBlk * rows), 1);
-  if (rows == kRowsPlainShortK) {
-    glm52_fp8_weight_only_gemv_kernel<kRowsPlainShortK>
-        <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
-  } else {
-    glm52_fp8_weight_only_gemv_kernel<kRowsPlainLongK>
-        <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
-  }
   return consume_last_cuda_error();
 }
 

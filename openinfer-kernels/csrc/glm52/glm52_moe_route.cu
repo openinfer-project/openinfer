@@ -15,8 +15,10 @@
 //      weighted SwiGLU quant, so this just sums the selected experts' W2 output
 //      rows back into the single token's routed output.
 //
-// The pad rows between experts (alignment slack) stay zero (the activation buffer
-// is zero-initialised), so they contribute nothing and are never read by combine.
+// Pad rows between experts (alignment slack) may hold stale data: every kernel
+// between scatter and combine is row-independent and combine reads only the
+// top-k experts' base rows via expert_offsets, so unused rows never reach the
+// output (see openinfer-glm52/src/moe_decode.rs module docs).
 
 #include "../common.cuh"
 

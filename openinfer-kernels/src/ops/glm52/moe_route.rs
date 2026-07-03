@@ -61,13 +61,17 @@ pub fn glm52_moe_route_offsets_launch(
 
 /// Replicate the single quantized hidden row (fp8 + per-group scale) into each
 /// selected expert's activation slot at `expert_offsets[topk_idx[j]]`, and write
-/// the expert-major per-row route weight for the weighted SwiGLU quant. The
-/// activation/scale/weight buffers must be zero-initialised so the alignment pad
-/// rows contribute nothing.
+/// the expert-major per-row route weight for the weighted SwiGLU quant.
+///
+/// Pad rows (and stale rows from a previous token) need NOT be zeroed: every
+/// kernel between scatter and combine is row-independent, and combine reads
+/// only the top-k experts' base rows via `expert_offsets` — garbage in unused
+/// rows never reaches the output (see `moe_decode.rs` module docs).
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_moe_route_scatter_launch(
     ctx: &DeviceContext,
     m_capacity: usize,
+    n_experts: usize,
     topk: usize,
     k: usize,
     scale_cols: usize,
@@ -81,8 +85,8 @@ pub fn glm52_moe_route_scatter_launch(
     row_weight: &mut CudaSlice<f32>,
 ) -> Result<()> {
     ensure!(
-        m_capacity > 0 && topk > 0 && k > 0 && scale_cols > 0,
-        "GLM5.2 MoE scatter needs positive m_capacity/topk/k/scale_cols, got {m_capacity}/{topk}/{k}/{scale_cols}"
+        m_capacity > 0 && n_experts > 0 && topk > 0 && k > 0 && scale_cols > 0,
+        "GLM5.2 MoE scatter needs positive m_capacity/n_experts/topk/k/scale_cols, got {m_capacity}/{n_experts}/{topk}/{k}/{scale_cols}"
     );
     ensure!(
         hidden_fp8.len() >= k && hidden_scale.len() >= scale_cols,
@@ -90,12 +94,15 @@ pub fn glm52_moe_route_scatter_launch(
         hidden_fp8.len(),
         hidden_scale.len()
     );
+    // The kernel indexes expert_offsets by EXPERT ID (0..n_experts), not by slot
+    // — the buffer must span the full grouped table, `n_experts + 1` entries.
     ensure!(
-        topk_idx.len() >= topk && topk_weight.len() >= topk && expert_offsets.len() > topk,
-        "GLM5.2 MoE scatter route buffers too small: idx {}, weight {}, offsets {}",
+        topk_idx.len() >= topk && topk_weight.len() >= topk && expert_offsets.len() > n_experts,
+        "GLM5.2 MoE scatter route buffers too small: idx {}, weight {}, offsets {} (need {})",
         topk_idx.len(),
         topk_weight.len(),
-        expert_offsets.len()
+        expert_offsets.len(),
+        n_experts + 1
     );
     ensure!(
         act.len() >= m_capacity * k
@@ -138,9 +145,11 @@ pub fn glm52_moe_route_scatter_launch(
 /// Sum the selected experts' W2 output rows (at `expert_offsets[topk_idx[j]]`)
 /// into the single token's routed output `[n]`. The route weight was already
 /// folded into the W2 input, so this is a plain sum.
+#[allow(clippy::too_many_arguments)]
 pub fn glm52_moe_combine_launch(
     ctx: &DeviceContext,
     m_capacity: usize,
+    n_experts: usize,
     n: usize,
     topk: usize,
     w2_out: &CudaSlice<bf16>,
@@ -149,8 +158,8 @@ pub fn glm52_moe_combine_launch(
     routed: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(
-        m_capacity > 0 && n > 0 && topk > 0,
-        "GLM5.2 MoE combine needs positive m_capacity/n/topk, got {m_capacity}/{n}/{topk}"
+        m_capacity > 0 && n_experts > 0 && n > 0 && topk > 0,
+        "GLM5.2 MoE combine needs positive m_capacity/n_experts/n/topk, got {m_capacity}/{n_experts}/{n}/{topk}"
     );
     ensure!(
         w2_out.len() >= m_capacity * n,
@@ -158,11 +167,13 @@ pub fn glm52_moe_combine_launch(
         w2_out.len(),
         m_capacity * n
     );
+    // Same expert-id-indexed contract as scatter: `n_experts + 1` entries.
     ensure!(
-        topk_idx.len() >= topk && expert_offsets.len() > topk && routed.len() >= n,
-        "GLM5.2 MoE combine route/out buffers too small: idx {}, offsets {}, routed {}",
+        topk_idx.len() >= topk && expert_offsets.len() > n_experts && routed.len() >= n,
+        "GLM5.2 MoE combine route/out buffers too small: idx {}, offsets {} (need {}), routed {}",
         topk_idx.len(),
         expert_offsets.len(),
+        n_experts + 1,
         routed.len()
     );
     let (w2_ptr, _w2_guard) = w2_out.device_ptr(&ctx.stream);
