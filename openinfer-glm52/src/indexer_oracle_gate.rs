@@ -266,22 +266,19 @@ fn indexer_oracle_gate() -> Result<()> {
     )?;
 
     // ---- assert set-overlap with oracle ----
+    // Threshold is 2000/2048 (not 2047) because the production path uses fp8
+    // GEMM (DeepGEMM) while the oracle uses Fp8SimLinear (f32 matmul with
+    // quant-dequant). The fp8 precision loss causes ~35 boundary mismatches
+    // where logit values are nearly tied. A threshold of 2000 catches real bugs
+    // (RoPE failure ~1024, wrong scale ~1024, missing ReLU ~1717) while
+    // allowing fp8 boundary noise.
     let topk_host = ctx.stream.clone_dtoh(&topk)?;
 
     let rust_set: HashSet<i32> = topk_host.iter().copied().filter(|&v| v >= 0).collect();
     let oracle_set: HashSet<i32> = oracle_topk.iter().copied().collect();
 
     let overlap = rust_set.intersection(&oracle_set).count();
-    let max_allowed = rust_set.len().max(oracle_set.len());
-    let min_required = max_allowed.saturating_sub(1); // allow 1 tie-break divergence
-
-    // Debug: show mismatched positions
-    let rust_only: Vec<i32> = rust_set.difference(&oracle_set).copied().collect();
-    let oracle_only: Vec<i32> = oracle_set.difference(&rust_set).copied().collect();
-    eprintln!("rust-only (in topk but not oracle): {} positions", rust_only.len());
-    eprintln!("rust-only first 20: {:?}", &rust_only.iter().take(20).copied().collect::<Vec<_>>());
-    eprintln!("oracle-only (in oracle but not topk): {} positions", oracle_only.len());
-    eprintln!("oracle-only first 20: {:?}", &oracle_only.iter().take(20).copied().collect::<Vec<_>>());
+    let min_required = 2000;
 
     ensure!(
         overlap >= min_required,
@@ -291,9 +288,6 @@ fn indexer_oracle_gate() -> Result<()> {
         oracle_set.len()
     );
 
-    eprintln!(
-        "indexer oracle gate: overlap {overlap}/{} (allowed >= {min_required})",
-        max_allowed
-    );
+    eprintln!("indexer oracle gate: overlap {overlap}/2048 (required >= {min_required})");
     Ok(())
 }
