@@ -225,6 +225,45 @@ fn upcast_bf16_to_f32(ctx: &DeviceContext, src: &[u8]) -> Result<CudaSlice<f32>>
     Ok(dst)
 }
 
+/// Cache-fill phase: compute k for one token and write it into the index_k_cache.
+/// Used during prefill to populate the cache for all positions before the
+/// topk query. Does NOT compute logits or topk — only wk + LayerNorm + RoPE(k)
+/// + quant + cache-write.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glm52_indexer_cache_fill(
+    ctx: &DeviceContext,
+    w: &Glm52IndexerLayerWeights,
+    hidden: &CudaSlice<bf16>,
+    cos: &CudaSlice<bf16>,
+    sin: &CudaSlice<bf16>,
+    index_k_cache: &mut CudaSlice<u8>,
+    cache_layout: Glm52IndexerCacheLayout,
+    slot_mapping: &CudaSlice<i64>,
+) -> Result<()> {
+    ensure!(hidden.len() >= HIDDEN, "GLM5.2 indexer cache_fill hidden too small");
+
+    let k_raw = fp8_linear(ctx, &w.wk, hidden)?; // [128]
+    let mut k = ctx.stream.alloc_zeros::<bf16>(INDEX_HEAD_DIM)?;
+    layer_norm_into(ctx, &k_raw, &w.k_norm_w, &w.k_norm_b, K_NORM_EPS, &mut k)?;
+
+    // RoPE: the kernel applies to both q and k; use a dummy q buffer.
+    let mut q_dummy = ctx.stream.alloc_zeros::<bf16>(INDEX_HEADS * INDEX_HEAD_DIM)?;
+    glm52_indexer_rope_launch(ctx, &mut q_dummy, &mut k, INDEX_HEADS, cos, sin)?;
+
+    glm52_indexer_k_quant_and_cache_launch(
+        ctx,
+        Glm52IndexerCacheInsert {
+            tokens: 1,
+            layout: cache_layout,
+            scale_format: Glm52IndexerScaleFormat::F32,
+        },
+        &k,
+        index_k_cache,
+        slot_mapping,
+    )?;
+    Ok(())
+}
+
 /// DSA indexer decode forward for one token (bs=1): computes sparse top-k
 /// slot indices for the FlashMLA sparse decode.
 ///

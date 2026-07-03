@@ -26,8 +26,10 @@ use sha2::{Digest, Sha256};
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::Glm52ProjBytes;
-use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward};
+use crate::fp8::{Glm52ProjBytes, ProjWeight, fp8_linear};
+use crate::indexer::{
+    Glm52IndexerLayerWeights, glm52_indexer_cache_fill, glm52_indexer_forward,
+};
 
 // ---- BEGIN GENERATED: glm52_oracle indexer probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
@@ -244,11 +246,17 @@ impl Layer0IndexerTensors {
         let weight_map = index["weight_map"]
             .as_object()
             .context("weight_map missing")?;
-        let prefix = "model.layers.0.self_attn.indexer";
+        // Load both indexer weights and q_a_proj / q_a_layernorm (needed to
+        // compute q_resid = q_a_layernorm(q_a_proj(hidden))).
+        let prefixes = [
+            "model.layers.0.self_attn.indexer",
+            "model.layers.0.self_attn.q_a_proj",
+            "model.layers.0.self_attn.q_a_layernorm",
+        ];
         let mut by_shard: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::default();
         for (name, shard) in weight_map {
-            if name.starts_with(prefix) {
+            if prefixes.iter().any(|p| name.starts_with(p)) {
                 by_shard
                     .entry(shard.as_str().context("shard not a string")?.to_owned())
                     .or_default()
@@ -296,6 +304,32 @@ fn load_indexer_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52In
     )
 }
 
+/// Load q_a_proj (fp8 [2048, 6144]) and q_a_layernorm.weight (bf16 [2048])
+/// from the checkpoint. Used to compute q_resid = rmsnorm(q_a_proj(hidden)).
+fn load_qa_proj(ctx: &DeviceContext, model_path: &Path) -> Result<(ProjWeight, Vec<f32>)> {
+    let t = Layer0IndexerTensors::load(model_path)?;
+    let qa = t.proj("model.layers.0.self_attn.q_a_proj", Q_LORA, HIDDEN)?;
+    let w = ProjWeight::upload(ctx, &qa)?;
+    let ln_bytes = t.bytes("model.layers.0.self_attn.q_a_layernorm.weight")?;
+    ensure!(ln_bytes.len() == Q_LORA * 2, "q_a_layernorm bytes mismatch");
+    let bf16_vals: &[bf16] =
+        unsafe { std::slice::from_raw_parts(ln_bytes.as_ptr().cast::<bf16>(), Q_LORA) };
+    let f32_vals: Vec<f32> = bf16_vals.iter().map(|v| v.to_f32()).collect();
+    Ok((w, f32_vals))
+}
+
+/// Host-side RMSNorm: y = x / sqrt(mean(x^2) + eps) * weight
+fn rmsnorm_host(x: &[bf16], weight: &[f32], eps: f32) -> Vec<bf16> {
+    let n = x.len();
+    let sum_sq: f32 = x.iter().map(|v| v.to_f32().powi(2)).sum();
+    let rms = (sum_sq / n as f32 + eps).sqrt();
+    let inv_rms = 1.0 / rms;
+    x.iter()
+        .enumerate()
+        .map(|(i, v)| bf16::from_f32(v.to_f32() * inv_rms * weight[i]))
+        .collect()
+}
+
 #[test]
 #[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
 fn indexer_oracle_gate() -> Result<()> {
@@ -316,26 +350,7 @@ fn indexer_oracle_gate() -> Result<()> {
 
     let ctx = DeviceContext::new()?;
     let w = load_indexer_layer0(&ctx, &model_path)?;
-
-    // ---- upload inputs for the last position ----
-    let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
-    ctx.stream.memcpy_htod(
-        &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
-        &mut hidden,
-    )?;
-
-    // q_resid: in the full pipeline this is q_a_layernorm(q_a_proj(hidden)).
-    // For the oracle gate we need the oracle to emit q_resid as a safetensors
-    // dump and load it here. For now, we use the seeded hidden as a placeholder
-    // until the oracle dump pipeline is wired.
-    // TODO: load q_resid from oracle safetensors dump.
-    let q_resid = ctx.stream.alloc_zeros::<bf16>(Q_LORA)?;
-
-    let (cos_host, sin_host) = rope_tables(position);
-    let mut cos = ctx.stream.alloc_zeros::<bf16>(32)?;
-    let mut sin = ctx.stream.alloc_zeros::<bf16>(32)?;
-    ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
-    ctx.stream.memcpy_htod(&sin_host, &mut sin)?;
+    let (qa_proj, qa_ln_w) = load_qa_proj(&ctx, &model_path)?;
 
     // ---- cache setup ----
     let cache_blocks = ORACLE_CTX.div_ceil(CACHE_BLOCK_SIZE);
@@ -347,27 +362,69 @@ fn indexer_oracle_gate() -> Result<()> {
     let cache_bytes = cache_layout.min_cache_bytes()?;
     let mut index_k_cache = ctx.stream.alloc_zeros::<u8>(cache_bytes)?;
 
-    // slot_mapping: position p → slot p
-    let slot_mapping_host = vec![position as i64];
-    let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
-    ctx.stream
-        .memcpy_htod(&slot_mapping_host, &mut slot_mapping)?;
-
     // block_table: identity mapping (block i = i)
     let block_table_host: Vec<i32> = (0..cache_blocks as i32).collect();
     let mut block_table = ctx.stream.alloc_zeros::<i32>(cache_blocks)?;
     ctx.stream
         .memcpy_htod(&block_table_host, &mut block_table)?;
 
+    // ---- fill cache for positions 0..position-1 ----
+    // The indexer forward only processes 1 token at a time; we must populate
+    // the KV cache for all prefix tokens before querying topk for the last.
+    let mut hidden_buf = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+    let mut cos_buf = ctx.stream.alloc_zeros::<bf16>(32)?;
+    let mut sin_buf = ctx.stream.alloc_zeros::<bf16>(32)?;
+    let mut slot_buf = ctx.stream.alloc_zeros::<i64>(1)?;
+    for pos in 0..position {
+        let h = &hidden_host[pos * HIDDEN..(pos + 1) * HIDDEN];
+        ctx.stream.memcpy_htod(h, &mut hidden_buf)?;
+        let (c, s) = rope_tables(pos);
+        ctx.stream.memcpy_htod(&c, &mut cos_buf)?;
+        ctx.stream.memcpy_htod(&s, &mut sin_buf)?;
+        ctx.stream.memcpy_htod(&[pos as i64], &mut slot_buf)?;
+        glm52_indexer_cache_fill(
+            &ctx,
+            &w,
+            &hidden_buf,
+            &cos_buf,
+            &sin_buf,
+            &mut index_k_cache,
+            cache_layout,
+            &slot_buf,
+        )?;
+    }
+
+    // ---- compute q_resid = rmsnorm(q_a_proj(hidden[last_pos])) ----
+    let last_hidden_host = &hidden_host[position * HIDDEN..(position + 1) * HIDDEN];
+    let mut last_hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+    ctx.stream.memcpy_htod(last_hidden_host, &mut last_hidden)?;
+    let q_a = fp8_linear(&ctx, &qa_proj, &last_hidden)?; // [2048]
+    let q_a_host = ctx.stream.clone_dtoh(&q_a)?;
+    let q_resid_host = rmsnorm_host(&q_a_host, &qa_ln_w, 1e-6);
+    let mut q_resid = ctx.stream.alloc_zeros::<bf16>(Q_LORA)?;
+    ctx.stream.memcpy_htod(&q_resid_host, &mut q_resid)?;
+
+    // ---- cos/sin + slot_mapping + seq_lens for the last position ----
+    let (cos_host, sin_host) = rope_tables(position);
+    let mut cos = ctx.stream.alloc_zeros::<bf16>(32)?;
+    let mut sin = ctx.stream.alloc_zeros::<bf16>(32)?;
+    ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
+    ctx.stream.memcpy_htod(&sin_host, &mut sin)?;
+
+    let slot_mapping_host = vec![position as i64];
+    let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
+    ctx.stream
+        .memcpy_htod(&slot_mapping_host, &mut slot_mapping)?;
+
     let seq_lens_host = vec![(position + 1) as i32];
     let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
     ctx.stream.memcpy_htod(&seq_lens_host, &mut seq_lens)?;
 
-    // ---- run the indexer forward ----
+    // ---- run the indexer forward (fills cache for last pos + computes topk) ----
     let topk = glm52_indexer_forward(
         &ctx,
         &w,
-        &hidden,
+        &last_hidden,
         &q_resid,
         &cos,
         &sin,
