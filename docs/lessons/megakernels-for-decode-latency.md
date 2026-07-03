@@ -19,6 +19,21 @@
 
 Instruction-set design and counter-sync debugging carry "tremendous complexity"; the TP kernel is explicitly unmaintained. None of the megakernel posts benchmark against CUDA Graphs except no-bubbles — treat vLLM/SGLang comparisons in MPK/TP posts as launch-overhead-inclusive. Any adoption here should ship as one model line's experiment with an A/B against that line's graphed baseline, never as shared-layer infrastructure first.
 
+## Measured GLM5.2 single-layer baseline (H100, bs=1, `glm52_kernel_bench`)
+
+Synthetic weights, parity-verified (the scratch forward is bitwise-identical to the alloc-heavy forward before timing). Two context lengths, iters=64:
+
+| | as-is gpu / wall | scratch gpu / wall | alloc bill |
+|---|---|---|---|
+| ctx 512  | 286.5 / 296.8 µs | 218.2 / 228.3 µs | **68.5 µs/layer** |
+| ctx 2048 | 291.1 / 301.6 µs | 219.6 / 230.0 µs | **71.6 µs/layer** |
+
+Per-stage (ctx 2048): o_proj 67.7 µs, kv_a 28.6, q_a 28.7, q_b 24.8 (each incl. its 4-malloc quant→relayout→GEMM chain); flashmla sparse decode 48.2 µs; assembly family (assemble+quant+pack, buffers reused) 8.4 µs. Context length barely moves the total (sparse top-k=2048 caps attention work).
+
+**The headline: eliminating per-call `cudaMalloc`s (the zero-alloc scratch forward) recovers ~70 µs/layer — 24% of the per-layer attention path — and it drops the *GPU-measured* time too (286→218 µs), not just wall.** That proves the synchronous mallocs were serializing against the stream, exactly the "step 0 dwarfs fusion" thesis above, now with real numbers. Projected 75-MoE-layer attention share: 22.3 ms/token as-is → ~17 ms/token with the arena alone.
+
+Measured on an R535 host via a 3-symbol `cuLibrary*`-enumeration shim (the box's 12.2 driver lacks the 12.4+ enumeration APIs cudarc calls); the shim only stubs kernel *enumeration* — dispatch uses the real `cuLibraryGetKernel`-by-name, and the parity assertion guards against any silent kernel-load breakage, so the timings are of real kernel execution.
+
 ## Next
 
-Blocked on the GLM5.2 single-layer baseline numbers (glm52_kernel_bench) to size step 0 vs step 1; then decide whether a sparse-ThunderMLA experiment is worth a design issue.
+Step 0 (allocation arena + CUDA Graph on the decode path) is now quantified at ~24%/layer and is the clear first move — bigger than any fusion. Step 1 (sparse-ThunderMLA fusion of the 48 µs flashmla partial+reduction) is the next-largest single lever; worth a design issue once step 0 lands. The scratch forward in this branch is the arena half of step 0.

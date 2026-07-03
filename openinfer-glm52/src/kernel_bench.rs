@@ -27,6 +27,8 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear};
+use openinfer_core::cuda_graph::CudaGraphState;
+
 use crate::mla_decode::{
     Glm52MlaDecodeScratch, Glm52MlaLayerWeights, glm52_mla_decode_forward,
     glm52_mla_decode_forward_into,
@@ -90,12 +92,16 @@ impl Glm52MlaDecodeBench {
         let (kvb_w, kvb_s) = synth_proj(HEADS * KV_B_ROWS_PER_HEAD, KV_LORA);
         let (o_w, o_s) = synth_proj(HIDDEN, HEADS * V_HEAD);
         let ln = bf16_ones_bytes(Q_LORA.max(KV_LORA));
-        let proj = |w: &[u8], s: &[u8], n: usize, k: usize| Glm52ProjBytes {
-            weight: w,
-            scale: s,
-            n,
-            k,
-        };
+        // A `fn` (not a closure) so the returned bytes borrow ties to the
+        // input slices' lifetime — a closure can't express that relation.
+        fn proj<'a>(w: &'a [u8], s: &'a [u8], n: usize, k: usize) -> Glm52ProjBytes<'a> {
+            Glm52ProjBytes {
+                weight: w,
+                scale: s,
+                n,
+                k,
+            }
+        }
         let weights = Glm52MlaLayerWeights::from_host(
             &ctx,
             &proj(&qa_w, &qa_s, Q_LORA, HIDDEN),
@@ -229,6 +235,47 @@ impl Glm52MlaDecodeBench {
         self.ctx.sync()?;
         let wall = wall_start.elapsed();
         Ok((Duration::from_secs_f64(gpu_ms / 1_000.0), wall))
+    }
+
+    /// The scratch forward captured into a CUDA Graph and replayed — collapses
+    /// the ~18 per-token kernel launches into a single `cuGraphLaunch`, so the
+    /// host-side launch overhead in the wall−gpu gap disappears. The scratch's
+    /// pre-allocated buffers and pre-computed tile schedule make the forward a
+    /// pure kernel sequence (no alloc, no sync), which capture requires.
+    pub fn measure_forward_graph(&mut self, iters: u64) -> Result<(Duration, Duration)> {
+        let mut scratch = Glm52MlaDecodeScratch::new(&self.ctx, self.contract)?;
+        let mut graph = CudaGraphState::new();
+        // First call captures the graph from the real kernel closure.
+        graph.run_or_capture(&self.ctx, || {
+            glm52_mla_decode_forward_into(
+                &self.ctx,
+                &self.weights,
+                &self.hidden,
+                &self.cos,
+                &self.sin,
+                &mut self.cache,
+                self.position,
+                &self.topk,
+                self.contract,
+                &mut scratch,
+            )
+        })?;
+        self.ctx.sync()?;
+        let wall_start = Instant::now();
+        let mut gpu_ms = 0.0f64;
+        for _ in 0..iters {
+            self.start.record(&self.ctx.stream)?;
+            // exec is instantiated now, so this replays the graph and never
+            // calls the closure.
+            graph.run_or_capture(&self.ctx, || Ok(()))?;
+            self.end.record(&self.ctx.stream)?;
+            gpu_ms += f64::from(self.start.elapsed_ms(&self.end)?);
+        }
+        self.ctx.sync()?;
+        Ok((
+            Duration::from_secs_f64(gpu_ms / 1_000.0),
+            wall_start.elapsed(),
+        ))
     }
 
     /// Bitwise parity between the as-is forward and the scratch forward.
@@ -429,5 +476,152 @@ impl Glm52MlaDecodeBench {
         }
         self.ctx.sync()?;
         Ok(wall.elapsed())
+    }
+
+    /// FlashMLA sparse decode (metadata + decode) at an overridden
+    /// `num_sm_parts`, everything else from the bench contract. bs=1 sparse
+    /// top-k=2048 over-splits at the default (one split per SM ⇒ ~16 KV/split
+    /// and a 132-way combine reducing 17.3 MB of `o_accum`); this sweeps the
+    /// split count to find where the combine round-trip stops paying for the
+    /// extra partial parallelism. Returns `None` if the kernel rejects the
+    /// count (`validate`/shape guard) so the caller can skip it.
+    pub fn measure_flashmla_at(
+        &mut self,
+        num_sm_parts: usize,
+        iters: u64,
+    ) -> Result<Option<Duration>> {
+        let mut c = self.contract;
+        c.num_sm_parts = num_sm_parts;
+        if c.validate().is_err() {
+            return Ok(None);
+        }
+        let query = self
+            .ctx
+            .stream
+            .clone_htod(&vec![bf16::from_f32(0.01); HEADS * QUERY_DIM])?;
+        let mut sched = self
+            .ctx
+            .stream
+            .alloc_zeros::<i32>(c.tile_scheduler_metadata_len())?;
+        let mut splits = self.ctx.stream.alloc_zeros::<i32>(c.num_splits_len())?;
+        let mut latent = self.ctx.stream.alloc_zeros::<bf16>(c.latent_len())?;
+        let mut lse = self.ctx.stream.alloc_zeros::<f32>(c.lse_len())?;
+        let mut lse_accum = self.ctx.stream.alloc_zeros::<f32>(c.lse_accum_len())?;
+        let mut o_accum = self.ctx.stream.alloc_zeros::<f32>(c.o_accum_len())?;
+        let run = |b: &mut Self,
+                   sched: &mut CudaSlice<i32>,
+                   splits: &mut CudaSlice<i32>,
+                   latent: &mut CudaSlice<bf16>,
+                   lse: &mut CudaSlice<f32>,
+                   lse_accum: &mut CudaSlice<f32>,
+                   o_accum: &mut CudaSlice<f32>|
+         -> Result<()> {
+            glm52_flashmla_sparse_decode_metadata_launch(
+                &b.ctx,
+                c.batch_size,
+                c.num_sm_parts,
+                sched,
+                splits,
+            )?;
+            glm52_flashmla_sparse_decode_launch(
+                &b.ctx, c, &query, &b.cache, &b.topk, sched, splits, latent, lse, lse_accum,
+                o_accum,
+            )
+        };
+        run(
+            self,
+            &mut sched,
+            &mut splits,
+            &mut latent,
+            &mut lse,
+            &mut lse_accum,
+            &mut o_accum,
+        )?;
+        self.ctx.sync()?;
+        let wall = Instant::now();
+        for _ in 0..iters {
+            run(
+                self,
+                &mut sched,
+                &mut splits,
+                &mut latent,
+                &mut lse,
+                &mut lse_accum,
+                &mut o_accum,
+            )?;
+        }
+        self.ctx.sync()?;
+        Ok(Some(wall.elapsed()))
+    }
+
+    /// The default `num_sm_parts` the device query picks (the over-split point).
+    pub fn default_num_sm_parts(&self) -> usize {
+        self.contract.num_sm_parts
+    }
+
+    /// Override the split count for every subsequent measurement (validated).
+    /// Lets the driver measure the whole graphed forward at the swept optimum,
+    /// not just the isolated flashmla stage.
+    pub fn set_num_sm_parts(&mut self, parts: usize) -> Result<()> {
+        let mut c = self.contract;
+        c.num_sm_parts = parts;
+        c.validate()?;
+        self.contract = c;
+        Ok(())
+    }
+
+    /// Confirm a swept `num_sm_parts` is a pure parallelization knob, not a
+    /// correctness one: run the sparse decode at `parts` and at the device
+    /// default, and report the max abs diff of the `latent` output. The split
+    /// count only changes the split-KV reduction tree, so outputs must agree
+    /// within fp associativity (not bitwise). A large diff means the count is
+    /// unsafe and its sweep timing must not be treated as a usable tuning.
+    pub fn flashmla_parts_max_diff(&mut self, parts: usize) -> Result<f32> {
+        let latent = |b: &mut Self, num_sm_parts: usize| -> Result<Vec<bf16>> {
+            let mut c = b.contract;
+            c.num_sm_parts = num_sm_parts;
+            c.validate()?;
+            let query = b
+                .ctx
+                .stream
+                .clone_htod(&vec![bf16::from_f32(0.01); HEADS * QUERY_DIM])?;
+            let mut sched = b
+                .ctx
+                .stream
+                .alloc_zeros::<i32>(c.tile_scheduler_metadata_len())?;
+            let mut splits = b.ctx.stream.alloc_zeros::<i32>(c.num_splits_len())?;
+            let mut out = b.ctx.stream.alloc_zeros::<bf16>(c.latent_len())?;
+            let mut lse = b.ctx.stream.alloc_zeros::<f32>(c.lse_len())?;
+            let mut lse_accum = b.ctx.stream.alloc_zeros::<f32>(c.lse_accum_len())?;
+            let mut o_accum = b.ctx.stream.alloc_zeros::<f32>(c.o_accum_len())?;
+            glm52_flashmla_sparse_decode_metadata_launch(
+                &b.ctx,
+                c.batch_size,
+                c.num_sm_parts,
+                &mut sched,
+                &mut splits,
+            )?;
+            glm52_flashmla_sparse_decode_launch(
+                &b.ctx,
+                c,
+                &query,
+                &b.cache,
+                &b.topk,
+                &sched,
+                &splits,
+                &mut out,
+                &mut lse,
+                &mut lse_accum,
+                &mut o_accum,
+            )?;
+            Ok(b.ctx.stream.clone_dtoh(&out)?)
+        };
+        let a = latent(self, self.contract.num_sm_parts)?;
+        let b = latent(self, parts)?;
+        self.ctx.sync()?;
+        Ok(a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x.to_f32() - y.to_f32()).abs())
+            .fold(0.0f32, f32::max))
     }
 }

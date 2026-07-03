@@ -482,6 +482,21 @@ pub(crate) struct Glm52MlaDecodeScratch {
 
 impl Glm52MlaDecodeScratch {
     pub(crate) fn new(ctx: &DeviceContext, contract: Glm52FlashMlaSparseDecode) -> Result<Self> {
+        // The FlashMLA tile schedule (sched/splits) is a pure function of
+        // batch_size + num_sm_parts — both fixed by the contract, independent
+        // of the per-token query/KV data. Compute it once here so the decode
+        // path drops one launch per layer per token (see forward_into).
+        let mut sched = ctx
+            .stream
+            .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?;
+        let mut splits = ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?;
+        glm52_flashmla_sparse_decode_metadata_launch(
+            ctx,
+            contract.batch_size,
+            contract.num_sm_parts,
+            &mut sched,
+            &mut splits,
+        )?;
         Ok(Self {
             fp8: Fp8LinearScratch::new(ctx, HEADS * V_HEAD)?,
             q_a: DeviceVec::zeros(ctx, Q_LORA)?,
@@ -495,10 +510,8 @@ impl Glm52MlaDecodeScratch {
             query: ctx.stream.alloc_zeros::<bf16>(HEADS * QUERY_DIM)?,
             ckv_fp8: ctx.stream.alloc_zeros::<u8>(KV_LORA)?,
             ckv_scales: ctx.stream.alloc_zeros::<f32>(KV_LORA / FP8_BLOCK)?,
-            sched: ctx
-                .stream
-                .alloc_zeros::<i32>(contract.tile_scheduler_metadata_len())?,
-            splits: ctx.stream.alloc_zeros::<i32>(contract.num_splits_len())?,
+            sched,
+            splits,
             latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
             lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
             lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
@@ -626,13 +639,8 @@ pub(crate) fn glm52_mla_decode_forward_into(
     )?;
 
     // ---- FlashMLA sparse decode ----
-    glm52_flashmla_sparse_decode_metadata_launch(
-        ctx,
-        contract.batch_size,
-        contract.num_sm_parts,
-        &mut scratch.sched,
-        &mut scratch.splits,
-    )?;
+    // The tile schedule was computed once in `Glm52MlaDecodeScratch::new`
+    // (data-independent); the per-token path only runs the decode itself.
     glm52_flashmla_sparse_decode_launch(
         ctx,
         contract,
