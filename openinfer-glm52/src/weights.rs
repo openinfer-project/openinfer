@@ -154,7 +154,6 @@ pub(crate) struct Glm52ShardLoadPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52RankWeightPlan {
     pub(crate) rank: usize,
-    pub(crate) loads_non_expert: bool,
     pub(crate) expert_range: std::ops::Range<usize>,
     pub(crate) tensor_count: usize,
 }
@@ -263,7 +262,6 @@ impl Glm52WeightManifest {
         Ok(Glm52RankLoadBundle {
             plan: Glm52RankWeightPlan {
                 rank,
-                loads_non_expert: rank == 0,
                 expert_range: expert_start..expert_start + GLM52_LOCAL_EXPERTS,
                 tensor_count,
             },
@@ -274,15 +272,15 @@ impl Glm52WeightManifest {
         })
     }
 
+    /// Every rank loads the full non-expert stack (DP8 replication, ~19.6 GiB
+    /// per rank) plus its 32-expert slice of every MoE layer.
     fn rank_tensor_names(&self, rank: usize) -> Result<Vec<String>> {
         ensure!(
             rank < GLM52_EP_RANKS,
             "GLM5.2 rank must be in 0..{GLM52_EP_RANKS}, got {rank}"
         );
         let mut names = Vec::new();
-        if rank == 0 {
-            self.push_non_expert_names(&mut names);
-        }
+        self.push_non_expert_names(&mut names);
         let expert_start = rank * GLM52_LOCAL_EXPERTS;
         let expert_range = expert_start..expert_start + GLM52_LOCAL_EXPERTS;
         for layer_idx in GLM52_DENSE_LAYERS..=GLM52_MTP_LAYER {

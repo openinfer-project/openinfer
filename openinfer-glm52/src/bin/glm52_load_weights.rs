@@ -17,7 +17,7 @@ impl Default for Args {
         Self {
             model_path: PathBuf::from(DEFAULT_MODEL_PATH),
             tp_size: 1,
-            dp_size: 1,
+            dp_size: 8,
         }
     }
 }
@@ -64,7 +64,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: cargo run --release -p openinfer-glm52 --bin glm52_load_weights -- [--model-path PATH] [--tp-size 1] [--dp-size 1]"
+                    "Usage: cargo run --release -p openinfer-glm52 --bin glm52_load_weights -- [--model-path PATH] [--tp-size 1] [--dp-size 8]"
                 );
                 std::process::exit(0);
             }

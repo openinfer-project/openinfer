@@ -114,12 +114,11 @@ pub(crate) fn load_rank_weights_to_gpu(
     let mut mmap_guard = MmapH2dLifetimeGuard::new(ctx, bundle.plan.rank);
     let mut sync_secs = 0.0f64;
     debug!(
-        "GLM5.2 rank {} start weight load: tensors={}, shards={}, bytes={}, non_expert={}, experts={:?}",
+        "GLM5.2 rank {} start weight load: tensors={}, shards={}, bytes={}, experts={:?}",
         bundle.plan.rank,
         bundle.plan.tensor_count,
         bundle.shards.len(),
         ByteSize(planned_total_bytes as u64),
-        bundle.plan.loads_non_expert,
         bundle.plan.expert_range
     );
 

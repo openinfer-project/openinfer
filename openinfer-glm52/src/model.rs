@@ -1,13 +1,12 @@
-//! GLM5.2 DP1/EP8 full-model decode: rank 0 owns the whole non-expert path
-//! (embed → 78 decoder layers → final norm → lm_head → greedy argmax) and its
-//! 32 local experts; ranks 1..7 hold only their 32 experts per MoE layer and
-//! enter the per-layer DeepEP collectives.
+//! GLM5.2 DP8/EP8 full-model decode: every rank owns the whole non-expert
+//! path (embed → 78 decoder layers → final norm → lm_head → greedy argmax)
+//! plus its 32 local experts, and serves one request at a time (bs=1 per
+//! rank; prefill rides decode token-by-token).
 //!
-//! bs=1, one token per step; prefill rides decode token-by-token. Every MoE
-//! layer is one collective (`glm52_moe_ep8_routed_forward`) that all ranks
-//! must enter in the same order — rank 0 walks layers 0..=77 and hits the 75
-//! MoE layers (3..=77) in ascending order; expert ranks replay exactly that
-//! sequence in `expert_step`.
+//! Every step, all 8 ranks run the forward in lock-step, each dispatching
+//! exactly one token (a real request token, or a padding token on an idle
+//! rank) into every MoE layer's DeepEP collective — the collectives require
+//! all ranks to enter in the same layer order 3..=77.
 
 use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
@@ -38,13 +37,13 @@ use crate::weights::{Glm52RankGpuWeights, retype_owned};
 /// Sizes the per-layer MLA and index-K caches at build time.
 pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
 
-/// The bs=1 coordinator's protocol constant: every rank enters each MoE
-/// collective having agreed on this many dispatched tokens per step. Rank 0's
-/// `decode_step` and the expert ranks' `expert_step` must derive their
-/// `global_tokens` from this single definition — a disagreement makes the
-/// grouped-GEMM row bound wrong on some rank, which the metadata kernel
-/// answers with a device trap.
-pub(crate) const GLM52_DECODE_GLOBAL_TOKENS: usize = 1;
+/// The DP8 coordinator's protocol constant: every rank enters each MoE
+/// collective having agreed on this many dispatched tokens per step — one
+/// token per rank (real or padding), so the global count is the rank count.
+/// Every rank's `decode_step` must derive its `global_tokens` from this
+/// single definition — a disagreement makes the grouped-GEMM row bound wrong
+/// on some rank, which the metadata kernel answers with a device trap.
+pub(crate) const GLM52_DECODE_GLOBAL_TOKENS: usize = crate::weights::GLM52_EP_RANKS;
 
 pub(crate) const ROPE_HALF: usize = 32;
 const ROPE_THETA: f32 = 8_000_000.0;
@@ -200,8 +199,8 @@ fn build_decoder_layer(
     })
 }
 
-/// Rank 0: the full non-expert model plus this rank's expert banks.
-pub(crate) struct Glm52Rank0Model {
+/// One DP rank: the full non-expert model plus this rank's expert banks.
+pub(crate) struct Glm52RankModel {
     layers: Vec<Glm52DecoderLayerWeights>,
     caches: Vec<Glm52LayerCaches>,
     embed: DeviceMatrix,
@@ -222,7 +221,7 @@ pub(crate) struct Glm52Rank0Model {
     token_id: CudaSlice<u32>,
 }
 
-impl Glm52Rank0Model {
+impl Glm52RankModel {
     pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: 1,
@@ -279,7 +278,7 @@ impl Glm52Rank0Model {
         let final_norm = take_bf16_vec(ctx, w, "model.norm.weight", GLM52_HIDDEN)?;
 
         // The MTP layer's experts are loaded (checkpoint-coverage validation)
-        // but out of campaign scope — drop rank 0's copy too.
+        // but out of campaign scope — drop this rank's copy.
         let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
 
         let block_table_host: Vec<i32> = (0..index_blocks as i32).collect();
@@ -323,8 +322,8 @@ impl Glm52Rank0Model {
     }
 
     /// One full-model step: feed `token` at `position`, return the greedy
-    /// next-token id. Enters 75 MoE collectives — the expert ranks must be
-    /// running `expert_step` concurrently.
+    /// next-token id. Enters 75 MoE collectives — every other rank must be
+    /// stepping concurrently (an idle rank steps a padding token).
     pub(crate) fn decode_step(
         &mut self,
         ctx: &DeviceContext,
@@ -384,7 +383,7 @@ impl Glm52Rank0Model {
                         GLM52_DECODE_GLOBAL_TOKENS,
                     )
                     .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?
-                    .context("rank-0 EP8 MoE returned no combined output")?;
+                    .context("EP8 MoE returned no combined output for a dispatched token")?;
                     let shared = moe.shared.forward(ctx, &boundary.normed)?;
                     let routed_hs = HiddenStates {
                         data: routed,
@@ -434,44 +433,4 @@ fn greedy_argmax(logits: &[bf16]) -> Result<u32> {
         "GLM5.2 greedy argmax found no finite logit (top = {best})"
     );
     Ok(best_idx as u32)
-}
-
-/// Ranks 1..7: one expert bank per MoE layer (3..=77, ascending), nothing else.
-pub(crate) struct Glm52ExpertRankModel {
-    banks: Vec<Glm52MoeExpertBank>,
-}
-
-impl Glm52ExpertRankModel {
-    pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
-        let banks = (GLM52_DENSE_LAYERS..GLM52_LAYERS)
-            .map(|layer| {
-                Glm52MoeExpertBank::from_regions(ctx, w.take_expert_layer(layer)?)
-                    .with_context(|| format!("build GLM5.2 expert bank for layer {layer}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // The MTP layer's experts are loaded (checkpoint-coverage validation)
-        // but out of campaign scope — drop them to reclaim ~1.2 GiB.
-        let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
-        Ok(Self { banks })
-    }
-
-    /// Replay one decode step's 75 MoE collectives in rank-0's layer order.
-    pub(crate) fn expert_step(
-        &self,
-        ctx: &DeviceContext,
-        ep8: &mut Glm52MoeEp8State,
-    ) -> Result<()> {
-        for (idx, bank) in self.banks.iter().enumerate() {
-            let combined =
-                glm52_moe_ep8_routed_forward(ctx, ep8, bank, None, GLM52_DECODE_GLOBAL_TOKENS)
-                    .with_context(|| {
-                        format!("GLM5.2 expert rank MoE layer {}", idx + GLM52_DENSE_LAYERS)
-                    })?;
-            ensure!(
-                combined.is_none(),
-                "GLM5.2 expert rank unexpectedly produced a combined output"
-            );
-        }
-        Ok(())
-    }
 }

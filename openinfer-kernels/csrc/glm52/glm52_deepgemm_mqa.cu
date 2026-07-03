@@ -1,22 +1,35 @@
-// GLM5.2 DSA indexer: DeepGEMM paged MQA logits C ABI wrapper (torch-free).
+// GLM5.2 DSA indexer: DeepGEMM paged MQA logits, AOT-instantiated (no JIT).
 //
-// Calls SM90FP8PagedMQALogitsRuntime + SM90PagedMQALogitsMetadataRuntime directly
-// with raw device pointers and manually-constructed TMA descriptors, bypassing
-// the torch::Tensor-based free functions in sm90_fp8_mqa_logits.hpp.
+// The decode path's codegen parameters are all compile-time constants
+// (next_n=1, 32 heads, head_dim 128, block_kv 64, split_kv 256, bf16 logits,
+// batch <= 32, 132 SMs), so both kernels are instantiated here directly from
+// DeepGEMM's device headers and launched with cudaLaunchKernelExC. This
+// removes DeepGEMM's runtime JIT entirely — its compiler, include parser and
+// launch-config helpers keep unsynchronized global state that the DP8
+// coordinator's 8 concurrent rank threads corrupt (include-parser
+// assertions, per-context CUfunction handles, a shared static attrs array),
+// and the per-launch codegen + code hashing cost ~0.4 ms per serialized
+// call. It also drops the OPENINFER_DEEPGEMM_ROOT / CUDA_HOME runtime
+// requirements — nothing is compiled at runtime anymore.
 //
-// This is the first real DeepGEMM JIT kernel call in the codebase.
-// DG_NO_TORCH is defined via build.rs (-DDG_NO_TORCH).
+// Requires sm_90a (build.rs promotes sm_90 targets). DG_NO_TORCH is defined
+// via build.rs.
 
 #include "../common.cuh"
 
 #include <cuda.h>
 #include <cstdint>
-#include <cmath>
-#include <memory>
-#include <mutex>
-#include <filesystem>
+#include <cstdio>
 
-#include <jit_kernels/impls/sm90_fp8_mqa_logits.hpp>
+// Without an sm_90a nvcc target the wgmma device code cannot be assembled;
+// build.rs then omits this define and both entry points compile as
+// NOT_SUPPORTED stubs (GLM5.2 decode is Hopper-only today).
+#ifdef GLM52_DEEPGEMM_MQA_SM90A
+
+#include <jit_kernels/impls/runtime_utils.hpp>
+
+#include <deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh>
+#include <deep_gemm/scheduler/sm90_paged_mqa_logits.cuh>
 
 namespace {
 
@@ -27,26 +40,64 @@ constexpr int kNumSpecializedThreads = 128;
 constexpr int kNumQStages = 3;
 constexpr int kNumKVStages = 3;
 
-std::once_flag g_dg_init_flag;
-CUresult g_dg_init_result = CUDA_SUCCESS;
+// AOT instantiation shape: the GLM5.2 DSA decode indexer. The C ABI keeps
+// the general parameters and fail-closes on anything the instantiation does
+// not cover.
+constexpr int kAotNextN = 1;
+constexpr int kAotNumHeads = 32;
+constexpr int kAotHeadDim = 128;
+constexpr int kAotBlockKv = 64;
+constexpr int kAotNumSms = 132;
+constexpr int kAotAlignedBatchSize = 32;
+constexpr int kAotNumMathThreads = kSplitKv / kMmaM * 128;
 
-CUresult ensure_dg_runtime_init() {
-    std::call_once(g_dg_init_flag, []() {
-        const char* dg_root = std::getenv("OPENINFER_DEEPGEMM_ROOT");
-        const char* cuda_home = std::getenv("CUDA_HOME");
-        if (!dg_root || !cuda_home) {
-            fprintf(stderr, "glm52_deepgemm_mqa: OPENINFER_DEEPGEMM_ROOT and CUDA_HOME must be set\n");
-            g_dg_init_result = CUDA_ERROR_INVALID_VALUE;
-            return;
+const auto kMetadataKernel = &deep_gemm::sched::sm90_paged_mqa_logits_metadata<
+    kAotAlignedBatchSize, kSplitKv, kAotNumSms, /*kIsVarlen=*/false>;
+
+const auto kLogitsKernel = &deep_gemm::sm90_fp8_paged_mqa_logits<
+    kAotNextN, kAotNumHeads, kAotHeadDim, kAotBlockKv,
+    /*kIsContextLens2D=*/false, /*kIsVarlen=*/false,
+    kNumQStages, kNumKVStages, kSplitKv,
+    kNumSpecializedThreads, kAotNumMathThreads, cutlass::bfloat16_t>;
+
+// Both kernels use programmatic dependent launch intrinsics
+// (cudaGridDependencySynchronize), so every launch carries the PDL
+// attribute — mirrors DeepGEMM's own launch config. The attrs array is
+// per-call stack storage (the vendored helper's static array is one of the
+// thread-safety hazards this file avoids).
+CUresult launch_aot(const void* func, dim3 grid_dim, dim3 block_dim, int smem_size,
+                    cudaStream_t stream, void** args) {
+    if (smem_size > 0) {
+        const cudaError_t attr_err = cudaFuncSetAttribute(
+            func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "glm52_deepgemm_mqa: cudaFuncSetAttribute failed: %s\n",
+                    cudaGetErrorString(attr_err));
+            return CUDA_ERROR_LAUNCH_FAILED;
         }
-        deep_gemm::Compiler::prepare_init(dg_root, cuda_home);
-        deep_gemm::KernelRuntime::prepare_init(cuda_home);
-        deep_gemm::IncludeParser::prepare_init(dg_root);
-    });
-    return g_dg_init_result;
+    }
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    cudaLaunchConfig_t config = {};
+    config.gridDim = grid_dim;
+    config.blockDim = block_dim;
+    config.dynamicSmemBytes = static_cast<size_t>(smem_size);
+    config.stream = stream;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    const cudaError_t err = cudaLaunchKernelExC(&config, func, args);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm52_deepgemm_mqa: launch failed: %s\n", cudaGetErrorString(err));
+        return CUDA_ERROR_LAUNCH_FAILED;
+    }
+    return CUDA_SUCCESS;
 }
 
-} // namespace anon
+} // namespace
 
 extern "C" {
 
@@ -68,43 +119,30 @@ CUresult glm52_deepgemm_paged_mqa_metadata_cuda(
     if (kSplitKv % block_kv != 0) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-
-    CUresult init_err = ensure_dg_runtime_init();
-    if (init_err != CUDA_SUCCESS) {
-        return init_err;
-    }
-
-    constexpr int num_threads = 32;
-    const int aligned_batch_size = deep_gemm::align(batch_size, 32);
-    const int num_smem_ints = is_varlen ? 3 * aligned_batch_size + 1 : aligned_batch_size;
-    const int smem_size = num_smem_ints * static_cast<int>(sizeof(int));
-    if (smem_size > kSM90SmemCapacity) {
+    // AOT instantiation bounds.
+    if (batch_size > kAotAlignedBatchSize || num_sms != kAotNumSms || is_varlen) {
         return CUDA_ERROR_INVALID_VALUE;
     }
 
-    const deep_gemm::SM90PagedMQALogitsMetadataRuntime::Args args = {
-        .aligned_batch_size = aligned_batch_size,
-        .split_kv = kSplitKv,
-        .num_sms = num_sms,
-        .is_varlen = is_varlen,
-        .batch_size = batch_size,
-        .next_n = next_n,
-        .is_context_lens_2d = is_context_lens_2d,
-        .context_lens = context_lens,
-        .indices = const_cast<int*>(indices_ptr),
-        .schedule_metadata = schedule_metadata,
-        .launch_args = deep_gemm::LaunchArgs(1, num_threads, smem_size)
-    };
+    const int smem_size = kAotAlignedBatchSize * static_cast<int>(sizeof(int));
+    static_assert(kAotAlignedBatchSize * sizeof(int) <= kSM90SmemCapacity);
 
-    try {
-        const auto code = deep_gemm::SM90PagedMQALogitsMetadataRuntime::generate(args);
-        const auto runtime = deep_gemm::compiler->build("sm90_paged_mqa_logits_metadata", code);
-        deep_gemm::SM90PagedMQALogitsMetadataRuntime::launch(runtime, args, stream);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "glm52_deepgemm_paged_mqa_metadata: %s\n", e.what());
-        return CUDA_ERROR_LAUNCH_FAILED;
-    }
-    return CUDA_SUCCESS;
+    const uint32_t arg_batch_size = static_cast<uint32_t>(batch_size);
+    const uint32_t arg_next_n = static_cast<uint32_t>(next_n);
+    const bool arg_is_2d = is_context_lens_2d;
+    const uint32_t* arg_context_lens = reinterpret_cast<const uint32_t*>(context_lens);
+    const uint32_t* arg_indices = reinterpret_cast<const uint32_t*>(indices_ptr);
+    uint32_t* arg_schedule = reinterpret_cast<uint32_t*>(schedule_metadata);
+    void* args[] = {
+        const_cast<uint32_t*>(&arg_batch_size),
+        const_cast<uint32_t*>(&arg_next_n),
+        const_cast<bool*>(&arg_is_2d),
+        &arg_context_lens,
+        &arg_indices,
+        &arg_schedule,
+    };
+    return launch_aot(reinterpret_cast<const void*>(kMetadataKernel),
+                      dim3(1, 1, 1), dim3(32, 1, 1), smem_size, stream, args);
 }
 
 CUresult glm52_deepgemm_paged_mqa_logits_cuda(
@@ -147,6 +185,11 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     if (next_n != 1 && next_n != 2) {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // AOT instantiation bounds.
+    if (next_n != kAotNextN || num_heads != kAotNumHeads || block_kv != kAotBlockKv ||
+        num_sms != kAotNumSms || is_context_lens_2d || is_varlen) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
     // Indexer cache layout: [block_kv * head_dim fp8 | block_kv * 4 f32] per block.
     // The stride must accommodate both regions.
     const int64_t min_stride = static_cast<int64_t>(block_kv) * (head_dim + 4);
@@ -166,134 +209,139 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
     const int num_math_warp_groups = split_kv / kMmaM;
     const int num_math_threads = num_math_warp_groups * 128;
 
-    CUresult init_err = ensure_dg_runtime_init();
-    if (init_err != CUDA_SUCCESS) {
-        return init_err;
+    const int next_n_atom = 1;
+
+    // TMA descriptor for q: [batch_size * next_n * num_heads, head_dim] (2D)
+    // gmem: inner=head_dim, outer=batch_size*next_n*num_heads
+    // smem: inner=head_dim, outer=next_n_atom*num_heads (must cover the
+    //   [kHeadDim, kNextN*kNumHeads] tile that tma::copy loads)
+    // gmem_outer_stride = head_dim (row stride of q in elements)
+    // swizzle_mode = head_dim (128)
+    const auto tensor_map_q = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<void*>(q), q_elem_size, deep_gemm::DgDtype::Float8_e4m3,
+        head_dim, batch_size * next_n * num_heads,
+        head_dim, next_n_atom * num_heads,
+        head_dim,
+        head_dim);
+
+    // Indexer cache layout (from glm52_indexer.cu::indexer_k_quant_and_cache_kernel):
+    // Each block is [block_kv * head_dim fp8 values][block_kv * 4 f32 scales],
+    // blocks strided by kv_cache_stride_bytes. The scales region starts at
+    // byte offset block_kv * head_dim within each block. We compute the
+    // scales pointer from the kv_cache base + that offset — no separate
+    // scales buffer needed (matches vllm's decode-path API).
+    const float* kv_cache_scales = reinterpret_cast<const float*>(
+        reinterpret_cast<const char*>(kv_cache) +
+        static_cast<size_t>(block_kv) * head_dim);
+
+    // TMA descriptor for kv_cache: [head_dim, block_kv, num_kv_blocks] (3D)
+    // gstride0 = head_dim (token stride within a block — fp8 values are
+    //   packed as [block_kv, head_dim] contiguous)
+    // gstride1 = kv_cache_stride_bytes / kv_elem_size (block stride —
+    //   jumps over the trailing scales region of each block)
+    const auto tensor_map_kv = deep_gemm::make_tma_3d_desc_raw(
+        const_cast<void*>(kv_cache), kv_elem_size, deep_gemm::DgDtype::Float8_e4m3,
+        head_dim, block_kv, num_kv_blocks,
+        head_dim, block_kv, 1,
+        head_dim,
+        static_cast<int>(kv_cache_stride_bytes / kv_elem_size),
+        head_dim);
+
+    // TMA descriptor for kv_cache_scales: [block_kv, num_kv_blocks] (2D, f32)
+    // The scales pointer is an offset into kv_cache (start of scale region
+    // in block 0). Within each block, scales are [block_kv] f32 contiguous.
+    // gstride0 = kv_cache_stride_bytes / kv_scales_elem_size (block stride)
+    const int aligned_block_kv = deep_gemm::get_tma_aligned_size(block_kv, kv_scales_elem_size);
+    const auto tensor_map_kv_scales = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<void*>(static_cast<const void*>(kv_cache_scales)),
+        kv_scales_elem_size, deep_gemm::DgDtype::Float,
+        aligned_block_kv, num_kv_blocks,
+        block_kv, 1,
+        static_cast<int>(kv_cache_stride_bytes / kv_scales_elem_size),
+        0);
+
+    // TMA descriptor for weights: [batch_size * next_n, num_heads] (2D)
+    // gmem: inner=num_heads, outer=batch_size*next_n
+    // smem: inner=num_heads (overwritten by swizzle=0, so stays), outer=next_n_atom
+    // gmem_outer_stride = weights.stride(0) = num_heads
+    // swizzle_mode = 0
+    // weights are f32 (per-head scaling factors folded with q_scale).
+    const auto tensor_map_weights = deep_gemm::make_tma_2d_desc_raw(
+        const_cast<void*>(weights), weights_elem_size, deep_gemm::DgDtype::Float,
+        num_heads, batch_size * next_n,
+        num_heads, next_n_atom,
+        num_heads,
+        0);
+
+    // smem size calculation (mirrors the original sm90_fp8_paged_mqa_logits)
+    const int swizzle_alignment = head_dim * 8;
+    const int smem_q_size_per_stage = next_n * num_heads * head_dim * q_elem_size;
+    const int aligned_smem_weight_size_per_stage = deep_gemm::align(
+        next_n * num_heads * weights_elem_size, swizzle_alignment);
+    const int smem_q_pipe_size = kNumQStages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage)
+                                 + deep_gemm::align(kNumQStages * 8 * 2, swizzle_alignment);
+    const int smem_kv_size_per_stage = block_kv * head_dim * kv_elem_size;
+    const int aligned_smem_kv_scale_size_per_stage = deep_gemm::align(
+        block_kv * kv_scales_elem_size, swizzle_alignment);
+    const int smem_kv_pipe_size = kNumKVStages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage)
+                                 + deep_gemm::align(kNumKVStages * 8 * 2, swizzle_alignment);
+    const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
+    const int smem_tmem_ptr = 4;
+    const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size
+                         + smem_umma_barriers + smem_tmem_ptr;
+    if (smem_size > kSM90SmemCapacity) {
+        return CUDA_ERROR_INVALID_VALUE;
     }
 
-    try {
-        const int next_n_atom = (is_varlen || next_n >= 2) ? 2 : 1;
-
-        // TMA descriptor for q: [batch_size * next_n * num_heads, head_dim] (2D)
-        // gmem: inner=head_dim, outer=batch_size*next_n*num_heads
-        // smem: inner=head_dim, outer=next_n_atom*num_heads (must cover the
-        //   [kHeadDim, kNextN*kNumHeads] tile that tma::copy loads)
-        // gmem_outer_stride = head_dim (row stride of q in elements)
-        // swizzle_mode = head_dim (128)
-        const auto tensor_map_q = deep_gemm::make_tma_2d_desc_raw(
-            const_cast<void*>(q), q_elem_size, deep_gemm::DgDtype::Float8_e4m3,
-            head_dim, batch_size * next_n * num_heads,
-            head_dim, next_n_atom * num_heads,
-            head_dim,
-            head_dim);
-
-        // Indexer cache layout (from glm52_indexer.cu::indexer_k_quant_and_cache_kernel):
-        // Each block is [block_kv * head_dim fp8 values][block_kv * 4 f32 scales],
-        // blocks strided by kv_cache_stride_bytes. The scales region starts at
-        // byte offset block_kv * head_dim within each block. We compute the
-        // scales pointer from the kv_cache base + that offset — no separate
-        // scales buffer needed (matches vllm's decode-path API).
-        const float* kv_cache_scales = reinterpret_cast<const float*>(
-            reinterpret_cast<const char*>(kv_cache) +
-            static_cast<size_t>(block_kv) * head_dim);
-
-        // TMA descriptor for kv_cache: [head_dim, block_kv, num_kv_blocks] (3D)
-        // gstride0 = head_dim (token stride within a block — fp8 values are
-        //   packed as [block_kv, head_dim] contiguous)
-        // gstride1 = kv_cache_stride_bytes / kv_elem_size (block stride —
-        //   jumps over the trailing scales region of each block)
-        const auto tensor_map_kv = deep_gemm::make_tma_3d_desc_raw(
-            const_cast<void*>(kv_cache), kv_elem_size, deep_gemm::DgDtype::Float8_e4m3,
-            head_dim, block_kv, num_kv_blocks,
-            head_dim, block_kv, 1,
-            head_dim,
-            static_cast<int>(kv_cache_stride_bytes / kv_elem_size),
-            head_dim);
-
-        // TMA descriptor for kv_cache_scales: [block_kv, num_kv_blocks] (2D, f32)
-        // The scales pointer is an offset into kv_cache (start of scale region
-        // in block 0). Within each block, scales are [block_kv] f32 contiguous.
-        // gstride0 = kv_cache_stride_bytes / kv_scales_elem_size (block stride)
-        const int aligned_block_kv = deep_gemm::get_tma_aligned_size(block_kv, kv_scales_elem_size);
-        const auto tensor_map_kv_scales = deep_gemm::make_tma_2d_desc_raw(
-            const_cast<void*>(static_cast<const void*>(kv_cache_scales)),
-            kv_scales_elem_size, deep_gemm::DgDtype::Float,
-            aligned_block_kv, num_kv_blocks,
-            block_kv, 1,
-            static_cast<int>(kv_cache_stride_bytes / kv_scales_elem_size),
-            0);
-
-        // TMA descriptor for weights: [batch_size * next_n, num_heads] (2D)
-        // gmem: inner=num_heads, outer=batch_size*next_n
-        // smem: inner=num_heads (overwritten by swizzle=0, so stays), outer=next_n_atom
-        // gmem_outer_stride = weights.stride(0) = num_heads
-        // swizzle_mode = 0
-        // weights are f32 (per-head scaling factors folded with q_scale).
-        const auto tensor_map_weights = deep_gemm::make_tma_2d_desc_raw(
-            const_cast<void*>(weights), weights_elem_size, deep_gemm::DgDtype::Float,
-            num_heads, batch_size * next_n,
-            num_heads, next_n_atom,
-            num_heads,
-            0);
-
-        // smem size calculation (mirrors the original sm90_fp8_paged_mqa_logits)
-        const int swizzle_alignment = head_dim * 8;
-        const int smem_q_size_per_stage = next_n * num_heads * head_dim * q_elem_size;
-        const int aligned_smem_weight_size_per_stage = deep_gemm::align(
-            next_n * num_heads * weights_elem_size, swizzle_alignment);
-        const int smem_q_pipe_size = kNumQStages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage)
-                                     + deep_gemm::align(kNumQStages * 8 * 2, swizzle_alignment);
-        const int smem_kv_size_per_stage = block_kv * head_dim * kv_elem_size;
-        const int aligned_smem_kv_scale_size_per_stage = deep_gemm::align(
-            block_kv * kv_scales_elem_size, swizzle_alignment);
-        const int smem_kv_pipe_size = kNumKVStages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage)
-                                     + deep_gemm::align(kNumKVStages * 8 * 2, swizzle_alignment);
-        const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
-        const int smem_tmem_ptr = 4;
-        const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size
-                             + smem_umma_barriers + smem_tmem_ptr;
-        if (smem_size > kSM90SmemCapacity) {
-            return CUDA_ERROR_INVALID_VALUE;
-        }
-
-        const deep_gemm::SM90FP8PagedMQALogitsRuntime::Args args = {
-            .batch_size = batch_size,
-            .next_n = next_n,
-            .num_heads = num_heads,
-            .head_dim = head_dim,
-            .block_kv = block_kv,
-            .is_context_lens_2d = is_context_lens_2d,
-            .is_varlen = is_varlen,
-            .block_table_stride = block_table_stride,
-            .logits_stride = logits_stride,
-            .num_q_stages = kNumQStages,
-            .num_kv_stages = kNumKVStages,
-            .split_kv = split_kv,
-            .context_lens = const_cast<int*>(context_lens),
-            .logits = logits,
-            .block_table = const_cast<int*>(block_table),
-            .indices = is_varlen ? const_cast<int*>(indices) : nullptr,
-            .schedule_meta = schedule_meta,
-            .tensor_map_q = tensor_map_q,
-            .tensor_map_kv = tensor_map_kv,
-            .tensor_map_kv_scales = tensor_map_kv_scales,
-            .tensor_map_weights = tensor_map_weights,
-            .logits_dtype = deep_gemm::DgDtype::BFloat16,
-            .num_specialized_threads = kNumSpecializedThreads,
-            .num_math_threads = num_math_threads,
-            .launch_args = deep_gemm::LaunchArgs(num_sms,
-                                                  kNumSpecializedThreads + num_math_threads,
-                                                  smem_size)
-        };
-
-        const auto code = deep_gemm::SM90FP8PagedMQALogitsRuntime::generate(args);
-        const auto runtime = deep_gemm::compiler->build("sm90_fp8_paged_mqa_logits", code);
-        deep_gemm::SM90FP8PagedMQALogitsRuntime::launch(runtime, args, stream);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "glm52_deepgemm_paged_mqa_logits: %s\n", e.what());
-        return CUDA_ERROR_LAUNCH_FAILED;
-    }
-    return CUDA_SUCCESS;
+    const uint32_t arg_batch_size = static_cast<uint32_t>(batch_size);
+    const uint32_t arg_logits_stride = static_cast<uint32_t>(logits_stride);
+    const uint32_t arg_block_table_stride = static_cast<uint32_t>(block_table_stride);
+    const uint32_t* arg_context_lens = reinterpret_cast<const uint32_t*>(context_lens);
+    cutlass::bfloat16_t* arg_logits = static_cast<cutlass::bfloat16_t*>(logits);
+    const uint32_t* arg_block_table = reinterpret_cast<const uint32_t*>(block_table);
+    // Non-varlen instantiation: the kernel ignores indices.
+    const uint32_t* arg_indices = nullptr;
+    const uint32_t* arg_schedule = reinterpret_cast<const uint32_t*>(schedule_meta);
+    void* args[] = {
+        const_cast<uint32_t*>(&arg_batch_size),
+        const_cast<uint32_t*>(&arg_logits_stride),
+        const_cast<uint32_t*>(&arg_block_table_stride),
+        &arg_context_lens,
+        &arg_logits,
+        &arg_block_table,
+        &arg_indices,
+        &arg_schedule,
+        const_cast<CUtensorMap*>(&tensor_map_q),
+        const_cast<CUtensorMap*>(&tensor_map_kv),
+        const_cast<CUtensorMap*>(&tensor_map_kv_scales),
+        const_cast<CUtensorMap*>(&tensor_map_weights),
+    };
+    (void)indices;
+    (void)is_varlen;
+    return launch_aot(reinterpret_cast<const void*>(kLogitsKernel),
+                      dim3(static_cast<unsigned>(num_sms), 1, 1),
+                      dim3(static_cast<unsigned>(kNumSpecializedThreads + num_math_threads), 1, 1),
+                      smem_size, stream, args);
 }
 
 } // extern "C"
+
+#else // !GLM52_DEEPGEMM_MQA_SM90A
+
+extern "C" {
+
+CUresult glm52_deepgemm_paged_mqa_metadata_cuda(
+    int*, int*, int, int, int, int, bool, bool, const int*, cudaStream_t) {
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+CUresult glm52_deepgemm_paged_mqa_logits_cuda(
+    const void*, const void*, int64_t, const void*, const int*, void*,
+    const int*, const int*, int*, int, int, int, int, int, int, bool, bool,
+    int, int, int, int, int, int, int, cudaStream_t) {
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+} // extern "C"
+
+#endif // GLM52_DEEPGEMM_MQA_SM90A

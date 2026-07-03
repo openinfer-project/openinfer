@@ -1,10 +1,11 @@
-//! GLM5.2 DP1/EP8 engine surface.
+//! GLM5.2 DP8/EP8 engine surface.
 //!
 //! Startup validates the official GLM5.2 FP8 checkpoint layout, loads rank
-//! slices to GPU memory (experts placed into their packed layout at H2D
-//! time), builds the resident model, and serves bs=1 greedy generation: rank
-//! 0 runs the full non-expert path, all 8 ranks enter the per-MoE-layer
-//! DeepEP collectives.
+//! slices to GPU memory (the non-expert stack replicated to every rank,
+//! experts placed into their packed layout at H2D time), builds the resident
+//! models, and serves greedy generation with one request per rank: every
+//! step all 8 ranks run the full model in lock-step and enter the
+//! per-MoE-layer DeepEP collectives.
 
 #[cfg(feature = "glm52")]
 mod bookend;
@@ -38,6 +39,8 @@ mod moe_decode;
 #[cfg(feature = "glm52")]
 mod moe_ep8;
 mod runner;
+#[cfg(feature = "glm52")]
+mod scheduler;
 mod weights;
 
 use std::{collections::BTreeSet, path::Path, time::Instant};
@@ -56,8 +59,9 @@ pub use config::{
     GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
 };
 
-/// First GLM5.2 cut: TP1/DP1 plus eight EP ranks. Rank 0 is the only rank with
-/// non-expert weights; every rank owns 32 routed experts.
+/// GLM5.2 parallel shape: TP1/DP8/EP8 is the only supported layout — every
+/// rank holds the full non-expert stack plus its 32 routed experts, and
+/// serves one request at a time.
 #[derive(Clone, Debug)]
 pub struct Glm52LaunchOptions {
     pub tp_size: usize,
@@ -67,12 +71,12 @@ pub struct Glm52LaunchOptions {
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
     ensure!(
         options.tp_size == 1,
-        "GLM5.2 load-weight branch requires --tp-size=1, got {}",
+        "GLM5.2 requires --tp-size=1, got {}",
         options.tp_size
     );
     ensure!(
-        options.dp_size == 1,
-        "GLM5.2 load-weight branch requires --dp-size=1; EP8 is a separate expert-rank split, got {}",
+        options.dp_size == GLM52_EP_RANKS,
+        "GLM5.2 requires --dp-size={GLM52_EP_RANKS} (or omitted), got {}",
         options.dp_size
     );
     start_engine(
@@ -131,7 +135,9 @@ fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHa
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
         let coord_handle = std::thread::Builder::new()
             .name("glm52-coord".into())
-            .spawn(move || runner::run_bs1_coordinator(submit_rx, loaded.workers, eos_token_ids))
+            .spawn(move || {
+                scheduler::run_dp8_coordinator(submit_rx, loaded.workers, &eos_token_ids);
+            })
             .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
         Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
     }
@@ -226,8 +232,10 @@ fn validate_startup(model_path: &Path, options: &Glm52LoadOptions) -> Result<Sta
         options.device_ordinals
     );
     ensure!(
-        options.tp_size == 1 && options.dp_size == 1 && options.ep_size == GLM52_EP_RANKS,
-        "GLM5.2 load-weight branch requires TP1/DP1/EP8, got TP{} DP{} EP{}",
+        options.tp_size == 1
+            && options.dp_size == GLM52_EP_RANKS
+            && options.ep_size == GLM52_EP_RANKS,
+        "GLM5.2 requires TP1/DP8/EP8, got TP{} DP{} EP{}",
         options.tp_size,
         options.dp_size,
         options.ep_size
