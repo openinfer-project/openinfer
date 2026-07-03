@@ -3957,6 +3957,7 @@ dependencies = [
  "pegaflow-core",
  "tokio",
  "tokio-stream",
+ "xxhash-rust",
 ]
 
 [[package]]
