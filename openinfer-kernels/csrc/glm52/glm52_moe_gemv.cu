@@ -292,6 +292,39 @@ CUresult glm52_fp8_weight_only_gemv_cuda(
   return consume_last_cuda_error();
 }
 
+// Warm the L2 with a weight buffer: pure streaming reads, results discarded
+// through a never-true guarded store. Launched on the aux stream while the
+// MoE combine holds the main stream (combine pushes over NVLink, leaving HBM
+// idle), so the NEXT layer's MLA projections find their weights L2-resident.
+// No side effects — byte-parity safe by construction.
+__global__ void glm52_l2_prefetch_kernel(const uint4* __restrict__ data,
+                                         size_t n_vec, unsigned int* sink) {
+  size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+  unsigned int acc = 0;
+  for (; i < n_vec; i += (size_t)gridDim.x * blockDim.x) {
+    const uint4 v = __ldg(data + i);
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (sink != nullptr && acc == 0xFFFFFFFFu && threadIdx.x == blockDim.x) {
+    *sink = acc;  // unreachable (threadIdx.x < blockDim.x); defeats DCE
+  }
+}
+
+CUresult glm52_l2_prefetch_cuda(const void* data, size_t bytes,
+                                cudaStream_t stream) {
+  if (data == nullptr || bytes == 0 || (bytes & 15u) != 0 ||
+      (reinterpret_cast<uintptr_t>(data) & 15u) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t n_vec = bytes / 16;
+  const int threads = 256;
+  const int blocks = 264;  // ~2 blocks/SM on H200; grid-stride covers the rest
+  glm52_l2_prefetch_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const uint4*>(data), n_vec,
+      static_cast<unsigned int*>(nullptr));
+  return consume_last_cuda_error();
+}
+
 CUresult glm52_silu_and_mul_weighted_bf16_cuda(
     const __nv_bfloat16* input, const float* topk_weights, __nv_bfloat16* output,
     int rows, int inter, cudaStream_t stream) {

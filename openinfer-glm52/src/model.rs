@@ -15,6 +15,7 @@ use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
     Glm52IndexerCacheLayout, add_into, argmax_bf16_into, glm52_flashmla_sparse_decode_num_sm_parts,
+    glm52_l2_prefetch_launch,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -425,6 +426,18 @@ impl Glm52RankModel {
                             &mut s.layer.shared_out,
                         )?;
                         let shared_done = aux.stream.record_event(None)?;
+                        // Warm the next layer's MLA projection weights into
+                        // L2 on the aux stream: the main stream spends the
+                        // back of this window in the combine (NVLink
+                        // traffic, HBM mostly idle). Pure reads — byte-parity
+                        // safe; the main stream does NOT wait on this (it
+                        // joins at `shared_done`), and the branch rejoins the
+                        // capture via the next layer's fork event.
+                        if layer + 1 < self.layers.len() {
+                            for w in self.layers[layer + 1].mla.l2_prefetch_targets() {
+                                glm52_l2_prefetch_launch(aux, w)?;
+                            }
+                        }
 
                         run_router_into(ctx, &moe.router, &s.layer.normed2, &mut s.router)?;
                         let dispatched = glm52_moe_ep8_routed_forward(
