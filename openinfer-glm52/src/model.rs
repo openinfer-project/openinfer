@@ -401,7 +401,6 @@ impl Glm52RankModel {
                         ctx,
                         dense,
                         &s.layer.normed2,
-                        &mut s.proj,
                         &mut s.dense_mlp,
                         &mut s.layer.mlp_out,
                     )?,
@@ -422,7 +421,6 @@ impl Glm52RankModel {
                         moe.shared.forward_into(
                             ctx,
                             &s.layer.normed2,
-                            &mut s.proj,
                             &mut s.shared_mlp,
                             &mut s.layer.shared_out,
                         )?;

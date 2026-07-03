@@ -30,19 +30,14 @@ use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
 use crate::dense::GLM52_DENSE_INTERMEDIATE;
-use crate::fp8::{Glm52MlpScratch, Glm52ProjScratch};
+use crate::fp8::Glm52MlpScratch;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52LayerScratch;
 use crate::mla_decode::{Glm52MlaAttendScratch, Glm52MlaFront};
 use crate::moe_decode::{GLM52_SHARED_EXPERT_INTERMEDIATE, Glm52RouterScratch};
 
-/// The widest fp8 projection activation (o_proj: k = 64 heads × 256 v_head).
-/// The single shared projection scratch is sized to it.
-const MAX_PROJ_K: usize = 16_384;
-
 /// Everything one decode step writes, allocated once per rank.
 pub(crate) struct Glm52DecodeScratch {
-    pub(crate) proj: Glm52ProjScratch,
     pub(crate) mla_front: Glm52MlaFront,
     pub(crate) mla_attend: Glm52MlaAttendScratch,
     pub(crate) idx: Glm52IndexerScratch,
@@ -69,7 +64,6 @@ impl Glm52DecodeScratch {
         mqa_shape: Glm52DeepGemmMqaLogitsShape,
     ) -> Result<Self> {
         Ok(Self {
-            proj: Glm52ProjScratch::new(ctx, MAX_PROJ_K)?,
             mla_front: Glm52MlaFront::new(ctx)?,
             mla_attend: Glm52MlaAttendScratch::new(ctx, contract)?,
             idx: Glm52IndexerScratch::new(ctx, mqa_shape)?,

@@ -46,7 +46,7 @@ use openinfer_kernels::tensor::DeviceContext;
 
 #[cfg(test)]
 use crate::fp8::fp8_linear;
-use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, fp8_linear_into};
+use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear_into};
 
 const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;
@@ -337,7 +337,6 @@ pub(crate) fn glm52_indexer_forward_into(
     slot_mapping: &CudaSlice<i64>,
     block_table: &CudaSlice<i32>,
     seq_lens: &CudaSlice<i32>,
-    proj: &mut Glm52ProjScratch,
     s: &mut Glm52IndexerScratch,
 ) -> Result<()> {
     ensure!(hidden.len() >= HIDDEN, "GLM5.2 indexer hidden too small");
@@ -352,8 +351,8 @@ pub(crate) fn glm52_indexer_forward_into(
     );
 
     // ---- projections ----
-    fp8_linear_into(ctx, &w.wq_b, q_resid, proj, &mut s.q)?; // [32*128 = 4096]
-    fp8_linear_into(ctx, &w.wk, hidden, proj, &mut s.k_raw)?; // [128]
+    fp8_linear_into(ctx, &w.wq_b, q_resid, &mut s.q)?; // [32*128 = 4096]
+    fp8_linear_into(ctx, &w.wk, hidden, &mut s.k_raw)?; // [128]
     // weights_proj: bf16 GEMM (transformers keeps weights_proj in fp32 via
     // _keep_in_fp32_modules; checkpoint stores bf16, so bf16 GEMM is the
     // closest match without a dedicated f32 GEMM path).
@@ -521,7 +520,6 @@ pub(crate) fn glm52_indexer_forward(
 ) -> Result<CudaSlice<i32>> {
     let shape =
         Glm52IndexerScratch::decode_shape(cache_layout, block_table.len(), num_sms, max_model_len);
-    let mut proj = Glm52ProjScratch::new(ctx, HIDDEN)?;
     let mut s = Glm52IndexerScratch::new(ctx, shape)?;
     glm52_indexer_forward_into(
         ctx,
@@ -535,7 +533,6 @@ pub(crate) fn glm52_indexer_forward(
         slot_mapping,
         block_table,
         seq_lens,
-        &mut proj,
         &mut s,
     )?;
     Ok(s.global_slots)

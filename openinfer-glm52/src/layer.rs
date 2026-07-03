@@ -150,13 +150,7 @@ pub(crate) fn glm52_layer_attention_half(
     carry_ready: &mut bool,
 ) -> Result<()> {
     rms_norm_into(ctx, &s.hidden, &w.input_ln, RMS_EPS, &mut s.layer.normed)?;
-    glm52_mla_front_into(
-        ctx,
-        &w.mla,
-        &s.layer.normed.data,
-        &mut s.proj,
-        &mut s.mla_front,
-    )?;
+    glm52_mla_front_into(ctx, &w.mla, &s.layer.normed.data, &mut s.mla_front)?;
     match &w.indexer {
         Glm52LayerIndexer::Full(indexer) => {
             let index_k_cache = caches
@@ -175,7 +169,6 @@ pub(crate) fn glm52_layer_attention_half(
                 step.slot_mapping,
                 step.block_table,
                 step.seq_lens,
-                &mut s.proj,
                 &mut s.idx,
             )?;
             *carry_ready = true;
@@ -201,7 +194,6 @@ pub(crate) fn glm52_layer_attention_half(
         step.slot_mapping,
         &s.idx.global_slots,
         step.mla_sched,
-        &mut s.proj,
         &mut s.mla_attend,
         &mut s.layer.attn,
     )?;
@@ -256,7 +248,6 @@ pub(crate) fn glm52_decoder_layer_forward(
             ctx,
             dense,
             &s.layer.normed2,
-            &mut s.proj,
             &mut s.dense_mlp,
             &mut s.layer.mlp_out,
         )?,

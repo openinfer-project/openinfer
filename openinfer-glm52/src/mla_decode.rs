@@ -16,17 +16,18 @@ use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 
+#[cfg(test)]
+use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, Glm52FlashMlaSparseDecode, Glm52MoeQuantShape,
-    gemm_strided_batched_bf16, glm52_flashmla_sparse_decode_launch,
-    glm52_flashmla_sparse_decode_metadata_launch, glm52_fp8_per_token_group_quant_bf16_launch,
-    glm52_mla_cache_pack_launch, glm52_mla_query_assemble_launch, rms_norm_into,
+    Glm52FlashMlaSparseDecode, Glm52MoeQuantShape, gemm_strided_batched_bf16,
+    glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
+    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
+    glm52_mla_query_assemble_launch, rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::fp8::{
-    FP8_BLOCK, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, bytes_to_f32, e4m3_to_f32,
-    fp8_linear_into,
+    FP8_BLOCK, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear_into,
 };
 
 const HEADS: usize = 64;
@@ -242,14 +243,13 @@ pub(crate) fn glm52_mla_front_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
     hidden: &CudaSlice<bf16>,
-    proj: &mut Glm52ProjScratch,
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
     ensure!(hidden.len() >= HIDDEN, "GLM5.2 MLA hidden too small");
-    fp8_linear_into(ctx, &w.q_a, hidden, proj, &mut front.q_a.data)?; // [2048]
+    fp8_linear_into(ctx, &w.q_a, hidden, &mut front.q_a.data)?; // [2048]
     rms_norm_into(ctx, &front.q_a, &w.q_a_ln, RMS_EPS, &mut front.q_resid)?;
-    fp8_linear_into(ctx, &w.q_b, &front.q_resid.data, proj, &mut front.q_full)?; // [64,256]
-    fp8_linear_into(ctx, &w.kv_a, hidden, proj, &mut front.ckv)?; // [576]
+    fp8_linear_into(ctx, &w.q_b, &front.q_resid.data, &mut front.q_full)?; // [64,256]
+    fp8_linear_into(ctx, &w.kv_a, hidden, &mut front.ckv)?; // [576]
     ctx.stream
         .memcpy_dtod(&front.ckv.slice(0..KV_LORA), &mut front.kv_c_raw.data)?;
     rms_norm_into(ctx, &front.kv_c_raw, &w.kv_a_ln, RMS_EPS, &mut front.kv_c)?;
@@ -317,14 +317,13 @@ pub(crate) fn glm52_mla_decode_forward(
         "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
         sched.contract.num_blocks
     );
-    let mut proj = Glm52ProjScratch::new(ctx, HEADS * V_HEAD)?;
     let mut front = Glm52MlaFront::new(ctx)?;
     let mut attend = Glm52MlaAttendScratch::new(ctx, &sched.contract)?;
     let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
     ctx.stream
         .memcpy_htod(&[position as i64], &mut slot_mapping)?;
     let mut o = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
-    glm52_mla_front_into(ctx, w, hidden, &mut proj, &mut front)?;
+    glm52_mla_front_into(ctx, w, hidden, &mut front)?;
     glm52_mla_attend_into(
         ctx,
         w,
@@ -335,7 +334,6 @@ pub(crate) fn glm52_mla_decode_forward(
         &slot_mapping,
         topk,
         sched,
-        &mut proj,
         &mut attend,
         &mut o,
     )?;
@@ -390,7 +388,6 @@ pub(crate) fn glm52_mla_attend_into(
     slot_mapping: &CudaSlice<i64>,
     topk: &CudaSlice<i32>,
     sched: &Glm52MlaSchedMetadata,
-    proj: &mut Glm52ProjScratch,
     s: &mut Glm52MlaAttendScratch,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
@@ -490,5 +487,5 @@ pub(crate) fn glm52_mla_attend_into(
         V_HEAD,
         HEADS,
     )?;
-    fp8_linear_into(ctx, &w.o_proj, &s.v, proj, out) // [6144]
+    fp8_linear_into(ctx, &w.o_proj, &s.v, out) // [6144]
 }

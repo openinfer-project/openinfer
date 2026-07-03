@@ -46,9 +46,7 @@ use openinfer_kernels::tensor::HiddenStates;
 
 #[cfg(test)]
 use crate::fp8::fp8_mlp;
-use crate::fp8::{
-    Glm52MlpScratch, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, bytes_to_f32, fp8_mlp_into,
-};
+use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp_into};
 
 pub(crate) const HIDDEN: usize = 6144;
 pub(crate) const EXPERTS: usize = 256;
@@ -152,7 +150,6 @@ impl Glm52MoeSharedExpert {
         &self,
         ctx: &DeviceContext,
         normed_hidden: &CudaSlice<bf16>,
-        proj: &mut Glm52ProjScratch,
         mlp: &mut Glm52MlpScratch,
         out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
@@ -162,7 +159,6 @@ impl Glm52MoeSharedExpert {
             &self.up,
             &self.down,
             normed_hidden,
-            proj,
             mlp,
             out,
         )

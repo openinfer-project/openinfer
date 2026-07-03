@@ -10,7 +10,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, Glm52ProjScratch, ProjWeight, fp8_mlp_into};
+use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, ProjWeight, fp8_mlp_into};
 
 const HIDDEN: usize = 6144;
 const INTERMEDIATE: usize = 12288;
@@ -79,7 +79,6 @@ pub(crate) fn glm52_dense_mlp_forward_into(
     ctx: &DeviceContext,
     weights: &Glm52DenseMlpWeights,
     normed_hidden: &CudaSlice<bf16>,
-    proj: &mut Glm52ProjScratch,
     mlp: &mut Glm52MlpScratch,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
@@ -89,7 +88,6 @@ pub(crate) fn glm52_dense_mlp_forward_into(
         &weights.up,
         &weights.down,
         normed_hidden,
-        proj,
         mlp,
         out,
     )
