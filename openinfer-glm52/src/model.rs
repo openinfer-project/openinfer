@@ -11,6 +11,7 @@
 use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
     Glm52IndexerCacheLayout, add_into, argmax_bf16_into, glm52_flashmla_sparse_decode_num_sm_parts,
@@ -221,6 +222,11 @@ pub(crate) struct Glm52RankModel {
     sin: CudaSlice<bf16>,
     token_id: CudaSlice<u32>,
     scratch: Glm52DecodeScratch,
+    /// The whole-step decode graph: captured on this rank's first step,
+    /// replayed every step after. Valid forever — every step has the same
+    /// kernel sequence and the same (arena) pointers by construction; the
+    /// per-step inputs are the five device buffers the prologue rewrites.
+    graph: CudaGraphState,
 }
 
 impl Glm52RankModel {
@@ -327,12 +333,25 @@ impl Glm52RankModel {
             sin: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
             token_id: ctx.stream.alloc_zeros::<u32>(1)?,
             scratch: Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?,
+            graph: CudaGraphState::new(),
         })
     }
 
     /// One full-model step: feed `token` at `position`, return the greedy
     /// next-token id. Enters 75 MoE collectives — every other rank must be
     /// stepping concurrently (an idle rank steps a padding token).
+    ///
+    /// The step body (embed → 78 layers → lm_head → argmax) is captured into
+    /// a CUDA graph on the first call and replayed afterwards: one graph
+    /// launch instead of ~4155 kernel launches per rank per step. The
+    /// prologue rewrites the five device input buffers the captured kernels
+    /// read (rope row, slot, seq_len, token), and the epilogue reads back the
+    /// 6-byte argmax result — both outside the graph. Capture-time safety:
+    /// stream capture records without executing, and in lock-step all ranks
+    /// capture on the same global step, so the DeepEP collectives first
+    /// execute together on every rank's first graph launch (the same
+    /// argument as the kimi decode graph; the ceiling is the ~100 s DeepEP
+    /// device timeout against a capture window of tens of ms).
     pub(crate) fn decode_step(
         &mut self,
         ctx: &DeviceContext,
@@ -367,73 +386,80 @@ impl Glm52RankModel {
             seq_lens: &self.seq_lens,
         };
 
-        let s = &mut self.scratch;
-        glm52_embed_into(ctx, &self.embed, &self.token_id, &mut s.hidden)?;
-        let mut carry_ready = false;
-        for (layer, (weights, cache)) in self.layers.iter().zip(self.caches.iter_mut()).enumerate()
-        {
-            glm52_layer_attention_half(ctx, weights, cache, &step, s, &mut carry_ready)
-                .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
-            match &weights.mlp {
-                Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
-                    ctx,
-                    dense,
-                    &s.layer.normed2,
-                    &mut s.proj,
-                    &mut s.dense_mlp,
-                    &mut s.layer.mlp_out,
-                )?,
-                Glm52LayerMlp::MoeEp8(moe) => {
-                    run_router_into(ctx, &moe.router, &s.layer.normed2, &mut s.router)?;
-                    let dispatched = glm52_moe_ep8_routed_forward(
+        let mut graph = std::mem::take(&mut self.graph);
+        let result = graph.run_or_capture(ctx, || {
+            let s = &mut self.scratch;
+            glm52_embed_into(ctx, &self.embed, &self.token_id, &mut s.hidden)?;
+            let mut carry_ready = false;
+            for (layer, (weights, cache)) in
+                self.layers.iter().zip(self.caches.iter_mut()).enumerate()
+            {
+                glm52_layer_attention_half(ctx, weights, cache, &step, s, &mut carry_ready)
+                    .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
+                match &weights.mlp {
+                    Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
                         ctx,
-                        ep8,
-                        &moe.bank,
-                        Some((&s.layer.normed2, &s.router.route)),
-                        GLM52_DECODE_GLOBAL_TOKENS,
-                    )
-                    .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
-                    ensure!(
-                        dispatched,
-                        "EP8 MoE returned no combined output for a dispatched token"
-                    );
-                    moe.shared.forward_into(
-                        ctx,
+                        dense,
                         &s.layer.normed2,
                         &mut s.proj,
-                        &mut s.shared_mlp,
-                        &mut s.layer.shared_out,
-                    )?;
-                    add_into(
-                        ctx,
-                        ep8.combined(),
-                        &s.layer.shared_out,
-                        GLM52_HIDDEN,
+                        &mut s.dense_mlp,
                         &mut s.layer.mlp_out,
-                    )?;
-                }
-                Glm52LayerMlp::Moe(_) => {
-                    anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
-                }
-            };
-            glm52_layer_finish(ctx, s)?;
-        }
+                    )?,
+                    Glm52LayerMlp::MoeEp8(moe) => {
+                        run_router_into(ctx, &moe.router, &s.layer.normed2, &mut s.router)?;
+                        let dispatched = glm52_moe_ep8_routed_forward(
+                            ctx,
+                            ep8,
+                            &moe.bank,
+                            Some((&s.layer.normed2, &s.router.route)),
+                            GLM52_DECODE_GLOBAL_TOKENS,
+                        )
+                        .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
+                        ensure!(
+                            dispatched,
+                            "EP8 MoE returned no combined output for a dispatched token"
+                        );
+                        moe.shared.forward_into(
+                            ctx,
+                            &s.layer.normed2,
+                            &mut s.proj,
+                            &mut s.shared_mlp,
+                            &mut s.layer.shared_out,
+                        )?;
+                        add_into(
+                            ctx,
+                            ep8.combined(),
+                            &s.layer.shared_out,
+                            GLM52_HIDDEN,
+                            &mut s.layer.mlp_out,
+                        )?;
+                    }
+                    Glm52LayerMlp::Moe(_) => {
+                        anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
+                    }
+                };
+                glm52_layer_finish(ctx, s)?;
+            }
 
-        glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, &mut s.final_normed)?;
-        glm52_lm_head_into(ctx, &s.final_normed, &self.lm_head, &mut s.logits)?;
-        // Device greedy argmax (same semantics as a host scan: lowest index
-        // wins ties, NaN never wins) — the step's egress shrinks from the
-        // full vocab row to 6 bytes, and the kernel chain ends on-device
-        // (the graph boundary for PR5c stage 3).
-        argmax_bf16_into(
-            ctx,
-            &s.logits.data,
-            GLM52_VOCAB,
-            &mut s.argmax_value,
-            &mut s.argmax_index,
-        )?;
-        let top_value = ctx.stream.clone_dtoh(&s.argmax_value)?[0].to_f32();
-        let top_index = ctx.stream.clone_dtoh(&s.argmax_index)?[0];
+            glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, &mut s.final_normed)?;
+            glm52_lm_head_into(ctx, &s.final_normed, &self.lm_head, &mut s.logits)?;
+            // Device greedy argmax (same semantics as a host scan: lowest
+            // index wins ties, NaN never wins) — the step's egress shrinks
+            // from the full vocab row to 6 bytes, and the kernel chain ends
+            // on-device (the graph boundary).
+            argmax_bf16_into(
+                ctx,
+                &s.logits.data,
+                GLM52_VOCAB,
+                &mut s.argmax_value,
+                &mut s.argmax_index,
+            )
+        });
+        self.graph = graph;
+        result?;
+
+        let top_value = ctx.stream.clone_dtoh(&self.scratch.argmax_value)?[0].to_f32();
+        let top_index = ctx.stream.clone_dtoh(&self.scratch.argmax_index)?[0];
         ensure!(
             top_value.is_finite(),
             "GLM5.2 greedy argmax found no finite logit (top = {top_value})"
