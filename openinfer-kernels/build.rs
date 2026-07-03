@@ -1309,6 +1309,11 @@ fn main() {
             if !moe_enabled && is_deepep_source(&csrc_dir, path) {
                 return None;
             }
+            // The GLM5.2 shim instantiation rides the deepep flags but only
+            // exists for the glm52 feature.
+            if !glm52_enabled && file_name == "deepep_shim_glm52.cu" {
+                return None;
+            }
             if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
                 return None;
             }

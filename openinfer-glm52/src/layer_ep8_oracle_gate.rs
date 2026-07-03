@@ -1,0 +1,203 @@
+//! EP8 layer-6 MoE oracle gate: the PR3 decoder-layer gate re-run with the
+//! MoE half going through the real 8-GPU DeepEP dispatch/combine.
+//!
+//! Rank 0 walks the full decoder layer (attention + indexer + EP8 MoE +
+//! shared expert) over the same seeded input as the EP1 gate; ranks 1..7 hold
+//! their 32 local experts and replay one collective per position. The probe
+//! constants, tolerance, and router tie-flip allowance are shared verbatim
+//! with `layer_oracle_gate` — passing here proves the collective path
+//! (dispatch → re-quant → metadata → grouped GEMMs → combine) computes the
+//! same layer output as the local EP1 chain.
+
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result, ensure};
+use cudarc::driver::CudaSlice;
+use half::bf16;
+use openinfer_kernels::ops::{
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
+    Glm52IndexerCacheLayout, add_batch, glm52_deepep_unique_id,
+    glm52_flashmla_sparse_decode_num_sm_parts,
+};
+use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
+
+use crate::layer::{
+    Glm52DecodeStep, Glm52LayerCaches, Glm52LayerMlp, glm52_layer_attention_half,
+    glm52_layer_finish,
+};
+use crate::layer_oracle_gate::{
+    GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
+    MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
+    assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
+};
+use crate::model::{INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE, rope_tables};
+use crate::moe_decode::{Glm52MoeExpertPath, HIDDEN, run_router};
+use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+
+const EP_RANKS: usize = 8;
+
+#[test]
+#[ignore = "requires 8×H200 + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4 + DeepGEMM env"]
+fn layer_moe_ep8_oracle_gate() -> Result<()> {
+    let hidden_host = checked_hidden(
+        MOE_ORACLE_SEED,
+        MOE_ORACLE_CTX,
+        MOE_ORACLE_INPUT_SCALE,
+        MOE_ORACLE_HIDDEN_DIGEST,
+    )?;
+    let unique_id = glm52_deepep_unique_id()?;
+    let tensors = Arc::new(LayerTensors::load(&model_path(), MOE_ORACLE_LAYER)?);
+
+    // Expert ranks: pack the 32 local experts, then replay one collective per
+    // position. Context creation inside is collective with rank 0's below.
+    let handles: Vec<_> = (1..EP_RANKS)
+        .map(|rank| {
+            let tensors = Arc::clone(&tensors);
+            std::thread::Builder::new()
+                .name(format!("ep8-gate-rank-{rank}"))
+                .spawn(move || -> Result<()> {
+                    let ctx = DeviceContext::new_with_device(rank)?;
+                    let bank = load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank)?;
+                    let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, rank)?;
+                    for _position in 0..MOE_ORACLE_CTX {
+                        let combined = glm52_moe_ep8_routed_forward(&ctx, &mut ep8, &bank, None)?;
+                        ensure!(combined.is_none(), "expert rank produced a combined output");
+                    }
+                    Ok(())
+                })
+                .expect("spawn ep8 gate rank thread")
+        })
+        .collect();
+
+    // Rank 0: full decoder layer with the EP8 MoE half, prefill-via-decode.
+    let ctx = DeviceContext::new_with_device(0)?;
+    let w = load_decoder_layer(
+        &ctx,
+        &model_path(),
+        MOE_ORACLE_LAYER,
+        GateLayerMlp::MoeEp8Rank0,
+    )?;
+    let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, 0)?;
+    let outputs = run_layer_prefill_ep8(&ctx, &w, &mut ep8, &hidden_host, MOE_ORACLE_CTX);
+
+    // The DeepEP context drop is collective: the expert threads drop theirs
+    // right after their last collective and spin in the destroy barrier, so
+    // rank 0 must drop BEFORE joining them (join-then-drop deadlocks until
+    // the ~100 s device timeout traps every rank).
+    drop(ep8);
+    for (rank, handle) in handles.into_iter().enumerate() {
+        handle
+            .join()
+            .expect("ep8 gate rank thread panicked")
+            .with_context(|| format!("ep8 gate rank {}", rank + 1))?;
+    }
+    assert_layer_probes(
+        "layer6/moe/ep8",
+        &outputs?,
+        MOE_ORACLE_LAYER_PROBES,
+        MOE_ORACLE_LAYER_TOL,
+        4,
+    );
+    Ok(())
+}
+
+/// The EP8 variant of the gate's prefill-via-decode walk: same decode
+/// environment as `layer_oracle_gate::run_layer_prefill`, with the MLP half
+/// driven through the collective.
+fn run_layer_prefill_ep8(
+    ctx: &DeviceContext,
+    w: &crate::layer::Glm52DecoderLayerWeights,
+    ep8: &mut Glm52MoeEp8State,
+    hidden_host: &[bf16],
+    oracle_ctx: usize,
+) -> Result<Vec<f32>> {
+    let Glm52LayerMlp::MoeEp8(moe) = &w.mlp else {
+        anyhow::bail!("ep8 gate requires the MoeEp8 layer weights");
+    };
+    let contract = Glm52FlashMlaSparseDecode {
+        batch_size: 1,
+        num_blocks: oracle_ctx.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+        topk: GLM52_FLASHMLA_SPARSE_TOPK,
+        num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
+        sm_scale: SM_SCALE,
+    };
+    let index_blocks = oracle_ctx.div_ceil(INDEX_CACHE_BLOCK);
+    let index_cache_layout = Glm52IndexerCacheLayout {
+        cache_blocks: index_blocks,
+        cache_block_size: INDEX_CACHE_BLOCK,
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (INDEX_HEAD_DIM + 4),
+    };
+    let mut caches = Glm52LayerCaches {
+        mla_cache: ctx
+            .stream
+            .alloc_zeros::<u8>(contract.packed_kv_cache_len())?,
+        index_k_cache: Some(
+            ctx.stream
+                .alloc_zeros::<u8>(index_cache_layout.min_cache_bytes()?)?,
+        ),
+    };
+
+    let block_table_host: Vec<i32> = (0..index_blocks as i32).collect();
+    let mut block_table = ctx.stream.alloc_zeros::<i32>(index_blocks)?;
+    ctx.stream
+        .memcpy_htod(&block_table_host, &mut block_table)?;
+    let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
+    let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
+    let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+    let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+
+    let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
+    for position in 0..oracle_ctx {
+        let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+        ctx.stream.memcpy_htod(
+            &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
+            &mut hidden,
+        )?;
+        let (cos_host, sin_host) = rope_tables(position);
+        ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
+        ctx.stream.memcpy_htod(&sin_host, &mut sin)?;
+        ctx.stream
+            .memcpy_htod(&[position as i64], &mut slot_mapping)?;
+        ctx.stream
+            .memcpy_htod(&[(position + 1) as i32], &mut seq_lens)?;
+
+        let step = Glm52DecodeStep {
+            position,
+            mla_cos: &cos,
+            mla_sin: &sin,
+            idx_cos: &cos,
+            idx_sin: &sin,
+            contract,
+            index_cache_layout,
+            slot_mapping: &slot_mapping,
+            block_table: &block_table,
+            seq_lens: &seq_lens,
+            num_sms: NUM_SMS,
+            max_model_len: oracle_ctx,
+            moe_path: Glm52MoeExpertPath::Grouped,
+        };
+        let mut topk_carry: Option<CudaSlice<i32>> = None;
+        let boundary =
+            glm52_layer_attention_half(ctx, w, &mut caches, hidden, &step, &mut topk_carry)?;
+        let route = run_router(ctx, &moe.router, &boundary.normed)?;
+        let routed =
+            glm52_moe_ep8_routed_forward(ctx, ep8, &moe.bank, Some((&boundary.normed, &route)))?
+                .context("rank-0 EP8 MoE returned no combined output")?;
+        let shared = moe.shared.forward(ctx, &boundary.normed)?;
+        let routed_hs = HiddenStates {
+            data: routed,
+            hidden_dim: HIDDEN,
+            seq_len: 1,
+        };
+        let shared_hs = HiddenStates {
+            data: shared,
+            hidden_dim: HIDDEN,
+            seq_len: 1,
+        };
+        let mlp = add_batch(ctx, &routed_hs, &shared_hs)?.data;
+        let out = glm52_layer_finish(ctx, boundary.residual, mlp)?;
+        let out_host = ctx.stream.clone_dtoh(&out)?;
+        outputs.extend(out_host.iter().map(|v| v.to_f32()));
+    }
+    Ok(outputs)
+}

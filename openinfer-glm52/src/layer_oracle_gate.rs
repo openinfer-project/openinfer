@@ -134,16 +134,16 @@ const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
 //     --ctx 200 --seed 0x5eed604d --layer 6 --precision fp8sim \
 //     --stage layer --input-scale 0.02
 // transformers=5.13.0.dev0 torch=2.12.1+cu130
-const MOE_ORACLE_SEED: u64 = 0x5eed604d;
-const MOE_ORACLE_CTX: usize = 200;
-const MOE_ORACLE_LAYER: usize = 6;
-const MOE_ORACLE_INPUT_SCALE: f64 = 0.02;
+pub(crate) const MOE_ORACLE_SEED: u64 = 0x5eed604d;
+pub(crate) const MOE_ORACLE_CTX: usize = 200;
+pub(crate) const MOE_ORACLE_LAYER: usize = 6;
+pub(crate) const MOE_ORACLE_INPUT_SCALE: f64 = 0.02;
 // sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
-const MOE_ORACLE_HIDDEN_DIGEST: &str = "d39daa8ba2c7f939";
+pub(crate) const MOE_ORACLE_HIDDEN_DIGEST: &str = "d39daa8ba2c7f939";
 // tap `layer_out` [200, 6144] bf16 digest=5ee66e7dc80d957e (provenance only)
 // tol = max(rel_tol 0.05 x delta_rms 1.946e-03, 3 x bf16-ulp 9.021e-05) — see emit_rust_layer.
-const MOE_ORACLE_LAYER_TOL: f32 = 2.706195228e-04;
-const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
+pub(crate) const MOE_ORACLE_LAYER_TOL: f32 = 2.706195228e-04;
+pub(crate) const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
     (7504, 3.393554688e-02),
     (10832, 1.940917969e-02),
     (30355, 4.028320312e-02),
@@ -259,7 +259,7 @@ fn bf16_digest(data: &[bf16]) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
-fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
+pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
     (0..ROPE_HALF)
         .map(|j| {
             let inv_freq = 1.0 / ROPE_THETA.powf(j as f32 / ROPE_HALF as f32);
@@ -272,12 +272,12 @@ fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
 /// Owned copies of every `model.layers.{L}.` tensor (attention + indexer +
 /// layernorms + MLP/MoE). For the MoE layer this is ~10 GB of host copies — a
 /// test-only cost that keeps the borrow story trivial.
-struct LayerTensors {
+pub(crate) struct LayerTensors {
     by_name: BTreeMap<String, Vec<u8>>,
 }
 
 impl LayerTensors {
-    fn load(model_path: &Path, layer: usize) -> Result<Self> {
+    pub(crate) fn load(model_path: &Path, layer: usize) -> Result<Self> {
         let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
             model_path.join("model.safetensors.index.json"),
         )?)?;
@@ -305,14 +305,14 @@ impl LayerTensors {
         Ok(Self { by_name })
     }
 
-    fn bytes(&self, name: &str) -> Result<&[u8]> {
+    pub(crate) fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.by_name
             .get(name)
             .map(Vec::as_slice)
             .with_context(|| format!("layer tensor {name} not loaded"))
     }
 
-    fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
+    pub(crate) fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
         Ok(Glm52ProjBytes {
             weight: self.bytes(&format!("{stem}.weight"))?,
             scale: self.bytes(&format!("{stem}.weight_scale_inv"))?,
@@ -322,11 +322,49 @@ impl LayerTensors {
     }
 }
 
-fn load_decoder_layer(
+/// Which MLP half the gate loads: dense, the EP1 all-256 MoE, or the EP8
+/// rank-0 MoE (router + shared + experts 0..32 — the collective driver runs
+/// the expert math).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GateLayerMlp {
+    Dense,
+    Moe,
+    MoeEp8Rank0,
+}
+
+/// Pack one EP8 rank's 32 local experts from the layer's host tensors.
+pub(crate) fn load_rank_expert_bank(
+    ctx: &DeviceContext,
+    t: &LayerTensors,
+    layer: usize,
+    rank: usize,
+) -> Result<crate::moe_decode::Glm52MoeExpertBank> {
+    let mp = format!("model.layers.{layer}.mlp");
+    let local = EXPERTS / 8;
+    let experts: Vec<Glm52MoeRoutedExpertBytes<'_>> = (rank * local..(rank + 1) * local)
+        .map(|e| {
+            let ep = format!("{mp}.experts.{e}");
+            Ok(Glm52MoeRoutedExpertBytes {
+                gate: t.proj(&format!("{ep}.gate_proj"), MOE_INTERMEDIATE, HIDDEN)?,
+                up: t.proj(&format!("{ep}.up_proj"), MOE_INTERMEDIATE, HIDDEN)?,
+                down: t.proj(&format!("{ep}.down_proj"), HIDDEN, MOE_INTERMEDIATE)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    crate::moe_decode::Glm52MoeExpertBank::pack_from_host(ctx, &experts)
+}
+
+fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
+    let mut dev = ctx.stream.alloc_zeros::<u8>(host.len())?;
+    ctx.stream.memcpy_htod(host, &mut dev)?;
+    Ok(dev)
+}
+
+pub(crate) fn load_decoder_layer(
     ctx: &DeviceContext,
     model_path: &Path,
     layer: usize,
-    dense: bool,
+    mlp_kind: GateLayerMlp,
 ) -> Result<Glm52DecoderLayerWeights> {
     let t = LayerTensors::load(model_path, layer)?;
     let p = format!("model.layers.{layer}");
@@ -352,47 +390,84 @@ fn load_decoder_layer(
         t.bytes(&format!("{ip}.k_norm.bias"))?,
     )?;
 
-    let mlp = if dense {
-        let mp = format!("{p}.mlp");
-        Glm52LayerMlp::Dense(Box::new(crate::dense::Glm52DenseMlpWeights::from_host(
-            ctx,
-            &t.proj(&format!("{mp}.gate_proj"), DENSE_INTERMEDIATE, HIDDEN)?,
-            &t.proj(&format!("{mp}.up_proj"), DENSE_INTERMEDIATE, HIDDEN)?,
-            &t.proj(&format!("{mp}.down_proj"), HIDDEN, DENSE_INTERMEDIATE)?,
-        )?))
-    } else {
-        let mp = format!("{p}.mlp");
-        let experts: Vec<Glm52MoeRoutedExpertBytes<'_>> = (0..EXPERTS)
-            .map(|e| {
-                let ep = format!("{mp}.experts.{e}");
-                Ok(Glm52MoeRoutedExpertBytes {
-                    gate: t.proj(&format!("{ep}.gate_proj"), MOE_INTERMEDIATE, HIDDEN)?,
-                    up: t.proj(&format!("{ep}.up_proj"), MOE_INTERMEDIATE, HIDDEN)?,
-                    down: t.proj(&format!("{ep}.down_proj"), HIDDEN, MOE_INTERMEDIATE)?,
+    let mp = format!("{p}.mlp");
+    let mlp = match mlp_kind {
+        GateLayerMlp::Dense => {
+            Glm52LayerMlp::Dense(Box::new(crate::dense::Glm52DenseMlpWeights::from_host(
+                ctx,
+                &t.proj(&format!("{mp}.gate_proj"), DENSE_INTERMEDIATE, HIDDEN)?,
+                &t.proj(&format!("{mp}.up_proj"), DENSE_INTERMEDIATE, HIDDEN)?,
+                &t.proj(&format!("{mp}.down_proj"), HIDDEN, DENSE_INTERMEDIATE)?,
+            )?))
+        }
+        GateLayerMlp::MoeEp8Rank0 => {
+            Glm52LayerMlp::MoeEp8(Box::new(crate::moe_ep8::Glm52MoeEp8LayerWeights {
+                router: crate::moe_decode::Glm52MoeRouterWeights::new(
+                    upload_u8(ctx, t.bytes(&format!("{mp}.gate.weight"))?)?,
+                    upload_u8(ctx, t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?)?,
+                )?,
+                shared: crate::moe_decode::Glm52MoeSharedExpert::new(
+                    crate::fp8::ProjWeight::upload(
+                        ctx,
+                        &t.proj(
+                            &format!("{mp}.shared_experts.gate_proj"),
+                            MOE_INTERMEDIATE,
+                            HIDDEN,
+                        )?,
+                    )?,
+                    crate::fp8::ProjWeight::upload(
+                        ctx,
+                        &t.proj(
+                            &format!("{mp}.shared_experts.up_proj"),
+                            MOE_INTERMEDIATE,
+                            HIDDEN,
+                        )?,
+                    )?,
+                    crate::fp8::ProjWeight::upload(
+                        ctx,
+                        &t.proj(
+                            &format!("{mp}.shared_experts.down_proj"),
+                            HIDDEN,
+                            MOE_INTERMEDIATE,
+                        )?,
+                    )?,
+                )?,
+                bank: load_rank_expert_bank(ctx, &t, layer, 0)?,
+            }))
+        }
+        GateLayerMlp::Moe => {
+            let experts: Vec<Glm52MoeRoutedExpertBytes<'_>> = (0..EXPERTS)
+                .map(|e| {
+                    let ep = format!("{mp}.experts.{e}");
+                    Ok(Glm52MoeRoutedExpertBytes {
+                        gate: t.proj(&format!("{ep}.gate_proj"), MOE_INTERMEDIATE, HIDDEN)?,
+                        up: t.proj(&format!("{ep}.up_proj"), MOE_INTERMEDIATE, HIDDEN)?,
+                        down: t.proj(&format!("{ep}.down_proj"), HIDDEN, MOE_INTERMEDIATE)?,
+                    })
                 })
-            })
-            .collect::<Result<_>>()?;
-        Glm52LayerMlp::Moe(Box::new(Glm52MoeLayerWeights::from_host(
-            ctx,
-            t.bytes(&format!("{mp}.gate.weight"))?,
-            t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?,
-            &experts,
-            &t.proj(
-                &format!("{mp}.shared_experts.gate_proj"),
-                MOE_INTERMEDIATE,
-                HIDDEN,
-            )?,
-            &t.proj(
-                &format!("{mp}.shared_experts.up_proj"),
-                MOE_INTERMEDIATE,
-                HIDDEN,
-            )?,
-            &t.proj(
-                &format!("{mp}.shared_experts.down_proj"),
-                HIDDEN,
-                MOE_INTERMEDIATE,
-            )?,
-        )?))
+                .collect::<Result<_>>()?;
+            Glm52LayerMlp::Moe(Box::new(Glm52MoeLayerWeights::from_host(
+                ctx,
+                t.bytes(&format!("{mp}.gate.weight"))?,
+                t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?,
+                &experts,
+                &t.proj(
+                    &format!("{mp}.shared_experts.gate_proj"),
+                    MOE_INTERMEDIATE,
+                    HIDDEN,
+                )?,
+                &t.proj(
+                    &format!("{mp}.shared_experts.up_proj"),
+                    MOE_INTERMEDIATE,
+                    HIDDEN,
+                )?,
+                &t.proj(
+                    &format!("{mp}.shared_experts.down_proj"),
+                    HIDDEN,
+                    MOE_INTERMEDIATE,
+                )?,
+            )?))
+        }
     };
 
     Ok(Glm52DecoderLayerWeights {
@@ -506,7 +581,7 @@ fn run_layer_prefill(
 /// each outlier's deviation at 8x tol — a systematic bug (dropped x2.5,
 /// swapped gate/up, wrong expert weights) shifts probes by orders more and
 /// still fails. Dense layers have no router and use zero allowance.
-fn assert_layer_probes(
+pub(crate) fn assert_layer_probes(
     label: &str,
     outputs: &[f32],
     probes: &[(usize, f32)],
@@ -548,12 +623,17 @@ fn assert_layer_probes(
     }
 }
 
-fn model_path() -> PathBuf {
+pub(crate) fn model_path() -> PathBuf {
     std::env::var_os("OPENINFER_TEST_MODEL_PATH")
         .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from)
 }
 
-fn checked_hidden(seed: u64, ctxlen: usize, scale: f64, digest: &str) -> Result<Vec<bf16>> {
+pub(crate) fn checked_hidden(
+    seed: u64,
+    ctxlen: usize,
+    scale: f64,
+    digest: &str,
+) -> Result<Vec<bf16>> {
     let hidden = seeded_hidden(seed, ctxlen * HIDDEN, scale);
     let got = bf16_digest(&hidden);
     ensure!(
@@ -573,7 +653,7 @@ fn layer_dense_oracle_gate() -> Result<()> {
         DENSE_ORACLE_HIDDEN_DIGEST,
     )?;
     let ctx = DeviceContext::new()?;
-    let w = load_decoder_layer(&ctx, &model_path(), DENSE_ORACLE_LAYER, true)?;
+    let w = load_decoder_layer(&ctx, &model_path(), DENSE_ORACLE_LAYER, GateLayerMlp::Dense)?;
     let outputs = run_layer_prefill(
         &ctx,
         &w,
@@ -601,7 +681,7 @@ fn layer_moe_oracle_gate() -> Result<()> {
         MOE_ORACLE_HIDDEN_DIGEST,
     )?;
     let ctx = DeviceContext::new()?;
-    let w = load_decoder_layer(&ctx, &model_path(), MOE_ORACLE_LAYER, false)?;
+    let w = load_decoder_layer(&ctx, &model_path(), MOE_ORACLE_LAYER, GateLayerMlp::Moe)?;
 
     // Grouped is the DeepEP-shaped spine; Gemv is the measured bs=1 alternative.
     // Both must land on the same oracle probes.

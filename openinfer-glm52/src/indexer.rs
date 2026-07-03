@@ -128,6 +128,44 @@ impl Glm52IndexerLayerWeights {
             k_norm_b: norm_b,
         })
     }
+
+    /// Build from already-resident weights (the production loader path). The
+    /// fp8 projections and the bf16 `weights_proj` are moved in; the two
+    /// 128-element k_norm tensors come as host bytes because the checkpoint
+    /// stores bf16 and FlashInfer LayerNorm needs f32 gamma/beta.
+    pub(crate) fn from_device(
+        ctx: &DeviceContext,
+        wq_b: ProjWeight,
+        wk: ProjWeight,
+        weights_proj: CudaSlice<bf16>,
+        k_norm_w: &[u8],
+        k_norm_b: &[u8],
+    ) -> Result<Self> {
+        let check = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
+            ensure!(
+                p.n == n && p.k == k,
+                "GLM5.2 indexer {label} shape [{},{}] != [{n},{k}]",
+                p.n,
+                p.k
+            );
+            Ok(())
+        };
+        check("wq_b", &wq_b, INDEX_HEADS * INDEX_HEAD_DIM, Q_LORA)?;
+        check("wk", &wk, INDEX_HEAD_DIM, HIDDEN)?;
+        ensure!(
+            weights_proj.len() == INDEX_HEADS * HIDDEN,
+            "GLM5.2 indexer weights_proj len {} != {} (bf16 [32, 6144])",
+            weights_proj.len(),
+            INDEX_HEADS * HIDDEN
+        );
+        Ok(Self {
+            wq_b,
+            wk,
+            weights_proj,
+            k_norm_w: upcast_bf16_to_f32(ctx, k_norm_w)?,
+            k_norm_b: upcast_bf16_to_f32(ctx, k_norm_b)?,
+        })
+    }
 }
 
 /// Copy bf16 bytes from a checkpoint tensor and upcast to f32 on host, then

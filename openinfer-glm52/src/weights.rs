@@ -19,13 +19,125 @@ mod context;
 mod load;
 
 pub(crate) use context::Glm52RankGpuContext;
+#[cfg(feature = "glm52")]
+pub(crate) use load::Glm52ExpertLayerRegions;
 pub(crate) use load::{Glm52RankGpuWeights, load_rank_weights_to_gpu};
 
 const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
-const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
+pub(crate) const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
 pub(crate) const GLM52_EP_RANKS: usize = 8;
 pub(crate) const GLM52_LOCAL_EXPERTS: usize = GLM52_ROUTED_EXPERTS / GLM52_EP_RANKS;
 const FP8_BLOCK_SIZE: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Expert packed placement: routed-expert tensors are written into their FINAL
+// expert-major layout at H2D time (per expert: [gate; up] rows, scales
+// likewise), byte-identical to `Glm52MoeLayerWeights::from_host` packing.
+// Repacking after load cannot work — a rank's expert slab (~85 GiB) plus its
+// packed copy exceeds the 141 GiB HBM — so placement happens in the loader.
+// ---------------------------------------------------------------------------
+
+/// Per-expert byte strides of the packed regions (expert intermediate 2048,
+/// hidden 6144, fp8 weights + f32 128×128-block scales).
+const EXPERT_PROJ_W13_BYTES: usize = GLM52_EXPERT_INTERMEDIATE * GLM52_HIDDEN; // one of gate|up
+const EXPERT_W13_WEIGHT_STRIDE: usize = 2 * EXPERT_PROJ_W13_BYTES;
+const EXPERT_PROJ_W13_SCALE_BYTES: usize =
+    GLM52_EXPERT_INTERMEDIATE.div_ceil(FP8_BLOCK_SIZE) * GLM52_HIDDEN.div_ceil(FP8_BLOCK_SIZE) * 4;
+const EXPERT_W13_SCALE_STRIDE: usize = 2 * EXPERT_PROJ_W13_SCALE_BYTES;
+const EXPERT_W2_WEIGHT_STRIDE: usize = GLM52_HIDDEN * GLM52_EXPERT_INTERMEDIATE;
+const EXPERT_W2_SCALE_STRIDE: usize =
+    GLM52_HIDDEN.div_ceil(FP8_BLOCK_SIZE) * GLM52_EXPERT_INTERMEDIATE.div_ceil(FP8_BLOCK_SIZE) * 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub(crate) enum Glm52ExpertRegionKind {
+    W13Weight,
+    W13Scale,
+    W2Weight,
+    W2Scale,
+}
+
+impl Glm52ExpertRegionKind {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::W13Weight,
+        Self::W13Scale,
+        Self::W2Weight,
+        Self::W2Scale,
+    ];
+
+    /// Total bytes of this region for one layer's rank-local experts.
+    pub(crate) fn region_bytes(self) -> usize {
+        GLM52_LOCAL_EXPERTS * self.expert_stride()
+    }
+
+    fn expert_stride(self) -> usize {
+        match self {
+            Self::W13Weight => EXPERT_W13_WEIGHT_STRIDE,
+            Self::W13Scale => EXPERT_W13_SCALE_STRIDE,
+            Self::W2Weight => EXPERT_W2_WEIGHT_STRIDE,
+            Self::W2Scale => EXPERT_W2_SCALE_STRIDE,
+        }
+    }
+}
+
+/// Destination of one routed-expert tensor inside its layer's packed regions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Glm52ExpertPlacement {
+    pub(crate) layer: usize,
+    pub(crate) region: Glm52ExpertRegionKind,
+    pub(crate) offset: usize,
+}
+
+/// Classify a tensor name: `Some(placement)` for routed-expert tensors (the
+/// expert index must fall in this rank's range), `None` for everything else
+/// (own-region tensors). Fails loudly on a malformed expert name or an expert
+/// outside the rank's range — either means the load plan is corrupt.
+pub(crate) fn expert_placement(
+    name: &str,
+    rank_experts: &std::ops::Range<usize>,
+) -> Result<Option<Glm52ExpertPlacement>> {
+    let Some((layer, rest)) = name
+        .strip_prefix("model.layers.")
+        .and_then(|rest| rest.split_once(".mlp.experts."))
+    else {
+        return Ok(None);
+    };
+    let layer = layer
+        .parse::<usize>()
+        .with_context(|| format!("GLM5.2 expert tensor has invalid layer index: {name}"))?;
+    let (expert, proj) = rest
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("GLM5.2 expert tensor has malformed name: {name}"))?;
+    let expert = expert
+        .parse::<usize>()
+        .with_context(|| format!("GLM5.2 expert tensor has invalid expert index: {name}"))?;
+    ensure!(
+        rank_experts.contains(&expert),
+        "GLM5.2 expert tensor {name} is outside this rank's expert range {rank_experts:?}"
+    );
+    let local = expert - rank_experts.start;
+
+    use Glm52ExpertRegionKind::*;
+    let (region, offset) = match proj {
+        "gate_proj.weight" => (W13Weight, local * EXPERT_W13_WEIGHT_STRIDE),
+        "up_proj.weight" => (
+            W13Weight,
+            local * EXPERT_W13_WEIGHT_STRIDE + EXPERT_PROJ_W13_BYTES,
+        ),
+        "gate_proj.weight_scale_inv" => (W13Scale, local * EXPERT_W13_SCALE_STRIDE),
+        "up_proj.weight_scale_inv" => (
+            W13Scale,
+            local * EXPERT_W13_SCALE_STRIDE + EXPERT_PROJ_W13_SCALE_BYTES,
+        ),
+        "down_proj.weight" => (W2Weight, local * EXPERT_W2_WEIGHT_STRIDE),
+        "down_proj.weight_scale_inv" => (W2Scale, local * EXPERT_W2_SCALE_STRIDE),
+        other => anyhow::bail!("GLM5.2 expert tensor {name} has unknown projection {other}"),
+    };
+    Ok(Some(Glm52ExpertPlacement {
+        layer,
+        region,
+        offset,
+    }))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TensorLoadSpec {
@@ -455,6 +567,27 @@ fn parse_layer_index(name: &str) -> Result<usize> {
         .map_err(|err| anyhow::anyhow!("GLM5.2 tensor has invalid layer index in {name}: {err}"))
 }
 
+/// Reinterpret an owned device byte buffer as a typed slice (no copy). The
+/// loader keeps every region as raw `u8`; consumers retype at construction.
+#[cfg(feature = "glm52")]
+pub(crate) fn retype_owned<T>(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    bytes: cudarc::driver::CudaSlice<u8>,
+) -> Result<cudarc::driver::CudaSlice<T>> {
+    ensure!(
+        bytes.len() % std::mem::size_of::<T>() == 0,
+        "GLM5.2 retype: {} bytes is not a multiple of element size {}",
+        bytes.len(),
+        std::mem::size_of::<T>()
+    );
+    let len = bytes.len() / std::mem::size_of::<T>();
+    let ptr = bytes.leak();
+    // SAFETY: ptr is a live device allocation of exactly len*size_of::<T>()
+    // bytes (leaked just above); cudaMalloc alignment (256B) covers any T we
+    // use (f32/bf16/i32).
+    Ok(unsafe { stream.upgrade_device_ptr::<T>(ptr, len) })
+}
+
 pub(crate) fn mmap_file(path: &Path) -> Result<Mmap> {
     let file = std::fs::File::open(path)
         .map_err(|err| anyhow::anyhow!("open {}: {err}", path.display()))?;
@@ -474,6 +607,36 @@ mod tests {
         assert_eq!(ranges[0], 0..32);
         assert_eq!(ranges[7], 224..256);
         assert_eq!(ranges.iter().map(std::ops::Range::len).sum::<usize>(), 256);
+    }
+
+    #[test]
+    fn expert_placement_matches_from_host_packing() {
+        // The packed layout must stay byte-identical to
+        // `Glm52MoeLayerWeights::from_host` (per expert: gate bytes then up
+        // bytes; scales likewise; down alone). Walk rank 1's experts in
+        // checkpoint order and require contiguous, gap-free regions.
+        let rank_experts = 32..64usize;
+        let mut cursor: BTreeMap<Glm52ExpertRegionKind, usize> = BTreeMap::new();
+        for expert in rank_experts.clone() {
+            for suffix in [
+                "gate_proj.weight",
+                "up_proj.weight",
+                "gate_proj.weight_scale_inv",
+                "up_proj.weight_scale_inv",
+                "down_proj.weight",
+                "down_proj.weight_scale_inv",
+            ] {
+                let name = format!("model.layers.7.mlp.experts.{expert}.{suffix}");
+                let placement = expert_placement(&name, &rank_experts).unwrap().unwrap();
+                assert_eq!(placement.layer, 7, "{suffix}");
+                let next = cursor.entry(placement.region).or_default();
+                assert_eq!(placement.offset, *next, "{suffix} expert {expert}");
+                *next += expected_tensor_contract(&name).unwrap().byte_len().unwrap();
+            }
+        }
+        for kind in Glm52ExpertRegionKind::ALL {
+            assert_eq!(cursor[&kind], kind.region_bytes(), "{kind:?}");
+        }
     }
 
     #[test]

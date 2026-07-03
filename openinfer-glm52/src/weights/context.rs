@@ -53,6 +53,30 @@ impl Glm52RankGpuContext {
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
+
+    /// The kernels-crate view of this rank's context/stream pair (shared
+    /// Arcs, not a new context) — what the forward bricks take. Also performs
+    /// the kernels-crate per-thread setup that `DeviceContext::new` would do:
+    /// the cuBLAS handle is thread-local per device, so the calling worker
+    /// thread must initialize its own (idempotent).
+    #[cfg(feature = "glm52")]
+    pub(crate) fn device_context(&self) -> Result<openinfer_kernels::tensor::DeviceContext> {
+        // SAFETY: plain device selection + idempotent handle creation.
+        unsafe {
+            let err = openinfer_kernels::ffi::cuda_set_device(self.device_ordinal as i32);
+            ensure!(
+                err == 0,
+                "GLM5.2 cudaSetDevice({}) failed: cudaError={err}",
+                self.device_ordinal
+            );
+            openinfer_kernels::ffi::cublas_init();
+        }
+        Ok(openinfer_kernels::tensor::DeviceContext {
+            ctx: self.ctx.clone(),
+            stream: self.stream.clone(),
+            device_ordinal: self.device_ordinal,
+        })
+    }
 }
 
 fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {

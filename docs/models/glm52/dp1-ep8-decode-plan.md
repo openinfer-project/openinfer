@@ -1,6 +1,6 @@
 # GLM5.2 DP1 EP8 Decode Plan
 
-> **TL;DR:** Five sub-PRs on top of the merged load-weight scaffold (PR #476) to reach a DP1/EP8 DSA decode serving path. **PR1 and PR2 are merged** (#477 MLA brick, #489+#521 DSA indexer, #499 oracle harness). PR3 (dense MLP + MoE + bookends + layer composition) is planned in `ep1-forward.md`, which supersedes this doc's PR3 section — key corrections there: no single-GPU full-model e2e (experts ≈ 700 GiB; e2e gate moves to PR4), cross-layer top-k sharing (21/78 layers run the indexer), and the MoE chain is designed against the DeepEP v2 elastic shim contract with CUDA-graph capturability as the acceptance bar. PR4 swaps EP1 MoE for DeepEP EP8 all-to-all. PR5 wires the real scheduler + CUDA Graph capture. Prefill rides decode kernels token-by-token until a dedicated prefill path is justified by measurement.
+> **TL;DR:** Five sub-PRs on top of the merged load-weight scaffold (PR #476) to reach a DP1/EP8 DSA decode serving path. **PR1–PR3 are merged** (#477 MLA brick, #489+#521 DSA indexer, #499 oracle harness, #530 EP1 decoder-layer forward). **PR4 (DeepEP EP8 MoE + full-model DP1 forward) is built and gated** — see `ep8-deepep-moe.md`, which supersedes this doc's PR4 section: GLM-baked DeepEP shim instantiation, load-time packed expert placement, rank-0 78-layer spine + bs=1 greedy coordinator. PR5 wires the real scheduler + CUDA Graph capture. Prefill rides decode kernels token-by-token until a dedicated prefill path is justified by measurement.
 >
 > **Last touched:** 2026-07
 
@@ -144,13 +144,11 @@ Dense MLP (first 3 layers) + bookends (embed / final RMSNorm / lm_head) + routed
 
 Reuses `fp8.rs` from PR1 and `indexer.rs` from PR2. Adds `dense.rs`, `bookend.rs`, `moe_decode.rs` (EP1 path — grouped FP8 GEMM with all 256 experts local). `glm52_trtllm_grouped` kernel op comes in here (first MoE caller).
 
-### PR4 — `feat/glm52-ep8-deepep-moe` (largest / highest-risk)
+### PR4 — `feat/glm52-ep8-deepep-moe`
 
-Replace EP1 MoE with EP8 DeepEP all-to-all. Rank 0 owns experts 0..31, ranks 1..7 own 32 each. Follows `openinfer-kimi-k2/src/runner/executor/tp1_dp8.rs` + `moe_deepep.rs` shape: DeepEP dispatch/combine via `openinfer-comm`, expert-shard weights from the existing EP8 slab (`Glm52RankGpuWeights`), router top-k scatter/combine.
+**Superseded by `ep8-deepep-moe.md`** (corrections there: the shim is instantiated per model config rather than reached through `openinfer-comm`; expert weights are placed into their packed layout at H2D time because post-load repacking cannot fit HBM; the e2e generation gate lands here with a minimal bs=1 coordinator). Original scope kept below for history.
 
-`Glm52MlaLayerWeights::from_device` and `Glm52IndexerLayerWeights::from_device` land here (first production consumer of the resident slab). Adds `moe_route.rs` / `router.rs` kernel ops (router top-k, scatter/combine glue).
-
-Gate: multi-rank MoE layer oracle + all-to-all liveness.
+Replace EP1 MoE with EP8 DeepEP all-to-all. Rank 0 owns experts 0..31, ranks 1..7 own 32 each. `from_device` constructors land here (first production consumer of the resident weights). Gate: multi-rank MoE layer oracle + full-model e2e generation.
 
 ### PR5 — `feat/glm52-server-wiring`
 
