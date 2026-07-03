@@ -258,7 +258,7 @@ impl Glm52RankThreadState {
             .loaded
             .take()
             .context("GLM5.2 build_model called before weights were loaded")?;
-        let dev_ctx = self.ctx.device_context();
+        let dev_ctx = self.ctx.device_context()?;
         let model = if self.placement.rank == 0 {
             Glm52RankModel::Rank0(Box::new(Glm52Rank0Model::build(&dev_ctx, &mut weights)?))
         } else {
@@ -281,7 +281,7 @@ impl Glm52RankThreadState {
 
     #[cfg(feature = "glm52")]
     fn rank0_step(&mut self, token: u32, position: usize) -> Result<u32> {
-        let dev_ctx = self.ctx.device_context();
+        let dev_ctx = self.ctx.device_context()?;
         let runtime = self
             .runtime
             .as_mut()
@@ -301,7 +301,7 @@ impl Glm52RankThreadState {
 
     #[cfg(feature = "glm52")]
     fn expert_step(&mut self) -> Result<()> {
-        let dev_ctx = self.ctx.device_context();
+        let dev_ctx = self.ctx.device_context()?;
         let runtime = self
             .runtime
             .as_mut()
