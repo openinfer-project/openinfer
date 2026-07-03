@@ -133,11 +133,15 @@ uv run --no-project python tools/accuracy/dump_qwen3_4b_hf_golden.py \
     --model-path models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
 ```
 
-Qwen3.5-4B uses a separate HF logits golden:
+Qwen3.5 uses size-keyed HF logits goldens (4B and 9B committed, short + long each). The dumper auto-names the fixture from the model config and `--prompt-lens`; 9B pins a revision:
 
 ```bash
-python3 tools/accuracy/dump_qwen35_4b_hf_golden.py \
-    --model-path models/Qwen3.5-4B --out test_data/qwen35-4b-hf-golden.safetensors
+# 4B short + long
+python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path models/Qwen3.5-4B
+python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path models/Qwen3.5-4B --prompt-lens 4097,8192 --decode-tokens 8
+# 9B (add --prompt-lens 4097,8192 --decode-tokens 8 for the long variant)
+python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path models/Qwen3.5-9B \
+    --model-revision c202236235762e1c871ad0ccb60c8ee5ba337b9a
 ```
 
 The older Qwen3.5 exact greedy JSON baseline and regeneration test are retired. Re-run the corresponding HF logits gate to confirm the new reference passes.

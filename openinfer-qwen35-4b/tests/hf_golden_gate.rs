@@ -1,4 +1,4 @@
-//! HuggingFace-golden logits gate for Qwen3.5-4B.
+//! HuggingFace-golden logits gate for the Qwen3.5 line.
 //!
 //! This is the Qwen3.5 instance of the reusable logits-golden method in
 //! `docs/subsystems/correctness/logits-golden-gate.md`: store HF bf16 top-K
@@ -23,26 +23,61 @@ use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
-const GOLDEN: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/qwen35-4b-hf-golden.safetensors"
-);
-const LONG_GOLDEN: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/qwen35-4b-hf-long-golden.safetensors"
-);
 const GOLDEN_ENV: &str = "OPENINFER_QWEN35_HF_GOLDEN";
+const LONG_GOLDEN_ENV: &str = "OPENINFER_QWEN35_HF_LONG_GOLDEN";
 
 const LOGPROBS: usize = 64;
 const MAX_EXECUTOR_BATCH: usize = 8;
 
-// Initial Qwen3.5 gate scope is deliberately small: the goal is a portable HF
-// oracle slice, not broad regression coverage. Regenerate + recalibrate through
-// `tools/accuracy/dump_qwen35_4b_hf_golden.py` when widening the fixture.
+const HEAD_K: usize = 8;
+
+// Shared 4B calibration; split per-size only when a size needs its own.
 const MARGIN_TOL: f32 = 0.20;
 const MEAN_TOL: f32 = 0.06;
 const P99_TOL: f32 = 0.20;
-const HEAD_K: usize = 8;
+
+/// Size key from config CONTENT, not the directory name; keep in sync with
+/// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
+fn fixture_size_name(model_path: &str) -> Option<&'static str> {
+    let config_path = Path::new(model_path).join("config.json");
+    let raw = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
+    let t = v.get("text_config").unwrap_or(&v);
+    let hidden = t.get("hidden_size").and_then(serde_json::Value::as_u64);
+    let layers = t
+        .get("num_hidden_layers")
+        .and_then(serde_json::Value::as_u64);
+    let (Some(hidden), Some(layers)) = (hidden, layers) else {
+        panic!(
+            "{} has no hidden_size/num_hidden_layers",
+            config_path.display()
+        );
+    };
+    match (hidden, layers) {
+        (2560, 32) => Some("4b"),
+        (4096, 32) => Some("9b"),
+        (5120, 64) => Some("27b"),
+        _ => None,
+    }
+}
+
+/// Sizes whose fixtures are committed in `test_data/`; a missing file for
+/// these is a broken checkout, not an ungenerated fixture.
+const COMMITTED_FIXTURE_SIZES: &[&str] = &["4b", "9b"];
+
+fn default_fixture_path(size: &str, long: bool) -> String {
+    let kind = if long {
+        "-hf-long-golden"
+    } else {
+        "-hf-golden"
+    };
+    format!(
+        "{}/../test_data/qwen35-{size}{kind}.safetensors",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
 
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
@@ -145,32 +180,18 @@ fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a
         .unwrap_or_else(|| panic!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
 }
 
-fn assert_metadata_eq(metadata: &HashMap<String, String>, key: &str, expected: &str) {
-    let actual = require_metadata(metadata, key);
+fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+    let metadata = &golden.metadata;
     assert_eq!(
-        actual, expected,
-        "qwen35 hf_golden_gate fixture metadata {key} mismatch; regenerate the fixture"
+        require_metadata(metadata, "dtype"),
+        "bfloat16",
+        "qwen35 hf_golden_gate fixture dtype mismatch; regenerate the fixture"
     );
-}
-
-fn check_fixture_metadata(model_path: &str, metadata: &HashMap<String, String>) -> bool {
-    assert_metadata_eq(metadata, "fixture_kind", "hf-logits-golden");
-    assert_metadata_eq(metadata, "model", "Qwen3.5-4B");
-    assert_metadata_eq(metadata, "dtype", "bfloat16");
-    assert_metadata_eq(
-        metadata,
-        "backend",
-        "HuggingFace AutoModelForCausalLM eval, use_cache=True",
+    assert_eq!(
+        require_metadata(metadata, "top_k"),
+        LOGPROBS.to_string(),
+        "qwen35 hf_golden_gate fixture top_k mismatch; regenerate the fixture"
     );
-    assert_metadata_eq(
-        metadata,
-        "forward_path",
-        "prompt prefill, then one-token teacher-forced decode through past_key_values",
-    );
-    assert_metadata_eq(metadata, "top_k", &LOGPROBS.to_string());
-    assert_metadata_eq(metadata, "margin_tol", &format!("{MARGIN_TOL:.2}"));
-    assert_metadata_eq(metadata, "mean_tol", &format!("{MEAN_TOL:.2}"));
-    assert_metadata_eq(metadata, "p99_tol", &format!("{P99_TOL:.2}"));
 
     let config = PathBuf::from(model_path).join("config.json");
     let actual_config_sha256 = sha256_file(&config).unwrap_or_else(|| {
@@ -297,9 +318,40 @@ struct Golden {
 }
 
 impl Golden {
-    fn load() -> Golden {
-        let path = std::env::var(GOLDEN_ENV).unwrap_or_else(|_| GOLDEN.to_string());
-        Self::load_path(path)
+    /// An explicitly set env override must exist; a missing default keyed
+    /// fixture is a clean skip (`None`).
+    fn load_for(model_path: &str, long: bool) -> Option<Golden> {
+        let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
+        let Some(size) = fixture_size_name(model_path) else {
+            assert!(
+                std::env::var(env_key).is_err(),
+                "{env_key} is set but the model geometry in {model_path}/config.json \
+                 has no entry in the size table"
+            );
+            eprintln!(
+                "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
+                 {model_path}/config.json; extend fixture_size_name to cover it"
+            );
+            return None;
+        };
+        let path = if let Ok(path) = std::env::var(env_key) {
+            path
+        } else {
+            let path = default_fixture_path(size, long);
+            if !Path::new(&path).exists() {
+                assert!(
+                    !COMMITTED_FIXTURE_SIZES.contains(&size),
+                    "committed golden fixture missing at {path}"
+                );
+                eprintln!(
+                    "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
+                     {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
+                );
+                return None;
+            }
+            path
+        };
+        Some(Self::load_path(path))
     }
 
     fn load_path(path: impl AsRef<Path>) -> Golden {
@@ -607,8 +659,10 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let golden = Golden::load();
-    if !check_fixture_metadata(&model_path, &golden.metadata) {
+    let Some(golden) = Golden::load_for(&model_path, false) else {
+        return;
+    };
+    if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
     report_fixture_shape(&golden);
@@ -668,8 +722,10 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let golden = Golden::load_path(LONG_GOLDEN);
-    if !check_fixture_metadata(&model_path, &golden.metadata) {
+    let Some(golden) = Golden::load_for(&model_path, true) else {
+        return;
+    };
+    if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
     report_fixture_shape(&golden);

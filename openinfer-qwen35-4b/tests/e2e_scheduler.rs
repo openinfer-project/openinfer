@@ -2,6 +2,7 @@
 ///
 /// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
 /// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
+use std::collections::HashSet;
 use std::time::Instant;
 
 use log::info;
@@ -245,6 +246,78 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
     }
 }
 
+/// Token-loop collapse of one completion (the Qwen3.5-9B untied-lm_head
+/// symptom): distinct-token ratio, longest same-token run, and an exact
+/// repeated-tail period each catch a different loop shape.
+struct Collapse {
+    distinct_ratio: f64,
+    max_run: usize,
+    tail_period: Option<usize>,
+    len: usize,
+}
+
+impl Collapse {
+    fn measure(tokens: &[u32]) -> Self {
+        let distinct: HashSet<u32> = tokens.iter().copied().collect();
+        let mut max_run = 0usize;
+        let mut run = 0usize;
+        let mut prev = None;
+        for &t in tokens {
+            run = if prev == Some(t) { run + 1 } else { 1 };
+            max_run = max_run.max(run);
+            prev = Some(t);
+        }
+        // Periods 1-2 already trip max_run / distinct_ratio; starting at 3 keeps
+        // benign short echoes ("no, no") out of this check.
+        let tail_period = (3..=tokens.len() / 2).find(|&p| {
+            tokens[tokens.len() - 2 * p..tokens.len() - p] == tokens[tokens.len() - p..]
+        });
+        Self {
+            // An empty completion (immediate EOS) is a valid stop, not a loop.
+            distinct_ratio: if tokens.is_empty() {
+                1.0
+            } else {
+                distinct.len() as f64 / tokens.len() as f64
+            },
+            max_run,
+            tail_period,
+            len: tokens.len(),
+        }
+    }
+
+    fn is_degenerate(&self) -> bool {
+        const DISTINCT_RATIO_FLOOR: f64 = 0.25;
+        const MAX_RUN_CEILING: usize = 8;
+        self.distinct_ratio < DISTINCT_RATIO_FLOOR
+            || self.max_run >= MAX_RUN_CEILING
+            || self.tail_period.is_some()
+    }
+}
+
+fn assert_no_model_wide_collapse(collapses: &[(&str, Collapse)]) {
+    let degenerate = collapses.iter().filter(|(_, c)| c.is_degenerate()).count();
+    if degenerate * 2 >= collapses.len() {
+        for (name, c) in collapses {
+            eprintln!(
+                "{}  {name} len={} distinct_ratio={:.3} max_run={} tail_period={:?}",
+                if c.is_degenerate() {
+                    "DEGENERATE"
+                } else {
+                    "ok        "
+                },
+                c.len,
+                c.distinct_ratio,
+                c.max_run,
+                c.tail_period,
+            );
+        }
+        panic!(
+            "{degenerate}/{} sequential completions are degenerate — model-wide broken generation",
+            collapses.len()
+        );
+    }
+}
+
 #[test]
 fn test_e2e_qwen35_scheduler() {
     // logging intentionally left to the test harness
@@ -310,6 +383,7 @@ fn test_e2e_qwen35_scheduler() {
 
     // ── 2. Sequential scheduler requests ────────────────────────────────
     info!("=== Phase 2: Qwen3.5 sequential scheduler requests ===");
+    let mut collapses = Vec::new();
     for case in CASES {
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
@@ -333,8 +407,10 @@ fn test_e2e_qwen35_scheduler() {
             assert_eq!(finish_reason, FinishReason::Length);
         }
 
+        collapses.push((case.name, Collapse::measure(&tokens)));
         info!("  PASS: {:?}", case.name);
     }
+    assert_no_model_wide_collapse(&collapses);
 
     // ── 3. Multi-request (scheduler state reuse) ────────────────────────
     info!("=== Phase 3: Multi-request ===");

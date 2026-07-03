@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the HuggingFace bf16 logprob golden for the Qwen3.5-4B gate.
+"""Generate the HuggingFace bf16 logprob golden for the Qwen3.5 gate.
 
 The Rust gate replays these fixed token sequences through openinfer with
 teacher-forced decode and compares top-K logprobs against this stored HF oracle.
@@ -7,7 +7,7 @@ For Qwen3.5 the HF oracle follows the same incremental shape: prefill the prompt
 with `use_cache=True`, then feed one fixed decode token at a time through
 `past_key_values`.
 
-    uv run --no-project python tools/accuracy/dump_qwen35_4b_hf_golden.py \
+    uv run --no-project python tools/accuracy/dump_qwen35_hf_golden.py \
         --model-path /data/models/Qwen3.5-4B \
         --out test_data/qwen35-4b-hf-golden.safetensors
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -33,6 +34,26 @@ MAX_PROMPT_LEN = 128
 DECODE_TOKENS = 8
 VOCAB_CEILING = 100_000
 TOP_K = 64
+
+
+# Keep in sync with `fixture_size_name` in
+# openinfer-qwen35-4b/tests/hf_golden_gate.rs (the size-key geometry table).
+SIZE_NAMES = {
+    (2560, 32): "Qwen3.5-4B",
+    (4096, 32): "Qwen3.5-9B",
+    (5120, 64): "Qwen3.5-27B",
+}
+
+
+def model_name_from_config(model_path: Path) -> str:
+    config = json.loads((model_path / "config.json").read_text())
+    text = config.get("text_config", config)
+    key = (text["hidden_size"], text["num_hidden_layers"])
+    if key not in SIZE_NAMES:
+        raise SystemExit(
+            f"no size-name mapping for hidden/layers {key}; extend SIZE_NAMES"
+        )
+    return SIZE_NAMES[key]
 
 
 def sha256_file(path: Path) -> str:
@@ -75,7 +96,9 @@ def load_model(model_path: str, dtype: str, device_map: str):
     if device_map == "none":
         model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).to("cuda")
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, device_map=device_map, **kwargs)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, device_map=device_map, **kwargs
+        )
     model.eval()
     return model
 
@@ -105,7 +128,12 @@ def parse_prompt_lens(value: str) -> list[int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="output path; defaults to test_data/qwen35-{size}-hf-golden.safetensors "
+        "derived from the model config (the only names the gate looks up)",
+    )
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     parser.add_argument(
         "--device-map",
@@ -142,6 +170,22 @@ def main() -> int:
     if args.vocab_ceiling <= 1:
         parser.error("--vocab-ceiling must be greater than 1")
 
+    size_key = (
+        model_name_from_config(Path(args.model_path)).removeprefix("Qwen3.5-").lower()
+    )
+    gate_names = {
+        f"qwen35-{size_key}-hf-golden.safetensors",
+        f"qwen35-{size_key}-hf-long-golden.safetensors",
+    }
+    if args.out is None:
+        kind = "-hf-long-golden" if args.prompt_lens else "-hf-golden"
+        args.out = f"test_data/qwen35-{size_key}{kind}.safetensors"
+    elif Path(args.out).name not in gate_names:
+        raise SystemExit(
+            f"--out basename {Path(args.out).name!r} will not be found by the gate; "
+            f"expected one of {sorted(gate_names)}"
+        )
+
     gen = torch.Generator().manual_seed(args.seed)
     prompts, decodes = [], []
     prompt_lens = args.prompt_lens
@@ -158,9 +202,13 @@ def main() -> int:
             for _ in range(args.num_seqs)
         ]
     for plen in prompt_lens:
-        prompts.append(torch.randint(1, args.vocab_ceiling, (plen,), generator=gen).tolist())
+        prompts.append(
+            torch.randint(1, args.vocab_ceiling, (plen,), generator=gen).tolist()
+        )
         decodes.append(
-            torch.randint(1, args.vocab_ceiling, (args.decode_tokens,), generator=gen).tolist()
+            torch.randint(
+                1, args.vocab_ceiling, (args.decode_tokens,), generator=gen
+            ).tolist()
         )
 
     model = load_model(args.model_path, args.dtype, args.device_map)
@@ -216,8 +264,7 @@ def main() -> int:
     tokenizer_revision = args.tokenizer_revision or model_revision
     meta = {
         "fixture_kind": "hf-logits-golden",
-        "model": "Qwen3.5-4B",
-        "model_path": args.model_path,
+        "model": model_name_from_config(model_path),
         "model_revision": model_revision,
         "tokenizer_revision": tokenizer_revision,
         "config_sha256": sha256_file(model_path / "config.json"),

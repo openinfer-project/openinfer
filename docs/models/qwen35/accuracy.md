@@ -1,8 +1,8 @@
-# Qwen3.5-4B Accuracy
+# Qwen3.5 Accuracy
 
-> **TL;DR:** Qwen3.5 accuracy now has short and long HF-backed logits goldens (`tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, and `test_data/qwen35-4b-hf-long-golden.safetensors`). The HF fixtures use `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so they match openinfer's prefill + decode shape. The long fixture crosses the old 4096-position RoPE cache boundary with 4097- and 8192-token prompts, and the #250 fix recovers full GSM8K 8-shot at `batch_size=1` to `strict-match` 79.38% / `flexible-extract` 79.30% vs the HF 79.45% baseline. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `e2e_scheduler` remains only a scheduler liveness/integration check. A broader OpenInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
+> **TL;DR:** Qwen3.5 accuracy now has short and long HF-backed logits goldens (`tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, and `test_data/qwen35-4b-hf-long-golden.safetensors`). The HF fixtures use `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so they match openinfer's prefill + decode shape. The long fixture crosses the old 4096-position RoPE cache boundary with 4097- and 8192-token prompts, and the #250 fix recovers full GSM8K 8-shot at `batch_size=1` to `strict-match` 79.38% / `flexible-extract` 79.30% vs the HF 79.45% baseline. The gate is size-portable: it derives a `4b`/`9b`/`27b` fixture key from the pointed model's config content; 9B now ships committed fixtures and runs the same logits gate (confirming the #516 untied-lm_head fix), and 27B joins once its fixture is dumped. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `e2e_scheduler` stays a scheduler liveness/integration check that now also gates model-wide collapse (free-running output must not degenerate into token loops). A broader OpenInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
 >
-> **Last touched:** 2026-06. The HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `OPENINFER_TEST_MODEL_PATH`: `cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request-flow behavior changes.
+> **Last touched:** 2026-07. The HF logits gate passes on RTX 5090 `sm_120` and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `OPENINFER_TEST_MODEL_PATH`: `cargo test --release -p openinfer-qwen35-4b --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request-flow behavior changes.
 
 ## Goal
 
@@ -13,9 +13,9 @@
 ## Current State
 
 - Reusable debugging method now lives in [../../playbooks/accuracy-parity-playbook.md](../../playbooks/accuracy-parity-playbook.md).
-- `openinfer-qwen35-4b/tests/hf_golden_gate.rs` checks openinfer logits against two pinned HF bf16 `past_key_values` oracles:
-  - `test_data/qwen35-4b-hf-golden.safetensors` for the short mixed-shape replay surfaces.
-  - `test_data/qwen35-4b-hf-long-golden.safetensors` for the long 4097/8192-token replay surface.
+- `openinfer-qwen35-4b/tests/hf_golden_gate.rs` checks openinfer logits against pinned HF bf16 `past_key_values` oracles, a short + long pair per committed size (`4b`, `9b`):
+  - `test_data/qwen35-4b-hf-golden.safetensors` / `qwen35-4b-hf-long-golden.safetensors` — 4B short mixed-shape + long 4097/8192-token replay surfaces.
+  - `test_data/qwen35-9b-hf-golden.safetensors` / `qwen35-9b-hf-long-golden.safetensors` — 9B (untied lm_head, #516) short + long, within the 4B tolerances.
 - `openinfer-qwen35-4b/tests/e2e.rs`, `openinfer-qwen35-4b/tests/regen_test_data.rs`, and `test_data/Qwen3.5-4B.json` are retired. They were exact-text OpenInfer self-baselines, not HF accuracy gates.
 - `openinfer-qwen35-4b/tests/e2e_scheduler.rs` still loads the model and exercises sequential, repeated, concurrent, and consumer-drop scheduler paths, but it no longer reads an exact-text JSON fixture.
 - A broader OpenInfer-owned rand/hash corpus was considered for issue #186, but checked-in exact token/hash data may drift across GPU architectures (`sm_80`, `sm_90`, `sm_120`). Keep that as follow-up design work until the cross-architecture stability policy is explicit.
@@ -34,10 +34,18 @@
 
 ## Current Accuracy Gates
 
+### Size-portable fixture selection
+
+- `hf_golden_gate.rs` derives the fixture key from config CONTENT, never the directory name: `text_config.hidden_size` / `num_hidden_layers` of `(2560, 32)` → `4b`, `(4096, 32)` → `9b`, `(5120, 64)` → `27b` (geometries from each size's config.json on the HF Hub). The mapping lives in `fixture_size_name` and must stay in sync with `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
+- Default fixture paths are `test_data/qwen35-{size}-hf-golden.safetensors` and `test_data/qwen35-{size}-hf-long-golden.safetensors`; `OPENINFER_QWEN35_HF_GOLDEN` / `OPENINFER_QWEN35_HF_LONG_GOLDEN` override them.
+- Failure semantics: an unreadable/malformed config or a missing committed fixture (`4b`/`9b`) panics; a size whose fixture was never generated (currently `27b`) skips and prints the expected path; an env override pointing at a missing file panics.
+- Tolerances are shared across sizes from the 4B calibration until a new size has a green baseline to calibrate against (the `MARGIN_TOL`/`MEAN_TOL`/`P99_TOL` consts); the 9B floor sits well inside them.
+- The model-wide collapse net folds into `tests/e2e_scheduler.rs` (Phase 2): its free-running completions fail when at least half collapse into token loops (distinct-token ratio, same-token run, or exact repeated tail period), reusing the scheduler test's model load — the size-independent net under the fixture gate.
+
 ### HF logits golden
 
 - Fixture: `test_data/qwen35-4b-hf-golden.safetensors` (~59 KiB).
-- Dumper: `tools/accuracy/dump_qwen35_4b_hf_golden.py`.
+- Dumper: `tools/accuracy/dump_qwen35_hf_golden.py`.
 - Oracle path: HF `AutoModelForCausalLM.eval()` in bf16, prompt prefill with `use_cache=True`, then one-token teacher-forced decode through `past_key_values`.
 - Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 - Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.
@@ -75,7 +83,7 @@ themselves.
 ### Long-prompt HF logits golden
 
 - Fixture: `test_data/qwen35-4b-hf-long-golden.safetensors` (~58 KiB).
-- Dumper: `tools/accuracy/dump_qwen35_4b_hf_golden.py` with `--prompt-lens 4097,8192 --decode-tokens 8`.
+- Dumper: `tools/accuracy/dump_qwen35_hf_golden.py` with `--prompt-lens 4097,8192 --decode-tokens 8`.
 - Oracle path: same HF `AutoModelForCausalLM.eval()` bf16 `past_key_values` path as the short golden.
 - Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 - Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.
