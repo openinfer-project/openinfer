@@ -53,6 +53,17 @@ impl Glm52RankGpuContext {
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
+
+    /// The kernels-crate view of this rank's context/stream pair (shared
+    /// Arcs, not a new context) — what the forward bricks take.
+    #[cfg(feature = "glm52")]
+    pub(crate) fn device_context(&self) -> openinfer_kernels::tensor::DeviceContext {
+        openinfer_kernels::tensor::DeviceContext {
+            ctx: self.ctx.clone(),
+            stream: self.stream.clone(),
+            device_ordinal: self.device_ordinal,
+        }
+    }
 }
 
 fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
