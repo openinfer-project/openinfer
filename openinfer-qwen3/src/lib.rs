@@ -373,7 +373,7 @@ pub fn start_engine_with_offload(
     ensure_batch_invariant_supported(
         decode_overlap,
         batch_invariant,
-        dflash_draft_model_path.is_some(),
+        dflash_draft_model_path.is_some() || eagle3_draft_model_path.is_some(),
     )?;
     apply_batch_invariant_policy(batch_invariant);
     let dflash_draft_model_path = dflash_draft_model_path
@@ -461,19 +461,39 @@ fn apply_batch_invariant_policy(batch_invariant: bool) {
 fn ensure_batch_invariant_supported(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
-    dflash: bool,
+    spec_drafter: bool,
 ) -> Result<()> {
     if batch_invariant && !matches!(decode_overlap, DecodeOverlap::Off) {
         anyhow::bail!(
             "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime"
         );
     }
-    if batch_invariant && dflash {
+    if batch_invariant && spec_drafter {
         anyhow::bail!(
-            "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
-             pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
-             are not pinned and would bail at the GEMM boundary under Pin"
+            "--batch-invariant is not supported with speculative decoding (DFlash or EAGLE-3): the \
+             decode-GEMM pin warms and self-checks only the base projections, so the drafter's \
+             fc/qkv/MLP/lm_head GEMMs are not pinned and would bail at the GEMM boundary under Pin"
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod batch_invariant_guard_tests {
+    use super::*;
+
+    /// A speculative drafter — DFlash *or* EAGLE-3 — adds un-pinned fc/qkv/lm_head
+    /// GEMM shapes, so Pin (`--batch-invariant`) must be refused at startup rather
+    /// than left to bail at the GEMM boundary on the first draft. Regression guard
+    /// for the EAGLE-3 arm, which the call site originally omitted.
+    #[test]
+    fn spec_drafter_rejects_batch_invariant() {
+        assert!(
+            ensure_batch_invariant_supported(DecodeOverlap::Off, true, true).is_err(),
+            "batch-invariant + speculative drafter must be rejected at startup"
+        );
+        // Base model under Pin, and a drafter without Pin, are both fine.
+        assert!(ensure_batch_invariant_supported(DecodeOverlap::Off, true, false).is_ok());
+        assert!(ensure_batch_invariant_supported(DecodeOverlap::Off, false, true).is_ok());
+    }
 }
