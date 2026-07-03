@@ -1,6 +1,6 @@
 # GLM5.2 whole-step decode CUDA graph (PR5c)
 
-> **TL;DR:** Execution record of PR5c: the whole per-rank decode step (embed → 78 layers → lm_head → device argmax) is captured into one CUDA graph and replayed every step. Measured on jz-38 8×H200, single request: **200 → 37.5 ms/step from the graph alone** (byte-identical to the PR5b record), **→ 31.3** after switching every m=1 projection to the weight-only fp8 GEMV (activation quant removed — re-gated via the #499 oracle in the new `--precision gemv` mode), **→ 25.3** after grid-striding the capacity-sized MoE quant/SiLU launches (block *scheduling*, not arithmetic, was their cost). 8-way concurrency stays free (25.0 ms/step, ~308 tok/s aggregate). Remaining gap to the ~22 ms vLLM DP8/EP8 reference is collective latency + rank stagger (~4 ms of dispatch/combine wait) — see the follow-ups. Indexer oracle reference drift is #541 (pre-existing on main).
+> **TL;DR:** Execution record of PR5c: the whole per-rank decode step (embed → 78 layers → lm_head → device argmax) is captured into one CUDA graph and replayed every step. Measured on jz-38 8×H200, single request: **200 → 37.5 ms/step from the graph alone** (byte-identical to the PR5b record), **→ 31.3** after switching every m=1 projection to the weight-only fp8 GEMV (activation quant removed — re-gated via the #499 oracle in the new `--precision gemv` mode), **→ 25.3** after grid-striding the capacity-sized MoE quant/SiLU launches (block *scheduling*, not arithmetic, was their cost), **→ 23.4** after packing gate|up into one GEMV, overlapping the shared expert with the MoE collectives on a second stream (fork/join events inside the graph), and staging the relayout's expert ranges in shared memory. 8-way concurrency stays free throughout. A step-timing probe puts the inter-step host gap at ~0.05 ms — the whole step lives inside the graph, so the remaining ~1.4 ms to the ~22 ms vLLM DP8/EP8 reference is collective latency floor + GEMV bandwidth headroom (#542). Indexer oracle reference drift is #541 (pre-existing on main).
 >
 > **Last touched:** 2026-07
 
@@ -38,7 +38,8 @@ Remaining after #535's MoE workspace: MLA attend scratch (`ql_nope/query/ckv_fp8
 | whole-step graph (arena + host-quiet + capture) | **37.5** | byte-identical to the PR5b/PR5a record; capture on each rank's first step, warm+capture 493 ms |
 | + weight-only fp8 GEMV for every m=1 projection | **31.3** | numerics change (activation quant removed) — re-gated via #499 oracle in `--precision gemv` mode |
 | + device-bounded MoE recv chain (`expert_offsets[n_local]`) | 30.1 | bit-preserving (pad rows never read); small win — block scheduling still dominated |
-| + grid-strided quant/SiLU (row grid capped at 256) | **25.3** | ~100k tiny blocks/launch → ~12k; work AND scheduling now scale with real rows |
+| + grid-strided quant/SiLU (row grid capped at 256) | 25.3 | ~100k tiny blocks/launch → ~12k; work AND scheduling now scale with real rows |
+| + gate\|up packed GEMV + shared-expert ∥ collectives + smem relayout ranges | **23.4** | per-row math unchanged; overlap = fork/join events inside the capture (kimi pattern) |
 
 8-way concurrency stays free throughout (same per-step wall as bs=1; ~308 tok/s aggregate at 128-tok requests). All e2e gates green each stage: determinism ×2, 8-way identical, mixed concurrency, disconnect, slot reuse, SIGTERM teardown ≤4 s.
 
@@ -61,8 +62,8 @@ Per rank per step, inflated ~15-20% by tracing:
 | combine_impl (75×) | ~3.3 | already device-bounded (the vendored kernel's capacity-sentinel reads the device psum) — this is the cooperative-launch + NVLink push latency floor of the 2-kernel combine design |
 | FlashMLA + cuBLAS absorb + norms + router + bookends | ~5 | near floor |
 
-Path to the ~22 ms vLLM DP8/EP8 reference: (1) isolate and shave the inter-step rank stagger the first MoE layer's dispatch absorbs (single D2H egress packet, tighter coordinator fan-out; needs a per-rank graph-launch timeline, not a kernel summary), (2) collective latency tuning — combine's 42 µs/layer is a design floor of the cooperative combine + reduce-epilogue pair; SM allocation (`kDecodeNumSms`/`kCombineWarps`) is the remaining knob. The quant-style capacity-loop lever does NOT exist here: dispatch/combine are already device-bounded.
+Measured dead ends (recorded in #542): the inter-step host gap is ~0.05 ms (step-timing probe — device self-feeding/pipelining buys nothing); `kDecodeNumSms` 32→16 is exactly flat (combine's 42 µs/layer is protocol/NVLink latency, not SM-count-bound); the quant-style capacity-loop lever does not exist for dispatch/combine (already device-bounded via the vendored capacity-sentinel). Remaining ~1.4 ms: collective latency floor (~4 ms of wait-inclusive dispatch/combine per step, partially hidden by the shared-expert overlap), GEMV bandwidth headroom (~73% of peak, µtuning territory), and FlashMLA `num_sm_parts` (numerics-churning — changes the split-combine reduction order, needs an oracle re-gate).
 
 ## Next action
 
-Follow-ups: inter-step stagger timeline + reduction; collective SM-allocation tuning; #541 indexer reference re-pin.
+Follow-ups: #542 (collective latency floor / GEMV BW / `num_sm_parts`), #541 indexer reference re-pin.
