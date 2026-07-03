@@ -394,6 +394,16 @@ fn indexer_oracle_gate() -> Result<()> {
         )?;
     }
 
+    // Debug: dump first 8 fp8 values and first scale from cache block 0
+    let cache_dbg = ctx.stream.clone_dtoh(&index_k_cache.slice(0..32))?;
+    let cache_scale = ctx.stream.clone_dtoh(&index_k_cache.slice(8192..8196))?;
+    eprintln!("cache block 0 first 8 fp8: {:?}", &cache_dbg[..8]);
+    eprintln!("cache block 0 scale[0]: {:?}", f32::from_le_bytes([cache_scale[0], cache_scale[1], cache_scale[2], cache_scale[3]]));
+    // Check block 32 (position 2048)
+    let blk32_offset = 32 * cache_layout.cache_block_stride_bytes;
+    let cache_dbg2 = ctx.stream.clone_dtoh(&index_k_cache.slice(blk32_offset as usize..(blk32_offset as usize + 8)))?;
+    eprintln!("cache block 32 first 8 fp8: {:?}", &cache_dbg2[..8]);
+
     // ---- compute q_resid = rmsnorm(q_a_proj(hidden[last_pos])) ----
     let last_hidden_host = &hidden_host[position * HIDDEN..(position + 1) * HIDDEN];
     let mut last_hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
