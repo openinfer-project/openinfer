@@ -18,6 +18,11 @@ path = "src/main.rs"
 name = "bench_serving"
 path = "src/bin/bench_serving/main.rs"
 
+[[bin]]
+name = "glm52_step_bench"
+path = "src/bin/glm52_step_bench.rs"
+required-features = ["glm52"]
+
 [dependencies]
 openinfer-core = { workspace = true }
 openinfer-deepseek-v2-lite = { workspace = true, optional = true }
