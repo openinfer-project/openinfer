@@ -20,10 +20,11 @@ use half::bf16;
 #[cfg(test)]
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use openinfer_kernels::ops::{
-    Glm52FlashMlaSparseDecode, Glm52MoeQuantShape, gemm_strided_batched_bf16,
-    glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
-    glm52_mla_ckv_split_launch, glm52_mla_query_assemble_launch, rms_norm_rows_into,
+    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode, Glm52MoeQuantShape,
+    gemm_strided_batched_bf16, glm52_flashmla_sparse_decode_launch,
+    glm52_flashmla_sparse_decode_metadata_launch, glm52_fp8_per_token_group_quant_bf16_launch,
+    glm52_mla_cache_pack_launch, glm52_mla_ckv_split_launch, glm52_mla_query_assemble_launch,
+    rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
@@ -224,6 +225,9 @@ pub(crate) struct Glm52MlaFront {
     kv_c_raw: CudaSlice<bf16>,           // [T, 512] pre kv_a_layernorm
     kv_c: CudaSlice<bf16>,               // [T, 512] post kv_a_layernorm
     k_pe: CudaSlice<bf16>,               // [T, 64] pre-rope
+    // Owned mma partial buffer for the front projections (q_a/q_b/kv_a). One
+    // per scratch struct: the ctx/aux stream overlap must never share one.
+    gemv_partial: CudaSlice<f32>,
 }
 
 impl Glm52MlaFront {
@@ -238,6 +242,9 @@ impl Glm52MlaFront {
             kv_c_raw: ctx.stream.alloc_zeros::<bf16>(tokens * KV_LORA)?,
             kv_c: ctx.stream.alloc_zeros::<bf16>(tokens * KV_LORA)?,
             k_pe: ctx.stream.alloc_zeros::<bf16>(tokens * ROPE_DIM)?,
+            gemv_partial: ctx
+                .stream
+                .alloc_zeros::<f32>(tokens * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
         })
     }
 }
@@ -254,7 +261,14 @@ pub(crate) fn glm52_mla_front_q_into(
 ) -> Result<()> {
     let t = front.tokens;
     ensure!(hidden.len() >= t * HIDDEN, "GLM5.2 MLA hidden too small");
-    fp8_linear_into(ctx, &w.q_a, t, hidden, &mut front.q_a)?; // [T, 2048]
+    fp8_linear_into(
+        ctx,
+        &w.q_a,
+        t,
+        hidden,
+        Some(&mut front.gemv_partial),
+        &mut front.q_a,
+    )?; // [T, 2048]
     rms_norm_rows_into(
         ctx,
         &front.q_a,
@@ -275,8 +289,22 @@ pub(crate) fn glm52_mla_front_rest_into(
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
     let t = front.tokens;
-    fp8_linear_into(ctx, &w.q_b, t, &front.q_resid, &mut front.q_full)?; // [T, 64, 256]
-    fp8_linear_into(ctx, &w.kv_a, t, hidden, &mut front.ckv)?; // [T, 576]
+    fp8_linear_into(
+        ctx,
+        &w.q_b,
+        t,
+        &front.q_resid,
+        Some(&mut front.gemv_partial),
+        &mut front.q_full,
+    )?; // [T, 64, 256]
+    fp8_linear_into(
+        ctx,
+        &w.kv_a,
+        t,
+        hidden,
+        Some(&mut front.gemv_partial),
+        &mut front.ckv,
+    )?; // [T, 576]
     glm52_mla_ckv_split_launch(ctx, t, &front.ckv, &mut front.kv_c_raw, &mut front.k_pe)?;
     rms_norm_rows_into(
         ctx,
@@ -316,6 +344,8 @@ pub(crate) struct Glm52MlaAttendScratch {
     lse_accum: CudaSlice<f32>,
     o_accum: CudaSlice<f32>,
     v: CudaSlice<bf16>,
+    // Owned mma partial buffer for the o_proj projection (see Glm52MlaFront).
+    gemv_partial: CudaSlice<f32>,
 }
 
 impl Glm52MlaAttendScratch {
@@ -331,6 +361,9 @@ impl Glm52MlaAttendScratch {
             lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
             o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
             v: ctx.stream.alloc_zeros::<bf16>(t * HEADS * V_HEAD)?,
+            gemv_partial: ctx
+                .stream
+                .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
         })
     }
 }
@@ -563,5 +596,5 @@ pub(crate) fn glm52_mla_attend_into(
         V_HEAD,
         HEADS,
     )?;
-    fp8_linear_into(ctx, &w.o_proj, t, &s.v, out) // [T, 6144]
+    fp8_linear_into(ctx, &w.o_proj, t, &s.v, Some(&mut s.gemv_partial), out) // [T, 6144]
 }

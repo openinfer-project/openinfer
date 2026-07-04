@@ -279,29 +279,12 @@ glm52_fp8_weight_only_gemv_batched_kernel(
 // (~ -66 us per MoE layer). Batch 4 wins only on the k=6144 column (see
 // mma_config); the rest stay on the register tile.
 constexpr int kMmaWarps = 4;
-// f32 partial scratch [KSPLIT, BATCH, n]; worst case over mma_config:
-// dense_gu at batch 8, ksplit 16.
-constexpr size_t kMmaScratchFloats = (size_t)16 * 8 * 24576;
-constexpr int kMmaMaxDevices = 16;
-float* g_mma_scratch[kMmaMaxDevices] = {};
-
-// Lazily allocates the worst-case scratch on first dispatch for the current
-// device. The model's pre-capture bucket warm-up (model.rs) triggers this
-// outside any CUDA-graph capture, so replays see a stable pointer; a capture
-// hitting a cold device fails the cudaMalloc cleanly and surfaces here. One
-// rank thread per device by construction, so no cross-thread race on a slot.
-CUresult mma_scratch_for_device(float** out) {
-  int dev = 0;
-  cudaError_t err = cudaGetDevice(&dev);
-  if (err != cudaSuccess) return map_cuda_error(err);
-  if (dev < 0 || dev >= kMmaMaxDevices) return CUDA_ERROR_INVALID_VALUE;
-  if (g_mma_scratch[dev] == nullptr) {
-    err = cudaMalloc(&g_mma_scratch[dev], kMmaScratchFloats * sizeof(float));
-    if (err != cudaSuccess) return map_cuda_error(err);
-  }
-  *out = g_mma_scratch[dev];
-  return CUDA_SUCCESS;
-}
+// The f32 partial scratch [KSPLIT, BATCH, n] is CALLER-OWNED and passed per
+// launch. Ownership matters: the layer forward deliberately overlaps the ctx
+// and aux streams (indexer fork, shared-expert fork), and both sides run
+// batched GEMVs — a shared per-device buffer would race on the device even
+// though the host is single-threaded per rank. Each Rust-side scratch struct
+// owns its own buffer, so two streams can never see the same pointer.
 
 // fp8 e4m3 pair -> packed bf16x2, exact (e4m3 c bf16 via the f16/f32 path).
 __device__ __forceinline__ unsigned mma_cvt_pair(unsigned char b0, unsigned char b1) {
@@ -431,14 +414,22 @@ __global__ void glm52_gemv_batched_mma_reduce_kernel(
 }
 
 // (ksplit, ntiles) per (batch, whitelisted shape); ksplit == 0 keeps the
-// register tile. Measured winners, jz-38 H200 2026-07-05 (see block comment).
+// register tile. Measured winners ONLY, jz-38 H200 2026-07-05 (see block
+// comment) — an explicit per-shape table so a future whitelist addition lands
+// on the register tile until someone measures it into here.
 struct MmaConfig { int ksplit; int ntiles; };
 MmaConfig mma_config(int batch, int n, int k) {
   if (batch == 8) {
-    if (n == 16384 && k == 2048) return {8, 4};  // q_b
-    if (n == 6144  && k == 2048) return {8, 1};  // shared_dn
-    if (n == 4096  && k == 2048) return {8, 1};  // idx_wq_b
-    return {16, 2};  // every k >= 6144 shape
+    if (n == 2048  && k == 6144)  return {16, 2};  // q_a / shared gate,up
+    if (n == 16384 && k == 2048)  return {8, 4};   // q_b
+    if (n == 576   && k == 6144)  return {16, 2};  // kv_a
+    if (n == 6144  && k == 16384) return {16, 2};  // o_proj
+    if (n == 24576 && k == 6144)  return {16, 2};  // dense gate|up
+    if (n == 6144  && k == 12288) return {16, 2};  // dense down
+    if (n == 4096  && k == 6144)  return {16, 2};  // shared gate|up
+    if (n == 6144  && k == 2048)  return {8, 1};   // shared down
+    if (n == 4096  && k == 2048)  return {8, 1};   // indexer wq_b
+    if (n == 128   && k == 6144)  return {16, 2};  // indexer wk
   }
   if (batch == 4 && k == 6144) {
     return {16, 2};  // q_a, kv_a, dense_gu, shared_gu, idx_wk
@@ -450,14 +441,12 @@ template <int BATCH, int KSPLIT, int NTILES>
 CUresult launch_gemv_batched_mma(const __nv_bfloat16* activation,
                                  const unsigned char* weight,
                                  const float* weight_scale, __nv_bfloat16* out,
-                                 int n, int k, cudaStream_t stream) {
+                                 float* scratch, size_t scratch_floats, int n,
+                                 int k, cudaStream_t stream) {
   if (n % 16 != 0 || k % (128 * KSPLIT) != 0 || (n / 16) % NTILES != 0 ||
-      (size_t)KSPLIT * BATCH * n > kMmaScratchFloats) {
+      scratch == nullptr || (size_t)KSPLIT * BATCH * n > scratch_floats) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  float* scratch = nullptr;
-  CUresult rs = mma_scratch_for_device(&scratch);
-  if (rs != CUDA_SUCCESS) return rs;
   const int tiles = n / 16;
   const dim3 grid(KSPLIT, (tiles / NTILES + kMmaWarps - 1) / kMmaWarps, 1);
   glm52_gemv_batched_mma_kernel<BATCH, KSPLIT, NTILES>
@@ -624,10 +613,15 @@ CUresult glm52_fp8_weight_only_gemv_cuda(
 // tile; batches 4/8 dispatch per shape between the tensor-core mma path and
 // the register tile (mma_config — deterministic per bucket, not bit-identical
 // to m=1; see the mma block comment for the numerics contract).
+// `scratch`/`scratch_floats` = caller-owned f32 partial buffer for the
+// tensor-core path (see the mma block comment for the ownership contract:
+// one buffer per stream, never shared across the ctx/aux overlap). Batches
+// that stay on the register tile ignore it; an mma-routed launch with a
+// null/short buffer fails INVALID_VALUE instead of racing.
 CUresult glm52_fp8_weight_only_gemv_batched_cuda(
     const __nv_bfloat16* activation, const unsigned char* weight,
-    const float* weight_scale, __nv_bfloat16* out, int batch, int n, int k,
-    cudaStream_t stream) {
+    const float* weight_scale, __nv_bfloat16* out, float* scratch,
+    size_t scratch_floats, int batch, int n, int k, cudaStream_t stream) {
   if (activation == nullptr || weight == nullptr || weight_scale == nullptr ||
       out == nullptr || !aligned16(activation) ||
       !whitelisted_linear_shape(n, k)) {
@@ -651,7 +645,8 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
       const MmaConfig cfg = mma_config(batch, n, k);
       if (cfg.ksplit == 16 && cfg.ntiles == 2) {
         return launch_gemv_batched_mma<kBatchedGemvBatch4, 16, 2>(
-            activation, weight, weight_scale, out, n, k, stream);
+            activation, weight, weight_scale, out, scratch, scratch_floats, n,
+            k, stream);
       }
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
@@ -667,15 +662,18 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
       const MmaConfig cfg = mma_config(batch, n, k);
       if (cfg.ksplit == 16 && cfg.ntiles == 2) {
         return launch_gemv_batched_mma<kBatchedGemvBatchFull, 16, 2>(
-            activation, weight, weight_scale, out, n, k, stream);
+            activation, weight, weight_scale, out, scratch, scratch_floats, n,
+            k, stream);
       }
       if (cfg.ksplit == 8 && cfg.ntiles == 4) {
         return launch_gemv_batched_mma<kBatchedGemvBatchFull, 8, 4>(
-            activation, weight, weight_scale, out, n, k, stream);
+            activation, weight, weight_scale, out, scratch, scratch_floats, n,
+            k, stream);
       }
       if (cfg.ksplit == 8 && cfg.ntiles == 1) {
         return launch_gemv_batched_mma<kBatchedGemvBatchFull, 8, 1>(
-            activation, weight, weight_scale, out, n, k, stream);
+            activation, weight, weight_scale, out, scratch, scratch_floats, n,
+            k, stream);
       }
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;

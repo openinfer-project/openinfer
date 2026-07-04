@@ -34,10 +34,10 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use openinfer_kernels::ops::{
-    GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK, Glm52DeepGemmMqaLogitsShape,
-    Glm52IndexerCacheInsert, Glm52IndexerCacheLayout, Glm52IndexerLocalTopKToSlots,
-    Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape, bf16_bytes_to_f32_into,
-    gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
+    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, GLM52_INDEXER_HEAD_DIM, GLM52_INDEXER_TOPK,
+    Glm52DeepGemmMqaLogitsShape, Glm52IndexerCacheInsert, Glm52IndexerCacheLayout,
+    Glm52IndexerLocalTopKToSlots, Glm52IndexerScaleFormat, Glm52IndexerTopK, Glm52MoeQuantShape,
+    bf16_bytes_to_f32_into, gemm_strided_batched_bf16, glm52_deepgemm_paged_mqa_logits_launch,
     glm52_deepgemm_paged_mqa_metadata_launch, glm52_flashinfer_topk_2048_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_indexer_k_quant_and_cache_launch,
     glm52_indexer_local_topk_to_slots_launch, glm52_indexer_rope_launch,
@@ -268,6 +268,10 @@ pub(crate) struct Glm52IndexerScratch {
     topk_values: CudaSlice<f32>,
     pub(crate) global_slots: CudaSlice<i32>,
     topk_lens: CudaSlice<i32>,
+    // Owned mma partial buffer (wq_b/wk). The indexer chain runs on the AUX
+    // stream concurrently with the ctx-side MLA front — this buffer being
+    // owned here (not shared per device) is what makes that overlap safe.
+    gemv_partial: CudaSlice<f32>,
 }
 
 impl Glm52IndexerScratch {
@@ -296,6 +300,9 @@ impl Glm52IndexerScratch {
             topk_values: ctx.stream.alloc_zeros::<f32>(t * GLM52_INDEXER_TOPK)?,
             global_slots: ctx.stream.alloc_zeros::<i32>(t * GLM52_INDEXER_TOPK)?,
             topk_lens: ctx.stream.alloc_zeros::<i32>(t)?,
+            gemv_partial: ctx
+                .stream
+                .alloc_zeros::<f32>(t * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
             shape,
         })
     }
@@ -387,8 +394,22 @@ pub(crate) fn glm52_indexer_forward_into(
     );
 
     // ---- projections ----
-    fp8_linear_into(ctx, &w.wq_b, t, q_resid, &mut s.q)?; // [T, 32*128]
-    fp8_linear_into(ctx, &w.wk, t, hidden, &mut s.k_raw)?; // [T, 128]
+    fp8_linear_into(
+        ctx,
+        &w.wq_b,
+        t,
+        q_resid,
+        Some(&mut s.gemv_partial),
+        &mut s.q,
+    )?; // [T, 32*128]
+    fp8_linear_into(
+        ctx,
+        &w.wk,
+        t,
+        hidden,
+        Some(&mut s.gemv_partial),
+        &mut s.k_raw,
+    )?; // [T, 128]
     // weights_proj: bf16 GEMM (transformers keeps weights_proj in fp32 via
     // _keep_in_fp32_modules; checkpoint stores bf16, so bf16 GEMM is the
     // closest match without a dedicated f32 GEMM path).
