@@ -110,7 +110,7 @@ impl Qwen35Model {
             self.config.rms_norm_eps,
             &mut normed,
         )?;
-        let logits = ops::gemm(&self.ctx, &self.embed_tokens, &normed)?;
+        let logits = ops::gemm(&self.ctx, self.output_projection(), &normed)?;
         debug_assert_eq!(logits.seq_len, n);
         Ok(logits)
     }

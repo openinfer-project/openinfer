@@ -157,9 +157,9 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "lm_head_prefill",
-                    rust: "prefill::batch_last_hidden_logits -> ops::gemm (tied embed_tokens)",
+                    rust: "prefill::batch_last_hidden_logits -> ops::gemm (output_projection)",
                     backend: "cuBLAS",
-                    notes: "LM head using tied embeddings (one cuBLAS GEMM over request rows)",
+                    notes: "LM head: untied lm_head.weight when the config unties embeddings, else embed_tokens (one cuBLAS GEMM over request rows)",
                 },
             ],
         },
@@ -268,9 +268,9 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 },
                 KernelOp {
                     id: "lm_head_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (tied embed_tokens)",
+                    rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (output_projection)",
                     backend: "cuBLAS",
-                    notes: "LM head using tied embeddings (one cuBLAS GEMM over the bucket-padded batch)",
+                    notes: "LM head: untied lm_head.weight when the config unties embeddings, else embed_tokens (one cuBLAS GEMM over the bucket-padded batch)",
                 },
                 // batched sampling
                 KernelOp {

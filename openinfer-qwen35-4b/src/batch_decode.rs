@@ -319,7 +319,7 @@ impl Qwen35Model {
         )?;
         ops::gemm_into(
             &self.ctx,
-            &self.embed_tokens,
+            self.output_projection(),
             &bufs.normed,
             &mut bufs.logits,
         );
