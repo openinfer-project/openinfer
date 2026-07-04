@@ -47,17 +47,20 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 
 ## Tests
 
-```bash
-# Unit tests (~9s)
-cargo test --release --workspace --lib
+The runner is cargo-nextest (`cargo binstall cargo-nextest`, >= 0.9.138; config and rationale in `.config/nextest.toml` + `docs/conventions/coding-style.md`). Bare `cargo test` still works, but nextest owns the sweep contract: hardware gates are excluded by the config's default filter and reported as skipped, and hung GPU tests are killed instead of wedging the session.
 
-# Accuracy and integration tests — require GPU + model weights
-cargo test --release -p openinfer-qwen3 --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
+```bash
+# Sweep (~10s): lib unit tests, green on any single-GPU box
+cargo nextest run --release --workspace
+
+# Accuracy and integration gates — require GPU + model weights, opt in per package
+OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
+  cargo nextest run --release -p openinfer-qwen3 --ignore-default-filter -E 'binary(hf_golden_gate)'
+OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B \
+  cargo nextest run --release -p openinfer-qwen35-4b --features qwen35-4b --ignore-default-filter -E 'binary(e2e_scheduler)'
 
 # Single test (filter by name)
-cargo test --release --workspace --lib prefix_cache -- --nocapture
+cargo nextest run --release --workspace -E 'test(prefix_cache)'
 ```
 
 Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 exact-text JSON baselines are retired; keep `e2e_scheduler` for scheduler liveness and request-flow coverage.

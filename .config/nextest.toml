@@ -1,0 +1,57 @@
+# Test runner config. Rationale in docs/conventions/coding-style.md.
+#
+# The contract: a bare `cargo nextest run --workspace` is the sweep — lib unit
+# tests only, safe on any single-GPU box. Hardware gates (integration tests
+# needing model weights / multi-GPU) are excluded by the default filter and
+# reported as skipped; run them per package with --ignore-default-filter.
+
+[profile.default]
+# Sweep = lib tests, minus the one lib test that needs RDMA hardware:
+# gdr_copy_flag_GPU requires a GDRCopy handle (gdrdrv), absent on plain GPU
+# workstations. It is excluded here — not env-probed inside the test — so the
+# selection stays visible; run it explicitly on RDMA hosts with
+# `cargo nextest run -p openinfer-comm-cuda-lib --ignore-default-filter`.
+default-filter = "kind(lib) - (package(openinfer-comm-cuda-lib) & test(gdr_copy_flag_GPU))"
+# Flaky = bug. Exact-match greedy gates are this repo's core asset; retries
+# would let nondeterminism rot unnoticed.
+retries = 0
+# A wedged NCCL collective or CUDA deadlock must go red, not hang the session.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Integration gates load real model weights — legitimately slow. Mark slow at
+# 5 min, kill at 1 h (a gate that quiet for an hour is hung, not loading).
+[[profile.default.overrides]]
+filter = "kind(test)"
+slow-timeout = { period = "300s", terminate-after = 12 }
+
+# nextest is process-per-test, so parallel GPU tests each create their own
+# CUDA context on the same device. Two tiers:
+#   gpu-gate: integration gates load full engines (GBs of VRAM, NCCL ports) —
+#             strictly one at a time.
+#   gpu-lib:  CUDA-touching lib tests hold small contexts — bounded, not
+#             serial, so pure-logic lib tests in the same packages don't queue
+#             behind a single slot.
+# CPU-only suites (kv-cache, sim, vllm-support, ...) keep full parallelism.
+[test-groups]
+gpu-gate = { max-threads = 1 }
+gpu-lib = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = "kind(test)"
+test-group = "gpu-gate"
+
+[[profile.default.overrides]]
+filter = """
+kind(lib) & (
+  package(openinfer-core)
+  | package(openinfer-kernels)
+  | package(openinfer-sample)
+  | package(openinfer-qwen3)
+  | package(openinfer-qwen35-4b)
+  | package(openinfer-glm52)
+  | package(openinfer-kimi-k2)
+  | package(openinfer-deepseek-v2-lite)
+  | package(openinfer-deepseek-v4)
+)
+"""
+test-group = "gpu-lib"
