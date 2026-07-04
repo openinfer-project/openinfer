@@ -173,8 +173,8 @@ __global__ void glm52_fp8_weight_only_gemv_kernel(
 // bucket-8 decode step. Shared staging does not help (LDS shares the L1TEX
 // pipe); registers are the only storage off that port, so reusing the chunk
 // across ROWS=4 rows cuts activation loads 4x: o_proj 132→66 µs, dense_dn
-// 99→51, q_b 42→26. ROWS=8 spills; WARPS=4 keeps ~3 blocks/SM resident at
-// ~96 regs (1-row/warp needs WARPS=8 to fill its lighter blocks). BATCH=2
+// 99→51, q_b 42→26. ROWS=8 spills; WARPS=4 keeps 3 blocks/SM resident at
+// 158 regs measured (ptxas sm_90; BATCH=4 is 128). BATCH=2
 // stays at ROWS=1: activation traffic is 2:16 against the weight there and
 // the 1-row/warp shape measures faster on 7 of 10 model shapes.
 template <int BATCH, int ROWS, int WARPS>
@@ -331,8 +331,8 @@ constexpr int kBatchedRows  = 4;
 constexpr int kBatchedWarps = 4;
 
 // Whitelist of the model's linear shapes (shared by the plain and batched
-// launchers; the tiling check differs — rpb is 8 or 32 for plain, 8 for
-// batched — so it is applied by each launcher, not here).
+// launchers; the tiling check differs — rpb is 8 or 32 for plain, 8 (batch 2)
+// or 16 (batch 4/8) for batched — so it is applied by each launcher, not here).
 bool whitelisted_linear_shape(int n, int k) {
   if (n == 2048  && k == 6144)  return true;  // q_a / shared gate,up
   if (n == 16384 && k == 2048)  return true;  // q_b
