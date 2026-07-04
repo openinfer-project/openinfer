@@ -16,9 +16,9 @@
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
 //! live in [`Glm52SlotState`] as pure data transitions, and the
-//! admission/bucket decisions in [`admission_target`] / [`step_bucket`] as
-//! pure functions over the occupancy; the coordinator is a thin shell that
-//! moves tokens between channels and the rank workers.
+//! admission/step-shape decisions in [`admission_target`] /
+//! [`plan_step_shapes`] as pure functions over the occupancy; the coordinator
+//! is a thin shell that moves tokens between channels and the rank workers.
 
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
@@ -172,19 +172,31 @@ fn admission_target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(us
     Some((rank, slot))
 }
 
-/// The step's global batch bucket: 1 row per rank while every rank holds at
-/// most one request, the full batch as soon as any rank holds two. Every rank
-/// must step with the same bucket — the MoE collectives agree on the global
-/// row count.
-fn step_bucket(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> usize {
-    if occupied
+/// Every rank's forward shape for one step, decided together from the same
+/// occupancy snapshot: the 1-row bucket only when EVERY rank holds at most
+/// one request (each rank forwards its single occupied slot — or slot 0 as
+/// padding when idle), the full batch everywhere otherwise. Deriving the
+/// bucket and the per-rank `One` slot from the same row data in one place is
+/// what keeps them consistent — the MoE collectives require all ranks to
+/// agree on the step's global row count, and a rank with two active slots
+/// must never be handed a 1-row shape (its second row would be silently
+/// dropped).
+fn plan_step_shapes(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52StepShape> {
+    let one_row = occupied
         .iter()
-        .all(|row| row.iter().filter(|&&o| o).count() <= 1)
-    {
-        1
-    } else {
-        GLM52_MAX_BATCH_PER_RANK
-    }
+        .all(|row| row.iter().filter(|&&o| o).count() <= 1);
+    occupied
+        .iter()
+        .map(|row| {
+            if one_row {
+                Glm52StepShape::One {
+                    slot: row.iter().position(|&o| o).unwrap_or(0),
+                }
+            } else {
+                Glm52StepShape::Full
+            }
+        })
+        .collect()
 }
 
 fn occupancy(slots: &[RankSlots]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {
@@ -243,6 +255,11 @@ pub(crate) fn run_dp8_coordinator(
                 break;
             };
             let req = pending.pop_front().expect("checked non-empty");
+            // The client left while the request sat in the queue — admitting
+            // it would burn a slot (and whole global steps) on a dead sink.
+            if req.token_tx.is_closed() {
+                continue;
+            }
             let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
             let _ = req.token_tx.send(TokenEvent::Scheduled {
                 queued_at_unix_s,
@@ -264,11 +281,12 @@ pub(crate) fn run_dp8_coordinator(
         // One lock-step step: every rank forwards the SAME bucket — each
         // active slot's next token, padding rows elsewhere — and all
         // responses are joined before any output is interpreted.
-        let bucket = step_bucket(&occupancy(&slots));
+        let shapes = plan_step_shapes(&occupancy(&slots));
         let responses = slots
             .iter()
             .zip(&workers)
-            .map(|(rank_slots, worker)| {
+            .zip(shapes)
+            .map(|((rank_slots, worker), shape)| {
                 let mut inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
                     GLM52_MAX_BATCH_PER_RANK];
                 for (slot, active) in rank_slots.iter().enumerate() {
@@ -277,18 +295,6 @@ pub(crate) fn run_dp8_coordinator(
                         inputs[slot] = (input.token, input.position);
                     }
                 }
-                let shape = if bucket == 1 {
-                    // ≤ 1 active slot per rank by the bucket decision; an
-                    // idle rank forwards the padding row in slot 0.
-                    Glm52StepShape::One {
-                        slot: rank_slots
-                            .iter()
-                            .position(Option::is_some)
-                            .unwrap_or_default(),
-                    }
-                } else {
-                    Glm52StepShape::Full
-                };
                 worker.step_async(inputs, shape)
             })
             .collect::<anyhow::Result<Vec<_>>>();
@@ -568,14 +574,26 @@ mod tests {
     }
 
     #[test]
-    fn bucket_is_one_row_until_a_rank_holds_two() {
-        assert_eq!(step_bucket(&occ(&[0, 0])), 1);
-        assert_eq!(step_bucket(&occ(&[1, 1, 1, 1, 1, 1, 1, 1])), 1);
-        assert_eq!(step_bucket(&occ(&[2, 0])), GLM52_MAX_BATCH_PER_RANK);
-        // The single active slot need not be slot 0 for the 1-row bucket.
-        let mut mid_slot = occ(&[0, 0]);
+    fn shapes_are_one_row_until_a_rank_holds_two() {
+        use Glm52StepShape::{Full, One};
+        assert_eq!(
+            plan_step_shapes(&occ(&[0, 0])),
+            vec![One { slot: 0 }, One { slot: 0 }]
+        );
+        assert_eq!(
+            plan_step_shapes(&occ(&[1, 1, 1, 1, 1, 1, 1, 1])),
+            vec![One { slot: 0 }; 8]
+        );
+        // One rank at two requests flips EVERY rank to the full batch.
+        assert_eq!(plan_step_shapes(&occ(&[2, 1])), vec![Full, Full]);
+        // The single active slot need not be slot 0 for the 1-row bucket,
+        // and each rank's One slot is its own occupied slot.
+        let mut mid_slot = occ(&[1, 0]);
         mid_slot[1][5] = true;
-        assert_eq!(step_bucket(&mid_slot), 1);
-        assert_eq!(admission_target(&mid_slot), Some((0, 0)));
+        assert_eq!(
+            plan_step_shapes(&mid_slot),
+            vec![One { slot: 0 }, One { slot: 5 }]
+        );
+        assert_eq!(admission_target(&mid_slot), Some((0, 1)));
     }
 }

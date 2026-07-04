@@ -240,15 +240,12 @@ pub(crate) struct Glm52RankModel {
     embed: DeviceMatrix,
     final_norm: DeviceVec,
     lm_head: DeviceMatrix,
-    /// FlashMLA plans, one per (attention tier × batch bucket): `short`
-    /// (topk 256, few SM parts) serves steps with `seq_len <=
-    /// GLM52_MLA_TOPK_SHORT`, `full` (topk 2048) everything beyond; the `b1`
-    /// pair is the 1-row bucket. Same math on the same real tokens — only the
-    /// padded index-walk length and the row count differ.
-    mla_sched_short: Glm52MlaSchedMetadata,
-    mla_sched_full: Glm52MlaSchedMetadata,
-    mla_sched_b1_short: Glm52MlaSchedMetadata,
-    mla_sched_b1_full: Glm52MlaSchedMetadata,
+    /// FlashMLA plans, indexed `[bucket][tier]` (see the index constants
+    /// below): the short tier (topk 256, few SM parts) serves steps with
+    /// `seq_len <= GLM52_MLA_TOPK_SHORT`, the full tier (topk 2048)
+    /// everything beyond. Same math on the same real tokens — only the padded
+    /// index-walk length and the row count differ.
+    mla_scheds: [[Glm52MlaSchedMetadata; 2]; 2],
     index_cache_layout: Glm52IndexerCacheLayout,
     /// `[GLM52_MAX_BATCH_PER_RANK, blocks_per_slot]` — row b maps slot b's
     /// context into its disjoint region of the index-K cache. Static: written
@@ -271,18 +268,23 @@ pub(crate) struct Glm52RankModel {
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
     token_ids: CudaSlice<u32>,
-    scratch: Glm52DecodeScratch,
-    scratch_b1: Glm52DecodeScratch,
-    /// The whole-step decode graphs, one per (attention tier × batch bucket):
-    /// each is captured on this rank's first step in that shape, replayed
-    /// every step after. Valid forever — within a shape every step has the
-    /// same kernel sequence and the same (arena) pointers by construction;
-    /// the per-step inputs are the device buffers the prologue rewrites.
-    graph_short: CudaGraphState,
-    graph_full: CudaGraphState,
-    graph_b1_short: CudaGraphState,
-    graph_b1_full: CudaGraphState,
+    /// Scratch arenas, indexed `[bucket]`.
+    scratches: [Glm52DecodeScratch; 2],
+    /// The whole-step decode graphs, indexed `[bucket][tier]`: each is
+    /// captured on this rank's first step in that shape, replayed every step
+    /// after. Valid forever — within a shape every step has the same kernel
+    /// sequence and the same (arena) pointers by construction; the per-step
+    /// inputs are the device buffers the prologue rewrites.
+    graphs: [[CudaGraphState; 2]; 2],
 }
+
+/// Index constants for the per-shape arrays: every consumer selects with the
+/// same `[BUCKET_*][TIER_*]` pair computed once per step, so a graph can
+/// never be taken from one shape slot and restored into another.
+const BUCKET_FULL: usize = 0;
+const BUCKET_ONE: usize = 1;
+const TIER_FULL: usize = 0;
+const TIER_SHORT: usize = 1;
 
 impl Glm52RankModel {
     pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
@@ -408,10 +410,16 @@ impl Glm52RankModel {
             embed,
             final_norm,
             lm_head,
-            mla_sched_short: Glm52MlaSchedMetadata::new(ctx, contract_short)?,
-            mla_sched_full: Glm52MlaSchedMetadata::new(ctx, contract)?,
-            mla_sched_b1_short: Glm52MlaSchedMetadata::new(ctx, contract_b1_short)?,
-            mla_sched_b1_full: Glm52MlaSchedMetadata::new(ctx, contract_b1)?,
+            mla_scheds: [
+                [
+                    Glm52MlaSchedMetadata::new(ctx, contract)?,
+                    Glm52MlaSchedMetadata::new(ctx, contract_short)?,
+                ],
+                [
+                    Glm52MlaSchedMetadata::new(ctx, contract_b1)?,
+                    Glm52MlaSchedMetadata::new(ctx, contract_b1_short)?,
+                ],
+            ],
             index_cache_layout,
             block_table,
             block_table_b1: ctx.stream.alloc_zeros::<i32>(blocks_per_slot)?,
@@ -432,12 +440,14 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
-            scratch: Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?,
-            scratch_b1: Glm52DecodeScratch::new(ctx, &contract_b1, mqa_shape_b1)?,
-            graph_short: CudaGraphState::new(),
-            graph_full: CudaGraphState::new(),
-            graph_b1_short: CudaGraphState::new(),
-            graph_b1_full: CudaGraphState::new(),
+            scratches: [
+                Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?,
+                Glm52DecodeScratch::new(ctx, &contract_b1, mqa_shape_b1)?,
+            ],
+            graphs: [
+                [CudaGraphState::new(), CudaGraphState::new()],
+                [CudaGraphState::new(), CudaGraphState::new()],
+            ],
         })
     }
 
@@ -533,20 +543,19 @@ impl Glm52RankModel {
             .map(|row| inputs[base_slot + row].1 + 1)
             .max()
             .is_some_and(|longest| longest <= GLM52_MLA_TOPK_SHORT);
+        // The step's shape indices — computed once; every per-shape array
+        // (plans, graphs, scratches) is selected with this same pair.
+        let bucket = if batch == 1 { BUCKET_ONE } else { BUCKET_FULL };
+        let tier = if short_tier { TIER_SHORT } else { TIER_FULL };
         let step = Glm52DecodeStep {
             mla_cos: &self.cos,
             mla_sin: &self.sin,
             idx_cos: &self.cos,
             idx_sin: &self.sin,
-            mla_sched: match (batch == 1, short_tier) {
-                (false, true) => &self.mla_sched_short,
-                (false, false) => &self.mla_sched_full,
-                (true, true) => &self.mla_sched_b1_short,
-                (true, false) => &self.mla_sched_b1_full,
-            },
+            mla_sched: &self.mla_scheds[bucket][tier],
             index_cache_layout: self.index_cache_layout,
             slot_mapping: &self.slot_mapping,
-            block_table: if batch == 1 {
+            block_table: if bucket == BUCKET_ONE {
                 &self.block_table_b1
             } else {
                 &self.block_table
@@ -557,17 +566,8 @@ impl Glm52RankModel {
         // collectives — guaranteed by the coordinator agreeing the bucket.
         let global_tokens = crate::weights::GLM52_EP_RANKS * batch;
 
-        let mut graph = std::mem::take(match (batch == 1, short_tier) {
-            (false, true) => &mut self.graph_short,
-            (false, false) => &mut self.graph_full,
-            (true, true) => &mut self.graph_b1_short,
-            (true, false) => &mut self.graph_b1_full,
-        });
-        let s = if batch == 1 {
-            &mut self.scratch_b1
-        } else {
-            &mut self.scratch
-        };
+        let mut graph = std::mem::take(&mut self.graphs[bucket][tier]);
+        let s = &mut self.scratches[bucket];
         let result = graph.run_or_capture(ctx, || {
             run_step_body(
                 ctx,
@@ -584,19 +584,10 @@ impl Glm52RankModel {
                 global_tokens,
             )
         });
-        *(match (batch == 1, short_tier) {
-            (false, true) => &mut self.graph_short,
-            (false, false) => &mut self.graph_full,
-            (true, true) => &mut self.graph_b1_short,
-            (true, false) => &mut self.graph_b1_full,
-        }) = graph;
+        self.graphs[bucket][tier] = graph;
         result?;
 
-        let s = if batch == 1 {
-            &self.scratch_b1
-        } else {
-            &self.scratch
-        };
+        let s = &self.scratches[bucket];
         let top_values = ctx.stream.clone_dtoh(&s.argmax_values)?;
         let top_indices = ctx.stream.clone_dtoh(&s.argmax_indices)?;
         let mut outputs = [0u32; GLM52_MAX_BATCH_PER_RANK];
@@ -719,7 +710,7 @@ fn run_step_body(
             Glm52LayerMlp::Moe(_) => {
                 anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
             }
-        };
+        }
         if layer + 1 < layers.len() {
             glm52_layer_finish_fused(ctx, s, parity, &layers[layer + 1].input_ln)?;
         } else {

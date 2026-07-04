@@ -41,9 +41,11 @@ use crate::moe_decode::{HIDDEN, run_router};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
 const EP_RANKS: usize = 8;
-/// The full-bucket protocol value the production coordinator agrees on —
-/// the gate replays its collectives at the same worst-case row bound.
-const GLOBAL_TOKENS: usize = EP_RANKS * GLM52_MAX_BATCH_PER_RANK;
+/// Both global-token protocol values the production coordinator can agree on
+/// — the full 8-row bucket (worst-case row bound) and the 1-row bucket. The
+/// gate replays its collectives at each, pinning the b1 collective row-bound
+/// math to the oracle instead of leaving it to e2e parity alone.
+const GLOBAL_TOKEN_BUCKETS: [usize; 2] = [EP_RANKS * GLM52_MAX_BATCH_PER_RANK, EP_RANKS];
 
 #[test]
 #[ignore = "requires 8×H200 + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4 + DeepGEMM env"]
@@ -68,15 +70,17 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
                     let ctx = DeviceContext::new_with_device(rank)?;
                     let bank = load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank)?;
                     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, rank)?;
-                    for _position in 0..MOE_ORACLE_CTX {
-                        let dispatched = glm52_moe_ep8_routed_forward(
-                            &ctx,
-                            &mut ep8,
-                            &bank,
-                            None,
-                            GLOBAL_TOKENS,
-                        )?;
-                        ensure!(!dispatched, "expert rank produced a combined output");
+                    for global_tokens in GLOBAL_TOKEN_BUCKETS {
+                        for _position in 0..MOE_ORACLE_CTX {
+                            let dispatched = glm52_moe_ep8_routed_forward(
+                                &ctx,
+                                &mut ep8,
+                                &bank,
+                                None,
+                                global_tokens,
+                            )?;
+                            ensure!(!dispatched, "expert rank produced a combined output");
+                        }
                     }
                     Ok(())
                 })
@@ -93,7 +97,21 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
         GateLayerMlp::MoeEp8Rank0,
     )?;
     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, 0)?;
-    let outputs = run_layer_prefill_ep8(&ctx, &w, &mut ep8, &hidden_host, MOE_ORACLE_CTX);
+    // Replay the layer once per global-token bucket, in the same order as the
+    // expert threads' collective loops.
+    let outputs: Result<Vec<Vec<f32>>> = GLOBAL_TOKEN_BUCKETS
+        .into_iter()
+        .map(|global_tokens| {
+            run_layer_prefill_ep8(
+                &ctx,
+                &w,
+                &mut ep8,
+                &hidden_host,
+                MOE_ORACLE_CTX,
+                global_tokens,
+            )
+        })
+        .collect();
 
     // The DeepEP context drop is collective: the expert threads drop theirs
     // right after their last collective and spin in the destroy barrier, so
@@ -106,13 +124,15 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
             .expect("ep8 gate rank thread panicked")
             .with_context(|| format!("ep8 gate rank {}", rank + 1))?;
     }
-    assert_layer_probes(
-        "layer6/moe/ep8",
-        &outputs?,
-        MOE_ORACLE_LAYER_PROBES,
-        MOE_ORACLE_LAYER_TOL,
-        4,
-    );
+    for (outputs, global_tokens) in outputs?.iter().zip(GLOBAL_TOKEN_BUCKETS) {
+        assert_layer_probes(
+            &format!("layer6/moe/ep8/g{global_tokens}"),
+            outputs,
+            MOE_ORACLE_LAYER_PROBES,
+            MOE_ORACLE_LAYER_TOL,
+            4,
+        );
+    }
     Ok(())
 }
 
@@ -125,6 +145,7 @@ fn run_layer_prefill_ep8(
     ep8: &mut Glm52MoeEp8State,
     hidden_host: &[bf16],
     oracle_ctx: usize,
+    global_tokens: usize,
 ) -> Result<Vec<f32>> {
     let Glm52LayerMlp::MoeEp8(moe) = &w.mlp else {
         anyhow::bail!("ep8 gate requires the MoeEp8 layer weights");
@@ -218,7 +239,7 @@ fn run_layer_prefill_ep8(
             ep8,
             &moe.bank,
             Some((&scratch.layer.normed2, &route, 1)),
-            GLOBAL_TOKENS,
+            global_tokens,
         )?;
         ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");
         let shared = moe.shared.forward(ctx, &scratch.layer.normed2)?;
