@@ -97,6 +97,47 @@ Measured dead ends (all recorded in #542): the inter-step host gap is ~0.05 ms (
 
 The same-node vLLM nsys diff (their trace: NCCL AllGather+ReduceScatter naive EP — NOT DeepEP — at 29+36 µs/layer medians, comparable to our 12+47) relocates the remaining 2.6 ms: (1) **expert GEMM** — vLLM's DeepGEMM swapAB runs ~10.8 µs/instance where our TRTLLM grouped takes 22.7 µs (64-row M-tile against ~8 real rows = 8× wasted MMA work; swapAB puts the skinny dimension on N). (2) **collective wait structure** (dispatch is rank-arrival-bound; fp8 payload measured neutral). A calibration lesson from the tier stage: node-granularity nsys inflates small kernels — the attention diff read as ~1 ms in trace proportions but bought 0.3 ms e2e; size expected wins from e2e A/B, not trace ratios.
 
+## Bucket-8 step attribution (jz-38 nsys 2026-07-05)
+
+Why does a bucket-8 step cost 45.6 ms when bucket-1 costs 22.5? Same methodology
+as above (node-granularity trace), two windows on the same binary: bucket-8 via
+long-prompt span ingestion (one slot, 8 rows/rank; 1800 rank-steps sampled) vs a
+bucket-1 solo control (2520 rank-steps). Total-kernel-time accounting closes:
+27.2 → 50.1 ms/rank-step (+22.9) against the bare-metal +23.1 wall delta.
+
+| component (per rank-step, total incl tails) | b1 | b8 | Δ |
+|---|---|---|---|
+| non-expert weight-only GEMV (all projections) | 6.5 | 21.6 | **+15.1** |
+| expert grouped GEMM (TRTLLM) | 3.4 | 7.2 | +3.8 |
+| MoE combine kernel | 3.6 | 5.4 | +1.8 |
+| MLA splitkv attention (8 queries vs 1) | 1.3 | 2.6 | +1.3 |
+| SiLU/quant glue | 1.2 | 1.8 | +0.6 |
+| dispatch (incl rank-arrival wait) | 4.4 | 4.6 | +0.2 |
+| everything else | ~6.8 | ~6.9 | ~0 |
+
+Two-thirds of the delta sits in the kernel designed to be batch-free: the
+batched weight-only GEMV reads each weight packet once for all 8 rows, but the
+1-row/warp layout issues 16 activation LDGs per weight LDG — ncu shows 93%
+L1TEX / 12% DRAM, i.e. the L1TEX **port** is saturated, not bandwidth or FMA.
+Shared-memory staging cannot help (LDS shares the L1TEX pipe on Hopper — a
+microbenched smem variant lost everywhere); registers are the only storage off
+that port. The collectives are nearly innocent: dispatch wait is flat and
+combine grows only +1.8 ms for 8× payload.
+
+Fix (`perf(glm52): ROWS=4 register tile for the batched weight-only GEMV`):
+each warp owns 4 output rows and reuses the register-held activation chunk
+across them, cutting per-row activation loads 4× while keeping per-row bit
+parity with the m=1 kernel (memcmp-gated microbench, all 10 shapes × batches
+{2,4,8}). Batch 2 keeps the 1-row/warp shape (act traffic negligible there).
+H200 microbench: o_proj 132→66 µs, dense_dn 99→51, q_b 42→26 at batch 8;
+weighted per-step: bucket-8 GEMV 23.0→13.9 ms, bucket-4 13.4→9.5 ms. ROWS=8
+spills registers; WARPS=4 keeps ~3 blocks/SM. **e2e measured (jz-38, dspark
+stack + cherry-pick): bucket-8 span step 45.6 → 37.0 ms (−19%), 1621-token
+prompt TTFT 9.25 → 7.55 s; bucket-1 solo 22.63 ms/step — flat, b1 path
+untouched.** Matches the microbench-weighted −9.1 ms prediction. Artifacts:
+traces + kern-sum CSVs `~/develop/xingming/b8span* b1ctrl*`, microbench
+`~/develop/xingming/gemv_bench` on jz-38.
+
 ## Next action
 
 Follow-ups: #542 (collective latency floor / GEMV BW / `num_sm_parts`), #541 indexer reference re-pin.
