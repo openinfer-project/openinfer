@@ -179,6 +179,10 @@ impl Qwen35Model {
             super::batch_decode_graph::MAX_BATCH
         );
 
+        if !self.config.decode_group_is_compiled() {
+            return self.batch_decode_via_prefill(token_ids, kv_states, graph_state);
+        }
+
         let padded_bs = bucket_for(bs);
 
         // Advance KV states and collect positions. Slot seq_len is incremented
@@ -229,6 +233,52 @@ impl Qwen35Model {
         });
         graph_state.graphs = graphs;
         result
+    }
+
+    /// Decode an uncompiled GQA group via the prefill path, writing `buffers.logits`
+    /// so callers sample as after the graph path.
+    pub(crate) fn batch_decode_via_prefill(
+        &self,
+        token_ids: &[u32],
+        kv_states: &mut [&mut KvState],
+        graph_state: &mut BatchDecodeGraphState,
+    ) -> Result<()> {
+        let bs = token_ids.len();
+        anyhow::ensure!(
+            bs > 0,
+            "batch_decode_via_prefill requires at least one request"
+        );
+        anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
+
+        let mut last_hiddens = Vec::with_capacity(bs);
+        for i in 0..bs {
+            let hidden = self.prefill_last_hidden(
+                &[token_ids[i]],
+                &mut *kv_states[i],
+                &mut graph_state.slot_states[i],
+            )?;
+            last_hiddens.push(hidden);
+        }
+
+        let bufs = &mut graph_state.buffers;
+        bufs.set_batch_size(bs);
+        for (i, hidden) in last_hiddens.iter().enumerate() {
+            ops::write_vec_into(&self.ctx, hidden, &mut bufs.hidden, i)?;
+        }
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+            &mut bufs.normed,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &bufs.normed,
+            &mut bufs.logits,
+        );
+        Ok(())
     }
 
     fn batch_decode_kernels_graph(

@@ -150,8 +150,16 @@ impl Config35 {
             t.linear_num_value_heads,
             t.linear_num_key_heads,
         );
+        anyhow::ensure!(
+            t.num_key_value_heads > 0
+                && t.num_attention_heads.is_multiple_of(t.num_key_value_heads),
+            "Qwen3.5 num_attention_heads ({}) must be a positive multiple of \
+             num_key_value_heads ({})",
+            t.num_attention_heads,
+            t.num_key_value_heads,
+        );
 
-        Ok(Self {
+        let config = Self {
             hidden_size: t.hidden_size,
             intermediate_size: t.intermediate_size,
             num_hidden_layers: t.num_hidden_layers,
@@ -171,7 +179,15 @@ impl Config35 {
             max_position_embeddings,
             layer_types,
             tie_word_embeddings,
-        })
+        };
+        if !config.decode_group_is_compiled() {
+            log::warn!(
+                "Qwen3.5 GQA group {}/{} has no compiled decode kernel; decode runs eager through the prefill path",
+                config.num_attention_heads,
+                config.num_key_value_heads,
+            );
+        }
+        Ok(config)
     }
 
     /// Number of full attention layers in the model.
@@ -195,6 +211,11 @@ impl Config35 {
     /// KV dimension for full attention.
     pub(crate) fn full_attn_kv_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim
+    }
+
+    pub(crate) fn decode_group_is_compiled(&self) -> bool {
+        openinfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
+            .contains(&(self.num_attention_heads / self.num_key_value_heads))
     }
 
     /// QKV projection output dimension for linear attention.
