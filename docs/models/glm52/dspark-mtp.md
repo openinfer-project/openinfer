@@ -138,6 +138,14 @@ code prompt, and if a bucket-4 step lands near ~30 ms that is ≈12 ms/token (1.
   | tech prose tok/s | 43.2 | 36.5 — SLOWER than plain | **68.6 (1.59×)** |
   | narrative tok/s | 43.6 | 33.6 — SLOWER | **59.7 (1.37×)** |
   | counting tok/s | 43.4 | 95.1 | **97.7 (2.25×)** |
+  | **sharegpt ×30 aggregate** | 40.2 | — | **61.1 (1.52×)** |
+
+  The closing A/B per the qwen3 methodology (30 sampled ShareGPT first-turn prompts at
+  `/data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json` on jz-38, c1 sequential,
+  temperature 0 + ignore_eos, 200 tokens each): **40.2 → 61.1 tok/s aggregate (1.52×), p50
+  per-request 42.7 → 66.3 (1.55×)**; accept incl. bonus 2.489 over 2395 rounds (hist
+  [695, 595, 343, 762] — 32% of rounds accept all 3 fed drafts); 18/30 outputs byte-identical
+  to plain, 12 near-tie divergent.
 
   Per-round wall matches the step-time model exactly: span-8 ≈ 46.6 ms/round (M1's 45.6 ms
   bucket-8 step + draft), span-4 ≈ 33.9 ms/round → **bucket-4 step ≈ 32 ms**. Span 4 wins on
@@ -203,8 +211,8 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
 
 ## Next action
 
-Close out the user-specified A/B: `vllm bench serve --temperature 0 --ignore-eos` on sharegpt
-prompts at c1, spec on vs off (qwen3 Bug 1 lesson: the bench default temperature is non-greedy
-and silently disables speculation — `--temperature 0` is mandatory). Later levers, measured
-not assumed: adaptive span (feed more drafts only when recent accept is high), draft/verify
-overlap, and the review's S1 (templating the hd64/hd128 prefill copy-paste).
+D3 measurement is closed (sharegpt c1 = 1.52×). Later levers, measured not assumed: adaptive
+span (feed more drafts only when recent accept is high — 32% of sharegpt rounds max out the
+3-draft span), draft/verify overlap, multi-slot spec behavior at c>8 (verify spans contend
+for bucket rows — the planner already splits, but the win under contention is unmeasured),
+and the M2 review's S1 (templating the hd64/hd128 prefill copy-paste).
