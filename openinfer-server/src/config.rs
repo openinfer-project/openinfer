@@ -139,6 +139,12 @@ pub(crate) struct Args {
     #[cfg(feature = "qwen3")]
     #[arg(long, default_value_t = (openinfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
     pub kv_cache_memory_margin_mib: usize,
+    /// KV cache page (block) size in tokens. FlashInfer's paged attention only
+    /// accepts a restricted set; 16 (default) or 64. Larger pages cut block
+    /// bookkeeping overhead at the cost of coarser-grained allocation.
+    #[cfg(feature = "qwen3-4b")]
+    #[arg(long, default_value_t = openinfer_qwen3_4b::DEFAULT_KV_PAGE_SIZE)]
+    pub kv_page_size: usize,
     /// How prefill and decode share the GPU (single-GPU Qwen3 only).
     /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
     /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green

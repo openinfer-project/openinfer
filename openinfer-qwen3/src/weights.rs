@@ -24,6 +24,10 @@ use crate::batch_decode_buffers::BatchDecodeBuffers;
 
 pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
 pub const DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES: usize = 150 * 1024 * 1024;
+/// Default KV cache page (block) size in tokens.
+pub const DEFAULT_KV_PAGE_SIZE: usize = 16;
+/// Page sizes FlashInfer's paged attention kernels accept (see #545).
+pub(crate) const VALID_KV_PAGE_SIZES: &[usize] = &[16, 64];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen3MemoryOptions {
@@ -34,13 +38,21 @@ pub struct Qwen3MemoryOptions {
     /// Extra bytes held back after the profile result to cover allocator
     /// fragmentation and small unprofiled runtime drift.
     pub kv_cache_memory_margin_bytes: usize,
+    /// KV cache page (block) size in tokens (`--kv-page-size`). FlashInfer
+    /// constrains this to [`VALID_KV_PAGE_SIZES`]; 16 by default.
+    pub page_size: usize,
 }
 
 impl Qwen3MemoryOptions {
-    pub const fn new(gpu_memory_utilization: f64, kv_cache_memory_margin_bytes: usize) -> Self {
+    pub const fn new(
+        gpu_memory_utilization: f64,
+        kv_cache_memory_margin_bytes: usize,
+        page_size: usize,
+    ) -> Self {
         Self {
             gpu_memory_utilization,
             kv_cache_memory_margin_bytes,
+            page_size,
         }
     }
 
@@ -49,6 +61,12 @@ impl Qwen3MemoryOptions {
             self.gpu_memory_utilization > 0.0 && self.gpu_memory_utilization <= 1.0,
             "gpu_memory_utilization must be in (0, 1], got {}",
             self.gpu_memory_utilization
+        );
+        anyhow::ensure!(
+            VALID_KV_PAGE_SIZES.contains(&self.page_size),
+            "page_size must be one of {:?}, got {}",
+            VALID_KV_PAGE_SIZES,
+            self.page_size
         );
         Ok(self)
     }
@@ -59,6 +77,7 @@ impl Default for Qwen3MemoryOptions {
         Self {
             gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             kv_cache_memory_margin_bytes: DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+            page_size: DEFAULT_KV_PAGE_SIZE,
         }
     }
 }
@@ -879,7 +898,7 @@ impl Qwen3Model {
     /// KV cache geometry and budget for kernel-call tracing.
     #[cfg(feature = "kernel-call-trace")]
     pub(crate) fn kv_budget(&self) -> KvBudget {
-        let geometry = self.kv_budget_geometry();
+        let geometry = self.kv_budget_geometry(DEFAULT_KV_PAGE_SIZE);
         let bytes_per_block = self.kv_bytes_per_block(&geometry);
         let (free_bytes, _) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo failed");
         let kv_budget_bytes = (free_bytes as f64 * 0.85) as usize;
@@ -901,7 +920,7 @@ impl Qwen3Model {
         memory_options: Qwen3MemoryOptions,
     ) -> Result<KvBudget> {
         let memory_options = memory_options.validate()?;
-        let geometry = self.kv_budget_geometry();
+        let geometry = self.kv_budget_geometry(memory_options.page_size);
         let bytes_per_block = self.kv_bytes_per_block(&geometry);
         let (initial_free_bytes, total_bytes) = mem_info_bytes()?;
         let requested_bytes =
@@ -1027,8 +1046,7 @@ impl Qwen3Model {
         ))
     }
 
-    fn kv_budget_geometry(&self) -> KvBudget {
-        let page_size = 16;
+    fn kv_budget_geometry(&self, page_size: usize) -> KvBudget {
         let num_kv_heads = self.local_num_key_value_heads();
         KvBudget {
             num_layers: self.config.num_hidden_layers,
@@ -1207,5 +1225,34 @@ mod tests {
             .slot_for_install("adapter-c", false)
             .expect("released slot should be reused");
         assert_eq!(slot_c, 0);
+    }
+
+    #[test]
+    fn memory_options_default_page_size_is_16() {
+        // #545: default behavior is unchanged when the flag is omitted.
+        assert_eq!(Qwen3MemoryOptions::default().page_size, 16);
+    }
+
+    #[test]
+    fn memory_options_accepts_valid_page_sizes() {
+        for &valid in VALID_KV_PAGE_SIZES {
+            Qwen3MemoryOptions::new(0.9, 0, valid)
+                .validate()
+                .unwrap_or_else(|_| panic!("page_size {valid} should be valid"));
+        }
+    }
+
+    #[test]
+    fn memory_options_rejects_invalid_page_sizes() {
+        // FlashInfer only accepts 16 and 64; anything else must fail validation.
+        for &invalid in &[0usize, 1, 15, 17, 32, 63, 65, 128] {
+            let err = Qwen3MemoryOptions::new(0.9, 0, invalid)
+                .validate()
+                .expect_err(&format!("page_size {invalid} should be rejected"));
+            assert!(
+                err.to_string().contains("page_size"),
+                "error should mention page_size, got: {err}"
+            );
+        }
     }
 }

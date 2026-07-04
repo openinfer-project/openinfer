@@ -217,6 +217,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     memory: openinfer_qwen3::Qwen3MemoryOptions::new(
                         args.gpu_memory_utilization,
                         kv_cache_memory_margin_bytes,
+                        args.kv_page_size,
                     )
                     .validate()?,
                     lora,

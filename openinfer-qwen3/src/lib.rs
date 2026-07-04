@@ -28,7 +28,8 @@ use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelIn
 pub use kernel_plan::kernel_plan;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 pub use weights::{
-    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, Qwen3MemoryOptions,
+    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE,
+    Qwen3MemoryOptions,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
