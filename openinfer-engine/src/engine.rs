@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -191,34 +191,39 @@ pub type TokenStreamReceiver = mpsc::UnboundedReceiver<(RequestTag, TokenEvent)>
 /// unchanged. Internally each event is tagged with the request's
 /// [`RequestTag`] and pushed onto one shared [`TokenStreamSender`].
 ///
-/// Cancellation moved from "drop the per-request receiver" to a shared
-/// `cancelled` flag: the frontend aborts a *single* request by flipping its
-/// flag without closing the channel the other requests still use. `send` and
-/// `is_closed` then report that request as gone, so the scheduler retires it on
-/// its next emit — the same *reactive* retirement the old consumer-drop gave,
-/// reached through the flag rather than channel closure. `tx.is_closed()` is
-/// the engine-wide signal (the whole demux is gone); the per-request signal is
-/// the flag. The flag is set with `Release` and read with `Acquire` so the
-/// abort is ordered against the frontend dropping the request's stream state.
+/// Cancellation moved from "drop the per-request receiver" to a shared abort
+/// reason: the frontend aborts a *single* request by setting its reason without
+/// closing the channel the other requests still use. `send` and `is_closed`
+/// then report that request as gone, so the scheduler retires it on its next
+/// emit — the same *reactive* retirement the old consumer-drop gave, reached
+/// through the reason rather than channel closure. `tx.is_closed()` is the
+/// engine-wide signal (the whole demux is gone); the per-request signal is the
+/// abort reason. The reason is set with `Release` and read with `Acquire` so
+/// the abort is ordered against the frontend dropping the request's stream
+/// state.
 #[derive(Clone)]
 pub struct TokenSink {
     tag: RequestTag,
     tx: TokenStreamSender,
-    cancelled: Arc<AtomicBool>,
+    abort_reason: Arc<AtomicU8>,
 }
 
 impl TokenSink {
-    pub fn new(tag: RequestTag, tx: TokenStreamSender, cancelled: Arc<AtomicBool>) -> Self {
-        Self { tag, tx, cancelled }
+    pub fn new(tag: RequestTag, tx: TokenStreamSender, abort_reason: Arc<AtomicU8>) -> Self {
+        Self {
+            tag,
+            tx,
+            abort_reason,
+        }
     }
 
     /// Emit one event for this request. Returns `Err` (handing the event back)
-    /// when the request was cancelled or the shared receiver is gone — both of
+    /// when the request was aborted or the shared receiver is gone — both of
     /// which the scheduler reads as "consumer dropped, retire the request",
     /// the same contract as the old per-request channel.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, event: TokenEvent) -> Result<(), mpsc::error::SendError<TokenEvent>> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.abort_reason() != RequestAbortReason::None {
             return Err(mpsc::error::SendError(event));
         }
         self.tx.send((self.tag.clone(), event)).map_err(|err| {
@@ -227,9 +232,26 @@ impl TokenSink {
         })
     }
 
-    /// `true` once the request is cancelled or the shared receiver is gone.
+    /// `true` once the request is aborted or the shared receiver is gone.
     pub fn is_closed(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) || self.tx.is_closed()
+        self.abort_reason() != RequestAbortReason::None || self.tx.is_closed()
+    }
+
+    /// `true` once the frontend explicitly cancelled this request after the
+    /// stream had already started.
+    pub fn is_cancelled(&self) -> bool {
+        self.abort_reason() == RequestAbortReason::Cancelled
+    }
+
+    /// `true` once the frontend observed a client disconnect before the first
+    /// response chunk for this request reached the client.
+    pub fn is_disconnected(&self) -> bool {
+        self.abort_reason() == RequestAbortReason::Disconnected
+    }
+
+    /// Current per-request abort reason.
+    pub fn abort_reason(&self) -> RequestAbortReason {
+        RequestAbortReason::from_raw(self.abort_reason.load(Ordering::Acquire))
     }
 
     /// The request id this sink tags its events with.
@@ -243,8 +265,34 @@ impl TokenSink {
     /// receiver yields the tagged events; the cancel flag is never tripped.
     pub fn standalone() -> (Self, TokenStreamReceiver) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let sink = Self::new(Arc::from("local"), tx, Arc::new(AtomicBool::new(false)));
+        let sink = Self::new(
+            Arc::from("local"),
+            tx,
+            Arc::new(AtomicU8::new(RequestAbortReason::None as u8)),
+        );
         (sink, rx)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RequestAbortReason {
+    None = 0,
+    Cancelled = 1,
+    Disconnected = 2,
+}
+
+impl RequestAbortReason {
+    pub fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Cancelled,
+            2 => Self::Disconnected,
+            _ => Self::None,
+        }
+    }
+
+    pub fn store(self, abort_reason: &AtomicU8) {
+        abort_reason.store(self as u8, Ordering::Release);
     }
 }
 
@@ -616,6 +664,73 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::unbounded_channel::<EngineCommand>();
         let handle = EngineHandle::new_with_command_channel(command_tx);
         assert!(handle.supports_lora_control());
+    }
+
+    #[test]
+    fn token_sink_distinguishes_cancelled_from_closed_receiver() {
+        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = TokenSink::new(Arc::from("request-a"), tx, Arc::clone(&abort_reason));
+
+        assert!(!sink.is_cancelled());
+        assert!(!sink.is_disconnected());
+        assert!(!sink.is_closed());
+        sink.send(TokenEvent::Token {
+            id: 7,
+            logprob: None,
+        })
+        .expect("uncancelled sink should send");
+        assert_eq!(rx.try_recv().expect("tagged event").0.as_ref(), "request-a");
+
+        RequestAbortReason::Cancelled.store(&abort_reason);
+        assert!(sink.is_cancelled());
+        assert!(!sink.is_disconnected());
+        assert!(sink.is_closed());
+        assert!(
+            sink.send(TokenEvent::Token {
+                id: 8,
+                logprob: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn token_sink_closed_receiver_is_not_explicit_cancel() {
+        let (sink, rx) = TokenSink::standalone();
+
+        drop(rx);
+
+        assert!(!sink.is_cancelled());
+        assert!(!sink.is_disconnected());
+        assert!(sink.is_closed());
+        assert!(
+            sink.send(TokenEvent::Token {
+                id: 7,
+                logprob: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn token_sink_distinguishes_disconnected_from_cancelled() {
+        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = TokenSink::new(Arc::from("request-a"), tx, Arc::clone(&abort_reason));
+
+        RequestAbortReason::Disconnected.store(&abort_reason);
+
+        assert!(!sink.is_cancelled());
+        assert!(sink.is_disconnected());
+        assert!(sink.is_closed());
+        assert!(
+            sink.send(TokenEvent::Token {
+                id: 7,
+                logprob: None,
+            })
+            .is_err()
+        );
     }
 
     #[tokio::test]

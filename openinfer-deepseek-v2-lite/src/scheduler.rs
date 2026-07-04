@@ -144,6 +144,8 @@ impl MixedRequestScheduler {
                         FinishReason::Error,
                         0,
                         Some(&message),
+                        self.active.len(),
+                        self.pending.len(),
                     );
                     let _ = pending.token_tx.send(TokenEvent::Rejected {
                         message,
@@ -151,7 +153,12 @@ impl MixedRequestScheduler {
                         completion_tokens: 0,
                     });
                 }
-                Err(scheduled) => log_schedule_disconnect_trace(&pending, &scheduled),
+                Err(scheduled) => log_schedule_disconnect_trace(
+                    &pending,
+                    &scheduled,
+                    self.active.len(),
+                    self.pending.len(),
+                ),
             }
         }
 
@@ -159,14 +166,27 @@ impl MixedRequestScheduler {
             match send_scheduled(&pending) {
                 Ok(scheduled) => {
                     let _ = send_prompt_echo(&pending);
-                    log_pending_terminal_trace(&pending, &scheduled, FinishReason::Length, 0, None);
+                    log_pending_terminal_trace(
+                        &pending,
+                        &scheduled,
+                        FinishReason::Length,
+                        0,
+                        None,
+                        self.active.len(),
+                        self.pending.len(),
+                    );
                     let _ = pending.token_tx.send(TokenEvent::Finished {
                         finish_reason: FinishReason::Length,
                         prompt_tokens: pending.prompt_tokens.len(),
                         completion_tokens: 0,
                     });
                 }
-                Err(scheduled) => log_schedule_disconnect_trace(&pending, &scheduled),
+                Err(scheduled) => log_schedule_disconnect_trace(
+                    &pending,
+                    &scheduled,
+                    self.active.len(),
+                    self.pending.len(),
+                ),
             }
         }
 
@@ -186,18 +206,26 @@ impl MixedRequestScheduler {
         let scheduled = match send_scheduled(&pending) {
             Ok(scheduled) => scheduled,
             Err(scheduled) => {
-                log_schedule_disconnect_trace(&pending, &scheduled);
+                log_schedule_disconnect_trace(
+                    &pending,
+                    &scheduled,
+                    self.active.len(),
+                    self.pending.len(),
+                );
                 return None;
             }
         };
 
         if !send_prompt_echo(&pending) {
+            let terminal_message = terminal_send_failure_message(&pending.token_tx, "prompt echo");
             log_pending_terminal_trace(
                 &pending,
                 &scheduled,
                 FinishReason::Error,
                 0,
-                Some("client disconnected before prompt echo"),
+                Some(&terminal_message),
+                self.active.len(),
+                self.pending.len(),
             );
             return None;
         }
@@ -221,6 +249,8 @@ impl MixedRequestScheduler {
                     prompt_len,
                     prefill_start.elapsed().as_secs_f64() * 1000.0,
                     &message,
+                    self.active.len(),
+                    self.pending.len(),
                 );
                 let _ = pending.token_tx.send(TokenEvent::Error {
                     message,
@@ -253,9 +283,11 @@ impl MixedRequestScheduler {
                 prefill_ms,
             ),
         };
-        active.trace.note_active_set(self.active.len() + 1);
+        active
+            .trace
+            .note_scheduler_state(self.active.len() + 1, self.pending.len());
 
-        if active.emit_token_or_finish(next) {
+        if active.emit_token_or_finish(next, self.active.len(), self.pending.len()) {
             return None;
         }
         Some(active)
@@ -268,11 +300,14 @@ impl MixedRequestScheduler {
             return;
         }
         for state in &mut self.active {
-            state.trace.note_active_set(active_set_size);
+            state
+                .trace
+                .note_scheduler_state(active_set_size, self.pending.len());
         }
         if active_set_size == 1 {
             let row = self.active.pop().expect("single active row present");
-            if let Some(survivor) = self.decode_single_row((0, row)) {
+            let mut active_remaining = active_set_size;
+            if let Some(survivor) = self.decode_single_row((0, row), &mut active_remaining) {
                 self.active.push(survivor.1);
             }
             return;
@@ -280,19 +315,29 @@ impl MixedRequestScheduler {
 
         if let Some(position) = common_decode_position(&self.active) {
             let rows: Vec<_> = self.active.drain(..).enumerate().collect();
-            self.active = restore_surviving_rows(self.decode_batch_group(position, rows));
+            let mut active_remaining = active_set_size;
+            self.active = restore_surviving_rows(self.decode_batch_group(
+                position,
+                rows,
+                &mut active_remaining,
+            ));
             return;
         }
 
         let groups = take_decode_position_groups(&mut self.active);
         let mut survivors = Vec::new();
+        let mut active_remaining = active_set_size;
         for group in groups {
             if group.rows.len() > 1 {
-                survivors.extend(self.decode_batch_group(group.position, group.rows));
+                survivors.extend(self.decode_batch_group(
+                    group.position,
+                    group.rows,
+                    &mut active_remaining,
+                ));
             } else {
                 let mut rows = group.rows;
                 if let Some(row) = rows.pop() {
-                    if let Some(survivor) = self.decode_single_row(row) {
+                    if let Some(survivor) = self.decode_single_row(row, &mut active_remaining) {
                         survivors.push(survivor);
                     }
                 }
@@ -303,11 +348,22 @@ impl MixedRequestScheduler {
 
     fn retire_bad_cache_positions(&mut self) {
         let config = self.generator.config();
+        let active_set_size = self.active.len();
+        let pending_queue_size = self.pending.len();
+        let mut active_set_size_after_terminal = active_set_size;
         let mut survivors = Vec::with_capacity(self.active.len());
         for state in self.active.drain(..) {
             match state.cache_position(config) {
                 Ok(()) => survivors.push(state),
-                Err(message) => state.emit_error(message.to_string()),
+                Err(message) => {
+                    active_set_size_after_terminal =
+                        active_set_size_after_terminal.saturating_sub(1);
+                    state.emit_error(
+                        message.to_string(),
+                        active_set_size_after_terminal,
+                        pending_queue_size,
+                    );
+                }
             }
         }
         self.active = survivors;
@@ -317,6 +373,7 @@ impl MixedRequestScheduler {
         &mut self,
         position: usize,
         rows: Vec<(usize, ActiveRequestState)>,
+        active_remaining: &mut usize,
     ) -> Vec<(usize, ActiveRequestState)> {
         let group_size = rows.len();
         let (indices, mut states): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
@@ -344,13 +401,20 @@ impl MixedRequestScheduler {
         );
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
+        let pending_queue_size = self.pending.len();
         match result {
             Ok(next_tokens) if next_tokens.len() == group_size => {
                 for (state, cache) in states.iter_mut().zip(caches) {
                     state.cache = cache;
                     state.trace.note_decode_step(group_size, decode_ms);
                 }
-                apply_decoded_tokens_to_rows(indices, states, next_tokens)
+                apply_decoded_tokens_to_rows(
+                    indices,
+                    states,
+                    next_tokens,
+                    active_remaining,
+                    pending_queue_size,
+                )
             }
             // The batched path mutates per-row caches as it advances through the
             // model. This gate avoids full-cache rollback clones; a batch decode
@@ -363,6 +427,8 @@ impl MixedRequestScheduler {
                         next_tokens.len(),
                         group_size
                     ),
+                    active_remaining,
+                    pending_queue_size,
                 );
                 Vec::new()
             }
@@ -373,6 +439,8 @@ impl MixedRequestScheduler {
                         "DeepSeek-V2-Lite batched decode failed for {} active requests: {err}",
                         group_size
                     ),
+                    active_remaining,
+                    pending_queue_size,
                 );
                 Vec::new()
             }
@@ -382,6 +450,7 @@ impl MixedRequestScheduler {
     fn decode_single_row(
         &mut self,
         (idx, mut state): (usize, ActiveRequestState),
+        active_remaining: &mut usize,
     ) -> Option<(usize, ActiveRequestState)> {
         let token = state.last_token;
         let position = state.next_decode_position();
@@ -399,10 +468,17 @@ impl MixedRequestScheduler {
         match result {
             Ok(next) => {
                 state.trace.note_decode_step(1, decode_ms);
-                (!state.emit_token_or_finish(next)).then_some((idx, state))
+                let terminal_active_set_size = active_remaining.saturating_sub(1);
+                if state.emit_token_or_finish(next, terminal_active_set_size, self.pending.len()) {
+                    *active_remaining = terminal_active_set_size;
+                    None
+                } else {
+                    Some((idx, state))
+                }
             }
             Err(err) => {
-                state.emit_error(err.to_string());
+                *active_remaining = active_remaining.saturating_sub(1);
+                state.emit_error(err.to_string(), *active_remaining, self.pending.len());
                 None
             }
         }
@@ -413,19 +489,33 @@ fn apply_decoded_tokens_to_rows(
     indices: Vec<usize>,
     states: Vec<ActiveRequestState>,
     next_tokens: Vec<u32>,
+    active_remaining: &mut usize,
+    pending_queue_size: usize,
 ) -> Vec<(usize, ActiveRequestState)> {
     indices
         .into_iter()
         .zip(states.into_iter().zip(next_tokens))
         .filter_map(|(idx, (mut state, token))| {
-            (!state.emit_token_or_finish(token)).then_some((idx, state))
+            let terminal_active_set_size = active_remaining.saturating_sub(1);
+            if state.emit_token_or_finish(token, terminal_active_set_size, pending_queue_size) {
+                *active_remaining = terminal_active_set_size;
+                None
+            } else {
+                Some((idx, state))
+            }
         })
         .collect()
 }
 
-fn retire_rows_with_error(states: Vec<ActiveRequestState>, message: String) {
+fn retire_rows_with_error(
+    states: Vec<ActiveRequestState>,
+    message: String,
+    active_remaining: &mut usize,
+    pending_queue_size: usize,
+) {
     for state in states {
-        state.emit_error(message.clone());
+        *active_remaining = active_remaining.saturating_sub(1);
+        state.emit_error(message.clone(), *active_remaining, pending_queue_size);
     }
 }
 
@@ -462,10 +552,20 @@ impl ActiveRequestState {
         Ok(())
     }
 
-    fn emit_token_or_finish(&mut self, token: u32) -> bool {
+    fn emit_token_or_finish(
+        &mut self,
+        token: u32,
+        active_set_size_at_terminal: usize,
+        pending_queue_size_at_terminal: usize,
+    ) -> bool {
         self.last_token = token;
         if !self.finish_policy.ignore_eos && token == self.finish_policy.eos_token_id {
-            self.log_http_trace(FinishReason::Stop, None);
+            self.log_http_trace(
+                FinishReason::Stop,
+                None,
+                active_set_size_at_terminal,
+                pending_queue_size_at_terminal,
+            );
             let _ = self.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: self.prompt_len,
@@ -487,9 +587,12 @@ impl ActiveRequestState {
             })
             .is_err()
         {
+            let terminal_message = terminal_send_failure_message(&self.token_tx, "token emit");
             self.log_http_trace(
                 FinishReason::Error,
-                Some("client disconnected before token emit"),
+                Some(&terminal_message),
+                active_set_size_at_terminal,
+                pending_queue_size_at_terminal,
             );
             return true;
         }
@@ -499,7 +602,12 @@ impl ActiveRequestState {
         self.generated += 1;
 
         if self.generated == self.max_tokens {
-            self.log_http_trace(FinishReason::Length, None);
+            self.log_http_trace(
+                FinishReason::Length,
+                None,
+                active_set_size_at_terminal,
+                pending_queue_size_at_terminal,
+            );
             let _ = self.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
                 prompt_tokens: self.prompt_len,
@@ -510,8 +618,18 @@ impl ActiveRequestState {
         false
     }
 
-    fn emit_error(self, message: String) {
-        self.log_http_trace(FinishReason::Error, Some(&message));
+    fn emit_error(
+        mut self,
+        message: String,
+        active_set_size_at_terminal: usize,
+        pending_queue_size_at_terminal: usize,
+    ) {
+        self.log_http_trace(
+            FinishReason::Error,
+            Some(&message),
+            active_set_size_at_terminal,
+            pending_queue_size_at_terminal,
+        );
         let _ = self.token_tx.send(TokenEvent::Error {
             message,
             prompt_tokens: self.prompt_len,
@@ -519,7 +637,15 @@ impl ActiveRequestState {
         });
     }
 
-    fn log_http_trace(&self, finish_reason: FinishReason, error: Option<&str>) {
+    fn log_http_trace(
+        &mut self,
+        finish_reason: FinishReason,
+        error: Option<&str>,
+        active_set_size_at_terminal: usize,
+        pending_queue_size_at_terminal: usize,
+    ) {
+        self.trace
+            .note_terminal_state(active_set_size_at_terminal, pending_queue_size_at_terminal);
         log_http_trace(
             trace_request_id(self.request_id.as_deref(), &self.token_tx),
             &self.trace,
@@ -567,6 +693,16 @@ fn send_prompt_echo(pending: &PendingRequest) -> bool {
         .is_ok()
 }
 
+fn terminal_send_failure_message(token_tx: &TokenSink, stage: &str) -> String {
+    if token_tx.is_disconnected() {
+        format!("client disconnected before {stage}")
+    } else if token_tx.is_cancelled() {
+        format!("client cancelled before {stage}")
+    } else {
+        format!("client disconnected before {stage}")
+    }
+}
+
 fn trace_request_id<'a>(request_id: Option<&'a str>, token_tx: &'a TokenSink) -> &'a str {
     request_id.unwrap_or_else(|| token_tx.tag().as_ref())
 }
@@ -577,8 +713,12 @@ fn log_pending_terminal_trace(
     finish_reason: FinishReason,
     completion_tokens: usize,
     error: Option<&str>,
+    active_set_size_at_terminal: usize,
+    pending_queue_size_at_terminal: usize,
 ) {
-    let trace = RequestTrace::terminal(scheduled.queued_at_unix_s, scheduled.scheduled_at_unix_s);
+    let mut trace =
+        RequestTrace::terminal(scheduled.queued_at_unix_s, scheduled.scheduled_at_unix_s);
+    trace.note_terminal_state(active_set_size_at_terminal, pending_queue_size_at_terminal);
     log_http_trace(
         trace_request_id(pending.request_id.as_deref(), &pending.token_tx),
         &trace,
@@ -589,13 +729,23 @@ fn log_pending_terminal_trace(
     );
 }
 
-fn log_schedule_disconnect_trace(pending: &PendingRequest, scheduled: &ScheduledTrace) {
+fn log_schedule_disconnect_trace(
+    pending: &PendingRequest,
+    scheduled: &ScheduledTrace,
+    active_set_size_at_terminal: usize,
+    pending_queue_size_at_terminal: usize,
+) {
     log_pending_terminal_trace(
         pending,
         scheduled,
         FinishReason::Error,
         0,
-        Some("client disconnected before scheduled event"),
+        Some(&terminal_send_failure_message(
+            &pending.token_tx,
+            "scheduled event",
+        )),
+        active_set_size_at_terminal,
+        pending_queue_size_at_terminal,
     );
 }
 
@@ -605,11 +755,14 @@ fn log_prefill_error_trace(
     prompt_tokens: usize,
     prefill_ms: f64,
     message: &str,
+    active_set_size_at_terminal: usize,
+    pending_queue_size_at_terminal: usize,
 ) {
     let mut trace =
         RequestTrace::terminal(scheduled.queued_at_unix_s, scheduled.scheduled_at_unix_s);
     trace.prefill_done_unix_s = Some(unix_now_s());
     trace.prefill_ms = Some(prefill_ms);
+    trace.note_terminal_state(active_set_size_at_terminal, pending_queue_size_at_terminal);
     log_http_trace(
         trace_request_id(pending.request_id.as_deref(), &pending.token_tx),
         &trace,

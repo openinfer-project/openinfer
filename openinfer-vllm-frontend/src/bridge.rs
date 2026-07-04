@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, atomic::AtomicU8};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +23,8 @@ use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use openinfer_engine::engine::{
-    EngineHandle, GenerateRequest, RequestTag, TokenEvent, TokenSink, TokenStreamReceiver,
+    EngineHandle, GenerateRequest, RequestAbortReason, RequestTag, TokenEvent, TokenSink,
+    TokenStreamReceiver,
 };
 
 use crate::wire::{
@@ -112,7 +112,7 @@ impl LocalEngineBridge {
 
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
-        // in `streams`, keyed by the same tag, and holds the cancel flag the
+        // in `streams`, keyed by the same tag, and holds the abort reason the
         // scheduler observes (via `TokenSink`) when an abort flips it.
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let mut streams: HashMap<RequestTag, RequestStreamState> = HashMap::new();
@@ -149,7 +149,7 @@ impl LocalEngineBridge {
         // Cancel every in-flight request so the scheduler retires them on its
         // next emit instead of pushing into a channel no one drains.
         for state in streams.values() {
-            state.cancelled.store(true, Ordering::Release);
+            state.abort(RequestAbortReason::Cancelled);
         }
         drop(output_tx);
         output_task.abort();
@@ -182,14 +182,23 @@ impl LocalEngineBridge {
                 let request_ids: Vec<String> =
                     vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
                 for request_id in request_ids {
-                    // Drop our state first, then flip the cancel flag (so the
+                    // Drop our state first, then set the abort reason (so the
                     // scheduler's next emit fails and retires the request). The
                     // `Release` store orders the `streams.remove` before the
-                    // flag the scheduler reads with `Acquire`; any token already
-                    // in flight for this id is discarded by the demux when it
-                    // finds no stream entry.
+                    // reason the scheduler reads with `Acquire`; any token
+                    // already in flight for this id is discarded by the demux
+                    // when it finds no stream entry. An abort before the first
+                    // token output reached the frontend is a disconnect; after
+                    // that first token it is stream cancellation. Scheduled
+                    // metadata can flush with the first engine output but is
+                    // not enough to prove a client-visible token.
                     if let Some(state) = streams.remove(request_id.as_str()) {
-                        state.cancelled.store(true, Ordering::Release);
+                        let reason = if state.has_emitted_tokens {
+                            RequestAbortReason::Cancelled
+                        } else {
+                            RequestAbortReason::Disconnected
+                        };
+                        state.abort(reason);
                     }
                 }
                 Ok(())
@@ -262,8 +271,8 @@ impl LocalEngineBridge {
         }
 
         let tag: RequestTag = Arc::from(request_id.as_str());
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let token_tx = TokenSink::new(tag.clone(), event_tx.clone(), Arc::clone(&cancelled));
+        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
+        let token_tx = TokenSink::new(tag.clone(), event_tx.clone(), Arc::clone(&abort_reason));
         self.handle
             .submit(GenerateRequest {
                 request_id: Some(request_id),
@@ -278,29 +287,35 @@ impl LocalEngineBridge {
             })
             .context("failed to submit request to scheduler")?;
 
-        streams.insert(tag, RequestStreamState::new(cancelled));
+        streams.insert(tag, RequestStreamState::new(abort_reason));
         Ok(())
     }
 }
 
 /// Per-request demux state held by the bridge loop, keyed by [`RequestTag`].
 /// Replaces the former per-request task's locals; `first_token_*` flush onto
-/// the request's first output, `cancelled` is the flag the scheduler's
+/// the request's first output, `abort_reason` is the state the scheduler's
 /// [`TokenSink`] checks so an abort retires the request without closing the
 /// shared channel.
 struct RequestStreamState {
     first_token_events: Option<Vec<EngineCoreEvent>>,
     first_token_prefill_stats: Option<PrefillStats>,
-    cancelled: Arc<AtomicBool>,
+    abort_reason: Arc<AtomicU8>,
+    has_emitted_tokens: bool,
 }
 
 impl RequestStreamState {
-    fn new(cancelled: Arc<AtomicBool>) -> Self {
+    fn new(abort_reason: Arc<AtomicU8>) -> Self {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
-            cancelled,
+            abort_reason,
+            has_emitted_tokens: false,
         }
+    }
+
+    fn abort(&self, reason: RequestAbortReason) {
+        reason.store(&self.abort_reason);
     }
 }
 
@@ -343,6 +358,9 @@ fn dispatch_burst(
         };
         let (output, terminated) = reduce_request(&tag, state, events);
         if let Some(output) = output {
+            if !output.new_token_ids.is_empty() {
+                state.has_emitted_tokens = true;
+            }
             outputs.push(output);
         }
         if terminated {

@@ -1,8 +1,8 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The retained vLLM TP2/EP2 matrix adds reproducible HTTP pressure evidence and preserves stock vLLM setup failures on this SM120/CUDA 12.8 stack. It is a benchmark snapshot, not a vLLM parity or production serving claim.
+> **TL;DR:** DeepSeek-V2-Lite has an EP2 correctness contract across HF, host-staged, and NCCL. The retained HTTP gates now cover mixed-request serving, traceable scheduler lifecycle, and a replayable reliability runner for cancel/disconnect/reject/overload recovery. This is reliability evidence only, not a vLLM parity, production serving, sparse dispatch, multi-node, or throughput-optimization claim.
 
-Last touched: 2026-06
+Last touched: 2026-07
 
 ## Capability Contract
 
@@ -22,6 +22,7 @@ Last touched: 2026-06
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
 | HTTP trace and position-subgroup decode batching | HTTP evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups while letting singleton or lagging positions decode independently. The 2026-06-24 2x RTX 5090 NCCL HTTP sweeps below complete short same-shape, 128-word smoke, and mixed 16/128-word cells with full trace coverage. |
+| HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
 
@@ -38,6 +39,8 @@ The retained correctness gate is deliberately narrow:
 The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-28 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, no comparison warnings, token hash `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`, and text hash `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 
 The mixed-request serving E2E computes sequential greedy token-id oracles with `DeepSeekV2LiteEp2Generator::generate_greedy`, then submits concurrent requests through `start_engine`. The retained 2026-06-23 run covers same-length mixed prompts for same-position batch decode, different-length mixed prompts for single-row decode fallback, and a valid request submitted beside an invalid `logprobs` request to prove explicit rejection does not poison the valid stream. Host-staged and NCCL both passed the mixed-serving E2E.
+
+The HTTP reliability gate is intentionally separate from the mixed-serving E2E. It proves that the serving bridge and scheduler surface terminal states in a machine-readable way, then uses a clean follow-up request after every failure scenario to show state recovery. Rejected requests that fail in the HTTP/frontend guard may have no scheduler trace; rejected requests admitted to the DSV2-Lite scheduler must have `openinfer_http_trace` terminal evidence. Cancelled and disconnected streams are classified separately by the request-local `TokenSink` cancellation flag versus a closed shared channel.
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, because the same model snapshot has produced different exact greedy text on those hosts while still matching HF on each host. Do not use the static hash pair list as a substitute for the same-host HF comparison when changing accuracy-sensitive code.
 
@@ -134,11 +137,86 @@ Mixed-shape proof: `prompt_words=16,128`, `num_requests=8` per repeat, four shor
 
 Interpretation: the old long-prompt prefill failure is fixed for this HTTP contract, and the post-fastpath rerun lifts mixed 16/128 throughput a bit, but the row is still dominated by long-prompt prefill and admission queueing. The c4/c8 rows prove subgroup batching can happen with mixed prompt lengths (`decode_batch_size_max=2` here), yet the latency profile is not a production serving claim.
 
+### Issue #453 No-Regression HTTP Benchmark
+
+Retained 2026-07-04 no-regression benchmark for #453 used real `/v1/completions` traffic after the reliability gate. Both host-staged and NCCL completed every cell with `failed=0`, `timeouts=0`, and full trace coverage (`missing_traces=[]`). The short same-shape rows use `prompt_words=64`, `max_tokens=64`, and concurrency `1/4/8`; the mixed rows use `prompt_words=16,128`, `max_tokens=16`, and concurrency `4/8`.
+
+| Backend | Shape | Completed | Failed/timeouts | Output tok/s | TTFT avg ms | TPOT/ITL avg ms | active max | decode batch max | traces | output hash |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| host-staged | short `64/64`, c1 | 8/8 | 0/0 | 22.886 | 1226.8 | 24.9 | 1 | 1 | 8/8 | `fed09e819c83762a` |
+| host-staged | short `64/64`, c4 | 8/8 | 0/0 | 21.698 | 2612.8 | 145.1 | 4 | 3 | 8/8 | `fed09e819c83762a` |
+| host-staged | short `64/64`, c8 | 8/8 | 0/0 | 21.830 | 5439.8 | 284.2 | 8 | 5 | 8/8 | `fed09e819c83762a` |
+| host-staged | mixed `16/128`, c4 | 8/8 | 0/0 | 8.281 | 4543.3 | 210.0 | 4 | 2 | 8/8 | `88d8d31234d66978` |
+| host-staged | mixed `16/128`, c8 | 8/8 | 0/0 | 8.288 | 7897.1 | 496.9 | 8 | 3 | 8/8 | `88d8d31234d66978` |
+| NCCL | short `64/64`, c1 | 8/8 | 0/0 | 24.873 | 1034.2 | 24.4 | 1 | 1 | 8/8 | `fed09e819c83762a` |
+| NCCL | short `64/64`, c4 | 8/8 | 0/0 | 23.678 | 2210.0 | 135.8 | 4 | 3 | 8/8 | `fed09e819c83762a` |
+| NCCL | short `64/64`, c8 | 8/8 | 0/0 | 23.872 | 4594.4 | 266.1 | 8 | 6 | 8/8 | `fed09e819c83762a` |
+| NCCL | mixed `16/128`, c4 | 8/8 | 0/0 | 9.186 | 2216.6 | 314.9 | 4 | 1 | 8/8 | `88d8d31234d66978` |
+| NCCL | mixed `16/128`, c8 | 8/8 | 0/0 | 9.269 | 6920.1 | 453.0 | 8 | 3 | 8/8 | `88d8d31234d66978` |
+
+This table is a no-regression and trace-coverage record. It is not a throughput optimization claim.
+
+### Issue #453 HTTP Reliability Gate
+
+The #453 runner is `scripts/bench_dsv2lite_http_reliability.py`. It uses standard-library HTTP streaming against `/v1/completions`, parses `openinfer_http_trace` from the server log, and writes one JSON artifact with per-scenario counts, output hashes, trace coverage, active/pending/decode maxima, terminal reasons, final healthy-baseline status, and clean follow-up results.
+
+Scenarios covered by the runner:
+
+- `cancel_disconnect`: closes a streaming request after the first token, closes another connection after early bytes, keeps a neighboring request completing, then sends a clean follow-up.
+- `invalid_requests`: sends non-greedy, `logprobs`, empty-prompt, and over-context requests beside a valid neighbor, then sends a clean follow-up.
+- `overload_active_cap`: sends more concurrent requests than the DSV2-Lite active cap (`DEFAULT_MAX_ACTIVE_REQUESTS=8`) and requires pending-queue trace evidence plus clean recovery.
+- `mixed_short_long_with_failures`: mixes 16-word and 128-word prompts with a cancelled stream and a rejected request, then sends a clean follow-up.
+
+Strict failure rules:
+
+- missing terminal trace fails, except for HTTP/frontend guard rejections that never reach the DSV2-Lite scheduler;
+- a clean follow-up failure fails;
+- success-hash drift within the same request kind fails;
+- unexplained timeout fails;
+- missing expected terminal reasons (`completed`, `rejected`, `cancelled`, `disconnected`) fail;
+- missing active-set pressure, pending-queue pressure, or decode-batch evidence fails in scenarios that require it.
+
+Validation completed for the runner schema, runner false-positive guards, scheduler accounting, the shared token-sink cancel/disconnect contract, host-staged/NCCL E2E exactness, and live host-staged/NCCL HTTP reliability:
+
+```bash
+python3 scripts/bench_dsv2lite_http_reliability.py --dry-run --out <artifact>.json
+python3 -m py_compile scripts/bench_dsv2lite_http_reliability.py tests/test_bench_dsv2lite_http_reliability.py
+python3 -m unittest tests.test_bench_dsv2lite_http_reliability
+cargo test --release -p openinfer-engine --lib token_sink -- --nocapture
+cargo test --release -p openinfer-vllm-frontend --lib abort -- --nocapture
+cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --lib scheduler -- --nocapture
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite OPENINFER_DSV2_LITE_EP_BACKEND=host-staged cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite OPENINFER_DSV2_LITE_EP_BACKEND=nccl cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+```
+
+The local dry-run passed all four scenarios and emits deterministic JSON. `tests/test_bench_dsv2lite_http_reliability.py` passed and verifies that the runner fails when a client-observed disconnect lacks a matching scheduler terminal reason or when trace fields are missing. `cargo test --release -p openinfer-engine --lib token_sink -- --nocapture` passed and verifies explicit cancel versus closed receiver behavior. `cargo test --release -p openinfer-vllm-frontend --lib abort -- --nocapture` passed and verifies that frontend aborts drop late tokens and classify disconnect before the first client-visible token separately from cancel after token output. The DSV2-Lite scheduler lifecycle subset passed `23 passed; 0 failed`; host-staged and NCCL `e2e_ep2` each passed `1 passed; 0 failed`. The SM120 NCCL validation used an NCCL 2.30.7 runtime library.
+
+Retained 2026-07-04 live HTTP reliability artifacts from real `/v1/completions` traffic:
+
+| Backend | Artifact | SHA-256 | Result | Scenario coverage |
+| --- | --- | --- | --- | --- |
+| host-staged | `http_reliability_host_staged.json` | `832d65a8e8b2b3a6ad0100c4a35f38475f040d6ffc192ec38a3b7384167187a5` | passed | cancel/disconnect, invalid requests, overload active-cap, mixed short/long with failures, clean follow-up after every scenario |
+| NCCL | `http_reliability_nccl.json` | `53bedd98f19c5241df588a1ade8756e84a5e8c99225a589c4ed303e90fba38fa` | passed | cancel/disconnect, invalid requests, overload active-cap, mixed short/long with failures, clean follow-up after every scenario |
+
+Scenario summaries:
+
+| Backend | Scenario | Counts | Terminal reasons | Trace maxima | Final baseline |
+| --- | --- | --- | --- | --- | --- |
+| host-staged | `cancel_disconnect` | completed `2`, cancelled `1`, disconnected `1`, failed/rejected/timeout `0` | cancelled `1`, disconnected `1`, completed_length `2` | active `2`, pending `0`, decode `1` | healthy |
+| host-staged | `invalid_requests` | completed `2`, rejected `4`, failed/timeout `0` | rejected and completed_length observed | active `1`, pending `0`, decode `1` | healthy |
+| host-staged | `overload_active_cap` | completed `13`, failed/rejected/timeout `0` | completed_length `13` | active `8`, pending `4`, decode `7` | healthy |
+| host-staged | `mixed_short_long_with_failures` | completed `5`, cancelled `1`, rejected `1`, failed/timeout `0` | cancelled, rejected, completed_length observed | active `4`, pending `0`, decode `2` | healthy |
+| NCCL | `cancel_disconnect` | completed `2`, cancelled `1`, disconnected `1`, failed/rejected/timeout `0` | cancelled `1`, disconnected `1`, completed_length `2` | active `2`, pending `0`, decode `1` | healthy |
+| NCCL | `invalid_requests` | completed `2`, rejected `4`, failed/timeout `0` | rejected and completed_length observed | active `1`, pending `0`, decode `1` | healthy |
+| NCCL | `overload_active_cap` | completed `13`, failed/rejected/timeout `0` | completed_length `13` | active `8`, pending `4`, decode `7` | healthy |
+| NCCL | `mixed_short_long_with_failures` | completed `5`, cancelled `1`, rejected `1`, failed/timeout `0` | cancelled, rejected, completed_length observed | active `5`, pending `0`, decode `2` | healthy |
+
 ### Interpretation
 
 - direct same-prompt diagnostics show NCCL is still much slower than host-staged, although aggregate decode throughput improves with larger diagnostic batch size;
 - NCCL remains a correctness-first backend and is still significantly slower than host-staged;
 - the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
+- the #453 runner and trace fields make failure isolation auditable; host-staged and NCCL live HTTP artifacts now prove cancel/disconnect/reject/overload/mixed-failure cleanup and clean follow-up recovery on the retained 2-GPU validation contract;
 - the 2026-06-28 clean matrix keeps stock vLLM startup failures visible because they are part of the reproducibility record;
 - the supplemental vLLM validation shows the HTTP contract can run after the FlashInfer SM120/CUDA 12.8 path is fixed, but it should stay separate from stock-package rows;
 - future performance claims should use the retained matrix contract, not older short-shape vLLM experiments.
@@ -153,6 +231,7 @@ Use these labels consistently:
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
 | `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows, and HTTP sweeps show non-1 `active_set_size` and `decode_batch_size_max`. | Fair vLLM parity, long-prompt latency readiness, or a before/after percentage unless a paired baseline run is recorded. |
+| `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
 | `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 from the retained matrix or the separate FlashInfer-fixed validation. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
@@ -200,6 +279,11 @@ The next implementation should be chosen from measured evidence:
    - reduce long-prompt prefill and admission-queue TTFT before claiming long-prompt serving readiness;
    - add paired baseline runs before claiming a percentage speedup from subgroup batching.
 
-5. Keep MoE internals readable.
+5. Keep the #453 HTTP reliability evidence retained.
+   - rerun the reliability runner for host-staged and NCCL when scheduler or HTTP lifecycle code changes;
+   - keep the JSON artifact hashes and server-log trace coverage in the PR evidence;
+   - keep #452 long/mixed-prompt latency, #465 soak, #466 SLO report, and #467 benchmark manifest separate.
+
+6. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;
    - avoid introducing a generic EP framework before the DeepSeek-V2-Lite EP2 path has a measured reason to need it.

@@ -7,7 +7,9 @@
 //! abort dropping late tokens. The full HTTP→ZMQ→bridge happy path is covered
 //! end to end by `openinfer-sim`'s `frontend_e2e` integration test (the CI gate).
 
-use openinfer_engine::engine::{FinishReason, TokenLogprob};
+use std::sync::atomic::Ordering;
+
+use openinfer_engine::engine::{FinishReason, RequestAbortReason, TokenLogprob};
 
 use super::*;
 
@@ -36,15 +38,15 @@ impl Demux {
         }
     }
 
-    /// Register a request as `start_request` does and return its cancel flag.
-    fn add(&mut self, id: &str) -> Arc<AtomicBool> {
+    /// Register a request as `start_request` does and return its abort reason.
+    fn add(&mut self, id: &str) -> Arc<AtomicU8> {
         let tag: RequestTag = Arc::from(id);
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         self.streams.insert(
             Arc::clone(&tag),
-            RequestStreamState::new(Arc::clone(&cancelled)),
+            RequestStreamState::new(Arc::clone(&abort_reason)),
         );
-        cancelled
+        abort_reason
     }
 
     fn emit(&self, id: &str, event: TokenEvent) {
@@ -333,10 +335,11 @@ fn burst_batches_multiple_requests_into_one_message() {
 #[test]
 fn aborted_request_drops_late_tokens() {
     let mut d = Demux::new();
-    let cancelled = d.add("req-abort");
+    let abort_reason = d.add("req-abort");
 
-    // Replicate the Abort handler: flip the cancel flag, drop the stream.
-    cancelled.store(true, Ordering::Relaxed);
+    // Replicate the Abort handler for a request that already emitted output:
+    // drop the stream and mark it as cancelled.
+    RequestAbortReason::Cancelled.store(&abort_reason);
     d.streams.remove("req-abort");
 
     d.emit(
@@ -350,6 +353,56 @@ fn aborted_request_drops_late_tokens() {
     assert!(
         d.next_output().is_none(),
         "no output is produced for an aborted request"
+    );
+}
+
+#[test]
+fn abort_reason_tracks_first_output_boundary() {
+    let mut d = Demux::new();
+    let disconnected = d.add("req-before-output");
+    let cancelled = d.add("req-after-output");
+
+    d.emit(
+        "req-after-output",
+        TokenEvent::Token {
+            id: 7,
+            logprob: None,
+        },
+    );
+    assert!(d.drain());
+    assert_eq!(d.next_output().expect("first output").outputs.len(), 1);
+    assert!(
+        d.streams
+            .get("req-after-output")
+            .is_some_and(|state| state.has_emitted_tokens)
+    );
+
+    let state = d
+        .streams
+        .remove("req-before-output")
+        .expect("disconnect stream");
+    let reason = if state.has_emitted_tokens {
+        RequestAbortReason::Cancelled
+    } else {
+        RequestAbortReason::Disconnected
+    };
+    state.abort(reason);
+
+    let state = d.streams.remove("req-after-output").expect("cancel stream");
+    let reason = if state.has_emitted_tokens {
+        RequestAbortReason::Cancelled
+    } else {
+        RequestAbortReason::Disconnected
+    };
+    state.abort(reason);
+
+    assert_eq!(
+        RequestAbortReason::from_raw(disconnected.load(Ordering::Acquire)),
+        RequestAbortReason::Disconnected
+    );
+    assert_eq!(
+        RequestAbortReason::from_raw(cancelled.load(Ordering::Acquire)),
+        RequestAbortReason::Cancelled
     );
 }
 

@@ -1,6 +1,6 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, atomic::AtomicU8};
 
-use openinfer_engine::engine::RequestTag;
+use openinfer_engine::engine::{RequestAbortReason, RequestTag};
 use openinfer_engine::sampler::SamplingParams;
 use tokio::sync::mpsc;
 
@@ -228,6 +228,44 @@ fn terminal_admission_events_keep_scheduler_contract() {
 }
 
 #[test]
+fn immediate_prefill_finish_reports_existing_active_count() {
+    let config = test_lite_config();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
+    let mut state = active_state("one-token", token_tx, 3, 0, 11, &config);
+    state.max_tokens = 1;
+
+    assert!(state.emit_token_or_finish(12, 2, 1));
+
+    match recv_event(&mut token_rx) {
+        TokenEvent::Token { id, .. } => assert_eq!(id, 12),
+        _ => panic!("expected first generated token"),
+    }
+    match recv_event(&mut token_rx) {
+        TokenEvent::Finished {
+            finish_reason,
+            completion_tokens,
+            ..
+        } => {
+            assert_eq!(finish_reason, FinishReason::Length);
+            assert_eq!(completion_tokens, 1);
+        }
+        _ => panic!("expected terminal length event"),
+    }
+
+    let payload = http_trace_payload(
+        "one-token",
+        &state.trace,
+        state.prompt_len,
+        state.generated,
+        FinishReason::Length,
+        None,
+    );
+    assert_eq!(payload["active_set_size_at_terminal"], 2);
+    assert_eq!(payload["pending_queue_size_at_terminal"], 1);
+    assert_eq!(payload["healthy_baseline_after_terminal"], false);
+}
+
+#[test]
 fn send_scheduled_returns_trace_when_client_is_closed() {
     let (pending, rx) = request("closed-before-schedule", 2, 1);
     drop(rx);
@@ -259,8 +297,8 @@ fn eos_retirement_is_independent_per_request() {
     let mut stop_state = active_state("stop", tx_stop, 3, 1, 10, &config);
     let mut live_state = active_state("live", tx_live, 2, 1, 11, &config);
 
-    assert!(stop_state.emit_token_or_finish(config.eos_token_id));
-    assert!(!live_state.emit_token_or_finish(12));
+    assert!(stop_state.emit_token_or_finish(config.eos_token_id, 2, 0));
+    assert!(!live_state.emit_token_or_finish(12, 2, 0));
 
     match recv_event(&mut rx_stop) {
         TokenEvent::Finished {
@@ -288,12 +326,16 @@ fn batch_decoded_tokens_retire_eos_independently() {
     let stop_state = active_state("stop", tx_stop, 3, 1, 10, &config);
     let live_state = active_state("live", tx_live, 3, 1, 11, &config);
 
+    let mut active_remaining = 2;
     let survivors = apply_decoded_tokens_to_rows(
         vec![0, 1],
         vec![stop_state, live_state],
         vec![config.eos_token_id, 12],
+        &mut active_remaining,
+        0,
     );
 
+    assert_eq!(active_remaining, 1);
     assert_eq!(survivors.len(), 1);
     assert_eq!(survivors[0].0, 1);
     assert_eq!(survivors[0].1.request_id.as_deref(), Some("live"));
@@ -319,7 +361,7 @@ fn batch_decoded_tokens_retire_eos_independently() {
 fn cancelled_token_sink_retires_request() {
     let config = test_lite_config();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
-    let cancelled = Arc::new(AtomicBool::new(true));
+    let cancelled = Arc::new(AtomicU8::new(RequestAbortReason::Cancelled as u8));
     let sink = TokenSink::new(
         RequestTag::from("cancelled"),
         stream_tx,
@@ -327,7 +369,7 @@ fn cancelled_token_sink_retires_request() {
     );
     let mut state = active_state("cancelled", sink, 2, 1, 11, &config);
 
-    assert!(state.emit_token_or_finish(12));
+    assert!(state.emit_token_or_finish(12, 1, 0));
     assert!(stream_rx.try_recv().is_err());
 }
 
@@ -338,7 +380,7 @@ fn closed_token_sink_retires_request() {
     drop(rx);
     let mut state = active_state("closed", sink, 2, 1, 11, &config);
 
-    assert!(state.emit_token_or_finish(12));
+    assert!(state.emit_token_or_finish(12, 1, 0));
 }
 
 #[test]
@@ -351,7 +393,9 @@ fn batch_decode_error_retires_all_active_requests() {
         active_state("second", second_tx, 4, 1, 12, &config),
     ];
 
-    retire_rows_with_error(active, "batch failed".to_string());
+    let mut active_remaining = 2;
+    retire_rows_with_error(active, "batch failed".to_string(), &mut active_remaining, 0);
+    assert_eq!(active_remaining, 0);
 
     match recv_event(&mut first_rx) {
         TokenEvent::Error {
@@ -389,7 +433,14 @@ fn subgroup_decode_error_retires_only_group_rows() {
     let _untouched = active_state("second", second_tx, 4, 1, 12, &config);
     let third = active_state("third", third_tx, 3, 2, 13, &config);
 
-    retire_rows_with_error(vec![first, third], "group failed".to_string());
+    let mut active_remaining = 3;
+    retire_rows_with_error(
+        vec![first, third],
+        "group failed".to_string(),
+        &mut active_remaining,
+        0,
+    );
+    assert_eq!(active_remaining, 1);
 
     match recv_event(&mut first_rx) {
         TokenEvent::Error { message, .. } => assert_eq!(message, "group failed"),
@@ -403,22 +454,136 @@ fn subgroup_decode_error_retires_only_group_rows() {
 }
 
 #[test]
+fn cross_group_terminal_accounting_uses_shared_active_remaining() {
+    let config = test_lite_config();
+    let (first_tx, mut first_rx) = TokenSink::standalone();
+    let (second_tx, mut second_rx) = TokenSink::standalone();
+    let (third_tx, mut third_rx) = TokenSink::standalone();
+    let first = active_state("first", first_tx, 3, 2, 11, &config);
+    let second = active_state("second", second_tx, 3, 2, 12, &config);
+    let mut third = active_state("third", third_tx, 3, 1, 13, &config);
+
+    let mut active_remaining = 3;
+    retire_rows_with_error(
+        vec![first, second],
+        "group failed".to_string(),
+        &mut active_remaining,
+        0,
+    );
+    assert_eq!(active_remaining, 1);
+
+    assert!(third.emit_token_or_finish(config.eos_token_id, active_remaining.saturating_sub(1), 0));
+    active_remaining = active_remaining.saturating_sub(1);
+    assert_eq!(active_remaining, 0);
+
+    let first_payload = match recv_event(&mut first_rx) {
+        TokenEvent::Error { .. } => http_trace_payload(
+            "first",
+            &trace(),
+            3,
+            2,
+            FinishReason::Error,
+            Some("group failed"),
+        ),
+        _ => panic!("first subgroup row should receive decode error"),
+    };
+    assert_eq!(first_payload["terminal_reason"], "error");
+    match recv_event(&mut second_rx) {
+        TokenEvent::Error { message, .. } => assert_eq!(message, "group failed"),
+        _ => panic!("second subgroup row should receive decode error"),
+    }
+    match recv_event(&mut third_rx) {
+        TokenEvent::Finished { finish_reason, .. } => {
+            assert_eq!(finish_reason, FinishReason::Stop);
+        }
+        _ => panic!("third row should finish independently"),
+    }
+}
+
+#[test]
 fn http_trace_payload_includes_error_and_batch_fields() {
     let mut trace = trace();
-    trace.note_active_set(4);
+    trace.note_scheduler_state(4, 2);
     trace.note_decode_step(2, 7.5);
+    trace.note_terminal_state(1, 0);
 
     let payload = http_trace_payload("req-a", &trace, 3, 2, FinishReason::Error, Some("boom"));
 
     assert_eq!(payload["request_id"], "req-a");
     assert_eq!(payload["finish_reason"], "error");
+    assert_eq!(payload["terminal_reason"], "error");
     assert_eq!(payload["prompt_tokens"], 3);
     assert_eq!(payload["completion_tokens"], 2);
     assert_eq!(payload["active_set_size"], 4);
+    assert_eq!(payload["active_set_size_max"], 4);
+    assert_eq!(payload["pending_queue_size_max"], 2);
+    assert_eq!(payload["active_set_size_at_terminal"], 1);
+    assert_eq!(payload["pending_queue_size_at_terminal"], 0);
+    assert_eq!(payload["healthy_baseline_after_terminal"], false);
     assert_eq!(payload["decode_batch_size_max"], 2);
     assert_eq!(payload["batch_decode_steps"], 1);
     assert_eq!(payload["first_decode_ms"], 7.5);
     assert_eq!(payload["error"], "boom");
+}
+
+#[test]
+fn terminal_reason_labels_are_machine_readable() {
+    let trace = trace();
+
+    let cancelled = http_trace_payload(
+        "cancelled",
+        &trace,
+        2,
+        1,
+        FinishReason::Error,
+        Some("client cancelled before token emit"),
+    );
+    assert_eq!(cancelled["terminal_reason"], "cancelled");
+
+    let disconnected = http_trace_payload(
+        "disconnected",
+        &trace,
+        2,
+        1,
+        FinishReason::Error,
+        Some("client disconnected before token emit"),
+    );
+    assert_eq!(disconnected["terminal_reason"], "disconnected");
+
+    let rejected = http_trace_payload(
+        "rejected",
+        &trace,
+        2,
+        0,
+        FinishReason::Error,
+        Some("DeepSeek-V2-Lite EP=2 mixed serving gate does not return logprobs yet"),
+    );
+    assert_eq!(rejected["terminal_reason"], "rejected");
+
+    let length = http_trace_payload("length", &trace, 2, 1, FinishReason::Length, None);
+    assert_eq!(length["terminal_reason"], "completed_length");
+}
+
+#[test]
+fn terminal_send_failure_message_distinguishes_cancel_from_disconnect() {
+    let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
+    let cancelled_flag = Arc::new(AtomicU8::new(RequestAbortReason::Cancelled as u8));
+    let cancelled = TokenSink::new(
+        RequestTag::from("cancelled"),
+        stream_tx,
+        Arc::clone(&cancelled_flag),
+    );
+    assert_eq!(
+        terminal_send_failure_message(&cancelled, "token emit"),
+        "client cancelled before token emit"
+    );
+
+    let (closed, closed_rx) = TokenSink::standalone();
+    drop(closed_rx);
+    assert_eq!(
+        terminal_send_failure_message(&closed, "token emit"),
+        "client disconnected before token emit"
+    );
 }
 
 #[test]
