@@ -91,6 +91,14 @@ pub(crate) struct Glm52SlotState {
     spec: SpecStats,
 }
 
+/// Drafts fed per verify span: 3 drafts + anchor = a bucket-4 verify step.
+/// A/B-measured on jz-38 (2026-07-04, docs/models/glm52/dspark-mtp.md): the
+/// bucket-4 step costs ~32 ms vs bucket-8's ~46, and that cheaper round beats
+/// span 8's extra accepted tail on EVERY tested prompt class — span 8 even
+/// loses to plain decode on low-accept prose. The drafter still proposes 7;
+/// the tail is simply not fed.
+const GLM52_DSPARK_SPAN_DRAFTS: usize = 3;
+
 /// Accept histogram over a request's verify rounds (spans that actually fed
 /// drafts; bonus-only single-row spans don't count).
 #[derive(Debug, Default)]
@@ -173,8 +181,10 @@ impl Glm52SlotState {
         self.fed >= self.prompt.len() && self.completion + 1 < self.max_tokens
     }
 
-    /// Install the draft lane's proposal for the next verify span.
-    pub(crate) fn set_drafts(&mut self, drafts: Vec<u32>) {
+    /// Install the draft lane's proposal for the next verify span, truncated
+    /// to [`GLM52_DSPARK_SPAN_DRAFTS`].
+    pub(crate) fn set_drafts(&mut self, mut drafts: Vec<u32>) {
+        drafts.truncate(GLM52_DSPARK_SPAN_DRAFTS);
         self.drafts = drafts;
     }
 
@@ -942,8 +952,9 @@ mod tests {
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
         state.set_drafts(vec![21, 22, 99, 98, 97, 96, 95]);
 
-        // Full 8-row verify span: anchor + 7 drafts at consecutive positions.
-        assert_eq!(state.feed_want(), 8);
+        // The proposal is truncated to GLM52_DSPARK_SPAN_DRAFTS: a 4-row
+        // verify span (anchor + 3 drafts) at consecutive positions.
+        assert_eq!(state.feed_want(), 4);
         assert_eq!(
             (0..3).map(|i| state.next_input_at(i)).collect::<Vec<_>>(),
             vec![
@@ -965,7 +976,7 @@ mod tests {
         // Target agrees with drafts 21, 22, diverges at the third (30 != 99):
         // commit the accepted prefix + the correction, context = anchor + 2
         // accepted rows.
-        let outputs = [21, 22, 30, 0, 0, 0, 0, 0];
+        let outputs = [21, 22, 30, 0];
         assert_eq!(
             state.advance_span(&outputs, EOS),
             commit(&[21, 22, 30], None, 3)
@@ -982,16 +993,16 @@ mod tests {
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
         state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27]);
 
-        // The planner granted only 4 of the 8 wanted rows: the span is the
-        // anchor + first 3 drafts, and acceptance ranges over those 3 only.
-        assert_eq!(state.feed_want(), 8);
-        let outputs = [21, 22, 23, 24];
+        // The planner granted only 3 of the 4 wanted rows: the span is the
+        // anchor + first 2 drafts, and acceptance ranges over those 2 only.
+        assert_eq!(state.feed_want(), 4);
+        let outputs = [21, 22, 23];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21, 22, 23, 24], None, 4)
+            commit(&[21, 22, 23], None, 3)
         );
-        assert_eq!(state.completion_tokens(), 5);
-        assert_eq!(state.decode_anchor(), Some((24, 5)));
+        assert_eq!(state.completion_tokens(), 4);
+        assert_eq!(state.decode_anchor(), Some((23, 4)));
     }
 
     #[test]
@@ -1001,10 +1012,10 @@ mod tests {
         // Draft 2 is the EOS token (7): accepted, counted, suppressed; the
         // rest of the committed run is dropped.
         state.set_drafts(vec![21, 7, 23, 24, 25, 26, 27]);
-        let outputs = [21, 7, 23, 24, 25, 26, 27, 28];
+        let outputs = [21, 7, 23, 24];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21], Some(FinishReason::Stop), 8)
+            commit(&[21], Some(FinishReason::Stop), 4)
         );
         assert_eq!(state.completion_tokens(), 3);
     }

@@ -1,6 +1,6 @@
 # GLM5.2 DSpark speculative decoding (greedy)
 
-**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (jz-38 gates green: 1621-token prompt byte-identical, **TTFT 35.8 s → 9.25 s = 3.9×**, bucket-8 solo step 45.6 ms), **M2 draft lane DONE in shadow mode** (jz-38: **measured shadow accept incl. bonus = 3.44 code / 2.4–2.9 prose / 4.74 predictable** vs the checkpoint's 3.967 val — capture layout + backbone + Markov validated in one number; output parity byte-identical drafter on/off; kernel fix: draft is head_dim 64, both qwen3 dflash attention kernels were hard-wired to 128), **M3** verify/accept round loop + span-4-vs-8 A/B + c1 A/B — next. Greedy only; confidence head parsed but unused (Phase 2).
+**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (jz-38 gates green: 1621-token prompt byte-identical, **TTFT 35.8 s → 9.25 s = 3.9×**, bucket-8 solo step 45.6 ms), **M2 draft lane DONE in shadow mode** (measured shadow accept incl. bonus 3.44 code / 2.4–2.9 prose vs the checkpoint's 3.967 val; kernel fix: draft is head_dim 64, both qwen3 dflash attention kernels were hard-wired to 128), **M3 verify/commit rounds DONE — speculative decoding is live**: c1 measured **1.37–2.25× tok/s over plain** (solo 22.5 → 15.7 ms/token = 1.43×) with **span 4 as the default** — the ~32 ms bucket-4 verify step beats span 8's ~46 ms on every prompt class (span 8 even loses to plain on low-accept prose). Parity: mostly byte-identical vs plain, near-tie divergence across bucket shapes is the known D2 FP property; spec itself is deterministic. Greedy only; confidence head parsed but unused (Phase 2).
 
 Last touched: 2026-07
 
@@ -123,15 +123,31 @@ code prompt, and if a bucket-4 step lands near ~30 ms that is ≈12 ms/token (1.
   MHA heads × head_dim 64, needing the dflash qk-norm-rope warp-count fix + a FlashInfer
   HEAD_DIM=64 prefill instantiation (the crash-early launcher checks caught it on the first
   draft round).
-- **M3 — round loop + gates + A/B**. Scheduler slot states (prompt-span / spec-round), accept
-  seam, cache-cap span truncation near 4096. Gates: greedy spec output == plain greedy output
-  on the D2.5 gate prompts (cross-bucket near-tie divergence is a known FP property — same
-  diagnostic treatment as D2), accepted-length telemetry. **A/B = the qwen3 dspark methodology
-  (`docs/models/qwen3/dspark-integration.md` Results section), c1 only** (user call): `vllm
-  bench serve --temperature 0 --ignore-eos` on sharegpt + code prompts against the HTTP server,
-  spec vs plain output tok/s, plus the accepted-draft histogram from the server's debug accept
-  trace. qwen3 Bug 1 lesson applies verbatim: the bench's default temperature is non-greedy and
-  silently disables speculation — `--temperature 0` is mandatory.
+- **M3 — round loop — DONE, jz-38 gate green (2026-07-04, `6f83e30` + span-4 default)**. A
+  decoding slot's span IS the verify span `[anchor, d1..dk]`; `advance_span` runs
+  `accept_greedy` over the span's per-row argmax and commits the accepted prefix + the
+  correction/bonus; the coordinator emits multi-token commits, appends only committed rows'
+  hidden, re-proposes from the new anchor. Rollback is free (seq_lens caps reads; the next
+  span overwrites). The plain path is the zero-draft special case — drafter off = M1 behavior
+  unchanged. **Measured (c1, greedy, 200-token completions + 512-token solo ×3):**
+
+  | | plain | spec span-8 | spec span-4 |
+  | --- | --- | --- | --- |
+  | solo ms/token | 22.5 | 19.4 (1.16×) | **15.7 (1.43×)** |
+  | code tok/s | 41.3 | 62.5 | **70.1 (1.70×)** |
+  | tech prose tok/s | 43.2 | 36.5 — SLOWER than plain | **68.6 (1.59×)** |
+  | narrative tok/s | 43.6 | 33.6 — SLOWER | **59.7 (1.37×)** |
+  | counting tok/s | 43.4 | 95.1 | **97.7 (2.25×)** |
+
+  Per-round wall matches the step-time model exactly: span-8 ≈ 46.6 ms/round (M1's 45.6 ms
+  bucket-8 step + draft), span-4 ≈ 33.9 ms/round → **bucket-4 step ≈ 32 ms**. Span 4 wins on
+  every prompt class (even high-accept counting: 46.6/4.7 > 33.9/3.6 ms/token), so
+  `GLM52_DSPARK_SPAN_DRAFTS = 3` is the default; span 8 is strictly dominated and loses to
+  plain decode outright on low-accept prose. Parity vs plain: 3/5 outputs byte-identical; the
+  other two diverge at a near-tie hundreds of tokens in (bucket-8/4 vs bucket-1 FP association
+  order — the known D2 property); spec is deterministic (same prompt twice → identical).
+  Truncating the proposal (not the block) costs nothing: the drafter still proposes 7, the
+  span feeds 3.
 
 ## Layout pinned against speculators source (2026-07-04)
 
@@ -187,8 +203,8 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
 
 ## Next action
 
-M3: round loop — verify = bucket-8 (and bucket-4 for the span A/B) step over one slot's
-consecutive positions, accept seam ported from `openinfer-qwen3/src/speculative.rs`, scheduler
-spec-round states, cache-cap span truncation near 4096; then the c1 A/B per the qwen3 dspark
-methodology (`vllm bench serve --temperature 0 --ignore-eos`, sharegpt + code, accept histogram
-from the shadow-style logs). Measure the bucket-4 solo step time early — it decides span 4 vs 8.
+Close out the user-specified A/B: `vllm bench serve --temperature 0 --ignore-eos` on sharegpt
+prompts at c1, spec on vs off (qwen3 Bug 1 lesson: the bench default temperature is non-greedy
+and silently disables speculation — `--temperature 0` is mandatory). Later levers, measured
+not assumed: adaptive span (feed more drafts only when recent accept is high), draft/verify
+overlap, and the review's S1 (templating the hd64/hd128 prefill copy-paste).
