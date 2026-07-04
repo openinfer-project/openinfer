@@ -31,6 +31,42 @@ pub fn embedding_decode_into(
     Ok(())
 }
 
+/// Slice-level batched embedding gather: `out[r] = table[ids[r]]` for `rows`
+/// rows of `table.cols`. Same kernel as [`embedding_batch`], for callers whose
+/// output lives in a persistent decode arena (also reused as the per-token
+/// rope-table row gather — a bit-exact row copy).
+pub fn embedding_rows_into(
+    ctx: &DeviceContext,
+    table: &DeviceMatrix,
+    ids: &CudaSlice<u32>,
+    rows: usize,
+    out: &mut CudaSlice<half::bf16>,
+) -> Result<()> {
+    anyhow::ensure!(rows > 0, "embedding_rows needs positive rows");
+    anyhow::ensure!(
+        ids.len() >= rows && out.len() >= rows * table.cols,
+        "embedding_rows buffers too small: ids {}, out {} for {rows}x{}",
+        ids.len(),
+        out.len(),
+        table.cols
+    );
+    let (e_ptr, _ge) = table.data.device_ptr(&ctx.stream);
+    let (t_ptr, _gt) = ids.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::embedding_batched_cuda(
+            e_ptr as *const ffi::Half,
+            t_ptr as *const u32,
+            o_ptr as *mut ffi::Half,
+            table.cols as i32,
+            rows as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Batched embedding lookup
 pub fn embedding_batch(
     ctx: &DeviceContext,

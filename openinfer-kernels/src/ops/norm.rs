@@ -30,6 +30,49 @@ pub fn rms_norm_into(
     Ok(())
 }
 
+/// Slice-level batched RMSNorm over `rows` rows of `dim`: same
+/// `flashinfer::norm::RMSNorm` template as [`rms_norm_into`] with
+/// batch_size=rows (one CTA per row), so each row is bit-identical to the
+/// single-row launch. For callers whose buffers live in a persistent decode
+/// arena rather than owned `HiddenStates`.
+pub fn rms_norm_rows_into(
+    ctx: &DeviceContext,
+    x: &CudaSlice<bf16>,
+    weight: &DeviceVec,
+    eps: f32,
+    dim: usize,
+    rows: usize,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(rows > 0 && dim > 0, "rms_norm_rows needs positive rows/dim");
+    ensure!(
+        x.len() >= rows * dim && out.len() >= rows * dim,
+        "rms_norm_rows buffers too small for {rows}x{dim}: x {}, out {}",
+        x.len(),
+        out.len()
+    );
+    ensure!(
+        weight.len == dim,
+        "rms_norm_rows weight len {} != dim {dim}",
+        weight.len
+    );
+    let (x_ptr, _gx) = x.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::rms_norm_batched_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            dim as i32,
+            rows as i32,
+            eps,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+    Ok(())
+}
+
 /// RMSNorm (allocating)
 pub fn rms_norm(
     ctx: &DeviceContext,
@@ -53,11 +96,19 @@ pub fn layer_norm_into(
     gamma: &CudaSlice<f32>,
     beta: &CudaSlice<f32>,
     eps: f32,
+    dim: usize,
+    rows: usize,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
-    ensure!(x.len() == out.len(), "layer_norm x/out length mismatch");
-    ensure!(gamma.len() >= x.len(), "layer_norm gamma too small");
-    ensure!(beta.len() >= x.len(), "layer_norm beta too small");
+    ensure!(rows > 0 && dim > 0, "layer_norm needs positive rows/dim");
+    ensure!(
+        x.len() >= rows * dim && out.len() >= rows * dim,
+        "layer_norm x/out too small for {rows}x{dim}: x {}, out {}",
+        x.len(),
+        out.len()
+    );
+    ensure!(gamma.len() >= dim, "layer_norm gamma too small");
+    ensure!(beta.len() >= dim, "layer_norm beta too small");
     let (x_ptr, _gx) = x.device_ptr(&ctx.stream);
     let (g_ptr, _gg) = gamma.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = beta.device_ptr(&ctx.stream);
@@ -68,7 +119,8 @@ pub fn layer_norm_into(
             g_ptr as *const f32,
             b_ptr as *const f32,
             o_ptr as *mut ffi::Half,
-            x.len() as i32,
+            dim as i32,
+            rows as i32,
             eps,
             ctx.stream.cu_stream(),
         )

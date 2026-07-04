@@ -39,7 +39,9 @@ pub use elementwise::{
     scaled_add_rows_indexed_into, scaled_add_rows_into, scaled_add_rows_token_range_into,
     silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
 };
-pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
+pub use embedding::{
+    embedding_batch, embedding_batch_vocab_shard, embedding_decode_into, embedding_rows_into,
+};
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
@@ -60,6 +62,7 @@ pub use norm::{
     fused_add_rms_norm_batch_into, fused_add_rms_norm_into, fused_add_rms_norm_round_batch_into,
     fused_add_rms_norm_round_into, layer_norm_into, rms_norm, rms_norm_batch_into,
     rms_norm_batch_offset_into, rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into,
+    rms_norm_rows_into,
 };
 pub use sampling::{
     BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,

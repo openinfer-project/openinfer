@@ -531,7 +531,7 @@ fn run_layer_prefill(
     let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
 
     let mqa_shape =
-        Glm52IndexerScratch::decode_shape(index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
+        Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
     let mut scratch = Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);

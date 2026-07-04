@@ -6,6 +6,7 @@ unsafe extern "C" {
         q: *mut Half,
         k: *mut Half,
         n_heads: i32,
+        tokens: i32,
         cos: *const Half,
         sin: *const Half,
         stream: CUstream,

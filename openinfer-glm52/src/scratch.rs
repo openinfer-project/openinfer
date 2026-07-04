@@ -38,7 +38,8 @@ use crate::layer::Glm52LayerScratch;
 use crate::mla_decode::{Glm52MlaAttendScratch, Glm52MlaFront};
 use crate::moe_decode::{GLM52_SHARED_EXPERT_INTERMEDIATE, Glm52RouterScratch};
 
-/// Everything one decode step writes, allocated once per rank.
+/// Everything one decode step writes, allocated once per rank and sized for
+/// the step's `tokens` rows.
 pub(crate) struct Glm52DecodeScratch {
     pub(crate) mla_front: Glm52MlaFront,
     pub(crate) mla_attend: Glm52MlaAttendScratch,
@@ -52,13 +53,14 @@ pub(crate) struct Glm52DecodeScratch {
     pub(crate) hidden: DeviceVec,
     pub(crate) final_normed: DeviceVec,
     pub(crate) logits: DeviceVec,
-    /// Device greedy argmax outputs: the top logit's bf16 value (for the
-    /// crash-early non-finite guard) and its index — the step's 6-byte D2H
-    /// egress. The two-stage argmax stages per-4096-tile partials first.
+    /// Device greedy argmax outputs: each row's top logit bf16 value (for the
+    /// crash-early non-finite guard) and its index — the step's per-row
+    /// 6-byte D2H egress. The two-stage argmax stages per-4096-tile partials
+    /// first.
     pub(crate) argmax_partial_values: CudaSlice<f32>,
     pub(crate) argmax_partial_indices: CudaSlice<i32>,
-    pub(crate) argmax_value: CudaSlice<bf16>,
-    pub(crate) argmax_index: CudaSlice<i32>,
+    pub(crate) argmax_values: CudaSlice<bf16>,
+    pub(crate) argmax_indices: CudaSlice<i32>,
 }
 
 impl Glm52DecodeScratch {
@@ -67,25 +69,31 @@ impl Glm52DecodeScratch {
         contract: &Glm52FlashMlaSparseDecode,
         mqa_shape: Glm52DeepGemmMqaLogitsShape,
     ) -> Result<Self> {
+        let tokens = contract.batch_size;
+        anyhow::ensure!(
+            mqa_shape.batch_size == tokens,
+            "GLM5.2 decode scratch: MQA batch {} != attend batch {tokens}",
+            mqa_shape.batch_size
+        );
         Ok(Self {
-            mla_front: Glm52MlaFront::new(ctx)?,
+            mla_front: Glm52MlaFront::new(ctx, tokens)?,
             mla_attend: Glm52MlaAttendScratch::new(ctx, contract)?,
             idx: Glm52IndexerScratch::new(ctx, mqa_shape)?,
-            dense_mlp: Glm52MlpScratch::new(ctx, GLM52_DENSE_INTERMEDIATE)?,
-            shared_mlp: Glm52MlpScratch::new(ctx, GLM52_SHARED_EXPERT_INTERMEDIATE)?,
-            router: Glm52RouterScratch::new(ctx)?,
-            layer: Glm52LayerScratch::new(ctx)?,
-            hidden: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
-            final_normed: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
-            logits: DeviceVec::zeros(ctx, GLM52_VOCAB)?,
+            dense_mlp: Glm52MlpScratch::new(ctx, GLM52_DENSE_INTERMEDIATE, tokens)?,
+            shared_mlp: Glm52MlpScratch::new(ctx, GLM52_SHARED_EXPERT_INTERMEDIATE, tokens)?,
+            router: Glm52RouterScratch::new(ctx, tokens)?,
+            layer: Glm52LayerScratch::new(ctx, tokens)?,
+            hidden: DeviceVec::zeros(ctx, tokens * GLM52_HIDDEN)?,
+            final_normed: DeviceVec::zeros(ctx, tokens * GLM52_HIDDEN)?,
+            logits: DeviceVec::zeros(ctx, tokens * GLM52_VOCAB)?,
             argmax_partial_values: ctx
                 .stream
-                .alloc_zeros::<f32>(argmax_batch_bf16_split_partials_len(1, GLM52_VOCAB))?,
+                .alloc_zeros::<f32>(argmax_batch_bf16_split_partials_len(tokens, GLM52_VOCAB))?,
             argmax_partial_indices: ctx
                 .stream
-                .alloc_zeros::<i32>(argmax_batch_bf16_split_partials_len(1, GLM52_VOCAB))?,
-            argmax_value: ctx.stream.alloc_zeros::<bf16>(1)?,
-            argmax_index: ctx.stream.alloc_zeros::<i32>(1)?,
+                .alloc_zeros::<i32>(argmax_batch_bf16_split_partials_len(tokens, GLM52_VOCAB))?,
+            argmax_values: ctx.stream.alloc_zeros::<bf16>(tokens)?,
+            argmax_indices: ctx.stream.alloc_zeros::<i32>(tokens)?,
         })
     }
 }

@@ -141,6 +141,7 @@ unsafe extern "C" {
         cos: *const Half,
         sin: *const Half,
         query: *mut Half,
+        tokens: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -153,6 +154,15 @@ unsafe extern "C" {
         cache: *mut u8,
         slot_mapping: *const i64,
         max_slots: i64,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_mla_ckv_split_cuda(
+        ckv: *const Half,
+        kv_c: *mut Half,
+        k_pe: *mut Half,
+        tokens: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -305,6 +315,17 @@ unsafe extern "C" {
         weight: *const u8,
         weight_scale: *const f32,
         out: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_weight_only_gemv_batched_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        out: *mut Half,
+        batch: i32,
         n: i32,
         k: i32,
         stream: CUstream,

@@ -1,12 +1,17 @@
 //! GLM5.2 DP8/EP8 full-model decode: every rank owns the whole non-expert
 //! path (embed → 78 decoder layers → final norm → lm_head → greedy argmax)
-//! plus its 32 local experts, and serves one request at a time (bs=1 per
-//! rank; prefill rides decode token-by-token).
+//! plus its 32 local experts, and forwards a fixed batch of
+//! `GLM52_MAX_BATCH_PER_RANK` token rows per step (real request tokens in
+//! occupied slots, padding rows elsewhere; prefill rides decode
+//! token-by-token). Each slot owns a disjoint `GLM52_MAX_MODEL_LEN`-token
+//! region of the paged KV/index caches, so pad rows write only their own
+//! dead slots.
 //!
 //! Every step, all 8 ranks run the forward in lock-step, each dispatching
-//! exactly one token (a real request token, or a padding token on an idle
-//! rank) into every MoE layer's DeepEP collective — the collectives require
-//! all ranks to enter in the same layer order 3..=77.
+//! exactly `GLM52_MAX_BATCH_PER_RANK` rows into every MoE layer's DeepEP
+//! collective — the collectives require all ranks to enter in the same layer
+//! order 3..=77, and the fixed row count keeps every step's kernel shapes
+//! identical (the whole-step CUDA graph's contract).
 
 use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
@@ -14,8 +19,8 @@ use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into,
-    glm52_flashmla_sparse_decode_num_sm_parts, rms_norm_into,
+    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, embedding_rows_into,
+    glm52_flashmla_sparse_decode_num_sm_parts, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -36,17 +41,28 @@ use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_ro
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
 
-/// bs=1 bring-up context cap: `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
-/// Sizes the per-layer MLA and index-K caches at build time.
+/// Per-request context cap: `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
+/// Sizes each slot's region of the per-layer MLA and index-K caches at build
+/// time.
 pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
 
+/// The fixed per-rank decode batch: every step forwards exactly this many
+/// rows (request tokens in occupied slots, padding rows elsewhere), so every
+/// step has the same kernel shapes by construction — the whole-step CUDA
+/// graph's contract. Each slot owns a `GLM52_MAX_MODEL_LEN`-token region of
+/// the paged caches. The CUDA side instantiates the batched weight-only GEMV
+/// for exactly this batch (`kBatchedGemvBatch` in `glm52_moe_gemv.cu`) — a
+/// drift crashes at the launch boundary.
+pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 8;
+
 /// The DP8 coordinator's protocol constant: every rank enters each MoE
-/// collective having agreed on this many dispatched tokens per step — one
-/// token per rank (real or padding), so the global count is the rank count.
-/// Every rank's `decode_step` must derive its `global_tokens` from this
-/// single definition — a disagreement makes the grouped-GEMM row bound wrong
-/// on some rank, which the metadata kernel answers with a device trap.
-pub(crate) const GLM52_DECODE_GLOBAL_TOKENS: usize = crate::weights::GLM52_EP_RANKS;
+/// collective having agreed on this many dispatched tokens per step —
+/// `GLM52_MAX_BATCH_PER_RANK` rows per rank (real or padding). Every rank's
+/// `decode_step` must derive its `global_tokens` from this single definition
+/// — a disagreement makes the grouped-GEMM row bound wrong on some rank,
+/// which the metadata kernel answers with a device trap.
+pub(crate) const GLM52_DECODE_GLOBAL_TOKENS: usize =
+    crate::weights::GLM52_EP_RANKS * GLM52_MAX_BATCH_PER_RANK;
 
 /// Short-context attention tier: while `seq_len <= 256` the DSA top-256 IS
 /// the full token set (exactly like top-2048 is below 2048 tokens), so the
@@ -226,17 +242,21 @@ pub(crate) struct Glm52RankModel {
     mla_sched_short: Glm52MlaSchedMetadata,
     mla_sched_full: Glm52MlaSchedMetadata,
     index_cache_layout: Glm52IndexerCacheLayout,
+    /// `[GLM52_MAX_BATCH_PER_RANK, blocks_per_slot]` — row b maps slot b's
+    /// context into its disjoint region of the index-K cache. Static: written
+    /// once at build.
     block_table: CudaSlice<i32>,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
     /// Device-resident rope tables for every position (`[GLM52_MAX_MODEL_LEN,
-    /// ROPE_HALF]`); a step slices its position's row instead of recomputing
-    /// on the host and copying up.
-    cos_table: CudaSlice<bf16>,
-    sin_table: CudaSlice<bf16>,
+    /// ROPE_HALF]` as a gatherable matrix); the prologue gathers each row's
+    /// position row instead of recomputing on the host and copying up.
+    cos_table: DeviceMatrix,
+    sin_table: DeviceMatrix,
+    positions: CudaSlice<u32>,
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
-    token_id: CudaSlice<u32>,
+    token_ids: CudaSlice<u32>,
     scratch: Glm52DecodeScratch,
     /// The whole-step decode graphs, one per attention tier: each is captured
     /// on this rank's first step in that tier, replayed every step after.
@@ -249,24 +269,27 @@ pub(crate) struct Glm52RankModel {
 
 impl Glm52RankModel {
     pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
+        let batch = GLM52_MAX_BATCH_PER_RANK;
         let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
         let contract = Glm52FlashMlaSparseDecode {
-            batch_size: 1,
-            num_blocks: GLM52_MAX_MODEL_LEN.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+            batch_size: batch,
+            num_blocks: batch * GLM52_MAX_MODEL_LEN.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
             sm_scale: SM_SCALE,
         };
-        // The short tier walks only 256/64 = 4 index blocks per batch — more
+        // The short tier walks only 256/64 = 4 index blocks per row — more
         // SM parts than blocks would just be empty splits for the combine.
         let contract_short = Glm52FlashMlaSparseDecode {
             topk: GLM52_MLA_TOPK_SHORT,
             num_sm_parts: num_sm_parts.min(GLM52_MLA_TOPK_SHORT / 64),
             ..contract
         };
-        let index_blocks = GLM52_MAX_MODEL_LEN.div_ceil(INDEX_CACHE_BLOCK);
+        // Each slot owns `blocks_per_slot` consecutive index-K cache blocks;
+        // the whole cache holds every slot's region back-to-back.
+        let blocks_per_slot = GLM52_MAX_MODEL_LEN.div_ceil(INDEX_CACHE_BLOCK);
         let index_cache_layout = Glm52IndexerCacheLayout {
-            cache_blocks: index_blocks,
+            cache_blocks: batch * blocks_per_slot,
             cache_block_size: INDEX_CACHE_BLOCK,
             cache_block_stride_bytes: INDEX_CACHE_BLOCK * (INDEX_HEAD_DIM + 4),
         };
@@ -315,8 +338,10 @@ impl Glm52RankModel {
         // but out of campaign scope — drop this rank's copy.
         let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
 
-        let block_table_host: Vec<i32> = (0..index_blocks as i32).collect();
-        let mut block_table = ctx.stream.alloc_zeros::<i32>(index_blocks)?;
+        // Row b of the block table maps slot b's context onto its own cache
+        // region: block j of slot b is global block b*blocks_per_slot + j.
+        let block_table_host: Vec<i32> = (0..batch * blocks_per_slot).map(|i| i as i32).collect();
+        let mut block_table = ctx.stream.alloc_zeros::<i32>(batch * blocks_per_slot)?;
         ctx.stream
             .memcpy_htod(&block_table_host, &mut block_table)?;
 
@@ -327,18 +352,19 @@ impl Glm52RankModel {
             cos_host.extend_from_slice(&cos_row);
             sin_host.extend_from_slice(&sin_row);
         }
-        let mut cos_table = ctx
+        let mut cos_table_data = ctx
             .stream
             .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * ROPE_HALF)?;
-        let mut sin_table = ctx
+        let mut sin_table_data = ctx
             .stream
             .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * ROPE_HALF)?;
-        ctx.stream.memcpy_htod(&cos_host, &mut cos_table)?;
-        ctx.stream.memcpy_htod(&sin_host, &mut sin_table)?;
+        ctx.stream.memcpy_htod(&cos_host, &mut cos_table_data)?;
+        ctx.stream.memcpy_htod(&sin_host, &mut sin_table_data)?;
 
         let mqa_shape = Glm52IndexerScratch::decode_shape(
+            batch,
             index_cache_layout,
-            index_blocks,
+            blocks_per_slot,
             NUM_SMS,
             GLM52_MAX_MODEL_LEN,
         );
@@ -352,67 +378,95 @@ impl Glm52RankModel {
             mla_sched_full: Glm52MlaSchedMetadata::new(ctx, contract)?,
             index_cache_layout,
             block_table,
-            slot_mapping: ctx.stream.alloc_zeros::<i64>(1)?,
-            seq_lens: ctx.stream.alloc_zeros::<i32>(1)?,
-            cos_table,
-            sin_table,
-            cos: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
-            sin: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
-            token_id: ctx.stream.alloc_zeros::<u32>(1)?,
+            slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
+            seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
+            cos_table: DeviceMatrix {
+                data: cos_table_data,
+                rows: GLM52_MAX_MODEL_LEN,
+                cols: ROPE_HALF,
+            },
+            sin_table: DeviceMatrix {
+                data: sin_table_data,
+                rows: GLM52_MAX_MODEL_LEN,
+                cols: ROPE_HALF,
+            },
+            positions: ctx.stream.alloc_zeros::<u32>(batch)?,
+            cos: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
+            sin: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
+            token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
             scratch: Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?,
             graph_short: CudaGraphState::new(),
             graph_full: CudaGraphState::new(),
         })
     }
 
-    /// One full-model step: feed `token` at `position`, return the greedy
-    /// next-token id. Enters 75 MoE collectives — every other rank must be
-    /// stepping concurrently (an idle rank steps a padding token).
+    /// One full-model step: feed each slot's `(token, position)` row, return
+    /// the greedy next-token id per row. Enters 75 MoE collectives — every
+    /// other rank must be stepping concurrently. Every step forwards exactly
+    /// `GLM52_MAX_BATCH_PER_RANK` rows; unoccupied slots carry the padding
+    /// row (token 0, position 0), whose cache writes land in that slot's own
+    /// dead region.
     ///
     /// The step body (embed → 78 layers → lm_head → argmax) is captured into
     /// a CUDA graph on the first call in each attention tier and replayed
     /// afterwards: one graph launch instead of ~4155 kernel launches per rank
-    /// per step. The
-    /// prologue rewrites the five device input buffers the captured kernels
-    /// read (rope row, slot, seq_len, token), and the epilogue reads back the
-    /// 6-byte argmax result — both outside the graph. Capture-time safety:
-    /// stream capture records without executing, and in lock-step all ranks
-    /// capture on the same global step, so the DeepEP collectives first
-    /// execute together on every rank's first graph launch (the same
-    /// argument as the kimi decode graph; the ceiling is the ~100 s DeepEP
-    /// device timeout against a capture window of tens of ms).
+    /// per step. The prologue rewrites the device input buffers the captured
+    /// kernels read (per-row rope rows, slots, seq_lens, tokens), and the
+    /// epilogue reads back the per-row argmax results — both outside the
+    /// graph. Capture-time safety: stream capture records without executing,
+    /// and in lock-step all ranks capture on the same global step, so the
+    /// DeepEP collectives first execute together on every rank's first graph
+    /// launch (the same argument as the kimi decode graph; the ceiling is
+    /// the ~100 s DeepEP device timeout against a capture window of tens of
+    /// ms).
     pub(crate) fn decode_step(
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: &mut Glm52MoeEp8State,
-        token: u32,
-        position: usize,
-    ) -> Result<u32> {
-        ensure!(
-            position < GLM52_MAX_MODEL_LEN,
-            "GLM5.2 position {position} exceeds the model-length cap {GLM52_MAX_MODEL_LEN}"
-        );
-        let rope = position * ROPE_HALF..(position + 1) * ROPE_HALF;
+        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+        let batch = GLM52_MAX_BATCH_PER_RANK;
+        let mut tokens_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
+        let mut positions_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
+        let mut slots_host = [0i64; GLM52_MAX_BATCH_PER_RANK];
+        let mut seq_lens_host = [0i32; GLM52_MAX_BATCH_PER_RANK];
+        for (slot, &(token, position)) in inputs.iter().enumerate() {
+            ensure!(
+                position < GLM52_MAX_MODEL_LEN,
+                "GLM5.2 slot {slot} position {position} exceeds the model-length cap {GLM52_MAX_MODEL_LEN}"
+            );
+            tokens_host[slot] = token;
+            positions_host[slot] = position as u32;
+            // Slot b owns cache tokens [b*MAX_LEN, (b+1)*MAX_LEN) — the same
+            // global slot id addresses both the MLA and index-K caches.
+            slots_host[slot] = (slot * GLM52_MAX_MODEL_LEN + position) as i64;
+            seq_lens_host[slot] = (position + 1) as i32;
+        }
+        ctx.stream.memcpy_htod(&tokens_host, &mut self.token_ids)?;
         ctx.stream
-            .memcpy_dtod(&self.cos_table.slice(rope.clone()), &mut self.cos)?;
+            .memcpy_htod(&positions_host, &mut self.positions)?;
         ctx.stream
-            .memcpy_dtod(&self.sin_table.slice(rope), &mut self.sin)?;
-        ctx.stream
-            .memcpy_htod(&[position as i64], &mut self.slot_mapping)?;
-        ctx.stream
-            .memcpy_htod(&[(position + 1) as i32], &mut self.seq_lens)?;
-        ctx.stream.memcpy_htod(&[token], &mut self.token_id)?;
+            .memcpy_htod(&slots_host, &mut self.slot_mapping)?;
+        ctx.stream.memcpy_htod(&seq_lens_host, &mut self.seq_lens)?;
+        // Gather each row's rotary table row (a bit-exact row copy).
+        embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
+        embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
 
-        // Attention tier: while the whole context fits in the short top-k,
+        // Attention tier: while EVERY row's context fits in the short top-k,
         // top-256 selects exactly the same tokens as top-2048 (all of them) —
         // the short graph only walks 1/8 of the padded FlashMLA index slots.
-        // Each tier has its own captured graph; a request crosses tiers at
-        // most once (seq_len only grows), and the lazily captured full graph
-        // records without executing, so the mid-serving capture holds the
-        // other ranks' collectives for tens of ms — far under the ~100 s
-        // DeepEP device timeout (same argument as the first-step capture).
-        let short_tier = position + 1 <= GLM52_MLA_TOPK_SHORT;
+        // Pad rows sit at position 0 and never lift the tier. Each tier has
+        // its own captured graph; a request crosses tiers at most once
+        // (seq_len only grows), and the lazily captured full graph records
+        // without executing, so the mid-serving capture holds the other
+        // ranks' collectives for tens of ms — far under the ~100 s DeepEP
+        // device timeout (same argument as the first-step capture).
+        let short_tier = inputs
+            .iter()
+            .map(|&(_, position)| position + 1)
+            .max()
+            .is_some_and(|longest| longest <= GLM52_MLA_TOPK_SHORT);
         let step = Glm52DecodeStep {
             mla_cos: &self.cos,
             mla_sin: &self.sin,
@@ -436,16 +490,18 @@ impl Glm52RankModel {
         });
         let result = graph.run_or_capture(ctx, || {
             let s = &mut self.scratch;
-            glm52_embed_into(ctx, &self.embed, &self.token_id, &mut s.hidden)?;
+            glm52_embed_into(ctx, &self.embed, &self.token_ids, batch, &mut s.hidden)?;
             // Layer 0's input norm is standalone (the embedding is the
             // residual); every later layer's input norm is fused into the
             // previous layer's closing add (`glm52_layer_finish_fused`).
-            rms_norm_into(
+            rms_norm_rows_into(
                 ctx,
-                &s.hidden,
+                &s.hidden.data,
                 &self.layers[0].input_ln,
                 GLM52_RMS_EPS,
-                &mut s.layer.normed,
+                GLM52_HIDDEN,
+                batch,
+                &mut s.layer.normed.data,
             )?;
             let mut carry_ready = false;
             for (layer, (weights, cache)) in
@@ -496,13 +552,13 @@ impl Glm52RankModel {
                             ctx,
                             ep8,
                             &moe.bank,
-                            Some((&s.layer.normed2, &s.router.route)),
+                            Some((&s.layer.normed2, &s.router.route, batch)),
                             GLM52_DECODE_GLOBAL_TOKENS,
                         )
                         .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
                         ensure!(
-                            dispatched,
-                            "EP8 MoE returned no combined output for a dispatched token"
+                            dispatched && ep8.combined_tokens() == batch,
+                            "EP8 MoE returned no combined output for the dispatched rows"
                         );
                         // Join: the closing add consumes both branches.
                         ctx.stream.wait(&shared_done)?;
@@ -510,7 +566,7 @@ impl Glm52RankModel {
                             ctx,
                             ep8.combined(),
                             &s.layer.shared_out,
-                            GLM52_HIDDEN,
+                            batch * GLM52_HIDDEN,
                             &mut s.layer.mlp_out,
                         )?;
                     }
@@ -525,24 +581,25 @@ impl Glm52RankModel {
                 }
             }
 
-            glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, &mut s.final_normed)?;
-            glm52_lm_head_into(ctx, &s.final_normed, &self.lm_head, &mut s.logits)?;
-            // Device greedy argmax (same semantics as a host scan: lowest
-            // index wins ties, NaN never wins) — the step's egress shrinks
-            // from the full vocab row to 6 bytes, and the kernel chain ends
-            // on-device (the graph boundary). Two-stage: per-4096-tile
-            // partials in parallel, then one finalize block — bit-identical
-            // to the single-block scan (the partials carry global indices,
-            // same total order), ~38 CTAs instead of one serial walk over
-            // the 154k-vocab row.
+            glm52_final_norm_into(ctx, &s.hidden, &self.final_norm, batch, &mut s.final_normed)?;
+            glm52_lm_head_into(ctx, &s.final_normed, &self.lm_head, batch, &mut s.logits)?;
+            // Device greedy argmax per row (same semantics as a host scan:
+            // lowest index wins ties, NaN never wins) — the step's egress
+            // shrinks from the full vocab rows to 6 bytes per row, and the
+            // kernel chain ends on-device (the graph boundary). Two-stage:
+            // per-4096-tile partials in parallel, then one finalize block per
+            // row — bit-identical to the single-block scan (the partials
+            // carry global indices, same total order), and each row's result
+            // is independent of its slot-mates.
             argmax_bf16_split_into(
                 ctx,
                 &s.logits.data,
+                batch,
                 GLM52_VOCAB,
                 &mut s.argmax_partial_values,
                 &mut s.argmax_partial_indices,
-                &mut s.argmax_value,
-                &mut s.argmax_index,
+                &mut s.argmax_values,
+                &mut s.argmax_indices,
             )
         });
         *(if short_tier {
@@ -552,16 +609,22 @@ impl Glm52RankModel {
         }) = graph;
         result?;
 
-        let top_value = ctx.stream.clone_dtoh(&self.scratch.argmax_value)?[0].to_f32();
-        let top_index = ctx.stream.clone_dtoh(&self.scratch.argmax_index)?[0];
-        ensure!(
-            top_value.is_finite(),
-            "GLM5.2 greedy argmax found no finite logit (top = {top_value})"
-        );
-        ensure!(
-            (0..GLM52_VOCAB as i32).contains(&top_index),
-            "GLM5.2 greedy argmax index {top_index} outside the vocab"
-        );
-        Ok(top_index as u32)
+        let top_values = ctx.stream.clone_dtoh(&self.scratch.argmax_values)?;
+        let top_indices = ctx.stream.clone_dtoh(&self.scratch.argmax_indices)?;
+        let mut outputs = [0u32; GLM52_MAX_BATCH_PER_RANK];
+        for slot in 0..batch {
+            let top_value = top_values[slot].to_f32();
+            let top_index = top_indices[slot];
+            ensure!(
+                top_value.is_finite(),
+                "GLM5.2 slot {slot} greedy argmax found no finite logit (top = {top_value})"
+            );
+            ensure!(
+                (0..GLM52_VOCAB as i32).contains(&top_index),
+                "GLM5.2 slot {slot} greedy argmax index {top_index} outside the vocab"
+            );
+            outputs[slot] = top_index as u32;
+        }
+        Ok(outputs)
     }
 }

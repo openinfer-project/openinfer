@@ -22,8 +22,10 @@ pub const GLM52_MLA_CACHE_BYTES: usize = 656;
 /// interleave-in / block-out. q_pe is read at `q_pe_base[q_pe_offset +
 /// h*q_pe_head_stride]`: pass `(0, 64)` for a contiguous `[H,64]` q_pe, or
 /// `(192, 256)` to read it in place from the `[H,256]` q_b output.
+#[allow(clippy::too_many_arguments)]
 pub fn glm52_mla_query_assemble_launch(
     ctx: &DeviceContext,
+    tokens: usize,
     ql_nope: &CudaSlice<bf16>,
     q_pe_base: &CudaSlice<bf16>,
     q_pe_offset: usize,
@@ -32,27 +34,28 @@ pub fn glm52_mla_query_assemble_launch(
     sin: &CudaSlice<bf16>,
     query: &mut CudaSlice<bf16>,
 ) -> Result<()> {
+    ensure!(tokens > 0, "GLM5.2 MLA assemble tokens must be positive");
     ensure!(
-        ql_nope.len() >= GLM52_MLA_HEADS * GLM52_MLA_QK_NOPE,
+        ql_nope.len() >= tokens * GLM52_MLA_HEADS * GLM52_MLA_QK_NOPE,
         "GLM5.2 MLA assemble ql_nope too small: have {}, need {}",
         ql_nope.len(),
-        GLM52_MLA_HEADS * GLM52_MLA_QK_NOPE
+        tokens * GLM52_MLA_HEADS * GLM52_MLA_QK_NOPE
     );
     ensure!(
         q_pe_base.len()
-            >= q_pe_offset + (GLM52_MLA_HEADS - 1) * q_pe_head_stride + GLM52_MLA_ROPE_DIM,
+            >= q_pe_offset + (tokens * GLM52_MLA_HEADS - 1) * q_pe_head_stride + GLM52_MLA_ROPE_DIM,
         "GLM5.2 MLA assemble q_pe (offset {q_pe_offset}, stride {q_pe_head_stride}) overruns buffer of {}",
         q_pe_base.len()
     );
     ensure!(
-        cos.len() >= GLM52_MLA_ROPE_HALF && sin.len() >= GLM52_MLA_ROPE_HALF,
-        "GLM5.2 MLA assemble cos/sin must be >= {GLM52_MLA_ROPE_HALF}"
+        cos.len() >= tokens * GLM52_MLA_ROPE_HALF && sin.len() >= tokens * GLM52_MLA_ROPE_HALF,
+        "GLM5.2 MLA assemble cos/sin must be >= tokens * {GLM52_MLA_ROPE_HALF}"
     );
     ensure!(
-        query.len() >= GLM52_MLA_HEADS * GLM52_MLA_QUERY_DIM,
+        query.len() >= tokens * GLM52_MLA_HEADS * GLM52_MLA_QUERY_DIM,
         "GLM5.2 MLA assemble query too small: have {}, need {}",
         query.len(),
-        GLM52_MLA_HEADS * GLM52_MLA_QUERY_DIM
+        tokens * GLM52_MLA_HEADS * GLM52_MLA_QUERY_DIM
     );
     let (ql_ptr, _g0) = ql_nope.device_ptr(&ctx.stream);
     let (qpe_ptr, _g1) = q_pe_base.device_ptr(&ctx.stream);
@@ -68,6 +71,7 @@ pub fn glm52_mla_query_assemble_launch(
             cos_ptr as *const ffi::Half,
             sin_ptr as *const ffi::Half,
             query_ptr as *mut ffi::Half,
+            tokens as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -84,6 +88,7 @@ pub fn glm52_mla_query_assemble_launch(
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_mla_cache_pack_launch(
     ctx: &DeviceContext,
+    tokens: usize,
     ckv_fp8: &CudaSlice<u8>,
     ckv_scales: &CudaSlice<f32>,
     k_pe: &CudaSlice<bf16>,
@@ -92,28 +97,33 @@ pub fn glm52_mla_cache_pack_launch(
     cache: &mut CudaSlice<u8>,
     slot_mapping: &CudaSlice<i64>,
 ) -> Result<()> {
+    ensure!(tokens > 0, "GLM5.2 MLA cache pack tokens must be positive");
     ensure!(
-        ckv_fp8.len() >= GLM52_MLA_KV_LORA,
-        "GLM5.2 MLA cache pack ckv_fp8 too small: have {}, need {GLM52_MLA_KV_LORA}",
-        ckv_fp8.len()
+        ckv_fp8.len() >= tokens * GLM52_MLA_KV_LORA,
+        "GLM5.2 MLA cache pack ckv_fp8 too small: have {}, need {}",
+        ckv_fp8.len(),
+        tokens * GLM52_MLA_KV_LORA
     );
     ensure!(
-        ckv_scales.len() >= GLM52_MLA_SCALE_GROUPS,
-        "GLM5.2 MLA cache pack ckv_scales too small: have {}, need {GLM52_MLA_SCALE_GROUPS}",
-        ckv_scales.len()
+        ckv_scales.len() >= tokens * GLM52_MLA_SCALE_GROUPS,
+        "GLM5.2 MLA cache pack ckv_scales too small: have {}, need {}",
+        ckv_scales.len(),
+        tokens * GLM52_MLA_SCALE_GROUPS
     );
     ensure!(
-        k_pe.len() >= GLM52_MLA_ROPE_DIM,
-        "GLM5.2 MLA cache pack k_pe too small: have {}, need {GLM52_MLA_ROPE_DIM}",
-        k_pe.len()
+        k_pe.len() >= tokens * GLM52_MLA_ROPE_DIM,
+        "GLM5.2 MLA cache pack k_pe too small: have {}, need {}",
+        k_pe.len(),
+        tokens * GLM52_MLA_ROPE_DIM
     );
     ensure!(
-        cos.len() >= GLM52_MLA_ROPE_HALF && sin.len() >= GLM52_MLA_ROPE_HALF,
-        "GLM5.2 MLA cache pack cos/sin must be >= {GLM52_MLA_ROPE_HALF}"
+        cos.len() >= tokens * GLM52_MLA_ROPE_HALF && sin.len() >= tokens * GLM52_MLA_ROPE_HALF,
+        "GLM5.2 MLA cache pack cos/sin must be >= tokens * {GLM52_MLA_ROPE_HALF}"
     );
     ensure!(
-        !slot_mapping.is_empty(),
-        "GLM5.2 MLA cache pack slot_mapping is empty"
+        slot_mapping.len() >= tokens,
+        "GLM5.2 MLA cache pack slot_mapping too small: have {}, need {tokens}",
+        slot_mapping.len()
     );
     // The slot itself is device data (graph-replayable); the kernel traps on
     // an out-of-window slot. Host-side we can only pin the window size.
@@ -139,10 +149,49 @@ pub fn glm52_mla_cache_pack_launch(
             cache_ptr as *mut u8,
             slot_ptr as *const i64,
             max_slots as i64,
+            tokens as i32,
             ctx.stream.cu_stream(),
         )
     };
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 MLA cache pack launch failed: {err}"))
+}
+
+/// Split the kv_a projection output `[T, 576]` into contiguous kv_c `[T, 512]`
+/// (pre-norm compressed kv) and k_pe `[T, 64]` (pre-rope shared key). Replaces
+/// the per-token dtod slice copies that don't batch.
+pub fn glm52_mla_ckv_split_launch(
+    ctx: &DeviceContext,
+    tokens: usize,
+    ckv: &CudaSlice<bf16>,
+    kv_c: &mut CudaSlice<bf16>,
+    k_pe: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(tokens > 0, "GLM5.2 MLA ckv split tokens must be positive");
+    let width = GLM52_MLA_KV_LORA + GLM52_MLA_ROPE_DIM;
+    ensure!(
+        ckv.len() >= tokens * width
+            && kv_c.len() >= tokens * GLM52_MLA_KV_LORA
+            && k_pe.len() >= tokens * GLM52_MLA_ROPE_DIM,
+        "GLM5.2 MLA ckv split buffers too small: ckv {}, kv_c {}, k_pe {} for {tokens} tokens",
+        ckv.len(),
+        kv_c.len(),
+        k_pe.len()
+    );
+    let (ckv_ptr, _g0) = ckv.device_ptr(&ctx.stream);
+    let (kv_c_ptr, _g1) = kv_c.device_ptr_mut(&ctx.stream);
+    let (k_pe_ptr, _g2) = k_pe.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_mla_ckv_split_cuda(
+            ckv_ptr as *const ffi::Half,
+            kv_c_ptr as *mut ffi::Half,
+            k_pe_ptr as *mut ffi::Half,
+            tokens as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 MLA ckv split launch failed: {err}"))
 }

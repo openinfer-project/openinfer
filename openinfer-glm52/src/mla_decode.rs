@@ -1,4 +1,5 @@
-//! Single-layer GLM5.2 MLA decode forward (bs=1): `hidden[6144] -> o[6144]`.
+//! Single-layer GLM5.2 MLA decode forward, row-batched:
+//! `hidden[T, 6144] -> o[T, 6144]` (each row is an independent token).
 //!
 //! Composes the oracle-validated GPU ops into one callable forward — the
 //! attention half of a decode layer. The pieces are each gated against the HF
@@ -22,7 +23,7 @@ use openinfer_kernels::ops::{
     Glm52FlashMlaSparseDecode, Glm52MoeQuantShape, gemm_strided_batched_bf16,
     glm52_flashmla_sparse_decode_launch, glm52_flashmla_sparse_decode_metadata_launch,
     glm52_fp8_per_token_group_quant_bf16_launch, glm52_mla_cache_pack_launch,
-    glm52_mla_query_assemble_launch, rms_norm_into,
+    glm52_mla_ckv_split_launch, glm52_mla_query_assemble_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
@@ -206,71 +207,89 @@ fn dequant_kv_b(
     Ok((uk, uv))
 }
 
-/// Persistent scratch for the MLA front-half projections of one token:
-/// everything derivable from `hidden` alone, before the sparse top-k is
-/// known. Written in place by [`glm52_mla_front_into`] every step (pointer-
-/// stable for graph capture); one instance is shared across all 78 layers —
-/// layer N's values are dead once layer N's attend consumed them. `q_resid`
-/// is exposed because the DSA indexer consumes it (`wq_b(q_resid)`) to
-/// *produce* the top-k that the attend half then attends over.
+/// Persistent scratch for the MLA front-half projections of one step's
+/// `tokens` rows: everything derivable from `hidden` alone, before the sparse
+/// top-k is known. Written in place by [`glm52_mla_front_into`] every step
+/// (pointer-stable for graph capture); one instance is shared across all 78
+/// layers — layer N's values are dead once layer N's attend consumed them.
+/// `q_resid` is exposed because the DSA indexer consumes it (`wq_b(q_resid)`)
+/// to *produce* the top-k that the attend half then attends over. The row
+/// count is baked here so every front kernel derives it from one place.
 pub(crate) struct Glm52MlaFront {
-    q_a: DeviceVec,                // [2048] pre q_a_layernorm
-    pub(crate) q_resid: DeviceVec, // [2048] post q_a_layernorm
-    q_full: CudaSlice<bf16>,       // [16384] = [64,256]
-    ckv: CudaSlice<bf16>,          // [576] = compressed_kv | k_pe
-    kv_c_raw: DeviceVec,           // [512] pre kv_a_layernorm
-    kv_c: DeviceVec,               // [512] post kv_a_layernorm
-    k_pe: CudaSlice<bf16>,         // [64] pre-rope
+    pub(crate) tokens: usize,
+    q_a: CudaSlice<bf16>,                // [T, 2048] pre q_a_layernorm
+    pub(crate) q_resid: CudaSlice<bf16>, // [T, 2048] post q_a_layernorm
+    q_full: CudaSlice<bf16>,             // [T, 64, 256]
+    ckv: CudaSlice<bf16>,                // [T, 576] = compressed_kv | k_pe
+    kv_c_raw: CudaSlice<bf16>,           // [T, 512] pre kv_a_layernorm
+    kv_c: CudaSlice<bf16>,               // [T, 512] post kv_a_layernorm
+    k_pe: CudaSlice<bf16>,               // [T, 64] pre-rope
 }
 
 impl Glm52MlaFront {
-    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
+        ensure!(tokens > 0, "GLM5.2 MLA front needs positive tokens");
         Ok(Self {
-            q_a: DeviceVec::zeros(ctx, Q_LORA)?,
-            q_resid: DeviceVec::zeros(ctx, Q_LORA)?,
-            q_full: ctx.stream.alloc_zeros::<bf16>(HEADS * Q_HEAD)?,
-            ckv: ctx.stream.alloc_zeros::<bf16>(KV_A_OUT)?,
-            kv_c_raw: DeviceVec::zeros(ctx, KV_LORA)?,
-            kv_c: DeviceVec::zeros(ctx, KV_LORA)?,
-            k_pe: ctx.stream.alloc_zeros::<bf16>(ROPE_DIM)?,
+            tokens,
+            q_a: ctx.stream.alloc_zeros::<bf16>(tokens * Q_LORA)?,
+            q_resid: ctx.stream.alloc_zeros::<bf16>(tokens * Q_LORA)?,
+            q_full: ctx.stream.alloc_zeros::<bf16>(tokens * HEADS * Q_HEAD)?,
+            ckv: ctx.stream.alloc_zeros::<bf16>(tokens * KV_A_OUT)?,
+            kv_c_raw: ctx.stream.alloc_zeros::<bf16>(tokens * KV_LORA)?,
+            kv_c: ctx.stream.alloc_zeros::<bf16>(tokens * KV_LORA)?,
+            k_pe: ctx.stream.alloc_zeros::<bf16>(tokens * ROPE_DIM)?,
         })
     }
 }
 
-/// The q-phase of the MLA front (bs=1): `q_a` projection + q_a_layernorm.
-/// Split out because `q_resid` is everything the DSA indexer needs — the
-/// caller can fork the indexer onto an aux stream right after this and run
-/// [`glm52_mla_front_rest_into`] concurrently.
+/// The q-phase of the MLA front: `q_a` projection + q_a_layernorm over the
+/// front's `tokens` rows. Split out because `q_resid` is everything the DSA
+/// indexer needs — the caller can fork the indexer onto an aux stream right
+/// after this and run [`glm52_mla_front_rest_into`] concurrently.
 pub(crate) fn glm52_mla_front_q_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
     hidden: &CudaSlice<bf16>,
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
-    ensure!(hidden.len() >= HIDDEN, "GLM5.2 MLA hidden too small");
-    fp8_linear_into(ctx, &w.q_a, hidden, &mut front.q_a.data)?; // [2048]
-    rms_norm_into(ctx, &front.q_a, &w.q_a_ln, RMS_EPS, &mut front.q_resid)
+    let t = front.tokens;
+    ensure!(hidden.len() >= t * HIDDEN, "GLM5.2 MLA hidden too small");
+    fp8_linear_into(ctx, &w.q_a, t, hidden, &mut front.q_a)?; // [T, 2048]
+    rms_norm_rows_into(
+        ctx,
+        &front.q_a,
+        &w.q_a_ln,
+        RMS_EPS,
+        Q_LORA,
+        t,
+        &mut front.q_resid,
+    )
 }
 
-/// The remainder of the MLA front (bs=1): q_b + kv_a projections and the
-/// kv_c/k_pe unpacking. Independent of the indexer.
+/// The remainder of the MLA front: q_b + kv_a projections and the kv_c/k_pe
+/// unpacking, over the front's `tokens` rows. Independent of the indexer.
 pub(crate) fn glm52_mla_front_rest_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
     hidden: &CudaSlice<bf16>,
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
-    fp8_linear_into(ctx, &w.q_b, &front.q_resid.data, &mut front.q_full)?; // [64,256]
-    fp8_linear_into(ctx, &w.kv_a, hidden, &mut front.ckv)?; // [576]
-    ctx.stream
-        .memcpy_dtod(&front.ckv.slice(0..KV_LORA), &mut front.kv_c_raw.data)?;
-    rms_norm_into(ctx, &front.kv_c_raw, &w.kv_a_ln, RMS_EPS, &mut front.kv_c)?;
-    ctx.stream
-        .memcpy_dtod(&front.ckv.slice(KV_LORA..KV_A_OUT), &mut front.k_pe)?;
-    Ok(())
+    let t = front.tokens;
+    fp8_linear_into(ctx, &w.q_b, t, &front.q_resid, &mut front.q_full)?; // [T, 64, 256]
+    fp8_linear_into(ctx, &w.kv_a, t, hidden, &mut front.ckv)?; // [T, 576]
+    glm52_mla_ckv_split_launch(ctx, t, &front.ckv, &mut front.kv_c_raw, &mut front.k_pe)?;
+    rms_norm_rows_into(
+        ctx,
+        &front.kv_c_raw,
+        &w.kv_a_ln,
+        RMS_EPS,
+        KV_LORA,
+        t,
+        &mut front.kv_c,
+    )
 }
 
-/// MLA front half (bs=1): fp8 projections + norms from `hidden` into the
+/// MLA front half: fp8 projections + norms from `hidden[T, 6144]` into the
 /// persistent front scratch.
 pub(crate) fn glm52_mla_front_into(
     ctx: &DeviceContext,
@@ -283,8 +302,9 @@ pub(crate) fn glm52_mla_front_into(
 }
 
 /// Persistent scratch for the MLA attend half: absorb/query-assemble/cache-
-/// pack intermediates and the FlashMLA output + split accumulators. Shared
-/// across all 78 layers, written in place every step.
+/// pack intermediates and the FlashMLA output + split accumulators, sized for
+/// the contract's `batch_size` rows. Shared across all 78 layers, written in
+/// place every step.
 pub(crate) struct Glm52MlaAttendScratch {
     ql_nope: CudaSlice<bf16>,
     query: CudaSlice<bf16>,
@@ -299,16 +319,17 @@ pub(crate) struct Glm52MlaAttendScratch {
 
 impl Glm52MlaAttendScratch {
     pub(crate) fn new(ctx: &DeviceContext, contract: &Glm52FlashMlaSparseDecode) -> Result<Self> {
+        let t = contract.batch_size;
         Ok(Self {
-            ql_nope: ctx.stream.alloc_zeros::<bf16>(HEADS * KV_LORA)?,
-            query: ctx.stream.alloc_zeros::<bf16>(HEADS * QUERY_DIM)?,
-            ckv_fp8: ctx.stream.alloc_zeros::<u8>(KV_LORA)?,
-            ckv_scales: ctx.stream.alloc_zeros::<f32>(KV_LORA / FP8_BLOCK)?,
+            ql_nope: ctx.stream.alloc_zeros::<bf16>(t * HEADS * KV_LORA)?,
+            query: ctx.stream.alloc_zeros::<bf16>(t * HEADS * QUERY_DIM)?,
+            ckv_fp8: ctx.stream.alloc_zeros::<u8>(t * KV_LORA)?,
+            ckv_scales: ctx.stream.alloc_zeros::<f32>(t * (KV_LORA / FP8_BLOCK))?,
             latent: ctx.stream.alloc_zeros::<bf16>(contract.latent_len())?,
             lse: ctx.stream.alloc_zeros::<f32>(contract.lse_len())?,
             lse_accum: ctx.stream.alloc_zeros::<f32>(contract.lse_accum_len())?,
             o_accum: ctx.stream.alloc_zeros::<f32>(contract.o_accum_len())?,
-            v: ctx.stream.alloc_zeros::<bf16>(HEADS * V_HEAD)?,
+            v: ctx.stream.alloc_zeros::<bf16>(t * HEADS * V_HEAD)?,
         })
     }
 }
@@ -341,7 +362,7 @@ pub(crate) fn glm52_mla_decode_forward(
         "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
         sched.contract.num_blocks
     );
-    let mut front = Glm52MlaFront::new(ctx)?;
+    let mut front = Glm52MlaFront::new(ctx, 1)?;
     let mut attend = Glm52MlaAttendScratch::new(ctx, &sched.contract)?;
     let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
     ctx.stream
@@ -403,12 +424,21 @@ impl Glm52MlaSchedMetadata {
     pub(crate) fn topk(&self) -> usize {
         self.contract.topk
     }
+
+    /// The decode row count this plan was built for — the single source of
+    /// truth for a step's batch shape (every consumer reads it from here).
+    pub(crate) fn batch(&self) -> usize {
+        self.contract.batch_size
+    }
 }
 
-/// MLA attend half (bs=1): consumes the front projections + the sparse top-k,
-/// packs the new token into the paged cache, runs FlashMLA sparse decode, and
-/// projects back into `out[6144]`. Every intermediate lives in the persistent
-/// attend scratch — the chain is allocation-free.
+/// MLA attend half over the plan's `batch()` rows: consumes the front
+/// projections + the per-row sparse top-k, packs each row's new token into
+/// its paged-cache slot, runs FlashMLA sparse decode, and projects back into
+/// `out[T, 6144]`. Every intermediate lives in the persistent attend scratch
+/// — the chain is allocation-free. `cos`/`sin` carry one `[32]` row per token
+/// (each row sits at its own position); `slot_mapping`/`topk` are `[T]` /
+/// `[T, topk]`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm52_mla_attend_into(
     ctx: &DeviceContext,
@@ -424,35 +454,47 @@ pub(crate) fn glm52_mla_attend_into(
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let contract = sched.contract;
-    // The new token is written to cache slot `slot_mapping[0]` (device data,
-    // so the launch replays under CUDA graph capture); the cache-pack kernel
-    // traps on a slot outside the paged window. The every-step host guard is
-    // the caller's position bound (`decode_step` prologue: position <
-    // GLM52_MAX_MODEL_LEN <= num_blocks * PAGE_SIZE by construction).
+    let t = contract.batch_size;
+    ensure!(
+        front.tokens == t,
+        "GLM5.2 MLA front rows {} != attend plan batch {t}",
+        front.tokens
+    );
+    // Each row's new token is written to cache slot `slot_mapping[row]`
+    // (device data, so the launch replays under CUDA graph capture); the
+    // cache-pack kernel traps on a slot outside the paged window. The
+    // every-step host guard is the caller's position bound (`decode_step`
+    // prologue: position < GLM52_MAX_MODEL_LEN and each row confined to its
+    // own slot region by construction).
 
-    // ---- absorb: ql_nope[64,512] = q_pass @ W_UK ----
+    // ---- absorb: ql_nope[T,64,512] = q_pass @ W_UK ----
+    // cuBLAS batches over heads; the T rows ride the GEMM's n dimension —
+    // column t of head h reads q_full[t, h, 0..192] (ldb = the [T,H,256]
+    // token stride) and writes ql_nope[t, h, 0..512] (ldc = the [T,H,512]
+    // token stride).
     gemm_strided_batched_bf16(
         ctx,
         false,
         false,
         KV_LORA,
-        1,
+        t,
         QK_NOPE,
         &w.w_uk,
         KV_LORA,
         QK_NOPE * KV_LORA,
         &front.q_full,
-        QK_NOPE,
+        HEADS * Q_HEAD,
         Q_HEAD,
         &mut s.ql_nope,
-        KV_LORA,
+        HEADS * KV_LORA,
         KV_LORA,
         HEADS,
     )?;
 
-    // ---- assemble query [64,576] = [ql_nope | rope(q_pe)] (q_pe in q_full @192) ----
+    // ---- assemble query [T,64,576] = [ql_nope | rope(q_pe)] (q_pe in q_full @192) ----
     glm52_mla_query_assemble_launch(
         ctx,
+        t,
         &s.ql_nope,
         &front.q_full,
         QK_NOPE,
@@ -462,20 +504,21 @@ pub(crate) fn glm52_mla_attend_into(
         &mut s.query,
     )?;
 
-    // ---- pack the new token into the cache: quant(kv_c) + rope(k_pe) ----
+    // ---- pack each row's new token into the cache: quant(kv_c) + rope(k_pe) ----
     glm52_fp8_per_token_group_quant_bf16_launch(
         ctx,
         Glm52MoeQuantShape {
-            rows: 1,
+            rows: t,
             width: KV_LORA,
             group_size: FP8_BLOCK,
         },
-        &front.kv_c.data,
+        &front.kv_c,
         &mut s.ckv_fp8,
         &mut s.ckv_scales,
     )?;
     glm52_mla_cache_pack_launch(
         ctx,
+        t,
         &s.ckv_fp8,
         &s.ckv_scales,
         &front.k_pe,
@@ -485,7 +528,7 @@ pub(crate) fn glm52_mla_attend_into(
         slot_mapping,
     )?;
 
-    // ---- FlashMLA sparse decode -> latent[64,512] ----
+    // ---- FlashMLA sparse decode -> latent[T,64,512] ----
     glm52_flashmla_sparse_decode_launch(
         ctx,
         contract,
@@ -500,24 +543,24 @@ pub(crate) fn glm52_mla_attend_into(
         &mut s.o_accum,
     )?;
 
-    // ---- back: v[64,256] = latent @ W_UV, then o_proj ----
+    // ---- back: v[T,64,256] = latent @ W_UV, then o_proj ----
     gemm_strided_batched_bf16(
         ctx,
         true,
         false,
         V_HEAD,
-        1,
+        t,
         KV_LORA,
         &w.w_uv,
         KV_LORA,
         V_HEAD * KV_LORA,
         &s.latent,
-        KV_LORA,
+        HEADS * KV_LORA,
         KV_LORA,
         &mut s.v,
-        V_HEAD,
+        HEADS * V_HEAD,
         V_HEAD,
         HEADS,
     )?;
-    fp8_linear_into(ctx, &w.o_proj, &s.v, out) // [6144]
+    fp8_linear_into(ctx, &w.o_proj, t, &s.v, out) // [T, 6144]
 }

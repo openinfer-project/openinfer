@@ -1,23 +1,23 @@
-//! GLM5.2 decode bookends for bs=1: the token embedding and the final RMSNorm +
-//! lm_head tail that bracket the layer stack.
+//! GLM5.2 decode bookends, row-batched: the token embedding and the final
+//! RMSNorm + lm_head tail that bracket the layer stack.
 //!
 //! All three are plain bf16 ops (the embedding table, `model.norm.weight`, and
 //! `lm_head.weight` are bf16, not fp8). These are thin wrappers over the shared
-//! `openinfer-kernels` embed/norm/gemv ops -- the only GLM5.2-specific facts are
+//! `openinfer-kernels` embed/norm/gemm ops -- the only GLM5.2-specific facts are
 //! the dimensions and the 1e-5 RMS epsilon.
 
 use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::ops::{embedding_decode_into, gemv, rms_norm_into};
+use openinfer_kernels::ops::{embedding_rows_into, gemm_strided_batched_bf16, rms_norm_rows_into};
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
 
 const RMS_EPS: f32 = 1.0e-5;
 
-/// Token embedding lookup: `embed[token_id] -> [HIDDEN]`. `token_id` is a
-/// single-element device buffer (read on-device, so the lookup is
-/// CUDA-graph-safe -- the scheduler rewrites it in place each decode step).
+/// Token embedding lookup: `embed[token_ids[r]] -> [T, HIDDEN]`. `token_ids`
+/// is a device buffer (read on-device, so the lookup is CUDA-graph-safe --
+/// the scheduler rewrites it in place each decode step).
 #[cfg(test)]
 pub(crate) fn glm52_embed(
     ctx: &DeviceContext,
@@ -34,15 +34,17 @@ pub(crate) fn glm52_embed(
         data: ctx.stream.alloc_zeros::<half::bf16>(GLM52_HIDDEN)?,
         len: GLM52_HIDDEN,
     };
-    glm52_embed_into(ctx, embed, token_id, &mut out)?;
+    glm52_embed_into(ctx, embed, token_id, 1, &mut out)?;
     Ok(out)
 }
 
-/// [`glm52_embed`] into a pre-allocated `[HIDDEN]` output (the decode path).
+/// [`glm52_embed`] over `tokens` rows into a pre-allocated `[T, HIDDEN]`
+/// output (the decode path).
 pub(crate) fn glm52_embed_into(
     ctx: &DeviceContext,
     embed: &DeviceMatrix,
-    token_id: &CudaSlice<u32>,
+    token_ids: &CudaSlice<u32>,
+    tokens: usize,
     out: &mut DeviceVec,
 ) -> Result<()> {
     ensure!(
@@ -51,8 +53,11 @@ pub(crate) fn glm52_embed_into(
         embed.rows,
         embed.cols
     );
-    ensure!(out.len == GLM52_HIDDEN, "GLM5.2 embed out len drifted");
-    embedding_decode_into(ctx, embed, token_id, out)
+    ensure!(
+        out.len == tokens * GLM52_HIDDEN,
+        "GLM5.2 embed out len drifted"
+    );
+    embedding_rows_into(ctx, embed, token_ids, tokens, &mut out.data)
 }
 
 /// Final RMSNorm: `rms_norm(hidden, model.norm.weight, eps=1e-5)`.
@@ -72,25 +77,38 @@ pub(crate) fn glm52_final_norm(
         data: ctx.stream.alloc_zeros::<half::bf16>(GLM52_HIDDEN)?,
         len: GLM52_HIDDEN,
     };
-    glm52_final_norm_into(ctx, hidden, norm_weight, &mut out)?;
+    glm52_final_norm_into(ctx, hidden, norm_weight, 1, &mut out)?;
     Ok(out)
 }
 
-/// [`glm52_final_norm`] into a pre-allocated `[HIDDEN]` output (the decode path).
+/// [`glm52_final_norm`] over `tokens` rows into a pre-allocated `[T, HIDDEN]`
+/// output (the decode path).
 pub(crate) fn glm52_final_norm_into(
     ctx: &DeviceContext,
     hidden: &DeviceVec,
     norm_weight: &DeviceVec,
+    tokens: usize,
     out: &mut DeviceVec,
 ) -> Result<()> {
     ensure!(
-        hidden.len == GLM52_HIDDEN && norm_weight.len == GLM52_HIDDEN,
-        "GLM5.2 final norm lengths hidden {} / weight {} != {GLM52_HIDDEN}",
+        hidden.len == tokens * GLM52_HIDDEN && norm_weight.len == GLM52_HIDDEN,
+        "GLM5.2 final norm lengths hidden {} / weight {} drifted",
         hidden.len,
         norm_weight.len
     );
-    ensure!(out.len == GLM52_HIDDEN, "GLM5.2 final norm out len drifted");
-    rms_norm_into(ctx, hidden, norm_weight, RMS_EPS, out)
+    ensure!(
+        out.len == tokens * GLM52_HIDDEN,
+        "GLM5.2 final norm out len drifted"
+    );
+    rms_norm_rows_into(
+        ctx,
+        &hidden.data,
+        norm_weight,
+        RMS_EPS,
+        GLM52_HIDDEN,
+        tokens,
+        &mut out.data,
+    )
 }
 
 /// lm_head projection: `lm_head @ normed -> [VOCAB]` logits. The weight is bf16
@@ -116,15 +134,20 @@ pub(crate) fn glm52_lm_head(
         data: ctx.stream.alloc_zeros::<half::bf16>(GLM52_VOCAB)?,
         len: GLM52_VOCAB,
     };
-    glm52_lm_head_into(ctx, normed, lm_head, &mut out)?;
+    glm52_lm_head_into(ctx, normed, lm_head, 1, &mut out)?;
     Ok(out)
 }
 
-/// [`glm52_lm_head`] into a pre-allocated `[VOCAB]` output (the decode path).
+/// [`glm52_lm_head`] over `tokens` rows into a pre-allocated `[T, VOCAB]`
+/// output (the decode path). One cuBLAS GEMM with the rows on the n
+/// dimension: the col-major `[VOCAB, T]` output IS the row-major `[T, VOCAB]`
+/// layout the argmax consumes, and the 1.9 GB weight is read once for all
+/// rows.
 pub(crate) fn glm52_lm_head_into(
     ctx: &DeviceContext,
     normed: &DeviceVec,
     lm_head: &DeviceMatrix,
+    tokens: usize,
     out: &mut DeviceVec,
 ) -> Result<()> {
     ensure!(
@@ -134,10 +157,30 @@ pub(crate) fn glm52_lm_head_into(
         lm_head.cols
     );
     ensure!(
-        normed.len == GLM52_HIDDEN,
-        "GLM5.2 lm_head input len {} != {GLM52_HIDDEN}",
+        normed.len == tokens * GLM52_HIDDEN,
+        "GLM5.2 lm_head input len {} drifted",
         normed.len
     );
-    ensure!(out.len == GLM52_VOCAB, "GLM5.2 lm_head out len drifted");
-    gemv(ctx, lm_head, normed, out)
+    ensure!(
+        out.len == tokens * GLM52_VOCAB,
+        "GLM5.2 lm_head out len drifted"
+    );
+    gemm_strided_batched_bf16(
+        ctx,
+        true,  // lm_head [VOCAB, HIDDEN] row-major -> col-major via transpose
+        false, // normed [T, HIDDEN] row-major = [HIDDEN, T] col-major
+        GLM52_VOCAB,
+        tokens,
+        GLM52_HIDDEN,
+        &lm_head.data,
+        GLM52_HIDDEN,
+        0,
+        &normed.data,
+        GLM52_HIDDEN,
+        0,
+        &mut out.data,
+        GLM52_VOCAB,
+        0,
+        1,
+    )
 }

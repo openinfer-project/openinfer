@@ -67,6 +67,8 @@ pub(crate) struct Glm52MoeEp8State {
     /// Dispatch inputs for token-less expert ranks (num_tokens = 0 still
     /// requires valid pointers).
     zero_x: CudaSlice<bf16>,
+    /// How many combined rows the last dispatching forward produced.
+    combined_tokens: usize,
     zero_topk_idx: CudaSlice<i32>,
     zero_topk_weight: CudaSlice<f32>,
     /// Grouped-GEMM chain workspace. Rows past a launch's `bound_rows` hold
@@ -82,9 +84,10 @@ pub(crate) struct Glm52MoeEp8State {
     w2_act_scale: CudaSlice<f32>,
     w2_scale_tma: CudaSlice<f32>,
     expert_out: CudaSlice<bf16>,
-    /// The combined routed output for this rank's (single) source token,
-    /// rewritten by every `glm52_moe_ep8_routed_forward` call. Persistent so
-    /// the whole chain is allocation-free (pointer-stable for graph capture).
+    /// The combined routed output for this rank's source tokens (row-major
+    /// `[tokens, HIDDEN]`), rewritten by every `glm52_moe_ep8_routed_forward`
+    /// call. Persistent so the whole chain is allocation-free (pointer-stable
+    /// for graph capture); sized at the shim's per-rank decode cap.
     combined: CudaSlice<bf16>,
 }
 
@@ -141,26 +144,35 @@ impl Glm52MoeEp8State {
             w2_act_scale: ctx.stream.alloc_zeros(expanded * W2_SCALE_COLS)?,
             w2_scale_tma: ctx.stream.alloc_zeros(w2_scale_tma_len)?,
             expert_out: ctx.stream.alloc_zeros(expanded * W2_N)?,
-            combined: ctx.stream.alloc_zeros(HIDDEN)?,
+            combined_tokens: 0,
+            combined: ctx
+                .stream
+                .alloc_zeros(info.decode_max_tokens_per_rank as usize * HIDDEN)?,
         })
     }
 
-    /// The routed output written by the last `glm52_moe_ep8_routed_forward`
-    /// call that dispatched a token (valid only when that call returned
-    /// `true`).
+    /// The routed output rows (`[tokens, HIDDEN]`) written by the last
+    /// `glm52_moe_ep8_routed_forward` call that dispatched tokens (valid only
+    /// when that call returned `true`).
     pub(crate) fn combined(&self) -> &CudaSlice<bf16> {
         &self.combined
+    }
+
+    /// Row count of [`Self::combined`] from the last dispatching forward.
+    pub(crate) fn combined_tokens(&self) -> usize {
+        self.combined_tokens
     }
 }
 
 /// One EP8 MoE layer's routed contribution — a collective every rank must
-/// enter simultaneously per layer. A rank with a token passes its
-/// post-attention normed hidden + router output; on `Ok(true)` the routed
-/// output `[HIDDEN]` (route weight and ×2.5 scaling already folded) is in
+/// enter simultaneously per layer. A rank with tokens passes its
+/// post-attention normed hidden rows + router output (`[T, HIDDEN]` /
+/// `[T, 8]`) and the row count; on `Ok(true)` the routed output
+/// `[T, HIDDEN]` (route weight and ×2.5 scaling already folded) is in
 /// `state.combined()`. A token-less rank passes `None` and gets `Ok(false)`.
-/// The DP8 production path always passes `Some` (idle ranks step a padding
-/// token); `None` survives for the EP8 layer oracle gate's single-dispatcher
-/// replay.
+/// The DP8 production path always passes `Some` (pad rows are dispatched like
+/// real ones); `None` survives for the EP8 layer oracle gate's
+/// single-dispatcher replay.
 ///
 /// `global_tokens` is the total token count dispatched across ALL ranks this
 /// step — every rank must pass the same value (a protocol constant of the
@@ -176,7 +188,7 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     ctx: &DeviceContext,
     state: &mut Glm52MoeEp8State,
     bank: &Glm52MoeExpertBank,
-    token: Option<(&CudaSlice<bf16>, &RoutedTopk)>,
+    token: Option<(&CudaSlice<bf16>, &RoutedTopk, usize)>,
     global_tokens: usize,
 ) -> Result<bool> {
     let n_local = state.info.num_local_experts as usize;
@@ -186,7 +198,11 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         bank.n_experts()
     );
     let expanded = state.info.decode_worst_expanded_tokens as usize;
-    let num_tokens = usize::from(token.is_some());
+    let num_tokens = token.map_or(0, |(_, _, t)| t);
+    ensure!(
+        token.is_none() || num_tokens > 0,
+        "GLM5.2 EP8 MoE dispatching rank must pass a positive token count"
+    );
     ensure!(
         global_tokens >= num_tokens,
         "GLM5.2 EP8 MoE global_tokens {global_tokens} < local tokens {num_tokens}"
@@ -199,7 +215,7 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     // Collective dispatch: bf16 token rows → expert-major aligned recv slots.
     {
         let (x, topk_idx, topk_weight) = match token {
-            Some((normed, route)) => (normed, &route.topk_idx, &route.topk_weight),
+            Some((normed, route, _)) => (normed, &route.topk_idx, &route.topk_weight),
             None => (&state.zero_x, &state.zero_topk_idx, &state.zero_topk_weight),
         };
         state.ep.decode_dispatch(
@@ -307,10 +323,11 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     )?;
 
     // Collective combine: weighted expert outputs → per-source-token sums,
-    // into the persistent `combined` buffer (`num_tokens` is 0 or 1, and the
-    // buffer holds one HIDDEN row).
+    // into the persistent `combined` buffer (`[num_tokens, HIDDEN]` rows of
+    // the per-rank-cap-sized buffer).
+    state.combined_tokens = num_tokens;
     let topk_idx = match token {
-        Some((_, route)) => &route.topk_idx,
+        Some((_, route, _)) => &route.topk_idx,
         None => &state.zero_topk_idx,
     };
     state.ep.decode_combine(

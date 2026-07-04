@@ -1,5 +1,6 @@
-//! GLM5.2 decoder-layer composition for bs=1 decode: two-norm residual layout
-//! around the MLA/DSA attention and the dense-or-MoE MLP.
+//! GLM5.2 decoder-layer composition for row-batched decode: two-norm residual
+//! layout around the MLA/DSA attention and the dense-or-MoE MLP. Every buffer
+//! carries the step's `tokens` independent rows.
 //!
 //! Per-layer math (vllm `DeepseekV2DecoderLayer`, verified for `glm_moe_dsa`):
 //!
@@ -24,9 +25,9 @@
 use anyhow::{Context as _, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_kernels::ops::{
-    Glm52IndexerCacheLayout, add_into, fused_add_rms_norm_round_into, rms_norm_into,
-};
+#[cfg(test)]
+use openinfer_kernels::ops::rms_norm_into;
+use openinfer_kernels::ops::{Glm52IndexerCacheLayout, add_into, fused_add_rms_norm_round_into};
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::dense::Glm52DenseMlpWeights;
@@ -104,8 +105,9 @@ pub(crate) struct Glm52DecodeStep<'a> {
 
 /// Persistent per-layer composition scratch: the residual-stream boundary
 /// buffers shared by all 78 layers (layer N's values are dead once layer N's
-/// closing add consumed them).
+/// closing add consumed them), sized for the step's `tokens` rows.
 pub(crate) struct Glm52LayerScratch {
+    pub(crate) tokens: usize,
     /// input_layernorm output — the MLA/indexer input. Written by the
     /// PREVIOUS layer's closing fused add+norm (layer 0's comes from a
     /// standalone norm of the embedding).
@@ -123,16 +125,17 @@ pub(crate) struct Glm52LayerScratch {
 }
 
 impl Glm52LayerScratch {
-    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
         Ok(Self {
-            normed: DeviceVec::zeros(ctx, HIDDEN)?,
+            tokens,
+            normed: DeviceVec::zeros(ctx, tokens * HIDDEN)?,
             attn: [
-                ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
-                ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+                ctx.stream.alloc_zeros::<bf16>(tokens * HIDDEN)?,
+                ctx.stream.alloc_zeros::<bf16>(tokens * HIDDEN)?,
             ],
-            normed2: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
-            mlp_out: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
-            shared_out: ctx.stream.alloc_zeros::<bf16>(HIDDEN)?,
+            normed2: ctx.stream.alloc_zeros::<bf16>(tokens * HIDDEN)?,
+            mlp_out: ctx.stream.alloc_zeros::<bf16>(tokens * HIDDEN)?,
+            shared_out: ctx.stream.alloc_zeros::<bf16>(tokens * HIDDEN)?,
         })
     }
 }
@@ -169,6 +172,13 @@ pub(crate) fn glm52_layer_attention_half(
     // `normed` + `q_resid` (the q-phase), while q_b/kv_a are independent of
     // it. Same kernels either way — byte-identical; the fork/join events
     // become graph edges at capture.
+    let tokens = step.mla_sched.batch();
+    ensure!(
+        s.layer.tokens == tokens && s.mla_front.tokens == tokens,
+        "GLM5.2 layer scratch rows {} / front rows {} != attend plan batch {tokens}",
+        s.layer.tokens,
+        s.mla_front.tokens
+    );
     glm52_mla_front_q_into(ctx, &w.mla, &s.layer.normed.data, &mut s.mla_front)?;
     let mut topk_ready = None;
     match &w.indexer {
@@ -188,7 +198,7 @@ pub(crate) fn glm52_layer_attention_half(
                 idx_ctx,
                 indexer,
                 &s.layer.normed.data,
-                &s.mla_front.q_resid.data,
+                &s.mla_front.q_resid,
                 step.idx_cos,
                 step.idx_sin,
                 index_k_cache,
@@ -257,7 +267,7 @@ pub(crate) fn glm52_layer_attention_half(
         &w.post_attn_ln,
         RMS_EPS,
         HIDDEN,
-        1,
+        tokens,
         &mut s.layer.normed2,
     )?;
     Ok(())
@@ -274,6 +284,7 @@ pub(crate) fn glm52_layer_finish_fused(
     parity: usize,
     next_input_ln: &DeviceVec,
 ) -> Result<()> {
+    let tokens = s.layer.tokens;
     fused_add_rms_norm_round_into(
         ctx,
         &mut s.layer.attn[parity],
@@ -281,7 +292,7 @@ pub(crate) fn glm52_layer_finish_fused(
         next_input_ln,
         RMS_EPS,
         HIDDEN,
-        1,
+        tokens,
         &mut s.layer.normed.data,
     )
 }
@@ -297,7 +308,7 @@ pub(crate) fn glm52_layer_finish(
         ctx,
         &s.layer.attn[parity],
         &s.layer.mlp_out,
-        HIDDEN,
+        s.layer.tokens * HIDDEN,
         &mut s.hidden.data,
     )
 }

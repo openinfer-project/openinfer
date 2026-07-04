@@ -69,6 +69,7 @@ unsafe extern "C" {
         beta: *const f32,
         out: *mut Half,
         n: i32,
+        rows: i32,
         eps: f32,
         stream: CUstream,
     ) -> CUresult;

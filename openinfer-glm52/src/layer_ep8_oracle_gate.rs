@@ -160,7 +160,7 @@ fn run_layer_prefill_ep8(
     let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
 
     let mqa_shape =
-        Glm52IndexerScratch::decode_shape(index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
+        Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
     let mut scratch = Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
@@ -214,7 +214,7 @@ fn run_layer_prefill_ep8(
             ctx,
             ep8,
             &moe.bank,
-            Some((&scratch.layer.normed2, &route)),
+            Some((&scratch.layer.normed2, &route, 1)),
             GLM52_DECODE_GLOBAL_TOKENS,
         )?;
         ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");

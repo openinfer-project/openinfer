@@ -1,12 +1,14 @@
-//! DP8 lock-step scheduler: one request per rank, one token per rank per
-//! step.
+//! DP8 lock-step scheduler: one request per rank (slot 0 of the rank's fixed
+//! `GLM52_MAX_BATCH_PER_RANK`-row decode batch; the remaining slots carry
+//! padding rows until multi-slot admission lands).
 //!
 //! Every global step ALL ranks run the full-model forward simultaneously —
 //! ranks with an active request feed its next token (prompt tokens ride the
-//! decode path one position at a time), idle ranks feed a padding token whose
-//! output is discarded. This satisfies the DeepEP contract that every rank
-//! enters every MoE layer's dispatch/combine collective, and makes DP1 the
-//! `active_ranks = 1` special case of the same protocol.
+//! decode path one position at a time), idle ranks/slots feed a padding row
+//! whose output is discarded. This satisfies the DeepEP contract that every
+//! rank enters every MoE layer's dispatch/combine collective with the agreed
+//! global row count, and makes DP1 the `active_ranks = 1` special case of
+//! the same protocol.
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
 //! live in [`Glm52SlotState`] as pure data transitions; the coordinator is a
@@ -15,7 +17,7 @@
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
 
-use crate::model::GLM52_MAX_MODEL_LEN;
+use crate::model::{GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN};
 use crate::runner::Glm52RankWorker;
 
 /// What a rank forwards this step. Idle ranks feed the padding input; its
@@ -203,8 +205,9 @@ pub(crate) fn run_dp8_coordinator(
             continue;
         }
 
-        // One lock-step step: every rank forwards one token (padding on idle
-        // ranks), all responses joined before any output is interpreted.
+        // One lock-step step: every rank forwards its fixed row batch — the
+        // active request (if any) in slot 0, padding rows elsewhere — and all
+        // responses are joined before any output is interpreted.
         let responses = slots
             .iter()
             .zip(&workers)
@@ -212,7 +215,10 @@ pub(crate) fn run_dp8_coordinator(
                 let input = slot
                     .as_ref()
                     .map_or(GLM52_PADDING_STEP, |active| active.state.next_input());
-                worker.step_async(input.token, input.position)
+                let mut inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
+                    GLM52_MAX_BATCH_PER_RANK];
+                inputs[0] = (input.token, input.position);
+                worker.step_async(inputs)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {
@@ -234,7 +240,7 @@ pub(crate) fn run_dp8_coordinator(
                 .recv()
                 .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its step response"));
             match result {
-                Ok(Ok(token)) => outputs.push(token),
+                Ok(Ok(step_tokens)) => outputs.push(step_tokens[0]),
                 Ok(Err(err)) | Err(err) => {
                     let err = err.context(format!("GLM5.2 rank {rank} step"));
                     log::error!("GLM5.2 rank {rank} step failed: {err:#}");

@@ -1,4 +1,4 @@
-//! Shared GLM5.2 fp8 block-scaled projection primitives (bs=1 decode).
+//! Shared GLM5.2 fp8 block-scaled projection primitives (decode, row-batched).
 //!
 //! Every dense/attention/expert projection in GLM5.2 is fp8 e4m3 with a per-128
 //! block `weight_scale_inv`. At m=1 the projection is a weight-only GEMV: the
@@ -154,22 +154,24 @@ pub(crate) fn pack_proj_pair(
     ProjWeight::from_device(weight, scale, n, a.k)
 }
 
-/// One fp8 projection (bs=1) into a pre-allocated output: weight-only GEMV of
-/// the bf16 activation against the fp8 `[n,k]` weight, block scale dequanted
-/// on the fly.
+/// One fp8 projection into a pre-allocated output: weight-only GEMV of `rows`
+/// bf16 activation rows against the fp8 `[n,k]` weight, block scale dequanted
+/// on the fly. rows > 1 runs the weight-stationary batched kernel — the weight
+/// is still read once, and every row is bit-identical to the rows=1 kernel.
 pub(crate) fn fp8_linear_into(
     ctx: &DeviceContext,
     w: &ProjWeight,
+    rows: usize,
     input: &CudaSlice<bf16>,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(
-        input.len() >= w.k,
-        "GLM5.2 fp8_linear input {} < k {}",
+        input.len() >= rows * w.k,
+        "GLM5.2 fp8_linear input {} < rows {rows} * k {}",
         input.len(),
         w.k
     );
-    glm52_fp8_weight_only_gemv_launch(ctx, w.n, w.k, input, &w.weight, &w.scale, out)
+    glm52_fp8_weight_only_gemv_launch(ctx, rows, w.n, w.k, input, &w.weight, &w.scale, out)
 }
 
 /// Allocating convenience over [`fp8_linear_into`] for the oracle-gate/test
@@ -181,7 +183,7 @@ pub(crate) fn fp8_linear(
     input: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
     let mut out = ctx.stream.alloc_zeros::<bf16>(w.n)?;
-    fp8_linear_into(ctx, w, input, &mut out)?;
+    fp8_linear_into(ctx, w, 1, input, &mut out)?;
     Ok(out)
 }
 
@@ -190,29 +192,32 @@ pub(crate) fn fp8_linear(
 /// 2048 — and each gets its own instance so a cross-wiring crashes here).
 pub(crate) struct Glm52MlpScratch {
     intermediate: usize,
+    rows: usize,
     gate_up: CudaSlice<bf16>,
     silu_out: CudaSlice<bf16>,
 }
 
 impl Glm52MlpScratch {
-    pub(crate) fn new(ctx: &DeviceContext, intermediate: usize) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, intermediate: usize, rows: usize) -> Result<Self> {
         ensure!(
             intermediate.is_multiple_of(FP8_BLOCK),
             "GLM5.2 fp8_mlp intermediate {intermediate} not a multiple of {FP8_BLOCK}"
         );
+        ensure!(rows > 0, "GLM5.2 fp8_mlp scratch needs positive rows");
         Ok(Self {
             intermediate,
-            gate_up: ctx.stream.alloc_zeros::<bf16>(2 * intermediate)?,
-            silu_out: ctx.stream.alloc_zeros::<bf16>(intermediate)?,
+            rows,
+            gate_up: ctx.stream.alloc_zeros::<bf16>(rows * 2 * intermediate)?,
+            silu_out: ctx.stream.alloc_zeros::<bf16>(rows * intermediate)?,
         })
     }
 }
 
-/// A plain fp8 SwiGLU MLP for one token (bs=1) into a pre-allocated output:
-/// `down(silu(gate(h)) * up(h))` with the gate|up projections PACKED into one
-/// `[2*intermediate, k]` weight (see [`pack_proj_pair`]) — a single GEMV
-/// writes the `[gate | up]` layout the SwiGLU consumes, no concat copies.
-/// `out` is `[down.n]` bf16 (= `[HIDDEN]`).
+/// A plain fp8 SwiGLU MLP over the scratch's `rows` tokens into a
+/// pre-allocated output: `down(silu(gate(h)) * up(h))` with the gate|up
+/// projections PACKED into one `[2*intermediate, k]` weight (see
+/// [`pack_proj_pair`]) — a single GEMV writes the `[gate | up]` layout the
+/// SwiGLU consumes, no concat copies. `out` is `[rows, down.n]` bf16.
 pub(crate) fn fp8_mlp_into(
     ctx: &DeviceContext,
     gate_up: &ProjWeight,
@@ -240,17 +245,17 @@ pub(crate) fn fp8_mlp_into(
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
         s.intermediate
     );
-    fp8_linear_into(ctx, gate_up, input, &mut s.gate_up)?;
+    fp8_linear_into(ctx, gate_up, s.rows, input, &mut s.gate_up)?;
     // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
     glm52_silu_and_mul_weighted_bf16_launch(
         ctx,
-        1,
+        s.rows,
         intermediate,
         &s.gate_up,
         None,
         &mut s.silu_out,
     )?;
-    fp8_linear_into(ctx, down, &s.silu_out, out)
+    fp8_linear_into(ctx, down, s.rows, &s.silu_out, out)
 }
 
 /// Allocating convenience over [`fp8_mlp_into`] for the oracle-gate/test
@@ -262,7 +267,7 @@ pub(crate) fn fp8_mlp(
     down: &ProjWeight,
     input: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
-    let mut s = Glm52MlpScratch::new(ctx, gate_up.n / 2)?;
+    let mut s = Glm52MlpScratch::new(ctx, gate_up.n / 2, 1)?;
     let mut out = ctx.stream.alloc_zeros::<bf16>(down.n)?;
     fp8_mlp_into(ctx, gate_up, down, input, &mut s, &mut out)?;
     Ok(out)

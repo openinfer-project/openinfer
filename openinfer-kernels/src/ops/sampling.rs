@@ -400,33 +400,40 @@ pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize 
     rows * vocab.div_ceil(TILE_ELEMS)
 }
 
-/// Single-row two-stage bf16 argmax: tile-parallel partials then one finalize
-/// block. Same total order as [`argmax_bf16_into`] (lowest GLOBAL index wins
-/// ties, NaN never wins) — the partials carry global indices, so the result
-/// is bit-identical to the single-block scan while the vocab row spreads over
-/// ~vocab/4096 CTAs instead of one. `partial_*` must hold
-/// `argmax_batch_bf16_split_partials_len(1, n)` elements.
+/// Row-wise two-stage bf16 argmax over `rows` rows of `n`: tile-parallel
+/// partials then one finalize block per row. Same per-row total order as
+/// [`argmax_bf16_into`] (lowest GLOBAL index wins ties, NaN never wins) — the
+/// partials carry global indices, so each row's result is bit-identical to
+/// the single-block scan (and independent of the other rows) while each vocab
+/// row spreads over ~n/4096 CTAs instead of one. `partial_*` must hold
+/// `argmax_batch_bf16_split_partials_len(rows, n)` elements; `values`/`indices`
+/// hold one element per row.
+#[allow(clippy::too_many_arguments)]
 pub fn argmax_bf16_split_into(
     ctx: &DeviceContext,
     logits: &CudaSlice<half::bf16>,
+    rows: usize,
     n: usize,
     partial_values: &mut CudaSlice<f32>,
     partial_indices: &mut CudaSlice<i32>,
-    value: &mut CudaSlice<half::bf16>,
-    index: &mut CudaSlice<i32>,
+    values: &mut CudaSlice<half::bf16>,
+    indices: &mut CudaSlice<i32>,
 ) -> Result<()> {
-    if n == 0 || logits.len() < n {
+    if rows == 0 || n == 0 || logits.len() < rows * n {
         return Err(anyhow!(
-            "argmax_bf16_split_into logits too small: have {}, need {n}",
-            logits.len()
+            "argmax_bf16_split_into logits too small: have {}, need {}",
+            logits.len(),
+            rows * n
         ));
     }
-    if value.is_empty() || index.is_empty() {
+    if values.len() < rows || indices.len() < rows {
         return Err(anyhow!(
-            "argmax_bf16_split_into outputs must hold one element"
+            "argmax_bf16_split_into outputs must hold {rows} elements: have {}/{}",
+            values.len(),
+            indices.len()
         ));
     }
-    let needed = argmax_batch_bf16_split_partials_len(1, n);
+    let needed = argmax_batch_bf16_split_partials_len(rows, n);
     if partial_values.len() < needed || partial_indices.len() < needed {
         return Err(anyhow!(
             "argmax_bf16_split_into partials too small: {}/{} need {needed}",
@@ -437,8 +444,8 @@ pub fn argmax_bf16_split_into(
     let (x_ptr, _gx) = logits.device_ptr(&ctx.stream);
     let (pv_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
     let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
-    let (v_ptr, _gv) = value.device_ptr_mut(&ctx.stream);
-    let (i_ptr, _gi) = index.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let (i_ptr, _gi) = indices.device_ptr_mut(&ctx.stream);
     unsafe {
         ffi::argmax_batch_bf16_split_cuda(
             x_ptr as *const ffi::Half,
@@ -446,7 +453,7 @@ pub fn argmax_bf16_split_into(
             i_ptr as *mut i32,
             pv_ptr as *mut f32,
             pi_ptr as *mut i32,
-            1,
+            rows as i32,
             n as i32,
             crate::tensor::active_cu_stream(ctx),
         );

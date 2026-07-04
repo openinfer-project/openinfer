@@ -357,25 +357,29 @@ pub(crate) struct RoutedTopk {
 
 /// Persistent router scratch for the decode path: the expert logits plus the
 /// top-k output the MoE dispatch consumes, written in place every MoE layer.
+/// Sized for `tokens` rows.
 pub(crate) struct Glm52RouterScratch {
+    tokens: usize,
     logits: CudaSlice<f32>,
     pub(crate) route: RoutedTopk,
 }
 
 impl Glm52RouterScratch {
-    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
+        ensure!(tokens > 0, "GLM5.2 router scratch needs positive tokens");
         Ok(Self {
-            logits: ctx.stream.alloc_zeros::<f32>(EXPERTS)?,
+            tokens,
+            logits: ctx.stream.alloc_zeros::<f32>(tokens * EXPERTS)?,
             route: RoutedTopk {
-                topk_idx: ctx.stream.alloc_zeros::<i32>(TOPK)?,
-                topk_weight: ctx.stream.alloc_zeros::<f32>(TOPK)?,
+                topk_idx: ctx.stream.alloc_zeros::<i32>(tokens * TOPK)?,
+                topk_weight: ctx.stream.alloc_zeros::<f32>(tokens * TOPK)?,
             },
         })
     }
 }
 
-/// Router for one token into the persistent scratch (`s.route` holds the
-/// result).
+/// Router over the scratch's `tokens` rows into the persistent scratch
+/// (`s.route` holds the per-row top-k, `[T, 8]`).
 pub(crate) fn run_router_into(
     ctx: &DeviceContext,
     router: &Glm52MoeRouterWeights,
@@ -390,8 +394,8 @@ pub(crate) fn run_router_into(
         ctx,
         Glm52RouterConfig::glm52(),
         Glm52RouterBatch {
-            active_tokens: 1,
-            padded_tokens: 1,
+            active_tokens: s.tokens,
+            padded_tokens: s.tokens,
         },
         normed_hidden,
         &router.gate_weight,
@@ -410,7 +414,7 @@ pub(crate) fn run_router(
     router: &Glm52MoeRouterWeights,
     normed_hidden: &CudaSlice<bf16>,
 ) -> Result<RoutedTopk> {
-    let mut s = Glm52RouterScratch::new(ctx)?;
+    let mut s = Glm52RouterScratch::new(ctx, 1)?;
     run_router_into(ctx, router, normed_hidden, &mut s)?;
     Ok(s.route)
 }

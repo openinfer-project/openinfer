@@ -159,6 +159,77 @@ __global__ void glm52_fp8_weight_only_gemv_kernel(
   gemv_row_tile<ROWS>(activation, weight, weight_scale, out, n, k);  // x straight from L2
 }
 
+// Batched weight-stationary GEMV: one warp owns ONE output row n0 and sweeps K once,
+// carrying BATCH accumulators — the weight is still read exactly once (the whole point
+// of batching a weight-memory-bound GEMV), only the FMA count grows with BATCH.
+// Each batch row's dot uses the same lane sweep, per-term order, and warp reduction
+// as gemv_row_tile<1>, so every row is bit-identical to the m=1 kernel run alone.
+// The BATCH activation rows ([BATCH, k] bf16, ≤ 256 KB at the largest K) stay
+// L2-resident across the n/8 blocks, same as the single row does today.
+template <int BATCH>
+__device__ __forceinline__ void gemv_row_tile_batched(
+    const __nv_bfloat16* __restrict__ xs,        // activation [BATCH, k]
+    const unsigned char* __restrict__ w_base,    // fp8 e4m3 [n, k]
+    const float* __restrict__ scale_base,        // f32 [n/128, k/128]
+    __nv_bfloat16* __restrict__ out,             // [BATCH, n]
+    int n, int k) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int n0   = blockIdx.y * kWarpsPerBlk + warp;  // 1 row/warp
+  const int scale_cols = k >> 7;
+  const float* scale_row = scale_base + (size_t)(n0 >> 7) * scale_cols;
+
+  float acc[BATCH];
+#pragma unroll
+  for (int b = 0; b < BATCH; ++b) acc[b] = 0.0f;
+
+  for (int kk = lane * kVec; kk < k; kk += kStep) {
+    const float scale = scale_row[kk >> 7];
+    const uint4 wp = __ldcs(reinterpret_cast<const uint4*>(
+        w_base + ((size_t)n0 * k) + kk));
+    const __nv_fp8x2_e4m3* w2 = reinterpret_cast<const __nv_fp8x2_e4m3*>(&wp);
+#pragma unroll
+    for (int b = 0; b < BATCH; ++b) {
+      const float4* xs4 = reinterpret_cast<const float4*>(xs + (size_t)b * k);
+      float4 xv0 = xs4[(kk >> 3)];
+      float4 xv1 = xs4[(kk >> 3) + 1];
+      const __nv_bfloat16* xh0 = reinterpret_cast<const __nv_bfloat16*>(&xv0);
+      const __nv_bfloat16* xh1 = reinterpret_cast<const __nv_bfloat16*>(&xv1);
+      float partial = 0.0f;
+      // Same per-term left-to-right association as gemv_row_tile — bit parity
+      // per row is the contract (see that kernel's comment).
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        __half2 h = static_cast<__half2>(w2[j]);
+        partial += __low2float(h) * __bfloat162float(xh0[2 * j]);
+        partial += __high2float(h) * __bfloat162float(xh0[2 * j + 1]);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        __half2 h = static_cast<__half2>(w2[4 + j]);
+        partial += __low2float(h) * __bfloat162float(xh1[2 * j]);
+        partial += __high2float(h) * __bfloat162float(xh1[2 * j + 1]);
+      }
+      acc[b] += scale * partial;
+    }
+  }
+#pragma unroll
+  for (int b = 0; b < BATCH; ++b) {
+    float v = warp_reduce_sum(acc[b]);
+    if (lane == 0) out[(size_t)b * n + n0] = __float2bfloat16(v);
+  }
+}
+
+template <int BATCH>
+__global__ void glm52_fp8_weight_only_gemv_batched_kernel(
+    const __nv_bfloat16* __restrict__ activation,  // [BATCH, k]
+    const unsigned char* __restrict__ weight,      // [n, k] e4m3
+    const float* __restrict__ weight_scale,        // [n/128, k/128]
+    __nv_bfloat16* __restrict__ out,               // [BATCH, n]
+    int n, int k) {
+  gemv_row_tile_batched<BATCH>(activation, weight, weight_scale, out, n, k);
+}
+
 // Routed grouped GEMV: blockIdx.x = slot in [0,topk); expert = topk_idx[slot].
 __global__ void glm52_moe_fp8_weight_only_gemv_kernel(
     const __nv_bfloat16* __restrict__ activation,  // W13: [k]; W2: [topk, k]
@@ -235,10 +306,15 @@ int plain_rows_per_warp(int k) {
   return k <= 2048 ? kRowsPlainShortK : kRowsPlainLongK;
 }
 
-// Whitelist of the model's plain-linear shapes (every non-expert fp8 projection).
-// Encoding these turns any future off-shape into a crash, not a silent read.
-bool valid_linear_shape(int n, int k) {
-  if (!valid_tiling(n, k, kWarpsPerBlk * plain_rows_per_warp(k))) return false;
+// The batched kernel's supported batch (one instantiation: the DP scheduler's
+// fixed per-rank decode batch). Rust's GLM52_MAX_BATCH_PER_RANK must match —
+// the launcher rejects any other batch, so a drift crashes at the boundary.
+constexpr int kBatchedGemvBatch = 8;
+
+// Whitelist of the model's linear shapes (shared by the plain and batched
+// launchers; the tiling check differs — rpb is 8 or 32 for plain, 8 for
+// batched — so it is applied by each launcher, not here).
+bool whitelisted_linear_shape(int n, int k) {
   if (n == 2048  && k == 6144)  return true;  // q_a / shared gate,up
   if (n == 16384 && k == 2048)  return true;  // q_b
   if (n == 576   && k == 6144)  return true;  // kv_a + rope (partial-N: 576%128!=0)
@@ -250,6 +326,12 @@ bool valid_linear_shape(int n, int k) {
   if (n == 4096  && k == 2048)  return true;  // indexer wq_b
   if (n == 128   && k == 6144)  return true;  // indexer wk
   return false;
+}
+
+// Encoding these turns any future off-shape into a crash, not a silent read.
+bool valid_linear_shape(int n, int k) {
+  return valid_tiling(n, k, kWarpsPerBlk * plain_rows_per_warp(k)) &&
+         whitelisted_linear_shape(n, k);
 }
 
 }  // namespace
@@ -289,6 +371,32 @@ CUresult glm52_fp8_weight_only_gemv_cuda(
     glm52_fp8_weight_only_gemv_kernel<kRowsPlainLongK>
         <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
   }
+  return consume_last_cuda_error();
+}
+
+// Batched plain GEMV: `out[b] = deq(weight) @ activation[b]` for b in [0, batch).
+// batch == 1 routes to the m=1 kernel (identical result — the batched tile is
+// per-row bit-identical to it by construction); the only other supported batch
+// is kBatchedGemvBatch (the DP scheduler's fixed per-rank decode batch).
+CUresult glm52_fp8_weight_only_gemv_batched_cuda(
+    const __nv_bfloat16* activation, const unsigned char* weight,
+    const float* weight_scale, __nv_bfloat16* out, int batch, int n, int k,
+    cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || weight_scale == nullptr ||
+      out == nullptr || !aligned16(activation) ||
+      !whitelisted_linear_shape(n, k) || !valid_tiling(n, k, kWarpsPerBlk)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (batch == 1) {
+    return glm52_fp8_weight_only_gemv_cuda(activation, weight, weight_scale, out,
+                                           n, k, stream);
+  }
+  if (batch != kBatchedGemvBatch) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const dim3 grid(1, n / kWarpsPerBlk, 1);
+  glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch>
+      <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
   return consume_last_cuda_error();
 }
 

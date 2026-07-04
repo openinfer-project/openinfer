@@ -179,6 +179,7 @@ pub fn glm52_moe_combine_slots_launch(
 /// (f32 `[ceil(n/128), k/128]`) kept as raw bytes.
 pub fn glm52_fp8_weight_only_gemv_launch(
     ctx: &DeviceContext,
+    rows: usize,
     n: usize,
     k: usize,
     activation: &CudaSlice<bf16>,
@@ -187,32 +188,38 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(
-        n > 0 && k > 0,
-        "GLM5.2 linear GEMV needs positive n/k, got {n}/{k}"
+        rows > 0 && n > 0 && k > 0,
+        "GLM5.2 linear GEMV needs positive rows/n/k, got {rows}/{n}/{k}"
     );
     let scale_len = n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK) * 4;
     ensure!(
         weight.len() >= n * k
             && scale_bytes.len() >= scale_len
-            && activation.len() >= k
-            && out.len() >= n,
-        "GLM5.2 linear GEMV buffers too small: w {} (need {}), scale {} (need {scale_len}), act {} (need {k}), out {} (need {n})",
+            && activation.len() >= rows * k
+            && out.len() >= rows * n,
+        "GLM5.2 linear GEMV buffers too small: w {} (need {}), scale {} (need {scale_len}), act {} (need {}), out {} (need {})",
         weight.len(),
         n * k,
         scale_bytes.len(),
         activation.len(),
-        out.len()
+        rows * k,
+        out.len(),
+        rows * n
     );
     let (act_ptr, _a) = activation.device_ptr(&ctx.stream);
     let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
     let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
     let (out_ptr, _o) = out.device_ptr_mut(&ctx.stream);
+    // rows == 1 runs the m=1 kernel; rows > 1 the weight-stationary batched
+    // kernel (per-row bit-identical to m=1; the CUDA side whitelists the
+    // supported batch — a drifted GLM52_MAX_BATCH_PER_RANK crashes here).
     unsafe {
-        ffi::glm52_fp8_weight_only_gemv_cuda(
+        ffi::glm52_fp8_weight_only_gemv_batched_cuda(
             act_ptr as *const ffi::Half,
             w_ptr as *const u8,
             s_ptr as *const f32,
             out_ptr as *mut ffi::Half,
+            rows as i32,
             n as i32,
             k as i32,
             ctx.stream.cu_stream(),
