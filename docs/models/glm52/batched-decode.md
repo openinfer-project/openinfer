@@ -38,6 +38,4 @@ One commit on `feat/glm52-batched-decode-step`: 27 files, +1060/−472.
 
 ## Next step
 
-PR-D2 `feat/glm52-continuous-batching`: multi-slot admission (least-loaded rank first), {1, 8} bucket graphs, then the concurrency scaling table {1, 8, 16, 32, 64} with diverse prompts and the vllm bench serve soak (input_len=1, random output, random qps).
-
-**D2 acceptance item carried from the D1 review:** D1's gates only ever put the real request in slot 0, so a stride bug that fires only at slot b>0 (where offsets are nonzero) is physically invisible to them. Before D2 merges, run a forced slot-k parity check (pin one request to slot 3/7 and byte-compare against the slot-0 output) — multi-slot admission exercises this naturally, but the explicit pinned check localizes a numerics break to the batch-stride layer instead of a 78-layer haystack.
+**Landed as D2** — multi-slot admission + {1, 8} bucket graphs, solo back to 22.4 ms/step, scaling table and soaks measured, and the slot-k parity acceptance item (pinned slot-3/7, both buckets) proven. See `continuous-batching.md`.

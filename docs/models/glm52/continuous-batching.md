@@ -1,6 +1,6 @@
 # GLM5.2 continuous batching (D2)
 
-> **TL;DR:** Execution record of PR-D2: multi-slot admission (up to 8 requests per rank, least-loaded rank first) + {1, 8} batch-bucket graphs (2 attention tiers × 2 buckets = 4 whole-step CUDA graphs, lazily captured). **Solo decode is back to 22.4 ms/step** (D1's fixed 8-row batch was 39.2; the PR5c record was 22.5) — an idle or ≤1-request-per-rank fleet steps a single row per rank, and the 8-row step is only paid when some rank holds two. jz-38: all oracle gates green; solo byte-identical to the PR5c and D1 records; 8/9/64-way, 80-way queueing, mixed tiers, disconnect, SIGTERM all PASS; pinned slot-3/7 parity PASS. **Known numerics property (root-caused, not a bug): the two buckets are distinct FP associations** — batch-1 and batch-8 kernels (cuBLAS n, FlashMLA split partitioning) produce bit-different logits, so a request whose lifetime spans a bucket switch can greedy-diverge from its solo replay at a near-tie (~token 215 on the probe prompt). Outputs are deterministic given the same occupancy timeline; slot/rank placement never changes bits within a bucket.
+> **TL;DR:** Execution record of PR-D2: multi-slot admission (up to 8 requests per rank, least-loaded rank first) + {1, 8} batch-bucket graphs (2 attention tiers × 2 buckets = 4 whole-step CUDA graphs, lazily captured). **Solo decode is back to 22.4 ms/step** (D1's fixed 8-row batch was 39.2; the PR5c record was 22.5); **diverse-prompt scaling: c8 256 tok/s → c64 911 tok/s (62.8 ms/step p50 / 63.6 p99)**; poisson soaks (rate 4/8, random output 32–224) 600/600 zero errors. jz-38: all oracle gates green (now covering both global-token buckets); solo byte-identical to the PR5c and D1 records; 8/9/64-way, 80-way queueing, mixed tiers, disconnect, SIGTERM all PASS; pinned slot-3/7 parity PASS. **Known numerics property (root-caused, not a bug): the two buckets are distinct FP associations** — a request spanning a bucket switch can greedy-diverge from its solo replay at a near-tie (~token 215 on the probe prompt); deterministic given the same occupancy timeline. **Known perf cliff: c16 ≈ c8 throughput** (2 real rows/rank pay the full 8-row step) — an intermediate bucket is the obvious follow-up, to be justified by its own A/B.
 >
 > **Last touched:** 2026-07
 
@@ -17,7 +17,7 @@ One commit on `feat/glm52-continuous-batching`: `openinfer-glm52` only, zero CUD
 
 | gate | result |
 |---|---|
-| oracle: MLA full / short tier / layer (grouped+gemv) / EP8 layer | all PASS |
+| oracle: MLA full / short tier / layer (grouped+gemv) / EP8 layer (replayed at BOTH global-token buckets, 64 and 8) | all PASS |
 | solo determinism ×2 (24 + 128 tok), vs PR5c v7 record, vs D1 record | PASS — byte-identical to both |
 | tier crossing 320-tok ×2 + prefix + post-short (b1 graphs) | PASS |
 | 8-way identical (one per rank — stays bucket 1) | PASS |
@@ -42,10 +42,29 @@ Slot-stride evidence beyond the pins: in the 9-way 320-tok probe, rank 0's two r
 
 So batch-1 and batch-8 logits differ in bits from the start (cuBLAS picks different kernels for n=1 vs n=8; FlashMLA distributes its SM parts over 1 vs 8 rows → different split-combine association), and greedy first flips at a near-tie ~215 tokens in. D1's "byte-identical" evidence (24/128 tok) was argmax-visible equality inside the flip-free region — there was never a cross-batch bit-parity guarantee. This is the standard batch-variant-numerics property every batching engine has (vLLM included); the guarantees that DO hold, all gate-proven: determinism given the same occupancy timeline, slot/rank placement invariance within a bucket, and state integrity across switches.
 
-## Measured performance
+## Measured performance (jz-38 8×H200, 2026-07-04)
 
-(placeholder — solo ms/step ×5 = 22.4 dead stable; scaling table {1,8,16,32,64} + soak pending)
+Solo probe (133-step greedy, ×5): **22.4 ms/step dead stable** — D1 was 39.2, the PR5c 1-row record 22.5.
+
+Closed-loop scaling, **diverse prompts** (random ~15-token prompts, 128-token outputs, non-streaming `/v1/completions`, `d2_engine_bench.py`):
+
+| concurrency | ms/step p50 | ms/step p99 | aggregate out tok/s | note |
+|---|---|---|---|---|
+| 1 | 21.5 | 21.6 | 42 | 1-row bucket |
+| 8 | 28.1 | 28.5 | 256 | still 1-row bucket; +25% over the identical-prompt 22.3 = routing diversity + request-boundary stagger |
+| 16 | 51.1 | 52.3 | 280 | **the cliff**: 2 real rows/rank pay the full 8-row step |
+| 32 | 57.1 | 57.7 | 502 | |
+| 64 | 62.8 | 63.6 | 911 | 22× the solo rate |
+
+Poisson-arrival soak (random output 32–224, non-streaming): rate 4 → 600/600 ok, 493 tok/s, request e2e p50 8.8 s / p99 14.2 s; rate 8 (mild overload) → 600/600 ok, 782 tok/s, p50 15.6 s / p99 27.0 s (queueing as designed). Post-traffic solo parity holds.
+
+Two measurement lessons this table encodes:
+
+- **Identical prompts overstate MoE throughput badly at scale**: the 64-way identical-prompt gate reads 1586 tok/s vs 911 diverse — a 74% inflation (degenerate routing collapses the expert segments). The known ~7-15% figure from bs=1-per-rank measurements grows with rows per step. D1's "~40 ms full-slot step" projection was made with pad rows (token 0 → degenerate routing); the real diverse 64-row step is ~63 ms.
+- **`vllm bench serve` (0.24) measurements against this server are client-distorted**: its streaming path reported ~39 ms/token at concurrency 1 where a streamed curl of the same request measures 23.0 (non-streamed 22.5 — so the server's SSE transport is fine, refuting an initial Nagle/TCP_NODELAY suspicion), and at concurrency 8 the client hung with every request complete and balanced on the server side (160/160 finished, all sockets drained, client parked in epoll). It also sends a non-zero default temperature, which the engine fast-rejects — pass `--temperature 0.0`. Engine numbers here therefore come from the non-streaming closed-loop harness; the vllm-bench client interaction is filed as a frontend follow-up.
 
 ## Next step
 
-(placeholder)
+- **Bucket tuning**: the c16 cliff (280 tok/s ≈ c8's 256) says a middle bucket (e.g. {1, 2 or 4, 8}) would pay for itself between 9 and ~24 concurrent requests. Each added bucket costs 2 more graphs + capture time and another FP-association regime; justify with its own diverse-prompt A/B, not projection.
+- Expert-GEMM M-tile work (#542's swapAB lead) re-opens now that real multi-row steps exist — re-measure at the 64-row diverse shape, where the 64-row M-tile is no longer 8× padding.
+- P/D decode-node work (KV ingestion from a vLLM prefill, true paged block table, >4096 context) is the next campaign; prefill stays out of scope per the standing prefill-by-vLLM decision.
