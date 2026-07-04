@@ -21,7 +21,8 @@ use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
     Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, embedding_rows_into,
-    glm52_flashmla_sparse_decode_num_sm_parts, rms_norm_rows_into,
+    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
+    rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -428,6 +429,45 @@ impl Glm52RankModel {
             .try_into()
             .map_err(|_| anyhow::anyhow!("GLM5.2 bucket state count drifted from the const"))?;
 
+        // Crash-early pre-flight: launch the batched weight-only GEMV once
+        // per bucket, so a GLM52_DECODE_BUCKETS entry without a matching CUDA
+        // template instantiation (`kBatchedGemvBatch*` in glm52_moe_gemv.cu)
+        // fails at startup — not on the first mid-serving step that reaches
+        // that bucket (graphs are lazily captured; nothing else exercises a
+        // bucket before real traffic does). Zeroed dummy operands in the
+        // smallest whitelisted linear shape (indexer wk, n=128 k=6144).
+        {
+            let (n, k) = (128usize, 6144usize);
+            let weight = ctx.stream.alloc_zeros::<u8>(n * k)?;
+            let scale = ctx
+                .stream
+                .alloc_zeros::<u8>(n.div_ceil(128) * k.div_ceil(128) * 4)?;
+            let activation = ctx
+                .stream
+                .alloc_zeros::<bf16>(GLM52_MAX_BATCH_PER_RANK * k)?;
+            let mut out = ctx
+                .stream
+                .alloc_zeros::<bf16>(GLM52_MAX_BATCH_PER_RANK * n)?;
+            for rows in GLM52_DECODE_BUCKETS {
+                glm52_fp8_weight_only_gemv_launch(
+                    ctx,
+                    rows,
+                    n,
+                    k,
+                    &activation,
+                    &weight,
+                    &scale,
+                    &mut out,
+                )
+                .with_context(|| {
+                    format!(
+                        "GLM5.2 decode bucket {rows} has no batched GEMV instantiation \
+                         (GLM52_DECODE_BUCKETS drifted from kBatchedGemvBatch* in glm52_moe_gemv.cu)"
+                    )
+                })?;
+            }
+        }
+
         Ok(Self {
             layers,
             caches,
@@ -487,9 +527,12 @@ impl Glm52RankModel {
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
-        let bidx = GLM52_DECODE_BUCKETS
-            .iter()
-            .position(|&rows| rows == shape.bucket)
+        // The bucket state's `rows` is the lookup key — an unknown bucket is
+        // a coordinator bug and fails the step before touching the GPU.
+        let bucket = self
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.rows == shape.bucket)
             .with_context(|| {
                 format!(
                     "GLM5.2 step bucket {} is not a member of {GLM52_DECODE_BUCKETS:?}",
@@ -497,10 +540,18 @@ impl Glm52RankModel {
                 )
             })?;
         let batch = shape.bucket;
-        // Each forwarded row must own a distinct slot (two rows on one slot
-        // would interleave writes into the same cache region), and the full
-        // bucket must be the identity mapping — its graphs read the static
-        // identity block table that is never rewritten.
+        // The full bucket must be the identity mapping — its graphs read the
+        // static identity block table that is never rewritten.
+        if batch == GLM52_MAX_BATCH_PER_RANK {
+            let identity: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
+            ensure!(
+                shape.slots == identity,
+                "GLM5.2 full-bucket step slots must be the identity mapping, got {:?}",
+                shape.slots
+            );
+        }
+        // Each forwarded row must own a distinct slot — two rows on one slot
+        // would interleave writes into the same cache region.
         let mut slot_seen = [false; GLM52_MAX_BATCH_PER_RANK];
         for row in 0..batch {
             let slot = shape.slots[row] as usize;
@@ -510,11 +561,6 @@ impl Glm52RankModel {
                 &shape.slots[..batch]
             );
             slot_seen[slot] = true;
-            ensure!(
-                batch < GLM52_MAX_BATCH_PER_RANK || slot == row,
-                "GLM5.2 full-bucket step slots must be the identity mapping, got {:?}",
-                shape.slots
-            );
         }
         let mut tokens_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
         let mut positions_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
@@ -553,7 +599,7 @@ impl Glm52RankModel {
                 let src = self
                     .block_table
                     .slice(slot * self.blocks_per_slot..(slot + 1) * self.blocks_per_slot);
-                let mut dst = self.buckets[bidx]
+                let mut dst = bucket
                     .block_table
                     .slice_mut(row * self.blocks_per_slot..(row + 1) * self.blocks_per_slot);
                 ctx.stream.memcpy_dtod(&src, &mut dst)?;
@@ -575,9 +621,8 @@ impl Glm52RankModel {
             .max()
             .is_some_and(|longest| longest <= GLM52_MLA_TOPK_SHORT);
         let tier = if short_tier { TIER_SHORT } else { TIER_FULL };
-        // Selecting the bucket state selects the plan, scratch, graph, and
-        // block table together — one coherent shape.
-        let bucket = &mut self.buckets[bidx];
+        // The bucket state selected above carries the plan, scratch, graph,
+        // and block table together — one coherent shape.
         let step = Glm52DecodeStep {
             mla_cos: &self.cos,
             mla_sin: &self.sin,
