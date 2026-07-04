@@ -94,11 +94,21 @@ cheaper verify step. Measure, don't assume.
   prompt echoed in `text` — pre-existing (main identical), frontend accounting, not engine.
   TTFT is 3.9× rather than 8× because a bucket-8 step costs 45.6 ms vs 22.4 — which also
   says a span-4 verify (bucket 4) is worth measuring against span-8 in M3.
-- **M2 — draft lane** (rank-local). Loader (skip embed/lm_head, reuse target head via the
-  target's lm_head GEMM), backbone forward (port qwen3 `dflash.rs` shape: qk-norm + rope +
-  KV-injection tail concat), Markov propose, aux capture plumbed from M1's capture buffer.
-  Gate: draft forward runs and proposes plausible spans on jz-38 (no losslessness claim yet —
-  greedy verify makes bad drafts a perf bug, not a correctness bug).
+- **M2 — draft lane** (rank-local), implemented as **shadow mode**: `--dflash-draft-model-path`
+  loads the drafter on every rank; the decode path is UNCHANGED, and per spec round the
+  coordinator (a) appends every live slot's step rows from the in-graph capture buffer to that
+  slot's draft pending context, (b) proposes 7 drafts at the current anchor once the previous
+  round is fully scored, and (c) scores proposals against the tokens plain decode actually
+  emits — logging `mean_accepted_drafts` / `mean_accepted_incl_bonus` + histogram per request
+  (`GLM5.2 dspark shadow:` lines). One number validates capture layout + backbone forward +
+  Markov head together: shadow accept ≈ their val 3.967 (incl. bonus) means the lane is right;
+  accept ≈ 0–1 means a layout bug. Pieces: `dspark.rs` (loader with config crash-early pin,
+  batched anchor-drop forward reusing target embed/lm_head, Markov loop at positions 1..=7),
+  5 in-graph capture copies at `GLM52_DSPARK_AUX_LAYERS = {7,22,38,54,69}` (see pin #5),
+  rank-local `Draft` command (resets → appends → proposals, FIFO-ordered before the next step),
+  draft KV sized `GLM52_MAX_MODEL_LEN + 8` (block headroom past the cap). The anchor-position
+  invariant (`anchor_pos == committed + pending`) is asserted in the draft — scheduler/draft
+  drift crashes instead of proposing from the wrong rope phase.
 - **M3 — round loop + gates + A/B**. Scheduler slot states (prompt-span / spec-round), accept
   seam, cache-cap span truncation near 4096. Gates: greedy spec output == plain greedy output
   on the D2.5 gate prompts (cross-bucket near-tie divergence is a known FP property — same
@@ -138,9 +148,16 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
    `sample_block`/`markov_step_argmax` math — port with the loop starting at position 1
    (anchor-drop) instead of 0 (anchor-first).
 
-Remaining unpinned: the vLLM-side aux-capture tensor (residual stream after layer k, pre-norm)
-is the family convention qwen3's byte-lossless gate already validated; confirm once against
-`speculators` `launch_vllm.py`'s capture hook when wiring M2's capture buffer.
+5. **Aux capture ids are vLLM "before layer idx" semantics — off by one vs qwen3's
+   convention.** Pinned from vLLM `deepseek_v2.py` (the model family GLM5.2 serves as) +
+   `launch_vllm.py`: the extractor captures `hidden_states + residual` at the TOP of the layer
+   loop, before running layer `idx`, and `--include-last-layer` legally appends
+   `id = num_hidden_layers` (handled after the loop) — so id k = the residual stream after k
+   layers, i.e. after layer k−1. The checkpoint's `[8, 23, 39, 55, 70]` therefore map to OUR
+   post-layer capture points `{7, 22, 38, 54, 69}` (`GLM52_DSPARK_AUX_LAYERS`). The qwen3
+   DFlash checkpoint (DeepSpec-trained) uses the opposite "after layer id" convention —
+   copying qwen3's capture wiring verbatim would have been the exact Bug-2 repeat this
+   section exists to prevent.
 
 ## Decisions
 

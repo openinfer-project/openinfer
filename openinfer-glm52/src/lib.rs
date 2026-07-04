@@ -12,6 +12,7 @@ mod bookend;
 mod bookend_oracle_gate;
 mod config;
 mod dense;
+mod dspark;
 mod fp8;
 mod indexer;
 #[cfg(test)]
@@ -55,6 +56,11 @@ pub use config::{
 pub struct Glm52LaunchOptions {
     pub tp_size: usize,
     pub dp_size: usize,
+    /// DSpark drafter checkpoint dir (`RedHatAI/GLM-5.2-speculator.dspark`).
+    /// M2: loads the draft lane in SHADOW mode — proposals are scored against
+    /// the tokens the plain decode actually emits and logged per request; the
+    /// decode path itself is unchanged.
+    pub dspark_draft_model_path: Option<std::path::PathBuf>,
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
@@ -76,6 +82,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             dp_size: options.dp_size,
             ep_size: GLM52_EP_RANKS,
         },
+        options.dspark_draft_model_path.as_deref(),
     )
 }
 
@@ -106,7 +113,11 @@ struct LoadedGlm52Runtime {
     report: GpuWeightLoadReport,
 }
 
-fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHandle> {
+fn start_engine(
+    model_path: &Path,
+    options: Glm52LoadOptions,
+    dspark_path: Option<&Path>,
+) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, &options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
     log::info!(
@@ -119,14 +130,46 @@ fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHa
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
     build_rank_models(&loaded.workers)?;
+    let dspark_enabled = if let Some(dspark_path) = dspark_path {
+        load_dspark_drafters(&loaded.workers, dspark_path)?;
+        true
+    } else {
+        false
+    };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
         .spawn(move || {
-            scheduler::run_dp8_coordinator(submit_rx, loaded.workers, &eos_token_ids);
+            scheduler::run_dp8_coordinator(
+                submit_rx,
+                loaded.workers,
+                &eos_token_ids,
+                dspark_enabled,
+            );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
     Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
+}
+
+/// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —
+/// the draft's embed/lm_head reuse the target's, so they are never loaded).
+fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Result<()> {
+    let started = Instant::now();
+    let responses = workers
+        .iter()
+        .map(|worker| worker.load_dspark_async(dspark_path))
+        .collect::<Result<Vec<_>>>()?;
+    for (rank, response) in responses.into_iter().enumerate() {
+        response.recv().map_err(|_| {
+            anyhow::anyhow!("GLM5.2 rank {rank} dropped its dspark-load response")
+        })??;
+    }
+    log::info!(
+        "GLM5.2 DSpark drafter loaded on all ranks in {:.2}s (shadow mode: proposals scored \
+         against plain decode, accept stats logged per request)",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Build every rank's resident model, then create the DeepEP contexts. Two

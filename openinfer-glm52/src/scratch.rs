@@ -51,6 +51,11 @@ pub(crate) struct Glm52DecodeScratch {
     /// The residual stream: embed writes it, every layer reads and rewrites
     /// it, the final norm consumes it.
     pub(crate) hidden: DeviceVec,
+    /// DSpark aux-hidden capture: each row's residual stream after the
+    /// [`crate::dspark::GLM52_DSPARK_AUX_LAYERS`] layers, concatenated per row
+    /// (`[tokens, 5 * GLM52_HIDDEN]`). Written inside the captured step graph
+    /// (5 strided row copies), read by the draft lane between steps.
+    pub(crate) captured: DeviceVec,
     pub(crate) final_normed: DeviceVec,
     pub(crate) logits: DeviceVec,
     /// Device greedy argmax outputs: each row's top logit bf16 value (for the
@@ -84,6 +89,7 @@ impl Glm52DecodeScratch {
             router: Glm52RouterScratch::new(ctx, tokens)?,
             layer: Glm52LayerScratch::new(ctx, tokens)?,
             hidden: DeviceVec::zeros(ctx, tokens * GLM52_HIDDEN)?,
+            captured: DeviceVec::zeros(ctx, tokens * crate::dspark::GLM52_DSPARK_CONTEXT_DIM)?,
             final_normed: DeviceVec::zeros(ctx, tokens * GLM52_HIDDEN)?,
             logits: DeviceVec::zeros(ctx, tokens * GLM52_VOCAB)?,
             argmax_partial_values: ctx

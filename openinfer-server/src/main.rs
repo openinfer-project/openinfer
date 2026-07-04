@@ -109,15 +109,17 @@ async fn main() -> anyhow::Result<()> {
 // defaults, capability constraints, cross-arg validation). The server only
 // picks the crate by detected model type and forwards the relevant CLI knobs.
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
-    // Only Qwen3 wires the DFlash drafter; fail loud rather than silently
-    // ignoring the flag for another model line.
+    // Only Qwen3 (DFlash/DSpark) and GLM5.2 (DSpark) wire a drafter; fail
+    // loud rather than silently ignoring the flag for another model line.
     #[cfg(feature = "qwen3")]
-    let is_qwen3 = matches!(model_type, ModelType::Qwen3);
+    let wires_drafter = matches!(model_type, ModelType::Qwen3);
     #[cfg(not(feature = "qwen3"))]
-    let is_qwen3 = false;
+    let wires_drafter = false;
+    #[cfg(feature = "glm52")]
+    let wires_drafter = wires_drafter || matches!(model_type, ModelType::Glm52);
     anyhow::ensure!(
-        args.dflash_draft_model_path.is_none() || is_qwen3,
-        "--dflash-draft-model-path is only supported for Qwen3 (got {model_type:?})"
+        args.dflash_draft_model_path.is_none() || wires_drafter,
+        "--dflash-draft-model-path is only supported for Qwen3 and GLM5.2 (got {model_type:?})"
     );
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
@@ -138,6 +140,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             openinfer_glm52::Glm52LaunchOptions {
                 tp_size: args.tp_size,
                 dp_size: args.dp_size.unwrap_or(8),
+                dspark_draft_model_path: args.dflash_draft_model_path.clone(),
             },
         )
         .context("failed to start GLM5.2 engine")?,

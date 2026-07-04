@@ -26,6 +26,7 @@
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
 
+use crate::dspark::GLM52_DSPARK_DRAFTS;
 use crate::model::{
     GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape,
 };
@@ -122,6 +123,14 @@ impl Glm52SlotState {
         }
     }
 
+    /// The next spec round's anchor once the request is decoding: the latest
+    /// emitted token and the position it will be fed at. `None` mid-prefill
+    /// (no token to extend yet).
+    pub(crate) fn decode_anchor(&self) -> Option<(u32, usize)> {
+        (self.fed >= self.prompt.len() && self.completion > 0)
+            .then(|| (self.last_token, self.prompt.len() + self.completion - 1))
+    }
+
     /// Fold one step's span of outputs in. Mid-prompt rows' outputs are
     /// discarded; the row that fed the LAST prompt token yields the first
     /// generated token, and decode spans are a single row — so only
@@ -189,6 +198,64 @@ pub(crate) fn validate_request(req: &GenerateRequest) -> Result<(), String> {
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
+    /// DSpark shadow scoring (M2): `Some` when the drafter is loaded. Each
+    /// round proposes 7 drafts from the current anchor and scores them
+    /// against the tokens the engine actually emits — the real accept rate
+    /// the M3 verify loop will get, with zero decode-path change.
+    shadow: Option<ShadowState>,
+}
+
+/// One request's shadow-round bookkeeping: at most one outstanding proposal
+/// (matching the M3 round cadence — a new proposal only after the previous
+/// round is fully scored), plus the accept histogram.
+#[derive(Default)]
+struct ShadowState {
+    outstanding: Vec<u32>,
+    matched: usize,
+    rounds: u64,
+    accepted_sum: u64,
+    hist: [u64; GLM52_DSPARK_DRAFTS + 1],
+}
+
+impl ShadowState {
+    /// Score one emitted token against the outstanding proposal. A mismatch
+    /// or a fully-matched proposal closes the round (the M3 loop would
+    /// re-anchor there).
+    fn score_token(&mut self, token: u32) {
+        if self.outstanding.is_empty() {
+            return;
+        }
+        if self.outstanding[self.matched] == token {
+            self.matched += 1;
+            if self.matched == self.outstanding.len() {
+                self.finish_round();
+            }
+        } else {
+            self.finish_round();
+        }
+    }
+
+    fn finish_round(&mut self) {
+        self.rounds += 1;
+        self.accepted_sum += self.matched as u64;
+        self.hist[self.matched] += 1;
+        self.outstanding.clear();
+        self.matched = 0;
+    }
+
+    fn log_on_release(&self, rank: usize, slot: usize) {
+        if self.rounds == 0 {
+            return;
+        }
+        let mean_accepted = self.accepted_sum as f64 / self.rounds as f64;
+        log::info!(
+            "GLM5.2 dspark shadow: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
+             mean_accepted_incl_bonus={:.3} hist={:?}",
+            self.rounds,
+            mean_accepted + 1.0,
+            self.hist,
+        );
+    }
 }
 
 /// Per-rank slot occupancy: `slots[rank][slot]`.
@@ -313,11 +380,16 @@ pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     workers: Vec<Glm52RankWorker>,
     eos_token_ids: &[u32],
+    dspark_enabled: bool,
 ) {
     let mut slots: Vec<RankSlots> = workers
         .iter()
         .map(|_| std::array::from_fn(|_| None))
         .collect();
+    // Slot draft states to clear on the next draft round (request left the
+    // slot, or a new one was admitted into it). Flushed with each step's
+    // Draft commands; the handler is idempotent, so duplicates are harmless.
+    let mut pending_resets: Vec<Vec<usize>> = workers.iter().map(|_| Vec::new()).collect();
     let mut pending = std::collections::VecDeque::<GenerateRequest>::new();
     let mut channel_open = true;
     let all_idle = |slots: &[RankSlots]| {
@@ -370,7 +442,14 @@ pub(crate) fn run_dp8_coordinator(
                 req.max_tokens,
                 req.params.ignore_eos,
             );
-            slots[rank][slot] = Some(ActiveRequest { req, state });
+            if dspark_enabled {
+                pending_resets[rank].push(slot);
+            }
+            slots[rank][slot] = Some(ActiveRequest {
+                req,
+                state,
+                shadow: dspark_enabled.then(ShadowState::default),
+            });
         }
         if all_idle(&slots) {
             continue;
@@ -435,7 +514,13 @@ pub(crate) fn run_dp8_coordinator(
             break 'serve;
         }
 
-        for ((rank_slots, rank_outputs), shape) in slots.iter_mut().zip(outputs).zip(&shapes) {
+        let mut rank_appends: Vec<Vec<(usize, usize)>> =
+            workers.iter().map(|_| Vec::new()).collect();
+        let mut rank_proposals: Vec<Vec<(usize, u32, usize)>> =
+            workers.iter().map(|_| Vec::new()).collect();
+        for (rank, ((rank_slots, rank_outputs), shape)) in
+            slots.iter_mut().zip(outputs).zip(&shapes).enumerate()
+        {
             // Walk the shape's contiguous per-slot runs; each active slot
             // folds its whole span of row outputs in at once.
             let mut row = 0usize;
@@ -445,27 +530,29 @@ pub(crate) fn run_dp8_coordinator(
                 while end < shape.bucket && shape.slots[end] as usize == slot_id {
                     end += 1;
                 }
-                let span_outputs = &rank_outputs[row..end];
+                let span_rows = row..end;
+                let span_outputs = &rank_outputs[span_rows.clone()];
                 row = end;
                 let slot = &mut rank_slots[slot_id];
                 let Some(active) = slot.as_mut() else {
                     continue;
                 };
                 let prompt_tokens = active.req.prompt_tokens.len();
-                match active.state.advance_span(span_outputs, eos_token_ids) {
+                let freed = match active.state.advance_span(span_outputs, eos_token_ids) {
                     Glm52StepOutcome::Prefilling => {
                         // Prefill never sends, so a disconnect is only
                         // visible through the sink probe — without it a long
                         // prompt zombies the slot until prefill completes.
-                        if active.req.token_tx.is_closed() {
-                            *slot = None;
-                        }
+                        active.req.token_tx.is_closed()
                     }
                     Glm52StepOutcome::Emit(token) => {
+                        if let Some(shadow) = active.shadow.as_mut() {
+                            shadow.score_token(token);
+                        }
                         // A dropped receiver (client disconnect) frees the
                         // slot; its KV lives in the slot's own cache region
                         // and dies with the slot.
-                        if active
+                        active
                             .req
                             .token_tx
                             .send(TokenEvent::Token {
@@ -473,11 +560,11 @@ pub(crate) fn run_dp8_coordinator(
                                 logprob: None,
                             })
                             .is_err()
-                        {
-                            *slot = None;
-                        }
                     }
                     Glm52StepOutcome::EmitAndFinish(token, finish_reason) => {
+                        if let Some(shadow) = active.shadow.as_mut() {
+                            shadow.score_token(token);
+                        }
                         let _ = active.req.token_tx.send(TokenEvent::Token {
                             id: token,
                             logprob: None,
@@ -487,7 +574,7 @@ pub(crate) fn run_dp8_coordinator(
                             prompt_tokens,
                             completion_tokens: active.state.completion_tokens(),
                         });
-                        *slot = None;
+                        true
                     }
                     Glm52StepOutcome::Finish(finish_reason) => {
                         let _ = active.req.token_tx.send(TokenEvent::Finished {
@@ -495,7 +582,85 @@ pub(crate) fn run_dp8_coordinator(
                             prompt_tokens,
                             completion_tokens: active.state.completion_tokens(),
                         });
-                        *slot = None;
+                        true
+                    }
+                };
+                if freed {
+                    if let Some(shadow) = &active.shadow {
+                        shadow.log_on_release(rank, slot_id);
+                        pending_resets[rank].push(slot_id);
+                    }
+                    *slot = None;
+                } else if let Some(shadow) = &active.shadow {
+                    // Every step row of a live slot feeds the draft context;
+                    // a new proposal starts once the previous round is fully
+                    // scored (the M3 verify cadence).
+                    rank_appends[rank].extend(span_rows.map(|r| (r, slot_id)));
+                    if shadow.outstanding.is_empty()
+                        && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
+                    {
+                        rank_proposals[rank].push((slot_id, anchor, anchor_pos));
+                    }
+                }
+            }
+        }
+
+        // Draft round (rank-local, no collectives): resets, context appends
+        // from THIS step's capture buffer, and new proposals. FIFO per-rank
+        // channels order it before the next step; the blocking join mirrors
+        // the M3 round cadence (draft sits between verify steps).
+        if dspark_enabled {
+            let mut draft_joins = Vec::new();
+            for (rank, worker) in workers.iter().enumerate() {
+                let resets = std::mem::take(&mut pending_resets[rank]);
+                let appends = std::mem::take(&mut rank_appends[rank]);
+                let proposals = std::mem::take(&mut rank_proposals[rank]);
+                if resets.is_empty() && appends.is_empty() && proposals.is_empty() {
+                    continue;
+                }
+                let proposal_slots: Vec<usize> =
+                    proposals.iter().map(|&(slot, _, _)| slot).collect();
+                match worker.draft_async(shapes[rank].bucket, resets, appends, proposals) {
+                    Ok(rx) => draft_joins.push((rank, proposal_slots, rx)),
+                    Err(err) => {
+                        fail_step(&mut slots, &err);
+                        break 'serve;
+                    }
+                }
+            }
+            for (rank, proposal_slots, rx) in draft_joins {
+                let result = rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its draft response"))
+                    .and_then(|r| r);
+                let spans = match result {
+                    Ok(spans) => spans,
+                    Err(err) => {
+                        // A draft failure is rank-local, but it means the
+                        // drafter's invariants broke — crash early rather
+                        // than silently degrade to plain decode.
+                        fail_step(
+                            &mut slots,
+                            &err.context(format!("GLM5.2 rank {rank} draft")),
+                        );
+                        break 'serve;
+                    }
+                };
+                if spans.len() != proposal_slots.len() {
+                    let err = anyhow::anyhow!(
+                        "GLM5.2 rank {rank} draft returned {} spans for {} proposals",
+                        spans.len(),
+                        proposal_slots.len()
+                    );
+                    fail_step(&mut slots, &err);
+                    break 'serve;
+                }
+                for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
+                    if let Some(active) = slots[rank][slot_id].as_mut()
+                        && let Some(shadow) = active.shadow.as_mut()
+                    {
+                        shadow.outstanding = span.to_vec();
+                        shadow.matched = 0;
                     }
                 }
             }
@@ -724,6 +889,51 @@ mod tests {
             state.advance_span(&[42], EOS),
             Glm52StepOutcome::EmitAndFinish(42, FinishReason::Length)
         );
+    }
+
+    #[test]
+    fn shadow_closes_rounds_at_mismatch_and_at_full_match() {
+        let mut shadow = ShadowState::default();
+        // No outstanding proposal: tokens are ignored.
+        shadow.score_token(9);
+        assert_eq!(shadow.rounds, 0);
+
+        shadow.outstanding = vec![1, 2, 3, 4, 5, 6, 7];
+        shadow.score_token(1);
+        shadow.score_token(2);
+        shadow.score_token(9); // mismatch closes the round at 2 accepted
+        assert_eq!((shadow.rounds, shadow.accepted_sum), (1, 2));
+        assert!(shadow.outstanding.is_empty());
+
+        shadow.outstanding = vec![1, 2, 3, 4, 5, 6, 7];
+        for token in [1, 2, 3, 4, 5, 6, 7] {
+            shadow.score_token(token);
+        }
+        assert_eq!((shadow.rounds, shadow.accepted_sum), (2, 9));
+        assert_eq!(shadow.hist[2], 1);
+        assert_eq!(shadow.hist[7], 1);
+        assert!(shadow.outstanding.is_empty());
+    }
+
+    #[test]
+    fn decode_anchor_is_the_latest_token_at_its_feed_position() {
+        let mut state = Glm52SlotState::new(vec![10, 11], 4, false);
+        assert_eq!(state.decode_anchor(), None);
+        assert_eq!(
+            state.advance_span(&[99, 42], EOS),
+            Glm52StepOutcome::Emit(42)
+        );
+        // The anchor is what the next decode row would feed.
+        assert_eq!(state.decode_anchor(), Some((42, 2)));
+        assert_eq!(
+            state.next_input_at(0),
+            Glm52StepInput {
+                token: 42,
+                position: 2
+            }
+        );
+        assert_eq!(state.advance_span(&[43], EOS), Glm52StepOutcome::Emit(43));
+        assert_eq!(state.decode_anchor(), Some((43, 3)));
     }
 
     fn occ(counts: &[usize]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {

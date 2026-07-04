@@ -20,9 +20,9 @@ use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, embedding_rows_into,
-    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
-    rms_norm_rows_into,
+    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into,
+    embedding_rows_into, glm52_flashmla_sparse_decode_num_sm_parts,
+    glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -300,6 +300,34 @@ const TIER_FULL: usize = 0;
 const TIER_SHORT: usize = 1;
 
 impl Glm52RankModel {
+    /// The token embedding table — the DSpark draft's block embedding reuses
+    /// it (the draft checkpoint's copy is byte-identical and not loaded).
+    pub(crate) fn embed(&self) -> &DeviceMatrix {
+        &self.embed
+    }
+
+    /// The lm_head — the DSpark draft's logits reuse it (same reuse contract
+    /// as [`Self::embed`]).
+    pub(crate) fn lm_head(&self) -> &DeviceMatrix {
+        &self.lm_head
+    }
+
+    /// The last step's aux-hidden capture buffer for `bucket` (`[bucket,
+    /// 5 * GLM52_HIDDEN]`, row = step row). Valid until the next step in the
+    /// same bucket overwrites it — the draft lane consumes it between steps.
+    pub(crate) fn captured(&self, bucket: usize) -> Result<&CudaSlice<bf16>> {
+        let state = self
+            .buckets
+            .iter()
+            .find(|state| state.rows == bucket)
+            .with_context(|| {
+                format!(
+                    "GLM5.2 capture bucket {bucket} is not a member of {GLM52_DECODE_BUCKETS:?}"
+                )
+            })?;
+        Ok(&state.scratch.captured.data)
+    }
+
     pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
         let batch = GLM52_MAX_BATCH_PER_RANK;
         let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
@@ -798,6 +826,25 @@ fn run_step_body(
             glm52_layer_finish_fused(ctx, s, parity, &layers[layer + 1].input_ln)?;
         } else {
             glm52_layer_finish(ctx, s, parity)?;
+        }
+        // DSpark aux-hidden capture: after layer L's closing add the residual
+        // stream lives in `attn[parity]` (updated in place by the fused
+        // add+norm; none of the capture layers is the last layer, which lands
+        // in `s.hidden` instead). Recorded into the step graph — pointer-
+        // stable, ~60 KB/row per step.
+        if let Some(feature) = crate::dspark::GLM52_DSPARK_AUX_LAYERS
+            .iter()
+            .position(|&aux| aux == layer)
+        {
+            copy_hidden_rows_raw_into(
+                ctx,
+                &s.layer.attn[parity],
+                GLM52_HIDDEN,
+                &mut s.captured.data,
+                crate::dspark::GLM52_DSPARK_CONTEXT_DIM,
+                feature * GLM52_HIDDEN,
+                batch,
+            )?;
         }
     }
 
