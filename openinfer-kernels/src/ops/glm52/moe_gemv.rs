@@ -210,9 +210,10 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
     let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
     let (out_ptr, _o) = out.device_ptr_mut(&ctx.stream);
-    // rows == 1 runs the m=1 kernel; rows > 1 the weight-stationary batched
-    // kernel (per-row bit-identical to m=1; the CUDA side whitelists the
-    // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here).
+    // rows == 1 runs the m=1 kernel; rows 2 the bit-parity register tile;
+    // rows 4/8 the tensor-core mma path on winning shapes (deterministic per
+    // bucket, not bit-identical to m=1). The CUDA side whitelists the
+    // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here.
     unsafe {
         ffi::glm52_fp8_weight_only_gemv_batched_cuda(
             act_ptr as *const ffi::Half,

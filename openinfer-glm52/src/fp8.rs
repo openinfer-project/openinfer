@@ -157,8 +157,11 @@ pub(crate) fn pack_proj_pair(
 
 /// One fp8 projection into a pre-allocated output: weight-only GEMV of `rows`
 /// bf16 activation rows against the fp8 `[n,k]` weight, block scale dequanted
-/// on the fly. rows > 1 runs the weight-stationary batched kernel — the weight
-/// is still read once, and every row is bit-identical to the rows=1 kernel.
+/// on the fly. rows > 1 runs a weight-stationary batched kernel — the weight
+/// is still read once. rows 1/2 keep bit-stable CUDA-core paths; rows 4/8
+/// dispatch to a tensor-core mma path on winning shapes (deterministic per
+/// bucket, not bit-identical to rows=1 — cross-bucket FP divergence is the
+/// accepted whole-step contract; numerics notes in glm52_moe_gemv.cu).
 pub(crate) fn fp8_linear_into(
     ctx: &DeviceContext,
     w: &ProjWeight,

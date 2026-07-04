@@ -244,6 +244,232 @@ glm52_fp8_weight_only_gemv_batched_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core batched path (batches 4/8, whitelisted shapes where it wins).
+//
+// At batch 8 the register-tile kernel above is compute-walled: the per-term
+// f32 FMA chain runs BATCH x 16 terms per 16-byte weight packet and caps
+// o_proj at ~66 us against a 28.5 us weight-read floor (H200, ncu: 65% SM,
+// occupancy/cache tweaks measured flat). mma.m16n8k16.bf16 retires that chain
+// on the tensor cores: fp8 e4m3 is exactly representable in bf16, so the
+// fp8 -> half2 -> f32 -> bf16x2 decode is lossless and the only numerics
+// change is the f32 accumulation order inside the mma (fixed by hardware, so
+// per-bucket deterministic and replay-stable — but NOT bit-identical to the
+// m=1 kernel; buckets 1/2 keep their exact paths, and cross-bucket FP
+// divergence is already the accepted whole-step contract since the expert
+// GEMM reassociates across buckets anyway).
+//
+// The kernel reads the ORIGINAL row-major [n, k] fp8 layout — no repack, no
+// second weight copy. The mma k-slot -> column map is a free permutation as
+// long as A and B slots agree (dot products are permutation-invariant):
+// sigma(step s, tid, d) = tid*16 + 4*s + d over a k64 super-chunk makes each
+// lane's A bytes one contiguous 16-byte LDG per owned row, with mma step s
+// consuming word s of that uint4, and the matching B slots one 8-byte load.
+//
+// Structure per warp: NTILES independent 16-row mma chains (shared B
+// fragments, 2-deep weight prefetch per chain) x KSPLIT k-slices in separate
+// blocks writing f32 partials to scratch; a tiny epilogue reduces the slices
+// in fixed order (deterministic) and converts to bf16. KSPLIT is the
+// occupancy lever the bit-parity kernels could never use.
+//
+// Measured (jz-38 H200 microbench, batch 8, us): o_proj 66.5 -> 45.8,
+// dense_gu 99.4 -> 58.6, dense_dn 50.9 -> 33.0, q_b 26.2 -> 16.9,
+// q_a 16.4 -> 10.7, kv_a 13.2 -> 7.7, shared_gu 19.3 -> 13.6,
+// shared_dn 11.5 -> 9.3, idx_wq_b 8.8 -> 7.8, idx_wk 12.5 -> 7.5
+// (~ -66 us per MoE layer). Batch 4 wins only on the k=6144 column (see
+// mma_config); the rest stay on the register tile.
+constexpr int kMmaWarps = 4;
+// f32 partial scratch [KSPLIT, BATCH, n]; worst case over mma_config:
+// dense_gu at batch 8, ksplit 16.
+constexpr size_t kMmaScratchFloats = (size_t)16 * 8 * 24576;
+constexpr int kMmaMaxDevices = 16;
+float* g_mma_scratch[kMmaMaxDevices] = {};
+
+// Lazily allocates the worst-case scratch on first dispatch for the current
+// device. The model's pre-capture bucket warm-up (model.rs) triggers this
+// outside any CUDA-graph capture, so replays see a stable pointer; a capture
+// hitting a cold device fails the cudaMalloc cleanly and surfaces here. One
+// rank thread per device by construction, so no cross-thread race on a slot.
+CUresult mma_scratch_for_device(float** out) {
+  int dev = 0;
+  cudaError_t err = cudaGetDevice(&dev);
+  if (err != cudaSuccess) return map_cuda_error(err);
+  if (dev < 0 || dev >= kMmaMaxDevices) return CUDA_ERROR_INVALID_VALUE;
+  if (g_mma_scratch[dev] == nullptr) {
+    err = cudaMalloc(&g_mma_scratch[dev], kMmaScratchFloats * sizeof(float));
+    if (err != cudaSuccess) return map_cuda_error(err);
+  }
+  *out = g_mma_scratch[dev];
+  return CUDA_SUCCESS;
+}
+
+// fp8 e4m3 pair -> packed bf16x2, exact (e4m3 c bf16 via the f16/f32 path).
+__device__ __forceinline__ unsigned mma_cvt_pair(unsigned char b0, unsigned char b1) {
+  __nv_fp8x2_e4m3 p;
+  p.__x = (unsigned short)(b0 | (b1 << 8));
+  __half2 h = static_cast<__half2>(p);
+  float2 f = __half22float2(h);
+  __nv_bfloat162 bb = __float22bfloat162_rn(f);
+  return *reinterpret_cast<unsigned*>(&bb);
+}
+
+template <int BATCH, int KSPLIT, int NTILES>
+__global__ __launch_bounds__(kMmaWarps * kWarpSize) void
+glm52_gemv_batched_mma_kernel(
+    const __nv_bfloat16* __restrict__ activation,  // [BATCH, k]
+    const unsigned char* __restrict__ weight,      // [n, k] e4m3, original layout
+    const float* __restrict__ weight_scale,        // [n/128, k/128]
+    float* __restrict__ partial,                   // [KSPLIT, BATCH, n] f32
+    int n, int k) {
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int tile0 = (blockIdx.y * kMmaWarps + warp) * NTILES;  // 16-row tiles
+  if (tile0 * 16 >= n) return;
+  const int gid = lane >> 2, tid = lane & 3;
+  const int kslice = k / KSPLIT;  // multiple of 128
+  const int k_begin = blockIdx.x * kslice;
+  const int scale_cols = k >> 7;
+
+  float macc[NTILES][4], cacc[NTILES][4];
+#pragma unroll
+  for (int t = 0; t < NTILES; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { macc[t][i] = 0.f; cacc[t][i] = 0.f; }
+
+  // Per chain: rows (gid, gid+8) of its tile; one 16B packet per row per k64.
+  const unsigned char* w0[NTILES];
+  const unsigned char* w1[NTILES];
+#pragma unroll
+  for (int t = 0; t < NTILES; ++t) {
+    const int n0 = (tile0 + t) * 16;
+    w0[t] = weight + (size_t)(n0 + gid) * k + k_begin + tid * 16;
+    w1[t] = weight + (size_t)(n0 + gid + 8) * k + k_begin + tid * 16;
+  }
+
+  // 2-deep weight-packet pipeline per chain: 2*NTILES LDGs in flight while the
+  // previous chunk's (serializing) asm mma chain retires.
+  uint4 wp0[NTILES], wp1[NTILES];
+#pragma unroll
+  for (int t = 0; t < NTILES; ++t) {
+    wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+    wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+  }
+  for (int kk = k_begin; kk < k_begin + kslice; kk += 64) {
+    uint4 c0[NTILES], c1[NTILES];
+#pragma unroll
+    for (int t = 0; t < NTILES; ++t) {
+      c0[t] = wp0[t]; c1[t] = wp1[t];
+      w0[t] += 64; w1[t] += 64;
+    }
+    if (kk + 64 < k_begin + kslice) {
+#pragma unroll
+      for (int t = 0; t < NTILES; ++t) {
+        wp0[t] = __ldcs(reinterpret_cast<const uint4*>(w0[t]));
+        wp1[t] = __ldcs(reinterpret_cast<const uint4*>(w1[t]));
+      }
+    }
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {  // four k16 mma steps per k64 super-chunk
+      unsigned b01 = 0, b23 = 0;
+      if (gid < BATCH) {
+        // sigma: B slots (tid*2, +1, +8, +9) = cols tid*16 + 4s + {0,1,2,3}.
+        const __nv_bfloat16* xrow =
+            activation + (size_t)gid * k + kk + tid * 16 + 4 * s;
+        const uint2 bv = *reinterpret_cast<const uint2*>(xrow);
+        b01 = bv.x; b23 = bv.y;
+      }
+#pragma unroll
+      for (int t = 0; t < NTILES; ++t) {
+        const unsigned char* p0 = reinterpret_cast<const unsigned char*>(&c0[t]) + 4 * s;
+        const unsigned char* p1 = reinterpret_cast<const unsigned char*>(&c1[t]) + 4 * s;
+        unsigned a0 = mma_cvt_pair(p0[0], p0[1]);  // row gid,   slots tid*2/+1
+        unsigned a1 = mma_cvt_pair(p1[0], p1[1]);  // row gid+8, slots tid*2/+1
+        unsigned a2 = mma_cvt_pair(p0[2], p0[3]);  // row gid,   slots tid*2+8/+9
+        unsigned a3 = mma_cvt_pair(p1[2], p1[3]);  // row gid+8, slots tid*2+8/+9
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(cacc[t][0]), "+f"(cacc[t][1]), "+f"(cacc[t][2]), "+f"(cacc[t][3])
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b01), "r"(b23));
+      }
+    }
+    if (((kk + 64) & 127) == 0) {  // end of a 128-col scale group
+#pragma unroll
+      for (int t = 0; t < NTILES; ++t) {
+        // A 16-row tile never straddles a /128 scale-row boundary (16 | 128).
+        const float scale =
+            weight_scale[(size_t)(((tile0 + t) * 16) >> 7) * scale_cols + (kk >> 7)];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { macc[t][i] += scale * cacc[t][i]; cacc[t][i] = 0.f; }
+      }
+    }
+  }
+  // C fragment: c0=(row gid, col tid*2) c1=(gid, +1) c2=(gid+8, tid*2) c3=(gid+8, +1);
+  // cols are batch indices.
+  float* out_slice = partial + (size_t)blockIdx.x * BATCH * n;
+  const int col0 = tid * 2;
+#pragma unroll
+  for (int t = 0; t < NTILES; ++t) {
+    const int n0 = (tile0 + t) * 16;
+    if (col0 < BATCH)     out_slice[(size_t)col0 * n + n0 + gid] = macc[t][0];
+    if (col0 + 1 < BATCH) out_slice[(size_t)(col0 + 1) * n + n0 + gid] = macc[t][1];
+    if (col0 < BATCH)     out_slice[(size_t)col0 * n + n0 + gid + 8] = macc[t][2];
+    if (col0 + 1 < BATCH) out_slice[(size_t)(col0 + 1) * n + n0 + gid + 8] = macc[t][3];
+  }
+}
+
+// Fixed-order k-slice reduction + bf16 store (deterministic epilogue).
+template <int BATCH, int KSPLIT>
+__global__ void glm52_gemv_batched_mma_reduce_kernel(
+    const float* __restrict__ partial, __nv_bfloat16* __restrict__ out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= BATCH * n) return;
+  float v = partial[i];
+#pragma unroll
+  for (int s = 1; s < KSPLIT; ++s) v += partial[(size_t)s * BATCH * n + i];
+  out[i] = __float2bfloat16(v);
+}
+
+// (ksplit, ntiles) per (batch, whitelisted shape); ksplit == 0 keeps the
+// register tile. Measured winners, jz-38 H200 2026-07-05 (see block comment).
+struct MmaConfig { int ksplit; int ntiles; };
+MmaConfig mma_config(int batch, int n, int k) {
+  if (batch == 8) {
+    if (n == 16384 && k == 2048) return {8, 4};  // q_b
+    if (n == 6144  && k == 2048) return {8, 1};  // shared_dn
+    if (n == 4096  && k == 2048) return {8, 1};  // idx_wq_b
+    return {16, 2};  // every k >= 6144 shape
+  }
+  if (batch == 4 && k == 6144) {
+    return {16, 2};  // q_a, kv_a, dense_gu, shared_gu, idx_wk
+  }
+  return {0, 0};
+}
+
+template <int BATCH, int KSPLIT, int NTILES>
+CUresult launch_gemv_batched_mma(const __nv_bfloat16* activation,
+                                 const unsigned char* weight,
+                                 const float* weight_scale, __nv_bfloat16* out,
+                                 int n, int k, cudaStream_t stream) {
+  if (n % 16 != 0 || k % (128 * KSPLIT) != 0 || (n / 16) % NTILES != 0 ||
+      (size_t)KSPLIT * BATCH * n > kMmaScratchFloats) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  float* scratch = nullptr;
+  CUresult rs = mma_scratch_for_device(&scratch);
+  if (rs != CUDA_SUCCESS) return rs;
+  const int tiles = n / 16;
+  const dim3 grid(KSPLIT, (tiles / NTILES + kMmaWarps - 1) / kMmaWarps, 1);
+  glm52_gemv_batched_mma_kernel<BATCH, KSPLIT, NTILES>
+      <<<grid, kMmaWarps * kWarpSize, 0, stream>>>(activation, weight,
+                                                   weight_scale, scratch, n, k);
+  const int rthreads = 256;
+  glm52_gemv_batched_mma_reduce_kernel<BATCH, KSPLIT>
+      <<<(BATCH * n + rthreads - 1) / rthreads, rthreads, 0, stream>>>(scratch,
+                                                                       out, n);
+  return consume_last_cuda_error();
+}
+
 // Routed grouped GEMV: blockIdx.x = slot in [0,topk); expert = topk_idx[slot].
 __global__ void glm52_moe_fp8_weight_only_gemv_kernel(
     const __nv_bfloat16* __restrict__ activation,  // W13: [k]; W2: [topk, k]
@@ -394,9 +620,10 @@ CUresult glm52_fp8_weight_only_gemv_cuda(
 }
 
 // Batched plain GEMV: `out[b] = deq(weight) @ activation[b]` for b in [0, batch).
-// batch == 1 routes to the m=1 kernel (identical result — the batched tile is
-// per-row bit-identical to it by construction); the other supported batches
-// are the decode buckets {2, 4, 8}, one template instantiation each.
+// batch == 1 routes to the m=1 kernel; batch 2 keeps the bit-parity register
+// tile; batches 4/8 dispatch per shape between the tensor-core mma path and
+// the register tile (mma_config — deterministic per bucket, not bit-identical
+// to m=1; see the mma block comment for the numerics contract).
 CUresult glm52_fp8_weight_only_gemv_batched_cuda(
     const __nv_bfloat16* activation, const unsigned char* weight,
     const float* weight_scale, __nv_bfloat16* out, int batch, int n, int k,
@@ -421,6 +648,11 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
       break;
     }
     case kBatchedGemvBatch4: {
+      const MmaConfig cfg = mma_config(batch, n, k);
+      if (cfg.ksplit == 16 && cfg.ntiles == 2) {
+        return launch_gemv_batched_mma<kBatchedGemvBatch4, 16, 2>(
+            activation, weight, weight_scale, out, n, k, stream);
+      }
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
       const dim3 grid(1, n / (kBatchedWarps * kBatchedRows), 1);
@@ -431,6 +663,20 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
       break;
     }
     case kBatchedGemvBatchFull: {
+      // Every whitelisted shape runs the tensor-core path at batch 8.
+      const MmaConfig cfg = mma_config(batch, n, k);
+      if (cfg.ksplit == 16 && cfg.ntiles == 2) {
+        return launch_gemv_batched_mma<kBatchedGemvBatchFull, 16, 2>(
+            activation, weight, weight_scale, out, n, k, stream);
+      }
+      if (cfg.ksplit == 8 && cfg.ntiles == 4) {
+        return launch_gemv_batched_mma<kBatchedGemvBatchFull, 8, 4>(
+            activation, weight, weight_scale, out, n, k, stream);
+      }
+      if (cfg.ksplit == 8 && cfg.ntiles == 1) {
+        return launch_gemv_batched_mma<kBatchedGemvBatchFull, 8, 1>(
+            activation, weight, weight_scale, out, n, k, stream);
+      }
       if (!valid_tiling(n, k, kBatchedWarps * kBatchedRows))
         return CUDA_ERROR_INVALID_VALUE;
       const dim3 grid(1, n / (kBatchedWarps * kBatchedRows), 1);
