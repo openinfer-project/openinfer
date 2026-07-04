@@ -431,8 +431,13 @@ MmaConfig mma_config(int batch, int n, int k) {
     if (n == 4096  && k == 2048)  return {8, 1};   // indexer wq_b
     if (n == 128   && k == 6144)  return {16, 2};  // indexer wk
   }
-  if (batch == 4 && k == 6144) {
-    return {16, 2};  // q_a, kv_a, dense_gu, shared_gu, idx_wk
+  if (batch == 4) {
+    // Only the shapes where mma measured ahead of the register tile at batch 4.
+    if (n == 2048  && k == 6144) return {16, 2};  // q_a / shared gate,up
+    if (n == 576   && k == 6144) return {16, 2};  // kv_a
+    if (n == 24576 && k == 6144) return {16, 2};  // dense gate|up
+    if (n == 4096  && k == 6144) return {16, 2};  // shared gate|up
+    if (n == 128   && k == 6144) return {16, 2};  // indexer wk
   }
   return {0, 0};
 }
