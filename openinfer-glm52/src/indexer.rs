@@ -45,9 +45,9 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::DeviceContext;
 
-#[cfg(test)]
-use crate::fp8::fp8_linear;
 use crate::fp8::{FP8_BLOCK, ProjWeight, fp8_linear_into};
+#[cfg(test)]
+use crate::fp8::{Glm52ProjBytes, fp8_linear};
 
 const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;

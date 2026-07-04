@@ -58,12 +58,13 @@ enum Glm52RankCommand {
         unique_id: Box<[u8; 128]>,
         resp: Sender<Result<()>>,
     },
-    /// One lock-step full-model step (75 MoE collectives inside): feed each
-    /// active slot's `(token, position)` row, reply with the greedy next
-    /// token per slot. The coordinator sends this to every rank each global
-    /// step with the SAME batch bucket in `shape` (the collectives require
-    /// every rank to agree on the step's global row count) — unoccupied
-    /// slots carry the padding row and their outputs are discarded.
+    /// One lock-step full-model step (75 MoE collectives inside): feed
+    /// `inputs[row]` per forwarded row (a slot's span rows walk consecutive
+    /// positions), reply with the greedy next token per ROW. The coordinator
+    /// sends this to every rank each global step with the SAME batch bucket
+    /// in `shape` (the collectives require every rank to agree on the step's
+    /// global row count) — padding rows ride free slots and their outputs
+    /// are discarded.
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,

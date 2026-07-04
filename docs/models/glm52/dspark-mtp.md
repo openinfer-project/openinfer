@@ -92,8 +92,12 @@ padding is the load-bearing unknown — M1 measures it for free. If it lands 30�
 - **M3 — round loop + gates + A/B**. Scheduler slot states (prompt-span / spec-round), accept
   seam, cache-cap span truncation near 4096. Gates: greedy spec output == plain greedy output
   on the D2.5 gate prompts (cross-bucket near-tie divergence is a known FP property — same
-  diagnostic treatment as D2), accepted-length telemetry. A/B on jz-38: solo + c2/c4/c8 diverse,
-  ms/step and tok/s/req, p50+p99.
+  diagnostic treatment as D2), accepted-length telemetry. **A/B = the qwen3 dspark methodology
+  (`docs/models/qwen3/dspark-integration.md` Results section), c1 only** (user call): `vllm
+  bench serve --temperature 0 --ignore-eos` on sharegpt + code prompts against the HTTP server,
+  spec vs plain output tok/s, plus the accepted-draft histogram from the server's debug accept
+  trace. qwen3 Bug 1 lesson applies verbatim: the bench's default temperature is non-greedy and
+  silently disables speculation — `--temperature 0` is mandatory.
 
 ## Layout pinned against speculators source (2026-07-04)
 

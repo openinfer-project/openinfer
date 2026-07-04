@@ -10,6 +10,8 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
+#[cfg(test)]
+use crate::fp8::Glm52ProjBytes;
 use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
 
 const HIDDEN: usize = 6144;

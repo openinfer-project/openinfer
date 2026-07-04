@@ -2,10 +2,10 @@
 //! path (embed → 78 decoder layers → final norm → lm_head → greedy argmax)
 //! plus its 32 local experts, and forwards one of the
 //! [`GLM52_DECODE_BUCKETS`] batch buckets per step (real request tokens in
-//! occupied slots, padding rows elsewhere; prefill rides decode
-//! token-by-token). Each slot owns a disjoint `GLM52_MAX_MODEL_LEN`-token
-//! region of the paged KV/index caches, so pad rows write only their own
-//! dead slots.
+//! occupied slots, padding rows elsewhere; prefill rides decode as *spans* —
+//! several consecutive positions of one slot in a single step). Each slot
+//! owns a disjoint `GLM52_MAX_MODEL_LEN`-token region of the paged KV/index
+//! caches, so pad rows write only their own dead slots.
 //!
 //! Every step, all 8 ranks run the forward in lock-step with the SAME bucket
 //! (the coordinator's global decision), each dispatching exactly that many
@@ -66,8 +66,14 @@ pub(crate) const GLM52_DECODE_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PE
 /// require every rank to enter with the same global row count), with
 /// `slots[row]` naming the cache slot each forwarded row addresses for
 /// `row < bucket` (active slots first, padding rows parked on free slots
-/// whose cache regions are dead). The full bucket must be the identity
-/// mapping — its graphs read the static identity block table.
+/// whose cache regions are dead).
+///
+/// A slot may own SEVERAL rows (a *span*): one contiguous run of rows walking
+/// consecutive positions of that slot's sequence — how prompt tokens batch
+/// through the decode path, and the shape a DSpark verify step reuses. Within
+/// a step, a later row of a span attends to the earlier rows' KV through the
+/// cache: per layer every row's cache write lands before any row's attention
+/// launches, and row `k`'s `seq_len` admits exactly the positions before it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52StepShape {
     pub(crate) bucket: usize,
@@ -253,7 +259,7 @@ pub(crate) struct Glm52RankModel {
     index_cache_layout: Glm52IndexerCacheLayout,
     /// `[GLM52_MAX_BATCH_PER_RANK, blocks_per_slot]` — row b maps slot b's
     /// context into its disjoint region of the index-K cache. Static: written
-    /// once at build; partial buckets' tables are gathered from it per step.
+    /// once at build; every bucket's table is gathered from it per step.
     block_table: CudaSlice<i32>,
     blocks_per_slot: usize,
     slot_mapping: CudaSlice<i64>,
@@ -275,11 +281,11 @@ pub(crate) struct Glm52RankModel {
 /// replayed every step after — valid forever, since within a shape every
 /// step has the same kernel sequence and the same arena pointers by
 /// construction; the per-step inputs are the device buffers the prologue
-/// rewrites), and the `[rows, blocks_per_slot]` block table. Partial
-/// buckets' tables are rewritten by the prologue (dtod gather of each
-/// forwarded row's slot region), so the captured graphs address whichever
-/// slots hold the requests through device data, never baked slot ids; the
-/// full bucket's table is the static identity map, never rewritten.
+/// rewrites), and the `[rows, blocks_per_slot]` block table, rewritten by
+/// the prologue every step (dtod gather of each forwarded row's slot
+/// region), so the captured graphs address whichever slots hold the
+/// requests — and span rows their repeated slot — through device data,
+/// never baked slot ids.
 struct Glm52BucketState {
     rows: usize,
     scheds: [Glm52MlaSchedMetadata; 2],
@@ -390,8 +396,7 @@ impl Glm52RankModel {
         // One Glm52BucketState per decode bucket: batch-`rows` contracts
         // (num_blocks is cache geometry, not batch, so it carries over),
         // plans, scratch, and a block table pre-filled with the identity
-        // prefix — the full bucket keeps it forever, partial buckets have
-        // theirs rewritten by the step prologue.
+        // prefix (the step prologue rewrites it per step).
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
@@ -497,13 +502,14 @@ impl Glm52RankModel {
         })
     }
 
-    /// One lock-step step: feed each forwarded slot's `(token, position)`
-    /// row, return the greedy next-token id per slot. Enters 75 MoE
-    /// collectives — every other rank must be stepping concurrently WITH THE
-    /// SAME BUCKET (`shape.bucket`): the coordinator agrees the bucket
-    /// globally per step. Row `r` carries the request (or padding) living in
-    /// `shape.slots[r]`; padding rows' cache writes land in their free slot's
-    /// own dead region.
+    /// One lock-step step: feed `inputs[row]` = the `(token, position)` each
+    /// forwarded row carries, return the greedy next-token id per ROW. Enters
+    /// 75 MoE collectives — every other rank must be stepping concurrently
+    /// WITH THE SAME BUCKET (`shape.bucket`): the coordinator agrees the
+    /// bucket globally per step. Row `r` addresses the cache slot
+    /// `shape.slots[r]`; a slot's span rows walk consecutive positions (see
+    /// [`Glm52StepShape`]); padding rows' cache writes land in their free
+    /// slot's own dead region.
     ///
     /// The step body (embed → 78 layers → lm_head → argmax) is captured into
     /// a CUDA graph on the first call in each (attention tier × bucket) shape
@@ -540,27 +546,32 @@ impl Glm52RankModel {
                 )
             })?;
         let batch = shape.bucket;
-        // The full bucket must be the identity mapping — its graphs read the
-        // static identity block table that is never rewritten.
-        if batch == GLM52_MAX_BATCH_PER_RANK {
-            let identity: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
-            ensure!(
-                shape.slots == identity,
-                "GLM5.2 full-bucket step slots must be the identity mapping, got {:?}",
-                shape.slots
-            );
-        }
-        // Each forwarded row must own a distinct slot — two rows on one slot
-        // would interleave writes into the same cache region.
-        let mut slot_seen = [false; GLM52_MAX_BATCH_PER_RANK];
+        // A slot's rows must form ONE contiguous run of consecutive
+        // positions: a gap would leave positions the later rows attend to
+        // unwritten this step (stale data from whatever request last held the
+        // slot), and a second run would re-enter a region the first already
+        // wrote. Single-row slots are the trivial run.
+        let mut slot_last_row = [None::<usize>; GLM52_MAX_BATCH_PER_RANK];
         for row in 0..batch {
             let slot = shape.slots[row] as usize;
             ensure!(
-                slot < GLM52_MAX_BATCH_PER_RANK && !slot_seen[slot],
-                "GLM5.2 step row {row} slot {slot} out of range or duplicated in {:?}",
+                slot < GLM52_MAX_BATCH_PER_RANK,
+                "GLM5.2 step row {row} slot {slot} out of range in {:?}",
                 &shape.slots[..batch]
             );
-            slot_seen[slot] = true;
+            match slot_last_row[slot] {
+                None => {}
+                Some(last) => {
+                    ensure!(
+                        last + 1 == row && inputs[last].1 + 1 == inputs[row].1,
+                        "GLM5.2 step slot {slot} span is not one contiguous run of \
+                         consecutive positions: rows {:?}, positions {:?}",
+                        &shape.slots[..batch],
+                        inputs[..batch].iter().map(|i| i.1).collect::<Vec<_>>()
+                    );
+                }
+            }
+            slot_last_row[slot] = Some(row);
         }
         let mut tokens_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
         let mut positions_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
@@ -568,7 +579,7 @@ impl Glm52RankModel {
         let mut seq_lens_host = [0i32; GLM52_MAX_BATCH_PER_RANK];
         for row in 0..batch {
             let slot = shape.slots[row] as usize;
-            let (token, position) = inputs[slot];
+            let (token, position) = inputs[row];
             ensure!(
                 position < GLM52_MAX_MODEL_LEN,
                 "GLM5.2 slot {slot} position {position} exceeds the model-length cap {GLM52_MAX_MODEL_LEN}"
@@ -589,21 +600,20 @@ impl Glm52RankModel {
         // Gather each row's rotary table row (a bit-exact row copy).
         embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
         embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
-        if batch < GLM52_MAX_BATCH_PER_RANK {
-            // Point each forwarded row's block-table row at its slot's cache
-            // region — device data, so the captured partial-bucket graphs
-            // replay against whichever slots hold the requests. The full
-            // bucket's table IS the static identity — nothing to rewrite.
-            for row in 0..batch {
-                let slot = shape.slots[row] as usize;
-                let src = self
-                    .block_table
-                    .slice(slot * self.blocks_per_slot..(slot + 1) * self.blocks_per_slot);
-                let mut dst = bucket
-                    .block_table
-                    .slice_mut(row * self.blocks_per_slot..(row + 1) * self.blocks_per_slot);
-                ctx.stream.memcpy_dtod(&src, &mut dst)?;
-            }
+        // Point each forwarded row's block-table row at its slot's cache
+        // region — device data, so the captured graphs replay against
+        // whichever slots hold the requests (span rows repeat their slot's
+        // region). Every bucket's table is rewritten every step: the full
+        // bucket stopped being an identity mapping once spans landed.
+        for row in 0..batch {
+            let slot = shape.slots[row] as usize;
+            let src = self
+                .block_table
+                .slice(slot * self.blocks_per_slot..(slot + 1) * self.blocks_per_slot);
+            let mut dst = bucket
+                .block_table
+                .slice_mut(row * self.blocks_per_slot..(row + 1) * self.blocks_per_slot);
+            ctx.stream.memcpy_dtod(&src, &mut dst)?;
         }
 
         // Attention tier: while EVERY forwarded row's context fits in the
@@ -617,7 +627,7 @@ impl Glm52RankModel {
         // collectives for tens of ms — far under the ~100 s DeepEP device
         // timeout (same argument as the first-step capture).
         let short_tier = (0..batch)
-            .map(|row| inputs[shape.slots[row] as usize].1 + 1)
+            .map(|row| inputs[row].1 + 1)
             .max()
             .is_some_and(|longest| longest <= GLM52_MLA_TOPK_SHORT);
         let tier = if short_tier { TIER_SHORT } else { TIER_FULL };
@@ -675,7 +685,7 @@ impl Glm52RankModel {
                 (0..GLM52_VOCAB as i32).contains(&top_index),
                 "GLM5.2 slot {slot} greedy argmax index {top_index} outside the vocab"
             );
-            outputs[slot] = top_index as u32;
+            outputs[row] = top_index as u32;
         }
         Ok(outputs)
     }

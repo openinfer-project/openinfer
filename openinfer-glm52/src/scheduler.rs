@@ -3,22 +3,25 @@
 //! rank's decode batch (and that slot's disjoint region of the paged caches).
 //!
 //! Every global step ALL ranks run the full-model forward simultaneously with
-//! the SAME batch bucket — ranks feed each active slot's next token (prompt
-//! tokens ride the decode path one position at a time), idle slots feed a
+//! the SAME batch bucket — ranks feed each active slot's *span* of next
+//! tokens (mid-prefill slots batch up to a bucket of consecutive prompt
+//! positions through one step; decode slots feed one row), idle slots feed a
 //! padding row whose output is discarded. This satisfies the DeepEP contract
 //! that every rank enters every MoE layer's dispatch/combine collective with
 //! the agreed global row count. The bucket is the smallest member of
-//! `GLM52_DECODE_BUCKETS` covering the fullest rank, so the whole fleet pays
-//! only for its deepest rank's row count. Requests join and leave slots at
-//! step boundaries (continuous batching) — admission is least-loaded rank
-//! first, so the fleet leaves the cheap 1-row bucket only past
-//! `GLM52_EP_RANKS` concurrent requests.
+//! `GLM52_DECODE_BUCKETS` covering the hungriest rank's row demand, so the
+//! fleet pays for prefill only while someone is prefilling and returns to the
+//! cheap 1-row bucket for pure decode. Requests join and leave slots at step
+//! boundaries (continuous batching) — admission is least-loaded rank first,
+//! so decode-only fleets leave the 1-row bucket only past `GLM52_EP_RANKS`
+//! concurrent requests.
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
 //! live in [`Glm52SlotState`] as pure data transitions, and the
 //! admission/step-shape decisions in [`admission_target`] /
-//! [`plan_step_shapes`] as pure functions over the occupancy; the coordinator
-//! is a thin shell that moves tokens between channels and the rank workers.
+//! [`plan_step_shapes`] as pure functions over the occupancy and feed wants;
+//! the coordinator is a thin shell that moves tokens between channels and the
+//! rank workers.
 
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
@@ -56,8 +59,10 @@ pub(crate) enum Glm52StepOutcome {
     Finish(FinishReason),
 }
 
-/// One rank's active request as a pure state machine: `next_input` decides
-/// what the rank forwards, `advance` folds the step's output token in.
+/// One rank's active request as a pure state machine: `feed_want` /
+/// `next_input_at` decide what the rank forwards (a span of consecutive
+/// prompt positions mid-prefill, one decode row after), `advance_span` folds
+/// the step's span of outputs in.
 #[derive(Debug)]
 pub(crate) struct Glm52SlotState {
     prompt: Vec<u32>,
@@ -88,13 +93,28 @@ impl Glm52SlotState {
         self.completion
     }
 
-    pub(crate) fn next_input(&self) -> Glm52StepInput {
+    /// Rows this request can usefully fill in one step: the whole remaining
+    /// prompt while mid-prefill (the planner caps it to the bucket), one
+    /// decode row afterwards.
+    pub(crate) fn feed_want(&self) -> usize {
         if self.fed < self.prompt.len() {
+            self.prompt.len() - self.fed
+        } else {
+            1
+        }
+    }
+
+    /// The `offset`-th row of this step's span: consecutive prompt positions
+    /// while mid-prefill, the single decode row afterwards.
+    pub(crate) fn next_input_at(&self, offset: usize) -> Glm52StepInput {
+        if self.fed < self.prompt.len() {
+            debug_assert!(self.fed + offset < self.prompt.len());
             Glm52StepInput {
-                token: self.prompt[self.fed],
-                position: self.fed,
+                token: self.prompt[self.fed + offset],
+                position: self.fed + offset,
             }
         } else {
+            debug_assert_eq!(offset, 0);
             Glm52StepInput {
                 token: self.last_token,
                 position: self.prompt.len() + self.completion - 1,
@@ -102,15 +122,28 @@ impl Glm52SlotState {
         }
     }
 
-    pub(crate) fn advance(&mut self, output: u32, eos_token_ids: &[u32]) -> Glm52StepOutcome {
+    /// Fold one step's span of outputs in. Mid-prompt rows' outputs are
+    /// discarded; the row that fed the LAST prompt token yields the first
+    /// generated token, and decode spans are a single row — so only
+    /// `outputs.last()` ever carries a real token.
+    pub(crate) fn advance_span(
+        &mut self,
+        outputs: &[u32],
+        eos_token_ids: &[u32],
+    ) -> Glm52StepOutcome {
+        debug_assert!(!outputs.is_empty());
         if self.fed < self.prompt.len() {
-            self.fed += 1;
+            debug_assert!(self.fed + outputs.len() <= self.prompt.len());
+            self.fed += outputs.len();
             if self.fed < self.prompt.len() {
                 return Glm52StepOutcome::Prefilling;
             }
-            // The last prompt token's step yielded the first generated token
+            // The last prompt token's row yielded the first generated token
             // — fall through to the decode accounting.
+        } else {
+            debug_assert_eq!(outputs.len(), 1);
         }
+        let output = *outputs.last().expect("span outputs are non-empty");
         self.completion += 1;
         if !self.ignore_eos && eos_token_ids.contains(&output) {
             return Glm52StepOutcome::Finish(FinishReason::Stop);
@@ -175,40 +208,87 @@ fn admission_target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(us
 }
 
 /// Every rank's forward shape for one step, decided together from the same
-/// occupancy snapshot: the smallest [`GLM52_DECODE_BUCKETS`] bucket covering
-/// the fullest rank (the MoE collectives require all ranks to agree on the
-/// step's global row count, and a rank must never be handed a bucket smaller
-/// than its active count — its extra rows would be silently dropped), then
-/// per rank the active slots first and free slots as padding up to the
-/// bucket. The full bucket forwards every slot, so its mapping is the
-/// identity — the contract the full-bucket graphs' static identity block
-/// table depends on (actives-first ordering only matters when it decides
-/// WHICH slots ride along as padding). Deriving the bucket and every rank's
-/// slot list from the same row data in one place is what keeps them
-/// consistent.
-fn plan_step_shapes(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52StepShape> {
-    let fullest = occupied
+/// feed-want snapshot (`wants[rank][slot]` = rows that slot can usefully
+/// fill: 0 free, 1 decode, remaining-prompt while mid-prefill).
+///
+/// The bucket is the smallest [`GLM52_DECODE_BUCKETS`] member covering the
+/// hungriest rank's row demand (each rank's demand = Σ wants, capped at the
+/// max bucket; never smaller than its active count — a smaller bucket would
+/// silently drop rows). Per rank, every active slot first gets one row
+/// (liveness), then the leftover bucket capacity extends mid-prefill slots
+/// into *spans* (consecutive prompt positions batched through one step) in
+/// ascending slot order; padding rows ride the free slots. Span rows are
+/// emitted as one contiguous run per slot — the [`Glm52StepShape`] contract.
+/// Deriving the bucket and every rank's row list from the same data in one
+/// place is what keeps them consistent.
+fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52StepShape> {
+    let hungriest = wants
         .iter()
-        .map(|row| row.iter().filter(|&&o| o).count())
+        .map(|row| {
+            row.iter()
+                .map(|&w| w.min(GLM52_MAX_BATCH_PER_RANK))
+                .sum::<usize>()
+                .min(GLM52_MAX_BATCH_PER_RANK)
+        })
         .max()
         .unwrap_or(0);
     let bucket = *GLM52_DECODE_BUCKETS
         .iter()
-        .find(|&&rows| rows >= fullest.max(1))
-        .expect("the largest bucket covers every occupancy by construction");
-    occupied
+        .find(|&&rows| rows >= hungriest.max(1))
+        .expect("the largest bucket covers every demand by construction");
+    wants
         .iter()
         .map(|row| {
-            let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
-            if bucket < GLM52_MAX_BATCH_PER_RANK {
-                let ordered = (0..GLM52_MAX_BATCH_PER_RANK)
-                    .filter(|&slot| row[slot])
-                    .chain((0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| !row[slot]));
-                for (dst, slot) in slots.iter_mut().zip(ordered) {
-                    *dst = slot as u8;
+            // Every active slot gets one row, then leftover capacity extends
+            // spans in ascending slot order.
+            let mut spans = [0usize; GLM52_MAX_BATCH_PER_RANK];
+            let mut used = 0usize;
+            for (slot, &want) in row.iter().enumerate() {
+                if want > 0 {
+                    // bucket >= this rank's capped demand >= its active count
+                    // by construction; a dropped active would stall forever.
+                    assert!(used < bucket, "bucket {bucket} smaller than active count");
+                    spans[slot] = 1;
+                    used += 1;
                 }
             }
+            for (slot, &want) in row.iter().enumerate() {
+                if spans[slot] == 0 {
+                    continue;
+                }
+                let extra = (want - spans[slot]).min(bucket - used);
+                spans[slot] += extra;
+                used += extra;
+            }
+            let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
+            let mut dst = 0usize;
+            for (slot, &span) in spans.iter().enumerate() {
+                for _ in 0..span {
+                    slots[dst] = slot as u8;
+                    dst += 1;
+                }
+            }
+            // Padding rows on free slots: there are always enough, because
+            // used >= actives and bucket <= MAX, so bucket - used <= frees.
+            let mut frees = (0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| row[slot] == 0);
+            while dst < bucket {
+                slots[dst] = frees.next().expect("bucket - used <= free slots") as u8;
+                dst += 1;
+            }
             Glm52StepShape { bucket, slots }
+        })
+        .collect()
+}
+
+fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER_RANK]> {
+    slots
+        .iter()
+        .map(|rank_slots| {
+            std::array::from_fn(|slot| {
+                rank_slots[slot]
+                    .as_ref()
+                    .map_or(0, |active| active.state.feed_want())
+            })
         })
         .collect()
 }
@@ -293,23 +373,29 @@ pub(crate) fn run_dp8_coordinator(
         }
 
         // One lock-step step: every rank forwards the SAME bucket — each
-        // active slot's next token, padding rows elsewhere — and all
-        // responses are joined before any output is interpreted.
-        let shapes = plan_step_shapes(&occupancy(&slots));
+        // active slot's span of consecutive next tokens, padding rows on the
+        // free slots — and all responses are joined before any output is
+        // interpreted.
+        let shapes = plan_step_shapes(&feed_wants(&slots));
         let responses = slots
             .iter()
             .zip(&workers)
-            .zip(shapes)
+            .zip(&shapes)
             .map(|((rank_slots, worker), shape)| {
                 let mut inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
                     GLM52_MAX_BATCH_PER_RANK];
-                for (slot, active) in rank_slots.iter().enumerate() {
-                    if let Some(active) = active {
-                        let input = active.state.next_input();
-                        inputs[slot] = (input.token, input.position);
+                // Row r is offset `span_offset[slot]` into its slot's span —
+                // spans are contiguous runs, so a per-slot counter walks them.
+                let mut span_offset = [0usize; GLM52_MAX_BATCH_PER_RANK];
+                for (row, input) in inputs.iter_mut().enumerate().take(shape.bucket) {
+                    let slot = shape.slots[row] as usize;
+                    if let Some(active) = &rank_slots[slot] {
+                        let step = active.state.next_input_at(span_offset[slot]);
+                        span_offset[slot] += 1;
+                        *input = (step.token, step.position);
                     }
                 }
-                worker.step_async(inputs, shape)
+                worker.step_async(inputs, *shape)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {
@@ -345,13 +431,24 @@ pub(crate) fn run_dp8_coordinator(
             break 'serve;
         }
 
-        for (rank_slots, rank_outputs) in slots.iter_mut().zip(outputs) {
-            for (slot, output) in rank_slots.iter_mut().zip(rank_outputs) {
+        for ((rank_slots, rank_outputs), shape) in slots.iter_mut().zip(outputs).zip(&shapes) {
+            // Walk the shape's contiguous per-slot runs; each active slot
+            // folds its whole span of row outputs in at once.
+            let mut row = 0usize;
+            while row < shape.bucket {
+                let slot_id = shape.slots[row] as usize;
+                let mut end = row + 1;
+                while end < shape.bucket && shape.slots[end] as usize == slot_id {
+                    end += 1;
+                }
+                let span_outputs = &rank_outputs[row..end];
+                row = end;
+                let slot = &mut rank_slots[slot_id];
                 let Some(active) = slot.as_mut() else {
                     continue;
                 };
                 let prompt_tokens = active.req.prompt_tokens.len();
-                match active.state.advance(output, eos_token_ids) {
+                match active.state.advance_span(span_outputs, eos_token_ids) {
                     Glm52StepOutcome::Prefilling => {
                         // Prefill never sends, so a disconnect is only
                         // visible through the sink probe — without it a long
@@ -473,37 +570,98 @@ mod tests {
     fn prefill_rides_decode_then_emits() {
         let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
 
+        assert_eq!(state.feed_want(), 3);
         assert_eq!(
-            state.next_input(),
+            state.next_input_at(0),
             Glm52StepInput {
                 token: 10,
                 position: 0
             }
         );
-        assert_eq!(state.advance(99, EOS), Glm52StepOutcome::Prefilling);
+        assert_eq!(state.advance_span(&[99], EOS), Glm52StepOutcome::Prefilling);
         assert_eq!(
-            state.next_input(),
+            state.next_input_at(0),
             Glm52StepInput {
                 token: 11,
                 position: 1
             }
         );
-        assert_eq!(state.advance(99, EOS), Glm52StepOutcome::Prefilling);
+        assert_eq!(state.advance_span(&[99], EOS), Glm52StepOutcome::Prefilling);
 
         // The last prompt token's step yields the first generated token.
         assert_eq!(
-            state.next_input(),
+            state.next_input_at(0),
             Glm52StepInput {
                 token: 12,
                 position: 2
             }
         );
-        assert_eq!(state.advance(42, EOS), Glm52StepOutcome::Emit(42));
+        assert_eq!(state.advance_span(&[42], EOS), Glm52StepOutcome::Emit(42));
         assert_eq!(state.completion_tokens(), 1);
 
         // Decode continues from the emitted token at the next position.
+        assert_eq!(state.feed_want(), 1);
         assert_eq!(
-            state.next_input(),
+            state.next_input_at(0),
+            Glm52StepInput {
+                token: 42,
+                position: 3
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_span_feeds_consecutive_positions_and_keeps_only_the_last_output() {
+        let mut state = Glm52SlotState::new(vec![10, 11, 12, 13], 4, false);
+
+        // One span covers three prompt tokens; mid-prompt outputs discarded.
+        assert_eq!(state.feed_want(), 4);
+        assert_eq!(
+            (0..3).map(|i| state.next_input_at(i)).collect::<Vec<_>>(),
+            vec![
+                Glm52StepInput {
+                    token: 10,
+                    position: 0
+                },
+                Glm52StepInput {
+                    token: 11,
+                    position: 1
+                },
+                Glm52StepInput {
+                    token: 12,
+                    position: 2
+                },
+            ]
+        );
+        assert_eq!(
+            state.advance_span(&[99, 98, 97], EOS),
+            Glm52StepOutcome::Prefilling
+        );
+
+        // The next span finishes the prompt; its last output is the first
+        // generated token.
+        assert_eq!(state.feed_want(), 1);
+        assert_eq!(
+            state.next_input_at(0),
+            Glm52StepInput {
+                token: 13,
+                position: 3
+            }
+        );
+        assert_eq!(state.advance_span(&[42], EOS), Glm52StepOutcome::Emit(42));
+        assert_eq!(state.completion_tokens(), 1);
+    }
+
+    #[test]
+    fn whole_prompt_in_one_span_emits_from_the_boundary_row() {
+        let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
+        assert_eq!(
+            state.advance_span(&[99, 98, 42], EOS),
+            Glm52StepOutcome::Emit(42)
+        );
+        assert_eq!(state.completion_tokens(), 1);
+        assert_eq!(
+            state.next_input_at(0),
             Glm52StepInput {
                 token: 42,
                 position: 3
@@ -515,7 +673,7 @@ mod tests {
     fn eos_is_suppressed_and_counts_toward_completion() {
         let mut state = Glm52SlotState::new(vec![10], 4, false);
         assert_eq!(
-            state.advance(7, EOS),
+            state.advance_span(&[7], EOS),
             Glm52StepOutcome::Finish(FinishReason::Stop)
         );
         assert_eq!(state.completion_tokens(), 1);
@@ -524,9 +682,9 @@ mod tests {
     #[test]
     fn ignore_eos_decodes_through_the_stop_token() {
         let mut state = Glm52SlotState::new(vec![10], 4, true);
-        assert_eq!(state.advance(7, EOS), Glm52StepOutcome::Emit(7));
+        assert_eq!(state.advance_span(&[7], EOS), Glm52StepOutcome::Emit(7));
         assert_eq!(
-            state.next_input(),
+            state.next_input_at(0),
             Glm52StepInput {
                 token: 7,
                 position: 1
@@ -537,9 +695,9 @@ mod tests {
     #[test]
     fn length_cap_emits_the_final_token() {
         let mut state = Glm52SlotState::new(vec![10], 2, false);
-        assert_eq!(state.advance(42, EOS), Glm52StepOutcome::Emit(42));
+        assert_eq!(state.advance_span(&[42], EOS), Glm52StepOutcome::Emit(42));
         assert_eq!(
-            state.advance(43, EOS),
+            state.advance_span(&[43], EOS),
             Glm52StepOutcome::EmitAndFinish(43, FinishReason::Length)
         );
         assert_eq!(state.completion_tokens(), 2);
@@ -549,7 +707,7 @@ mod tests {
     fn eos_outranks_the_length_cap() {
         let mut state = Glm52SlotState::new(vec![10], 1, false);
         assert_eq!(
-            state.advance(7, EOS),
+            state.advance_span(&[7], EOS),
             Glm52StepOutcome::Finish(FinishReason::Stop)
         );
     }
@@ -557,9 +715,9 @@ mod tests {
     #[test]
     fn max_tokens_one_emits_then_finishes() {
         let mut state = Glm52SlotState::new(vec![10, 11], 1, false);
-        assert_eq!(state.advance(99, EOS), Glm52StepOutcome::Prefilling);
+        assert_eq!(state.advance_span(&[99], EOS), Glm52StepOutcome::Prefilling);
         assert_eq!(
-            state.advance(42, EOS),
+            state.advance_span(&[42], EOS),
             Glm52StepOutcome::EmitAndFinish(42, FinishReason::Length)
         );
     }
@@ -568,6 +726,14 @@ mod tests {
         counts
             .iter()
             .map(|&c| std::array::from_fn(|slot| slot < c))
+            .collect()
+    }
+
+    /// `counts` decode-phase requests per rank (each wants one row).
+    fn decode_wants(counts: &[usize]) -> Vec<[usize; GLM52_MAX_BATCH_PER_RANK]> {
+        counts
+            .iter()
+            .map(|&c| std::array::from_fn(|slot| usize::from(slot < c)))
             .collect()
     }
 
@@ -597,49 +763,96 @@ mod tests {
     }
 
     #[test]
-    fn bucket_is_the_smallest_covering_the_fullest_rank() {
+    fn bucket_is_the_smallest_covering_the_hungriest_rank() {
         assert_eq!(
-            forwarded(&plan_step_shapes(&occ(&[0, 0]))),
+            forwarded(&plan_step_shapes(&decode_wants(&[0, 0]))),
             vec![(1, vec![0]), (1, vec![0])]
         );
         assert_eq!(
-            forwarded(&plan_step_shapes(&occ(&[1; 8]))),
+            forwarded(&plan_step_shapes(&decode_wants(&[1; 8]))),
             vec![(1, vec![0]); 8]
         );
         // One rank at two requests lifts EVERY rank to the 2-row bucket —
         // idle ranks pad with free slots.
         assert_eq!(
-            forwarded(&plan_step_shapes(&occ(&[2, 1]))),
+            forwarded(&plan_step_shapes(&decode_wants(&[2, 1]))),
             vec![(2, vec![0, 1]), (2, vec![0, 1])]
         );
         assert_eq!(
-            forwarded(&plan_step_shapes(&occ(&[3, 1])))[0],
+            forwarded(&plan_step_shapes(&decode_wants(&[3, 1])))[0],
             (4, vec![0, 1, 2, 3])
         );
         // Past the 4-row bucket the full batch takes over.
-        assert_eq!(forwarded(&plan_step_shapes(&occ(&[5, 1])))[0].0, 8);
+        assert_eq!(forwarded(&plan_step_shapes(&decode_wants(&[5, 1])))[0].0, 8);
     }
 
     #[test]
-    fn partial_buckets_pack_actives_first_and_full_is_identity() {
+    fn partial_buckets_pack_actives_first() {
         // A rank holding slots {1, 5} forwards them in rows 0..2; the padding
         // rows (bucket 4) ride on the lowest free slots.
-        let mut holey = occ(&[0, 3]);
-        holey[0][1] = true;
-        holey[0][5] = true;
+        let mut holey = decode_wants(&[0, 3]);
+        holey[0][1] = 1;
+        holey[0][5] = 1;
         assert_eq!(
             forwarded(&plan_step_shapes(&holey)),
             vec![(4, vec![1, 5, 0, 2]), (4, vec![0, 1, 2, 3])]
         );
-        assert_eq!(admission_target(&holey), Some((0, 0)));
-        // The full bucket forwards every slot as the identity mapping — the
-        // full-bucket graphs read the static identity block table.
-        let mut deep = occ(&[5, 0]);
-        deep[0][0] = false;
-        deep[0][7] = true;
+        let mut deep = decode_wants(&[5, 0]);
+        deep[0][0] = 0;
+        deep[0][7] = 1;
         assert_eq!(
             forwarded(&plan_step_shapes(&deep))[0],
-            (8, (0..8).collect::<Vec<u8>>())
+            (8, vec![1, 2, 3, 4, 7, 0, 5, 6])
+        );
+    }
+
+    #[test]
+    fn prefill_want_extends_one_slot_into_a_span() {
+        // A lone mid-prefill request with plenty of prompt left fills the
+        // whole max bucket with its span; idle ranks pad.
+        let mut wants = decode_wants(&[0, 0]);
+        wants[0][2] = 3000;
+        let shapes = plan_step_shapes(&wants);
+        assert_eq!(
+            forwarded(&shapes)[0],
+            (8, vec![2, 2, 2, 2, 2, 2, 2, 2]),
+            "one hungry slot owns every row of the max bucket"
+        );
+        assert_eq!(
+            forwarded(&shapes)[1],
+            (8, (0..8).map(|s| s as u8).collect())
+        );
+
+        // A short prompt remainder only lifts the bucket as far as needed.
+        let mut wants = decode_wants(&[0, 0]);
+        wants[0][0] = 3;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants))[0],
+            (4, vec![0, 0, 0, 1])
+        );
+    }
+
+    #[test]
+    fn spans_share_the_bucket_with_decode_slots_actives_first() {
+        // Slot 0 decodes (1 row), slot 1 is mid-prefill: liveness rows first,
+        // then the leftover capacity extends the prefill span — one
+        // contiguous run per slot.
+        let mut wants = decode_wants(&[0]);
+        wants[0][0] = 1;
+        wants[0][1] = 100;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants))[0],
+            (8, vec![0, 1, 1, 1, 1, 1, 1, 1])
+        );
+
+        // Two mid-prefill slots split the leftover in ascending slot order.
+        let mut wants = decode_wants(&[0]);
+        wants[0][0] = 3;
+        wants[0][1] = 2;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants))[0],
+            (8, vec![0, 0, 0, 1, 1, 2, 3, 4]),
+            "wants met, remaining rows pad on free slots"
         );
     }
 }
