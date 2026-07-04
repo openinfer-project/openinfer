@@ -163,13 +163,14 @@ __global__ void dflash_qk_norm_rope_kernel(
     float sq = warp_reduce_sum(val * val);
     int warp_id = d / WARP_SIZE;
     int lane_id = d % WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;  // head_dim / 32: 2 (dim 64) or 4 (dim 128)
     __shared__ float warp_sums[4];
     if (lane_id == 0) warp_sums[warp_id] = sq;
     __syncthreads();
 
     __shared__ float s_inv_rms;
     if (warp_id == 0) {
-        float v = (lane_id < 4) ? warp_sums[lane_id] : 0.0f;
+        float v = (lane_id < num_warps) ? warp_sums[lane_id] : 0.0f;
         float total = warp_reduce_sum(v);
         if (lane_id == 0) s_inv_rms = rsqrtf(total / head_dim + eps);
     }
@@ -275,9 +276,13 @@ int dflash_qk_norm_rope_cuda(
     int cos_max_pos,
     cudaStream_t stream
 ) {
+    // One thread per dim element, whole warps only, and the shared buffers
+    // (warp_sums[4], smem[HEAD_DIM]) are sized for head_dim <= 128. Serves
+    // Qwen3 DFlash (head_dim 128) and the GLM5.2 DSpark drafter (head_dim 64).
     if (q == nullptr || k == nullptr || q_norm_weight == nullptr ||
         k_norm_weight == nullptr || cos_cache == nullptr || sin_cache == nullptr ||
-        num_q_heads <= 0 || num_kv_heads <= 0 || head_dim != HEAD_DIM ||
+        num_q_heads <= 0 || num_kv_heads <= 0 ||
+        head_dim % WARP_SIZE != 0 || head_dim <= 0 || head_dim > HEAD_DIM ||
         q_len <= 0 || k_len <= 0 || q_start_pos < 0 || k_start_pos < 0 ||
         q_start_pos + q_len > cos_max_pos || k_start_pos + k_len > cos_max_pos) {
         return static_cast<int>(cudaErrorInvalidValue);

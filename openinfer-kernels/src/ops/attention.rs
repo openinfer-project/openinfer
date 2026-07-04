@@ -824,8 +824,17 @@ pub fn single_prefill_nhd_noncausal_into(
     let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
     let out_ptr = out_ptr + byte_offset;
+    // FlashInfer's prefill kernel is a compile-time HEAD_DIM template: 128 is
+    // the Qwen3 DFlash drafter, 64 the GLM5.2 DSpark drafter.
+    let kernel = match head_dim {
+        128 => ffi::single_prefill_nhd_noncausal_cuda,
+        64 => ffi::single_prefill_nhd_noncausal_cuda_hd64,
+        other => anyhow::bail!(
+            "single_prefill_nhd_noncausal has no head_dim {other} instantiation (64/128 only)"
+        ),
+    };
     let result = unsafe {
-        ffi::single_prefill_nhd_noncausal_cuda(
+        kernel(
             q_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             k_ptr as *const ffi::Half,
