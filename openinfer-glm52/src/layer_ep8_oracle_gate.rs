@@ -34,13 +34,16 @@ use crate::layer_oracle_gate::{
     assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
 };
 use crate::model::{
-    GLM52_DECODE_GLOBAL_TOKENS, INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE,
+    GLM52_MAX_BATCH_PER_RANK, INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE,
     rope_tables,
 };
 use crate::moe_decode::{HIDDEN, run_router};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
 const EP_RANKS: usize = 8;
+/// The full-bucket protocol value the production coordinator agrees on —
+/// the gate replays its collectives at the same worst-case row bound.
+const GLOBAL_TOKENS: usize = EP_RANKS * GLM52_MAX_BATCH_PER_RANK;
 
 #[test]
 #[ignore = "requires 8×H200 + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4 + DeepGEMM env"]
@@ -71,7 +74,7 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
                             &mut ep8,
                             &bank,
                             None,
-                            GLM52_DECODE_GLOBAL_TOKENS,
+                            GLOBAL_TOKENS,
                         )?;
                         ensure!(!dispatched, "expert rank produced a combined output");
                     }
@@ -215,7 +218,7 @@ fn run_layer_prefill_ep8(
             ep8,
             &moe.bank,
             Some((&scratch.layer.normed2, &route, 1)),
-            GLM52_DECODE_GLOBAL_TOKENS,
+            GLOBAL_TOKENS,
         )?;
         ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");
         let shared = moe.shared.forward(ctx, &scratch.layer.normed2)?;

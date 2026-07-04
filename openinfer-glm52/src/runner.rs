@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use anyhow::Context as _;
 
 #[cfg(feature = "glm52")]
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel};
+use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepShape};
 #[cfg(feature = "glm52")]
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::weights::{
@@ -70,13 +70,15 @@ enum Glm52RankCommand {
         resp: Sender<Result<()>>,
     },
     /// One lock-step full-model step (75 MoE collectives inside): feed each
-    /// slot's `(token, position)` row, reply with the greedy next token per
-    /// slot. The coordinator sends this to every rank each global step —
-    /// unoccupied slots carry the padding row and their outputs are
-    /// discarded.
+    /// active slot's `(token, position)` row, reply with the greedy next
+    /// token per slot. The coordinator sends this to every rank each global
+    /// step with the SAME batch bucket in `shape` (the collectives require
+    /// every rank to agree on the step's global row count) — unoccupied
+    /// slots carry the padding row and their outputs are discarded.
     #[cfg(feature = "glm52")]
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
+        shape: Glm52StepShape,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
     },
     Shutdown,
@@ -162,11 +164,13 @@ impl Glm52RankWorker {
     pub(crate) fn step_async(
         &self,
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
     ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::Step {
                 inputs: Box::new(inputs),
+                shape,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -309,6 +313,7 @@ impl Glm52RankThreadState {
     fn step(
         &mut self,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -321,7 +326,7 @@ impl Glm52RankThreadState {
             .context("GLM5.2 step before setup_comm")?;
         runtime
             .model
-            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs)
+            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape)
     }
 }
 
@@ -340,8 +345,12 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
                 let _ = resp.send(state.setup_comm(&unique_id));
             }
             #[cfg(feature = "glm52")]
-            Glm52RankCommand::Step { inputs, resp } => {
-                let _ = resp.send(state.step(&inputs));
+            Glm52RankCommand::Step {
+                inputs,
+                shape,
+                resp,
+            } => {
+                let _ = resp.send(state.step(&inputs, shape));
             }
             Glm52RankCommand::Shutdown => break,
         }

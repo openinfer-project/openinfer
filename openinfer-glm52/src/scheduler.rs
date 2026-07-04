@@ -1,23 +1,29 @@
-//! DP8 lock-step scheduler: one request per rank (slot 0 of the rank's fixed
-//! `GLM52_MAX_BATCH_PER_RANK`-row decode batch; the remaining slots carry
-//! padding rows until multi-slot admission lands).
+//! DP8 lock-step continuous-batching scheduler: up to
+//! `GLM52_MAX_BATCH_PER_RANK` requests per rank, each owning one slot of the
+//! rank's decode batch (and that slot's disjoint region of the paged caches).
 //!
-//! Every global step ALL ranks run the full-model forward simultaneously —
-//! ranks with an active request feed its next token (prompt tokens ride the
-//! decode path one position at a time), idle ranks/slots feed a padding row
-//! whose output is discarded. This satisfies the DeepEP contract that every
-//! rank enters every MoE layer's dispatch/combine collective with the agreed
-//! global row count, and makes DP1 the `active_ranks = 1` special case of
-//! the same protocol.
+//! Every global step ALL ranks run the full-model forward simultaneously with
+//! the SAME batch bucket — ranks feed each active slot's next token (prompt
+//! tokens ride the decode path one position at a time), idle slots feed a
+//! padding row whose output is discarded. This satisfies the DeepEP contract
+//! that every rank enters every MoE layer's dispatch/combine collective with
+//! the agreed global row count. The bucket is {1, 8}: while no rank holds
+//! more than one request, every rank steps a single row (the cheap 1-row
+//! graphs); as soon as any rank holds two, every rank steps the full 8-row
+//! batch. Requests join and leave slots at step boundaries (continuous
+//! batching) — admission is least-loaded rank first, so the fleet reaches
+//! bucket 8 only past `GLM52_EP_RANKS` concurrent requests.
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
-//! live in [`Glm52SlotState`] as pure data transitions; the coordinator is a
-//! thin shell that moves tokens between channels and the rank workers.
+//! live in [`Glm52SlotState`] as pure data transitions, and the
+//! admission/bucket decisions in [`admission_target`] / [`step_bucket`] as
+//! pure functions over the occupancy; the coordinator is a thin shell that
+//! moves tokens between channels and the rank workers.
 
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
 
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN};
+use crate::model::{GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape};
 use crate::runner::Glm52RankWorker;
 
 /// What a rank forwards this step. Idle ranks feed the padding input; its
@@ -150,22 +156,69 @@ struct ActiveRequest {
     state: Glm52SlotState,
 }
 
-/// DP8 coordinator: admits up to one request per rank and drives all ranks in
-/// lock-step. Consumes the workers; returns when the submit channel closes or
-/// a step fails (the EP8 collective group cannot recover from a failed step —
-/// see the teardown comment below).
+/// Per-rank slot occupancy: `slots[rank][slot]`.
+type RankSlots = [Option<ActiveRequest>; GLM52_MAX_BATCH_PER_RANK];
+
+/// Where the next queued request goes: the least-loaded rank (ties → lowest
+/// rank id), its lowest free slot. `None` when every slot in the fleet is
+/// taken. Least-loaded-first keeps occupancy balanced, which keeps the fleet
+/// in the cheap 1-row bucket until concurrency exceeds the rank count.
+fn admission_target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(usize, usize)> {
+    let (rank, row) = occupied
+        .iter()
+        .enumerate()
+        .min_by_key(|(rank, row)| (row.iter().filter(|&&o| o).count(), *rank))?;
+    let slot = row.iter().position(|&o| !o)?;
+    Some((rank, slot))
+}
+
+/// The step's global batch bucket: 1 row per rank while every rank holds at
+/// most one request, the full batch as soon as any rank holds two. Every rank
+/// must step with the same bucket — the MoE collectives agree on the global
+/// row count.
+fn step_bucket(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> usize {
+    if occupied
+        .iter()
+        .all(|row| row.iter().filter(|&&o| o).count() <= 1)
+    {
+        1
+    } else {
+        GLM52_MAX_BATCH_PER_RANK
+    }
+}
+
+fn occupancy(slots: &[RankSlots]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {
+    slots
+        .iter()
+        .map(|rank_slots| std::array::from_fn(|slot| rank_slots[slot].is_some()))
+        .collect()
+}
+
+/// DP8 coordinator: admits up to `GLM52_MAX_BATCH_PER_RANK` requests per rank
+/// (least-loaded rank first) and drives all ranks in lock-step. Consumes the
+/// workers; returns when the submit channel closes or a step fails (the EP8
+/// collective group cannot recover from a failed step — see the teardown
+/// comment below).
 pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     workers: Vec<Glm52RankWorker>,
     eos_token_ids: &[u32],
 ) {
-    let mut slots: Vec<Option<ActiveRequest>> = (0..workers.len()).map(|_| None).collect();
+    let mut slots: Vec<RankSlots> = workers
+        .iter()
+        .map(|_| std::array::from_fn(|_| None))
+        .collect();
     let mut pending = std::collections::VecDeque::<GenerateRequest>::new();
     let mut channel_open = true;
+    let all_idle = |slots: &[RankSlots]| {
+        slots
+            .iter()
+            .all(|rank_slots| rank_slots.iter().all(Option::is_none))
+    };
 
     'serve: loop {
         // Intake: block when fully idle, otherwise drain what's queued.
-        if channel_open && slots.iter().all(Option::is_none) && pending.is_empty() {
+        if channel_open && all_idle(&slots) && pending.is_empty() {
             match submit_rx.blocking_recv() {
                 Some(req) => intake(req, &mut pending),
                 None => channel_open = false,
@@ -178,15 +231,18 @@ pub(crate) fn run_dp8_coordinator(
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
         }
-        if !channel_open && slots.iter().all(Option::is_none) && pending.is_empty() {
+        if !channel_open && all_idle(&slots) && pending.is_empty() {
             break;
         }
 
-        // Admission: fill free ranks from the queue, one request per rank.
-        for slot in slots.iter_mut().filter(|slot| slot.is_none()) {
-            let Some(req) = pending.pop_front() else {
+        // Admission: fill free slots from the queue, least-loaded rank first.
+        // New requests join the lock-step at the next step boundary (their
+        // prefill rides decode alongside everyone else's rows).
+        while !pending.is_empty() {
+            let Some((rank, slot)) = admission_target(&occupancy(&slots)) else {
                 break;
             };
+            let req = pending.pop_front().expect("checked non-empty");
             let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
             let _ = req.token_tx.send(TokenEvent::Scheduled {
                 queued_at_unix_s,
@@ -199,26 +255,41 @@ pub(crate) fn run_dp8_coordinator(
                 req.max_tokens,
                 req.params.ignore_eos,
             );
-            *slot = Some(ActiveRequest { req, state });
+            slots[rank][slot] = Some(ActiveRequest { req, state });
         }
-        if slots.iter().all(Option::is_none) {
+        if all_idle(&slots) {
             continue;
         }
 
-        // One lock-step step: every rank forwards its fixed row batch — the
-        // active request (if any) in slot 0, padding rows elsewhere — and all
+        // One lock-step step: every rank forwards the SAME bucket — each
+        // active slot's next token, padding rows elsewhere — and all
         // responses are joined before any output is interpreted.
+        let bucket = step_bucket(&occupancy(&slots));
         let responses = slots
             .iter()
             .zip(&workers)
-            .map(|(slot, worker)| {
-                let input = slot
-                    .as_ref()
-                    .map_or(GLM52_PADDING_STEP, |active| active.state.next_input());
+            .map(|(rank_slots, worker)| {
                 let mut inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
                     GLM52_MAX_BATCH_PER_RANK];
-                inputs[0] = (input.token, input.position);
-                worker.step_async(inputs)
+                for (slot, active) in rank_slots.iter().enumerate() {
+                    if let Some(active) = active {
+                        let input = active.state.next_input();
+                        inputs[slot] = (input.token, input.position);
+                    }
+                }
+                let shape = if bucket == 1 {
+                    // ≤ 1 active slot per rank by the bucket decision; an
+                    // idle rank forwards the padding row in slot 0.
+                    Glm52StepShape::One {
+                        slot: rank_slots
+                            .iter()
+                            .position(Option::is_some)
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    Glm52StepShape::Full
+                };
+                worker.step_async(inputs, shape)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {
@@ -240,12 +311,12 @@ pub(crate) fn run_dp8_coordinator(
                 .recv()
                 .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its step response"));
             match result {
-                Ok(Ok(step_tokens)) => outputs.push(step_tokens[0]),
+                Ok(Ok(step_tokens)) => outputs.push(step_tokens),
                 Ok(Err(err)) | Err(err) => {
                     let err = err.context(format!("GLM5.2 rank {rank} step"));
                     log::error!("GLM5.2 rank {rank} step failed: {err:#}");
                     step_err.get_or_insert(err);
-                    outputs.push(0);
+                    outputs.push([0; GLM52_MAX_BATCH_PER_RANK]);
                 }
             }
         }
@@ -254,55 +325,57 @@ pub(crate) fn run_dp8_coordinator(
             break 'serve;
         }
 
-        for (slot, output) in slots.iter_mut().zip(outputs) {
-            let Some(active) = slot.as_mut() else {
-                continue;
-            };
-            let prompt_tokens = active.req.prompt_tokens.len();
-            match active.state.advance(output, eos_token_ids) {
-                Glm52StepOutcome::Prefilling => {
-                    // Prefill never sends, so a disconnect is only visible
-                    // through the sink probe — without it a long prompt
-                    // zombies the rank until prefill completes.
-                    if active.req.token_tx.is_closed() {
-                        *slot = None;
+        for (rank_slots, rank_outputs) in slots.iter_mut().zip(outputs) {
+            for (slot, output) in rank_slots.iter_mut().zip(rank_outputs) {
+                let Some(active) = slot.as_mut() else {
+                    continue;
+                };
+                let prompt_tokens = active.req.prompt_tokens.len();
+                match active.state.advance(output, eos_token_ids) {
+                    Glm52StepOutcome::Prefilling => {
+                        // Prefill never sends, so a disconnect is only
+                        // visible through the sink probe — without it a long
+                        // prompt zombies the slot until prefill completes.
+                        if active.req.token_tx.is_closed() {
+                            *slot = None;
+                        }
                     }
-                }
-                Glm52StepOutcome::Emit(token) => {
-                    // A dropped receiver (client disconnect) frees the rank;
-                    // its KV lives in the rank's own cache slots and dies
-                    // with the slot.
-                    if active
-                        .req
-                        .token_tx
-                        .send(TokenEvent::Token {
+                    Glm52StepOutcome::Emit(token) => {
+                        // A dropped receiver (client disconnect) frees the
+                        // slot; its KV lives in the slot's own cache region
+                        // and dies with the slot.
+                        if active
+                            .req
+                            .token_tx
+                            .send(TokenEvent::Token {
+                                id: token,
+                                logprob: None,
+                            })
+                            .is_err()
+                        {
+                            *slot = None;
+                        }
+                    }
+                    Glm52StepOutcome::EmitAndFinish(token, finish_reason) => {
+                        let _ = active.req.token_tx.send(TokenEvent::Token {
                             id: token,
                             logprob: None,
-                        })
-                        .is_err()
-                    {
+                        });
+                        let _ = active.req.token_tx.send(TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens,
+                            completion_tokens: active.state.completion_tokens(),
+                        });
                         *slot = None;
                     }
-                }
-                Glm52StepOutcome::EmitAndFinish(token, finish_reason) => {
-                    let _ = active.req.token_tx.send(TokenEvent::Token {
-                        id: token,
-                        logprob: None,
-                    });
-                    let _ = active.req.token_tx.send(TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens,
-                        completion_tokens: active.state.completion_tokens(),
-                    });
-                    *slot = None;
-                }
-                Glm52StepOutcome::Finish(finish_reason) => {
-                    let _ = active.req.token_tx.send(TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens,
-                        completion_tokens: active.state.completion_tokens(),
-                    });
-                    *slot = None;
+                    Glm52StepOutcome::Finish(finish_reason) => {
+                        let _ = active.req.token_tx.send(TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens,
+                            completion_tokens: active.state.completion_tokens(),
+                        });
+                        *slot = None;
+                    }
                 }
             }
         }
@@ -354,11 +427,11 @@ fn intake(req: GenerateRequest, pending: &mut std::collections::VecDeque<Generat
 /// first dispatch and every layer after it would run against the wrong
 /// expert bank — byte-deterministic garbage, no crash. The group cannot be
 /// re-synced; fail every active request and tear the engine down.
-fn fail_step(slots: &mut [Option<ActiveRequest>], err: &anyhow::Error) {
+fn fail_step(slots: &mut [RankSlots], err: &anyhow::Error) {
     log::error!(
         "GLM5.2 step failed; shutting the engine down (the EP8 collective group cannot recover): {err:#}"
     );
-    for slot in slots.iter_mut() {
+    for slot in slots.iter_mut().flatten() {
         let Some(active) = slot.take() else {
             continue;
         };
@@ -469,5 +542,40 @@ mod tests {
             state.advance(42, EOS),
             Glm52StepOutcome::EmitAndFinish(42, FinishReason::Length)
         );
+    }
+
+    fn occ(counts: &[usize]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {
+        counts
+            .iter()
+            .map(|&c| std::array::from_fn(|slot| slot < c))
+            .collect()
+    }
+
+    #[test]
+    fn admission_prefers_least_loaded_rank_then_lowest_slot() {
+        // Empty fleet: rank 0, slot 0.
+        assert_eq!(admission_target(&occ(&[0, 0, 0])), Some((0, 0)));
+        // Rank 1 is the least loaded.
+        assert_eq!(admission_target(&occ(&[2, 1, 2])), Some((1, 1)));
+        // Tie between ranks 0 and 2 → lowest rank id.
+        assert_eq!(admission_target(&occ(&[1, 2, 1])), Some((0, 1)));
+        // A hole in the middle of a rank's slots is reused first.
+        let mut holey = occ(&[3, 3]);
+        holey[1][1] = false;
+        assert_eq!(admission_target(&holey), Some((1, 1)));
+        // Full fleet: no target.
+        assert_eq!(admission_target(&occ(&[GLM52_MAX_BATCH_PER_RANK; 2])), None);
+    }
+
+    #[test]
+    fn bucket_is_one_row_until_a_rank_holds_two() {
+        assert_eq!(step_bucket(&occ(&[0, 0])), 1);
+        assert_eq!(step_bucket(&occ(&[1, 1, 1, 1, 1, 1, 1, 1])), 1);
+        assert_eq!(step_bucket(&occ(&[2, 0])), GLM52_MAX_BATCH_PER_RANK);
+        // The single active slot need not be slot 0 for the 1-row bucket.
+        let mut mid_slot = occ(&[0, 0]);
+        mid_slot[1][5] = true;
+        assert_eq!(step_bucket(&mid_slot), 1);
+        assert_eq!(admission_target(&mid_slot), Some((0, 0)));
     }
 }
