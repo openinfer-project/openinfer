@@ -386,7 +386,7 @@ def run_correctness_gate(args: argparse.Namespace, out_dir: Path) -> dict[str, A
         ),
         (
             ["cargo", "test", "--release", "-p", "openinfer-deepseek-v2-lite",
-             "--features", "deepseek-v2-lite", "--test", "e2e_ep2", "--", "--nocapture"],
+             "--test", "e2e_ep2", "--", "--nocapture"],
             {
                 "OPENINFER_TEST_MODEL_PATH": model,
                 "OPENINFER_DSV2_LITE_E2E_CASE_SET": case_set,
@@ -396,7 +396,7 @@ def run_correctness_gate(args: argparse.Namespace, out_dir: Path) -> dict[str, A
         ),
         (
             ["cargo", "test", "--release", "-p", "openinfer-deepseek-v2-lite",
-             "--features", "deepseek-v2-lite", "--test", "e2e_ep2", "--", "--nocapture"],
+             "--test", "e2e_ep2", "--", "--nocapture"],
             {
                 "OPENINFER_TEST_MODEL_PATH": model,
                 "OPENINFER_DSV2_LITE_E2E_CASE_SET": case_set,
@@ -456,7 +456,7 @@ def run_direct_diagnostic(args: argparse.Namespace, out_dir: Path) -> list[dict[
             artifact.parent.mkdir(parents=True, exist_ok=True)
             cmd = [
                 "cargo", "run", "--release", "-p", "openinfer-deepseek-v2-lite",
-                "--features", "deepseek-v2-lite", "--bin", "dsv2_lite_ep2_decode_attribution",
+                "--bin", "dsv2_lite_ep2_decode_attribution",
                 "--", "--model-path", str(args.model_path), "--batch-size", str(batch_size),
                 "--out", display_path(artifact),
             ]
@@ -1536,7 +1536,7 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
                 "batch_size": batch,
                 "command": redact_command([
                     "cargo", "run", "--release", "-p", "openinfer-deepseek-v2-lite",
-                    "--features", "deepseek-v2-lite", "--bin", "dsv2_lite_ep2_decode_attribution",
+                    "--bin", "dsv2_lite_ep2_decode_attribution",
                     "--", "--model-path", str(args.model_path), "--batch-size", str(batch),
                 ]),
             }

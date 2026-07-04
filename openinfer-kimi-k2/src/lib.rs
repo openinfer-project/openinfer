@@ -1,7 +1,4 @@
 //! Text-only Kimi-K2.6 model crate.
-//!
-//! The current crate stage owns the compile-checked operator API surface and
-//! text-only config probing. CUDA/runtime bodies land behind these headers.
 
 #![allow(incomplete_features)]
 // `use super::*` is the flat-module-layout idiom for these tightly-coupled
@@ -14,40 +11,28 @@
 use std::path::Path;
 
 use anyhow::Result;
-#[cfg(feature = "kimi-k2")]
 use openinfer_core::engine::EpBackend;
 use openinfer_core::engine::{EngineHandle, EngineLoadOptions};
 
-#[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;
 pub(crate) mod config;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
-#[cfg(feature = "kimi-k2")]
 mod runner;
-#[cfg(feature = "kimi-k2")]
 mod typed_scratch;
-#[cfg(feature = "kimi-k2")]
 mod weights;
 
 pub use config::{KIMI_K2_LAYERS, probe_config_json};
 
-#[cfg(feature = "kimi-k2")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     runner::start_engine(model_path, &options)
-}
-
-#[cfg(not(feature = "kimi-k2"))]
-pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
-    anyhow::bail!("Kimi-K2 runtime is feature-gated; rebuild with --features kimi-k2")
 }
 
 /// Server-facing launch knobs for Kimi-K2. The binary passes raw CLI values;
 /// [`launch`] owns the EP topology policy — validating TP/DP, deriving the EP
 /// world and its device ordinals — so the server never hardcodes Kimi's
 /// parallel layout.
-#[cfg(feature = "kimi-k2")]
 #[derive(Clone, Copy, Debug)]
 pub struct KimiLaunchOptions {
     pub tp_size: usize,
@@ -57,7 +42,6 @@ pub struct KimiLaunchOptions {
 }
 
 /// Start the Kimi-K2 engine from server-facing [`KimiLaunchOptions`].
-#[cfg(feature = "kimi-k2")]
 pub fn launch(model_path: &Path, options: KimiLaunchOptions) -> Result<EngineHandle> {
     use log::info;
     use openinfer_core::parallel::ParallelConfig;

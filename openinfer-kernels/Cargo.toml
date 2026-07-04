@@ -17,15 +17,19 @@ cc = { workspace = true }
 openinfer-build = { workspace = true }
 
 [features]
+# One feature per model line scoping its csrc/ + AOT codegen; features that
+# need more than nvcc say so here. See docs/conventions/feature-flags.md.
 default = []
 tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35-4b"]
-# Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
-# needs Python + Triton at build time.
+# Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — needs Python + Triton
+# at build time.
 qwen35-4b = []
+# DeepSeek-V4 kernels — need Python + TileLang + CuTe DSL at build time.
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
 deepseek-v2-lite = []
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
+# Needs NCCL >= 2.30.4 headers/lib for the DeepEP shim.
 moe = []
 glm52 = ["moe"]
 kimi-k2 = ["moe"]

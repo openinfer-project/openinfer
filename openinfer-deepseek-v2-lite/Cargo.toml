@@ -7,10 +7,6 @@ autobenches = false
 autobins = false
 autotests = false
 
-[features]
-default = []
-deepseek-v2-lite = ["dep:openinfer-kernels", "openinfer-kernels/deepseek-v2-lite"]
-
 [dependencies]
 anyhow = { workspace = true }
 cudarc = { workspace = true }
@@ -21,7 +17,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 nvtx = { workspace = true }
 openinfer-core = { workspace = true }
-openinfer-kernels = { workspace = true, optional = true }
+openinfer-kernels = { workspace = true, features = ["deepseek-v2-lite"] }
 openinfer-engine = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
@@ -36,9 +32,7 @@ workspace = true
 [[test]]
 name = "e2e_ep2"
 path = "tests/e2e_ep2.rs"
-required-features = ["deepseek-v2-lite"]
 
 [[bin]]
 name = "dsv2_lite_ep2_decode_attribution"
 path = "src/bin/dsv2_lite_ep2_decode_attribution.rs"
-required-features = ["deepseek-v2-lite"]

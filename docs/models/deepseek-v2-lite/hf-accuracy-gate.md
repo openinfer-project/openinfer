@@ -59,13 +59,13 @@ python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
 OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
-  cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+  cargo test --release -p openinfer-deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
 OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
 OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
-  cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+  cargo test --release -p openinfer-deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --hf target/accuracy/dsv2-lite-ep2/hf.json \

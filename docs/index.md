@@ -202,3 +202,4 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | --- | --- |
 | `conventions/bench-regression.md` | Benchmark regression tracking: one snapshot per model, git-tracked history, TPOT >2% / TTFT >3% thresholds. |
 | `conventions/coding-style.md` | Testing principle: prefer integration tests, don't test what E2E catches. |
+| `conventions/feature-flags.md` | Cargo feature standard: one name per model line; pure-CUDA model crates carry no self feature (Tier A), Python-toolchain crates keep a single whole-crate gate (Tier B); selection lives in server + kernels. |

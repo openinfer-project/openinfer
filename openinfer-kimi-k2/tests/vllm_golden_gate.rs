@@ -47,9 +47,10 @@
 //! Requires 8 GPUs and Kimi-K2.6 weights. `OPENINFER_TEST_MODEL_PATH` must
 //! point at the weights and the fixture must exist — both fail loudly when
 //! missing. No silent skip: a gate that can quietly report "ok 0.00s" guards
-//! nothing (the qwen35 gate's env-gated skip taught us that). Building the
-//! target at all requires the `kimi-k2` feature (`required-features` in
-//! Cargo.toml), so feature-less workspace test runs never see it.
+//! nothing (the qwen35 gate's env-gated skip taught us that). Like the qwen3
+//! and glm52 gates, this target builds in any workspace test sweep and fails
+//! loudly on hosts without the weights — run gates per package, and keep the
+//! routine sweep to `cargo test --workspace --lib`.
 
 use std::path::Path;
 use std::time::{Duration, Instant};

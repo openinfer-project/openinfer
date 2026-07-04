@@ -48,15 +48,20 @@ vllm-text = { workspace = true }
 tikv-jemallocator = "0.6"
 
 [features]
+# One feature per model line, same name as the crate suffix. Pure-CUDA model
+# crates compile their full selves; the server feature just adds the dep.
+# Toolchain-gated crates (build-time Python) additionally forward their
+# self-named feature. See docs/conventions/feature-flags.md.
 # Qwen3-4B is the default model line: pure Rust + CUDA, no Python at build time.
 default = ["qwen3"]
 qwen3 = ["dep:openinfer-qwen3"]
 # Qwen3.5 pulls in the Triton AOT kernels (Python + Triton at build time).
 qwen35-4b = ["dep:openinfer-qwen35-4b", "openinfer-qwen35-4b/qwen35-4b"]
+# DeepSeek-V4 pulls in TileLang + CuTe DSL AOT kernels (Python at build time).
 deepseek-v4 = ["dep:openinfer-deepseek-v4", "openinfer-deepseek-v4/deepseek-v4"]
-deepseek-v2-lite = ["dep:openinfer-deepseek-v2-lite", "openinfer-deepseek-v2-lite/deepseek-v2-lite"]
+deepseek-v2-lite = ["dep:openinfer-deepseek-v2-lite"]
 glm52 = ["dep:openinfer-glm52"]
-kimi-k2 = ["dep:openinfer-kimi-k2", "openinfer-kimi-k2/kimi-k2"]
+kimi-k2 = ["dep:openinfer-kimi-k2"]
 pplx-ep = ["deepseek-v4", "openinfer-deepseek-v4/pplx-ep"]
 deepseek-v4-cutedsl-diagnostic = [
     "deepseek-v4",
