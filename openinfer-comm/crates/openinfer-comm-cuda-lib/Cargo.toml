@@ -23,6 +23,7 @@ cudart-sys = { path = "../openinfer-comm-cudart-sys", package = "openinfer-comm-
 gdrapi-sys = { path = "../openinfer-comm-gdrapi-sys", package = "openinfer-comm-gdrapi-sys" }
 
 libc = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }
 bincode = { workspace = true, features = ["derive", "alloc"] }
 
