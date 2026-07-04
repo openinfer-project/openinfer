@@ -3,19 +3,10 @@ use std::{
     thread,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-#[cfg(not(feature = "glm52"))]
-use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
-#[cfg(not(feature = "glm52"))]
-use tokio::sync::mpsc;
 
-#[cfg(feature = "glm52")]
-use anyhow::Context as _;
-
-#[cfg(feature = "glm52")]
 use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepShape};
-#[cfg(feature = "glm52")]
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::weights::{
     GLM52_EP_RANKS, Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle,
@@ -58,13 +49,11 @@ enum Glm52RankCommand {
     /// Non-collective: adopt the resident weights into the rank's model.
     /// Every rank must report success BEFORE anyone enters SetupComm — a
     /// build failure on one rank must never strand the others in NCCL init.
-    #[cfg(feature = "glm52")]
     BuildModel {
         resp: Sender<Result<()>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
     /// to every rank concurrently, only after all builds succeeded.
-    #[cfg(feature = "glm52")]
     SetupComm {
         unique_id: Box<[u8; 128]>,
         resp: Sender<Result<()>>,
@@ -75,7 +64,6 @@ enum Glm52RankCommand {
     /// step with the SAME batch bucket in `shape` (the collectives require
     /// every rank to agree on the step's global row count) — unoccupied
     /// slots carry the padding row and their outputs are discarded.
-    #[cfg(feature = "glm52")]
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
@@ -139,7 +127,6 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    #[cfg(feature = "glm52")]
     pub(crate) fn build_model_async(&self) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -148,7 +135,6 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    #[cfg(feature = "glm52")]
     pub(crate) fn setup_comm_async(&self, unique_id: [u8; 128]) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -160,7 +146,6 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    #[cfg(feature = "glm52")]
     pub(crate) fn step_async(
         &self,
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
@@ -206,7 +191,6 @@ impl Drop for Glm52RankWorker {
     }
 }
 
-#[cfg(feature = "glm52")]
 struct Glm52RankRuntime {
     model: Box<Glm52RankModel>,
     /// Second stream on the same device: the shared expert overlaps the MoE
@@ -221,7 +205,6 @@ struct Glm52RankThreadState {
     ctx: Glm52RankGpuContext,
     bundle: Glm52RankLoadBundle,
     loaded: Option<Glm52RankGpuWeights>,
-    #[cfg(feature = "glm52")]
     runtime: Option<Glm52RankRuntime>,
 }
 
@@ -236,7 +219,6 @@ impl Glm52RankThreadState {
             ctx,
             bundle,
             loaded: None,
-            #[cfg(feature = "glm52")]
             runtime: None,
         }
     }
@@ -261,7 +243,6 @@ impl Glm52RankThreadState {
         Ok(report)
     }
 
-    #[cfg(feature = "glm52")]
     fn build_model(&mut self) -> Result<()> {
         let mut weights = self
             .loaded
@@ -287,7 +268,6 @@ impl Glm52RankThreadState {
         Ok(())
     }
 
-    #[cfg(feature = "glm52")]
     fn setup_comm(&mut self, unique_id: &[u8; 128]) -> Result<()> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -309,7 +289,6 @@ impl Glm52RankThreadState {
         Ok(())
     }
 
-    #[cfg(feature = "glm52")]
     fn step(
         &mut self,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
@@ -336,15 +315,12 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
             Glm52RankCommand::LoadWeights { model_path, resp } => {
                 let _ = resp.send(state.load_weights(&model_path));
             }
-            #[cfg(feature = "glm52")]
             Glm52RankCommand::BuildModel { resp } => {
                 let _ = resp.send(state.build_model());
             }
-            #[cfg(feature = "glm52")]
             Glm52RankCommand::SetupComm { unique_id, resp } => {
                 let _ = resp.send(state.setup_comm(&unique_id));
             }
-            #[cfg(feature = "glm52")]
             Glm52RankCommand::Step {
                 inputs,
                 shape,
@@ -358,31 +334,4 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
     // The DeepEP context drop is collective — it runs here as every rank's
     // worker exits its loop after the coordinator broadcast Shutdown.
     drop(state);
-}
-
-/// Featureless builds stop at weight residency: requests are rejected after
-/// scheduling (the `glm52` feature compiles the real engine).
-#[cfg(not(feature = "glm52"))]
-pub(crate) fn run_rejecting_load_only_coordinator(
-    mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
-    workers: Vec<Glm52RankWorker>,
-) {
-    let _workers = workers;
-    while let Some(req) = submit_rx.blocking_recv() {
-        let prompt_tokens = req.prompt_tokens.len();
-        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-        let scheduled_at_unix_s = unix_now_s();
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s,
-            prompt_tokens,
-            cached_tokens: 0,
-        });
-        let _ = req.token_tx.send(TokenEvent::Rejected {
-            message: "GLM5.2 forward requires the glm52 cargo feature; this build is load-only"
-                .to_owned(),
-            prompt_tokens,
-            completion_tokens: 0,
-        });
-    }
 }

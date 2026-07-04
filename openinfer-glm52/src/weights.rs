@@ -19,7 +19,6 @@ mod context;
 mod load;
 
 pub(crate) use context::Glm52RankGpuContext;
-#[cfg(feature = "glm52")]
 pub(crate) use load::Glm52ExpertLayerRegions;
 pub(crate) use load::{Glm52RankGpuWeights, load_rank_weights_to_gpu};
 
@@ -567,7 +566,6 @@ fn parse_layer_index(name: &str) -> Result<usize> {
 
 /// Reinterpret an owned device byte buffer as a typed slice (no copy). The
 /// loader keeps every region as raw `u8`; consumers retype at construction.
-#[cfg(feature = "glm52")]
 pub(crate) fn retype_owned<T>(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     bytes: cudarc::driver::CudaSlice<u8>,

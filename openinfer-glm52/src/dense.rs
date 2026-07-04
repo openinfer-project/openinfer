@@ -10,7 +10,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{Glm52MlpScratch, Glm52ProjBytes, ProjWeight, fp8_mlp_into, pack_proj_pair};
+use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
 
 const HIDDEN: usize = 6144;
 const INTERMEDIATE: usize = 12288;
@@ -29,6 +29,7 @@ pub(crate) struct Glm52DenseMlpWeights {
 impl Glm52DenseMlpWeights {
     /// Upload the dense MLP projections, validating every extent against the
     /// GLM5.2 dense-layer architecture (crash-early on a packaging drift).
+    #[cfg(test)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         gate: &Glm52ProjBytes<'_>,

@@ -4,15 +4,6 @@ license = "Apache-2.0"
 version = "0.1.0"
 edition = "2024"
 autobenches = false
-autobins = false
-
-[[bin]]
-name = "glm52_load_weights"
-path = "src/bin/glm52_load_weights.rs"
-
-[features]
-default = []
-glm52 = ["dep:openinfer-kernels", "openinfer-kernels/glm52"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -23,7 +14,7 @@ half = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
 openinfer-core = { workspace = true }
-openinfer-kernels = { workspace = true, optional = true }
+openinfer-kernels = { workspace = true, features = ["glm52"] }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

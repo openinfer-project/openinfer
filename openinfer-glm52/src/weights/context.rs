@@ -59,7 +59,6 @@ impl Glm52RankGpuContext {
     /// the kernels-crate per-thread setup that `DeviceContext::new` would do:
     /// the cuBLAS handle is thread-local per device, so the calling worker
     /// thread must initialize its own (idempotent).
-    #[cfg(feature = "glm52")]
     pub(crate) fn device_context(&self) -> Result<openinfer_kernels::tensor::DeviceContext> {
         // SAFETY: plain device selection + idempotent handle creation.
         unsafe {
@@ -81,7 +80,6 @@ impl Glm52RankGpuContext {
     /// A second stream on the same context, for work that overlaps the main
     /// stream inside the decode step (fork/join via events — the shared
     /// expert runs concurrently with the MoE collectives).
-    #[cfg(feature = "glm52")]
     pub(crate) fn auxiliary_device_context(
         &self,
         role: &str,

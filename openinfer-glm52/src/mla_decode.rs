@@ -60,7 +60,7 @@ impl Glm52MlaLayerWeights {
     /// Build from raw checkpoint bytes: upload the fp8 projections + bf16
     /// layernorm gammas, and host-dequant kv_b into the bf16 absorb factors
     /// W_UK = kv_b[:, :192, :], W_UV = kv_b[:, 192:, :].
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         q_a: &Glm52ProjBytes,
@@ -291,6 +291,7 @@ pub(crate) fn glm52_mla_front_rest_into(
 
 /// MLA front half: fp8 projections + norms from `hidden[T, 6144]` into the
 /// persistent front scratch.
+#[cfg(test)]
 pub(crate) fn glm52_mla_front_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,

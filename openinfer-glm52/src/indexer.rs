@@ -47,7 +47,7 @@ use openinfer_kernels::tensor::DeviceContext;
 
 #[cfg(test)]
 use crate::fp8::fp8_linear;
-use crate::fp8::{FP8_BLOCK, Glm52ProjBytes, ProjWeight, fp8_linear_into};
+use crate::fp8::{FP8_BLOCK, ProjWeight, fp8_linear_into};
 
 const HIDDEN: usize = 6144;
 const Q_LORA: usize = 2048;
@@ -73,7 +73,7 @@ impl Glm52IndexerLayerWeights {
     /// `Glm52MlaLayerWeights::from_host`. `weights_proj` is a bf16 `[32, 6144]`
     /// tensor (transformers keeps it in fp32 via `_keep_in_fp32_modules`, but
     /// the checkpoint stores bf16).
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         wq_b: &Glm52ProjBytes,

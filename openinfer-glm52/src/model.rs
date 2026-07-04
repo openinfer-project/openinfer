@@ -707,6 +707,7 @@ fn run_step_body(
                     &mut s.layer.mlp_out,
                 )?;
             }
+            #[cfg(test)]
             Glm52LayerMlp::Moe(_) => {
                 anyhow::bail!("GLM5.2 EP8 spine built an EP1 MoE layer — loader bug")
             }

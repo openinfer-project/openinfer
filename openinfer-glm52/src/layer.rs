@@ -38,6 +38,7 @@ use crate::mla_decode::{
     Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_attend_into, glm52_mla_front_q_into,
     glm52_mla_front_rest_into,
 };
+#[cfg(test)]
 use crate::moe_decode::Glm52MoeLayerWeights;
 #[cfg(test)]
 use crate::moe_decode::{Glm52MoeExpertPath, glm52_moe_forward};
@@ -57,6 +58,7 @@ const RMS_EPS: f32 = GLM52_RMS_EPS;
 /// stays small.
 pub(crate) enum Glm52LayerMlp {
     Dense(Box<Glm52DenseMlpWeights>),
+    #[cfg(test)]
     Moe(Box<Glm52MoeLayerWeights>),
     MoeEp8(Box<Glm52MoeEp8LayerWeights>),
 }

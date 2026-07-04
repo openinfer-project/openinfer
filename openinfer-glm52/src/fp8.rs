@@ -58,6 +58,7 @@ pub(crate) struct ProjWeight {
 }
 
 impl ProjWeight {
+    #[cfg(test)]
     pub(crate) fn upload(ctx: &DeviceContext, b: &Glm52ProjBytes) -> Result<Self> {
         ensure!(
             b.weight.len() == b.n * b.k,

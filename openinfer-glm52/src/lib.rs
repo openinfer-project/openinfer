@@ -7,41 +7,30 @@
 //! step all 8 ranks run the full model in lock-step and enter the
 //! per-MoE-layer DeepEP collectives.
 
-#[cfg(feature = "glm52")]
 mod bookend;
-#[cfg(all(test, feature = "glm52"))]
+#[cfg(test)]
 mod bookend_oracle_gate;
 mod config;
-#[cfg(feature = "glm52")]
 mod dense;
-#[cfg(feature = "glm52")]
 mod fp8;
-#[cfg(feature = "glm52")]
 mod indexer;
-#[cfg(all(test, feature = "glm52"))]
+#[cfg(test)]
 mod indexer_oracle_gate;
-#[cfg(all(test, feature = "glm52"))]
+#[cfg(test)]
 mod indexer_smoke;
-#[cfg(feature = "glm52")]
 mod layer;
-#[cfg(all(test, feature = "glm52"))]
+#[cfg(test)]
 mod layer_ep8_oracle_gate;
-#[cfg(all(test, feature = "glm52"))]
+#[cfg(test)]
 mod layer_oracle_gate;
-#[cfg(feature = "glm52")]
 mod mla_decode;
-#[cfg(all(test, feature = "glm52"))]
+#[cfg(test)]
 mod mla_oracle_gate;
-#[cfg(feature = "glm52")]
 mod model;
-#[cfg(feature = "glm52")]
 mod moe_decode;
-#[cfg(feature = "glm52")]
 mod moe_ep8;
 mod runner;
-#[cfg(feature = "glm52")]
 mod scheduler;
-#[cfg(feature = "glm52")]
 mod scratch;
 mod weights;
 
@@ -50,8 +39,6 @@ use std::{collections::BTreeSet, path::Path, time::Instant};
 use anyhow::{Result, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::EngineHandle;
-#[cfg(not(feature = "glm52"))]
-use runner::run_rejecting_load_only_coordinator;
 use runner::{Glm52RankPlacement, Glm52RankWorker};
 use tokio::sync::mpsc;
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
@@ -130,31 +117,16 @@ fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHa
         format_bytes(&loaded.report.rank_bytes),
     );
 
-    #[cfg(feature = "glm52")]
-    {
-        let eos_token_ids = read_eos_token_ids(model_path)?;
-        build_rank_models(&loaded.workers)?;
-        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
-        let coord_handle = std::thread::Builder::new()
-            .name("glm52-coord".into())
-            .spawn(move || {
-                scheduler::run_dp8_coordinator(submit_rx, loaded.workers, &eos_token_ids);
-            })
-            .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
-        Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
-    }
-
-    #[cfg(not(feature = "glm52"))]
-    {
-        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
-        let coord_handle = std::thread::Builder::new()
-            .name("glm52-load-coord".into())
-            .spawn(move || run_rejecting_load_only_coordinator(submit_rx, loaded.workers))
-            .map_err(|err| {
-                anyhow::anyhow!("failed to spawn GLM5.2 load-only coordinator: {err}")
-            })?;
-        Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
-    }
+    let eos_token_ids = read_eos_token_ids(model_path)?;
+    build_rank_models(&loaded.workers)?;
+    let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let coord_handle = std::thread::Builder::new()
+        .name("glm52-coord".into())
+        .spawn(move || {
+            scheduler::run_dp8_coordinator(submit_rx, loaded.workers, &eos_token_ids);
+        })
+        .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
+    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
 }
 
 /// Build every rank's resident model, then create the DeepEP contexts. Two
@@ -162,7 +134,6 @@ fn start_engine(model_path: &Path, options: Glm52LoadOptions) -> Result<EngineHa
 /// drift) — every rank must report success BEFORE anyone enters the
 /// collective context creation, or a single failure strands the other seven
 /// ranks in NCCL init with no timeout.
-#[cfg(feature = "glm52")]
 fn build_rank_models(workers: &[Glm52RankWorker]) -> Result<()> {
     let build_started = Instant::now();
     let responses = workers
@@ -194,7 +165,6 @@ fn build_rank_models(workers: &[Glm52RankWorker]) -> Result<()> {
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
 /// number or an array of numbers).
-#[cfg(feature = "glm52")]
 fn read_eos_token_ids(model_path: &Path) -> Result<Vec<u32>> {
     let path = model_path.join("generation_config.json");
     let content = std::fs::read_to_string(&path)

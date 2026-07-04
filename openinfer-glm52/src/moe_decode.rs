@@ -29,16 +29,20 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 #[cfg(test)]
 use openinfer_kernels::ops::add_batch;
+#[cfg(test)]
 use openinfer_kernels::ops::{
     GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, GLM52_GEMV_KIND_W2, GLM52_GEMV_KIND_W13,
-    Glm52MoeQuantShape, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
-    Glm52TrtllmGroupedFp8Contract, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
-    glm52_deepgemm_grouped_offset_tma_aligned_f32_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_moe_combine_launch,
+    Glm52MoeQuantShape, glm52_fp8_per_token_group_quant_bf16_launch, glm52_moe_combine_launch,
     glm52_moe_combine_slots_launch, glm52_moe_fp8_weight_only_gemv_launch,
-    glm52_moe_route_offsets_launch, glm52_moe_route_scatter_launch, glm52_router_noaux_tc_launch,
+    glm52_moe_route_offsets_launch, glm52_moe_route_scatter_launch,
     glm52_silu_and_mul_weighted_bf16_launch,
-    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch, glm52_trtllm_grouped_fp8_launch,
+    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch,
+};
+use openinfer_kernels::ops::{
+    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, Glm52TrtllmGroupedFp8Contract,
+    Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
+    glm52_deepgemm_grouped_offset_tma_aligned_f32_launch, glm52_router_noaux_tc_launch,
+    glm52_trtllm_grouped_fp8_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 #[cfg(test)]
@@ -46,9 +50,9 @@ use openinfer_kernels::tensor::HiddenStates;
 
 #[cfg(test)]
 use crate::fp8::fp8_mlp;
-use crate::fp8::{
-    Glm52MlpScratch, Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp_into, pack_proj_pair,
-};
+use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
+#[cfg(test)]
+use crate::fp8::{Glm52ProjBytes, bytes_to_f32};
 
 pub(crate) const HIDDEN: usize = 6144;
 pub(crate) const EXPERTS: usize = 256;
@@ -70,9 +74,11 @@ pub(crate) const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
 /// experts owns at most one row, padded to the 64-row alignment, so
 /// `TOPK * ALIGNMENT` is a tight upper bound (`route_offsets` emits
 /// `expert_offsets[E] <=` it).
+#[cfg(test)]
 const M_CAPACITY: usize = TOPK * GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT; // 512
 
 /// Which expert-GEMM implementation runs the routed contribution.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Glm52MoeExpertPath {
     /// TRTLLM grouped FP8 GEMM over expert-major aligned slots — the layout the
@@ -84,6 +90,7 @@ pub(crate) enum Glm52MoeExpertPath {
 }
 
 /// Raw per-expert checkpoint bytes for one routed expert (fp8 block-scaled).
+#[cfg(test)]
 pub(crate) struct Glm52MoeRoutedExpertBytes<'a> {
     pub(crate) gate: Glm52ProjBytes<'a>, // [INTERMEDIATE, HIDDEN]
     pub(crate) up: Glm52ProjBytes<'a>,   // [INTERMEDIATE, HIDDEN]
@@ -222,6 +229,7 @@ impl Glm52MoeExpertBank {
     /// Pack per-expert checkpoint bytes expert-major and upload (test path;
     /// works for any expert count — 256 at EP1, a 32-expert rank slice for
     /// the EP8 gate).
+    #[cfg(test)]
     pub(crate) fn pack_from_host(
         ctx: &DeviceContext,
         experts: &[Glm52MoeRoutedExpertBytes<'_>],
@@ -302,18 +310,21 @@ impl Glm52MoeExpertBank {
 /// All weights for one MoE layer at EP1 (all 256 routed experts local), plus
 /// the router and the single shared expert. Built once on device; borrowed by
 /// every decode step.
+#[cfg(test)]
 pub(crate) struct Glm52MoeLayerWeights {
     pub(crate) router: Glm52MoeRouterWeights,
     pub(crate) bank: Glm52MoeExpertBank,
     pub(crate) shared: Glm52MoeSharedExpert,
 }
 
+#[cfg(test)]
 impl Glm52MoeLayerWeights {
     /// Pack per-expert checkpoint tensors into the expert-major grouped
     /// buffers and upload everything (the oracle/test path). W13 = per-expert
     /// `[gate; up]` rows with scales concatenated likewise; W2 = down. The
     /// production path adopts loader-packed regions with the same layout
     /// ([`Glm52MoeExpertBank::from_regions`]).
+    #[cfg(test)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         gate_weight: &[u8],
@@ -420,6 +431,7 @@ pub(crate) fn run_router(
 }
 
 /// Routed contribution via the DeepEP-shaped grouped FP8 GEMM chain.
+#[cfg(test)]
 fn routed_forward_grouped(
     ctx: &DeviceContext,
     bank: &Glm52MoeExpertBank,
@@ -542,6 +554,7 @@ fn routed_forward_grouped(
 }
 
 /// Routed contribution via the bs=1 weight-only fp8 GEMV chain.
+#[cfg(test)]
 fn routed_forward_gemv(
     ctx: &DeviceContext,
     bank: &Glm52MoeExpertBank,
@@ -670,6 +683,7 @@ pub(crate) fn glm52_moe_forward(
 /// `groups`/`m_capacity` are runtime: 256/512 at EP1 (bs=1), 32/row-bound at
 /// EP8 (moe_ep8 drives this over the DeepEP recv layout).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn grouped_gemm(
     ctx: &DeviceContext,
     kind: Glm52TrtllmGroupedFp8Kind,
