@@ -63,7 +63,7 @@ GPU-argmax-vs-host-log-softmax disagreement on the same logits.
 
 # Run the gate (8 GPUs; vLLM must be stopped first — both need the full node):
 OPENINFER_TEST_MODEL_PATH=/data/models/Kimi-K2.6 \
-cargo test -p openinfer-kimi-k2 --features kimi-k2 --release \
+cargo test -p openinfer-kimi-k2 --release \
   --test vllm_golden_gate -- --nocapture
 ```
 

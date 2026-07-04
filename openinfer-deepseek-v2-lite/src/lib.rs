@@ -1,37 +1,25 @@
-#[cfg(feature = "deepseek-v2-lite")]
 mod attribution;
 mod config;
-#[cfg(feature = "deepseek-v2-lite")]
 mod device;
-#[cfg(feature = "deepseek-v2-lite")]
 mod engine;
 mod ep;
-#[cfg(feature = "deepseek-v2-lite")]
 mod host_ops;
-#[cfg(feature = "deepseek-v2-lite")]
 mod model;
-#[cfg(feature = "deepseek-v2-lite")]
 mod nccl_backend;
-#[cfg(feature = "deepseek-v2-lite")]
 mod runtime;
-#[cfg(feature = "deepseek-v2-lite")]
 mod scheduler;
-#[cfg(feature = "deepseek-v2-lite")]
 mod weights;
 
 use std::path::Path;
 
 use anyhow::Result;
-#[cfg(feature = "deepseek-v2-lite")]
 use openinfer_engine::engine::EpBackend;
 use openinfer_engine::engine::{EngineHandle, EngineLoadOptions};
 
-#[cfg(feature = "deepseek-v2-lite")]
 pub use attribution::{CallSiteRollup, DecodeAttributionProfile, SectionRollup, SectionSample};
 pub use config::Config;
 use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;
-#[cfg(feature = "deepseek-v2-lite")]
 pub use runtime::{
     BatchedGenerationResult, DecodeGraphReadinessReport, DeepSeekV2LiteEp2Generator,
     GenerationResult, GenerationStats,
@@ -62,16 +50,8 @@ pub fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(feature = "deepseek-v2-lite")]
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     engine::start_engine(model_path, options)
-}
-
-#[cfg(not(feature = "deepseek-v2-lite"))]
-pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
-    anyhow::bail!(
-        "DeepSeek-V2-Lite runtime is feature-gated; rebuild with --features deepseek-v2-lite"
-    )
 }
 
 /// Start the DeepSeek-V2-Lite engine for the server. The binary forwards the
@@ -80,7 +60,6 @@ pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<E
 /// the request (warning if one came in). The diagnostic decode graph probe lives
 /// in the attribution gate. The EP=2 topology (devices `0..1`) is fixed by the
 /// model.
-#[cfg(feature = "deepseek-v2-lite")]
 pub fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
     if cuda_graph {
         log::warn!("DeepSeek V2 Lite does not support CUDA Graph; ignoring --cuda-graph=true");
@@ -95,12 +74,5 @@ pub fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
             ep_backend: EpBackend::Nccl,
             seed: 42,
         },
-    )
-}
-
-#[cfg(not(feature = "deepseek-v2-lite"))]
-pub fn launch(_model_path: &Path, _cuda_graph: bool) -> Result<EngineHandle> {
-    anyhow::bail!(
-        "DeepSeek-V2-Lite runtime is feature-gated; rebuild with --features deepseek-v2-lite"
     )
 }

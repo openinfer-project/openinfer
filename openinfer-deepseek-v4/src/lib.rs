@@ -1,17 +1,16 @@
+//! DeepSeek-V4 model crate. The whole crate rides the `deepseek-v4` feature:
+//! its kernels need TileLang + CuTe DSL Python toolchains at build time, so a
+//! featureless workspace build must not pull them in.
+#![cfg(feature = "deepseek-v4")]
+
 mod config;
-#[cfg(feature = "deepseek-v4")]
 mod direct;
-#[cfg(feature = "deepseek-v4")]
 pub mod e2e_runner;
-#[cfg(feature = "deepseek-v4")]
 mod model;
-#[cfg(feature = "deepseek-v4")]
 mod runtime;
-#[cfg(feature = "deepseek-v4")]
 mod weights;
 
 pub use config::{Config, RopeScaling, TensorParallelConfig};
-#[cfg(feature = "deepseek-v4")]
 pub use direct::{
     DeepSeekV4DirectGenerator, DeepSeekV4RequestState, DirectDecodeStep, DirectGeneration,
     DirectKvCacheActiveSnapshot, DirectKvCacheLease, DirectKvCacheReject,
@@ -23,7 +22,6 @@ pub use direct::{
 /// the model's call, not the server's. V4's direct engine has no CUDA Graph
 /// capture, so it ignores the request (warning if one came in). The MP8
 /// topology (devices `0..7`) is likewise fixed by the model.
-#[cfg(feature = "deepseek-v4")]
 pub fn launch(
     model_path: &std::path::Path,
     cuda_graph: bool,
@@ -48,14 +46,12 @@ pub fn launch(
         },
     )
 }
-#[cfg(feature = "deepseek-v4")]
 pub use model::{
     AttentionWeightNames, AttentionWeights, BlockWeightNames, BlockWeights, CompressorWeightNames,
     CompressorWeights, DeepSeekRankModel, ExpertWeightNames, ExpertWeights, FfnWeightNames,
     FfnWeights, IndexerWeightNames, IndexerWeights, QuantLinearNames, QuantLinearRef,
     RankWeightView, TensorRef, TopLevelWeightNames,
 };
-#[cfg(feature = "deepseek-v4")]
 pub use runtime::{
     AttentionProjections, Bf16Cache, Bf16HiddenStates, CompressorDecodeState, DeepSeekRopeCache,
     F32HiddenStates, F32Logits, HcHiddenStates, HcPreState, LayerDecodeCache, MoeFusedRoutePlan,
@@ -88,7 +84,6 @@ pub use runtime::{
     sparse_attention_prefill_bf16_hidden, window_and_compress_topk_indices, window_topk_indices,
     window_topk_indices_decode,
 };
-#[cfg(feature = "deepseek-v4")]
 pub use weights::{
     GpuRawTensor, RankGpuContext, RankManifest, RankWeights, TensorInfo, load_rank_manifest,
     load_rank_subset_to_gpu, load_rank_to_gpu, mp_rank_path,

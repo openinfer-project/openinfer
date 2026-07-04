@@ -66,7 +66,7 @@ Remote validation ran on Ubuntu 22.04 with 2x NVIDIA GeForce RTX 5090, driver
 
 Passed gates:
 
-- `cargo check --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --lib --tests`
+- `cargo check --offline --release -p openinfer-deepseek-v2-lite --lib --tests`
 - HF oracle dump with `tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py`
 - host-staged `tests/e2e_ep2.rs`
 - NCCL `tests/e2e_ep2.rs` using `LD_LIBRARY_PATH=/root/autodl-tmp/nccl-2.27.7/nvidia/nccl/lib`

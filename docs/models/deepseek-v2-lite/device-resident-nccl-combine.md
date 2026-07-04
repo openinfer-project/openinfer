@@ -37,10 +37,10 @@ Validated 2026-06-08 on the provided 2x RTX 5090 host with DeepSeek-V2-Lite snap
 Commands run:
 
 ```bash
-cargo test --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 --no-run
+cargo test --offline --release -p openinfer-deepseek-v2-lite --test e2e_ep2 --no-run
 
 cargo clippy --offline --release -p openinfer-deepseek-v2-lite \
-  --features deepseek-v2-lite --bins --tests -- \
+  --bins --tests -- \
   -D warnings \
   -A clippy::option_option \
   -A clippy::manual_midpoint \
@@ -54,12 +54,12 @@ python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
-  cargo test --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+  cargo test --offline --release -p openinfer-deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
 OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
 OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl-after-decouple-cleanup.json \
-  cargo test --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+  cargo test --offline --release -p openinfer-deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --hf target/accuracy/dsv2-lite-ep2/hf.json \
@@ -70,7 +70,6 @@ python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
 
 OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
   cargo run --offline --release -p openinfer-deepseek-v2-lite \
-    --features deepseek-v2-lite \
     --bin dsv2_lite_ep2_decode_attribution \
     -- --model-path models/DeepSeek-V2-Lite \
     --batch-size 1 \
@@ -92,7 +91,7 @@ Follow-up review gate on 2026-06-09 after fixing those lints:
 cargo fmt --all --check
 
 cargo clippy --release -p openinfer-deepseek-v2-lite \
-  --features deepseek-v2-lite --bins --tests -- -D warnings
+  --bins --tests -- -D warnings
 ```
 
 Both commands passed on the same remote source copy after syncing the follow-up `host_ops.rs` and `logging.rs` fixes. The clippy command ran without `clippy::manual_midpoint`, `clippy::needless_range_loop`, or `clippy::option_option` allows.

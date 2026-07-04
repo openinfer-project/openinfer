@@ -438,7 +438,6 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
     let logits = DeviceBuf::zeroed(logits_bytes)?;
 
     // block_table: [batch_size, block_table_stride] i32
-    let bt_bytes = (batch_size * block_table_stride) as usize * std::mem::size_of::<i32>();
     let block_table_host: Vec<i32> = (0..num_kv_blocks).collect();
     let block_table = DeviceBuf::from_host(&block_table_host)?;
 

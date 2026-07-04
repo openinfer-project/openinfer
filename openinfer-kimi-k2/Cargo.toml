@@ -18,7 +18,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 openinfer-bench = { workspace = true }
 openinfer-core = { workspace = true }
-openinfer-kernels = { workspace = true }
+openinfer-kernels = { workspace = true, features = ["kimi-k2"] }
 openinfer-sample = { workspace = true }
 openinfer-kv-cache = { workspace = true }
 rand = { workspace = true }
@@ -29,18 +29,15 @@ tokio = { workspace = true }
 
 [features]
 default = []
-kimi-k2 = ["openinfer-kernels/kimi-k2"]
 kernel-call-trace = ["openinfer-core/kernel-call-trace"]
 kernel-report = [
     "dep:clap",
-    "kimi-k2",
     "kernel-call-trace",
 ]
 
 [[test]]
 name = "vllm_golden_gate"
 path = "tests/vllm_golden_gate.rs"
-required-features = ["kimi-k2"]
 
 [[bin]]
 name = "kimi_kernel_report"
