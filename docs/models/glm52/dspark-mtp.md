@@ -1,6 +1,6 @@
 # GLM5.2 DSpark speculative decoding (greedy)
 
-**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1** span-steps for prompt ingestion (no draft model, exactness-gated, ~8× fewer prompt steps), **M2** draft backbone + Markov propose (rank-local), **M3** verify/accept round loop + A/B. Greedy only; confidence head parsed but unused (Phase 2).
+**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (all jz-38 gates green: 1621-token prompt byte-identical to main's token-by-token walk, **TTFT 35.8 s → 9.25 s = 3.9×**, solo decode unchanged, bucket-8 solo step measured 45.6 ms → projected spec solo ≈ 1.8×), **M2** draft backbone + Markov propose (rank-local) — next, **M3** verify/accept round loop + c1 A/B. Greedy only; confidence head parsed but unused (Phase 2).
 
 Last touched: 2026-07
 
@@ -71,19 +71,29 @@ Coordinator sees two command round-trips per round (Step, then Draft); channel l
 against a ~30–70 ms step. Draft forward ≈ 1–3 ms (5 dense layers × 8 rows + 8 sequential
 rank-256 GEMV+argmax micro-steps). Draft/verify overlap is a later optimization, not Phase 1.
 
-**Expected win (to be measured, not promised):** plain solo = 21.4 ms/token (bucket 1). Spec solo
-= (bucket-8 step + draft) per ~3.97 committed tokens. The bucket-8 step time with 1 real slot +
-padding is the load-bearing unknown — M1 measures it for free. If it lands 30–45 ms, solo goes
-~1.7–2.4×. If it lands near the c64-diverse 70 ms, span 4 (bucket 4) is the fallback knob.
+**Projected win (bucket-8 step now measured by M1 = 45.6 ms solo):** spec solo =
+(45.6 ms verify + ~2–3 ms draft) per ~3.97 committed tokens ≈ **12.2 ms/token vs 22.4 plain ≈
+1.8×**. Span 4 (bucket 4) is the counter-hypothesis to A/B in M3: fewer drafts per round but a
+cheaper verify step. Measure, don't assume.
 
 ## Milestones
 
-- **M1 — span steps for prompt ingestion** (no draft model). Feed known prompt tokens 8/step via
-  the relaxed row→slot mapping. Gates: byte-parity of KV/outputs vs token-by-token feeding
-  (boundary tokens exact), oracle gates still green, D2 pinned-slot parity. Ships alone: ~8×
-  fewer prompt steps (prompt 2000 → 250 steps ≈ 44 s → 7 s TTFT at bucket-8 step ≈ 28 ms)
-  until P/D KV injection replaces in-engine prompt walking. Also produces the bucket-8
-  one-real-slot step-time measurement M3's math needs.
+- **M1 — span steps for prompt ingestion** (no draft model) — **DONE, all jz-38 gates green
+  (2026-07-04, `62defc6` + fairness fix)**. Measured (1621-token prompt, ×3 stable):
+  **TTFT 35.2–36.6 s → 9.25 s (3.9×)**, 1621 → 203 steps; solo decode 22.5–22.6 ms/step
+  (main 22.4–22.5, no regression); **bucket-8 one-real-slot step = 45.6 ms** — the number
+  M3's round math needed. Correctness: 1621-token prompt output **byte-identical** span-path
+  vs main's token-by-token walk (+ determinism ×2); short-prompt outputs identical to main;
+  9-way mutual + ==solo; queue-80 / drain / mixed long-prefill-during-8-way-decode (full
+  lengths; text diverges from solo = the known cross-shape FP association property) / SIGTERM
+  all PASS. Toxic review: approve, no blockers; fairness finding fixed (leftover rows now
+  round-robin across co-resident prefills — ascending-slot greed starved the later prefill
+  to 1 row/step). Two notes left open: re-check the now-always-on full-bucket block-table
+  gather (8×256 B dtod/step) at the next c64 bench; the repetitive gate prompt makes GLM
+  emit EOS as its first token, and the frontend then reports `completion_tokens=0` with the
+  prompt echoed in `text` — pre-existing (main identical), frontend accounting, not engine.
+  TTFT is 3.9× rather than 8× because a bucket-8 step costs 45.6 ms vs 22.4 — which also
+  says a span-4 verify (bucket 4) is worth measuring against span-8 in M3.
 - **M2 — draft lane** (rank-local). Loader (skip embed/lm_head, reuse target head via the
   target's lm_head GEMM), backbone forward (port qwen3 `dflash.rs` shape: qk-norm + rope +
   KV-injection tail concat), Markov propose, aux capture plumbed from M1's capture buffer.
@@ -146,6 +156,6 @@ is the family convention qwen3's byte-lossless gate already validated; confirm o
 
 ## Next action
 
-M1: relax `Glm52StepShape` row→slot mapping (repeated slots, per-slot consecutive positions),
-add the aux-capture buffer to the step graph, switch prompt ingestion to span-8 feeding, gate
-byte-parity on jz-38.
+M2: draft lane — loader (skip embed/lm_head), qwen3-shape backbone forward + Markov propose at
+V=154880, aux-hidden capture buffer (5 dtod copies at layers {8,23,39,55,70}) added to the step
+graph. Pin the vLLM-side capture-tensor convention against `speculators` `launch_vllm.py` first.

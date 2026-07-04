@@ -216,20 +216,16 @@ fn admission_target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(us
 /// max bucket; never smaller than its active count — a smaller bucket would
 /// silently drop rows). Per rank, every active slot first gets one row
 /// (liveness), then the leftover bucket capacity extends mid-prefill slots
-/// into *spans* (consecutive prompt positions batched through one step) in
-/// ascending slot order; padding rows ride the free slots. Span rows are
-/// emitted as one contiguous run per slot — the [`Glm52StepShape`] contract.
+/// into *spans* (consecutive prompt positions batched through one step),
+/// round-robin across the hungry slots so co-resident prefills drain in
+/// parallel; padding rows ride the free slots. Span rows are emitted as one
+/// contiguous run per slot — the [`Glm52StepShape`] contract.
 /// Deriving the bucket and every rank's row list from the same data in one
 /// place is what keeps them consistent.
 fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52StepShape> {
     let hungriest = wants
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|&w| w.min(GLM52_MAX_BATCH_PER_RANK))
-                .sum::<usize>()
-                .min(GLM52_MAX_BATCH_PER_RANK)
-        })
+        .map(|row| row.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK))
         .max()
         .unwrap_or(0);
     let bucket = *GLM52_DECODE_BUCKETS
@@ -240,7 +236,10 @@ fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52Ste
         .iter()
         .map(|row| {
             // Every active slot gets one row, then leftover capacity extends
-            // spans in ascending slot order.
+            // spans one row per slot per round (round-robin), so two
+            // mid-prefill slots on one rank drain in parallel instead of the
+            // lowest slot starving the later one down to a liveness row for
+            // its whole prefill.
             let mut spans = [0usize; GLM52_MAX_BATCH_PER_RANK];
             let mut used = 0usize;
             for (slot, &want) in row.iter().enumerate() {
@@ -252,13 +251,18 @@ fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52Ste
                     used += 1;
                 }
             }
-            for (slot, &want) in row.iter().enumerate() {
-                if spans[slot] == 0 {
-                    continue;
+            loop {
+                let mut gave = false;
+                for (slot, &want) in row.iter().enumerate() {
+                    if used < bucket && spans[slot] > 0 && spans[slot] < want {
+                        spans[slot] += 1;
+                        used += 1;
+                        gave = true;
+                    }
                 }
-                let extra = (want - spans[slot]).min(bucket - used);
-                spans[slot] += extra;
-                used += extra;
+                if !gave || used == bucket {
+                    break;
+                }
             }
             let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
             let mut dst = 0usize;
@@ -845,7 +849,8 @@ mod tests {
             (8, vec![0, 1, 1, 1, 1, 1, 1, 1])
         );
 
-        // Two mid-prefill slots split the leftover in ascending slot order.
+        // Two mid-prefill slots with small wants: both met, remaining rows
+        // pad on free slots.
         let mut wants = decode_wants(&[0]);
         wants[0][0] = 3;
         wants[0][1] = 2;
@@ -853,6 +858,30 @@ mod tests {
             forwarded(&plan_step_shapes(&wants))[0],
             (8, vec![0, 0, 0, 1, 1, 2, 3, 4]),
             "wants met, remaining rows pad on free slots"
+        );
+    }
+
+    #[test]
+    fn two_long_prefills_split_the_leftover_round_robin() {
+        // Two co-resident long prefills split the bucket evenly — neither
+        // starves at a single liveness row while the other eats the leftover.
+        let mut wants = decode_wants(&[0]);
+        wants[0][2] = 3000;
+        wants[0][5] = 3000;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants))[0],
+            (8, vec![2, 2, 2, 2, 5, 5, 5, 5])
+        );
+
+        // A decode slot in the mix keeps its single row; the prefills split
+        // what remains (7 rows -> 4 + 3 by round-robin order).
+        let mut wants = decode_wants(&[0]);
+        wants[0][0] = 1;
+        wants[0][3] = 3000;
+        wants[0][6] = 3000;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants))[0],
+            (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
         );
     }
 }
