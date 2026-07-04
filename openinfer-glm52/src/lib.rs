@@ -41,6 +41,8 @@ mod moe_ep8;
 mod runner;
 #[cfg(feature = "glm52")]
 mod scheduler;
+#[cfg(feature = "glm52")]
+mod scratch;
 mod weights;
 
 use std::{collections::BTreeSet, path::Path, time::Instant};

@@ -12,20 +12,21 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_batch, glm52_deepep_unique_id,
+    Glm52IndexerCacheLayout, add_into, glm52_deepep_unique_id,
     glm52_flashmla_sparse_decode_num_sm_parts,
 };
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
+use openinfer_kernels::tensor::DeviceContext;
 
+use crate::indexer::Glm52IndexerScratch;
 use crate::layer::{
     Glm52DecodeStep, Glm52LayerCaches, Glm52LayerMlp, glm52_layer_attention_half,
     glm52_layer_finish,
 };
 use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::scratch::Glm52DecodeScratch;
 
 use crate::layer_oracle_gate::{
     GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
@@ -36,7 +37,7 @@ use crate::model::{
     GLM52_DECODE_GLOBAL_TOKENS, INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE,
     rope_tables,
 };
-use crate::moe_decode::{Glm52MoeExpertPath, HIDDEN, run_router};
+use crate::moe_decode::{HIDDEN, run_router};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
 const EP_RANKS: usize = 8;
@@ -65,14 +66,14 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
                     let bank = load_rank_expert_bank(&ctx, &tensors, MOE_ORACLE_LAYER, rank)?;
                     let mut ep8 = Glm52MoeEp8State::new(&ctx, &unique_id, EP_RANKS, rank)?;
                     for _position in 0..MOE_ORACLE_CTX {
-                        let combined = glm52_moe_ep8_routed_forward(
+                        let dispatched = glm52_moe_ep8_routed_forward(
                             &ctx,
                             &mut ep8,
                             &bank,
                             None,
                             GLM52_DECODE_GLOBAL_TOKENS,
                         )?;
-                        ensure!(combined.is_none(), "expert rank produced a combined output");
+                        ensure!(!dispatched, "expert rank produced a combined output");
                     }
                     Ok(())
                 })
@@ -158,12 +159,15 @@ fn run_layer_prefill_ep8(
     let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
     let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
 
+    let mqa_shape =
+        Glm52IndexerScratch::decode_shape(index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
+    let mut scratch = Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?;
+
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
-        let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
         ctx.stream.memcpy_htod(
             &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
-            &mut hidden,
+            &mut scratch.hidden.data,
         )?;
         let (cos_host, sin_host) = rope_tables(position);
         ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
@@ -174,7 +178,6 @@ fn run_layer_prefill_ep8(
             .memcpy_htod(&[(position + 1) as i32], &mut seq_lens)?;
 
         let step = Glm52DecodeStep {
-            position,
             mla_cos: &cos,
             mla_sin: &sin,
             idx_cos: &cos,
@@ -184,36 +187,47 @@ fn run_layer_prefill_ep8(
             slot_mapping: &slot_mapping,
             block_table: &block_table,
             seq_lens: &seq_lens,
-            num_sms: NUM_SMS,
-            max_model_len: oracle_ctx,
-            moe_path: Glm52MoeExpertPath::Grouped,
         };
-        let mut topk_carry: Option<CudaSlice<i32>> = None;
-        let boundary =
-            glm52_layer_attention_half(ctx, w, &mut caches, hidden, &step, &mut topk_carry)?;
-        let route = run_router(ctx, &moe.router, &boundary.normed)?;
-        let routed = glm52_moe_ep8_routed_forward(
+        let mut carry_ready = false;
+        // Gate walk: standalone input norm + fixed parity 0 (one layer per
+        // call, stream in scratch.hidden — same shape as the EP1 gate).
+        openinfer_kernels::ops::rms_norm_into(
+            ctx,
+            &scratch.hidden,
+            &w.input_ln,
+            crate::layer::GLM52_RMS_EPS,
+            &mut scratch.layer.normed,
+        )?;
+        glm52_layer_attention_half(
+            ctx,
+            None,
+            w,
+            &mut caches,
+            &step,
+            &mut scratch,
+            &mut carry_ready,
+            0,
+            true,
+        )?;
+        let route = run_router(ctx, &moe.router, &scratch.layer.normed2)?;
+        let dispatched = glm52_moe_ep8_routed_forward(
             ctx,
             ep8,
             &moe.bank,
-            Some((&boundary.normed, &route)),
+            Some((&scratch.layer.normed2, &route)),
             GLM52_DECODE_GLOBAL_TOKENS,
-        )?
-        .context("rank-0 EP8 MoE returned no combined output")?;
-        let shared = moe.shared.forward(ctx, &boundary.normed)?;
-        let routed_hs = HiddenStates {
-            data: routed,
-            hidden_dim: HIDDEN,
-            seq_len: 1,
-        };
-        let shared_hs = HiddenStates {
-            data: shared,
-            hidden_dim: HIDDEN,
-            seq_len: 1,
-        };
-        let mlp = add_batch(ctx, &routed_hs, &shared_hs)?.data;
-        let out = glm52_layer_finish(ctx, boundary.residual, mlp)?;
-        let out_host = ctx.stream.clone_dtoh(&out)?;
+        )?;
+        ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");
+        let shared = moe.shared.forward(ctx, &scratch.layer.normed2)?;
+        add_into(
+            ctx,
+            ep8.combined(),
+            &shared,
+            HIDDEN,
+            &mut scratch.layer.mlp_out,
+        )?;
+        glm52_layer_finish(ctx, &mut scratch, 0)?;
+        let out_host = ctx.stream.clone_dtoh(&scratch.hidden.data)?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
     Ok(outputs)

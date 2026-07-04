@@ -170,6 +170,20 @@ class Fp8SimLinear(torch.nn.Module):
         return torch.nn.functional.linear(xdq, self.w).to(torch.bfloat16)
 
 
+class GemvSimLinear(torch.nn.Module):
+    """Engine weight-only GEMV emulation (`--precision gemv`, the m=1 decode
+    path): the bf16 activation is read directly (no activation quant), the fp8
+    weight is block-dequanted, f32 accumulate, bf16 out. = `Fp8SimLinear`
+    minus the activation quant-dequant."""
+
+    def __init__(self, weight_f32: torch.Tensor):
+        super().__init__()
+        self.register_buffer("w", weight_f32)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x.to(torch.float32), self.w).to(torch.bfloat16)
+
+
 class Bf16Linear(torch.nn.Module):
     """Plain bf16 linear on dequantized weights (the `--precision bf16` path,
     and the kv_b decompression in both modes — the engine holds kv_b's absorb
@@ -183,9 +197,34 @@ class Bf16Linear(torch.nn.Module):
         return torch.nn.functional.linear(x, self.w)
 
 
+LINEAR_CLS = {"fp8sim": Fp8SimLinear, "gemv": GemvSimLinear, "bf16": Bf16Linear}
+
+
 # ---------------------------------------------------------------------------
 # Model assembly from the official transformers module
 # ---------------------------------------------------------------------------
+
+
+def assert_indexer_rope_interleave():
+    """Crash-early verifier of the verifier: GLM5.2's config sets
+    `indexer_rope_interleave=true` and the engine implements interleaved
+    indexer RoPE (validated against transformers 5.13.0.dev0 with PR #46842).
+    The transformers 5.13.0 RELEASE regressed the fix back to non-interleaved
+    (`apply_rotary_pos_emb`), which shifts ~450/2048 top-k slots at ctx 4096 —
+    probes generated with it would gate the engine against the wrong
+    convention. Use a build with the fix (e.g. the repo `.venv`'s
+    5.13.0.dev0: `.venv/bin/python tools/accuracy/glm52_oracle.py ...`)."""
+    import inspect
+
+    from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as m
+
+    src = inspect.getsource(m.GlmMoeDsaIndexer.forward)
+    assert "apply_rotary_pos_emb_interleave" in src, (
+        "this transformers build applies NON-interleaved RoPE in the "
+        "GLM-MoE-DSA indexer (5.13.0-release regression of PR #46842); "
+        "regenerating probes with it would mis-gate the engine — use a build "
+        "with the interleave fix (repo .venv has 5.13.0.dev0)"
+    )
 
 
 def load_config(model_path: Path):
@@ -220,7 +259,7 @@ def patch_attention(attn, ckpt: Checkpoint, layer: int, precision: str, fault: s
             print("// !!! FAULT INJECTED: q_b head-0 negated — DO NOT COMMIT", file=sys.stderr)
         return w
 
-    linear_cls = Fp8SimLinear if precision == "fp8sim" else Bf16Linear
+    linear_cls = LINEAR_CLS[precision]
     attn.q_a_proj = linear_cls(proj("q_a_proj"))
     attn.q_b_proj = linear_cls(proj("q_b_proj"))
     attn.kv_a_proj_with_mqa = linear_cls(proj("kv_a_proj_with_mqa"))
@@ -295,7 +334,7 @@ class Fp8SimExperts(torch.nn.Module):
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final = torch.zeros_like(hidden_states)
-        if self.precision == "fp8sim":
+        if self.precision in ("fp8sim", "gemv"):
             hidden_states = quant_dequant_groups(hidden_states)
         act = hidden_states.to(torch.float32)
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
@@ -305,7 +344,7 @@ class Fp8SimExperts(torch.nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             gate, up = torch.nn.functional.linear(act[token_idx], gate_up).chunk(2, dim=-1)
             prod = torch.nn.functional.silu(gate) * up
-            if self.precision == "fp8sim":
+            if self.precision in ("fp8sim", "gemv"):
                 prod = quant_dequant_groups(prod.to(torch.bfloat16)).to(torch.float32)
             out = torch.nn.functional.linear(prod, down)
             out = out * top_k_weights[token_idx, top_k_pos, None].to(torch.float32)
@@ -333,7 +372,7 @@ def build_decoder_layer(ckpt: Checkpoint, config, layer: int, precision: str, fa
         f"{prefix}.post_attention_layernorm.weight"
     ).to(torch.bfloat16)
 
-    linear_cls = Fp8SimLinear if precision == "fp8sim" else Bf16Linear
+    linear_cls = LINEAR_CLS[precision]
 
     def mlp_proj(module: GlmMoeDsaMLP, stem_prefix: str):
         for stem in ("gate_proj", "up_proj", "down_proj"):
@@ -389,7 +428,7 @@ def run(attn, config, hidden: torch.Tensor, precision: str, fault: str) -> dict[
         # Engine cache fidelity: kv_c lives in the paged cache as fp8 per-128
         # group; everything downstream (kv_b decompress -> K/V) must see the
         # quantized value, exactly like FlashMLA reading the cache.
-        if precision == "fp8sim":
+        if precision in ("fp8sim", "gemv"):
             out = quant_dequant_groups(out)
         taps["kv_c_cached"] = out.detach().squeeze(0)
         return out
@@ -672,7 +711,15 @@ def main() -> int:
     p.add_argument("--ctx", type=int, default=200, help="positions; <=2048 so full top-k == DSA")
     p.add_argument("--seed", type=lambda s: int(s, 0), default=0x5EED_604D)
     p.add_argument("--layer", type=int, default=0)
-    p.add_argument("--precision", choices=["fp8sim", "bf16"], default="fp8sim")
+    p.add_argument(
+        "--precision",
+        choices=["fp8sim", "gemv", "bf16"],
+        default="fp8sim",
+        help="fp8sim: engine's TRTLLM fp8-GEMM era (activation quant everywhere). "
+        "gemv: engine's weight-only-GEMV era — bf16 activations in every m=1 "
+        "projection, fp8 kv-cache + fp8 routed-expert chain kept. "
+        "bf16: untouched official path (cross-check).",
+    )
     p.add_argument("--emit", choices=["rust", "safetensors", "both"], default="rust")
     p.add_argument("--out", type=Path, help="safetensors dump path")
     p.add_argument("--probes", type=int, default=64)
@@ -692,6 +739,7 @@ def main() -> int:
     import transformers
 
     versions = f"transformers={transformers.__version__} torch={torch.__version__}"
+    assert_indexer_rope_interleave()
     config = load_config(args.model_path)
     ckpt = Checkpoint(args.model_path)
     if args.input_scale is None:

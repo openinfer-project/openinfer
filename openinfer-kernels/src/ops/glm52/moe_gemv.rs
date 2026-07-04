@@ -170,3 +170,54 @@ pub fn glm52_moe_combine_slots_launch(
     .result()
     .map_err(|err| anyhow!("GLM5.2 combine-slots launch failed: {err}"))
 }
+
+/// Plain weight-only fp8 GEMV (bs=1): `out[n] = deq(weight[n,k]) @ activation[k]`
+/// with the bf16 activation read directly (no activation quant, no scale
+/// relayout) and the e4m3 block-scale weight dequanted on the fly. Replaces
+/// the TRTLLM CUTLASS block-scale GEMM at m=1, where the M-tile pads 1->64 and
+/// runs compute-bound. `scale_bytes` is the checkpoint `weight_scale_inv`
+/// (f32 `[ceil(n/128), k/128]`) kept as raw bytes.
+pub fn glm52_fp8_weight_only_gemv_launch(
+    ctx: &DeviceContext,
+    n: usize,
+    k: usize,
+    activation: &CudaSlice<bf16>,
+    weight: &CudaSlice<u8>,
+    scale_bytes: &CudaSlice<u8>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        n > 0 && k > 0,
+        "GLM5.2 linear GEMV needs positive n/k, got {n}/{k}"
+    );
+    let scale_len = n.div_ceil(FP8_BLOCK) * k.div_ceil(FP8_BLOCK) * 4;
+    ensure!(
+        weight.len() >= n * k
+            && scale_bytes.len() >= scale_len
+            && activation.len() >= k
+            && out.len() >= n,
+        "GLM5.2 linear GEMV buffers too small: w {} (need {}), scale {} (need {scale_len}), act {} (need {k}), out {} (need {n})",
+        weight.len(),
+        n * k,
+        scale_bytes.len(),
+        activation.len(),
+        out.len()
+    );
+    let (act_ptr, _a) = activation.device_ptr(&ctx.stream);
+    let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
+    let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
+    let (out_ptr, _o) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::glm52_fp8_weight_only_gemv_cuda(
+            act_ptr as *const ffi::Half,
+            w_ptr as *const u8,
+            s_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            k as i32,
+            ctx.stream.cu_stream(),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("GLM5.2 linear GEMV launch failed: {err}"))
+}

@@ -150,7 +150,19 @@ unsafe extern "C" {
         k_pe: *const Half,
         cos: *const Half,
         sin: *const Half,
-        cache_token: *mut u8,
+        cache: *mut u8,
+        slot_mapping: *const i64,
+        max_slots: i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_indexer_weights_fold_cuda(
+        weights: *const Half,
+        q_scale: *const f32,
+        softmax_scale: f32,
+        n_heads_scale: f32,
+        out: *mut f32,
+        heads: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -162,6 +174,29 @@ unsafe extern "C" {
         rows: i32,
         hidden_dim: i32,
         group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_per_token_group_quant_bf16_bounded_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        row_bound: *const i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_cuda(
+        input: *const Half,
+        topk_weights: *const f32,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_size: i32,
+        group_size: i32,
+        row_bound: *const i64,
         stream: CUstream,
     ) -> CUresult;
 
@@ -260,6 +295,16 @@ unsafe extern "C" {
         weight_scale: *const f32,
         out: *mut Half,
         topk: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_weight_only_gemv_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        out: *mut Half,
         n: i32,
         k: i32,
         stream: CUstream,

@@ -74,12 +74,24 @@ __global__ void glm52_mla_query_assemble_kernel(
 }
 
 __global__ void glm52_mla_cache_pack_kernel(
-    const unsigned char* __restrict__ ckv_fp8,  // [512]
+    const unsigned char* __restrict__ ckv_fp8,   // [512]
     const float* __restrict__ ckv_scales,        // [4]
     const __nv_bfloat16* __restrict__ k_pe,      // [64] pre-rope
     const __nv_bfloat16* __restrict__ cos,       // [32]
     const __nv_bfloat16* __restrict__ sin,       // [32]
-    unsigned char* __restrict__ cache_token) {   // [656] (slot base)
+    unsigned char* __restrict__ cache,           // [max_slots, 656]
+    const long long* __restrict__ slot_mapping,  // [1] write slot
+    long long max_slots) {
+  // The write slot comes from device memory so the launch is CUDA-graph
+  // replayable (a host scalar would bake the capture step's position into
+  // the graph). Out-of-window slots trap: a silent modulo/clamp would stomp
+  // a live cache line.
+  const long long slot = slot_mapping[0];
+  if (slot < 0 || slot >= max_slots) {
+    __trap();
+  }
+  unsigned char* __restrict__ cache_token =
+      cache + slot * static_cast<long long>(kCacheBytes);
   const int tid = threadIdx.x;
   // 512 e4m3 ckv
   for (int i = tid; i < kKvLora; i += blockDim.x) {
@@ -128,14 +140,17 @@ CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
                                    const __nv_bfloat16* k_pe,
                                    const __nv_bfloat16* cos,
                                    const __nv_bfloat16* sin,
-                                   unsigned char* cache_token,
+                                   unsigned char* cache,
+                                   const long long* slot_mapping,
+                                   long long max_slots,
                                    cudaStream_t stream) {
   if (ckv_fp8 == nullptr || ckv_scales == nullptr || k_pe == nullptr ||
-      cos == nullptr || sin == nullptr || cache_token == nullptr) {
+      cos == nullptr || sin == nullptr || cache == nullptr ||
+      slot_mapping == nullptr || max_slots <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  glm52_mla_cache_pack_kernel<<<1, 128, 0, stream>>>(ckv_fp8, ckv_scales, k_pe, cos,
-                                                     sin, cache_token);
+  glm52_mla_cache_pack_kernel<<<1, 128, 0, stream>>>(
+      ckv_fp8, ckv_scales, k_pe, cos, sin, cache, slot_mapping, max_slots);
   return consume_last_cuda_error();
 }
 

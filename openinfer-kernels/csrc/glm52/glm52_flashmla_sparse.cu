@@ -71,8 +71,12 @@ CUresult current_sm90_num_sm_parts(int* num_sm_parts) {
 
 bool valid_common_shape(int batch_size, int num_blocks, int topk,
                         int num_sm_parts) {
+  // topk is a runtime parameter of the FlashMLA sparse kernel; its only hard
+  // constraint is TOPK_BLOCK_SIZE alignment (KU_ASSERT in splitkv_mla.cuh).
+  // kTopk stays the model-level ceiling (the DSA top-2048 contract).
   return batch_size > 0 && batch_size <= kBatchCapacity && num_blocks > 0 &&
-         topk == kTopk && num_sm_parts > 0 && num_sm_parts <= kMaxSmParts;
+         topk > 0 && topk <= kTopk && topk % kBlockSizeTopk == 0 &&
+         num_sm_parts > 0 && num_sm_parts <= kMaxSmParts;
 }
 
 }  // namespace

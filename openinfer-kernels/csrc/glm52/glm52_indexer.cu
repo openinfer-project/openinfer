@@ -205,6 +205,23 @@ __global__ void local_topk_to_global_slots_kernel(
   }
 }
 
+// Fold the per-head weights_proj output with the per-head q quant scale and
+// the two attention scale constants. Multiplication order matches the
+// retired host-side fold bit-for-bit (left-to-right f32, no FMA — there is
+// no add to contract into).
+__global__ void indexer_weights_fold_kernel(
+    const __nv_bfloat16* __restrict__ weights,  // [heads]
+    const float* __restrict__ q_scale,          // [heads]
+    float softmax_scale, float n_heads_scale,
+    float* __restrict__ out,                    // [heads]
+    int heads) {
+  const int h = threadIdx.x;
+  if (h < heads) {
+    out[h] = __bfloat162float(weights[h]) * q_scale[h] * softmax_scale *
+             n_heads_scale;
+  }
+}
+
 CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaSuccess) return CUDA_SUCCESS;
   if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
@@ -307,6 +324,20 @@ CUresult glm52_indexer_local_topk_to_slots_cuda(
       global_slots, topk_lens, local_topk_offsets, local_topk_stride,
       seq_lens, block_table, block_table_stride, block_table_cols,
       block_size, topk);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_indexer_weights_fold_cuda(const __nv_bfloat16* weights,
+                                          const float* q_scale,
+                                          float softmax_scale,
+                                          float n_heads_scale, float* out,
+                                          int heads, cudaStream_t stream) {
+  if (weights == nullptr || q_scale == nullptr || out == nullptr ||
+      heads <= 0 || heads > 1024) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  indexer_weights_fold_kernel<<<1, heads, 0, stream>>>(
+      weights, q_scale, softmax_scale, n_heads_scale, out, heads);
   return consume_last_cuda_error();
 }
 

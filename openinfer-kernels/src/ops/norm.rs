@@ -176,6 +176,53 @@ pub fn fused_add_rms_norm_round_batch_into(
     Ok(())
 }
 
+/// Slice-level twin of [`fused_add_rms_norm_round_batch_into`] — same kernel
+/// — for callers whose buffers live in a persistent decode arena rather than
+/// owned `HiddenStates`: `hidden += residual` (sum rounded to bf16), then
+/// `out = rms_norm(hidden, weight)` over `seq_len` rows of `hidden_dim`.
+pub fn fused_add_rms_norm_round_into(
+    ctx: &DeviceContext,
+    hidden: &mut CudaSlice<bf16>,
+    residual: &CudaSlice<bf16>,
+    weight: &DeviceVec,
+    eps: f32,
+    hidden_dim: usize,
+    seq_len: usize,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let n = hidden_dim * seq_len;
+    ensure!(
+        hidden.len() >= n && residual.len() >= n && out.len() >= n,
+        "fused_add_rms_norm_round_into buffers too small for {seq_len}x{hidden_dim}: hidden {}, residual {}, out {}",
+        hidden.len(),
+        residual.len(),
+        out.len()
+    );
+    ensure!(
+        weight.len == hidden_dim,
+        "fused_add_rms_norm_round_into weight len {} != hidden_dim {hidden_dim}",
+        weight.len
+    );
+    let (h_ptr, _gh) = hidden.device_ptr_mut(&ctx.stream);
+    let (r_ptr, _gr) = residual.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::fused_add_rms_norm_round_batched_cuda(
+            h_ptr as *mut ffi::Half,
+            r_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            hidden_dim as i32,
+            seq_len as i32,
+            eps,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Batched RMSNorm into pre-allocated output buffer (zero allocation).
 pub fn rms_norm_batch_into(
     ctx: &DeviceContext,
