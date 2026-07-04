@@ -365,9 +365,9 @@ pub(crate) fn glm52_mla_decode_forward(
 }
 
 /// A FlashMLA sparse decode contract paired with its tile-scheduler plan. The
-/// plan depends only on `batch_size` and `num_sm_parts` — not on position,
-/// sequence length, or layer — so it is computed once (model build time)
-/// instead of per layer per step (78 × ~25 µs/step at bs=1). Owning the
+/// plan depends only on `batch_size`, `topk` and `num_sm_parts` — not on
+/// position, sequence length, or layer — so it is computed once (model build
+/// time) instead of per layer per step (78 × ~25 µs/step at bs=1). Owning the
 /// contract makes a plan/contract mismatch unrepresentable: every consumer
 /// reads both from the same object.
 pub(crate) struct Glm52MlaSchedMetadata {
@@ -385,6 +385,7 @@ impl Glm52MlaSchedMetadata {
         glm52_flashmla_sparse_decode_metadata_launch(
             ctx,
             contract.batch_size,
+            contract.topk,
             contract.num_sm_parts,
             &mut tile_scheduler_metadata,
             &mut num_splits,
@@ -394,6 +395,13 @@ impl Glm52MlaSchedMetadata {
             tile_scheduler_metadata,
             num_splits,
         })
+    }
+
+    /// The sparse index-list length this plan was built for. The DSA indexer
+    /// must produce its top-k with the same k — reading it from the plan makes
+    /// an indexer/attend mismatch unrepresentable.
+    pub(crate) fn topk(&self) -> usize {
+        self.contract.topk
     }
 }
 

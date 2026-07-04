@@ -196,6 +196,7 @@ pub(crate) fn glm52_layer_attention_half(
                 step.slot_mapping,
                 step.block_table,
                 step.seq_lens,
+                step.mla_sched.topk(),
                 &mut s.idx,
             )?;
             if let Some(aux) = aux {

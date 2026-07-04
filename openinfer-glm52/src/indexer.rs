@@ -322,8 +322,11 @@ impl Glm52IndexerScratch {
 /// - `block_table` / `seq_lens` describe the paged KV layout for logits +
 ///   slot conversion; they must match the shape the scratch was built with.
 ///
-/// `s.global_slots` ends as `topk_indices[2048]` (i32, `-1`-padded for short
-/// context).
+/// `s.global_slots` ends as `topk_indices[topk]` (i32, `-1`-padded for short
+/// context). `topk` is the attend plan's index-list length (≤ 2048): a
+/// short-context step selects top-`topk` instead of top-2048 — identical
+/// selection whenever `seq_len <= topk` (both are "all tokens"), which is
+/// exactly the regime the caller's graph tiering guarantees.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm52_indexer_forward_into(
     ctx: &DeviceContext,
@@ -337,10 +340,15 @@ pub(crate) fn glm52_indexer_forward_into(
     slot_mapping: &CudaSlice<i64>,
     block_table: &CudaSlice<i32>,
     seq_lens: &CudaSlice<i32>,
+    topk: usize,
     s: &mut Glm52IndexerScratch,
 ) -> Result<()> {
     ensure!(hidden.len() >= HIDDEN, "GLM5.2 indexer hidden too small");
     ensure!(q_resid.len() >= Q_LORA, "GLM5.2 indexer q_resid too small");
+    ensure!(
+        topk > 0 && topk <= GLM52_INDEXER_TOPK,
+        "GLM5.2 indexer topk {topk} outside 1..={GLM52_INDEXER_TOPK}"
+    );
     let shape = s.shape;
     ensure!(
         shape.num_kv_blocks == cache_layout.cache_blocks
@@ -471,7 +479,7 @@ pub(crate) fn glm52_indexer_forward_into(
         ctx,
         Glm52IndexerTopK {
             num_rows: 1,
-            top_k: GLM52_INDEXER_TOPK,
+            top_k: topk,
             max_len: shape.logits_stride,
         },
         &s.logits_f32,
@@ -485,7 +493,7 @@ pub(crate) fn glm52_indexer_forward_into(
         ctx,
         Glm52IndexerLocalTopKToSlots {
             num_tokens: 1,
-            topk: GLM52_INDEXER_TOPK,
+            topk,
             block_size: cache_layout.cache_block_size,
             block_table_cols: block_table.len(),
         },
@@ -533,6 +541,7 @@ pub(crate) fn glm52_indexer_forward(
         slot_mapping,
         block_table,
         seq_lens,
+        GLM52_INDEXER_TOPK,
         &mut s,
     )?;
     Ok(s.global_slots)

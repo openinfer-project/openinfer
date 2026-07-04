@@ -48,6 +48,14 @@ pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
 /// on some rank, which the metadata kernel answers with a device trap.
 pub(crate) const GLM52_DECODE_GLOBAL_TOKENS: usize = crate::weights::GLM52_EP_RANKS;
 
+/// Short-context attention tier: while `seq_len <= 256` the DSA top-256 IS
+/// the full token set (exactly like top-2048 is below 2048 tokens), so the
+/// short-tier graph attends the same tokens at 1/8 the FlashMLA padding work
+/// — the V3.2 sparse kernel always walks all `topk` index slots (`-1` pads
+/// run the full load+GEMM and are only masked in softmax). Must be a multiple
+/// of the 64-entry topk block.
+pub(crate) const GLM52_MLA_TOPK_SHORT: usize = 256;
+
 pub(crate) const ROPE_HALF: usize = 32;
 const ROPE_THETA: f32 = 8_000_000.0;
 /// 1/sqrt(qk_head_dim = 192 + 64).
@@ -211,7 +219,12 @@ pub(crate) struct Glm52RankModel {
     embed: DeviceMatrix,
     final_norm: DeviceVec,
     lm_head: DeviceMatrix,
-    mla_sched: Glm52MlaSchedMetadata,
+    /// FlashMLA plans for the two attention tiers: `short` (topk 256, few SM
+    /// parts) serves steps with `seq_len <= GLM52_MLA_TOPK_SHORT`, `full`
+    /// (topk 2048) everything beyond. Same math on the same real tokens —
+    /// only the padded index-walk length differs.
+    mla_sched_short: Glm52MlaSchedMetadata,
+    mla_sched_full: Glm52MlaSchedMetadata,
     index_cache_layout: Glm52IndexerCacheLayout,
     block_table: CudaSlice<i32>,
     slot_mapping: CudaSlice<i64>,
@@ -225,21 +238,31 @@ pub(crate) struct Glm52RankModel {
     sin: CudaSlice<bf16>,
     token_id: CudaSlice<u32>,
     scratch: Glm52DecodeScratch,
-    /// The whole-step decode graph: captured on this rank's first step,
-    /// replayed every step after. Valid forever — every step has the same
-    /// kernel sequence and the same (arena) pointers by construction; the
-    /// per-step inputs are the five device buffers the prologue rewrites.
-    graph: CudaGraphState,
+    /// The whole-step decode graphs, one per attention tier: each is captured
+    /// on this rank's first step in that tier, replayed every step after.
+    /// Valid forever — within a tier every step has the same kernel sequence
+    /// and the same (arena) pointers by construction; the per-step inputs are
+    /// the five device buffers the prologue rewrites.
+    graph_short: CudaGraphState,
+    graph_full: CudaGraphState,
 }
 
 impl Glm52RankModel {
     pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
+        let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: 1,
             num_blocks: GLM52_MAX_MODEL_LEN.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
-            num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
+            num_sm_parts,
             sm_scale: SM_SCALE,
+        };
+        // The short tier walks only 256/64 = 4 index blocks per batch — more
+        // SM parts than blocks would just be empty splits for the combine.
+        let contract_short = Glm52FlashMlaSparseDecode {
+            topk: GLM52_MLA_TOPK_SHORT,
+            num_sm_parts: num_sm_parts.min(GLM52_MLA_TOPK_SHORT / 64),
+            ..contract
         };
         let index_blocks = GLM52_MAX_MODEL_LEN.div_ceil(INDEX_CACHE_BLOCK);
         let index_cache_layout = Glm52IndexerCacheLayout {
@@ -325,7 +348,8 @@ impl Glm52RankModel {
             embed,
             final_norm,
             lm_head,
-            mla_sched: Glm52MlaSchedMetadata::new(ctx, contract)?,
+            mla_sched_short: Glm52MlaSchedMetadata::new(ctx, contract_short)?,
+            mla_sched_full: Glm52MlaSchedMetadata::new(ctx, contract)?,
             index_cache_layout,
             block_table,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(1)?,
@@ -336,7 +360,8 @@ impl Glm52RankModel {
             sin: ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?,
             token_id: ctx.stream.alloc_zeros::<u32>(1)?,
             scratch: Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?,
-            graph: CudaGraphState::new(),
+            graph_short: CudaGraphState::new(),
+            graph_full: CudaGraphState::new(),
         })
     }
 
@@ -345,8 +370,9 @@ impl Glm52RankModel {
     /// stepping concurrently (an idle rank steps a padding token).
     ///
     /// The step body (embed → 78 layers → lm_head → argmax) is captured into
-    /// a CUDA graph on the first call and replayed afterwards: one graph
-    /// launch instead of ~4155 kernel launches per rank per step. The
+    /// a CUDA graph on the first call in each attention tier and replayed
+    /// afterwards: one graph launch instead of ~4155 kernel launches per rank
+    /// per step. The
     /// prologue rewrites the five device input buffers the captured kernels
     /// read (rope row, slot, seq_len, token), and the epilogue reads back the
     /// 6-byte argmax result — both outside the graph. Capture-time safety:
@@ -378,19 +404,36 @@ impl Glm52RankModel {
             .memcpy_htod(&[(position + 1) as i32], &mut self.seq_lens)?;
         ctx.stream.memcpy_htod(&[token], &mut self.token_id)?;
 
+        // Attention tier: while the whole context fits in the short top-k,
+        // top-256 selects exactly the same tokens as top-2048 (all of them) —
+        // the short graph only walks 1/8 of the padded FlashMLA index slots.
+        // Each tier has its own captured graph; a request crosses tiers at
+        // most once (seq_len only grows), and the lazily captured full graph
+        // records without executing, so the mid-serving capture holds the
+        // other ranks' collectives for tens of ms — far under the ~100 s
+        // DeepEP device timeout (same argument as the first-step capture).
+        let short_tier = position + 1 <= GLM52_MLA_TOPK_SHORT;
         let step = Glm52DecodeStep {
             mla_cos: &self.cos,
             mla_sin: &self.sin,
             idx_cos: &self.cos,
             idx_sin: &self.sin,
-            mla_sched: &self.mla_sched,
+            mla_sched: if short_tier {
+                &self.mla_sched_short
+            } else {
+                &self.mla_sched_full
+            },
             index_cache_layout: self.index_cache_layout,
             slot_mapping: &self.slot_mapping,
             block_table: &self.block_table,
             seq_lens: &self.seq_lens,
         };
 
-        let mut graph = std::mem::take(&mut self.graph);
+        let mut graph = std::mem::take(if short_tier {
+            &mut self.graph_short
+        } else {
+            &mut self.graph_full
+        });
         let result = graph.run_or_capture(ctx, || {
             let s = &mut self.scratch;
             glm52_embed_into(ctx, &self.embed, &self.token_id, &mut s.hidden)?;
@@ -496,7 +539,11 @@ impl Glm52RankModel {
                 &mut s.argmax_index,
             )
         });
-        self.graph = graph;
+        *(if short_tier {
+            &mut self.graph_short
+        } else {
+            &mut self.graph_full
+        }) = graph;
         result?;
 
         let top_value = ctx.stream.clone_dtoh(&self.scratch.argmax_value)?[0].to_f32();

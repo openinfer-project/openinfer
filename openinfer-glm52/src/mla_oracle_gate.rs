@@ -231,6 +231,26 @@ fn load_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52MlaLayerWe
 #[test]
 #[ignore = "requires H200 + GLM-5.2-FP8 checkpoint"]
 fn mla_oracle_gate() -> Result<()> {
+    run_mla_oracle_gate(GLM52_FLASHMLA_SPARSE_TOPK, None)
+}
+
+/// The short-tier plan (topk 256, few SM parts) must land on the SAME oracle
+/// within the SAME tolerance: at ctx <= topk both tiers attend all tokens —
+/// only the padded index-walk length and the split/combine partition differ.
+#[test]
+#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint"]
+fn mla_oracle_gate_short_tier() -> Result<()> {
+    ensure!(
+        ORACLE_CTX <= crate::model::GLM52_MLA_TOPK_SHORT,
+        "oracle ctx outgrew the short tier — bump the tier or the gate"
+    );
+    run_mla_oracle_gate(
+        crate::model::GLM52_MLA_TOPK_SHORT,
+        Some(crate::model::GLM52_MLA_TOPK_SHORT / 64),
+    )
+}
+
+fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     let model_path = std::env::var_os("OPENINFER_TEST_MODEL_PATH")
         .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from);
 
@@ -244,11 +264,12 @@ fn mla_oracle_gate() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let w = load_layer0(&ctx, &model_path)?;
 
+    let device_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
     let contract = Glm52FlashMlaSparseDecode {
         batch_size: 1,
         num_blocks: ORACLE_CTX.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
-        topk: GLM52_FLASHMLA_SPARSE_TOPK,
-        num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
+        topk,
+        num_sm_parts: sm_parts_cap.map_or(device_sm_parts, |cap| device_sm_parts.min(cap)),
         sm_scale: SM_SCALE,
     };
     let mut cache = ctx
@@ -271,15 +292,15 @@ fn mla_oracle_gate() -> Result<()> {
         ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
         ctx.stream.memcpy_htod(&sin_host, &mut sin)?;
 
-        let mut topk_host = vec![-1i32; GLM52_FLASHMLA_SPARSE_TOPK];
+        let mut topk_host = vec![-1i32; topk];
         for (slot, v) in topk_host.iter_mut().enumerate().take(position + 1) {
             *v = slot as i32;
         }
-        let mut topk = ctx.stream.alloc_zeros::<i32>(GLM52_FLASHMLA_SPARSE_TOPK)?;
-        ctx.stream.memcpy_htod(&topk_host, &mut topk)?;
+        let mut topk_dev = ctx.stream.alloc_zeros::<i32>(topk)?;
+        ctx.stream.memcpy_htod(&topk_host, &mut topk_dev)?;
 
         let o = glm52_mla_decode_forward(
-            &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk, &mla_sched,
+            &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk_dev, &mla_sched,
         )?;
         let o_host = ctx.stream.clone_dtoh(&o)?;
         outputs.extend(o_host.iter().map(|v| v.to_f32()));
