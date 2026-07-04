@@ -112,6 +112,59 @@ extern "C" int gpu_chain_speculative_sampling_cuda(
   return static_cast<int>(err);
 }
 
+// Shared front half of the batched sampling pipeline: gather the requested
+// bf16 rows into f32 `probs`, softmax with per-row temperature, then optionally
+// top-k and top-p renormalize in place — leaving `probs` a proper distribution
+// with filtered tokens as exact zeros. The verify path stops here; the min_p
+// sampling path draws afterward. Returns the cudaError as int (0 == success).
+static int gather_softmax_renorm_flashinfer(
+    const __nv_bfloat16* logits, const int* row_indices, float* probs,
+    const float* temperature_arr, const int* top_k_arr, const float* top_p_arr,
+    uint8_t* topk_row_states_scratch, void* softmax_workspace,
+    size_t softmax_workspace_bytes, int n_rows, int vocab_size, bool do_top_k,
+    bool do_top_p, cudaStream_t stream) {
+  dim3 gather_grid(
+      (vocab_size + GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD - 1) /
+          (GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD),
+      n_rows);
+  gather_cast_logits_f32_kernel<<<gather_grid, GATHER_CAST_BLOCK, 0, stream>>>(
+      logits, row_indices, probs, vocab_size);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return static_cast<int>(err);
+  }
+  // In-place: phase 2 of both OnlineSoftmax strategies is an elementwise
+  // read-then-write of the same index.
+  err = flashinfer::sampling::OnlineSoftmax<float>(
+      probs, probs, n_rows, vocab_size, const_cast<float*>(temperature_arr),
+      /*temperature_val=*/1.0f, softmax_workspace, softmax_workspace_bytes,
+      /*enable_pdl=*/false, stream);
+  if (err != cudaSuccess) {
+    return static_cast<int>(err);
+  }
+  if (do_top_k) {
+    auto* row_states =
+        reinterpret_cast<flashinfer::sampling::RadixRowState*>(topk_row_states_scratch);
+    if (row_states == nullptr) {
+      return static_cast<int>(cudaErrorInvalidValue);
+    }
+    // In-place: the renorm kernels reduce a threshold first, then rewrite
+    // each element from its own index.
+    err = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+        probs, probs, const_cast<int*>(top_k_arr), n_rows,
+        /*top_k_val=*/0, vocab_size, row_states, stream);
+    if (err != cudaSuccess) {
+      return static_cast<int>(err);
+    }
+  }
+  if (do_top_p) {
+    err = flashinfer::sampling::TopPRenormProb<float>(
+        probs, probs, const_cast<float*>(top_p_arr), n_rows,
+        /*top_p_val=*/0.0f, vocab_size, stream);
+  }
+  return static_cast<int>(err);
+}
+
 // The verify-side half of the batched sampling pipeline: gather + softmax +
 // top-k/top-p renorm, WITHOUT the terminal sampling kernel — the renormalized
 // probabilities stay in probs_out for a downstream consumer (speculative
@@ -125,42 +178,10 @@ extern "C" int gpu_verify_probs_flashinfer_cuda(
     uint8_t* topk_row_states_scratch, void* softmax_workspace,
     size_t softmax_workspace_bytes, int n_rows, int vocab_size, int has_top_k_filter,
     int has_top_p_filter, cudaStream_t stream) {
-  dim3 gather_grid(
-      (vocab_size + GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD - 1) /
-          (GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD),
-      n_rows);
-  gather_cast_logits_f32_kernel<<<gather_grid, GATHER_CAST_BLOCK, 0, stream>>>(
-      logits, row_indices, probs_out, vocab_size);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
-  }
-  err = flashinfer::sampling::OnlineSoftmax<float>(
-      probs_out, probs_out, n_rows, vocab_size, const_cast<float*>(temperature_arr),
-      /*temperature_val=*/1.0f, softmax_workspace, softmax_workspace_bytes,
-      /*enable_pdl=*/false, stream);
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
-  }
-  if (has_top_k_filter) {
-    auto* row_states =
-        reinterpret_cast<flashinfer::sampling::RadixRowState*>(topk_row_states_scratch);
-    if (row_states == nullptr) {
-      return static_cast<int>(cudaErrorInvalidValue);
-    }
-    err = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
-        probs_out, probs_out, const_cast<int*>(top_k_arr), n_rows,
-        /*top_k_val=*/0, vocab_size, row_states, stream);
-    if (err != cudaSuccess) {
-      return static_cast<int>(err);
-    }
-  }
-  if (has_top_p_filter) {
-    err = flashinfer::sampling::TopPRenormProb<float>(
-        probs_out, probs_out, const_cast<float*>(top_p_arr), n_rows,
-        /*top_p_val=*/0.0f, vocab_size, stream);
-  }
-  return static_cast<int>(err);
+  return gather_softmax_renorm_flashinfer(
+      logits, row_indices, probs_out, temperature_arr, top_k_arr, top_p_arr,
+      topk_row_states_scratch, softmax_workspace, softmax_workspace_bytes, n_rows,
+      vocab_size, has_top_k_filter != 0, has_top_p_filter != 0, stream);
 }
 
 extern "C" int gpu_sample_batch_flashinfer_cuda(
@@ -171,59 +192,32 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
     size_t softmax_workspace_bytes, int n_rows, int vocab_size, int has_top_k_filter,
     int has_top_p_filter, uint64_t seed, uint64_t offset, cudaStream_t stream) {
   OPENINFER_FFI_GUARD_BEGIN
-  dim3 gather_grid(
-      (vocab_size + GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD - 1) /
-          (GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD),
-      n_rows);
-  gather_cast_logits_f32_kernel<<<gather_grid, GATHER_CAST_BLOCK, 0, stream>>>(
-      logits, row_indices, probs_scratch, vocab_size);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
-  }
-
-  // In-place: phase 2 of both OnlineSoftmax strategies is an elementwise
-  // read-then-write of the same index.
-  err = flashinfer::sampling::OnlineSoftmax<float>(
-      probs_scratch, probs_scratch, n_rows, vocab_size, const_cast<float*>(temperature_arr),
-      /*temperature_val=*/1.0f, softmax_workspace, softmax_workspace_bytes,
-      /*enable_pdl=*/false, stream);
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
-  }
-
   bool* valid = reinterpret_cast<bool*>(valid_scratch);
   if (min_p_arr != nullptr) {
-    if (has_top_k_filter) {
-      auto* row_states =
-          reinterpret_cast<flashinfer::sampling::RadixRowState*>(topk_row_states_scratch);
-      if (row_states == nullptr) {
-        return static_cast<int>(cudaErrorInvalidValue);
-      }
-      // In-place: the renorm kernels reduce a threshold first, then rewrite
-      // each element from its own index.
-      err = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
-          probs_scratch, probs_scratch, const_cast<int*>(top_k_arr), n_rows,
-          /*top_k_val=*/0, vocab_size, row_states, stream);
-      if (err != cudaSuccess) {
-        return static_cast<int>(err);
-      }
+    // min_p reads a renormalized distribution, so filter before drawing.
+    int rc = gather_softmax_renorm_flashinfer(
+        logits, row_indices, probs_scratch, temperature_arr, top_k_arr, top_p_arr,
+        topk_row_states_scratch, softmax_workspace, softmax_workspace_bytes, n_rows,
+        vocab_size, has_top_k_filter != 0, has_top_p_filter != 0, stream);
+    if (rc != 0) {
+      return rc;
     }
-    if (has_top_p_filter) {
-      err = flashinfer::sampling::TopPRenormProb<float>(
-          probs_scratch, probs_scratch, const_cast<float*>(top_p_arr), n_rows,
-          /*top_p_val=*/0.0f, vocab_size, stream);
-      if (err != cudaSuccess) {
-        return static_cast<int>(err);
-      }
-    }
-    err = flashinfer::sampling::MinPSamplingFromProb<float, int>(
+    cudaError_t err = flashinfer::sampling::MinPSamplingFromProb<float, int>(
         probs_scratch, const_cast<float*>(min_p_arr), output, valid,
         /*indices=*/nullptr, n_rows, /*min_p_val=*/0.0f, vocab_size,
         /*deterministic=*/true, /*seed_arr=*/nullptr, seed, /*offset_arr=*/nullptr, offset,
         stream);
     return static_cast<int>(err);
   }
+  // Fast path: gather + softmax only — the fused sampler filters at draw time.
+  int rc = gather_softmax_renorm_flashinfer(
+      logits, row_indices, probs_scratch, temperature_arr, top_k_arr, top_p_arr,
+      topk_row_states_scratch, softmax_workspace, softmax_workspace_bytes, n_rows,
+      vocab_size, /*do_top_k=*/false, /*do_top_p=*/false, stream);
+  if (rc != 0) {
+    return rc;
+  }
+  cudaError_t err;
   if (has_top_k_filter) {
     err = flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
         probs_scratch, const_cast<int*>(top_k_arr), const_cast<float*>(top_p_arr), output, valid,
