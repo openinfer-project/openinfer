@@ -400,6 +400,60 @@ pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize 
     rows * vocab.div_ceil(TILE_ELEMS)
 }
 
+/// Single-row two-stage bf16 argmax: tile-parallel partials then one finalize
+/// block. Same total order as [`argmax_bf16_into`] (lowest GLOBAL index wins
+/// ties, NaN never wins) — the partials carry global indices, so the result
+/// is bit-identical to the single-block scan while the vocab row spreads over
+/// ~vocab/4096 CTAs instead of one. `partial_*` must hold
+/// `argmax_batch_bf16_split_partials_len(1, n)` elements.
+pub fn argmax_bf16_split_into(
+    ctx: &DeviceContext,
+    logits: &CudaSlice<half::bf16>,
+    n: usize,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+    value: &mut CudaSlice<half::bf16>,
+    index: &mut CudaSlice<i32>,
+) -> Result<()> {
+    if n == 0 || logits.len() < n {
+        return Err(anyhow!(
+            "argmax_bf16_split_into logits too small: have {}, need {n}",
+            logits.len()
+        ));
+    }
+    if value.is_empty() || index.is_empty() {
+        return Err(anyhow!(
+            "argmax_bf16_split_into outputs must hold one element"
+        ));
+    }
+    let needed = argmax_batch_bf16_split_partials_len(1, n);
+    if partial_values.len() < needed || partial_indices.len() < needed {
+        return Err(anyhow!(
+            "argmax_bf16_split_into partials too small: {}/{} need {needed}",
+            partial_values.len(),
+            partial_indices.len()
+        ));
+    }
+    let (x_ptr, _gx) = logits.device_ptr(&ctx.stream);
+    let (pv_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = value.device_ptr_mut(&ctx.stream);
+    let (i_ptr, _gi) = index.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::argmax_batch_bf16_split_cuda(
+            x_ptr as *const ffi::Half,
+            v_ptr as *mut ffi::Half,
+            i_ptr as *mut i32,
+            pv_ptr as *mut f32,
+            pi_ptr as *mut i32,
+            1,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+    Ok(())
+}
+
 /// Two-stage indexed batched argmax: tile-parallel partials then a per-row
 /// finalize. Lowest index wins ties; each vocab row spreads over many CTAs
 /// instead of one.

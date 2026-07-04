@@ -14,8 +14,8 @@ use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, argmax_bf16_into, glm52_flashmla_sparse_decode_num_sm_parts,
-    rms_norm_into,
+    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into,
+    glm52_flashmla_sparse_decode_num_sm_parts, rms_norm_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -530,11 +530,17 @@ impl Glm52RankModel {
             // Device greedy argmax (same semantics as a host scan: lowest
             // index wins ties, NaN never wins) — the step's egress shrinks
             // from the full vocab row to 6 bytes, and the kernel chain ends
-            // on-device (the graph boundary).
-            argmax_bf16_into(
+            // on-device (the graph boundary). Two-stage: per-4096-tile
+            // partials in parallel, then one finalize block — bit-identical
+            // to the single-block scan (the partials carry global indices,
+            // same total order), ~38 CTAs instead of one serial walk over
+            // the 154k-vocab row.
+            argmax_bf16_split_into(
                 ctx,
                 &s.logits.data,
                 GLM52_VOCAB,
+                &mut s.argmax_partial_values,
+                &mut s.argmax_partial_indices,
                 &mut s.argmax_value,
                 &mut s.argmax_index,
             )

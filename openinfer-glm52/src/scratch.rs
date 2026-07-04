@@ -25,7 +25,9 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 
-use openinfer_kernels::ops::{Glm52DeepGemmMqaLogitsShape, Glm52FlashMlaSparseDecode};
+use openinfer_kernels::ops::{
+    Glm52DeepGemmMqaLogitsShape, Glm52FlashMlaSparseDecode, argmax_batch_bf16_split_partials_len,
+};
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
 use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
@@ -52,7 +54,9 @@ pub(crate) struct Glm52DecodeScratch {
     pub(crate) logits: DeviceVec,
     /// Device greedy argmax outputs: the top logit's bf16 value (for the
     /// crash-early non-finite guard) and its index — the step's 6-byte D2H
-    /// egress.
+    /// egress. The two-stage argmax stages per-4096-tile partials first.
+    pub(crate) argmax_partial_values: CudaSlice<f32>,
+    pub(crate) argmax_partial_indices: CudaSlice<i32>,
     pub(crate) argmax_value: CudaSlice<bf16>,
     pub(crate) argmax_index: CudaSlice<i32>,
 }
@@ -74,6 +78,12 @@ impl Glm52DecodeScratch {
             hidden: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
             final_normed: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
             logits: DeviceVec::zeros(ctx, GLM52_VOCAB)?,
+            argmax_partial_values: ctx
+                .stream
+                .alloc_zeros::<f32>(argmax_batch_bf16_split_partials_len(1, GLM52_VOCAB))?,
+            argmax_partial_indices: ctx
+                .stream
+                .alloc_zeros::<i32>(argmax_batch_bf16_split_partials_len(1, GLM52_VOCAB))?,
             argmax_value: ctx.stream.alloc_zeros::<bf16>(1)?,
             argmax_index: ctx.stream.alloc_zeros::<i32>(1)?,
         })
