@@ -306,10 +306,12 @@ int plain_rows_per_warp(int k) {
   return k <= 2048 ? kRowsPlainShortK : kRowsPlainLongK;
 }
 
-// The batched kernel's supported batch (one instantiation: the DP scheduler's
-// fixed per-rank decode batch). Rust's GLM52_MAX_BATCH_PER_RANK must match —
-// the launcher rejects any other batch, so a drift crashes at the boundary.
-constexpr int kBatchedGemvBatch = 8;
+// The batched kernel's supported batches (one instantiation per decode
+// bucket beyond 1). Rust's GLM52_DECODE_BUCKETS must match — the launcher
+// rejects any other batch, so a drift crashes at the boundary.
+constexpr int kBatchedGemvBatch2 = 2;
+constexpr int kBatchedGemvBatch4 = 4;
+constexpr int kBatchedGemvBatchFull = 8;
 
 // Whitelist of the model's linear shapes (shared by the plain and batched
 // launchers; the tiling check differs — rpb is 8 or 32 for plain, 8 for
@@ -376,8 +378,8 @@ CUresult glm52_fp8_weight_only_gemv_cuda(
 
 // Batched plain GEMV: `out[b] = deq(weight) @ activation[b]` for b in [0, batch).
 // batch == 1 routes to the m=1 kernel (identical result — the batched tile is
-// per-row bit-identical to it by construction); the only other supported batch
-// is kBatchedGemvBatch (the DP scheduler's fixed per-rank decode batch).
+// per-row bit-identical to it by construction); the other supported batches
+// are the decode buckets {2, 4, 8}, one template instantiation each.
 CUresult glm52_fp8_weight_only_gemv_batched_cuda(
     const __nv_bfloat16* activation, const unsigned char* weight,
     const float* weight_scale, __nv_bfloat16* out, int batch, int n, int k,
@@ -391,12 +393,26 @@ CUresult glm52_fp8_weight_only_gemv_batched_cuda(
     return glm52_fp8_weight_only_gemv_cuda(activation, weight, weight_scale, out,
                                            n, k, stream);
   }
-  if (batch != kBatchedGemvBatch) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
   const dim3 grid(1, n / kWarpsPerBlk, 1);
-  glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch>
-      <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale, out, n, k);
+  switch (batch) {
+    case kBatchedGemvBatch2:
+      glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch2>
+          <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale,
+                                               out, n, k);
+      break;
+    case kBatchedGemvBatch4:
+      glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatch4>
+          <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale,
+                                               out, n, k);
+      break;
+    case kBatchedGemvBatchFull:
+      glm52_fp8_weight_only_gemv_batched_kernel<kBatchedGemvBatchFull>
+          <<<grid, kBlockThreads, 0, stream>>>(activation, weight, weight_scale,
+                                               out, n, k);
+      break;
+    default:
+      return CUDA_ERROR_INVALID_VALUE;
+  }
   return consume_last_cuda_error();
 }
 

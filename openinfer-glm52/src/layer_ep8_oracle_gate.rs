@@ -34,18 +34,27 @@ use crate::layer_oracle_gate::{
     assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
 };
 use crate::model::{
-    GLM52_MAX_BATCH_PER_RANK, INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE,
+    GLM52_DECODE_BUCKETS, INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE,
     rope_tables,
 };
 use crate::moe_decode::{HIDDEN, run_router};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
 const EP_RANKS: usize = 8;
-/// Both global-token protocol values the production coordinator can agree on
-/// — the full 8-row bucket (worst-case row bound) and the 1-row bucket. The
-/// gate replays its collectives at each, pinning the b1 collective row-bound
-/// math to the oracle instead of leaving it to e2e parity alone.
-const GLOBAL_TOKEN_BUCKETS: [usize; 2] = [EP_RANKS * GLM52_MAX_BATCH_PER_RANK, EP_RANKS];
+/// Every global-token protocol value the production coordinator can agree on
+/// — one per decode bucket, largest first (the worst-case row bound leads).
+/// The gate replays its collectives at each, pinning every bucket's
+/// collective row-bound math to the oracle instead of leaving it to e2e
+/// parity alone.
+const GLOBAL_TOKEN_BUCKETS: [usize; GLM52_DECODE_BUCKETS.len()] = {
+    let mut buckets = [0usize; GLM52_DECODE_BUCKETS.len()];
+    let mut i = 0;
+    while i < GLM52_DECODE_BUCKETS.len() {
+        buckets[i] = EP_RANKS * GLM52_DECODE_BUCKETS[GLM52_DECODE_BUCKETS.len() - 1 - i];
+        i += 1;
+    }
+    buckets
+};
 
 #[test]
 #[ignore = "requires 8×H200 + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4 + DeepGEMM env"]

@@ -7,12 +7,12 @@
 //! tokens ride the decode path one position at a time), idle slots feed a
 //! padding row whose output is discarded. This satisfies the DeepEP contract
 //! that every rank enters every MoE layer's dispatch/combine collective with
-//! the agreed global row count. The bucket is {1, 8}: while no rank holds
-//! more than one request, every rank steps a single row (the cheap 1-row
-//! graphs); as soon as any rank holds two, every rank steps the full 8-row
-//! batch. Requests join and leave slots at step boundaries (continuous
-//! batching) — admission is least-loaded rank first, so the fleet reaches
-//! bucket 8 only past `GLM52_EP_RANKS` concurrent requests.
+//! the agreed global row count. The bucket is the smallest member of
+//! `GLM52_DECODE_BUCKETS` covering the fullest rank, so the whole fleet pays
+//! only for its deepest rank's row count. Requests join and leave slots at
+//! step boundaries (continuous batching) — admission is least-loaded rank
+//! first, so the fleet leaves the cheap 1-row bucket only past
+//! `GLM52_EP_RANKS` concurrent requests.
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
 //! live in [`Glm52SlotState`] as pure data transitions, and the
@@ -23,7 +23,9 @@
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
 
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape};
+use crate::model::{
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape,
+};
 use crate::runner::Glm52RankWorker;
 
 /// What a rank forwards this step. Idle ranks feed the padding input; its
@@ -173,28 +175,40 @@ fn admission_target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(us
 }
 
 /// Every rank's forward shape for one step, decided together from the same
-/// occupancy snapshot: the 1-row bucket only when EVERY rank holds at most
-/// one request (each rank forwards its single occupied slot — or slot 0 as
-/// padding when idle), the full batch everywhere otherwise. Deriving the
-/// bucket and the per-rank `One` slot from the same row data in one place is
-/// what keeps them consistent — the MoE collectives require all ranks to
-/// agree on the step's global row count, and a rank with two active slots
-/// must never be handed a 1-row shape (its second row would be silently
-/// dropped).
+/// occupancy snapshot: the smallest [`GLM52_DECODE_BUCKETS`] bucket covering
+/// the fullest rank (the MoE collectives require all ranks to agree on the
+/// step's global row count, and a rank must never be handed a bucket smaller
+/// than its active count — its extra rows would be silently dropped), then
+/// per rank the active slots first and free slots as padding up to the
+/// bucket. The full bucket forwards every slot, so its mapping is the
+/// identity — the contract the full-bucket graphs' static identity block
+/// table depends on (actives-first ordering only matters when it decides
+/// WHICH slots ride along as padding). Deriving the bucket and every rank's
+/// slot list from the same row data in one place is what keeps them
+/// consistent.
 fn plan_step_shapes(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52StepShape> {
-    let one_row = occupied
+    let fullest = occupied
         .iter()
-        .all(|row| row.iter().filter(|&&o| o).count() <= 1);
+        .map(|row| row.iter().filter(|&&o| o).count())
+        .max()
+        .unwrap_or(0);
+    let bucket = *GLM52_DECODE_BUCKETS
+        .iter()
+        .find(|&&rows| rows >= fullest.max(1))
+        .expect("the largest bucket covers every occupancy by construction");
     occupied
         .iter()
         .map(|row| {
-            if one_row {
-                Glm52StepShape::One {
-                    slot: row.iter().position(|&o| o).unwrap_or(0),
+            let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
+            if bucket < GLM52_MAX_BATCH_PER_RANK {
+                let ordered = (0..GLM52_MAX_BATCH_PER_RANK)
+                    .filter(|&slot| row[slot])
+                    .chain((0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| !row[slot]));
+                for (dst, slot) in slots.iter_mut().zip(ordered) {
+                    *dst = slot as u8;
                 }
-            } else {
-                Glm52StepShape::Full
             }
+            Glm52StepShape { bucket, slots }
         })
         .collect()
 }
@@ -573,27 +587,59 @@ mod tests {
         assert_eq!(admission_target(&occ(&[GLM52_MAX_BATCH_PER_RANK; 2])), None);
     }
 
+    /// The observable part of a shape: the bucket and the forwarded rows'
+    /// slots (trailing entries beyond the bucket are never read).
+    fn forwarded(shapes: &[Glm52StepShape]) -> Vec<(usize, Vec<u8>)> {
+        shapes
+            .iter()
+            .map(|shape| (shape.bucket, shape.slots[..shape.bucket].to_vec()))
+            .collect()
+    }
+
     #[test]
-    fn shapes_are_one_row_until_a_rank_holds_two() {
-        use Glm52StepShape::{Full, One};
+    fn bucket_is_the_smallest_covering_the_fullest_rank() {
         assert_eq!(
-            plan_step_shapes(&occ(&[0, 0])),
-            vec![One { slot: 0 }, One { slot: 0 }]
+            forwarded(&plan_step_shapes(&occ(&[0, 0]))),
+            vec![(1, vec![0]), (1, vec![0])]
         );
         assert_eq!(
-            plan_step_shapes(&occ(&[1, 1, 1, 1, 1, 1, 1, 1])),
-            vec![One { slot: 0 }; 8]
+            forwarded(&plan_step_shapes(&occ(&[1; 8]))),
+            vec![(1, vec![0]); 8]
         );
-        // One rank at two requests flips EVERY rank to the full batch.
-        assert_eq!(plan_step_shapes(&occ(&[2, 1])), vec![Full, Full]);
-        // The single active slot need not be slot 0 for the 1-row bucket,
-        // and each rank's One slot is its own occupied slot.
-        let mut mid_slot = occ(&[1, 0]);
-        mid_slot[1][5] = true;
+        // One rank at two requests lifts EVERY rank to the 2-row bucket —
+        // idle ranks pad with free slots.
         assert_eq!(
-            plan_step_shapes(&mid_slot),
-            vec![One { slot: 0 }, One { slot: 5 }]
+            forwarded(&plan_step_shapes(&occ(&[2, 1]))),
+            vec![(2, vec![0, 1]), (2, vec![0, 1])]
         );
-        assert_eq!(admission_target(&mid_slot), Some((0, 1)));
+        assert_eq!(
+            forwarded(&plan_step_shapes(&occ(&[3, 1])))[0],
+            (4, vec![0, 1, 2, 3])
+        );
+        // Past the 4-row bucket the full batch takes over.
+        assert_eq!(forwarded(&plan_step_shapes(&occ(&[5, 1])))[0].0, 8);
+    }
+
+    #[test]
+    fn partial_buckets_pack_actives_first_and_full_is_identity() {
+        // A rank holding slots {1, 5} forwards them in rows 0..2; the padding
+        // rows (bucket 4) ride on the lowest free slots.
+        let mut holey = occ(&[0, 3]);
+        holey[0][1] = true;
+        holey[0][5] = true;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&holey)),
+            vec![(4, vec![1, 5, 0, 2]), (4, vec![0, 1, 2, 3])]
+        );
+        assert_eq!(admission_target(&holey), Some((0, 0)));
+        // The full bucket forwards every slot as the identity mapping — the
+        // full-bucket graphs read the static identity block table.
+        let mut deep = occ(&[5, 0]);
+        deep[0][0] = false;
+        deep[0][7] = true;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&deep))[0],
+            (8, (0..8).collect::<Vec<u8>>())
+        );
     }
 }
