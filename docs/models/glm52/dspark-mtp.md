@@ -1,6 +1,6 @@
 # GLM5.2 DSpark speculative decoding (greedy)
 
-**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (all jz-38 gates green: 1621-token prompt byte-identical to main's token-by-token walk, **TTFT 35.8 s → 9.25 s = 3.9×**, solo decode unchanged, bucket-8 solo step measured 45.6 ms → projected spec solo ≈ 1.8×), **M2** draft backbone + Markov propose (rank-local) — next, **M3** verify/accept round loop + c1 A/B. Greedy only; confidence head parsed but unused (Phase 2).
+**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (jz-38 gates green: 1621-token prompt byte-identical, **TTFT 35.8 s → 9.25 s = 3.9×**, bucket-8 solo step 45.6 ms), **M2 draft lane DONE in shadow mode** (jz-38: **measured shadow accept incl. bonus = 3.44 code / 2.4–2.9 prose / 4.74 predictable** vs the checkpoint's 3.967 val — capture layout + backbone + Markov validated in one number; output parity byte-identical drafter on/off; kernel fix: draft is head_dim 64, both qwen3 dflash attention kernels were hard-wired to 128), **M3** verify/accept round loop + span-4-vs-8 A/B + c1 A/B — next. Greedy only; confidence head parsed but unused (Phase 2).
 
 Last touched: 2026-07
 
@@ -71,10 +71,13 @@ Coordinator sees two command round-trips per round (Step, then Draft); channel l
 against a ~30–70 ms step. Draft forward ≈ 1–3 ms (5 dense layers × 8 rows + 8 sequential
 rank-256 GEMV+argmax micro-steps). Draft/verify overlap is a later optimization, not Phase 1.
 
-**Projected win (bucket-8 step now measured by M1 = 45.6 ms solo):** spec solo =
-(45.6 ms verify + ~2–3 ms draft) per ~3.97 committed tokens ≈ **12.2 ms/token vs 22.4 plain ≈
-1.8×**. Span 4 (bucket 4) is the counter-hypothesis to A/B in M3: fewer drafts per round but a
-cheaper verify step. Measure, don't assume.
+**Projected win, updated with M2's measured accept:** spec solo ≈ (45.6 ms bucket-8 verify +
+~3 ms draft) per committed tokens/round → at code-prompt accept 3.44 ≈ **14.1 ms/token
+(1.6×)**; at prose accept 2.4–2.9 ≈ 17–20 ms/token (**1.1–1.3×**) — span 8 is marginal on
+prose because the bucket-8 step costs 2× the bucket-1 step. **Span 4 (bucket 4) may win:**
+re-scoring M2's accept histograms with drafts capped at 3 gives ≈2.8 committed/round on the
+code prompt, and if a bucket-4 step lands near ~30 ms that is ≈12 ms/token (1.9×). The M3 A/B
+(span 8 vs span 4, and measuring the bucket-4 step time) decides; don't assume.
 
 ## Milestones
 
@@ -94,21 +97,32 @@ cheaper verify step. Measure, don't assume.
   prompt echoed in `text` — pre-existing (main identical), frontend accounting, not engine.
   TTFT is 3.9× rather than 8× because a bucket-8 step costs 45.6 ms vs 22.4 — which also
   says a span-4 verify (bucket 4) is worth measuring against span-8 in M3.
-- **M2 — draft lane** (rank-local), implemented as **shadow mode**: `--dflash-draft-model-path`
-  loads the drafter on every rank; the decode path is UNCHANGED, and per spec round the
-  coordinator (a) appends every live slot's step rows from the in-graph capture buffer to that
-  slot's draft pending context, (b) proposes 7 drafts at the current anchor once the previous
-  round is fully scored, and (c) scores proposals against the tokens plain decode actually
-  emits — logging `mean_accepted_drafts` / `mean_accepted_incl_bonus` + histogram per request
-  (`GLM5.2 dspark shadow:` lines). One number validates capture layout + backbone forward +
-  Markov head together: shadow accept ≈ their val 3.967 (incl. bonus) means the lane is right;
-  accept ≈ 0–1 means a layout bug. Pieces: `dspark.rs` (loader with config crash-early pin,
-  batched anchor-drop forward reusing target embed/lm_head, Markov loop at positions 1..=7),
-  5 in-graph capture copies at `GLM52_DSPARK_AUX_LAYERS = {7,22,38,54,69}` (see pin #5),
-  rank-local `Draft` command (resets → appends → proposals, FIFO-ordered before the next step),
-  draft KV sized `GLM52_MAX_MODEL_LEN + 8` (block headroom past the cap). The anchor-position
-  invariant (`anchor_pos == committed + pending`) is asserted in the draft — scheduler/draft
-  drift crashes instead of proposing from the wrong rope phase.
+- **M2 — draft lane** (rank-local), implemented as **shadow mode** — **DONE, jz-38 gate green
+  (2026-07-04, `f03cb29`)**. `--dflash-draft-model-path` loads the drafter on every rank; the
+  decode path is UNCHANGED, and per spec round the coordinator (a) appends every live slot's
+  step rows from the in-graph capture buffer to that slot's draft pending context, (b) proposes
+  7 drafts at the current anchor once the previous round is fully scored, and (c) scores
+  proposals against the tokens plain decode actually emits (`GLM5.2 dspark shadow:` log lines).
+  **Measured shadow accept (incl. bonus = committed tokens/round): code-gen prompt 3.44,
+  technical prose 2.89, narrative prose 2.40, highly-predictable counting 4.74** (43–82 rounds
+  each; checkpoint's own val: 3.967 on their eval set) — the right ballpark everywhere, and the
+  zero-accept fraction on the code prompt (10/59 = 17%) matches their published first-position
+  accept 0.83. A capture-layout bug would have collapsed this to ≈1.x. Output parity: all 4
+  prompts + solo byte-identical with the drafter on vs off (shadow perturbs nothing; the
+  in-graph capture copies change no results). Pieces: `dspark.rs` (loader with config
+  crash-early pin, batched anchor-drop forward reusing target embed/lm_head, Markov loop at
+  positions 1..=7), 5 in-graph capture copies at `GLM52_DSPARK_AUX_LAYERS = {7,22,38,54,69}`
+  (see pin #5), rank-local `Draft` command (resets → appends → proposals, FIFO-ordered before
+  the next step), draft KV sized `GLM52_MAX_MODEL_LEN + 8`. The anchor-position invariant
+  (`anchor_pos == committed + pending`) is asserted in the draft — scheduler/draft drift
+  crashes instead of proposing from the wrong rope phase. Cost: solo decode 22.50–22.56
+  ms/step with the in-graph capture copies (M1 baseline 22.4–22.6 — free), 23.32–23.44 with
+  the shadow drafter proposing every round ≈ **2.2 ms per draft round** — inside the 1–3 ms
+  the round-cadence math assumed. Bring-up bug worth remembering: both
+  draft attention kernels were hard-wired to qwen3's head_dim 128 — the dspark draft is 64
+  MHA heads × head_dim 64, needing the dflash qk-norm-rope warp-count fix + a FlashInfer
+  HEAD_DIM=64 prefill instantiation (the crash-early launcher checks caught it on the first
+  draft round).
 - **M3 — round loop + gates + A/B**. Scheduler slot states (prompt-span / spec-round), accept
   seam, cache-cap span truncation near 4096. Gates: greedy spec output == plain greedy output
   on the D2.5 gate prompts (cross-bucket near-tie divergence is a known FP property — same
@@ -173,6 +187,8 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
 
 ## Next action
 
-M2: draft lane — loader (skip embed/lm_head), qwen3-shape backbone forward + Markov propose at
-V=154880, aux-hidden capture buffer (5 dtod copies at layers {8,23,39,55,70}) added to the step
-graph. Pin the vLLM-side capture-tensor convention against `speculators` `launch_vllm.py` first.
+M3: round loop — verify = bucket-8 (and bucket-4 for the span A/B) step over one slot's
+consecutive positions, accept seam ported from `openinfer-qwen3/src/speculative.rs`, scheduler
+spec-round states, cache-cap span truncation near 4096; then the c1 A/B per the qwen3 dspark
+methodology (`vllm bench serve --temperature 0 --ignore-eos`, sharegpt + code, accept histogram
+from the shadow-style logs). Measure the bucket-4 solo step time early — it decides span 4 vs 8.
