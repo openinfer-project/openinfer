@@ -51,6 +51,12 @@ struct Cli {
     warmup_steps: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Also measure solo span-8 ingestion: one request with this many prompt
+    /// tokens, ms per span step = the DSpark span-verify / TTFT shape (one
+    /// real slot, other ranks padded) — a different point than the diverse
+    /// full-load bucket sweep above. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    ingest_tokens: usize,
 }
 
 const GLM52_RANKS: usize = 8;
@@ -99,6 +105,32 @@ fn main() -> Result<()> {
             mean,
             conc as f64 * 1000.0 / p50,
         );
+    }
+    if cli.ingest_tokens > 0 {
+        // Twice: the first run doubles as warm-up, the second is the number.
+        for round in 0..2 {
+            let prompt = random_prompt(cli.ingest_tokens, cli.seed, 99, round);
+            let started = Instant::now();
+            let stamps = run_stream(
+                &handle,
+                format!("step-bench-ingest-{round}"),
+                prompt,
+                SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+                1,
+            )?;
+            ensure!(stamps.len() == 1, "ingest emitted {} tokens", stamps.len());
+            let wall = started.elapsed().as_secs_f64();
+            let span_steps = cli.ingest_tokens.div_ceil(8);
+            println!(
+                "ingest[{round}]: {} tokens, wall {:.2}s, {:.2} ms/span8-step (solo, one real slot)",
+                cli.ingest_tokens,
+                wall,
+                wall * 1e3 / span_steps as f64,
+            );
+        }
     }
     Ok(())
 }
