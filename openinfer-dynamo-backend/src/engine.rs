@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,7 +27,8 @@ use dynamo_backend_common::{
 };
 use futures::stream::BoxStream;
 use openinfer_engine::engine::{
-    EngineHandle, GenerateRequest, KvBlockEvent, LoadSnapshot, TokenSink, TokenStreamReceiver,
+    EngineHandle, GenerateRequest, KvBlockEvent, LoadSnapshot, RequestAbortReason, TokenSink,
+    TokenStreamReceiver,
 };
 use openinfer_qwen3::{
     DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
@@ -263,18 +264,17 @@ impl LLMEngine for OpeninferBackend {
         let params = convert::to_sampling_params(&request);
         let max_tokens = convert::resolve_max_tokens(&request);
 
-        // Per-request private channel + cancel flag. openinfer's scheduler
-        // learns to retire this request by observing the flag (its next emit
-        // sees the sink closed) — the reactive abort the engine is built
-        // around. `TokenSink::standalone()` hard-codes a never-tripped flag,
-        // so we build the sink by hand to own the flag. The channel is
-        // unbounded, but each request emits at most `max_tokens` items before
-        // its terminal, so growth is bounded by the token cap, not by consumer
-        // backpressure.
+        // Per-request private channel + abort reason. openinfer's scheduler
+        // learns to retire this request by observing the reason (its next emit
+        // sees the sink aborted) — the reactive abort the engine is built
+        // around. `TokenSink::standalone()` hard-codes a never-tripped reason,
+        // so we build the sink by hand to own it. The channel is unbounded, but
+        // each request emits at most `max_tokens` items before its terminal, so
+        // growth is bounded by the token cap, not by consumer backpressure.
         let (tx, rx): (_, TokenStreamReceiver) = mpsc::unbounded_channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         let tag: Arc<str> = Arc::from(ctx.id());
-        let sink = TokenSink::new(tag, tx, cancelled.clone());
+        let sink = TokenSink::new(tag, tx, Arc::clone(&abort_reason));
 
         let req = GenerateRequest {
             request_id: Some(ctx.id().to_string()),
@@ -299,7 +299,7 @@ impl LLMEngine for OpeninferBackend {
 
         Ok(Box::pin(token_stream(
             rx,
-            cancelled,
+            abort_reason,
             ctx.inner_arc(),
             self.cancel_token(),
             prompt_tokens,
@@ -389,7 +389,7 @@ impl LLMEngine for OpeninferBackend {
 /// — or on cancellation, whichever comes first.
 fn token_stream(
     mut rx: TokenStreamReceiver,
-    cancelled: Arc<AtomicBool>,
+    abort_reason: Arc<AtomicU8>,
     ctx: Arc<dyn AsyncEngineContext>,
     cancel: CancellationToken,
     prompt_tokens: u32,
@@ -418,13 +418,13 @@ fn token_stream(
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    cancelled.store(true, Ordering::Release);
+                    RequestAbortReason::Cancelled.store(&abort_reason);
                     yield Ok(LLMEngineOutput::cancelled()
                         .with_usage(cancel_usage(completion_tokens, cached_tokens)));
                     break;
                 }
                 _ = ctx.stopped() => {
-                    cancelled.store(true, Ordering::Release);
+                    RequestAbortReason::Cancelled.store(&abort_reason);
                     yield Ok(LLMEngineOutput::cancelled()
                         .with_usage(cancel_usage(completion_tokens, cached_tokens)));
                     break;
