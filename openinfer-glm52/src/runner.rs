@@ -258,12 +258,13 @@ struct Glm52RankRuntime {
 }
 
 /// This rank's DSpark lane: the replicated draft model, the shared forward
-/// scratch, and one lazily-allocated draft state per slot (~350 MB each,
-/// dropped on reset).
+/// scratch, and one draft state per slot (~350 MB each, all preallocated at
+/// load — a mid-serving draft round must never hit the allocator, and a
+/// transient OOM there would tear the whole engine down).
 struct Glm52DsparkRank {
     model: Glm52DsparkModel,
     scratch: Glm52DsparkScratch,
-    slots: [Option<Glm52DsparkSlotState>; GLM52_MAX_BATCH_PER_RANK],
+    slots: [Glm52DsparkSlotState; GLM52_MAX_BATCH_PER_RANK],
 }
 
 struct Glm52RankThreadState {
@@ -346,10 +347,18 @@ impl Glm52RankThreadState {
             "GLM5.2 rank {} DSpark drafter already loaded",
             self.placement.rank
         );
+        let model = Glm52DsparkModel::load(&dev_ctx, path)?;
+        let scratch = Glm52DsparkScratch::new(&dev_ctx)?;
+        let mut slots = Vec::with_capacity(GLM52_MAX_BATCH_PER_RANK);
+        for _ in 0..GLM52_MAX_BATCH_PER_RANK {
+            slots.push(Glm52DsparkSlotState::new(&dev_ctx)?);
+        }
         runtime.dspark = Some(Glm52DsparkRank {
-            model: Glm52DsparkModel::load(&dev_ctx, path)?,
-            scratch: Glm52DsparkScratch::new(&dev_ctx)?,
-            slots: std::array::from_fn(|_| None),
+            model,
+            scratch,
+            slots: slots
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("GLM5.2 dspark slot state count drifted"))?,
         });
         Ok(())
     }
@@ -373,7 +382,7 @@ impl Glm52RankThreadState {
 
         for &slot in resets {
             ensure!(slot < GLM52_MAX_BATCH_PER_RANK, "dspark reset slot {slot}");
-            dspark.slots[slot] = None;
+            dspark.slots[slot].reset();
         }
         if !appends.is_empty() {
             let captured = model.captured(bucket)?;
@@ -382,11 +391,7 @@ impl Glm52RankThreadState {
                     row < bucket && slot < GLM52_MAX_BATCH_PER_RANK,
                     "dspark append row {row} (bucket {bucket}) slot {slot}"
                 );
-                let state = match &mut dspark.slots[slot] {
-                    Some(state) => state,
-                    empty => empty.insert(Glm52DsparkSlotState::new(&dev_ctx)?),
-                };
-                state.append_captured_row(&dev_ctx, captured, row)?;
+                dspark.slots[slot].append_captured_row(&dev_ctx, captured, row)?;
             }
         }
         if proposals.is_empty() {
@@ -409,9 +414,6 @@ impl Glm52RankThreadState {
                 continue;
             }
             wanted.next();
-            let state = state
-                .as_mut()
-                .with_context(|| format!("dspark propose on slot {slot} without state"))?;
             states.push(state);
             anchors.push((anchor, anchor_pos));
         }

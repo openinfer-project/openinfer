@@ -26,7 +26,7 @@
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
 use tokio::sync::mpsc;
 
-use crate::dspark::GLM52_DSPARK_DRAFTS;
+use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
     GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape,
 };
@@ -46,18 +46,25 @@ pub(crate) const GLM52_PADDING_STEP: Glm52StepInput = Glm52StepInput {
     position: 0,
 };
 
-/// The consequence of a step's output token for one request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The consequence of one step's span of outputs for one request.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Glm52StepOutcome {
-    /// Mid-prefill: the model's output is discarded, keep feeding the prompt.
+    /// Mid-prefill: the model's outputs are discarded, keep feeding the prompt.
     Prefilling,
-    /// Emit this token and keep decoding.
-    Emit(u32),
-    /// Emit this token, then the request is finished (length cap).
-    EmitAndFinish(u32, FinishReason),
-    /// The request is finished without emitting (EOS is suppressed but counts
-    /// toward the completion length — the engine-wide contract).
-    Finish(FinishReason),
+    /// Commit the span's agreed tokens: emit `emitted` in order, then finish
+    /// if `finish` is set. A suppressed EOS counts toward the completion
+    /// length but is not emitted (the engine-wide contract), and truncates
+    /// the committed run. Plain decode commits exactly one token; a verify
+    /// span commits the accepted draft prefix plus the model's correction or
+    /// bonus token (1..=span tokens).
+    Commit {
+        emitted: Vec<u32>,
+        finish: Option<FinishReason>,
+        /// Leading span rows whose tokens are now committed context for the
+        /// draft lane: all rows of a prompt span; anchor + accepted drafts of
+        /// a verify span (rejected rows' captured hidden is dead).
+        context_rows: usize,
+    },
 }
 
 /// One rank's active request as a pure state machine: `feed_want` /
@@ -73,9 +80,24 @@ pub(crate) struct Glm52SlotState {
     fed: usize,
     /// Generated tokens (a suppressed EOS counts).
     completion: usize,
-    /// The model's latest output; the next decode input once the prompt is
+    /// The latest committed token; the next span's anchor once the prompt is
     /// fully fed.
     last_token: u32,
+    /// The current spec-round proposal from the rank's draft lane, consumed
+    /// (and cleared) by the next span. Empty = plain single-row decode — the
+    /// drafter-off path is this same code with `drafts` never set.
+    drafts: Vec<u32>,
+    /// Accept telemetry across the request's verify rounds.
+    spec: SpecStats,
+}
+
+/// Accept histogram over a request's verify rounds (spans that actually fed
+/// drafts; bonus-only single-row spans don't count).
+#[derive(Debug, Default)]
+struct SpecStats {
+    rounds: u64,
+    accepted_sum: u64,
+    hist: [u64; GLM52_DSPARK_DRAFTS + 1],
 }
 
 impl Glm52SlotState {
@@ -87,6 +109,8 @@ impl Glm52SlotState {
             fed: 0,
             completion: 0,
             last_token: 0,
+            drafts: Vec::new(),
+            spec: SpecStats::default(),
         }
     }
 
@@ -95,18 +119,24 @@ impl Glm52SlotState {
     }
 
     /// Rows this request can usefully fill in one step: the whole remaining
-    /// prompt while mid-prefill (the planner caps it to the bucket), one
-    /// decode row afterwards.
+    /// prompt while mid-prefill (the planner caps it to the bucket); the
+    /// verify span (anchor + proposed drafts) in decode, capped so a round
+    /// can never commit past `max_tokens` — which also keeps every fed
+    /// position under the model-length cap, since `validate_request` pins
+    /// `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
     pub(crate) fn feed_want(&self) -> usize {
         if self.fed < self.prompt.len() {
             self.prompt.len() - self.fed
         } else {
-            1
+            (1 + self.drafts.len()).min(self.max_tokens - self.completion)
         }
     }
 
     /// The `offset`-th row of this step's span: consecutive prompt positions
-    /// while mid-prefill, the single decode row afterwards.
+    /// while mid-prefill; the anchor (offset 0) then the draft prefix in
+    /// decode. The planner may grant fewer rows than `feed_want` — the span
+    /// is then a prefix (anchor + first drafts), and the un-fed drafts are
+    /// discarded by `advance_span`.
     pub(crate) fn next_input_at(&self, offset: usize) -> Glm52StepInput {
         if self.fed < self.prompt.len() {
             debug_assert!(self.fed + offset < self.prompt.len());
@@ -115,53 +145,120 @@ impl Glm52SlotState {
                 position: self.fed + offset,
             }
         } else {
-            debug_assert_eq!(offset, 0);
+            debug_assert!(offset <= self.drafts.len());
+            let token = if offset == 0 {
+                self.last_token
+            } else {
+                self.drafts[offset - 1]
+            };
             Glm52StepInput {
-                token: self.last_token,
-                position: self.prompt.len() + self.completion - 1,
+                token,
+                position: self.prompt.len() + self.completion - 1 + offset,
             }
         }
     }
 
     /// The next spec round's anchor once the request is decoding: the latest
-    /// emitted token and the position it will be fed at. `None` mid-prefill
+    /// committed token and the position it will be fed at. `None` mid-prefill
     /// (no token to extend yet).
     pub(crate) fn decode_anchor(&self) -> Option<(u32, usize)> {
         (self.fed >= self.prompt.len() && self.completion > 0)
             .then(|| (self.last_token, self.prompt.len() + self.completion - 1))
     }
 
-    /// Fold one step's span of outputs in. Mid-prompt rows' outputs are
-    /// discarded; the row that fed the LAST prompt token yields the first
-    /// generated token, and decode spans are a single row — so only
-    /// `outputs.last()` ever carries a real token.
+    /// Whether a fresh draft proposal is worth requesting: decoding, and at
+    /// least two tokens of budget left (a one-token tail can only ever commit
+    /// the anchor's own output — a plain row).
+    pub(crate) fn wants_drafts(&self) -> bool {
+        self.fed >= self.prompt.len() && self.completion + 1 < self.max_tokens
+    }
+
+    /// Install the draft lane's proposal for the next verify span.
+    pub(crate) fn set_drafts(&mut self, drafts: Vec<u32>) {
+        self.drafts = drafts;
+    }
+
+    /// Fold one step's span of outputs in.
+    ///
+    /// Mid-prompt rows' outputs are discarded; the row that fed the LAST
+    /// prompt token yields the first generated token. In decode the span is
+    /// a verify: `outputs[k]` is the target's greedy token after span row
+    /// `k` (anchor + fed draft prefix), and [`accept_greedy`] commits the
+    /// agreed prefix plus one model token. The plain single-row step is the
+    /// zero-draft special case of the same rule.
     pub(crate) fn advance_span(
         &mut self,
         outputs: &[u32],
         eos_token_ids: &[u32],
     ) -> Glm52StepOutcome {
         debug_assert!(!outputs.is_empty());
-        if self.fed < self.prompt.len() {
+        let (committed, context_rows) = if self.fed < self.prompt.len() {
             debug_assert!(self.fed + outputs.len() <= self.prompt.len());
             self.fed += outputs.len();
             if self.fed < self.prompt.len() {
                 return Glm52StepOutcome::Prefilling;
             }
-            // The last prompt token's row yielded the first generated token
-            // — fall through to the decode accounting.
+            // Boundary: every span row is committed prompt context, and the
+            // last row's output is the first generated token.
+            let output = *outputs.last().expect("span outputs are non-empty");
+            (vec![output], outputs.len())
         } else {
-            debug_assert_eq!(outputs.len(), 1);
+            let drafts_fed = outputs.len() - 1;
+            debug_assert!(drafts_fed <= self.drafts.len());
+            let committed = accept_greedy(&self.drafts[..drafts_fed], outputs);
+            if drafts_fed > 0 {
+                self.spec.record(committed.len() - 1);
+            }
+            let context_rows = committed.len();
+            (committed, context_rows)
+        };
+        self.drafts.clear();
+
+        let mut emitted = Vec::with_capacity(committed.len());
+        let mut finish = None;
+        for &token in &committed {
+            self.completion += 1;
+            if !self.ignore_eos && eos_token_ids.contains(&token) {
+                finish = Some(FinishReason::Stop);
+                break;
+            }
+            emitted.push(token);
+            self.last_token = token;
+            if self.completion >= self.max_tokens {
+                finish = Some(FinishReason::Length);
+                break;
+            }
         }
-        let output = *outputs.last().expect("span outputs are non-empty");
-        self.completion += 1;
-        if !self.ignore_eos && eos_token_ids.contains(&output) {
-            return Glm52StepOutcome::Finish(FinishReason::Stop);
+        Glm52StepOutcome::Commit {
+            emitted,
+            finish,
+            context_rows,
         }
-        if self.completion >= self.max_tokens {
-            return Glm52StepOutcome::EmitAndFinish(output, FinishReason::Length);
+    }
+
+    /// Log the request's accept telemetry when it leaves its slot (only when
+    /// it ran verify rounds — plain-decode requests stay silent).
+    pub(crate) fn log_spec_stats(&self, rank: usize, slot: usize) {
+        let stats = &self.spec;
+        if stats.rounds == 0 {
+            return;
         }
-        self.last_token = output;
-        Glm52StepOutcome::Emit(output)
+        let mean_accepted = stats.accepted_sum as f64 / stats.rounds as f64;
+        log::info!(
+            "GLM5.2 dspark: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
+             mean_accepted_incl_bonus={:.3} hist={:?}",
+            stats.rounds,
+            mean_accepted + 1.0,
+            stats.hist,
+        );
+    }
+}
+
+impl SpecStats {
+    fn record(&mut self, accepted_drafts: usize) {
+        self.rounds += 1;
+        self.accepted_sum += accepted_drafts as u64;
+        self.hist[accepted_drafts.min(GLM52_DSPARK_DRAFTS)] += 1;
     }
 }
 
@@ -198,64 +295,6 @@ pub(crate) fn validate_request(req: &GenerateRequest) -> Result<(), String> {
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
-    /// DSpark shadow scoring (M2): `Some` when the drafter is loaded. Each
-    /// round proposes 7 drafts from the current anchor and scores them
-    /// against the tokens the engine actually emits — the real accept rate
-    /// the M3 verify loop will get, with zero decode-path change.
-    shadow: Option<ShadowState>,
-}
-
-/// One request's shadow-round bookkeeping: at most one outstanding proposal
-/// (matching the M3 round cadence — a new proposal only after the previous
-/// round is fully scored), plus the accept histogram.
-#[derive(Default)]
-struct ShadowState {
-    outstanding: Vec<u32>,
-    matched: usize,
-    rounds: u64,
-    accepted_sum: u64,
-    hist: [u64; GLM52_DSPARK_DRAFTS + 1],
-}
-
-impl ShadowState {
-    /// Score one emitted token against the outstanding proposal. A mismatch
-    /// or a fully-matched proposal closes the round (the M3 loop would
-    /// re-anchor there).
-    fn score_token(&mut self, token: u32) {
-        if self.outstanding.is_empty() {
-            return;
-        }
-        if self.outstanding[self.matched] == token {
-            self.matched += 1;
-            if self.matched == self.outstanding.len() {
-                self.finish_round();
-            }
-        } else {
-            self.finish_round();
-        }
-    }
-
-    fn finish_round(&mut self) {
-        self.rounds += 1;
-        self.accepted_sum += self.matched as u64;
-        self.hist[self.matched] += 1;
-        self.outstanding.clear();
-        self.matched = 0;
-    }
-
-    fn log_on_release(&self, rank: usize, slot: usize) {
-        if self.rounds == 0 {
-            return;
-        }
-        let mean_accepted = self.accepted_sum as f64 / self.rounds as f64;
-        log::info!(
-            "GLM5.2 dspark shadow: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
-             mean_accepted_incl_bonus={:.3} hist={:?}",
-            self.rounds,
-            mean_accepted + 1.0,
-            self.hist,
-        );
-    }
 }
 
 /// Per-rank slot occupancy: `slots[rank][slot]`.
@@ -445,11 +484,7 @@ pub(crate) fn run_dp8_coordinator(
             if dspark_enabled {
                 pending_resets[rank].push(slot);
             }
-            slots[rank][slot] = Some(ActiveRequest {
-                req,
-                state,
-                shadow: dspark_enabled.then(ShadowState::default),
-            });
+            slots[rank][slot] = Some(ActiveRequest { req, state });
         }
         if all_idle(&slots) {
             continue;
@@ -538,65 +573,63 @@ pub(crate) fn run_dp8_coordinator(
                     continue;
                 };
                 let prompt_tokens = active.req.prompt_tokens.len();
-                let freed = match active.state.advance_span(span_outputs, eos_token_ids) {
-                    Glm52StepOutcome::Prefilling => {
-                        // Prefill never sends, so a disconnect is only
-                        // visible through the sink probe — without it a long
-                        // prompt zombies the slot until prefill completes.
-                        active.req.token_tx.is_closed()
-                    }
-                    Glm52StepOutcome::Emit(token) => {
-                        if let Some(shadow) = active.shadow.as_mut() {
-                            shadow.score_token(token);
+                let (freed, context_rows) =
+                    match active.state.advance_span(span_outputs, eos_token_ids) {
+                        Glm52StepOutcome::Prefilling => {
+                            // Prefill never sends, so a disconnect is only
+                            // visible through the sink probe — without it a
+                            // long prompt zombies the slot until prefill
+                            // completes. Every prompt row is committed
+                            // context.
+                            (active.req.token_tx.is_closed(), span_outputs.len())
                         }
-                        // A dropped receiver (client disconnect) frees the
-                        // slot; its KV lives in the slot's own cache region
-                        // and dies with the slot.
-                        active
-                            .req
-                            .token_tx
-                            .send(TokenEvent::Token {
-                                id: token,
-                                logprob: None,
-                            })
-                            .is_err()
-                    }
-                    Glm52StepOutcome::EmitAndFinish(token, finish_reason) => {
-                        if let Some(shadow) = active.shadow.as_mut() {
-                            shadow.score_token(token);
+                        Glm52StepOutcome::Commit {
+                            emitted,
+                            finish,
+                            context_rows,
+                        } => {
+                            // A dropped receiver (client disconnect) frees
+                            // the slot; its KV lives in the slot's own cache
+                            // region and dies with the slot.
+                            let mut freed = false;
+                            for token in emitted {
+                                if active
+                                    .req
+                                    .token_tx
+                                    .send(TokenEvent::Token {
+                                        id: token,
+                                        logprob: None,
+                                    })
+                                    .is_err()
+                                {
+                                    freed = true;
+                                    break;
+                                }
+                            }
+                            if let Some(finish_reason) = finish
+                                && !freed
+                            {
+                                let _ = active.req.token_tx.send(TokenEvent::Finished {
+                                    finish_reason,
+                                    prompt_tokens,
+                                    completion_tokens: active.state.completion_tokens(),
+                                });
+                                freed = true;
+                            }
+                            (freed, context_rows)
                         }
-                        let _ = active.req.token_tx.send(TokenEvent::Token {
-                            id: token,
-                            logprob: None,
-                        });
-                        let _ = active.req.token_tx.send(TokenEvent::Finished {
-                            finish_reason,
-                            prompt_tokens,
-                            completion_tokens: active.state.completion_tokens(),
-                        });
-                        true
-                    }
-                    Glm52StepOutcome::Finish(finish_reason) => {
-                        let _ = active.req.token_tx.send(TokenEvent::Finished {
-                            finish_reason,
-                            prompt_tokens,
-                            completion_tokens: active.state.completion_tokens(),
-                        });
-                        true
-                    }
-                };
+                    };
                 if freed {
-                    if let Some(shadow) = &active.shadow {
-                        shadow.log_on_release(rank, slot_id);
+                    active.state.log_spec_stats(rank, slot_id);
+                    if dspark_enabled {
                         pending_resets[rank].push(slot_id);
                     }
                     *slot = None;
-                } else if let Some(shadow) = &active.shadow {
-                    // Every step row of a live slot feeds the draft context;
-                    // a new proposal starts once the previous round is fully
-                    // scored (the M3 verify cadence).
-                    rank_appends[rank].extend(span_rows.map(|r| (r, slot_id)));
-                    if shadow.outstanding.is_empty()
+                } else if dspark_enabled {
+                    // Committed rows' captured hidden feeds the draft
+                    // context; then re-propose from the new anchor.
+                    rank_appends[rank].extend(span_rows.take(context_rows).map(|r| (r, slot_id)));
+                    if active.state.wants_drafts()
                         && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
                     {
                         rank_proposals[rank].push((slot_id, anchor, anchor_pos));
@@ -606,9 +639,10 @@ pub(crate) fn run_dp8_coordinator(
         }
 
         // Draft round (rank-local, no collectives): resets, context appends
-        // from THIS step's capture buffer, and new proposals. FIFO per-rank
-        // channels order it before the next step; the blocking join mirrors
-        // the M3 round cadence (draft sits between verify steps).
+        // from THIS step's capture buffer, and new proposals for the next
+        // verify span. FIFO per-rank channels order it before the next step;
+        // the blocking join keeps the round cadence (draft sits between
+        // verify steps, ~2 ms against a 22-46 ms step).
         if dspark_enabled {
             let mut draft_joins = Vec::new();
             for (rank, worker) in workers.iter().enumerate() {
@@ -656,11 +690,8 @@ pub(crate) fn run_dp8_coordinator(
                     break 'serve;
                 }
                 for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
-                    if let Some(active) = slots[rank][slot_id].as_mut()
-                        && let Some(shadow) = active.shadow.as_mut()
-                    {
-                        shadow.outstanding = span.to_vec();
-                        shadow.matched = 0;
+                    if let Some(active) = slots[rank][slot_id].as_mut() {
+                        active.state.set_drafts(span.to_vec());
                     }
                 }
             }
@@ -735,6 +766,18 @@ mod tests {
 
     const EOS: &[u32] = &[7];
 
+    fn commit(
+        emitted: &[u32],
+        finish: Option<FinishReason>,
+        context_rows: usize,
+    ) -> Glm52StepOutcome {
+        Glm52StepOutcome::Commit {
+            emitted: emitted.to_vec(),
+            finish,
+            context_rows,
+        }
+    }
+
     #[test]
     fn prefill_rides_decode_then_emits() {
         let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
@@ -765,7 +808,7 @@ mod tests {
                 position: 2
             }
         );
-        assert_eq!(state.advance_span(&[42], EOS), Glm52StepOutcome::Emit(42));
+        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], None, 1));
         assert_eq!(state.completion_tokens(), 1);
 
         // Decode continues from the emitted token at the next position.
@@ -817,16 +860,17 @@ mod tests {
                 position: 3
             }
         );
-        assert_eq!(state.advance_span(&[42], EOS), Glm52StepOutcome::Emit(42));
+        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], None, 1));
         assert_eq!(state.completion_tokens(), 1);
     }
 
     #[test]
     fn whole_prompt_in_one_span_emits_from_the_boundary_row() {
         let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
+        // All three span rows are committed prompt context.
         assert_eq!(
             state.advance_span(&[99, 98, 42], EOS),
-            Glm52StepOutcome::Emit(42)
+            commit(&[42], None, 3)
         );
         assert_eq!(state.completion_tokens(), 1);
         assert_eq!(
@@ -843,7 +887,7 @@ mod tests {
         let mut state = Glm52SlotState::new(vec![10], 4, false);
         assert_eq!(
             state.advance_span(&[7], EOS),
-            Glm52StepOutcome::Finish(FinishReason::Stop)
+            commit(&[], Some(FinishReason::Stop), 1)
         );
         assert_eq!(state.completion_tokens(), 1);
     }
@@ -851,7 +895,7 @@ mod tests {
     #[test]
     fn ignore_eos_decodes_through_the_stop_token() {
         let mut state = Glm52SlotState::new(vec![10], 4, true);
-        assert_eq!(state.advance_span(&[7], EOS), Glm52StepOutcome::Emit(7));
+        assert_eq!(state.advance_span(&[7], EOS), commit(&[7], None, 1));
         assert_eq!(
             state.next_input_at(0),
             Glm52StepInput {
@@ -864,10 +908,10 @@ mod tests {
     #[test]
     fn length_cap_emits_the_final_token() {
         let mut state = Glm52SlotState::new(vec![10], 2, false);
-        assert_eq!(state.advance_span(&[42], EOS), Glm52StepOutcome::Emit(42));
+        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], None, 1));
         assert_eq!(
             state.advance_span(&[43], EOS),
-            Glm52StepOutcome::EmitAndFinish(43, FinishReason::Length)
+            commit(&[43], Some(FinishReason::Length), 1)
         );
         assert_eq!(state.completion_tokens(), 2);
     }
@@ -877,7 +921,7 @@ mod tests {
         let mut state = Glm52SlotState::new(vec![10], 1, false);
         assert_eq!(
             state.advance_span(&[7], EOS),
-            Glm52StepOutcome::Finish(FinishReason::Stop)
+            commit(&[], Some(FinishReason::Stop), 1)
         );
     }
 
@@ -887,42 +931,114 @@ mod tests {
         assert_eq!(state.advance_span(&[99], EOS), Glm52StepOutcome::Prefilling);
         assert_eq!(
             state.advance_span(&[42], EOS),
-            Glm52StepOutcome::EmitAndFinish(42, FinishReason::Length)
+            commit(&[42], Some(FinishReason::Length), 1)
         );
     }
 
     #[test]
-    fn shadow_closes_rounds_at_mismatch_and_at_full_match() {
-        let mut shadow = ShadowState::default();
-        // No outstanding proposal: tokens are ignored.
-        shadow.score_token(9);
-        assert_eq!(shadow.rounds, 0);
+    fn verify_span_commits_accepted_prefix_plus_correction() {
+        let mut state = Glm52SlotState::new(vec![10], 32, false);
+        // Boundary emits the anchor t0 = 20.
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        state.set_drafts(vec![21, 22, 99, 98, 97, 96, 95]);
 
-        shadow.outstanding = vec![1, 2, 3, 4, 5, 6, 7];
-        shadow.score_token(1);
-        shadow.score_token(2);
-        shadow.score_token(9); // mismatch closes the round at 2 accepted
-        assert_eq!((shadow.rounds, shadow.accepted_sum), (1, 2));
-        assert!(shadow.outstanding.is_empty());
+        // Full 8-row verify span: anchor + 7 drafts at consecutive positions.
+        assert_eq!(state.feed_want(), 8);
+        assert_eq!(
+            (0..3).map(|i| state.next_input_at(i)).collect::<Vec<_>>(),
+            vec![
+                Glm52StepInput {
+                    token: 20,
+                    position: 1
+                },
+                Glm52StepInput {
+                    token: 21,
+                    position: 2
+                },
+                Glm52StepInput {
+                    token: 22,
+                    position: 3
+                },
+            ]
+        );
 
-        shadow.outstanding = vec![1, 2, 3, 4, 5, 6, 7];
-        for token in [1, 2, 3, 4, 5, 6, 7] {
-            shadow.score_token(token);
-        }
-        assert_eq!((shadow.rounds, shadow.accepted_sum), (2, 9));
-        assert_eq!(shadow.hist[2], 1);
-        assert_eq!(shadow.hist[7], 1);
-        assert!(shadow.outstanding.is_empty());
+        // Target agrees with drafts 21, 22, diverges at the third (30 != 99):
+        // commit the accepted prefix + the correction, context = anchor + 2
+        // accepted rows.
+        let outputs = [21, 22, 30, 0, 0, 0, 0, 0];
+        assert_eq!(
+            state.advance_span(&outputs, EOS),
+            commit(&[21, 22, 30], None, 3)
+        );
+        assert_eq!(state.completion_tokens(), 4);
+        // The correction is the next anchor; drafts were consumed.
+        assert_eq!(state.decode_anchor(), Some((30, 4)));
+        assert_eq!(state.feed_want(), 1);
+    }
+
+    #[test]
+    fn verify_span_truncated_by_the_planner_accepts_only_fed_drafts() {
+        let mut state = Glm52SlotState::new(vec![10], 32, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27]);
+
+        // The planner granted only 4 of the 8 wanted rows: the span is the
+        // anchor + first 3 drafts, and acceptance ranges over those 3 only.
+        assert_eq!(state.feed_want(), 8);
+        let outputs = [21, 22, 23, 24];
+        assert_eq!(
+            state.advance_span(&outputs, EOS),
+            commit(&[21, 22, 23, 24], None, 4)
+        );
+        assert_eq!(state.completion_tokens(), 5);
+        assert_eq!(state.decode_anchor(), Some((24, 5)));
+    }
+
+    #[test]
+    fn eos_inside_the_committed_run_truncates_and_finishes() {
+        let mut state = Glm52SlotState::new(vec![10], 32, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        // Draft 2 is the EOS token (7): accepted, counted, suppressed; the
+        // rest of the committed run is dropped.
+        state.set_drafts(vec![21, 7, 23, 24, 25, 26, 27]);
+        let outputs = [21, 7, 23, 24, 25, 26, 27, 28];
+        assert_eq!(
+            state.advance_span(&outputs, EOS),
+            commit(&[21], Some(FinishReason::Stop), 8)
+        );
+        assert_eq!(state.completion_tokens(), 3);
+    }
+
+    #[test]
+    fn length_cap_truncates_the_verify_want_and_the_committed_run() {
+        let mut state = Glm52SlotState::new(vec![10], 4, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27]);
+        // remaining = 3 -> the span may commit at most 3 more tokens.
+        assert_eq!(state.feed_want(), 3);
+        let outputs = [21, 22, 23];
+        assert_eq!(
+            state.advance_span(&outputs, EOS),
+            commit(&[21, 22, 23], Some(FinishReason::Length), 3)
+        );
+        assert_eq!(state.completion_tokens(), 4);
+    }
+
+    #[test]
+    fn wants_drafts_only_with_two_tokens_of_budget() {
+        let mut state = Glm52SlotState::new(vec![10], 3, false);
+        assert!(!state.wants_drafts(), "mid-prefill never wants drafts");
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        assert!(state.wants_drafts());
+        assert_eq!(state.advance_span(&[21], EOS), commit(&[21], None, 1));
+        assert!(!state.wants_drafts(), "one-token tail is a plain row");
     }
 
     #[test]
     fn decode_anchor_is_the_latest_token_at_its_feed_position() {
         let mut state = Glm52SlotState::new(vec![10, 11], 4, false);
         assert_eq!(state.decode_anchor(), None);
-        assert_eq!(
-            state.advance_span(&[99, 42], EOS),
-            Glm52StepOutcome::Emit(42)
-        );
+        assert_eq!(state.advance_span(&[99, 42], EOS), commit(&[42], None, 2));
         // The anchor is what the next decode row would feed.
         assert_eq!(state.decode_anchor(), Some((42, 2)));
         assert_eq!(
@@ -932,7 +1048,7 @@ mod tests {
                 position: 2
             }
         );
-        assert_eq!(state.advance_span(&[43], EOS), Glm52StepOutcome::Emit(43));
+        assert_eq!(state.advance_span(&[43], EOS), commit(&[43], None, 1));
         assert_eq!(state.decode_anchor(), Some((43, 3)));
     }
 

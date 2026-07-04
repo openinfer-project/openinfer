@@ -57,9 +57,9 @@ pub struct Glm52LaunchOptions {
     pub tp_size: usize,
     pub dp_size: usize,
     /// DSpark drafter checkpoint dir (`RedHatAI/GLM-5.2-speculator.dspark`).
-    /// M2: loads the draft lane in SHADOW mode — proposals are scored against
-    /// the tokens the plain decode actually emits and logged per request; the
-    /// decode path itself is unchanged.
+    /// Enables greedy speculative decoding: verify spans ride the decode
+    /// buckets, accepted tokens commit in batches, per-request accept stats
+    /// are logged on release.
     pub dspark_draft_model_path: Option<std::path::PathBuf>,
 }
 
@@ -165,8 +165,8 @@ fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Resu
         })??;
     }
     log::info!(
-        "GLM5.2 DSpark drafter loaded on all ranks in {:.2}s (shadow mode: proposals scored \
-         against plain decode, accept stats logged per request)",
+        "GLM5.2 DSpark drafter loaded on all ranks in {:.2}s (speculative decoding: verify \
+         spans ride the decode buckets, accept stats logged per request)",
         started.elapsed().as_secs_f64()
     );
     Ok(())
