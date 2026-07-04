@@ -51,8 +51,13 @@ Closed-loop scaling, **diverse prompts** (random ~15-token prompts, 128-token ou
 | concurrency | ms/step p50 | ms/step p99 | aggregate out tok/s | note |
 |---|---|---|---|---|
 | 1 | 21.5 | 21.6 | 42 | 1-row bucket |
-| 8 | 28.1 | 28.5 | 256 | still 1-row bucket; +25% over the identical-prompt 22.3 = routing diversity + request-boundary stagger |
-| 16 | 51.1 | 52.3 | 280 | **the cliff**: 2 real rows/rank pay the full 8-row step |
+| 2 | 24.1 | 24.3 | 75 | 1-row bucket — per-step cost climbs gently with active ranks (more real dispatch in the collectives + request-boundary stagger) |
+| 4 | 26.6 | 26.8 | 135 | |
+| 7 | 29.3 | 29.7 | 215 | |
+| 8 | 28.1 | 28.5 | 256 | last 1-row point; +25% over the identical-prompt 22.3 = routing diversity |
+| **9** | **47.1** | **49.2** | **171** | **the cliff is non-monotonic**: the 9th request drops TOTAL throughput below c7 — everyone pays the 64-row step for 9 real rows |
+| 12 | 49.0 | 49.5 | 220 | still below c8; break-even ≈ c14 |
+| 16 | 51.1 | 52.3 | 280 | |
 | 32 | 57.1 | 57.7 | 502 | |
 | 64 | 62.8 | 63.6 | 911 | 22× the solo rate |
 
@@ -65,6 +70,6 @@ Two measurement lessons this table encodes:
 
 ## Next step
 
-- **Bucket tuning**: the c16 cliff (280 tok/s ≈ c8's 256) says a middle bucket (e.g. {1, 2 or 4, 8}) would pay for itself between 9 and ~24 concurrent requests. Each added bucket costs 2 more graphs + capture time and another FP-association regime; justify with its own diverse-prompt A/B, not projection.
+- **Bucket tuning**: the cliff is non-monotonic — c9 (171 tok/s) drops below c7 (215) and break-even with c8 is ≈ c14, so the 9–14 concurrency band is strictly worse than rejecting the 9th request would be. A middle bucket (e.g. 4: two more graphs + a `kBatchedGemvBatch` instantiation for batch 4 + one more FP-association regime) would serve c9–c32 at a ~30 ms-class step; justify with its own diverse-prompt A/B, not projection.
 - Expert-GEMM M-tile work (#542's swapAB lead) re-opens now that real multi-row steps exist — re-measure at the 64-row diverse shape, where the 64-row M-tile is no longer 8× padding.
 - P/D decode-node work (KV ingestion from a vLLM prefill, true paged block table, >4096 context) is the next campaign; prefill stays out of scope per the standing prefill-by-vLLM decision.
