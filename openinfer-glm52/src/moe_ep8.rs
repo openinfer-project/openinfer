@@ -17,7 +17,7 @@
 //! The dispatch payload is bf16 (the shim's wire format); each rank re-quants
 //! its received rows before the grouped GEMMs. Re-quant / SiLU / grouped GEMM
 //! cover `bound_rows` — the host-derived aligned-segment bound for the step's
-//! global token count (2080 at the DP8 protocol's 8 tokens/step vs the
+//! global token count (2528 at the DP8 protocol's 64 tokens/step vs the
 //! 10240-row capacity); the metadata
 //! kernel device-traps if a real segment ends past it. Rows past the bound
 //! hold stale bytes, but every kernel is row-independent and combine only
@@ -67,8 +67,6 @@ pub(crate) struct Glm52MoeEp8State {
     /// Dispatch inputs for token-less expert ranks (num_tokens = 0 still
     /// requires valid pointers).
     zero_x: CudaSlice<bf16>,
-    /// How many combined rows the last dispatching forward produced.
-    combined_tokens: usize,
     zero_topk_idx: CudaSlice<i32>,
     zero_topk_weight: CudaSlice<f32>,
     /// Grouped-GEMM chain workspace. Rows past a launch's `bound_rows` hold
@@ -144,7 +142,6 @@ impl Glm52MoeEp8State {
             w2_act_scale: ctx.stream.alloc_zeros(expanded * W2_SCALE_COLS)?,
             w2_scale_tma: ctx.stream.alloc_zeros(w2_scale_tma_len)?,
             expert_out: ctx.stream.alloc_zeros(expanded * W2_N)?,
-            combined_tokens: 0,
             combined: ctx
                 .stream
                 .alloc_zeros(info.decode_max_tokens_per_rank as usize * HIDDEN)?,
@@ -156,11 +153,6 @@ impl Glm52MoeEp8State {
     /// when that call returned `true`).
     pub(crate) fn combined(&self) -> &CudaSlice<bf16> {
         &self.combined
-    }
-
-    /// Row count of [`Self::combined`] from the last dispatching forward.
-    pub(crate) fn combined_tokens(&self) -> usize {
-        self.combined_tokens
     }
 }
 
@@ -182,7 +174,7 @@ impl Glm52MoeEp8State {
 /// on this rank, and each non-empty local expert segment pads to the
 /// `GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT` boundary, so the last aligned
 /// segment end is at most `min(expanded, g*TOPK + (ALIGN-1)*min(g*TOPK,
-/// n_local))`. At the DP8 protocol's 8 tokens/step that is 2080 rows vs the
+/// n_local))`. At the DP8 protocol's 64 tokens/step that is 2528 rows vs the
 /// 10240-row capacity.
 pub(crate) fn glm52_moe_ep8_routed_forward(
     ctx: &DeviceContext,
@@ -325,7 +317,6 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     // Collective combine: weighted expert outputs → per-source-token sums,
     // into the persistent `combined` buffer (`[num_tokens, HIDDEN]` rows of
     // the per-rank-cap-sized buffer).
-    state.combined_tokens = num_tokens;
     let topk_idx = match token {
         Some((_, route, _)) => &route.topk_idx,
         None => &state.zero_topk_idx,

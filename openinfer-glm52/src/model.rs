@@ -557,7 +557,7 @@ impl Glm52RankModel {
                         )
                         .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
                         ensure!(
-                            dispatched && ep8.combined_tokens() == batch,
+                            dispatched,
                             "EP8 MoE returned no combined output for the dispatched rows"
                         );
                         // Join: the closing add consumes both branches.
