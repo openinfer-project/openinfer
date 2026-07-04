@@ -1,6 +1,6 @@
 # GLM5.2 whole-step decode CUDA graph (PR5c)
 
-> **TL;DR:** Execution record of PR5c: the whole per-rank decode step (embed → 78 layers → lm_head → device argmax) is captured into one CUDA graph and replayed every step. Measured on jz-38 8×H200, single request: **200 → 37.5 ms/step from the graph alone** (byte-identical to the PR5b record), **→ 31.3** after switching every m=1 projection to the weight-only fp8 GEMV (activation quant removed — re-gated via the #499 oracle in the new `--precision gemv` mode), **→ 25.3** after grid-striding the capacity-sized MoE quant/SiLU launches (block *scheduling*, not arithmetic, was their cost), **→ 23.4** after packing gate|up into one GEMV, overlapping the shared expert with the MoE collectives on a second stream (fork/join events inside the graph), and staging the relayout's expert ranges in shared memory, **→ 22.9 single** after fusing each layer's closing add with the next layer's input norm (ping-ponged attn buffers, bit-identical `_round` kernel) and running the DSA indexer concurrently with the MLA front's q_b/kv_a, **→ 22.6 single / 22.3 at 8-way (~346 tok/s aggregate)** after two-tier attention graphs (short-context FlashMLA topk 256 — while `seq_len <= 256` the DSA top-256 IS the full token set, so the short-tier graph attends the same tokens at 1/8 the padded index walk; tier-crossing and mixed-tier concurrency e2e-gated, short tier oracle-gated). A step-timing probe puts the inter-step host gap at ~0.05 ms — the whole step lives inside the graph; **vLLM GLM5.2 DP8/EP8 measured on the same node/workload: steady-state 20.0 ms/step (TPOT 19.8)** — the remaining 2.6 ms gap sits mostly in the expert GEMM (their swapAB ~10.8 µs/instance vs our 64-row-M-tile TRTLLM grouped at 22.7 µs — ~8 real rows pay an 8× tile) and the collectives' wait structure (#542; fp8 dispatch payload is measured perf-NEUTRAL — dispatch is rank-arrival-wait-bound, not byte-bound). Indexer oracle reference drift is #541 (pre-existing on main).
+> **TL;DR:** Execution record of PR5c: the whole per-rank decode step (embed → 78 layers → lm_head → device argmax) is captured into one CUDA graph and replayed every step. Measured on jz-38 8×H200, single request: **200 → 37.5 ms/step from the graph alone** (byte-identical to the PR5b record), **→ 31.3** after switching every m=1 projection to the weight-only fp8 GEMV (activation quant removed — re-gated via the #499 oracle in the new `--precision gemv` mode), **→ 25.3** after grid-striding the capacity-sized MoE quant/SiLU launches (block *scheduling*, not arithmetic, was their cost), **→ 23.4** after packing gate|up into one GEMV, overlapping the shared expert with the MoE collectives on a second stream (fork/join events inside the graph), and staging the relayout's expert ranges in shared memory, **→ 22.9 single** after fusing each layer's closing add with the next layer's input norm (ping-ponged attn buffers, bit-identical `_round` kernel) and running the DSA indexer concurrently with the MLA front's q_b/kv_a, **→ 22.6 single / 22.3 at 8-way (~346 tok/s aggregate)** after two-tier attention graphs (short-context FlashMLA topk 256 — while `seq_len <= 256` the DSA top-256 IS the full token set, so the short-tier graph attends the same tokens at 1/8 the padded index walk; tier-crossing and mixed-tier concurrency e2e-gated, short tier oracle-gated), **→ 22.5 single** after swapping the device argmax to the shared two-stage split kernel (bit-identical; the single-CTA scan was the last serial kernel in the step). A step-timing probe puts the inter-step host gap at ~0.05 ms — the whole step lives inside the graph; **vLLM GLM5.2 DP8/EP8 measured on the same node/workload: steady-state 20.0 ms/step (TPOT 19.8)** — the remaining 2.6 ms gap sits mostly in the expert GEMM (their swapAB ~10.8 µs/instance vs our 64-row-M-tile TRTLLM grouped at 22.7 µs — ~8 real rows pay an 8× tile) and the collectives' wait structure (#542; fp8 dispatch payload is measured perf-NEUTRAL — dispatch is rank-arrival-wait-bound, not byte-bound). Indexer oracle reference drift is #541 (pre-existing on main).
 >
 > **Last touched:** 2026-07
 
@@ -41,7 +41,8 @@ Remaining after #535's MoE workspace: MLA attend scratch (`ql_nope/query/ckv_fp8
 | + grid-strided quant/SiLU (row grid capped at 256) | 25.3 | ~100k tiny blocks/launch → ~12k; work AND scheduling now scale with real rows |
 | + gate\|up packed GEMV + shared-expert ∥ collectives + smem relayout ranges | 23.4 | per-row math unchanged; overlap = fork/join events inside the capture (kimi pattern) |
 | + closing-add fused with next input-norm + indexer ∥ MLA front | 22.9 (8-way 22.6, ~341 tok/s) | bit-identical `_round` fusion; indexer forks after q_resid, joins before attend |
-| + two-tier attention graphs (short-context topk 256) | **22.6** (8-way 22.3, ~346 tok/s) | same attended tokens below seq 256, 1/8 the FlashMLA padded walk; per-tier graph picked by position; indexer top-k narrows with the attend plan; new `mla_oracle_gate_short_tier` + tier-crossing/mixed-tier e2e gates (v7) |
+| + two-tier attention graphs (short-context topk 256) | 22.6 (8-way 22.3, ~346 tok/s) | same attended tokens below seq 256, 1/8 the FlashMLA padded walk; per-tier graph picked by position; indexer top-k narrows with the attend plan; new `mla_oracle_gate_short_tier` + tier-crossing/mixed-tier e2e gates (v7) |
+| + two-stage device argmax (qwen split kernel) | **22.5** | bit-identical (global-index total order); the 154k-vocab single-CTA scan (0.22 ms traced) was the last serial kernel — e2e buys 0.1 ms, the rest was hidden |
 
 8-way concurrency stays free throughout (same per-step wall as bs=1; ~308 tok/s aggregate at 128-tok requests). All e2e gates green each stage: determinism ×2, 8-way identical, mixed concurrency, disconnect, slot reuse, SIGTERM teardown ≤4 s.
 
@@ -51,18 +52,44 @@ Three latent findings shaken out on the way:
 - **Block scheduling, not arithmetic, dominated the capacity-sized quant/SiLU launches** (2080×48 ≈ 100k 128-thread blocks ≈ 60 µs/layer): a device-bound early-return recovers nothing because retired blocks still get scheduled — the kernels are now grid-strided (row grid capped at 256, loop bounded by `expert_offsets[n_local]` on device).
 - **The HF `glm_moe_dsa` indexer reference is a moving target** (#541): the 5.13.0 release regressed the RoPE-interleave fix (the oracle script now refuses such builds), and `5.13.0.dev0` drifted between snapshots — the indexer oracle gate needs a pinned or vllm-derived reference before its overlap threshold means anything. Not introduced by this branch (main scores the same ~1585/2048 against any freshly generated oracle).
 
-## Where the remaining ~30 ms sits (nsys, node-granularity trace — proportions only)
+## Where the 22.6 ms sits (final-state profile, jz-38 nsys 2026-07-04)
 
-Per rank per step, inflated ~15-20% by tracing:
+Methodology (read this before trusting any number): node-granularity trace
+(`--cuda-graph-trace=node`) of the shipped build, 133-step greedy request,
+totals divided by 1064 rank-steps. Small kernels inflate 30-50% under node
+tracing, and the collective kernels' `avg` absorbs boundary stalls — so the
+table uses **median × instances**, which sums to ~21 ms against the 22.6 e2e
+wall; the difference is rank-arrival wait pooled into the dispatch/combine
+side. Use this for magnitudes and ordering, and size any expected win with an
+e2e A/B, never with trace ratios (the tier stage read ~1 ms in trace and
+bought 0.3 ms e2e).
 
-| bucket | ms | assessment |
-|---|---|---|
-| dispatch_impl (75×) | ~6.7 | med 12.5 µs — mostly rank-arrival wait: per-layer straggler jitter (expert-count varies per rank per layer) + inter-step launch stagger; the tail (max 24 ms) sits at request/step boundaries |
-| weight-only GEMV (588×) | ~6.6 | near the weight-BW floor (o_proj 100 MB → ~25 µs); little headroom |
-| quant chain | ~4.7 → ~1 | grid-stride fix above |
-| grouped expert GEMM (150×) | ~3.4 | ~8 hit experts/rank × 37.5 MB weights ≈ physics floor shared with vLLM |
-| combine_impl (75×) | ~3.3 | already device-bounded (the vendored kernel's capacity-sentinel reads the device psum) — this is the cooperative-launch + NVLink push latency floor of the 2-kernel combine design |
-| FlashMLA + cuBLAS absorb + norms + router + bookends | ~5 | near floor |
+| bucket | ~ms/step | share | assessment |
+|---|---|---|---|
+| MoE collective wait (dispatch rank-arrival + combine device-bound spin) | ~5.6 | 25% | dispatch kernel proper is only 12.4 µs × 75; combine 47 µs × 75 + reduce-epilogue 9.5 µs × 75 — the wait lives inside the kernels. Engineering headroom, not physics (vLLM pays 29+36 µs/layer medians on plain NCCL AG+RS) |
+| non-expert projection GEMVs (q_a/q_b/kv_a/o_proj × 78 + dense) | ~3.6 | 16% | weight-BW floor at ~75-80%; little headroom |
+| expert grouped GEMM (TRTLLM, 2 × 75) | ~3.2 | 14% | 21.4 µs med/instance; **the biggest single movable item** — vLLM's DeepGEMM swapAB does it in 10.8 µs (64-row M-tile vs ~8 real rows = 8× wasted MMA; #542) |
+| FlashMLA short tier (splitkv 16.4 µs + combine 4.9 µs × 78) | ~1.7 | 7% | splitkv is the 4-index-block serial floor; combine collapsed 12.6→4.9 µs with 4 SM parts |
+| quant / SiLU / relayout / metadata glue | ~1.7 | 7% | post-grid-stride steady state |
+| shared expert + indexer (aux stream) | ~1.1 | — | overlapped with the collectives; mostly off the wall clock |
+| absorb GEMMs (nvjet W_UK/W_UV × 78) | ~1.0 | 4% | cuBLAS already optimal for this shape (ncu-proven in the PP era) |
+| router (gate GEMM + top-8 + splitK reduce) | ~1.0 | 4% | |
+| norms (fused + standalone) | ~0.8 | 4% | |
+| bookends (lm_head 0.45 + argmax + embed) | ~0.7 | 3% | lm_head is the 1.9 GB weight-read floor; the argmax was a serial single-CTA 0.22 ms until the two-stage split swap (below) |
+| small kernels (cache-pack, assemble, adds, sort) | ~0.4 | 2% | |
+
+Rough split: ~6.7 ms is weight-read physics (GEMVs + expert-GEMM bytes +
+absorb + lm_head), ~5.6 ms is collective wait (engineering), the rest is
+long-tail kernel time. The path to vLLM's measured 20.0 = expert GEMM swapAB
+(~1.5 ms) + whatever shortening each layer's critical path recovers from the
+arrival wait.
+
+A late find from this profile: the device argmax was the last serial
+single-CTA kernel in the step (one 256-thread block walking the 154k-vocab
+row, 0.22 ms/step); it now uses the shared two-stage split kernel (per-4096
+-tile partials + finalize, the qwen3 dspark path) — bit-identical by
+construction, e2e-parity-gated, 22.6 → 22.5 (the calibration rule above in
+action again: 0.22 ms of traced serial time bought 0.1 ms of wall).
 
 Attempted, proven correct, and measured perf-NEUTRAL: **FP8 dispatch payload** (source-rank quant commutes with byte-preserving dispatch → bit-identical; vendored SF-pack support wired through config/shim/wrapper/moe_ep8, plus a plain-copy SF patch after the `cp.async.mbarrier.arrive` accounting hang). Clean probe on an idle node: 22.9-23.0 ms/step, parity PASS — identical to bf16 dispatch. nsys shows `dispatch_impl` kernel time really drops (~0.4-0.5 ms/step) but wall time doesn't move: **dispatch is rank-arrival-wait-bound, not byte-bound, at DP8/bs=1**. Not landed (complexity without measured win); full diff preserved on `wip/glm52-fp8-dispatch` @ c275be8 for when per-rank batches make dispatch byte-bound. An earlier "26.2 regression" reading was a contaminated measurement (another user's vLLM run on the same GPUs).
 
