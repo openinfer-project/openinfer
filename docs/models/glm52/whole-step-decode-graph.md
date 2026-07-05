@@ -240,8 +240,61 @@ stale binaries whose numbers happened to look plausible. The gate script now
 refuses to run unless `nm` finds the new kernel symbols; keep that pattern.
 (Silver lining: the stale run produced the TRUE same-day baseline sweep.)
 
+## MegaMoE (DeepGEMM PR #323) evaluated — NOT usable at decode payloads (jz-38, 2026-07-05)
+
+MegaMoE is DeepGEMM's mega-kernel fusing dispatch → L1 GEMM → SwiGLU → L2
+GEMM → combine into one launch over symmetric NVLink memory (official release
+is SM100 FP8×FP4 only; [PR #323](https://github.com/deepseek-ai/DeepGEMM/pull/323)
+is the community SM90 FP8×FP8 adaptation, actively tuned — its tip has a
+"Tune SM90 MegaMoE decode heuristics for GLM5.2" commit from ByteDance).
+Evaluated as the candidate replacement for our per-layer MoE chain.
+
+Post-#567 re-profile first (same node-granularity methodology as above, 19.6
+ms/step untraced): dispatch+combine kernels are now **4.75 ms/step
+median×instances, 7.73 ms/step wait-inclusive** — the whole MoE block
+(collectives + quant/SiLU glue + masked GEMM) is ~8.3 ms med×inst ≈ **103
+µs/layer kernel-resident, ~145 µs/layer wait-inclusive**, the largest bucket
+in the step. That is the prize any fusion has to beat.
+
+Measured (PR #323 tip a444600, sgl tvm-ffi wheel built with CUDA 12.8, kexi
+venv torch 2.11 read-only, isolated `--target` pydeps; accuracy suite
+**28/28 PASS** at GLM5.2 shapes, diff ~6e-4 vs torch reference — the kernel
+is *correct*):
+
+```
+cd ~/develop/xingming/megamoe-deepgemm && PYTHONPATH=~/develop/xingming/pydeps \
+python -u sgl_deep_gemm/tests/test_mega_moe_hopper.py --fused-only-sweep \
+  --batches 1 2 4 8 16 32 64 --hidden 6144 --intermediate-hidden 2048 \
+  --num-experts 256 --num-topk 8 --num-max-tokens-per-rank 128 \
+  --activation-clamp inf --num-processes 8
+```
+
+| tokens/rank | fused µs/call | HBM GB/s | our chain per layer |
+|---|---|---|---|
+| 1 | 201.7 | 749 | ~103 µs kernel-resident / ~145 µs wait-inclusive |
+| 8 | 345.9 | 2732 | |
+| 64 | 399.6 | 3051 | |
+
+**~200 µs structural floor at decode payloads — ~2× slower than our existing
+unfused chain.** 75 layers × 200 µs = 15 ms/step of MoE alone. Ruled out as
+causes: swapAB off (`DG_SM90_FP8_SWAP_AB=0` → 189 µs, same), small symm
+buffer (`--num-max-tokens-per-rank 8` → 200 µs, same). The floor is the
+in-kernel NVLink handshake + expert-wave scheduling: our whole comm set
+(dispatch 12.4 + combine 30 + reduce 9.6 + prologue/copy 6.4) is ~58 µs
+kernel-resident for the same protocol work.
+
+Why the community's "2.7× at bs=1 on H20" doesn't transfer: their baseline is
+DeepEP v2 + grouped GEMM orchestrated per-kernel from Python — MegaMoE's win
+there is launch/orchestration overhead we already removed with the whole-step
+CUDA graph. Against a graph-replayed chain, only MegaMoE's floor remains.
+Revisit only if the SM90 kernel's small-payload floor drops ~4× upstream, or
+for Blackwell (official SM100 path is FP8×FP4 — a weight-format change with
+its own accuracy question). Checkout preserved at
+`~/develop/xingming/megamoe-deepgemm` (branch pr323).
+
 ## Next action
 
 Follow-ups: #542 (collective latency floor — the expert-GEMM half is done,
-the wait-structure half remains), #559 residual (combine +1.9, MLA +1.2 at
-b8), #541 indexer reference re-pin.
+the wait-structure half remains: rank-arrival stagger, per-rank launch
+timeline; MegaMoE-style kernel fusion is measured OUT, section above), #559
+residual (combine +1.9, MLA +1.2 at b8), #541 indexer reference re-pin.
