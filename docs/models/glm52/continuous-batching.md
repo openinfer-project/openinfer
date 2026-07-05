@@ -110,5 +110,5 @@ During the first D2.5 bench attempt one c2 request hung the client forever: the 
 
 ## Next step
 
-- Expert-GEMM M-tile work (#542's swapAB lead) re-opens now that real multi-row steps exist — re-measure at the 64-row diverse shape, where the 64-row M-tile is no longer 8× padding.
+- ~~Expert-GEMM M-tile work (#542's swapAB lead)~~ DONE 2026-07-05: DeepGEMM masked grouped GEMM landed (the "swapAB" attribution was wrong — see whole-step-decode-graph.md); c64 diverse 1113 → 1475 tok/s, sweep −16..−24 % across buckets.
 - P/D decode-node work (KV ingestion from a vLLM prefill, true paged block table, >4096 context) is the next campaign; prefill stays out of scope per the standing prefill-by-vLLM decision.

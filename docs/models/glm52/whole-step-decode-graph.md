@@ -68,7 +68,7 @@ bought 0.3 ms e2e).
 |---|---|---|---|
 | MoE collective wait (dispatch rank-arrival + combine device-bound spin) | ~5.6 | 25% | dispatch kernel proper is only 12.4 µs × 75; combine 47 µs × 75 + reduce-epilogue 9.5 µs × 75 — the wait lives inside the kernels. Engineering headroom, not physics (vLLM pays 29+36 µs/layer medians on plain NCCL AG+RS) |
 | non-expert projection GEMVs (q_a/q_b/kv_a/o_proj × 78 + dense) | ~3.6 | 16% | weight-BW floor at ~75-80%; little headroom |
-| expert grouped GEMM (TRTLLM, 2 × 75) | ~3.2 | 14% | 21.4 µs med/instance; **the biggest single movable item** — vLLM's DeepGEMM swapAB does it in 10.8 µs (64-row M-tile vs ~8 real rows = 8× wasted MMA; #542) |
+| expert grouped GEMM (TRTLLM, 2 × 75) | ~3.2 | 14% | 21.4 µs med/instance; **the biggest single movable item** — vLLM's DeepGEMM does it in 10.8 µs. RESOLVED 2026-07-05: replaced by the DeepGEMM masked grouped GEMM (section below; the "swapAB" attribution here was wrong — their kernel is MGroupedMasked with the same 64-row BLOCK_M) |
 | FlashMLA short tier (splitkv 16.4 µs + combine 4.9 µs × 78) | ~1.7 | 7% | splitkv is the 4-index-block serial floor; combine collapsed 12.6→4.9 µs with 4 SM parts |
 | quant / SiLU / relayout / metadata glue | ~1.7 | 7% | post-grid-stride steady state |
 | shared expert + indexer (aux stream) | ~1.1 | — | overlapped with the collectives; mostly off the wall clock |
@@ -80,9 +80,9 @@ bought 0.3 ms e2e).
 
 Rough split: ~6.7 ms is weight-read physics (GEMVs + expert-GEMM bytes +
 absorb + lm_head), ~5.6 ms is collective wait (engineering), the rest is
-long-tail kernel time. The path to vLLM's measured 20.0 = expert GEMM swapAB
-(~1.5 ms) + whatever shortening each layer's critical path recovers from the
-arrival wait.
+long-tail kernel time. The path to vLLM's measured 20.0 = the expert GEMM
+swap (~1.5 ms; landed 2026-07-05, masked-GEMM section below) + whatever
+shortening each layer's critical path recovers from the arrival wait.
 
 A late find from this profile: the device argmax was the last serial
 single-CTA kernel in the step (one 256-thread block walking the 154k-vocab
@@ -95,7 +95,7 @@ Attempted, proven correct, and measured perf-NEUTRAL: **FP8 dispatch payload** (
 
 Measured dead ends (all recorded in #542): the inter-step host gap is ~0.05 ms (step-timing probe — device self-feeding/pipelining buys nothing); `kDecodeNumSms` 32→16 AND 32→64 both exactly flat (combine's 42 µs/layer is protocol/NVLink latency, insensitive to SM count in either direction); FlashMLA `num_sm_parts` 32→4 REGRESSES at topk 2048 (25.1 — fewer splits make splitkv the long pole; the short tier uses 4 parts because it only walks 4 index blocks); L2-prefetching the next layer's MLA weights on the aux stream REGRESSES (24.7 — contends with the grouped GEMM and thrashes L2); the quant-style capacity-loop lever does not exist for dispatch/combine (already device-bounded via the vendored capacity-sentinel).
 
-The same-node vLLM nsys diff (their trace: NCCL AllGather+ReduceScatter naive EP — NOT DeepEP — at 29+36 µs/layer medians, comparable to our 12+47) relocates the remaining 2.6 ms: (1) **expert GEMM** — vLLM's DeepGEMM swapAB runs ~10.8 µs/instance where our TRTLLM grouped takes 22.7 µs (64-row M-tile against ~8 real rows = 8× wasted MMA work; swapAB puts the skinny dimension on N). (2) **collective wait structure** (dispatch is rank-arrival-bound; fp8 payload measured neutral). A calibration lesson from the tier stage: node-granularity nsys inflates small kernels — the attention diff read as ~1 ms in trace proportions but bought 0.3 ms e2e; size expected wins from e2e A/B, not trace ratios.
+The same-node vLLM nsys diff (their trace: NCCL AllGather+ReduceScatter naive EP — NOT DeepEP — at 29+36 µs/layer medians, comparable to our 12+47) relocates the remaining 2.6 ms: (1) **expert GEMM** — vLLM's DeepGEMM runs ~10.8 µs/instance where our TRTLLM grouped takes 22.7 µs (resolved 2026-07-05: their kernel turned out to be MGroupedMasked, not swapAB — see the masked-GEMM section). (2) **collective wait structure** (dispatch is rank-arrival-bound; fp8 payload measured neutral). A calibration lesson from the tier stage: node-granularity nsys inflates small kernels — the attention diff read as ~1 ms in trace proportions but bought 0.3 ms e2e; size expected wins from e2e A/B, not trace ratios.
 
 ## Bucket-8 step attribution (jz-38 nsys 2026-07-05)
 
@@ -179,7 +179,69 @@ in our AOT setup — its SM90 dense path expects the DeepGEMM JIT runtime.
 c64 diverse decode 1046 → 1121 tok/s (−8 % step); b1/b2 flat.** Iteration ran
 on the in-process `glm52_step_bench` (one weight load, ~3 min/cycle).
 
+## DeepGEMM masked grouped expert GEMM (jz-38, 2026-07-05)
+
+**Correction first: the "swapAB" attribution above was wrong.** Reading vLLM's
+DeepGEMM JIT cache on this node (`/data/cache/glm52_mtp_local/vllm/deep_gemm`)
+shows the exact instantiations its 10.8 µs/instance came from:
+`sm90_fp8_gemm_1d2d_impl<..., GemmType::MGroupedMasked>` with **BLOCK_M=64**
+— the same 64-row M-tile as our TRTLLM kernel, no operand swap anywhere
+(vLLM's `deep_gemm` copy is vendored at
+`site-packages/vllm/third_party/deep_gemm`). The gap was kernel quality
+(persistent 132-SM scheduler, TMA multicast on B, 8/6-deep pipelines, no
+scale-relayout kernel) plus their lower hit-expert count at single-request
+decode. W13 (4096×6144): BLOCK_N=128, 8 stages; W2 (6144×2048): BLOCK_N=192,
+6 stages; both TMA multicast 2 on B, 132 SMs.
+
+Our vendored DeepGEMM tree already supports `MGroupedMasked` in the SM90 1d2d
+impl, so the port is an AOT instantiation (the `glm52_deepgemm_mqa.cu`
+pattern — no JIT, no torch, no Python) plus a layout bridge:
+
+- the metadata kernel emits `masked_m` (real rows/expert) and a `row_map`
+  (aligned recv row → masked slot, -1 on alignment gaps) next to the segment
+  offsets it already computed;
+- the re-quant and SwiGLU-quant kernels keep their aligned-row loop space and
+  device row bound, but write through `row_map` into fixed-stride
+  `[32, 64, k]` slabs, with per-row scales going **straight into the
+  mn-major TMA layout** the GEMM's SFA descriptor reads — the
+  offset-scale-relayout kernel is deleted, not moved;
+- one new remap kernel puts the W2 output back into the aligned slots
+  `decode_combine` addresses. DeepEP dispatch/combine untouched.
+
+Standalone A/B first (same data, same masked_m distribution, same node —
+`~/develop/xingming/dgmask_bench/bench.cu`): masked wins 1.51-1.93× over
+TRTLLM+relayout at 2/7/27 hit-expert scenarios, numerics match an fp32
+reference at bf16-rounding level (4e-3 rel-to-row-RMS). Two bench traps worth
+keeping: uniform-random fp8 bytes blow up the QGMMA reduced-precision
+accumulator far beyond real data (use normal-quantized fills), and the
+production TRTLLM launch is capacity-proportional (m_capacity = bound_rows ≈
+2080 at 8 global tokens), so a bench that sizes it by real rows flatters it.
+
+e2e A/B (same day, same node, `glm52_step_bench` + gate suite):
+
+| workload | TRTLLM | masked | Δ |
+|---|---|---|---|
+| sweep b1 (8 diverse, conc 8) | 30.4 ms | 25.4 | −16 % |
+| sweep b2 | 39.0 | 30.9 | −21 % |
+| sweep b4 | 47.3 | 36.4 | −23 % |
+| sweep b8 (c64 diverse) | 57.5 ms / 1113 tok/s | 43.5 / **1475 tok/s** | −24 % |
+| solo span-8 ingest (spec-8 verify step) | 32.2 | 28.2 | −13 % |
+
+EP8 layer-6 oracle green at every global-token bucket (g=64/32/16/8): 62/64
+probes with the same two known router-near-tie outliers as the EP1/TRTLLM
+record. The masked capacity invariant lives at the protocol level
+(`global_tokens ≤ 64`; each token contributes ≤1 row per expert), NOT at the
+shim's `decode_max_tokens_per_rank=128` buffer capacity — the metadata kernel
+device-traps as the backstop.
+
+Ops lesson that cost this session hours: `cargo build … | tail` swallows the
+exit code — a failed jz-38 build "passed", and a whole gate suite ran on
+stale binaries whose numbers happened to look plausible. The gate script now
+refuses to run unless `nm` finds the new kernel symbols; keep that pattern.
+(Silver lining: the stale run produced the TRUE same-day baseline sweep.)
+
 ## Next action
 
-Follow-ups: #542 (collective latency floor / expert GEMM swapAB), #559 residual
-(expert GEMM +3.8, combine +1.9, MLA +1.2 at b8), #541 indexer reference re-pin.
+Follow-ups: #542 (collective latency floor — the expert-GEMM half is done,
+the wait-structure half remains), #559 residual (combine +1.9, MLA +1.2 at
+b8), #541 indexer reference re-pin.

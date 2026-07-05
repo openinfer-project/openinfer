@@ -34,13 +34,19 @@ rank 0                                          ranks 1..7
 router (256-wide, bs tokens)                    —
 deepep decode_dispatch(normed bf16, topk)       decode_dispatch(dummy, 0 tokens)
         └→ recv_x bf16 [10240,6144], recv_topk_weights, psum_expert[33]
-fp8 per-token-group re-quant over worst-case rows        (same)
-metadata kernel: psum i32 → expert_offsets i64 (32 groups)
-TRTLLM grouped FP8 W13 (groups=32) → weighted SiLU·quant (weights = recv_topk_weights)
-TRTLLM grouped FP8 W2 → expert outputs (routed ×2.5 already folded by router)
+metadata kernel: psum i32 → expert_offsets i64 + masked_m + row_map (32 groups)
+fp8 per-token-group re-quant → masked [32,64,k] slabs + mn-major TMA scales
+DeepGEMM masked grouped FP8 W13 → weighted SiLU·quant (weights = recv_topk_weights)
+DeepGEMM masked grouped FP8 W2 → remap masked→aligned slots
 deepep decode_combine → combined[bs,6144]       decode_combine (0 tokens)
 rank 0: + shared expert + residual              —
 ```
+
+(2026-07-05: the TRTLLM grouped GEMMs + activation-scale relayout were
+replaced by the DeepGEMM MGroupedMasked AOT instantiation — 1.5-1.9× on the
+same data, c64 1113 → 1475 tok/s e2e; the masked-layout bridge and A/B record
+live in whole-step-decode-graph.md. The aligned-segment recv layout and the
+row-isolation invariant below are unchanged.)
 
 PR3's `Glm52MoeLayerWeights` splits into `Glm52MoeRouterWeights` + shared-expert projections + `Glm52MoeExpertBank` (n_experts is 256 at EP1, 32 per rank at EP8); the EP1 gates recompose the same pieces, unchanged math.
 
