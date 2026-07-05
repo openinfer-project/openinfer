@@ -28,7 +28,7 @@ use crate::layer::{
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::scratch::Glm52DecodeScratch;
 
-use crate::layer_oracle_gate::{
+use super::layer::{
     GateLayerMlp, LayerTensors, MOE_ORACLE_CTX, MOE_ORACLE_HIDDEN_DIGEST, MOE_ORACLE_INPUT_SCALE,
     MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
     assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
@@ -146,7 +146,7 @@ fn layer_moe_ep8_oracle_gate() -> Result<()> {
 }
 
 /// The EP8 variant of the gate's prefill-via-decode walk: same decode
-/// environment as `layer_oracle_gate::run_layer_prefill`, with the MLP half
+/// environment as `oracle::layer::run_layer_prefill`, with the MLP half
 /// driven through the collective.
 fn run_layer_prefill_ep8(
     ctx: &DeviceContext,
@@ -200,7 +200,7 @@ fn run_layer_prefill_ep8(
     for position in 0..oracle_ctx {
         ctx.stream.memcpy_htod(
             &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
-            &mut scratch.hidden.data,
+            scratch.hidden.data_mut(),
         )?;
         let (cos_host, sin_host) = rope_tables(position);
         ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
@@ -216,7 +216,6 @@ fn run_layer_prefill_ep8(
             idx_cos: &cos,
             idx_sin: &sin,
             mla_sched: &mla_sched,
-            index_cache_layout,
             slot_mapping: &slot_mapping,
             block_table: &block_table,
             seq_lens: &seq_lens,
@@ -224,12 +223,14 @@ fn run_layer_prefill_ep8(
         let mut carry_ready = false;
         // Gate walk: standalone input norm + fixed parity 0 (one layer per
         // call, stream in scratch.hidden — same shape as the EP1 gate).
-        openinfer_kernels::ops::rms_norm_into(
+        openinfer_kernels::ops::rms_norm_rows_into(
             ctx,
-            &scratch.hidden,
+            scratch.hidden.data(),
             &w.input_ln,
-            crate::layer::GLM52_RMS_EPS,
-            &mut scratch.layer.normed,
+            crate::config::GLM52_RMS_EPS,
+            HIDDEN,
+            1,
+            scratch.layer.normed.data_mut(),
         )?;
         glm52_layer_attention_half(
             ctx,
@@ -242,25 +243,25 @@ fn run_layer_prefill_ep8(
             0,
             true,
         )?;
-        let route = run_router(ctx, &moe.router, &scratch.layer.normed2)?;
+        let route = run_router(ctx, &moe.router, scratch.layer.normed2.data())?;
         let dispatched = glm52_moe_ep8_routed_forward(
             ctx,
             ep8,
             &moe.bank,
-            Some((&scratch.layer.normed2, &route, 1)),
+            Some((scratch.layer.normed2.data(), &route, 1)),
             global_tokens,
         )?;
         ensure!(dispatched, "rank-0 EP8 MoE returned no combined output");
-        let shared = moe.shared.forward(ctx, &scratch.layer.normed2)?;
+        let shared = moe.shared.forward(ctx, scratch.layer.normed2.data())?;
         add_into(
             ctx,
             ep8.combined(),
             &shared,
             HIDDEN,
-            &mut scratch.layer.mlp_out,
+            scratch.layer.mlp_out.data_mut(),
         )?;
         glm52_layer_finish(ctx, &mut scratch, 0)?;
-        let out_host = ctx.stream.clone_dtoh(&scratch.hidden.data)?;
+        let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
     Ok(outputs)

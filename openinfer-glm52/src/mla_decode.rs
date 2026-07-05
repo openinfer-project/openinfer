@@ -28,22 +28,29 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
+use crate::config::{
+    GLM52_HEADS, GLM52_HIDDEN, GLM52_KV_A_OUT, GLM52_KV_LORA_RANK, GLM52_Q_LORA_RANK,
+    GLM52_QK_HEAD_DIM, GLM52_QK_NOPE_HEAD_DIM, GLM52_QK_ROPE_HEAD_DIM, GLM52_RMS_EPS as RMS_EPS,
+    GLM52_V_HEAD_DIM,
+};
 use crate::fp8::{
     FP8_BLOCK, Glm52ProjBytes, ProjWeight, bytes_to_f32, e4m3_to_f32, fp8_linear_into,
 };
+use crate::rows::Rows;
 
-const HEADS: usize = 64;
-const HIDDEN: usize = 6144;
-const Q_LORA: usize = 2048;
-const QK_NOPE: usize = 192; // absorbed q nope width per head
-const Q_HEAD: usize = 256; // qk_nope(192) + qk_rope(64)
-const ROPE_DIM: usize = 64;
-const KV_LORA: usize = 512;
-const KV_A_OUT: usize = 576; // compressed_kv(512) + k_pe(64)
-const V_HEAD: usize = 256;
+// Local short names for the config-owned architecture constants (the module
+// is dense with shape math; the values live in one place).
+const HEADS: usize = GLM52_HEADS;
+const HIDDEN: usize = GLM52_HIDDEN;
+const Q_LORA: usize = GLM52_Q_LORA_RANK;
+const QK_NOPE: usize = GLM52_QK_NOPE_HEAD_DIM; // absorbed q nope width per head
+const Q_HEAD: usize = GLM52_QK_HEAD_DIM; // qk_nope(192) + qk_rope(64)
+const ROPE_DIM: usize = GLM52_QK_ROPE_HEAD_DIM;
+const KV_LORA: usize = GLM52_KV_LORA_RANK;
+const KV_A_OUT: usize = GLM52_KV_A_OUT; // compressed_kv(512) + k_pe(64)
+const V_HEAD: usize = GLM52_V_HEAD_DIM;
 const KV_B_ROWS_PER_HEAD: usize = QK_NOPE + V_HEAD; // 448
 const QUERY_DIM: usize = KV_LORA + ROPE_DIM; // 576
-const RMS_EPS: f32 = 1.0e-5;
 
 /// One MLA layer's attention weights, device-resident.
 pub(crate) struct Glm52MlaLayerWeights {
@@ -217,14 +224,13 @@ fn dequant_kv_b(
 /// to *produce* the top-k that the attend half then attends over. The row
 /// count is baked here so every front kernel derives it from one place.
 pub(crate) struct Glm52MlaFront {
-    pub(crate) tokens: usize,
-    q_a: CudaSlice<bf16>,                // [T, 2048] pre q_a_layernorm
-    pub(crate) q_resid: CudaSlice<bf16>, // [T, 2048] post q_a_layernorm
-    q_full: CudaSlice<bf16>,             // [T, 64, 256]
-    ckv: CudaSlice<bf16>,                // [T, 576] = compressed_kv | k_pe
-    kv_c_raw: CudaSlice<bf16>,           // [T, 512] pre kv_a_layernorm
-    kv_c: CudaSlice<bf16>,               // [T, 512] post kv_a_layernorm
-    k_pe: CudaSlice<bf16>,               // [T, 64] pre-rope
+    q_a: CudaSlice<bf16>,             // [T, 2048] pre q_a_layernorm
+    pub(crate) q_resid: Rows<Q_LORA>, // [T, 2048] post q_a_layernorm
+    q_full: CudaSlice<bf16>,          // [T, 64, 256]
+    ckv: CudaSlice<bf16>,             // [T, 576] = compressed_kv | k_pe
+    kv_c_raw: CudaSlice<bf16>,        // [T, 512] pre kv_a_layernorm
+    kv_c: CudaSlice<bf16>,            // [T, 512] post kv_a_layernorm
+    k_pe: CudaSlice<bf16>,            // [T, 64] pre-rope
     // Owned mma partial buffer for the front projections (q_a/q_b/kv_a). One
     // per scratch struct: the ctx/aux stream overlap must never share one.
     gemv_partial: CudaSlice<f32>,
@@ -232,11 +238,9 @@ pub(crate) struct Glm52MlaFront {
 
 impl Glm52MlaFront {
     pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
-        ensure!(tokens > 0, "GLM5.2 MLA front needs positive tokens");
         Ok(Self {
-            tokens,
             q_a: ctx.stream.alloc_zeros::<bf16>(tokens * Q_LORA)?,
-            q_resid: ctx.stream.alloc_zeros::<bf16>(tokens * Q_LORA)?,
+            q_resid: Rows::zeros(ctx, tokens)?,
             q_full: ctx.stream.alloc_zeros::<bf16>(tokens * HEADS * Q_HEAD)?,
             ckv: ctx.stream.alloc_zeros::<bf16>(tokens * KV_A_OUT)?,
             kv_c_raw: ctx.stream.alloc_zeros::<bf16>(tokens * KV_LORA)?,
@@ -247,6 +251,11 @@ impl Glm52MlaFront {
                 .alloc_zeros::<f32>(tokens * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
         })
     }
+
+    /// The step row count every front buffer was sized for.
+    pub(crate) fn tokens(&self) -> usize {
+        self.q_resid.tokens()
+    }
 }
 
 /// The q-phase of the MLA front: `q_a` projection + q_a_layernorm over the
@@ -256,16 +265,15 @@ impl Glm52MlaFront {
 pub(crate) fn glm52_mla_front_q_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
-    hidden: &CudaSlice<bf16>,
+    hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
-    let t = front.tokens;
-    ensure!(hidden.len() >= t * HIDDEN, "GLM5.2 MLA hidden too small");
+    let t = front.tokens();
     fp8_linear_into(
         ctx,
         &w.q_a,
         t,
-        hidden,
+        hidden.data(),
         Some(&mut front.gemv_partial),
         &mut front.q_a,
     )?; // [T, 2048]
@@ -276,7 +284,7 @@ pub(crate) fn glm52_mla_front_q_into(
         RMS_EPS,
         Q_LORA,
         t,
-        &mut front.q_resid,
+        front.q_resid.data_mut(),
     )
 }
 
@@ -285,15 +293,15 @@ pub(crate) fn glm52_mla_front_q_into(
 pub(crate) fn glm52_mla_front_rest_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
-    hidden: &CudaSlice<bf16>,
+    hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
-    let t = front.tokens;
+    let t = front.tokens();
     fp8_linear_into(
         ctx,
         &w.q_b,
         t,
-        &front.q_resid,
+        front.q_resid.data(),
         Some(&mut front.gemv_partial),
         &mut front.q_full,
     )?; // [T, 64, 256]
@@ -301,7 +309,7 @@ pub(crate) fn glm52_mla_front_rest_into(
         ctx,
         &w.kv_a,
         t,
-        hidden,
+        hidden.data(),
         Some(&mut front.gemv_partial),
         &mut front.ckv,
     )?; // [T, 576]
@@ -323,7 +331,7 @@ pub(crate) fn glm52_mla_front_rest_into(
 pub(crate) fn glm52_mla_front_into(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
-    hidden: &CudaSlice<bf16>,
+    hidden: &Rows<HIDDEN>,
     front: &mut Glm52MlaFront,
 ) -> Result<()> {
     glm52_mla_front_q_into(ctx, w, hidden, front)?;
@@ -383,25 +391,28 @@ impl Glm52MlaAttendScratch {
 pub(crate) fn glm52_mla_decode_forward(
     ctx: &DeviceContext,
     w: &Glm52MlaLayerWeights,
-    hidden: &CudaSlice<bf16>,
+    hidden: &Rows<HIDDEN>,
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     cache: &mut CudaSlice<u8>,
     position: usize,
     topk: &CudaSlice<i32>,
     sched: &Glm52MlaSchedMetadata,
-) -> Result<CudaSlice<bf16>> {
+) -> Result<Rows<HIDDEN>> {
     ensure!(
         position < sched.contract.num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
         "GLM5.2 MLA position {position} outside paged cache ({} blocks x {GLM52_FLASHMLA_SPARSE_PAGE_SIZE})",
         sched.contract.num_blocks
     );
-    let mut front = Glm52MlaFront::new(ctx, 1)?;
+    // Front, attend scratch, and output all sized from the plan's contract —
+    // the same one-construction-point coherence the production bucket state
+    // provides.
+    let mut front = Glm52MlaFront::new(ctx, sched.batch())?;
     let mut attend = Glm52MlaAttendScratch::new(ctx, &sched.contract)?;
     let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
     ctx.stream
         .memcpy_htod(&[position as i64], &mut slot_mapping)?;
-    let mut o = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+    let mut o = Rows::zeros(ctx, sched.batch())?;
     glm52_mla_front_into(ctx, w, hidden, &mut front)?;
     glm52_mla_attend_into(
         ctx,
@@ -485,15 +496,10 @@ pub(crate) fn glm52_mla_attend_into(
     topk: &CudaSlice<i32>,
     sched: &Glm52MlaSchedMetadata,
     s: &mut Glm52MlaAttendScratch,
-    out: &mut CudaSlice<bf16>,
+    out: &mut Rows<HIDDEN>,
 ) -> Result<()> {
     let contract = sched.contract;
     let t = contract.batch_size;
-    ensure!(
-        front.tokens == t,
-        "GLM5.2 MLA front rows {} != attend plan batch {t}",
-        front.tokens
-    );
     // Each row's new token is written to cache slot `slot_mapping[row]`
     // (device data, so the launch replays under CUDA graph capture); the
     // cache-pack kernel traps on a slot outside the paged window. The
@@ -596,5 +602,12 @@ pub(crate) fn glm52_mla_attend_into(
         V_HEAD,
         HEADS,
     )?;
-    fp8_linear_into(ctx, &w.o_proj, t, &s.v, Some(&mut s.gemv_partial), out) // [T, 6144]
+    fp8_linear_into(
+        ctx,
+        &w.o_proj,
+        t,
+        &s.v,
+        Some(&mut s.gemv_partial),
+        out.data_mut(),
+    ) // [T, 6144]
 }

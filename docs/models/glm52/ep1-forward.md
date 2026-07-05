@@ -95,11 +95,11 @@ Adaptation, not rewrite: the picks must land on main's refactored op surfaces (`
 
 ## Oracle gates
 
-Extends `tools/accuracy/glm52_oracle.py` + the `mla_oracle_gate.rs` pattern (probe consts, input-digest-first, fp8sim precision, `--emit rust`). Note: layer 3 (the first MoE layer) is a **shared-indexer** layer, so the MoE gate uses **layer 6** — the first layer that is both MoE and `full`-indexer, making the decoder-layer oracle self-contained.
+Extends `tools/accuracy/glm52_oracle.py` + the `oracle/mla.rs` pattern (probe consts, input-digest-first, fp8sim precision, `--emit rust`). Note: layer 3 (the first MoE layer) is a **shared-indexer** layer, so the MoE gate uses **layer 6** — the first layer that is both MoE and `full`-indexer, making the decoder-layer oracle self-contained.
 
-1. **`layer_oracle_gate.rs::layer_moe_oracle_gate`** — layer 6, full decoder layer via `--stage layer` (official `GlmMoeDsaDecoderLayer`, fp8sim linears incl. a lazy-dequant `Fp8SimExperts`): probes on `layer_out`, run for BOTH expert paths (Grouped and Gemv) against the same constants; router last-position selection emitted as a debugging reference.
-2. **`layer_oracle_gate.rs::layer_dense_oracle_gate`** — layer 0 full-layer probes (residual/norm wiring around the already-gated MLA brick + `fp8_mlp` at 12288).
-3. **`bookend_oracle_gate.rs`** — `--stage bookend`: embed-rows digest (exact — bf16 gather), logits probes, per-position argmax (exact).
+1. **`oracle/layer.rs::layer_moe_oracle_gate`** — layer 6, full decoder layer via `--stage layer` (official `GlmMoeDsaDecoderLayer`, fp8sim linears incl. a lazy-dequant `Fp8SimExperts`): probes on `layer_out`, run for BOTH expert paths (Grouped and Gemv) against the same constants; router last-position selection emitted as a debugging reference.
+2. **`oracle/layer.rs::layer_dense_oracle_gate`** — layer 0 full-layer probes (residual/norm wiring around the already-gated MLA brick + `fp8_mlp` at 12288).
+3. **`oracle/bookend.rs`** — `--stage bookend`: embed-rows digest (exact — bf16 gather), logits probes, per-position argmax (exact).
 4. **Regression pins**: Rust-vs-Rust sha256 on `topk_ids` + probe RMS on `layer_out`, same GPU (the indexer gate precedent).
 
 Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harness.md` pitfalls section.
@@ -107,7 +107,7 @@ Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harn
 ## Execution order
 
 1. Cherry-pick the kernel ops (router, moe_route, trtllm_grouped wrapper, moe_gemv) onto main's op surfaces; synthetic smoke for the grouped chain (multi-group, non-uniform token counts — the scale-relayout layouts are where garbage hides).
-2. `moe_decode.rs` (grouped spine + GEMV alternative behind one signature, arena-fed) + `moe_oracle_gate.rs` (layer 3) via the self-contained harness.
+2. `moe_decode.rs` (grouped spine + GEMV alternative behind one signature, arena-fed) + `oracle/layer.rs` (layer 3) via the self-contained harness.
 3. Cherry-pick `dense.rs`/`bookend.rs`; new `layer.rs` composition with cross-layer top-k threading; layer-0 gate.
 4. Bookend taps (embed/final-norm/logits/argmax).
 5. fmt/clippy, toxic-review pass, PR.

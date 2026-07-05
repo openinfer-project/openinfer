@@ -10,15 +10,13 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::tensor::DeviceContext;
 
+use crate::config::GLM52_HIDDEN;
 #[cfg(test)]
 use crate::fp8::Glm52ProjBytes;
 use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
 
-const HIDDEN: usize = 6144;
-const INTERMEDIATE: usize = 12288;
-
-/// The dense-layer intermediate width (sizes the shared decode mlp scratch).
-pub(crate) const GLM52_DENSE_INTERMEDIATE: usize = INTERMEDIATE;
+const HIDDEN: usize = GLM52_HIDDEN;
+const INTERMEDIATE: usize = crate::config::GLM52_DENSE_INTERMEDIATE;
 
 /// The fp8 projections of one dense MLP layer, resident on device. gate|up
 /// are packed into one `[2*INTERMEDIATE, HIDDEN]` projection at build (one

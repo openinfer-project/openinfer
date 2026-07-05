@@ -28,15 +28,16 @@ use half::bf16;
 use openinfer_kernels::ops::{
     Glm52DeepGemmMqaLogitsShape, Glm52FlashMlaSparseDecode, argmax_batch_bf16_split_partials_len,
 };
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
-use crate::dense::GLM52_DENSE_INTERMEDIATE;
+use crate::config::{GLM52_DENSE_INTERMEDIATE, GLM52_HIDDEN, GLM52_VOCAB};
+use crate::dspark::GLM52_DSPARK_CONTEXT_DIM;
 use crate::fp8::Glm52MlpScratch;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52LayerScratch;
 use crate::mla_decode::{Glm52MlaAttendScratch, Glm52MlaFront};
 use crate::moe_decode::{GLM52_SHARED_EXPERT_INTERMEDIATE, Glm52RouterScratch};
+use crate::rows::Rows;
 
 /// Everything one decode step writes, allocated once per rank and sized for
 /// the step's `tokens` rows.
@@ -50,14 +51,14 @@ pub(crate) struct Glm52DecodeScratch {
     pub(crate) layer: Glm52LayerScratch,
     /// The residual stream: embed writes it, every layer reads and rewrites
     /// it, the final norm consumes it.
-    pub(crate) hidden: DeviceVec,
+    pub(crate) hidden: Rows<GLM52_HIDDEN>,
     /// DSpark aux-hidden capture: each row's residual stream after the
     /// [`crate::dspark::GLM52_DSPARK_AUX_LAYERS`] layers, concatenated per row
     /// (`[tokens, 5 * GLM52_HIDDEN]`). Written inside the captured step graph
     /// (5 strided row copies), read by the draft lane between steps.
-    pub(crate) captured: DeviceVec,
-    pub(crate) final_normed: DeviceVec,
-    pub(crate) logits: DeviceVec,
+    pub(crate) captured: Rows<GLM52_DSPARK_CONTEXT_DIM>,
+    pub(crate) final_normed: Rows<GLM52_HIDDEN>,
+    pub(crate) logits: Rows<GLM52_VOCAB>,
     /// Device greedy argmax outputs: each row's top logit bf16 value (for the
     /// crash-early non-finite guard) and its index — the step's per-row
     /// 6-byte D2H egress. The two-stage argmax stages per-4096-tile partials
@@ -88,10 +89,10 @@ impl Glm52DecodeScratch {
             shared_mlp: Glm52MlpScratch::new(ctx, GLM52_SHARED_EXPERT_INTERMEDIATE, tokens)?,
             router: Glm52RouterScratch::new(ctx, tokens)?,
             layer: Glm52LayerScratch::new(ctx, tokens)?,
-            hidden: DeviceVec::zeros(ctx, tokens * GLM52_HIDDEN)?,
-            captured: DeviceVec::zeros(ctx, tokens * crate::dspark::GLM52_DSPARK_CONTEXT_DIM)?,
-            final_normed: DeviceVec::zeros(ctx, tokens * GLM52_HIDDEN)?,
-            logits: DeviceVec::zeros(ctx, tokens * GLM52_VOCAB)?,
+            hidden: Rows::zeros(ctx, tokens)?,
+            captured: Rows::zeros(ctx, tokens)?,
+            final_normed: Rows::zeros(ctx, tokens)?,
+            logits: Rows::zeros(ctx, tokens)?,
             argmax_partial_values: ctx
                 .stream
                 .alloc_zeros::<f32>(argmax_batch_bf16_split_partials_len(tokens, GLM52_VOCAB))?,

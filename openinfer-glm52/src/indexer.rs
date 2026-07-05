@@ -45,14 +45,16 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::DeviceContext;
 
+use crate::config::{GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_INDEX_HEADS, GLM52_Q_LORA_RANK};
 use crate::fp8::{FP8_BLOCK, ProjWeight, fp8_linear_into};
 #[cfg(test)]
 use crate::fp8::{Glm52ProjBytes, fp8_linear};
+use crate::rows::Rows;
 
-const HIDDEN: usize = 6144;
-const Q_LORA: usize = 2048;
-const INDEX_HEADS: usize = 32;
-const INDEX_HEAD_DIM: usize = 128;
+const HIDDEN: usize = GLM52_HIDDEN;
+const Q_LORA: usize = GLM52_Q_LORA_RANK;
+const INDEX_HEADS: usize = GLM52_INDEX_HEADS;
+const INDEX_HEAD_DIM: usize = GLM52_INDEX_HEAD_DIM;
 // vllm: softmax_scale = head_dim ** -0.5 = 128 ** -0.5
 const SOFTMAX_SCALE: f32 = 0.088_388_35; // 1.0 / 128.0f32.sqrt()
 // vllm: n_heads ** -0.5 = 32 ** -0.5
@@ -341,10 +343,11 @@ impl Glm52IndexerScratch {
 /// - `hidden` is the step's hidden states (`[T, 6144]`).
 /// - `cos`/`sin` carry one indexer RoPE `[32]` row per token.
 /// - `index_k_cache` is the paged fp8 indexer key cache (mutable — each row's
-///   new k is quantized and written into it at `slot_mapping[row]`).
+///   new k is quantized and written into it at `slot_mapping[row]`). Its
+///   layout is read from the scratch's build-time shape (one source of
+///   truth — a shape/layout mismatch is unrepresentable).
 /// - `block_table` (`[T, block_table_stride]`) / `seq_lens` (`[T]`) describe
-///   each row's paged KV region for logits + slot conversion; they must match
-///   the shape the scratch was built with.
+///   each row's paged KV region for logits + slot conversion.
 ///
 /// `s.global_slots` ends as `topk_indices[T, topk]` (i32, `-1`-padded for
 /// short context). `topk` is the attend plan's index-list length (≤ 2048): a
@@ -355,12 +358,11 @@ impl Glm52IndexerScratch {
 pub(crate) fn glm52_indexer_forward_into(
     ctx: &DeviceContext,
     w: &Glm52IndexerLayerWeights,
-    hidden: &CudaSlice<bf16>,
-    q_resid: &CudaSlice<bf16>,
+    hidden: &Rows<HIDDEN>,
+    q_resid: &Rows<Q_LORA>,
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     index_k_cache: &mut CudaSlice<u8>,
-    cache_layout: Glm52IndexerCacheLayout,
     slot_mapping: &CudaSlice<i64>,
     block_table: &CudaSlice<i32>,
     seq_lens: &CudaSlice<i32>,
@@ -369,36 +371,23 @@ pub(crate) fn glm52_indexer_forward_into(
 ) -> Result<()> {
     let shape = s.shape;
     let t = shape.batch_size;
-    ensure!(
-        hidden.len() >= t * HIDDEN,
-        "GLM5.2 indexer hidden too small"
-    );
-    ensure!(
-        q_resid.len() >= t * Q_LORA,
-        "GLM5.2 indexer q_resid too small"
-    );
-    ensure!(
-        topk > 0 && topk <= GLM52_INDEXER_TOPK,
-        "GLM5.2 indexer topk {topk} outside 1..={GLM52_INDEXER_TOPK}"
-    );
-    ensure!(
-        shape.num_kv_blocks == cache_layout.cache_blocks
-            && shape.block_kv == cache_layout.cache_block_size
-            && shape.kv_cache_stride_bytes == cache_layout.cache_block_stride_bytes
-            && t * shape.block_table_stride == block_table.len(),
-        "GLM5.2 indexer scratch shape drifted from the step's cache layout"
-    );
-    ensure!(
-        slot_mapping.len() >= t && seq_lens.len() >= t,
-        "GLM5.2 indexer slot_mapping/seq_lens too small for batch {t}"
-    );
+    // The paged cache layout the scratch shape was built from
+    // (`Glm52IndexerScratch::decode_shape` copies these three fields in).
+    let cache_layout = Glm52IndexerCacheLayout {
+        cache_blocks: shape.num_kv_blocks,
+        cache_block_size: shape.block_kv,
+        cache_block_stride_bytes: shape.kv_cache_stride_bytes,
+    };
+    // `topk` comes from the attend plan; its 1..=GLM52_INDEXER_TOPK range is
+    // pinned at compile time against both tier constants (model.rs const
+    // asserts).
 
     // ---- projections ----
     fp8_linear_into(
         ctx,
         &w.wq_b,
         t,
-        q_resid,
+        q_resid.data(),
         Some(&mut s.gemv_partial),
         &mut s.q,
     )?; // [T, 32*128]
@@ -406,7 +395,7 @@ pub(crate) fn glm52_indexer_forward_into(
         ctx,
         &w.wk,
         t,
-        hidden,
+        hidden.data(),
         Some(&mut s.gemv_partial),
         &mut s.k_raw,
     )?; // [T, 128]
@@ -427,7 +416,7 @@ pub(crate) fn glm52_indexer_forward_into(
         &w.weights_proj,
         HIDDEN, // lda = k (row stride of transposed weights)
         0,      // stride_a (batch=1, unused)
-        hidden,
+        hidden.data(),
         HIDDEN, // ldb = k
         0,      // stride_b
         &mut s.weights_bf16,
@@ -567,8 +556,8 @@ pub(crate) fn glm52_indexer_forward_into(
 pub(crate) fn glm52_indexer_forward(
     ctx: &DeviceContext,
     w: &Glm52IndexerLayerWeights,
-    hidden: &CudaSlice<bf16>,
-    q_resid: &CudaSlice<bf16>,
+    hidden: &Rows<HIDDEN>,
+    q_resid: &Rows<Q_LORA>,
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
     index_k_cache: &mut CudaSlice<u8>,
@@ -595,7 +584,6 @@ pub(crate) fn glm52_indexer_forward(
         cos,
         sin,
         index_k_cache,
-        cache_layout,
         slot_mapping,
         block_table,
         seq_lens,

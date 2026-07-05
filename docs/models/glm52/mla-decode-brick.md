@@ -25,7 +25,7 @@ cargo check --release -p openinfer-glm52
 
 ## Oracle gate
 
-Delivered in the follow-up `feat/glm52-oracle-harness`: `tools/accuracy/glm52_oracle.py` + `src/mla_oracle_gate.rs`. Design, verification (negative controls), and pitfalls in `oracle-harness.md`.
+Delivered in the follow-up `feat/glm52-oracle-harness`: `tools/accuracy/glm52_oracle.py` + `src/oracle/mla.rs`. Design, verification (negative controls), and pitfalls in `oracle-harness.md`.
 
 ## Hand-written CUDA kernels
 

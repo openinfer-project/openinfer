@@ -8,28 +8,21 @@
 //! per-MoE-layer DeepEP collectives.
 
 mod bookend;
-#[cfg(test)]
-mod bookend_oracle_gate;
 mod config;
 mod dense;
 mod dspark;
 mod fp8;
 mod indexer;
 #[cfg(test)]
-mod indexer_oracle_gate;
-#[cfg(test)]
 mod indexer_smoke;
 mod layer;
-#[cfg(test)]
-mod layer_ep8_oracle_gate;
-#[cfg(test)]
-mod layer_oracle_gate;
 mod mla_decode;
-#[cfg(test)]
-mod mla_oracle_gate;
 mod model;
 mod moe_decode;
 mod moe_ep8;
+#[cfg(test)]
+mod oracle;
+mod rows;
 mod runner;
 mod scheduler;
 mod scratch;

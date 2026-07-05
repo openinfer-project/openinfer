@@ -230,11 +230,12 @@ fn indexer_oracle_gate() -> Result<()> {
 
     // ---- last position inputs ----
     let last_hidden_host = &hidden_host[position * HIDDEN..(position + 1) * HIDDEN];
-    let mut last_hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
-    ctx.stream.memcpy_htod(last_hidden_host, &mut last_hidden)?;
+    let mut last_hidden = crate::rows::Rows::<HIDDEN>::zeros(&ctx, 1)?;
+    ctx.stream
+        .memcpy_htod(last_hidden_host, last_hidden.data_mut())?;
 
-    let mut q_resid = ctx.stream.alloc_zeros::<bf16>(Q_LORA)?;
-    ctx.stream.memcpy_htod(q_resid_last, &mut q_resid)?;
+    let mut q_resid = crate::rows::Rows::<Q_LORA>::zeros(&ctx, 1)?;
+    ctx.stream.memcpy_htod(q_resid_last, q_resid.data_mut())?;
 
     let mut cos = ctx.stream.alloc_zeros::<bf16>(32)?;
     let mut sin = ctx.stream.alloc_zeros::<bf16>(32)?;

@@ -281,10 +281,10 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     // attends over the full prefix [0..=p] via a -1-padded top-k list.
     let mut outputs = Vec::with_capacity(ORACLE_CTX * HIDDEN);
     for position in 0..ORACLE_CTX {
-        let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
+        let mut hidden = crate::rows::Rows::<HIDDEN>::zeros(&ctx, 1)?;
         ctx.stream.memcpy_htod(
             &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
-            &mut hidden,
+            hidden.data_mut(),
         )?;
         let (cos_host, sin_host) = rope_tables(position);
         let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
@@ -302,7 +302,7 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
         let o = glm52_mla_decode_forward(
             &ctx, &w, &hidden, &cos, &sin, &mut cache, position, &topk_dev, &mla_sched,
         )?;
-        let o_host = ctx.stream.clone_dtoh(&o)?;
+        let o_host = ctx.stream.clone_dtoh(o.data())?;
         outputs.extend(o_host.iter().map(|v| v.to_f32()));
     }
 

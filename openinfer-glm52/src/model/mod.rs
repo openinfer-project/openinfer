@@ -28,13 +28,15 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
-use crate::config::{GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_LAYERS, GLM52_VOCAB};
+use crate::config::{
+    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_RMS_EPS, GLM52_VOCAB,
+};
 use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward_into};
 use crate::fp8::ProjWeight;
 use crate::indexer::{Glm52IndexerLayerWeights, Glm52IndexerScratch};
 use crate::layer::{
-    GLM52_RMS_EPS, Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer,
-    Glm52LayerMlp, glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
+    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
+    glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
 };
 use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
 use crate::moe_decode::{
@@ -110,6 +112,14 @@ pub(crate) struct Glm52StepShape {
 /// run the full load+GEMM and are only masked in softmax). Must be a multiple
 /// of the 64-entry topk block.
 pub(crate) const GLM52_MLA_TOPK_SHORT: usize = 256;
+
+// Both attention tiers' `topk` feed the DSA indexer's top-k selection, whose
+// buffers are sized for GLM52_INDEX_TOPK rows — pin the range here so the
+// indexer forward never needs to re-check it per layer per step.
+const _: () = assert!(GLM52_MLA_TOPK_SHORT > 0 && GLM52_MLA_TOPK_SHORT.is_multiple_of(64));
+const _: () = assert!(GLM52_MLA_TOPK_SHORT <= GLM52_INDEX_TOPK);
+const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK > 0);
+const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK <= GLM52_INDEX_TOPK);
 
 pub(crate) const ROPE_HALF: usize = 32;
 const ROPE_THETA: f32 = 8_000_000.0;
@@ -279,7 +289,6 @@ pub(crate) struct Glm52RankModel {
     /// plans, scratch, graphs, and block table together — a graph can never
     /// be taken from one shape and restored into another.
     buckets: [Glm52BucketState; GLM52_DECODE_BUCKETS.len()],
-    index_cache_layout: Glm52IndexerCacheLayout,
     /// `[GLM52_MAX_BATCH_PER_RANK, blocks_per_slot]` — row b maps slot b's
     /// context into its disjoint region of the index-K cache. Static: written
     /// once at build; every bucket's table is gathered from it per step.
@@ -360,7 +369,7 @@ impl Glm52RankModel {
                     "GLM5.2 capture bucket {bucket} is not a member of {GLM52_DECODE_BUCKETS:?}"
                 )
             })?;
-        Ok(&state.scratch.captured.data)
+        Ok(state.scratch.captured.data())
     }
 
     pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
@@ -551,7 +560,6 @@ impl Glm52RankModel {
             final_norm,
             lm_head,
             buckets,
-            index_cache_layout,
             block_table,
             blocks_per_slot,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
@@ -763,7 +771,6 @@ impl Glm52RankModel {
             idx_cos: &self.cos,
             idx_sin: &self.sin,
             mla_sched: &bucket.scheds[tier],
-            index_cache_layout: self.index_cache_layout,
             slot_mapping: &self.slot_mapping,
             block_table: &bucket.block_table,
             seq_lens: &self.seq_lens,
@@ -816,18 +823,18 @@ fn run_step_body(
     global_tokens: usize,
 ) -> Result<()> {
     let batch = step.mla_sched.batch();
-    glm52_embed_into(ctx, embed, token_ids, batch, &mut s.hidden)?;
+    glm52_embed_into(ctx, embed, token_ids, &mut s.hidden)?;
     // Layer 0's input norm is standalone (the embedding is the residual);
     // every later layer's input norm is fused into the previous layer's
     // closing add (`glm52_layer_finish_fused`).
     rms_norm_rows_into(
         ctx,
-        &s.hidden.data,
+        s.hidden.data(),
         &layers[0].input_ln,
         GLM52_RMS_EPS,
         GLM52_HIDDEN,
         batch,
-        &mut s.layer.normed.data,
+        s.layer.normed.data_mut(),
     )?;
     let mut carry_ready = false;
     for (layer, (weights, cache)) in layers.iter().zip(caches.iter_mut()).enumerate() {
@@ -848,9 +855,9 @@ fn run_step_body(
             Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
                 ctx,
                 dense,
-                &s.layer.normed2,
+                s.layer.normed2.data(),
                 &mut s.dense_mlp,
-                &mut s.layer.mlp_out,
+                s.layer.mlp_out.data_mut(),
             )?,
             Glm52LayerMlp::MoeEp8(moe) => {
                 // Fork: the shared expert only needs `normed2`, so it runs on
@@ -864,18 +871,18 @@ fn run_step_body(
                 aux.stream.wait(&normed_ready)?;
                 moe.shared.forward_into(
                     aux,
-                    &s.layer.normed2,
+                    s.layer.normed2.data(),
                     &mut s.shared_mlp,
-                    &mut s.layer.shared_out,
+                    s.layer.shared_out.data_mut(),
                 )?;
                 let shared_done = aux.stream.record_event(None)?;
 
-                run_router_into(ctx, &moe.router, &s.layer.normed2, &mut s.router)?;
+                run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
                 let dispatched = glm52_moe_ep8_routed_forward(
                     ctx,
                     ep8,
                     &moe.bank,
-                    Some((&s.layer.normed2, &s.router.route, batch)),
+                    Some((s.layer.normed2.data(), &s.router.route, batch)),
                     global_tokens,
                 )
                 .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
@@ -888,9 +895,9 @@ fn run_step_body(
                 add_into(
                     ctx,
                     ep8.combined(),
-                    &s.layer.shared_out,
+                    s.layer.shared_out.data(),
                     batch * GLM52_HIDDEN,
-                    &mut s.layer.mlp_out,
+                    s.layer.mlp_out.data_mut(),
                 )?;
             }
             #[cfg(test)]
@@ -914,9 +921,9 @@ fn run_step_body(
         {
             copy_hidden_rows_raw_into(
                 ctx,
-                &s.layer.attn[parity],
+                s.layer.attn[parity].data(),
                 GLM52_HIDDEN,
-                &mut s.captured.data,
+                s.captured.data_mut(),
                 crate::dspark::GLM52_DSPARK_CONTEXT_DIM,
                 feature * GLM52_HIDDEN,
                 batch,
@@ -924,8 +931,8 @@ fn run_step_body(
         }
     }
 
-    glm52_final_norm_into(ctx, &s.hidden, final_norm, batch, &mut s.final_normed)?;
-    glm52_lm_head_into(ctx, &s.final_normed, lm_head, batch, &mut s.logits)?;
+    glm52_final_norm_into(ctx, &s.hidden, final_norm, &mut s.final_normed)?;
+    glm52_lm_head_into(ctx, &s.final_normed, lm_head, &mut s.logits)?;
     // Device greedy argmax per row (same semantics as a host scan: lowest
     // index wins ties, NaN never wins) — the step's egress shrinks from the
     // full vocab rows to 6 bytes per row, and the kernel chain ends on-device
@@ -935,7 +942,7 @@ fn run_step_body(
     // row's result is independent of its slot-mates.
     argmax_bf16_split_into(
         ctx,
-        &s.logits.data,
+        s.logits.data(),
         batch,
         GLM52_VOCAB,
         &mut s.argmax_partial_values,

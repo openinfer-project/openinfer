@@ -195,7 +195,7 @@ fn bookend_oracle_gate() -> Result<()> {
     for &id in &token_ids {
         ctx.stream.memcpy_htod(&[id], &mut token_id_buf)?;
         let row = glm52_embed(&ctx, &embed, &token_id_buf)?;
-        embed_rows.extend(ctx.stream.clone_dtoh(&row.data)?);
+        embed_rows.extend(ctx.stream.clone_dtoh(row.data())?);
     }
     let embed_digest = bf16_digest(&embed_rows);
     ensure!(
@@ -208,16 +208,16 @@ fn bookend_oracle_gate() -> Result<()> {
     ensure!(ORACLE_ARGMAX.len() == ORACLE_CTX, "argmax length mismatch");
     let mut logits_all: Vec<f32> = Vec::with_capacity(ORACLE_CTX * GLM52_VOCAB);
     for position in 0..ORACLE_CTX {
-        let mut hidden = DeviceVec::zeros(&ctx, GLM52_HIDDEN)?;
+        let mut hidden = crate::rows::Rows::<GLM52_HIDDEN>::zeros(&ctx, 1)?;
         ctx.stream.memcpy_htod(
             &hidden_host[position * GLM52_HIDDEN..(position + 1) * GLM52_HIDDEN],
-            &mut hidden.data,
+            hidden.data_mut(),
         )?;
         let normed = glm52_final_norm(&ctx, &hidden, &norm_weight)?;
         let logits = glm52_lm_head(&ctx, &normed, &lm_head)?;
         let logits_host: Vec<f32> = ctx
             .stream
-            .clone_dtoh(&logits.data)?
+            .clone_dtoh(logits.data())?
             .iter()
             .map(|v| v.to_f32())
             .collect();

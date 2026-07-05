@@ -56,10 +56,10 @@ use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
 #[cfg(test)]
 use crate::fp8::{Glm52ProjBytes, bytes_to_f32};
 
-pub(crate) const HIDDEN: usize = 6144;
-pub(crate) const EXPERTS: usize = 256;
-pub(crate) const TOPK: usize = 8;
-const INTERMEDIATE: usize = 2048;
+pub(crate) const HIDDEN: usize = crate::config::GLM52_HIDDEN;
+pub(crate) const EXPERTS: usize = crate::config::GLM52_ROUTED_EXPERTS;
+pub(crate) const TOPK: usize = crate::config::GLM52_TOPK;
+const INTERMEDIATE: usize = crate::config::GLM52_EXPERT_INTERMEDIATE;
 pub(crate) const QUANT_GROUP: usize = 128;
 
 pub(crate) const W13_N: usize = 2 * INTERMEDIATE; // 4096 (gate|up)

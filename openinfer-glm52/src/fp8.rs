@@ -240,20 +240,11 @@ pub(crate) fn fp8_mlp_into(
     s: &mut Glm52MlpScratch,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
-    ensure!(
-        gate_up.n.is_multiple_of(2),
-        "GLM5.2 fp8_mlp packed gate|up n {} is odd",
-        gate_up.n
-    );
+    // gate_up/down internal consistency is pinned where the weight bundles
+    // are built (`Glm52DenseMlpWeights` / `Glm52MoeSharedExpert` check exact
+    // shapes); the scratch pairing is the one cross-object join this call
+    // introduces, so it is the one thing validated here.
     let intermediate = gate_up.n / 2;
-    ensure!(
-        down.k == intermediate && gate_up.k == down.n,
-        "GLM5.2 fp8_mlp shape mismatch: gate_up [{},{}], down [{},{}]",
-        gate_up.n,
-        gate_up.k,
-        down.n,
-        down.k
-    );
     ensure!(
         s.intermediate == intermediate,
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",

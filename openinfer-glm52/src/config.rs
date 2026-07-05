@@ -31,6 +31,9 @@ pub const GLM52_TOPK: usize = 8;
 const GLM52_SHARED_EXPERTS: usize = 1;
 const GLM52_ROUTED_SCALING_FACTOR: f64 = 2.5;
 const GLM52_RMS_NORM_EPS: f64 = 1.0e-5;
+/// The f32 the GPU norm kernels consume (every RMSNorm in the model shares
+/// the one checkpoint eps that `probe_config_json` validates).
+pub(crate) const GLM52_RMS_EPS: f32 = GLM52_RMS_NORM_EPS as f32;
 
 pub const GLM52_INDEX_TOPK: usize = 2048;
 const GLM52_INDEX_TOPK_FREQ: usize = 4;

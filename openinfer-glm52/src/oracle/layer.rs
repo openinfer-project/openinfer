@@ -538,7 +538,7 @@ fn run_layer_prefill(
     for position in 0..oracle_ctx {
         ctx.stream.memcpy_htod(
             &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
-            &mut scratch.hidden.data,
+            scratch.hidden.data_mut(),
         )?;
         let (cos_host, sin_host) = rope_tables(position);
         ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
@@ -554,7 +554,6 @@ fn run_layer_prefill(
             idx_cos: &cos,
             idx_sin: &sin,
             mla_sched: &mla_sched,
-            index_cache_layout,
             slot_mapping: &slot_mapping,
             block_table: &block_table,
             seq_lens: &seq_lens,
@@ -569,7 +568,7 @@ fn run_layer_prefill(
             &mut scratch,
             &mut carry_ready,
         )?;
-        let out_host = ctx.stream.clone_dtoh(&scratch.hidden.data)?;
+        let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
     // Debugging aid: dump the engine outputs (f32 LE) for offline diffing

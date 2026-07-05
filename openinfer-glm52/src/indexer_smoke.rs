@@ -14,11 +14,13 @@ use half::bf16;
 use openinfer_kernels::ops::{GLM52_INDEXER_TOPK, Glm52IndexerCacheLayout};
 use openinfer_kernels::tensor::DeviceContext;
 
+use crate::config::{GLM52_HIDDEN, GLM52_Q_LORA_RANK};
 use crate::fp8::{FP8_BLOCK, Glm52ProjBytes};
 use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward};
+use crate::rows::Rows;
 
-const HIDDEN: usize = 6144;
-const Q_LORA: usize = 2048;
+const HIDDEN: usize = GLM52_HIDDEN;
+const Q_LORA: usize = GLM52_Q_LORA_RANK;
 const INDEX_HEADS: usize = 32;
 const INDEX_HEAD_DIM: usize = 128;
 const CACHE_BLOCK_SIZE: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
@@ -78,8 +80,8 @@ fn indexer_smoke() -> Result<()> {
     )?;
 
     // ---- inputs ----
-    let hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
-    let q_resid = ctx.stream.alloc_zeros::<bf16>(Q_LORA)?;
+    let hidden: Rows<HIDDEN> = Rows::zeros(&ctx, 1)?;
+    let q_resid: Rows<Q_LORA> = Rows::zeros(&ctx, 1)?;
     let cos = ctx.stream.alloc_zeros::<bf16>(32)?;
     let sin = ctx.stream.alloc_zeros::<bf16>(32)?;
 
