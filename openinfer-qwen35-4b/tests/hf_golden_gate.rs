@@ -65,7 +65,7 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
 
 /// Sizes whose fixtures are committed in `test_data/`; a missing file for
 /// these is a broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["4b", "9b"];
+const COMMITTED_FIXTURE_SIZES: &[&str] = &["4b", "9b", "27b"];
 
 fn default_fixture_path(size: &str, long: bool) -> String {
     let kind = if long {
