@@ -240,8 +240,111 @@ stale binaries whose numbers happened to look plausible. The gate script now
 refuses to run unless `nm` finds the new kernel symbols; keep that pattern.
 (Silver lining: the stale run produced the TRUE same-day baseline sweep.)
 
+## MegaMoE (DeepGEMM PR #323) evaluated — NOT usable at decode payloads (jz-38, 2026-07-05)
+
+MegaMoE is DeepGEMM's mega-kernel fusing dispatch → L1 GEMM → SwiGLU → L2
+GEMM → combine into one launch over symmetric NVLink memory (official release
+is SM100 FP8×FP4 only; [PR #323](https://github.com/deepseek-ai/DeepGEMM/pull/323)
+is the community SM90 FP8×FP8 adaptation, actively tuned — its tip has a
+"Tune SM90 MegaMoE decode heuristics for GLM5.2" commit from ByteDance).
+Evaluated as the candidate replacement for our per-layer MoE chain.
+
+Post-#567 re-profile first (same node-granularity methodology as above, 19.6
+ms/step untraced): dispatch+combine kernels are now **4.75 ms/step
+median×instances, 7.73 ms/step wait-inclusive** — the whole MoE block
+(collectives + quant/SiLU glue + masked GEMM) is ~8.3 ms med×inst ≈ **103
+µs/layer kernel-resident, ~145 µs/layer wait-inclusive**, the largest bucket
+in the step. That is the prize any fusion has to beat.
+
+Measured (PR #323 tip a444600, sgl tvm-ffi wheel built with CUDA 12.8, kexi
+venv torch 2.11 read-only, isolated `--target` pydeps; accuracy suite
+**28/28 PASS** at GLM5.2 shapes, diff ~6e-4 vs torch reference — the kernel
+is *correct*):
+
+```
+cd ~/develop/xingming/megamoe-deepgemm && PYTHONPATH=~/develop/xingming/pydeps \
+python -u sgl_deep_gemm/tests/test_mega_moe_hopper.py --fused-only-sweep \
+  --batches 1 2 4 8 16 32 64 --hidden 6144 --intermediate-hidden 2048 \
+  --num-experts 256 --num-topk 8 --num-max-tokens-per-rank 128 \
+  --activation-clamp inf --num-processes 8
+```
+
+| tokens/rank | fused µs/call | HBM GB/s | our chain per layer |
+|---|---|---|---|
+| 1 | 201.7 | 749 | ~103 µs kernel-resident / ~145 µs wait-inclusive |
+| 8 | 345.9 | 2732 | |
+| 64 | 399.6 | 3051 | |
+
+**~200 µs structural floor at decode payloads — ~2× slower than our existing
+unfused chain.** 75 layers × 200 µs = 15 ms/step of MoE alone. Ruled out as
+causes: swapAB off (`DG_SM90_FP8_SWAP_AB=0` → 189 µs, same), small symm
+buffer (`--num-max-tokens-per-rank 8` → 200 µs, same). The floor is the
+in-kernel NVLink handshake + expert-wave scheduling: our whole comm set
+(dispatch 12.4 + combine 30 + reduce 9.6 + prologue/copy 6.4) is ~58 µs
+kernel-resident for the same protocol work.
+
+Why the community's "2.7× at bs=1 on H20" doesn't transfer: their baseline is
+DeepEP v2 + grouped GEMM orchestrated per-kernel from Python — MegaMoE's win
+there is launch/orchestration overhead we already removed with the whole-step
+CUDA graph. Against a graph-replayed chain, only MegaMoE's floor remains.
+Revisit only if the SM90 kernel's small-payload floor drops ~4× upstream, or
+for Blackwell (official SM100 path is FP8×FP4 — a weight-format change with
+its own accuracy question). Checkout preserved at
+`~/develop/xingming/megamoe-deepgemm` (branch pr323).
+
+## Arrival-stagger anatomy + the cuGraphLaunch discovery (jz-38, 2026-07-05)
+
+Methodology upgrade first: `--cuda-graph-trace=graph` records one range per
+whole-step replay per device at **near-zero overhead** (traced 2715 ms vs
+untraced 2708 ms for the same request — vs +100% under node tracing), giving
+honest per-rank step timelines. Analyzer: `graph_stagger.py` /
+`stagger_analyze.py` on jz-38.
+
+Where the "wait-inclusive minus kernel-median" ~3 ms/step actually sits (solo,
+19.6–20.4 ms/step):
+
+| component | measured | mechanism |
+|---|---|---|
+| **`cuGraphLaunch` on the critical path** | **~700 µs/step/rank** (steady p50 700, p90 930; API trace avg 766) | host-side launch cost of the ~2000-node step graph; `exec_start − launch_end ≈ −4 µs` proves the GPU idles through it. Userspace libcuda work (strace: no ioctl, 99% sched_yield) |
+| step-boundary device idle | 641–810 µs/step | the launch above + argmax D2H → host token processing → coordinator round |
+| cross-rank step-start spread | 364 µs median / max 965 | ranks' launches land at different times; absorbed entirely by the layer-0 dispatch barrier (interior dispatch arrival spread is 4 µs — the protocol itself is tight) |
+| per-layer combine straggler | 44 µs/layer spread (p90 67) × 75 | uneven per-rank expert-hit chains; in solo mode partly ARTIFICIAL — 7/8 rows are pads all routing like token 0, hammering the same 8 experts every layer |
+
+Refuted along the way (each with a measurement): deep C-state exit latency
+(`/dev/cpu_dma_latency`=0 → no change), and — via a standalone microbench
+(`~/develop/xingming/coop_bench/`) — every structural suspect for the launch
+cost: node count (2025-node graph → 4.1 µs), cooperative, cluster, PDL,
+fork/join event nodes, 200 KB dynamic smem, 8-thread simultaneous launches
+(6–9 µs each), pageable-D2H lock contention, and per-node parameter bytes
+(512 B/node → 4.2 µs). The microbench cannot reproduce 700 µs; the cause
+lives in the production context state (8 peer-mapped contexts, ~45 real
+cubins, NVLink/host-mapped memory), not in any single graph feature. An
+earlier "inter-step host gap ~0.05 ms" note came from an in-process probe
+that did not see the e2e server's launch path — superseded by these numbers.
+
+**Double-replay probe (decisive): launch-ahead works on the real graph.** A
+6-line jz-38-only patch launched the same step graph twice back-to-back
+(inputs unchanged → the second replay recomputes the first bit-identically;
+generation text unchanged). Graph-trace gaps went bimodal exactly as
+predicted: **intra-step replay gap 5.4 µs median (p90 5.7)** — the second
+launch's ~700 µs host cost fully hides under the first replay's 20 ms
+execution — vs 810 µs at the true step boundary. Wall 39.9 ms/step = 2 ×
+20.2 − 0.5. Patch reverted, clean binary rebuilt.
+
+Validated lever: **device-fed decode loop** — a feed kernel copies the
+argmax result into the next step's input-token buffer on device, per-step
+scalars advance on device, and the host enqueues replay i+1 while i executes
+(EOS/streaming trail one step; a discarded speculative step is harmless).
+Expected: the 641–810 µs boundary idle AND the 364 µs cross-rank spread off
+the critical path, ~1 ms/step at solo (≈5%), same absolute saving per
+spec-8 verify step. Second lever, independent: mask pad-row routing
+(`topk_idx = -1`) in partial buckets to kill the artificial combine
+straggler and 7/8 of solo collective payload.
+
 ## Next action
 
-Follow-ups: #542 (collective latency floor — the expert-GEMM half is done,
-the wait-structure half remains), #559 residual (combine +1.9, MLA +1.2 at
-b8), #541 indexer reference re-pin.
+Build the device-fed decode loop (launch-ahead validated above — ~1 ms/step);
+then pad-row masked routing. Remaining from #542: per-layer combine straggler
+under real diverse load = expert imbalance (EPLB territory, deferred by user
+2026-07-05). MegaMoE fusion measured OUT (section above). #559 residual
+(combine +1.9, MLA +1.2 at b8), #541 indexer reference re-pin.
