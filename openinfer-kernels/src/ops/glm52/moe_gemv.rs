@@ -171,12 +171,25 @@ pub fn glm52_moe_combine_slots_launch(
     .map_err(|err| anyhow!("GLM5.2 combine-slots launch failed: {err}"))
 }
 
+/// f32 partial-scratch floats PER ROW the tensor-core batched GEMV path can
+/// need: max ksplit (16) × max whitelisted n (dense gate|up 24576). Callers
+/// size their buffer as `rows * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW` — one
+/// constant instead of mirroring the CUDA-side per-shape config table; the
+/// launcher still guards the exact requirement and rejects a short buffer.
+pub const GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW: usize = 16 * 24576;
+
 /// Plain weight-only fp8 GEMV (bs=1): `out[n] = deq(weight[n,k]) @ activation[k]`
 /// with the bf16 activation read directly (no activation quant, no scale
 /// relayout) and the e4m3 block-scale weight dequanted on the fly. Replaces
 /// the TRTLLM CUTLASS block-scale GEMM at m=1, where the M-tile pads 1->64 and
 /// runs compute-bound. `scale_bytes` is the checkpoint `weight_scale_inv`
 /// (f32 `[ceil(n/128), k/128]`) kept as raw bytes.
+///
+/// `scratch` is the caller-owned f32 partial buffer for the rows-4/8
+/// tensor-core path. Ownership contract: the layer forward overlaps the ctx
+/// and aux streams, so a scratch buffer must belong to exactly one launch
+/// stream — every scratch struct owns its own. Pass `None` only on rows ≤ 2
+/// paths; an mma-routed launch without a buffer fails loudly.
 pub fn glm52_fp8_weight_only_gemv_launch(
     ctx: &DeviceContext,
     rows: usize,
@@ -185,6 +198,7 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     activation: &CudaSlice<bf16>,
     weight: &CudaSlice<u8>,
     scale_bytes: &CudaSlice<u8>,
+    scratch: Option<&mut CudaSlice<f32>>,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(
@@ -210,15 +224,26 @@ pub fn glm52_fp8_weight_only_gemv_launch(
     let (w_ptr, _w) = weight.device_ptr(&ctx.stream);
     let (s_ptr, _s) = scale_bytes.device_ptr(&ctx.stream);
     let (out_ptr, _o) = out.device_ptr_mut(&ctx.stream);
-    // rows == 1 runs the m=1 kernel; rows > 1 the weight-stationary batched
-    // kernel (per-row bit-identical to m=1; the CUDA side whitelists the
-    // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here).
+    let (scr_ptr, scr_floats, _scr) = match scratch {
+        Some(buf) => {
+            let len = buf.len();
+            let (ptr, guard) = buf.device_ptr_mut(&ctx.stream);
+            (ptr as *mut f32, len, Some(guard))
+        }
+        None => (std::ptr::null_mut(), 0, None),
+    };
+    // rows == 1 runs the m=1 kernel; rows 2 the bit-parity register tile;
+    // rows 4/8 the tensor-core mma path on winning shapes (deterministic per
+    // bucket, not bit-identical to m=1). The CUDA side whitelists the
+    // supported batches — a drifted GLM52_DECODE_BUCKETS crashes here.
     unsafe {
         ffi::glm52_fp8_weight_only_gemv_batched_cuda(
             act_ptr as *const ffi::Half,
             w_ptr as *const u8,
             s_ptr as *const f32,
             out_ptr as *mut ffi::Half,
+            scr_ptr,
+            scr_floats,
             rows as i32,
             n as i32,
             k as i32,

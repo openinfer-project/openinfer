@@ -138,6 +138,48 @@ untouched.** Matches the microbench-weighted −9.1 ms prediction. Artifacts:
 traces + kern-sum CSVs `~/develop/xingming/b8span* b1ctrl*`, microbench
 `~/develop/xingming/gemv_bench` on jz-38.
 
+## Tensor-core GEMV for batches 4/8 (jz-38, 2026-07-05, #559)
+
+Post-#558 re-attribution (same two-window method, fixed binary): the b8−b1
+delta fell +22.9 → +15.2 ms and the GEMV was still the largest term:
+
+| component (per rank-step, totals) | b1 | b8 post-#558 | Δ |
+|---|---|---|---|
+| weight-only GEMV | 6.4 | 13.2 | **+6.8** |
+| expert grouped GEMM | 3.4 | 7.2 | +3.8 |
+| MoE combine | 4.3 | 6.2 | +1.9 |
+| glue | 5.8 | 7.0 | +1.2 |
+| MLA splitkv | 2.1 | 3.3 | +1.2 |
+| dispatch (incl wait) | 5.3 | 5.7 | +0.4 |
+
+ncu on the ROWS=4 tile showed the wall had MOVED: L1TEX 46% (fixed), DRAM 24%,
+Compute 65% — the BATCH×16-term f32 FMA chain itself. Computed CUDA-core
+floor for o_proj at batch 8 ≈ 32 µs vs the 28.5 µs weight-read floor;
+occupancy and cache-policy variants (KernelWiki NVFP4-GEMV levers) measured
+flat or worse. Conclusion: the CUDA-core design space was exhausted — the fix
+is `mma.m16n8k16.bf16` (fp8 e4m3 decodes losslessly to bf16).
+
+Key trick: no weight repack. The mma k-slot→column map is a free permutation
+when A and B agree, so σ(step s, tid, d) = tid·16+4s+d over a k64 super-chunk
+reads the *original* row-major layout with one 16-byte LDG per owned row —
+no second weight copy, m=1/batch-2 paths byte-untouched. KSPLIT k-slices
+write f32 partials to a 12.6 MB per-device scratch (allocated by the
+pre-capture bucket warm-up) and a fixed-order epilogue reduces them:
+deterministic and replay-stable per bucket, but **not** bit-identical to m=1
+(validated by tolerance: max_rel < 2e-2, ≥90 % of bf16 outputs exact, plus
+e2e greedy coherence and dspark accept-rate parity).
+
+A packed fragment layout is ~30 % faster still on the big shapes (o_proj 32 vs
+46 µs) but needs either a second weight copy (+15 GB/rank — doesn't fit) or an
+m=1 kernel rewrite that changes bucket-1 numerics; recorded as a non-goal.
+The vendored TRT-LLM dense fp8 `gemm()` entry (w8a8 library route) is a no-op
+in our AOT setup — its SM90 dense path expects the DeepGEMM JIT runtime.
+
+**e2e measured (jz-38): solo span-8 ingest step 36.9 → 32.2 ms (−12.6 %),
+c64 diverse decode 1046 → 1121 tok/s (−8 % step); b1/b2 flat.** Iteration ran
+on the in-process `glm52_step_bench` (one weight load, ~3 min/cycle).
+
 ## Next action
 
-Follow-ups: #542 (collective latency floor / GEMV BW / `num_sm_parts`), #541 indexer reference re-pin.
+Follow-ups: #542 (collective latency floor / expert GEMM swapAB), #559 residual
+(expert GEMM +3.8, combine +1.9, MLA +1.2 at b8), #541 indexer reference re-pin.

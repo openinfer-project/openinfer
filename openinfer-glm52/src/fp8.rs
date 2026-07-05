@@ -14,7 +14,8 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use openinfer_kernels::ops::{
-    glm52_fp8_weight_only_gemv_launch, glm52_silu_and_mul_weighted_bf16_launch,
+    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, glm52_fp8_weight_only_gemv_launch,
+    glm52_silu_and_mul_weighted_bf16_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -157,13 +158,17 @@ pub(crate) fn pack_proj_pair(
 
 /// One fp8 projection into a pre-allocated output: weight-only GEMV of `rows`
 /// bf16 activation rows against the fp8 `[n,k]` weight, block scale dequanted
-/// on the fly. rows > 1 runs the weight-stationary batched kernel — the weight
-/// is still read once, and every row is bit-identical to the rows=1 kernel.
+/// on the fly. rows > 1 runs a weight-stationary batched kernel — the weight
+/// is still read once. rows 1/2 keep bit-stable CUDA-core paths; rows 4/8
+/// dispatch to a tensor-core mma path on winning shapes (deterministic per
+/// bucket, not bit-identical to rows=1 — cross-bucket FP divergence is the
+/// accepted whole-step contract; numerics notes in glm52_moe_gemv.cu).
 pub(crate) fn fp8_linear_into(
     ctx: &DeviceContext,
     w: &ProjWeight,
     rows: usize,
     input: &CudaSlice<bf16>,
+    scratch: Option<&mut CudaSlice<f32>>,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(
@@ -172,7 +177,9 @@ pub(crate) fn fp8_linear_into(
         input.len(),
         w.k
     );
-    glm52_fp8_weight_only_gemv_launch(ctx, rows, w.n, w.k, input, &w.weight, &w.scale, out)
+    glm52_fp8_weight_only_gemv_launch(
+        ctx, rows, w.n, w.k, input, &w.weight, &w.scale, scratch, out,
+    )
 }
 
 /// Allocating convenience over [`fp8_linear_into`] for the oracle-gate/test
@@ -184,7 +191,7 @@ pub(crate) fn fp8_linear(
     input: &CudaSlice<bf16>,
 ) -> Result<CudaSlice<bf16>> {
     let mut out = ctx.stream.alloc_zeros::<bf16>(w.n)?;
-    fp8_linear_into(ctx, w, 1, input, &mut out)?;
+    fp8_linear_into(ctx, w, 1, input, None, &mut out)?;
     Ok(out)
 }
 
@@ -196,6 +203,9 @@ pub(crate) struct Glm52MlpScratch {
     rows: usize,
     gate_up: CudaSlice<bf16>,
     silu_out: CudaSlice<bf16>,
+    // Owned mma partial buffer: one per scratch so the ctx/aux stream overlap
+    // can never see a shared pointer (see glm52_fp8_weight_only_gemv_launch).
+    gemv_partial: CudaSlice<f32>,
 }
 
 impl Glm52MlpScratch {
@@ -210,6 +220,9 @@ impl Glm52MlpScratch {
             rows,
             gate_up: ctx.stream.alloc_zeros::<bf16>(rows * 2 * intermediate)?,
             silu_out: ctx.stream.alloc_zeros::<bf16>(rows * intermediate)?,
+            gemv_partial: ctx
+                .stream
+                .alloc_zeros::<f32>(rows * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW)?,
         })
     }
 }
@@ -246,7 +259,14 @@ pub(crate) fn fp8_mlp_into(
         "GLM5.2 fp8_mlp scratch sized for intermediate {} but weights have {intermediate}",
         s.intermediate
     );
-    fp8_linear_into(ctx, gate_up, s.rows, input, &mut s.gate_up)?;
+    fp8_linear_into(
+        ctx,
+        gate_up,
+        s.rows,
+        input,
+        Some(&mut s.gemv_partial),
+        &mut s.gate_up,
+    )?;
     // bf16 SwiGLU (no route weight, no activation quant) -> bf16 down input.
     glm52_silu_and_mul_weighted_bf16_launch(
         ctx,
@@ -256,7 +276,14 @@ pub(crate) fn fp8_mlp_into(
         None,
         &mut s.silu_out,
     )?;
-    fp8_linear_into(ctx, down, s.rows, &s.silu_out, out)
+    fp8_linear_into(
+        ctx,
+        down,
+        s.rows,
+        &s.silu_out,
+        Some(&mut s.gemv_partial),
+        out,
+    )
 }
 
 /// Allocating convenience over [`fp8_mlp_into`] for the oracle-gate/test

@@ -325,6 +325,8 @@ unsafe extern "C" {
         weight: *const u8,
         weight_scale: *const f32,
         out: *mut Half,
+        scratch: *mut f32,
+        scratch_floats: usize,
         batch: i32,
         n: i32,
         k: i32,
