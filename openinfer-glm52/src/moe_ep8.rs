@@ -127,9 +127,7 @@ impl Glm52MoeEp8State {
             info.num_ranks
         );
         ensure!(
-            info.num_local_experts as usize == GLM52_DEEPGEMM_MASKED_GROUPS
-                && (info.num_ranks as usize) * (info.decode_max_tokens_per_rank as usize)
-                    <= GLM52_DEEPGEMM_MASKED_CAP,
+            info.num_local_experts as usize == GLM52_DEEPGEMM_MASKED_GROUPS,
             "GLM5.2 masked grouped GEMM instantiation does not cover the DeepEP shim: {info:?}"
         );
         let ep = Glm52DeepEp::new(unique_id, num_ranks, rank_idx)
@@ -214,6 +212,14 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
     ensure!(
         global_tokens >= num_tokens,
         "GLM5.2 EP8 MoE global_tokens {global_tokens} < local tokens {num_tokens}"
+    );
+    // Each source token contributes at most one row per expert, so the
+    // masked per-expert capacity covers the step iff it covers the global
+    // token count (a protocol constant — the DeepEP shim's own capacity is
+    // larger; the metadata kernel device-traps as the backstop).
+    ensure!(
+        global_tokens <= GLM52_DEEPGEMM_MASKED_CAP,
+        "GLM5.2 EP8 MoE global_tokens {global_tokens} exceeds the masked grouped GEMM per-expert capacity {GLM52_DEEPGEMM_MASKED_CAP}"
     );
     let expanded_rows = global_tokens * TOPK;
     let bound_rows = expanded.min(
