@@ -12,6 +12,10 @@
 //!   cargo test --release -p openinfer-glm52 --features glm52 --lib mla_oracle -- --ignored --nocapture
 //! ```
 
+// The probe constants are pasted verbatim from the harness output; reformatting
+// them for these lints would churn on every regeneration.
+#![allow(clippy::unreadable_literal, clippy::excessive_precision)]
+
 mod bookend;
 mod indexer;
 mod layer;

@@ -410,7 +410,7 @@ pub(crate) fn load_decoder_layer(
                 )?,
                 shared: crate::moe_decode::Glm52MoeSharedExpert::new(
                     ctx,
-                    crate::fp8::ProjWeight::upload(
+                    &crate::fp8::ProjWeight::upload(
                         ctx,
                         &t.proj(
                             &format!("{mp}.shared_experts.gate_proj"),
@@ -418,7 +418,7 @@ pub(crate) fn load_decoder_layer(
                             HIDDEN,
                         )?,
                     )?,
-                    crate::fp8::ProjWeight::upload(
+                    &crate::fp8::ProjWeight::upload(
                         ctx,
                         &t.proj(
                             &format!("{mp}.shared_experts.up_proj"),

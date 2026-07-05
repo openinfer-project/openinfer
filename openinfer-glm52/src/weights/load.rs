@@ -313,7 +313,7 @@ impl<'a> CurrentShardMmap<'a> {
 impl Drop for CurrentShardMmap<'_> {
     fn drop(&mut self) {
         if self.stream_work.get() {
-            if let Err(error) = self.ctx.set_current().and_then(|_| self.ctx.sync()) {
+            if let Err(error) = self.ctx.set_current().and_then(|()| self.ctx.sync()) {
                 error!(
                     "failed to synchronize GLM5.2 rank {} before dropping current H2D mmap: {error:#}",
                     self.rank
@@ -400,7 +400,7 @@ impl Drop for MmapH2dLifetimeGuard<'_> {
         if self.pending_mmaps.is_empty() && self.live_mmap_groups.is_empty() {
             return;
         }
-        if let Err(error) = self.ctx.set_current().and_then(|_| self.ctx.sync()) {
+        if let Err(error) = self.ctx.set_current().and_then(|()| self.ctx.sync()) {
             error!(
                 "failed to synchronize GLM5.2 rank {} before dropping H2D mmap guard: {error:#}",
                 self.rank

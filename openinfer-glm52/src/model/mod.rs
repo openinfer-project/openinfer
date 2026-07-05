@@ -196,9 +196,12 @@ fn build_decoder_layer(
             GLM52_HIDDEN,
         )?,
         take_bf16_vec(ctx, w, &format!("{p}.self_attn.kv_a_layernorm.weight"), 512)?,
-        kv_b,
+        &kv_b,
         take_proj(w, &format!("{p}.self_attn.o_proj"), GLM52_HIDDEN, 16_384)?,
     )?;
+    // kv_b is only dequanted into the absorb factors, not stored — free the
+    // fp8 blob before the indexer/MLP uploads below.
+    drop(kv_b);
 
     let indexer = if glm52_layer_has_full_indexer(layer) {
         let ip = format!("{p}.self_attn.indexer");
@@ -228,8 +231,8 @@ fn build_decoder_layer(
     let mlp = if layer < GLM52_DENSE_LAYERS {
         Glm52LayerMlp::Dense(Box::new(Glm52DenseMlpWeights::from_device(
             ctx,
-            take_proj(w, &format!("{mp}.gate_proj"), 12_288, GLM52_HIDDEN)?,
-            take_proj(w, &format!("{mp}.up_proj"), 12_288, GLM52_HIDDEN)?,
+            &take_proj(w, &format!("{mp}.gate_proj"), 12_288, GLM52_HIDDEN)?,
+            &take_proj(w, &format!("{mp}.up_proj"), 12_288, GLM52_HIDDEN)?,
             take_proj(w, &format!("{mp}.down_proj"), GLM52_HIDDEN, 12_288)?,
         )?))
     } else {
@@ -240,13 +243,13 @@ fn build_decoder_layer(
             )?,
             shared: Glm52MoeSharedExpert::new(
                 ctx,
-                take_proj(
+                &take_proj(
                     w,
                     &format!("{mp}.shared_experts.gate_proj"),
                     2048,
                     GLM52_HIDDEN,
                 )?,
-                take_proj(
+                &take_proj(
                     w,
                     &format!("{mp}.shared_experts.up_proj"),
                     2048,
@@ -726,8 +729,8 @@ impl Glm52RankModel {
         ctx.stream
             .memcpy_htod(&slots_host, &mut self.slot_mapping)?;
         ctx.stream.memcpy_htod(&seq_lens_host, &mut self.seq_lens)?;
-        for row in 0..batch {
-            self.device_positions[row] = inputs[row].1;
+        for (dst, &(_, position)) in self.device_positions.iter_mut().zip(&inputs[..batch]) {
+            *dst = position;
         }
         // Gather each row's rotary table row (a bit-exact row copy).
         embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;

@@ -490,7 +490,7 @@ pub(crate) fn run_dp8_coordinator(
     // capture stall. Row 0 at position GLM52_MLA_TOPK_SHORT lifts the step
     // into the full tier; every row is a padding write into a free slot's
     // dead cache region.
-    for &bucket in GLM52_DECODE_BUCKETS.iter() {
+    for &bucket in &GLM52_DECODE_BUCKETS {
         for full_tier in [false, true] {
             let mut shape = Glm52StepShape {
                 bucket,

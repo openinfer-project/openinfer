@@ -350,6 +350,6 @@ pub(crate) fn glm52_decoder_layer_forward(
         Glm52LayerMlp::MoeEp8(_) => anyhow::bail!(
             "GLM5.2 EP8 MoE layers require the collective driver (moe_ep8), not the single-layer forward"
         ),
-    };
+    }
     glm52_layer_finish(ctx, s, 0)
 }

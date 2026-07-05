@@ -3,8 +3,6 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 mod flashmla_sparse;
 pub use flashmla_sparse::*;
-mod hadamard;
-pub use hadamard::*;
 mod indexer;
 pub use indexer::*;
 mod indexer_rope;
@@ -22,15 +20,6 @@ unsafe extern "C" {
         slot_mapping: *mut i64,
         seq_lens: *mut i32,
         rows: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_deepgemm_mn_major_tma_aligned_f32_cuda(
-        input: *const f32,
-        output: *mut f32,
-        rows: i32,
-        scale_cols: i32,
-        aligned_rows: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -68,50 +57,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // --- TRTLLM FP8 block-scale linear (m=1 dense projection) -----------------
-    pub fn glm52_trtllm_fp8_linear_contract_cuda(
-        m: i32,
-        n: i32,
-        k: i32,
-        weight_scale_rows: i32,
-        weight_scale_cols: i32,
-        activation_scale_cols: i32,
-    ) -> CUresult;
-
-    pub fn glm52_trtllm_fp8_linear_workspace_size_cuda(
-        m: i32,
-        n: i32,
-        k: i32,
-        workspace_bytes: *mut usize,
-    ) -> CUresult;
-
-    pub fn glm52_trtllm_fp8_linear_launch_cuda(
-        a: *const u8,
-        a_scale: *const f32,
-        b: *const u8,
-        b_scale: *const f32,
-        out: *mut Half,
-        workspace: *mut std::ffi::c_void,
-        workspace_bytes: usize,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // --- TRTLLM FP8 block-scale grouped MoE (PR3, compiled now) ---------------
-    pub fn glm52_trtllm_grouped_fp8_contract_cuda(
-        operand_kind: i32,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        weight_scale_rows: i32,
-        weight_scale_cols: i32,
-        activation_scale_cols: i32,
-        activation_scale_trtllm_rows: i32,
-    ) -> CUresult;
-
     pub fn glm52_trtllm_grouped_fp8_workspace_size_cuda(
         operand_kind: i32,
         groups: i32,
@@ -193,29 +139,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_fp8_per_token_group_quant_bf16_bounded_cuda(
-        input: *const Half,
-        output: *mut u8,
-        scales: *mut f32,
-        rows: i32,
-        hidden_dim: i32,
-        group_size: i32,
-        row_bound: *const i64,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_cuda(
-        input: *const Half,
-        topk_weights: *const f32,
-        output: *mut u8,
-        scales: *mut f32,
-        rows: i32,
-        hidden_size: i32,
-        group_size: i32,
-        row_bound: *const i64,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn glm52_fp8_per_token_group_quant_bf16_masked_cuda(
         input: *const Half,
         output: *mut u8,
@@ -240,16 +163,6 @@ unsafe extern "C" {
         row_bound: *const i64,
         row_map: *const i32,
         masked_cap: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_silu_and_mul_per_token_group_quant_bf16_cuda(
-        input: *const Half,
-        output: *mut u8,
-        scales: *mut f32,
-        rows: i32,
-        hidden_size: i32,
-        group_size: i32,
         stream: CUstream,
     ) -> CUresult;
 

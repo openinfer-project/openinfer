@@ -94,6 +94,8 @@ pub(crate) fn expert_placement(
     name: &str,
     rank_experts: &std::ops::Range<usize>,
 ) -> Result<Option<Glm52ExpertPlacement>> {
+    use Glm52ExpertRegionKind::{W2Scale, W2Weight, W13Scale, W13Weight};
+
     let Some((layer, rest)) = name
         .strip_prefix("model.layers.")
         .and_then(|rest| rest.split_once(".mlp.experts."))
@@ -115,7 +117,6 @@ pub(crate) fn expert_placement(
     );
     let local = expert - rank_experts.start;
 
-    use Glm52ExpertRegionKind::*;
     let (region, offset) = match proj {
         "gate_proj.weight" => (W13Weight, local * EXPERT_W13_WEIGHT_STRIDE),
         "up_proj.weight" => (
@@ -571,7 +572,7 @@ pub(crate) fn retype_owned<T>(
     bytes: cudarc::driver::CudaSlice<u8>,
 ) -> Result<cudarc::driver::CudaSlice<T>> {
     ensure!(
-        bytes.len() % std::mem::size_of::<T>() == 0,
+        bytes.len().is_multiple_of(std::mem::size_of::<T>()),
         "GLM5.2 retype: {} bytes is not a multiple of element size {}",
         bytes.len(),
         std::mem::size_of::<T>()

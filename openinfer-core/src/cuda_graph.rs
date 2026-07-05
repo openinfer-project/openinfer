@@ -42,7 +42,7 @@ pub struct CudaGraphState {
     /// this field. `Drop::drop` runs before the struct's fields are dropped, so
     /// holding the `Arc` here guarantees the context outlives the destroy calls
     /// regardless of field order. `None` until the first capture instantiates.
-    _ctx: Option<Arc<CudaContext>>,
+    ctx_anchor: Option<Arc<CudaContext>>,
 }
 
 // SAFETY: the graph/exec handles are only ever touched from the single
@@ -61,7 +61,7 @@ impl CudaGraphState {
         Self {
             graph: std::ptr::null_mut(),
             exec: std::ptr::null_mut(),
-            _ctx: None,
+            ctx_anchor: None,
         }
     }
 
@@ -130,7 +130,7 @@ impl CudaGraphState {
         // stuck in the capturing state, then propagate the original error.
         if let Err(e) = kernels() {
             let mut aborted: CUgraph = std::ptr::null_mut();
-            unsafe { sys::cuStreamEndCapture(stream, &mut aborted) };
+            unsafe { sys::cuStreamEndCapture(stream, &raw mut aborted) };
             if !aborted.is_null() {
                 unsafe { sys::cuGraphDestroy(aborted) };
             }
@@ -140,14 +140,14 @@ impl CudaGraphState {
         synchronize(CudaGraphPhase::BeforeEndCapture);
         let mut graph: CUgraph = std::ptr::null_mut();
         check(
-            unsafe { sys::cuStreamEndCapture(stream, &mut graph) },
+            unsafe { sys::cuStreamEndCapture(stream, &raw mut graph) },
             "cuStreamEndCapture",
         )?;
         let mut exec: CUgraphExec = std::ptr::null_mut();
         check(
             unsafe {
                 sys::cuGraphInstantiateWithFlags(
-                    &mut exec,
+                    &raw mut exec,
                     graph,
                     CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64,
                 )
@@ -156,7 +156,7 @@ impl CudaGraphState {
         )?;
         self.graph = graph;
         self.exec = exec;
-        self._ctx = Some(ctx.ctx.clone());
+        self.ctx_anchor = Some(ctx.ctx.clone());
         synchronize(CudaGraphPhase::AfterEndCapture);
         debug!("CUDA Graph captured successfully");
 

@@ -83,29 +83,6 @@ impl Glm52TrtllmGroupedFp8Contract {
     }
 }
 
-pub fn glm52_trtllm_grouped_fp8_contract_validate(
-    kind: Glm52TrtllmGroupedFp8Kind,
-    contract: Glm52TrtllmGroupedFp8Contract,
-) -> Result<()> {
-    contract.validate(kind)?;
-    let result = unsafe {
-        ffi::glm52_trtllm_grouped_fp8_contract_cuda(
-            kind.abi(),
-            contract.groups as i32,
-            contract.m_capacity as i32,
-            contract.n as i32,
-            contract.k as i32,
-            contract.weight_scale_rows as i32,
-            contract.weight_scale_cols as i32,
-            contract.activation_scale_cols as i32,
-            contract.activation_scale_trtllm_rows as i32,
-        )
-    };
-    result
-        .result()
-        .map_err(|err| anyhow!("GLM5.2 TRTLLM grouped FP8 ABI contract check failed: {err}"))
-}
-
 pub fn glm52_trtllm_grouped_fp8_workspace_size(
     kind: Glm52TrtllmGroupedFp8Kind,
     contract: Glm52TrtllmGroupedFp8Contract,

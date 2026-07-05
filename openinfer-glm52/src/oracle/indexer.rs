@@ -136,15 +136,21 @@ fn indexer_oracle_gate() -> Result<()> {
     let mmap = crate::weights::mmap_file(&probes_path)?;
     let st = safetensors::SafeTensors::deserialize(mmap.as_ref())?;
 
+    // safetensors data() is a byte view into the mmap with no alignment
+    // guarantee — decode per element instead of casting the pointer.
+    let bf16_vec = |data: &[u8]| -> Vec<bf16> {
+        data.chunks_exact(2)
+            .map(|b| bf16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    };
+
     let hidden_data = st.tensor("hidden")?.data();
     ensure!(
         hidden_data.len() == ORACLE_CTX * HIDDEN * 2,
         "hidden size mismatch"
     );
-    let hidden_host: &[bf16] = unsafe {
-        std::slice::from_raw_parts(hidden_data.as_ptr().cast::<bf16>(), ORACLE_CTX * HIDDEN)
-    };
-    let hidden_digest = bf16_digest(hidden_host);
+    let hidden_host: Vec<bf16> = bf16_vec(hidden_data);
+    let hidden_digest = bf16_digest(&hidden_host);
     ensure!(
         hidden_digest == ORACLE_HIDDEN_DIGEST,
         "hidden digest {hidden_digest} != oracle {ORACLE_HIDDEN_DIGEST}: \
@@ -153,21 +159,18 @@ fn indexer_oracle_gate() -> Result<()> {
 
     let cos_data = st.tensor("cos")?.data();
     ensure!(cos_data.len() == ORACLE_CTX * 64 * 2, "cos size mismatch");
-    let cos_host: &[bf16] =
-        unsafe { std::slice::from_raw_parts(cos_data.as_ptr().cast::<bf16>(), ORACLE_CTX * 64) };
+    let cos_host: Vec<bf16> = bf16_vec(cos_data);
 
     let sin_data = st.tensor("sin")?.data();
     ensure!(sin_data.len() == ORACLE_CTX * 64 * 2, "sin size mismatch");
-    let sin_host: &[bf16] =
-        unsafe { std::slice::from_raw_parts(sin_data.as_ptr().cast::<bf16>(), ORACLE_CTX * 64) };
+    let sin_host: Vec<bf16> = bf16_vec(sin_data);
 
     let qr_data = st.tensor("q_resid")?.data();
     ensure!(
         qr_data.len() == ORACLE_CTX * Q_LORA * 2,
         "q_resid size mismatch"
     );
-    let qr_host: &[bf16] =
-        unsafe { std::slice::from_raw_parts(qr_data.as_ptr().cast::<bf16>(), ORACLE_CTX * Q_LORA) };
+    let qr_host: Vec<bf16> = bf16_vec(qr_data);
     let q_resid_last: &[bf16] = &qr_host[position * Q_LORA..(position + 1) * Q_LORA];
 
     let topk_data = st.tensor("topk_indices")?.data();
@@ -175,12 +178,10 @@ fn indexer_oracle_gate() -> Result<()> {
         topk_data.len() == ORACLE_CTX * GLM52_INDEXER_TOPK * 4,
         "topk size mismatch"
     );
-    let topk_all: &[i32] = unsafe {
-        std::slice::from_raw_parts(
-            topk_data.as_ptr().cast::<i32>(),
-            ORACLE_CTX * GLM52_INDEXER_TOPK,
-        )
-    };
+    let topk_all: Vec<i32> = topk_data
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
     let oracle_topk: &[i32] =
         &topk_all[position * GLM52_INDEXER_TOPK..(position + 1) * GLM52_INDEXER_TOPK];
 

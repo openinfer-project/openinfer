@@ -37,12 +37,12 @@ struct DeviceBuf {
 impl DeviceBuf {
     fn alloc(bytes: usize) -> Result<Self> {
         let mut ptr = ptr::null_mut();
-        cuda_check(unsafe { cudaMalloc(&mut ptr, bytes) })?;
+        cuda_check(unsafe { cudaMalloc(&raw mut ptr, bytes) })?;
         Ok(Self { ptr })
     }
 
     fn from_host<T: Copy>(data: &[T]) -> Result<Self> {
-        let bytes = data.len() * size_of::<T>();
+        let bytes = std::mem::size_of_val(data);
         let buf = Self::alloc(bytes)?;
         if bytes > 0 {
             cuda_check(unsafe {
@@ -106,7 +106,7 @@ fn cu_check(r: CUresult) -> Result<()> {
 /// Returns Ok(true) on skip (caller early-returns), Ok(false) on success.
 const STREAM: CUstream = ptr::null_mut();
 
-// ─── indexer cache: quant + pack → gather round-trip ──────────────────────
+// ─── indexer cache: quant + pack → readback ───────────────────────────────
 
 fn indexer_cache_round_trip() -> Result<()> {
     let tokens = 4;
@@ -131,7 +131,7 @@ fn indexer_cache_round_trip() -> Result<()> {
     cu_check(unsafe {
         ffi::glm52_indexer_k_quant_and_cache_cuda(
             k_dev.ptr as *const ffi::Half,
-            cache_dev.ptr as *mut u8,
+            cache_dev.ptr.cast::<u8>(),
             slot_dev.ptr as *const i64,
             tokens as i32,
             head_dim as i32,
@@ -144,34 +144,16 @@ fn indexer_cache_round_trip() -> Result<()> {
     })?;
     cuda_check(unsafe { cudaDeviceSynchronize() })?;
 
-    // Gather back
-    let block_table: Vec<i32> = vec![0];
-    let cu_seq_lens: Vec<i32> = vec![0, tokens as i32];
-    let block_dev = DeviceBuf::from_host(&block_table)?;
-    let cu_dev = DeviceBuf::from_host(&cu_seq_lens)?;
-    let dst_k = DeviceBuf::zeroed(tokens * head_dim)?;
-    let dst_scale = DeviceBuf::zeroed(tokens * 4)?;
-
-    cu_check(unsafe {
-        ffi::glm52_indexer_k_gather_quant_cache_cuda(
-            cache_dev.ptr as *const u8,
-            dst_k.ptr as *mut u8,
-            dst_scale.ptr as *mut u8,
-            block_dev.ptr as *const i32,
-            cu_dev.ptr as *const i32,
-            1, // batch_size
-            1, // num_blocks_per_seq
-            tokens as i32,
-            head_dim as i32,
-            128, // quant_block_size
-            cache_block_size as i32,
-            stride as i64,
-            STREAM,
-        )
-    })?;
-    cuda_check(unsafe { cudaDeviceSynchronize() })?;
-
-    let scales: Vec<f32> = dst_scale.to_host(tokens)?;
+    // Read the cache back directly: per block, block_size×head_dim fp8 bytes,
+    // then block_size f32 scales.
+    let cache_host: Vec<u8> = cache_dev.to_host(cache_bytes)?;
+    let scale_base = cache_block_size * head_dim;
+    let scales: Vec<f32> = (0..tokens)
+        .map(|t| {
+            let b = &cache_host[scale_base + t * 4..scale_base + (t + 1) * 4];
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        })
+        .collect();
     for (i, &s) in scales.iter().enumerate() {
         ensure!(s > 0.0, "indexer cache: scale[{}] = {}, expected > 0", i, s);
     }
@@ -193,16 +175,18 @@ fn local_topk_to_slots_multi_token_stride() -> Result<()> {
     let offsets: Vec<i32> = vec![0, 1, 2, 3, 0, 1, 2, 3];
     let seq_lens: Vec<i32> = vec![4, 4];
 
+    let num_slots = 2 * 4; // num_tokens * topk
+
     let offsets_dev = DeviceBuf::from_host(&offsets)?;
     let block_dev = DeviceBuf::from_host(&block_table)?;
     let seq_dev = DeviceBuf::from_host(&seq_lens)?;
-    let slots_dev = DeviceBuf::zeroed(8 * size_of::<i32>())?;
+    let slots_dev = DeviceBuf::zeroed(num_slots * size_of::<i32>())?;
     let lens_dev = DeviceBuf::zeroed(2 * size_of::<i32>())?;
 
     cu_check(unsafe {
         ffi::glm52_indexer_local_topk_to_slots_cuda(
-            slots_dev.ptr as *mut i32,
-            lens_dev.ptr as *mut i32,
+            slots_dev.ptr.cast::<i32>(),
+            lens_dev.ptr.cast::<i32>(),
             offsets_dev.ptr as *const i32,
             4, // local_topk_stride (== topk)
             seq_dev.ptr as *const i32,
@@ -239,49 +223,6 @@ fn local_topk_to_slots_multi_token_stride() -> Result<()> {
     Ok(())
 }
 
-// ─── Hadamard ─────────────────────────────────────────────────────────────
-
-fn hadamard_correctness() -> Result<()> {
-    let head_dim = 128;
-    let input: Vec<bf16> = vec![bf16::from_f32(1.0); head_dim];
-
-    let in_dev = DeviceBuf::from_host(&input)?;
-    let out_dev = DeviceBuf::zeroed(head_dim * size_of::<bf16>())?;
-
-    cu_check(unsafe {
-        ffi::glm52_indexer_hadamard_bf16_cuda(
-            in_dev.ptr as *const ffi::Half,
-            out_dev.ptr as *mut ffi::Half,
-            1, // tokens
-            head_dim as i32,
-            STREAM,
-        )
-    })?;
-    cuda_check(unsafe { cudaDeviceSynchronize() })?;
-
-    let output: Vec<bf16> = out_dev.to_host(head_dim)?;
-
-    // Row 0 of H_128 is all +1, so output[0] = sum(1..128) * (1/sqrt(128)) = sqrt(128)
-    let expected = (head_dim as f32).sqrt();
-    let got = output[0].to_f32();
-    ensure!(
-        (got - expected).abs() < 0.1,
-        "Hadamard[0] = {}, expected ~{}",
-        got,
-        expected
-    );
-
-    // Row 1 has half +1 half -1, so output[1] ≈ 0
-    let got1 = output[1].to_f32();
-    ensure!(got1.abs() < 0.1, "Hadamard[1] = {}, expected ~0", got1);
-
-    eprintln!(
-        "hadamard_correctness: [0]={:.4} (exp {:.4}), [1]={:.4} (exp 0), OK",
-        got, expected, got1
-    );
-    Ok(())
-}
-
 // Regression for P2: per-row `lengths` must filter padded/stale logits.
 // logits = [0..max_len), but lengths[0]=10 so only indices 6..9 are valid
 // top-k. If lengths were ignored (old TopKDispatch path), the kernel would
@@ -301,12 +242,12 @@ fn flashinfer_topk_lengths_filter() -> Result<()> {
     let result = unsafe {
         ffi::glm52_flashinfer_topk_2048_cuda(
             logits_dev.ptr as *const f32,
-            indices_dev.ptr as *mut i32,
-            values_dev.ptr as *mut f32,
+            indices_dev.ptr.cast::<i32>(),
+            values_dev.ptr.cast::<f32>(),
             lengths_dev.ptr as *const i32,
             1, // num_rows
             top_k as i32,
-            max_len as i32,
+            max_len,
             STREAM,
         )
     };
@@ -321,9 +262,8 @@ fn flashinfer_topk_lengths_filter() -> Result<()> {
     );
     cuda_check(unsafe { cudaDeviceSynchronize() })?;
 
-    let indices: Vec<i32> = indices_dev.to_host(top_k)?;
-    let mut sorted = indices.to_vec();
-    sorted.sort();
+    let mut sorted: Vec<i32> = indices_dev.to_host(top_k)?;
+    sorted.sort_unstable();
     // With lengths=10, valid logits are indices 0..9 (values 0..9); top-4
     // are indices 6,7,8,9. Stale tail (2044..2047) must NOT win.
     assert_eq!(
@@ -349,11 +289,6 @@ fn test_indexer_cache_round_trip() {
 #[test]
 fn test_local_topk_to_slots_multi_token_stride() {
     local_topk_to_slots_multi_token_stride().expect("local_topk_to_slots multi-token stride");
-}
-
-#[test]
-fn test_hadamard_correctness() {
-    hadamard_correctness().expect("Hadamard");
 }
 
 #[test]
@@ -403,8 +338,8 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
     // Metadata kernel launch
     let r = unsafe {
         ffi::glm52_deepgemm_paged_mqa_metadata_cuda(
-            context_lens.ptr as *mut i32,
-            schedule_metadata.ptr as *mut i32,
+            context_lens.ptr.cast::<i32>(),
+            schedule_metadata.ptr.cast::<i32>(),
             batch_size,
             next_n,
             block_kv,
@@ -438,7 +373,6 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
     let logits = DeviceBuf::zeroed(logits_bytes)?;
 
     // block_table: [batch_size, block_table_stride] i32
-    let bt_bytes = (batch_size * block_table_stride) as usize * std::mem::size_of::<i32>();
     let block_table_host: Vec<i32> = (0..num_kv_blocks).collect();
     let block_table = DeviceBuf::from_host(&block_table_host)?;
 
@@ -452,7 +386,7 @@ fn deepgemm_paged_mqa_launch() -> Result<()> {
             logits.ptr,
             block_table.ptr as *const i32,
             std::ptr::null(),
-            schedule_metadata.ptr as *mut i32,
+            schedule_metadata.ptr.cast::<i32>(),
             batch_size,
             next_n,
             num_heads,

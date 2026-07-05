@@ -101,17 +101,14 @@ pub fn glm52_deepgemm_paged_mqa_metadata_launch(
 
     let (cl_ptr, _cl_guard) = context_lens.device_ptr_mut(&ctx.stream);
     let (sm_ptr, _sm_guard) = schedule_metadata.device_ptr_mut(&ctx.stream);
-    let indices_ptr = match indices {
-        Some(buf) => {
-            ensure!(shape.is_varlen, "indices provided but is_varlen=false");
-            ensure!(buf.len() >= shape.batch_size, "indices too small");
-            let (ptr, _guard) = buf.device_ptr(&ctx.stream);
-            ptr as *const i32
-        }
-        None => {
-            ensure!(!shape.is_varlen, "is_varlen=true but no indices provided");
-            std::ptr::null()
-        }
+    let indices_ptr = if let Some(buf) = indices {
+        ensure!(shape.is_varlen, "indices provided but is_varlen=false");
+        ensure!(buf.len() >= shape.batch_size, "indices too small");
+        let (ptr, _guard) = buf.device_ptr(&ctx.stream);
+        ptr as *const i32
+    } else {
+        ensure!(!shape.is_varlen, "is_varlen=true but no indices provided");
+        std::ptr::null()
     };
 
     let result = unsafe {
@@ -207,16 +204,13 @@ pub fn glm52_deepgemm_paged_mqa_logits_launch(
     let (logits_ptr, _logits_guard) = logits.device_ptr_mut(&ctx.stream);
     let (bt_ptr, _bt_guard) = block_table.device_ptr(&ctx.stream);
     let (sm_ptr, _sm_guard) = schedule_meta.device_ptr_mut(&ctx.stream);
-    let indices_ptr = match indices {
-        Some(buf) => {
-            ensure!(shape.is_varlen, "indices provided but is_varlen=false");
-            let (ptr, _guard) = buf.device_ptr(&ctx.stream);
-            ptr as *const i32
-        }
-        None => {
-            ensure!(!shape.is_varlen, "is_varlen=true but no indices provided");
-            std::ptr::null()
-        }
+    let indices_ptr = if let Some(buf) = indices {
+        ensure!(shape.is_varlen, "indices provided but is_varlen=false");
+        let (ptr, _guard) = buf.device_ptr(&ctx.stream);
+        ptr as *const i32
+    } else {
+        ensure!(!shape.is_varlen, "is_varlen=true but no indices provided");
+        std::ptr::null()
     };
 
     let result = unsafe {

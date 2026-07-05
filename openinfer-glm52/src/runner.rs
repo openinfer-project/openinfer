@@ -149,7 +149,7 @@ impl Glm52RankWorker {
                     }
                 };
                 let _ = startup_tx.send(Ok(()));
-                rank_worker_loop(rx, Glm52RankThreadState::new(placement, ctx, bundle));
+                rank_worker_loop(&rx, Glm52RankThreadState::new(placement, ctx, bundle));
             })
             .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 rank worker: {err}"))?;
         startup_rx
@@ -499,7 +499,7 @@ impl Glm52RankThreadState {
     }
 }
 
-fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadState) {
+fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadState) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Glm52RankCommand::LoadWeights { model_path, resp } => {

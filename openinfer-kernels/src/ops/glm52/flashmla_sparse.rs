@@ -102,7 +102,8 @@ impl Glm52FlashMlaSparseDecode {
 
 pub fn glm52_flashmla_sparse_decode_num_sm_parts() -> Result<usize> {
     let mut num_sm_parts = 0i32;
-    let result = unsafe { ffi::glm52_flashmla_sparse_decode_num_sm_parts_cuda(&mut num_sm_parts) };
+    let result =
+        unsafe { ffi::glm52_flashmla_sparse_decode_num_sm_parts_cuda(&raw mut num_sm_parts) };
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 FlashMLA sparse num_sm_parts query failed: {err}"))?;

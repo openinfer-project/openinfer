@@ -61,8 +61,8 @@ impl Glm52DenseMlpWeights {
     /// Build from already-resident projections (the production loader path).
     pub(crate) fn from_device(
         ctx: &DeviceContext,
-        gate: ProjWeight,
-        up: ProjWeight,
+        gate: &ProjWeight,
+        up: &ProjWeight,
         down: ProjWeight,
     ) -> Result<Self> {
         let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
@@ -74,11 +74,11 @@ impl Glm52DenseMlpWeights {
             );
             Ok(())
         };
-        shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
-        shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
+        shape("gate_proj", gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", up, INTERMEDIATE, HIDDEN)?;
         shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
         Ok(Self {
-            gate_up: pack_proj_pair(ctx, &gate, &up)?,
+            gate_up: pack_proj_pair(ctx, gate, up)?,
             down,
         })
     }

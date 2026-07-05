@@ -57,25 +57,25 @@ pub struct Glm52LaunchOptions {
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
+    let Glm52LaunchOptions {
+        tp_size,
+        dp_size,
+        dspark_draft_model_path,
+    } = options;
+    ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
-        options.tp_size == 1,
-        "GLM5.2 requires --tp-size=1, got {}",
-        options.tp_size
-    );
-    ensure!(
-        options.dp_size == GLM52_EP_RANKS,
-        "GLM5.2 requires --dp-size={GLM52_EP_RANKS} (or omitted), got {}",
-        options.dp_size
+        dp_size == GLM52_EP_RANKS,
+        "GLM5.2 requires --dp-size={GLM52_EP_RANKS} (or omitted), got {dp_size}"
     );
     start_engine(
         model_path,
-        Glm52LoadOptions {
+        &Glm52LoadOptions {
             device_ordinals: (0..GLM52_EP_RANKS).collect(),
-            tp_size: options.tp_size,
-            dp_size: options.dp_size,
+            tp_size,
+            dp_size,
             ep_size: GLM52_EP_RANKS,
         },
-        options.dspark_draft_model_path.as_deref(),
+        dspark_draft_model_path.as_deref(),
     )
 }
 
@@ -108,10 +108,10 @@ struct LoadedGlm52Runtime {
 
 fn start_engine(
     model_path: &Path,
-    options: Glm52LoadOptions,
+    options: &Glm52LoadOptions,
     dspark_path: Option<&Path>,
 ) -> Result<EngineHandle> {
-    let startup = validate_startup(model_path, &options)?;
+    let startup = validate_startup(model_path, options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
     log::info!(
         "GLM5.2 load-weight startup complete: ranks={}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}",

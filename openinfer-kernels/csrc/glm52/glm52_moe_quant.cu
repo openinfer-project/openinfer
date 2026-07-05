@@ -210,24 +210,6 @@ CUresult glm52_fp8_per_token_group_quant_bf16_cuda(
   return consume_last_cuda_error();
 }
 
-CUresult glm52_fp8_per_token_group_quant_bf16_bounded_cuda(
-    const __nv_bfloat16* input, unsigned char* output, float* scales, int rows,
-    int hidden_dim, int group_size, const long long* row_bound,
-    cudaStream_t stream) {
-  if (input == nullptr || output == nullptr || scales == nullptr ||
-      row_bound == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (!valid_quant_shape(rows, hidden_dim, group_size)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  dim3 grid(row_grid(rows), hidden_dim / kGroupSize, 1);
-  fp8_per_token_group_quant_bf16_k128_kernel<false>
-      <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
-                                        hidden_dim, row_bound, nullptr, 0);
-  return consume_last_cuda_error();
-}
-
 CUresult glm52_fp8_per_token_group_quant_bf16_masked_cuda(
     const __nv_bfloat16* input, unsigned char* output, float* scales, int rows,
     int hidden_dim, int group_size, const long long* row_bound,
@@ -244,23 +226,6 @@ CUresult glm52_fp8_per_token_group_quant_bf16_masked_cuda(
       <<<grid, kGroupSize, 0, stream>>>(input, output, scales, rows,
                                         hidden_dim, row_bound, row_map,
                                         masked_cap);
-  return consume_last_cuda_error();
-}
-
-CUresult glm52_silu_and_mul_per_token_group_quant_bf16_cuda(
-    const __nv_bfloat16* input, unsigned char* output, float* scales, int rows,
-    int hidden_size, int group_size, cudaStream_t stream) {
-  if (input == nullptr || output == nullptr || scales == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (!valid_quant_shape(rows, hidden_size, group_size)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-
-  dim3 grid(row_grid(rows), hidden_size / kGroupSize, 1);
-  silu_and_mul_per_token_group_quant_bf16_k128_kernel<false>
-      <<<grid, kGroupSize, 0, stream>>>(input, nullptr, output, scales, rows,
-                                        hidden_size, nullptr, nullptr, 0);
   return consume_last_cuda_error();
 }
 
@@ -282,25 +247,6 @@ CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_cuda(
   silu_and_mul_per_token_group_quant_bf16_k128_kernel<false>
       <<<grid, kGroupSize, 0, stream>>>(input, topk_weights, output, scales,
                                         rows, hidden_size, nullptr, nullptr, 0);
-  return consume_last_cuda_error();
-}
-
-CUresult glm52_silu_and_mul_weighted_per_token_group_quant_bf16_bounded_cuda(
-    const __nv_bfloat16* input, const float* topk_weights,
-    unsigned char* output, float* scales, int rows, int hidden_size,
-    int group_size, const long long* row_bound, cudaStream_t stream) {
-  if (input == nullptr || topk_weights == nullptr || output == nullptr ||
-      scales == nullptr || row_bound == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (!valid_quant_shape(rows, hidden_size, group_size)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  dim3 grid(row_grid(rows), hidden_size / kGroupSize, 1);
-  silu_and_mul_per_token_group_quant_bf16_k128_kernel<false>
-      <<<grid, kGroupSize, 0, stream>>>(input, topk_weights, output, scales,
-                                        rows, hidden_size, row_bound, nullptr,
-                                        0);
   return consume_last_cuda_error();
 }
 

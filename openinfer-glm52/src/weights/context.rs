@@ -104,12 +104,12 @@ fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
     unsafe {
         let mut dev: sys::CUdevice = 0;
         check_cu(
-            sys::cuDeviceGet(&mut dev, device_ordinal as i32),
+            sys::cuDeviceGet(&raw mut dev, device_ordinal as i32),
             "cuDeviceGet",
         )?;
         let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
         check_cu(
-            sys::cuDeviceGetDefaultMemPool(&mut pool, dev),
+            sys::cuDeviceGetDefaultMemPool(&raw mut pool, dev),
             "cuDeviceGetDefaultMemPool",
         )?;
         let mut threshold: u64 = u64::MAX;
@@ -117,7 +117,7 @@ fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
             sys::cuMemPoolSetAttribute(
                 pool,
                 sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                (&mut threshold as *mut u64).cast::<std::ffi::c_void>(),
+                (&raw mut threshold).cast::<std::ffi::c_void>(),
             ),
             "cuMemPoolSetAttribute(RELEASE_THRESHOLD)",
         )?;

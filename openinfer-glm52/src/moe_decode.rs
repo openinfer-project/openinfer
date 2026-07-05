@@ -131,8 +131,8 @@ pub(crate) struct Glm52MoeSharedExpert {
 impl Glm52MoeSharedExpert {
     pub(crate) fn new(
         ctx: &DeviceContext,
-        gate: ProjWeight,
-        up: ProjWeight,
+        gate: &ProjWeight,
+        up: &ProjWeight,
         down: ProjWeight,
     ) -> Result<Self> {
         let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
@@ -144,11 +144,11 @@ impl Glm52MoeSharedExpert {
             );
             Ok(())
         };
-        shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
-        shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
+        shape("gate_proj", gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", up, INTERMEDIATE, HIDDEN)?;
         shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
         Ok(Self {
-            gate_up: pack_proj_pair(ctx, &gate, &up)?,
+            gate_up: pack_proj_pair(ctx, gate, up)?,
             down,
         })
     }
@@ -352,8 +352,8 @@ impl Glm52MoeLayerWeights {
             bank: Glm52MoeExpertBank::pack_from_host(ctx, experts)?,
             shared: Glm52MoeSharedExpert::new(
                 ctx,
-                ProjWeight::upload(ctx, shared_gate)?,
-                ProjWeight::upload(ctx, shared_up)?,
+                &ProjWeight::upload(ctx, shared_gate)?,
+                &ProjWeight::upload(ctx, shared_up)?,
                 ProjWeight::upload(ctx, shared_down)?,
             )?,
         })
