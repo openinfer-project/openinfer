@@ -71,6 +71,10 @@ enum Glm52RankCommand {
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
+        /// The coordinator expects the next step to repeat this shape with
+        /// each row advanced by its own argmax — the rank may enqueue that
+        /// next replay launch-ahead (see `Glm52RankModel::decode_step`).
+        lease: bool,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
     },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
@@ -174,12 +178,14 @@ impl Glm52RankWorker {
         &self,
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        lease: bool,
     ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::Step {
                 inputs: Box::new(inputs),
                 shape,
+                lease,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -456,6 +462,7 @@ impl Glm52RankThreadState {
         &mut self,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        lease: bool,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -468,7 +475,7 @@ impl Glm52RankThreadState {
             .context("GLM5.2 step before setup_comm")?;
         runtime
             .model
-            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape)
+            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape, lease)
     }
 }
 
@@ -487,9 +494,10 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
             Glm52RankCommand::Step {
                 inputs,
                 shape,
+                lease,
                 resp,
             } => {
-                let _ = resp.send(state.step(&inputs, shape));
+                let _ = resp.send(state.step(&inputs, shape, lease));
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));

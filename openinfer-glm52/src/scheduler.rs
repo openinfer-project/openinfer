@@ -505,6 +505,18 @@ pub(crate) fn run_dp8_coordinator(
         // free slots — and all responses are joined before any output is
         // interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots));
+        // Launch-ahead lease: a rank may speculatively enqueue the next step
+        // iff it is guaranteed to repeat this shape with every row advanced
+        // by its own argmax — pure single-token decode everywhere, nothing
+        // queued for admission, and no draft round between steps. A request
+        // finishing this step breaks the lease implicitly (the rank-side
+        // input match fails next step), costing one wasted replay.
+        let lease = pending.is_empty()
+            && !dspark_enabled
+            && slots
+                .iter()
+                .flat_map(|rank_slots| rank_slots.iter().flatten())
+                .all(|active| active.state.feed_want() == 1);
         let responses = slots
             .iter()
             .zip(&workers)
@@ -523,7 +535,7 @@ pub(crate) fn run_dp8_coordinator(
                         *input = (step.token, step.position);
                     }
                 }
-                worker.step_async(inputs, *shape)
+                worker.step_async(inputs, *shape, lease)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {

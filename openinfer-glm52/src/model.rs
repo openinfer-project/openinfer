@@ -15,15 +15,15 @@
 //! shapes identical within a bucket (the whole-step CUDA graphs' contract).
 
 use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, PinnedHostSlice};
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK,
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout,
     add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into, embedding_rows_into,
-    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
-    rms_norm_rows_into,
+    glm52_decode_feed_launch, glm52_flashmla_sparse_decode_num_sm_parts,
+    glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -41,6 +41,7 @@ use crate::moe_decode::{
     Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, run_router_into,
 };
 use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::scheduler::GLM52_PADDING_STEP;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
 
@@ -284,6 +285,36 @@ pub(crate) struct Glm52RankModel {
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
     token_ids: CudaSlice<u32>,
+    /// Pinned landing buffers for the per-step argmax D2H. Pinned memory
+    /// makes the copy truly asynchronous, so the next step's replay can be
+    /// enqueued (launch-ahead) before the host blocks on this step's result.
+    argmax_values_host: PinnedHostSlice<bf16>,
+    argmax_indices_host: PinnedHostSlice<i32>,
+    /// In-flight speculative next-step replay, if any (see `decode_step`).
+    speculated: Option<Glm52SpeculatedStep>,
+    /// What the per-row `positions` device buffer currently holds (padding
+    /// rows included): the feed kernel advances it without host readback,
+    /// and a speculation must keep every row under the model-length cap.
+    device_positions: [usize; GLM52_MAX_BATCH_PER_RANK],
+}
+
+/// A speculative next-step whole-graph replay already enqueued on the decode
+/// stream: the feed kernel advanced the device input buffers in place and
+/// the bucket graph was launched ahead, hiding the ~0.7 ms host-side
+/// `cuGraphLaunch` under the current step's execution (measured on jz-38:
+/// 5.4 µs intra-step replay gap vs 810 µs at an unhidden step boundary).
+/// Consumed only when the coordinator's next step matches `expect` exactly;
+/// on any mismatch the full host prologue overwrites the advanced inputs and
+/// the stale replay degrades to a recompute whose rows never influence the
+/// following real replay (per-row math is row-independent).
+struct Glm52SpeculatedStep {
+    bucket: usize,
+    slots: [u8; GLM52_MAX_BATCH_PER_RANK],
+    /// The coordinator inputs this speculation assumed: active rows carry
+    /// (this step's argmax, position + 1); padding rows repeat the padding
+    /// input verbatim (their device rows keep self-feeding, which is
+    /// harmless — pad outputs are never read and rows are isolated).
+    expect: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
 }
 
 /// Everything one decode bucket owns: batch-`rows` FlashMLA plans (per
@@ -542,6 +573,12 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
+            // Read only after a D2H lands in them (the write-combined pages
+            // start uninitialized).
+            argmax_values_host: unsafe { ctx.ctx.alloc_pinned::<bf16>(batch)? },
+            argmax_indices_host: unsafe { ctx.ctx.alloc_pinned::<i32>(batch)? },
+            speculated: None,
+            device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
         })
     }
 
@@ -575,7 +612,35 @@ impl Glm52RankModel {
         ep8: &mut Glm52MoeEp8State,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        lease: bool,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+        let batch = shape.bucket;
+        // Launch-ahead fast path: if the previous step speculatively enqueued
+        // exactly this step (same bucket, slots, and inputs), the replay is
+        // already executing on the stream — skip the whole host prologue.
+        let speculation_hit = self.speculated.as_ref().is_some_and(|speculated| {
+            speculated.bucket == batch
+                && speculated.slots[..batch] == shape.slots[..batch]
+                && speculated.expect[..batch] == inputs[..batch]
+        });
+        self.speculated = None;
+        if !speculation_hit {
+            self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape)?;
+        }
+        self.decode_step_harvest(ctx, inputs, shape, lease)
+    }
+
+    /// The non-leased step path: validate the shape, rewrite every per-step
+    /// device input buffer from the coordinator's `inputs`, and run (or lazily
+    /// capture) the whole-step graph for the step's bucket × tier.
+    fn decode_step_prologue_and_replay(
+        &mut self,
+        ctx: &DeviceContext,
+        aux: &DeviceContext,
+        ep8: &mut Glm52MoeEp8State,
+        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
+    ) -> Result<()> {
         // The bucket state's `rows` is the lookup key — an unknown bucket is
         // a coordinator bug and fails the step before touching the GPU.
         let bucket = self
@@ -640,6 +705,9 @@ impl Glm52RankModel {
         ctx.stream
             .memcpy_htod(&slots_host, &mut self.slot_mapping)?;
         ctx.stream.memcpy_htod(&seq_lens_host, &mut self.seq_lens)?;
+        for row in 0..batch {
+            self.device_positions[row] = inputs[row].1;
+        }
         // Gather each row's rotary table row (a bit-exact row copy).
         embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
         embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
@@ -710,11 +778,105 @@ impl Glm52RankModel {
             )
         });
         bucket.graphs[tier] = graph;
-        result?;
+        result
+    }
 
-        let s = &bucket.scratch;
-        let top_values = ctx.stream.clone_dtoh(&s.argmax_values)?;
-        let top_indices = ctx.stream.clone_dtoh(&s.argmax_indices)?;
+    /// Post-replay tail shared by both step paths: enqueue the argmax D2H,
+    /// then — with the copy still in flight — optionally speculate the next
+    /// step (feed kernel + rope-row gathers + launch-ahead replay), and only
+    /// then block for this step's result. The speculative `cuGraphLaunch`
+    /// thereby overlaps this step's execution instead of idling the GPU at
+    /// the next step boundary.
+    fn decode_step_harvest(
+        &mut self,
+        ctx: &DeviceContext,
+        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
+        lease: bool,
+    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+        let batch = shape.bucket;
+        let bucket = self
+            .buckets
+            .iter_mut()
+            .find(|bucket| bucket.rows == batch)
+            .expect("decode_step validated the bucket");
+        ctx.stream
+            .memcpy_dtoh(&bucket.scratch.argmax_values, &mut self.argmax_values_host)?;
+        ctx.stream.memcpy_dtoh(
+            &bucket.scratch.argmax_indices,
+            &mut self.argmax_indices_host,
+        )?;
+
+        // Speculate only when every row is a single-token row (distinct
+        // slots — span steps repeat a slot), every advanced position stays
+        // under the model-length cap, and the target tier's graph is already
+        // captured (a lazy capture runs the step closure — never
+        // speculatively).
+        let mut speculated = false;
+        if lease {
+            let mut seen = [false; GLM52_MAX_BATCH_PER_RANK];
+            let single_token_rows = shape.slots[..batch].iter().all(|&slot| {
+                let slot = slot as usize;
+                slot < GLM52_MAX_BATCH_PER_RANK && !std::mem::replace(&mut seen[slot], true)
+            });
+            let under_cap = self.device_positions[..batch]
+                .iter()
+                .all(|&position| position + 1 < GLM52_MAX_MODEL_LEN);
+            if single_token_rows && under_cap {
+                let longest_next = self.device_positions[..batch]
+                    .iter()
+                    .map(|&position| position + 2)
+                    .max()
+                    .expect("decode buckets forward at least one row");
+                let tier = if longest_next <= GLM52_MLA_TOPK_SHORT {
+                    TIER_SHORT
+                } else {
+                    TIER_FULL
+                };
+                if bucket.graphs[tier].is_captured() {
+                    glm52_decode_feed_launch(
+                        ctx,
+                        &bucket.scratch.argmax_indices,
+                        &mut self.token_ids,
+                        &mut self.positions,
+                        &mut self.slot_mapping,
+                        &mut self.seq_lens,
+                        batch,
+                    )?;
+                    embedding_rows_into(
+                        ctx,
+                        &self.cos_table,
+                        &self.positions,
+                        batch,
+                        &mut self.cos,
+                    )?;
+                    embedding_rows_into(
+                        ctx,
+                        &self.sin_table,
+                        &self.positions,
+                        batch,
+                        &mut self.sin,
+                    )?;
+                    bucket.graphs[tier].launch_captured(ctx)?;
+                    for position in &mut self.device_positions[..batch] {
+                        *position += 1;
+                    }
+                    speculated = true;
+                }
+            }
+        }
+
+        // Block on the D2H (the pinned slices synchronize on their own copy
+        // events) and unpack — identical semantics to the old blocking
+        // readback.
+        let top_values = self
+            .argmax_values_host
+            .as_slice()
+            .map_err(|err| anyhow::anyhow!("GLM5.2 argmax values D2H sync failed: {err}"))?;
+        let top_indices = self
+            .argmax_indices_host
+            .as_slice()
+            .map_err(|err| anyhow::anyhow!("GLM5.2 argmax indices D2H sync failed: {err}"))?;
         let mut outputs = [0u32; GLM52_MAX_BATCH_PER_RANK];
         for row in 0..batch {
             let slot = shape.slots[row] as usize;
@@ -729,6 +891,21 @@ impl Glm52RankModel {
                 "GLM5.2 slot {slot} greedy argmax index {top_index} outside the vocab"
             );
             outputs[row] = top_index as u32;
+        }
+
+        if speculated {
+            let padding = (GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
+            let mut expect = [padding; GLM52_MAX_BATCH_PER_RANK];
+            for row in 0..batch {
+                if inputs[row] != padding {
+                    expect[row] = (outputs[row], inputs[row].1 + 1);
+                }
+            }
+            self.speculated = Some(Glm52SpeculatedStep {
+                bucket: batch,
+                slots: shape.slots,
+                expect,
+            });
         }
         Ok(outputs)
     }
