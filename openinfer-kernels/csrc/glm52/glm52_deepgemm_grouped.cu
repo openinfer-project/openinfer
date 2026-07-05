@@ -209,14 +209,16 @@ struct MaskedGemmAot {
       cutlass::bfloat16_t,
       deep_gemm::epilogue::transform::EpilogueIdentity>;
 
-  // Mirrors SM90ArchSpec::get_pipeline_config for this shape.
+  // Mirrors SM90ArchSpec::get_pipeline_config for this shape. Local align —
+  // the vendored deep_gemm::align is not constexpr-evaluable (its ceil_div
+  // is a plain function).
+  static constexpr int align_up(int x, int a) { return (x + a - 1) / a * a; }
   static constexpr int smem_size() {
-    const int smem_cd = deep_gemm::align<int>(64 * BN * 2, 1024);
+    const int smem_cd = align_up(64 * BN * 2, 1024);
     const int smem_barriers = 16 * 8 * 2;
-    const int per_stage = 64 * 128 + BN * 128 + deep_gemm::align<int>(64 * 4, 128);
+    const int per_stage = 64 * 128 + BN * 128 + align_up(64 * 4, 128);
     const int use_uniform_sfb = (128 % BN == 0) ? 1 : 2;
-    const int smem_extra_sfb =
-        deep_gemm::align<int>((K / 128) * 4 * use_uniform_sfb, 8);
+    const int smem_extra_sfb = align_up((K / 128) * 4 * use_uniform_sfb, 8);
     return smem_cd + smem_barriers + smem_extra_sfb +
            static_cast<int>(STAGES) * per_stage;
   }
