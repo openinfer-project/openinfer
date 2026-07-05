@@ -613,19 +613,39 @@ impl Glm52RankModel {
         ep8: &mut Glm52MoeEp8State,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        consume: bool,
         lease: bool,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let batch = shape.bucket;
-        // Launch-ahead fast path: if the previous step speculatively enqueued
-        // exactly this step (same bucket, slots, and inputs), the replay is
-        // already executing on the stream — skip the whole host prologue.
-        let speculation_hit = self.speculated.as_ref().is_some_and(|speculated| {
-            speculated.bucket == batch
-                && speculated.slots[..batch] == shape.slots[..batch]
-                && speculated.expect[..batch] == inputs[..batch]
-        });
-        self.speculated = None;
-        if !speculation_hit {
+        if consume {
+            // Launch-ahead fast path: the coordinator says this step IS the
+            // replay every rank speculatively enqueued last step. That claim
+            // is global — a speculative replay is a full set of collectives,
+            // so ranks must consume together or not at all. Any mismatch is
+            // a protocol bug; failing the step beats a silent fallback that
+            // would desync the collective pairing (measured as the ~100 s
+            // DeepEP device-timeout trap).
+            let speculated = self.speculated.take().context(
+                "GLM5.2 launch-ahead desync: the coordinator consumed a speculation this rank \
+                 never enqueued",
+            )?;
+            ensure!(
+                speculated.bucket == batch
+                    && speculated.slots[..batch] == shape.slots[..batch]
+                    && speculated.expect[..batch] == inputs[..batch],
+                "GLM5.2 launch-ahead desync: consumed speculation (bucket {}, slots {:?}, expect \
+                 {:?}) does not match the step (bucket {batch}, slots {:?}, inputs {:?})",
+                speculated.bucket,
+                &speculated.slots[..speculated.bucket],
+                &speculated.expect[..speculated.bucket],
+                &shape.slots[..batch],
+                &inputs[..batch],
+            );
+        } else {
+            // Any stale speculation was enqueued by EVERY rank (the lease is
+            // a global grant), so the stale replay's collectives pair up and
+            // it degrades to a harmless recompute the prologue overwrites.
+            self.speculated = None;
             self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape)?;
         }
         self.decode_step_harvest(ctx, inputs, shape, lease)
@@ -810,63 +830,62 @@ impl Glm52RankModel {
             &mut bucket.argmax_indices_host,
         )?;
 
-        // Speculate only when every row is a single-token row (distinct
-        // slots — span steps repeat a slot), every advanced position stays
-        // under the model-length cap, and the target tier's graph is already
-        // captured (a lazy capture runs the step closure — never
-        // speculatively).
+        // Speculation must be all-ranks-or-none: the speculative replay is a
+        // full set of collectives, so every precondition here is a GLOBAL
+        // invariant the coordinator's lease already guarantees (single-token
+        // rows from the shape, position headroom from its slot bookkeeping —
+        // pad rows never outrun active rows — and captured graphs from the
+        // startup pre-capture). A rank that silently skipped would desync
+        // the collective pairing; crash early instead.
         let mut speculated = false;
         if lease {
             let mut seen = [false; GLM52_MAX_BATCH_PER_RANK];
-            let single_token_rows = shape.slots[..batch].iter().all(|&slot| {
+            for &slot in &shape.slots[..batch] {
                 let slot = slot as usize;
-                slot < GLM52_MAX_BATCH_PER_RANK && !std::mem::replace(&mut seen[slot], true)
-            });
-            let under_cap = self.device_positions[..batch]
-                .iter()
-                .all(|&position| position + 1 < GLM52_MAX_MODEL_LEN);
-            if single_token_rows && under_cap {
-                let longest_next = self.device_positions[..batch]
-                    .iter()
-                    .map(|&position| position + 2)
-                    .max()
-                    .expect("decode buckets forward at least one row");
-                let tier = if longest_next <= GLM52_MLA_TOPK_SHORT {
-                    TIER_SHORT
-                } else {
-                    TIER_FULL
-                };
-                if bucket.graphs[tier].is_captured() {
-                    glm52_decode_feed_launch(
-                        ctx,
-                        &bucket.scratch.argmax_indices,
-                        &mut self.token_ids,
-                        &mut self.positions,
-                        &mut self.slot_mapping,
-                        &mut self.seq_lens,
-                        batch,
-                    )?;
-                    embedding_rows_into(
-                        ctx,
-                        &self.cos_table,
-                        &self.positions,
-                        batch,
-                        &mut self.cos,
-                    )?;
-                    embedding_rows_into(
-                        ctx,
-                        &self.sin_table,
-                        &self.positions,
-                        batch,
-                        &mut self.sin,
-                    )?;
-                    bucket.graphs[tier].launch_captured(ctx)?;
-                    for position in &mut self.device_positions[..batch] {
-                        *position += 1;
-                    }
-                    speculated = true;
-                }
+                ensure!(
+                    slot < GLM52_MAX_BATCH_PER_RANK && !std::mem::replace(&mut seen[slot], true),
+                    "GLM5.2 launch-ahead lease granted for a step with repeated slot {slot} \
+                     (span rows are never leased)"
+                );
             }
+            for &position in &self.device_positions[..batch] {
+                ensure!(
+                    position + 1 < GLM52_MAX_MODEL_LEN,
+                    "GLM5.2 launch-ahead lease granted with a row at position {position} — the \
+                     advanced step would breach the model-length cap"
+                );
+            }
+            let longest_next = self.device_positions[..batch]
+                .iter()
+                .map(|&position| position + 2)
+                .max()
+                .expect("decode buckets forward at least one row");
+            let tier = if longest_next <= GLM52_MLA_TOPK_SHORT {
+                TIER_SHORT
+            } else {
+                TIER_FULL
+            };
+            ensure!(
+                bucket.graphs[tier].is_captured(),
+                "GLM5.2 launch-ahead lease granted before the (bucket {batch}, tier {tier}) graph \
+                 was captured — the startup pre-capture must cover every shape"
+            );
+            glm52_decode_feed_launch(
+                ctx,
+                &bucket.scratch.argmax_indices,
+                &mut self.token_ids,
+                &mut self.positions,
+                &mut self.slot_mapping,
+                &mut self.seq_lens,
+                batch,
+            )?;
+            embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
+            embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
+            bucket.graphs[tier].launch_captured(ctx)?;
+            for position in &mut self.device_positions[..batch] {
+                *position += 1;
+            }
+            speculated = true;
         }
 
         // Block on the D2H (the pinned slices synchronize on their own copy

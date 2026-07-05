@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 
 use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape,
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, GLM52_MLA_TOPK_SHORT,
+    Glm52StepShape,
 };
 use crate::runner::Glm52RankWorker;
 
@@ -447,6 +448,66 @@ pub(crate) fn run_dp8_coordinator(
             .all(|rank_slots| rank_slots.iter().all(Option::is_none))
     };
 
+    // Pre-capture every whole-step graph (bucket × attention tier) while the
+    // ranks are idle and trivially in lock-step. Launch-ahead speculation
+    // requires captured-ness to be UNIFORM across ranks — a lazily capturing
+    // rank would skip the speculative replay the others enqueued and desync
+    // the collectives — and pre-capturing also removes the old mid-serving
+    // capture stall. Row 0 at position GLM52_MLA_TOPK_SHORT lifts the step
+    // into the full tier; every row is a padding write into a free slot's
+    // dead cache region.
+    for &bucket in GLM52_DECODE_BUCKETS.iter() {
+        for full_tier in [false, true] {
+            let mut shape = Glm52StepShape {
+                bucket,
+                slots: [0; GLM52_MAX_BATCH_PER_RANK],
+            };
+            for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
+                *dst = slot as u8;
+            }
+            let mut inputs =
+                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+            if full_tier {
+                inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
+            }
+            let responses = match workers
+                .iter()
+                .map(|worker| worker.step_async(inputs, shape, false, false))
+                .collect::<anyhow::Result<Vec<_>>>()
+            {
+                Ok(responses) => responses,
+                Err(err) => {
+                    log::error!("GLM5.2 graph pre-capture failed to submit: {err:#}");
+                    return;
+                }
+            };
+            for (rank, resp) in responses.into_iter().enumerate() {
+                let result = resp
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
+                    .and_then(|r| r);
+                if let Err(err) = result {
+                    log::error!(
+                        "GLM5.2 graph pre-capture (bucket {bucket}, full_tier {full_tier}) \
+                         failed on rank {rank}: {err:#}"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    log::info!(
+        "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
+        GLM52_DECODE_BUCKETS.len()
+    );
+
+    // The step shapes that carried the last launch-ahead lease, and whether
+    // any slot changed hands since it was granted — together they decide
+    // whether this step consumes the speculation (must be all-ranks-or-none,
+    // so the decision lives here, on global data, not on the ranks).
+    let mut leased_shapes: Option<Vec<Glm52StepShape>> = None;
+    let mut slots_changed = false;
+
     'serve: loop {
         // Intake: block when fully idle, otherwise drain what's queued.
         if channel_open && all_idle(&slots) && pending.is_empty() {
@@ -495,6 +556,7 @@ pub(crate) fn run_dp8_coordinator(
                 pending_resets[rank].push(slot);
             }
             slots[rank][slot] = Some(ActiveRequest { req, state });
+            slots_changed = true;
         }
         if all_idle(&slots) {
             continue;
@@ -505,18 +567,31 @@ pub(crate) fn run_dp8_coordinator(
         // free slots — and all responses are joined before any output is
         // interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots));
-        // Launch-ahead lease: a rank may speculatively enqueue the next step
-        // iff it is guaranteed to repeat this shape with every row advanced
-        // by its own argmax — pure single-token decode everywhere, nothing
-        // queued for admission, and no draft round between steps. A request
-        // finishing this step breaks the lease implicitly (the rank-side
-        // input match fails next step), costing one wasted replay.
+        // Consume the in-flight speculation iff this step is exactly the
+        // one every rank enqueued: same shapes, and no slot changed hands
+        // (a finish/admission can reuse a slot id without changing the
+        // shape, so shape equality alone is not enough).
+        let consume =
+            !slots_changed && matches!(&leased_shapes, Some(previous) if *previous == shapes);
+        // Launch-ahead lease: every rank MUST speculatively enqueue the next
+        // step iff it is guaranteed to repeat this shape with every row
+        // advanced by its own argmax — pure single-token decode everywhere
+        // with model-length headroom, nothing queued for admission, and no
+        // draft round between steps. A request finishing this step breaks
+        // the lease at the coordinator (slots_changed), costing one wasted
+        // replay. The grant is global: speculative replays are collectives,
+        // so per-rank discretion would desync the pairing.
         let lease = pending.is_empty()
             && !dspark_enabled
             && slots
                 .iter()
                 .flat_map(|rank_slots| rank_slots.iter().flatten())
-                .all(|active| active.state.feed_want() == 1);
+                .all(|active| {
+                    active.state.feed_want() == 1
+                        && active.state.next_input_at(0).position + 1 < GLM52_MAX_MODEL_LEN
+                });
+        leased_shapes = lease.then(|| shapes.clone());
+        slots_changed = false;
         let responses = slots
             .iter()
             .zip(&workers)
@@ -535,7 +610,7 @@ pub(crate) fn run_dp8_coordinator(
                         *input = (step.token, step.position);
                     }
                 }
-                worker.step_async(inputs, *shape, lease)
+                worker.step_async(inputs, *shape, consume, lease)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {
@@ -647,6 +722,7 @@ pub(crate) fn run_dp8_coordinator(
                         pending_resets[rank].push(slot_id);
                     }
                     *slot = None;
+                    slots_changed = true;
                 } else if dspark_enabled {
                     // Committed rows' captured hidden feeds the draft
                     // context; then re-propose from the new anchor.

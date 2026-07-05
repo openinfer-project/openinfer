@@ -71,9 +71,12 @@ enum Glm52RankCommand {
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
-        /// The coordinator expects the next step to repeat this shape with
-        /// each row advanced by its own argmax — the rank may enqueue that
-        /// next replay launch-ahead (see `Glm52RankModel::decode_step`).
+        /// This step IS the speculative replay every rank enqueued last
+        /// step (global claim — consumption must be all-ranks-or-none).
+        consume: bool,
+        /// The coordinator guarantees the next step repeats this shape with
+        /// each row advanced by its own argmax — every rank MUST enqueue
+        /// that next replay launch-ahead (see `Glm52RankModel::decode_step`).
         lease: bool,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
     },
@@ -178,6 +181,7 @@ impl Glm52RankWorker {
         &self,
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        consume: bool,
         lease: bool,
     ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
         let (resp_tx, resp_rx) = bounded(1);
@@ -185,6 +189,7 @@ impl Glm52RankWorker {
             .send(Glm52RankCommand::Step {
                 inputs: Box::new(inputs),
                 shape,
+                consume,
                 lease,
                 resp: resp_tx,
             })
@@ -462,6 +467,7 @@ impl Glm52RankThreadState {
         &mut self,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        consume: bool,
         lease: bool,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let dev_ctx = self.ctx.device_context()?;
@@ -473,9 +479,15 @@ impl Glm52RankThreadState {
             .ep8
             .as_mut()
             .context("GLM5.2 step before setup_comm")?;
-        runtime
-            .model
-            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape, lease)
+        runtime.model.decode_step(
+            &dev_ctx,
+            &runtime.aux_ctx,
+            ep8,
+            inputs,
+            shape,
+            consume,
+            lease,
+        )
     }
 }
 
@@ -494,10 +506,11 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
             Glm52RankCommand::Step {
                 inputs,
                 shape,
+                consume,
                 lease,
                 resp,
             } => {
-                let _ = resp.send(state.step(&inputs, shape, lease));
+                let _ = resp.send(state.step(&inputs, shape, consume, lease));
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));
