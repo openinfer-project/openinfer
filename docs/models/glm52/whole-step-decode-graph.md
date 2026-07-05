@@ -1,6 +1,6 @@
 # GLM5.2 whole-step decode CUDA graph (PR5c)
 
-> **TL;DR:** Execution record of PR5c: the whole per-rank decode step (embed → 78 layers → lm_head → device argmax) is captured into one CUDA graph and replayed every step. Measured on jz-38 8×H200, single request: **200 → 37.5 ms/step from the graph alone** (byte-identical to the PR5b record), **→ 31.3** after switching every m=1 projection to the weight-only fp8 GEMV (activation quant removed — re-gated via the #499 oracle in the new `--precision gemv` mode), **→ 25.3** after grid-striding the capacity-sized MoE quant/SiLU launches (block *scheduling*, not arithmetic, was their cost), **→ 23.4** after packing gate|up into one GEMV, overlapping the shared expert with the MoE collectives on a second stream (fork/join events inside the graph), and staging the relayout's expert ranges in shared memory, **→ 22.9 single** after fusing each layer's closing add with the next layer's input norm (ping-ponged attn buffers, bit-identical `_round` kernel) and running the DSA indexer concurrently with the MLA front's q_b/kv_a, **→ 22.6 single / 22.3 at 8-way (~346 tok/s aggregate)** after two-tier attention graphs (short-context FlashMLA topk 256 — while `seq_len <= 256` the DSA top-256 IS the full token set, so the short-tier graph attends the same tokens at 1/8 the padded index walk; tier-crossing and mixed-tier concurrency e2e-gated, short tier oracle-gated), **→ 22.5 single** after swapping the device argmax to the shared two-stage split kernel (bit-identical; the single-CTA scan was the last serial kernel in the step). A step-timing probe puts the inter-step host gap at ~0.05 ms — the whole step lives inside the graph; **vLLM GLM5.2 DP8/EP8 measured on the same node/workload: steady-state 20.0 ms/step (TPOT 19.8)** — the remaining 2.6 ms gap sits mostly in the expert GEMM (their ~10.8 µs/instance vs our 64-row-M-tile TRTLLM grouped at 22.7 µs) and the collectives' wait structure (#542; fp8 dispatch payload is measured perf-NEUTRAL — dispatch is rank-arrival-wait-bound, not byte-bound). **→ 19.6 single (2026-07-05, below the vLLM reference)** after replacing the TRTLLM grouped expert GEMM with the DeepGEMM masked grouped GEMM (the "swapAB" attribution was wrong — retraction + A/B record in the masked-GEMM section; c64 diverse 1113 → 1475 tok/s, solo span-8 32.2 → 28.2 ms). Indexer oracle reference drift is #541 (pre-existing on main).
+> **TL;DR:** Execution record of PR5c: the whole per-rank decode step (embed → 78 layers → lm_head → device argmax) is captured into one CUDA graph and replayed every step. Measured on jz-38 8×H200, single request: **200 → 37.5 ms/step from the graph alone** (byte-identical to the PR5b record), **→ 31.3** after switching every m=1 projection to the weight-only fp8 GEMV (activation quant removed — re-gated via the #499 oracle in the new `--precision gemv` mode), **→ 25.3** after grid-striding the capacity-sized MoE quant/SiLU launches (block *scheduling*, not arithmetic, was their cost), **→ 23.4** after packing gate|up into one GEMV, overlapping the shared expert with the MoE collectives on a second stream (fork/join events inside the graph), and staging the relayout's expert ranges in shared memory, **→ 22.9 single** after fusing each layer's closing add with the next layer's input norm (ping-ponged attn buffers, bit-identical `_round` kernel) and running the DSA indexer concurrently with the MLA front's q_b/kv_a, **→ 22.6 single / 22.3 at 8-way (~346 tok/s aggregate)** after two-tier attention graphs (short-context FlashMLA topk 256 — while `seq_len <= 256` the DSA top-256 IS the full token set, so the short-tier graph attends the same tokens at 1/8 the padded index walk; tier-crossing and mixed-tier concurrency e2e-gated, short tier oracle-gated), **→ 22.5 single** after swapping the device argmax to the shared two-stage split kernel (bit-identical; the single-CTA scan was the last serial kernel in the step). A step-timing probe puts the inter-step host gap at ~0.05 ms — the whole step lives inside the graph; **vLLM GLM5.2 DP8/EP8 measured on the same node/workload: steady-state 20.0 ms/step (TPOT 19.8)** — the remaining 2.6 ms gap sits mostly in the expert GEMM (their ~10.8 µs/instance vs our 64-row-M-tile TRTLLM grouped at 22.7 µs) and the collectives' wait structure (#542; fp8 dispatch payload is measured perf-NEUTRAL — dispatch is rank-arrival-wait-bound, not byte-bound). **→ 19.6 single (2026-07-05, below the vLLM reference)** after replacing the TRTLLM grouped expert GEMM with the DeepGEMM masked grouped GEMM (the "swapAB" attribution was wrong — retraction + A/B record in the masked-GEMM section; c64 diverse 1113 → 1475 tok/s, solo span-8 32.2 → 28.2 ms). **Launch-ahead decode (D8, 2026-07-05): the ~0.7 ms host-side cuGraphLaunch + step-boundary idle move off the critical path (inter-step device idle 641–804 → 43 µs; solo 19.5 ms/step, zero variance) — feed kernel + pinned D2H + coordinator-global speculation lease, byte-parity gated.** Indexer oracle reference drift is #541 (pre-existing on main).
 >
 > **Last touched:** 2026-07
 
@@ -341,10 +341,61 @@ spec-8 verify step. Second lever, independent: mask pad-row routing
 (`topk_idx = -1`) in partial buckets to kill the artificial combine
 straggler and 7/8 of solo collective payload.
 
+## Launch-ahead decode (D8, jz-38, 2026-07-05)
+
+The stagger investigation (docs PR #568) found `cuGraphLaunch` costing
+~700 µs of host-side driver work per rank per step **with the GPU idle
+through it**, plus a ~364 µs cross-rank launch spread — together the
+641–810 µs step-boundary idle. The double-replay probe proved the launch
+hides completely under the previous replay's execution (5.4 µs intra-step
+gap). This branch turns that into the serving path:
+
+- a **feed kernel** advances `token_ids`/`positions`/`slot_mapping`/
+  `seq_lens` in place from the step's device argmax; rope rows re-gather on
+  device; the argmax D2H lands in per-bucket **pinned** buffers so the copy
+  is truly asynchronous — the next step's replay is enqueued before the
+  host blocks on this step's result. Zero graph changes: everything is
+  eager launches stream-ordered behind the executing replay, so the leased
+  path is byte-identical by construction.
+- **the speculation is all-ranks-or-none**: a speculative replay is a full
+  set of collectives. The coordinator decides both flags on global data —
+  `lease` (next step repeats this shape; includes model-length headroom,
+  and pad rows can never outrun active rows) and `consume` (this step IS
+  the speculation; needs unchanged shapes AND no slot handoff, because a
+  finish+admission can reuse a slot id under an identical shape). Rank-side
+  checks are hard `ensure!`s, not silent fallbacks — the first gate run
+  desynced exactly there (the 1/8 near-tie variant hit EOS early, that rank
+  fell back while others consumed, and the collective pairing slipped into
+  the ~100 s DeepEP device-timeout trap).
+- **every bucket × tier graph is pre-captured at startup** (8 warm pad
+  steps while the ranks are trivially in lock-step): captured-ness must be
+  uniform for the same reason, and the old mid-serving capture stall goes
+  away with it.
+
+Measured (jz-38, same-day baselines):
+
+| metric | main | launch-ahead |
+|---|---|---|
+| inter-step device idle (own-gap, graph trace) | 641–804 µs | **43.0 µs** (p90 44.8) |
+| cross-rank step-start spread | 350–364 µs (max 965–1097) | **32.6 µs** (max 42.5) |
+| `cuGraphLaunch` p50 | 700 µs on the critical path | 660 µs, fully overlapped |
+| solo ms/step (5 runs) | 19.6–20.4, run-to-run wander | **19.5, zero variance** |
+
+Gates: determinism + byte-parity vs the main record PASS (short + 128-tok
+head), 8-way identical (7/8 + the known deterministic near-tie variant),
+8-way 128-tok concurrent 391 tok/s aggregate, staggered-admission churn +
+post-churn determinism PASS, post-disconnect + teardown PASS.
+
+Pitfalls recorded: cudarc's `memcpy_dtoh` copies the DESTINATION's byte
+count (an oversized pinned buffer reads past the device allocation —
+CUDA_ERROR_INVALID_VALUE); and a speculative-consume decision made from
+per-rank data (inputs, positions, captured-ness) desyncs the collectives —
+every such condition must come from the coordinator or be an invariant.
+
 ## Next action
 
-Build the device-fed decode loop (launch-ahead validated above — ~1 ms/step);
-then pad-row masked routing. Remaining from #542: per-layer combine straggler
-under real diverse load = expert imbalance (EPLB territory, deferred by user
-2026-07-05). MegaMoE fusion measured OUT (section above). #559 residual
-(combine +1.9, MLA +1.2 at b8), #541 indexer reference re-pin.
+Follow-ups: #542 wait-structure — launch-ahead lands the boundary half
+(section above); the per-layer combine straggler under diverse load is
+expert imbalance (EPLB, deferred). Pad-row masked routing (`topk_idx = -1`)
+is the next small lever. #559 residual (combine +1.9, MLA +1.2 at b8),
+#541 indexer reference re-pin.
