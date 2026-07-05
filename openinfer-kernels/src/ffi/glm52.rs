@@ -24,39 +24,35 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_deepgemm_grouped_fp8_contract_cuda(
-        operand_kind: i32,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        weight_scale_rows: i32,
-        weight_scale_cols: i32,
-        activation_scale_cols: i32,
-        activation_scale_tma_rows: i32,
-        psum_entries: i32,
-        expert_alignment: i32,
-    ) -> CUresult;
-
     pub fn glm52_deepgemm_grouped_fp8_metadata_cuda(
         psum_expert: *const i32,
         expert_offsets: *mut i64,
+        masked_m: *mut i32,
+        row_map: *mut i32,
         groups: i32,
         m_capacity: i32,
         expert_alignment: i32,
+        masked_cap: i32,
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_deepgemm_grouped_fp8_launch_cuda(
+    pub fn glm52_deepgemm_masked_out_to_aligned_cuda(
+        masked_out: *const Half,
+        masked_m: *const i32,
+        expert_offsets: *const i64,
+        aligned_out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_deepgemm_masked_grouped_fp8_launch_cuda(
         operand_kind: i32,
         a: *const u8,
         a_scale: *const f32,
         b: *const u8,
         b_scale: *const f32,
-        psum_expert: *const i32,
+        masked_m: *const i32,
         out: *mut Half,
-        groups: i32,
-        m_capacity: i32,
         n: i32,
         k: i32,
         stream: CUstream,
@@ -207,6 +203,33 @@ unsafe extern "C" {
         hidden_size: i32,
         group_size: i32,
         row_bound: *const i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_per_token_group_quant_bf16_masked_cuda(
+        input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        row_bound: *const i64,
+        row_map: *const i32,
+        masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
+        input: *const Half,
+        topk_weights: *const f32,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_size: i32,
+        group_size: i32,
+        row_bound: *const i64,
+        row_map: *const i32,
+        masked_cap: i32,
         stream: CUstream,
     ) -> CUresult;
 

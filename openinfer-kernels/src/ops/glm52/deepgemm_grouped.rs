@@ -1,3 +1,10 @@
+//! GLM5.2 EP8 routed-expert GEMM: DeepGEMM SM90 MGroupedMasked fp8
+//! blockscale, AOT-instantiated (no JIT, no torch). The metadata kernel
+//! bridges the DeepEP aligned-segment recv layout to the masked layout via
+//! `masked_m` + `row_map`; the remap kernel puts the W2 output back into the
+//! aligned slots `decode_combine` addresses. See
+//! `csrc/glm52/glm52_deepgemm_grouped.cu`.
+
 use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
@@ -7,10 +14,14 @@ use crate::tensor::DeviceContext;
 
 pub const GLM52_DEEPGEMM_GROUPED_W13_KIND: i32 = 1;
 pub const GLM52_DEEPGEMM_GROUPED_W2_KIND: i32 = 2;
-/// Per-expert row alignment of the grouped layout (a fixed design constant; the
-/// group count and m_capacity are runtime — PP8 EP1 owns all 256 experts and
-/// bs=1 decode sizes m_capacity to top_k*alignment).
+/// Per-expert row alignment of the DeepEP recv segment layout (a fixed design
+/// constant shared with the vendored shim).
 pub const GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT: usize = 64;
+/// Masked-layout constants baked into the AOT GEMM instantiation: one rank's
+/// local expert count and the per-expert row capacity (the DP8 protocol's
+/// worst case — all 64 global tokens routing one row each to one expert).
+pub const GLM52_DEEPGEMM_MASKED_GROUPS: usize = 32;
+pub const GLM52_DEEPGEMM_MASKED_CAP: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Glm52DeepGemmGroupedFp8Kind {
@@ -25,128 +36,59 @@ impl Glm52DeepGemmGroupedFp8Kind {
             Self::W2 => GLM52_DEEPGEMM_GROUPED_W2_KIND,
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Glm52DeepGemmGroupedFp8Contract {
-    pub groups: usize,
-    pub m_capacity: usize,
-    pub n: usize,
-    pub k: usize,
-    pub weight_scale_rows: usize,
-    pub weight_scale_cols: usize,
-    pub activation_scale_cols: usize,
-    pub activation_scale_tma_rows: usize,
-    pub psum_entries: usize,
-    pub expert_alignment: usize,
-}
-
-impl Glm52DeepGemmGroupedFp8Contract {
-    pub fn validate(self, kind: Glm52DeepGemmGroupedFp8Kind) -> Result<()> {
-        ensure!(
-            self.groups > 0 && self.psum_entries == self.groups,
-            "GLM5.2 DeepGEMM grouped FP8 needs groups>0 with one psum entry per group, got groups={}, psum_entries={}",
-            self.groups,
-            self.psum_entries
-        );
-        ensure!(
-            self.m_capacity > 0 && self.activation_scale_tma_rows == self.m_capacity,
-            "GLM5.2 DeepGEMM grouped FP8 needs m_capacity>0 == activation scale rows, got m_capacity={}, activation_scale_tma_rows={}",
-            self.m_capacity,
-            self.activation_scale_tma_rows
-        );
-        ensure!(
-            self.expert_alignment == GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT,
-            "GLM5.2 DeepGEMM grouped FP8 expert alignment must be {}, got {}",
-            GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT,
-            self.expert_alignment
-        );
-        match kind {
-            Glm52DeepGemmGroupedFp8Kind::W13 => self.validate_w13(),
-            Glm52DeepGemmGroupedFp8Kind::W2 => self.validate_w2(),
+    fn shape(self) -> (usize, usize) {
+        match self {
+            Self::W13 => (4096, 6144),
+            Self::W2 => (6144, 2048),
         }
     }
-
-    fn validate_w13(self) -> Result<()> {
-        ensure!(
-            self.n == 4096
-                && self.k == 6144
-                && self.weight_scale_rows == 32
-                && self.weight_scale_cols == 48
-                && self.activation_scale_cols == 48,
-            "GLM5.2 DeepGEMM W13 contract drifted: {self:?}"
-        );
-        Ok(())
-    }
-
-    fn validate_w2(self) -> Result<()> {
-        ensure!(
-            self.n == 6144
-                && self.k == 2048
-                && self.weight_scale_rows == 48
-                && self.weight_scale_cols == 16
-                && self.activation_scale_cols == 16,
-            "GLM5.2 DeepGEMM W2 contract drifted: {self:?}"
-        );
-        Ok(())
-    }
 }
 
-pub fn glm52_deepgemm_grouped_fp8_contract_validate(
-    kind: Glm52DeepGemmGroupedFp8Kind,
-    contract: Glm52DeepGemmGroupedFp8Contract,
-) -> Result<()> {
-    contract.validate(kind)?;
-    let result = unsafe {
-        ffi::glm52_deepgemm_grouped_fp8_contract_cuda(
-            kind.abi(),
-            contract.groups as i32,
-            contract.m_capacity as i32,
-            contract.n as i32,
-            contract.k as i32,
-            contract.weight_scale_rows as i32,
-            contract.weight_scale_cols as i32,
-            contract.activation_scale_cols as i32,
-            contract.activation_scale_tma_rows as i32,
-            contract.psum_entries as i32,
-            contract.expert_alignment as i32,
-        )
-    };
-    result
-        .result()
-        .map_err(|err| anyhow!("GLM5.2 DeepGEMM grouped FP8 ABI contract check failed: {err}"))
-}
-
-/// `m_capacity` is the row bound the caller's quant/relayout kernels covered;
-/// the kernel device-traps if any aligned expert segment ends past it (a
-/// cross-rank token-count disagreement — silently computing on uncovered rows
-/// would mix stale activations into real outputs).
+/// psum (i32 aligned running ends) → aligned segment starts (`expert_offsets`,
+/// with `[groups]` = the aligned end), per-expert real row counts
+/// (`masked_m`), and the aligned-row → masked-slot map (`row_map`, -1 across
+/// alignment gaps). `m_capacity` is the row bound the caller's quant kernels
+/// cover; the kernel device-traps if any segment ends past it (a cross-rank
+/// token-count disagreement) or exceeds the masked per-expert capacity.
 pub fn glm52_deepgemm_grouped_fp8_metadata_launch(
     ctx: &DeviceContext,
     groups: usize,
     m_capacity: usize,
     psum_expert: &CudaSlice<i32>,
     expert_offsets: &mut CudaSlice<i64>,
+    masked_m: &mut CudaSlice<i32>,
+    row_map: &mut CudaSlice<i32>,
 ) -> Result<()> {
     ensure!(
         groups > 0 && m_capacity > 0,
         "GLM5.2 DeepGEMM grouped FP8 metadata needs groups>0 and m_capacity>0, got groups={groups}, m_capacity={m_capacity}"
     );
     ensure!(
-        psum_expert.len() >= groups && expert_offsets.len() > groups,
-        "GLM5.2 DeepGEMM grouped FP8 metadata buffers too small for {groups} groups: psum={}, offsets={}",
+        psum_expert.len() >= groups
+            && expert_offsets.len() > groups
+            && masked_m.len() >= groups
+            && row_map.len() >= m_capacity,
+        "GLM5.2 DeepGEMM grouped FP8 metadata buffers too small for {groups} groups / {m_capacity} rows: psum={}, offsets={}, masked_m={}, row_map={}",
         psum_expert.len(),
-        expert_offsets.len()
+        expert_offsets.len(),
+        masked_m.len(),
+        row_map.len()
     );
     let (psum_ptr, _psum_guard) = psum_expert.device_ptr(&ctx.stream);
     let (offsets_ptr, _offsets_guard) = expert_offsets.device_ptr_mut(&ctx.stream);
+    let (masked_ptr, _masked_guard) = masked_m.device_ptr_mut(&ctx.stream);
+    let (map_ptr, _map_guard) = row_map.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::glm52_deepgemm_grouped_fp8_metadata_cuda(
             psum_ptr as *const i32,
             offsets_ptr as *mut i64,
+            masked_ptr as *mut i32,
+            map_ptr as *mut i32,
             groups as i32,
             m_capacity as i32,
             GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT as i32,
+            GLM52_DEEPGEMM_MASKED_CAP as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -155,102 +97,105 @@ pub fn glm52_deepgemm_grouped_fp8_metadata_launch(
         .map_err(|err| anyhow!("GLM5.2 DeepGEMM grouped FP8 metadata launch failed: {err}"))
 }
 
-pub fn glm52_deepgemm_grouped_fp8_launch(
+/// Masked grouped fp8 GEMM over the rank's 32 local experts:
+/// `out[g, :masked_m[g], n] = deq(weight[g]) @ deq(activation[g])`.
+/// Activation `[32, 64, k]` fp8, activation scale `[32, k/128, 64]` f32
+/// mn-major, weight `[32, n, k]` fp8 (bank layout as-is), weight scale
+/// `[32, n/128, k/128]` f32 (checkpoint layout as-is), out `[32, 64, n]`
+/// bf16. Requires sm_90a (NOT_SUPPORTED elsewhere).
+pub fn glm52_deepgemm_masked_grouped_fp8_launch(
     ctx: &DeviceContext,
     kind: Glm52DeepGemmGroupedFp8Kind,
-    contract: Glm52DeepGemmGroupedFp8Contract,
     activation: &CudaSlice<u8>,
-    activation_scale_tma: &CudaSlice<f32>,
+    activation_scale: &CudaSlice<f32>,
     weight: &CudaSlice<u8>,
     weight_scale: &CudaSlice<f32>,
-    psum_expert: &CudaSlice<i32>,
+    masked_m: &CudaSlice<i32>,
     output: &mut CudaSlice<bf16>,
 ) -> Result<()> {
-    validate_launch_buffers(
-        kind,
-        contract,
-        activation,
-        activation_scale_tma,
-        weight,
-        weight_scale,
-        psum_expert,
-        output,
-    )?;
-    let (activation_ptr, _activation_guard) = activation.device_ptr(&ctx.stream);
-    let (activation_scale_ptr, _activation_scale_guard) =
-        activation_scale_tma.device_ptr(&ctx.stream);
-    let (weight_ptr, _weight_guard) = weight.device_ptr(&ctx.stream);
-    let (weight_scale_ptr, _weight_scale_guard) = weight_scale.device_ptr(&ctx.stream);
-    let (psum_ptr, _psum_guard) = psum_expert.device_ptr(&ctx.stream);
-    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    let (n, k) = kind.shape();
+    let groups = GLM52_DEEPGEMM_MASKED_GROUPS;
+    let cap = GLM52_DEEPGEMM_MASKED_CAP;
+    ensure!(
+        activation.len() >= groups * cap * k
+            && activation_scale.len() >= groups * (k / 128) * cap
+            && weight.len() >= groups * n * k
+            && weight_scale.len() >= groups * (n / 128) * (k / 128)
+            && masked_m.len() >= groups
+            && output.len() >= groups * cap * n,
+        "GLM5.2 DeepGEMM masked grouped FP8 {kind:?} buffers too small: act {}, act_scale {}, w {}, w_scale {}, masked_m {}, out {}",
+        activation.len(),
+        activation_scale.len(),
+        weight.len(),
+        weight_scale.len(),
+        masked_m.len(),
+        output.len()
+    );
+    let (act_ptr, _act_guard) = activation.device_ptr(&ctx.stream);
+    let (act_scale_ptr, _act_scale_guard) = activation_scale.device_ptr(&ctx.stream);
+    let (w_ptr, _w_guard) = weight.device_ptr(&ctx.stream);
+    let (w_scale_ptr, _w_scale_guard) = weight_scale.device_ptr(&ctx.stream);
+    let (masked_ptr, _masked_guard) = masked_m.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = output.device_ptr_mut(&ctx.stream);
     let result = unsafe {
-        ffi::glm52_deepgemm_grouped_fp8_launch_cuda(
+        ffi::glm52_deepgemm_masked_grouped_fp8_launch_cuda(
             kind.abi(),
-            activation_ptr as *const u8,
-            activation_scale_ptr as *const f32,
-            weight_ptr as *const u8,
-            weight_scale_ptr as *const f32,
-            psum_ptr as *const i32,
-            output_ptr as *mut ffi::Half,
-            contract.groups as i32,
-            contract.m_capacity as i32,
-            contract.n as i32,
-            contract.k as i32,
+            act_ptr as *const u8,
+            act_scale_ptr as *const f32,
+            w_ptr as *const u8,
+            w_scale_ptr as *const f32,
+            masked_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            n as i32,
+            k as i32,
             ctx.stream.cu_stream(),
         )
     };
     result
         .result()
-        .map_err(|err| anyhow!("GLM5.2 DeepGEMM grouped FP8 launch failed: {err}"))
+        .map_err(|err| anyhow!("GLM5.2 DeepGEMM masked grouped FP8 {kind:?} launch failed: {err}"))
 }
 
-fn validate_launch_buffers(
-    kind: Glm52DeepGemmGroupedFp8Kind,
-    contract: Glm52DeepGemmGroupedFp8Contract,
-    activation: &CudaSlice<u8>,
-    activation_scale_tma: &CudaSlice<f32>,
-    weight: &CudaSlice<u8>,
-    weight_scale: &CudaSlice<f32>,
-    psum_expert: &CudaSlice<i32>,
-    output: &CudaSlice<bf16>,
+/// Masked GEMM output `[32, 64, n]` → the aligned recv slots
+/// `decode_combine` addresses (rows `offsets[g] + r` for `r < masked_m[g]`).
+pub fn glm52_deepgemm_masked_out_to_aligned_launch(
+    ctx: &DeviceContext,
+    n: usize,
+    masked_out: &CudaSlice<bf16>,
+    masked_m: &CudaSlice<i32>,
+    expert_offsets: &CudaSlice<i64>,
+    aligned_out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
-    contract.validate(kind)?;
-    let activation_len = contract.m_capacity * contract.k;
+    let groups = GLM52_DEEPGEMM_MASKED_GROUPS;
+    let cap = GLM52_DEEPGEMM_MASKED_CAP;
     ensure!(
-        activation.len() >= activation_len,
-        "GLM5.2 DeepGEMM grouped FP8 activation buffer too small: have {}, need {activation_len}",
-        activation.len()
-    );
-    let activation_scale_len = contract.activation_scale_tma_rows * contract.activation_scale_cols;
-    ensure!(
-        activation_scale_tma.len() >= activation_scale_len,
-        "GLM5.2 DeepGEMM grouped FP8 activation scale buffer too small: have {}, need {activation_scale_len}",
-        activation_scale_tma.len()
-    );
-    let weight_len = contract.groups * contract.n * contract.k;
-    ensure!(
-        weight.len() >= weight_len,
-        "GLM5.2 DeepGEMM grouped FP8 weight buffer too small: have {}, need {weight_len}",
-        weight.len()
-    );
-    let weight_scale_len =
-        contract.groups * contract.weight_scale_rows * contract.weight_scale_cols;
-    ensure!(
-        weight_scale.len() >= weight_scale_len,
-        "GLM5.2 DeepGEMM grouped FP8 weight scale buffer too small: have {}, need {weight_scale_len}",
-        weight_scale.len()
+        n > 0 && n.is_multiple_of(4),
+        "GLM5.2 masked-out remap needs n % 4 == 0, got {n}"
     );
     ensure!(
-        psum_expert.len() >= contract.psum_entries,
-        "GLM5.2 DeepGEMM grouped FP8 psum_expert buffer too small: have {}, need {}",
-        psum_expert.len(),
-        contract.psum_entries
+        masked_out.len() >= groups * cap * n
+            && masked_m.len() >= groups
+            && expert_offsets.len() > groups,
+        "GLM5.2 masked-out remap buffers too small: masked {}, masked_m {}, offsets {}",
+        masked_out.len(),
+        masked_m.len(),
+        expert_offsets.len()
     );
-    let output_len = contract.m_capacity * contract.n;
-    ensure!(
-        output.len() >= output_len,
-        "GLM5.2 DeepGEMM grouped FP8 output buffer too small: have {}, need {output_len}",
-        output.len()
-    );
-    Ok(())
+    let (src_ptr, _src_guard) = masked_out.device_ptr(&ctx.stream);
+    let (masked_ptr, _masked_guard) = masked_m.device_ptr(&ctx.stream);
+    let (offsets_ptr, _offsets_guard) = expert_offsets.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = aligned_out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_deepgemm_masked_out_to_aligned_cuda(
+            src_ptr as *const ffi::Half,
+            masked_ptr as *const i32,
+            offsets_ptr as *const i64,
+            dst_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 masked-out remap launch failed: {err}"))
 }
