@@ -39,10 +39,12 @@ use openinfer_kernels::ops::{
     glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch,
 };
 use openinfer_kernels::ops::{
-    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, Glm52TrtllmGroupedFp8Contract,
-    Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
-    glm52_deepgemm_grouped_offset_tma_aligned_f32_launch, glm52_router_noaux_tc_launch,
-    glm52_trtllm_grouped_fp8_launch,
+    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, glm52_router_noaux_tc_launch,
+};
+#[cfg(test)]
+use openinfer_kernels::ops::{
+    Glm52TrtllmGroupedFp8Contract, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
+    glm52_deepgemm_grouped_offset_tma_aligned_f32_launch, glm52_trtllm_grouped_fp8_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 #[cfg(test)]
@@ -679,9 +681,10 @@ pub(crate) fn glm52_moe_forward(
 }
 
 /// Relayout the plain per-row activation scale into the offset-major TMA layout,
-/// then run one grouped FP8 GEMM. Returns the bf16 output `[m_capacity, n]`.
-/// `groups`/`m_capacity` are runtime: 256/512 at EP1 (bs=1), 32/row-bound at
-/// EP8 (moe_ep8 drives this over the DeepEP recv layout).
+/// then run one TRTLLM grouped FP8 GEMM. Returns the bf16 output
+/// `[m_capacity, n]`. Test-only since the EP8 chain moved to the DeepGEMM
+/// masked grouped GEMM: the EP1 oracle gates keep cross-checking the expert
+/// paths through this reference route.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn grouped_gemm(
@@ -700,65 +703,14 @@ pub(crate) fn grouped_gemm(
     expert_offsets: &CudaSlice<i64>,
 ) -> Result<CudaSlice<bf16>> {
     let scale_layout = Glm52TrtllmGroupedOffsetScaleLayout::f32(m_capacity, scale_cols, groups);
-    let mut activation_scale_tma = ctx.stream.alloc_zeros::<f32>(scale_layout.output_len()?)?;
+    let mut scale_tma = ctx.stream.alloc_zeros::<f32>(scale_layout.output_len()?)?;
     let mut out = ctx.stream.alloc_zeros::<bf16>(m_capacity * n)?;
-    grouped_gemm_into(
-        ctx,
-        kind,
-        groups,
-        m_capacity,
-        n,
-        k,
-        scale_cols,
-        weight_scale_rows,
-        activation,
-        activation_scale_plain,
-        weight,
-        weight_scale,
-        expert_offsets,
-        &mut activation_scale_tma,
-        &mut out,
-    )?;
-    Ok(out)
-}
-
-/// `grouped_gemm` writing into caller-owned buffers (EP8's persistent
-/// workspace): `scale_tma` and `out` must hold at least the layout /
-/// `m_capacity * n` for the largest `m_capacity` ever passed — launches may
-/// cover fewer rows than the buffers, never more.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn grouped_gemm_into(
-    ctx: &DeviceContext,
-    kind: Glm52TrtllmGroupedFp8Kind,
-    groups: usize,
-    m_capacity: usize,
-    n: usize,
-    k: usize,
-    scale_cols: usize,
-    weight_scale_rows: usize,
-    activation: &CudaSlice<u8>,
-    activation_scale_plain: &CudaSlice<f32>,
-    weight: &CudaSlice<u8>,
-    weight_scale: &CudaSlice<f32>,
-    expert_offsets: &CudaSlice<i64>,
-    scale_tma: &mut CudaSlice<f32>,
-    out: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    let scale_layout = Glm52TrtllmGroupedOffsetScaleLayout::f32(m_capacity, scale_cols, groups);
-    let scale_tma_len = scale_layout.output_len()?;
-    ensure!(
-        scale_tma.len() >= scale_tma_len && out.len() >= m_capacity * n,
-        "GLM5.2 grouped GEMM workspace too small: scale_tma {} < {scale_tma_len} or out {} < {}",
-        scale_tma.len(),
-        out.len(),
-        m_capacity * n
-    );
     glm52_deepgemm_grouped_offset_tma_aligned_f32_launch(
         ctx,
         scale_layout,
         activation_scale_plain,
         expert_offsets,
-        scale_tma,
+        &mut scale_tma,
     )?;
 
     let contract = Glm52TrtllmGroupedFp8Contract {
@@ -776,11 +728,11 @@ pub(crate) fn grouped_gemm_into(
         kind,
         contract,
         activation,
-        scale_tma,
+        &scale_tma,
         weight,
         weight_scale,
         expert_offsets,
-        out,
+        &mut out,
     )?;
-    Ok(())
+    Ok(out)
 }

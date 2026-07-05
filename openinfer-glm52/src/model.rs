@@ -62,6 +62,16 @@ pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 8;
 /// continuum) keep the whole-step graphs' fixed-shape contract.
 pub(crate) const GLM52_DECODE_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PER_RANK];
 
+// The DeepGEMM masked grouped expert GEMM gives every local expert a fixed
+// per-expert row slab; each source token contributes at most one row per
+// expert, so the protocol's worst-case global token count must fit it.
+// Compile-time so a future GLM52_MAX_BATCH_PER_RANK bump fails here, not at
+// graph capture.
+const _: () = assert!(
+    crate::weights::GLM52_EP_RANKS * GLM52_MAX_BATCH_PER_RANK
+        <= openinfer_kernels::ops::GLM52_DEEPGEMM_MASKED_CAP
+);
+
 /// The step's forward shape, agreed globally by the coordinator: `bucket`
 /// rows per rank (a member of [`GLM52_DECODE_BUCKETS`] — the MoE collectives
 /// require every rank to enter with the same global row count), with

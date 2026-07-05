@@ -210,8 +210,8 @@ pub(crate) fn glm52_moe_ep8_routed_forward(
         "GLM5.2 EP8 MoE dispatching rank must pass a positive token count"
     );
     ensure!(
-        global_tokens >= num_tokens,
-        "GLM5.2 EP8 MoE global_tokens {global_tokens} < local tokens {num_tokens}"
+        global_tokens >= num_tokens && global_tokens > 0,
+        "GLM5.2 EP8 MoE global_tokens {global_tokens} must be positive and >= local tokens {num_tokens}"
     );
     // Each source token contributes at most one row per expert, so the
     // masked per-expert capacity covers the step iff it covers the global

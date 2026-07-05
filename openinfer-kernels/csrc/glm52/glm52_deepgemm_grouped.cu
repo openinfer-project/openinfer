@@ -21,8 +21,12 @@
 // Instantiation configs are the ones vLLM's DeepGEMM JIT picked for these
 // exact shapes on H200 (read from its kernel cache): BLOCK_M=64, W13
 // BLOCK_N=128/8 stages, W2 BLOCK_N=192/6 stages, TMA multicast 2 on B,
-// 132 persistent SMs. Requires sm_90a; without it the GEMM entry compiles as
-// a NOT_SUPPORTED stub (metadata/remap stay real — plain CUDA).
+// 132 persistent SMs. Requires sm_90a. build.rs compiles this whole TU for
+// sm_90a only when any sm_90 target exists (the MQA treatment) — so on a
+// mixed-SM build the metadata/remap kernels are Hopper-only too, matching
+// the rest of the GLM5.2 decode path; a build with NO sm_90 target compiles
+// everything for the native arch with the GEMM entry as a NOT_SUPPORTED
+// stub.
 
 #include "../common.cuh"
 
