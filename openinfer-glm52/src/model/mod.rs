@@ -22,8 +22,8 @@ use openinfer_kernels::ops::{
     GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK,
     GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout,
     add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into, embedding_rows_into,
-    glm52_decode_feed_launch, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
+    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
+    rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -41,9 +41,11 @@ use crate::moe_decode::{
     Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, run_router_into,
 };
 use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
-use crate::scheduler::GLM52_PADDING_STEP;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
+
+mod launch_ahead;
+use launch_ahead::Glm52SpeculatedStep;
 
 /// Per-request context cap: `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
 /// Sizes each slot's region of the per-layer MLA and index-K caches at build
@@ -73,6 +75,10 @@ const _: () = assert!(
         <= openinfer_kernels::ops::GLM52_DEEPGEMM_MASKED_CAP
 );
 
+// The decode feed kernel runs one 32-thread block (`glm52_decode_feed.cu`);
+// a batch-cap bump past it must widen the kernel, not silently truncate.
+const _: () = assert!(GLM52_MAX_BATCH_PER_RANK <= 32);
+
 /// The step's forward shape, agreed globally by the coordinator: `bucket`
 /// rows per rank (a member of [`GLM52_DECODE_BUCKETS`] — the MoE collectives
 /// require every rank to enter with the same global row count), with
@@ -90,6 +96,11 @@ const _: () = assert!(
 pub(crate) struct Glm52StepShape {
     pub(crate) bucket: usize,
     pub(crate) slots: [u8; GLM52_MAX_BATCH_PER_RANK],
+    /// Rows `0..active_rows` carry real requests; `active_rows..bucket` are
+    /// padding. Carried explicitly because a padding input is NOT
+    /// value-distinguishable from an active one (a single-token prompt `[0]`
+    /// legally feeds `(token 0, position 0)`).
+    pub(crate) active_rows: usize,
 }
 
 /// Short-context attention tier: while `seq_len <= 256` the DSA top-256 IS
@@ -291,25 +302,6 @@ pub(crate) struct Glm52RankModel {
     /// rows included): the feed kernel advances it without host readback,
     /// and a speculation must keep every row under the model-length cap.
     device_positions: [usize; GLM52_MAX_BATCH_PER_RANK],
-}
-
-/// A speculative next-step whole-graph replay already enqueued on the decode
-/// stream: the feed kernel advanced the device input buffers in place and
-/// the bucket graph was launched ahead, hiding the ~0.7 ms host-side
-/// `cuGraphLaunch` under the current step's execution (measured on jz-38:
-/// 5.4 µs intra-step replay gap vs 810 µs at an unhidden step boundary).
-/// Consumed only when the coordinator's next step matches `expect` exactly;
-/// on any mismatch the full host prologue overwrites the advanced inputs and
-/// the stale replay degrades to a recompute whose rows never influence the
-/// following real replay (per-row math is row-independent).
-struct Glm52SpeculatedStep {
-    bucket: usize,
-    slots: [u8; GLM52_MAX_BATCH_PER_RANK],
-    /// The coordinator inputs this speculation assumed: active rows carry
-    /// (this step's argmax, position + 1); padding rows repeat the padding
-    /// input verbatim (their device rows keep self-feeding, which is
-    /// harmless — pad outputs are never read and rows are isolated).
-    expect: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
 }
 
 /// Everything one decode bucket owns: batch-`rows` FlashMLA plans (per
@@ -613,11 +605,10 @@ impl Glm52RankModel {
         ep8: &mut Glm52MoeEp8State,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
-        consume: bool,
-        lease: bool,
+        flags: crate::runner::Glm52StepFlags,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let batch = shape.bucket;
-        if consume {
+        if flags.consume {
             // Launch-ahead fast path: the coordinator says this step IS the
             // replay every rank speculatively enqueued last step. That claim
             // is global — a speculative replay is a full set of collectives,
@@ -631,6 +622,7 @@ impl Glm52RankModel {
             )?;
             ensure!(
                 speculated.bucket == batch
+                    && speculated.active_rows == shape.active_rows
                     && speculated.slots[..batch] == shape.slots[..batch]
                     && speculated.expect[..batch] == inputs[..batch],
                 "GLM5.2 launch-ahead desync: consumed speculation (bucket {}, slots {:?}, expect \
@@ -648,7 +640,7 @@ impl Glm52RankModel {
             self.speculated = None;
             self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape)?;
         }
-        self.decode_step_harvest(ctx, inputs, shape, lease)
+        self.decode_step_harvest(ctx, inputs, shape, flags.lease)
     }
 
     /// The non-leased step path: validate the shape, rewrite every per-step
@@ -800,136 +792,6 @@ impl Glm52RankModel {
         });
         bucket.graphs[tier] = graph;
         result
-    }
-
-    /// Post-replay tail shared by both step paths: enqueue the argmax D2H,
-    /// then — with the copy still in flight — optionally speculate the next
-    /// step (feed kernel + rope-row gathers + launch-ahead replay), and only
-    /// then block for this step's result. The speculative `cuGraphLaunch`
-    /// thereby overlaps this step's execution instead of idling the GPU at
-    /// the next step boundary.
-    fn decode_step_harvest(
-        &mut self,
-        ctx: &DeviceContext,
-        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
-        shape: Glm52StepShape,
-        lease: bool,
-    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
-        let batch = shape.bucket;
-        let bucket = self
-            .buckets
-            .iter_mut()
-            .find(|bucket| bucket.rows == batch)
-            .expect("decode_step validated the bucket");
-        ctx.stream.memcpy_dtoh(
-            &bucket.scratch.argmax_values,
-            &mut bucket.argmax_values_host,
-        )?;
-        ctx.stream.memcpy_dtoh(
-            &bucket.scratch.argmax_indices,
-            &mut bucket.argmax_indices_host,
-        )?;
-
-        // Speculation must be all-ranks-or-none: the speculative replay is a
-        // full set of collectives, so every precondition here is a GLOBAL
-        // invariant the coordinator's lease already guarantees (single-token
-        // rows from the shape, position headroom from its slot bookkeeping —
-        // pad rows never outrun active rows — and captured graphs from the
-        // startup pre-capture). A rank that silently skipped would desync
-        // the collective pairing; crash early instead.
-        let mut speculated = false;
-        if lease {
-            let mut seen = [false; GLM52_MAX_BATCH_PER_RANK];
-            for &slot in &shape.slots[..batch] {
-                let slot = slot as usize;
-                ensure!(
-                    slot < GLM52_MAX_BATCH_PER_RANK && !std::mem::replace(&mut seen[slot], true),
-                    "GLM5.2 launch-ahead lease granted for a step with repeated slot {slot} \
-                     (span rows are never leased)"
-                );
-            }
-            for &position in &self.device_positions[..batch] {
-                ensure!(
-                    position + 1 < GLM52_MAX_MODEL_LEN,
-                    "GLM5.2 launch-ahead lease granted with a row at position {position} — the \
-                     advanced step would breach the model-length cap"
-                );
-            }
-            let longest_next = self.device_positions[..batch]
-                .iter()
-                .map(|&position| position + 2)
-                .max()
-                .expect("decode buckets forward at least one row");
-            let tier = if longest_next <= GLM52_MLA_TOPK_SHORT {
-                TIER_SHORT
-            } else {
-                TIER_FULL
-            };
-            ensure!(
-                bucket.graphs[tier].is_captured(),
-                "GLM5.2 launch-ahead lease granted before the (bucket {batch}, tier {tier}) graph \
-                 was captured — the startup pre-capture must cover every shape"
-            );
-            glm52_decode_feed_launch(
-                ctx,
-                &bucket.scratch.argmax_indices,
-                &mut self.token_ids,
-                &mut self.positions,
-                &mut self.slot_mapping,
-                &mut self.seq_lens,
-                batch,
-            )?;
-            embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
-            embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
-            bucket.graphs[tier].launch_captured(ctx)?;
-            for position in &mut self.device_positions[..batch] {
-                *position += 1;
-            }
-            speculated = true;
-        }
-
-        // Block on the D2H (the pinned slices synchronize on their own copy
-        // events) and unpack — identical semantics to the old blocking
-        // readback.
-        let top_values = bucket
-            .argmax_values_host
-            .as_slice()
-            .map_err(|err| anyhow::anyhow!("GLM5.2 argmax values D2H sync failed: {err}"))?;
-        let top_indices = bucket
-            .argmax_indices_host
-            .as_slice()
-            .map_err(|err| anyhow::anyhow!("GLM5.2 argmax indices D2H sync failed: {err}"))?;
-        let mut outputs = [0u32; GLM52_MAX_BATCH_PER_RANK];
-        for row in 0..batch {
-            let slot = shape.slots[row] as usize;
-            let top_value = top_values[row].to_f32();
-            let top_index = top_indices[row];
-            ensure!(
-                top_value.is_finite(),
-                "GLM5.2 slot {slot} greedy argmax found no finite logit (top = {top_value})"
-            );
-            ensure!(
-                (0..GLM52_VOCAB as i32).contains(&top_index),
-                "GLM5.2 slot {slot} greedy argmax index {top_index} outside the vocab"
-            );
-            outputs[row] = top_index as u32;
-        }
-
-        if speculated {
-            let padding = (GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
-            let mut expect = [padding; GLM52_MAX_BATCH_PER_RANK];
-            for row in 0..batch {
-                if inputs[row] != padding {
-                    expect[row] = (outputs[row], inputs[row].1 + 1);
-                }
-            }
-            self.speculated = Some(Glm52SpeculatedStep {
-                bucket: batch,
-                slots: shape.slots,
-                expect,
-            });
-        }
-        Ok(outputs)
     }
 }
 
