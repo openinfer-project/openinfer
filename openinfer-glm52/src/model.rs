@@ -285,11 +285,6 @@ pub(crate) struct Glm52RankModel {
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
     token_ids: CudaSlice<u32>,
-    /// Pinned landing buffers for the per-step argmax D2H. Pinned memory
-    /// makes the copy truly asynchronous, so the next step's replay can be
-    /// enqueued (launch-ahead) before the host blocks on this step's result.
-    argmax_values_host: PinnedHostSlice<bf16>,
-    argmax_indices_host: PinnedHostSlice<i32>,
     /// In-flight speculative next-step replay, if any (see `decode_step`).
     speculated: Option<Glm52SpeculatedStep>,
     /// What the per-row `positions` device buffer currently holds (padding
@@ -334,6 +329,12 @@ struct Glm52BucketState {
     scratch: Glm52DecodeScratch,
     graphs: [CudaGraphState; 2],
     block_table: CudaSlice<i32>,
+    /// Pinned landing buffers for this bucket's argmax D2H, sized exactly
+    /// `rows` (`memcpy_dtoh` copies the DESTINATION's byte count). Pinned
+    /// memory keeps the copy asynchronous so the next step's replay can be
+    /// enqueued launch-ahead before the host blocks on the result.
+    argmax_values_host: PinnedHostSlice<bf16>,
+    argmax_indices_host: PinnedHostSlice<i32>,
 }
 
 /// Tier index into the per-tier arrays: every consumer selects with the same
@@ -498,6 +499,10 @@ impl Glm52RankModel {
                 scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape)?,
                 graphs: [CudaGraphState::new(), CudaGraphState::new()],
                 block_table: bucket_table,
+                // Read only after a D2H lands in them (the write-combined
+                // pages start uninitialized).
+                argmax_values_host: unsafe { ctx.ctx.alloc_pinned::<bf16>(rows)? },
+                argmax_indices_host: unsafe { ctx.ctx.alloc_pinned::<i32>(rows)? },
             });
         }
         let buckets: [Glm52BucketState; GLM52_DECODE_BUCKETS.len()] = buckets
@@ -573,10 +578,6 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
-            // Read only after a D2H lands in them (the write-combined pages
-            // start uninitialized).
-            argmax_values_host: unsafe { ctx.ctx.alloc_pinned::<bf16>(batch)? },
-            argmax_indices_host: unsafe { ctx.ctx.alloc_pinned::<i32>(batch)? },
             speculated: None,
             device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
         })
@@ -800,11 +801,13 @@ impl Glm52RankModel {
             .iter_mut()
             .find(|bucket| bucket.rows == batch)
             .expect("decode_step validated the bucket");
-        ctx.stream
-            .memcpy_dtoh(&bucket.scratch.argmax_values, &mut self.argmax_values_host)?;
+        ctx.stream.memcpy_dtoh(
+            &bucket.scratch.argmax_values,
+            &mut bucket.argmax_values_host,
+        )?;
         ctx.stream.memcpy_dtoh(
             &bucket.scratch.argmax_indices,
-            &mut self.argmax_indices_host,
+            &mut bucket.argmax_indices_host,
         )?;
 
         // Speculate only when every row is a single-token row (distinct
@@ -869,11 +872,11 @@ impl Glm52RankModel {
         // Block on the D2H (the pinned slices synchronize on their own copy
         // events) and unpack — identical semantics to the old blocking
         // readback.
-        let top_values = self
+        let top_values = bucket
             .argmax_values_host
             .as_slice()
             .map_err(|err| anyhow::anyhow!("GLM5.2 argmax values D2H sync failed: {err}"))?;
-        let top_indices = self
+        let top_indices = bucket
             .argmax_indices_host
             .as_slice()
             .map_err(|err| anyhow::anyhow!("GLM5.2 argmax indices D2H sync failed: {err}"))?;
