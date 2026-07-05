@@ -19,10 +19,11 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK, Glm52FlashMlaSparseDecode,
-    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into,
-    embedding_rows_into, glm52_flashmla_sparse_decode_num_sm_parts,
-    glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
+    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK,
+    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout,
+    add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into, embedding_rows_into,
+    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
+    rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -481,6 +482,9 @@ impl Glm52RankModel {
             let mut out = ctx
                 .stream
                 .alloc_zeros::<bf16>(GLM52_MAX_BATCH_PER_RANK * n)?;
+            let mut gemv_partial = ctx.stream.alloc_zeros::<f32>(
+                GLM52_MAX_BATCH_PER_RANK * GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW,
+            )?;
             for rows in GLM52_DECODE_BUCKETS {
                 glm52_fp8_weight_only_gemv_launch(
                     ctx,
@@ -490,6 +494,7 @@ impl Glm52RankModel {
                     &activation,
                     &weight,
                     &scale,
+                    Some(&mut gemv_partial),
                     &mut out,
                 )
                 .with_context(|| {
