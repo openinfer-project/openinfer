@@ -1,3 +1,4 @@
+mod decode_feed;
 mod deepgemm_grouped;
 mod deepgemm_layout;
 mod deepgemm_mqa;
@@ -14,6 +15,7 @@ mod topk;
 mod trtllm_grouped;
 mod trtllm_linear;
 
+pub use decode_feed::*;
 pub use deepgemm_grouped::*;
 pub use deepgemm_layout::*;
 pub use deepgemm_mqa::*;

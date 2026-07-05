@@ -65,6 +65,27 @@ impl CudaGraphState {
         }
     }
 
+    /// Whether a graph has been captured and instantiated — i.e. whether
+    /// [`Self::launch_captured`] can replay without running the kernel closure.
+    pub fn is_captured(&self) -> bool {
+        !self.exec.is_null()
+    }
+
+    /// Replay the captured graph. Errors if nothing has been captured yet —
+    /// callers that may hit an uncaptured shape go through
+    /// [`Self::run_or_capture`] instead.
+    pub fn launch_captured(&mut self, ctx: &DeviceContext) -> Result<()> {
+        anyhow::ensure!(
+            self.is_captured(),
+            "CUDA graph replay requested before any capture"
+        );
+        let stream = active_cu_stream(ctx);
+        check(
+            unsafe { sys::cuGraphLaunch(self.exec, stream) },
+            "cuGraphLaunch",
+        )
+    }
+
     /// Run kernel closure directly, or capture into a graph and replay.
     ///
     /// `kernels` must be a pure GPU kernel sequence — no CPU-GPU sync, no allocation.

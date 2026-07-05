@@ -28,9 +28,10 @@ use tokio::sync::mpsc;
 
 use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, Glm52StepShape,
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, GLM52_MLA_TOPK_SHORT,
+    Glm52StepShape,
 };
-use crate::runner::Glm52RankWorker;
+use crate::runner::{Glm52RankWorker, Glm52StepFlags};
 
 /// What a rank forwards this step. Idle ranks feed the padding input; its
 /// KV/index-cache writes land in the idle rank's own dead cache slots and are
@@ -390,14 +391,48 @@ fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52Ste
             }
             // Padding rows on free slots: there are always enough, because
             // used >= actives and bucket <= MAX, so bucket - used <= frees.
+            let active_rows = dst;
             let mut frees = (0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| row[slot] == 0);
             while dst < bucket {
                 slots[dst] = frees.next().expect("bucket - used <= free slots") as u8;
                 dst += 1;
             }
-            Glm52StepShape { bucket, slots }
+            Glm52StepShape {
+                bucket,
+                slots,
+                active_rows,
+            }
         })
         .collect()
+}
+
+/// The launch-ahead flag decision — pure so the desync rules are testable.
+/// `consume`: this step IS the speculation every rank enqueued (same shapes
+/// AND no slot changed hands — a finish + admission can reuse a slot id
+/// under an identical-looking shape). `lease`: every rank must enqueue the
+/// next step speculatively — pure single-token decode everywhere with
+/// model-length headroom, nothing queued, no draft round. Both are global
+/// claims: a speculative replay is a full set of collectives, so per-rank
+/// discretion would desync the pairing.
+fn launch_ahead_flags(
+    shapes: &[Glm52StepShape],
+    leased_shapes: Option<&[Glm52StepShape]>,
+    slots_changed: bool,
+    pending_empty: bool,
+    dspark_enabled: bool,
+    slots: &[RankSlots],
+) -> Glm52StepFlags {
+    let consume = !slots_changed && leased_shapes == Some(shapes);
+    let lease = pending_empty
+        && !dspark_enabled
+        && slots
+            .iter()
+            .flat_map(|rank_slots| rank_slots.iter().flatten())
+            .all(|active| {
+                active.state.feed_want() == 1
+                    && active.state.next_input_at(0).position + 1 < GLM52_MAX_MODEL_LEN
+            });
+    Glm52StepFlags { consume, lease }
 }
 
 fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER_RANK]> {
@@ -447,6 +482,67 @@ pub(crate) fn run_dp8_coordinator(
             .all(|rank_slots| rank_slots.iter().all(Option::is_none))
     };
 
+    // Pre-capture every whole-step graph (bucket × attention tier) while the
+    // ranks are idle and trivially in lock-step. Launch-ahead speculation
+    // requires captured-ness to be UNIFORM across ranks — a lazily capturing
+    // rank would skip the speculative replay the others enqueued and desync
+    // the collectives — and pre-capturing also removes the old mid-serving
+    // capture stall. Row 0 at position GLM52_MLA_TOPK_SHORT lifts the step
+    // into the full tier; every row is a padding write into a free slot's
+    // dead cache region.
+    for &bucket in GLM52_DECODE_BUCKETS.iter() {
+        for full_tier in [false, true] {
+            let mut shape = Glm52StepShape {
+                bucket,
+                slots: [0; GLM52_MAX_BATCH_PER_RANK],
+                active_rows: 0,
+            };
+            for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
+                *dst = slot as u8;
+            }
+            let mut inputs =
+                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+            if full_tier {
+                inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
+            }
+            let responses = match workers
+                .iter()
+                .map(|worker| worker.step_async(inputs, shape, Glm52StepFlags::plain()))
+                .collect::<anyhow::Result<Vec<_>>>()
+            {
+                Ok(responses) => responses,
+                Err(err) => {
+                    log::error!("GLM5.2 graph pre-capture failed to submit: {err:#}");
+                    return;
+                }
+            };
+            for (rank, resp) in responses.into_iter().enumerate() {
+                let result = resp
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
+                    .and_then(|r| r);
+                if let Err(err) = result {
+                    log::error!(
+                        "GLM5.2 graph pre-capture (bucket {bucket}, full_tier {full_tier}) \
+                         failed on rank {rank}: {err:#}"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    log::info!(
+        "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
+        GLM52_DECODE_BUCKETS.len()
+    );
+
+    // The step shapes that carried the last launch-ahead lease, and whether
+    // any slot changed hands since it was granted — together they decide
+    // whether this step consumes the speculation (must be all-ranks-or-none,
+    // so the decision lives here, on global data, not on the ranks).
+    let mut leased_shapes: Option<Vec<Glm52StepShape>> = None;
+    let mut slots_changed = false;
+
     'serve: loop {
         // Intake: block when fully idle, otherwise drain what's queued.
         if channel_open && all_idle(&slots) && pending.is_empty() {
@@ -495,6 +591,7 @@ pub(crate) fn run_dp8_coordinator(
                 pending_resets[rank].push(slot);
             }
             slots[rank][slot] = Some(ActiveRequest { req, state });
+            slots_changed = true;
         }
         if all_idle(&slots) {
             continue;
@@ -505,6 +602,16 @@ pub(crate) fn run_dp8_coordinator(
         // free slots — and all responses are joined before any output is
         // interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots));
+        let flags = launch_ahead_flags(
+            &shapes,
+            leased_shapes.as_deref(),
+            slots_changed,
+            pending.is_empty(),
+            dspark_enabled,
+            &slots,
+        );
+        leased_shapes = flags.lease.then(|| shapes.clone());
+        slots_changed = false;
         let responses = slots
             .iter()
             .zip(&workers)
@@ -523,7 +630,7 @@ pub(crate) fn run_dp8_coordinator(
                         *input = (step.token, step.position);
                     }
                 }
-                worker.step_async(inputs, *shape)
+                worker.step_async(inputs, *shape, flags)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {
@@ -635,6 +742,7 @@ pub(crate) fn run_dp8_coordinator(
                         pending_resets[rank].push(slot_id);
                     }
                     *slot = None;
+                    slots_changed = true;
                 } else if dspark_enabled {
                     // Committed rows' captured hidden feeds the draft
                     // context; then re-propose from the new anchor.
@@ -767,6 +875,56 @@ fn fail_step(slots: &mut [RankSlots], err: &anyhow::Error) {
             prompt_tokens: active.req.prompt_tokens.len(),
             completion_tokens: active.state.completion_tokens(),
         });
+    }
+}
+
+#[cfg(test)]
+mod launch_ahead_flag_tests {
+    use super::*;
+
+    fn shape(bucket: usize, active_rows: usize) -> Glm52StepShape {
+        let mut slots = [0u8; GLM52_MAX_BATCH_PER_RANK];
+        for (slot, dst) in slots.iter_mut().enumerate().take(bucket) {
+            *dst = slot as u8;
+        }
+        Glm52StepShape {
+            bucket,
+            slots,
+            active_rows,
+        }
+    }
+
+    #[test]
+    fn consume_requires_unchanged_shapes_and_untouched_slots() {
+        let shapes = vec![shape(1, 1)];
+        let flags = launch_ahead_flags(&shapes, Some(&shapes), false, true, false, &[]);
+        assert!(flags.consume);
+    }
+
+    #[test]
+    fn slot_handoff_blocks_consume_even_under_identical_shapes() {
+        // A finish + admission can reuse a slot id without changing the
+        // shape — the desync class the first gate run hit.
+        let shapes = vec![shape(1, 1)];
+        let flags = launch_ahead_flags(&shapes, Some(&shapes), true, true, false, &[]);
+        assert!(!flags.consume);
+    }
+
+    #[test]
+    fn active_row_count_is_part_of_shape_equality() {
+        // Same bucket/slots but a row flipped active <-> pad must not consume:
+        // a padding input is not value-distinguishable from an active one.
+        let leased = vec![shape(1, 1)];
+        let shapes = vec![shape(1, 0)];
+        let flags = launch_ahead_flags(&shapes, Some(&leased), false, true, false, &[]);
+        assert!(!flags.consume);
+    }
+
+    #[test]
+    fn no_lease_without_an_empty_queue() {
+        let shapes = vec![shape(1, 1)];
+        let flags = launch_ahead_flags(&shapes, None, false, false, false, &[]);
+        assert!(!flags.lease && !flags.consume);
     }
 }
 

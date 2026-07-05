@@ -15,6 +15,16 @@ mod deepgemm_mqa;
 pub use deepgemm_mqa::*;
 
 unsafe extern "C" {
+    pub fn glm52_decode_feed_launch_cuda(
+        argmax_indices: *const i32,
+        token_ids: *mut u32,
+        positions: *mut u32,
+        slot_mapping: *mut i64,
+        seq_lens: *mut i32,
+        rows: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_deepgemm_mn_major_tma_aligned_f32_cuda(
         input: *const f32,
         output: *mut f32,

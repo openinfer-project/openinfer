@@ -44,6 +44,29 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) loaded_to_gpu: bool,
 }
 
+/// The coordinator's launch-ahead directives for one step — both are GLOBAL
+/// claims (a speculative replay is a full set of collectives, so ranks must
+/// act on them together or not at all).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Glm52StepFlags {
+    /// This step IS the speculative replay every rank enqueued last step.
+    pub(crate) consume: bool,
+    /// The next step is guaranteed to repeat this shape with each row
+    /// advanced by its own argmax — every rank MUST enqueue that next
+    /// replay launch-ahead (see `Glm52RankModel::decode_step`).
+    pub(crate) lease: bool,
+}
+
+impl Glm52StepFlags {
+    /// No speculation in either direction (warm pre-capture, tests).
+    pub(crate) fn plain() -> Self {
+        Self {
+            consume: false,
+            lease: false,
+        }
+    }
+}
+
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
@@ -71,6 +94,7 @@ enum Glm52RankCommand {
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
+        flags: Glm52StepFlags,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
     },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
@@ -174,12 +198,14 @@ impl Glm52RankWorker {
         &self,
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        flags: Glm52StepFlags,
     ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::Step {
                 inputs: Box::new(inputs),
                 shape,
+                flags,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -456,6 +482,7 @@ impl Glm52RankThreadState {
         &mut self,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        flags: Glm52StepFlags,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -468,7 +495,7 @@ impl Glm52RankThreadState {
             .context("GLM5.2 step before setup_comm")?;
         runtime
             .model
-            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape)
+            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape, flags)
     }
 }
 
@@ -487,9 +514,10 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
             Glm52RankCommand::Step {
                 inputs,
                 shape,
+                flags,
                 resp,
             } => {
-                let _ = resp.send(state.step(&inputs, shape));
+                let _ = resp.send(state.step(&inputs, shape, flags));
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));
