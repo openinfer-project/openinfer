@@ -129,7 +129,7 @@ Qwen3.5-4B follows the same HF-golden rule with one model-specific caveat: its f
 After a change that alters numerical output, regenerate the reference. The Qwen3-4B golden is recomputed on GPU through HuggingFace:
 
 ```bash
-uv run --no-project python tools/accuracy/dump_qwen3_4b_hf_golden.py \
+uv run --no-project python tools/accuracy/dump_qwen3_hf_golden.py \
     --model-path models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
 ```
 
