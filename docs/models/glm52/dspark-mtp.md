@@ -123,6 +123,17 @@ code prompt, and if a bucket-4 step lands near ~30 ms that is ≈12 ms/token (1.
   MHA heads × head_dim 64, needing the dflash qk-norm-rope warp-count fix + a FlashInfer
   HEAD_DIM=64 prefill instantiation (the crash-early launcher checks caught it on the first
   draft round).
+- **Draft round cost, direct measurement (2026-07-06, `dspark_propose_smoke`)**: a
+  single-GPU perf smoke (`openinfer-glm52/src/dspark_smoke.rs`, zero-weight synthetic
+  drafter at checkpoint geometry — kernel time is value-independent, so it runs on any
+  ~11 GB card, no checkpoint) confirms the shadow-mode 2.2 ms: **jz-38 H200 bs=1 =
+  2.01 ms/round, bs=8 = 4.82 ms** (7 drafts/round). That is 63%/53% of the
+  bandwidth-bound floor (6.1 GB / 12.3 GB weight traffic ÷ 4.8 TB/s): nsys shows the gap
+  is 8-row GEMVs cruising at ~78% of HBM peak plus ~0.2 ms of tiny kernels and ~0.2 ms
+  launch gaps per round — fixed costs that don't shrink with bandwidth (the same bench
+  hits 84% efficiency on a 5070 Ti). bs=8 doubles traffic because the varlen loop
+  re-reads k/v tail + fc weights per request. Headroom, in order: piecewise-graph the
+  draft (reclaim ~0.4 ms), batch the per-request k/v/fc GEMMs at bs>1.
 - **M3 — round loop — DONE, jz-38 gate green (2026-07-04, `6f83e30` + span-4 default)**. A
   decoding slot's span IS the verify span `[anchor, d1..dk]`; `advance_span` runs
   `accept_greedy` over the span's per-row argmax and commits the accepted prefix + the
