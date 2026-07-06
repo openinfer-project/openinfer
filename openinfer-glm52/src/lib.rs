@@ -53,9 +53,10 @@ pub struct Glm52LaunchOptions {
     pub tp_size: usize,
     pub dp_size: usize,
     /// DSpark drafter checkpoint dir (`RedHatAI/GLM-5.2-speculator.dspark`).
-    /// Enables greedy speculative decoding: verify spans ride the decode
-    /// buckets, accepted tokens commit in batches, per-request accept stats
-    /// are logged on release.
+    /// Enables speculative decoding for greedy AND sampled requests (the
+    /// verify span prefix-matches per-row sampled tokens — lossless): verify
+    /// spans ride the decode buckets, accepted tokens commit in batches,
+    /// per-request accept stats are logged on release.
     pub dspark_draft_model_path: Option<std::path::PathBuf>,
     /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
     /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);

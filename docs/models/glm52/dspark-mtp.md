@@ -211,7 +211,10 @@ and greedy neutrality (drafter-on greedy on this diff byte-matches main).
 **Frontend gap:** `wire.rs` still strips `seed` (the shared frontend serves models whose
 schedulers don't feed request-local steps — qwen3's legacy path, #284); the parity gates used
 a gate-only passthrough patch (`seed: params.seed.map(|s| s as u64)`), reverted after. Seeded
-requests over HTTP land with the sampling-parity issue, not this milestone.
+requests over HTTP land with the sampling-parity issue, not this milestone. Note the seeded
+verify span samples one row per FlashInfer call (the replayable-stream contract pins the
+philox subsequence to 0, so rows can't batch) — 4 sequential passes per round, cost
+unmeasured; the 2.38× above is the unseeded batched path.
 
 ## Layout pinned against speculators source (2026-07-04)
 

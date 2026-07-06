@@ -640,7 +640,7 @@ impl Glm52DsparkModel {
 }
 
 /// Prefix-match speculative acceptance — ported from
-/// `openinfer-qwen3/src/speculative.rs::accept_greedy`.
+/// `openinfer-qwen3/src/speculative.rs::accept_prefix_match`.
 ///
 /// * `proposed` — the `K` draft tokens fed after the anchor.
 /// * `target_tokens` — the verify step's committed token after each of the
@@ -663,7 +663,7 @@ impl Glm52DsparkModel {
 /// full rejection-sampling variant buys ≤ 1.5% throughput over this rule on
 /// code at temperature 1.0 — not worth its complexity).
 #[must_use]
-pub(crate) fn accept_greedy(proposed: &[u32], target_tokens: &[u32]) -> Vec<u32> {
+pub(crate) fn accept_prefix_match(proposed: &[u32], target_tokens: &[u32]) -> Vec<u32> {
     debug_assert_eq!(
         target_tokens.len(),
         proposed.len() + 1,
@@ -879,12 +879,12 @@ impl Glm52DsparkScratch {
 
 #[cfg(test)]
 mod tests {
-    use super::accept_greedy;
+    use super::accept_prefix_match;
 
     #[test]
     fn accepts_full_run_plus_bonus() {
         assert_eq!(
-            accept_greedy(&[10, 11, 12], &[10, 11, 12, 13]),
+            accept_prefix_match(&[10, 11, 12], &[10, 11, 12, 13]),
             vec![10, 11, 12, 13]
         );
     }
@@ -892,18 +892,18 @@ mod tests {
     #[test]
     fn accepts_prefix_then_correction() {
         assert_eq!(
-            accept_greedy(&[10, 11, 99], &[10, 11, 22, 33]),
+            accept_prefix_match(&[10, 11, 99], &[10, 11, 22, 33]),
             vec![10, 11, 22]
         );
     }
 
     #[test]
     fn rejects_first_draft_commits_the_correction() {
-        assert_eq!(accept_greedy(&[10, 11, 12], &[7, 8, 9, 10]), vec![7]);
+        assert_eq!(accept_prefix_match(&[10, 11, 12], &[7, 8, 9, 10]), vec![7]);
     }
 
     #[test]
     fn empty_proposal_commits_the_model_token() {
-        assert_eq!(accept_greedy(&[], &[42]), vec![42]);
+        assert_eq!(accept_prefix_match(&[], &[42]), vec![42]);
     }
 }

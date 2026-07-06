@@ -34,7 +34,7 @@ use openinfer_sample::{SamplingParams, mix_seed};
 use tokio::sync::mpsc;
 
 use crate::config::GLM52_VOCAB;
-use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
+use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_prefix_match};
 use crate::model::{
     GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, GLM52_MODEL_LEN_ALIGN,
     Glm52StepKv, Glm52StepShape, glm52_pool_blocks, glm52_table_width,
@@ -202,7 +202,7 @@ impl Glm52SlotState {
     /// prefix) samples, and row `k`'s step is `completion + k` — the same
     /// step a plain decode would sample that token at, which is what makes a
     /// seeded request's speculative stream replay its plain stream
-    /// token-exactly ([`accept_greedy`] then just prefix-matches the sampled
+    /// token-exactly ([`accept_prefix_match`] then just prefix-matches the sampled
     /// tokens against the drafts; the zero-draft plain row is the same rule).
     pub(crate) fn sampling_rows(&self, span_rows: usize) -> Vec<(usize, u64)> {
         debug_assert!(span_rows > 0);
@@ -249,7 +249,7 @@ impl Glm52SlotState {
     /// a verify: `outputs[k]` is the target's committed token after span row
     /// `k` (anchor + fed draft prefix) — the fused argmax for greedy
     /// requests, the sampled token for non-greedy ones — and
-    /// [`accept_greedy`] commits the agreed prefix plus one model token.
+    /// [`accept_prefix_match`] commits the agreed prefix plus one model token.
     /// With sampled outputs that prefix-match IS lossless speculative
     /// sampling for a deterministic draft: every committed token is a sample
     /// from the target distribution, acceptance only decides how many ride
@@ -274,7 +274,7 @@ impl Glm52SlotState {
         } else {
             let drafts_fed = outputs.len() - 1;
             debug_assert!(drafts_fed <= self.drafts.len());
-            let committed = accept_greedy(&self.drafts[..drafts_fed], outputs);
+            let committed = accept_prefix_match(&self.drafts[..drafts_fed], outputs);
             if drafts_fed > 0 {
                 self.spec.record(committed.len() - 1);
             }
@@ -338,11 +338,7 @@ impl SpecStats {
     }
 }
 
-pub(crate) fn validate_request(
-    req: &GenerateRequest,
-    max_model_len: usize,
-    dspark_enabled: bool,
-) -> Result<(), String> {
+pub(crate) fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
         return Err("GLM5.2 requires a non-empty prompt".to_owned());
     }
@@ -811,13 +807,13 @@ pub(crate) fn run_dp8_coordinator(
         // Intake: block when fully idle, otherwise drain what's queued.
         if channel_open && all_idle(&slots) && pending.is_empty() {
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending, max_model_len, dspark_enabled),
+                Some(req) => intake(req, &mut pending, max_model_len),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending, max_model_len, dspark_enabled),
+                Ok(req) => intake(req, &mut pending, max_model_len),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
@@ -1278,9 +1274,8 @@ fn intake(
     req: GenerateRequest,
     pending: &mut std::collections::VecDeque<GenerateRequest>,
     max_model_len: usize,
-    dspark_enabled: bool,
 ) {
-    if let Err(message) = validate_request(&req, max_model_len, dspark_enabled) {
+    if let Err(message) = validate_request(&req, max_model_len) {
         let prompt_tokens = req.prompt_tokens.len();
         let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
         let _ = req.token_tx.send(TokenEvent::Scheduled {
@@ -1737,6 +1732,31 @@ mod tests {
         assert_eq!(state.sampling_rows(2), vec![(0, 1), (1, 2)]);
     }
 
+    #[test]
+    fn sampling_steps_track_completion_across_rounds() {
+        // The seed contract's invariant: a token's sample step equals the
+        // completion index it lands at, regardless of how many rows rode
+        // each round — a partial accept must not shift the next round's
+        // steps (an off-by-one here silently breaks seeded replayability).
+        let mut state = state(vec![10, 11, 12], 16, false);
+        assert_eq!(
+            state.advance_span(&[99, 98, 42], EOS),
+            commit(&[42], 1, None, 3)
+        );
+        state.set_drafts(vec![50, 51, 52]);
+        assert_eq!(state.sampling_rows(4), vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
+        // Partial accept: sampled rows match d1, d2, reject d3 → commit
+        // [d1, d2, correction] = 3 tokens.
+        assert_eq!(
+            state.advance_span(&[50, 51, 77, 88], EOS),
+            commit(&[50, 51, 77], 3, None, 3)
+        );
+        // Next round resumes at completion = 4: plain decode would sample
+        // its 5th token (index 4) at step 4 — so must the verify span.
+        state.set_drafts(vec![60, 61, 62]);
+        assert_eq!(state.sampling_rows(4), vec![(0, 4), (1, 5), (2, 6), (3, 7)]);
+    }
+
     fn request(
         prompt: Vec<u32>,
         params: openinfer_sample::SamplingParams,
@@ -1761,14 +1781,6 @@ mod tests {
             temperature,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn non_greedy_is_admitted_with_and_without_the_drafter() {
-        // Sampled verify: the drafter no longer restricts sampling params.
-        let req = request(vec![10], sampled(0.7), 4);
-        assert!(validate_request(&req, 4096, false).is_ok());
-        assert!(validate_request(&req, 4096, true).is_ok());
     }
 
     #[test]
@@ -1802,7 +1814,7 @@ mod tests {
         for params in cases {
             let req = request(vec![10], params, 4);
             assert!(
-                validate_request(&req, 4096, false).is_err(),
+                validate_request(&req, 4096).is_err(),
                 "params must be rejected at intake: {params:?}"
             );
         }
@@ -1816,7 +1828,7 @@ mod tests {
             },
             4,
         );
-        assert!(validate_request(&req, 4096, false).is_ok());
+        assert!(validate_request(&req, 4096).is_ok());
     }
 
     #[test]

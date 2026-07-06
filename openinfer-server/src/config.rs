@@ -117,10 +117,10 @@ pub(crate) struct Args {
     pub no_prefix_cache: bool,
 
     /// Speculative drafter model path: Qwen3 DFlash/DSpark decoding, or the
-    /// GLM5.2 DSpark drafter (greedy speculative decoding; per-request accept
-    /// stats logged). For Qwen3: single-GPU greedy only; incompatible with
-    /// --enable-lora and --kv-offload, and forces the prefix cache off (it
-    /// needs clean target hidden states).
+    /// GLM5.2 DSpark drafter (greedy AND sampled requests speculate;
+    /// per-request accept stats logged). For Qwen3: single-GPU greedy only;
+    /// incompatible with --enable-lora and --kv-offload, and forces the
+    /// prefix cache off (it needs clean target hidden states).
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
