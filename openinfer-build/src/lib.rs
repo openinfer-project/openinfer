@@ -210,33 +210,27 @@ pub fn emit_rerun_if_changed_files(src_dir: &str, extensions: &[&str]) {
 mod tests {
     use super::*;
 
-    struct TempTree(PathBuf);
+    struct TempTree(tempfile::TempDir);
 
     impl TempTree {
-        fn new(name: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("openinfer-build-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
+        fn new() -> Self {
+            Self(tempfile::tempdir().unwrap())
+        }
+
+        fn root(&self) -> &Path {
+            self.0.path()
         }
 
         fn mkdirs(&self, rel: &str) -> PathBuf {
-            let dir = self.0.join(rel);
+            let dir = self.root().join(rel);
             std::fs::create_dir_all(&dir).unwrap();
             dir
         }
 
         fn touch(&self, rel: &str) {
-            let file = self.0.join(rel);
+            let file = self.root().join(rel);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, b"").unwrap();
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -246,40 +240,40 @@ mod tests {
 
     #[test]
     fn classic_layout() {
-        let tree = TempTree::new("classic");
+        let tree = TempTree::new();
         tree.touch("include/cuda.h");
         tree.touch("bin/nvcc");
         let lib64 = tree.mkdirs("lib64");
         tree.mkdirs("lib64/stubs");
 
-        let tk = CudaToolkit::from_root(tree.0.clone());
-        assert_eq!(tk.nvcc, tree.0.join("bin/nvcc"));
-        assert_eq!(tk.header_dir("cuda.h"), Some(tree.0.join("include")));
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
+        assert_eq!(tk.nvcc, tree.root().join("bin/nvcc"));
+        assert_eq!(tk.header_dir("cuda.h"), Some(tree.root().join("include")));
         assert_eq!(tk.lib_dirs, vec![lib64.clone()]);
         assert!(lib64.join("stubs").is_dir());
     }
 
     #[test]
     fn conda_layout() {
-        let tree = TempTree::new("conda");
+        let tree = TempTree::new();
         let target = target_dir();
         tree.mkdirs("include");
         tree.touch(&format!("targets/{target}/include/cuda.h"));
         let lib = tree.mkdirs("lib");
         let targets_lib = tree.mkdirs(&format!("targets/{target}/lib"));
 
-        let tk = CudaToolkit::from_root(tree.0.clone());
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
         assert_eq!(tk.nvcc, PathBuf::from("nvcc"));
         assert_eq!(
             tk.header_dir("cuda.h"),
-            Some(tree.0.join(format!("targets/{target}/include")))
+            Some(tree.root().join(format!("targets/{target}/include")))
         );
         assert_eq!(tk.lib_dirs, vec![lib, targets_lib]);
     }
 
     #[test]
     fn hpc_sdk_layout_adds_math_libs_sibling() {
-        let tree = TempTree::new("hpcsdk");
+        let tree = TempTree::new();
         let root = tree.mkdirs("release/cuda/12.6");
         let lib64 = tree.mkdirs("release/cuda/12.6/lib64");
         let math = tree.mkdirs("release/math_libs/12.6/lib64");
@@ -290,33 +284,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_dirs_dedupe() {
-        let tree = TempTree::new("symlink");
+        let tree = TempTree::new();
         let target = target_dir();
         tree.touch(&format!("targets/{target}/include/cuda.h"));
         tree.mkdirs(&format!("targets/{target}/lib"));
         std::os::unix::fs::symlink(
-            tree.0.join(format!("targets/{target}/include")),
-            tree.0.join("include"),
+            tree.root().join(format!("targets/{target}/include")),
+            tree.root().join("include"),
         )
         .unwrap();
         std::os::unix::fs::symlink(
-            tree.0.join(format!("targets/{target}/lib")),
-            tree.0.join("lib"),
+            tree.root().join(format!("targets/{target}/lib")),
+            tree.root().join("lib"),
         )
         .unwrap();
 
-        let tk = CudaToolkit::from_root(tree.0.clone());
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
         assert_eq!(tk.include_dirs.len(), 1);
         assert_eq!(tk.lib_dirs.len(), 1);
-        assert_eq!(tk.header_dir("cuda.h"), Some(tree.0.join("include")));
+        assert_eq!(tk.header_dir("cuda.h"), Some(tree.root().join("include")));
     }
 
     #[test]
     fn unknown_layout_yields_nothing() {
-        let tree = TempTree::new("unknown");
+        let tree = TempTree::new();
         tree.mkdirs("weird/place");
 
-        let tk = CudaToolkit::from_root(tree.0.clone());
+        let tk = CudaToolkit::from_root(tree.root().to_path_buf());
         assert!(tk.lib_dirs.is_empty());
         assert!(tk.include_dirs.is_empty());
         assert_eq!(tk.header_dir("cuda.h"), None);
@@ -324,9 +318,9 @@ mod tests {
 
     #[test]
     fn find_package_returns_matching_root_and_check_file() {
-        let tree = TempTree::new("findpkg");
+        let tree = TempTree::new();
         tree.touch("include/gdrapi.h");
-        let root_str = tree.0.to_str().unwrap().to_string();
+        let root_str = tree.root().to_str().unwrap().to_string();
 
         let (root, header) = find_package(
             "test",
@@ -334,15 +328,15 @@ mod tests {
             &[&root_str],
             &["targets/missing/include/gdrapi.h", "include/gdrapi.h"],
         );
-        assert_eq!(root, tree.0);
-        assert_eq!(header, tree.0.join("include/gdrapi.h"));
+        assert_eq!(root, tree.root());
+        assert_eq!(header, tree.root().join("include/gdrapi.h"));
     }
 
     #[test]
     #[should_panic(expected = "none of")]
     fn missing_header_panics_with_all_candidates() {
-        let tree = TempTree::new("empty");
-        let root_str = tree.0.to_str().unwrap().to_string();
+        let tree = TempTree::new();
+        let root_str = tree.root().to_str().unwrap().to_string();
         find_package(
             "test",
             "OPENINFER_TEST_UNSET_ENV",

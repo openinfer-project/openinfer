@@ -11,6 +11,8 @@ mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use lora::fixtures as lora_fixtures;
 mod prefill;
 mod scheduler;
 mod speculative;

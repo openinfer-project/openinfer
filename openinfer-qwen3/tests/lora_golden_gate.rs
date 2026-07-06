@@ -15,16 +15,15 @@
 //! Needs a CUDA GPU and Qwen3-4B weights (`OPENINFER_TEST_MODEL_PATH`); skips cleanly
 //! otherwise.
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob};
 use openinfer_core::sampler::SamplingParams;
+use openinfer_qwen3::lora_fixtures::{self as fixtures, FixtureTensor};
 use openinfer_qwen3::runtime::{
     DecodePlan, DecodeStepItem, PrefillPlan, PrefillStepItem, Qwen3Executor, RequestId,
 };
-use safetensors::tensor::View;
 use safetensors::{Dtype, SafeTensors};
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
@@ -190,34 +189,12 @@ struct Golden {
     base_topk_lp: Vec<f32>,
     lora_topk_ids: Vec<i32>,
     lora_topk_lp: Vec<f32>,
-    adapter_tensors: BTreeMap<String, AdapterTensor>,
+    adapter_tensors: BTreeMap<String, FixtureTensor>,
     adapter_config_json: String,
     num_seqs: usize,
     decode_len: usize,
     positions: usize,
     k: usize,
-}
-
-#[derive(Clone)]
-struct AdapterTensor {
-    dtype: Dtype,
-    shape: Vec<usize>,
-    data: Vec<u8>,
-}
-
-impl View for AdapterTensor {
-    fn dtype(&self) -> Dtype {
-        self.dtype
-    }
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-    fn data(&self) -> Cow<'_, [u8]> {
-        Cow::Borrowed(&self.data)
-    }
-    fn data_len(&self) -> usize {
-        self.data.len()
-    }
 }
 
 impl Golden {
@@ -257,7 +234,7 @@ impl Golden {
                 let t = st.tensor(name).expect("adapter tensor");
                 adapter_tensors.insert(
                     tensor_name.to_string(),
-                    AdapterTensor {
+                    FixtureTensor {
                         dtype: t.dtype(),
                         shape: t.shape().to_vec(),
                         data: t.data().to_vec(),
@@ -318,25 +295,10 @@ impl Golden {
     }
 
     /// Reconstruct the PEFT adapter directory the fixture embeds.
-    fn write_adapter_dir(&self) -> PathBuf {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "openinfer-qwen3-lora-golden-{}-{now}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp adapter dir");
-        std::fs::write(dir.join("adapter_config.json"), &self.adapter_config_json)
-            .expect("write adapter_config.json");
-        safetensors::serialize_to_file(
-            self.adapter_tensors.clone(),
-            None,
-            &dir.join("adapter_model.safetensors"),
-        )
-        .expect("write adapter_model.safetensors");
+    fn write_adapter_dir(&self) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        fixtures::write_adapter_config_json(dir.path(), &self.adapter_config_json);
+        fixtures::write_adapter_tensors(dir.path(), self.adapter_tensors.clone());
         dir
     }
 }
@@ -509,15 +471,13 @@ fn lora_logprobs_match_peft_golden_within_bf16_tolerance() {
     let golden = Golden::load();
     let adapter_dir = golden.write_adapter_dir();
 
-    run_suite(&golden, &model_path, &adapter_dir, &[0], "");
+    run_suite(&golden, &model_path, adapter_dir.path(), &[0], "");
 
     if cuda_device_count() >= 2 {
-        run_suite(&golden, &model_path, &adapter_dir, &[0, 1], "tp2 ");
+        run_suite(&golden, &model_path, adapter_dir.path(), &[0, 1], "tp2 ");
     } else {
         eprintln!("skipping lora_golden_gate TP=2 pass: <2 CUDA devices visible");
     }
-
-    let _ = std::fs::remove_dir_all(&adapter_dir);
 }
 
 fn cuda_device_count() -> usize {

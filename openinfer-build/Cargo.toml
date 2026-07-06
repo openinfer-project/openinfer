@@ -3,3 +3,6 @@ edition = "2024"
 name = "openinfer-build"
 license = "Apache-2.0"
 publish = false
+
+[dev-dependencies]
+tempfile = { workspace = true }

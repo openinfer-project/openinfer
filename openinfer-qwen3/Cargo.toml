@@ -33,6 +33,7 @@ toml = { workspace = true, optional = true }
 
 [features]
 kernel-call-trace = ["openinfer-core/kernel-call-trace"]
+test-fixtures = []
 kernel-report = [
     "dep:clap",
     "dep:comfy-table",
@@ -45,7 +46,9 @@ kernel-report = [
 ]
 
 [dev-dependencies]
+openinfer-qwen3 = { workspace = true, features = ["test-fixtures"] }
 openinfer-vllm-support = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 vllm-text = { workspace = true }
 

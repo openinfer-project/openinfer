@@ -3605,6 +3605,9 @@ dependencies = [
 [[package]]
 name = "openinfer-build"
 version = "0.0.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "openinfer-comm"
@@ -3839,6 +3842,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "vllm-text",
 ]
@@ -3981,6 +3985,7 @@ dependencies = [
  "openinfer-kernels",
  "openinfer-kv-cache",
  "openinfer-kv-offload",
+ "openinfer-qwen3",
  "openinfer-sample",
  "openinfer-vllm-support",
  "rand 0.10.1",
@@ -3988,6 +3993,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "toml",
  "vllm-text",
@@ -4012,6 +4018,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "vllm-text",
 ]
@@ -4069,6 +4076,7 @@ dependencies = [
  "openinfer-vllm-frontend",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

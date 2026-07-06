@@ -25,6 +25,9 @@ const SUPPORTED_TARGET_MODULES: &[&str] = &[
     "down_proj",
 ];
 
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct LoraAdapterManifest {
     pub(crate) path: PathBuf,
@@ -758,16 +761,10 @@ fn shard_projection_for_tensor_parallel(
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::collections::BTreeMap;
-    use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use safetensors::View;
-
+    use super::fixtures::{self, FixtureTensor};
     use super::*;
-
-    static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
 
     fn tiny_config() -> Config {
         Config {
@@ -787,102 +784,22 @@ mod tests {
         }
     }
 
-    fn temp_adapter_dir(test_name: &str) -> PathBuf {
-        let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "openinfer-qwen3-lora-{test_name}-{}-{id}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create temp adapter dir");
-        path
-    }
-
-    fn write_adapter_config(path: &Path, targets: &[&str], rank: usize) {
-        let targets = targets
-            .iter()
-            .map(|target| format!("\"{target}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        fs::write(
-            path.join(ADAPTER_CONFIG_FILE),
-            format!(
-                r#"{{
-  "peft_type": "LORA",
-  "r": {rank},
-  "lora_alpha": 16,
-  "target_modules": [{targets}]
-}}"#
-            ),
-        )
-        .expect("write adapter config");
-    }
-
     fn write_adapter_weights(path: &Path, config: &Config, targets: &[&str], rank: usize) {
         let mut tensors = BTreeMap::new();
         for layer_idx in 0..config.num_hidden_layers {
             for target in targets {
                 let spec = projection_spec(config, target).expect("projection spec");
-                push_tensor(
+                fixtures::push_projection(
                     &mut tensors,
-                    tensor_name(layer_idx, spec.path_segment, "lora_A"),
-                    vec![rank, spec.in_dim],
-                );
-                push_tensor(
-                    &mut tensors,
-                    tensor_name(layer_idx, spec.path_segment, "lora_B"),
-                    vec![spec.out_dim, rank],
+                    layer_idx,
+                    spec.path_segment,
+                    rank,
+                    spec.in_dim,
+                    spec.out_dim,
                 );
             }
         }
-        safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
-            .expect("write safetensors");
-    }
-
-    #[derive(Clone)]
-    struct TestTensor {
-        dtype: Dtype,
-        shape: Vec<usize>,
-        data: Vec<u8>,
-    }
-
-    impl View for TestTensor {
-        fn dtype(&self) -> Dtype {
-            self.dtype
-        }
-
-        fn shape(&self) -> &[usize] {
-            &self.shape
-        }
-
-        fn data(&self) -> Cow<'_, [u8]> {
-            Cow::Borrowed(&self.data)
-        }
-
-        fn data_len(&self) -> usize {
-            self.data.len()
-        }
-    }
-
-    fn push_tensor(tensors: &mut BTreeMap<String, TestTensor>, name: String, shape: Vec<usize>) {
-        push_tensor_with_dtype(tensors, name, shape, Dtype::BF16, 0.0);
-    }
-
-    fn push_tensor_with_dtype(
-        tensors: &mut BTreeMap<String, TestTensor>,
-        name: String,
-        shape: Vec<usize>,
-        dtype: Dtype,
-        value: f32,
-    ) {
-        let elems = shape.iter().product::<usize>();
-        let data = match dtype {
-            Dtype::BF16 => bf16::from_f32(value).to_bits().to_le_bytes().repeat(elems),
-            Dtype::F16 => f16::from_f32(value).to_bits().to_le_bytes().repeat(elems),
-            Dtype::F32 => value.to_le_bytes().repeat(elems),
-            _ => panic!("unsupported test dtype {dtype:?}"),
-        };
-        tensors.insert(name, TestTensor { dtype, shape, data });
+        fixtures::write_adapter_tensors(path, tensors);
     }
 
     fn matrix(rows: usize, cols: usize) -> LoraMatrix {
@@ -899,13 +816,14 @@ mod tests {
     #[test]
     fn validates_supported_qwen3_lora_adapter() {
         let config = tiny_config();
-        let path = temp_adapter_dir("valid");
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
         let targets = SUPPORTED_TARGET_MODULES;
-        write_adapter_config(&path, targets, 2);
-        write_adapter_weights(&path, &config, targets, 2);
+        fixtures::write_adapter_config(path, 2, 16, targets);
+        write_adapter_weights(path, &config, targets, 2);
 
         let manifest = load_lora_adapter(
-            &path,
+            path,
             &config,
             crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         )
@@ -924,12 +842,13 @@ mod tests {
     #[test]
     fn loads_lora_tensors_grouped_by_layer_and_target() {
         let config = tiny_config();
-        let path = temp_adapter_dir("load");
-        write_adapter_config(&path, &["q_proj", "down_proj"], 2);
-        write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
+        fixtures::write_adapter_config(path, 2, 16, &["q_proj", "down_proj"]);
+        write_adapter_weights(path, &config, &["q_proj", "down_proj"], 2);
 
         let adapter = load_lora_adapter(
-            &path,
+            path,
             &config,
             crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         )
@@ -958,31 +877,25 @@ mod tests {
     #[test]
     fn loads_supported_lora_tensor_dtypes_as_bf16() {
         let config = tiny_config();
-        let path = temp_adapter_dir("dtype-load");
-        write_adapter_config(&path, &["q_proj"], 2);
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
+        fixtures::write_adapter_config(path, 2, 16, &["q_proj"]);
 
         let mut tensors = BTreeMap::new();
         for layer_idx in 0..config.num_hidden_layers {
-            push_tensor_with_dtype(
-                &mut tensors,
+            tensors.insert(
                 tensor_name(layer_idx, "self_attn.q_proj", "lora_A"),
-                vec![2, config.hidden_size],
-                Dtype::F16,
-                1.5,
+                FixtureTensor::filled(Dtype::F16, vec![2, config.hidden_size], 1.5),
             );
-            push_tensor_with_dtype(
-                &mut tensors,
+            tensors.insert(
                 tensor_name(layer_idx, "self_attn.q_proj", "lora_B"),
-                vec![config.hidden_size, 2],
-                Dtype::F32,
-                2.25,
+                FixtureTensor::filled(Dtype::F32, vec![config.hidden_size, 2], 2.25),
             );
         }
-        safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
-            .expect("write safetensors");
+        fixtures::write_adapter_tensors(path, tensors);
 
         let adapter = load_lora_adapter(
-            &path,
+            path,
             &config,
             crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         )
@@ -996,12 +909,13 @@ mod tests {
     #[test]
     fn rejects_unsupported_target_module() {
         let config = tiny_config();
-        let path = temp_adapter_dir("unsupported-target");
-        write_adapter_config(&path, &["q_proj", "embed_tokens"], 2);
-        write_adapter_weights(&path, &config, &["q_proj"], 2);
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
+        fixtures::write_adapter_config(path, 2, 16, &["q_proj", "embed_tokens"]);
+        write_adapter_weights(path, &config, &["q_proj"], 2);
 
         let error = load_lora_adapter(
-            &path,
+            path,
             &config,
             crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         )
@@ -1013,11 +927,12 @@ mod tests {
     #[test]
     fn rejects_lora_rank_above_configured_limit() {
         let config = tiny_config();
-        let path = temp_adapter_dir("rank-limit");
-        write_adapter_config(&path, &["q_proj"], 2);
-        write_adapter_weights(&path, &config, &["q_proj"], 2);
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
+        fixtures::write_adapter_config(path, 2, 16, &["q_proj"]);
+        write_adapter_weights(path, &config, &["q_proj"], 2);
 
-        let error = load_lora_adapter(&path, &config, 1)
+        let error = load_lora_adapter(path, &config, 1)
             .expect_err("rank above max_lora_rank should fail")
             .to_string();
 
@@ -1083,31 +998,30 @@ mod tests {
     #[test]
     fn rejects_wrong_lora_tensor_shape() {
         let config = tiny_config();
-        let path = temp_adapter_dir("bad-shape");
-        write_adapter_config(&path, &["q_proj"], 2);
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
+        fixtures::write_adapter_config(path, 2, 16, &["q_proj"]);
 
         let mut tensors = BTreeMap::new();
         for layer_idx in 0..config.num_hidden_layers {
-            push_tensor(
-                &mut tensors,
+            tensors.insert(
                 tensor_name(layer_idx, "self_attn.q_proj", "lora_A"),
-                vec![2, config.hidden_size],
+                FixtureTensor::filled(Dtype::BF16, vec![2, config.hidden_size], 0.0),
             );
-            push_tensor(
-                &mut tensors,
+            let b_rows = if layer_idx == 0 {
+                config.hidden_size + 1
+            } else {
+                config.hidden_size
+            };
+            tensors.insert(
                 tensor_name(layer_idx, "self_attn.q_proj", "lora_B"),
-                if layer_idx == 0 {
-                    vec![config.hidden_size + 1, 2]
-                } else {
-                    vec![config.hidden_size, 2]
-                },
+                FixtureTensor::filled(Dtype::BF16, vec![b_rows, 2], 0.0),
             );
         }
-        safetensors::serialize_to_file(tensors, None, &path.join(ADAPTER_WEIGHTS_FILE))
-            .expect("write safetensors");
+        fixtures::write_adapter_tensors(path, tensors);
 
         let error = load_lora_adapter(
-            &path,
+            path,
             &config,
             crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         )
@@ -1161,11 +1075,12 @@ mod tests {
     #[test]
     fn shards_full_adapter_for_tensor_parallel() {
         let config = tiny_config();
-        let path = temp_adapter_dir("tp-shard");
-        write_adapter_config(&path, &["q_proj", "down_proj"], 2);
-        write_adapter_weights(&path, &config, &["q_proj", "down_proj"], 2);
+        let dir = tempfile::tempdir().expect("create temp adapter dir");
+        let path = dir.path();
+        fixtures::write_adapter_config(path, 2, 16, &["q_proj", "down_proj"]);
+        write_adapter_weights(path, &config, &["q_proj", "down_proj"], 2);
         let adapter = load_lora_adapter(
-            &path,
+            path,
             &config,
             crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
         )

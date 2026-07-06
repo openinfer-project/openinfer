@@ -1113,13 +1113,6 @@ mod tests {
     use super::*;
     use crate::lora::{DeviceLoraLayer, LoraAdapterManifest};
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "openinfer-qwen3-lora-{name}-{}",
-            std::process::id()
-        ))
-    }
-
     fn test_device_adapter(name: &str, path: &Path) -> DeviceLoraAdapter {
         DeviceLoraAdapter {
             name: name.to_string(),
@@ -1138,20 +1131,20 @@ mod tests {
     #[test]
     fn install_lora_adapter_requires_load_inplace_to_replace_existing_name() {
         let mut adapters = HashMap::new();
-        let first_path = temp_path("replace-first");
-        let second_path = temp_path("replace-second");
+        let first_path = Path::new("adapters/replace-first");
+        let second_path = Path::new("adapters/replace-second");
 
-        let first = test_device_adapter("adapter-a", &first_path);
+        let first = test_device_adapter("adapter-a", first_path);
         install_lora_adapter_in_registry(&mut adapters, first, false)
             .expect("install first adapter");
         assert_eq!(
             adapters
                 .get("adapter-a")
                 .map(|adapter| adapter.manifest.path.as_path()),
-            Some(first_path.as_path()),
+            Some(first_path),
         );
 
-        let duplicate = test_device_adapter("adapter-a", &second_path);
+        let duplicate = test_device_adapter("adapter-a", second_path);
         let error = install_lora_adapter_in_registry(&mut adapters, duplicate, false)
             .expect_err("duplicate adapter without load_inplace should fail")
             .to_string();
@@ -1160,17 +1153,17 @@ mod tests {
             adapters
                 .get("adapter-a")
                 .map(|adapter| adapter.manifest.path.as_path()),
-            Some(first_path.as_path()),
+            Some(first_path),
         );
 
-        let replacement = test_device_adapter("adapter-a", &second_path);
+        let replacement = test_device_adapter("adapter-a", second_path);
         install_lora_adapter_in_registry(&mut adapters, replacement, true)
             .expect("replace adapter");
         assert_eq!(
             adapters
                 .get("adapter-a")
                 .map(|adapter| adapter.manifest.path.as_path()),
-            Some(second_path.as_path()),
+            Some(second_path),
         );
     }
 
