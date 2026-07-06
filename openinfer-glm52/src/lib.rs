@@ -79,9 +79,11 @@ pub struct Glm52LaunchOptions {
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
 /// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
-/// and the non-expert weights are replicated, so the same token prefix
-/// produces byte-identical KV on every rank — any rank restores what any
-/// rank saved.
+/// and the non-expert weights are replicated, so any rank's KV for a token
+/// prefix is as good as any other's — the same tolerance as reusing a
+/// rank's own prefix cache (FP reduction order may differ across the batch
+/// shapes that computed it, never the semantics). Any rank restores what
+/// any rank saved.
 #[derive(Clone, Debug)]
 pub struct Glm52KvOffloadOptions {
     /// Host pinned-memory pool size in bytes, shared by all ranks.
@@ -486,8 +488,9 @@ fn build_rank_models(
 }
 
 /// One shared pegaflow host (one pinned pool) with each rank's arenas
-/// registered as its own instance under a single namespace — MLA KV is
-/// byte-identical across DP ranks, so any rank restores what any rank saved.
+/// registered as its own instance under a single namespace — replicated
+/// non-expert weights make DP ranks' KV interchangeable, so any rank
+/// restores what any rank saved.
 /// The namespace folds the layout facts that make blocks interchange-safe
 /// (per-token packing, page size, layer count); pool capacity deliberately
 /// stays out (a block's bytes don't depend on it).

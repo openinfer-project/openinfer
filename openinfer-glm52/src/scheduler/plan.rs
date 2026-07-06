@@ -109,18 +109,30 @@ pub(super) fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> V
 /// inside the padding page), nothing queued, no draft round. Both are global
 /// claims: a speculative replay is a full set of collectives, so per-rank
 /// discretion would desync the pairing.
+///
+/// `offload_enabled` kills the lease outright: a leased replay keeps writing
+/// KV on the rank stream for ~a step after the coordinator joined its
+/// argmax D2H, and the offload restore leg H2Ds into freshly-reallocated
+/// pool pages on pegaflow's OWN stream at the very next admission — the two
+/// are unordered, so a replay row landing after the restore would silently
+/// poison a content-addressed block for every later match. Without leases,
+/// the joined D2H is the last thing on the rank stream and admission truly
+/// is a quiet boundary. Costs ~0.7 ms/step, offload deployments only.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn launch_ahead_flags(
     shapes: &[Glm52StepShape],
     leased_shapes: Option<&[Glm52StepShape]>,
     slots_changed: bool,
     pending_empty: bool,
     dspark_enabled: bool,
+    offload_enabled: bool,
     slots: &[RankSlots],
     max_model_len: usize,
 ) -> Glm52StepFlags {
     let consume = !slots_changed && leased_shapes == Some(shapes);
     let lease = pending_empty
         && !dspark_enabled
+        && !offload_enabled
         && slots
             .iter()
             .flat_map(|rank_slots| rank_slots.iter().flatten())
@@ -225,7 +237,8 @@ mod tests {
     #[test]
     fn consume_requires_unchanged_shapes_and_untouched_slots() {
         let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, Some(&shapes), false, true, false, &[], 4096);
+        let flags =
+            launch_ahead_flags(&shapes, Some(&shapes), false, true, false, false, &[], 4096);
         assert!(flags.consume);
     }
 
@@ -234,7 +247,7 @@ mod tests {
         // A finish + admission can reuse a slot id without changing the
         // shape — the desync class the first gate run hit.
         let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, Some(&shapes), true, true, false, &[], 4096);
+        let flags = launch_ahead_flags(&shapes, Some(&shapes), true, true, false, false, &[], 4096);
         assert!(!flags.consume);
     }
 
@@ -244,14 +257,15 @@ mod tests {
         // a padding input is not value-distinguishable from an active one.
         let leased = vec![shape(1, 1)];
         let shapes = vec![shape(1, 0)];
-        let flags = launch_ahead_flags(&shapes, Some(&leased), false, true, false, &[], 4096);
+        let flags =
+            launch_ahead_flags(&shapes, Some(&leased), false, true, false, false, &[], 4096);
         assert!(!flags.consume);
     }
 
     #[test]
     fn no_lease_without_an_empty_queue() {
         let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, None, false, false, false, &[], 4096);
+        let flags = launch_ahead_flags(&shapes, None, false, false, false, false, &[], 4096);
         assert!(!flags.lease && !flags.consume);
     }
 
@@ -271,18 +285,30 @@ mod tests {
     }
 
     #[test]
+    fn offload_blocks_the_lease() {
+        // A leased replay keeps writing KV on the rank stream after the
+        // join; the offload restore H2Ds on pegaflow's stream, unordered
+        // against it. Offload on ⇒ never lease.
+        let shapes = vec![shape(1, 1)];
+        let greedy = decoding_fleet(openinfer_sample::SamplingParams::default());
+        assert!(!launch_ahead_flags(&shapes, None, false, true, false, true, &greedy, 4096).lease);
+    }
+
+    #[test]
     fn non_greedy_request_blocks_the_lease() {
         // The speculation feeds each row's argmax token; a sampled row would
         // replay the wrong input, so any non-greedy active blocks the lease.
         let shapes = vec![shape(1, 1)];
         let greedy = decoding_fleet(openinfer_sample::SamplingParams::default());
-        assert!(launch_ahead_flags(&shapes, None, false, true, false, &greedy, 4096).lease);
+        assert!(launch_ahead_flags(&shapes, None, false, true, false, false, &greedy, 4096).lease);
 
         let sampled = decoding_fleet(openinfer_sample::SamplingParams {
             temperature: 0.7,
             ..Default::default()
         });
-        assert!(!launch_ahead_flags(&shapes, None, false, true, false, &sampled, 4096).lease);
+        assert!(
+            !launch_ahead_flags(&shapes, None, false, true, false, false, &sampled, 4096).lease
+        );
 
         // An effectively-greedy request (top_p nucleus <= 1/vocab holds only
         // the argmax token) takes the argmax path, so it may ride the lease.
@@ -291,7 +317,9 @@ mod tests {
             top_p: 0.5 / GLM52_VOCAB as f32,
             ..Default::default()
         });
-        assert!(launch_ahead_flags(&shapes, None, false, true, false, &tiny_top_p, 4096).lease);
+        assert!(
+            launch_ahead_flags(&shapes, None, false, true, false, false, &tiny_top_p, 4096).lease
+        );
     }
 
     #[test]

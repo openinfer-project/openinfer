@@ -305,8 +305,11 @@ pub struct HostConfig {
 /// DP-rank sharing model: each rank registers its own GPU arenas as its own
 /// pegaflow *instance*, but blocks land in the one host tier keyed by
 /// `(namespace, hash)` — with a shared namespace, any rank restores what any
-/// rank saved (MLA KV is byte-identical across DP ranks, so the blocks are
-/// interchangeable).
+/// rank saved. Callers share a namespace only when their KV is
+/// interchangeable across instances: for replicated-weight DP ranks that
+/// holds to the same tolerance as reusing a rank's own prefix cache (the
+/// bytes may differ by FP reduction order across batch shapes, exactly like
+/// two local recomputations of the same prefix would).
 ///
 /// Dropping the last handle drops the [`Runtime`], which abandons any
 /// in-flight fire-and-forget saves (acceptable — the host tier is a cache)
