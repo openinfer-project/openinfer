@@ -1,6 +1,6 @@
 # GLM5.2 × pegaflow: host-tier KV offload → P/D disaggregation
 
-> **TL;DR:** Design record (no code yet). The pegaflow in-process bridge already exists and serves qwen3 (`openinfer-kv-offload` embeds `PegaEngine` directly); GLM5.2 integration is an extension, not greenfield. M1 = single-engine host-tier offload wired into the admission prefix-match; M2 = cross-engine P/D (vLLM prefill → openinfer decode) via the #540 hash-compat pattern. Design pins to pegaflow-core **v0.23.2 rev d46fd16** (the vendored dep), not the local v0.22.6 checkout.
+> **TL;DR:** M1 is implemented (`feat/kv-offload-shared-host`): shared `OffloadHost` + 8 rank instances on one namespace, 99 arenas/rank (78 MLA + 21 index-K), restore at admission / save on release, behind `--kv-offload` (+`--kv-offload-hugepages`). Device-side KV layout is verified byte-identical to vLLM's (our kernels are ports); the M2 gap is block hashing only. M2 = cross-engine P/D (vLLM prefill → openinfer decode) via the #540 hash-compat pattern. Design pins to pegaflow-core **v0.23.2 rev d46fd16** (the vendored dep), not the local v0.22.6 checkout.
 >
 > **Last touched:** 2026-07
 
@@ -36,6 +36,14 @@ Blocked on M1. Two hard problems, both with prior art:
 - The PyO3 package is a gRPC client — reference contract only, not our path.
 - vLLM connector requires `storage_offset()==0` and registers CUDA-IPC handles; our in-process path passes raw device pointers and skips IPC entirely.
 
+## M1 implementation notes (2026-07-06, `feat/kv-offload-shared-host`)
+
+- `OffloadHost` (openinfer-kv-offload) owns the pinned pool + runtime + P2P lifecycle; `OffloadEngine::with_arenas_on(host, ...)` registers a rank as one more pegaflow instance over the shared pool. `use_hugepages` is a `HostConfig`/CLI knob.
+- Each rank registers 99 arenas in one instance (78 `glm52.L{n}.mla` + 21 `glm52.L{n}.idxk` — full-indexer layers are `{0,1,2} ∪ {6,10,…,74}`, NOT a 5-layer set), so one save/load entry per block moves both caches atomically. `Glm52RankModel::kv_arenas` asserts allocation sizes against the geometry at registration.
+- Restore leg (`scheduler/offload.rs`): at admission — a step boundary, all ranks joined — probe → query → load into `reserve_loaded_blocks` pages → blocking `wait()` → `commit_loaded_blocks`; the probe is held across `match_and_add_prefix` so the committed blocks can't evict before the re-match. Save leg: on release, fire-and-forget, `assigned_block_guards` pin the pages through the D2H copy; prefix-matched head skipped (already host-resident).
+- Launch rejects `--kv-offload` with `--no-prefix-cache` or the DSpark drafter. Blocking the coordinator on the load stalls all 8 ranks for the restore duration — the accepted M1 cost; qwen3-style per-tick polling is the follow-up lever if restore latency shows up in ITL.
+- jz-38 hugepages: `echo N > /proc/sys/vm/nr_hugepages` works live as root (platform still zeroes it at reboot).
+
 ## Next action
 
-M1 step 1 (done, `feat/kv-offload-arena-registration`): `KvArena` + `OffloadEngine::with_arenas` extend the registration to explicit multi-arena geometry; qwen3's `from_buffer` delegates to it. Step 2: the shared-`PegaEngine` constructor (one host pool, 8 rank instances, one namespace), then the GLM5.2 arena exposure + admission CPU leg.
+Land the M1 branch once the jz-38 gates pass (evict-restore byte parity via churn eviction, mixed load with restores, hugepage pool, no-offload parity anchor). Then M2: #540-pattern vLLM hash compat + the byte-dump layout gate below.
