@@ -4,6 +4,7 @@ use std::thread;
 use anyhow::Result;
 use crossbeam_channel as channel;
 
+use crate::batch_decode::DecodeGraphUse;
 use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
 use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
@@ -331,6 +332,12 @@ fn execute_step_on_lane(
             kv_views,
             sample_seed,
         } => {
+            // Under TP, replay is only safe once the sweep captured every graph;
+            // reaching here without it would be a mid-serving capture (#481).
+            anyhow::ensure!(
+                !lane.model.tp_graph_enabled() || lane.precapture_complete,
+                "TP decode with CUDA Graph requires the startup pre-capture sweep"
+            );
             let token_ids: Vec<u32> = requests.iter().map(|req| req.token_id).collect();
             let lora_adapters: Vec<Option<&str>> = requests
                 .iter()
@@ -1133,13 +1140,6 @@ impl Qwen3Executor {
             "KV block events are only supported on the single-GPU path; got {} devices",
             device_ordinals.len()
         );
-        anyhow::ensure!(
-            !enable_cuda_graph || device_ordinals.len() == 1,
-            "CUDA Graph is not supported under tensor parallelism (the captured decode \
-             graph would record NCCL collectives with no cross-rank capture alignment); \
-             got {} devices",
-            device_ordinals.len()
-        );
         // The store cursor announces a block as cacheable the moment it is
         // registered, assuming GPU-resident reuse. With KV offload on, a block
         // can be evicted to the host tier and restored under a different lineage
@@ -1262,6 +1262,9 @@ impl Qwen3Executor {
             )?);
         }
 
+        // Each comm is built on its rank's compute stream — the same stream
+        // decode capture runs on — so its all-reduces land inside the captured
+        // graph; a comm on any other stream would execute them eagerly instead.
         let streams = models
             .iter()
             .map(|m| m.device_ctx().stream.clone())
@@ -1305,6 +1308,80 @@ impl Qwen3Executor {
                 RankWorker::spawn(index + 1, lane)
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // Pre-capture every reachable decode graph now (see [`PrecapturePhase`]):
+        // after every RankWorker is spawned (each launch blocks on its peers) and
+        // exactly once (a mid-serving re-run is the #481 capture window).
+        // Uncompiled GQA groups reroute decode to the eager unified path and skip it.
+        if enable_cuda_graph && metadata.config.decode_group_is_compiled() {
+            // NCCL has no device timeout, so a desynced sweep wedges forever;
+            // this watchdog aborts on the deadline. abort() not exit() — exit's
+            // cudart atexit teardown takes the same wedged driver lock — and it
+            // disarms only on the explicit success send (drop-on-error stays armed).
+            let (sweep_done_tx, sweep_done_rx) = channel::bounded::<()>(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            thread::Builder::new()
+                .name("qwen3-tp-precapture-watchdog".into())
+                .spawn(move || {
+                    if sweep_done_rx.recv_deadline(deadline).is_ok() {
+                        return;
+                    }
+                    // A sender drop (error path) can wake us early; stay armed
+                    // to the deadline before deciding startup is wedged.
+                    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                    eprintln!(
+                        "qwen3 TP decode graph pre-capture did not complete within 600s — NCCL wedge suspected, aborting"
+                    );
+                    log::error!(
+                        "qwen3 TP decode graph pre-capture did not complete within 600s — NCCL wedge suspected, aborting"
+                    );
+                    std::process::abort();
+                })
+                .map_err(|e| anyhow::anyhow!("failed to spawn pre-capture watchdog: {e}"))?;
+            let started = std::time::Instant::now();
+            let run_phase = |phase: PrecapturePhase| -> Result<()> {
+                let pending = std::iter::once(&primary)
+                    .chain(workers.iter())
+                    .map(|worker| worker.precapture(phase))
+                    .collect::<Result<Vec<_>>>()?;
+                let ranks = pending.len();
+                for (rank, recv) in pending.into_iter().enumerate() {
+                    let outcome = recv.recv().map_err(|_| {
+                        anyhow::anyhow!(
+                            "tensor-parallel rank {rank} dropped during graph pre-capture {phase:?}"
+                        )
+                    });
+                    if let Err(e) = outcome.and_then(|r| {
+                        r.map_err(|e| {
+                            anyhow::anyhow!(
+                                "tensor-parallel rank {rank} graph pre-capture {phase:?} failed: {e:#}"
+                            )
+                        })
+                    }) {
+                        // Peers past this rank may be wedged in an unpaired
+                        // collective; name them so the wedge is attributable.
+                        log::error!(
+                            "graph pre-capture aborting in {phase:?}; ranks {:?} were not yet collected and may be wedged in NCCL collectives",
+                            (rank + 1..ranks).collect::<Vec<_>>()
+                        );
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            };
+            run_phase(PrecapturePhase::Warmup)?;
+            for bucket_idx in 0..BATCH_BUCKETS.len() {
+                run_phase(PrecapturePhase::Capture { bucket_idx })?;
+                run_phase(PrecapturePhase::Launch { bucket_idx })?;
+            }
+            run_phase(PrecapturePhase::Finalize)?;
+            let _ = sweep_done_tx.send(());
+            log::info!(
+                "TP decode graph pre-capture: {} buckets per rank captured in {:.2}s",
+                BATCH_BUCKETS.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
 
         Ok(Self {
             metadata,
@@ -1394,6 +1471,13 @@ impl Qwen3Executor {
             "decode-overlap is unsupported for GQA group size {}/{}: no compiled decode kernel",
             self.metadata.config.num_attention_heads,
             self.metadata.config.num_key_value_heads,
+        );
+        // TP decode graphs are pre-captured on the compute stream only; a split
+        // decode stream would route capture into the graphs_split cache with no
+        // cross-rank alignment (and the streams below are built on device 0).
+        anyhow::ensure!(
+            self.workers.is_empty() || matches!(overlap, crate::DecodeOverlap::Off),
+            "decode-overlap is unsupported under tensor parallelism"
         );
         let device_ordinal = 0; // single-GPU path
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
@@ -2717,10 +2801,13 @@ struct DFlashMeta {
 }
 
 struct LocalQwen3Lane {
+    /// Before `model` on purpose: NCCL comm teardown polls until every graph
+    /// that recorded its collectives is destroyed, so these graphs must drop
+    /// before `model.tp_comm`.
+    bufs: BatchDecodeBuffers,
     model: Qwen3Model,
     kv_buffer: KvBuffer,
     layout: KvLayout,
-    bufs: BatchDecodeBuffers,
     sample_scratch: openinfer_sample::SampleScratch,
     /// Request-local decode steps handed to `select_batch`, reused across
     /// steps to keep the sampling hot path allocation-free. All zeros until
@@ -2740,6 +2827,11 @@ struct LocalQwen3Lane {
     verify_bufs: Option<VerifyGraphBuffers>,
     /// KV pool block count — the worst-case page-list bound for `verify_bufs`.
     total_blocks: usize,
+    /// Shared dead page backing both production padding rows and the sweep's
+    /// synthetic rows.
+    padding_block_id: i32,
+    /// Set by the sweep's `Finalize`; arms the TP replay fail-loud in serving.
+    precapture_complete: bool,
 }
 
 /// Stored state for an async prefill that was launched but not yet synced.
@@ -2802,7 +2894,57 @@ impl LocalQwen3Lane {
             dflash: None,
             verify_bufs: None,
             total_blocks,
+            padding_block_id,
+            precapture_complete: false,
         })
+    }
+
+    /// One phase of the TP startup sweep ([`PrecapturePhase`]). Synthetic rows
+    /// are token 0 at position 0 over the shared padding page; outputs unused.
+    fn precapture_phase(&mut self, phase: PrecapturePhase) -> Result<()> {
+        match phase {
+            PrecapturePhase::Warmup => self.model.warmup_tp_collective(),
+            PrecapturePhase::Capture { bucket_idx } => {
+                self.precapture_decode(bucket_idx, DecodeGraphUse::CaptureOnly)
+            }
+            PrecapturePhase::Launch { bucket_idx } => {
+                self.precapture_decode(bucket_idx, DecodeGraphUse::Replay)
+            }
+            PrecapturePhase::Finalize => {
+                for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
+                    let path = BatchDecodeBuffers::attention_path(bucket);
+                    let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, path);
+                    anyhow::ensure!(
+                        self.bufs.graphs[graph_idx].is_captured(),
+                        "TP decode graph pre-capture left bucket {bucket} ({path:?}) uncaptured"
+                    );
+                }
+                self.precapture_complete = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn precapture_decode(&mut self, bucket_idx: usize, graph_use: DecodeGraphUse) -> Result<()> {
+        let bucket = BATCH_BUCKETS[bucket_idx];
+        let token_ids = vec![0u32; bucket];
+        let kv_views: Vec<KvView> = (0..bucket)
+            .map(|_| KvView::new(vec![self.padding_block_id], 1, self.layout.page_size))
+            .collect();
+        let lora_adapters: Vec<Option<&str>> = vec![None; bucket];
+        self.model.batch_decode(
+            &token_ids,
+            &kv_views,
+            &lora_adapters,
+            self.kv_buffer.buffer(),
+            &self.layout,
+            &mut self.bufs,
+            graph_use,
+        )?;
+        // Capture acks only after the async cuGraphUpload lands; Launch acks
+        // only after the collectives drained.
+        self.model.device_ctx().stream.synchronize()?;
+        Ok(())
     }
 
     /// Load the DFlash draft model into this lane (primary rank only). The draft
@@ -3027,6 +3169,7 @@ impl LocalQwen3Lane {
             self.kv_buffer.buffer(),
             &self.layout,
             &mut self.bufs,
+            DecodeGraphUse::Serve,
         )
     }
 
@@ -3165,7 +3308,33 @@ enum WorkerCommand {
         request_id: RequestId,
         resp: channel::Sender<Result<()>>,
     },
+    /// Startup-only (TP + CUDA Graph): one phase of the decode-graph
+    /// pre-capture sweep. See [`LocalQwen3Lane::precapture_phase`].
+    Precapture {
+        phase: PrecapturePhase,
+        resp: channel::Sender<Result<()>>,
+    },
     Shutdown,
+}
+
+/// One controller-barriered phase of the TP decode-graph pre-capture sweep.
+///
+/// Capture and launch are separate phases because a captured collective's first
+/// launch blocks on its peers: overlapping that with a peer still in capture/
+/// instantiate/upload (which contend driver locks and allocate device memory)
+/// deadlocks the driver. So every rank finishes capturing a bucket before any
+/// rank launches it.
+#[derive(Clone, Copy, Debug)]
+enum PrecapturePhase {
+    /// One eager all-reduce per bucket message size, so the size-selected NCCL
+    /// algorithm connects before any `cuStreamBeginCapture` records it.
+    Warmup,
+    /// Record + instantiate + upload one bucket; no launch, no cross-rank dependency.
+    Capture { bucket_idx: usize },
+    /// Launch one bucket (pure enqueue after `Capture`) + sync; collectives pair across ranks.
+    Launch { bucket_idx: usize },
+    /// Verify every graph captured, mark the lane serve-ready.
+    Finalize,
 }
 
 enum WorkerStepOutcome {
@@ -3257,6 +3426,10 @@ impl RankWorker {
                                     lane.drop_dflash_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
+                                WorkerCommand::Precapture { phase, resp } => {
+                                    let result = lane.precapture_phase(phase);
+                                    let _ = resp.send(result);
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -3294,6 +3467,19 @@ impl RankWorker {
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    /// Start one sweep phase; returns the ack receiver. The controller fans a
+    /// phase out to all ranks before collecting acks so their collectives pair.
+    fn precapture(&self, phase: PrecapturePhase) -> Result<channel::Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::Precapture {
+                phase,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on precapture {phase:?}"))?;
         Ok(resp_rx)
     }
 

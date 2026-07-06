@@ -96,6 +96,25 @@ impl CudaGraphState {
         self.run_or_capture_synchronized(ctx, |_| {}, kernels)
     }
 
+    /// Capture, instantiate, and upload — no launch — so a later
+    /// [`Self::launch_captured`] is a pure enqueue (an un-uploaded exec uploads
+    /// implicitly on first launch). Async; synchronize before launching.
+    pub fn capture_only<F>(&mut self, ctx: &DeviceContext, kernels: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        anyhow::ensure!(
+            !self.is_captured(),
+            "capture_only on an already-captured graph would leak the live exec"
+        );
+        let stream = active_cu_stream(ctx);
+        self.capture_and_instantiate(ctx, stream, &mut |_| {}, kernels)?;
+        check(
+            unsafe { sys::cuGraphUpload(self.exec, stream) },
+            "cuGraphUpload",
+        )
+    }
+
     pub fn run_or_capture_synchronized<F, S>(
         &mut self,
         ctx: &DeviceContext,
@@ -118,6 +137,28 @@ impl CudaGraphState {
             return Ok(());
         }
 
+        self.capture_and_instantiate(ctx, stream, &mut synchronize, kernels)?;
+
+        synchronize(CudaGraphPhase::BeforeLaunch);
+        check(
+            unsafe { sys::cuGraphLaunch(self.exec, stream) },
+            "cuGraphLaunch first launch",
+        )?;
+        synchronize(CudaGraphPhase::AfterLaunch);
+        Ok(())
+    }
+
+    fn capture_and_instantiate<F, S>(
+        &mut self,
+        ctx: &DeviceContext,
+        stream: sys::CUstream,
+        synchronize: &mut S,
+        kernels: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+        S: FnMut(CudaGraphPhase),
+    {
         debug!("Capturing CUDA Graph for decode path...");
         synchronize(CudaGraphPhase::BeforeBeginCapture);
         check(
@@ -159,13 +200,6 @@ impl CudaGraphState {
         self.ctx_anchor = Some(ctx.ctx.clone());
         synchronize(CudaGraphPhase::AfterEndCapture);
         debug!("CUDA Graph captured successfully");
-
-        synchronize(CudaGraphPhase::BeforeLaunch);
-        check(
-            unsafe { sys::cuGraphLaunch(self.exec, stream) },
-            "cuGraphLaunch first launch",
-        )?;
-        synchronize(CudaGraphPhase::AfterLaunch);
         Ok(())
     }
 }

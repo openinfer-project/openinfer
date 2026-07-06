@@ -654,12 +654,23 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
 
     // TP=2: the same eager suite sharded over two GPUs. Same golden, same
     // tolerances — a reduction-order, shard-offset, or all-reduce bug drifts
-    // logits far past the bf16 noise floor. Eager-only: TP CUDA-graph support
-    // is deferred follow-up work (docs/models/qwen3/tp-design.md).
+    // logits far past the bf16 noise floor.
     let gpus = cuda_device_count();
     if gpus < 2 {
         eprintln!("skipping hf_golden_gate TP=2 pass: {gpus} CUDA device(s) visible, need 2");
         return;
     }
     run_eager_suite(&golden, &model_path, &[0, 1], "tp2 ");
+
+    // TP=2, graph on: replay the pre-captured decode graphs against the same
+    // golden, so a bad shard, pointer, or collective in a capture drifts logits.
+    if decode_group_compiled(&model_path) {
+        let mut ex = Qwen3Executor::from_runtime(&model_path, true, &[0, 1])
+            .expect("build cuda-graph TP executor");
+        ex.set_prefix_cache_enabled(false);
+        for n in BUCKET_STRADDLES {
+            let (batched, _) = run(&golden, &mut ex, &all[..n], true);
+            report_and_assert(&format!("tp2 batched cuda-graph ({n} padded)"), &batched);
+        }
+    }
 }

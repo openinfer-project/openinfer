@@ -194,8 +194,8 @@ pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
 /// Server-facing launch knobs for the Qwen3 engine.
 ///
 /// The binary maps raw CLI flags into this struct; [`launch`] then owns the
-/// Qwen3 startup policy — the TP→device mapping and the LoRA↔CUDA-Graph and
-/// TP↔CUDA-Graph exclusions — and dispatches to the right low-level entry.
+/// Qwen3 startup policy — the TP→device mapping and the LoRA↔CUDA-Graph
+/// exclusion — and dispatches to the right low-level entry.
 /// That policy lives with the model instead of leaking into the server.
 #[derive(Clone, Debug)]
 pub struct Qwen3LaunchOptions {
@@ -203,8 +203,8 @@ pub struct Qwen3LaunchOptions {
     pub device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     pub tp_size: usize,
-    /// Whether the user requested CUDA Graph. LoRA serving and tensor
-    /// parallelism force it off.
+    /// Whether the user requested CUDA Graph. LoRA serving forces it off;
+    /// under tensor parallelism every decode graph is pre-captured at startup.
     pub cuda_graph: bool,
     pub offload: Qwen3OffloadOptions,
     pub no_prefix_cache: bool,
@@ -232,16 +232,10 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         (0..options.tp_size).collect()
     };
     // LoRA serving repoints adapter weights between steps, which a captured
-    // decode graph bakes in; under TP the graph would capture each layer's
-    // NCCL all-reduces with nothing aligning capture across ranks.
+    // decode graph bakes in.
     let enable_cuda_graph = if options.lora.is_some() {
         if options.cuda_graph {
             warn!("Qwen3: CUDA Graph is disabled while LoRA serving is enabled");
-        }
-        false
-    } else if options.tp_size > 1 {
-        if options.cuda_graph {
-            warn!("Qwen3: CUDA Graph is disabled under tensor parallelism");
         }
         false
     } else {
@@ -262,6 +256,12 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.no_prefix_cache
         );
     }
+    // Also rejected at enable_decode_overlap (the load-bearing guard); failing
+    // here saves the full TP model load + graph pre-capture before the error.
+    anyhow::ensure!(
+        options.tp_size == 1 || matches!(options.decode_overlap, DecodeOverlap::Off),
+        "decode-overlap is unsupported under tensor parallelism"
+    );
     anyhow::ensure!(
         !(options.dflash_draft_model_path.is_some() && options.lora.is_some()),
         "DFlash speculative decoding cannot be combined with LoRA serving"

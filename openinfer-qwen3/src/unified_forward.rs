@@ -60,7 +60,14 @@ impl Qwen3Model {
         // sample. The synthetic views are short, but the pre-allocated decode
         // arena and graph state are the same serving objects used later. Skip it
         // for uncompiled-group models: the unified sample below bounds their KV.
+        // Eager under TP: ranks profile uncoordinated, so an in-profile capture
+        // would hit the same deadlock the sweep avoids (see `PrecapturePhase`).
         if self.config.decode_group_is_compiled() {
+            let graph_use = if self.tensor_parallel.world_size > 1 {
+                crate::batch_decode::DecodeGraphUse::Eager
+            } else {
+                crate::batch_decode::DecodeGraphUse::Serve
+            };
             self.batch_decode(
                 &decode_tokens,
                 &decode_views,
@@ -68,6 +75,7 @@ impl Qwen3Model {
                 kv_buffer.buffer(),
                 &layout,
                 decode_bufs,
+                graph_use,
             )?;
             mark_peak()?;
         }

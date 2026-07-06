@@ -1,4 +1,5 @@
-//! TP=2 launch with CUDA Graph requested — guards `launch` disabling CUDA Graph under TP.
+//! TP=2 launch with CUDA Graph on — decode replays the graphs pre-captured at
+//! startup, so this gates both the sweep and graph-on concurrent serving.
 //! The drain loop polls with a deadline so a deadlock fails instead of wedging the run.
 
 use std::mem::ManuallyDrop;

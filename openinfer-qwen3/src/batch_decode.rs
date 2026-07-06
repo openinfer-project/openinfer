@@ -42,6 +42,20 @@ macro_rules! trace_decode_kv_len {
     ($kv_len:expr, $body:block) => {{ $body }};
 }
 
+/// How a `batch_decode` call interacts with the per-bucket CUDA graphs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecodeGraphUse {
+    /// Replay if captured, lazily capture otherwise (single-GPU serving).
+    Serve,
+    /// Eager kernels even with graphs enabled; the TP memory profile uses it to
+    /// avoid an uncoordinated capture (see [`PrecapturePhase`]).
+    Eager,
+    /// Record + instantiate + upload, no launch (the TP sweep's `Capture`).
+    CaptureOnly,
+    /// Replay only; error if never captured (the TP sweep's `Launch`).
+    Replay,
+}
+
 impl Qwen3Model {
     /// Batch decode step: N requests, 1 new token each, one forward pass.
     ///
@@ -57,6 +71,7 @@ impl Qwen3Model {
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
         bufs: &mut BatchDecodeBuffers,
+        graph_use: DecodeGraphUse,
     ) -> Result<()> {
         let bs = token_ids.len();
         assert_eq!(bs, kv_views.len());
@@ -71,7 +86,12 @@ impl Qwen3Model {
         );
         let lora_slots = self.decode_lora_slots(lora_adapters)?;
         let use_lora = lora_slots.is_some();
-        let use_cuda_graph = self.enable_cuda_graph && lora_slots.is_none();
+        let graphs_available = self.enable_cuda_graph && lora_slots.is_none();
+        anyhow::ensure!(
+            graphs_available || matches!(graph_use, DecodeGraphUse::Serve | DecodeGraphUse::Eager),
+            "batch_decode {graph_use:?} requires CUDA graphs enabled and no LoRA rows"
+        );
+        let use_cuda_graph = graphs_available && graph_use != DecodeGraphUse::Eager;
 
         // Derive positions from views (seq_len - 1 = position of the new token)
         let mut positions: Vec<i32> = kv_views.iter().map(|v| (v.seq_len() - 1) as i32).collect();
@@ -118,7 +138,8 @@ impl Qwen3Model {
             } else {
                 std::mem::take(&mut bufs.graphs)
             };
-            let result = graphs[graph_idx].run_or_capture(&self.ctx, || {
+            let graph = &mut graphs[graph_idx];
+            let kernels = || {
                 trace_decode_kv_len!(trace_kv_len, {
                     self.batch_decode_kernels(
                         kv_buffer,
@@ -129,7 +150,13 @@ impl Qwen3Model {
                         bufs,
                     )
                 })
-            });
+            };
+            let result = match graph_use {
+                DecodeGraphUse::Serve => graph.run_or_capture(&self.ctx, kernels),
+                DecodeGraphUse::CaptureOnly => graph.capture_only(&self.ctx, kernels),
+                DecodeGraphUse::Replay => graph.launch_captured(&self.ctx),
+                DecodeGraphUse::Eager => unreachable!("use_cuda_graph excludes Eager"),
+            };
             if on_split_stream {
                 bufs.graphs_split = graphs;
             } else {

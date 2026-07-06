@@ -620,7 +620,9 @@ impl Qwen3Model {
         };
 
         if model.enable_cuda_graph {
-            debug!("Decode path CUDA Graph is enabled (captures on first decode step)");
+            debug!(
+                "Decode path CUDA Graph is enabled (single GPU captures on first decode step; TP pre-captures every bucket at startup)"
+            );
         } else {
             debug!("Decode path CUDA Graph is disabled");
         }
@@ -662,6 +664,31 @@ impl Qwen3Model {
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
         self.tp_comm = Some(comm);
+    }
+
+    /// Whether decode steps replay pre-captured graphs that record NCCL
+    /// collectives — i.e. CUDA Graph on a tensor-parallel model.
+    pub(crate) fn tp_graph_enabled(&self) -> bool {
+        self.enable_cuda_graph && self.tp_comm.is_some()
+    }
+
+    /// Force NCCL connect before any capture records a collective (lazy connect
+    /// inside `cuStreamBeginCapture` is the classic hazard). NCCL >= 2.22
+    /// connects per size-selected algorithm, so warm one all-reduce at every
+    /// bucket's message size. No-op without a TP communicator.
+    pub(crate) fn warmup_tp_collective(&self) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            let buckets = crate::batch_decode_buffers::BATCH_BUCKETS;
+            let max_elems = buckets.last().unwrap() * self.config.hidden_size;
+            let mut scratch = self.ctx.stream.alloc_zeros::<bf16>(max_elems)?;
+            for &bucket in buckets {
+                let mut view = scratch.slice_mut(0..bucket * self.config.hidden_size);
+                comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
+                    .map_err(|e| anyhow::anyhow!("nccl warm-up all-reduce failed: {e:?}"))?;
+            }
+            self.ctx.stream.synchronize()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn install_lora_adapter(

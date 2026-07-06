@@ -735,7 +735,7 @@ The next practical steps should be:
 
 - keep the current TP path stable and avoid reopening the earlier decode append bug
 - further unify the `tp=1` and `tp>1` scheduler / executor flow now that both paths are real and runnable
-- defer TP-specific CUDA Graph work until after that runtime shape is cleaner and more stable
+- keep the TP decode-graph startup pre-capture (every reachable bucket graph is captured in lock-step at init, so TP `batch_decode` steps are pure replay; mixed prefill+decode steps stay on the eager unified path) aligned with any bucket/attention-path changes
 - then revisit vocab-side replication only after the execution and correctness story is stable
 
 So the right reading of the current status is:
@@ -743,7 +743,8 @@ So the right reading of the current status is:
 - the architecture direction is validated
 - the TP path is real and runnable
 - the implementation is still a first-pass runtime bring-up, not the final production shape
-- TP-specific CUDA Graph support should still be treated as follow-up work rather than a solved part of the current baseline
+- TP CUDA Graph is now served via startup pre-capture (#498): every reachable (bucket, attention-path) decode graph is captured per rank at init while the ranks are trivially in lock-step, after every rank worker has spawned — uniform captured-ness across ranks is an invariant established at construction, not a runtime property
+- the sweep is two-phase per bucket (dual-GPU measured requirement, not a nicety): every rank records + instantiates + uploads the bucket's graph before any rank launches it, because a launched captured collective spins on its peers while capture/instantiate/upload contend process-wide driver locks — overlapping the two deadlocks the driver; for the same reason the TP memory profile's decode exercise runs eager, and the NCCL warmup runs one eager all-reduce per bucket size (connections are established per size-selected algorithm)
 
 The core bar for this milestone is straightforward:
 
@@ -754,7 +755,6 @@ The core bar for this milestone is straightforward:
 The following questions are intentionally deferred until after the first TP milestone is proven:
 
 - how far to push throughput optimization in the first TP implementation
-- when to restore or redesign CUDA Graph support for TP paths
 - when to shard vocab-facing weights instead of replicating them
 - whether later multi-GPU support should expand first toward larger dense models, MoE, or broader serving topology work
 

@@ -113,6 +113,7 @@ pub fn trace_decode_kernel_calls(
             kv_mgr.buffer().buffer(),
             &layout,
             &mut bufs,
+            crate::batch_decode::DecodeGraphUse::Serve,
         )
     })?;
     Ok(calls)
