@@ -1,17 +1,21 @@
 //! Batched decode for Qwen3.5: N requests, 1 token each, shared full-attn kernels
 //! and per-request recurrent-state updates for linear attention.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use super::batch_decode_graph::{BATCH_BUCKETS, BatchDecodeGraphState, bucket_for};
 use super::decode_buffers::BatchDecodeBuffers35;
 use super::recurrent_state::RecurrentState;
-use super::weights::{FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model};
+use super::weights::{
+    FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
+};
 use crate::ops;
 use openinfer_core::kv_pool::{KvLayout, KvState};
 use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
+
+static LOG_UNCOMPILED_DECODE_ROUTE: std::sync::Once = std::sync::Once::new();
 
 impl Qwen35Model {
     pub(crate) fn select_tokens_from_logits_varied(
@@ -151,6 +155,74 @@ impl Qwen35Model {
         Ok(())
     }
 
+    fn batch_decode_full_attention_via_prefill(
+        &self,
+        attn: &FullAttentionLayer,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        layout: &KvLayout,
+        plan: &ops::PrefillPagedPlan,
+        layer_idx: usize,
+        bs: usize,
+        bufs: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+
+        ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
+        ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
+        ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
+
+        ops::qk_norm_partial_rope_batched_decode_hd256_into(
+            &self.ctx,
+            &bufs.q_full,
+            &mut bufs.q_attn,
+            &mut bufs.k_attn,
+            &attn.q_norm,
+            &attn.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            &bufs.positions_d,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.rotary_dim,
+            eps,
+        );
+
+        ops::paged_attention_batch_decode_via_prefill_hd256_into(
+            &self.ctx,
+            &bufs.q_attn,
+            &bufs.k_attn,
+            &bufs.v_attn,
+            kv_buffer,
+            layout,
+            layer_idx,
+            plan,
+            &bufs.positions_d,
+            &mut bufs.attn_out_full,
+            self.config.num_attention_heads,
+            bs,
+        )?;
+
+        unsafe {
+            let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (out_ptr, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            crate::ffi::attention_gate_batch_hd256_cuda(
+                qf_ptr as *const crate::ffi::Half,
+                out_ptr as *mut crate::ffi::Half,
+                self.config.num_attention_heads as i32,
+                bs as i32,
+                self.ctx.stream.cu_stream(),
+            );
+        }
+
+        ops::gemm_into(
+            &self.ctx,
+            &attn.o_proj,
+            &bufs.attn_out_full,
+            &mut bufs.attn_results,
+        );
+        Ok(())
+    }
+
     // =========================================================================
     // CUDA Graph batch decode
     // =========================================================================
@@ -180,7 +252,18 @@ impl Qwen35Model {
         );
 
         if !self.config.decode_group_is_compiled() {
-            return self.batch_decode_via_prefill(token_ids, kv_states, graph_state);
+            LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
+                let group = self.config.num_attention_heads / self.config.num_key_value_heads;
+                log::info!(
+                    "Qwen3.5 decode GQA group {group} ({} q heads / {} kv heads) has no compiled BatchDecode kernel; batched hybrid eager fallback active, bs_capacity={}",
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    graph_state.buffers.max_batch_size,
+                );
+            });
+            // Paged-prefill attention stays eager; verify_graph records that
+            // captured prefill attention under-reads growing decode KV.
+            return self.batch_decode_batched_hybrid(token_ids, kv_states, graph_state);
         }
 
         let padded_bs = bucket_for(bs);
@@ -235,9 +318,7 @@ impl Qwen35Model {
         result
     }
 
-    /// Decode an uncompiled GQA group via the prefill path, writing `buffers.logits`
-    /// so callers sample as after the graph path.
-    pub(crate) fn batch_decode_via_prefill(
+    fn batch_decode_batched_hybrid(
         &self,
         token_ids: &[u32],
         kv_states: &mut [&mut KvState],
@@ -246,39 +327,94 @@ impl Qwen35Model {
         let bs = token_ids.len();
         anyhow::ensure!(
             bs > 0,
-            "batch_decode_via_prefill requires at least one request"
+            "batch_decode_batched_hybrid requires at least one request"
         );
-        anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
+        anyhow::ensure!(
+            bs == kv_states.len(),
+            "batch_decode_batched_hybrid token_ids / kv_states len mismatch: token_ids={}, kv_states={}",
+            bs,
+            kv_states.len()
+        );
+        anyhow::ensure!(
+            bs <= graph_state.buffers.max_batch_size,
+            "batch_decode_batched_hybrid bs={bs} exceeds buffer capacity {}",
+            graph_state.buffers.max_batch_size
+        );
 
-        let mut last_hiddens = Vec::with_capacity(bs);
-        for i in 0..bs {
-            let hidden = self.prefill_last_hidden(
-                &[token_ids[i]],
-                &mut *kv_states[i],
-                &mut graph_state.slot_states[i],
-            )?;
-            last_hiddens.push(hidden);
+        let mut positions_i32 = Vec::with_capacity(bs);
+        let mut start_positions = Vec::with_capacity(bs);
+        for (i, kv) in kv_states.iter_mut().enumerate() {
+            let pos = kv.seq_len();
+            self.ensure_rope_cache_covers(pos + 1)
+                .with_context(|| format!("hybrid decode rope cache pos={} slot={i}", pos + 1))?;
+            kv.ensure_capacity(pos + 1)
+                .with_context(|| format!("hybrid decode KV capacity pos={} slot={i}", pos + 1))?;
+            kv.advance(1);
+            graph_state.slot_states[i].seq_len += 1;
+            positions_i32.push(pos as i32);
+            start_positions.push(pos);
         }
 
         let bufs = &mut graph_state.buffers;
         bufs.set_batch_size(bs);
-        for (i, hidden) in last_hiddens.iter().enumerate() {
-            ops::write_vec_into(&self.ctx, hidden, &mut bufs.hidden, i)?;
-        }
-        ops::rms_norm_batch_offset_into(
+        self.ctx
+            .stream
+            .memcpy_htod(token_ids, &mut bufs.token_ids_d)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "hybrid decode H2D token_ids bs={bs}, cap={}: {e}",
+                    bufs.max_batch_size
+                )
+            })?;
+        self.ctx
+            .stream
+            .memcpy_htod(&positions_i32, &mut bufs.positions_d)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "hybrid decode H2D positions bs={bs}, cap={}: {e}",
+                    bufs.max_batch_size
+                )
+            })?;
+
+        let page_indices: Vec<Vec<i32>> =
+            kv_states.iter().map(|kv| kv.page_indices_i32()).collect();
+        let last_page_lens: Vec<usize> = kv_states.iter().map(|kv| kv.last_page_len()).collect();
+        let seq_lens = vec![1usize; bs];
+        // cta_tile_q 0 = the kernel's own FA2 derivation; the hd256 FFI takes no override.
+        let plan = ops::PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,
-            &bufs.hidden,
-            &self.norm,
-            self.config.rms_norm_eps,
-            &mut bufs.normed,
-        )?;
-        ops::gemm_into(
-            &self.ctx,
-            self.output_projection(),
-            &bufs.normed,
-            &mut bufs.logits,
+            &page_indices,
+            &last_page_lens,
+            &start_positions,
+            &seq_lens,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            0,
+        )
+        .with_context(|| {
+            format!(
+                "hybrid decode build PrefillPagedPlan bs={bs}, pages={}, heads={}/{}, head_dim={}",
+                page_indices.iter().map(Vec::len).sum::<usize>(),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim
+            )
+        })?;
+
+        let kv_buffer = kv_states[0].buffer();
+        let layout = *kv_states[0].layout();
+        anyhow::ensure!(
+            layout.num_kv_heads == self.config.num_key_value_heads
+                && layout.head_dim == self.config.head_dim,
+            "hybrid decode KV layout mismatch bs={bs}: layout kv_heads={}, head_dim={}; config kv_heads={}, head_dim={}",
+            layout.num_kv_heads,
+            layout.head_dim,
+            self.config.num_key_value_heads,
+            self.config.head_dim
         );
-        Ok(())
+        let slot_states = &mut graph_state.slot_states;
+        self.batch_decode_batched_hybrid_kernels(kv_buffer, &layout, &plan, bs, slot_states, bufs)
     }
 
     fn batch_decode_kernels_graph(
@@ -376,6 +512,117 @@ impl Qwen35Model {
         debug_assert_eq!(bufs.logits.seq_len, padded_bs);
 
         Ok(())
+    }
+
+    fn batch_decode_batched_hybrid_kernels(
+        &self,
+        kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
+        layout: &KvLayout,
+        plan: &ops::PrefillPagedPlan,
+        bs: usize,
+        slot_states: &mut [RecurrentState],
+        bufs: &mut BatchDecodeBuffers35,
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.token_ids_d,
+            &mut bufs.hidden,
+        )?;
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden,
+                &layer.input_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+
+            match &layer.attn {
+                LayerKind::FullAttention(attn) => {
+                    self.batch_decode_full_attention_via_prefill(
+                        attn, kv_buffer, layout, plan, full_idx, bs, bufs,
+                    )
+                    .with_context(|| {
+                        format!("hybrid decode full-attn layer_idx={layer_idx}, full_idx={full_idx}, bs={bs}")
+                    })?;
+                    full_idx += 1;
+                }
+                LayerKind::LinearAttention(attn) => {
+                    self.batch_decode_linear_attention_slots(
+                        attn, slot_states, linear_idx, bs, bufs,
+                    )
+                        .with_context(|| {
+                            format!("hybrid decode linear-attn layer_idx={layer_idx}, linear_idx={linear_idx}, bs={bs}")
+                        })?;
+                    linear_idx += 1;
+                }
+            }
+
+            self.batch_decode_mlp_tail(layer, bufs, eps)
+                .with_context(|| {
+                    format!("hybrid decode MLP tail layer_idx={layer_idx}, bs={bs}")
+                })?;
+        }
+
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden,
+            &self.norm,
+            eps,
+            &mut bufs.normed,
+        )?;
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &bufs.normed,
+            &mut bufs.logits,
+        );
+        debug_assert_eq!(bufs.logits.seq_len, bs);
+        Ok(())
+    }
+
+    fn batch_decode_mlp_tail(
+        &self,
+        layer: &TransformerBlock35,
+        bufs: &mut BatchDecodeBuffers35,
+        eps: f32,
+    ) -> Result<()> {
+        ops::add_batch_into(
+            &self.ctx,
+            &bufs.hidden,
+            &bufs.attn_results,
+            &mut bufs.hidden_mid,
+        )?;
+
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden_mid,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
+
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.gate_up_proj,
+            &bufs.normed,
+            &mut bufs.gate_up_out,
+        );
+        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.down_proj,
+            &bufs.act_out,
+            &mut bufs.mlp_out,
+        );
+
+        ops::add_batch_into(&self.ctx, &bufs.hidden_mid, &bufs.mlp_out, &mut bufs.hidden)
     }
 
     /// Linear attention decode over slot-indexed recurrent state.

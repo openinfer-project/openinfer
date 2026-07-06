@@ -165,8 +165,8 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
         },
         // ── Decode ──────────────────────────────────────────────────────────
         //
-        // CUDA-Graph captured. 1 token per request, bucket-padded to the
-        // nearest BATCH_BUCKET size. Recurrent state managed per slot.
+        // Compiled GQA groups use CUDA Graph bucket padding. Uncompiled groups
+        // run eager at real batch size and reuse paged prefill for full attn.
         //
         KernelPhase {
             name: "decode",
@@ -174,44 +174,50 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 // shared decode prologue
                 KernelOp {
                     id: "embedding_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::embedding_batch",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::embedding_batch",
                     backend: "CUDA",
-                    notes: "one token per request; bucket-padded for CUDA Graph",
+                    notes: "one token per request; compiled path bucket-pads, uncompiled fallback uses real bs",
                 },
                 KernelOp {
                     id: "rms_norm_offset_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::rms_norm_batch_offset_into",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::rms_norm_batch_offset_into",
                     backend: "FlashInfer",
                     notes: "(1+w) GemmaRMSNorm per layer (via flashinfer::norm::GemmaRMSNorm)",
                 },
                 // full-attention decode (8 layers)
                 KernelOp {
                     id: "qkv_gemm_decode_full",
-                    rust: "batch_decode::batch_decode_full_attention -> ops::gemm_into (q/k/v_proj)",
+                    rust: "batch_decode::{batch_decode_full_attention,batch_decode_full_attention_via_prefill} -> ops::gemm_into (q/k/v_proj)",
                     backend: "cuBLAS",
-                    notes: "3 cuBLAS GEMMs — Q, K, V projection over bucket-padded batch",
+                    notes: "3 cuBLAS GEMMs — Q, K, V projection over the active decode batch",
                 },
                 KernelOp {
                     id: "qk_norm_partial_rope_decode",
-                    rust: "batch_decode::batch_decode_full_attention -> ops::qk_norm_partial_rope_batched_decode_hd256_into",
+                    rust: "batch_decode::{batch_decode_full_attention,batch_decode_full_attention_via_prefill} -> ops::qk_norm_partial_rope_batched_decode_hd256_into",
                     backend: "CUDA",
                     notes: "Q/K RMSNorm + partial RoPE, head_dim=256",
                 },
                 KernelOp {
-                    id: "paged_decode_attention",
+                    id: "paged_decode_attention_compiled_group",
                     rust: "batch_decode::batch_decode_full_attention -> ops::paged_attention_batch_decode_hd256_into",
                     backend: "CUDA",
-                    notes: "wraps paged_kv_scatter + paged_attention_decode — custom CUDA, NOT FlashInfer",
+                    notes: "compiled GQA groups: shared paged_kv_scatter + ffi::paged_attention_decode_cuda_hd256",
+                },
+                KernelOp {
+                    id: "paged_decode_attention_uncompiled_group",
+                    rust: "batch_decode::batch_decode_full_attention_via_prefill -> ops::paged_attention_batch_decode_via_prefill_hd256_into",
+                    backend: "CUDA",
+                    notes: "uncompiled GQA groups: shared paged_kv_scatter + ffi::batch_prefill_paged_cuda_hd256, eager only",
                 },
                 KernelOp {
                     id: "attention_gate_decode",
-                    rust: "batch_decode::batch_decode_full_attention -> ffi::attention_gate_batch_hd256_cuda",
+                    rust: "batch_decode::{batch_decode_full_attention,batch_decode_full_attention_via_prefill} -> ffi::attention_gate_batch_hd256_cuda",
                     backend: "CUDA",
                     notes: "Q-gated attention output scaling",
                 },
                 KernelOp {
                     id: "o_proj_decode_full",
-                    rust: "batch_decode::batch_decode_full_attention -> ops::gemm_into (o_proj)",
+                    rust: "batch_decode::{batch_decode_full_attention,batch_decode_full_attention_via_prefill} -> ops::gemm_into (o_proj)",
                     backend: "cuBLAS",
                     notes: "attention output projection",
                 },
@@ -249,28 +255,28 @@ pub static KERNEL_PLAN: KernelPlan = KernelPlan {
                 // shared decode epilogue (every layer)
                 KernelOp {
                     id: "residual_add_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::add_batch_into",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_mlp_tail} -> ops::add_batch_into",
                     backend: "CUDA",
                     notes: "residual connections (post-attn, post-mlp)",
                 },
                 KernelOp {
                     id: "mlp_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (gate_up/down) + silu_mul_fused_batch_into",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_mlp_tail} -> ops::gemm_into (gate_up/down) + silu_mul_fused_batch_into",
                     backend: "CUDA + cuBLAS",
                     notes: "SwiGLU MLP — fused gate+up cuBLAS GEMM, CUDA SiLU*mul, down cuBLAS GEMM",
                 },
                 // final norm + sampling (once per decode step, not per layer)
                 KernelOp {
                     id: "final_norm_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::rms_norm_batch_offset_into",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::rms_norm_batch_offset_into",
                     backend: "FlashInfer",
                     notes: "final RMSNorm on logits hidden state (via flashinfer::norm::GemmaRMSNorm)",
                 },
                 KernelOp {
                     id: "lm_head_decode",
-                    rust: "batch_decode::batch_decode_kernels_graph -> ops::gemm_into (output_projection)",
+                    rust: "batch_decode::{batch_decode_kernels_graph,batch_decode_batched_hybrid_kernels} -> ops::gemm_into (output_projection)",
                     backend: "cuBLAS",
-                    notes: "LM head: untied lm_head.weight when the config unties embeddings, else embed_tokens (one cuBLAS GEMM over the bucket-padded batch)",
+                    notes: "LM head: untied lm_head.weight when configured, else embed_tokens; logits rows are dense 0..active_bs",
                 },
                 // batched sampling
                 KernelOp {

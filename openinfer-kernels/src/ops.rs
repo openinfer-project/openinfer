@@ -19,7 +19,8 @@ mod sampling;
 pub use attention::{
     PrefillPagedPlan, SUPPORTED_GQA_GROUP_SIZES, dflash_qk_norm_rope_into,
     paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
+    paged_attention_batch_decode_split_kv_into,
+    paged_attention_batch_decode_via_prefill_hd256_into, prefill_attention_paged_into,
     qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
     single_prefill_nhd_noncausal_into,
 };
