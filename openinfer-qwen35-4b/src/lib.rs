@@ -19,6 +19,7 @@ pub mod prefill_buffers;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
+mod tp_executor;
 mod unified_forward;
 mod weights;
 
@@ -40,6 +41,8 @@ pub mod runtime {
         DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
         PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen35Executor, RequestId,
     };
+    pub use crate::scheduler::start_with_capacity;
+    pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
 }
 
