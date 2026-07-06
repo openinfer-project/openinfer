@@ -1,6 +1,11 @@
 //! DP8 lock-step continuous-batching scheduler: up to
 //! `GLM52_MAX_BATCH_PER_RANK` requests per rank, each owning one slot of the
-//! rank's decode batch (and that slot's disjoint region of the paged caches).
+//! rank's decode batch. KV pages come from a per-rank [`BlockPool`]
+//! (64-token pages, content-hashed blocks): admission reserves a request's
+//! full-lifetime page count up front (honor-or-reject — a request that can
+//! never fit is rejected, one that can't fit *now* stays queued), so decode
+//! can never run out of pages mid-request, and released requests' sealed
+//! blocks stay matchable as the prefix cache.
 //!
 //! Every global step ALL ranks run the full-model forward simultaneously with
 //! the SAME batch bucket — ranks feed each active slot's *span* of next
@@ -24,19 +29,25 @@
 //! rank workers.
 
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
+use openinfer_kv_cache::{BlockPool, RequestKv};
 use openinfer_sample::{SamplingParams, mix_seed};
 use tokio::sync::mpsc;
 
 use crate::config::GLM52_VOCAB;
 use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, Glm52StepShape,
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, GLM52_MODEL_LEN_ALIGN,
+    Glm52StepKv, Glm52StepShape, glm52_pool_blocks, glm52_table_width,
 };
 use crate::runner::{Glm52RankWorker, Glm52RowSample, Glm52StepFlags};
 
-/// What a rank forwards this step. Idle ranks feed the padding input; its
-/// KV/index-cache writes land in the idle rank's own dead cache slots and are
-/// overwritten when a request is admitted there.
+/// The KV page size (== the FlashMLA page / index-K block / model-len
+/// alignment — one 64 everywhere).
+const PAGE: usize = GLM52_MODEL_LEN_ALIGN;
+
+/// What a rank forwards this step. Idle rows feed the padding input; their
+/// KV/index-cache writes land in the pool's reserved padding page, which no
+/// request is ever assigned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52StepInput {
     pub(crate) token: u32,
@@ -53,14 +64,15 @@ pub(crate) const GLM52_PADDING_STEP: Glm52StepInput = Glm52StepInput {
 pub(crate) enum Glm52StepOutcome {
     /// Mid-prefill: the model's outputs are discarded, keep feeding the prompt.
     Prefilling,
-    /// Commit the span's agreed tokens: emit `emitted` in order, then finish
-    /// if `finish` is set. A suppressed EOS counts toward the completion
-    /// length but is not emitted (the engine-wide contract), and truncates
-    /// the committed run. Plain decode commits exactly one token; a verify
-    /// span commits the accepted draft prefix plus the model's correction or
-    /// bonus token (1..=span tokens).
+    /// Commit the span's agreed tokens: `committed` is the consumed run
+    /// (what advances the request's KV bookkeeping — a suppressed EOS is its
+    /// last entry), of which the leading `emit` tokens are sent to the
+    /// client, then finish if `finish` is set. Plain decode commits exactly
+    /// one token; a verify span commits the accepted draft prefix plus the
+    /// model's correction or bonus token (1..=span tokens).
     Commit {
-        emitted: Vec<u32>,
+        committed: Vec<u32>,
+        emit: usize,
         finish: Option<FinishReason>,
         /// Leading span rows whose tokens are now committed context for the
         /// draft lane: all rows of a prompt span; anchor + accepted drafts of
@@ -116,12 +128,21 @@ struct SpecStats {
 }
 
 impl Glm52SlotState {
-    pub(crate) fn new(prompt: Vec<u32>, max_tokens: usize, ignore_eos: bool) -> Self {
+    /// `cached_tokens` = the prefix-cache hit: those leading prompt tokens'
+    /// KV is already resident in pool pages, so feeding starts past them
+    /// (the matcher always leaves >= 1 prompt token uncached).
+    pub(crate) fn new(
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        ignore_eos: bool,
+        cached_tokens: usize,
+    ) -> Self {
+        debug_assert!(cached_tokens < prompt.len());
         Self {
+            fed: cached_tokens,
             prompt,
             max_tokens,
             ignore_eos,
-            fed: 0,
             completion: 0,
             last_token: 0,
             drafts: Vec::new(),
@@ -253,7 +274,8 @@ impl Glm52SlotState {
         };
         self.drafts.clear();
 
-        let mut emitted = Vec::with_capacity(committed.len());
+        let mut committed = committed;
+        let mut emit = 0usize;
         let mut finish = None;
         for &token in &committed {
             self.completion += 1;
@@ -261,15 +283,21 @@ impl Glm52SlotState {
                 finish = Some(FinishReason::Stop);
                 break;
             }
-            emitted.push(token);
+            emit += 1;
             self.last_token = token;
             if self.completion >= self.max_tokens {
                 finish = Some(FinishReason::Length);
                 break;
             }
         }
+        // Truncate to the consumed run (a suppressed EOS is consumed but not
+        // emitted) so the caller's KV bookkeeping advances by exactly the
+        // tokens this state accounted for.
+        let consumed = emit + usize::from(matches!(finish, Some(FinishReason::Stop)));
+        committed.truncate(consumed);
         Glm52StepOutcome::Commit {
-            emitted,
+            committed,
+            emit,
             finish,
             context_rows,
         }
@@ -369,19 +397,49 @@ pub(crate) fn validate_request(
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
+    /// The request's page assignments in the rank's pool. Block RAII: blocks
+    /// return to the pool (registered ones as matchable prefix-cache entries)
+    /// when this drops or `release()`s.
+    kv: RequestKv,
 }
 
 /// Per-rank slot occupancy: `slots[rank][slot]`.
 type RankSlots = [Option<ActiveRequest>; GLM52_MAX_BATCH_PER_RANK];
 
-/// Where the next queued request goes: the least-loaded rank (ties → lowest
-/// rank id), its lowest free slot. `None` when every slot in the fleet is
-/// taken. Least-loaded-first keeps occupancy balanced, which keeps the fleet
-/// in the cheap 1-row bucket until concurrency exceeds the rank count.
-fn admission_target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(usize, usize)> {
+/// Pool pages a request draws over its whole lifetime, reserved at
+/// admission. One more token than the last KV-written position: kvbm appends
+/// the final generated token to the sequence and provisions its page even
+/// though its KV is never written (the dangling-token contract — the same
+/// off-by-one Kimi's admission had to learn empirically).
+fn lifetime_blocks(prompt_tokens: usize, max_tokens: usize) -> usize {
+    (prompt_tokens + max_tokens).div_ceil(PAGE)
+}
+
+/// Where the next queued request goes: among the ranks with a free slot AND
+/// enough unreserved pool pages for the request's full lifetime, the
+/// least-loaded one (ties → lowest rank id), its lowest free slot. `None`
+/// when no rank can take it — the queue holds (a request that fits the pool
+/// geometry always fits an EMPTY rank, so FCFS deferral never livelocks).
+/// Least-loaded-first keeps occupancy balanced, which keeps the fleet in the
+/// cheap 1-row bucket until concurrency exceeds the rank count.
+///
+/// `committed[rank]` = Σ active requests' [`lifetime_blocks`];
+/// `usable[rank]` = pool blocks minus the reserved padding page. The
+/// reservation is conservative: prefix-cache hits share pages between
+/// requests, but each holder reserves them in full — over-reserving can only
+/// defer admission, never strand a decode.
+fn admission_target(
+    occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]],
+    committed: &[usize],
+    usable: &[usize],
+    need_blocks: usize,
+) -> Option<(usize, usize)> {
     let (rank, row) = occupied
         .iter()
         .enumerate()
+        .filter(|(rank, row)| {
+            committed[*rank] + need_blocks <= usable[*rank] && row.iter().any(|&o| !o)
+        })
         .min_by_key(|(rank, row)| (row.iter().filter(|&&o| o).count(), *rank))?;
     let slot = row.iter().position(|&o| !o)?;
     Some((rank, slot))
@@ -475,9 +533,14 @@ fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52Ste
 /// under an identical-looking shape). `lease`: every rank must enqueue the
 /// next step speculatively — pure single-token GREEDY decode everywhere (the
 /// speculation feeds each row's argmax token, so a sampled row would replay
-/// the wrong input) with model-length headroom, nothing queued, no draft
-/// round. Both are global claims: a speculative replay is a full set of
-/// collectives, so per-rank discretion would desync the pairing.
+/// the wrong input) with model-length headroom, off every 64-token page
+/// boundary (the feed kernel's `slot_mapping += 1` only stays valid inside
+/// the current page, and the advanced step's page must already be in the
+/// uploaded block table; breaking the streak at every active row's boundary
+/// also bounds padding rows — reset to position 0 by each full prologue —
+/// inside the padding page), nothing queued, no draft round. Both are global
+/// claims: a speculative replay is a full set of collectives, so per-rank
+/// discretion would desync the pairing.
 fn launch_ahead_flags(
     shapes: &[Glm52StepShape],
     leased_shapes: Option<&[Glm52StepShape]>,
@@ -494,9 +557,7 @@ fn launch_ahead_flags(
             .iter()
             .flat_map(|rank_slots| rank_slots.iter().flatten())
             .all(|active| {
-                takes_argmax(&active.req.params)
-                    && active.state.feed_want() == 1
-                    && active.state.next_input_at(0).position + 1 < max_model_len
+                takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
             });
     Glm52StepFlags { consume, lease }
 }
@@ -509,6 +570,15 @@ fn launch_ahead_flags(
 /// is what keeps "sampled row never rides a launch-ahead step" structural.
 fn takes_argmax(params: &SamplingParams) -> bool {
     openinfer_sample::effectively_greedy(params, GLM52_VOCAB)
+}
+
+/// Whether one active request's KV position permits leasing the next step: a
+/// pure single-token decode row with model-length headroom whose advanced
+/// position stays inside its current 64-token page (see
+/// [`launch_ahead_flags`] for why the page boundary breaks the streak).
+fn lease_ok(state: &Glm52SlotState, max_model_len: usize) -> bool {
+    let position = state.next_input_at(0).position;
+    state.feed_want() == 1 && position + 1 < max_model_len && !(position + 1).is_multiple_of(PAGE)
 }
 
 /// The step rows a rank samples instead of argmaxes: walk the shape's
@@ -560,18 +630,87 @@ fn occupancy(slots: &[RankSlots]) -> Vec<[bool; GLM52_MAX_BATCH_PER_RANK]> {
         .collect()
 }
 
+/// What one slot's span asked kvbm for this step — decides which `apply_*`
+/// commits the outputs (schedule and apply must pair exactly).
+#[derive(Clone, Copy, Debug)]
+enum SpanKind {
+    /// Prompt span that does NOT finish the prompt: KV advances, no token.
+    PrefillChunk,
+    /// Prompt span whose last row feeds the final prompt token: its output
+    /// is the first generated token.
+    PrefillBoundary,
+    /// Single decode row (the zero-draft case).
+    Decode,
+    /// Verify span: anchor + fed drafts, committing the accepted prefix.
+    Speculative,
+}
+
+/// The all-padding-rows step KV: every page-table entry is the pool's
+/// padding page, every write slot points into it (positions are `< PAGE` by
+/// construction for padding rows — pre-capture probes position
+/// [`GLM52_MLA_TOPK_SHORT`], a PAGE multiple, and serving pads sit at 0).
+fn padding_step_kv(
+    bucket: usize,
+    table_width: usize,
+    padding_page: i32,
+    inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+) -> Glm52StepKv {
+    let pages = vec![padding_page; bucket * table_width].into_boxed_slice();
+    let mut slot_mapping = [0i64; GLM52_MAX_BATCH_PER_RANK];
+    for (row, slot) in slot_mapping.iter_mut().enumerate().take(bucket) {
+        *slot = padding_page as i64 * PAGE as i64 + (inputs[row].1 % PAGE) as i64;
+    }
+    Glm52StepKv {
+        pages,
+        slot_mapping,
+    }
+}
+
 /// DP8 coordinator: admits up to `GLM52_MAX_BATCH_PER_RANK` requests per rank
-/// (least-loaded rank first) and drives all ranks in lock-step. Consumes the
-/// workers; returns when the submit channel closes or a step fails (the EP8
-/// collective group cannot recover from a failed step — see the teardown
-/// comment below).
+/// (least-loaded rank with pool budget first) and drives all ranks in
+/// lock-step. Consumes the workers; returns when the submit channel closes
+/// or a step fails (the EP8 collective group cannot recover from a failed
+/// step — see the teardown comment below).
 pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     workers: Vec<Glm52RankWorker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
     max_model_len: usize,
+    no_prefix_cache: bool,
 ) {
+    // One KV page pool per rank: pool block ids index the rank's per-layer
+    // MLA and index-K arenas directly (the arenas were built for
+    // `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
+    // padding page.
+    let pools: Vec<BlockPool> = match workers
+        .iter()
+        .map(|_| BlockPool::new(PAGE, glm52_pool_blocks(max_model_len)))
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(pools) => pools,
+        Err(err) => {
+            log::error!("GLM5.2 KV pool construction failed: {err:#}");
+            for worker in &workers {
+                let _ = worker.request_shutdown();
+            }
+            return;
+        }
+    };
+    let table_width = glm52_table_width(max_model_len);
+    // Pool pages available to requests per rank (total minus the padding
+    // page) — constant for the engine's lifetime.
+    let usable_blocks: Vec<usize> = pools.iter().map(|pool| pool.total_blocks() - 1).collect();
+    // The DSpark draft lane asserts every anchor position equals its
+    // committed + pending context rows — a skipped (cache-hit) prefix never
+    // produces the aux-hidden captures the draft consumes, so prefix
+    // matching is off while the drafter is on. Speculative decoding and
+    // prefix caching are mutually exclusive for now (the qwen3 offload path
+    // draws the same line). `--no-prefix-cache` is the explicit kill switch.
+    let prefix_cache_enabled = !dspark_enabled && !no_prefix_cache;
+    if dspark_enabled && !no_prefix_cache {
+        log::info!("GLM5.2 prefix cache disabled: the DSpark drafter is on");
+    }
     let mut slots: Vec<RankSlots> = workers
         .iter()
         .map(|_| std::array::from_fn(|_| None))
@@ -594,8 +733,8 @@ pub(crate) fn run_dp8_coordinator(
     // rank would skip the speculative replay the others enqueued and desync
     // the collectives — and pre-capturing also removes the old mid-serving
     // capture stall. Row 0 at position GLM52_MLA_TOPK_SHORT lifts the step
-    // into the full tier; every row is a padding write into a free slot's
-    // dead cache region.
+    // into the full tier; every row is a padding write into the pool's
+    // padding page.
     for &bucket in &GLM52_DECODE_BUCKETS {
         for full_tier in [false, true] {
             let mut shape = Glm52StepShape {
@@ -613,14 +752,22 @@ pub(crate) fn run_dp8_coordinator(
             }
             let responses = match workers
                 .iter()
-                .map(|worker| {
-                    worker.step_async(inputs, shape, Glm52StepFlags::plain(), Vec::new(), 0)
+                .zip(&pools)
+                .map(|(worker, pool)| {
+                    let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
+                    worker.step_async(inputs, shape, kv, Glm52StepFlags::plain(), Vec::new(), 0)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
             {
                 Ok(responses) => responses,
                 Err(err) => {
                     log::error!("GLM5.2 graph pre-capture failed to submit: {err:#}");
+                    // The DeepEP contexts already exist: broadcast Shutdown
+                    // before the workers' sequential Drop joins them (the
+                    // same collective-teardown contract as the exit path).
+                    for worker in &workers {
+                        let _ = worker.request_shutdown();
+                    }
                     return;
                 }
             };
@@ -634,6 +781,9 @@ pub(crate) fn run_dp8_coordinator(
                         "GLM5.2 graph pre-capture (bucket {bucket}, full_tier {full_tier}) \
                          failed on rank {rank}: {err:#}"
                     );
+                    for worker in &workers {
+                        let _ = worker.request_shutdown();
+                    }
                     return;
                 }
             }
@@ -674,11 +824,27 @@ pub(crate) fn run_dp8_coordinator(
             break;
         }
 
-        // Admission: fill free slots from the queue, least-loaded rank first.
-        // New requests join the lock-step at the next step boundary (their
-        // prefill rides decode alongside everyone else's rows).
-        while !pending.is_empty() {
-            let Some((rank, slot)) = admission_target(&occupancy(&slots)) else {
+        // Admission: fill free slots from the queue, least-loaded rank (with
+        // pool budget for the request's full lifetime) first. New requests
+        // join the lock-step at the next step boundary (their prefill rides
+        // decode alongside everyone else's rows).
+        while let Some(front) = pending.front() {
+            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
+            let committed: Vec<usize> = slots
+                .iter()
+                .map(|rank_slots| {
+                    rank_slots
+                        .iter()
+                        .flatten()
+                        .map(|active| {
+                            lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
+                        })
+                        .sum()
+                })
+                .collect();
+            let Some((rank, slot)) =
+                admission_target(&occupancy(&slots), &committed, &usable_blocks, need_blocks)
+            else {
                 break;
             };
             let req = pending.pop_front().expect("checked non-empty");
@@ -687,22 +853,47 @@ pub(crate) fn run_dp8_coordinator(
             if req.token_tx.is_closed() {
                 continue;
             }
+            let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+            let cached_tokens = if prefix_cache_enabled {
+                match kv.match_and_add_prefix(&pools[rank]) {
+                    Ok(cached) => cached,
+                    Err(err) => {
+                        // A fresh request failing to match is a kvbm state
+                        // invariant break — crash early, don't serve on a
+                        // pool whose bookkeeping already lied once. This
+                        // request is already out of `pending` and never
+                        // reaches a slot, so fail it explicitly (fail_step
+                        // and the shutdown sweep can't see it).
+                        let err = err.context("GLM5.2 prefix match at admission");
+                        let _ = req.token_tx.send(TokenEvent::Error {
+                            message: format!("{err:#}"),
+                            prompt_tokens: req.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                        fail_step(&mut slots, &err);
+                        break 'serve;
+                    }
+                }
+            } else {
+                0
+            };
             let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
             let _ = req.token_tx.send(TokenEvent::Scheduled {
                 queued_at_unix_s,
                 scheduled_at_unix_s: unix_now_s(),
                 prompt_tokens: req.prompt_tokens.len(),
-                cached_tokens: 0,
+                cached_tokens,
             });
             let state = Glm52SlotState::new(
                 req.prompt_tokens.clone(),
                 req.max_tokens,
                 req.params.ignore_eos,
+                cached_tokens,
             );
             if dspark_enabled {
                 pending_resets[rank].push(slot);
             }
-            slots[rank][slot] = Some(ActiveRequest { req, state });
+            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
             slots_changed = true;
         }
         if all_idle(&slots) {
@@ -726,37 +917,121 @@ pub(crate) fn run_dp8_coordinator(
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;
-        let responses = slots
+        // Per-rank submit: schedule each active span's KV (full-lifetime
+        // reservation makes every schedule succeed — a failure is an
+        // accounting bug and fails the step), build the row inputs, page
+        // rows and write slots, collect the step's sampling rows, and fire
+        // the step. `span_kinds[rank][slot]` records what was scheduled so
+        // the output walk applies the exact pairing.
+        let mut span_kinds: Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]> = workers
             .iter()
-            .zip(&workers)
-            .zip(&shapes)
-            .enumerate()
-            .map(|(rank, ((rank_slots, worker), shape))| {
-                let mut inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
-                    GLM52_MAX_BATCH_PER_RANK];
-                // Row r is offset `span_offset[slot]` into its slot's span —
-                // spans are contiguous runs, so a per-slot counter walks them.
-                let mut span_offset = [0usize; GLM52_MAX_BATCH_PER_RANK];
-                for (row, input) in inputs.iter_mut().enumerate().take(shape.bucket) {
-                    let slot = shape.slots[row] as usize;
-                    if let Some(active) = &rank_slots[slot] {
-                        let step = active.state.next_input_at(span_offset[slot]);
-                        span_offset[slot] += 1;
-                        *input = (step.token, step.position);
+            .map(|_| [None; GLM52_MAX_BATCH_PER_RANK])
+            .collect();
+        let mut responses = Vec::with_capacity(workers.len());
+        let mut submit_err: Option<anyhow::Error> = None;
+        'submit: for (rank, ((rank_slots, worker), shape)) in
+            slots.iter_mut().zip(&workers).zip(&shapes).enumerate()
+        {
+            let pool = &pools[rank];
+            let padding_page = pool.padding_block_id();
+            let sampling = collect_sampling_rows(shape, rank_slots);
+            let seed = mix_seed(mix_seed(GLM52_SAMPLE_SEED, sample_step), rank as u64);
+            let mut inputs =
+                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+            // A consumed speculation replays with device-advanced inputs and
+            // never reads the step KV — skip building the page rows (the
+            // whole point of launch-ahead is keeping this host path off the
+            // hot step boundary). KV *scheduling* still runs: kvbm's
+            // bookkeeping must advance every step.
+            let mut pages = if flags.consume {
+                Vec::new()
+            } else {
+                vec![padding_page; shape.bucket * table_width]
+            };
+            let mut slot_mapping = [padding_page as i64 * PAGE as i64; GLM52_MAX_BATCH_PER_RANK];
+            // Walk the shape's contiguous per-slot runs.
+            let mut row = 0usize;
+            while row < shape.bucket {
+                let slot_id = shape.slots[row] as usize;
+                let mut end = row + 1;
+                while end < shape.bucket && shape.slots[end] as usize == slot_id {
+                    end += 1;
+                }
+                let span = end - row;
+                let Some(active) = rank_slots[slot_id].as_mut() else {
+                    // Padding rows keep the padding-page defaults.
+                    row = end;
+                    continue;
+                };
+                for (offset, r) in (row..end).enumerate() {
+                    let step = active.state.next_input_at(offset);
+                    inputs[r] = (step.token, step.position);
+                }
+                // The span must extend kvbm's view exactly: its first row's
+                // position is the next KV slot to write. Drift between the
+                // slot state's position math and the pool's bookkeeping
+                // writes KV into the wrong page — fail the step instead.
+                if inputs[row].1 != active.kv.kv_position() {
+                    submit_err = Some(anyhow::anyhow!(
+                        "GLM5.2 rank {rank} slot {slot_id} span starts at position {} but the \
+                         KV pool is at {}",
+                        inputs[row].1,
+                        active.kv.kv_position()
+                    ));
+                    break 'submit;
+                }
+                let mid_prefill = active.state.fed < active.state.prompt.len();
+                let (kind, scheduled) = if mid_prefill {
+                    let kind = if active.state.fed + span == active.state.prompt.len() {
+                        SpanKind::PrefillBoundary
+                    } else {
+                        SpanKind::PrefillChunk
+                    };
+                    (kind, active.kv.schedule_prefill(span, pool))
+                } else if span == 1 {
+                    (SpanKind::Decode, active.kv.schedule_decode(pool))
+                } else {
+                    (
+                        SpanKind::Speculative,
+                        active.kv.schedule_speculative(span, pool),
+                    )
+                };
+                if let Err(err) = scheduled {
+                    submit_err = Some(anyhow::anyhow!(
+                        "GLM5.2 rank {rank} slot {slot_id} violated its full-lifetime KV \
+                         reservation ({kind:?}, span {span}): {err}"
+                    ));
+                    break 'submit;
+                }
+                span_kinds[rank][slot_id] = Some(kind);
+                if !flags.consume {
+                    let row_pages = active.kv.step_page_indices(span);
+                    for r in row..end {
+                        pages[r * table_width..r * table_width + row_pages.len()]
+                            .copy_from_slice(&row_pages);
+                        let position = inputs[r].1;
+                        slot_mapping[r] = row_pages[position / PAGE] as i64 * PAGE as i64
+                            + (position % PAGE) as i64;
                     }
                 }
-                let sampling = collect_sampling_rows(shape, rank_slots);
-                let seed = mix_seed(mix_seed(GLM52_SAMPLE_SEED, sample_step), rank as u64);
-                worker.step_async(inputs, *shape, flags, sampling, seed)
-            })
-            .collect::<anyhow::Result<Vec<_>>>();
-        let responses = match responses {
-            Ok(responses) => responses,
-            Err(err) => {
-                fail_step(&mut slots, &err);
-                break 'serve;
+                row = end;
             }
-        };
+            let kv = Glm52StepKv {
+                pages: pages.into_boxed_slice(),
+                slot_mapping,
+            };
+            match worker.step_async(inputs, *shape, kv, flags, sampling, seed) {
+                Ok(rx) => responses.push(rx),
+                Err(err) => {
+                    submit_err = Some(err);
+                    break 'submit;
+                }
+            }
+        }
+        if let Some(err) = submit_err {
+            fail_step(&mut slots, &err);
+            break 'serve;
+        }
         // Join ALL ranks before failing: the rank the coordinator happens to
         // recv first often reports the ~100 s DeepEP device-timeout trap, not
         // the root cause — the rank that actually failed answers later. Log
@@ -787,7 +1062,8 @@ pub(crate) fn run_dp8_coordinator(
             workers.iter().map(|_| Vec::new()).collect();
         let mut rank_proposals: Vec<Vec<(usize, u32, usize)>> =
             workers.iter().map(|_| Vec::new()).collect();
-        for (rank, ((rank_slots, rank_outputs), shape)) in
+        let mut walk_err: Option<anyhow::Error> = None;
+        'walk: for (rank, ((rank_slots, rank_outputs), shape)) in
             slots.iter_mut().zip(outputs).zip(&shapes).enumerate()
         {
             // Walk the shape's contiguous per-slot runs; each active slot
@@ -807,54 +1083,92 @@ pub(crate) fn run_dp8_coordinator(
                     continue;
                 };
                 let prompt_tokens = active.req.prompt_tokens.len();
-                let (freed, context_rows) =
-                    match active.state.advance_span(span_outputs, eos_token_ids) {
-                        Glm52StepOutcome::Prefilling => {
-                            // Prefill never sends, so a disconnect is only
-                            // visible through the sink probe — without it a
-                            // long prompt zombies the slot until prefill
-                            // completes. Every prompt row is committed
-                            // context.
-                            (active.req.token_tx.is_closed(), span_outputs.len())
-                        }
-                        Glm52StepOutcome::Commit {
-                            emitted,
-                            finish,
-                            context_rows,
-                        } => {
-                            // A dropped receiver (client disconnect) frees
-                            // the slot; its KV lives in the slot's own cache
-                            // region and dies with the slot.
-                            let mut freed = false;
-                            for token in emitted {
-                                if active
-                                    .req
-                                    .token_tx
-                                    .send(TokenEvent::Token {
-                                        id: token,
-                                        logprob: None,
-                                    })
-                                    .is_err()
-                                {
-                                    freed = true;
-                                    break;
-                                }
-                            }
-                            if let Some(finish_reason) = finish
-                                && !freed
+                let outcome = active.state.advance_span(span_outputs, eos_token_ids);
+                // Commit the span's KV bookkeeping under the exact kind the
+                // submit phase scheduled — a mispairing is a coordinator bug
+                // and fails the step.
+                let pool = &pools[rank];
+                let applied = match (&outcome, span_kinds[rank][slot_id]) {
+                    (Glm52StepOutcome::Prefilling, Some(SpanKind::PrefillChunk)) => {
+                        active.kv.apply_prefill_chunk(pool)
+                    }
+                    (
+                        Glm52StepOutcome::Commit { committed, .. },
+                        Some(SpanKind::PrefillBoundary),
+                    ) => active.kv.apply_prefill(committed[0], pool),
+                    (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::Decode)) => {
+                        active.kv.apply_decode(committed[0], pool).map(|_| ())
+                    }
+                    (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::Speculative)) => {
+                        active.kv.apply_speculative(committed, pool).map(|_| ())
+                    }
+                    (outcome, kind) => Err(anyhow::anyhow!(
+                        "GLM5.2 rank {rank} slot {slot_id} outcome {outcome:?} does not pair \
+                         with scheduled span kind {kind:?}"
+                    )),
+                };
+                if let Err(err) = applied {
+                    walk_err =
+                        Some(err.context(format!("GLM5.2 rank {rank} slot {slot_id} KV apply")));
+                    break 'walk;
+                }
+                let (freed, context_rows) = match outcome {
+                    Glm52StepOutcome::Prefilling => {
+                        // Prefill never sends, so a disconnect is only
+                        // visible through the sink probe — without it a
+                        // long prompt zombies the slot until prefill
+                        // completes. Every prompt row is committed
+                        // context.
+                        (active.req.token_tx.is_closed(), span_outputs.len())
+                    }
+                    Glm52StepOutcome::Commit {
+                        committed,
+                        emit,
+                        finish,
+                        context_rows,
+                    } => {
+                        // A dropped receiver (client disconnect) frees the
+                        // slot; its pool pages release with the request
+                        // (sealed blocks stay matchable as prefix cache).
+                        let mut freed = false;
+                        for &token in &committed[..emit] {
+                            if active
+                                .req
+                                .token_tx
+                                .send(TokenEvent::Token {
+                                    id: token,
+                                    logprob: None,
+                                })
+                                .is_err()
                             {
-                                let _ = active.req.token_tx.send(TokenEvent::Finished {
-                                    finish_reason,
-                                    prompt_tokens,
-                                    completion_tokens: active.state.completion_tokens(),
-                                });
                                 freed = true;
+                                break;
                             }
-                            (freed, context_rows)
                         }
-                    };
+                        if let Some(finish_reason) = finish
+                            && !freed
+                        {
+                            let _ = active.req.token_tx.send(TokenEvent::Finished {
+                                finish_reason,
+                                prompt_tokens,
+                                completion_tokens: active.state.completion_tokens(),
+                            });
+                            freed = true;
+                        }
+                        (freed, context_rows)
+                    }
+                };
                 if freed {
                     active.state.log_spec_stats(rank, slot_id);
+                    if let Err(err) = active.kv.release() {
+                        // Blocks still return via assignment RAII when the
+                        // slot drops — the explicit release only failed to
+                        // run from a clean Idle state.
+                        log::warn!(
+                            "GLM5.2 rank {rank} slot {slot_id} KV release failed \
+                             (blocks return via RAII): {err:#}"
+                        );
+                    }
                     if dspark_enabled {
                         pending_resets[rank].push(slot_id);
                     }
@@ -871,6 +1185,10 @@ pub(crate) fn run_dp8_coordinator(
                     }
                 }
             }
+        }
+        if let Some(err) = walk_err {
+            fail_step(&mut slots, &err);
+            break 'serve;
         }
 
         // Draft round (rank-local, no collectives): resets, context appends
@@ -1049,6 +1367,13 @@ mod launch_ahead_flag_tests {
         assert!(!flags.lease && !flags.consume);
     }
 
+    /// A standalone `RequestKv` for slot-state tests that never schedule KV
+    /// (the pool is leaked so the kvbm internals outlive the test value).
+    fn test_kv(prompt: Vec<u32>, max_tokens: usize) -> RequestKv {
+        let pool: &'static BlockPool = Box::leak(Box::new(BlockPool::new(PAGE, 64).unwrap()));
+        pool.new_request(prompt, max_tokens, None)
+    }
+
     /// One rank holding a single decoding request with the given params (its
     /// prompt token is already fed, so `feed_want() == 1`).
     fn decoding_fleet(params: openinfer_sample::SamplingParams) -> Vec<RankSlots> {
@@ -1064,13 +1389,14 @@ mod launch_ahead_flag_tests {
             logprobs: 0,
             echo: false,
         };
-        let mut state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, false);
+        let mut state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, false, 0);
         assert!(matches!(
             state.advance_span(&[20], &[]),
             Glm52StepOutcome::Commit { .. }
         ));
+        let kv = test_kv(req.prompt_tokens.clone(), req.max_tokens);
         let mut slots: RankSlots = std::array::from_fn(|_| None);
-        slots[0] = Some(ActiveRequest { req, state });
+        slots[0] = Some(ActiveRequest { req, state, kv });
         vec![slots]
     }
 
@@ -1105,13 +1431,26 @@ mod tests {
 
     const EOS: &[u32] = &[7];
 
+    fn state(prompt: Vec<u32>, max_tokens: usize, ignore_eos: bool) -> Glm52SlotState {
+        Glm52SlotState::new(prompt, max_tokens, ignore_eos, 0)
+    }
+
+    /// A standalone `RequestKv` for tests that never schedule KV (the pool
+    /// is leaked so the kvbm internals outlive the test value).
+    fn test_kv(prompt: Vec<u32>, max_tokens: usize) -> RequestKv {
+        let pool: &'static BlockPool = Box::leak(Box::new(BlockPool::new(PAGE, 64).unwrap()));
+        pool.new_request(prompt, max_tokens, None)
+    }
+
     fn commit(
-        emitted: &[u32],
+        committed: &[u32],
+        emit: usize,
         finish: Option<FinishReason>,
         context_rows: usize,
     ) -> Glm52StepOutcome {
         Glm52StepOutcome::Commit {
-            emitted: emitted.to_vec(),
+            committed: committed.to_vec(),
+            emit,
             finish,
             context_rows,
         }
@@ -1119,7 +1458,7 @@ mod tests {
 
     #[test]
     fn prefill_rides_decode_then_emits() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
+        let mut state = state(vec![10, 11, 12], 4, false);
 
         assert_eq!(state.feed_want(), 3);
         assert_eq!(
@@ -1147,7 +1486,7 @@ mod tests {
                 position: 2
             }
         );
-        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], None, 1));
+        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], 1, None, 1));
         assert_eq!(state.completion_tokens(), 1);
 
         // Decode continues from the emitted token at the next position.
@@ -1163,7 +1502,7 @@ mod tests {
 
     #[test]
     fn prompt_span_feeds_consecutive_positions_and_keeps_only_the_last_output() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 12, 13], 4, false);
+        let mut state = state(vec![10, 11, 12, 13], 4, false);
 
         // One span covers three prompt tokens; mid-prompt outputs discarded.
         assert_eq!(state.feed_want(), 4);
@@ -1199,17 +1538,17 @@ mod tests {
                 position: 3
             }
         );
-        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], None, 1));
+        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], 1, None, 1));
         assert_eq!(state.completion_tokens(), 1);
     }
 
     #[test]
     fn whole_prompt_in_one_span_emits_from_the_boundary_row() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
+        let mut state = state(vec![10, 11, 12], 4, false);
         // All three span rows are committed prompt context.
         assert_eq!(
             state.advance_span(&[99, 98, 42], EOS),
-            commit(&[42], None, 3)
+            commit(&[42], 1, None, 3)
         );
         assert_eq!(state.completion_tokens(), 1);
         assert_eq!(
@@ -1223,18 +1562,18 @@ mod tests {
 
     #[test]
     fn eos_is_suppressed_and_counts_toward_completion() {
-        let mut state = Glm52SlotState::new(vec![10], 4, false);
+        let mut state = state(vec![10], 4, false);
         assert_eq!(
             state.advance_span(&[7], EOS),
-            commit(&[], Some(FinishReason::Stop), 1)
+            commit(&[7], 0, Some(FinishReason::Stop), 1)
         );
         assert_eq!(state.completion_tokens(), 1);
     }
 
     #[test]
     fn ignore_eos_decodes_through_the_stop_token() {
-        let mut state = Glm52SlotState::new(vec![10], 4, true);
-        assert_eq!(state.advance_span(&[7], EOS), commit(&[7], None, 1));
+        let mut state = state(vec![10], 4, true);
+        assert_eq!(state.advance_span(&[7], EOS), commit(&[7], 1, None, 1));
         assert_eq!(
             state.next_input_at(0),
             Glm52StepInput {
@@ -1246,39 +1585,39 @@ mod tests {
 
     #[test]
     fn length_cap_emits_the_final_token() {
-        let mut state = Glm52SlotState::new(vec![10], 2, false);
-        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], None, 1));
+        let mut state = state(vec![10], 2, false);
+        assert_eq!(state.advance_span(&[42], EOS), commit(&[42], 1, None, 1));
         assert_eq!(
             state.advance_span(&[43], EOS),
-            commit(&[43], Some(FinishReason::Length), 1)
+            commit(&[43], 1, Some(FinishReason::Length), 1)
         );
         assert_eq!(state.completion_tokens(), 2);
     }
 
     #[test]
     fn eos_outranks_the_length_cap() {
-        let mut state = Glm52SlotState::new(vec![10], 1, false);
+        let mut state = state(vec![10], 1, false);
         assert_eq!(
             state.advance_span(&[7], EOS),
-            commit(&[], Some(FinishReason::Stop), 1)
+            commit(&[7], 0, Some(FinishReason::Stop), 1)
         );
     }
 
     #[test]
     fn max_tokens_one_emits_then_finishes() {
-        let mut state = Glm52SlotState::new(vec![10, 11], 1, false);
+        let mut state = state(vec![10, 11], 1, false);
         assert_eq!(state.advance_span(&[99], EOS), Glm52StepOutcome::Prefilling);
         assert_eq!(
             state.advance_span(&[42], EOS),
-            commit(&[42], Some(FinishReason::Length), 1)
+            commit(&[42], 1, Some(FinishReason::Length), 1)
         );
     }
 
     #[test]
     fn verify_span_commits_accepted_prefix_plus_correction() {
-        let mut state = Glm52SlotState::new(vec![10], 32, false);
+        let mut state = state(vec![10], 32, false);
         // Boundary emits the anchor t0 = 20.
-        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         state.set_drafts(vec![21, 22, 99, 98, 97, 96, 95]);
 
         // The proposal is truncated to GLM52_DSPARK_SPAN_DRAFTS: a 4-row
@@ -1308,7 +1647,7 @@ mod tests {
         let outputs = [21, 22, 30, 0];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21, 22, 30], None, 3)
+            commit(&[21, 22, 30], 3, None, 3)
         );
         assert_eq!(state.completion_tokens(), 4);
         // The correction is the next anchor; drafts were consumed.
@@ -1318,8 +1657,8 @@ mod tests {
 
     #[test]
     fn verify_span_truncated_by_the_planner_accepts_only_fed_drafts() {
-        let mut state = Glm52SlotState::new(vec![10], 32, false);
-        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        let mut state = state(vec![10], 32, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27]);
 
         // The planner granted only 3 of the 4 wanted rows: the span is the
@@ -1328,7 +1667,7 @@ mod tests {
         let outputs = [21, 22, 23];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21, 22, 23], None, 3)
+            commit(&[21, 22, 23], 3, None, 3)
         );
         assert_eq!(state.completion_tokens(), 4);
         assert_eq!(state.decode_anchor(), Some((23, 4)));
@@ -1336,47 +1675,47 @@ mod tests {
 
     #[test]
     fn eos_inside_the_committed_run_truncates_and_finishes() {
-        let mut state = Glm52SlotState::new(vec![10], 32, false);
-        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        let mut state = state(vec![10], 32, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         // Draft 2 is the EOS token (7): accepted, counted, suppressed; the
         // rest of the committed run is dropped.
         state.set_drafts(vec![21, 7, 23, 24, 25, 26, 27]);
         let outputs = [21, 7, 23, 24];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21], Some(FinishReason::Stop), 4)
+            commit(&[21, 7], 1, Some(FinishReason::Stop), 4)
         );
         assert_eq!(state.completion_tokens(), 3);
     }
 
     #[test]
     fn length_cap_truncates_the_verify_want_and_the_committed_run() {
-        let mut state = Glm52SlotState::new(vec![10], 4, false);
-        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        let mut state = state(vec![10], 4, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27]);
         // remaining = 3 -> the span may commit at most 3 more tokens.
         assert_eq!(state.feed_want(), 3);
         let outputs = [21, 22, 23];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21, 22, 23], Some(FinishReason::Length), 3)
+            commit(&[21, 22, 23], 3, Some(FinishReason::Length), 3)
         );
         assert_eq!(state.completion_tokens(), 4);
     }
 
     #[test]
     fn wants_drafts_only_with_two_tokens_of_budget() {
-        let mut state = Glm52SlotState::new(vec![10], 3, false);
+        let mut state = state(vec![10], 3, false);
         assert!(!state.wants_drafts(), "mid-prefill never wants drafts");
-        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         assert!(state.wants_drafts());
-        assert_eq!(state.advance_span(&[21], EOS), commit(&[21], None, 1));
+        assert_eq!(state.advance_span(&[21], EOS), commit(&[21], 1, None, 1));
         assert!(!state.wants_drafts(), "one-token tail is a plain row");
     }
 
     #[test]
     fn sampling_row_is_the_committed_row_of_the_span() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
+        let mut state = state(vec![10, 11, 12], 4, false);
         // Mid-prompt span: outputs discarded, nothing to sample.
         assert_eq!(state.sampling_row(2), None);
         // Prompt-completing span: the last row's output is the first
@@ -1384,7 +1723,7 @@ mod tests {
         assert_eq!(state.sampling_row(3), Some(2));
         assert_eq!(
             state.advance_span(&[99, 98, 42], EOS),
-            commit(&[42], None, 3)
+            commit(&[42], 1, None, 3)
         );
         // Plain decode: the single anchor row.
         assert_eq!(state.sampling_row(1), Some(0));
@@ -1483,17 +1822,18 @@ mod tests {
         };
         let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
 
-        let mut decode_state = Glm52SlotState::new(vec![10], 8, false);
+        let mut decode_state = state(vec![10], 8, false);
         assert_eq!(
             decode_state.advance_span(&[20], EOS),
-            commit(&[20], None, 1)
+            commit(&[20], 1, None, 1)
         );
         rank_slots[0] = Some(ActiveRequest {
             req: request(vec![10], sampled(0.8), 8),
             state: decode_state,
+            kv: test_kv(vec![10], 8),
         });
 
-        let mut boundary_state = Glm52SlotState::new(vec![10, 11, 12, 13, 14], 8, false);
+        let mut boundary_state = state(vec![10, 11, 12, 13, 14], 8, false);
         assert_eq!(
             boundary_state.advance_span(&[99, 98], EOS),
             Glm52StepOutcome::Prefilling
@@ -1501,21 +1841,24 @@ mod tests {
         rank_slots[1] = Some(ActiveRequest {
             req: request(vec![10, 11, 12, 13, 14], sampled(0.8), 8),
             state: boundary_state,
+            kv: test_kv(vec![10, 11, 12, 13, 14], 8),
         });
 
-        let mut greedy_state = Glm52SlotState::new(vec![10], 8, false);
+        let mut greedy_state = state(vec![10], 8, false);
         assert_eq!(
             greedy_state.advance_span(&[20], EOS),
-            commit(&[20], None, 1)
+            commit(&[20], 1, None, 1)
         );
         rank_slots[2] = Some(ActiveRequest {
             req: request(vec![10], openinfer_sample::SamplingParams::default(), 8),
             state: greedy_state,
+            kv: test_kv(vec![10], 8),
         });
 
         rank_slots[3] = Some(ActiveRequest {
             req: request(vec![30; 10], sampled(0.8), 8),
-            state: Glm52SlotState::new(vec![30; 10], 8, false),
+            state: state(vec![30; 10], 8, false),
+            kv: test_kv(vec![30; 10], 8),
         });
 
         let rows = collect_sampling_rows(&shape, &rank_slots);
@@ -1539,8 +1882,8 @@ mod tests {
             active_rows: 1,
         };
         let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
-        let mut state = Glm52SlotState::new(vec![10], 8, false);
-        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        let mut state = state(vec![10], 8, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         rank_slots[0] = Some(ActiveRequest {
             req: request(
                 vec![10],
@@ -1551,15 +1894,19 @@ mod tests {
                 8,
             ),
             state,
+            kv: test_kv(vec![10], 8),
         });
         assert!(collect_sampling_rows(&shape, &rank_slots).is_empty());
     }
 
     #[test]
     fn decode_anchor_is_the_latest_token_at_its_feed_position() {
-        let mut state = Glm52SlotState::new(vec![10, 11], 4, false);
+        let mut state = state(vec![10, 11], 4, false);
         assert_eq!(state.decode_anchor(), None);
-        assert_eq!(state.advance_span(&[99, 42], EOS), commit(&[42], None, 2));
+        assert_eq!(
+            state.advance_span(&[99, 42], EOS),
+            commit(&[42], 1, None, 2)
+        );
         // The anchor is what the next decode row would feed.
         assert_eq!(state.decode_anchor(), Some((42, 2)));
         assert_eq!(
@@ -1569,7 +1916,7 @@ mod tests {
                 position: 2
             }
         );
-        assert_eq!(state.advance_span(&[43], EOS), commit(&[43], None, 1));
+        assert_eq!(state.advance_span(&[43], EOS), commit(&[43], 1, None, 1));
         assert_eq!(state.decode_anchor(), Some((43, 3)));
     }
 
@@ -1588,20 +1935,247 @@ mod tests {
             .collect()
     }
 
+    /// `admission_target` with an unconstrained pool budget — the pure
+    /// occupancy-placement behavior.
+    fn target(occupied: &[[bool; GLM52_MAX_BATCH_PER_RANK]]) -> Option<(usize, usize)> {
+        let committed = vec![0usize; occupied.len()];
+        let usable = vec![usize::MAX; occupied.len()];
+        admission_target(occupied, &committed, &usable, 1)
+    }
+
     #[test]
     fn admission_prefers_least_loaded_rank_then_lowest_slot() {
         // Empty fleet: rank 0, slot 0.
-        assert_eq!(admission_target(&occ(&[0, 0, 0])), Some((0, 0)));
+        assert_eq!(target(&occ(&[0, 0, 0])), Some((0, 0)));
         // Rank 1 is the least loaded.
-        assert_eq!(admission_target(&occ(&[2, 1, 2])), Some((1, 1)));
+        assert_eq!(target(&occ(&[2, 1, 2])), Some((1, 1)));
         // Tie between ranks 0 and 2 → lowest rank id.
-        assert_eq!(admission_target(&occ(&[1, 2, 1])), Some((0, 1)));
+        assert_eq!(target(&occ(&[1, 2, 1])), Some((0, 1)));
         // A hole in the middle of a rank's slots is reused first.
         let mut holey = occ(&[3, 3]);
         holey[1][1] = false;
-        assert_eq!(admission_target(&holey), Some((1, 1)));
+        assert_eq!(target(&holey), Some((1, 1)));
         // Full fleet: no target.
-        assert_eq!(admission_target(&occ(&[GLM52_MAX_BATCH_PER_RANK; 2])), None);
+        assert_eq!(target(&occ(&[GLM52_MAX_BATCH_PER_RANK; 2])), None);
+    }
+
+    #[test]
+    fn admission_respects_the_pool_budget() {
+        // Rank 0 has free slots but its pool is fully reserved; rank 1 (more
+        // loaded but with budget) takes the request. No rank fits → defer.
+        let occupied = occ(&[1, 2]);
+        assert_eq!(
+            admission_target(&occupied, &[90, 40], &[100, 100], 20),
+            Some((1, 2))
+        );
+        assert_eq!(
+            admission_target(&occupied, &[90, 90], &[100, 100], 20),
+            None
+        );
+        // Exact fit admits.
+        assert_eq!(
+            admission_target(&occupied, &[80, 90], &[100, 100], 20),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn lifetime_blocks_counts_the_dangling_token() {
+        // 64 prompt + 1 max_tokens: the generated token is appended to the
+        // sequence (dangling) and provisions page 2 even though its KV is
+        // never written.
+        assert_eq!(lifetime_blocks(64, 1), 2);
+        assert_eq!(lifetime_blocks(63, 1), 1);
+        assert_eq!(lifetime_blocks(64, 64), 2);
+        assert_eq!(lifetime_blocks(64, 65), 3);
+    }
+
+    /// Drive one request end to end through the coordinator's exact
+    /// schedule/apply sequence against `pool` — the offline replica of the
+    /// two engine-fatal submit-walk assertions (span start == `kv_position`,
+    /// schedule never fails under the admission reservation). Verify spans
+    /// fully accept their drafts, maximizing the KV draw per round. Returns
+    /// the first schedule failure (the tight-budget control asserts one).
+    fn drive_request(
+        pool: &BlockPool,
+        prompt_len: usize,
+        max_tokens: usize,
+        with_drafts: bool,
+    ) -> Result<(), String> {
+        let prompt: Vec<u32> = (0..prompt_len as u32).map(|t| 10_000 + t).collect();
+        let mut state = Glm52SlotState::new(prompt.clone(), max_tokens, true, 0);
+        let mut kv = pool.new_request(prompt, max_tokens, None);
+        let mut fresh = 60_000u32;
+        loop {
+            if with_drafts && state.wants_drafts() {
+                state.set_drafts(vec![70_001, 70_002, 70_003, 70_004, 70_005, 70_006, 70_007]);
+            }
+            let span = state.feed_want().min(GLM52_MAX_BATCH_PER_RANK);
+            assert_eq!(
+                state.next_input_at(0).position,
+                kv.kv_position(),
+                "span start drifted from the pool's kv_position"
+            );
+            let mid_prefill = state.fed < state.prompt.len();
+            if mid_prefill {
+                kv.schedule_prefill(span, pool)
+                    .map_err(|e| format!("schedule_prefill: {e}"))?;
+            } else if span == 1 {
+                kv.schedule_decode(pool)
+                    .map_err(|e| format!("schedule_decode: {e}"))?;
+            } else {
+                kv.schedule_speculative(span, pool)
+                    .map_err(|e| format!("schedule_speculative: {e}"))?;
+            }
+            // The prologue's page-row coverage, offline: the exact page row
+            // must cover every fed position.
+            let pages = kv.step_page_indices(span);
+            let last_position = state.next_input_at(span - 1).position;
+            assert!(
+                pages.len() * PAGE > last_position,
+                "page row misses a fed position"
+            );
+            fresh += 1;
+            // Rows 1.. echo the fed tokens (a verify span fully accepts its
+            // drafts), the last row emits a fresh token.
+            let outputs: Vec<u32> = (1..span)
+                .map(|offset| state.next_input_at(offset).token)
+                .chain(std::iter::once(fresh))
+                .collect();
+            match state.advance_span(&outputs, &[]) {
+                Glm52StepOutcome::Prefilling => {
+                    kv.apply_prefill_chunk(pool).expect("apply_prefill_chunk");
+                }
+                Glm52StepOutcome::Commit {
+                    committed, finish, ..
+                } => {
+                    if mid_prefill {
+                        kv.apply_prefill(committed[0], pool).expect("apply_prefill");
+                    } else if span == 1 {
+                        kv.apply_decode(committed[0], pool).expect("apply_decode");
+                    } else {
+                        kv.apply_speculative(&committed, pool)
+                            .expect("apply_speculative");
+                    }
+                    if finish.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        kv.release().map_err(|e| format!("release: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_lifetime_reservation_covers_kvbm_peak_draw() {
+        // The submit walk turns any schedule failure into an engine
+        // teardown; this is that contract's offline test. A pool sized
+        // exactly `lifetime_blocks + 1` (padding) must carry every shape end
+        // to end — and one block less must NOT, or the reservation is merely
+        // sufficient by accident, not tight.
+        for &(prompt_len, max_tokens) in &[
+            (64usize, 64usize),
+            (64, 65),
+            (63, 65),
+            (1, 128),
+            (127, 2),
+            (192, 3),
+            (65, 1),
+        ] {
+            for with_drafts in [false, true] {
+                let lifetime = lifetime_blocks(prompt_len, max_tokens);
+                let pool = BlockPool::new(PAGE, lifetime + 1).expect("pool");
+                drive_request(&pool, prompt_len, max_tokens, with_drafts).unwrap_or_else(|e| {
+                    panic!("({prompt_len},{max_tokens},drafts={with_drafts}): {e}")
+                });
+                let tight = BlockPool::new(PAGE, lifetime).expect("tight pool");
+                assert!(
+                    drive_request(&tight, prompt_len, max_tokens, with_drafts).is_err(),
+                    "({prompt_len},{max_tokens},drafts={with_drafts}): a budget below the \
+                     lifetime must fail somewhere"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eos_truncated_speculative_apply_stays_in_contract() {
+        // EOS mid-verify-span truncates `committed` (the suppressed EOS is
+        // its last entry); `apply_speculative` with the truncated run and
+        // the release must both stay clean.
+        let pool = BlockPool::new(PAGE, 16).expect("pool");
+        let prompt: Vec<u32> = (0..70).collect();
+        let mut state = Glm52SlotState::new(prompt.clone(), 32, false, 0);
+        let mut kv = pool.new_request(prompt, 32, None);
+        loop {
+            if state.fed >= state.prompt.len() {
+                break;
+            }
+            let span = state.feed_want().min(GLM52_MAX_BATCH_PER_RANK);
+            assert_eq!(state.next_input_at(0).position, kv.kv_position());
+            kv.schedule_prefill(span, &pool).expect("schedule_prefill");
+            match state.advance_span(&vec![50u32; span], EOS) {
+                Glm52StepOutcome::Prefilling => {
+                    kv.apply_prefill_chunk(&pool).expect("apply_prefill_chunk");
+                }
+                Glm52StepOutcome::Commit { committed, .. } => {
+                    kv.apply_prefill(committed[0], &pool)
+                        .expect("apply_prefill");
+                }
+            }
+        }
+        state.set_drafts(vec![21, 7, 23]);
+        let span = state.feed_want();
+        assert_eq!(span, 4, "anchor + 3 drafts");
+        assert_eq!(state.next_input_at(0).position, kv.kv_position());
+        kv.schedule_speculative(span, &pool)
+            .expect("schedule_speculative");
+        let outcome = state.advance_span(&[21, 7, 23, 99], EOS);
+        let Glm52StepOutcome::Commit {
+            committed,
+            emit,
+            finish,
+            ..
+        } = outcome
+        else {
+            panic!("verify span must commit");
+        };
+        assert_eq!(committed, vec![21, 7], "truncated to the consumed run");
+        assert_eq!(emit, 1, "the suppressed EOS is consumed, not emitted");
+        assert_eq!(finish, Some(FinishReason::Stop));
+        kv.apply_speculative(&committed, &pool)
+            .expect("apply_speculative with the truncated run");
+        kv.release().expect("release");
+    }
+
+    #[test]
+    fn lease_breaks_at_the_page_boundary() {
+        // Anchor at position 62 → the next position 63 stays in page 0:
+        // lease ok. Anchor at position 63 → position 64 opens page 1: the
+        // feed kernel's `slot_mapping += 1` would leave the page — no lease.
+        let mut s = state((0..63).collect(), 8, false);
+        let mut outputs = vec![99u32; 63];
+        *outputs.last_mut().unwrap() = 42;
+        assert_eq!(s.advance_span(&outputs, EOS), commit(&[42], 1, None, 63));
+        assert_eq!(s.next_input_at(0).position, 63);
+        assert!(!lease_ok(&s, 4096), "position 63 -> 64 crosses the page");
+        assert_eq!(s.advance_span(&[43], EOS), commit(&[43], 1, None, 1));
+        assert_eq!(s.next_input_at(0).position, 64);
+        assert!(lease_ok(&s, 4096), "position 64 -> 65 stays inside page 1");
+        // Model-length headroom still gates.
+        assert!(!lease_ok(&s, 65));
+    }
+
+    #[test]
+    fn cached_prefix_starts_feeding_at_the_suffix() {
+        // 3 blocks of prompt with the first 2 cache-hit: feeding starts at
+        // position 128 and only the suffix is ever fed.
+        let prompt: Vec<u32> = (0..192).collect();
+        let s = Glm52SlotState::new(prompt, 8, false, 128);
+        assert_eq!(s.feed_want(), 64);
+        assert_eq!(s.next_input_at(0).position, 128);
+        assert_eq!(s.next_input_at(0).token, 128);
     }
 
     /// The observable part of a shape: the bucket and the forwarded rows'

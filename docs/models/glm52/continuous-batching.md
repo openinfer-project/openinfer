@@ -111,4 +111,4 @@ During the first D2.5 bench attempt one c2 request hung the client forever: the 
 ## Next step
 
 - ~~Expert-GEMM M-tile work (#542's swapAB lead)~~ DONE 2026-07-05: DeepGEMM masked grouped GEMM landed (the "swapAB" attribution was wrong — see whole-step-decode-graph.md); c64 diverse 1113 → 1475 tok/s, sweep −16..−24 % across buckets.
-- P/D decode-node work (KV ingestion from a vLLM prefill, true paged block table) is the next campaign; prefill stays out of scope per the standing prefill-by-vLLM decision. (The static per-slot cap itself is no longer hardcoded 4096 — #579 made it VRAM-derived at launch with a `--max-model-len` override; the shared page pool remains open.)
+- P/D decode-node work (KV ingestion from a vLLM prefill) is the next campaign; prefill stays out of scope per the standing prefill-by-vLLM decision. (The static per-slot cap itself is no longer hardcoded 4096 — #579 made it VRAM-derived at launch with a `--max-model-len` override; the shared page pool landed — see `paged-kv-prefix-cache.md` for the true paged block table + prefix caching this campaign builds on.)

@@ -85,6 +85,19 @@ impl Glm52RankModel {
                     "GLM5.2 launch-ahead lease granted with a row at position {position} — the \
                      advanced step would breach the model-length cap"
                 );
+                // The feed kernel advances slot_mapping by +1, which only
+                // stays inside the row's current 64-token page off a page
+                // boundary; the next page is not even in the uploaded block
+                // table. The coordinator's lease gate breaks the streak at
+                // every ACTIVE row's boundary, which also bounds every
+                // padding row (reset to position 0 by each full prologue)
+                // inside the padding page — a violation here is a gate bug.
+                ensure!(
+                    !(position + 1).is_multiple_of(super::GLM52_MODEL_LEN_ALIGN),
+                    "GLM5.2 launch-ahead lease granted with a row crossing the 64-token page \
+                     boundary at position {position} — the advanced slot mapping would leave \
+                     its page"
+                );
             }
             let longest_next = self.device_positions[..batch]
                 .iter()

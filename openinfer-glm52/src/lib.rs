@@ -62,6 +62,11 @@ pub struct Glm52LaunchOptions {
     /// an explicit value is still validated against that budget so an
     /// impossible cap fails at launch, not at the first long request.
     pub max_model_len: Option<usize>,
+    /// vLLM-style kill switch: disable prefix matching outright (every
+    /// prefill recomputes the full prompt). Prefix caching is also forced
+    /// off while the DSpark drafter is on — the draft lane needs the
+    /// aux-hidden captures a skipped prefix never produces.
+    pub no_prefix_cache: bool,
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
@@ -70,6 +75,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         dp_size,
         dspark_draft_model_path,
         max_model_len,
+        no_prefix_cache,
     } = options;
     ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
@@ -86,6 +92,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         },
         dspark_draft_model_path.as_deref(),
         max_model_len,
+        no_prefix_cache,
     )
 }
 
@@ -252,6 +259,7 @@ fn start_engine(
     options: &Glm52LoadOptions,
     dspark_path: Option<&Path>,
     requested_max_model_len: Option<usize>,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
@@ -334,6 +342,7 @@ fn start_engine(
                 &eos_token_ids,
                 dspark_enabled,
                 max_model_len,
+                no_prefix_cache,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;

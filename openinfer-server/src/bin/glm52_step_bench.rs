@@ -80,6 +80,7 @@ fn main() -> Result<()> {
             dp_size: GLM52_RANKS,
             dspark_draft_model_path: None,
             max_model_len: None,
+            no_prefix_cache: false,
         },
     )
     .context("failed to start GLM5.2 engine")?;

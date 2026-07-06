@@ -10,7 +10,7 @@ use crate::dspark::{
     GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch, Glm52DsparkSlotState,
 };
 
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepShape};
+use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::weights::{
     GLM52_EP_RANKS, Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle,
@@ -112,6 +112,7 @@ enum Glm52RankCommand {
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
+        kv: Box<Glm52StepKv>,
         flags: Glm52StepFlags,
         /// Rows sampled instead of argmaxed (non-greedy requests; empty on
         /// the all-greedy fast path), and the step's philox seed for their
@@ -229,6 +230,7 @@ impl Glm52RankWorker {
         &self,
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        kv: Glm52StepKv,
         flags: Glm52StepFlags,
         sampling: Vec<Glm52RowSample>,
         seed: u64,
@@ -238,6 +240,7 @@ impl Glm52RankWorker {
             .send(Glm52RankCommand::Step {
                 inputs: Box::new(inputs),
                 shape,
+                kv: Box::new(kv),
                 flags,
                 sampling,
                 seed,
@@ -532,6 +535,7 @@ impl Glm52RankThreadState {
         &mut self,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        kv: &Glm52StepKv,
         flags: Glm52StepFlags,
         sampling: &[Glm52RowSample],
         seed: u64,
@@ -551,6 +555,7 @@ impl Glm52RankThreadState {
             ep8,
             inputs,
             shape,
+            kv,
             flags,
             sampling,
             seed,
@@ -576,12 +581,13 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::Step {
                 inputs,
                 shape,
+                kv,
                 flags,
                 sampling,
                 seed,
                 resp,
             } => {
-                let _ = resp.send(state.step(&inputs, shape, flags, &sampling, seed));
+                let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));

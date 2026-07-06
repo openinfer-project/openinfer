@@ -3,9 +3,11 @@
 //! plus its 32 local experts, and forwards one of the
 //! [`GLM52_DECODE_BUCKETS`] batch buckets per step (real request tokens in
 //! occupied slots, padding rows elsewhere; prefill rides decode as *spans* —
-//! several consecutive positions of one slot in a single step). Each slot
-//! owns a disjoint `max_model_len`-token region of the paged KV/index
-//! caches, so pad rows write only their own dead slots.
+//! several consecutive positions of one slot in a single step). KV lives in
+//! a rank-wide pool of 64-token pages: the coordinator's `BlockPool` assigns
+//! pages per request, and every step's [`Glm52StepKv`] carries each row's
+//! page table row plus its flat cache write slot — padding rows ride the
+//! pool's reserved padding page, whose garbage writes nobody reads.
 //!
 //! Every step, all 8 ranks run the forward in lock-step with the SAME bucket
 //! (the coordinator's global decision), each dispatching exactly that many
@@ -51,16 +53,38 @@ mod build;
 mod launch_ahead;
 use launch_ahead::Glm52SpeculatedStep;
 
-/// The per-rank slot count and the largest decode bucket. Each slot owns a
-/// `max_model_len`-token region of the paged caches.
+/// The per-rank slot count and the largest decode bucket. A slot is a batch
+/// lane (and the draft lane's state key), not a cache region — KV pages come
+/// from the rank's shared pool.
 pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 8;
 
-/// Every slot region and cache geometry is carved in units of the 64-token
-/// FlashMLA page (== the index-K cache block), so the per-request context cap
-/// must sit on a page boundary — the identity block table maps slot `b` to
-/// blocks `[b*blocks_per_slot, (b+1)*blocks_per_slot)`, and a non-multiple
-/// cap would let slot `b`'s tokens spill into slot `b+1`'s first block.
+/// Cache geometry is carved in units of the 64-token FlashMLA page (== the
+/// index-K cache block), so the per-request context cap must sit on a page
+/// boundary — the page-table width is `max_model_len / page`, and a
+/// non-multiple cap would strand a partial page the table cannot address.
 pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+
+/// The rank-wide KV pool size for a given per-request cap: capacity for
+/// every slot's full-lifetime draw plus the reserved padding page
+/// (`BlockPool` block 0 — padding rows and CUDA-graph pre-capture write
+/// there). A request's lifetime draw is `ceil((prompt + max_tokens)/page)`
+/// with `prompt + max_tokens <= cap + 1` (`validate_request`) — one page
+/// more than its KV ever writes, because kvbm appends the final generated
+/// token and eagerly provisions its page (the dangling-token contract). The
+/// `cap + 1` here keeps 8 concurrent max-shape requests admissible, exactly
+/// like the pre-pool per-slot layout. The coordinator's `BlockPool` and the
+/// rank arenas ([`Glm52RankModel::build`]) MUST agree on this count: pool
+/// block ids index the arenas directly.
+pub(crate) fn glm52_pool_blocks(max_model_len: usize) -> usize {
+    GLM52_MAX_BATCH_PER_RANK * (max_model_len + 1).div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE) + 1
+}
+
+/// Page-table width: the pages a single request at the full cap addresses.
+/// Every per-row page table (bucket block tables) is this wide; rows with
+/// fewer pages are padded with the padding page id.
+pub(crate) fn glm52_table_width(max_model_len: usize) -> usize {
+    max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE)
+}
 
 /// Exact GPU bytes [`Glm52RankModel::build`] allocates on a rank for a given
 /// context cap — every `max_model_len`-scaled term of the build, computed
@@ -71,13 +95,12 @@ pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 /// len-scaled allocation in `build` MUST be added here or the probe
 /// under-charges.
 pub(crate) fn glm52_arena_bytes(max_model_len: usize) -> Result<usize> {
-    let batch = GLM52_MAX_BATCH_PER_RANK;
-    let num_blocks = batch * max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE);
+    let num_blocks = glm52_pool_blocks(max_model_len);
     let mla = GLM52_LAYERS
         * num_blocks
         * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
         * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
-    let (blocks_per_slot, index_layout) = glm52_index_cache_layout(max_model_len);
+    let (table_width, index_layout) = glm52_index_cache_layout(max_model_len);
     let index_k = (0..GLM52_LAYERS)
         .filter(|&layer| glm52_layer_has_full_indexer(layer))
         .count()
@@ -86,23 +109,22 @@ pub(crate) fn glm52_arena_bytes(max_model_len: usize) -> Result<usize> {
     let bucket_rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
     let indexer_logits =
         bucket_rows * max_model_len.next_multiple_of(256) * (size_of::<bf16>() + size_of::<f32>());
-    let block_tables = (batch + bucket_rows) * blocks_per_slot * size_of::<i32>();
+    let block_tables = bucket_rows * table_width * size_of::<i32>();
     Ok(mla + index_k + rope_tables + indexer_logits + block_tables)
 }
 
-/// The per-slot block count and index-K cache layout for a given cap — the
-/// ONE construction shared by [`Glm52RankModel::build`] and the arena ledger
+/// The page-table width and index-K cache layout for a given cap — the ONE
+/// construction shared by [`Glm52RankModel::build`] and the arena ledger
 /// ([`glm52_arena_bytes`]), so a layout change cannot drift between them.
 fn glm52_index_cache_layout(max_model_len: usize) -> (usize, Glm52IndexerCacheLayout) {
-    // Each slot owns `blocks_per_slot` consecutive index-K cache blocks;
-    // the whole cache holds every slot's region back-to-back.
-    let blocks_per_slot = max_model_len.div_ceil(INDEX_CACHE_BLOCK);
+    // The index-K cache is indexed by the same pool block ids as the MLA
+    // cache, so it holds the same block count.
     let layout = Glm52IndexerCacheLayout {
-        cache_blocks: GLM52_MAX_BATCH_PER_RANK * blocks_per_slot,
+        cache_blocks: glm52_pool_blocks(max_model_len),
         cache_block_size: INDEX_CACHE_BLOCK,
         cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
-    (blocks_per_slot, layout)
+    (glm52_table_width(max_model_len), layout)
 }
 
 /// The decode batch buckets, ascending. Each bucket has its own captured
@@ -152,6 +174,24 @@ pub(crate) struct Glm52StepShape {
     pub(crate) active_rows: usize,
 }
 
+/// The step's KV paging, decided by the coordinator's per-rank `BlockPool`:
+/// where each forwarded row's cache writes land and which pages its
+/// attention/indexer walk. Uploaded by the step prologue into the bucket's
+/// device block table / slot mapping (the captured graphs read only those
+/// device buffers — a page's physical id is data, never baked).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Glm52StepKv {
+    /// `[bucket, table_width]` row-major page ids. Row `r` holds the pages
+    /// covering its request's KV through this step (span rows repeat their
+    /// slot's row); entries past the covered pages — and every padding row —
+    /// are the pool's padding page id.
+    pub(crate) pages: Box<[i32]>,
+    /// Per-row flat cache write slot: `pages[position/64]*64 + position%64`
+    /// (the fp8_ds_mla packed cache and the index-K cache share this token
+    /// index space). Padding rows point into the padding page.
+    pub(crate) slot_mapping: [i64; GLM52_MAX_BATCH_PER_RANK],
+}
+
 /// Short-context attention tier: while `seq_len <= 256` the DSA top-256 IS
 /// the full token set (exactly like top-2048 is below 2048 tokens), so the
 /// short-tier graph attends the same tokens at 1/8 the FlashMLA padding work
@@ -197,14 +237,13 @@ pub(crate) struct Glm52RankModel {
     /// plans, scratch, graphs, and block table together — a graph can never
     /// be taken from one shape and restored into another.
     buckets: [Glm52BucketState; GLM52_DECODE_BUCKETS.len()],
-    /// `[GLM52_MAX_BATCH_PER_RANK, blocks_per_slot]` — row b maps slot b's
-    /// context into its disjoint region of the index-K cache. Static: written
-    /// once at build; every bucket's table is gathered from it per step.
-    block_table: CudaSlice<i32>,
-    blocks_per_slot: usize,
+    /// Width of every per-row page-table row ([`glm52_table_width`]): the
+    /// pages one request at the full cap addresses.
+    table_width: usize,
     /// Per-request context cap: `prompt + max_tokens - 1 <= max_model_len`.
-    /// Decided at launch (VRAM probe or `--max-model-len`); sized every
-    /// slot's region of the per-layer MLA and index-K caches at build time.
+    /// Decided at launch (VRAM probe or `--max-model-len`); sized the
+    /// rank-wide per-layer MLA and index-K page pools at build time
+    /// ([`glm52_pool_blocks`]).
     max_model_len: usize,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
@@ -237,11 +276,11 @@ pub(crate) struct Glm52RankModel {
 /// replayed every step after — valid forever, since within a shape every
 /// step has the same kernel sequence and the same arena pointers by
 /// construction; the per-step inputs are the device buffers the prologue
-/// rewrites), and the `[rows, blocks_per_slot]` block table, rewritten by
-/// the prologue every step (dtod gather of each forwarded row's slot
-/// region), so the captured graphs address whichever slots hold the
-/// requests — and span rows their repeated slot — through device data,
-/// never baked slot ids.
+/// rewrites), and the `[rows, table_width]` block table, uploaded by the
+/// prologue every step from the coordinator's [`Glm52StepKv`] page rows, so
+/// the captured graphs address whichever pool pages hold the requests —
+/// and span rows their repeated slot's row — through device data, never
+/// baked page ids.
 struct Glm52BucketState {
     rows: usize,
     scheds: [Glm52MlaSchedMetadata; 2],
@@ -309,7 +348,7 @@ impl Glm52RankModel {
         let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
-            num_blocks: batch * max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+            num_blocks: glm52_pool_blocks(max_model_len),
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
             sm_scale: GLM52_SM_SCALE,
@@ -321,7 +360,7 @@ impl Glm52RankModel {
             num_sm_parts: num_sm_parts.min(GLM52_MLA_TOPK_SHORT / 64),
             ..contract
         };
-        let (blocks_per_slot, index_cache_layout) = glm52_index_cache_layout(max_model_len);
+        let (table_width, index_cache_layout) = glm52_index_cache_layout(max_model_len);
 
         let mut layers = Vec::with_capacity(GLM52_LAYERS);
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
@@ -367,13 +406,6 @@ impl Glm52RankModel {
         // but out of campaign scope — drop this rank's copy.
         let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
 
-        // Row b of the block table maps slot b's context onto its own cache
-        // region: block j of slot b is global block b*blocks_per_slot + j.
-        let block_table_host: Vec<i32> = (0..batch * blocks_per_slot).map(|i| i as i32).collect();
-        let mut block_table = ctx.stream.alloc_zeros::<i32>(batch * blocks_per_slot)?;
-        ctx.stream
-            .memcpy_htod(&block_table_host, &mut block_table)?;
-
         let mut cos_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
         let mut sin_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
         for position in 0..max_model_len {
@@ -392,8 +424,8 @@ impl Glm52RankModel {
 
         // One Glm52BucketState per decode bucket: batch-`rows` contracts
         // (num_blocks is cache geometry, not batch, so it carries over),
-        // plans, scratch, and a block table pre-filled with the identity
-        // prefix (the step prologue rewrites it per step).
+        // plans, scratch, and a zeroed block table (never read before the
+        // first step prologue uploads the coordinator's page rows).
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
@@ -407,15 +439,11 @@ impl Glm52RankModel {
             let mqa_shape = Glm52IndexerScratch::decode_shape(
                 rows,
                 index_cache_layout,
-                blocks_per_slot,
+                table_width,
                 NUM_SMS,
                 max_model_len,
             );
-            let mut bucket_table = ctx.stream.alloc_zeros::<i32>(rows * blocks_per_slot)?;
-            ctx.stream.memcpy_htod(
-                &block_table_host[..rows * blocks_per_slot],
-                &mut bucket_table,
-            )?;
+            let bucket_table = ctx.stream.alloc_zeros::<i32>(rows * table_width)?;
             buckets.push(Glm52BucketState {
                 rows,
                 scheds: [
@@ -485,8 +513,7 @@ impl Glm52RankModel {
             final_norm,
             lm_head,
             buckets,
-            block_table,
-            blocks_per_slot,
+            table_width,
             max_model_len,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
@@ -517,10 +544,10 @@ impl Glm52RankModel {
     /// Enters
     /// 75 MoE collectives — every other rank must be stepping concurrently
     /// WITH THE SAME BUCKET (`shape.bucket`): the coordinator agrees the
-    /// bucket globally per step. Row `r` addresses the cache slot
-    /// `shape.slots[r]`; a slot's span rows walk consecutive positions (see
-    /// [`Glm52StepShape`]); padding rows' cache writes land in their free
-    /// slot's own dead region.
+    /// bucket globally per step. Row `r` writes and reads KV through `kv`'s
+    /// page row / slot mapping; a slot's span rows walk consecutive positions
+    /// (see [`Glm52StepShape`]); padding rows' cache writes land in the
+    /// pool's padding page, which nobody reads meaningfully.
     ///
     /// The step body (embed → 78 layers → lm_head → argmax) is captured into
     /// a CUDA graph on the first call in each (attention tier × bucket) shape
@@ -544,6 +571,7 @@ impl Glm52RankModel {
         ep8: &mut Glm52MoeEp8State,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        kv: &Glm52StepKv,
         flags: crate::runner::Glm52StepFlags,
         sampling: &[crate::runner::Glm52RowSample],
         seed: u64,
@@ -588,7 +616,7 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape)?;
+            self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape, kv)?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -686,6 +714,7 @@ impl Glm52RankModel {
         ep8: &mut Glm52MoeEp8State,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
+        kv: &Glm52StepKv,
     ) -> Result<()> {
         // The bucket state's `rows` is the lookup key — an unknown bucket is
         // a coordinator bug and fails the step before touching the GPU.
@@ -727,9 +756,14 @@ impl Glm52RankModel {
             }
             slot_last_row[slot] = Some(row);
         }
+        ensure!(
+            kv.pages.len() == batch * self.table_width,
+            "GLM5.2 step KV pages {} != bucket {batch} x table width {}",
+            kv.pages.len(),
+            self.table_width
+        );
         let mut tokens_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
         let mut positions_host = [0u32; GLM52_MAX_BATCH_PER_RANK];
-        let mut slots_host = [0i64; GLM52_MAX_BATCH_PER_RANK];
         let mut seq_lens_host = [0i32; GLM52_MAX_BATCH_PER_RANK];
         for row in 0..batch {
             let slot = shape.slots[row] as usize;
@@ -739,18 +773,28 @@ impl Glm52RankModel {
                 "GLM5.2 slot {slot} position {position} exceeds the model-length cap {}",
                 self.max_model_len
             );
+            // The coordinator's page row must place this row's write slot
+            // inside the page covering its position — a drifted slot mapping
+            // would write one row's KV into another request's page.
+            let page =
+                kv.pages[row * self.table_width + position / GLM52_FLASHMLA_SPARSE_PAGE_SIZE];
+            let expect = page as i64 * GLM52_FLASHMLA_SPARSE_PAGE_SIZE as i64
+                + (position % GLM52_FLASHMLA_SPARSE_PAGE_SIZE) as i64;
+            ensure!(
+                kv.slot_mapping[row] == expect,
+                "GLM5.2 row {row} slot mapping {} does not match page {page} at position \
+                 {position} (expect {expect})",
+                kv.slot_mapping[row]
+            );
             tokens_host[row] = token;
             positions_host[row] = position as u32;
-            // Slot b owns cache tokens [b*MAX_LEN, (b+1)*MAX_LEN) — the same
-            // global slot id addresses both the MLA and index-K caches.
-            slots_host[row] = (slot * self.max_model_len + position) as i64;
             seq_lens_host[row] = (position + 1) as i32;
         }
         ctx.stream.memcpy_htod(&tokens_host, &mut self.token_ids)?;
         ctx.stream
             .memcpy_htod(&positions_host, &mut self.positions)?;
         ctx.stream
-            .memcpy_htod(&slots_host, &mut self.slot_mapping)?;
+            .memcpy_htod(&kv.slot_mapping, &mut self.slot_mapping)?;
         ctx.stream.memcpy_htod(&seq_lens_host, &mut self.seq_lens)?;
         for (dst, &(_, position)) in self.device_positions.iter_mut().zip(&inputs[..batch]) {
             *dst = position;
@@ -758,21 +802,12 @@ impl Glm52RankModel {
         // Gather each row's rotary table row (a bit-exact row copy).
         embedding_rows_into(ctx, &self.cos_table, &self.positions, batch, &mut self.cos)?;
         embedding_rows_into(ctx, &self.sin_table, &self.positions, batch, &mut self.sin)?;
-        // Point each forwarded row's block-table row at its slot's cache
-        // region — device data, so the captured graphs replay against
-        // whichever slots hold the requests (span rows repeat their slot's
-        // region). Every bucket's table is rewritten every step: the full
-        // bucket stopped being an identity mapping once spans landed.
-        for row in 0..batch {
-            let slot = shape.slots[row] as usize;
-            let src = self
-                .block_table
-                .slice(slot * self.blocks_per_slot..(slot + 1) * self.blocks_per_slot);
-            let mut dst = bucket
-                .block_table
-                .slice_mut(row * self.blocks_per_slot..(row + 1) * self.blocks_per_slot);
-            ctx.stream.memcpy_dtod(&src, &mut dst)?;
-        }
+        // Upload the step's page rows into the bucket's device block table —
+        // device data, so the captured graphs replay against whichever pool
+        // pages hold the requests (span rows repeat their slot's row, padding
+        // rows ride the padding page).
+        ctx.stream
+            .memcpy_htod(&kv.pages[..], &mut bucket.block_table)?;
 
         // Attention tier: while EVERY forwarded row's context fits in the
         // short top-k, top-256 selects exactly the same tokens as top-2048
