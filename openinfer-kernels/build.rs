@@ -1098,7 +1098,71 @@ fn generate_triton_artifacts(
 
     let func_name = func_name.expect("Triton generator did not print FUNC_NAME");
     let c_path = c_path.expect("Triton generator did not print C_PATH");
+    patch_triton_aot_per_device_handles(&c_path);
     (func_name, c_path)
+}
+
+fn patch_triton_aot_per_device_handles(c_path: &Path) {
+    let src = fs::read_to_string(c_path).expect("failed to read generated Triton C source");
+    let module_name = src
+        .lines()
+        .find_map(|line| line.strip_prefix("CUmodule "))
+        .and_then(|rest| rest.strip_suffix(" = NULL;"))
+        .map(str::to_string)
+        .expect("generated Triton C source should declare one CUmodule");
+    let function_name = src
+        .lines()
+        .find_map(|line| line.strip_prefix("CUfunction "))
+        .and_then(|rest| rest.strip_suffix(" = NULL;"))
+        .map(str::to_string)
+        .expect("generated Triton C source should declare one CUfunction");
+
+    let patched = src
+        .replace(
+            &format!("CUmodule {module_name} = NULL;"),
+            &format!("CUmodule {module_name}[16] = {{0}};"),
+        )
+        .replace(
+            &format!("CUfunction {function_name} = NULL;"),
+            &format!("CUfunction {function_name}[16] = {{0}};"),
+        )
+        .replace(
+            &format!("CUDA_CHECK(cuModuleUnload({module_name}));"),
+            &format!(
+                "CUdevice dev = 0;\n    CUDA_CHECK(cuCtxGetDevice(&dev));\n    if ({module_name}[dev] != NULL) {{\n      CUDA_CHECK(cuModuleUnload({module_name}[dev]));\n      {module_name}[dev] = NULL;\n      {function_name}[dev] = NULL;\n    }}"
+            ),
+        );
+    let patched = patched
+        .replace(
+            &format!("cuModuleLoadData(&{module_name}, bin)"),
+            &format!("cuModuleLoadData(&{module_name}[dev], bin)"),
+        )
+        .replace(
+            &format!("cuModuleGetFunction(&{function_name}, {module_name}, "),
+            &format!("cuModuleGetFunction(&{function_name}[dev], {module_name}[dev], "),
+        )
+        .replace(
+            &format!("cuFuncSetCacheConfig({function_name}, "),
+            &format!("cuFuncSetCacheConfig({function_name}[dev], "),
+        )
+        .replace(
+            &format!("cuFuncSetAttribute({function_name}, "),
+            &format!("cuFuncSetAttribute({function_name}[dev], "),
+        )
+        .replace(
+            &format!("if ({function_name} == NULL)\n       load_"),
+            &format!("int dev = 0;\n    CUDA_CHECK(cuCtxGetDevice(&dev));\n    if ({function_name}[dev] == NULL)\n       load_"),
+        )
+        .replace(
+            &format!("return cuLaunchKernel({function_name}, "),
+            &format!("return cuLaunchKernel({function_name}[dev], "),
+        )
+        .replace(
+            "int dev = 0;\n    void *bin =",
+            "int dev = 0;\n    CUDA_CHECK(cuCtxGetDevice(&dev));\n    void *bin =",
+        );
+
+    fs::write(c_path, patched).expect("failed to patch generated Triton C source");
 }
 
 fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> PathBuf {

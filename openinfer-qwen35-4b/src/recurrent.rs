@@ -418,13 +418,15 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &mut scratch.beta,
         num_key_heads,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill prepare failed: {e}"))?;
     gated_delta_rule_prefill_chunk_cumsum_inplace(
         ctx,
         &mut scratch.g_cumsum,
         qkv.seq_len,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill cumsum failed: {e}"))?;
     gated_delta_rule_prefill_chunk_a_into(
         ctx,
         &scratch.k_expanded,
@@ -432,14 +434,16 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &scratch.beta,
         &mut scratch.a_tril,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill A stage failed: {e}"))?;
     gated_delta_rule_prefill_chunk_solve_into(
         ctx,
         &scratch.a_tril,
         &mut scratch.a_inv,
         qkv.seq_len,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill solve failed: {e}"))?;
     gated_delta_rule_prefill_chunk_recompute_into(
         ctx,
         &scratch.k_expanded,
@@ -450,7 +454,8 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &scratch.a_inv,
         &scratch.g_cumsum,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill recompute failed: {e}"))?;
     gated_delta_rule_prefill_chunk_state_stage_into(
         ctx,
         &scratch.k_expanded,
@@ -461,7 +466,8 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         &mut scratch.chunk_state,
         &mut scratch.v_new,
         num_value_heads,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("GDR prefill state stage failed: {e}"))?;
     gated_delta_rule_prefill_chunk_o_stage_into(
         ctx,
         &scratch.q_expanded,
@@ -473,6 +479,7 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         num_value_heads,
         1.0 / (key_dim as f32).sqrt(),
     )
+    .map_err(|e| anyhow::anyhow!("GDR prefill output stage failed: {e}"))
 }
 
 #[cfg(test)]

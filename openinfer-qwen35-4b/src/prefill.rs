@@ -170,13 +170,14 @@ impl Qwen35Model {
         kv_state.ensure_capacity(end_pos)?;
         kv_state.advance(seq_len);
         let kv_desc = kv_state.desc();
+        let tp = self.tensor_parallel;
         let prefill_plan = PrefillPagedPlan::new(
             &self.ctx,
             &kv_desc,
             base_pos,
             seq_len,
-            c.num_attention_heads,
-            c.num_key_value_heads,
+            c.local_num_attention_heads(tp),
+            c.local_num_key_value_heads(tp),
             c.head_dim,
         )?;
 
@@ -230,8 +231,9 @@ impl Qwen35Model {
             self.batched_rms_norm_offset(hidden_batch, &layer.input_layernorm, eps)?;
 
         // 2. Attention / Linear attention — per-token for correctness
+        let tp = self.tensor_parallel;
         let attn_out_dim = match &layer.attn {
-            LayerKind::FullAttention(_) => c.full_attn_q_dim(),
+            LayerKind::FullAttention(_) => c.local_full_attn_q_dim(tp),
             LayerKind::LinearAttention(_) => c.linear_attn_z_dim(),
         };
 
@@ -265,9 +267,10 @@ impl Qwen35Model {
 
         // 4. MLP (batched)
         let gate_up_out = ops::gemm(&self.ctx, &layer.mlp.gate_up_proj, &normed_batch)?;
-        let mut act_out = HiddenStates::zeros(&self.ctx, c.intermediate_size, seq_len)?;
+        let mut act_out = HiddenStates::zeros(&self.ctx, c.local_intermediate_size(tp), seq_len)?;
         ops::silu_mul_fused_batch_into(&self.ctx, &gate_up_out, &mut act_out)?;
-        let mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
+        let mut mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
+        self.all_reduce_hidden(&mut mlp_out)?;
 
         // 5. Residual
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
@@ -285,7 +288,10 @@ impl Qwen35Model {
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
-        let attn_out_dim = c.full_attn_q_dim();
+        let tp = self.tensor_parallel;
+        let num_attention_heads = c.local_num_attention_heads(tp);
+        let num_key_value_heads = c.local_num_key_value_heads(tp);
+        let attn_out_dim = c.local_full_attn_q_dim(tp);
         let eps = c.rms_norm_eps;
         let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, normed_batch)?;
         let k_batch = ops::gemm(&self.ctx, &attn.k_proj, normed_batch)?;
@@ -332,8 +338,8 @@ impl Qwen35Model {
                 layer_k_off,
                 layer_v_off,
                 pi_ptr as *const i32,
-                c.num_attention_heads as i32,
-                c.num_key_value_heads as i32,
+                num_attention_heads as i32,
+                num_key_value_heads as i32,
                 seq_len as i32,
                 sp_ptr as *const i32,
                 c.rotary_dim as i32,
@@ -381,8 +387,8 @@ impl Qwen35Model {
                     kti_ptr as *const i32,
                     kcs_ptr as *const i32,
                     tnr_ptr as *const u32,
-                    c.num_attention_heads as i32,
-                    c.num_key_value_heads as i32,
+                    num_attention_heads as i32,
+                    num_key_value_heads as i32,
                     HEAD_DIM as i32,
                     layout.page_size as i32,
                     seq_len as i32,
@@ -408,7 +414,7 @@ impl Qwen35Model {
                 ffi::attention_gate_batch_hd256_cuda(
                     qf_ptr as *const ffi::Half,
                     out_ptr as *mut ffi::Half,
-                    c.num_attention_heads as i32,
+                    num_attention_heads as i32,
                     seq_len as i32,
                     self.ctx.stream.cu_stream(),
                 );
@@ -418,7 +424,9 @@ impl Qwen35Model {
         *full_idx += 1;
 
         // O projection (batched)
-        ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)
+        let mut projected = ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)?;
+        self.all_reduce_hidden(&mut projected)?;
+        Ok(projected)
     }
 
     fn prefill_linear_attention(

@@ -1,12 +1,13 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::nccl::safe::{Comm, ReduceOp};
 use log::{debug, info};
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::time::Instant;
 
 use super::config::{Config35, LayerType, TensorParallelConfig};
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use openinfer_core::weight_loader::{
     deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
     load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards, precompute_rope,
@@ -103,7 +104,15 @@ pub struct Qwen35Model {
     pub(super) kv_pool: openinfer_core::kv_pool::KvPool,
     /// Decode-slot count the recurrent-state reserve was sized for.
     pub(super) reserved_decode_slots: usize,
+    pub(super) tp_comm: Option<Comm>,
 }
+
+// SAFETY: A Qwen3.5 model instance is bound to one CUDA device and driven from
+// one owning scheduler/worker thread at a time. TP constructs one independent
+// rank-local model per worker; the model is moved between threads only during
+// startup, never shared for concurrent mutation.
+unsafe impl Send for Qwen35Model {}
+unsafe impl Sync for Qwen35Model {}
 
 /// Graph slot state + one in-flight prefill transient per decode slot.
 const STATES_PER_DECODE_SLOT: usize = 2;
@@ -519,6 +528,7 @@ impl Qwen35Model {
             sin_cache,
             kv_pool,
             reserved_decode_slots: max_batch,
+            tp_comm: None,
         })
     }
 
@@ -550,6 +560,22 @@ impl Qwen35Model {
 
     pub(crate) fn kv_pool(&self) -> &openinfer_core::kv_pool::KvPool {
         &self.kv_pool
+    }
+
+    pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
+        self.tp_comm = Some(comm);
+    }
+
+    pub(crate) fn all_reduce_hidden(&self, hidden: &mut HiddenStates) -> Result<()> {
+        self.all_reduce_hidden_untraced(hidden)
+    }
+
+    pub(crate) fn all_reduce_hidden_untraced(&self, hidden: &mut HiddenStates) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
+                .map_err(|e| anyhow::anyhow!("Qwen3.5 NCCL all-reduce failed: {e:?}"))?;
+        }
+        Ok(())
     }
 
     /// Tune small-batch decode GEMM algorithms on the thread that will capture
