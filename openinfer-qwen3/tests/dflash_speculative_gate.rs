@@ -44,10 +44,9 @@ use std::time::Duration;
 
 use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_core::sampler::SamplingParams;
-use openinfer_qwen3_4b::{
+use openinfer_qwen3::{
     DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE, DEFAULT_MAX_PREFILL_TOKENS,
     DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
-};
 };
 use vllm_text::tokenizer::DynTokenizer;
 

@@ -29,11 +29,8 @@ use futures::stream::BoxStream;
 use openinfer_engine::engine::{
     EngineHandle, GenerateRequest, KvBlockEvent, LoadSnapshot, TokenSink, TokenStreamReceiver,
 };
-use openinfer_qwen3_4b::{
+use openinfer_qwen3::{
     DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE,
-    DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions,
-    Qwen3OffloadOptions,
-};
     DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions,
     Qwen3OffloadOptions,
 };

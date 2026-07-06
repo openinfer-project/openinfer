@@ -1084,8 +1084,9 @@ impl Qwen3Model {
             bytes_per_block + dflash_kv_bytes_per_token * geometry.block_size;
         let num_blocks = (kv_budget_bytes / effective_bytes_per_block).max(64);
         let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
+        let page_size = geometry.block_size;
         log::info!(
-            "KV cache ({source}): {num_blocks} blocks ({kv_mb} MB, {:.0}% of {:.0} MB free)",
+            "KV cache ({source}): {num_blocks} blocks ({kv_mb} MB, page size {page_size}, {:.0}% of {:.0} MB free)",
             kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
