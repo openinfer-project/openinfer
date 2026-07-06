@@ -199,6 +199,25 @@ target is peaked.
 Plain sampled solo is 20.7 (not greedy's 19.5): a non-greedy request forfeits launch-ahead —
 which the drafter disables anyway, so speculation loses nothing.
 
+**Under real concurrency (vllm-bench Rust client, sharegpt first turns, output 200,
+temp 1.0 / top_p 0.95, same seed both arms, jz-38 2026-07-06):**
+
+| c | tok/s off → on | TPOT p50 off → on (ms) | TPOT p99 off → on | TTFT p50 off → on |
+| --- | --- | --- | --- | --- |
+| 1 | 40.6 → 57.7 (1.42×) | 20.4 → 12.5 | 20.6 → 18.7 | 321 → 320 |
+| 2 | 81.7 → 98.7 (1.21×) | 21.9 → 15.2 | 25.4 → 20.0 | 121 → 385 |
+| 4 | 130.6 → 163.9 (1.25×) | 25.7 → 18.2 | 28.0 → 25.2 | 258 → 435 |
+| 8 | 225.3 → 281.3 (1.25×) | 29.6 → 19.6 | 34.3 → 30.3 | 230 → 511 |
+
+The win holds through c8 (≤ 1 request/rank — verify spans don't yet contend for slots):
+throughput +21–25%, TPOT p50 1.4–1.6×. Two honest costs visible in the tails: **TPOT p99
+improves less than p50** (round-granular commits jitter the ITL — a rejected round pays a
+bucket-4 step for one token), and **the spec arm's TTFT p50 is ~150–280 ms worse under
+load** (the drafter forces prefix caching off, and verify spans lift the global bucket
+while co-resident prompts prefill). c > 8 (multi-slot contention) remains unmeasured.
+Note the Python `vllm bench serve` c8 client hang (#548) did NOT reproduce with the Rust
+`vllm-bench` client — 8/8 runs completed 100%.
+
 **Parity (gates 2026-07-06).** Seeded determinism: same seeded request twice under spec →
 byte-identical. Seeded spec-vs-plain: all 4 prompts eventually diverge at a near-tie — but
 P2 tracked plain for **35 consecutive sampled tokens** before diverging, which is ~1e-5
