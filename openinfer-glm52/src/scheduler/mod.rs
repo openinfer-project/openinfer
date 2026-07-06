@@ -36,6 +36,8 @@ mod slot;
 #[cfg(test)]
 mod testkit;
 
+use anyhow::Context as _;
+
 use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
 use openinfer_kv_cache::{BlockPool, RequestKv};
 use openinfer_sample::mix_seed;
@@ -169,72 +171,17 @@ pub(crate) fn run_dp8_coordinator(
             .all(|rank_slots| rank_slots.iter().all(Option::is_none))
     };
 
-    // Pre-capture every whole-step graph (bucket × attention tier) while the
-    // ranks are idle and trivially in lock-step. Launch-ahead speculation
-    // requires captured-ness to be UNIFORM across ranks — a lazily capturing
-    // rank would skip the speculative replay the others enqueued and desync
-    // the collectives — and pre-capturing also removes the old mid-serving
-    // capture stall. Row 0 at position GLM52_MLA_TOPK_SHORT lifts the step
-    // into the full tier; every row is a padding write into the pool's
-    // padding page.
-    for &bucket in &GLM52_DECODE_BUCKETS {
-        for full_tier in [false, true] {
-            let mut shape = Glm52StepShape {
-                bucket,
-                slots: [0; GLM52_MAX_BATCH_PER_RANK],
-                active_rows: 0,
-            };
-            for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
-                *dst = slot as u8;
-            }
-            let mut inputs =
-                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
-            if full_tier {
-                inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
-            }
-            let responses = match workers
-                .iter()
-                .zip(&pools)
-                .map(|(worker, pool)| {
-                    let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
-                    worker.step_async(inputs, shape, kv, Glm52StepFlags::plain(), Vec::new(), 0)
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-            {
-                Ok(responses) => responses,
-                Err(err) => {
-                    log::error!("GLM5.2 graph pre-capture failed to submit: {err:#}");
-                    // The DeepEP contexts already exist: broadcast Shutdown
-                    // before the workers' sequential Drop joins them (the
-                    // same collective-teardown contract as the exit path).
-                    for worker in &workers {
-                        let _ = worker.request_shutdown();
-                    }
-                    return;
-                }
-            };
-            for (rank, resp) in responses.into_iter().enumerate() {
-                let result = resp
-                    .recv()
-                    .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
-                    .and_then(|r| r);
-                if let Err(err) = result {
-                    log::error!(
-                        "GLM5.2 graph pre-capture (bucket {bucket}, full_tier {full_tier}) \
-                         failed on rank {rank}: {err:#}"
-                    );
-                    for worker in &workers {
-                        let _ = worker.request_shutdown();
-                    }
-                    return;
-                }
-            }
+    // Pre-capture before serving (see [`precapture_step_graphs`]). The DeepEP
+    // contexts already exist: on failure broadcast Shutdown before the
+    // workers' sequential Drop joins them (the same collective-teardown
+    // contract as the exit path).
+    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width) {
+        log::error!("GLM5.2 graph pre-capture failed: {err:#}");
+        for worker in &workers {
+            let _ = worker.request_shutdown();
         }
+        return;
     }
-    log::info!(
-        "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
-        GLM52_DECODE_BUCKETS.len()
-    );
 
     // The step shapes that carried the last launch-ahead lease, and whether
     // any slot changed hands since it was granted — together they decide
@@ -266,77 +213,21 @@ pub(crate) fn run_dp8_coordinator(
             break;
         }
 
-        // Admission: fill free slots from the queue, least-loaded rank (with
-        // pool budget for the request's full lifetime) first. New requests
-        // join the lock-step at the next step boundary (their prefill rides
-        // decode alongside everyone else's rows).
-        while let Some(front) = pending.front() {
-            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
-            let committed: Vec<usize> = slots
-                .iter()
-                .map(|rank_slots| {
-                    rank_slots
-                        .iter()
-                        .flatten()
-                        .map(|active| {
-                            lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
-                        })
-                        .sum()
-                })
-                .collect();
-            let Some((rank, slot)) =
-                admission_target(&occupancy(&slots), &committed, &usable_blocks, need_blocks)
-            else {
-                break;
-            };
-            let req = pending.pop_front().expect("checked non-empty");
-            // The client left while the request sat in the queue — admitting
-            // it would burn a slot (and whole global steps) on a dead sink.
-            if req.token_tx.is_closed() {
-                continue;
-            }
-            let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-            let cached_tokens = if prefix_cache_enabled {
-                match kv.match_and_add_prefix(&pools[rank]) {
-                    Ok(cached) => cached,
-                    Err(err) => {
-                        // A fresh request failing to match is a kvbm state
-                        // invariant break — crash early, don't serve on a
-                        // pool whose bookkeeping already lied once. This
-                        // request is already out of `pending` and never
-                        // reaches a slot, so fail it explicitly (fail_step
-                        // and the shutdown sweep can't see it).
-                        let err = err.context("GLM5.2 prefix match at admission");
-                        let _ = req.token_tx.send(TokenEvent::Error {
-                            message: format!("{err:#}"),
-                            prompt_tokens: req.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                        fail_step(&mut slots, &err);
-                        break 'serve;
-                    }
-                }
-            } else {
-                0
-            };
-            let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-            let _ = req.token_tx.send(TokenEvent::Scheduled {
-                queued_at_unix_s,
-                scheduled_at_unix_s: unix_now_s(),
-                prompt_tokens: req.prompt_tokens.len(),
-                cached_tokens,
-            });
-            let state = Glm52SlotState::new(
-                req.prompt_tokens.clone(),
-                req.max_tokens,
-                req.params.ignore_eos,
-                cached_tokens,
-            );
-            if dspark_enabled {
-                pending_resets[rank].push(slot);
-            }
-            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
-            slots_changed = true;
+        // Admission (see [`admit_from_queue`]); an admission failure is a kvbm
+        // state invariant break — crash early, don't serve on a pool whose
+        // bookkeeping already lied once.
+        if let Err(err) = admit_from_queue(
+            &mut pending,
+            &mut slots,
+            &pools,
+            &usable_blocks,
+            prefix_cache_enabled,
+            dspark_enabled,
+            &mut pending_resets,
+            &mut slots_changed,
+        ) {
+            fail_step(&mut slots, &err);
+            break 'serve;
         }
         if all_idle(&slots) {
             continue;
@@ -359,337 +250,53 @@ pub(crate) fn run_dp8_coordinator(
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;
-        // Per-rank submit: schedule each active span's KV (full-lifetime
-        // reservation makes every schedule succeed — a failure is an
-        // accounting bug and fails the step), build the row inputs, page
-        // rows and write slots, collect the step's sampling rows, and fire
-        // the step. `span_kinds[rank][slot]` records what was scheduled so
-        // the output walk applies the exact pairing.
-        let mut span_kinds: Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]> = workers
-            .iter()
-            .map(|_| [None; GLM52_MAX_BATCH_PER_RANK])
-            .collect();
-        let mut responses = Vec::with_capacity(workers.len());
-        let mut submit_err: Option<anyhow::Error> = None;
-        'submit: for (rank, ((rank_slots, worker), shape)) in
-            slots.iter_mut().zip(&workers).zip(&shapes).enumerate()
-        {
-            let pool = &pools[rank];
-            let padding_page = pool.padding_block_id();
-            let sampling = collect_sampling_rows(shape, rank_slots);
-            let seed = mix_seed(mix_seed(GLM52_SAMPLE_SEED, sample_step), rank as u64);
-            let mut inputs =
-                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
-            // A consumed speculation replays with device-advanced inputs and
-            // never reads the step KV — skip building the page rows (the
-            // whole point of launch-ahead is keeping this host path off the
-            // hot step boundary). KV *scheduling* still runs: kvbm's
-            // bookkeeping must advance every step.
-            let mut pages = if flags.consume {
-                Vec::new()
-            } else {
-                vec![padding_page; shape.bucket * table_width]
-            };
-            let mut slot_mapping = [padding_page as i64 * PAGE as i64; GLM52_MAX_BATCH_PER_RANK];
-            // Walk the shape's contiguous per-slot runs.
-            let mut row = 0usize;
-            while row < shape.bucket {
-                let slot_id = shape.slots[row] as usize;
-                let mut end = row + 1;
-                while end < shape.bucket && shape.slots[end] as usize == slot_id {
-                    end += 1;
-                }
-                let span = end - row;
-                let Some(active) = rank_slots[slot_id].as_mut() else {
-                    // Padding rows keep the padding-page defaults.
-                    row = end;
-                    continue;
-                };
-                for (offset, r) in (row..end).enumerate() {
-                    let step = active.state.next_input_at(offset);
-                    inputs[r] = (step.token, step.position);
-                }
-                // The span must extend kvbm's view exactly: its first row's
-                // position is the next KV slot to write. Drift between the
-                // slot state's position math and the pool's bookkeeping
-                // writes KV into the wrong page — fail the step instead.
-                if inputs[row].1 != active.kv.kv_position() {
-                    submit_err = Some(anyhow::anyhow!(
-                        "GLM5.2 rank {rank} slot {slot_id} span starts at position {} but the \
-                         KV pool is at {}",
-                        inputs[row].1,
-                        active.kv.kv_position()
-                    ));
-                    break 'submit;
-                }
-                let mid_prefill = active.state.mid_prefill();
-                let (kind, scheduled) = if mid_prefill {
-                    let kind = if active.state.remaining_prompt() == span {
-                        SpanKind::PrefillBoundary
-                    } else {
-                        SpanKind::PrefillChunk
-                    };
-                    (kind, active.kv.schedule_prefill(span, pool))
-                } else if span == 1 {
-                    (SpanKind::Decode, active.kv.schedule_decode(pool))
-                } else {
-                    (
-                        SpanKind::Speculative,
-                        active.kv.schedule_speculative(span, pool),
-                    )
-                };
-                if let Err(err) = scheduled {
-                    submit_err = Some(anyhow::anyhow!(
-                        "GLM5.2 rank {rank} slot {slot_id} violated its full-lifetime KV \
-                         reservation ({kind:?}, span {span}): {err}"
-                    ));
-                    break 'submit;
-                }
-                span_kinds[rank][slot_id] = Some(kind);
-                if !flags.consume {
-                    let row_pages = active.kv.step_page_indices(span);
-                    for r in row..end {
-                        pages[r * table_width..r * table_width + row_pages.len()]
-                            .copy_from_slice(&row_pages);
-                        let position = inputs[r].1;
-                        slot_mapping[r] = row_pages[position / PAGE] as i64 * PAGE as i64
-                            + (position % PAGE) as i64;
-                    }
-                }
-                row = end;
+        // One lock-step step (see [`submit_and_join_step`]).
+        let (outputs, span_kinds) = match submit_and_join_step(
+            &workers,
+            &pools,
+            &mut slots,
+            &shapes,
+            flags,
+            table_width,
+            sample_step,
+        ) {
+            Ok(step) => step,
+            Err(err) => {
+                fail_step(&mut slots, &err);
+                break 'serve;
             }
-            let kv = Glm52StepKv {
-                pages: pages.into_boxed_slice(),
-                slot_mapping,
-            };
-            match worker.step_async(inputs, *shape, kv, flags, sampling, seed) {
-                Ok(rx) => responses.push(rx),
-                Err(err) => {
-                    submit_err = Some(err);
-                    break 'submit;
-                }
-            }
-        }
-        if let Some(err) = submit_err {
-            fail_step(&mut slots, &err);
-            break 'serve;
-        }
-        // Join ALL ranks before failing: the rank the coordinator happens to
-        // recv first often reports the ~100 s DeepEP device-timeout trap, not
-        // the root cause — the rank that actually failed answers later. Log
-        // every error so the root cause has a landing spot, then tear down on
-        // the first one in rank order.
-        let mut outputs = Vec::with_capacity(responses.len());
-        let mut step_err: Option<anyhow::Error> = None;
-        for (rank, resp) in responses.into_iter().enumerate() {
-            let result = resp
-                .recv()
-                .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its step response"));
-            match result {
-                Ok(Ok(step_tokens)) => outputs.push(step_tokens),
-                Ok(Err(err)) | Err(err) => {
-                    let err = err.context(format!("GLM5.2 rank {rank} step"));
-                    log::error!("GLM5.2 rank {rank} step failed: {err:#}");
-                    step_err.get_or_insert(err);
-                    outputs.push([0; GLM52_MAX_BATCH_PER_RANK]);
-                }
-            }
-        }
-        if let Some(err) = step_err {
-            fail_step(&mut slots, &err);
-            break 'serve;
-        }
+        };
 
-        let mut rank_appends: Vec<Vec<(usize, usize)>> =
-            workers.iter().map(|_| Vec::new()).collect();
-        let mut rank_proposals: Vec<Vec<(usize, u32, usize)>> =
-            workers.iter().map(|_| Vec::new()).collect();
-        let mut walk_err: Option<anyhow::Error> = None;
-        'walk: for (rank, ((rank_slots, rank_outputs), shape)) in
-            slots.iter_mut().zip(outputs).zip(&shapes).enumerate()
-        {
-            // Walk the shape's contiguous per-slot runs; each active slot
-            // folds its whole span of row outputs in at once.
-            let mut row = 0usize;
-            while row < shape.bucket {
-                let slot_id = shape.slots[row] as usize;
-                let mut end = row + 1;
-                while end < shape.bucket && shape.slots[end] as usize == slot_id {
-                    end += 1;
-                }
-                let span_rows = row..end;
-                let span_outputs = &rank_outputs[span_rows.clone()];
-                row = end;
-                let slot = &mut rank_slots[slot_id];
-                let Some(active) = slot.as_mut() else {
-                    continue;
-                };
-                let prompt_tokens = active.req.prompt_tokens.len();
-                let outcome = active.state.advance_span(span_outputs, eos_token_ids);
-                // Commit the span's KV bookkeeping under the exact kind the
-                // submit phase scheduled — a mispairing is a coordinator bug
-                // and fails the step.
-                let pool = &pools[rank];
-                let applied = match (&outcome, span_kinds[rank][slot_id]) {
-                    (Glm52StepOutcome::Prefilling, Some(SpanKind::PrefillChunk)) => {
-                        active.kv.apply_prefill_chunk(pool)
-                    }
-                    (
-                        Glm52StepOutcome::Commit { committed, .. },
-                        Some(SpanKind::PrefillBoundary),
-                    ) => active.kv.apply_prefill(committed[0], pool),
-                    (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::Decode)) => {
-                        active.kv.apply_decode(committed[0], pool).map(|_| ())
-                    }
-                    (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::Speculative)) => {
-                        active.kv.apply_speculative(committed, pool).map(|_| ())
-                    }
-                    (outcome, kind) => Err(anyhow::anyhow!(
-                        "GLM5.2 rank {rank} slot {slot_id} outcome {outcome:?} does not pair \
-                         with scheduled span kind {kind:?}"
-                    )),
-                };
-                if let Err(err) = applied {
-                    walk_err =
-                        Some(err.context(format!("GLM5.2 rank {rank} slot {slot_id} KV apply")));
-                    break 'walk;
-                }
-                let (freed, context_rows) = match outcome {
-                    Glm52StepOutcome::Prefilling => {
-                        // Prefill never sends, so a disconnect is only
-                        // visible through the sink probe — without it a
-                        // long prompt zombies the slot until prefill
-                        // completes. Every prompt row is committed
-                        // context.
-                        (active.req.token_tx.is_closed(), span_outputs.len())
-                    }
-                    Glm52StepOutcome::Commit {
-                        committed,
-                        emit,
-                        finish,
-                        context_rows,
-                    } => {
-                        // A dropped receiver (client disconnect) frees the
-                        // slot; its pool pages release with the request
-                        // (sealed blocks stay matchable as prefix cache).
-                        let mut freed = false;
-                        for &token in &committed[..emit] {
-                            if active
-                                .req
-                                .token_tx
-                                .send(TokenEvent::Token {
-                                    id: token,
-                                    logprob: None,
-                                })
-                                .is_err()
-                            {
-                                freed = true;
-                                break;
-                            }
-                        }
-                        if let Some(finish_reason) = finish
-                            && !freed
-                        {
-                            let _ = active.req.token_tx.send(TokenEvent::Finished {
-                                finish_reason,
-                                prompt_tokens,
-                                completion_tokens: active.state.completion_tokens(),
-                            });
-                            freed = true;
-                        }
-                        (freed, context_rows)
-                    }
-                };
-                if freed {
-                    active.state.log_spec_stats(rank, slot_id);
-                    if let Err(err) = active.kv.release() {
-                        // Blocks still return via assignment RAII when the
-                        // slot drops — the explicit release only failed to
-                        // run from a clean Idle state.
-                        log::warn!(
-                            "GLM5.2 rank {rank} slot {slot_id} KV release failed \
-                             (blocks return via RAII): {err:#}"
-                        );
-                    }
-                    if dspark_enabled {
-                        pending_resets[rank].push(slot_id);
-                    }
-                    *slot = None;
-                    slots_changed = true;
-                } else if dspark_enabled {
-                    // Committed rows' captured hidden feeds the draft
-                    // context; then re-propose from the new anchor.
-                    rank_appends[rank].extend(span_rows.take(context_rows).map(|r| (r, slot_id)));
-                    if active.state.wants_drafts()
-                        && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
-                    {
-                        rank_proposals[rank].push((slot_id, anchor, anchor_pos));
-                    }
-                }
+        let (rank_appends, rank_proposals) = match apply_step_outputs(
+            &mut slots,
+            outputs,
+            &shapes,
+            &span_kinds,
+            &pools,
+            eos_token_ids,
+            dspark_enabled,
+            &mut pending_resets,
+            &mut slots_changed,
+        ) {
+            Ok(walked) => walked,
+            Err(err) => {
+                fail_step(&mut slots, &err);
+                break 'serve;
             }
-        }
-        if let Some(err) = walk_err {
+        };
+
+        if dspark_enabled
+            && let Err(err) = run_draft_round(
+                &workers,
+                &mut slots,
+                &shapes,
+                &mut pending_resets,
+                rank_appends,
+                rank_proposals,
+            )
+        {
             fail_step(&mut slots, &err);
             break 'serve;
-        }
-
-        // Draft round (rank-local, no collectives): resets, context appends
-        // from THIS step's capture buffer, and new proposals for the next
-        // verify span. FIFO per-rank channels order it before the next step;
-        // the blocking join keeps the round cadence (draft sits between
-        // verify steps, ~2 ms against a 22-46 ms step).
-        if dspark_enabled {
-            let mut draft_joins = Vec::new();
-            for (rank, worker) in workers.iter().enumerate() {
-                let resets = std::mem::take(&mut pending_resets[rank]);
-                let appends = std::mem::take(&mut rank_appends[rank]);
-                let proposals = std::mem::take(&mut rank_proposals[rank]);
-                if resets.is_empty() && appends.is_empty() && proposals.is_empty() {
-                    continue;
-                }
-                let proposal_slots: Vec<usize> =
-                    proposals.iter().map(|&(slot, _, _)| slot).collect();
-                match worker.draft_async(shapes[rank].bucket, resets, appends, proposals) {
-                    Ok(rx) => draft_joins.push((rank, proposal_slots, rx)),
-                    Err(err) => {
-                        fail_step(&mut slots, &err);
-                        break 'serve;
-                    }
-                }
-            }
-            for (rank, proposal_slots, rx) in draft_joins {
-                let result = rx
-                    .recv()
-                    .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its draft response"))
-                    .and_then(|r| r);
-                let spans = match result {
-                    Ok(spans) => spans,
-                    Err(err) => {
-                        // A draft failure is rank-local, but it means the
-                        // drafter's invariants broke — crash early rather
-                        // than silently degrade to plain decode.
-                        fail_step(
-                            &mut slots,
-                            &err.context(format!("GLM5.2 rank {rank} draft")),
-                        );
-                        break 'serve;
-                    }
-                };
-                if spans.len() != proposal_slots.len() {
-                    let err = anyhow::anyhow!(
-                        "GLM5.2 rank {rank} draft returned {} spans for {} proposals",
-                        spans.len(),
-                        proposal_slots.len()
-                    );
-                    fail_step(&mut slots, &err);
-                    break 'serve;
-                }
-                for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
-                    if let Some(active) = slots[rank][slot_id].as_mut() {
-                        active.state.set_drafts(span.to_vec());
-                    }
-                }
-            }
         }
     }
 
@@ -710,6 +317,502 @@ pub(crate) fn run_dp8_coordinator(
         let _ = worker.request_shutdown();
     }
     drop(workers);
+}
+
+/// Pre-capture every whole-step graph (bucket × attention tier) while the
+/// ranks are idle and trivially in lock-step. Launch-ahead speculation
+/// requires captured-ness to be UNIFORM across ranks — a lazily capturing
+/// rank would skip the speculative replay the others enqueued and desync the
+/// collectives — and pre-capturing also removes the old mid-serving capture
+/// stall. Row 0 at position GLM52_MLA_TOPK_SHORT lifts the step into the
+/// full tier; every row is a padding write into the pool's padding page.
+fn precapture_step_graphs(
+    workers: &[Glm52RankWorker],
+    pools: &[BlockPool],
+    table_width: usize,
+) -> anyhow::Result<()> {
+    for &bucket in &GLM52_DECODE_BUCKETS {
+        for full_tier in [false, true] {
+            let mut shape = Glm52StepShape {
+                bucket,
+                slots: [0; GLM52_MAX_BATCH_PER_RANK],
+                active_rows: 0,
+            };
+            for (slot, dst) in shape.slots.iter_mut().enumerate().take(bucket) {
+                *dst = slot as u8;
+            }
+            let mut inputs =
+                [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+            if full_tier {
+                inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
+            }
+            let responses = workers
+                .iter()
+                .zip(pools)
+                .map(|(worker, pool)| {
+                    let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
+                    worker.step_async(inputs, shape, kv, Glm52StepFlags::plain(), Vec::new(), 0)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .context("GLM5.2 graph pre-capture submit")?;
+            for (rank, resp) in responses.into_iter().enumerate() {
+                resp.recv()
+                    .map_err(|_| anyhow::anyhow!("rank dropped its pre-capture response"))
+                    .and_then(|r| r)
+                    .with_context(|| {
+                        format!(
+                            "GLM5.2 graph pre-capture (bucket {bucket}, full_tier \
+                             {full_tier}) on rank {rank}"
+                        )
+                    })?;
+            }
+        }
+    }
+    log::info!(
+        "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
+        GLM52_DECODE_BUCKETS.len()
+    );
+    Ok(())
+}
+
+/// Admission: fill free slots from the queue, least-loaded rank (with pool
+/// budget for the request's full lifetime) first. New requests join the
+/// lock-step at the next step boundary (their prefill rides decode alongside
+/// everyone else's rows). An `Err` is a kvbm invariant break — the caller
+/// fails the step (the affected request was already answered here).
+#[allow(clippy::too_many_arguments)]
+fn admit_from_queue(
+    pending: &mut std::collections::VecDeque<GenerateRequest>,
+    slots: &mut [RankSlots],
+    pools: &[BlockPool],
+    usable_blocks: &[usize],
+    prefix_cache_enabled: bool,
+    dspark_enabled: bool,
+    pending_resets: &mut [Vec<usize>],
+    slots_changed: &mut bool,
+) -> anyhow::Result<()> {
+    while let Some(front) = pending.front() {
+        let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
+        let committed: Vec<usize> = slots
+            .iter()
+            .map(|rank_slots| {
+                rank_slots
+                    .iter()
+                    .flatten()
+                    .map(|active| {
+                        lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
+                    })
+                    .sum()
+            })
+            .collect();
+        let Some((rank, slot)) =
+            admission_target(&occupancy(slots), &committed, usable_blocks, need_blocks)
+        else {
+            break;
+        };
+        let req = pending.pop_front().expect("checked non-empty");
+        // The client left while the request sat in the queue — admitting
+        // it would burn a slot (and whole global steps) on a dead sink.
+        if req.token_tx.is_closed() {
+            continue;
+        }
+        let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+        let cached_tokens = if prefix_cache_enabled {
+            match kv.match_and_add_prefix(&pools[rank]) {
+                Ok(cached) => cached,
+                Err(err) => {
+                    // A fresh request failing to match is a kvbm state
+                    // invariant break — crash early, don't serve on a
+                    // pool whose bookkeeping already lied once. This
+                    // request is already out of `pending` and never
+                    // reaches a slot, so fail it explicitly (fail_step
+                    // and the shutdown sweep can't see it).
+                    let err = err.context("GLM5.2 prefix match at admission");
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: format!("{err:#}"),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                    return Err(err);
+                }
+            }
+        } else {
+            0
+        };
+        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+        let _ = req.token_tx.send(TokenEvent::Scheduled {
+            queued_at_unix_s,
+            scheduled_at_unix_s: unix_now_s(),
+            prompt_tokens: req.prompt_tokens.len(),
+            cached_tokens,
+        });
+        let state = Glm52SlotState::new(
+            req.prompt_tokens.clone(),
+            req.max_tokens,
+            req.params.ignore_eos,
+            cached_tokens,
+        );
+        if dspark_enabled {
+            pending_resets[rank].push(slot);
+        }
+        slots[rank][slot] = Some(ActiveRequest { req, state, kv });
+        *slots_changed = true;
+    }
+    Ok(())
+}
+
+/// One lock-step step: per-rank submit — schedule each active span's KV
+/// (full-lifetime reservation makes every schedule succeed; a failure is an
+/// accounting bug and fails the step), build the row inputs, page rows and
+/// write slots, collect the step's sampling rows, and fire — then join ALL
+/// ranks before failing: the rank the coordinator happens to recv first
+/// often reports the ~100 s DeepEP device-timeout trap, not the root cause.
+/// Returns every rank's outputs plus what the submit phase scheduled per
+/// slot (`span_kinds[rank][slot]`), which the output walk pairs exactly.
+#[allow(clippy::type_complexity)]
+fn submit_and_join_step(
+    workers: &[Glm52RankWorker],
+    pools: &[BlockPool],
+    slots: &mut [RankSlots],
+    shapes: &[Glm52StepShape],
+    flags: Glm52StepFlags,
+    table_width: usize,
+    sample_step: u64,
+) -> anyhow::Result<(
+    Vec<[u32; GLM52_MAX_BATCH_PER_RANK]>,
+    Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]>,
+)> {
+    let mut span_kinds: Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]> = workers
+        .iter()
+        .map(|_| [None; GLM52_MAX_BATCH_PER_RANK])
+        .collect();
+    let mut responses = Vec::with_capacity(workers.len());
+    let mut submit_err: Option<anyhow::Error> = None;
+    'submit: for (rank, ((rank_slots, worker), shape)) in
+        slots.iter_mut().zip(workers).zip(shapes).enumerate()
+    {
+        let pool = &pools[rank];
+        let padding_page = pool.padding_block_id();
+        let sampling = collect_sampling_rows(shape, rank_slots);
+        let seed = mix_seed(mix_seed(GLM52_SAMPLE_SEED, sample_step), rank as u64);
+        let mut inputs =
+            [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
+        // A consumed speculation replays with device-advanced inputs and
+        // never reads the step KV — skip building the page rows (the
+        // whole point of launch-ahead is keeping this host path off the
+        // hot step boundary). KV *scheduling* still runs: kvbm's
+        // bookkeeping must advance every step.
+        let mut pages = if flags.consume {
+            Vec::new()
+        } else {
+            vec![padding_page; shape.bucket * table_width]
+        };
+        let mut slot_mapping = [padding_page as i64 * PAGE as i64; GLM52_MAX_BATCH_PER_RANK];
+        // Walk the shape's contiguous per-slot runs.
+        let mut row = 0usize;
+        while row < shape.bucket {
+            let slot_id = shape.slots[row] as usize;
+            let mut end = row + 1;
+            while end < shape.bucket && shape.slots[end] as usize == slot_id {
+                end += 1;
+            }
+            let span = end - row;
+            let Some(active) = rank_slots[slot_id].as_mut() else {
+                // Padding rows keep the padding-page defaults.
+                row = end;
+                continue;
+            };
+            for (offset, r) in (row..end).enumerate() {
+                let step = active.state.next_input_at(offset);
+                inputs[r] = (step.token, step.position);
+            }
+            // The span must extend kvbm's view exactly: its first row's
+            // position is the next KV slot to write. Drift between the
+            // slot state's position math and the pool's bookkeeping
+            // writes KV into the wrong page — fail the step instead.
+            if inputs[row].1 != active.kv.kv_position() {
+                submit_err = Some(anyhow::anyhow!(
+                    "GLM5.2 rank {rank} slot {slot_id} span starts at position {} but the \
+                     KV pool is at {}",
+                    inputs[row].1,
+                    active.kv.kv_position()
+                ));
+                break 'submit;
+            }
+            let mid_prefill = active.state.mid_prefill();
+            let (kind, scheduled) = if mid_prefill {
+                let kind = if active.state.remaining_prompt() == span {
+                    SpanKind::PrefillBoundary
+                } else {
+                    SpanKind::PrefillChunk
+                };
+                (kind, active.kv.schedule_prefill(span, pool))
+            } else if span == 1 {
+                (SpanKind::Decode, active.kv.schedule_decode(pool))
+            } else {
+                (
+                    SpanKind::Speculative,
+                    active.kv.schedule_speculative(span, pool),
+                )
+            };
+            if let Err(err) = scheduled {
+                submit_err = Some(anyhow::anyhow!(
+                    "GLM5.2 rank {rank} slot {slot_id} violated its full-lifetime KV \
+                     reservation ({kind:?}, span {span}): {err}"
+                ));
+                break 'submit;
+            }
+            span_kinds[rank][slot_id] = Some(kind);
+            if !flags.consume {
+                let row_pages = active.kv.step_page_indices(span);
+                for r in row..end {
+                    pages[r * table_width..r * table_width + row_pages.len()]
+                        .copy_from_slice(&row_pages);
+                    let position = inputs[r].1;
+                    slot_mapping[r] =
+                        row_pages[position / PAGE] as i64 * PAGE as i64 + (position % PAGE) as i64;
+                }
+            }
+            row = end;
+        }
+        let kv = Glm52StepKv {
+            pages: pages.into_boxed_slice(),
+            slot_mapping,
+        };
+        match worker.step_async(inputs, *shape, kv, flags, sampling, seed) {
+            Ok(rx) => responses.push(rx),
+            Err(err) => {
+                submit_err = Some(err);
+                break 'submit;
+            }
+        }
+    }
+    if let Some(err) = submit_err {
+        return Err(err);
+    }
+    // Join ALL ranks before failing: the rank the coordinator happens to
+    // recv first often reports the ~100 s DeepEP device-timeout trap, not
+    // the root cause — the rank that actually failed answers later. Log
+    // every error so the root cause has a landing spot, then tear down on
+    // the first one in rank order.
+    let mut outputs = Vec::with_capacity(responses.len());
+    let mut step_err: Option<anyhow::Error> = None;
+    for (rank, resp) in responses.into_iter().enumerate() {
+        let result = resp
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its step response"));
+        match result {
+            Ok(Ok(step_tokens)) => outputs.push(step_tokens),
+            Ok(Err(err)) | Err(err) => {
+                let err = err.context(format!("GLM5.2 rank {rank} step"));
+                log::error!("GLM5.2 rank {rank} step failed: {err:#}");
+                step_err.get_or_insert(err);
+                outputs.push([0; GLM52_MAX_BATCH_PER_RANK]);
+            }
+        }
+    }
+    if let Some(err) = step_err {
+        return Err(err);
+    }
+    Ok((outputs, span_kinds))
+}
+
+/// Fold every rank's span of outputs into its slot state, commit the span's
+/// KV bookkeeping under the exact kind the submit phase scheduled (a
+/// mispairing is a coordinator bug and fails the step), emit tokens and
+/// finish/disconnect releases, and collect the draft lane's context appends
+/// and next-round proposals.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_step_outputs(
+    slots: &mut [RankSlots],
+    outputs: Vec<[u32; GLM52_MAX_BATCH_PER_RANK]>,
+    shapes: &[Glm52StepShape],
+    span_kinds: &[[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]],
+    pools: &[BlockPool],
+    eos_token_ids: &[u32],
+    dspark_enabled: bool,
+    pending_resets: &mut [Vec<usize>],
+    slots_changed: &mut bool,
+) -> anyhow::Result<(Vec<Vec<(usize, usize)>>, Vec<Vec<(usize, u32, usize)>>)> {
+    let mut rank_appends: Vec<Vec<(usize, usize)>> = slots.iter().map(|_| Vec::new()).collect();
+    let mut rank_proposals: Vec<Vec<(usize, u32, usize)>> =
+        slots.iter().map(|_| Vec::new()).collect();
+    for (rank, ((rank_slots, rank_outputs), shape)) in
+        slots.iter_mut().zip(outputs).zip(shapes).enumerate()
+    {
+        // Walk the shape's contiguous per-slot runs; each active slot
+        // folds its whole span of row outputs in at once.
+        let mut row = 0usize;
+        while row < shape.bucket {
+            let slot_id = shape.slots[row] as usize;
+            let mut end = row + 1;
+            while end < shape.bucket && shape.slots[end] as usize == slot_id {
+                end += 1;
+            }
+            let span_rows = row..end;
+            let span_outputs = &rank_outputs[span_rows.clone()];
+            row = end;
+            let slot = &mut rank_slots[slot_id];
+            let Some(active) = slot.as_mut() else {
+                continue;
+            };
+            let prompt_tokens = active.req.prompt_tokens.len();
+            let outcome = active.state.advance_span(span_outputs, eos_token_ids);
+            // Commit the span's KV bookkeeping under the exact kind the
+            // submit phase scheduled — a mispairing is a coordinator bug
+            // and fails the step.
+            let pool = &pools[rank];
+            let applied = match (&outcome, span_kinds[rank][slot_id]) {
+                (Glm52StepOutcome::Prefilling, Some(SpanKind::PrefillChunk)) => {
+                    active.kv.apply_prefill_chunk(pool)
+                }
+                (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::PrefillBoundary)) => {
+                    active.kv.apply_prefill(committed[0], pool)
+                }
+                (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::Decode)) => {
+                    active.kv.apply_decode(committed[0], pool).map(|_| ())
+                }
+                (Glm52StepOutcome::Commit { committed, .. }, Some(SpanKind::Speculative)) => {
+                    active.kv.apply_speculative(committed, pool).map(|_| ())
+                }
+                (outcome, kind) => Err(anyhow::anyhow!(
+                    "GLM5.2 rank {rank} slot {slot_id} outcome {outcome:?} does not pair \
+                     with scheduled span kind {kind:?}"
+                )),
+            };
+            if let Err(err) = applied {
+                return Err(err.context(format!("GLM5.2 rank {rank} slot {slot_id} KV apply")));
+            }
+            let (freed, context_rows) = match outcome {
+                Glm52StepOutcome::Prefilling => {
+                    // Prefill never sends, so a disconnect is only
+                    // visible through the sink probe — without it a
+                    // long prompt zombies the slot until prefill
+                    // completes. Every prompt row is committed
+                    // context.
+                    (active.req.token_tx.is_closed(), span_outputs.len())
+                }
+                Glm52StepOutcome::Commit {
+                    committed,
+                    emit,
+                    finish,
+                    context_rows,
+                } => {
+                    // A dropped receiver (client disconnect) frees the
+                    // slot; its pool pages release with the request
+                    // (sealed blocks stay matchable as prefix cache).
+                    let mut freed = false;
+                    for &token in &committed[..emit] {
+                        if active
+                            .req
+                            .token_tx
+                            .send(TokenEvent::Token {
+                                id: token,
+                                logprob: None,
+                            })
+                            .is_err()
+                        {
+                            freed = true;
+                            break;
+                        }
+                    }
+                    if let Some(finish_reason) = finish
+                        && !freed
+                    {
+                        let _ = active.req.token_tx.send(TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens,
+                            completion_tokens: active.state.completion_tokens(),
+                        });
+                        freed = true;
+                    }
+                    (freed, context_rows)
+                }
+            };
+            if freed {
+                active.state.log_spec_stats(rank, slot_id);
+                if let Err(err) = active.kv.release() {
+                    // Blocks still return via assignment RAII when the
+                    // slot drops — the explicit release only failed to
+                    // run from a clean Idle state.
+                    log::warn!(
+                        "GLM5.2 rank {rank} slot {slot_id} KV release failed \
+                         (blocks return via RAII): {err:#}"
+                    );
+                }
+                if dspark_enabled {
+                    pending_resets[rank].push(slot_id);
+                }
+                *slot = None;
+                *slots_changed = true;
+            } else if dspark_enabled {
+                // Committed rows' captured hidden feeds the draft
+                // context; then re-propose from the new anchor.
+                rank_appends[rank].extend(span_rows.take(context_rows).map(|r| (r, slot_id)));
+                if active.state.wants_drafts()
+                    && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
+                {
+                    rank_proposals[rank].push((slot_id, anchor, anchor_pos));
+                }
+            }
+        }
+    }
+    Ok((rank_appends, rank_proposals))
+}
+
+/// Draft round (rank-local, no collectives): resets, context appends from
+/// THIS step's capture buffer, and new proposals for the next verify span.
+/// FIFO per-rank channels order it before the next step; the blocking join
+/// keeps the round cadence (draft sits between verify steps, ~2 ms against a
+/// 22-46 ms step).
+fn run_draft_round(
+    workers: &[Glm52RankWorker],
+    slots: &mut [RankSlots],
+    shapes: &[Glm52StepShape],
+    pending_resets: &mut [Vec<usize>],
+    rank_appends: Vec<Vec<(usize, usize)>>,
+    rank_proposals: Vec<Vec<(usize, u32, usize)>>,
+) -> anyhow::Result<()> {
+    let mut draft_joins = Vec::new();
+    for (rank, (worker, (appends, proposals))) in workers
+        .iter()
+        .zip(rank_appends.into_iter().zip(rank_proposals))
+        .enumerate()
+    {
+        let resets = std::mem::take(&mut pending_resets[rank]);
+        if resets.is_empty() && appends.is_empty() && proposals.is_empty() {
+            continue;
+        }
+        let proposal_slots: Vec<usize> = proposals.iter().map(|&(slot, _, _)| slot).collect();
+        let rx = worker.draft_async(shapes[rank].bucket, resets, appends, proposals)?;
+        draft_joins.push((rank, proposal_slots, rx));
+    }
+    for (rank, proposal_slots, rx) in draft_joins {
+        let result = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its draft response"))
+            .and_then(|r| r);
+        let spans = match result {
+            Ok(spans) => spans,
+            // A draft failure is rank-local, but it means the drafter's
+            // invariants broke — crash early rather than silently degrade
+            // to plain decode.
+            Err(err) => return Err(err.context(format!("GLM5.2 rank {rank} draft"))),
+        };
+        if spans.len() != proposal_slots.len() {
+            return Err(anyhow::anyhow!(
+                "GLM5.2 rank {rank} draft returned {} spans for {} proposals",
+                spans.len(),
+                proposal_slots.len()
+            ));
+        }
+        for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
+            if let Some(active) = slots[rank][slot_id].as_mut() {
+                active.state.set_drafts(span.to_vec());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A failed step leaves the ranks permanently out of lockstep: whichever
