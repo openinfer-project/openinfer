@@ -147,6 +147,10 @@ pub(super) fn restore_host_prefix(
         },
         Err(err) => {
             log::warn!("GLM5.2 host-tier load submit failed (prefill from scratch): {err}");
+            // `load` consumes the lease only past its early validation; a
+            // submit error may leave it pinning the host blocks until the
+            // lease TTL. Release explicitly (no-op if already consumed).
+            engine.release_query_lease(lease);
         }
     }
     probe
