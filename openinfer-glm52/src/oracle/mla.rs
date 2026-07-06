@@ -36,8 +36,10 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::DeviceContext;
 
+use crate::config::{GLM52_ROPE_HALF, GLM52_SM_SCALE};
 use crate::fp8::Glm52ProjBytes;
 use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata, glm52_mla_decode_forward};
+use crate::model::rope_tables;
 
 // ---- BEGIN GENERATED: glm52_oracle probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
@@ -119,10 +121,6 @@ const ORACLE_O_PROBES: &[(usize, f32)] = &[
 // ---- END GENERATED ----
 
 const HIDDEN: usize = 6144;
-const ROPE_HALF: usize = 32;
-const ROPE_THETA: f32 = 8_000_000.0;
-// qk_head_dim(256)^-0.5; rope_type "default" means no yarn mscale correction.
-const SM_SCALE: f32 = 0.0625;
 
 /// splitmix64 -> 53-bit uniform -> (u - 0.5) * 4.0 -> f32 -> bf16. Mirror of
 /// the Python generator, including the f64 -> f32 -> bf16 double rounding
@@ -147,18 +145,6 @@ fn bf16_digest(data: &[bf16]) -> String {
         hasher.update(v.to_bits().to_le_bytes());
     }
     hex::encode(&hasher.finalize()[..8])
-}
-
-/// Per-position rotary table first half `[32]` in the HF pipeline's precision:
-/// angles in f32, cos/sin rounded to bf16.
-fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
-    (0..ROPE_HALF)
-        .map(|j| {
-            let inv_freq = 1.0 / ROPE_THETA.powf(j as f32 / ROPE_HALF as f32);
-            let angle = position as f32 * inv_freq;
-            (bf16::from_f32(angle.cos()), bf16::from_f32(angle.sin()))
-        })
-        .unzip()
 }
 
 /// Copy layer-0 attention tensors out of the checkpoint shards. Owned copies
@@ -270,7 +256,7 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
         num_blocks: ORACLE_CTX.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
         topk,
         num_sm_parts: sm_parts_cap.map_or(device_sm_parts, |cap| device_sm_parts.min(cap)),
-        sm_scale: SM_SCALE,
+        sm_scale: GLM52_SM_SCALE,
     };
     let mut cache = ctx
         .stream
@@ -287,8 +273,8 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
             hidden.data_mut(),
         )?;
         let (cos_host, sin_host) = rope_tables(position);
-        let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
-        let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+        let mut cos = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
+        let mut sin = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
         ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
         ctx.stream.memcpy_htod(&sin_host, &mut sin)?;
 

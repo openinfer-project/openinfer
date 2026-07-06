@@ -14,19 +14,18 @@ use half::bf16;
 use openinfer_kernels::ops::{GLM52_INDEXER_TOPK, Glm52IndexerCacheLayout};
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_HIDDEN, GLM52_Q_LORA_RANK};
+use crate::config::{GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_Q_LORA_RANK, GLM52_ROPE_HALF};
 use crate::fp8::{FP8_BLOCK, Glm52ProjBytes};
 use crate::indexer::{Glm52IndexerLayerWeights, glm52_indexer_forward};
+use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS};
 use crate::rows::Rows;
 
 const HIDDEN: usize = GLM52_HIDDEN;
 const Q_LORA: usize = GLM52_Q_LORA_RANK;
 const INDEX_HEADS: usize = 32;
-const INDEX_HEAD_DIM: usize = 128;
-const CACHE_BLOCK_SIZE: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
+const INDEX_HEAD_DIM: usize = GLM52_INDEX_HEAD_DIM;
 const CACHE_BLOCKS: usize = 4;
 const MAX_MODEL_LEN: usize = 512;
-const NUM_SMS: usize = 132;
 
 fn deepgemm_env_ready() -> bool {
     std::env::var("OPENINFER_DEEPGEMM_ROOT").is_ok() && std::env::var("CUDA_HOME").is_ok()
@@ -82,14 +81,14 @@ fn indexer_smoke() -> Result<()> {
     // ---- inputs ----
     let hidden: Rows<HIDDEN> = Rows::zeros(&ctx, 1)?;
     let q_resid: Rows<Q_LORA> = Rows::zeros(&ctx, 1)?;
-    let cos = ctx.stream.alloc_zeros::<bf16>(32)?;
-    let sin = ctx.stream.alloc_zeros::<bf16>(32)?;
+    let cos = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
+    let sin = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
 
     // ---- cache setup ----
     let cache_layout = Glm52IndexerCacheLayout {
         cache_blocks: CACHE_BLOCKS,
-        cache_block_size: CACHE_BLOCK_SIZE,
-        cache_block_stride_bytes: CACHE_BLOCK_SIZE * (INDEX_HEAD_DIM + 4),
+        cache_block_size: INDEX_CACHE_BLOCK,
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
     let cache_bytes = cache_layout.min_cache_bytes()?;
     let mut index_k_cache = ctx.stream.alloc_zeros::<u8>(cache_bytes)?;
@@ -131,7 +130,7 @@ fn indexer_smoke() -> Result<()> {
     for &v in &topk_host {
         assert!(v >= -1, "topk slot {v} < -1 (corrupted)");
         assert!(
-            v < (CACHE_BLOCKS * CACHE_BLOCK_SIZE) as i32,
+            v < (CACHE_BLOCKS * INDEX_CACHE_BLOCK) as i32,
             "topk slot {v} out of range"
         );
     }

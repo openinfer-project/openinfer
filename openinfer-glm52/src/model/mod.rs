@@ -29,29 +29,28 @@ use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
 use crate::config::{
-    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_RMS_EPS, GLM52_VOCAB,
+    GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_RMS_EPS,
+    GLM52_ROPE_HALF, GLM52_SM_SCALE, GLM52_VOCAB, glm52_layer_has_full_indexer,
 };
-use crate::dense::{Glm52DenseMlpWeights, glm52_dense_mlp_forward_into};
-use crate::fp8::ProjWeight;
-use crate::indexer::{Glm52IndexerLayerWeights, Glm52IndexerScratch};
+use crate::dense::glm52_dense_mlp_forward_into;
+use crate::indexer::Glm52IndexerScratch;
 use crate::layer::{
-    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
+    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerMlp,
     glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
 };
-use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
-use crate::moe_decode::{
-    Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert, run_router_into,
-};
-use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::mla_decode::Glm52MlaSchedMetadata;
+use crate::moe_decode::run_router_into;
+use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
 
+mod build;
 mod launch_ahead;
 use launch_ahead::Glm52SpeculatedStep;
 
 /// Per-request context cap: `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
 /// Sizes each slot's region of the per-layer MLA and index-K caches at build
-/// time.
+/// time.dan
 pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
 
 /// The per-rank slot count and the largest decode bucket. Each slot owns a
@@ -121,163 +120,21 @@ const _: () = assert!(GLM52_MLA_TOPK_SHORT <= GLM52_INDEX_TOPK);
 const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK > 0);
 const _: () = assert!(GLM52_FLASHMLA_SPARSE_TOPK <= GLM52_INDEX_TOPK);
 
-pub(crate) const ROPE_HALF: usize = 32;
-const ROPE_THETA: f32 = 8_000_000.0;
-/// 1/sqrt(qk_head_dim = 192 + 64).
-pub(crate) const SM_SCALE: f32 = 0.0625;
-pub(crate) const INDEX_HEAD_DIM: usize = 128;
-/// DeepGEMM paged MQA requires BLOCK_KV=64.
+/// DeepGEMM paged MQA requires BLOCK_KV=64 — a kernel constraint, not a
+/// model property (kept here, not in config.rs).
 pub(crate) const INDEX_CACHE_BLOCK: usize = 64;
+/// H200 SM count — hardware property, not a model property.
 pub(crate) const NUM_SMS: usize = 132;
 
-/// `indexer_types[layer]` per the transformers derivation
-/// (`index_topk_freq=4`, `index_skip_topk_offset=3`): full iff
-/// `max(layer-2, 0) % 4 == 0` → {0,1,2} ∪ {6,10,…,74}, 21 of 78 layers.
-pub(crate) fn glm52_layer_has_full_indexer(layer: usize) -> bool {
-    layer.saturating_sub(2).is_multiple_of(4)
-}
-
 pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
-    (0..ROPE_HALF)
+    let theta = crate::config::GLM52_ROPE_THETA as f32;
+    (0..GLM52_ROPE_HALF)
         .map(|j| {
-            let inv_freq = 1.0 / ROPE_THETA.powf(j as f32 / ROPE_HALF as f32);
+            let inv_freq = 1.0 / theta.powf(j as f32 / GLM52_ROPE_HALF as f32);
             let angle = position as f32 * inv_freq;
             (bf16::from_f32(angle.cos()), bf16::from_f32(angle.sin()))
         })
         .unzip()
-}
-
-/// Take one fp8 projection (weight + scale) out of the resident tensor map.
-fn take_proj(w: &mut Glm52RankGpuWeights, stem: &str, n: usize, k: usize) -> Result<ProjWeight> {
-    ProjWeight::from_device(
-        w.take_tensor(&format!("{stem}.weight"))?,
-        w.take_tensor(&format!("{stem}.weight_scale_inv"))?,
-        n,
-        k,
-    )
-}
-
-/// Take a bf16 vector (e.g. a layernorm gamma) out of the resident map.
-fn take_bf16_vec(
-    ctx: &DeviceContext,
-    w: &mut Glm52RankGpuWeights,
-    name: &str,
-    len: usize,
-) -> Result<DeviceVec> {
-    let raw = w.take_tensor(name)?;
-    ensure!(
-        raw.len() == len * 2,
-        "GLM5.2 tensor {name} bytes {} != bf16 [{len}]",
-        raw.len()
-    );
-    Ok(DeviceVec {
-        data: retype_owned::<bf16>(&ctx.stream, raw)?,
-        len,
-    })
-}
-
-fn build_decoder_layer(
-    ctx: &DeviceContext,
-    w: &mut Glm52RankGpuWeights,
-    layer: usize,
-) -> Result<Glm52DecoderLayerWeights> {
-    let p = format!("model.layers.{layer}");
-
-    let kv_b = take_proj(w, &format!("{p}.self_attn.kv_b_proj"), 28_672, 512)?;
-    let mla = Glm52MlaLayerWeights::from_device(
-        ctx,
-        take_proj(w, &format!("{p}.self_attn.q_a_proj"), 2048, GLM52_HIDDEN)?,
-        take_bf16_vec(ctx, w, &format!("{p}.self_attn.q_a_layernorm.weight"), 2048)?,
-        take_proj(w, &format!("{p}.self_attn.q_b_proj"), 16_384, 2048)?,
-        take_proj(
-            w,
-            &format!("{p}.self_attn.kv_a_proj_with_mqa"),
-            576,
-            GLM52_HIDDEN,
-        )?,
-        take_bf16_vec(ctx, w, &format!("{p}.self_attn.kv_a_layernorm.weight"), 512)?,
-        &kv_b,
-        take_proj(w, &format!("{p}.self_attn.o_proj"), GLM52_HIDDEN, 16_384)?,
-    )?;
-    // kv_b is only dequanted into the absorb factors, not stored — free the
-    // fp8 blob before the indexer/MLP uploads below.
-    drop(kv_b);
-
-    let indexer = if glm52_layer_has_full_indexer(layer) {
-        let ip = format!("{p}.self_attn.indexer");
-        let k_norm_w = ctx
-            .stream
-            .clone_dtoh(&w.take_tensor(&format!("{ip}.k_norm.weight"))?)?;
-        let k_norm_b = ctx
-            .stream
-            .clone_dtoh(&w.take_tensor(&format!("{ip}.k_norm.bias"))?)?;
-        let weights_proj = retype_owned::<bf16>(
-            &ctx.stream,
-            w.take_tensor(&format!("{ip}.weights_proj.weight"))?,
-        )?;
-        Glm52LayerIndexer::Full(Box::new(Glm52IndexerLayerWeights::from_device(
-            ctx,
-            take_proj(w, &format!("{ip}.wq_b"), 32 * INDEX_HEAD_DIM, 2048)?,
-            take_proj(w, &format!("{ip}.wk"), INDEX_HEAD_DIM, GLM52_HIDDEN)?,
-            weights_proj,
-            &k_norm_w,
-            &k_norm_b,
-        )?))
-    } else {
-        Glm52LayerIndexer::Shared
-    };
-
-    let mp = format!("{p}.mlp");
-    let mlp = if layer < GLM52_DENSE_LAYERS {
-        Glm52LayerMlp::Dense(Box::new(Glm52DenseMlpWeights::from_device(
-            ctx,
-            &take_proj(w, &format!("{mp}.gate_proj"), 12_288, GLM52_HIDDEN)?,
-            &take_proj(w, &format!("{mp}.up_proj"), 12_288, GLM52_HIDDEN)?,
-            take_proj(w, &format!("{mp}.down_proj"), GLM52_HIDDEN, 12_288)?,
-        )?))
-    } else {
-        Glm52LayerMlp::MoeEp8(Box::new(Glm52MoeEp8LayerWeights {
-            router: Glm52MoeRouterWeights::new(
-                w.take_tensor(&format!("{mp}.gate.weight"))?,
-                w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
-            )?,
-            shared: Glm52MoeSharedExpert::new(
-                ctx,
-                &take_proj(
-                    w,
-                    &format!("{mp}.shared_experts.gate_proj"),
-                    2048,
-                    GLM52_HIDDEN,
-                )?,
-                &take_proj(
-                    w,
-                    &format!("{mp}.shared_experts.up_proj"),
-                    2048,
-                    GLM52_HIDDEN,
-                )?,
-                take_proj(
-                    w,
-                    &format!("{mp}.shared_experts.down_proj"),
-                    GLM52_HIDDEN,
-                    2048,
-                )?,
-            )?,
-            bank: Glm52MoeExpertBank::from_regions(ctx, w.take_expert_layer(layer)?)?,
-        }))
-    };
-
-    Ok(Glm52DecoderLayerWeights {
-        input_ln: take_bf16_vec(ctx, w, &format!("{p}.input_layernorm.weight"), GLM52_HIDDEN)?,
-        post_attn_ln: take_bf16_vec(
-            ctx,
-            w,
-            &format!("{p}.post_attention_layernorm.weight"),
-            GLM52_HIDDEN,
-        )?,
-        mla,
-        indexer,
-        mlp,
-    })
 }
 
 /// One DP rank: the full non-expert model plus this rank's expert banks.
@@ -300,7 +157,7 @@ pub(crate) struct Glm52RankModel {
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
     /// Device-resident rope tables for every position (`[GLM52_MAX_MODEL_LEN,
-    /// ROPE_HALF]` as a gatherable matrix); the prologue gathers each row's
+    /// GLM52_ROPE_HALF]` as a gatherable matrix); the prologue gathers each row's
     /// position row instead of recomputing on the host and copying up.
     cos_table: DeviceMatrix,
     sin_table: DeviceMatrix,
@@ -383,7 +240,7 @@ impl Glm52RankModel {
             num_blocks: batch * GLM52_MAX_MODEL_LEN.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
-            sm_scale: SM_SCALE,
+            sm_scale: GLM52_SM_SCALE,
         };
         // The short tier walks only 256/64 = 4 index blocks per row — more
         // SM parts than blocks would just be empty splits for the combine.
@@ -398,14 +255,14 @@ impl Glm52RankModel {
         let index_cache_layout = Glm52IndexerCacheLayout {
             cache_blocks: batch * blocks_per_slot,
             cache_block_size: INDEX_CACHE_BLOCK,
-            cache_block_stride_bytes: INDEX_CACHE_BLOCK * (INDEX_HEAD_DIM + 4),
+            cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
         };
 
         let mut layers = Vec::with_capacity(GLM52_LAYERS);
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
         for layer in 0..GLM52_LAYERS {
             layers.push(
-                build_decoder_layer(ctx, w, layer)
+                build::build_decoder_layer(ctx, w, layer)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
             caches.push(Glm52LayerCaches {
@@ -439,7 +296,7 @@ impl Glm52RankModel {
             rows: GLM52_VOCAB,
             cols: GLM52_HIDDEN,
         };
-        let final_norm = take_bf16_vec(ctx, w, "model.norm.weight", GLM52_HIDDEN)?;
+        let final_norm = build::take_bf16_vec(ctx, w, "model.norm.weight", GLM52_HIDDEN)?;
 
         // The MTP layer's experts are loaded (checkpoint-coverage validation)
         // but out of campaign scope — drop this rank's copy.
@@ -452,8 +309,8 @@ impl Glm52RankModel {
         ctx.stream
             .memcpy_htod(&block_table_host, &mut block_table)?;
 
-        let mut cos_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * ROPE_HALF);
-        let mut sin_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * ROPE_HALF);
+        let mut cos_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF);
+        let mut sin_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF);
         for position in 0..GLM52_MAX_MODEL_LEN {
             let (cos_row, sin_row) = rope_tables(position);
             cos_host.extend_from_slice(&cos_row);
@@ -461,10 +318,10 @@ impl Glm52RankModel {
         }
         let mut cos_table_data = ctx
             .stream
-            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * ROPE_HALF)?;
+            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF)?;
         let mut sin_table_data = ctx
             .stream
-            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * ROPE_HALF)?;
+            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF)?;
         ctx.stream.memcpy_htod(&cos_host, &mut cos_table_data)?;
         ctx.stream.memcpy_htod(&sin_host, &mut sin_table_data)?;
 
@@ -570,16 +427,16 @@ impl Glm52RankModel {
             cos_table: DeviceMatrix {
                 data: cos_table_data,
                 rows: GLM52_MAX_MODEL_LEN,
-                cols: ROPE_HALF,
+                cols: GLM52_ROPE_HALF,
             },
             sin_table: DeviceMatrix {
                 data: sin_table_data,
                 rows: GLM52_MAX_MODEL_LEN,
-                cols: ROPE_HALF,
+                cols: GLM52_ROPE_HALF,
             },
             positions: ctx.stream.alloc_zeros::<u32>(batch)?,
-            cos: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
-            sin: ctx.stream.alloc_zeros::<bf16>(batch * ROPE_HALF)?,
+            cos: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
+            sin: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
             speculated: None,
             device_positions: [0; GLM52_MAX_BATCH_PER_RANK],

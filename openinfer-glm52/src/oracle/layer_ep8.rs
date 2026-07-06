@@ -33,10 +33,8 @@ use super::layer::{
     MOE_ORACLE_LAYER, MOE_ORACLE_LAYER_PROBES, MOE_ORACLE_LAYER_TOL, MOE_ORACLE_SEED,
     assert_layer_probes, checked_hidden, load_decoder_layer, load_rank_expert_bank, model_path,
 };
-use crate::model::{
-    GLM52_DECODE_BUCKETS, INDEX_CACHE_BLOCK, INDEX_HEAD_DIM, NUM_SMS, ROPE_HALF, SM_SCALE,
-    rope_tables,
-};
+use crate::config::{GLM52_INDEX_HEAD_DIM, GLM52_ROPE_HALF, GLM52_SM_SCALE};
+use crate::model::{GLM52_DECODE_BUCKETS, INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
 use crate::moe_decode::{HIDDEN, run_router};
 use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
 
@@ -164,13 +162,13 @@ fn run_layer_prefill_ep8(
         num_blocks: oracle_ctx.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
         topk: GLM52_FLASHMLA_SPARSE_TOPK,
         num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
-        sm_scale: SM_SCALE,
+        sm_scale: GLM52_SM_SCALE,
     };
     let index_blocks = oracle_ctx.div_ceil(INDEX_CACHE_BLOCK);
     let index_cache_layout = Glm52IndexerCacheLayout {
         cache_blocks: index_blocks,
         cache_block_size: INDEX_CACHE_BLOCK,
-        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (INDEX_HEAD_DIM + 4),
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
     let mut caches = Glm52LayerCaches {
         mla_cache: ctx
@@ -188,8 +186,8 @@ fn run_layer_prefill_ep8(
         .memcpy_htod(&block_table_host, &mut block_table)?;
     let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
     let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
-    let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
-    let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+    let mut cos = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
+    let mut sin = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
     let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
 
     let mqa_shape =
