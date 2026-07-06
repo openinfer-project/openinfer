@@ -404,6 +404,15 @@ pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize 
     rows * vocab.div_ceil(TILE_ELEMS)
 }
 
+/// Partial-buffer length for the Markov-step argmax, whose tiles are 1024
+/// elements: its read is one logits row + one bias row, so it needs 4x the
+/// blocks of the full-row batched argmax to not be latency-bound (see
+/// `MARKOV_STEP_TILE_ELEMS` in `argmax.cu`).
+pub fn markov_step_argmax_partials_len(rows: usize, vocab: usize) -> usize {
+    const TILE_ELEMS: usize = 1024;
+    rows * vocab.div_ceil(TILE_ELEMS)
+}
+
 /// Row-wise two-stage bf16 argmax over `rows` rows of `n`: tile-parallel
 /// partials then one finalize block per row. Same per-row total order as
 /// [`argmax_bf16_into`] (lowest GLOBAL index wins ties, NaN never wins) — the
@@ -589,7 +598,7 @@ pub fn markov_step_argmax_into(
             rows * block_size
         ));
     }
-    let needed = argmax_batch_bf16_split_partials_len(rows, vocab);
+    let needed = markov_step_argmax_partials_len(rows, vocab);
     if partial_values.len() < needed || partial_indices.len() < needed {
         return Err(anyhow!(
             "markov step partials too small: {}/{} need {}",

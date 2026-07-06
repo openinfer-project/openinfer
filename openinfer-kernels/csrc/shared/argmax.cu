@@ -4,6 +4,12 @@
 
 #define SAMPLE_BLOCK 256
 #define ARGMAX_BATCH_TILE_ELEMS 4096
+// The Markov-step argmax reads only ~0.6 MB (one logits row + one bias row) —
+// at 4096-elem tiles its ~38 blocks leave the kernel latency-bound (~10 us for
+// a ~0.2 us read on H100). 1024-elem tiles give ~152 blocks and put it back on
+// the bandwidth curve (measured 9.7 -> 4.5 us). Markov-only: the batched
+// argmax reads a full row per block and keeps the wider tile.
+#define MARKOV_STEP_TILE_ELEMS 1024
 
 __device__ __forceinline__ bool argmax_better(float lhs_val, int lhs_idx,
                                               float rhs_val, int rhs_idx) {
@@ -257,8 +263,8 @@ __global__ void markov_step_partial_kernel(
   int row = blockIdx.y;
   if (row >= rows || tile >= tiles_per_row) return;
 
-  int start = tile * ARGMAX_BATCH_TILE_ELEMS;
-  int end = start + ARGMAX_BATCH_TILE_ELEMS;
+  int start = tile * MARKOV_STEP_TILE_ELEMS;
+  int end = start + MARKOV_STEP_TILE_ELEMS;
   if (end > n) end = n;
   const __nv_bfloat16* base_row =
       base + static_cast<size_t>(row * block_size + step) * n;
@@ -396,7 +402,7 @@ void markov_step_argmax_cuda(const __nv_bfloat16* base,
                              int* partial_indices, unsigned int* out_tokens,
                              unsigned int* sampled_tokens,
                              cudaStream_t stream) {
-  int tiles_per_row = (n + ARGMAX_BATCH_TILE_ELEMS - 1) / ARGMAX_BATCH_TILE_ELEMS;
+  int tiles_per_row = (n + MARKOV_STEP_TILE_ELEMS - 1) / MARKOV_STEP_TILE_ELEMS;
   size_t smem = SAMPLE_BLOCK * (sizeof(float) + sizeof(int));
   markov_step_partial_kernel<<<dim3(tiles_per_row, rows), SAMPLE_BLOCK, smem, stream>>>(
       base, bias, block_size, step, partial_values, partial_indices, rows, n,

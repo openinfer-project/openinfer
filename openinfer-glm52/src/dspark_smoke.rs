@@ -20,9 +20,9 @@ use half::bf16;
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix};
 
 use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
-use crate::dspark::{dspark_cache_len, 
+use crate::dspark::{
     GLM52_DSPARK_CONTEXT_DIM, GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch,
-    Glm52DsparkSlotState,
+    Glm52DsparkSlotState, dspark_cache_len,
 };
 
 const WARMUP: usize = 5;
@@ -95,5 +95,84 @@ fn dspark_propose_smoke() -> Result<()> {
              max {max:.3} ms ({ITERS} rounds, 7 drafts/round)"
         );
     }
+    Ok(())
+}
+
+/// Graph-vs-eager parity: with non-degenerate pseudo-random weights, the
+/// graphed propose (piecewise forward segments + the captured Markov chain)
+/// must emit exactly the tokens the plain eager path emits, round for round —
+/// the graphs replay the same kernels at the same shapes, so any divergence is
+/// a capture bug, not numerics.
+#[test]
+#[ignore = "GPU parity test — needs a CUDA device with ~11 GB free VRAM"]
+fn dspark_propose_graph_parity() -> Result<()> {
+    const ROUNDS: usize = 12;
+    let ctx = DeviceContext::new()?;
+    let cache_len = dspark_cache_len(4096);
+    let mut model = Glm52DsparkModel::synthetic(&ctx, cache_len)?;
+    model.randomize_for_test(&ctx)?;
+    let rand_head = |seed: u32| -> Result<DeviceMatrix> {
+        let mut state = seed | 1;
+        let host: Vec<half::bf16> = (0..GLM52_VOCAB * GLM52_HIDDEN)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                half::bf16::from_f32(((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.02)
+            })
+            .collect();
+        Ok(DeviceMatrix {
+            data: ctx.stream.clone_htod(&host)?,
+            rows: GLM52_VOCAB,
+            cols: GLM52_HIDDEN,
+        })
+    };
+    let embed = rand_head(11)?;
+    let lm_head = rand_head(23)?;
+    let captured: cudarc::driver::CudaSlice<half::bf16> = {
+        let host: Vec<half::bf16> = (0..GLM52_DSPARK_CONTEXT_DIM)
+            .map(|i| half::bf16::from_f32(((i % 97) as f32 - 48.0) * 0.001))
+            .collect();
+        ctx.stream.clone_htod(&host)?
+    };
+
+    let mut run = |graphs: bool| -> Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>> {
+        // SAFETY: the test binary runs GPU tests with --test-threads=1.
+        unsafe {
+            if graphs {
+                std::env::remove_var("DSPARK_NO_FORWARD_GRAPH");
+                std::env::remove_var("DSPARK_NO_MARKOV_GRAPH");
+            } else {
+                std::env::set_var("DSPARK_NO_FORWARD_GRAPH", "1");
+                std::env::set_var("DSPARK_NO_MARKOV_GRAPH", "1");
+            }
+        }
+        let mut scratch = Glm52DsparkScratch::new(&ctx, cache_len)?;
+        let mut state = Glm52DsparkSlotState::new(&ctx, cache_len)?;
+        let mut all = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            state.append_captured_row(&ctx, &captured, 0)?;
+            let anchors = vec![(7 + round as u32, round + 1)];
+            let mut refs = vec![&mut state];
+            let drafts =
+                model.propose(&ctx, &embed, &lm_head, &mut refs, &anchors, &mut scratch)?;
+            all.push(drafts[0]);
+        }
+        unsafe {
+            std::env::remove_var("DSPARK_NO_FORWARD_GRAPH");
+            std::env::remove_var("DSPARK_NO_MARKOV_GRAPH");
+        }
+        Ok(all)
+    };
+
+    let graphed = run(true)?;
+    let eager = run(false)?;
+    assert_eq!(
+        graphed, eager,
+        "graphed propose diverged from the eager path"
+    );
+    // Non-degenerate sanity: the random weights must not all-tie to token 0.
+    assert!(
+        graphed.iter().flatten().any(|&t| t != 0),
+        "parity ran on degenerate logits (all drafts are token 0)"
+    );
     Ok(())
 }
