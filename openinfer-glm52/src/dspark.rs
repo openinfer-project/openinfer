@@ -604,6 +604,21 @@ impl Glm52DsparkModel {
         scratch.w1emb.seq_len = rows;
         scratch.bias.seq_len = rows;
 
+        if crate::abprobe::enabled() {
+            // Dump the block logits (Markov-bias-free q ingredient) for draft
+            // positions 1..=7, keyed by the round's anchor position.
+            for (i, &(_, anchor_pos)) in anchors.iter().enumerate() {
+                for k in 1..block {
+                    let row = scratch
+                        .logits
+                        .data
+                        .slice((i * block + k) * GLM52_VOCAB..(i * block + k + 1) * GLM52_VOCAB);
+                    let host = ctx.stream.clone_dtoh(&row)?;
+                    crate::abprobe::write_bf16(&format!("q_{anchor_pos}_k{k}.bin"), &host);
+                }
+            }
+        }
+
         let anchor_tokens: Vec<u32> = anchors.iter().map(|&(token, _)| token).collect();
         {
             let mut prev = scratch.prev_tokens.slice_mut(..rows);
@@ -617,6 +632,18 @@ impl Glm52DsparkModel {
                 &mut scratch.w1emb,
             )?;
             gemm_into_checked(ctx, &self.markov_w2, &scratch.w1emb, &mut scratch.bias)?;
+            if crate::abprobe::enabled() {
+                // The bias row at Markov step k completes q_k:
+                // q_k = softmax(block_logits[k] + bias_k).
+                for (i, &(_, anchor_pos)) in anchors.iter().enumerate() {
+                    let row = scratch
+                        .bias
+                        .data
+                        .slice(i * GLM52_VOCAB..(i + 1) * GLM52_VOCAB);
+                    let host = ctx.stream.clone_dtoh(&row)?;
+                    crate::abprobe::write_bf16(&format!("qb_{anchor_pos}_k{step}.bin"), &host);
+                }
+            }
             markov_step_argmax_into(
                 ctx,
                 &scratch.logits,
@@ -633,9 +660,18 @@ impl Glm52DsparkModel {
         }
         let sampled_view = scratch.sampled_tokens.slice(..rows * block);
         let sampled = ctx.stream.clone_dtoh(&sampled_view)?;
-        Ok((0..rows)
+        let proposals: Vec<[u32; GLM52_DSPARK_DRAFTS]> = (0..rows)
             .map(|i| std::array::from_fn(|k| sampled[i * block + 1 + k]))
-            .collect())
+            .collect();
+        if crate::abprobe::enabled() {
+            for (i, &(_, anchor_pos)) in anchors.iter().enumerate() {
+                crate::abprobe::manifest(&format!(
+                    "{{\"kind\":\"round\",\"anchor_pos\":{anchor_pos},\"drafts\":{:?}}}",
+                    proposals[i]
+                ));
+            }
+        }
+        Ok(proposals)
     }
 }
 

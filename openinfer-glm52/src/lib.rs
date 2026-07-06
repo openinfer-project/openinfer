@@ -7,6 +7,7 @@
 //! step all 8 ranks run the full model in lock-step and enter the
 //! per-MoE-layer DeepEP collectives.
 
+mod abprobe;
 mod bookend;
 mod config;
 mod dense;

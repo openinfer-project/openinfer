@@ -354,7 +354,10 @@ pub(crate) fn validate_request(
     // Plain decode samples per-row; the DSpark verify span is greedy-only
     // ([`accept_greedy`] compares the target's argmax against the drafts —
     // rejection sampling is future work).
-    if dspark_enabled && !req.params.is_greedy() {
+    // abprobe: a non-greedy request under the drafter becomes a SHADOW slot —
+    // plain sampled decode with the draft lane proposing (and dumping) every
+    // round, drafts never installed into a span.
+    if dspark_enabled && !req.params.is_greedy() && !crate::abprobe::enabled() {
         return Err(
             "GLM5.2 with the DSpark drafter supports greedy sampling only (temperature 0)"
                 .to_owned(),
@@ -1084,6 +1087,19 @@ pub(crate) fn run_dp8_coordinator(
                 };
                 let prompt_tokens = active.req.prompt_tokens.len();
                 let outcome = active.state.advance_span(span_outputs, eos_token_ids);
+                if crate::abprobe::enabled()
+                    && !active.req.params.is_greedy()
+                    && let Glm52StepOutcome::Commit { committed, .. } = &outcome
+                {
+                    // Post-advance completion count N: the committed token's
+                    // sample step (the `p_step{}.bin` key) is N-1.
+                    crate::abprobe::manifest(&format!(
+                        "{{\"kind\":\"commit\",\"completion\":{},\"tokens\":{:?},\
+                         \"prompt_len\":{prompt_tokens}}}",
+                        active.state.completion_tokens(),
+                        committed,
+                    ));
+                }
                 // Commit the span's KV bookkeeping under the exact kind the
                 // submit phase scheduled — a mispairing is a coordinator bug
                 // and fails the step.
@@ -1244,6 +1260,12 @@ pub(crate) fn run_dp8_coordinator(
                 }
                 for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
                     if let Some(active) = slots[rank][slot_id].as_mut() {
+                        // abprobe shadow slot: the round was dumped rank-side
+                        // (`markov_propose`); installing drafts would breach
+                        // the greedy-only verify gate.
+                        if crate::abprobe::enabled() && !active.req.params.is_greedy() {
+                            continue;
+                        }
                         active.state.set_drafts(span.to_vec());
                     }
                 }

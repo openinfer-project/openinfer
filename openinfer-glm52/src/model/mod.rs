@@ -701,6 +701,23 @@ impl Glm52RankModel {
             )?;
             outputs[s.row] = tokens[0];
         }
+        if crate::abprobe::enabled() {
+            // Dump every sampled row's full target logits, keyed by the
+            // request-local sample step (see the scheduler's commit manifest).
+            for s in sampling {
+                let row = bucket
+                    .scratch
+                    .logits
+                    .data()
+                    .slice(s.row * GLM52_VOCAB..(s.row + 1) * GLM52_VOCAB);
+                let host = ctx.stream.clone_dtoh(&row)?;
+                crate::abprobe::write_bf16(&format!("p_step{}.bin", s.step), &host);
+                crate::abprobe::manifest(&format!(
+                    "{{\"kind\":\"sample\",\"step\":{},\"token\":{}}}",
+                    s.step, outputs[s.row]
+                ));
+            }
+        }
         Ok(())
     }
 
