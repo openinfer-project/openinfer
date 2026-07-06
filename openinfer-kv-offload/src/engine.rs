@@ -165,7 +165,26 @@ impl LoadHandle {
     }
 }
 
-/// Per-layer registration geometry derived once from a [`KvBuffer`]'s layout.
+/// One strided GPU arena to register as one pegaflow "layer": `num_blocks`
+/// copy units of `bytes_per_block`, sitting `block_stride_bytes` apart from
+/// `base_ptr`. A fused buffer (qwen3) contributes one arena per model layer;
+/// a model with sidecar caches (GLM5.2: MLA latent + index-K per layer, two
+/// separate allocations sharing pool block ids) contributes several arenas
+/// per model layer — pegaflow moves whatever arenas are registered under one
+/// block id together, which is what keeps sidecars in lockstep with their
+/// main cache.
+///
+/// `name` keys the arena for the whole engine lifetime (save/load fan across
+/// every registered name); it must be unique within the engine.
+pub struct KvArena {
+    pub name: String,
+    pub base_ptr: u64,
+    pub num_blocks: usize,
+    pub bytes_per_block: usize,
+    pub block_stride_bytes: usize,
+}
+
+/// Per-layer registration geometry fed to pegaflow's one batched call.
 ///
 /// Only `data_ptrs` and `size_bytes` differ per layer; the rest are the same
 /// scalar broadcast across all layers (kept as vectors only to feed pegaflow's
@@ -201,26 +220,51 @@ impl Registration {
         // One block's copy unit for a layer = its whole [K|V] span in a page.
         let layer_bytes = layout.layer_stride * ELEM_SIZE;
         let page_stride_bytes = layout.page_stride * ELEM_SIZE;
-        let total_bytes = num_blocks * page_stride_bytes;
 
-        let n = layout.num_layers;
+        let arenas: Vec<KvArena> = (0..layout.num_layers)
+            .map(|layer| KvArena {
+                name: layer.to_string(),
+                base_ptr: base_ptr + (layer * layer_bytes) as u64,
+                num_blocks,
+                bytes_per_block: layer_bytes,
+                block_stride_bytes: page_stride_bytes,
+            })
+            .collect();
+        Self::from_arenas(&arenas)
+    }
+
+    /// One pegaflow layer per arena, single-segment (an arena is one copy
+    /// unit per block by definition; K/V split segments only exist for the
+    /// symmetric-pair layouts vLLM registers).
+    fn from_arenas(arenas: &[KvArena]) -> Self {
+        let n = arenas.len();
         let mut reg = Registration {
             layer_names: Vec::with_capacity(n),
             data_ptrs: Vec::with_capacity(n),
             size_bytes: Vec::with_capacity(n),
-            num_blocks: vec![num_blocks; n],
-            bytes_per_block: vec![layer_bytes; n],
+            num_blocks: Vec::with_capacity(n),
+            bytes_per_block: Vec::with_capacity(n),
             kv_stride_bytes: vec![0; n],
             segments: vec![1; n],
-            block_stride_bytes: vec![page_stride_bytes; n],
+            block_stride_bytes: Vec::with_capacity(n),
         };
-        for layer in 0..n {
-            let layer_off = layer * layer_bytes;
-            reg.layer_names.push(layer.to_string());
-            reg.data_ptrs.push(base_ptr + layer_off as u64);
-            // The layer's region runs from its [K|V] base to the end of the
-            // buffer; bounds are validated against the strided last-block reach.
-            reg.size_bytes.push(total_bytes - layer_off);
+        for arena in arenas {
+            assert!(
+                arena.bytes_per_block <= arena.block_stride_bytes,
+                "arena {} copy unit {} overruns its block stride {}",
+                arena.name,
+                arena.bytes_per_block,
+                arena.block_stride_bytes
+            );
+            reg.layer_names.push(arena.name.clone());
+            reg.data_ptrs.push(arena.base_ptr);
+            // The arena's region must cover the strided reach of its last
+            // block (pegaflow validates copies against this bound).
+            reg.size_bytes
+                .push((arena.num_blocks - 1) * arena.block_stride_bytes + arena.bytes_per_block);
+            reg.num_blocks.push(arena.num_blocks);
+            reg.bytes_per_block.push(arena.bytes_per_block);
+            reg.block_stride_bytes.push(arena.block_stride_bytes);
         }
         reg
     }
@@ -277,6 +321,22 @@ impl OffloadEngine {
         buffer: &KvBuffer,
         stream: &CudaStream,
     ) -> Result<Self, EngineError> {
+        let reg = Registration::from_buffer(buffer, stream);
+        Self::build(config, reg)
+    }
+
+    /// Build the engine over explicit arenas instead of one fused
+    /// [`KvBuffer`] — for models whose per-layer caches are separate
+    /// allocations (GLM5.2: MLA latent + index-K per layer). Same contract as
+    /// [`Self::new`], plus: every arena's device allocation must stay live
+    /// and pointer-stable for the engine's lifetime (the registration bakes
+    /// raw device addresses), and all arenas must be indexed by the same pool
+    /// block ids.
+    pub fn with_arenas(config: OffloadConfig, arenas: &[KvArena]) -> Result<Self, EngineError> {
+        Self::build(config, Registration::from_arenas(arenas))
+    }
+
+    fn build(config: OffloadConfig, reg: Registration) -> Result<Self, EngineError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.runtime_threads.max(1))
             .enable_all()
@@ -386,7 +446,6 @@ impl OffloadEngine {
             None => None,
         };
 
-        let reg = Registration::from_buffer(buffer, stream);
         engine.register_context_layer_batch_strided(
             &config.instance_id,
             &config.namespace,
@@ -702,5 +761,72 @@ impl OffloadEngine {
     /// empties the CPU tier.
     pub fn evict_all(&self) {
         self.engine.cleanup_memory_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GLM5.2 shape: two arenas per model layer (MLA latent + index-K
+    /// sidecar) with different copy units, sharing pool block ids. Pins the
+    /// per-arena mapping and the exact strided-reach size bound pegaflow
+    /// validates copies against.
+    #[test]
+    fn arena_registration_geometry() {
+        const MLA: usize = 656 * 64;
+        const IDXK: usize = 132 * 64;
+        let arenas = [
+            KvArena {
+                name: "0.mla".into(),
+                base_ptr: 0x1000,
+                num_blocks: 10,
+                bytes_per_block: MLA,
+                block_stride_bytes: MLA,
+            },
+            KvArena {
+                name: "0.idxk".into(),
+                base_ptr: 0x9000,
+                num_blocks: 10,
+                bytes_per_block: IDXK,
+                block_stride_bytes: IDXK,
+            },
+        ];
+        let reg = Registration::from_arenas(&arenas);
+        assert_eq!(reg.layer_names, ["0.mla", "0.idxk"]);
+        assert_eq!(reg.data_ptrs, [0x1000, 0x9000]);
+        assert_eq!(reg.segments, [1, 1]);
+        assert_eq!(reg.kv_stride_bytes, [0, 0]);
+        assert_eq!(reg.num_blocks, [10, 10]);
+        assert_eq!(reg.bytes_per_block, [MLA, IDXK]);
+        assert_eq!(reg.block_stride_bytes, [MLA, IDXK]);
+        assert_eq!(reg.size_bytes, [10 * MLA, 10 * IDXK]);
+    }
+
+    /// A page-interleaved arena (the qwen3 fused layout expressed as arenas):
+    /// stride exceeds the copy unit, and the size bound is the reach of the
+    /// last block, not `num_blocks * stride`.
+    #[test]
+    fn interleaved_arena_size_is_last_block_reach() {
+        let reg = Registration::from_arenas(&[KvArena {
+            name: "3".into(),
+            base_ptr: 0x100,
+            num_blocks: 4,
+            bytes_per_block: 512,
+            block_stride_bytes: 4096,
+        }]);
+        assert_eq!(reg.size_bytes, [3 * 4096 + 512]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overruns its block stride")]
+    fn arena_copy_unit_must_fit_its_stride() {
+        let _ = Registration::from_arenas(&[KvArena {
+            name: "bad".into(),
+            base_ptr: 0,
+            num_blocks: 1,
+            bytes_per_block: 4096,
+            block_stride_bytes: 512,
+        }]);
     }
 }
