@@ -1,13 +1,15 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use log::{debug, info};
+use safetensors::SafeTensors;
+use std::collections::HashMap;
 use std::time::Instant;
 
-use super::config::{Config35, LayerType};
+use super::config::{Config35, LayerType, TensorParallelConfig};
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use openinfer_core::weight_loader::{
     deserialize_shards, load_shard_info_fixed, load_tensor_1d, load_tensor_1d_f32, load_tensor_2d,
-    mmap_shards, precompute_rope,
+    load_tensor_2d_col_shard, load_tensor_2d_row_shard, mmap_shards, precompute_rope,
 };
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
@@ -68,10 +70,28 @@ pub(super) struct TransformerBlock35 {
     pub(super) mlp: MLP35,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelRuntimeConfig {
+    pub(crate) enable_cuda_graph: bool,
+    pub(crate) tensor_parallel: Option<TensorParallelConfig>,
+    pub(crate) device_ordinal: usize,
+}
+
+impl Default for ModelRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enable_cuda_graph: true,
+            tensor_parallel: None,
+            device_ordinal: 0,
+        }
+    }
+}
+
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config35,
+    pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
     pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock35>,
@@ -91,6 +111,36 @@ const STATES_PER_DECODE_SLOT: usize = 2;
 const MIN_KV_PAGES: usize = 64;
 
 impl Qwen35Model {
+    pub fn from_safetensors_with_options(
+        model_path: &str,
+        enable_cuda_graph: bool,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn from_safetensors_with_device_options(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinal: usize,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph,
+                device_ordinal,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+impl Qwen35Model {
     /// `max_batch` must be a decode bucket ({1,2,4,8,16,32,64}).
     pub fn from_safetensors(
         model_path: &str,
@@ -102,18 +152,48 @@ impl Qwen35Model {
             "decode batch capacity must be one of {:?}, got {max_batch}",
             super::batch_decode_graph::BATCH_BUCKETS,
         );
+        Self::from_safetensors_with_runtime_and_capacity(
+            model_path,
+            ModelRuntimeConfig {
+                device_ordinal,
+                ..Default::default()
+            },
+            max_batch,
+        )
+    }
+
+    pub(crate) fn from_safetensors_with_runtime(
+        model_path: &str,
+        runtime: ModelRuntimeConfig,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime_and_capacity(
+            model_path,
+            runtime,
+            super::batch_decode_graph::MAX_BATCH,
+        )
+    }
+
+    fn from_safetensors_with_runtime_and_capacity(
+        model_path: &str,
+        runtime: ModelRuntimeConfig,
+        max_batch: usize,
+    ) -> Result<Self> {
         info!("Loading Qwen3.5 model from: {}", model_path);
-        debug!("Initializing GPU");
-        let ctx = DeviceContext::new_with_device(device_ordinal)?;
+        debug!("Initializing GPU device {}", runtime.device_ordinal);
+        let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
         let mut config = Config35::from_file(model_path)?;
+        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
+        tensor_parallel.validate_for(&config, runtime.enable_cuda_graph)?;
         debug!(
-            "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}",
+            "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
             config.num_hidden_layers,
             config.num_full_attention_layers(),
             config.num_hidden_layers - config.num_full_attention_layers(),
-            config.max_position_embeddings
+            config.max_position_embeddings,
+            tensor_parallel.rank,
+            tensor_parallel.world_size,
         );
         let effective_vocab = super::config::tokenizer_effective_vocab(model_path)?;
         anyhow::ensure!(
@@ -173,6 +253,9 @@ impl Qwen35Model {
             config.num_hidden_layers
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let (_, q_rows) = tensor_parallel.shard_range(config.full_attn_q_dim());
+        let (kv_row_offset, kv_rows) = tensor_parallel.shard_range(config.full_attn_kv_dim());
+        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(config.intermediate_size);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("{}.layers.{}", wp, i);
             let layer_type = config.layer_types[i];
@@ -181,29 +264,40 @@ impl Qwen35Model {
                 LayerType::FullAttention => {
                     let attn_prefix = format!("{}.self_attn", prefix);
                     LayerKind::FullAttention(FullAttentionLayer {
-                        q_proj: load_tensor_2d(
+                        q_proj: load_full_attention_gated_q_proj(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.q_proj.weight", attn_prefix),
+                            &config,
+                            tensor_parallel,
                         )?,
-                        k_proj: load_tensor_2d(
+                        k_proj: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.k_proj.weight", attn_prefix),
+                            tensor_parallel,
+                            kv_row_offset,
+                            kv_rows,
                         )?,
-                        v_proj: load_tensor_2d(
+                        v_proj: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.v_proj.weight", attn_prefix),
+                            tensor_parallel,
+                            kv_row_offset,
+                            kv_rows,
                         )?,
-                        o_proj: load_tensor_2d(
+                        o_proj: load_tensor_2d_col_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.o_proj.weight", attn_prefix),
+                            tensor_parallel,
+                            tensor_parallel.shard_range(config.full_attn_q_dim()).0,
+                            q_rows,
                         )?,
                         q_norm: load_tensor_1d(
                             &ctx,
@@ -280,17 +374,23 @@ impl Qwen35Model {
                 }
             };
 
-            let gate_proj = load_tensor_2d(
+            let gate_proj = load_tensor_2d_row_shard_if_needed(
                 &ctx,
                 &shards,
                 &weight_map,
                 &format!("{}.mlp.gate_proj.weight", prefix),
+                tensor_parallel,
+                inter_row_offset,
+                inter_rows,
             )?;
-            let up_proj = load_tensor_2d(
+            let up_proj = load_tensor_2d_row_shard_if_needed(
                 &ctx,
                 &shards,
                 &weight_map,
                 &format!("{}.mlp.up_proj.weight", prefix),
+                tensor_parallel,
+                inter_row_offset,
+                inter_rows,
             )?;
             let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
             drop(gate_proj);
@@ -312,11 +412,14 @@ impl Qwen35Model {
                 )?,
                 mlp: MLP35 {
                     gate_up_proj,
-                    down_proj: load_tensor_2d(
+                    down_proj: load_tensor_2d_col_shard_if_needed(
                         &ctx,
                         &shards,
                         &weight_map,
                         &format!("{}.mlp.down_proj.weight", prefix),
+                        tensor_parallel,
+                        inter_row_offset,
+                        inter_rows,
                     )?,
                 },
             };
@@ -348,12 +451,17 @@ impl Qwen35Model {
             "GPU model loaded in {:.0}ms",
             t_gpu.elapsed().as_secs_f64() * 1e3
         );
+        if runtime.enable_cuda_graph {
+            debug!("Decode path CUDA Graph is enabled");
+        } else {
+            debug!("Decode path CUDA Graph is disabled");
+        }
         // Paged KV pool for the 8 full-attention layers.
         let page_size = 16usize;
         let num_full_layers = config.num_full_attention_layers();
         let layout = openinfer_core::kv_pool::KvLayout::new(
             num_full_layers,
-            config.num_key_value_heads,
+            config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
         );
@@ -393,7 +501,7 @@ impl Qwen35Model {
         let kv_pool = openinfer_core::kv_pool::KvPool::new(
             &ctx,
             num_full_layers,
-            config.num_key_value_heads,
+            config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
             num_pages,
@@ -402,6 +510,7 @@ impl Qwen35Model {
         Ok(Self {
             ctx,
             config,
+            tensor_parallel,
             embed_tokens,
             lm_head,
             layers,
@@ -452,12 +561,13 @@ impl Qwen35Model {
         let ctx = &self.ctx;
         let hidden = self.config.hidden_size;
         let vocab = self.config.selection_vocab;
-        let full_q = self.config.full_attn_q_proj_dim();
-        let full_kv = self.config.full_attn_kv_dim();
+        let tp = self.tensor_parallel;
+        let full_q = self.config.local_full_attn_gated_q_dim(tp);
+        let full_kv = self.config.local_full_attn_kv_dim(tp);
         let linear_qkv = self.config.linear_attn_qkv_dim();
         let linear_z = self.config.linear_attn_z_dim();
         let linear_ba = self.config.linear_num_value_heads;
-        let intermediate = self.config.intermediate_size;
+        let intermediate = self.config.local_intermediate_size(tp);
 
         let full_q_samples: Vec<_> = self
             .layers
@@ -578,4 +688,173 @@ fn tune_if_nonempty(
         return Ok(());
     }
     crate::ops::gemm_lt_tune(ctx, samples, rows, n)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GatedQShardRange {
+    q_row_offset: usize,
+    gate_row_offset: usize,
+    rows: usize,
+}
+
+fn full_attention_gated_q_shard_range(
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> GatedQShardRange {
+    let (q_row_offset, rows) = tensor_parallel.shard_range(config.full_attn_q_dim());
+    GatedQShardRange {
+        q_row_offset,
+        gate_row_offset: config.full_attn_q_dim() + q_row_offset,
+        rows,
+    }
+}
+
+fn load_full_attention_gated_q_proj(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> Result<DeviceMatrix> {
+    if !tensor_parallel.is_sharded() {
+        return load_tensor_2d(ctx, shards, weight_map, name);
+    }
+
+    let range = full_attention_gated_q_shard_range(config, tensor_parallel);
+    let q_proj = load_tensor_2d_row_shard(
+        ctx,
+        shards,
+        weight_map,
+        name,
+        range.q_row_offset,
+        range.rows,
+    )?;
+    let gate_proj = load_tensor_2d_row_shard(
+        ctx,
+        shards,
+        weight_map,
+        name,
+        range.gate_row_offset,
+        range.rows,
+    )?;
+    let fused = DeviceMatrix::vstack(ctx, &[&q_proj, &gate_proj])?;
+    drop(q_proj);
+    drop(gate_proj);
+    Ok(fused)
+}
+
+fn load_tensor_2d_row_shard_if_needed(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tensor_parallel: TensorParallelConfig,
+    row_offset: usize,
+    rows: usize,
+) -> Result<DeviceMatrix> {
+    if tensor_parallel.is_sharded() {
+        load_tensor_2d_row_shard(ctx, shards, weight_map, name, row_offset, rows)
+    } else {
+        load_tensor_2d(ctx, shards, weight_map, name)
+    }
+}
+
+fn load_tensor_2d_col_shard_if_needed(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    tensor_parallel: TensorParallelConfig,
+    col_offset: usize,
+    cols: usize,
+) -> Result<DeviceMatrix> {
+    if tensor_parallel.is_sharded() {
+        load_tensor_2d_col_shard(ctx, shards, weight_map, name, col_offset, cols)
+    } else {
+        load_tensor_2d(ctx, shards, weight_map, name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config35 {
+        Config35 {
+            hidden_size: 2560,
+            intermediate_size: 9216,
+            num_hidden_layers: 32,
+            vocab_size: 248320,
+            rms_norm_eps: 1e-6,
+            eos_token_id: 151645,
+            num_attention_heads: 16,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_num_value_heads: 32,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            rotary_dim: 64,
+            max_position_embeddings: 262_144,
+            layer_types: vec![LayerType::LinearAttention; 32],
+        }
+    }
+
+    #[test]
+    fn gated_q_shard_range_keeps_matching_q_and_gate_rows() {
+        let config = test_config();
+
+        let rank0 = full_attention_gated_q_shard_range(
+            &config,
+            TensorParallelConfig {
+                rank: 0,
+                world_size: 2,
+            },
+        );
+        assert_eq!(
+            rank0,
+            GatedQShardRange {
+                q_row_offset: 0,
+                gate_row_offset: 4096,
+                rows: 2048,
+            }
+        );
+
+        let rank1 = full_attention_gated_q_shard_range(
+            &config,
+            TensorParallelConfig {
+                rank: 1,
+                world_size: 2,
+            },
+        );
+        assert_eq!(
+            rank1,
+            GatedQShardRange {
+                q_row_offset: 2048,
+                gate_row_offset: 6144,
+                rows: 2048,
+            }
+        );
+    }
+
+    #[test]
+    fn mlp_tp2_uses_matching_gate_up_rows_and_down_cols() {
+        let config = test_config();
+        let tp = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
+
+        let (inter_offset, inter_rows) = tp.shard_range(config.intermediate_size);
+        assert_eq!((inter_offset, inter_rows), (4608, 4608));
+        assert_eq!(config.local_intermediate_size(tp), inter_rows);
+
+        let local_gate_up_rows = 2 * inter_rows;
+        let local_down_cols = inter_rows;
+        assert_eq!(local_gate_up_rows, 9216);
+        assert_eq!(local_down_cols, 4608);
+    }
 }
