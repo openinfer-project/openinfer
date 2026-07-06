@@ -128,8 +128,8 @@ impl Glm52SlotState {
     /// position under the model-length cap, since `validate_request` pins
     /// `prompt + max_tokens - 1 <= max_model_len`.
     pub(super) fn feed_want(&self) -> usize {
-        if self.fed < self.prompt.len() {
-            self.prompt.len() - self.fed
+        if self.mid_prefill() {
+            self.remaining_prompt()
         } else {
             (1 + self.drafts.len()).min(self.max_tokens - self.completion)
         }
@@ -141,7 +141,7 @@ impl Glm52SlotState {
     /// is then a prefix (anchor + first drafts), and the un-fed drafts are
     /// discarded by `advance_span`.
     pub(super) fn next_input_at(&self, offset: usize) -> Glm52StepInput {
-        if self.fed < self.prompt.len() {
+        if self.mid_prefill() {
             debug_assert!(self.fed + offset < self.prompt.len());
             Glm52StepInput {
                 token: self.prompt[self.fed + offset],
@@ -173,8 +173,8 @@ impl Glm52SlotState {
     /// tokens against the drafts; the zero-draft plain row is the same rule).
     pub(super) fn sampling_rows(&self, span_rows: usize) -> Vec<(usize, u64)> {
         debug_assert!(span_rows > 0);
-        if self.fed < self.prompt.len() {
-            if self.fed + span_rows == self.prompt.len() {
+        if self.mid_prefill() {
+            if span_rows == self.remaining_prompt() {
                 vec![(span_rows - 1, self.completion as u64)]
             } else {
                 Vec::new()
@@ -191,7 +191,7 @@ impl Glm52SlotState {
     /// committed token and the position it will be fed at. `None` mid-prefill
     /// (no token to extend yet).
     pub(super) fn decode_anchor(&self) -> Option<(u32, usize)> {
-        (self.fed >= self.prompt.len() && self.completion > 0)
+        (!self.mid_prefill() && self.completion > 0)
             .then(|| (self.last_token, self.prompt.len() + self.completion - 1))
     }
 
@@ -199,7 +199,7 @@ impl Glm52SlotState {
     /// least two tokens of budget left (a one-token tail can only ever commit
     /// the anchor's own output — a plain row).
     pub(super) fn wants_drafts(&self) -> bool {
-        self.fed >= self.prompt.len() && self.completion + 1 < self.max_tokens
+        !self.mid_prefill() && self.completion + 1 < self.max_tokens
     }
 
     /// Install the draft lane's proposal for the next verify span, truncated
@@ -228,10 +228,10 @@ impl Glm52SlotState {
         eos_token_ids: &[u32],
     ) -> Glm52StepOutcome {
         debug_assert!(!outputs.is_empty());
-        let (committed, context_rows) = if self.fed < self.prompt.len() {
-            debug_assert!(self.fed + outputs.len() <= self.prompt.len());
+        let (committed, context_rows) = if self.mid_prefill() {
+            debug_assert!(outputs.len() <= self.remaining_prompt());
             self.fed += outputs.len();
-            if self.fed < self.prompt.len() {
+            if self.mid_prefill() {
                 return Glm52StepOutcome::Prefilling;
             }
             // Boundary: every span row is committed prompt context, and the
