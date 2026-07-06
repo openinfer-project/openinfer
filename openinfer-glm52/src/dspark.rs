@@ -552,15 +552,26 @@ impl Glm52DsparkModel {
                 ..
             } = &mut *scratch;
 
-            // The dense head of layer `l`: input norm, batched q GEMM, and the
-            // per-state tail assembly + k/v GEMMs (constant offsets/shapes for
-            // a given context_len).
-            macro_rules! layer_head {
+            // The batch-wide dense prolog of layer `l`: input norm + q GEMM.
+            macro_rules! layer_prolog {
                 ($l:expr) => {{
                     let layer = &self.layers[$l];
                     rms_norm_batch_into(ctx, hidden, &layer.input_ln, DSPARK_RMS_EPS, normed);
                     gemm_rows_into_checked(ctx, &layer.qkv, 0, DSPARK_QKV_DIM, normed, q_batch)?;
-                    for (i, state) in states.iter().enumerate() {
+                }};
+            }
+            // One slot's tail assembly + k/v GEMMs into the SHARED tail
+            // scratch. The tail must be consumed (state_dynamic!) before the
+            // next slot's prep overwrites it — at `active == 1` the graphed
+            // composition satisfies this trivially; at `active > 1` the layer
+            // interleaves prep/dynamic per slot exactly like the pre-graph
+            // code did.
+            macro_rules! state_prep {
+                ($l:expr, $i:expr, $state:expr) => {{
+                    let layer = &self.layers[$l];
+                    let state = $state;
+                    let i: usize = $i;
+                    {
                         let context_len = context_lens[i];
                         let tail_len = context_len + block;
                         let row_offset = i * block;
@@ -630,11 +641,13 @@ impl Glm52DsparkModel {
                     std::mem::swap(&mut *hidden, &mut *hidden_out);
                 }};
             }
-            // The round-varying middle of layer `l` — always eager.
-            macro_rules! layer_dynamic {
-                ($l:expr) => {{
+            // One slot's round-varying middle — always eager.
+            macro_rules! state_dynamic {
+                ($l:expr, $i:expr, $state:expr) => {{
                     let layer = &self.layers[$l];
-                    for (i, state) in states.iter_mut().enumerate() {
+                    let state = $state;
+                    let i: usize = $i;
+                    {
                         let context_len = context_lens[i];
                         let tail_len = context_len + block;
                         let row_offset = i * block;
@@ -701,36 +714,77 @@ impl Glm52DsparkModel {
                 }};
             }
 
-            // SEG 0: embedding + context projection + layer 0 head.
-            run_seg!(0, {
+            macro_rules! context_projection {
+                () => {{
+                    for state in states.iter_mut() {
+                        gemm_into_checked(
+                            ctx,
+                            &self.fc,
+                            &state.pending,
+                            &mut state.context_projected,
+                        )?;
+                        rms_norm_batch_into(
+                            ctx,
+                            &state.context_projected,
+                            &self.hidden_norm,
+                            DSPARK_RMS_EPS,
+                            &mut state.context_hidden,
+                        );
+                    }
+                }};
+            }
+
+            if active == 1 {
+                // bs=1: the single slot's prep can sit in the dense segments
+                // (nothing else touches the shared tail scratch before the
+                // dynamic middle consumes it), which is what makes the
+                // piecewise graph composition legal.
+                run_seg!(0, {
+                    embedding_batch(ctx, embed, token_ids_d, hidden)?;
+                    context_projection!();
+                    layer_prolog!(0);
+                    state_prep!(0, 0, &mut *states[0]);
+                });
+                for l in 0..DSPARK_LAYERS {
+                    state_dynamic!(l, 0, &mut *states[0]);
+                    if l + 1 < DSPARK_LAYERS {
+                        run_seg!(l + 1, {
+                            layer_tail!(l);
+                            layer_prolog!(l + 1);
+                            state_prep!(l + 1, 0, &mut *states[0]);
+                        });
+                    } else {
+                        // Final segment: last layer tail + draft head logits.
+                        run_seg!(l + 1, {
+                            layer_tail!(l);
+                            rms_norm_batch_into(
+                                ctx,
+                                hidden,
+                                &self.norm,
+                                DSPARK_RMS_EPS,
+                                logits_normed,
+                            );
+                            gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
+                        });
+                    }
+                }
+            } else {
+                // bs>1 (eager, ungraphed): the tail scratch is shared across
+                // slots, so each slot's prep must be consumed by its dynamic
+                // middle before the next slot's prep overwrites it — the
+                // original per-slot interleave.
                 embedding_batch(ctx, embed, token_ids_d, hidden)?;
-                for state in states.iter_mut() {
-                    gemm_into_checked(ctx, &self.fc, &state.pending, &mut state.context_projected)?;
-                    rms_norm_batch_into(
-                        ctx,
-                        &state.context_projected,
-                        &self.hidden_norm,
-                        DSPARK_RMS_EPS,
-                        &mut state.context_hidden,
-                    );
+                context_projection!();
+                for l in 0..DSPARK_LAYERS {
+                    layer_prolog!(l);
+                    for i in 0..active {
+                        state_prep!(l, i, &mut *states[i]);
+                        state_dynamic!(l, i, &mut *states[i]);
+                    }
+                    layer_tail!(l);
                 }
-                layer_head!(0);
-            });
-            for l in 0..DSPARK_LAYERS {
-                layer_dynamic!(l);
-                if l + 1 < DSPARK_LAYERS {
-                    run_seg!(l + 1, {
-                        layer_tail!(l);
-                        layer_head!(l + 1);
-                    });
-                } else {
-                    // Final segment: last layer tail + draft head logits.
-                    run_seg!(l + 1, {
-                        layer_tail!(l);
-                        rms_norm_batch_into(ctx, hidden, &self.norm, DSPARK_RMS_EPS, logits_normed);
-                        gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
-                    });
-                }
+                rms_norm_batch_into(ctx, hidden, &self.norm, DSPARK_RMS_EPS, logits_normed);
+                gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
             }
         }
         if fwd_on {
@@ -818,13 +872,18 @@ impl Glm52DsparkModel {
                 .collect());
         }
         scratch.markov_warm[rows - 1] = true;
+        // Fixed-orientation ping-pong, NOT a field swap: a swap flips which
+        // buffer the `prev_tokens` field names, and a graph captured for one
+        // row count bakes the buffer addresses — an odd number of swaps on an
+        // eager round (7 steps) for a different row count would leave the
+        // anchor h2d above writing a buffer the captured graph never reads.
         for step in 1..block {
-            embedding_batch(
-                ctx,
-                &self.markov_w1,
-                &scratch.prev_tokens,
-                &mut scratch.w1emb,
-            )?;
+            let (prev, next): (&CudaSlice<u32>, &mut CudaSlice<u32>) = if step % 2 == 1 {
+                (&scratch.prev_tokens, &mut scratch.next_tokens)
+            } else {
+                (&scratch.next_tokens, &mut scratch.prev_tokens)
+            };
+            embedding_batch(ctx, &self.markov_w1, prev, &mut scratch.w1emb)?;
             gemm_into_checked(ctx, &self.markov_w2, &scratch.w1emb, &mut scratch.bias)?;
             markov_step_argmax_into(
                 ctx,
@@ -835,10 +894,9 @@ impl Glm52DsparkModel {
                 rows,
                 &mut scratch.partial_values,
                 &mut scratch.partial_indices,
-                &mut scratch.next_tokens,
+                next,
                 &mut scratch.sampled_tokens,
             )?;
-            std::mem::swap(&mut scratch.prev_tokens, &mut scratch.next_tokens);
         }
         let sampled_view = scratch.sampled_tokens.slice(..rows * block);
         let sampled = ctx.stream.clone_dtoh(&sampled_view)?;

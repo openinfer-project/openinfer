@@ -185,3 +185,88 @@ fn dspark_propose_graph_parity() -> Result<()> {
     );
     Ok(())
 }
+
+/// Slot isolation under batching: with the shared tail scratch, each slot's
+/// tail prep must be consumed before the next slot's prep overwrites it — a
+/// prep-all-then-consume-all reorder makes earlier slots attend with the last
+/// slot's K/V. Exact bs-vs-single equality is NOT promisable (cuBLAS picks
+/// different algorithms per M, so bs=2 and bs=1 can legitimately differ in
+/// the last ulp), but slot ISOLATION is exact: run the same slot-A inputs in
+/// two bs=2 calls that differ only in slot B's content — the batch shape is
+/// identical, so slot A's math is bit-identical unless B's data leaks in.
+#[test]
+#[ignore = "GPU isolation test — needs a CUDA device with ~11 GB free VRAM"]
+fn dspark_propose_batched_slot_isolation() -> Result<()> {
+    const ROUNDS: usize = 6;
+    let ctx = DeviceContext::new()?;
+    let cache_len = dspark_cache_len(4096);
+    let mut model = Glm52DsparkModel::synthetic(&ctx, cache_len)?;
+    model.randomize_for_test(&ctx)?;
+    let rand_head = |seed: u32| -> Result<DeviceMatrix> {
+        let mut state = seed | 1;
+        let host: Vec<half::bf16> = (0..GLM52_VOCAB * GLM52_HIDDEN)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                half::bf16::from_f32(((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.02)
+            })
+            .collect();
+        Ok(DeviceMatrix {
+            data: ctx.stream.clone_htod(&host)?,
+            rows: GLM52_VOCAB,
+            cols: GLM52_HIDDEN,
+        })
+    };
+    let embed = rand_head(11)?;
+    let lm_head = rand_head(23)?;
+    let captured_row = |salt: u32| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
+        let host: Vec<half::bf16> = (0..GLM52_DSPARK_CONTEXT_DIM)
+            .map(|i| half::bf16::from_f32((((i as u32 + salt) % 97) as f32 - 48.0) * 0.001))
+            .collect();
+        Ok(ctx.stream.clone_htod(&host)?)
+    };
+    let cap_a = captured_row(3)?;
+
+    let mut run = |cap_b_salt: u32,
+                   anchor_b_base: u32|
+     -> Result<(
+        Vec<[u32; GLM52_DSPARK_DRAFTS]>,
+        Vec<[u32; GLM52_DSPARK_DRAFTS]>,
+    )> {
+        let cap_b = captured_row(cap_b_salt)?;
+        let mut scratch = Glm52DsparkScratch::new(&ctx, cache_len)?;
+        let mut a = Glm52DsparkSlotState::new(&ctx, cache_len)?;
+        let mut b = Glm52DsparkSlotState::new(&ctx, cache_len)?;
+        let mut drafts_a = Vec::new();
+        let mut drafts_b = Vec::new();
+        for round in 0..ROUNDS {
+            a.append_captured_row(&ctx, &cap_a, 0)?;
+            b.append_captured_row(&ctx, &cap_b, 0)?;
+            let anchors = vec![
+                (11 + round as u32 * 7, round + 1),
+                (anchor_b_base + round as u32 * 5, round + 1),
+            ];
+            let mut refs = vec![&mut a, &mut b];
+            let drafts =
+                model.propose(&ctx, &embed, &lm_head, &mut refs, &anchors, &mut scratch)?;
+            drafts_a.push(drafts[0]);
+            drafts_b.push(drafts[1]);
+        }
+        Ok((drafts_a, drafts_b))
+    };
+
+    let (a1, b1) = run(41, 900)?;
+    let (a2, b2) = run(67, 5000)?;
+    assert_eq!(
+        a1, a2,
+        "slot A's drafts changed when only slot B's content did"
+    );
+    assert_ne!(
+        b1, b2,
+        "slot B's inputs changed but its drafts did not (degenerate)"
+    );
+    assert!(
+        a1.iter().flatten().any(|&t| t != 0),
+        "isolation ran on degenerate logits"
+    );
+    Ok(())
+}
