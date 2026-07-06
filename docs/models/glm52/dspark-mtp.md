@@ -1,6 +1,6 @@
-# GLM5.2 DSpark speculative decoding (greedy)
+# GLM5.2 DSpark speculative decoding
 
-**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (jz-38 gates green: 1621-token prompt byte-identical, **TTFT 35.8 s → 9.25 s = 3.9×**, bucket-8 solo step 45.6 ms), **M2 draft lane DONE in shadow mode** (measured shadow accept incl. bonus 3.44 code / 2.4–2.9 prose vs the checkpoint's 3.967 val; kernel fix: draft is head_dim 64, both qwen3 dflash attention kernels were hard-wired to 128), **M3 verify/commit rounds DONE — speculative decoding is live**: c1 measured **1.37–2.25× tok/s over plain** (solo 22.5 → 15.7 ms/token = 1.43×) with **span 4 as the default** — the ~32 ms bucket-4 verify step beats span 8's ~46 ms on every prompt class (span 8 even loses to plain on low-accept prose). Parity: mostly byte-identical vs plain, near-tie divergence across bucket shapes is the known D2 FP property; spec itself is deterministic. Greedy only; confidence head parsed but unused (Phase 2).
+**TL;DR:** Replace the token-by-token decode cadence with DSpark speculative rounds, using the community `RedHatAI/GLM-5.2-speculator.dspark` checkpoint (NOT the native MTP layer — its tensors stay dropped at load). The draft is a **qwen3-architecture** 5-layer dense backbone at GLM's hidden 6144 (64-head MHA, head_dim 64, q/k-norm) + rank-256 Markov head — the same DSpark shape we already ship for Qwen3-4B (`docs/models/qwen3/dspark-integration.md`), so `dspark.rs`/the Markov kernel/the verify-accept seam port over. The verify step maps 1:1 onto the D2.5 multi-row decode bucket: **span 8 = anchor + 7 drafts = one bucket-8 step where all 8 rows are consecutive positions of ONE slot** — no new attention kernels, no graph shape changes, just relaxed row→slot mapping. Checkpoint facts verified on jz-38: draft `embed_tokens`/`lm_head` are **byte-identical to the target's** (sha256-compared) → skip loading both (~3.8 GB loaded per rank instead of 7.6). Milestones: **M1 span-steps DONE** (jz-38 gates green: 1621-token prompt byte-identical, **TTFT 35.8 s → 9.25 s = 3.9×**, bucket-8 solo step 45.6 ms), **M2 draft lane DONE in shadow mode** (measured shadow accept incl. bonus 3.44 code / 2.4–2.9 prose vs the checkpoint's 3.967 val; kernel fix: draft is head_dim 64, both qwen3 dflash attention kernels were hard-wired to 128), **M3 verify/commit rounds DONE — speculative decoding is live**: c1 measured **1.37–2.25× tok/s over plain** (solo 22.5 → 15.7 ms/token = 1.43×) with **span 4 as the default** — the ~32 ms bucket-4 verify step beats span 8's ~46 ms on every prompt class (span 8 even loses to plain on low-accept prose). Parity: mostly byte-identical vs plain, near-tie divergence across bucket shapes is the known D2 FP property; spec itself is deterministic. **M4 sampled verify DONE — the greedy-only gate is lifted**: non-greedy requests speculate via prefix-match over per-row SAMPLED tokens (lossless for a deterministic draft; every committed token is a true sample), seeded rows mix the request-local step so a seeded spec stream replays its plain stream. c1 (1.0, 0.95) measured **plain 20.7 → spec 8.7 ms/tok on code (2.38×)**; accept incl. bonus matches the shadow-probe predictions per class (code 2.55/2.67, narrative 1.72/1.72). Full rejection sampling (sampled draft + residual resampling) was probe-measured at ≤ +1.5% over this rule on code and REJECTED — see "Sampled verify". Confidence head parsed but unused (Phase 2).
 
 Last touched: 2026-07
 
@@ -157,6 +157,62 @@ code prompt, and if a bucket-4 step lands near ~30 ms that is ≈12 ms/token (1.
   Truncating the proposal (not the block) costs nothing: the drafter still proposes 7, the
   span feeds 3.
 
+## Sampled verify — non-greedy speculation (M4, 2026-07-06)
+
+**Mechanism.** The verify span's committed rows are SAMPLED instead of argmaxed (the #586
+post-graph FlashInfer pass, now over every span row), and `accept_greedy` prefix-matches the
+sampled tokens against the drafts. For a deterministic (greedy) draft this rule is lossless
+speculative sampling: row `k`'s token is a true sample from the target distribution given the
+accepted prefix, and it commits whether or not it matches the draft — the match only decides
+how many tokens ride one step. **Seed contract:** row `k` samples at request-local step
+`completion + k` with `mix_seed(request_seed, step)` — the exact step a plain decode would
+sample that token at, so a seeded request's speculative stream replays its plain stream
+token-for-token (up to the D2 cross-bucket FP property, see Parity below).
+
+**Why not full rejection sampling (min(1, p/q) + residual resampling)?** Probe-measured
+before building (branch `probe/glm52-ab-accept`, raw-logits dump + offline eval, 318
+rounds/class at the customer-dominant (1.0, 0.95)):
+
+| span-4 accept incl. bonus | A: sampled verify | B: rejection sampling |
+| --- | --- | --- |
+| code | 2.67 | 2.71 |
+| tech prose | 2.36 | 2.50 |
+| narrative | 1.72 | 1.91 |
+| counting | 3.81 | 3.76 |
+
+B's theoretical headroom does not materialize: the greedy draft is a *confidence
+concentrator* — the Markov head's full distribution q is noisier than its argmax, so
+`Σ min(p,q)` is dragged down by q's spread while `p(argmax q)` is not. B buys ≤ +1.5%
+throughput on code at the cost of draft sampling, q materialization, a residual-resampling
+kernel, and statistical-only gates (no byte parity). Temperature sensitivity is mild:
+(0.1, 1.0) accepts only 4–15% above (1.0, 0.95) — the draft is right exactly where the
+target is peaked.
+
+**Measured (jz-38 2026-07-06, c1, temp 1.0 / top_p 0.95, ignore_eos, span-4):**
+
+| | plain sampled | spec sampled |
+| --- | --- | --- |
+| solo code ms/token (512 tok) | 20.72 | **8.71 (2.38×)** |
+| code / tech prose / narrative / counting ms/token (320 tok) | 20.7 | 10.8 / 13.2 / 15.6 / 7.6 |
+| accept incl. bonus (measured vs probe prediction) | — | 2.55/2.67 · 2.06/2.36 · **1.72/1.72** · 3.67/3.81 |
+
+Plain sampled solo is 20.7 (not greedy's 19.5): a non-greedy request forfeits launch-ahead —
+which the drafter disables anyway, so speculation loses nothing.
+
+**Parity (gates 2026-07-06).** Seeded determinism: same seeded request twice under spec →
+byte-identical. Seeded spec-vs-plain: all 4 prompts eventually diverge at a near-tie — but
+P2 tracked plain for **35 consecutive sampled tokens** before diverging, which is ~1e-5
+probability under a broken seed stream: the divergences are the D2 cross-bucket FP property,
+AMPLIFIED by sampling (an inverse-CDF draw flips whenever the uniform lands within the
+bucket-4-vs-bucket-1 logits wiggle of a boundary — greedy only flips at exact argmax ties).
+Treat sampled spec-vs-plain parity as a statistical gate; byte gates are determinism (above)
+and greedy neutrality (drafter-on greedy on this diff byte-matches main).
+
+**Frontend gap:** `wire.rs` still strips `seed` (the shared frontend serves models whose
+schedulers don't feed request-local steps — qwen3's legacy path, #284); the parity gates used
+a gate-only passthrough patch (`seed: params.seed.map(|s| s as u64)`), reverted after. Seeded
+requests over HTTP land with the sampling-parity issue, not this milestone.
+
 ## Layout pinned against speculators source (2026-07-04)
 
 Read from `vllm-project/speculators` `src/speculators/models/{dflash,dspark}` (main). The four
@@ -202,8 +258,11 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
 - **dspark over native MTP** (user call): the native MTP-layer tensors stay dropped at
   `build_model`. DSpark gives a trained, measured (3.97 accepted) drafter without bringing up
   MTP-layer training parity.
-- **Greedy only** (Phase 1): our engine is greedy; `accept_greedy` is the shared seam. Markov
-  head is required (it *is* the dspark draft quality); confidence head deferred.
+- **Prefix-match accept for BOTH greedy and sampled verify** (M4 supersedes the Phase-1
+  greedy-only call): `accept_greedy` is the single seam — argmax tokens for greedy requests,
+  per-row sampled tokens for non-greedy. Full rejection sampling measured out (≤ +1.5% on
+  code, see "Sampled verify"); Markov head is required (it *is* the dspark draft quality);
+  confidence head deferred.
 - **Reuse target embed + lm_head**: proven byte-identical; draft logits = target lm_head GEMM
   over draft final hidden (bf16 dense GEMM `[8, 6144] × [6144, 154880]`, rank-local).
 - **Verify span 8 default**: matches checkpoint training width AND the bucket ladder's top.
@@ -211,8 +270,10 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
 
 ## Next action
 
-D3 measurement is closed (sharegpt c1 = 1.52×). Later levers, measured not assumed: adaptive
-span (feed more drafts only when recent accept is high — 32% of sharegpt rounds max out the
-3-draft span), draft/verify overlap, multi-slot spec behavior at c>8 (verify spans contend
-for bucket rows — the planner already splits, but the win under contention is unmeasured),
-and the M2 review's S1 (templating the hd64/hd128 prefill copy-paste).
+D3 measurement is closed (sharegpt c1 = 1.52× greedy; sampled c1 code = 2.38× post-D5).
+Later levers, measured not assumed: adaptive span (feed more drafts only when recent accept
+is high — 32% of sharegpt rounds max out the 3-draft span), draft/verify overlap (#582),
+multi-slot spec behavior at c>8 (verify spans contend for bucket rows — the planner already
+splits, but the win under contention is unmeasured), seed passthrough in the shared frontend
+(the sampling-parity issue / #284 — unblocks seeded requests over HTTP), and the M2 review's
+S1 (templating the hd64/hd128 prefill copy-paste).
