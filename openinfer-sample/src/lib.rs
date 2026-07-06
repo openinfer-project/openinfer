@@ -263,7 +263,10 @@ pub fn mix_seed(seed: u64, step: u64) -> u64 {
 ///
 /// Besides explicit greedy params, a `top_p` at or below `1/vocab` leaves only
 /// the argmax token in the nucleus: the softmax maximum is always `>= 1/vocab`.
-fn effectively_greedy(params: &SamplingParams, vocab_size: usize) -> bool {
+/// Public for the models that drive their own greedy path (see the module
+/// docs): routing these rows to the sampler instead would make them stochastic
+/// on bf16-tied maxima, diverging from [`select_batch`]'s semantics.
+pub fn effectively_greedy(params: &SamplingParams, vocab_size: usize) -> bool {
     params.is_greedy()
         || (vocab_size > 0
             && params.top_p.is_finite()

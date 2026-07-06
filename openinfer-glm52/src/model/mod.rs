@@ -26,7 +26,9 @@ use openinfer_kernels::ops::{
     glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStatesRef};
-use openinfer_sample::{BatchSamplingRow, BatchSamplingScratch, gpu_sample_batch_into, mix_seed};
+use openinfer_sample::{
+    BatchSamplingRow, BatchSamplingScratch, effectively_greedy, gpu_sample_batch_into, mix_seed,
+};
 
 use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
 use crate::config::{
@@ -624,8 +626,8 @@ impl Glm52RankModel {
                 shape.active_rows
             );
             ensure!(
-                !s.params.is_greedy(),
-                "GLM5.2 greedy row {} routed to the sampler (coordinator bug)",
+                !effectively_greedy(&s.params, GLM52_VOCAB),
+                "GLM5.2 effectively-greedy row {} routed to the sampler (coordinator bug)",
                 s.row
             );
         }

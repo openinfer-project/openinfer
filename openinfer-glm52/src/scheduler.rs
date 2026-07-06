@@ -24,9 +24,10 @@
 //! rank workers.
 
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
-use openinfer_sample::mix_seed;
+use openinfer_sample::{SamplingParams, mix_seed};
 use tokio::sync::mpsc;
 
+use crate::config::GLM52_VOCAB;
 use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
     GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, Glm52StepShape,
@@ -493,11 +494,21 @@ fn launch_ahead_flags(
             .iter()
             .flat_map(|rank_slots| rank_slots.iter().flatten())
             .all(|active| {
-                active.req.params.is_greedy()
+                takes_argmax(&active.req.params)
                     && active.state.feed_want() == 1
                     && active.state.next_input_at(0).position + 1 < max_model_len
             });
     Glm52StepFlags { consume, lease }
+}
+
+/// Whether a request's committed rows take the fused argmax — the shared
+/// effectively-greedy predicate over the GLM vocab (a `top_p <= 1/vocab`
+/// nucleus holds only the argmax token; routing it to the sampler would make
+/// bf16-tied maxima stochastic, diverging from `select_batch`'s semantics).
+/// The SAME predicate gates lease-granting and sampling-row collection, which
+/// is what keeps "sampled row never rides a launch-ahead step" structural.
+fn takes_argmax(params: &SamplingParams) -> bool {
+    openinfer_sample::effectively_greedy(params, GLM52_VOCAB)
 }
 
 /// The step rows a rank samples instead of argmaxes: walk the shape's
@@ -515,7 +526,7 @@ fn collect_sampling_rows(shape: &Glm52StepShape, rank_slots: &RankSlots) -> Vec<
             end += 1;
         }
         if let Some(active) = &rank_slots[slot]
-            && !active.req.params.is_greedy()
+            && !takes_argmax(&active.req.params)
             && let Some(offset) = active.state.sampling_row(end - row)
         {
             sampling.push(Glm52RowSample {
@@ -1076,6 +1087,15 @@ mod launch_ahead_flag_tests {
             ..Default::default()
         });
         assert!(!launch_ahead_flags(&shapes, None, false, true, false, &sampled, 4096).lease);
+
+        // An effectively-greedy request (top_p nucleus <= 1/vocab holds only
+        // the argmax token) takes the argmax path, so it may ride the lease.
+        let tiny_top_p = decoding_fleet(openinfer_sample::SamplingParams {
+            temperature: 0.7,
+            top_p: 0.5 / GLM52_VOCAB as f32,
+            ..Default::default()
+        });
+        assert!(launch_ahead_flags(&shapes, None, false, true, false, &tiny_top_p, 4096).lease);
     }
 }
 
@@ -1505,6 +1525,34 @@ mod tests {
         // (row 1 + offset 2 = 3, first generated token → step 0). Slot 3's
         // mid-prompt span and slot 2's greedy row contribute nothing.
         assert_eq!(picked, vec![(0, 1), (3, 0)]);
+    }
+
+    #[test]
+    fn effectively_greedy_rows_take_the_argmax_path() {
+        // temperature > 0 but the top_p nucleus (<= 1/vocab) holds only the
+        // argmax token: the row must NOT be collected for the sampler — the
+        // FlashInfer pass could pick a different bf16-tied maximum, whereas
+        // `select_batch` pins this case to the deterministic argmax.
+        let shape = Glm52StepShape {
+            bucket: 1,
+            slots: [0; GLM52_MAX_BATCH_PER_RANK],
+            active_rows: 1,
+        };
+        let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
+        let mut state = Glm52SlotState::new(vec![10], 8, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        rank_slots[0] = Some(ActiveRequest {
+            req: request(
+                vec![10],
+                openinfer_sample::SamplingParams {
+                    top_p: 0.5 / GLM52_VOCAB as f32,
+                    ..sampled(0.8)
+                },
+                8,
+            ),
+            state,
+        });
+        assert!(collect_sampling_rows(&shape, &rank_slots).is_empty());
     }
 
     #[test]
