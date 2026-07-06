@@ -3887,6 +3887,7 @@ dependencies = [
  "memmap2",
  "openinfer-core",
  "openinfer-kernels",
+ "openinfer-sample",
  "safetensors",
  "serde_json",
  "sha2 0.11.0",

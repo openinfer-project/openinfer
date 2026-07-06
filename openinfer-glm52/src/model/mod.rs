@@ -25,7 +25,8 @@ use openinfer_kernels::ops::{
     embedding_rows_into, glm52_flashmla_sparse_decode_num_sm_parts,
     glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
 };
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStatesRef};
+use openinfer_sample::{BatchSamplingRow, BatchSamplingScratch, gpu_sample_batch_into, mix_seed};
 
 use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
 use crate::config::{
@@ -214,6 +215,12 @@ pub(crate) struct Glm52RankModel {
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
     token_ids: CudaSlice<u32>,
+    /// FlashInfer batch-sampling buffers for the non-greedy rows, sized for
+    /// the max bucket × vocab and shared by every bucket (the sampling pass
+    /// runs outside the captured graphs, so pointer stability per bucket is
+    /// not required). Allocated at build — a mid-serving step must never hit
+    /// the allocator.
+    sampling_scratch: BatchSamplingScratch,
     /// In-flight speculative next-step replay, if any (see `decode_step`).
     speculated: Option<Glm52SpeculatedStep>,
     /// What the per-row `positions` device buffer currently holds (padding
@@ -495,13 +502,17 @@ impl Glm52RankModel {
             cos: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             sin: ctx.stream.alloc_zeros::<bf16>(batch * GLM52_ROPE_HALF)?,
             token_ids: ctx.stream.alloc_zeros::<u32>(batch)?,
+            sampling_scratch: BatchSamplingScratch::new(ctx, batch, GLM52_VOCAB)?,
             speculated: None,
             device_positions: [0; GLM52_MAX_BATCH_PER_RANK],
         })
     }
 
     /// One lock-step step: feed `inputs[row]` = the `(token, position)` each
-    /// forwarded row carries, return the greedy next-token id per ROW. Enters
+    /// forwarded row carries, return the next-token id per ROW (the fused
+    /// greedy argmax, overwritten for the coordinator's `sampling` rows by a
+    /// post-graph FlashInfer sampling pass — see [`Self::sample_rows_into`]).
+    /// Enters
     /// 75 MoE collectives — every other rank must be stepping concurrently
     /// WITH THE SAME BUCKET (`shape.bucket`): the coordinator agrees the
     /// bucket globally per step. Row `r` addresses the cache slot
@@ -523,6 +534,7 @@ impl Glm52RankModel {
     /// decode graph; the ceiling is the ~100 s DeepEP device timeout against
     /// a capture window of tens of ms — already proven by the mid-serving
     /// tier-crossing capture).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_step(
         &mut self,
         ctx: &DeviceContext,
@@ -531,7 +543,18 @@ impl Glm52RankModel {
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         flags: crate::runner::Glm52StepFlags,
+        sampling: &[crate::runner::Glm52RowSample],
+        seed: u64,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
+        // A launch-ahead speculation feeds this step's ARGMAX token to the
+        // next step, so it can never coexist with a sampled row — the
+        // coordinator withholds the lease while any non-greedy request is
+        // active, and a violation here is a protocol bug.
+        ensure!(
+            sampling.is_empty() || (!flags.consume && !flags.lease),
+            "GLM5.2 sampling rows cannot ride a launch-ahead step (the speculation feeds the \
+             argmax token, not the sampled one)"
+        );
         let batch = shape.bucket;
         if flags.consume {
             // Launch-ahead fast path: the coordinator says this step IS the
@@ -565,7 +588,90 @@ impl Glm52RankModel {
             self.speculated = None;
             self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape)?;
         }
-        self.decode_step_harvest(ctx, inputs, shape, flags.lease)
+        let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
+        self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
+        Ok(outputs)
+    }
+
+    /// Overwrite the sampled rows' tokens: a non-greedy request's committed
+    /// row takes a FlashInfer temperature/top-k/top-p/min_p pass over the
+    /// step's logits instead of the fused argmax. Unseeded rows ride one
+    /// batched call under the step seed; a seeded row is its own single-row
+    /// call with `mix_seed(request_seed, step)` — the same replayable-stream
+    /// contract as `openinfer_sample::select_batch`.
+    fn sample_rows_into(
+        &mut self,
+        ctx: &DeviceContext,
+        shape: Glm52StepShape,
+        sampling: &[crate::runner::Glm52RowSample],
+        seed: u64,
+        outputs: &mut [u32; GLM52_MAX_BATCH_PER_RANK],
+    ) -> Result<()> {
+        if sampling.is_empty() {
+            return Ok(());
+        }
+        for pair in sampling.windows(2) {
+            ensure!(
+                pair[0].row < pair[1].row,
+                "GLM5.2 sampling rows must be strictly ascending: {sampling:?}"
+            );
+        }
+        for s in sampling {
+            ensure!(
+                s.row < shape.active_rows,
+                "GLM5.2 sampling row {} outside the step's {} active rows",
+                s.row,
+                shape.active_rows
+            );
+            ensure!(
+                !s.params.is_greedy(),
+                "GLM5.2 greedy row {} routed to the sampler (coordinator bug)",
+                s.row
+            );
+        }
+        let bucket = self
+            .buckets
+            .iter()
+            .find(|bucket| bucket.rows == shape.bucket)
+            .expect("decode_step validated the bucket");
+        let logits = HiddenStatesRef {
+            data: bucket.scratch.logits.data(),
+            hidden_dim: GLM52_VOCAB,
+            seq_len: shape.bucket,
+        };
+        let as_row = |s: &crate::runner::Glm52RowSample| BatchSamplingRow {
+            row: s.row,
+            temperature: s.params.temperature,
+            top_k: s.params.top_k,
+            top_p: s.params.top_p,
+            min_p: s.params.min_p,
+        };
+        let unseeded: Vec<BatchSamplingRow> = sampling
+            .iter()
+            .filter(|s| s.params.seed.is_none())
+            .map(as_row)
+            .collect();
+        if !unseeded.is_empty() {
+            let tokens =
+                gpu_sample_batch_into(ctx, logits, &unseeded, seed, &mut self.sampling_scratch)?;
+            for (row, token) in unseeded.iter().zip(tokens) {
+                outputs[row.row] = token;
+            }
+        }
+        for s in sampling {
+            let Some(request_seed) = s.params.seed else {
+                continue;
+            };
+            let tokens = gpu_sample_batch_into(
+                ctx,
+                logits,
+                &[as_row(s)],
+                mix_seed(request_seed, s.step),
+                &mut self.sampling_scratch,
+            )?;
+            outputs[s.row] = tokens[0];
+        }
+        Ok(())
     }
 
     /// The non-leased step path: validate the shape, rewrite every per-step

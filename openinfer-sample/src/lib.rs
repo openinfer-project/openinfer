@@ -248,8 +248,11 @@ pub fn select_batch(
 }
 
 /// SplitMix64 over (seed, step): a distinct, well-mixed philox seed per
-/// request step, deterministic across runs and batch layouts.
-fn mix_seed(seed: u64, step: u64) -> u64 {
+/// request step, deterministic across runs and batch layouts. Public for the
+/// models that drive their own greedy path (see the module docs) and must
+/// reproduce [`select_batch`]'s seeded-row semantics: mix the request seed
+/// with the request-local step, one single-row call per seeded row.
+pub fn mix_seed(seed: u64, step: u64) -> u64 {
     let mut z = seed ^ step.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

@@ -242,7 +242,7 @@ fn mixed_batch_keeps_plain_rows_on_the_fast_path() {
     let ctx = DeviceContext::new().unwrap();
     let vocab = 16;
     let spread: Vec<f32> = (0..vocab).map(|i| i as f32 * 0.3).collect();
-    let rows: Vec<Vec<f32>> = vec![spread.clone(), spread.clone(), spread.clone()];
+    let rows: Vec<Vec<f32>> = vec![spread.clone(), spread.clone(), spread];
     let arena_mixed = make_arena(&ctx, &rows);
     let arena_plain = make_arena(&ctx, &rows[..2]);
     let mut scratch = SampleScratch::new(&ctx, vocab, rows.len()).unwrap();

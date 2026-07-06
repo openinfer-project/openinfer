@@ -71,6 +71,18 @@ impl Glm52StepFlags {
     }
 }
 
+/// One step row whose committed token is sampled instead of taking the fused
+/// greedy argmax: a non-greedy request's plain decode row, or the last row of
+/// its prompt-completing span. `step` is the request-local decode step
+/// (tokens generated so far) — a seeded request's philox seed mixes it so its
+/// tokens replay independently of batch composition.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Glm52RowSample {
+    pub(crate) row: usize,
+    pub(crate) params: openinfer_sample::SamplingParams,
+    pub(crate) step: u64,
+}
+
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
@@ -91,7 +103,8 @@ enum Glm52RankCommand {
     },
     /// One lock-step full-model step (75 MoE collectives inside): feed
     /// `inputs[row]` per forwarded row (a slot's span rows walk consecutive
-    /// positions), reply with the greedy next token per ROW. The coordinator
+    /// positions), reply with the next token per ROW (greedy argmax, or a
+    /// sampling pass for the rows in `sampling`). The coordinator
     /// sends this to every rank each global step with the SAME batch bucket
     /// in `shape` (the collectives require every rank to agree on the step's
     /// global row count) — padding rows ride free slots and their outputs
@@ -100,6 +113,11 @@ enum Glm52RankCommand {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
         flags: Glm52StepFlags,
+        /// Rows sampled instead of argmaxed (non-greedy requests; empty on
+        /// the all-greedy fast path), and the step's philox seed for their
+        /// unseeded members.
+        sampling: Vec<Glm52RowSample>,
+        seed: u64,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
     },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
@@ -212,6 +230,8 @@ impl Glm52RankWorker {
         inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         flags: Glm52StepFlags,
+        sampling: Vec<Glm52RowSample>,
+        seed: u64,
     ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -219,6 +239,8 @@ impl Glm52RankWorker {
                 inputs: Box::new(inputs),
                 shape,
                 flags,
+                sampling,
+                seed,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -511,6 +533,8 @@ impl Glm52RankThreadState {
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         flags: Glm52StepFlags,
+        sampling: &[Glm52RowSample],
+        seed: u64,
     ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -521,9 +545,16 @@ impl Glm52RankThreadState {
             .ep8
             .as_mut()
             .context("GLM5.2 step before setup_comm")?;
-        runtime
-            .model
-            .decode_step(&dev_ctx, &runtime.aux_ctx, ep8, inputs, shape, flags)
+        runtime.model.decode_step(
+            &dev_ctx,
+            &runtime.aux_ctx,
+            ep8,
+            inputs,
+            shape,
+            flags,
+            sampling,
+            seed,
+        )
     }
 }
 
@@ -546,9 +577,11 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 inputs,
                 shape,
                 flags,
+                sampling,
+                seed,
                 resp,
             } => {
-                let _ = resp.send(state.step(&inputs, shape, flags));
+                let _ = resp.send(state.step(&inputs, shape, flags, &sampling, seed));
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));
