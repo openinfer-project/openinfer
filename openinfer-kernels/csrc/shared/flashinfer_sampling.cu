@@ -90,6 +90,7 @@ extern "C" int gpu_chain_speculative_sampling_cuda(
     int* output_token_ids, int* output_accepted_num, int* output_emitted_num,
     int batch_size, int num_speculative_tokens, int vocab_size, int onehot_draft,
     uint64_t seed, uint64_t offset, cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   if (onehot_draft) {
     const size_t total = static_cast<size_t>(batch_size) * num_speculative_tokens;
     cudaError_t err = cudaMemsetAsync(
@@ -110,6 +111,7 @@ extern "C" int gpu_chain_speculative_sampling_cuda(
       vocab_size, /*deterministic=*/true, /*seed_arr=*/nullptr, seed,
       /*offset_arr=*/nullptr, offset, stream);
   return static_cast<int>(err);
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 // Shared front half of the batched sampling pipeline: gather the requested
@@ -178,10 +180,12 @@ extern "C" int gpu_verify_probs_flashinfer_cuda(
     uint8_t* topk_row_states_scratch, void* softmax_workspace,
     size_t softmax_workspace_bytes, int n_rows, int vocab_size, int has_top_k_filter,
     int has_top_p_filter, cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   return gather_softmax_renorm_flashinfer(
       logits, row_indices, probs_out, temperature_arr, top_k_arr, top_p_arr,
       topk_row_states_scratch, softmax_workspace, softmax_workspace_bytes, n_rows,
       vocab_size, has_top_k_filter != 0, has_top_p_filter != 0, stream);
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 extern "C" int gpu_sample_batch_flashinfer_cuda(

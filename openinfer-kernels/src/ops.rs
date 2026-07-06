@@ -73,7 +73,9 @@ pub use sampling::{
     argmax_bf16_split_into, flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes,
     gpu_sample_batch_into, markov_step_argmax_into, markov_step_argmax_partials_len,
 };
-pub use spec_sampling::{gpu_spec_accept_into, gpu_verify_probs_into};
+pub use spec_sampling::{
+    SpecAcceptCounts, SpecAcceptScratch, gpu_spec_accept_into, gpu_verify_probs_into,
+};
 
 /// Calling thread's last FFI exception message, ready to append to an error;
 /// empty unless `result` is the -1 sentinel set by the C++ guard. Public for

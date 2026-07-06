@@ -124,13 +124,15 @@ pub fn gpu_verify_probs_into(
 ///
 /// `target_probs` must be post-filter probabilities (`gpu_verify_probs_into`),
 /// `batch x (K+1) x vocab`; `draft_probs` is `batch x K x vocab` scratch.
-/// One philox draw sequence per row; pass a fresh `seed`/`offset` per step
-/// (same discipline as the batched sampler).
 ///
-/// Returns `(accepted, emitted)` per row. **`emitted` is the accepted-prefix
-/// length** (what the commit logic consumes); `accepted` keeps counting
-/// hypothetical acceptances *past* the first rejection — it is FlashInfer's
-/// acceptance-rate telemetry, not a commit signal.
+/// **Seeded requests are not representable here.** The chain kernel folds the
+/// row index into the philox subsequence, so a fixed-seed request's draw
+/// stream depends on batch composition — the exact replay trap the batched
+/// sampler documents and dodges with per-row calls, and a per-row path does
+/// not exist for the chain. Callers must keep seeded requests off the
+/// speculative path entirely (a gate the verify scheduler enforces the same
+/// way it already keeps min_p rows off it). Pass a fresh `seed`/`offset` per
+/// verify step for the unseeded rows.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_spec_accept_into(
     ctx: &DeviceContext,
@@ -144,10 +146,16 @@ pub fn gpu_spec_accept_into(
     onehot_draft: bool,
     seed: u64,
     offset: u64,
-) -> Result<(Vec<i32>, Vec<i32>)> {
+    scratch: &mut SpecAcceptScratch,
+) -> Result<SpecAcceptCounts> {
     ensure!(
         batch > 0 && num_spec_tokens > 0 && vocab > 0,
         "spec accept requires batch > 0, K > 0, and vocab > 0"
+    );
+    ensure!(
+        batch <= scratch.max_batch,
+        "spec accept scratch too small: batch {batch} > capacity {}",
+        scratch.max_batch
     );
     ensure!(
         draft_probs.len() >= batch * num_spec_tokens * vocab
@@ -156,16 +164,18 @@ pub fn gpu_spec_accept_into(
             && output_token_ids.len() >= batch * (num_spec_tokens + 1),
         "spec accept buffer too small for batch {batch} x K {num_spec_tokens} x vocab {vocab}"
     );
-    // The kernel accumulates into the counters, so they start at zero.
-    let mut accepted: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
-    let mut emitted: CudaSlice<i32> = ctx.stream.alloc_zeros(batch)?;
+    // The kernel accumulates into the counters, so they must start at zero on
+    // every call — memset instead of a fresh allocation (this runs every
+    // verify step; scratch buffers are allocate-once by convention).
+    ctx.stream.memset_zeros(&mut scratch.accepted)?;
+    ctx.stream.memset_zeros(&mut scratch.emitted)?;
     {
         let (dp, _g1) = draft_probs.device_ptr_mut(&ctx.stream);
         let (ids, _g2) = draft_token_ids.device_ptr(&ctx.stream);
         let (tp, _g3) = target_probs.device_ptr_mut(&ctx.stream);
         let (out, _g4) = output_token_ids.device_ptr_mut(&ctx.stream);
-        let (acc, _g5) = accepted.device_ptr_mut(&ctx.stream);
-        let (emi, _g6) = emitted.device_ptr_mut(&ctx.stream);
+        let (acc, _g5) = scratch.accepted.device_ptr_mut(&ctx.stream);
+        let (emi, _g6) = scratch.emitted.device_ptr_mut(&ctx.stream);
         let err = unsafe {
             ffi::gpu_chain_speculative_sampling_cuda(
                 dp as *mut f32,
@@ -185,13 +195,50 @@ pub fn gpu_spec_accept_into(
         };
         ensure!(
             err == 0,
-            "chain speculative sampling failed: cudaError {err}"
+            "chain speculative sampling failed with error {err}{}",
+            crate::ops::ffi_exception_message(err)
         );
     }
-    let accepted_h = ctx.stream.clone_dtoh(&accepted)?;
-    let emitted_h = ctx.stream.clone_dtoh(&emitted)?;
+    let accepted_view = scratch.accepted.slice(..batch);
+    let emitted_view = scratch.emitted.slice(..batch);
+    let acceptance_telemetry = ctx.stream.clone_dtoh(&accepted_view)?;
+    let emitted = ctx.stream.clone_dtoh(&emitted_view)?;
     ctx.sync()?;
-    Ok((accepted_h, emitted_h))
+    Ok(SpecAcceptCounts {
+        emitted,
+        acceptance_telemetry,
+    })
+}
+
+/// Per-row results of one chain-rejection call, named so the commit signal
+/// and the telemetry cannot be swapped silently (they are both `Vec<i32>`).
+pub struct SpecAcceptCounts {
+    /// The accepted-prefix length per row — **the commit signal**: the row's
+    /// output holds `emitted` accepted drafts plus one resampled/bonus token,
+    /// then `-1` filler.
+    pub emitted: Vec<i32>,
+    /// FlashInfer's acceptance-rate telemetry: keeps counting hypothetical
+    /// acceptances *past* the first rejection. Never commit on this.
+    pub acceptance_telemetry: Vec<i32>,
+}
+
+/// Allocate-once device counters for [`gpu_spec_accept_into`] (it runs every
+/// verify step; per-call `alloc_zeros` is against the scratch convention).
+pub struct SpecAcceptScratch {
+    accepted: CudaSlice<i32>,
+    emitted: CudaSlice<i32>,
+    max_batch: usize,
+}
+
+impl SpecAcceptScratch {
+    pub fn new(ctx: &DeviceContext, max_batch: usize) -> Result<Self> {
+        ensure!(max_batch > 0, "spec accept scratch requires max_batch > 0");
+        Ok(Self {
+            accepted: ctx.stream.alloc_zeros(max_batch)?,
+            emitted: ctx.stream.alloc_zeros(max_batch)?,
+            max_batch,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +247,7 @@ mod tests {
 
     use super::super::sampling::test_support::{ARENA_ROWS, VOCAB, arena_with_rows, flat_row};
     use super::super::sampling::{BatchSamplingRow, BatchSamplingScratch};
-    use super::{gpu_spec_accept_into, gpu_verify_probs_into};
+    use super::{SpecAcceptScratch, gpu_spec_accept_into, gpu_verify_probs_into};
     use crate::tensor::DeviceContext;
 
     #[test]
@@ -299,7 +346,8 @@ mod tests {
             ctx.stream.alloc_zeros(2 * k * VOCAB).expect("draft probs");
         let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(2 * (k + 1)).expect("out");
 
-        let (accepted, emitted) = gpu_spec_accept_into(
+        let mut scratch = SpecAcceptScratch::new(&ctx, 2).expect("scratch");
+        let counts = gpu_spec_accept_into(
             &ctx,
             &mut draft_probs,
             &drafts_d,
@@ -311,8 +359,10 @@ mod tests {
             /*onehot_draft=*/ true,
             0x5eed,
             0,
+            &mut scratch,
         )
         .expect("spec accept");
+        let (accepted, emitted) = (counts.acceptance_telemetry, counts.emitted);
         let out_h = ctx.stream.clone_dtoh(&out).expect("D2H");
         ctx.sync().expect("sync");
 
@@ -327,7 +377,10 @@ mod tests {
         // acceptances past the rejection - telemetry, asserted only >= 0).
         assert_eq!(&out_h[3..], &[555, -1, -1], "row1 {:?}", &out_h[3..]);
         assert_eq!(emitted[1], 0, "row1 emitted prefix");
-        assert!(accepted[1] >= 0, "row1 telemetry sane");
+        // Telemetry keeps counting past the rejection: pos 1's draft (200) is
+        // hypothetically accepted (target pos1 mass is 1.0 on 200), so the
+        // acceptance counter reads exactly 1 while the commit signal reads 0.
+        assert_eq!(accepted[1], 1, "row1 acceptance telemetry");
     }
 
     #[test]
@@ -365,7 +418,8 @@ mod tests {
             .expect("draft probs");
         let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(batch * (k + 1)).expect("out");
 
-        let (_accepted, emitted) = gpu_spec_accept_into(
+        let mut scratch = SpecAcceptScratch::new(&ctx, batch).expect("scratch");
+        let counts = gpu_spec_accept_into(
             &ctx,
             &mut draft_probs,
             &drafts_d,
@@ -377,8 +431,10 @@ mod tests {
             /*onehot_draft=*/ true,
             0xC0FFEE,
             0,
+            &mut scratch,
         )
         .expect("spec accept");
+        let emitted = counts.emitted;
         let out_h = ctx.stream.clone_dtoh(&out).expect("D2H");
         ctx.sync().expect("sync");
 
@@ -399,5 +455,56 @@ mod tests {
             (0.63..=0.77).contains(&rate),
             "acceptance rate {rate} outside [0.63, 0.77] (expected 0.70)"
         );
+    }
+
+    #[test]
+    fn spec_accept_explicit_draft_probs_corner_points() {
+        // onehot_draft = false: the caller supplies the true proposal
+        // distribution. Row 0: q puts 0.5 on the draft while the target puts
+        // 1.0 there -> accept probability min(1, 1.0/0.5) = 1, certain accept;
+        // the bonus position is deterministic on 777. Row 1: q puts 1.0 on the
+        // draft while the target puts 0 there -> certain rejection; the
+        // residual relu(target - draft) is exactly {555: 1.0}.
+        let ctx = DeviceContext::new().expect("create CUDA context");
+        let k = 1usize;
+        let mut target = vec![0.0f32; 2 * (k + 1) * VOCAB];
+        target[100] = 1.0; // row0 pos0 -> all mass on the draft
+        target[VOCAB + 777] = 1.0; // row0 bonus -> 777
+        let r1 = 2 * VOCAB;
+        target[r1 + 555] = 1.0; // row1 pos0: no mass on the draft
+        target[r1 + VOCAB + 300] = 1.0; // never reached
+        let mut target_d: CudaSlice<f32> =
+            ctx.stream.clone_htod(&target).expect("target probs H2D");
+        let mut draft = vec![0.0f32; 2 * k * VOCAB];
+        draft[100] = 0.5; // row0: q(draft) = 0.5
+        draft[200] = 0.5;
+        draft[VOCAB + 100] = 1.0; // row1: q(draft) = 1.0
+        let mut draft_d: CudaSlice<f32> = ctx.stream.clone_htod(&draft).expect("draft probs H2D");
+        let drafts_d = ctx.stream.clone_htod(&[100i32, 100]).expect("draft ids");
+        let mut out: CudaSlice<i32> = ctx.stream.alloc_zeros(2 * (k + 1)).expect("out");
+        let mut scratch = SpecAcceptScratch::new(&ctx, 2).expect("scratch");
+
+        let counts = gpu_spec_accept_into(
+            &ctx,
+            &mut draft_d,
+            &drafts_d,
+            &mut target_d,
+            &mut out,
+            2,
+            k,
+            VOCAB,
+            /*onehot_draft=*/ false,
+            0xFACE,
+            0,
+            &mut scratch,
+        )
+        .expect("spec accept");
+        let out_h = ctx.stream.clone_dtoh(&out).expect("D2H");
+        ctx.sync().expect("sync");
+
+        assert_eq!(&out_h[..2], &[100, 777], "row0 {:?}", &out_h[..2]);
+        assert_eq!(counts.emitted[0], 1, "row0 emitted prefix");
+        assert_eq!(&out_h[2..], &[555, -1], "row1 {:?}", &out_h[2..]);
+        assert_eq!(counts.emitted[1], 0, "row1 emitted prefix");
     }
 }
