@@ -278,7 +278,7 @@ fn dspark_propose_batched_slot_isolation() -> Result<()> {
     let cap_a = captured_row(3)?;
 
     let run = |cap_b_salt: u32,
-                   anchor_b_base: u32|
+               anchor_b_base: u32|
      -> Result<(
         Vec<[u32; GLM52_DSPARK_DRAFTS]>,
         Vec<[u32; GLM52_DSPARK_DRAFTS]>,
