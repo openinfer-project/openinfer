@@ -330,6 +330,45 @@ impl Glm52DsparkModel {
         self.cache_len
     }
 
+    /// Zero-weight model at the checkpoint's exact geometry, for perf smoke
+    /// tests without the checkpoint — GPU kernel time is value-independent.
+    #[cfg(test)]
+    pub(crate) fn synthetic(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
+        let mat = |rows: usize, cols: usize| -> Result<DeviceMatrix> {
+            Ok(DeviceMatrix {
+                data: ctx.stream.alloc_zeros(rows * cols)?,
+                rows,
+                cols,
+            })
+        };
+        let mut layers = Vec::with_capacity(DSPARK_LAYERS);
+        for _ in 0..DSPARK_LAYERS {
+            layers.push(DsparkLayer {
+                input_ln: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
+                qkv: mat(3 * DSPARK_QKV_DIM, GLM52_HIDDEN)?,
+                o_proj: mat(GLM52_HIDDEN, DSPARK_QKV_DIM)?,
+                q_norm: DeviceVec::zeros(ctx, DSPARK_HEAD_DIM)?,
+                k_norm: DeviceVec::zeros(ctx, DSPARK_HEAD_DIM)?,
+                post_ln: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
+                gate_up: mat(2 * DSPARK_INTER, GLM52_HIDDEN)?,
+                down: mat(GLM52_HIDDEN, DSPARK_INTER)?,
+            });
+        }
+        let (cos_cache, sin_cache) =
+            precompute_rope(ctx, DSPARK_HEAD_DIM, cache_len, DSPARK_ROPE_THETA)?;
+        Ok(Self {
+            layers,
+            norm: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
+            hidden_norm: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
+            fc: mat(GLM52_HIDDEN, GLM52_DSPARK_CONTEXT_DIM)?,
+            markov_w1: mat(GLM52_VOCAB, DSPARK_MARKOV_RANK)?,
+            markov_w2: mat(GLM52_VOCAB, DSPARK_MARKOV_RANK)?,
+            cos_cache,
+            sin_cache,
+            cache_len,
+        })
+    }
+
     /// Propose `GLM52_DSPARK_DRAFTS` draft tokens for each state, batched.
     ///
     /// Dense ops (embedding, norms, q/o/mlp GEMMs, logits) run once over the
