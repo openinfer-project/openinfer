@@ -93,10 +93,13 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
 /// the post-probe allocations the exact arena ledger does not model: the
 /// MLA W_UK/W_UV bf16 dequant during build (~1.1 GiB net over the freed fp8
 /// kv_b), DeepEP collective buffers, the 8 whole-step graph instantiations,
-/// cuBLAS workspaces, and allocator fragmentation. Conservative; the
-/// post-build re-probe below turns any drift into a launch failure instead
-/// of a mid-serving OOM.
-const GLM52_VRAM_RESERVE_BYTES: usize = 4 << 30;
+/// cuBLAS workspaces, and allocator fragmentation. Measured on 8×H200
+/// (jz-38, 2026-07-06): the worst rank's non-arena post-probe allocations
+/// came to ~3.05 GiB, so 5 GiB leaves ~2 GiB of post-build headroom over
+/// the [`GLM52_POST_BUILD_MIN_FREE_BYTES`] floor; the post-build re-probe
+/// below turns any drift into a launch failure instead of a mid-serving
+/// OOM.
+const GLM52_VRAM_RESERVE_BYTES: usize = 5 << 30;
 
 /// Extra reserve when the DSpark drafter is enabled: the replicated draft
 /// weights (~3.8 GiB bf16) plus its dense forward scratch, which load after
