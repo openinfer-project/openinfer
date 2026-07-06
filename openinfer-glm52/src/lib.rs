@@ -298,13 +298,32 @@ fn start_engine(
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
     build_rank_models(&loaded.workers, max_model_len)?;
-    let dspark_enabled = if let Some(dspark_path) = dspark_path {
-        load_dspark_drafters(&loaded.workers, dspark_path)?;
-        true
-    } else {
-        false
+    // From here the DeepEP contexts exist and their destruction is COLLECTIVE:
+    // a startup failure must broadcast Shutdown to every rank BEFORE the
+    // workers' sequential Drop joins them one by one (the same teardown
+    // contract as the coordinator exit) — otherwise the first dropped worker
+    // blocks in the destroy barrier waiting for ranks that were never told to
+    // shut down, and the launch error surfaces only after the ~100 s DeepEP
+    // device timeout.
+    let post_comm_startup = || -> Result<bool> {
+        let dspark_enabled = if let Some(dspark_path) = dspark_path {
+            load_dspark_drafters(&loaded.workers, dspark_path)?;
+            true
+        } else {
+            false
+        };
+        ensure_post_build_headroom(&loaded.workers)?;
+        Ok(dspark_enabled)
     };
-    ensure_post_build_headroom(&loaded.workers)?;
+    let dspark_enabled = match post_comm_startup() {
+        Ok(dspark_enabled) => dspark_enabled,
+        Err(err) => {
+            for worker in &loaded.workers {
+                let _ = worker.request_shutdown();
+            }
+            return Err(err);
+        }
+    };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
