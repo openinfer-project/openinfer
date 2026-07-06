@@ -11,6 +11,8 @@ mod bookend;
 mod config;
 mod dense;
 mod dspark;
+#[cfg(test)]
+mod dspark_smoke;
 mod fp8;
 mod indexer;
 #[cfg(test)]
