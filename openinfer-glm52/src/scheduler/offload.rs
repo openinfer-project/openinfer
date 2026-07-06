@@ -1,0 +1,102 @@
+//! Host-tier KV offload glue: the coordinator's two touch points with the
+//! shared pegaflow pool. Restore runs at admission (a step boundary — every
+//! rank is joined, so blocking on the load is safe and the loaded pages race
+//! nothing); save runs on request release, fire-and-forget, with block
+//! guards pinning the pages until the D2H copy lands.
+//!
+//! Both legs are cache maintenance, never a correctness dependency: every
+//! failure degrades to a full prefill (or a forfeited future hit) with a
+//! warn, in contrast to the pool-invariant breaks around them that fail the
+//! step. The launch-time contract (`Glm52LaunchOptions` validation) already
+//! guarantees offload implies the prefix cache is on.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use openinfer_kv_cache::{BlockPool, PrefixProbe, RequestKv};
+use openinfer_kv_offload::{OffloadEngine, QueryOutcome};
+
+/// Distinguishes concurrent queries inside pegaflow's bookkeeping; nothing
+/// joins on it, so a process-local counter is enough.
+static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Restore the prompt-prefix blocks the GPU cache no longer holds from the
+/// host tier: probe → query → load into reserved pool pages → commit as
+/// matchable prefix. Blocks on the load — admission is a step boundary, and
+/// the request's first prefill chunk must not read half-restored pages.
+///
+/// Returns the probe, which holds the GPU-hit and freshly-committed blocks
+/// alive; the caller keeps it across `match_and_add_prefix` so the restored
+/// prefix cannot be evicted before it is re-matched.
+pub(super) fn restore_host_prefix(
+    engine: &OffloadEngine,
+    pool: &BlockPool,
+    prompt_tokens: &[u32],
+) -> PrefixProbe {
+    let mut probe = pool.probe_prefix(prompt_tokens.to_vec(), None);
+    let hashes = probe.cpu_query_hashes();
+    if hashes.is_empty() {
+        return probe;
+    }
+    let req_key = format!("glm52-admit-{}", QUERY_SEQ.fetch_add(1, Ordering::Relaxed));
+    let hit = match engine.query(&req_key, &hashes) {
+        Ok(QueryOutcome::Ready(hit)) => hit,
+        Ok(QueryOutcome::Loading) => {
+            // Host-memory-only setup: pegaflow has no deeper tier to fetch
+            // from, so an async outcome means a config drift worth seeing.
+            log::warn!("GLM5.2 host-tier query went async in a host-only setup; skipping restore");
+            return probe;
+        }
+        Err(err) => {
+            log::warn!("GLM5.2 host-tier query failed (prefill from scratch): {err}");
+            return probe;
+        }
+    };
+    let Some(lease) = hit.lease else {
+        return probe;
+    };
+    let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) else {
+        // Block pressure: the pool cannot hold the restored prefix right
+        // now. Prefill recomputes it — correct, just colder.
+        engine.release_query_lease(lease);
+        return probe;
+    };
+    let page_ids = reservation.page_ids();
+    let restored = reservation.len();
+    match engine.load(lease, page_ids) {
+        Ok(handle) => match handle.wait() {
+            Ok(()) => {
+                pool.commit_loaded_blocks(&mut probe, reservation);
+                // The only signal separating a host-tier restore from a plain
+                // GPU prefix hit — the parity/eviction gates key on it.
+                log::info!("GLM5.2 host-tier restore: {restored} blocks committed");
+            }
+            Err(err) => {
+                log::warn!("GLM5.2 host-tier load failed (prefill from scratch): {err}");
+            }
+        },
+        Err(err) => {
+            log::warn!("GLM5.2 host-tier load submit failed (prefill from scratch): {err}");
+        }
+    }
+    probe
+}
+
+/// Send the request's freshly-sealed blocks to the host tier before its pool
+/// pages release. Skips the prefix-matched head — those blocks were restored
+/// from the host tier or saved when their producing request released, so
+/// they are already resident there. Fire-and-forget: the guards keep the
+/// pages pinned (unreusable) until the D2H copy lands, and the last step
+/// that wrote them has already joined, so the bytes are final.
+pub(super) fn save_sealed_on_release(engine: &OffloadEngine, kv: &RequestKv) {
+    let sealed = kv.assigned_block_hashes();
+    let matched = kv.prefix_matched_blocks();
+    if sealed.len() <= matched {
+        return;
+    }
+    let fresh = &sealed[matched..];
+    let block_ids: Vec<i32> = fresh.iter().map(|(id, _)| *id).collect();
+    let block_hashes: Vec<Vec<u8>> = fresh.iter().map(|(_, hash)| hash.to_vec()).collect();
+    let mut guards = kv.assigned_block_guards();
+    let guards = guards.split_off(matched);
+    engine.save(&block_ids, &block_hashes, guards);
+}

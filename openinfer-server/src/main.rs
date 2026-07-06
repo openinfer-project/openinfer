@@ -143,6 +143,13 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 dspark_draft_model_path: args.dflash_draft_model_path.clone(),
                 max_model_len: args.max_model_len,
                 no_prefix_cache: args.no_prefix_cache,
+                kv_offload: args
+                    .kv_offload
+                    .then(|| openinfer_glm52::Glm52KvOffloadOptions {
+                        pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
+                            as usize,
+                        use_hugepages: args.kv_offload_hugepages,
+                    }),
             },
         )
         .context("failed to start GLM5.2 engine")?,
@@ -162,6 +169,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             let offload = if args.kv_offload {
                 let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
                 let mut offload = Qwen3OffloadOptions::enabled(bytes);
+                offload.use_hugepages = args.kv_offload_hugepages;
                 if let (Some(metaserver_addr), Some(advertise_addr)) = (
                     args.kv_p2p_metaserver_addr.clone(),
                     args.kv_p2p_advertise_addr.clone(),
