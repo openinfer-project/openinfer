@@ -113,7 +113,7 @@ code prompt, and if a bucket-4 step lands near ~30 ms that is ≈12 ms/token (1.
   crash-early pin, batched anchor-drop forward reusing target embed/lm_head, Markov loop at
   positions 1..=7), 5 in-graph capture copies at `GLM52_DSPARK_AUX_LAYERS = {7,22,38,54,69}`
   (see pin #5), rank-local `Draft` command (resets → appends → proposals, FIFO-ordered before
-  the next step), draft KV sized `GLM52_MAX_MODEL_LEN + 8`. The anchor-position invariant
+  the next step), draft KV sized `max_model_len + 8`. The anchor-position invariant
   (`anchor_pos == committed + pending`) is asserted in the draft — scheduler/draft drift
   crashes instead of proposing from the wrong rope phase. Cost: solo decode 22.50–22.56
   ms/step with the in-graph capture copies (M1 baseline 22.4–22.6 — free), 23.32–23.44 with
@@ -178,7 +178,7 @@ bring-up-critical semantics, so M2 doesn't rediscover qwen3's Bug 2:
    before the anchor.
 3. **Block position ids = `anchor_pos + k`** (`get_base_indices_for_anchored_blocks`), rope
    from the flat `rope_parameters.rope_theta = 8e6`. Same committed+context position walk as
-   qwen3; the draft never sees positions > 4096 under the current cap.
+   qwen3; the draft never sees positions past the launch-time `max_model_len` cap.
 4. **Markov loop: prev(k) = block token k−1, applied at positions 1..7.** Training builds
    `prev_token_ids = [b0, b0..b6]` and biases the whole block, but position 0 is dropped, so
    inference is 7 sequential steps: `prev = anchor → bias → argmax(position 1) = d1 → prev = d1

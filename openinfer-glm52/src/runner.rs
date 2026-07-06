@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use crate::dspark::{
     GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch, Glm52DsparkSlotState,
 };
+
 use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepShape};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::weights::{
@@ -42,6 +43,9 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) loaded_total_bytes: usize,
     pub(crate) resident_raw_bytes: usize,
     pub(crate) loaded_to_gpu: bool,
+    /// This rank's device free VRAM right after the weights landed — the
+    /// launch-time context-cap probe takes the fleet minimum.
+    pub(crate) free_vram_bytes: usize,
 }
 
 /// The coordinator's launch-ahead directives for one step — both are GLOBAL
@@ -76,6 +80,7 @@ enum Glm52RankCommand {
     /// Every rank must report success BEFORE anyone enters SetupComm — a
     /// build failure on one rank must never strand the others in NCCL init.
     BuildModel {
+        max_model_len: usize,
         resp: Sender<Result<()>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -103,6 +108,11 @@ enum Glm52RankCommand {
     LoadDspark {
         path: PathBuf,
         resp: Sender<Result<()>>,
+    },
+    /// Non-collective: report this rank's current free device VRAM (the
+    /// post-build headroom check).
+    FreeVram {
+        resp: Sender<Result<usize>>,
     },
     /// Rank-local draft round (no collectives; runs between global steps).
     /// `resets` clear slot draft states (request left / new admission),
@@ -175,10 +185,13 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn build_model_async(&self) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn build_model_async(&self, max_model_len: usize) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
-            .send(Glm52RankCommand::BuildModel { resp: resp_tx })
+            .send(Glm52RankCommand::BuildModel {
+                max_model_len,
+                resp: resp_tx,
+            })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
         Ok(resp_rx)
     }
@@ -219,6 +232,14 @@ impl Glm52RankWorker {
                 path: path.to_path_buf(),
                 resp: resp_tx,
             })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn free_vram_async(&self) -> Result<Receiver<Result<usize>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::FreeVram { resp: resp_tx })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
         Ok(resp_rx)
     }
@@ -284,9 +305,10 @@ struct Glm52RankRuntime {
 }
 
 /// This rank's DSpark lane: the replicated draft model, the shared forward
-/// scratch, and one draft state per slot (~350 MB each, all preallocated at
-/// load — a mid-serving draft round must never hit the allocator, and a
-/// transient OOM there would tear the whole engine down).
+/// scratch, and one draft state per slot — every buffer preallocated to the
+/// launch-time cap at load (the VRAM probe's ledger charged exactly this
+/// footprint), because a mid-serving draft round must never hit the
+/// allocator: a transient OOM there would tear the whole engine down.
 struct Glm52DsparkRank {
     model: Glm52DsparkModel,
     scratch: Glm52DsparkScratch,
@@ -325,24 +347,30 @@ impl Glm52RankThreadState {
             loaded.loaded_total_bytes,
             loaded.weights.total_bytes
         );
+        let free_vram_bytes = self.ctx.free_vram_bytes()?;
         let report = Glm52RankWeightLoadReport {
             rank: self.placement.rank,
             loaded_tensor_count: loaded.loaded_tensor_count,
             loaded_total_bytes: loaded.loaded_total_bytes,
             resident_raw_bytes: loaded.weights.total_bytes,
             loaded_to_gpu: true,
+            free_vram_bytes,
         };
         self.loaded = Some(loaded.weights);
         Ok(report)
     }
 
-    fn build_model(&mut self) -> Result<()> {
+    fn build_model(&mut self, max_model_len: usize) -> Result<()> {
         let mut weights = self
             .loaded
             .take()
             .context("GLM5.2 build_model called before weights were loaded")?;
         let dev_ctx = self.ctx.device_context()?;
-        let model = Box::new(Glm52RankModel::build(&dev_ctx, &mut weights)?);
+        let model = Box::new(Glm52RankModel::build(
+            &dev_ctx,
+            &mut weights,
+            max_model_len,
+        )?);
         ensure!(
             weights.expert_layers.is_empty(),
             "GLM5.2 rank {} left {} expert layers unconsumed after model build",
@@ -373,11 +401,11 @@ impl Glm52RankThreadState {
             "GLM5.2 rank {} DSpark drafter already loaded",
             self.placement.rank
         );
-        let model = Glm52DsparkModel::load(&dev_ctx, path)?;
-        let scratch = Glm52DsparkScratch::new(&dev_ctx)?;
+        let model = Glm52DsparkModel::load(&dev_ctx, path, runtime.model.max_model_len())?;
+        let scratch = Glm52DsparkScratch::new(&dev_ctx, model.cache_len())?;
         let mut slots = Vec::with_capacity(GLM52_MAX_BATCH_PER_RANK);
         for _ in 0..GLM52_MAX_BATCH_PER_RANK {
-            slots.push(Glm52DsparkSlotState::new(&dev_ctx)?);
+            slots.push(Glm52DsparkSlotState::new(&dev_ctx, model.cache_len())?);
         }
         runtime.dspark = Some(Glm52DsparkRank {
             model,
@@ -505,8 +533,11 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::LoadWeights { model_path, resp } => {
                 let _ = resp.send(state.load_weights(&model_path));
             }
-            Glm52RankCommand::BuildModel { resp } => {
-                let _ = resp.send(state.build_model());
+            Glm52RankCommand::BuildModel {
+                max_model_len,
+                resp,
+            } => {
+                let _ = resp.send(state.build_model(max_model_len));
             }
             Glm52RankCommand::SetupComm { unique_id, resp } => {
                 let _ = resp.send(state.setup_comm(&unique_id));
@@ -521,6 +552,9 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             }
             Glm52RankCommand::LoadDspark { path, resp } => {
                 let _ = resp.send(state.load_dspark(&path));
+            }
+            Glm52RankCommand::FreeVram { resp } => {
+                let _ = resp.send(state.ctx.free_vram_bytes());
             }
             Glm52RankCommand::Draft {
                 bucket,

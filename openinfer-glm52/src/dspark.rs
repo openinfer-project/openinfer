@@ -38,7 +38,7 @@ use openinfer_kernels::ops::{
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN};
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 /// Draft block width: anchor + 7 mask positions. Equals the top decode bucket
 /// — a full verify span is one bucket-8 step.
@@ -62,10 +62,31 @@ pub(crate) const GLM52_DSPARK_AUX_LAYERS: [usize; 5] = [7, 22, 38, 54, 69];
 pub(crate) const GLM52_DSPARK_CONTEXT_DIM: usize = GLM52_DSPARK_AUX_LAYERS.len() * GLM52_HIDDEN;
 
 /// The draft writes `block` transient rows past the committed+context length,
-/// and the last verifiable anchor sits at position `GLM52_MAX_MODEL_LEN - 1`
-/// — so the draft KV/rope tables need `block` positions of headroom past the
+/// and the last verifiable anchor sits at position `max_model_len - 1` — so
+/// the draft KV/rope tables need `block` positions of headroom past the
 /// target's context cap.
-const DSPARK_CACHE_LEN: usize = GLM52_MAX_MODEL_LEN + GLM52_DSPARK_BLOCK;
+pub(crate) fn dspark_cache_len(max_model_len: usize) -> usize {
+    max_model_len + GLM52_DSPARK_BLOCK
+}
+
+/// Exact GPU bytes the DSpark lane allocates on a rank for a given context
+/// cap — the same terms `load`/`Glm52DsparkScratch::new`/
+/// `Glm52DsparkSlotState::new` allocate (everything is preallocated to the
+/// cap at load: a mid-serving draft round never touches the allocator, so
+/// this ledger IS the allocation, not a shadow of it). Per slot: the
+/// per-layer draft KV, the pending captured-context rows, and the projected
+/// context pair; rank-wide: the varlen tail scratch and the rope tables.
+/// The launch-time VRAM probe charges this before deciding `max_model_len`.
+pub(crate) fn glm52_dspark_arena_bytes(max_model_len: usize) -> usize {
+    let cache_len = dspark_cache_len(max_model_len);
+    let bf16 = size_of::<half::bf16>();
+    let kv = DSPARK_LAYERS * 2 * DSPARK_QKV_DIM * cache_len * bf16;
+    let pending = GLM52_DSPARK_CONTEXT_DIM * cache_len * bf16;
+    let context = 2 * GLM52_HIDDEN * cache_len * bf16;
+    let tail = (GLM52_HIDDEN + 2 * DSPARK_QKV_DIM) * cache_len * bf16;
+    let rope = 2 * cache_len * DSPARK_HEAD_DIM * bf16;
+    GLM52_MAX_BATCH_PER_RANK * (kv + pending + context) + tail + rope
+}
 
 const DSPARK_LAYERS: usize = 5;
 const DSPARK_HEADS: usize = 64;
@@ -104,6 +125,9 @@ pub(crate) struct Glm52DsparkModel {
     markov_w2: DeviceMatrix,
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
+    /// Draft KV/rope capacity: the target's `max_model_len` plus one block of
+    /// transient headroom (see [`dspark_cache_len`]).
+    cache_len: usize,
 }
 
 /// Crash-early config pin: this module hardcodes the checkpoint's geometry,
@@ -176,8 +200,9 @@ fn ensure_matrix(m: &DeviceMatrix, name: &str, rows: usize, cols: usize) -> Resu
 }
 
 impl Glm52DsparkModel {
-    pub(crate) fn load(ctx: &DeviceContext, path: &Path) -> Result<Self> {
+    pub(crate) fn load(ctx: &DeviceContext, path: &Path, max_model_len: usize) -> Result<Self> {
         validate_config(path)?;
+        let cache_len = dspark_cache_len(max_model_len);
         let path_str = path
             .to_str()
             .context("dspark model path is not valid UTF-8")?;
@@ -284,7 +309,7 @@ impl Glm52DsparkModel {
         // loaded: the first two are byte-identical to the target's, the
         // confidence head is Phase 2.
         let (cos_cache, sin_cache) =
-            precompute_rope(ctx, DSPARK_HEAD_DIM, DSPARK_CACHE_LEN, DSPARK_ROPE_THETA)?;
+            precompute_rope(ctx, DSPARK_HEAD_DIM, cache_len, DSPARK_ROPE_THETA)?;
         ctx.sync()?;
 
         Ok(Self {
@@ -296,7 +321,13 @@ impl Glm52DsparkModel {
             markov_w2,
             cos_cache,
             sin_cache,
+            cache_len,
         })
+    }
+
+    /// The draft KV/rope capacity slot states must be allocated with.
+    pub(crate) fn cache_len(&self) -> usize {
+        self.cache_len
     }
 
     /// Propose `GLM52_DSPARK_DRAFTS` draft tokens for each state, batched.
@@ -348,9 +379,10 @@ impl Glm52DsparkModel {
             );
             let tail_len = context_len + block;
             ensure!(
-                state.committed_len + tail_len <= DSPARK_CACHE_LEN,
-                "dspark draft cache overflow: committed={}, tail={tail_len}, cap={DSPARK_CACHE_LEN}",
-                state.committed_len
+                state.committed_len + tail_len <= self.cache_len,
+                "dspark draft cache overflow: committed={}, tail={tail_len}, cap={}",
+                state.committed_len,
+                self.cache_len
             );
             context_lens.push(context_len);
         }
@@ -373,7 +405,7 @@ impl Glm52DsparkModel {
         // then hidden_norm — persisted in the state so every layer's tail
         // concat can read it.
         for (i, state) in states.iter_mut().enumerate() {
-            state.ensure_context_capacity(ctx, context_lens[i])?;
+            state.set_context_len(context_lens[i])?;
             state.pending.seq_len = context_lens[i];
             gemm_into_checked(ctx, &self.fc, &state.pending, &mut state.context_projected)?;
             rms_norm_batch_into(
@@ -408,7 +440,7 @@ impl Glm52DsparkModel {
                 let context_len = context_lens[i];
                 let tail_len = context_len + block;
                 let row_offset = i * block;
-                scratch.ensure_tail_capacity(ctx, tail_len)?;
+                scratch.set_tail_len(tail_len)?;
 
                 // tail_input = [context_hidden | normed block rows].
                 copy_hidden_token_range_into(
@@ -646,8 +678,10 @@ struct DsparkLayerKv {
 /// Per-slot draft state: the draft KV over committed tokens, the pending
 /// captured-context rows not yet projected, and the per-round projected
 /// context (persists across the layer loop, so it lives here, not in the
-/// shared scratch). ~350 MB per slot — allocated on a slot's first append
-/// after admission and dropped on reset.
+/// shared scratch). Everything is preallocated to `cache_len` at load — a
+/// mid-serving draft round must never hit the allocator (a transient OOM
+/// there would tear the whole engine down), and the launch-time VRAM probe
+/// already charged the full-cap footprint ([`glm52_dspark_arena_bytes`]).
 pub(crate) struct Glm52DsparkSlotState {
     layers: Vec<DsparkLayerKv>,
     /// Captured target hidden `[pending_len, 30720]` awaiting projection.
@@ -656,27 +690,30 @@ pub(crate) struct Glm52DsparkSlotState {
     committed_len: usize,
     context_projected: HiddenStates,
     context_hidden: HiddenStates,
+    /// The drafter's KV capacity ([`Glm52DsparkModel::cache_len`]) — the
+    /// pending-context growth cap and the overflow guard bound.
+    cache_len: usize,
 }
 
 impl Glm52DsparkSlotState {
-    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
         let mut layers = Vec::with_capacity(DSPARK_LAYERS);
         for _ in 0..DSPARK_LAYERS {
             layers.push(DsparkLayerKv {
-                k: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, DSPARK_CACHE_LEN)?,
-                v: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, DSPARK_CACHE_LEN)?,
+                k: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, cache_len)?,
+                v: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, cache_len)?,
             });
         }
-        let mut pending =
-            HiddenStates::zeros(ctx, GLM52_DSPARK_CONTEXT_DIM, GLM52_DSPARK_BLOCK * 2)?;
+        let mut pending = HiddenStates::zeros(ctx, GLM52_DSPARK_CONTEXT_DIM, cache_len)?;
         pending.seq_len = 0;
         Ok(Self {
             layers,
             pending,
             pending_len: 0,
             committed_len: 0,
-            context_projected: HiddenStates::zeros(ctx, GLM52_HIDDEN, GLM52_DSPARK_BLOCK * 2)?,
-            context_hidden: HiddenStates::zeros(ctx, GLM52_HIDDEN, GLM52_DSPARK_BLOCK * 2)?,
+            context_projected: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
+            context_hidden: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
+            cache_len,
         })
     }
 
@@ -690,8 +727,8 @@ impl Glm52DsparkSlotState {
     }
 
     /// Append one step row's captured hidden (a `[30720]` row of the step
-    /// capture buffer) to the pending context. Grows the pending buffer by
-    /// doubling up to the cache cap.
+    /// capture buffer) to the pending context. The buffer holds `cache_len`
+    /// rows from birth — allocation-free by construction.
     pub(crate) fn append_captured_row(
         &mut self,
         ctx: &DeviceContext,
@@ -700,28 +737,10 @@ impl Glm52DsparkSlotState {
     ) -> Result<()> {
         let required = self.pending_len + 1;
         ensure!(
-            self.committed_len + required + GLM52_DSPARK_BLOCK <= DSPARK_CACHE_LEN,
+            self.committed_len + required + GLM52_DSPARK_BLOCK <= self.cache_len,
             "dspark pending context would exceed the draft cache: committed={}, pending={required}",
             self.committed_len
         );
-        let capacity = self.pending.data.len() / GLM52_DSPARK_CONTEXT_DIM;
-        if required > capacity {
-            let new_capacity = (capacity * 2).max(required).min(DSPARK_CACHE_LEN);
-            let mut next = HiddenStates::zeros(ctx, GLM52_DSPARK_CONTEXT_DIM, new_capacity)?;
-            if self.pending_len > 0 {
-                self.pending.seq_len = self.pending_len;
-                next.seq_len = new_capacity;
-                copy_hidden_token_range_into(
-                    ctx,
-                    &self.pending,
-                    0,
-                    &mut next,
-                    0,
-                    self.pending_len,
-                )?;
-            }
-            self.pending = next;
-        }
         let src =
             captured.slice(row * GLM52_DSPARK_CONTEXT_DIM..(row + 1) * GLM52_DSPARK_CONTEXT_DIM);
         let mut dst = self.pending.data.slice_mut(
@@ -733,11 +752,14 @@ impl Glm52DsparkSlotState {
         Ok(())
     }
 
-    fn ensure_context_capacity(&mut self, ctx: &DeviceContext, context_len: usize) -> Result<()> {
-        if context_len > self.context_projected.data.len() / GLM52_HIDDEN {
-            self.context_projected = HiddenStates::zeros(ctx, GLM52_HIDDEN, context_len)?;
-            self.context_hidden = HiddenStates::zeros(ctx, GLM52_HIDDEN, context_len)?;
-        }
+    /// Point the projected-context pair at this round's rows. Preallocated to
+    /// `cache_len` — the bound is already enforced by the caller's overflow
+    /// guard, so exceeding it here is a bug, not a growth request.
+    fn set_context_len(&mut self, context_len: usize) -> Result<()> {
+        ensure!(
+            context_len <= self.context_projected.data.len() / GLM52_HIDDEN,
+            "dspark context length {context_len} exceeds the preallocated cap"
+        );
         self.context_projected.seq_len = context_len;
         self.context_hidden.seq_len = context_len;
         Ok(())
@@ -775,9 +797,13 @@ pub(crate) struct Glm52DsparkScratch {
 }
 
 impl Glm52DsparkScratch {
-    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
         let max_rows = GLM52_MAX_BATCH_PER_RANK * GLM52_DSPARK_BLOCK;
-        let tail_capacity = GLM52_DSPARK_BLOCK;
+        // The varlen tail holds one request's context + block rows; context
+        // is bounded by the draft cache, so `cache_len` covers every round —
+        // preallocated so a draft round never touches the allocator (and the
+        // VRAM probe's ledger charged exactly this).
+        let tail_capacity = cache_len;
         let partials = argmax_batch_bf16_split_partials_len(GLM52_MAX_BATCH_PER_RANK, GLM52_VOCAB);
         Ok(Self {
             block_token_ids_h: vec![DSPARK_MASK_TOKEN; max_rows],
@@ -825,12 +851,14 @@ impl Glm52DsparkScratch {
         self.logits.seq_len = block_rows;
     }
 
-    fn ensure_tail_capacity(&mut self, ctx: &DeviceContext, tail_len: usize) -> Result<()> {
-        if tail_len > self.tail_input.data.len() / GLM52_HIDDEN {
-            self.tail_input = HiddenStates::zeros(ctx, GLM52_HIDDEN, tail_len)?;
-            self.k_tail = HiddenStates::zeros(ctx, DSPARK_QKV_DIM, tail_len)?;
-            self.v_tail = HiddenStates::zeros(ctx, DSPARK_QKV_DIM, tail_len)?;
-        }
+    /// Point the varlen tail buffers at this request's `context + block`
+    /// rows. Preallocated to the draft cache length — the caller's overflow
+    /// guard already bounds `tail_len`, so exceeding it is a bug.
+    fn set_tail_len(&mut self, tail_len: usize) -> Result<()> {
+        ensure!(
+            tail_len <= self.tail_input.data.len() / GLM52_HIDDEN,
+            "dspark tail length {tail_len} exceeds the preallocated cap"
+        );
         self.tail_input.seq_len = tail_len;
         self.k_tail.seq_len = tail_len;
         self.v_tail.seq_len = tail_len;

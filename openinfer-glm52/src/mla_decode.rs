@@ -504,7 +504,7 @@ pub(crate) fn glm52_mla_attend_into(
     // (device data, so the launch replays under CUDA graph capture); the
     // cache-pack kernel traps on a slot outside the paged window. The
     // every-step host guard is the caller's position bound (`decode_step`
-    // prologue: position < GLM52_MAX_MODEL_LEN and each row confined to its
+    // prologue: position < max_model_len and each row confined to its
     // own slot region by construction).
 
     // ---- absorb: ql_nope[T,64,512] = q_pass @ W_UK ----

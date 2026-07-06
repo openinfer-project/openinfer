@@ -37,6 +37,9 @@ use runner::{Glm52RankPlacement, Glm52RankWorker};
 use tokio::sync::mpsc;
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
 
+use crate::config::GLM52_MAX_CONTEXT;
+use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes};
+
 pub use config::{
     GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
     GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
@@ -54,6 +57,11 @@ pub struct Glm52LaunchOptions {
     /// buckets, accepted tokens commit in batches, per-request accept stats
     /// are logged on release.
     pub dspark_draft_model_path: Option<std::path::PathBuf>,
+    /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
+    /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);
+    /// an explicit value is still validated against that budget so an
+    /// impossible cap fails at launch, not at the first long request.
+    pub max_model_len: Option<usize>,
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
@@ -61,6 +69,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         tp_size,
         dp_size,
         dspark_draft_model_path,
+        max_model_len,
     } = options;
     ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
@@ -76,7 +85,134 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ep_size: GLM52_EP_RANKS,
         },
         dspark_draft_model_path.as_deref(),
+        max_model_len,
     )
+}
+
+/// Free VRAM held back from the context-cap budget on every rank, covering
+/// the post-probe allocations the exact arena ledger does not model: the
+/// MLA W_UK/W_UV bf16 dequant during build (~1.1 GiB net over the freed fp8
+/// kv_b), DeepEP collective buffers, the 8 whole-step graph instantiations,
+/// cuBLAS workspaces, and allocator fragmentation. Conservative; the
+/// post-build re-probe below turns any drift into a launch failure instead
+/// of a mid-serving OOM.
+const GLM52_VRAM_RESERVE_BYTES: usize = 4 << 30;
+
+/// Extra reserve when the DSpark drafter is enabled: the replicated draft
+/// weights (~3.8 GiB bf16) plus its dense forward scratch, which load after
+/// the probe. The drafter's cap-scaled buffers are in the exact ledger
+/// (`glm52_dspark_arena_bytes`), not here.
+const GLM52_DSPARK_VRAM_RESERVE_BYTES: usize = 5 << 30;
+
+/// The smallest cap worth serving with (the pre-refactor bring-up value);
+/// a budget below this is a misconfiguration, not a working engine.
+const GLM52_MIN_MODEL_LEN: usize = 4096;
+
+/// Free VRAM every rank must still have AFTER the model, DeepEP contexts,
+/// and the optional drafter are fully resident — headroom for the whole-step
+/// graph instantiations (captured lazily by the coordinator) and allocator
+/// fragmentation. The post-build re-probe fails launch below this, so a
+/// ledger/reserve drift crashes at startup, not mid-serving.
+const GLM52_POST_BUILD_MIN_FREE_BYTES: usize = 1 << 30;
+
+/// The launch-time context-cap decision and the numbers behind it — the log
+/// line and the tests consume the same values the decision used, so they
+/// cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+struct Glm52ContextBudget {
+    max_model_len: usize,
+    /// Exact bytes the cap costs a rank (build arenas + drafter lane).
+    arena_bytes: usize,
+    reserve_bytes: usize,
+    budget_bytes: usize,
+}
+
+/// Exact cap-scaled bytes a rank allocates for a candidate cap: the build
+/// arenas plus, when the drafter is enabled, the DSpark lane.
+fn glm52_cap_bytes(max_model_len: usize, dspark_enabled: bool) -> Result<usize> {
+    Ok(glm52_arena_bytes(max_model_len)?
+        + if dspark_enabled {
+            crate::dspark::glm52_dspark_arena_bytes(max_model_len)
+        } else {
+            0
+        })
+}
+
+/// Decide the per-request context cap from the post-weight-load VRAM budget.
+/// Every slot's cache region is sized `max_model_len` tokens at build, so a
+/// candidate cap's cost is exact arithmetic ([`glm52_cap_bytes`]) over the
+/// fleet-minimum free bytes — kept free of CUDA so the policy is
+/// unit-testable. Auto mode binary-searches the largest aligned cap that
+/// fits; an explicit cap must be aligned and fit, or launch fails.
+fn derive_max_model_len(
+    requested: Option<usize>,
+    min_free_vram_bytes: usize,
+    dspark_enabled: bool,
+) -> Result<Glm52ContextBudget> {
+    let reserve_bytes = GLM52_VRAM_RESERVE_BYTES
+        + if dspark_enabled {
+            GLM52_DSPARK_VRAM_RESERVE_BYTES
+        } else {
+            0
+        };
+    let budget_bytes = min_free_vram_bytes.saturating_sub(reserve_bytes);
+    let max_model_len = if let Some(requested) = requested {
+        ensure!(
+            requested >= GLM52_MIN_MODEL_LEN,
+            "GLM5.2 --max-model-len {requested} is below the minimum {GLM52_MIN_MODEL_LEN}"
+        );
+        ensure!(
+            requested <= GLM52_MAX_CONTEXT,
+            "GLM5.2 --max-model-len {requested} exceeds the checkpoint's \
+             max_position_embeddings {GLM52_MAX_CONTEXT}"
+        );
+        ensure!(
+            requested.is_multiple_of(GLM52_MODEL_LEN_ALIGN),
+            "GLM5.2 --max-model-len {requested} must be a multiple of {GLM52_MODEL_LEN_ALIGN} \
+             (the FlashMLA page size); nearest valid values are {} and {}",
+            requested / GLM52_MODEL_LEN_ALIGN * GLM52_MODEL_LEN_ALIGN,
+            requested.next_multiple_of(GLM52_MODEL_LEN_ALIGN),
+        );
+        let required = glm52_cap_bytes(requested, dspark_enabled)?;
+        ensure!(
+            required <= budget_bytes,
+            "GLM5.2 --max-model-len {requested} needs {} of cache per rank but only {} \
+             fits (min rank free VRAM {} - reserve {}); lower it or free VRAM",
+            ByteSize(required as u64),
+            ByteSize(budget_bytes as u64),
+            ByteSize(min_free_vram_bytes as u64),
+            ByteSize(reserve_bytes as u64),
+        );
+        requested
+    } else {
+        // Largest aligned cap whose exact cost fits the budget: the cost is
+        // monotone in the cap, so binary search over the aligned candidates.
+        let (mut lo, mut hi) = (0, GLM52_MAX_CONTEXT / GLM52_MODEL_LEN_ALIGN);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, dspark_enabled)? <= budget_bytes {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let derived = lo * GLM52_MODEL_LEN_ALIGN;
+        ensure!(
+            derived >= GLM52_MIN_MODEL_LEN,
+            "GLM5.2 free VRAM leaves a context cap of {derived} (< {GLM52_MIN_MODEL_LEN}): \
+             budget {} (min rank free VRAM {} - reserve {})",
+            ByteSize(budget_bytes as u64),
+            ByteSize(min_free_vram_bytes as u64),
+            ByteSize(reserve_bytes as u64),
+        );
+        derived
+    };
+    Ok(Glm52ContextBudget {
+        max_model_len,
+        arena_bytes: glm52_cap_bytes(max_model_len, dspark_enabled)?,
+        reserve_bytes,
+        budget_bytes,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -96,9 +232,11 @@ struct StartupValidation {
 }
 
 #[derive(Debug)]
+/// Per-rank facts gathered while the weights landed (index = rank).
 struct GpuWeightLoadReport {
-    rank_tensor_counts: Vec<usize>,
-    rank_bytes: Vec<usize>,
+    tensor_counts: Vec<usize>,
+    bytes: Vec<usize>,
+    free_vram_bytes: Vec<usize>,
 }
 
 struct LoadedGlm52Runtime {
@@ -110,6 +248,7 @@ fn start_engine(
     model_path: &Path,
     options: &Glm52LoadOptions,
     dspark_path: Option<&Path>,
+    requested_max_model_len: Option<usize>,
 ) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
@@ -117,18 +256,52 @@ fn start_engine(
         "GLM5.2 load-weight startup complete: ranks={}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}",
         startup.device_ordinals.len(),
         startup.rank_tensor_counts,
-        loaded.report.rank_tensor_counts,
-        format_bytes(&loaded.report.rank_bytes),
+        loaded.report.tensor_counts,
+        format_bytes(&loaded.report.bytes),
+    );
+
+    let min_free_vram_bytes = loaded
+        .report
+        .free_vram_bytes
+        .iter()
+        .copied()
+        .min()
+        .expect("at least one rank loaded");
+    let budget = derive_max_model_len(
+        requested_max_model_len,
+        min_free_vram_bytes,
+        dspark_path.is_some(),
+    )?;
+    let max_model_len = budget.max_model_len;
+    log::info!(
+        "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights, \
+         cap-scaled arenas {} across {} slots{}, reserve {}, budget {}",
+        if requested_max_model_len.is_some() {
+            "--max-model-len"
+        } else {
+            "VRAM-derived"
+        },
+        ByteSize(min_free_vram_bytes as u64),
+        ByteSize(budget.arena_bytes as u64),
+        model::GLM52_MAX_BATCH_PER_RANK,
+        if dspark_path.is_some() {
+            " (dspark lane included)"
+        } else {
+            ""
+        },
+        ByteSize(budget.reserve_bytes as u64),
+        ByteSize(budget.budget_bytes as u64),
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
-    build_rank_models(&loaded.workers)?;
+    build_rank_models(&loaded.workers, max_model_len)?;
     let dspark_enabled = if let Some(dspark_path) = dspark_path {
         load_dspark_drafters(&loaded.workers, dspark_path)?;
         true
     } else {
         false
     };
+    ensure_post_build_headroom(&loaded.workers)?;
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
@@ -138,6 +311,7 @@ fn start_engine(
                 loaded.workers,
                 &eos_token_ids,
                 dspark_enabled,
+                max_model_len,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
@@ -165,16 +339,48 @@ fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Resu
     Ok(())
 }
 
+/// Re-probe every rank once everything the reserve constants stand in for is
+/// resident (model arenas, dequanted MLA weights, DeepEP contexts, optional
+/// drafter): if any rank is left with less headroom than the whole-step
+/// graph instantiations and allocator slack need, fail the launch with the
+/// numbers — a reserve/ledger drift must crash here, not as a mid-serving
+/// OOM that tears the collective group down.
+fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
+    let responses = workers
+        .iter()
+        .map(Glm52RankWorker::free_vram_async)
+        .collect::<Result<Vec<_>>>()?;
+    let mut per_rank = Vec::with_capacity(responses.len());
+    for (rank, response) in responses.into_iter().enumerate() {
+        let free = response
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its VRAM-probe response"))??;
+        ensure!(
+            free >= GLM52_POST_BUILD_MIN_FREE_BYTES,
+            "GLM5.2 rank {rank} has only {} free VRAM after build (< {} headroom for graph \
+             capture); lower --max-model-len or free device memory",
+            ByteSize(free as u64),
+            ByteSize(GLM52_POST_BUILD_MIN_FREE_BYTES as u64),
+        );
+        per_rank.push(free);
+    }
+    log::info!(
+        "GLM5.2 post-build free VRAM per rank: {:?}",
+        format_bytes(&per_rank)
+    );
+    Ok(())
+}
+
 /// Build every rank's resident model, then create the DeepEP contexts. Two
 /// phases on purpose: the build is per-rank and can fail (OOM, packaging
 /// drift) — every rank must report success BEFORE anyone enters the
 /// collective context creation, or a single failure strands the other seven
 /// ranks in NCCL init with no timeout.
-fn build_rank_models(workers: &[Glm52RankWorker]) -> Result<()> {
+fn build_rank_models(workers: &[Glm52RankWorker], max_model_len: usize) -> Result<()> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
-        .map(Glm52RankWorker::build_model_async)
+        .map(|worker| worker.build_model_async(max_model_len))
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
@@ -338,6 +544,10 @@ fn load_rank_weights_to_gpu(
         .iter()
         .map(|report| report.loaded_total_bytes)
         .collect::<Vec<_>>();
+    let rank_free_vram_bytes = reports
+        .iter()
+        .map(|report| report.free_vram_bytes)
+        .collect::<Vec<_>>();
     log::info!(
         "GLM5.2 rank weight load cost {:.2}s: ranks={}, tensors={:?}, resident_bytes={:?}",
         load_started.elapsed().as_secs_f64(),
@@ -349,8 +559,9 @@ fn load_rank_weights_to_gpu(
     Ok(LoadedGlm52Runtime {
         workers,
         report: GpuWeightLoadReport {
-            rank_tensor_counts,
-            rank_bytes,
+            tensor_counts: rank_tensor_counts,
+            bytes: rank_bytes,
+            free_vram_bytes: rank_free_vram_bytes,
         },
     })
 }
@@ -360,4 +571,83 @@ fn format_bytes(values: &[usize]) -> Vec<String> {
         .iter()
         .map(|&value| ByteSize(value as u64).to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod max_model_len_tests {
+    use super::*;
+
+    /// Free VRAM that budgets exactly a `cap`-token context (exact ledger +
+    /// reserve) — inverted through the same `glm52_cap_bytes` the derivation
+    /// uses, so the tests exercise the policy, not a parallel formula.
+    fn free_for(cap: usize, dspark: bool) -> usize {
+        let reserve = GLM52_VRAM_RESERVE_BYTES
+            + if dspark {
+                GLM52_DSPARK_VRAM_RESERVE_BYTES
+            } else {
+                0
+            };
+        reserve + glm52_cap_bytes(cap, dspark).expect("cap bytes")
+    }
+
+    #[test]
+    fn derived_cap_is_aligned_and_scales_with_free_vram() {
+        let cap = derive_max_model_len(None, free_for(10_048, false), false)
+            .expect("derive")
+            .max_model_len;
+        assert_eq!(cap, 10_048, "exact budget for an aligned cap derives it");
+        assert!(cap.is_multiple_of(GLM52_MODEL_LEN_ALIGN));
+        let larger = derive_max_model_len(None, free_for(50_048, false), false)
+            .expect("derive")
+            .max_model_len;
+        assert!(larger > cap);
+    }
+
+    #[test]
+    fn dspark_lane_shrinks_the_derived_cap() {
+        let free = free_for(50_048, false);
+        let plain = derive_max_model_len(None, free, false).expect("derive");
+        let dspark = derive_max_model_len(None, free, true).expect("derive");
+        assert!(
+            dspark.max_model_len < plain.max_model_len,
+            "dspark cap-scaled cost must shrink the cap"
+        );
+    }
+
+    #[test]
+    fn derived_cap_never_exceeds_the_checkpoint_ceiling() {
+        let budget = derive_max_model_len(None, usize::MAX / 2, false).expect("derive");
+        assert_eq!(budget.max_model_len, GLM52_MAX_CONTEXT);
+    }
+
+    #[test]
+    fn too_little_vram_fails_instead_of_serving_a_toy_cap() {
+        let err = derive_max_model_len(None, free_for(1024, false), false)
+            .expect_err("sub-minimum cap must fail");
+        assert!(err.to_string().contains("context cap"), "{err}");
+    }
+
+    #[test]
+    fn unaligned_requested_cap_is_rejected_with_the_nearest_valid_values() {
+        let err = derive_max_model_len(Some(5000), free_for(100_032, false), false)
+            .expect_err("unaligned cap must fail, not silently round");
+        let message = err.to_string();
+        assert!(
+            message.contains("4992") && message.contains("5056"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn requested_cap_beyond_the_budget_fails_at_launch() {
+        let err = derive_max_model_len(Some(99_968), free_for(10_048, false), false)
+            .expect_err("over-budget cap must fail");
+        assert!(err.to_string().contains("--max-model-len"), "{err}");
+    }
+
+    #[test]
+    fn requested_cap_below_the_minimum_fails() {
+        derive_max_model_len(Some(1024), free_for(100_032, false), false)
+            .expect_err("sub-minimum cap must fail");
+    }
 }

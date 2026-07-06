@@ -4,7 +4,7 @@
 //! [`GLM52_DECODE_BUCKETS`] batch buckets per step (real request tokens in
 //! occupied slots, padding rows elsewhere; prefill rides decode as *spans* —
 //! several consecutive positions of one slot in a single step). Each slot
-//! owns a disjoint `GLM52_MAX_MODEL_LEN`-token region of the paged KV/index
+//! owns a disjoint `max_model_len`-token region of the paged KV/index
 //! caches, so pad rows write only their own dead slots.
 //!
 //! Every step, all 8 ranks run the forward in lock-step with the SAME bucket
@@ -19,11 +19,11 @@ use cudarc::driver::{CudaSlice, PinnedHostSlice};
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
-    GLM52_FLASHMLA_SPARSE_PAGE_SIZE, GLM52_FLASHMLA_SPARSE_TOPK,
-    GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode, Glm52IndexerCacheLayout,
-    add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into, embedding_rows_into,
-    glm52_flashmla_sparse_decode_num_sm_parts, glm52_fp8_weight_only_gemv_launch,
-    rms_norm_rows_into,
+    GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+    GLM52_FLASHMLA_SPARSE_TOPK, GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW, Glm52FlashMlaSparseDecode,
+    Glm52IndexerCacheLayout, add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into,
+    embedding_rows_into, glm52_flashmla_sparse_decode_num_sm_parts,
+    glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
@@ -48,14 +48,59 @@ mod build;
 mod launch_ahead;
 use launch_ahead::Glm52SpeculatedStep;
 
-/// Per-request context cap: `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
-/// Sizes each slot's region of the per-layer MLA and index-K caches at build
-/// time.dan
-pub(crate) const GLM52_MAX_MODEL_LEN: usize = 4096;
-
 /// The per-rank slot count and the largest decode bucket. Each slot owns a
-/// `GLM52_MAX_MODEL_LEN`-token region of the paged caches.
+/// `max_model_len`-token region of the paged caches.
 pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 8;
+
+/// Every slot region and cache geometry is carved in units of the 64-token
+/// FlashMLA page (== the index-K cache block), so the per-request context cap
+/// must sit on a page boundary — the identity block table maps slot `b` to
+/// blocks `[b*blocks_per_slot, (b+1)*blocks_per_slot)`, and a non-multiple
+/// cap would let slot `b`'s tokens spill into slot `b+1`'s first block.
+pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
+
+/// Exact GPU bytes [`Glm52RankModel::build`] allocates on a rank for a given
+/// context cap — every `max_model_len`-scaled term of the build, computed
+/// from the same layout formulas the allocations use (the FlashMLA packed
+/// cache and index-K layouts, the device rope tables, the per-bucket indexer
+/// logits scratch with its 256-rounded stride, and the block tables). The
+/// launch-time VRAM probe sizes `max_model_len` against this, so a new
+/// len-scaled allocation in `build` MUST be added here or the probe
+/// under-charges.
+pub(crate) fn glm52_arena_bytes(max_model_len: usize) -> Result<usize> {
+    let batch = GLM52_MAX_BATCH_PER_RANK;
+    let num_blocks = batch * max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE);
+    let mla = GLM52_LAYERS
+        * num_blocks
+        * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
+        * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+    let (blocks_per_slot, index_layout) = glm52_index_cache_layout(max_model_len);
+    let index_k = (0..GLM52_LAYERS)
+        .filter(|&layer| glm52_layer_has_full_indexer(layer))
+        .count()
+        * index_layout.min_cache_bytes()?;
+    let rope_tables = 2 * max_model_len * GLM52_ROPE_HALF * size_of::<bf16>();
+    let bucket_rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
+    let indexer_logits =
+        bucket_rows * max_model_len.next_multiple_of(256) * (size_of::<bf16>() + size_of::<f32>());
+    let block_tables = (batch + bucket_rows) * blocks_per_slot * size_of::<i32>();
+    Ok(mla + index_k + rope_tables + indexer_logits + block_tables)
+}
+
+/// The per-slot block count and index-K cache layout for a given cap — the
+/// ONE construction shared by [`Glm52RankModel::build`] and the arena ledger
+/// ([`glm52_arena_bytes`]), so a layout change cannot drift between them.
+fn glm52_index_cache_layout(max_model_len: usize) -> (usize, Glm52IndexerCacheLayout) {
+    // Each slot owns `blocks_per_slot` consecutive index-K cache blocks;
+    // the whole cache holds every slot's region back-to-back.
+    let blocks_per_slot = max_model_len.div_ceil(INDEX_CACHE_BLOCK);
+    let layout = Glm52IndexerCacheLayout {
+        cache_blocks: GLM52_MAX_BATCH_PER_RANK * blocks_per_slot,
+        cache_block_size: INDEX_CACHE_BLOCK,
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
+    };
+    (blocks_per_slot, layout)
+}
 
 /// The decode batch buckets, ascending. Each bucket has its own captured
 /// CUDA graphs, scratch arena, and FlashMLA plans, and the batched GEMV
@@ -154,9 +199,13 @@ pub(crate) struct Glm52RankModel {
     /// once at build; every bucket's table is gathered from it per step.
     block_table: CudaSlice<i32>,
     blocks_per_slot: usize,
+    /// Per-request context cap: `prompt + max_tokens - 1 <= max_model_len`.
+    /// Decided at launch (VRAM probe or `--max-model-len`); sized every
+    /// slot's region of the per-layer MLA and index-K caches at build time.
+    max_model_len: usize,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
-    /// Device-resident rope tables for every position (`[GLM52_MAX_MODEL_LEN,
+    /// Device-resident rope tables for every position (`[max_model_len,
     /// GLM52_ROPE_HALF]` as a gatherable matrix); the prologue gathers each row's
     /// position row instead of recomputing on the host and copying up.
     cos_table: DeviceMatrix,
@@ -216,6 +265,11 @@ impl Glm52RankModel {
         &self.lm_head
     }
 
+    /// The per-request context cap this rank's cache arenas were built for.
+    pub(crate) fn max_model_len(&self) -> usize {
+        self.max_model_len
+    }
+
     /// The last step's aux-hidden capture buffer for `bucket` (`[bucket,
     /// 5 * GLM52_HIDDEN]`, row = step row). Valid until the next step in the
     /// same bucket overwrites it — the draft lane consumes it between steps.
@@ -232,12 +286,21 @@ impl Glm52RankModel {
         Ok(state.scratch.captured.data())
     }
 
-    pub(crate) fn build(ctx: &DeviceContext, w: &mut Glm52RankGpuWeights) -> Result<Self> {
+    pub(crate) fn build(
+        ctx: &DeviceContext,
+        w: &mut Glm52RankGpuWeights,
+        max_model_len: usize,
+    ) -> Result<Self> {
+        ensure!(
+            max_model_len > 0 && max_model_len.is_multiple_of(GLM52_MODEL_LEN_ALIGN),
+            "GLM5.2 max_model_len {max_model_len} must be a positive multiple of \
+             {GLM52_MODEL_LEN_ALIGN} (the FlashMLA page / index-K block size)"
+        );
         let batch = GLM52_MAX_BATCH_PER_RANK;
         let num_sm_parts = glm52_flashmla_sparse_decode_num_sm_parts()?;
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: batch,
-            num_blocks: batch * GLM52_MAX_MODEL_LEN.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+            num_blocks: batch * max_model_len.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
             topk: GLM52_FLASHMLA_SPARSE_TOPK,
             num_sm_parts,
             sm_scale: GLM52_SM_SCALE,
@@ -249,14 +312,7 @@ impl Glm52RankModel {
             num_sm_parts: num_sm_parts.min(GLM52_MLA_TOPK_SHORT / 64),
             ..contract
         };
-        // Each slot owns `blocks_per_slot` consecutive index-K cache blocks;
-        // the whole cache holds every slot's region back-to-back.
-        let blocks_per_slot = GLM52_MAX_MODEL_LEN.div_ceil(INDEX_CACHE_BLOCK);
-        let index_cache_layout = Glm52IndexerCacheLayout {
-            cache_blocks: batch * blocks_per_slot,
-            cache_block_size: INDEX_CACHE_BLOCK,
-            cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
-        };
+        let (blocks_per_slot, index_cache_layout) = glm52_index_cache_layout(max_model_len);
 
         let mut layers = Vec::with_capacity(GLM52_LAYERS);
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
@@ -309,19 +365,19 @@ impl Glm52RankModel {
         ctx.stream
             .memcpy_htod(&block_table_host, &mut block_table)?;
 
-        let mut cos_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF);
-        let mut sin_host = Vec::with_capacity(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF);
-        for position in 0..GLM52_MAX_MODEL_LEN {
+        let mut cos_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
+        let mut sin_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
+        for position in 0..max_model_len {
             let (cos_row, sin_row) = rope_tables(position);
             cos_host.extend_from_slice(&cos_row);
             sin_host.extend_from_slice(&sin_row);
         }
         let mut cos_table_data = ctx
             .stream
-            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF)?;
+            .alloc_zeros::<bf16>(max_model_len * GLM52_ROPE_HALF)?;
         let mut sin_table_data = ctx
             .stream
-            .alloc_zeros::<bf16>(GLM52_MAX_MODEL_LEN * GLM52_ROPE_HALF)?;
+            .alloc_zeros::<bf16>(max_model_len * GLM52_ROPE_HALF)?;
         ctx.stream.memcpy_htod(&cos_host, &mut cos_table_data)?;
         ctx.stream.memcpy_htod(&sin_host, &mut sin_table_data)?;
 
@@ -344,7 +400,7 @@ impl Glm52RankModel {
                 index_cache_layout,
                 blocks_per_slot,
                 NUM_SMS,
-                GLM52_MAX_MODEL_LEN,
+                max_model_len,
             );
             let mut bucket_table = ctx.stream.alloc_zeros::<i32>(rows * blocks_per_slot)?;
             ctx.stream.memcpy_htod(
@@ -422,16 +478,17 @@ impl Glm52RankModel {
             buckets,
             block_table,
             blocks_per_slot,
+            max_model_len,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
             cos_table: DeviceMatrix {
                 data: cos_table_data,
-                rows: GLM52_MAX_MODEL_LEN,
+                rows: max_model_len,
                 cols: GLM52_ROPE_HALF,
             },
             sin_table: DeviceMatrix {
                 data: sin_table_data,
-                rows: GLM52_MAX_MODEL_LEN,
+                rows: max_model_len,
                 cols: GLM52_ROPE_HALF,
             },
             positions: ctx.stream.alloc_zeros::<u32>(batch)?,
@@ -570,14 +627,15 @@ impl Glm52RankModel {
             let slot = shape.slots[row] as usize;
             let (token, position) = inputs[row];
             ensure!(
-                position < GLM52_MAX_MODEL_LEN,
-                "GLM5.2 slot {slot} position {position} exceeds the model-length cap {GLM52_MAX_MODEL_LEN}"
+                position < self.max_model_len,
+                "GLM5.2 slot {slot} position {position} exceeds the model-length cap {}",
+                self.max_model_len
             );
             tokens_host[row] = token;
             positions_host[row] = position as u32;
             // Slot b owns cache tokens [b*MAX_LEN, (b+1)*MAX_LEN) — the same
             // global slot id addresses both the MLA and index-K caches.
-            slots_host[row] = (slot * GLM52_MAX_MODEL_LEN + position) as i64;
+            slots_host[row] = (slot * self.max_model_len + position) as i64;
             seq_lens_host[row] = (position + 1) as i32;
         }
         ctx.stream.memcpy_htod(&tokens_host, &mut self.token_ids)?;

@@ -8,8 +8,8 @@ use openinfer_kernels::ops::{embedding_rows_into, glm52_decode_feed_launch};
 use openinfer_kernels::tensor::DeviceContext;
 
 use super::{
-    GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, GLM52_MLA_TOPK_SHORT, GLM52_VOCAB,
-    Glm52RankModel, Glm52StepShape, TIER_FULL, TIER_SHORT,
+    GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, GLM52_VOCAB, Glm52RankModel, Glm52StepShape,
+    TIER_FULL, TIER_SHORT,
 };
 
 /// A speculative next-step whole-graph replay already enqueued on the decode
@@ -81,7 +81,7 @@ impl Glm52RankModel {
             }
             for &position in &self.device_positions[..batch] {
                 ensure!(
-                    position + 1 < GLM52_MAX_MODEL_LEN,
+                    position + 1 < self.max_model_len,
                     "GLM5.2 launch-ahead lease granted with a row at position {position} — the \
                      advanced step would breach the model-length cap"
                 );

@@ -44,6 +44,17 @@ impl Glm52RankGpuContext {
         })
     }
 
+    /// This rank's device free VRAM. Re-binds the rank's context first so
+    /// the query reads THIS device regardless of what the calling thread
+    /// happened to have current — the number sizes every rank's cache
+    /// arenas, so a wrong-device read must be unrepresentable.
+    pub(crate) fn free_vram_bytes(&self) -> Result<usize> {
+        self.set_current()?;
+        let (free, _total) = cudarc::driver::result::mem_get_info()
+            .map_err(|err| anyhow::anyhow!("cuMemGetInfo failed: {err:?}"))?;
+        Ok(free)
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()

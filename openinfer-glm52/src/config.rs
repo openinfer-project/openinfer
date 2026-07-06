@@ -8,7 +8,10 @@ pub const GLM52_VOCAB: usize = 154_880;
 pub const GLM52_LAYERS: usize = 78;
 pub const GLM52_DENSE_LAYERS: usize = 3;
 pub const GLM52_MOE_LAYERS: usize = GLM52_LAYERS - GLM52_DENSE_LAYERS;
-const GLM52_MAX_CONTEXT: usize = 1_048_576;
+/// The checkpoint's `max_position_embeddings` — `probe_config_json` pins the
+/// config to exactly this, so it doubles as the architecture ceiling any
+/// launch-time `max_model_len` must respect.
+pub(crate) const GLM52_MAX_CONTEXT: usize = 1_048_576;
 
 pub(crate) const GLM52_HEADS: usize = 64;
 const GLM52_KV_HEADS: usize = 64;

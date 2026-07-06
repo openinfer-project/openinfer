@@ -129,6 +129,11 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 
+    /// Per-request context cap: prompt + max_tokens - 1 must fit. GLM5.2 only;
+    /// when omitted, GLM5.2 sizes it from post-weight-load free VRAM.
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, CUDA Graph capture, and margin.
@@ -239,6 +244,15 @@ impl Args {
                     );
                 }
             }
+        }
+        // Fail loud rather than silently ignoring the flag for a model line
+        // that does not consume it (Qwen3/3.5 read theirs from config.json).
+        #[cfg(feature = "glm52")]
+        let supports_max_model_len = matches!(model_type, ModelType::Glm52);
+        #[cfg(not(feature = "glm52"))]
+        let supports_max_model_len = false;
+        if self.max_model_len.is_some() && !supports_max_model_len {
+            bail!("--max-model-len is currently supported only for GLM5.2 (got {model_type:?})");
         }
         Ok(())
     }

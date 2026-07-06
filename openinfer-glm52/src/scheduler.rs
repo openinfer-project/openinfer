@@ -28,8 +28,7 @@ use tokio::sync::mpsc;
 
 use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
-    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MAX_MODEL_LEN, GLM52_MLA_TOPK_SHORT,
-    Glm52StepShape,
+    GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, Glm52StepShape,
 };
 use crate::runner::{Glm52RankWorker, Glm52StepFlags};
 
@@ -132,7 +131,7 @@ impl Glm52SlotState {
     /// verify span (anchor + proposed drafts) in decode, capped so a round
     /// can never commit past `max_tokens` — which also keeps every fed
     /// position under the model-length cap, since `validate_request` pins
-    /// `prompt + max_tokens - 1 <= GLM52_MAX_MODEL_LEN`.
+    /// `prompt + max_tokens - 1 <= max_model_len`.
     pub(crate) fn feed_want(&self) -> usize {
         if self.fed < self.prompt.len() {
             self.prompt.len() - self.fed
@@ -273,7 +272,7 @@ impl SpecStats {
     }
 }
 
-pub(crate) fn validate_request(req: &GenerateRequest) -> Result<(), String> {
+pub(crate) fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
         return Err("GLM5.2 requires a non-empty prompt".to_owned());
     }
@@ -284,9 +283,9 @@ pub(crate) fn validate_request(req: &GenerateRequest) -> Result<(), String> {
     // generated token is fed at position prompt+max_tokens-2, so requiring
     // prompt+max_tokens-1 <= cap keeps every step strictly below the cap.
     let last_position = req.prompt_tokens.len() + req.max_tokens - 1;
-    if last_position > GLM52_MAX_MODEL_LEN {
+    if last_position > max_model_len {
         return Err(format!(
-            "GLM5.2 bring-up context cap: prompt {} + max_tokens {} exceeds {GLM52_MAX_MODEL_LEN}",
+            "GLM5.2 context cap: prompt {} + max_tokens {} exceeds max_model_len {max_model_len}",
             req.prompt_tokens.len(),
             req.max_tokens
         ));
@@ -421,6 +420,7 @@ fn launch_ahead_flags(
     pending_empty: bool,
     dspark_enabled: bool,
     slots: &[RankSlots],
+    max_model_len: usize,
 ) -> Glm52StepFlags {
     let consume = !slots_changed && leased_shapes == Some(shapes);
     let lease = pending_empty
@@ -430,7 +430,7 @@ fn launch_ahead_flags(
             .flat_map(|rank_slots| rank_slots.iter().flatten())
             .all(|active| {
                 active.state.feed_want() == 1
-                    && active.state.next_input_at(0).position + 1 < GLM52_MAX_MODEL_LEN
+                    && active.state.next_input_at(0).position + 1 < max_model_len
             });
     Glm52StepFlags { consume, lease }
 }
@@ -465,6 +465,7 @@ pub(crate) fn run_dp8_coordinator(
     workers: Vec<Glm52RankWorker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
+    max_model_len: usize,
 ) {
     let mut slots: Vec<RankSlots> = workers
         .iter()
@@ -547,13 +548,13 @@ pub(crate) fn run_dp8_coordinator(
         // Intake: block when fully idle, otherwise drain what's queued.
         if channel_open && all_idle(&slots) && pending.is_empty() {
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending),
+                Some(req) => intake(req, &mut pending, max_model_len),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending),
+                Ok(req) => intake(req, &mut pending, max_model_len),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
@@ -609,6 +610,7 @@ pub(crate) fn run_dp8_coordinator(
             pending.is_empty(),
             dspark_enabled,
             &slots,
+            max_model_len,
         );
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
@@ -837,8 +839,12 @@ pub(crate) fn run_dp8_coordinator(
 
 /// Fast-reject invalid requests at intake (Scheduled → Rejected, the same
 /// event order the bs=1 coordinator emitted); valid ones queue for a rank.
-fn intake(req: GenerateRequest, pending: &mut std::collections::VecDeque<GenerateRequest>) {
-    if let Err(message) = validate_request(&req) {
+fn intake(
+    req: GenerateRequest,
+    pending: &mut std::collections::VecDeque<GenerateRequest>,
+    max_model_len: usize,
+) {
+    if let Err(message) = validate_request(&req, max_model_len) {
         let prompt_tokens = req.prompt_tokens.len();
         let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
         let _ = req.token_tx.send(TokenEvent::Scheduled {
@@ -897,7 +903,7 @@ mod launch_ahead_flag_tests {
     #[test]
     fn consume_requires_unchanged_shapes_and_untouched_slots() {
         let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, Some(&shapes), false, true, false, &[]);
+        let flags = launch_ahead_flags(&shapes, Some(&shapes), false, true, false, &[], 4096);
         assert!(flags.consume);
     }
 
@@ -906,7 +912,7 @@ mod launch_ahead_flag_tests {
         // A finish + admission can reuse a slot id without changing the
         // shape — the desync class the first gate run hit.
         let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, Some(&shapes), true, true, false, &[]);
+        let flags = launch_ahead_flags(&shapes, Some(&shapes), true, true, false, &[], 4096);
         assert!(!flags.consume);
     }
 
@@ -916,14 +922,14 @@ mod launch_ahead_flag_tests {
         // a padding input is not value-distinguishable from an active one.
         let leased = vec![shape(1, 1)];
         let shapes = vec![shape(1, 0)];
-        let flags = launch_ahead_flags(&shapes, Some(&leased), false, true, false, &[]);
+        let flags = launch_ahead_flags(&shapes, Some(&leased), false, true, false, &[], 4096);
         assert!(!flags.consume);
     }
 
     #[test]
     fn no_lease_without_an_empty_queue() {
         let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, None, false, false, false, &[]);
+        let flags = launch_ahead_flags(&shapes, None, false, false, false, &[], 4096);
         assert!(!flags.lease && !flags.consume);
     }
 }

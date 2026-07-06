@@ -141,6 +141,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 tp_size: args.tp_size,
                 dp_size: args.dp_size.unwrap_or(8),
                 dspark_draft_model_path: args.dflash_draft_model_path.clone(),
+                max_model_len: args.max_model_len,
             },
         )
         .context("failed to start GLM5.2 engine")?,
