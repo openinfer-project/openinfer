@@ -3,16 +3,23 @@
 //!
 //! Uses the zero-weight synthetic model at the checkpoint's exact geometry —
 //! GPU kernel time is value-independent, so no checkpoint or 8-GPU box is
-//! needed. Requires ~11 GB free VRAM (weights 3.9 GB + embed/lm_head 3.8 GB +
-//! bs=8 slot states 2.8 GB).
+//! needed. Requires ~14 GiB free VRAM at peak (weights 3.9 GiB + embed/
+//! lm_head 3.8 GiB + bs=8 slot states ~5.5 GiB + scratch; see
+//! `glm52_dspark_arena_bytes`).
 //!
 //! Run (single GPU):
 //! ```text
-//! cargo test --release -p openinfer-glm52 --features glm52 --lib \
+//! cargo test --release -p openinfer-glm52 --lib \
 //!   dspark_propose_smoke -- --nocapture --ignored
 //! ```
 
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// Serializes the env-mutating tests (the graph kill-switches are process
+/// globals) — `--test-threads=1` is recommended for GPU tests but this makes
+/// the requirement local instead of assumed.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 use anyhow::Result;
 use half::bf16;
@@ -98,15 +105,39 @@ fn dspark_propose_smoke() -> Result<()> {
     Ok(())
 }
 
-/// Graph-vs-eager parity: with non-degenerate pseudo-random weights, the
-/// graphed propose (piecewise forward segments + the captured Markov chain)
-/// must emit exactly the tokens the plain eager path emits, round for round —
-/// the graphs replay the same kernels at the same shapes, so any divergence is
-/// a capture bug, not numerics.
+/// Graph-vs-eager parity under the schedules serving actually produces:
+/// mixed accept lengths (1..=8 pending rows per round — each `context_len` is
+/// its own graph key, and the tail bounds must be re-set every round, not
+/// baked at capture) and mixed row counts (a bs=2 round between bs=1 rounds —
+/// bs>1 must not disturb the captured bs=1 graphs or the Markov buffer
+/// orientation). The graphed run must emit exactly the eager run's tokens.
 #[test]
-#[ignore = "GPU parity test — needs a CUDA device with ~11 GB free VRAM"]
+#[ignore = "GPU parity test — needs a CUDA device with ~14 GiB free VRAM"]
 fn dspark_propose_graph_parity() -> Result<()> {
-    const ROUNDS: usize = 12;
+    // Per-round (mode, len_a, len_b); mode 0 = slot A only, 1 = slot B only,
+    // 2 = both (bs=2). Deliberate teeth: (A, len 8) warms at r3, captures at
+    // r5, and REPLAYS at r7 right after a round whose tails were shorter —
+    // pre-fix, the replay would consume the stale (smaller) tail seq_len and
+    // trip the copy range check. The bs=2 rounds between bs=1 rounds pin the
+    // Markov buffer orientation across row counts.
+    const ROUNDS: usize = 14;
+    const SCHEDULE: [(u8, usize, usize); ROUNDS] = [
+        (0, 1, 0), // A warm (A,1)
+        (1, 0, 3), // B warm (B,3)
+        (2, 2, 4), // both, eager
+        (0, 8, 0), // A warm (A,8)
+        (1, 0, 5), // B warm (B,5)
+        (0, 8, 0), // A capture (A,8)
+        (1, 0, 3), // B capture (B,3) — leaves short tails
+        (0, 8, 0), // A REPLAY (A,8): stale-short seq_len fires pre-fix
+        (2, 1, 1), // both, eager
+        (0, 1, 0), // A capture (A,1)
+        (1, 0, 5), // B capture (B,5)
+        (0, 8, 0), // A replay (A,8) again
+        (1, 0, 3), // B replay (B,3)
+        (0, 1, 0), // A replay (A,1)
+    ];
+    let _env = ENV_LOCK.lock().unwrap();
     let ctx = DeviceContext::new()?;
     let cache_len = dspark_cache_len(4096);
     let mut model = Glm52DsparkModel::synthetic(&ctx, cache_len)?;
@@ -134,8 +165,8 @@ fn dspark_propose_graph_parity() -> Result<()> {
         ctx.stream.clone_htod(&host)?
     };
 
-    let mut run = |graphs: bool| -> Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>> {
-        // SAFETY: the test binary runs GPU tests with --test-threads=1.
+    let run = |graphs: bool| -> Result<Vec<Vec<[u32; GLM52_DSPARK_DRAFTS]>>> {
+        // SAFETY: ENV_LOCK serializes the env-mutating tests in this file.
         unsafe {
             if graphs {
                 std::env::remove_var("DSPARK_NO_FORWARD_GRAPH");
@@ -146,24 +177,44 @@ fn dspark_propose_graph_parity() -> Result<()> {
             }
         }
         let mut scratch = Glm52DsparkScratch::new(&ctx, cache_len)?;
-        // Two slots proposing on alternating rounds, both at active == 1 — the
-        // slot-rotation case the graph key must survive: a captured segment
-        // bakes the slot's pending/context buffer pointers, so a graph
-        // captured for slot A must never replay for slot B.
         let mut slot_a = Glm52DsparkSlotState::new(&ctx, cache_len)?;
         let mut slot_b = Glm52DsparkSlotState::new(&ctx, cache_len)?;
-        let mut turns = [0usize; 2];
+        let mut pos = [0usize; 2];
         let mut all = Vec::with_capacity(ROUNDS);
-        for round in 0..ROUNDS {
-            let which = round % 2;
-            let state = if which == 0 { &mut slot_a } else { &mut slot_b };
-            state.append_captured_row(&ctx, &captured, 0)?;
-            turns[which] += 1;
-            let anchors = vec![(7 + round as u32, turns[which])];
-            let mut refs = vec![&mut *state];
-            let drafts =
-                model.propose(&ctx, &embed, &lm_head, &mut refs, &anchors, &mut scratch)?;
-            all.push(drafts[0]);
+        for (round, &(mode, len_a, len_b)) in SCHEDULE.iter().enumerate() {
+            let mut round_drafts = Vec::new();
+            if mode == 2 {
+                for _ in 0..len_a {
+                    slot_a.append_captured_row(&ctx, &captured, 0)?;
+                }
+                for _ in 0..len_b {
+                    slot_b.append_captured_row(&ctx, &captured, 0)?;
+                }
+                pos[0] += len_a;
+                pos[1] += len_b;
+                let anchors = vec![(7 + round as u32, pos[0]), (91 + round as u32, pos[1])];
+                let mut refs = vec![&mut slot_a, &mut slot_b];
+                let drafts =
+                    model.propose(&ctx, &embed, &lm_head, &mut refs, &anchors, &mut scratch)?;
+                round_drafts.extend(drafts);
+            } else {
+                let which = mode as usize;
+                let (state, len, anchor_base) = if which == 0 {
+                    (&mut slot_a, len_a, 7u32)
+                } else {
+                    (&mut slot_b, len_b, 91u32)
+                };
+                for _ in 0..len {
+                    state.append_captured_row(&ctx, &captured, 0)?;
+                }
+                pos[which] += len;
+                let anchors = vec![(anchor_base + round as u32, pos[which])];
+                let mut refs = vec![&mut *state];
+                let drafts =
+                    model.propose(&ctx, &embed, &lm_head, &mut refs, &anchors, &mut scratch)?;
+                round_drafts.extend(drafts);
+            }
+            all.push(round_drafts);
         }
         unsafe {
             std::env::remove_var("DSPARK_NO_FORWARD_GRAPH");
@@ -178,9 +229,8 @@ fn dspark_propose_graph_parity() -> Result<()> {
         graphed, eager,
         "graphed propose diverged from the eager path"
     );
-    // Non-degenerate sanity: the random weights must not all-tie to token 0.
     assert!(
-        graphed.iter().flatten().any(|&t| t != 0),
+        graphed.iter().flatten().flatten().any(|&t| t != 0),
         "parity ran on degenerate logits (all drafts are token 0)"
     );
     Ok(())
@@ -198,6 +248,7 @@ fn dspark_propose_graph_parity() -> Result<()> {
 #[ignore = "GPU isolation test — needs a CUDA device with ~11 GB free VRAM"]
 fn dspark_propose_batched_slot_isolation() -> Result<()> {
     const ROUNDS: usize = 6;
+    let _env = ENV_LOCK.lock().unwrap();
     let ctx = DeviceContext::new()?;
     let cache_len = dspark_cache_len(4096);
     let mut model = Glm52DsparkModel::synthetic(&ctx, cache_len)?;
@@ -226,7 +277,7 @@ fn dspark_propose_batched_slot_isolation() -> Result<()> {
     };
     let cap_a = captured_row(3)?;
 
-    let mut run = |cap_b_salt: u32,
+    let run = |cap_b_salt: u32,
                    anchor_b_base: u32|
      -> Result<(
         Vec<[u32; GLM52_DSPARK_DRAFTS]>,

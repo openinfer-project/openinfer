@@ -331,93 +331,6 @@ impl Glm52DsparkModel {
         self.cache_len
     }
 
-    /// Zero-weight model at the checkpoint's exact geometry, for perf smoke
-    /// tests without the checkpoint — GPU kernel time is value-independent.
-    #[cfg(test)]
-    pub(crate) fn synthetic(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
-        let mat = |rows: usize, cols: usize| -> Result<DeviceMatrix> {
-            Ok(DeviceMatrix {
-                data: ctx.stream.alloc_zeros(rows * cols)?,
-                rows,
-                cols,
-            })
-        };
-        let mut layers = Vec::with_capacity(DSPARK_LAYERS);
-        for _ in 0..DSPARK_LAYERS {
-            layers.push(DsparkLayer {
-                input_ln: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
-                qkv: mat(3 * DSPARK_QKV_DIM, GLM52_HIDDEN)?,
-                o_proj: mat(GLM52_HIDDEN, DSPARK_QKV_DIM)?,
-                q_norm: DeviceVec::zeros(ctx, DSPARK_HEAD_DIM)?,
-                k_norm: DeviceVec::zeros(ctx, DSPARK_HEAD_DIM)?,
-                post_ln: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
-                gate_up: mat(2 * DSPARK_INTER, GLM52_HIDDEN)?,
-                down: mat(GLM52_HIDDEN, DSPARK_INTER)?,
-            });
-        }
-        let (cos_cache, sin_cache) =
-            precompute_rope(ctx, DSPARK_HEAD_DIM, cache_len, DSPARK_ROPE_THETA)?;
-        Ok(Self {
-            layers,
-            norm: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
-            hidden_norm: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,
-            fc: mat(GLM52_HIDDEN, GLM52_DSPARK_CONTEXT_DIM)?,
-            markov_w1: mat(GLM52_VOCAB, DSPARK_MARKOV_RANK)?,
-            markov_w2: mat(GLM52_VOCAB, DSPARK_MARKOV_RANK)?,
-            cos_cache,
-            sin_cache,
-            cache_len,
-        })
-    }
-
-    /// Deterministic pseudo-random weights over the synthetic model, for
-    /// graph-vs-eager parity tests: kernel *timing* is value-independent, but
-    /// draft-token parity needs non-degenerate logits (all-zero weights make
-    /// every argmax a trivial index-0 tie).
-    #[cfg(test)]
-    pub(crate) fn randomize_for_test(&mut self, ctx: &DeviceContext) -> Result<()> {
-        fn fill(
-            ctx: &DeviceContext,
-            buf: &mut CudaSlice<half::bf16>,
-            seed: u32,
-            scale: f32,
-            offset: f32,
-        ) -> Result<()> {
-            let mut state = seed | 1;
-            let host: Vec<half::bf16> = (0..buf.len())
-                .map(|_| {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    half::bf16::from_f32(
-                        ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * scale + offset,
-                    )
-                })
-                .collect();
-            ctx.stream.memcpy_htod(&host, buf)?;
-            Ok(())
-        }
-        let mut seed = 0x5eed_u32;
-        let mut next = || {
-            seed = seed.wrapping_add(0x9e37_79b9);
-            seed
-        };
-        for layer in &mut self.layers {
-            fill(ctx, &mut layer.qkv.data, next(), 0.02, 0.0)?;
-            fill(ctx, &mut layer.o_proj.data, next(), 0.02, 0.0)?;
-            fill(ctx, &mut layer.gate_up.data, next(), 0.02, 0.0)?;
-            fill(ctx, &mut layer.down.data, next(), 0.02, 0.0)?;
-            fill(ctx, &mut layer.input_ln.data, next(), 0.1, 1.0)?;
-            fill(ctx, &mut layer.post_ln.data, next(), 0.1, 1.0)?;
-            fill(ctx, &mut layer.q_norm.data, next(), 0.1, 1.0)?;
-            fill(ctx, &mut layer.k_norm.data, next(), 0.1, 1.0)?;
-        }
-        fill(ctx, &mut self.norm.data, next(), 0.1, 1.0)?;
-        fill(ctx, &mut self.hidden_norm.data, next(), 0.1, 1.0)?;
-        fill(ctx, &mut self.fc.data, next(), 0.02, 0.0)?;
-        fill(ctx, &mut self.markov_w1.data, next(), 0.5, 0.0)?;
-        fill(ctx, &mut self.markov_w2.data, next(), 0.5, 0.0)?;
-        Ok(())
-    }
-
     /// Propose `GLM52_DSPARK_DRAFTS` draft tokens for each state, batched.
     ///
     /// Dense ops (embedding, norms, q/o/mlp GEMMs, logits) run once over the
@@ -500,21 +413,27 @@ impl Glm52DsparkModel {
             max_tail <= scratch.tail_input.data.len() / GLM52_HIDDEN,
             "dspark tail length {max_tail} exceeds the preallocated cap"
         );
+        // The tail seq_lens must be set OUTSIDE the graphable region: a replay
+        // does not run the captured closure, but the always-eager dynamic
+        // middle consumes these bounds every round — a stale value from a
+        // previous accept length either trips the copy range check (engine
+        // teardown) or ropes garbage rows. At bs=1 this single assignment is
+        // the round's truth; at bs>1 state_prep re-sets them per slot (eager).
+        let tail_len0 = context_lens[0] + block;
+        scratch.tail_input.seq_len = tail_len0;
+        scratch.k_tail.seq_len = tail_len0;
+        scratch.v_tail.seq_len = tail_len0;
 
-        // Piecewise forward graph (bs=1 steady state): the only round-varying
-        // kernel arguments in the forward are `committed_len`-derived — the
-        // rope positions, the two KV-append copy offsets, and the attention
-        // kv_len — i.e. 4 launches per layer, which run EAGER (a captured
-        // FlashInfer prefill bakes its KV iteration count). Everything else is
-        // shape-static per `context_len`, captured as `DSPARK_LAYERS + 1`
-        // dense segments keyed by `context_len` and replayed. rows > 1 falls
-        // back to eager: the tail scratch (tail_input/k_tail/v_tail) is shared
-        // across slots, so the per-slot prep/consume interleave cannot be
-        // re-ordered into dense-vs-dynamic spans. The first round per key
-        // stays eager (cuBLAS lazily allocates workspace on first touch, which
-        // would abort capture). The hidden/hidden_out swap is a host pointer
-        // swap: capture bakes the alternation, and no eager op touches either
-        // buffer. DSPARK_NO_FORWARD_GRAPH=1 disables.
+        // Piecewise forward graph (bs=1): only the `committed_len`-derived
+        // arguments vary per round (rope positions, KV-append offsets,
+        // attention kv_len — 4 launches/layer, kept EAGER since a captured
+        // FlashInfer prefill bakes its KV iteration count). The rest is
+        // shape-static per `context_len` → `DSPARK_LAYERS + 1` dense segments,
+        // replayed. rows > 1 falls back to eager (shared tail scratch, see
+        // state_prep). First round per key stays eager (cuBLAS lazy workspace
+        // would abort capture). The hidden/hidden_out swap is host-side and
+        // baked by capture; no eager op touches either buffer.
+        // DSPARK_NO_FORWARD_GRAPH=1 disables.
         let slot_ident = {
             let (ptr, _guard) = states[0].pending.data.device_ptr(&ctx.stream);
             ptr
@@ -524,7 +443,7 @@ impl Glm52DsparkModel {
             && context_lens[0] <= GLM52_DSPARK_BLOCK
             && std::env::var_os("DSPARK_NO_FORWARD_GRAPH").is_none();
         let use_graph = fwd_on && scratch.forward_warm.contains(&fwd_key);
-        if fwd_on && use_graph {
+        if use_graph {
             scratch
                 .forward_graphs
                 .entry(fwd_key)
@@ -819,14 +738,11 @@ impl Glm52DsparkModel {
             let mut prev = scratch.prev_tokens.slice_mut(..rows);
             ctx.stream.memcpy_htod(&anchor_tokens, &mut prev)?;
         }
-        // Graph the 7-step chain: every shape and pointer in the loop is
-        // static for a given `rows` (`step` is baked per node; the prev/next
-        // ping-pong alternates deterministically; the anchor htod above and
-        // the dtoh below stay outside), so after a one-round warm-up (cuBLAS
-        // lazily allocates its workspace on first touch, which would abort
-        // capture) the whole chain replays as ONE graph launch instead of
-        // ~21 kernel launches. DSPARK_NO_MARKOV_GRAPH=1 restores the plain
-        // loop for A/B.
+        // Graph the 7-step chain: everything in the loop is pointer- and
+        // shape-static per `rows` (`step` bakes per node; anchor h2d and the
+        // d2h stay outside), so after a one-round warm-up (cuBLAS lazy
+        // workspace) it replays as ONE launch instead of ~21.
+        // DSPARK_NO_MARKOV_GRAPH=1 restores the plain loop.
         let use_graph = std::env::var_os("DSPARK_NO_MARKOV_GRAPH").is_none();
         if use_graph && scratch.markov_warm[rows - 1] {
             let Glm52DsparkScratch {
@@ -872,11 +788,10 @@ impl Glm52DsparkModel {
                 .collect());
         }
         scratch.markov_warm[rows - 1] = true;
-        // Fixed-orientation ping-pong, NOT a field swap: a swap flips which
-        // buffer the `prev_tokens` field names, and a graph captured for one
-        // row count bakes the buffer addresses — an odd number of swaps on an
-        // eager round (7 steps) for a different row count would leave the
-        // anchor h2d above writing a buffer the captured graph never reads.
+        // Fixed-orientation ping-pong, NOT a field swap: captured graphs bake
+        // the buffer addresses, and an odd number of swaps on an eager round
+        // for another row count would desync the anchor h2d from every
+        // already-captured chain.
         for step in 1..block {
             let (prev, next): (&CudaSlice<u32>, &mut CudaSlice<u32>) = if step % 2 == 1 {
                 (&scratch.prev_tokens, &mut scratch.next_tokens)
@@ -946,102 +861,6 @@ pub(crate) fn accept_prefix_match(proposed: &[u32], target_tokens: &[u32]) -> Ve
     // `n <= proposed.len() < target_tokens.len()`, so this index is valid.
     committed.push(target_tokens[n]);
     committed
-}
-
-struct DsparkLayerKv {
-    k: HiddenStates,
-    v: HiddenStates,
-}
-
-/// Per-slot draft state: the draft KV over committed tokens, the pending
-/// captured-context rows not yet projected, and the per-round projected
-/// context (persists across the layer loop, so it lives here, not in the
-/// shared scratch). Everything is preallocated to `cache_len` at load — a
-/// mid-serving draft round must never hit the allocator (a transient OOM
-/// there would tear the whole engine down), and the launch-time VRAM probe
-/// already charged the full-cap footprint ([`glm52_dspark_arena_bytes`]).
-pub(crate) struct Glm52DsparkSlotState {
-    layers: Vec<DsparkLayerKv>,
-    /// Captured target hidden `[pending_len, 30720]` awaiting projection.
-    pending: HiddenStates,
-    pending_len: usize,
-    committed_len: usize,
-    context_projected: HiddenStates,
-    context_hidden: HiddenStates,
-    /// The drafter's KV capacity ([`Glm52DsparkModel::cache_len`]) — the
-    /// pending-context growth cap and the overflow guard bound.
-    cache_len: usize,
-}
-
-impl Glm52DsparkSlotState {
-    pub(crate) fn new(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
-        let mut layers = Vec::with_capacity(DSPARK_LAYERS);
-        for _ in 0..DSPARK_LAYERS {
-            layers.push(DsparkLayerKv {
-                k: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, cache_len)?,
-                v: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, cache_len)?,
-            });
-        }
-        let mut pending = HiddenStates::zeros(ctx, GLM52_DSPARK_CONTEXT_DIM, cache_len)?;
-        pending.seq_len = 0;
-        Ok(Self {
-            layers,
-            pending,
-            pending_len: 0,
-            committed_len: 0,
-            context_projected: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
-            context_hidden: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
-            cache_len,
-        })
-    }
-
-    /// Clear the slot for a new request. The KV/pending contents need no
-    /// scrubbing: `committed_len`/`pending_len` gate every read, and new
-    /// rows overwrite in place.
-    pub(crate) fn reset(&mut self) {
-        self.committed_len = 0;
-        self.pending_len = 0;
-        self.pending.seq_len = 0;
-    }
-
-    /// Append one step row's captured hidden (a `[30720]` row of the step
-    /// capture buffer) to the pending context. The buffer holds `cache_len`
-    /// rows from birth — allocation-free by construction.
-    pub(crate) fn append_captured_row(
-        &mut self,
-        ctx: &DeviceContext,
-        captured: &CudaSlice<half::bf16>,
-        row: usize,
-    ) -> Result<()> {
-        let required = self.pending_len + 1;
-        ensure!(
-            self.committed_len + required + GLM52_DSPARK_BLOCK <= self.cache_len,
-            "dspark pending context would exceed the draft cache: committed={}, pending={required}",
-            self.committed_len
-        );
-        let src =
-            captured.slice(row * GLM52_DSPARK_CONTEXT_DIM..(row + 1) * GLM52_DSPARK_CONTEXT_DIM);
-        let mut dst = self.pending.data.slice_mut(
-            self.pending_len * GLM52_DSPARK_CONTEXT_DIM..required * GLM52_DSPARK_CONTEXT_DIM,
-        );
-        ctx.stream.memcpy_dtod(&src, &mut dst)?;
-        self.pending_len = required;
-        self.pending.seq_len = required;
-        Ok(())
-    }
-
-    /// Point the projected-context pair at this round's rows. Preallocated to
-    /// `cache_len` — the bound is already enforced by the caller's overflow
-    /// guard, so exceeding it here is a bug, not a growth request.
-    fn set_context_len(&mut self, context_len: usize) -> Result<()> {
-        ensure!(
-            context_len <= self.context_projected.data.len() / GLM52_HIDDEN,
-            "dspark context length {context_len} exceeds the preallocated cap"
-        );
-        self.context_projected.seq_len = context_len;
-        self.context_hidden.seq_len = context_len;
-        Ok(())
-    }
 }
 
 /// Rank-level draft scratch, allocated once for the whole slot batch. Dense
@@ -1148,49 +967,15 @@ impl Glm52DsparkScratch {
         self.logits_normed.seq_len = block_rows;
         self.logits.seq_len = block_rows;
     }
-
-    /// Point the varlen tail buffers at this request's `context + block`
-    /// rows. Preallocated to the draft cache length — the caller's overflow
-    /// guard already bounds `tail_len`, so exceeding it is a bug.
-    fn set_tail_len(&mut self, tail_len: usize) -> Result<()> {
-        ensure!(
-            tail_len <= self.tail_input.data.len() / GLM52_HIDDEN,
-            "dspark tail length {tail_len} exceeds the preallocated cap"
-        );
-        self.tail_input.seq_len = tail_len;
-        self.k_tail.seq_len = tail_len;
-        self.v_tail.seq_len = tail_len;
-        Ok(())
-    }
 }
 
+#[path = "dspark_slot.rs"]
+mod slot;
+pub(crate) use slot::Glm52DsparkSlotState;
+
+/// Test-only constructors (`synthetic`, `randomize_for_test`) live in a
+/// child module file so this one stays under the module size budget; a child
+/// module keeps access to the private fields.
 #[cfg(test)]
-mod tests {
-    use super::accept_prefix_match;
-
-    #[test]
-    fn accepts_full_run_plus_bonus() {
-        assert_eq!(
-            accept_prefix_match(&[10, 11, 12], &[10, 11, 12, 13]),
-            vec![10, 11, 12, 13]
-        );
-    }
-
-    #[test]
-    fn accepts_prefix_then_correction() {
-        assert_eq!(
-            accept_prefix_match(&[10, 11, 99], &[10, 11, 22, 33]),
-            vec![10, 11, 22]
-        );
-    }
-
-    #[test]
-    fn rejects_first_draft_commits_the_correction() {
-        assert_eq!(accept_prefix_match(&[10, 11, 12], &[7, 8, 9, 10]), vec![7]);
-    }
-
-    #[test]
-    fn empty_proposal_commits_the_model_token() {
-        assert_eq!(accept_prefix_match(&[], &[42]), vec![42]);
-    }
-}
+#[path = "dspark_test_support.rs"]
+mod test_support;
