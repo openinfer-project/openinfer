@@ -146,12 +146,21 @@ fn dspark_propose_graph_parity() -> Result<()> {
             }
         }
         let mut scratch = Glm52DsparkScratch::new(&ctx, cache_len)?;
-        let mut state = Glm52DsparkSlotState::new(&ctx, cache_len)?;
+        // Two slots proposing on alternating rounds, both at active == 1 — the
+        // slot-rotation case the graph key must survive: a captured segment
+        // bakes the slot's pending/context buffer pointers, so a graph
+        // captured for slot A must never replay for slot B.
+        let mut slot_a = Glm52DsparkSlotState::new(&ctx, cache_len)?;
+        let mut slot_b = Glm52DsparkSlotState::new(&ctx, cache_len)?;
+        let mut turns = [0usize; 2];
         let mut all = Vec::with_capacity(ROUNDS);
         for round in 0..ROUNDS {
+            let which = round % 2;
+            let state = if which == 0 { &mut slot_a } else { &mut slot_b };
             state.append_captured_row(&ctx, &captured, 0)?;
-            let anchors = vec![(7 + round as u32, round + 1)];
-            let mut refs = vec![&mut state];
+            turns[which] += 1;
+            let anchors = vec![(7 + round as u32, turns[which])];
+            let mut refs = vec![&mut *state];
             let drafts =
                 model.propose(&ctx, &embed, &lm_head, &mut refs, &anchors, &mut scratch)?;
             all.push(drafts[0]);

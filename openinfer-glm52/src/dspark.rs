@@ -23,7 +23,7 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr};
 
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::weight_loader::{
@@ -515,11 +515,21 @@ impl Glm52DsparkModel {
         // would abort capture). The hidden/hidden_out swap is a host pointer
         // swap: capture bakes the alternation, and no eager op touches either
         // buffer. DSPARK_NO_FORWARD_GRAPH=1 disables.
-        let fwd_key = context_lens[0] - 1;
+        let slot_ident = {
+            let (ptr, _guard) = states[0].pending.data.device_ptr(&ctx.stream);
+            ptr
+        };
+        let fwd_key = (slot_ident, context_lens[0]);
         let fwd_on = active == 1
-            && fwd_key < scratch.forward_warm.len()
+            && context_lens[0] <= GLM52_DSPARK_BLOCK
             && std::env::var_os("DSPARK_NO_FORWARD_GRAPH").is_none();
-        let use_graph = fwd_on && scratch.forward_warm[fwd_key];
+        let use_graph = fwd_on && scratch.forward_warm.contains(&fwd_key);
+        if fwd_on && use_graph {
+            scratch
+                .forward_graphs
+                .entry(fwd_key)
+                .or_insert_with(|| (0..=DSPARK_LAYERS).map(|_| CudaGraphState::new()).collect());
+        }
 
         {
             let Glm52DsparkScratch {
@@ -681,7 +691,9 @@ impl Glm52DsparkModel {
             macro_rules! run_seg {
                 ($idx:expr, $body:block) => {{
                     if use_graph {
-                        forward_graphs[fwd_key][$idx]
+                        forward_graphs
+                            .get_mut(&fwd_key)
+                            .expect("forward graph entry created before the segments")[$idx]
                             .run_or_capture(ctx, || -> Result<()> { $body Ok(()) })?;
                     } else {
                         (|| -> Result<()> { $body Ok(()) })()?;
@@ -721,8 +733,8 @@ impl Glm52DsparkModel {
                 }
             }
         }
-        if fwd_on && !scratch.forward_warm[fwd_key] {
-            scratch.forward_warm[fwd_key] = true;
+        if fwd_on {
+            scratch.forward_warm.insert(fwd_key);
         }
         // Host bookkeeping the eager path used to do inline.
         for (i, state) in states.iter_mut().enumerate() {
@@ -1007,10 +1019,15 @@ pub(crate) struct Glm52DsparkScratch {
     /// loop so cuBLAS's lazy workspace allocation happens outside capture.
     markov_graphs: Vec<CudaGraphState>,
     markov_warm: Vec<bool>,
-    /// Piecewise forward graphs (bs=1 only), keyed by `context_len - 1`:
-    /// `DSPARK_LAYERS + 1` dense segments each, with a per-key warm flag.
-    forward_graphs: Vec<Vec<CudaGraphState>>,
-    forward_warm: Vec<bool>,
+    /// Piecewise forward graphs (bs=1 only), keyed by **(slot identity,
+    /// context_len)** — the captured segments bake per-slot buffer pointers
+    /// (`state.pending`, `state.context_projected`, `state.context_hidden`),
+    /// so a graph captured for one slot must never replay for another. Slot
+    /// identity is the device address of the slot's `pending` buffer (stable
+    /// for the slot's lifetime; the `&mut` reference itself is not). Bounded
+    /// by `GLM52_MAX_BATCH_PER_RANK x GLM52_DSPARK_BLOCK` entries.
+    forward_graphs: std::collections::HashMap<(u64, usize), Vec<CudaGraphState>>,
+    forward_warm: std::collections::HashSet<(u64, usize)>,
 }
 
 impl Glm52DsparkScratch {
@@ -1050,10 +1067,8 @@ impl Glm52DsparkScratch {
                 .map(|_| CudaGraphState::new())
                 .collect(),
             markov_warm: vec![false; GLM52_MAX_BATCH_PER_RANK],
-            forward_graphs: (0..GLM52_DSPARK_BLOCK)
-                .map(|_| (0..=DSPARK_LAYERS).map(|_| CudaGraphState::new()).collect())
-                .collect(),
-            forward_warm: vec![false; GLM52_DSPARK_BLOCK],
+            forward_graphs: std::collections::HashMap::new(),
+            forward_warm: std::collections::HashSet::new(),
         })
     }
 
