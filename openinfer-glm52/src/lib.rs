@@ -318,7 +318,12 @@ fn start_engine(
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
-    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
+    // Publish the launch-time cap so the frontend clamps its config.json
+    // max_position_embeddings (1M) at the API boundary instead of admitting
+    // requests the scheduler would reject (same contract as qwen3/dsv2-lite).
+    let servable_len = u32::try_from(max_model_len)
+        .expect("max_model_len is bounded by GLM52_MAX_CONTEXT and fits u32");
+    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle).with_servable_len(servable_len))
 }
 
 /// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —
