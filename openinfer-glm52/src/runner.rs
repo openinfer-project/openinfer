@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context as _, Result, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use openinfer_kv_offload::KvArena;
 
 use crate::dspark::{
     GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch, Glm52DsparkSlotState,
@@ -93,9 +94,11 @@ enum Glm52RankCommand {
     /// Non-collective: adopt the resident weights into the rank's model.
     /// Every rank must report success BEFORE anyone enters SetupComm — a
     /// build failure on one rank must never strand the others in NCCL init.
+    /// Replies with the rank's cache arena descriptors so launch can
+    /// register them with the shared KV offload host.
     BuildModel {
         max_model_len: usize,
-        resp: Sender<Result<()>>,
+        resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
     /// to every rank concurrently, only after all builds succeeded.
@@ -206,7 +209,10 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn build_model_async(&self, max_model_len: usize) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn build_model_async(
+        &self,
+        max_model_len: usize,
+    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::BuildModel {
@@ -387,7 +393,7 @@ impl Glm52RankThreadState {
         Ok(report)
     }
 
-    fn build_model(&mut self, max_model_len: usize) -> Result<()> {
+    fn build_model(&mut self, max_model_len: usize) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
             .take()
@@ -407,6 +413,7 @@ impl Glm52RankThreadState {
         // Non-expert leftovers are the MTP-layer tensors (out of scope) —
         // dropped with `weights` here.
         drop(weights);
+        let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
         self.runtime = Some(Glm52RankRuntime {
             model,
@@ -414,7 +421,7 @@ impl Glm52RankThreadState {
             ep8: None,
             dspark: None,
         });
-        Ok(())
+        Ok(arenas)
     }
 
     fn load_dspark(&mut self, path: &Path) -> Result<()> {

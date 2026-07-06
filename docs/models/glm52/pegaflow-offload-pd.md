@@ -1,6 +1,6 @@
 # GLM5.2 × pegaflow: host-tier KV offload → P/D disaggregation
 
-> **TL;DR:** Design record (no code yet). The pegaflow in-process bridge already exists and serves qwen3 (`openinfer-kv-offload` embeds `PegaEngine` directly); GLM5.2 integration is an extension, not greenfield. M1 = single-engine host-tier offload wired into the admission prefix-match; M2 = cross-engine P/D (vLLM prefill → openinfer decode) via the #540 hash-compat pattern. Design pins to pegaflow-core **v0.23.2 rev d46fd16** (the vendored dep), not the local v0.22.6 checkout.
+> **TL;DR:** M1 is implemented (`feat/kv-offload-shared-host`): shared `OffloadHost` + 8 rank instances on one namespace, 99 arenas/rank (78 MLA + 21 index-K), restore at admission / save on release, behind `--kv-offload` (+`--kv-offload-hugepages`). Device-side KV layout is verified byte-identical to vLLM's (our kernels are ports); the M2 gap is block hashing only. M2 = cross-engine P/D (vLLM prefill → openinfer decode) via the #540 hash-compat pattern. Design pins to pegaflow-core **v0.23.2 rev d46fd16** (the vendored dep), not the local v0.22.6 checkout.
 >
 > **Last touched:** 2026-07
 
@@ -21,14 +21,18 @@ The standing decision is prefill-by-vLLM (no dedicated GLM5.2 prefill path). P/D
 3. **Host pool = hugepages on jz-38**: the box has RAM to spare and `PegaEngine::new_with_config(pool_size, use_hugepages, …)` supports it directly; bench the tier with hugepages on (note the jiuzhang platform reclaims node-38 hugepage reservations at reboot — re-check `HugePages_Total` before runs).
 4. **Hook**: admission's `match_and_add_prefix` grows the CPU leg exactly like qwen3's executor — GPU match first, then `cpu_query_hashes` against pegaflow, lease + async load into freshly-reserved pool pages, `commit_loaded_blocks`, and only then report `cached_tokens`. Loads must complete before the request's first step (admission is a step boundary; block on the `LoadHandle` like qwen3 does).
 5. **Save policy**: sealed (content-addressed) blocks flow to the host tier on release, same as qwen3's `save_sealed_blocks`. dspark × prefix-cache exclusivity carries over unchanged — drafter on ⇒ no prefix matching ⇒ offload restore off (#590 owns lifting that).
-6. **Gates** (jz-38): byte parity — evict-then-restore a 1200-token varied prompt and require the warm output byte-identical to the resident-prefix run; step-bench flat vs the D5/D10 anchors (save is off the step path, restore is admission-side); 17-way mixed load with restores zero-error; `--no-prefix-cache` disables the whole leg.
+6. **Gates** (jz-38, run 2026-07-06, ALL PASS): evict-restore byte parity — a 1466-token prompt's greedy completion byte-identical cold → warm-restored (22 blocks from host) → no-offload server; TTFT 5371 ms cold vs **157.6 ms warm-restored (~34×)**, offload-on miss path 5064 ms (within single-sample noise of no-offload); 16-way mixed re-run after eviction = 15 full-prefix restores (42-43 blocks), 0 errors, 2.2 s wall; hugepage pool verified (`HugePages_Free` 17408 → 1024 at launch); zero host-tier warns across the 160-prompt churn.
 
 ## M2 — cross-engine P/D (vLLM prefill → openinfer decode)
 
 Blocked on M1. Two hard problems, both with prior art:
 
 - **Hash compat**: openinfer xxh3-lineage vs vLLM SHA-256 `block_hashes` never collide onto the same keys. PR #540 (qwen3) already built the pattern: compute vLLM-compatible hashes for the prompt at admission and query the vLLM-written namespace. Port that, plus the namespace derivation (vLLM side = SHA-256 over model/dtype/tp/heads/... — `connector/common.py:210`; ours must reproduce it byte-for-byte).
-- **Layout parity**: vLLM's GLM5.2 runs the same FlashMLA-sparse fp8_ds_mla + DeepGEMM indexer contracts, but byte-level identity of both arenas (656 B token layout, index-K packing, scale placement) must be *proven*, not assumed — gate: dump one block from each engine for the same prefix and byte-compare before any e2e. Also reconcile page granularity (our fixed 64-token page vs vLLM scheduler-block × dcp/pcp virtual blocks).
+- **Layout parity**: verified at source level 2026-07-06 against the sibling vLLM checkout (`/data/code/workspace-rustllm/vllm`, `cdab28319`) — byte-for-byte MATCH on everything device-side, because our kernels are ports of vLLM's: 656 B/token field order `[512 fp8 NoPE][4×f32 scale, ÷448, group=128][64×bf16 RoPE]` (vLLM `cache_kernels.cu:447-547` ↔ ours `glm52_mla_assembly.cu:33-34`), index-K block-split `[64×128 fp8][64×4 B f32 scale]` (vLLM `cache_kernels.cu:550-607` ↔ ours `glm52_indexer.cu:69-87`, which cites the vLLM kernel by name), page=64, layer-outermost page-contiguous arenas both sides. Remaining gate before e2e: dump one block per arena from each engine for the same prefix and byte-compare (guards silent drift on either side's bumps). One structural note: vLLM keeps MLA and indexer caches as separate KV groups; we index both off one pool block id — irrelevant to byte parity, matters only for block-id translation.
+
+## Open problem: the tail blocks P/D can't ship (2026-07-07)
+
+The content-addressed tier only ever holds *sealed* 64-token blocks, and the reuse cap is `cacheable = (prompt−1)/64` — the tail partial page plus the prompt's final token never enter it (the last token must forward to produce first-step logits). M1 measured the cost: with 96% of a 1466-token prompt restored, warm TTFT is still 157.6 ms, ~150 ms of which is prefilling the ≤64 uncached tail tokens; the restore itself (query + 76 MB H2D) is ~3-5 ms. Harmless for host-tier caching, but in M2 P/D over pegaflow P2P this becomes a **per-request floor on the decode side**: every handed-off request re-prefills up to 64 tokens no matter how perfect the transfer is. Directions if/when it matters: partial-block entries keyed by `(hash, valid_len)` (needs pegaflow + kvbm contract changes — kvbm deliberately refuses to register unsealed blocks), or the prefill side shipping the boundary step's sampled token + KV so decode starts at step 1 (a protocol change, not a cache entry). Deferred until M2 shows the 150 ms floor actually hurts the target workload.
 
 ## Pitfalls pinned during the survey
 
@@ -36,6 +40,14 @@ Blocked on M1. Two hard problems, both with prior art:
 - The PyO3 package is a gRPC client — reference contract only, not our path.
 - vLLM connector requires `storage_offset()==0` and registers CUDA-IPC handles; our in-process path passes raw device pointers and skips IPC entirely.
 
+## M1 implementation notes (2026-07-06, `feat/kv-offload-shared-host`)
+
+- `OffloadHost` (openinfer-kv-offload) owns the pinned pool + runtime + P2P lifecycle; `OffloadEngine::with_arenas_on(host, ...)` registers a rank as one more pegaflow instance over the shared pool. `use_hugepages` is a `HostConfig`/CLI knob.
+- Each rank registers 99 arenas in one instance (78 `glm52.L{n}.mla` + 21 `glm52.L{n}.idxk` — full-indexer layers are `{0,1,2} ∪ {6,10,…,74}`, NOT a 5-layer set), so one save/load entry per block moves both caches atomically. `Glm52RankModel::kv_arenas` asserts allocation sizes against the geometry at registration.
+- Restore leg (`scheduler/offload.rs`): at admission — a step boundary, all ranks joined — probe → query → load into `reserve_loaded_blocks` pages → blocking `wait()` → `commit_loaded_blocks`; the probe is held across `match_and_add_prefix` so the committed blocks can't evict before the re-match. Save leg: on release, fire-and-forget, `assigned_block_guards` pin the pages through the D2H copy; prefix-matched head skipped (already host-resident).
+- Launch rejects `--kv-offload` with `--no-prefix-cache` or the DSpark drafter. Blocking the coordinator on the load stalls all 8 ranks for the restore duration — the accepted M1 cost; qwen3-style per-tick polling is the follow-up lever if restore latency shows up in ITL.
+- jz-38 hugepages: `echo N > /proc/sys/vm/nr_hugepages` works live as root (platform still zeroes it at reboot).
+
 ## Next action
 
-M1 step 1 (done, `feat/kv-offload-arena-registration`): `KvArena` + `OffloadEngine::with_arenas` extend the registration to explicit multi-arena geometry; qwen3's `from_buffer` delegates to it. Step 2: the shared-`PegaEngine` constructor (one host pool, 8 rank instances, one namespace), then the GLM5.2 arena exposure + admission CPU leg.
+Land the M1 branch once the jz-38 gates pass (evict-restore byte parity via churn eviction, mixed load with restores, hugepage pool, no-offload parity anchor). Then M2: #540-pattern vLLM hash compat + the byte-dump layout gate below.

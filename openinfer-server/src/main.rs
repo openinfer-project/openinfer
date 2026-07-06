@@ -135,17 +135,33 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 .context("failed to start DeepSeek V2 Lite engine")?
         }
         #[cfg(feature = "glm52")]
-        ModelType::Glm52 => openinfer_glm52::launch(
-            &args.model_path,
-            openinfer_glm52::Glm52LaunchOptions {
-                tp_size: args.tp_size,
-                dp_size: args.dp_size.unwrap_or(8),
-                dspark_draft_model_path: args.dflash_draft_model_path.clone(),
-                max_model_len: args.max_model_len,
-                no_prefix_cache: args.no_prefix_cache,
-            },
-        )
-        .context("failed to start GLM5.2 engine")?,
+        ModelType::Glm52 => {
+            // The shared --kv-p2p-* flags only reach the qwen3 engine; fail
+            // loud instead of silently starting host-only offload in what
+            // looks like a P2P deployment (GLM5.2 P2P lands with M2).
+            anyhow::ensure!(
+                args.kv_p2p_metaserver_addr.is_none(),
+                "GLM5.2 KV offload is host-tier only for now; --kv-p2p-* flags are not supported"
+            );
+            openinfer_glm52::launch(
+                &args.model_path,
+                openinfer_glm52::Glm52LaunchOptions {
+                    tp_size: args.tp_size,
+                    dp_size: args.dp_size.unwrap_or(8),
+                    dspark_draft_model_path: args.dflash_draft_model_path.clone(),
+                    max_model_len: args.max_model_len,
+                    no_prefix_cache: args.no_prefix_cache,
+                    kv_offload: args
+                        .kv_offload
+                        .then(|| openinfer_glm52::Glm52KvOffloadOptions {
+                            pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
+                                as usize,
+                            use_hugepages: args.kv_offload_hugepages,
+                        }),
+                },
+            )
+            .context("failed to start GLM5.2 engine")?
+        }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,
@@ -162,6 +178,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             let offload = if args.kv_offload {
                 let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
                 let mut offload = Qwen3OffloadOptions::enabled(bytes);
+                offload.use_hugepages = args.kv_offload_hugepages;
                 if let (Some(metaserver_addr), Some(advertise_addr)) = (
                     args.kv_p2p_metaserver_addr.clone(),
                     args.kv_p2p_advertise_addr.clone(),

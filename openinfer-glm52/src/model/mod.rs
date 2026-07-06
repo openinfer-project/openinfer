@@ -17,7 +17,7 @@
 //! shapes identical within a bucket (the whole-step CUDA graphs' contract).
 
 use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::{CudaSlice, PinnedHostSlice};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr as _, PinnedHostSlice};
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::{
@@ -28,6 +28,7 @@ use openinfer_kernels::ops::{
     glm52_fp8_weight_only_gemv_launch, rms_norm_rows_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStatesRef};
+use openinfer_kv_offload::KvArena;
 use openinfer_sample::{
     BatchSamplingRow, BatchSamplingScratch, effectively_greedy, gpu_sample_batch_into, mix_seed,
 };
@@ -332,6 +333,54 @@ impl Glm52RankModel {
                 )
             })?;
         Ok(state.scratch.captured.data())
+    }
+
+    /// The per-layer cache arenas this rank registers with the KV offload
+    /// tier: one `glm52.L{n}.mla` arena per layer plus a `glm52.L{n}.idxk`
+    /// sidecar on the full-indexer layers, all indexed by the same pool block
+    /// ids. Registering both under one instance makes every save/load move a
+    /// block's MLA page and its index-K slice together — an MLA page restored
+    /// without its index-K would be silent corruption. The arenas are
+    /// contiguous, so a block's stride equals its copy size.
+    pub(crate) fn kv_arenas(&self, stream: &CudaStream) -> Result<Vec<KvArena>> {
+        let num_blocks = glm52_pool_blocks(self.max_model_len);
+        let mla_block_bytes =
+            GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+        let idxk_block_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+        let mut arenas = Vec::with_capacity(self.caches.len() * 2);
+        for (layer, caches) in self.caches.iter().enumerate() {
+            ensure!(
+                caches.mla_cache.len() == num_blocks * mla_block_bytes,
+                "GLM5.2 layer {layer} MLA arena is {} bytes, expected \
+                 {num_blocks} blocks x {mla_block_bytes}",
+                caches.mla_cache.len(),
+            );
+            let (base_ptr, _sync) = caches.mla_cache.device_ptr(stream);
+            arenas.push(KvArena {
+                name: format!("glm52.L{layer}.mla"),
+                base_ptr,
+                num_blocks,
+                bytes_per_block: mla_block_bytes,
+                block_stride_bytes: mla_block_bytes,
+            });
+            if let Some(index_k) = &caches.index_k_cache {
+                ensure!(
+                    index_k.len() == num_blocks * idxk_block_bytes,
+                    "GLM5.2 layer {layer} index-K arena is {} bytes, expected \
+                     {num_blocks} blocks x {idxk_block_bytes}",
+                    index_k.len(),
+                );
+                let (base_ptr, _sync) = index_k.device_ptr(stream);
+                arenas.push(KvArena {
+                    name: format!("glm52.L{layer}.idxk"),
+                    base_ptr,
+                    num_blocks,
+                    bytes_per_block: idxk_block_bytes,
+                    block_stride_bytes: idxk_block_bytes,
+                });
+            }
+        }
+        Ok(arenas)
     }
 
     pub(crate) fn build(

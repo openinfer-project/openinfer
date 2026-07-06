@@ -71,10 +71,12 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub deepseek_prefill_profile: bool,
 
-    /// Enable pegaflow KV offload (host-tier "L2" cache) on the single-GPU
-    /// Qwen3 path. Sealed KV blocks are saved to host pinned memory and
-    /// restored into HBM before prefill when a prompt's prefix has fallen out
-    /// of the GPU cache.
+    /// Enable pegaflow KV offload (host-tier "L2" cache): single-GPU Qwen3,
+    /// or GLM5.2 DP8 (one pool shared by all 8 ranks under one namespace).
+    /// Sealed KV blocks are saved to host pinned memory and restored into
+    /// HBM before prefill when a prompt's prefix has fallen out of the GPU
+    /// cache. GLM5.2 requires the prefix cache: incompatible with
+    /// --no-prefix-cache and the DSpark drafter.
     #[arg(long, default_value_t = false)]
     pub kv_offload: bool,
 
@@ -82,6 +84,13 @@ pub(crate) struct Args {
     /// allocates the whole pool up front, so RSS reflects this at startup.
     #[arg(long, default_value_t = 8.0)]
     pub kv_offload_host_gib: f64,
+
+    /// Back the KV offload pool with 2 MiB hugepages. The box must hold a
+    /// reservation covering the pool (`HugePages_Total` in /proc/meminfo;
+    /// `echo N > /proc/sys/vm/nr_hugepages` as root) — allocation fails at
+    /// startup otherwise.
+    #[arg(long, default_value_t = false, requires = "kv_offload")]
+    pub kv_offload_hugepages: bool,
 
     /// Join the cross-instance KV P2P mesh: pegaflow MetaServer gRPC address
     /// (e.g. `http://127.0.0.1:50056`). Saved block hashes register there and

@@ -31,6 +31,7 @@
 mod admission;
 #[cfg(test)]
 mod contract_tests;
+mod offload;
 mod plan;
 mod slot;
 #[cfg(test)]
@@ -40,6 +41,7 @@ use anyhow::Context as _;
 
 use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
 use openinfer_kv_cache::{BlockPool, RequestKv};
+use openinfer_kv_offload::OffloadEngine;
 use openinfer_sample::mix_seed;
 use tokio::sync::mpsc;
 
@@ -112,9 +114,12 @@ fn padding_step_kv(
 
 /// DP8 coordinator: admits up to `GLM52_MAX_BATCH_PER_RANK` requests per rank
 /// (least-loaded rank with pool budget first) and drives all ranks in
-/// lock-step. Consumes the workers; returns when the submit channel closes
-/// or a step fails (the EP8 collective group cannot recover from a failed
-/// step — see the teardown comment below).
+/// lock-step. Consumes the workers — and the offload engines: they hold the
+/// shared pegaflow host, which must outlive every in-flight save and dies
+/// with the coordinator. Returns when the submit channel closes or a step
+/// fails (the EP8 collective group cannot recover from a failed step — see
+/// the teardown comment below).
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     workers: Vec<Glm52RankWorker>,
@@ -122,7 +127,10 @@ pub(crate) fn run_dp8_coordinator(
     dspark_enabled: bool,
     max_model_len: usize,
     no_prefix_cache: bool,
+    offload: Option<Vec<OffloadEngine>>,
 ) {
+    let offload: Option<Vec<offload::RankOffload>> =
+        offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
     // One KV page pool per rank: pool block ids index the rank's per-layer
     // MLA and index-K arenas directly (the arenas were built for
     // `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
@@ -221,6 +229,7 @@ pub(crate) fn run_dp8_coordinator(
             &mut slots,
             &pools,
             &usable_blocks,
+            offload.as_deref(),
             prefix_cache_enabled,
             dspark_enabled,
             &mut pending_resets,
@@ -244,6 +253,7 @@ pub(crate) fn run_dp8_coordinator(
             slots_changed,
             pending.is_empty(),
             dspark_enabled,
+            offload.is_some(),
             &slots,
             max_model_len,
         );
@@ -273,6 +283,7 @@ pub(crate) fn run_dp8_coordinator(
             &shapes,
             &span_kinds,
             &pools,
+            offload.as_deref(),
             eos_token_ids,
             dspark_enabled,
             &mut pending_resets,
@@ -309,6 +320,17 @@ pub(crate) fn run_dp8_coordinator(
         });
     }
 
+    // Drain in-flight release saves and drop the offload engines BEFORE the
+    // workers drop the models: the registered arenas' device memory must
+    // outlive every D2H copy (the `with_arenas` contract), and pegaflow's
+    // save worker cannot cancel a copy already handed to it. `flush_saves`
+    // is deadline-bounded, so a stuck host tier cannot hang teardown.
+    if let Some(offload) = offload {
+        for rank in &offload {
+            rank.engine.flush_saves();
+        }
+        drop(offload);
+    }
     // The DeepEP context drop is collective: broadcast Shutdown to every rank
     // BEFORE the workers' Drop joins them one by one — a sequential
     // shutdown-then-join would leave a rank spinning in the destroy barrier
@@ -386,6 +408,7 @@ fn admit_from_queue(
     slots: &mut [RankSlots],
     pools: &[BlockPool],
     usable_blocks: &[usize],
+    offload: Option<&[offload::RankOffload]>,
     prefix_cache_enabled: bool,
     dspark_enabled: bool,
     pending_resets: &mut [Vec<usize>],
@@ -405,8 +428,21 @@ fn admit_from_queue(
                     .sum()
             })
             .collect();
+        // Pages pinned by in-flight release saves are physically
+        // unallocatable until their D2H lands — hide them from the
+        // full-lifetime budget so admission defers instead of promising
+        // pages a later `schedule_prefill` cannot get (which would
+        // fail_step the whole engine).
+        let usable: Vec<usize> = match offload {
+            Some(offload) => usable_blocks
+                .iter()
+                .zip(offload)
+                .map(|(&usable, rank)| usable.saturating_sub(rank.pinned_blocks()))
+                .collect(),
+            None => usable_blocks.to_vec(),
+        };
         let Some((rank, slot)) =
-            admission_target(&occupancy(slots), &committed, usable_blocks, need_blocks)
+            admission_target(&occupancy(slots), &committed, &usable, need_blocks)
         else {
             break;
         };
@@ -417,6 +453,14 @@ fn admit_from_queue(
             continue;
         }
         let mut kv = pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+        // Host-tier restore first, so the single GPU prefix match below sees
+        // the union of HBM-resident and freshly-restored blocks. The probe
+        // stays alive across the match: it holds the committed blocks, and
+        // dropping it earlier would open an eviction window between commit
+        // and re-match.
+        let _restored_hold = offload.filter(|_| prefix_cache_enabled).map(|offload| {
+            offload::restore_host_prefix(&offload[rank].engine, &pools[rank], &req.prompt_tokens)
+        });
         let cached_tokens = if prefix_cache_enabled {
             match kv.match_and_add_prefix(&pools[rank]) {
                 Ok(cached) => cached,
@@ -629,6 +673,7 @@ fn apply_step_outputs(
     shapes: &[Glm52StepShape],
     span_kinds: &[[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]],
     pools: &[BlockPool],
+    offload: Option<&[offload::RankOffload]>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
     pending_resets: &mut [Vec<usize>],
@@ -731,6 +776,13 @@ fn apply_step_outputs(
             };
             if freed {
                 active.state.log_spec_stats(rank, slot_id);
+                // Offload the freshly-sealed blocks BEFORE release: the
+                // hashes and guards come off the still-assigned request
+                // state, and the guards keep the pages pinned through the
+                // async D2H copy.
+                if let Some(offload) = offload {
+                    offload[rank].save_sealed_on_release(&active.kv);
+                }
                 if let Err(err) = active.kv.release() {
                     // Blocks still return via assignment RAII when the
                     // slot drops — the explicit release only failed to

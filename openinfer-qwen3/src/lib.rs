@@ -90,6 +90,8 @@ pub struct Qwen3OffloadOptions {
     pub enabled: bool,
     /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
     pub pinned_pool_bytes: usize,
+    /// Back the pool with 2 MiB hugepages (the box must hold a reservation).
+    pub use_hugepages: bool,
     /// `Some` joins the cross-instance P2P mesh: block hashes register with a
     /// MetaServer, peers pull missing prefixes over RDMA, and this engine
     /// serves theirs. The P/D disaggregation data plane.
@@ -123,6 +125,7 @@ impl Qwen3OffloadOptions {
         Self {
             enabled: false,
             pinned_pool_bytes: 0,
+            use_hugepages: false,
             p2p: None,
         }
     }
@@ -131,6 +134,7 @@ impl Qwen3OffloadOptions {
         Self {
             enabled: true,
             pinned_pool_bytes,
+            use_hugepages: false,
             p2p: None,
         }
     }

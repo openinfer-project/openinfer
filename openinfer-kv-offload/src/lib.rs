@@ -16,7 +16,8 @@
 mod engine;
 
 pub use engine::{
-    KvArena, LoadHandle, OffloadConfig, OffloadEngine, P2pConfig, QueryHit, QueryOutcome,
+    HostConfig, KvArena, LoadHandle, OffloadConfig, OffloadEngine, OffloadHost, P2pConfig,
+    QueryHit, QueryOutcome,
 };
 
 // Re-exported so callers name pegaflow's engine types through this bridge.

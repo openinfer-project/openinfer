@@ -14,7 +14,7 @@
 use cudarc::driver::{CudaContext, result};
 use half::bf16;
 use openinfer_kv_cache::KvBuffer;
-use openinfer_kv_offload::{OffloadConfig, OffloadEngine};
+use openinfer_kv_offload::{OffloadConfig, OffloadEngine, QueryOutcome};
 
 const NUM_LAYERS: usize = 4;
 const NUM_KV_HEADS: usize = 2;
@@ -108,7 +108,10 @@ fn gpu_cpu_gpu_roundtrip_preserves_kv_bytes() {
     engine.flush_saves();
 
     // ── Query the CPU tier: the full 3-block prefix must be resident ──
-    let hit = engine.query("roundtrip-req", &hashes).expect("query");
+    // Host-memory-only setup: `Loading` can't occur, the query is terminal.
+    let QueryOutcome::Ready(hit) = engine.query("roundtrip-req", &hashes).expect("query") else {
+        panic!("host-memory-only query must be terminal");
+    };
     assert_eq!(
         hit.num_blocks, 3,
         "all three saved blocks should hit the CPU tier"

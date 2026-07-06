@@ -1848,6 +1848,7 @@ fn build_offload(
         opts.pinned_pool_bytes,
     )
     .with_namespace(namespace);
+    config.use_hugepages = opts.use_hugepages;
     if let Some(p2p) = &opts.p2p {
         config = config.with_p2p(openinfer_kv_offload::P2pConfig {
             metaserver_addr: p2p.metaserver_addr.clone(),

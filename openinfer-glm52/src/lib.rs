@@ -33,6 +33,7 @@ use std::{collections::BTreeSet, path::Path, time::Instant};
 use anyhow::{Result, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::EngineHandle;
+use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
 use runner::{Glm52RankPlacement, Glm52RankWorker};
 use tokio::sync::mpsc;
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
@@ -68,6 +69,28 @@ pub struct Glm52LaunchOptions {
     /// off while the DSpark drafter is on — the draft lane needs the
     /// aux-hidden captures a skipped prefix never produces.
     pub no_prefix_cache: bool,
+    /// `Some` adds the pegaflow host tier under the prefix cache: sealed KV
+    /// blocks flow to one shared pinned pool on request release, and a
+    /// prompt whose prefix fell out of HBM restores from it at admission.
+    /// Requires the prefix cache (rejected at launch alongside the DSpark
+    /// drafter or `no_prefix_cache`).
+    pub kv_offload: Option<Glm52KvOffloadOptions>,
+}
+
+/// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
+/// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
+/// and the non-expert weights are replicated, so any rank's KV for a token
+/// prefix is as good as any other's — the same tolerance as reusing a
+/// rank's own prefix cache (FP reduction order may differ across the batch
+/// shapes that computed it, never the semantics). Any rank restores what
+/// any rank saved.
+#[derive(Clone, Debug)]
+pub struct Glm52KvOffloadOptions {
+    /// Host pinned-memory pool size in bytes, shared by all ranks.
+    pub pinned_pool_bytes: usize,
+    /// Back the pool with hugepages (the box must hold a reservation —
+    /// check `HugePages_Total`).
+    pub use_hugepages: bool,
 }
 
 pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
@@ -77,11 +100,21 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         dspark_draft_model_path,
         max_model_len,
         no_prefix_cache,
+        kv_offload,
     } = options;
     ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
         dp_size == GLM52_EP_RANKS,
         "GLM5.2 requires --dp-size={GLM52_EP_RANKS} (or omitted), got {dp_size}"
+    );
+    // The offload tier extends the prefix cache (restored blocks surface as
+    // matched prefix), so a config that disables prefix matching while asking
+    // for offload is contradictory — fail loud instead of silently idling an
+    // allocated multi-GiB pinned pool.
+    ensure!(
+        kv_offload.is_none() || (dspark_draft_model_path.is_none() && !no_prefix_cache),
+        "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
+         DSpark drafter (speculative decoding and prefix caching are mutually exclusive)"
     );
     start_engine(
         model_path,
@@ -94,6 +127,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         dspark_draft_model_path.as_deref(),
         max_model_len,
         no_prefix_cache,
+        kv_offload,
     )
 }
 
@@ -261,6 +295,7 @@ fn start_engine(
     dspark_path: Option<&Path>,
     requested_max_model_len: Option<usize>,
     no_prefix_cache: bool,
+    kv_offload: Option<Glm52KvOffloadOptions>,
 ) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
@@ -306,7 +341,7 @@ fn start_engine(
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
-    build_rank_models(&loaded.workers, max_model_len)?;
+    let rank_arenas = build_rank_models(&loaded.workers, max_model_len)?;
     // From here the DeepEP contexts exist and their destruction is COLLECTIVE:
     // a startup failure must broadcast Shutdown to every rank BEFORE the
     // workers' sequential Drop joins them one by one (the same teardown
@@ -314,7 +349,7 @@ fn start_engine(
     // blocks in the destroy barrier waiting for ranks that were never told to
     // shut down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout.
-    let post_comm_startup = || -> Result<bool> {
+    let post_comm_startup = || -> Result<(bool, Option<Vec<OffloadEngine>>)> {
         let dspark_enabled = if let Some(dspark_path) = dspark_path {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
             true
@@ -322,10 +357,13 @@ fn start_engine(
             false
         };
         ensure_post_build_headroom(&loaded.workers)?;
-        Ok(dspark_enabled)
+        let offload = kv_offload
+            .map(|opts| build_offload_engines(&opts, rank_arenas, &startup.device_ordinals))
+            .transpose()?;
+        Ok((dspark_enabled, offload))
     };
-    let dspark_enabled = match post_comm_startup() {
-        Ok(dspark_enabled) => dspark_enabled,
+    let (dspark_enabled, offload) = match post_comm_startup() {
+        Ok(started) => started,
         Err(err) => {
             for worker in &loaded.workers {
                 let _ = worker.request_shutdown();
@@ -344,6 +382,7 @@ fn start_engine(
                 dspark_enabled,
                 max_model_len,
                 no_prefix_cache,
+                offload,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
@@ -413,16 +452,22 @@ fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
 /// drift) — every rank must report success BEFORE anyone enters the
 /// collective context creation, or a single failure strands the other seven
 /// ranks in NCCL init with no timeout.
-fn build_rank_models(workers: &[Glm52RankWorker], max_model_len: usize) -> Result<()> {
+fn build_rank_models(
+    workers: &[Glm52RankWorker],
+    max_model_len: usize,
+) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
         .map(|worker| worker.build_model_async(max_model_len))
         .collect::<Result<Vec<_>>>()?;
+    let mut rank_arenas = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
-        response
-            .recv()
-            .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??;
+        rank_arenas.push(
+            response
+                .recv()
+                .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??,
+        );
     }
 
     let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
@@ -439,7 +484,61 @@ fn build_rank_models(workers: &[Glm52RankWorker], max_model_len: usize) -> Resul
         "GLM5.2 rank models built in {:.2}s (weights adopted in place + DeepEP contexts up)",
         build_started.elapsed().as_secs_f64()
     );
-    Ok(())
+    Ok(rank_arenas)
+}
+
+/// One shared pegaflow host (one pinned pool) with each rank's arenas
+/// registered as its own instance under a single namespace — replicated
+/// non-expert weights make DP ranks' KV interchangeable, so any rank
+/// restores what any rank saved.
+/// The namespace folds the layout facts that make blocks interchange-safe
+/// (per-token packing, page size, layer count); pool capacity deliberately
+/// stays out (a block's bytes don't depend on it).
+fn build_offload_engines(
+    opts: &Glm52KvOffloadOptions,
+    rank_arenas: Vec<Vec<KvArena>>,
+    device_ordinals: &[usize],
+) -> Result<Vec<OffloadEngine>> {
+    let host = OffloadHost::new(HostConfig {
+        pinned_pool_bytes: opts.pinned_pool_bytes,
+        use_hugepages: opts.use_hugepages,
+        runtime_threads: 2,
+        p2p: None,
+    })
+    .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
+    let namespace = format!(
+        "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+        config::GLM52_INDEX_HEAD_DIM + 4,
+    );
+    let engines = rank_arenas
+        .into_iter()
+        .zip(device_ordinals)
+        .enumerate()
+        .map(|(rank, (arenas, &device_ordinal))| {
+            OffloadEngine::with_arenas_on(
+                std::sync::Arc::clone(&host),
+                format!("glm52-rank{rank}"),
+                &namespace,
+                device_ordinal as i32,
+                &arenas,
+            )
+            .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let arenas_per_rank = GLM52_LAYERS
+        + (0..GLM52_LAYERS)
+            .filter(|&layer| config::glm52_layer_has_full_indexer(layer))
+            .count();
+    log::info!(
+        "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
+         {} rank instances x {arenas_per_rank} arenas",
+        ByteSize(opts.pinned_pool_bytes as u64),
+        opts.use_hugepages,
+        engines.len(),
+    );
+    Ok(engines)
 }
 
 /// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a

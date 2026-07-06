@@ -3888,6 +3888,7 @@ dependencies = [
  "openinfer-core",
  "openinfer-kernels",
  "openinfer-kv-cache",
+ "openinfer-kv-offload",
  "openinfer-sample",
  "safetensors",
  "serde_json",

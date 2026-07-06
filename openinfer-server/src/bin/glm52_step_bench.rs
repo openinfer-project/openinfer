@@ -81,6 +81,7 @@ fn main() -> Result<()> {
             dspark_draft_model_path: None,
             max_model_len: None,
             no_prefix_cache: false,
+            kv_offload: None,
         },
     )
     .context("failed to start GLM5.2 engine")?;
