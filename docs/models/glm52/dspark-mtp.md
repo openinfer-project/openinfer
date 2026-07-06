@@ -218,6 +218,27 @@ while co-resident prompts prefill). c > 8 (multi-slot contention) remains unmeas
 Note the Python `vllm bench serve` c8 client hang (#548) did NOT reproduce with the Rust
 `vllm-bench` client — 8/8 runs completed 100%.
 
+**Span-8 re-measured under sampling (c1, same workload/seed): still dominated.** 53.8
+tok/s / TPOT p50 14.13 vs span-4's 57.7 / 12.45. The verify cost is NOT the reason
+anymore — the bucket-8 solo round is ~33 ms post-D4/D5 (not the stale 45.6 ms M1 anchor),
+only 21% over bucket-4's 27.3 — the extra 4 draft positions just buy too little
+(+0.14 tokens/round). The per-request accept histograms still show a real tail (some
+requests accept all 7 in 5% of rounds), which is the adaptive-span opportunity, not a
+fixed-span one.
+
+**vLLM production reference (GLM5.2-FP8, native MTP `num_speculative_tokens=2`, DP16×TP2
++ EP, read-only metrics pull 2026-07-06):** acceptance length 2.19–2.39 incl. bonus,
+per-position acceptance **0.80 / 0.45**, per-request ~13–17 ms/tok at its typical
+Running=2–3/engine. Same-load comparison: parity with our span-4 sampled path (12.45 c1 /
+15.16 c2), with a structurally different draft profile — MTP's acceptance is front-loaded
+(0.80 → 0.45) where dspark's chain is flat (~0.72 → ~0.70), so our draft holds up better
+at deep positions and adaptive span has more headroom here than there. Their K=2 mirrors
+our span-4-over-span-8 conclusion: everyone cuts the tail. **Metric-semantics gotcha for
+anyone reading vLLM spec-decode dashboards: vLLM v1 observes ITL once per engine output —
+one spec round emits ~acceptance-length tokens at once, so the ITL panel reads ≈ the ROUND
+wall (30–40 ms) while TPOT reads round/acceptance (~10–17 ms). They differ by the
+acceptance length by construction; neither is wrong.**
+
 **Parity (gates 2026-07-06).** Seeded determinism: same seeded request twice under spec →
 byte-identical. Seeded spec-vs-plain: all 4 prompts eventually diverge at a near-tie — but
 P2 tracked plain for **35 consecutive sampled tokens** before diverging, which is ~1e-5
