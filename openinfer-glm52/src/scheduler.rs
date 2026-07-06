@@ -194,25 +194,29 @@ impl Glm52SlotState {
         }
     }
 
-    /// The span row whose output `advance_span` will commit, for the sampler
-    /// to overwrite: the prompt-completing span's last row (its output is the
-    /// first generated token) or the plain decode row. `None` while the span
-    /// is still mid-prompt (outputs discarded). Only meaningful for
-    /// non-greedy requests, which never carry drafts (DSpark verify is
-    /// greedy-only), so a decode span is always the single anchor row.
-    pub(crate) fn sampling_row(&self, span_rows: usize) -> Option<usize> {
+    /// The span rows whose outputs `advance_span` may commit, each with the
+    /// request-local decode step its token lands at — the sampler overwrites
+    /// exactly these rows. Empty while the span is still mid-prompt (outputs
+    /// discarded); a prompt-completing span's last row yields the first
+    /// generated token. A decode span is a verify: EVERY row (anchor + draft
+    /// prefix) samples, and row `k`'s step is `completion + k` — the same
+    /// step a plain decode would sample that token at, which is what makes a
+    /// seeded request's speculative stream replay its plain stream
+    /// token-exactly ([`accept_greedy`] then just prefix-matches the sampled
+    /// tokens against the drafts; the zero-draft plain row is the same rule).
+    pub(crate) fn sampling_rows(&self, span_rows: usize) -> Vec<(usize, u64)> {
         debug_assert!(span_rows > 0);
         if self.fed < self.prompt.len() {
-            (self.fed + span_rows == self.prompt.len()).then(|| span_rows - 1)
+            if self.fed + span_rows == self.prompt.len() {
+                vec![(span_rows - 1, self.completion as u64)]
+            } else {
+                Vec::new()
+            }
         } else {
-            // Sampling a verify span would feed a sampled token into
-            // `accept_greedy` — whoever lifts the DSpark greedy-only gate
-            // must build rejection sampling first, not trip this in release.
-            assert!(
-                self.drafts.is_empty(),
-                "sampling a DSpark verify span is unsupported (greedy-only gate breached)"
-            );
-            Some(0)
+            debug_assert!(span_rows <= 1 + self.drafts.len());
+            (0..span_rows)
+                .map(|k| (k, (self.completion + k) as u64))
+                .collect()
         }
     }
 
@@ -242,10 +246,15 @@ impl Glm52SlotState {
     ///
     /// Mid-prompt rows' outputs are discarded; the row that fed the LAST
     /// prompt token yields the first generated token. In decode the span is
-    /// a verify: `outputs[k]` is the target's greedy token after span row
-    /// `k` (anchor + fed draft prefix), and [`accept_greedy`] commits the
-    /// agreed prefix plus one model token. The plain single-row step is the
-    /// zero-draft special case of the same rule.
+    /// a verify: `outputs[k]` is the target's committed token after span row
+    /// `k` (anchor + fed draft prefix) — the fused argmax for greedy
+    /// requests, the sampled token for non-greedy ones — and
+    /// [`accept_greedy`] commits the agreed prefix plus one model token.
+    /// With sampled outputs that prefix-match IS lossless speculative
+    /// sampling for a deterministic draft: every committed token is a sample
+    /// from the target distribution, acceptance only decides how many ride
+    /// one step. The plain single-row step is the zero-draft special case of
+    /// the same rule.
     pub(crate) fn advance_span(
         &mut self,
         outputs: &[u32],
@@ -350,15 +359,6 @@ pub(crate) fn validate_request(
             req.prompt_tokens.len(),
             req.max_tokens
         ));
-    }
-    // Plain decode samples per-row; the DSpark verify span is greedy-only
-    // ([`accept_greedy`] compares the target's argmax against the drafts —
-    // rejection sampling is future work).
-    if dspark_enabled && !req.params.is_greedy() {
-        return Err(
-            "GLM5.2 with the DSpark drafter supports greedy sampling only (temperature 0)"
-                .to_owned(),
-        );
     }
     // Mirror the sampler kernel's parameter ensures HERE: past intake a bad
     // value only surfaces as a failed step, and a failed step tears the whole
@@ -582,10 +582,11 @@ fn lease_ok(state: &Glm52SlotState, max_model_len: usize) -> bool {
 }
 
 /// The step rows a rank samples instead of argmaxes: walk the shape's
-/// contiguous per-slot runs and mark each non-greedy slot's committed row
-/// (see [`Glm52SlotState::sampling_row`]) with its request params and
-/// request-local decode step. Rows come out strictly ascending — the runs
-/// are disjoint and walked in order — which `sample_rows_into` re-checks.
+/// contiguous per-slot runs and mark each non-greedy slot's committable rows
+/// (see [`Glm52SlotState::sampling_rows`]) with their request params and
+/// request-local decode steps. Rows come out strictly ascending — the runs
+/// are disjoint and walked in order, offsets ascend within a run — which
+/// `sample_rows_into` re-checks.
 fn collect_sampling_rows(shape: &Glm52StepShape, rank_slots: &RankSlots) -> Vec<Glm52RowSample> {
     let mut sampling = Vec::new();
     let mut row = 0usize;
@@ -597,13 +598,14 @@ fn collect_sampling_rows(shape: &Glm52StepShape, rank_slots: &RankSlots) -> Vec<
         }
         if let Some(active) = &rank_slots[slot]
             && !takes_argmax(&active.req.params)
-            && let Some(offset) = active.state.sampling_row(end - row)
         {
-            sampling.push(Glm52RowSample {
-                row: row + offset,
-                params: active.req.params,
-                step: active.state.completion_tokens() as u64,
-            });
+            for (offset, step) in active.state.sampling_rows(end - row) {
+                sampling.push(Glm52RowSample {
+                    row: row + offset,
+                    params: active.req.params,
+                    step,
+                });
+            }
         }
         row = end;
     }
@@ -1714,19 +1716,25 @@ mod tests {
     }
 
     #[test]
-    fn sampling_row_is_the_committed_row_of_the_span() {
-        let mut state = state(vec![10, 11, 12], 4, false);
+    fn sampling_rows_are_the_committable_rows_of_the_span() {
+        let mut state = state(vec![10, 11, 12], 8, false);
         // Mid-prompt span: outputs discarded, nothing to sample.
-        assert_eq!(state.sampling_row(2), None);
+        assert_eq!(state.sampling_rows(2), vec![]);
         // Prompt-completing span: the last row's output is the first
-        // generated token.
-        assert_eq!(state.sampling_row(3), Some(2));
+        // generated token, sampled at step 0.
+        assert_eq!(state.sampling_rows(3), vec![(2, 0)]);
         assert_eq!(
             state.advance_span(&[99, 98, 42], EOS),
             commit(&[42], 1, None, 3)
         );
-        // Plain decode: the single anchor row.
-        assert_eq!(state.sampling_row(1), Some(0));
+        // Plain decode: the single anchor row, at the request-local step.
+        assert_eq!(state.sampling_rows(1), vec![(0, 1)]);
+        // Verify span: every row samples, row k at step completion + k —
+        // the steps a plain decode would sample those tokens at.
+        state.set_drafts(vec![50, 51, 52]);
+        assert_eq!(state.sampling_rows(4), vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
+        // The planner may grant fewer rows: the prefix samples.
+        assert_eq!(state.sampling_rows(2), vec![(0, 1), (1, 2)]);
     }
 
     fn request(
@@ -1756,10 +1764,11 @@ mod tests {
     }
 
     #[test]
-    fn non_greedy_is_rejected_only_with_the_drafter() {
+    fn non_greedy_is_admitted_with_and_without_the_drafter() {
+        // Sampled verify: the drafter no longer restricts sampling params.
         let req = request(vec![10], sampled(0.7), 4);
         assert!(validate_request(&req, 4096, false).is_ok());
-        assert!(validate_request(&req, 4096, true).is_err());
+        assert!(validate_request(&req, 4096, true).is_ok());
     }
 
     #[test]
@@ -1811,14 +1820,15 @@ mod tests {
     }
 
     #[test]
-    fn collect_sampling_rows_marks_each_spans_committed_row() {
-        // Bucket 8: slot 0 decodes (non-greedy), slot 1 finishes its prompt
-        // with a 3-row span (non-greedy), slot 3 is mid-prompt (non-greedy,
-        // span does NOT complete), slot 2 decodes greedily, slots 4-5 pad.
+    fn collect_sampling_rows_marks_each_spans_committable_rows() {
+        // Bucket 8: slot 0 runs a 2-row verify span (non-greedy, drafts
+        // installed), slot 1 finishes its prompt with a 3-row span
+        // (non-greedy), slot 3 is mid-prompt (non-greedy, span does NOT
+        // complete), slot 2 decodes greedily, row 7 pads.
         let shape = Glm52StepShape {
             bucket: 8,
-            slots: [0, 1, 1, 1, 3, 2, 4, 5],
-            active_rows: 6,
+            slots: [0, 0, 1, 1, 1, 3, 2, 4],
+            active_rows: 7,
         };
         let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
 
@@ -1827,6 +1837,7 @@ mod tests {
             decode_state.advance_span(&[20], EOS),
             commit(&[20], 1, None, 1)
         );
+        decode_state.set_drafts(vec![50, 51, 52]);
         rank_slots[0] = Some(ActiveRequest {
             req: request(vec![10], sampled(0.8), 8),
             state: decode_state,
@@ -1863,11 +1874,12 @@ mod tests {
 
         let rows = collect_sampling_rows(&shape, &rank_slots);
         let picked: Vec<(usize, u64)> = rows.iter().map(|s| (s.row, s.step)).collect();
-        // Slot 0's decode row is step row 0 (one committed token so far →
-        // request-local step 1); slot 1's boundary span commits its LAST row
-        // (row 1 + offset 2 = 3, first generated token → step 0). Slot 3's
+        // Slot 0's verify span samples BOTH rows (anchor row 0 at step 1,
+        // draft row 1 at step 2 — the planner granted 2 of its 4 wanted
+        // rows); slot 1's boundary span commits its LAST row (row 2 +
+        // offset 2 = 4, first generated token → step 0). Slot 3's
         // mid-prompt span and slot 2's greedy row contribute nothing.
-        assert_eq!(picked, vec![(0, 1), (3, 0)]);
+        assert_eq!(picked, vec![(0, 1), (1, 2), (4, 0)]);
     }
 
     #[test]

@@ -639,34 +639,45 @@ impl Glm52DsparkModel {
     }
 }
 
-/// Greedy speculative acceptance — ported verbatim from
+/// Prefix-match speculative acceptance — ported from
 /// `openinfer-qwen3/src/speculative.rs::accept_greedy`.
 ///
 /// * `proposed` — the `K` draft tokens fed after the anchor.
-/// * `target_argmax` — the verify step's greedy token after each of the
-///   `K + 1` span rows: `target_argmax[0]` follows the anchor,
-///   `target_argmax[K]` is the model's own continuation after the whole run.
+/// * `target_tokens` — the verify step's committed token after each of the
+///   `K + 1` span rows (`target_tokens[0]` follows the anchor,
+///   `target_tokens[K]` is the model's continuation after the whole run):
+///   the fused argmax for a greedy request, the per-row sampled token for a
+///   non-greedy one.
 ///
 /// Returns the longest accepted prefix of `proposed` followed by exactly one
 /// model token (the correction at the first divergence, or the bonus
 /// continuation when every draft is accepted) — always `1..=K + 1` tokens, so
 /// a verify step always makes at least one token of progress.
+///
+/// With sampled `target_tokens` this rule is LOSSLESS speculative sampling
+/// for a deterministic (greedy) draft: row `k`'s token is a true sample from
+/// the target distribution given the accepted prefix, and it is committed
+/// whether or not it matches `proposed[k]` — the match only decides whether
+/// the round keeps riding. Every committed token is therefore distributed
+/// exactly as plain sampled decode (measured A/B on jz-38 2026-07-06: the
+/// full rejection-sampling variant buys ≤ 1.5% throughput over this rule on
+/// code at temperature 1.0 — not worth its complexity).
 #[must_use]
-pub(crate) fn accept_greedy(proposed: &[u32], target_argmax: &[u32]) -> Vec<u32> {
+pub(crate) fn accept_greedy(proposed: &[u32], target_tokens: &[u32]) -> Vec<u32> {
     debug_assert_eq!(
-        target_argmax.len(),
+        target_tokens.len(),
         proposed.len() + 1,
-        "verify must produce one greedy token per draft plus a bonus"
+        "verify must produce one committed token per draft plus a bonus"
     );
     let n = proposed
         .iter()
-        .zip(target_argmax)
-        .take_while(|(draft, argmax)| draft == argmax)
+        .zip(target_tokens)
+        .take_while(|(draft, target)| draft == target)
         .count();
     let mut committed = Vec::with_capacity(n + 1);
     committed.extend_from_slice(&proposed[..n]);
-    // `n <= proposed.len() < target_argmax.len()`, so this index is valid.
-    committed.push(target_argmax[n]);
+    // `n <= proposed.len() < target_tokens.len()`, so this index is valid.
+    committed.push(target_tokens[n]);
     committed
 }
 

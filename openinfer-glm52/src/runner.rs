@@ -72,10 +72,12 @@ impl Glm52StepFlags {
 }
 
 /// One step row whose committed token is sampled instead of taking the fused
-/// greedy argmax: a non-greedy request's plain decode row, or the last row of
-/// its prompt-completing span. `step` is the request-local decode step
-/// (tokens generated so far) — a seeded request's philox seed mixes it so its
-/// tokens replay independently of batch composition.
+/// greedy argmax: a non-greedy request's decode span row (every row of a
+/// verify span — anchor and draft prefix alike), or the last row of its
+/// prompt-completing span. `step` is the request-local decode step the row's
+/// token lands at — a seeded request's philox seed mixes it, so its tokens
+/// replay independently of batch composition AND of how many rows rode each
+/// speculative round (spec and plain produce the same seeded stream).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Glm52RowSample {
     pub(crate) row: usize,
