@@ -145,7 +145,7 @@ pub(crate) fn run_dp8_coordinator(
     let span_drafts = if tp8_solo_span {
         crate::dspark::GLM52_DSPARK_DRAFTS
     } else {
-        slot::GLM52_DSPARK_SPAN_DRAFTS
+        slot::GLM52_DSPARK_EP8_SPAN_DRAFTS
     };
     let offload: Option<Vec<offload::RankOffload>> =
         offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());

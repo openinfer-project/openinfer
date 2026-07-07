@@ -33,6 +33,12 @@ use crate::weights::{Glm52WeightManifest, expected_tensor_contract, mmap_file, r
 
 const H: usize = GLM52_TP8_HIDDEN;
 const RANKS: usize = GLM52_TP8_RANKS;
+
+// The span shape assumes the scheduler's largest bucket IS the kernel's row
+// count: a bigger bucket would pass every >= buffer ensure while the kernel
+// silently computes only 8 rows (stale mlp_out on the rest).
+const _: () =
+    assert!(crate::model::GLM52_MAX_BATCH_PER_RANK == openinfer_kernels::ops::GLM52_TP8_TOKENS);
 const BANK: usize = GLM52_TP8_BANK_EXPERTS;
 const SLICE_ROWS: usize = GLM52_TP8_SLICE_ROWS;
 const SLICE_I: usize = GLM52_TP8_SLICE_I;
@@ -525,7 +531,6 @@ impl Glm52MoeTp8State {
             peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
-            span_owner_dev: None,
         };
         glm52_moe_tp8_layer_launch(
             ctx,
@@ -579,12 +584,13 @@ impl Glm52MoeTp8State {
             peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
-            span_owner_dev: Some(&self.span_owner_dev),
         };
         glm52_moe_tp8_layer_launch(
             ctx,
             slot,
-            Glm52Tp8RowMap::Span,
+            Glm52Tp8RowMap::Span {
+                owner_dev: &self.span_owner_dev,
+            },
             normed2,
             topk_idx,
             topk_prob,

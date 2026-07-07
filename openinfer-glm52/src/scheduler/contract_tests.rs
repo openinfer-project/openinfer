@@ -10,7 +10,7 @@ use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 use super::PAGE;
 use super::admission::lifetime_blocks;
-use super::slot::GLM52_DSPARK_SPAN_DRAFTS;
+use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
 use super::slot::{Glm52SlotState, Glm52StepOutcome};
 use super::testkit::EOS;
 
@@ -34,7 +34,7 @@ fn drive_request(
         if with_drafts && state.wants_drafts() {
             state.set_drafts(
                 vec![70_001, 70_002, 70_003, 70_004, 70_005, 70_006, 70_007],
-                GLM52_DSPARK_SPAN_DRAFTS,
+                GLM52_DSPARK_EP8_SPAN_DRAFTS,
             );
         }
         let span = state.feed_want().min(GLM52_MAX_BATCH_PER_RANK);
@@ -152,7 +152,7 @@ fn eos_truncated_speculative_apply_stays_in_contract() {
             }
         }
     }
-    state.set_drafts(vec![21, 7, 23], GLM52_DSPARK_SPAN_DRAFTS);
+    state.set_drafts(vec![21, 7, 23], GLM52_DSPARK_EP8_SPAN_DRAFTS);
     let span = state.feed_want();
     assert_eq!(span, 4, "anchor + 3 drafts");
     assert_eq!(state.next_input_at(0).position, kv.kv_position());

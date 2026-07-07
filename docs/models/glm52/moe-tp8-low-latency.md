@@ -200,6 +200,10 @@ inverts here, so tp8 feeds the drafter's full 7-draft proposal.
 Baselines: plain tp8 solo 65.5 tok/s (15.27 ms/tok), EP8+DSpark span-4 code ≈ 75 —
 **2.5–2.9× on code**. Bonus from the same shape: solo prefill rides span-8 (8 prompt
 tokens/step), long-prompt cold TTFT ~2400 tokens 5.37 s vs ~36 s at 1 token/step.
+Cost: the RS LL region grows a row dimension ([parity][row][src][hidden], one layout
+for both mappings since any rank can be the device-staged owner) — ~900 MiB/rank for
+75 layers vs ~112 before, which the post-build VRAM probe deducts from KV capacity
+(≈5.5k tokens' worth).
 Correctness: span-vs-dp8 bit-identity gate (`oracle/layer_tp8.rs::layer_moe_tp8_span_matches_dp8`
 — same 8 rows through both mappings must match exactly, plus the pad zero-fill
 contract), determinism ×2, 2-concurrent clamp-back, clean shutdown, EP8 span-4

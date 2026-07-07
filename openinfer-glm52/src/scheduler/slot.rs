@@ -76,7 +76,7 @@ pub(super) struct Glm52SlotState {
 /// MoE mapping computes 8 rows at the same MoE cost as 1 — so the tp8
 /// coordinator feeds all 7 (`GLM52_DSPARK_DRAFTS`); the cap is a per-round
 /// argument, not this constant.
-pub(super) const GLM52_DSPARK_SPAN_DRAFTS: usize = 3;
+pub(super) const GLM52_DSPARK_EP8_SPAN_DRAFTS: usize = 3;
 
 /// Accept histogram over a request's verify rounds (spans that actually fed
 /// drafts; bonus-only single-row spans don't count).
@@ -206,7 +206,7 @@ impl Glm52SlotState {
     }
 
     /// Install the draft lane's proposal for the next verify span, truncated
-    /// to the topology's span cap ([`GLM52_DSPARK_SPAN_DRAFTS`] under EP8,
+    /// to the topology's span cap ([`GLM52_DSPARK_EP8_SPAN_DRAFTS`] under EP8,
     /// all of [`GLM52_DSPARK_DRAFTS`] under TP8's span shape).
     pub(super) fn set_drafts(&mut self, mut drafts: Vec<u32>, span_drafts: usize) {
         drafts.truncate(span_drafts);
@@ -476,9 +476,12 @@ mod tests {
         let mut state = state(vec![10], 32, false);
         // Boundary emits the anchor t0 = 20.
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
-        state.set_drafts(vec![21, 22, 99, 98, 97, 96, 95], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(
+            vec![21, 22, 99, 98, 97, 96, 95],
+            GLM52_DSPARK_EP8_SPAN_DRAFTS,
+        );
 
-        // The proposal is truncated to GLM52_DSPARK_SPAN_DRAFTS: a 4-row
+        // The proposal is truncated to GLM52_DSPARK_EP8_SPAN_DRAFTS: a 4-row
         // verify span (anchor + 3 drafts) at consecutive positions.
         assert_eq!(state.feed_want(), 4);
         assert_eq!(
@@ -517,7 +520,10 @@ mod tests {
     fn verify_span_truncated_by_the_planner_accepts_only_fed_drafts() {
         let mut state = state(vec![10], 32, false);
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
-        state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(
+            vec![21, 22, 23, 24, 25, 26, 27],
+            GLM52_DSPARK_EP8_SPAN_DRAFTS,
+        );
 
         // The planner granted only 3 of the 4 wanted rows: the span is the
         // anchor + first 2 drafts, and acceptance ranges over those 2 only.
@@ -537,7 +543,10 @@ mod tests {
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
         // Draft 2 is the EOS token (7): accepted, counted, suppressed; the
         // rest of the committed run is dropped.
-        state.set_drafts(vec![21, 7, 23, 24, 25, 26, 27], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(
+            vec![21, 7, 23, 24, 25, 26, 27],
+            GLM52_DSPARK_EP8_SPAN_DRAFTS,
+        );
         let outputs = [21, 7, 23, 24];
         assert_eq!(
             state.advance_span(&outputs, EOS),
@@ -550,7 +559,10 @@ mod tests {
     fn length_cap_truncates_the_verify_want_and_the_committed_run() {
         let mut state = state(vec![10], 4, false);
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
-        state.set_drafts(vec![21, 22, 23, 24, 25, 26, 27], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(
+            vec![21, 22, 23, 24, 25, 26, 27],
+            GLM52_DSPARK_EP8_SPAN_DRAFTS,
+        );
         // remaining = 3 -> the span may commit at most 3 more tokens.
         assert_eq!(state.feed_want(), 3);
         let outputs = [21, 22, 23];
@@ -587,7 +599,7 @@ mod tests {
         assert_eq!(state.sampling_rows(1), vec![(0, 1)]);
         // Verify span: every row samples, row k at step completion + k —
         // the steps a plain decode would sample those tokens at.
-        state.set_drafts(vec![50, 51, 52], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(vec![50, 51, 52], GLM52_DSPARK_EP8_SPAN_DRAFTS);
         assert_eq!(state.sampling_rows(4), vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
         // The planner may grant fewer rows: the prefix samples.
         assert_eq!(state.sampling_rows(2), vec![(0, 1), (1, 2)]);
@@ -604,7 +616,7 @@ mod tests {
             state.advance_span(&[99, 98, 42], EOS),
             commit(&[42], 1, None, 3)
         );
-        state.set_drafts(vec![50, 51, 52], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(vec![50, 51, 52], GLM52_DSPARK_EP8_SPAN_DRAFTS);
         assert_eq!(state.sampling_rows(4), vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
         // Partial accept: sampled rows match d1, d2, reject d3 → commit
         // [d1, d2, correction] = 3 tokens.
@@ -614,7 +626,7 @@ mod tests {
         );
         // Next round resumes at completion = 4: plain decode would sample
         // its 5th token (index 4) at step 4 — so must the verify span.
-        state.set_drafts(vec![60, 61, 62], GLM52_DSPARK_SPAN_DRAFTS);
+        state.set_drafts(vec![60, 61, 62], GLM52_DSPARK_EP8_SPAN_DRAFTS);
         assert_eq!(state.sampling_rows(4), vec![(0, 4), (1, 5), (2, 6), (3, 7)]);
     }
 
