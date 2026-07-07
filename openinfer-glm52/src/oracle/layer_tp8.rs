@@ -77,7 +77,7 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
                         rank,
                         MOE_ORACLE_LAYER,
                     )?;
-                    let mut tp8 = Glm52MoeTp8State::new(&ctx, rank, rank, &exchange)?;
+                    let mut tp8 = Glm52MoeTp8State::new(&ctx, rank, rank, &exchange, 1)?;
                     let mp = format!("model.layers.{MOE_ORACLE_LAYER}.mlp");
                     let router = Glm52MoeRouterWeights::new(
                         upload_u8(&ctx, tensors.bytes(&format!("{mp}.gate.weight"))?)?,
@@ -92,7 +92,8 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
                     run_router_into(&ctx, &router, &normed2, &mut router_scratch)?;
                     let mut pad_out = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
                     for _position in 0..MOE_ORACLE_CTX {
-                        tp8.forward(&ctx, &bank, &normed2, &router_scratch, &mut pad_out)?;
+                        tp8.advance_epoch(&ctx)?;
+                        tp8.forward(&ctx, 0, &bank, &normed2, &router_scratch, &mut pad_out)?;
                     }
                     // The LL buffers may be written by peers until every
                     // rank's last kernel retires — sync before dropping.
@@ -114,7 +115,7 @@ fn layer_moe_tp8_oracle_gate() -> Result<()> {
         GateLayerMlp::MoeEp8Rank0,
     )?;
     let bank = load_tp8_slice_layer(&ctx, &model_path(), &manifest, 0, MOE_ORACLE_LAYER)?;
-    let mut tp8 = Glm52MoeTp8State::new(&ctx, 0, 0, &exchange)?;
+    let mut tp8 = Glm52MoeTp8State::new(&ctx, 0, 0, &exchange, 1)?;
     let outputs = run_layer_prefill_tp8(&ctx, &w, &mut tp8, &bank, &hidden_host, MOE_ORACLE_CTX);
     ctx.stream.synchronize()?;
 
@@ -242,8 +243,10 @@ fn run_layer_prefill_tp8(
             scratch.layer.normed2.data(),
             &mut router_scratch,
         )?;
+        tp8.advance_epoch(ctx)?;
         tp8.forward(
             ctx,
+            0,
             bank,
             scratch.layer.normed2.data(),
             &router_scratch,

@@ -1,5 +1,6 @@
-// GLM5.2 bucket-1 TP8 MoE: one cooperative kernel per layer replacing the
-// EP8 dispatch/grouped-GEMM/combine chain (docs/models/glm52/moe-tp8-low-latency.md).
+// GLM5.2 bucket-1 TP8 MoE: one short chain of phase kernels per layer
+// replacing the EP8 dispatch/grouped-GEMM/combine chain
+// (docs/models/glm52/moe-tp8-low-latency.md).
 //
 // Topology: every rank holds a 1/8 intermediate-slice of ALL 257 experts
 // (routed + shared folded in as expert index 256). Routing runs OUTSIDE this
@@ -7,8 +8,9 @@
 // routes its own token, so selection is byte-identical to the EP8 path and
 // this kernel only consumes (idx, prob) pairs.
 //
-// Phases (device-side epoch, parity double-buffered LL packets, zero fences —
-// the tag rides每个 128-bit packet; graph replay never changes parameters):
+// Phases (device-side step epoch, per-layer slot regions with parity
+// double-buffered LL packets, zero fences — the tag rides each 128-bit
+// packet; graph replay never changes parameters):
 //   AG  own normed2 (bf16 [H]) + own topk (8 idx + 8 prob) pushed to every
 //       rank's allgather slots; poll peers -> xg[8][H] + topk_all
 //   U   active-expert union (block 0, ballot compaction; slot order = expert
@@ -27,8 +29,8 @@
 //     128-column boundaries; a misaligned slice silently drops its tail)
 //   - LL spins are capped and __trap on overrun (crash early, never ride
 //     the ~100 s device timeout with a half-paired collective)
-//   - no block barrier inside thread-divergent LL branches (a __syncthreads
-//     there deadlocks against grid.sync — probe-proven)
+//   - phase ordering is kernel boundaries only; a spin may wait exclusively
+//     on cross-rank packets (see the phase-ordering note below)
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -76,36 +78,18 @@ __device__ __forceinline__ void ll_wait(const uint4* p, unsigned tag, uint4* out
   *out = q;
 }
 
-// Software grid barrier (sense-reversing on a monotonic generation counter).
-// Deliberately NOT a cooperative launch + cg::grid_group: a full-device
-// cooperative kernel node makes every cudaGraphLaunch of the containing
-// whole-step graph ~90 us more expensive on the host (measured pilot=1 vs
-// pilot=0, graph-mode nsys), and the 8 rank threads' launches serialize on
-// the driver — a flat ~0.8 ms/step tax that erased the per-layer win. The
-// grid is sized to co-residency (occupancy API) and the stream is graph-
-// serialized, so all blocks become resident and the barrier completes; the
-// spin cap traps instead of hanging if that invariant is ever violated.
-// `gen` is monotonic across launches and replays — no reset, same trick as
-// the LL epoch. `count` self-resets each round.
-__device__ __forceinline__ void grid_barrier(unsigned* count, unsigned* gen) {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    __threadfence();
-    const unsigned g = *(volatile unsigned*)gen;
-    if (atomicAdd(count, 1u) == gridDim.x - 1) {
-      *count = 0u;
-      __threadfence();
-      atomicAdd(gen, 1u);
-    } else {
-      long c = 0;
-      while (*(volatile unsigned*)gen == g) {
-        if (++c > 2000000000L) __trap();
-      }
-    }
-    __threadfence();
-  }
-  __syncthreads();
-}
+// Phase ordering is kernel boundaries, deliberately: the layer runs as a
+// short chain of graph nodes and cross-phase visibility comes from the
+// stream order, with ZERO device fences. A software grid barrier (and the
+// cooperative grid.sync it replaced) compiles to a MEMBAR.SC.GPU +
+// CCTL.IVALL + global-atomic cluster per site; 5 sites x every block x 8
+// pilot layers invalidates L1 across the whole GPU thousands of times per
+// step and taxes the memory-bound kernels on ALL layers (~+0.5 ms/step solo,
+// measured — the TP8 kernel's own wall stays innocent at ~56 us). The fence
+// flavor cannot be tamed (fence.acq_rel.gpu keeps CCTL.IVALL, ld.acquire
+// adds more — SASS-verified); only removing intra-kernel cross-block
+// dependencies does. Iron rule for these kernels: a spin may only wait on
+// CROSS-RANK packets, never on data another block of the same kernel writes.
 
 // fp8 e4m3 pair -> packed bf16x2, exact (e4m3 is representable in bf16).
 __device__ __forceinline__ unsigned mma_cvt_pair(unsigned char b0, unsigned char b1) {
@@ -230,24 +214,43 @@ struct Glm52MoeTp8Args {
   uint4* peer_ag[kRanks];        // peer p's ag buffer + myrank*kAgPackets
   uint4* peer_rs[kRanks];        // peer p's rs buffer + myrank*H
   unsigned long long* epoch_dev;
-  unsigned* barrier_state;  // [2] = {count, generation}, zero-initialized once
   int nranks, myrank;
+  // Which per-layer LL buffer slot region this layer uses (AG and RS buffers
+  // are sized slots x parity x src x packets; tag = step epoch is shared by
+  // all layers of a step, so each layer needs its own region for the parity
+  // double-buffer to alternate across steps).
+  int layer_slot;
 };
 
-__global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
-    Glm52MoeTp8Args a) {
-  __shared__ int wcnt[8];
-  __shared__ int scomp[kExperts];
-  unsigned* const bar = a.barrier_state;
-  const int t = threadIdx.x, w = t >> 5;
-  const int gw = blockIdx.x * (kThreads / 32) + w, TW = gridDim.x * (kThreads / 32);
-  const int gt = blockIdx.x * kThreads + t;
-  const int GT = gridDim.x * kThreads;
-  const unsigned long long ep = *a.epoch_dev;
-  const unsigned tag = (unsigned)ep;
-  const size_t ag_off = (size_t)(ep & 1) * kRanks * kAgPackets;
-  const size_t rs_off = (size_t)(ep & 1) * kRanks * kHidden;
+// Per-kernel preamble shared by every phase kernel: the step epoch (advanced
+// once per step by the epoch_advance node) selects the tag and the parity
+// half of this layer's slot region.
+#define TP8_PREAMBLE                                                          \
+  const int t = threadIdx.x;                                                  \
+  const int gt = blockIdx.x * kThreads + t;                                   \
+  const int GT = gridDim.x * kThreads;                                        \
+  const unsigned long long ep = *a.epoch_dev;                                 \
+  const unsigned tag = (unsigned)ep;                                          \
+  const size_t ag_off =                                                       \
+      ((size_t)a.layer_slot * 2 + (ep & 1)) * kRanks * kAgPackets;            \
+  const size_t rs_off =                                                       \
+      ((size_t)a.layer_slot * 2 + (ep & 1)) * kRanks * kHidden;               \
+  (void)tag;                                                                  \
+  (void)gt;                                                                   \
+  (void)GT;                                                                   \
+  (void)ag_off;                                                               \
+  (void)rs_off;
 
+// Step head: one node per step advances the shared epoch (all layers of the
+// step share the tag; per-layer slot regions keep their parity alternating
+// across steps). Launch-ahead replays advance it too — device-side only.
+__global__ void tp8_epoch_advance_kernel(unsigned long long* epoch_dev) {
+  *epoch_dev += 1;
+}
+
+__global__ void __launch_bounds__(kThreads) tp8_ag_push_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
   // ---- AG push: own normed2 + topk to every rank's slot (incl. self) ----
   for (int i = gt; i < kExperts; i += GT) a.gused[i] = 0;
   for (int i = gt; i < kUnionMax * kTokens; i += GT) a.guprob[i] = 0.f;
@@ -268,7 +271,13 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     }
     st_ll(a.peer_ag[p] + ag_off + i, v, tag);
   }
-  // ---- AG poll: assemble xg + topk_all ----
+}
+
+__global__ void __launch_bounds__(kThreads) tp8_ag_recv_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
+  // ---- AG poll: assemble xg + topk_all (waits on cross-rank pushes only;
+  // self packets were pushed by the ag_push node, already retired) ----
   for (int pk = gt; pk < kAgPackets * a.nranks; pk += GT) {
     const int src = pk / kAgPackets, i = pk % kAgPackets;
     uint4 q;
@@ -289,10 +298,16 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
       }
     }
   }
-  grid_barrier(bar, bar + 1);
+}
 
-  // ---- union (block 0): ballot compaction over gathered topk ----
-  if (blockIdx.x == 0) {
+// ---- union: ballot compaction over gathered topk (single block) ----
+__global__ void __launch_bounds__(kThreads) tp8_union_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
+  __shared__ int wcnt[8];
+  __shared__ int scomp[kExperts];
+  const int w = t >> 5;
+  {
     if (t < kTokens * kTopk) {
       atomicOr(&a.gused[a.topk_all_idx[t]], 1);
     }
@@ -323,10 +338,15 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
       }
     }
   }
-  grid_barrier(bar, bar + 1);
-  const int UC = *a.gucnt;
+}
 
-  // ---- B: gate|up mma over the union (NT=2 chains) ----
+// ---- B: gate|up mma over the union (NT=2 chains) ----
+__global__ void __launch_bounds__(kThreads) tp8_gemm_b_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
+  const int w = t >> 5;
+  const int gw = blockIdx.x * (kThreads / 32) + w, TW = gridDim.x * (kThreads / 32);
+  const int UC = *a.gucnt;
   {
     const int kslice = kHidden / kKsplitB;
     const int pairs = kSliceRows / 32;  // 16 double-tile jobs per expert
@@ -352,8 +372,12 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
       }
     }
   }
-  grid_barrier(bar, bar + 1);
-  // SiLU epilogue: gate rows [0,256), up rows [256,512), fixed-order k reduce.
+}
+
+// SiLU epilogue: gate rows [0,256), up rows [256,512), fixed-order k reduce.
+__global__ void __launch_bounds__(kThreads) tp8_silu_kernel(Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
+  const int UC = *a.gucnt;
   for (int i = gt; i < UC * kTokens * kSliceI; i += GT) {
     int u = i / (kTokens * kSliceI);
     int rem = i - u * kTokens * kSliceI;
@@ -370,9 +394,15 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     float sg = G / (1.f + __expf(-G));
     a.ug[((size_t)u * kTokens + j) * kSliceI + row] = __float2bfloat16(sg * U);
   }
-  grid_barrier(bar, bar + 1);
+}
 
-  // ---- C: down mma (k = 256, single slice) ----
+// ---- C: down mma (k = 256, single slice) ----
+__global__ void __launch_bounds__(kThreads) tp8_gemm_c_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
+  const int w = t >> 5;
+  const int gw = blockIdx.x * (kThreads / 32) + w, TW = gridDim.x * (kThreads / 32);
+  const int UC = *a.gucnt;
   for (int job = gw; job < UC * (kHidden / 16); job += TW) {
     int u = job / (kHidden / 16), tile = job % (kHidden / 16);
     int e = a.guidx[u];
@@ -389,9 +419,13 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     cp[(size_t)c0 * kHidden + tile * 16 + gid + 8] = acc[0][2];
     cp[(size_t)(c0 + 1) * kHidden + tile * 16 + gid + 8] = acc[0][3];
   }
-  grid_barrier(bar, bar + 1);
+}
 
-  // ---- RS: fixed-order prob-weighted sum, push token j -> rank j ----
+// ---- RS push: fixed-order prob-weighted sum, push token j -> rank j ----
+__global__ void __launch_bounds__(kThreads) tp8_rs_push_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
+  const int UC = *a.gucnt;
   for (int i = gt; i < kTokens * kHidden; i += GT) {
     int j = i / kHidden, h = i - j * kHidden;
     float s = 0;
@@ -401,7 +435,14 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     }
     st_ll(a.peer_rs[j] + rs_off + h, make_uint2(__float_as_uint(s), 0u), tag);
   }
-  // receive own token: 8 partials, fixed source order
+}
+
+// ---- RS recv: own token's 8 partials, fixed source order. Self partials
+// were pushed by the rs_push node (already retired) — the spin only waits
+// on cross-rank arrivals. ----
+__global__ void __launch_bounds__(kThreads) tp8_rs_recv_kernel(
+    Glm52MoeTp8Args a) {
+  TP8_PREAMBLE
   for (int h = gt; h < kHidden; h += GT) {
     float s = 0;
     for (int r = 0; r < a.nranks; r++) {
@@ -411,14 +452,14 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     }
     a.mlp_out[h] = __float2bfloat16(s);
   }
-  if (blockIdx.x == 0 && t == 0) *a.epoch_dev = ep + 1;
 }
 
 }  // namespace
 
 extern "C" {
 
-// Grid sizing: co-resident blocks for the cooperative launch.
+// Grid sizing default for the mma phase kernels (occupancy-derived;
+// no longer a correctness invariant — nothing grid-syncs anymore).
 int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
   int dev = 0;
   cudaError_t e = cudaGetDevice(&dev);
@@ -428,7 +469,7 @@ int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
   if (e != cudaSuccess) return (int)e;
   int per_sm = 0;
   e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &per_sm, glm52_moe_tp8_layer_kernel, kThreads, 0);
+      &per_sm, tp8_gemm_b_kernel, kThreads, 0);
   if (e != cudaSuccess) return (int)e;
   *out_blocks = sms * per_sm;
   return 0;
@@ -550,7 +591,7 @@ int glm52_moe_tp8_layer_launch_cuda(
     void* topk_all_prob, void* guidx, void* guprob, void* gucnt, void* gused,
     void* bpart, void* ug, void* cpart, void* ag_local, void* rs_local,
     const void* const* peer_ag, const void* const* peer_rs, void* epoch_dev,
-    void* barrier_state, int nranks, int myrank, int grid_blocks,
+    int layer_slot, int nranks, int myrank, int grid_blocks,
     cudaStream_t stream) {
   if (nranks != kRanks || myrank < 0 || myrank >= nranks) {
     return (int)cudaErrorInvalidValue;
@@ -581,17 +622,45 @@ int glm52_moe_tp8_layer_launch_cuda(
     a.peer_rs[p] = (uint4*)peer_rs[p];
   }
   a.epoch_dev = (unsigned long long*)epoch_dev;
-  a.barrier_state = (unsigned*)barrier_state;
   a.nranks = nranks;
   a.myrank = myrank;
+  a.layer_slot = layer_slot;
 
-  // Plain launch on purpose — see grid_barrier above for why the cooperative
-  // attribute is banned here. grid_blocks must not exceed the occupancy
-  // returned by glm52_moe_tp8_max_blocks_cuda (co-residency invariant).
+  // One layer = a short chain of plain graph nodes; stream order is the only
+  // cross-phase synchronization (see the phase-ordering note above). Spins
+  // wait exclusively on cross-rank packets, so no grid size here is
+  // deadlock-capable; grid_blocks (occupancy-derived) sizes the mma kernels.
   void* args[] = {&a};
-  return (int)cudaLaunchKernel((const void*)glm52_moe_tp8_layer_kernel,
-                               dim3(grid_blocks), dim3(kThreads), args, 0,
-                               stream);
+  const int ag_blocks = (kAgPackets * kRanks + kThreads - 1) / kThreads;
+  const int rs_blocks = (kHidden + kThreads - 1) / kThreads;
+  struct Phase {
+    const void* fn;
+    int blocks;
+  } phases[] = {
+      {(const void*)tp8_ag_push_kernel, ag_blocks},
+      {(const void*)tp8_ag_recv_kernel, ag_blocks},
+      {(const void*)tp8_union_kernel, 1},
+      {(const void*)tp8_gemm_b_kernel, grid_blocks},
+      {(const void*)tp8_silu_kernel, grid_blocks},
+      {(const void*)tp8_gemm_c_kernel, grid_blocks},
+      {(const void*)tp8_rs_push_kernel, rs_blocks * kTokens},
+      {(const void*)tp8_rs_recv_kernel, rs_blocks},
+  };
+  for (const Phase& ph : phases) {
+    cudaError_t e = cudaLaunchKernel(ph.fn, dim3(ph.blocks), dim3(kThreads),
+                                     args, 0, stream);
+    if (e != cudaSuccess) return (int)e;
+  }
+  return 0;
+}
+
+// Step-head epoch advance: exactly one node per replayed step (all TP8
+// layers of the step share the epoch; per-layer slot regions alternate
+// parity across steps).
+int glm52_moe_tp8_epoch_advance_cuda(void* epoch_dev, cudaStream_t stream) {
+  void* args[] = {&epoch_dev};
+  return (int)cudaLaunchKernel((const void*)tp8_epoch_advance_kernel, dim3(1),
+                               dim3(1), args, 0, stream);
 }
 
 }  // extern "C"

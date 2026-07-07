@@ -607,6 +607,7 @@ impl Glm52RankThreadState {
                 self.placement.rank,
                 self.placement.device_ordinal,
                 exchange,
+                self.tp8_slices.len(),
             )?;
             runtime.tp8 = Some(Glm52MoeTp8Rank {
                 state,

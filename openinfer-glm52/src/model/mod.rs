@@ -938,6 +938,16 @@ fn run_step_body(
     global_tokens: usize,
 ) -> Result<()> {
     let batch = step.mla_sched.batch();
+    // TP8 step head: advance the shared LL epoch exactly once per replayed
+    // step (all pilot layers of the step share the tag; per-layer slot
+    // regions alternate parity across steps).
+    if batch == 1 {
+        if let Some(rank) = tp8.as_deref_mut() {
+            if !rank.slices.is_empty() {
+                rank.state.advance_epoch(ctx)?;
+            }
+        }
+    }
     glm52_embed_into(ctx, embed, token_ids, &mut s.hidden)?;
     // Layer 0's input norm is standalone (the embedding is the residual);
     // every later layer's input norm is fused into the previous layer's
@@ -983,16 +993,18 @@ fn run_step_body(
                 let tp8_layer = if batch == 1 {
                     tp8.as_deref_mut().and_then(|rank| {
                         let Glm52MoeTp8Rank { state, slices } = rank;
-                        slices.get(&layer).map(|bank| (state, bank))
+                        let slot = slices.range(..layer).count();
+                        slices.get(&layer).map(|bank| (state, slot, bank))
                     })
                 } else {
                     None
                 };
-                if let Some((tp8_state, bank)) = tp8_layer {
+                if let Some((tp8_state, slot, bank)) = tp8_layer {
                     run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
                     tp8_state
                         .forward(
                             ctx,
+                            slot,
                             bank,
                             s.layer.normed2.data(),
                             &s.router,

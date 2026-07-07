@@ -332,10 +332,15 @@ unsafe extern "C" {
         peer_ag: *const *const std::ffi::c_void,
         peer_rs: *const *const std::ffi::c_void,
         epoch_dev: *mut u64,
-        barrier_state: *mut u32,
+        layer_slot: i32,
         nranks: i32,
         myrank: i32,
         grid_blocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_moe_tp8_epoch_advance_cuda(
+        epoch_dev: *mut std::ffi::c_void,
         stream: CUstream,
     ) -> CUresult;
 }

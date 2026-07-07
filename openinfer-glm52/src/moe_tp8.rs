@@ -16,10 +16,11 @@ use anyhow::{Context, Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_TP8_AG_BUF_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
-    GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_BUF_PACKETS, GLM52_TP8_SLICE_I,
+    GLM52_TP8_AG_SLOT_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
+    GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I,
     GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
-    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
+    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch,
+    glm52_moe_tp8_max_blocks,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -298,7 +299,6 @@ pub(crate) struct Glm52MoeTp8State {
     peer_ag: [u64; RANKS],
     peer_rs: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
-    barrier_state: CudaSlice<u32>,
     xg: CudaSlice<bf16>,
     topk_all_idx: CudaSlice<i32>,
     topk_all_prob: CudaSlice<f32>,
@@ -317,8 +317,10 @@ impl Glm52MoeTp8State {
         rank: usize,
         device_ordinal: usize,
         exchange: &Glm52Tp8Exchange,
+        slots: usize,
     ) -> Result<Self> {
         ensure!(rank < RANKS, "TP8 rank {rank} out of range");
+        ensure!(slots > 0, "TP8 state needs at least one layer slot");
         // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch), so
         // the per-accessor VA tables index directly by device ordinal.
         let fleet: Vec<usize> = (0..RANKS).collect();
@@ -326,8 +328,8 @@ impl Glm52MoeTp8State {
             fleet.contains(&device_ordinal),
             "TP8 device ordinal {device_ordinal} outside the 0..8 fleet"
         );
-        let ag = Glm52Tp8LlBuffer::alloc(GLM52_TP8_AG_BUF_PACKETS * 16, &fleet)?;
-        let rs = Glm52Tp8LlBuffer::alloc(GLM52_TP8_RS_BUF_PACKETS * 16, &fleet)?;
+        let ag = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_AG_SLOT_PACKETS * 16, &fleet)?;
+        let rs = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_RS_SLOT_PACKETS * 16, &fleet)?;
         let vas = Glm52Tp8LlVas {
             ag: std::array::from_fn(|a| ag.addr_for(a)),
             rs: std::array::from_fn(|a| rs.addr_for(a)),
@@ -338,8 +340,8 @@ impl Glm52MoeTp8State {
         // source-rank slot. Kernel buffer layout is [parity][src_rank][packet]
         // (the kernel adds the parity offset itself), so the slot stride is
         // one rank's packet count x 16 B.
-        let ag_slot = (GLM52_TP8_AG_BUF_PACKETS / RANKS / 2) * 16;
-        let rs_slot = (GLM52_TP8_RS_BUF_PACKETS / RANKS / 2) * 16;
+        let ag_slot = (GLM52_TP8_AG_SLOT_PACKETS / RANKS / 2) * 16;
+        let rs_slot = (GLM52_TP8_RS_SLOT_PACKETS / RANKS / 2) * 16;
         let peer_ag =
             std::array::from_fn(|p| table[p].ag[device_ordinal] + (rank * ag_slot) as u64);
         let peer_rs =
@@ -359,7 +361,6 @@ impl Glm52MoeTp8State {
             peer_ag,
             peer_rs,
             epoch_dev,
-            barrier_state: ctx.stream.alloc_zeros(2)?,
             xg: ctx.stream.alloc_zeros(RANKS * H)?,
             topk_all_idx: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
             topk_all_prob: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
@@ -373,12 +374,21 @@ impl Glm52MoeTp8State {
         })
     }
 
-    /// Whole-layer TP8 MoE for this rank's single token (bucket-1 only): the
+    /// Advance the step epoch — exactly once per decode step, before any
+    /// layer's `forward` of that step (captured into the same graph).
+    pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
+        glm52_moe_tp8_epoch_advance(ctx, &mut self.epoch_dev)
+    }
+
+    /// One layer's TP8 MoE for this rank's single token (bucket-1 only): the
     /// production router already ran (`router.route` holds the top-8), and
     /// `mlp_out` receives routed + shared like the EP8 arm's closing add.
+    /// `slot` is the layer's LL buffer region (its index among this rank's
+    /// pilot layers).
     pub(crate) fn forward(
         &mut self,
         ctx: &DeviceContext,
+        slot: usize,
         bank: &Glm52MoeTp8SliceBank,
         normed2: &CudaSlice<bf16>,
         router: &Glm52RouterScratch,
@@ -401,10 +411,10 @@ impl Glm52MoeTp8State {
             peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
-            barrier_state: &mut self.barrier_state,
         };
         glm52_moe_tp8_layer_launch(
             ctx,
+            slot,
             normed2,
             &router.route.topk_idx,
             &router.route.topk_weight,
