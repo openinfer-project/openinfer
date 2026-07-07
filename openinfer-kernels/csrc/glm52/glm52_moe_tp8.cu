@@ -57,6 +57,16 @@ static_assert(kHidden % (kKsplitB * 128) == 0, "w13 kslice must be 128-aligned")
 constexpr int kAgDataPackets = kHidden / 4;
 constexpr int kAgPackets = kAgDataPackets + 6;
 
+// LL packet contract: the tag rides in the 4th word of one 16 B aligned
+// vector store, and readers treat tag-match as "payload words are valid".
+// PTX only guarantees PER-ELEMENT atomicity for vector accesses; the
+// tag-guards-payload protocol additionally assumes the interconnect delivers
+// an aligned 16 B write as one observable unit. That holds on NVLink (the
+// same assumption NCCL's LL128 protocol makes — NCCL disables LL128 on PCIe
+// paths for exactly this reason) and is enforced at buffer alloc time via
+// CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED (the NVLink-vs-PCIe
+// discriminator): see glm52_moe_tp8_alloc_ll_cuda. On an unprobed PCIe P2P
+// topology a torn packet would be SILENT data corruption.
 __device__ __forceinline__ void st_ll(uint4* p, uint2 v, unsigned tag) {
   asm volatile("st.volatile.global.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(p),
                    "r"(v.x), "r"(v.y), "r"(0u), "r"(tag));
@@ -509,6 +519,21 @@ int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, const int* device_ordinals,
   std::lock_guard<std::mutex> lock(g_ll_vmm_mu);
   if (n_devices <= 0 || n_devices > kLlMaxDevices || g_ll_vmm_count >= 64) {
     return (int)cudaErrorInvalidValue;
+  }
+  // The LL packet protocol needs aligned 16 B stores to cross the fabric as
+  // one unit (see st_ll). NVLink provides that; PCIe P2P does not. Native
+  // atomic support is the discriminating device attribute — refuse to build
+  // LL buffers over links where a packet could tear.
+  for (int i = 0; i < n_devices; ++i) {
+    if (device_ordinals[i] == dev) continue;
+    int native_atomics = 0;
+    if (cuDeviceGetP2PAttribute(&native_atomics,
+                                CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED,
+                                (CUdevice)dev,
+                                (CUdevice)device_ordinals[i]) != CUDA_SUCCESS ||
+        native_atomics == 0) {
+      return (int)cudaErrorNotSupported;
+    }
   }
   CUmemAllocationProp prop = {};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;

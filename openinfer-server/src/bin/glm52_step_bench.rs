@@ -71,11 +71,7 @@ fn main() -> Result<()> {
     logging::init_default();
     let cli = Cli::parse();
     ensure!(!cli.buckets.is_empty(), "--buckets must be non-empty");
-    let moe_topo = match cli.moe_topo.as_str() {
-        "ep8" => openinfer_glm52::Glm52MoeTopo::Ep8,
-        "tp8" => openinfer_glm52::Glm52MoeTopo::Tp8,
-        other => bail!("--moe-topo must be ep8 or tp8, got {other}"),
-    };
+    let moe_topo: openinfer_glm52::Glm52MoeTopo = cli.moe_topo.parse().context("--moe-topo")?;
     if moe_topo == openinfer_glm52::Glm52MoeTopo::Tp8 {
         ensure!(
             cli.buckets.iter().all(|&b| b == 1),

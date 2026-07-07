@@ -58,12 +58,13 @@ pub struct Glm52Tp8LlBuffer {
     /// `vas[i]` is the VA device `i` must use to reach this buffer
     /// (positionally aligned with the `device_ordinals` passed to `alloc`).
     vas: Vec<u64>,
-    #[allow(dead_code)]
-    bytes: usize,
 }
 
-// The buffer is device memory touched only by kernels; the owning rank thread
-// coordinates lifetime with peers (destroy barrier before teardown).
+// The buffer is device memory touched only by kernels. Lifetime at shutdown
+// is coordinated by the rank workers: every rank synchronizes its stream and
+// joins the exchange's teardown rendezvous BEFORE any rank drops its buffers
+// (`Glm52Tp8Exchange::teardown_rendezvous`), so Drop's unmap never pulls a
+// mapping from under a peer's in-flight kernel.
 unsafe impl Send for Glm52Tp8LlBuffer {}
 unsafe impl Sync for Glm52Tp8LlBuffer {}
 
@@ -88,7 +89,7 @@ impl Glm52Tp8LlBuffer {
         }
         .result()
         .map_err(|err| anyhow!("TP8 LL buffer alloc ({bytes} B) failed: {err}"))?;
-        Ok(Self { vas, bytes })
+        Ok(Self { vas })
     }
 
     /// The VA through which fleet member `idx` (position in the `alloc`

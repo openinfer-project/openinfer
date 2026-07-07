@@ -995,11 +995,7 @@ fn run_step_body(
                 // EP8 dispatch/combine chain. Same router, same `mlp_out`
                 // contract — larger buckets keep EP8 below.
                 let tp8_layer = if batch == 1 {
-                    tp8.as_deref_mut().and_then(|rank| {
-                        let Glm52MoeTp8Rank { state, slices } = rank;
-                        let slot = slices.range(..layer).count();
-                        slices.get(&layer).map(|bank| (state, slot, bank))
-                    })
+                    tp8.as_deref_mut().and_then(|rank| rank.layer_bank(layer))
                 } else {
                     None
                 };
@@ -1032,11 +1028,7 @@ fn run_step_body(
                 );
                 let (state, slot, bank) = tp8
                     .as_deref_mut()
-                    .and_then(|rank| {
-                        let Glm52MoeTp8Rank { state, slices } = rank;
-                        let slot = slices.range(..layer).count();
-                        slices.get(&layer).map(|bank| (state, slot, bank))
-                    })
+                    .and_then(|rank| rank.layer_bank(layer))
                     .with_context(|| {
                         format!("GLM5.2 TP8 layer {layer} has no slice bank — loader drifted")
                     })?;

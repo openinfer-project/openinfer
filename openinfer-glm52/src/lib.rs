@@ -104,6 +104,18 @@ pub enum Glm52MoeTopo {
     Tp8,
 }
 
+impl std::str::FromStr for Glm52MoeTopo {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "ep8" => Ok(Self::Ep8),
+            "tp8" => Ok(Self::Tp8),
+            other => anyhow::bail!("GLM5.2 MoE topology must be ep8 or tp8, got {other}"),
+        }
+    }
+}
+
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
 /// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
 /// and the non-expert weights are replicated, so any rank's KV for a token

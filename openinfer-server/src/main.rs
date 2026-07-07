@@ -17,15 +17,6 @@ use config::Args;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(feature = "glm52")]
-fn parse_glm52_moe_topo(value: &str) -> anyhow::Result<openinfer_glm52::Glm52MoeTopo> {
-    match value {
-        "ep8" => Ok(openinfer_glm52::Glm52MoeTopo::Ep8),
-        "tp8" => Ok(openinfer_glm52::Glm52MoeTopo::Tp8),
-        other => anyhow::bail!("--moe-topo must be ep8 or tp8, got {other}"),
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_default();
@@ -168,7 +159,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                             use_hugepages: args.kv_offload_hugepages,
                         }),
                     moe_tp8_pilot_layers: args.moe_tp8_pilot_layers,
-                    moe_topo: parse_glm52_moe_topo(&args.moe_topo)?,
+                    moe_topo: args.moe_topo.parse().context("--moe-topo")?,
                 },
             )
             .context("failed to start GLM5.2 engine")?

@@ -363,6 +363,12 @@ struct Glm52RankRuntime {
     /// collective too): the runtime state plus the slice banks loaded in
     /// LoadWeights.
     tp8: Option<Glm52MoeTp8Rank>,
+    /// Kept from SetupComm for the shutdown-side teardown rendezvous: the
+    /// TP8 LL buffers are peer-mapped on every device, so no rank may unmap
+    /// (drop `tp8`) until every rank has retired its GPU work — see
+    /// `teardown_tp8`. Stored on ALL ranks (even if this rank's TP8 setup
+    /// failed) so the barrier's participant count is always the full fleet.
+    tp8_exchange: Option<Arc<Glm52Tp8Exchange>>,
     /// Populated by LoadDspark when the drafter is enabled.
     dspark: Option<Glm52DsparkRank>,
 }
@@ -500,6 +506,7 @@ impl Glm52RankThreadState {
             aux_ctx,
             ep8: None,
             tp8: None,
+            tp8_exchange: None,
             dspark: None,
         });
         Ok(arenas)
@@ -615,6 +622,10 @@ impl Glm52RankThreadState {
             "GLM5.2 rank {} DeepEP context already created",
             self.placement.rank
         );
+        // Before anything fallible: every rank must hold the exchange so the
+        // shutdown teardown rendezvous counts the full fleet even when this
+        // rank's DeepEP or TP8 setup fails below.
+        runtime.tp8_exchange = tp8_exchange.cloned();
         // Collective: every rank calls this concurrently.
         runtime.ep8 = Some(Glm52MoeEp8State::new(
             &dev_ctx,
@@ -643,6 +654,35 @@ impl Glm52RankThreadState {
             });
         }
         Ok(())
+    }
+
+    /// Shutdown path only: retire this rank's in-flight GPU work, then block
+    /// in the fleet-wide teardown rendezvous before dropping the TP8 state —
+    /// unmapping an LL buffer pulls the mapping from under EVERY device, so
+    /// it is only safe once no rank can still be replaying a step.
+    fn teardown_tp8(&mut self) {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let Some(exchange) = runtime.tp8_exchange.take() else {
+            return;
+        };
+        match self.ctx.device_context() {
+            Ok(dev_ctx) => {
+                if let Err(err) = dev_ctx.stream.synchronize() {
+                    log::warn!(
+                        "GLM5.2 rank {} TP8 teardown stream sync failed: {err:#}",
+                        self.placement.rank
+                    );
+                }
+            }
+            Err(err) => log::warn!(
+                "GLM5.2 rank {} TP8 teardown could not reach its device: {err:#}",
+                self.placement.rank
+            ),
+        }
+        exchange.teardown_rendezvous(self.placement.rank);
+        runtime.tp8 = None;
     }
 
     fn step(
@@ -732,6 +772,13 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::Shutdown => break,
         }
     }
+    // TP8 LL buffers are peer-mapped on every device, and a speculative
+    // launch-ahead replay can still be in flight when Shutdown lands (harvest
+    // only blocks on the argmax D2H). Quiesce this rank, then rendezvous with
+    // the fleet before any rank unmaps — must run before the collective
+    // DeepEP drop below, and keeps LL teardown independent of
+    // `Glm52RankRuntime` field order.
+    state.teardown_tp8();
     // The DeepEP context drop is collective — it runs here as every rank's
     // worker exits its loop after the coordinator broadcast Shutdown.
     drop(state);

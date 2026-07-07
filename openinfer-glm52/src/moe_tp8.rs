@@ -11,8 +11,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
@@ -26,7 +27,7 @@ use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::{GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE, GLM52_HIDDEN};
 use crate::moe_decode::{
-    Glm52RouterScratch, QUANT_GROUP, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS,
+    EXPERTS, Glm52RouterScratch, QUANT_GROUP, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS,
 };
 use crate::weights::{Glm52WeightManifest, expected_tensor_contract, mmap_file, retype_owned};
 
@@ -246,21 +247,35 @@ struct Glm52Tp8LlVas {
 }
 
 /// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
-/// per-accessor VA tables and blocks until all 8 are in.
+/// per-accessor VA tables (or its setup failure, as a poison pill) and blocks
+/// until all 8 are in. Also owns the shutdown-side rendezvous so no rank
+/// unmaps LL buffers a peer's in-flight kernels could still be reading.
 pub(crate) struct Glm52Tp8Exchange {
-    slots: Mutex<[Option<Glm52Tp8LlVas>; RANKS]>,
+    slots: Mutex<[Option<Result<Glm52Tp8LlVas, String>>; RANKS]>,
     all_in: Condvar,
+    departed: Mutex<usize>,
+    all_out: Condvar,
 }
 
 impl Glm52Tp8Exchange {
     pub(crate) fn new() -> Self {
         Self {
-            slots: Mutex::new([None; RANKS]),
+            slots: Mutex::new(std::array::from_fn(|_| None)),
             all_in: Condvar::new(),
+            departed: Mutex::new(0),
+            all_out: Condvar::new(),
         }
     }
 
-    fn publish_and_wait(&self, rank: usize, vas: Glm52Tp8LlVas) -> Result<[Glm52Tp8LlVas; RANKS]> {
+    /// Publish this rank's mappings — or its failure. A failed rank MUST
+    /// still publish (the `Err` is the poison pill): otherwise the other 7
+    /// ranks would block forever and the launch error would surface as a
+    /// silent hang instead of a message.
+    fn publish_and_wait(
+        &self,
+        rank: usize,
+        vas: Result<Glm52Tp8LlVas, String>,
+    ) -> Result<[Glm52Tp8LlVas; RANKS]> {
         let mut slots = self.slots.lock().expect("TP8 exchange poisoned");
         ensure!(
             slots[rank].is_none(),
@@ -269,9 +284,67 @@ impl Glm52Tp8Exchange {
         slots[rank] = Some(vas);
         self.all_in.notify_all();
         while slots.iter().any(Option::is_none) {
-            slots = self.all_in.wait(slots).expect("TP8 exchange poisoned");
+            let (guard, timeout) = self
+                .all_in
+                .wait_timeout(slots, Duration::from_secs(120))
+                .expect("TP8 exchange poisoned");
+            slots = guard;
+            if timeout.timed_out() && slots.iter().any(Option::is_none) {
+                let missing: Vec<usize> = (0..RANKS).filter(|&r| slots[r].is_none()).collect();
+                bail!(
+                    "TP8 LL rendezvous timed out after 120s — rank(s) {missing:?} never \
+                     published (worker died before reaching the exchange?)"
+                );
+            }
         }
-        Ok(std::array::from_fn(|r| slots[r].expect("checked above")))
+        let failed: Vec<String> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(r, s)| match s {
+                Some(Err(err)) => Some(format!("rank {r}: {err}")),
+                _ => None,
+            })
+            .collect();
+        ensure!(
+            failed.is_empty(),
+            "TP8 LL setup failed on peer rank(s): {}",
+            failed.join("; ")
+        );
+        Ok(std::array::from_fn(|r| {
+            *slots[r]
+                .as_ref()
+                .expect("checked above")
+                .as_ref()
+                .expect("failures bailed above")
+        }))
+    }
+
+    /// Shutdown-side barrier: the caller must have synchronized its stream
+    /// first (its own kernels are retired). Once all 8 ranks arrive, no
+    /// kernel anywhere can still touch an LL buffer, so every rank may unmap
+    /// in any order. On timeout (a peer died mid-serving and will never
+    /// arrive) we log and proceed — the dead peer's device may see an
+    /// illegal-address on its already-doomed context, which beats hanging
+    /// the whole process shutdown.
+    pub(crate) fn teardown_rendezvous(&self, rank: usize) {
+        let mut departed = self.departed.lock().expect("TP8 exchange poisoned");
+        *departed += 1;
+        self.all_out.notify_all();
+        while *departed < RANKS {
+            let (guard, timeout) = self
+                .all_out
+                .wait_timeout(departed, Duration::from_secs(120))
+                .expect("TP8 exchange poisoned");
+            departed = guard;
+            if timeout.timed_out() && *departed < RANKS {
+                log::warn!(
+                    "GLM5.2 rank {rank} TP8 teardown rendezvous timed out ({}/{RANKS} arrived) \
+                     — unmapping anyway; a peer rank likely died",
+                    *departed
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -282,6 +355,20 @@ impl Glm52Tp8Exchange {
 pub(crate) struct Glm52MoeTp8Rank {
     pub(crate) state: Glm52MoeTp8State,
     pub(crate) slices: BTreeMap<usize, Glm52MoeTp8SliceBank>,
+}
+
+impl Glm52MoeTp8Rank {
+    /// This layer's TP8 pieces: runtime state, LL slot index (the layer's
+    /// position among this rank's sliced layers), and slice bank. `None`
+    /// when the layer has no slice bank (pilot mode covers a subset).
+    pub(crate) fn layer_bank(
+        &mut self,
+        layer: usize,
+    ) -> Option<(&mut Glm52MoeTp8State, usize, &Glm52MoeTp8SliceBank)> {
+        let slot = self.slices.range(..layer).count();
+        let bank = self.slices.get(&layer)?;
+        Some((&mut self.state, slot, bank))
+    }
 }
 
 /// Per-rank TP8 runtime state: LL buffers, peer pointer tables, scratch
@@ -319,22 +406,32 @@ impl Glm52MoeTp8State {
         exchange: &Glm52Tp8Exchange,
         slots: usize,
     ) -> Result<Self> {
-        ensure!(rank < RANKS, "TP8 rank {rank} out of range");
-        ensure!(slots > 0, "TP8 state needs at least one layer slot");
-        // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch), so
-        // the per-accessor VA tables index directly by device ordinal.
-        let fleet: Vec<usize> = (0..RANKS).collect();
-        ensure!(
-            fleet.contains(&device_ordinal),
-            "TP8 device ordinal {device_ordinal} outside the 0..8 fleet"
-        );
-        let ag = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_AG_SLOT_PACKETS * 16, &fleet)?;
-        let rs = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_RS_SLOT_PACKETS * 16, &fleet)?;
-        let vas = Glm52Tp8LlVas {
-            ag: std::array::from_fn(|a| ag.addr_for(a)),
-            rs: std::array::from_fn(|a| rs.addr_for(a)),
-        };
+        // Everything fallible before the exchange runs inside this closure so
+        // its error is PUBLISHED as the poison pill — a rank that bails
+        // without publishing would hang the other 7 in the rendezvous.
+        let prep = (|| -> Result<(Glm52Tp8LlBuffer, Glm52Tp8LlBuffer)> {
+            ensure!(rank < RANKS, "TP8 rank {rank} out of range");
+            ensure!(slots > 0, "TP8 state needs at least one layer slot");
+            // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch),
+            // so the per-accessor VA tables index directly by device ordinal.
+            ensure!(
+                device_ordinal < RANKS,
+                "TP8 device ordinal {device_ordinal} outside the 0..8 fleet"
+            );
+            let fleet: Vec<usize> = (0..RANKS).collect();
+            let ag = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_AG_SLOT_PACKETS * 16, &fleet)?;
+            let rs = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_RS_SLOT_PACKETS * 16, &fleet)?;
+            Ok((ag, rs))
+        })();
+        let vas = prep
+            .as_ref()
+            .map(|(ag, rs)| Glm52Tp8LlVas {
+                ag: std::array::from_fn(|a| ag.addr_for(a)),
+                rs: std::array::from_fn(|a| rs.addr_for(a)),
+            })
+            .map_err(|err| format!("{err:#}"));
         let table = exchange.publish_and_wait(rank, vas)?;
+        let (ag, rs) = prep.expect("own failure would have surfaced via publish_and_wait");
         // Peer pointers: THIS device's VA for peer p's buffer (per-accessor
         // mapping — see `Glm52Tp8LlBuffer`), pre-offset to this rank's
         // source-rank slot. Kernel buffer layout is [parity][src_rank][packet]
@@ -367,7 +464,7 @@ impl Glm52MoeTp8State {
             guidx: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX)?,
             guprob: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX * RANKS)?,
             gucnt: ctx.stream.alloc_zeros(1)?,
-            gused: ctx.stream.alloc_zeros(256)?,
+            gused: ctx.stream.alloc_zeros(EXPERTS)?,
             bpart: ctx.stream.alloc_zeros(GLM52_TP8_BPART_LEN)?,
             ug: ctx.stream.alloc_zeros(GLM52_TP8_UG_LEN)?,
             cpart: ctx.stream.alloc_zeros(GLM52_TP8_CPART_LEN)?,
