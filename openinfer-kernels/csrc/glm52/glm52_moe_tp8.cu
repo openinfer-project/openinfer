@@ -225,11 +225,21 @@ struct Glm52MoeTp8Args {
   uint4* peer_rs[kRanks];        // peer p's rs buffer + myrank*H
   unsigned long long* epoch_dev;
   int nranks, myrank;
-  // Which per-layer LL buffer slot region this layer uses (AG and RS buffers
-  // are sized slots x parity x src x packets; tag = step epoch is shared by
-  // all layers of a step, so each layer needs its own region for the parity
-  // double-buffer to alternate across steps).
+  // Which per-layer LL buffer slot region this layer uses (AG buffers are
+  // sized slots x parity x src x packets, RS buffers slots x parity x row x
+  // src x packets; tag = step epoch is shared by all layers of a step, so
+  // each layer needs its own region for the parity double-buffer to
+  // alternate across steps).
   int layer_slot;
+  // Row-to-owner mapping. -1 = dp8: row i is rank i's token (normed2 /
+  // topk_* / mlp_out are this rank's single row — the bucket-1 c8 shape).
+  // >= 0 = span mode: ALL kTokens rows belong to rank span_owner (its
+  // normed2/topk_*/mlp_out are [kTokens]-row arrays: 1 committed token + 7
+  // speculative drafts); the other ranks contribute slice compute only and
+  // zero-fill their pad mlp_out. Compute phases (union/B/SiLU/C) are
+  // mapping-agnostic — only where rows come from (AG) and where results go
+  // (RS) changes.
+  int span_owner;
 };
 
 // Per-kernel preamble shared by every phase kernel: the step epoch (advanced
@@ -244,7 +254,7 @@ struct Glm52MoeTp8Args {
   const size_t ag_off =                                                       \
       ((size_t)a.layer_slot * 2 + (ep & 1)) * kRanks * kAgPackets;            \
   const size_t rs_off =                                                       \
-      ((size_t)a.layer_slot * 2 + (ep & 1)) * kRanks * kHidden;               \
+      ((size_t)a.layer_slot * 2 + (ep & 1)) * kTokens * kRanks * kHidden;     \
   (void)tag;                                                                  \
   (void)gt;                                                                   \
   (void)GT;                                                                   \
@@ -261,25 +271,40 @@ __global__ void tp8_epoch_advance_kernel(unsigned long long* epoch_dev) {
 __global__ void __launch_bounds__(kThreads) tp8_ag_push_kernel(
     Glm52MoeTp8Args a) {
   TP8_PREAMBLE
-  // ---- AG push: own normed2 + topk to every rank's slot (incl. self) ----
+  // ---- AG push: the rows THIS rank owns -> their src slots in every rank's
+  // buffer (incl. self). dp8: one row into slot myrank. span: the owner
+  // pushes all kTokens rows into slots 0..kTokens (8x egress, concentrated
+  // on one rank — ~1.6 MB/layer, measured budget in the design doc); the
+  // other ranks push nothing but still zero the scratch. peer_ag[] is baked
+  // with +myrank*kAgPackets at exchange time, hence the (row - myrank)
+  // rebase. ----
   for (int i = gt; i < kExperts; i += GT) a.gused[i] = 0;
   for (int i = gt; i < kUnionMax * kTokens; i += GT) a.guprob[i] = 0.f;
-  for (int pk = gt; pk < kAgPackets * a.nranks; pk += GT) {
-    const int p = pk / kAgPackets, i = pk % kAgPackets;
+  const bool span = a.span_owner >= 0;
+  const int rows_mine = span ? (a.myrank == a.span_owner ? kTokens : 0) : 1;
+  for (int rp = gt; rp < rows_mine * a.nranks * kAgPackets; rp += GT) {
+    const int row = span ? rp / (a.nranks * kAgPackets) : a.myrank;
+    const int rem = rp % (a.nranks * kAgPackets);
+    const int p = rem / kAgPackets, i = rem % kAgPackets;
+    const size_t rbase = span ? (size_t)row : 0;  // row index into own arrays
     uint2 v;
     if (i < kAgDataPackets) {
-      v = *reinterpret_cast<const uint2*>(a.normed2 + (size_t)i * 4);
+      v = *reinterpret_cast<const uint2*>(a.normed2 + rbase * kHidden +
+                                          (size_t)i * 4);
     } else {
       const int j = i - kAgDataPackets;  // 0,1: idx (4 x i16); 2..5: prob (2 x f32)
+      const int* ti = a.topk_idx + rbase * kTopk;
+      const float* tp = a.topk_prob + rbase * kTopk;
       if (j < 2) {
-        v.x = (unsigned)a.topk_idx[j * 4 + 0] | ((unsigned)a.topk_idx[j * 4 + 1] << 16);
-        v.y = (unsigned)a.topk_idx[j * 4 + 2] | ((unsigned)a.topk_idx[j * 4 + 3] << 16);
+        v.x = (unsigned)ti[j * 4 + 0] | ((unsigned)ti[j * 4 + 1] << 16);
+        v.y = (unsigned)ti[j * 4 + 2] | ((unsigned)ti[j * 4 + 3] << 16);
       } else {
-        v.x = __float_as_uint(a.topk_prob[(j - 2) * 2 + 0]);
-        v.y = __float_as_uint(a.topk_prob[(j - 2) * 2 + 1]);
+        v.x = __float_as_uint(tp[(j - 2) * 2 + 0]);
+        v.y = __float_as_uint(tp[(j - 2) * 2 + 1]);
       }
     }
-    st_ll(a.peer_ag[p] + ag_off + i, v, tag);
+    st_ll(a.peer_ag[p] + ag_off + (ptrdiff_t)(row - a.myrank) * kAgPackets + i,
+          v, tag);
   }
 }
 
@@ -431,11 +456,16 @@ __global__ void __launch_bounds__(kThreads) tp8_gemm_c_kernel(
   }
 }
 
-// ---- RS push: fixed-order prob-weighted sum, push token j -> rank j ----
+// ---- RS push: fixed-order prob-weighted sum, push row j's partial to the
+// rank that owns it (dp8: rank j; span: span_owner for every row). The RS
+// buffer is [row][src][hidden] — peer_rs[] is baked with the src offset
+// (+myrank*kHidden), the row stride is added here. Total push volume is
+// mapping-independent; span mode only concentrates the destination. ----
 __global__ void __launch_bounds__(kThreads) tp8_rs_push_kernel(
     Glm52MoeTp8Args a) {
   TP8_PREAMBLE
   const int UC = *a.gucnt;
+  const bool span = a.span_owner >= 0;
   for (int i = gt; i < kTokens * kHidden; i += GT) {
     int j = i / kHidden, h = i - j * kHidden;
     float s = 0;
@@ -443,24 +473,41 @@ __global__ void __launch_bounds__(kThreads) tp8_rs_push_kernel(
       float p = a.guprob[(size_t)u * kTokens + j];
       if (p != 0.f) s += p * a.cpart[((size_t)u * kTokens + j) * kHidden + h];
     }
-    st_ll(a.peer_rs[j] + rs_off + h, make_uint2(__float_as_uint(s), 0u), tag);
+    const int dst = span ? a.span_owner : j;
+    st_ll(a.peer_rs[dst] + rs_off + (size_t)j * kRanks * kHidden + h,
+          make_uint2(__float_as_uint(s), 0u), tag);
   }
 }
 
-// ---- RS recv: own token's 8 partials, fixed source order. Self partials
-// were pushed by the rs_push node (already retired) — the spin only waits
-// on cross-rank arrivals. ----
+// ---- RS recv: reduce the rows this rank owns (fixed source order). Self
+// partials were pushed by the rs_push node (already retired) — the spin only
+// waits on cross-rank arrivals. dp8: one row (row myrank). span owner: all
+// kTokens rows (8x reduce work + concentrated ingress ~5.5 MB/layer,
+// budgeted). span non-owners own nothing: their pad rows never entered the
+// MoE, so mlp_out is zero-filled — deterministic, and no NaN can leak into
+// the next layer's attention through a pad row. ----
 __global__ void __launch_bounds__(kThreads) tp8_rs_recv_kernel(
     Glm52MoeTp8Args a) {
   TP8_PREAMBLE
-  for (int h = gt; h < kHidden; h += GT) {
+  const bool span = a.span_owner >= 0;
+  if (span && a.myrank != a.span_owner) {
+    for (int i = gt; i < kTokens * kHidden; i += GT) {
+      a.mlp_out[i] = __float2bfloat16(0.f);
+    }
+    return;
+  }
+  const int nrows = span ? kTokens : 1;
+  for (int i = gt; i < nrows * kHidden; i += GT) {
+    const int jr = i / kHidden, h = i - jr * kHidden;
+    const int j = span ? jr : a.myrank;
     float s = 0;
     for (int r = 0; r < a.nranks; r++) {
       uint4 q;
-      ll_wait(a.rs_local + rs_off + (size_t)r * kHidden + h, tag, &q);
+      ll_wait(a.rs_local + rs_off + ((size_t)j * kRanks + r) * kHidden + h,
+              tag, &q);
       s += __uint_as_float(q.x);
     }
-    a.mlp_out[h] = __float2bfloat16(s);
+    a.mlp_out[(size_t)jr * kHidden + h] = __float2bfloat16(s);
   }
 }
 
@@ -616,9 +663,10 @@ int glm52_moe_tp8_layer_launch_cuda(
     void* topk_all_prob, void* guidx, void* guprob, void* gucnt, void* gused,
     void* bpart, void* ug, void* cpart, void* ag_local, void* rs_local,
     const void* const* peer_ag, const void* const* peer_rs, void* epoch_dev,
-    int layer_slot, int nranks, int myrank, int grid_blocks,
+    int layer_slot, int nranks, int myrank, int span_owner, int grid_blocks,
     cudaStream_t stream) {
-  if (nranks != kRanks || myrank < 0 || myrank >= nranks) {
+  if (nranks != kRanks || myrank < 0 || myrank >= nranks ||
+      span_owner >= nranks) {
     return (int)cudaErrorInvalidValue;
   }
   Glm52MoeTp8Args a = {};
@@ -650,26 +698,31 @@ int glm52_moe_tp8_layer_launch_cuda(
   a.nranks = nranks;
   a.myrank = myrank;
   a.layer_slot = layer_slot;
+  a.span_owner = span_owner;
 
   // One layer = a short chain of plain graph nodes; stream order is the only
   // cross-phase synchronization (see the phase-ordering note above). Spins
   // wait exclusively on cross-rank packets, so no grid size here is
   // deadlock-capable; grid_blocks (occupancy-derived) sizes the mma kernels.
   void* args[] = {&a};
+  const int ag_push_rows = span_owner >= 0 ? kTokens : 1;
+  const int ag_push_blocks =
+      (kAgPackets * kRanks * ag_push_rows + kThreads - 1) / kThreads;
   const int ag_blocks = (kAgPackets * kRanks + kThreads - 1) / kThreads;
+  const int rs_recv_rows = span_owner >= 0 ? kTokens : 1;
   const int rs_blocks = (kHidden + kThreads - 1) / kThreads;
   struct Phase {
     const void* fn;
     int blocks;
   } phases[] = {
-      {(const void*)tp8_ag_push_kernel, ag_blocks},
+      {(const void*)tp8_ag_push_kernel, ag_push_blocks},
       {(const void*)tp8_ag_recv_kernel, ag_blocks},
       {(const void*)tp8_union_kernel, 1},
       {(const void*)tp8_gemm_b_kernel, grid_blocks},
       {(const void*)tp8_silu_kernel, grid_blocks},
       {(const void*)tp8_gemm_c_kernel, grid_blocks},
       {(const void*)tp8_rs_push_kernel, rs_blocks * kTokens},
-      {(const void*)tp8_rs_recv_kernel, rs_blocks},
+      {(const void*)tp8_rs_recv_kernel, rs_blocks * rs_recv_rows},
   };
   for (const Phase& ph : phases) {
     cudaError_t e = cudaLaunchKernel(ph.fn, dim3(ph.blocks), dim3(kThreads),

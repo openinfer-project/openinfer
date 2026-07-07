@@ -23,6 +23,9 @@ pub const GLM52_TP8_SLICE_ROWS: usize = 512;
 pub const GLM52_TP8_SLICE_I: usize = 256;
 /// Worst-case active-expert union: 8 tokens x (topk + shared).
 pub const GLM52_TP8_UNION_MAX: usize = GLM52_TP8_RANKS * (GLM52_TP8_TOPK + 1);
+/// Rows per TP8 layer step (= kTokens in the kernel): 8 in both mappings —
+/// dp8 gathers 1 row from each rank, span mode gathers 8 rows from the owner.
+pub const GLM52_TP8_TOKENS: usize = 8;
 /// gate/up k-split factor (kernel-side kKsplitB).
 pub const GLM52_TP8_KSPLIT_B: usize = 16;
 /// LL allgather packets per rank: H/4 data + 2 idx + 4 prob (16 B each).
@@ -34,8 +37,12 @@ pub const GLM52_TP8_AG_PACKETS: usize = GLM52_TP8_HIDDEN / 4 + 6;
 /// a step, so each layer needs its own region for parity to alternate).
 pub const GLM52_TP8_AG_SLOT_PACKETS: usize = 2 * GLM52_TP8_RANKS * GLM52_TP8_AG_PACKETS;
 /// LL reduce-scatter buffer length in u128 packets (parity-double-buffered).
-/// One layer slot's RS region (parity x src x hidden packets).
-pub const GLM52_TP8_RS_SLOT_PACKETS: usize = 2 * GLM52_TP8_RANKS * GLM52_TP8_HIDDEN;
+/// One layer slot's RS region (parity x row x src x hidden packets). The row
+/// dimension exists for span mode (all 8 rows' partials land on one owner
+/// rank); dp8 mode uses only the row == own-rank stripe. One layout for both
+/// mappings — no mode-dependent addressing.
+pub const GLM52_TP8_RS_SLOT_PACKETS: usize =
+    2 * GLM52_TP8_TOKENS * GLM52_TP8_RANKS * GLM52_TP8_HIDDEN;
 
 /// f32 scratch length for gate|up k-split partials.
 pub const GLM52_TP8_BPART_LEN: usize =
@@ -158,9 +165,23 @@ pub struct Glm52MoeTp8Buffers<'a> {
     pub epoch_dev: &'a mut CudaSlice<u64>,
 }
 
-/// Launch one layer's TP8 MoE phase-kernel chain for this rank's token.
-/// `topk_idx`/`topk_prob` are the production router's output for the local
-/// token; `mlp_out` receives routed + shared (no residual), like the EP8
+/// Row-to-owner mapping of one TP8 layer step (always 8 rows through the
+/// compute phases; only where rows come from and where results go differs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Glm52Tp8RowMap {
+    /// Row i is rank i's token (bucket-1 c8): `normed2`/`topk_*`/`mlp_out`
+    /// hold this rank's single row.
+    Dp8,
+    /// All 8 rows belong to `owner` (1 committed + 7 speculative drafts):
+    /// the owner's `normed2`/`topk_*`/`mlp_out` are 8-row arrays; the other
+    /// ranks' row inputs are ignored and their pad `mlp_out` (8 rows) is
+    /// zero-filled.
+    Span { owner: usize },
+}
+
+/// Launch one layer's TP8 MoE phase-kernel chain. `topk_idx`/`topk_prob` are
+/// the production router's output for the rows this rank owns under
+/// `row_map`; `mlp_out` receives routed + shared (no residual), like the EP8
 /// arm's combined-plus-shared sum. `layer_slot` selects this layer's LL
 /// buffer region; the step epoch must have been advanced once this step via
 /// [`glm52_moe_tp8_epoch_advance`].
@@ -168,6 +189,7 @@ pub struct Glm52MoeTp8Buffers<'a> {
 pub fn glm52_moe_tp8_layer_launch(
     ctx: &DeviceContext,
     layer_slot: usize,
+    row_map: Glm52Tp8RowMap,
     normed2: &CudaSlice<bf16>,
     topk_idx: &CudaSlice<i32>,
     topk_prob: &CudaSlice<f32>,
@@ -183,14 +205,41 @@ pub fn glm52_moe_tp8_layer_launch(
     const H: usize = GLM52_TP8_HIDDEN;
     const E: usize = GLM52_TP8_BANK_EXPERTS;
     ensure!(myrank < GLM52_TP8_RANKS, "TP8 myrank {myrank} out of range");
+    let span_owner: i32 = match row_map {
+        Glm52Tp8RowMap::Dp8 => -1,
+        Glm52Tp8RowMap::Span { owner } => {
+            ensure!(
+                owner < GLM52_TP8_RANKS,
+                "TP8 span owner {owner} out of range"
+            );
+            owner as i32
+        }
+    };
+    // Rows whose data flows through this rank's own arrays: the span owner
+    // reads/writes 8 rows, span non-owners still need 8 pad mlp_out rows.
+    let in_rows = match row_map {
+        Glm52Tp8RowMap::Dp8 => 1,
+        Glm52Tp8RowMap::Span { owner } => {
+            if owner == myrank {
+                GLM52_TP8_TOKENS
+            } else {
+                0
+            }
+        }
+    };
+    let out_rows = match row_map {
+        Glm52Tp8RowMap::Dp8 => 1,
+        Glm52Tp8RowMap::Span { .. } => GLM52_TP8_TOKENS,
+    };
     ensure!(
-        normed2.len() >= H && mlp_out.len() >= H,
-        "TP8 hidden buffers too small: normed2 {}, mlp_out {}",
+        normed2.len() >= in_rows.max(1) * H && mlp_out.len() >= out_rows * H,
+        "TP8 hidden buffers too small for {row_map:?}: normed2 {}, mlp_out {}",
         normed2.len(),
         mlp_out.len()
     );
     ensure!(
-        topk_idx.len() >= GLM52_TP8_TOPK && topk_prob.len() >= GLM52_TP8_TOPK,
+        topk_idx.len() >= in_rows.max(1) * GLM52_TP8_TOPK
+            && topk_prob.len() >= in_rows.max(1) * GLM52_TP8_TOPK,
         "TP8 topk buffers too small: idx {}, prob {}",
         topk_idx.len(),
         topk_prob.len()
@@ -280,6 +329,7 @@ pub fn glm52_moe_tp8_layer_launch(
             layer_slot as i32,
             GLM52_TP8_RANKS as i32,
             myrank as i32,
+            span_owner,
             grid_blocks as i32,
             ctx.stream.cu_stream(),
         )

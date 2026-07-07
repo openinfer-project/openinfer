@@ -17,11 +17,11 @@ use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_TP8_AG_SLOT_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
-    GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I,
-    GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
-    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch,
-    glm52_moe_tp8_max_blocks,
+    GLM52_TP8_AG_PACKETS, GLM52_TP8_AG_SLOT_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN,
+    GLM52_TP8_CPART_LEN, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS,
+    GLM52_TP8_SLICE_I, GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
+    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, Glm52Tp8RowMap, glm52_moe_tp8_epoch_advance,
+    glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -437,8 +437,12 @@ impl Glm52MoeTp8State {
         // source-rank slot. Kernel buffer layout is [parity][src_rank][packet]
         // (the kernel adds the parity offset itself), so the slot stride is
         // one rank's packet count x 16 B.
-        let ag_slot = (GLM52_TP8_AG_SLOT_PACKETS / RANKS / 2) * 16;
-        let rs_slot = (GLM52_TP8_RS_SLOT_PACKETS / RANKS / 2) * 16;
+        // Per-SRC strides: peer pointers are baked to this rank's source slot.
+        // AG region is [parity][src][packets]; RS region is [parity][row]
+        // [src][hidden] (the kernel adds the row stride itself), so the src
+        // stride is one hidden row of packets in both mappings.
+        let ag_slot = GLM52_TP8_AG_PACKETS * 16;
+        let rs_slot = GLM52_TP8_HIDDEN * 16;
         let peer_ag =
             std::array::from_fn(|p| table[p].ag[device_ordinal] + (rank * ag_slot) as u64);
         let peer_rs =
@@ -512,9 +516,63 @@ impl Glm52MoeTp8State {
         glm52_moe_tp8_layer_launch(
             ctx,
             slot,
+            Glm52Tp8RowMap::Dp8,
             normed2,
             &router.route.topk_idx,
             &router.route.topk_weight,
+            &bank.w13,
+            &bank.w13_scale,
+            &bank.w2,
+            &bank.w2_scale,
+            mlp_out,
+            &mut bufs,
+            self.rank,
+            self.grid_blocks,
+        )
+    }
+
+    /// Span-mode layer forward: all 8 rows (1 committed + 7 drafts) belong
+    /// to `owner`. On the owner, `normed2`/`topk_idx`/`topk_prob` are 8-row
+    /// arrays and `mlp_out` receives 8 rows of routed + shared; on the other
+    /// ranks the row inputs are ignored (any valid device buffer) and the
+    /// 8-row `mlp_out` is zero-filled (pads never enter the MoE).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_span(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        owner: usize,
+        bank: &Glm52MoeTp8SliceBank,
+        normed2: &CudaSlice<bf16>,
+        topk_idx: &CudaSlice<i32>,
+        topk_prob: &CudaSlice<f32>,
+        mlp_out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        debug_assert_eq!(GLM52_HIDDEN, H);
+        let mut bufs = Glm52MoeTp8Buffers {
+            xg: &mut self.xg,
+            topk_all_idx: &mut self.topk_all_idx,
+            topk_all_prob: &mut self.topk_all_prob,
+            guidx: &mut self.guidx,
+            guprob: &mut self.guprob,
+            gucnt: &mut self.gucnt,
+            gused: &mut self.gused,
+            bpart: &mut self.bpart,
+            ug: &mut self.ug,
+            cpart: &mut self.cpart,
+            ag_local: self.ag_local,
+            rs_local: self.rs_local,
+            peer_ag: self.peer_ag,
+            peer_rs: self.peer_rs,
+            epoch_dev: &mut self.epoch_dev,
+        };
+        glm52_moe_tp8_layer_launch(
+            ctx,
+            slot,
+            Glm52Tp8RowMap::Span { owner },
+            normed2,
+            topk_idx,
+            topk_prob,
             &bank.w13,
             &bank.w13_scale,
             &bank.w2,
