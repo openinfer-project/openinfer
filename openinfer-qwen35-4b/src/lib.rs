@@ -66,6 +66,24 @@ pub fn start_engine(
         seed,
         ..
     } = options;
+    if device_ordinals.len() > 1 {
+        if enable_cuda_graph {
+            return Err(anyhow!(
+                "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
+            ));
+        }
+        let model_path = model_path
+            .to_str()
+            .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
+        return scheduler::start_tp_with_capacity(
+            model_path,
+            seed,
+            &device_ordinals,
+            max_batch,
+            max_prefill_tokens,
+        );
+    }
+
     anyhow::ensure!(
         enable_cuda_graph,
         "Qwen3.5 decode always captures CUDA Graphs; --cuda-graph=false is not supported"

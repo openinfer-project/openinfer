@@ -29,10 +29,12 @@ enum TpWorkerCommand {
     },
     RunPrefillChunks {
         chunks: Vec<TpPrefillChunkItem>,
+        sample_seed: u64,
         resp: mpsc::Sender<Result<TpWorkerReply>>,
     },
     RunDecodeStep {
-        requests: Vec<DecodeStepItem>,
+        requests: Vec<TpDecodeStepItem>,
+        sample_seed: u64,
         resp: mpsc::Sender<Result<TpWorkerReply>>,
     },
     RunUnifiedStep {
@@ -58,6 +60,10 @@ pub struct Qwen35TpExecutor {
     workers: Vec<TpWorker>,
     world_size: usize,
     max_batch: usize,
+    page_size: usize,
+    capacity_pages_for_requests: usize,
+    max_position_embeddings: usize,
+    eos_token_id: u32,
 }
 
 #[derive(Clone)]
@@ -65,6 +71,7 @@ pub struct TpPrefillChunkItem {
     request_id: RequestId,
     prompt_tokens: Vec<u32>,
     logprobs: usize,
+    sampling_params: SamplingParams,
     finish_prefill: bool,
 }
 
@@ -79,7 +86,48 @@ impl TpPrefillChunkItem {
             request_id,
             prompt_tokens,
             logprobs,
+            sampling_params: SamplingParams::default(),
             finish_prefill,
+        }
+    }
+
+    pub fn new_with_sampling(
+        request_id: RequestId,
+        prompt_tokens: Vec<u32>,
+        logprobs: usize,
+        sampling_params: SamplingParams,
+        finish_prefill: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            prompt_tokens,
+            logprobs,
+            sampling_params,
+            finish_prefill,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TpDecodeStepItem {
+    request_id: RequestId,
+    token_id: u32,
+    logprobs: usize,
+    sampling_params: SamplingParams,
+}
+
+impl TpDecodeStepItem {
+    pub fn new(
+        request_id: RequestId,
+        token_id: u32,
+        logprobs: usize,
+        sampling_params: SamplingParams,
+    ) -> Self {
+        Self {
+            request_id,
+            token_id,
+            logprobs,
+            sampling_params,
         }
     }
 }
@@ -121,6 +169,13 @@ impl Qwen35TpExecutor {
                 },
             )?);
         }
+        let first = models
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP executor loaded no models"))?;
+        let page_size = first.kv_pool().layout().page_size;
+        let capacity_pages_for_requests = first.kv_pool().capacity_pages().saturating_sub(1);
+        let max_position_embeddings = first.config().max_position_embeddings;
+        let eos_token_id = first.config().eos_token_id;
 
         let nccl_id = cudarc::nccl::safe::Id::new()
             .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
@@ -141,6 +196,10 @@ impl Qwen35TpExecutor {
             workers,
             world_size,
             max_batch,
+            page_size,
+            capacity_pages_for_requests,
+            max_position_embeddings,
+            eos_token_id,
         })
     }
 
@@ -150,6 +209,22 @@ impl Qwen35TpExecutor {
 
     pub fn max_batch(&self) -> usize {
         self.max_batch
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub fn capacity_pages_for_requests(&self) -> usize {
+        self.capacity_pages_for_requests
+    }
+
+    pub fn max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        token_id == self.eos_token_id
     }
 
     pub fn ping_all(&self) -> Result<()> {
@@ -171,6 +246,14 @@ impl Qwen35TpExecutor {
     }
 
     pub fn execute_prefill_chunks(&self, chunks: &[TpPrefillChunkItem]) -> Result<PrefillResult> {
+        self.execute_prefill_chunks_with_seed(chunks, 0)
+    }
+
+    pub fn execute_prefill_chunks_with_seed(
+        &self,
+        chunks: &[TpPrefillChunkItem],
+        sample_seed: u64,
+    ) -> Result<PrefillResult> {
         anyhow::ensure!(
             !chunks.is_empty(),
             "Qwen3.5 TP prefill chunk command requires at least one chunk"
@@ -181,6 +264,7 @@ impl Qwen35TpExecutor {
             let (resp_tx, resp_rx) = mpsc::channel();
             worker.send(TpWorkerCommand::RunPrefillChunks {
                 chunks: chunks.clone(),
+                sample_seed,
                 resp: resp_tx,
             })?;
             pending.push(resp_rx);
@@ -193,12 +277,37 @@ impl Qwen35TpExecutor {
             !plan.requests.is_empty(),
             "Qwen3.5 TP decode plan requires at least one request"
         );
-        let requests = plan.requests.to_vec();
+        let requests: Vec<TpDecodeStepItem> = plan
+            .requests
+            .iter()
+            .map(|request| {
+                TpDecodeStepItem::new(
+                    request.request_id,
+                    request.token_id,
+                    request.logprobs,
+                    SamplingParams::default(),
+                )
+            })
+            .collect();
+        self.execute_decode_items(&requests, 0)
+    }
+
+    pub fn execute_decode_items(
+        &self,
+        requests: &[TpDecodeStepItem],
+        sample_seed: u64,
+    ) -> Result<DecodeResult> {
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "Qwen3.5 TP decode plan requires at least one request"
+        );
+        let requests = requests.to_vec();
         let mut pending = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
             let (resp_tx, resp_rx) = mpsc::channel();
             worker.send(TpWorkerCommand::RunDecodeStep {
                 requests: requests.clone(),
+                sample_seed,
                 resp: resp_tx,
             })?;
             pending.push(resp_rx);
@@ -227,10 +336,12 @@ impl Qwen35TpExecutor {
                 TpWorkerCommandKind::Ping => TpWorkerCommand::Ping { resp: resp_tx },
                 TpWorkerCommandKind::RunPrefillChunks => TpWorkerCommand::RunPrefillChunks {
                     chunks: Vec::new(),
+                    sample_seed: 0,
                     resp: resp_tx,
                 },
                 TpWorkerCommandKind::RunDecodeStep => TpWorkerCommand::RunDecodeStep {
                     requests: Vec::new(),
+                    sample_seed: 0,
                     resp: resp_tx,
                 },
                 TpWorkerCommandKind::RunUnifiedStep => {
@@ -398,12 +509,20 @@ impl TpWorkerState {
                 TpWorkerCommand::Ping { resp } => {
                     let _ = resp.send(Ok(TpWorkerReply::Ack));
                 }
-                TpWorkerCommand::RunPrefillChunks { chunks, resp } => {
-                    let result = self.execute_prefill_chunks(&chunks);
+                TpWorkerCommand::RunPrefillChunks {
+                    chunks,
+                    sample_seed,
+                    resp,
+                } => {
+                    let result = self.execute_prefill_chunks(&chunks, sample_seed);
                     let _ = resp.send(result);
                 }
-                TpWorkerCommand::RunDecodeStep { requests, resp } => {
-                    let result = self.execute_decode(&requests);
+                TpWorkerCommand::RunDecodeStep {
+                    requests,
+                    sample_seed,
+                    resp,
+                } => {
+                    let result = self.execute_decode(&requests, sample_seed);
                     let _ = resp.send(result);
                 }
                 TpWorkerCommand::RunUnifiedStep { resp } => {
@@ -421,7 +540,11 @@ impl TpWorkerState {
         }
     }
 
-    fn execute_prefill_chunks(&mut self, chunks: &[TpPrefillChunkItem]) -> Result<TpWorkerReply> {
+    fn execute_prefill_chunks(
+        &mut self,
+        chunks: &[TpPrefillChunkItem],
+        sample_seed: u64,
+    ) -> Result<TpWorkerReply> {
         anyhow::ensure!(
             !chunks.is_empty(),
             "Qwen3.5 TP prefill chunk command requires at least one chunk"
@@ -457,7 +580,7 @@ impl TpWorkerState {
 
             if chunk.finish_prefill {
                 if self.rank == 0 {
-                    let result = self.sample_final_prefill_chunk(chunk, &logits)?;
+                    let result = self.sample_final_prefill_chunk(chunk, &logits, sample_seed)?;
                     primary_results.push(result);
                 }
                 self.requests[state_idx].phase = TpRequestPhase::Decoding;
@@ -477,16 +600,16 @@ impl TpWorkerState {
         &mut self,
         chunk: &TpPrefillChunkItem,
         logits: &openinfer_core::tensor::HiddenStates,
+        sample_seed: u64,
     ) -> Result<PrefillRequestResult> {
         let cpu_logits =
             snapshot_requested_logprobs(self.model.device_ctx(), logits, &[chunk.logprobs])?;
-        let params = vec![SamplingParams::default()];
-        let params_refs: Vec<&SamplingParams> = params.iter().collect();
+        let params_refs = [&chunk.sampling_params];
         let tokens = openinfer_sample::select_batch(
             self.model.device_ctx(),
             logits,
             &params_refs,
-            0,
+            sample_seed,
             &mut self.sample_scratch,
         )?;
         let first_token = tokens[0];
@@ -500,7 +623,11 @@ impl TpWorkerState {
         })
     }
 
-    fn execute_decode(&mut self, requests: &[DecodeStepItem]) -> Result<TpWorkerReply> {
+    fn execute_decode(
+        &mut self,
+        requests: &[TpDecodeStepItem],
+        sample_seed: u64,
+    ) -> Result<TpWorkerReply> {
         anyhow::ensure!(
             !requests.is_empty(),
             "Qwen3.5 TP decode command requires at least one request"
@@ -515,7 +642,7 @@ impl TpWorkerState {
 
         let mut primary_results =
             Vec::with_capacity(if self.rank == 0 { requests.len() } else { 0 });
-        for request in requests {
+        for (row_idx, request) in requests.iter().enumerate() {
             let state_idx = self.request_index(request.request_id).ok_or_else(|| {
                 anyhow::anyhow!(
                     "Qwen3.5 TP decode request {} has no worker state",
@@ -546,13 +673,12 @@ impl TpWorkerState {
                     &self.decode_buffers.logits,
                     &[request.logprobs],
                 )?;
-                let params = vec![SamplingParams::default()];
-                let params_refs: Vec<&SamplingParams> = params.iter().collect();
+                let params_refs = [&request.sampling_params];
                 let tokens = openinfer_sample::select_batch(
                     self.model.device_ctx(),
                     &self.decode_buffers.logits,
                     &params_refs,
-                    0,
+                    sample_seed.wrapping_add(row_idx as u64),
                     &mut self.sample_scratch,
                 )?;
                 let token = tokens[0];
@@ -620,7 +746,7 @@ fn validate_prefill_chunks(chunks: &[TpPrefillChunkItem]) -> Result<()> {
     Ok(())
 }
 
-fn validate_decode_requests(requests: &[DecodeStepItem]) -> Result<()> {
+fn validate_decode_requests(requests: &[TpDecodeStepItem]) -> Result<()> {
     let mut seen = HashSet::with_capacity(requests.len());
     for request in requests {
         anyhow::ensure!(
@@ -639,6 +765,17 @@ impl From<PrefillStepItem> for TpPrefillChunkItem {
             request.prompt_tokens,
             request.logprobs,
             true,
+        )
+    }
+}
+
+impl From<DecodeStepItem> for TpDecodeStepItem {
+    fn from(request: DecodeStepItem) -> Self {
+        Self::new(
+            request.request_id,
+            request.token_id,
+            request.logprobs,
+            SamplingParams::default(),
         )
     }
 }
@@ -779,12 +916,17 @@ mod tests {
 
     #[test]
     fn validates_decode_request_shape() {
-        validate_decode_requests(&[DecodeStepItem::new(RequestId::new(1), 9707, 0)])
-            .expect("single decode request is valid");
+        validate_decode_requests(&[TpDecodeStepItem::new(
+            RequestId::new(1),
+            9707,
+            0,
+            SamplingParams::default(),
+        )])
+        .expect("single decode request is valid");
 
         let duplicate = [
-            DecodeStepItem::new(RequestId::new(1), 9707, 0),
-            DecodeStepItem::new(RequestId::new(1), 560, 0),
+            TpDecodeStepItem::new(RequestId::new(1), 9707, 0, SamplingParams::default()),
+            TpDecodeStepItem::new(RequestId::new(1), 560, 0, SamplingParams::default()),
         ];
         let err = validate_decode_requests(&duplicate)
             .unwrap_err()
