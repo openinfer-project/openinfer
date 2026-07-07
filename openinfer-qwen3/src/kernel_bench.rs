@@ -513,8 +513,9 @@ impl AttentionDecodeCase {
         };
         if result != 0 {
             bail!(
-                "{} paged attention failed with error {result}",
-                path.name(self.split_config)
+                "{} paged attention failed with error {result}{}",
+                path.name(self.split_config),
+                openinfer_kernels::ops::ffi_exception_message(result)
             );
         }
         Ok(result)
@@ -823,7 +824,10 @@ impl AttentionPrefillCase {
             )
         };
         if result != 0 {
-            bail!("segmented paged_kv_scatter_cuda failed with error {result}");
+            bail!(
+                "segmented paged_kv_scatter_cuda failed with error {result}{}",
+                openinfer_kernels::ops::ffi_exception_message(result)
+            );
         }
         Ok(())
     }
@@ -885,7 +889,10 @@ impl AttentionPrefillCase {
             )
         };
         if result != 0 {
-            bail!("segmented batch_prefill_paged_cuda failed with error {result}");
+            bail!(
+                "segmented batch_prefill_paged_cuda failed with error {result}{}",
+                openinfer_kernels::ops::ffi_exception_message(result)
+            );
         }
         Ok(())
     }
@@ -1017,7 +1024,10 @@ impl SinglePrefillCase {
             )
         };
         if result != 0 {
-            bail!("single_prefill_cuda failed with error {result}");
+            bail!(
+                "single_prefill_cuda failed with error {result}{}",
+                openinfer_kernels::ops::ffi_exception_message(result)
+            );
         }
         Ok(())
     }

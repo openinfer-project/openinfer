@@ -15,22 +15,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_indexer_k_gather_quant_cache_cuda(
-        indexer_cache: *const u8,
-        dst_k: *mut u8,
-        dst_scale: *mut u8,
-        block_table: *const i32,
-        cu_seq_lens: *const i32,
-        batch_size: i32,
-        num_blocks_per_seq: i32,
-        tokens: i32,
-        head_dim: i32,
-        quant_block_size: i32,
-        cache_block_size: i32,
-        cache_block_stride_bytes: i64,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn glm52_indexer_local_topk_to_slots_cuda(
         global_slots: *mut i32,
         topk_lens: *mut i32,

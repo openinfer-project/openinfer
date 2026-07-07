@@ -109,15 +109,17 @@ async fn main() -> anyhow::Result<()> {
 // defaults, capability constraints, cross-arg validation). The server only
 // picks the crate by detected model type and forwards the relevant CLI knobs.
 fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
-    // Only Qwen3 wires the DFlash drafter; fail loud rather than silently
-    // ignoring the flag for another model line.
+    // Only Qwen3 (DFlash/DSpark) and GLM5.2 (DSpark) wire a drafter; fail
+    // loud rather than silently ignoring the flag for another model line.
     #[cfg(feature = "qwen3")]
-    let is_qwen3 = matches!(model_type, ModelType::Qwen3);
+    let wires_drafter = matches!(model_type, ModelType::Qwen3);
     #[cfg(not(feature = "qwen3"))]
-    let is_qwen3 = false;
+    let wires_drafter = false;
+    #[cfg(feature = "glm52")]
+    let wires_drafter = wires_drafter || matches!(model_type, ModelType::Glm52);
     anyhow::ensure!(
-        args.dflash_draft_model_path.is_none() || is_qwen3,
-        "--dflash-draft-model-path is only supported for Qwen3 (got {model_type:?})"
+        args.dflash_draft_model_path.is_none() || wires_drafter,
+        "--dflash-draft-model-path is only supported for Qwen3 and GLM5.2 (got {model_type:?})"
     );
     let handle = match model_type {
         #[cfg(feature = "deepseek-v4")]
@@ -133,14 +135,33 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                 .context("failed to start DeepSeek V2 Lite engine")?
         }
         #[cfg(feature = "glm52")]
-        ModelType::Glm52 => openinfer_glm52::launch(
-            &args.model_path,
-            openinfer_glm52::Glm52LaunchOptions {
-                tp_size: args.tp_size,
-                dp_size: args.dp_size.unwrap_or(8),
-            },
-        )
-        .context("failed to start GLM5.2 engine")?,
+        ModelType::Glm52 => {
+            // The shared --kv-p2p-* flags only reach the qwen3 engine; fail
+            // loud instead of silently starting host-only offload in what
+            // looks like a P2P deployment (GLM5.2 P2P lands with M2).
+            anyhow::ensure!(
+                args.kv_p2p_metaserver_addr.is_none(),
+                "GLM5.2 KV offload is host-tier only for now; --kv-p2p-* flags are not supported"
+            );
+            openinfer_glm52::launch(
+                &args.model_path,
+                openinfer_glm52::Glm52LaunchOptions {
+                    tp_size: args.tp_size,
+                    dp_size: args.dp_size.unwrap_or(8),
+                    dspark_draft_model_path: args.dflash_draft_model_path.clone(),
+                    max_model_len: args.max_model_len,
+                    no_prefix_cache: args.no_prefix_cache,
+                    kv_offload: args
+                        .kv_offload
+                        .then(|| openinfer_glm52::Glm52KvOffloadOptions {
+                            pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
+                                as usize,
+                            use_hugepages: args.kv_offload_hugepages,
+                        }),
+                },
+            )
+            .context("failed to start GLM5.2 engine")?
+        }
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => openinfer_kimi_k2::launch(
             &args.model_path,
@@ -157,6 +178,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             let offload = if args.kv_offload {
                 let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
                 let mut offload = Qwen3OffloadOptions::enabled(bytes);
+                offload.use_hugepages = args.kv_offload_hugepages;
                 if let (Some(metaserver_addr), Some(advertise_addr)) = (
                     args.kv_p2p_metaserver_addr.clone(),
                     args.kv_p2p_advertise_addr.clone(),
@@ -217,6 +239,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     memory: openinfer_qwen3::Qwen3MemoryOptions::new(
                         args.gpu_memory_utilization,
                         kv_cache_memory_margin_bytes,
+                        args.kv_page_size,
                     )
                     .validate()?,
                     lora,

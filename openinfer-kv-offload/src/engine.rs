@@ -83,6 +83,8 @@ pub struct OffloadConfig {
     pub device_id: i32,
     /// Host pinned-memory pool size in bytes (the CPU KV tier capacity).
     pub pinned_pool_bytes: usize,
+    /// Back the pinned pool with hugepages (see [`HostConfig::use_hugepages`]).
+    pub use_hugepages: bool,
     /// Worker threads for the embedded runtime that drives pegaflow's async
     /// save/query. Two is plenty: save is fire-and-forget, query is a brief
     /// memory-cache lookup.
@@ -98,8 +100,20 @@ impl OffloadConfig {
             namespace: "openinfer".to_string(),
             device_id,
             pinned_pool_bytes,
+            use_hugepages: false,
             runtime_threads: 2,
             p2p: None,
+        }
+    }
+
+    /// The host-tier half of this config (private-host constructors split it
+    /// off before consuming the instance fields).
+    fn host(&self) -> HostConfig {
+        HostConfig {
+            pinned_pool_bytes: self.pinned_pool_bytes,
+            use_hugepages: self.use_hugepages,
+            runtime_threads: self.runtime_threads,
+            p2p: self.p2p.clone(),
         }
     }
 
@@ -165,7 +179,26 @@ impl LoadHandle {
     }
 }
 
-/// Per-layer registration geometry derived once from a [`KvBuffer`]'s layout.
+/// One strided GPU arena to register as one pegaflow "layer": `num_blocks`
+/// copy units of `bytes_per_block`, sitting `block_stride_bytes` apart from
+/// `base_ptr`. A fused buffer (qwen3) contributes one arena per model layer;
+/// a model with sidecar caches (GLM5.2: MLA latent + index-K per layer, two
+/// separate allocations sharing pool block ids) contributes several arenas
+/// per model layer — pegaflow moves whatever arenas are registered under one
+/// block id together, which is what keeps sidecars in lockstep with their
+/// main cache.
+///
+/// `name` keys the arena for the whole engine lifetime (save/load fan across
+/// every registered name); it must be unique within the engine.
+pub struct KvArena {
+    pub name: String,
+    pub base_ptr: u64,
+    pub num_blocks: usize,
+    pub bytes_per_block: usize,
+    pub block_stride_bytes: usize,
+}
+
+/// Per-layer registration geometry fed to pegaflow's one batched call.
 ///
 /// Only `data_ptrs` and `size_bytes` differ per layer; the rest are the same
 /// scalar broadcast across all layers (kept as vectors only to feed pegaflow's
@@ -201,82 +234,98 @@ impl Registration {
         // One block's copy unit for a layer = its whole [K|V] span in a page.
         let layer_bytes = layout.layer_stride * ELEM_SIZE;
         let page_stride_bytes = layout.page_stride * ELEM_SIZE;
-        let total_bytes = num_blocks * page_stride_bytes;
 
-        let n = layout.num_layers;
+        let arenas: Vec<KvArena> = (0..layout.num_layers)
+            .map(|layer| KvArena {
+                name: layer.to_string(),
+                base_ptr: base_ptr + (layer * layer_bytes) as u64,
+                num_blocks,
+                bytes_per_block: layer_bytes,
+                block_stride_bytes: page_stride_bytes,
+            })
+            .collect();
+        Self::from_arenas(&arenas)
+    }
+
+    /// One pegaflow layer per arena, single-segment (an arena is one copy
+    /// unit per block by definition; K/V split segments only exist for the
+    /// symmetric-pair layouts vLLM registers).
+    fn from_arenas(arenas: &[KvArena]) -> Self {
+        let n = arenas.len();
         let mut reg = Registration {
             layer_names: Vec::with_capacity(n),
             data_ptrs: Vec::with_capacity(n),
             size_bytes: Vec::with_capacity(n),
-            num_blocks: vec![num_blocks; n],
-            bytes_per_block: vec![layer_bytes; n],
+            num_blocks: Vec::with_capacity(n),
+            bytes_per_block: Vec::with_capacity(n),
             kv_stride_bytes: vec![0; n],
             segments: vec![1; n],
-            block_stride_bytes: vec![page_stride_bytes; n],
+            block_stride_bytes: Vec::with_capacity(n),
         };
-        for layer in 0..n {
-            let layer_off = layer * layer_bytes;
-            reg.layer_names.push(layer.to_string());
-            reg.data_ptrs.push(base_ptr + layer_off as u64);
-            // The layer's region runs from its [K|V] base to the end of the
-            // buffer; bounds are validated against the strided last-block reach.
-            reg.size_bytes.push(total_bytes - layer_off);
+        for arena in arenas {
+            assert!(
+                arena.bytes_per_block <= arena.block_stride_bytes,
+                "arena {} copy unit {} overruns its block stride {}",
+                arena.name,
+                arena.bytes_per_block,
+                arena.block_stride_bytes
+            );
+            reg.layer_names.push(arena.name.clone());
+            reg.data_ptrs.push(arena.base_ptr);
+            // The arena's region must cover the strided reach of its last
+            // block (pegaflow validates copies against this bound).
+            reg.size_bytes
+                .push((arena.num_blocks - 1) * arena.block_stride_bytes + arena.bytes_per_block);
+            reg.num_blocks.push(arena.num_blocks);
+            reg.bytes_per_block.push(arena.bytes_per_block);
+            reg.block_stride_bytes.push(arena.block_stride_bytes);
         }
         reg
     }
 }
 
-/// In-process bridge from openinfer's GPU KV cache to pegaflow's offload tiers.
+/// Host-tier knobs for a shared [`OffloadHost`].
+pub struct HostConfig {
+    /// Host pinned-memory pool size in bytes (the CPU KV tier capacity).
+    pub pinned_pool_bytes: usize,
+    /// Back the pinned pool with hugepages (pegaflow supports it natively).
+    /// Verify the box actually holds a reservation (`HugePages_Total`) —
+    /// some cluster platforms re-claim it across reboots.
+    pub use_hugepages: bool,
+    /// Worker threads for the runtime that drives pegaflow's async save/query.
+    pub runtime_threads: usize,
+    /// `Some` joins the cross-instance P2P mesh (see [`P2pConfig`]).
+    pub p2p: Option<P2pConfig>,
+}
+
+/// The shared side of the offload: one [`PegaEngine`] (one host pool), the
+/// tokio runtime that drives it, and the optional P2P serving lifecycle.
 ///
-/// Dropping the engine drops its [`Runtime`], which abandons any in-flight
-/// fire-and-forget [`Self::save`] tasks. That is acceptable: the host tier is a
-/// cache, so a lost save only forfeits a future hit, never inference
-/// correctness. Saves that must survive a handoff (eviction) use the synchronous
-/// [`Self::save_blocking`] instead. The P2P serving tasks (if any) stop with
-/// the runtime as well; peers degrade to their own local prefill. In-flight
-/// [`Self::flush_saves_then`] barriers are cancelled too, dropping their
-/// `then` callbacks unrun — a P/D prefill node shutting down mid-flush never
-/// delivers those requests' withheld `Finished` events; clients see the
-/// stream close instead, the same as any teardown mid-request.
-pub struct OffloadEngine {
+/// One host serves any number of rank-level [`OffloadEngine`]s. That is the
+/// DP-rank sharing model: each rank registers its own GPU arenas as its own
+/// pegaflow *instance*, but blocks land in the one host tier keyed by
+/// `(namespace, hash)` — with a shared namespace, any rank restores what any
+/// rank saved. Callers share a namespace only when their KV is
+/// interchangeable across instances: for replicated-weight DP ranks that
+/// holds to the same tolerance as reusing a rank's own prefix cache (the
+/// bytes may differ by FP reduction order across batch shapes, exactly like
+/// two local recomputations of the same prefix would).
+///
+/// Dropping the last handle drops the [`Runtime`], which abandons any
+/// in-flight fire-and-forget saves (acceptable — the host tier is a cache)
+/// and stops the P2P serving tasks; peers degrade to their own local
+/// prefill. In-flight [`OffloadEngine::flush_saves_then`] barriers are
+/// cancelled too, dropping their `then` callbacks unrun.
+pub struct OffloadHost {
     engine: Arc<PegaEngine>,
     runtime: Runtime,
-    instance_id: String,
-    device_id: i32,
-    /// Owned per-layer names; load borrows these as `&[&str]`.
-    layer_names: Vec<String>,
-    /// In-flight fire-and-forget save tasks plus the completion signal of the
-    /// latest flush barrier. One lock so a barrier's "drain handles + chain
-    /// behind the previous barrier" is atomic — two racing barriers can never
-    /// each take half the coverage (see [`Self::flush_saves_then`]).
-    write_barrier: Mutex<WriteBarrierState>,
     /// `Some` when P2P is on: resolves the P2P serving tasks (gRPC transfer
     /// service + transfer-lock GC) on drop.
     p2p_shutdown: Option<oneshot::Sender<()>>,
 }
 
-/// Save handles and barrier chain behind [`OffloadEngine::write_barrier`].
-struct WriteBarrierState {
-    /// In-flight fire-and-forget save tasks; finished handles are pruned on
-    /// each [`OffloadEngine::save`].
-    pending_saves: Vec<JoinHandle<()>>,
-    /// Completion signal of the latest spawned flush barrier (fires on
-    /// success and deadline alike). `None` before the first barrier.
-    prev_flush_done: Option<oneshot::Receiver<()>>,
-}
-
-impl OffloadEngine {
-    /// Build the engine and register `buffer` as the GPU side of the offload.
-    ///
-    /// `stream` must be the stream that owns `buffer` (used only to read its
-    /// base device address). pegaflow attaches the device's primary CUDA
-    /// context for its own worker transfers — the same context openinfer runs
-    /// on — so the registered pointers are valid across both.
-    pub fn new(
-        config: OffloadConfig,
-        buffer: &KvBuffer,
-        stream: &CudaStream,
-    ) -> Result<Self, EngineError> {
+impl OffloadHost {
+    pub fn new(config: HostConfig) -> Result<Arc<Self>, EngineError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.runtime_threads.max(1))
             .enable_all()
@@ -300,7 +349,7 @@ impl OffloadEngine {
             let _guard = runtime.enter();
             Arc::new(PegaEngine::new_with_config(
                 config.pinned_pool_bytes,
-                false,
+                config.use_hugepages,
                 storage_config,
             )?)
         };
@@ -308,7 +357,7 @@ impl OffloadEngine {
         // P2P serving side: peers discovered us via the MetaServer and dial
         // `advertise_addr` for the RDMA handshake + block queries. Same
         // lifecycle as the engine — shut down (via the oneshot) on drop.
-        let p2p_shutdown = match &config.p2p {
+        let p2p_shutdown = match config.p2p {
             Some(p2p) => {
                 let listen: std::net::SocketAddr = p2p.advertise_addr.parse().map_err(|e| {
                     EngineError::InvalidArgument(format!(
@@ -386,11 +435,120 @@ impl OffloadEngine {
             None => None,
         };
 
+        Ok(Arc::new(Self {
+            engine,
+            runtime,
+            p2p_shutdown,
+        }))
+    }
+
+    pub fn p2p_enabled(&self) -> bool {
+        self.p2p_shutdown.is_some()
+    }
+}
+
+/// In-process bridge from one rank's GPU KV cache to pegaflow's offload
+/// tiers, over a shared or private [`OffloadHost`].
+///
+/// Save is best-effort fire-and-forget (a lost save only forfeits a future
+/// hit, never inference correctness); saves that must survive a handoff
+/// (eviction) use the synchronous [`Self::save_blocking`]. Runtime and P2P
+/// lifetime live on the host — see [`OffloadHost`] for drop semantics.
+pub struct OffloadEngine {
+    host: Arc<OffloadHost>,
+    instance_id: String,
+    device_id: i32,
+    /// Owned per-layer names; load borrows these as `&[&str]`.
+    layer_names: Vec<String>,
+    /// In-flight fire-and-forget save tasks plus the completion signal of the
+    /// latest flush barrier. One lock so a barrier's "drain handles + chain
+    /// behind the previous barrier" is atomic — two racing barriers can never
+    /// each take half the coverage (see [`Self::flush_saves_then`]).
+    write_barrier: Mutex<WriteBarrierState>,
+}
+
+/// Save handles and barrier chain behind [`OffloadEngine::write_barrier`].
+struct WriteBarrierState {
+    /// In-flight fire-and-forget save tasks; finished handles are pruned on
+    /// each [`OffloadEngine::save`].
+    pending_saves: Vec<JoinHandle<()>>,
+    /// Completion signal of the latest spawned flush barrier (fires on
+    /// success and deadline alike). `None` before the first barrier.
+    prev_flush_done: Option<oneshot::Receiver<()>>,
+}
+
+impl OffloadEngine {
+    /// Build a private host and register `buffer` as the GPU side of the
+    /// offload.
+    ///
+    /// `stream` must be the stream that owns `buffer` (used only to read its
+    /// base device address). pegaflow attaches the device's primary CUDA
+    /// context for its own worker transfers — the same context openinfer runs
+    /// on — so the registered pointers are valid across both.
+    pub fn new(
+        config: OffloadConfig,
+        buffer: &KvBuffer,
+        stream: &CudaStream,
+    ) -> Result<Self, EngineError> {
         let reg = Registration::from_buffer(buffer, stream);
-        engine.register_context_layer_batch_strided(
-            &config.instance_id,
+        let host = OffloadHost::new(config.host())?;
+        Self::register(
+            host,
+            config.instance_id,
             &config.namespace,
             config.device_id,
+            reg,
+        )
+    }
+
+    /// Build the engine over explicit arenas instead of one fused
+    /// [`KvBuffer`] — for models whose per-layer caches are separate
+    /// allocations (GLM5.2: MLA latent + index-K per layer). Same contract as
+    /// [`Self::new`], plus: every arena's device allocation must stay live
+    /// and pointer-stable for the engine's lifetime (the registration bakes
+    /// raw device addresses), and all arenas must be indexed by the same pool
+    /// block ids.
+    pub fn with_arenas(config: OffloadConfig, arenas: &[KvArena]) -> Result<Self, EngineError> {
+        let host = OffloadHost::new(config.host())?;
+        Self::register(
+            host,
+            config.instance_id,
+            &config.namespace,
+            config.device_id,
+            Registration::from_arenas(arenas),
+        )
+    }
+
+    /// [`Self::with_arenas`] onto an existing shared host: this rank becomes
+    /// one more pegaflow instance over the host's single pool. Ranks that
+    /// should see each other's blocks pass the same `namespace`.
+    pub fn with_arenas_on(
+        host: Arc<OffloadHost>,
+        instance_id: impl Into<String>,
+        namespace: &str,
+        device_id: i32,
+        arenas: &[KvArena],
+    ) -> Result<Self, EngineError> {
+        Self::register(
+            host,
+            instance_id.into(),
+            namespace,
+            device_id,
+            Registration::from_arenas(arenas),
+        )
+    }
+
+    fn register(
+        host: Arc<OffloadHost>,
+        instance_id: String,
+        namespace: &str,
+        device_id: i32,
+        reg: Registration,
+    ) -> Result<Self, EngineError> {
+        host.engine.register_context_layer_batch_strided(
+            &instance_id,
+            namespace,
+            device_id,
             TP_RANK,
             PP_RANK,
             TP_SIZE,
@@ -417,16 +575,14 @@ impl OffloadEngine {
         )?;
 
         Ok(Self {
-            engine,
-            runtime,
-            instance_id: config.instance_id,
-            device_id: config.device_id,
+            host,
+            instance_id,
+            device_id,
             layer_names: reg.layer_names,
             write_barrier: Mutex::new(WriteBarrierState {
                 pending_saves: Vec::new(),
                 prev_flush_done: None,
             }),
-            p2p_shutdown,
         })
     }
 
@@ -480,10 +636,10 @@ impl OffloadEngine {
             return;
         }
         let saves = self.build_saves(block_ids, block_hashes);
-        let engine = Arc::clone(&self.engine);
+        let engine = Arc::clone(&self.host.engine);
         let instance_id = self.instance_id.clone();
         let device_id = self.device_id;
-        let handle = self.runtime.spawn(async move {
+        let handle = self.host.runtime.spawn(async move {
             if let Err(e) = engine
                 .batch_save_kv_blocks_from_ipc(&instance_id, TP_RANK, PP_RANK, device_id, saves)
                 .await
@@ -521,8 +677,9 @@ impl OffloadEngine {
         }
         assert_outside_runtime("save_blocking");
         let saves = self.build_saves(block_ids, block_hashes);
-        self.runtime
-            .block_on(self.engine.batch_save_kv_blocks_from_ipc(
+        self.host
+            .runtime
+            .block_on(self.host.engine.batch_save_kv_blocks_from_ipc(
                 &self.instance_id,
                 TP_RANK,
                 PP_RANK,
@@ -551,13 +708,14 @@ impl OffloadEngine {
             }));
         }
         assert_outside_runtime("query");
-        let status = self
-            .runtime
-            .block_on(self.engine.count_prefix_hit_blocks_with_prefetch(
-                &self.instance_id,
-                req_id,
-                block_hashes,
-            ))?;
+        let status =
+            self.host
+                .runtime
+                .block_on(self.host.engine.count_prefix_hit_blocks_with_prefetch(
+                    &self.instance_id,
+                    req_id,
+                    block_hashes,
+                ))?;
 
         match status {
             PrefetchStatus::Loading => Ok(QueryOutcome::Loading),
@@ -569,7 +727,10 @@ impl OffloadEngine {
                     }));
                 }
                 let num_blocks = blocks.len();
-                let lease = self.engine.create_query_lease(&self.instance_id, blocks)?;
+                let lease = self
+                    .host
+                    .engine
+                    .create_query_lease(&self.instance_id, blocks)?;
                 Ok(QueryOutcome::Ready(QueryHit {
                     lease: Some(lease),
                     num_blocks,
@@ -593,7 +754,7 @@ impl OffloadEngine {
         // pegaflow indexes GPU blocks by `usize` (see `build_saves`).
         let dst_block_ids: Vec<usize> = dst_block_ids.into_iter().map(|id| id as usize).collect();
         let loads = [(lease, dst_block_ids)];
-        let rx = self.engine.batch_load_kv_blocks_multi_layer_inproc(
+        let rx = self.host.engine.batch_load_kv_blocks_multi_layer_inproc(
             &self.instance_id,
             TP_RANK,
             self.device_id,
@@ -605,7 +766,7 @@ impl OffloadEngine {
 
     /// Whether this engine participates in the cross-instance P2P mesh.
     pub fn p2p_enabled(&self) -> bool {
-        self.p2p_shutdown.is_some()
+        self.host.p2p_enabled()
     }
 
     /// Release a query lease without loading it.
@@ -617,7 +778,7 @@ impl OffloadEngine {
     /// blocks would sit unevictable until the lease's TTL expires. A no-op if
     /// the lease was already consumed by a `load`.
     pub fn release_query_lease(&self, lease: QueryLeaseId) {
-        self.engine.release_query_lease(&lease);
+        self.host.engine.release_query_lease(&lease);
     }
 
     /// Blocking form of [`Self::flush_saves_then`], for tests and eviction
@@ -631,7 +792,7 @@ impl OffloadEngine {
         });
         // block_on (not a bare channel wait) keeps the call-from-a-runtime
         // misuse a loud tokio panic instead of a silently deadlocked worker.
-        let _ = self.runtime.block_on(rx);
+        let _ = self.host.runtime.block_on(rx);
     }
 
     /// Barrier the save pipeline, then call `then` — without blocking the
@@ -672,8 +833,8 @@ impl OffloadEngine {
             let prev_done = barrier.prev_flush_done.replace(done_rx);
             (handles, prev_done)
         };
-        let engine = Arc::clone(&self.engine);
-        self.runtime.spawn(async move {
+        let engine = Arc::clone(&self.host.engine);
+        self.host.runtime.spawn(async move {
             let flushed = tokio::time::timeout(FLUSH_DEADLINE, async {
                 if let Some(prev) = prev_done {
                     // A cancelled predecessor (runtime teardown) resolves as
@@ -701,6 +862,73 @@ impl OffloadEngine {
     /// a backing store would survive; the dense v1 path has none, so this
     /// empties the CPU tier.
     pub fn evict_all(&self) {
-        self.engine.cleanup_memory_cache();
+        self.host.engine.cleanup_memory_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GLM5.2 shape: two arenas per model layer (MLA latent + index-K
+    /// sidecar) with different copy units, sharing pool block ids. Pins the
+    /// per-arena mapping and the exact strided-reach size bound pegaflow
+    /// validates copies against.
+    #[test]
+    fn arena_registration_geometry() {
+        const MLA: usize = 656 * 64;
+        const IDXK: usize = 132 * 64;
+        let arenas = [
+            KvArena {
+                name: "0.mla".into(),
+                base_ptr: 0x1000,
+                num_blocks: 10,
+                bytes_per_block: MLA,
+                block_stride_bytes: MLA,
+            },
+            KvArena {
+                name: "0.idxk".into(),
+                base_ptr: 0x9000,
+                num_blocks: 10,
+                bytes_per_block: IDXK,
+                block_stride_bytes: IDXK,
+            },
+        ];
+        let reg = Registration::from_arenas(&arenas);
+        assert_eq!(reg.layer_names, ["0.mla", "0.idxk"]);
+        assert_eq!(reg.data_ptrs, [0x1000, 0x9000]);
+        assert_eq!(reg.segments, [1, 1]);
+        assert_eq!(reg.kv_stride_bytes, [0, 0]);
+        assert_eq!(reg.num_blocks, [10, 10]);
+        assert_eq!(reg.bytes_per_block, [MLA, IDXK]);
+        assert_eq!(reg.block_stride_bytes, [MLA, IDXK]);
+        assert_eq!(reg.size_bytes, [10 * MLA, 10 * IDXK]);
+    }
+
+    /// A page-interleaved arena (the qwen3 fused layout expressed as arenas):
+    /// stride exceeds the copy unit, and the size bound is the reach of the
+    /// last block, not `num_blocks * stride`.
+    #[test]
+    fn interleaved_arena_size_is_last_block_reach() {
+        let reg = Registration::from_arenas(&[KvArena {
+            name: "3".into(),
+            base_ptr: 0x100,
+            num_blocks: 4,
+            bytes_per_block: 512,
+            block_stride_bytes: 4096,
+        }]);
+        assert_eq!(reg.size_bytes, [3 * 4096 + 512]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overruns its block stride")]
+    fn arena_copy_unit_must_fit_its_stride() {
+        let _ = Registration::from_arenas(&[KvArena {
+            name: "bad".into(),
+            base_ptr: 0,
+            num_blocks: 1,
+            bytes_per_block: 4096,
+            block_stride_bytes: 512,
+        }]);
     }
 }

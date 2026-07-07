@@ -18,7 +18,6 @@ memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
 
 [features]
 default = []

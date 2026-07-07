@@ -117,7 +117,7 @@ After checking vendored FlashInfer / existing repo code, only **one** new CUDA k
 
 ## Oracle gate
 
-Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `mla_oracle_gate.rs`):
+Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `oracle/mla.rs`):
 
 1. **Bump transformers pin** to 5.13.0.dev0 (or 5.13.0 release if available). The indexer RoPE fix (PR #46842) is required for oracle correctness. `glm52_oracle.py` line 6 already has the pin comment.
 2. **Add `--stage indexer` tap set** to the harness: `index_q`, `index_k`, `index_weights`, `mqa_logits`, `topk_indices`. The harness already captures `topk_indices` (line 301) but does not assert it.
@@ -151,7 +151,7 @@ OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 2. Write `indexer.rs` model-crate forward, composing all 9 steps. `from_host` constructor only.
 3. Register `indexer` module in `lib.rs` as `#[allow(dead_code)]`.
 4. Bump `glm52_oracle.py` transformers pin to 5.13.0.dev0; add `--stage indexer` tap set.
-5. Write `indexer_oracle_gate.rs` — set-overlap assertion + short-context regression.
+5. Write `oracle/indexer.rs` — set-overlap assertion + short-context regression.
 6. Build + test on jz38 (H200).
 
 ## Read

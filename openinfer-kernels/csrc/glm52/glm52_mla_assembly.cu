@@ -50,49 +50,96 @@ __device__ __forceinline__ __nv_bfloat16 rope_block(const __nv_bfloat16* x, int 
   return __float2bfloat16(v);
 }
 
+constexpr int kScaleGroups = 4;  // KvLora / 128
+
 // q_pe lives at `q_pe_base[q_pe_offset + h*q_pe_head_stride + ...]`: contiguous
-// [H,64] (offset 0, stride 64) when split out, or embedded in the q_b output
-// [H,256] (offset 192, stride 256) in the fused forward.
+// [T,H,64] (offset 0, stride 64) when split out, or embedded in the q_b output
+// [T,H,256] (offset 192, stride 256) in the fused forward. The per-token q_pe
+// stride is kHeads * q_pe_head_stride in both layouts. cos/sin carry one [32]
+// row PER TOKEN (each token sits at its own position).
 __global__ void glm52_mla_query_assemble_kernel(
-    const __nv_bfloat16* __restrict__ ql_nope,    // [H, 512]
+    const __nv_bfloat16* __restrict__ ql_nope,    // [T, H, 512]
     const __nv_bfloat16* __restrict__ q_pe_base,  // q_pe at offset/stride
     int q_pe_offset, int q_pe_head_stride,
-    const __nv_bfloat16* __restrict__ cos,        // [32]
-    const __nv_bfloat16* __restrict__ sin,        // [32]
-    __nv_bfloat16* __restrict__ query) {          // [H, 576]
+    const __nv_bfloat16* __restrict__ cos,        // [T, 32]
+    const __nv_bfloat16* __restrict__ sin,        // [T, 32]
+    __nv_bfloat16* __restrict__ query) {          // [T, H, 576]
   const int h = blockIdx.x;
+  const int t = blockIdx.y;
   if (h >= kHeads) return;
-  const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset + h * q_pe_head_stride;
+  const __nv_bfloat16* q_pe = q_pe_base + q_pe_offset +
+                              (size_t)t * kHeads * q_pe_head_stride +
+                              h * q_pe_head_stride;
+  const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
+  const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
+  const __nv_bfloat16* ql_t = ql_nope + (size_t)t * kHeads * kQkNope;
+  __nv_bfloat16* query_t = query + (size_t)t * kHeads * kQueryDim;
   for (int i = threadIdx.x; i < kQueryDim; i += blockDim.x) {
     if (i < kQkNope) {
-      query[h * kQueryDim + i] = ql_nope[h * kQkNope + i];
+      query_t[h * kQueryDim + i] = ql_t[h * kQkNope + i];
     } else {
       const int r = i - kQkNope;  // 0..63
-      query[h * kQueryDim + i] = rope_block(q_pe, r, cos, sin);
+      query_t[h * kQueryDim + i] = rope_block(q_pe, r, cos_t, sin_t);
     }
   }
 }
 
 __global__ void glm52_mla_cache_pack_kernel(
-    const unsigned char* __restrict__ ckv_fp8,  // [512]
-    const float* __restrict__ ckv_scales,        // [4]
-    const __nv_bfloat16* __restrict__ k_pe,      // [64] pre-rope
-    const __nv_bfloat16* __restrict__ cos,       // [32]
-    const __nv_bfloat16* __restrict__ sin,       // [32]
-    unsigned char* __restrict__ cache_token) {   // [656] (slot base)
+    const unsigned char* __restrict__ ckv_fp8,   // [T, 512]
+    const float* __restrict__ ckv_scales,        // [T, 4]
+    const __nv_bfloat16* __restrict__ k_pe,      // [T, 64] pre-rope
+    const __nv_bfloat16* __restrict__ cos,       // [T, 32]
+    const __nv_bfloat16* __restrict__ sin,       // [T, 32]
+    unsigned char* __restrict__ cache,           // [max_slots, 656]
+    const long long* __restrict__ slot_mapping,  // [T] write slots
+    long long max_slots) {
+  // The write slot comes from device memory so the launch is CUDA-graph
+  // replayable (a host scalar would bake the capture step's position into
+  // the graph). Out-of-window slots trap: a silent modulo/clamp would stomp
+  // a live cache line.
+  const int t = blockIdx.x;
+  const long long slot = slot_mapping[t];
+  if (slot < 0 || slot >= max_slots) {
+    __trap();
+  }
+  unsigned char* __restrict__ cache_token =
+      cache + slot * static_cast<long long>(kCacheBytes);
+  const unsigned char* ckv_t = ckv_fp8 + (size_t)t * kKvLora;
+  const float* scales_t = ckv_scales + (size_t)t * kScaleGroups;
+  const __nv_bfloat16* k_pe_t = k_pe + (size_t)t * kRopeDim;
+  const __nv_bfloat16* cos_t = cos + (size_t)t * kRopeHalf;
+  const __nv_bfloat16* sin_t = sin + (size_t)t * kRopeHalf;
   const int tid = threadIdx.x;
   // 512 e4m3 ckv
   for (int i = tid; i < kKvLora; i += blockDim.x) {
-    cache_token[i] = ckv_fp8[i];
+    cache_token[i] = ckv_t[i];
   }
   // 4 f32 group scales at byte 512 (slot base is 4-aligned: 656 % 4 == 0)
-  if (tid < 4) {
-    reinterpret_cast<float*>(cache_token + kScaleOffset)[tid] = ckv_scales[tid];
+  if (tid < kScaleGroups) {
+    reinterpret_cast<float*>(cache_token + kScaleOffset)[tid] = scales_t[tid];
   }
   // 64 bf16 rope(k_pe) at byte 528
   __nv_bfloat16* kpe_out = reinterpret_cast<__nv_bfloat16*>(cache_token + kKpeOffset);
   for (int r = tid; r < kRopeDim; r += blockDim.x) {
-    kpe_out[r] = rope_block(k_pe, r, cos, sin);
+    kpe_out[r] = rope_block(k_pe_t, r, cos_t, sin_t);
+  }
+}
+
+// Split the kv_a projection output [T, 576] into the contiguous kv_c [T, 512]
+// (pre-norm compressed kv) and k_pe [T, 64] (pre-rope shared key) the decode
+// chain consumes — replaces the per-token dtod slice copies that don't batch.
+__global__ void glm52_mla_ckv_split_kernel(
+    const __nv_bfloat16* __restrict__ ckv,  // [T, 576]
+    __nv_bfloat16* __restrict__ kv_c,       // [T, 512]
+    __nv_bfloat16* __restrict__ k_pe) {     // [T, 64]
+  const int t = blockIdx.x;
+  const __nv_bfloat16* row = ckv + (size_t)t * (kKvLora + kRopeDim);
+  for (int i = threadIdx.x; i < kKvLora + kRopeDim; i += blockDim.x) {
+    if (i < kKvLora) {
+      kv_c[(size_t)t * kKvLora + i] = row[i];
+    } else {
+      k_pe[(size_t)t * kRopeDim + (i - kKvLora)] = row[i];
+    }
   }
 }
 
@@ -113,12 +160,14 @@ CUresult glm52_mla_query_assemble_cuda(const __nv_bfloat16* ql_nope,
                                        int q_pe_offset, int q_pe_head_stride,
                                        const __nv_bfloat16* cos,
                                        const __nv_bfloat16* sin,
-                                       __nv_bfloat16* query, cudaStream_t stream) {
+                                       __nv_bfloat16* query, int tokens,
+                                       cudaStream_t stream) {
   if (ql_nope == nullptr || q_pe_base == nullptr || cos == nullptr ||
-      sin == nullptr || query == nullptr) {
+      sin == nullptr || query == nullptr || tokens <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  glm52_mla_query_assemble_kernel<<<kHeads, 192, 0, stream>>>(
+  const dim3 grid(kHeads, tokens, 1);
+  glm52_mla_query_assemble_kernel<<<grid, 192, 0, stream>>>(
       ql_nope, q_pe_base, q_pe_offset, q_pe_head_stride, cos, sin, query);
   return consume_last_cuda_error();
 }
@@ -128,14 +177,27 @@ CUresult glm52_mla_cache_pack_cuda(const unsigned char* ckv_fp8,
                                    const __nv_bfloat16* k_pe,
                                    const __nv_bfloat16* cos,
                                    const __nv_bfloat16* sin,
-                                   unsigned char* cache_token,
+                                   unsigned char* cache,
+                                   const long long* slot_mapping,
+                                   long long max_slots, int tokens,
                                    cudaStream_t stream) {
   if (ckv_fp8 == nullptr || ckv_scales == nullptr || k_pe == nullptr ||
-      cos == nullptr || sin == nullptr || cache_token == nullptr) {
+      cos == nullptr || sin == nullptr || cache == nullptr ||
+      slot_mapping == nullptr || max_slots <= 0 || tokens <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  glm52_mla_cache_pack_kernel<<<1, 128, 0, stream>>>(ckv_fp8, ckv_scales, k_pe, cos,
-                                                     sin, cache_token);
+  glm52_mla_cache_pack_kernel<<<tokens, 128, 0, stream>>>(
+      ckv_fp8, ckv_scales, k_pe, cos, sin, cache, slot_mapping, max_slots);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_mla_ckv_split_cuda(const __nv_bfloat16* ckv, __nv_bfloat16* kv_c,
+                                  __nv_bfloat16* k_pe, int tokens,
+                                  cudaStream_t stream) {
+  if (ckv == nullptr || kv_c == nullptr || k_pe == nullptr || tokens <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  glm52_mla_ckv_split_kernel<<<tokens, 192, 0, stream>>>(ckv, kv_c, k_pe);
   return consume_last_cuda_error();
 }
 

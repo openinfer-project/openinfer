@@ -346,6 +346,10 @@ impl KvCapacity {
 pub struct LoadSnapshot {
     pub kv_used_blocks: u64,
     pub kv_total_blocks: u64,
+    /// Requests currently occupying a decode/prefill slot.
+    pub num_running_reqs: u64,
+    /// Requests admitted but not yet running (KV pressure, prefetch wait).
+    pub num_waiting_reqs: u64,
 }
 
 /// One full KV block that just became reusable from this engine's prefix cache.

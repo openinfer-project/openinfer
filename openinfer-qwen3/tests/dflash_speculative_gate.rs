@@ -45,8 +45,8 @@ use std::time::Duration;
 use openinfer_core::engine::{EngineHandle, GenerateRequest, TokenEvent, TokenSink};
 use openinfer_core::sampler::SamplingParams;
 use openinfer_qwen3::{
-    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap,
-    Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
+    DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE, DEFAULT_MAX_PREFILL_TOKENS,
+    DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions, Qwen3OffloadOptions,
 };
 use vllm_text::tokenizer::DynTokenizer;
 
@@ -109,9 +109,13 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         // baseline so both take the same cold prefill path.
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
-        memory: Qwen3MemoryOptions::new(0.85, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES)
-            .validate()
-            .expect("valid memory options"),
+        memory: Qwen3MemoryOptions::new(
+            0.85,
+            DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+            DEFAULT_KV_PAGE_SIZE,
+        )
+        .validate()
+        .expect("valid memory options"),
         lora: None,
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,

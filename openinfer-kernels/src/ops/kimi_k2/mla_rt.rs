@@ -158,7 +158,10 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
         )
     };
     if result != 0 {
-        bail!("kimi_flashinfer_batch_decode_mla_cuda failed with cudaError={result}");
+        bail!(
+            "kimi_flashinfer_batch_decode_mla_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
     Ok(())
 }
@@ -320,7 +323,10 @@ pub fn kimi_flashinfer_single_prefill_mla_rt(
         )
     };
     if result != 0 {
-        bail!("kimi_flashinfer_single_prefill_mla_cuda failed with cudaError={result}");
+        bail!(
+            "kimi_flashinfer_single_prefill_mla_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
     }
     Ok(())
 }

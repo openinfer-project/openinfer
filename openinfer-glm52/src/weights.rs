@@ -19,7 +19,6 @@ mod context;
 mod load;
 
 pub(crate) use context::Glm52RankGpuContext;
-#[cfg(feature = "glm52")]
 pub(crate) use load::Glm52ExpertLayerRegions;
 pub(crate) use load::{Glm52RankGpuWeights, load_rank_weights_to_gpu};
 
@@ -95,6 +94,8 @@ pub(crate) fn expert_placement(
     name: &str,
     rank_experts: &std::ops::Range<usize>,
 ) -> Result<Option<Glm52ExpertPlacement>> {
+    use Glm52ExpertRegionKind::{W2Scale, W2Weight, W13Scale, W13Weight};
+
     let Some((layer, rest)) = name
         .strip_prefix("model.layers.")
         .and_then(|rest| rest.split_once(".mlp.experts."))
@@ -116,7 +117,6 @@ pub(crate) fn expert_placement(
     );
     let local = expert - rank_experts.start;
 
-    use Glm52ExpertRegionKind::*;
     let (region, offset) = match proj {
         "gate_proj.weight" => (W13Weight, local * EXPERT_W13_WEIGHT_STRIDE),
         "up_proj.weight" => (
@@ -567,13 +567,12 @@ fn parse_layer_index(name: &str) -> Result<usize> {
 
 /// Reinterpret an owned device byte buffer as a typed slice (no copy). The
 /// loader keeps every region as raw `u8`; consumers retype at construction.
-#[cfg(feature = "glm52")]
 pub(crate) fn retype_owned<T>(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     bytes: cudarc::driver::CudaSlice<u8>,
 ) -> Result<cudarc::driver::CudaSlice<T>> {
     ensure!(
-        bytes.len() % std::mem::size_of::<T>() == 0,
+        bytes.len().is_multiple_of(std::mem::size_of::<T>()),
         "GLM5.2 retype: {} bytes is not a multiple of element size {}",
         bytes.len(),
         std::mem::size_of::<T>()

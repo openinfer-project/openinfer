@@ -131,101 +131,6 @@ pub fn glm52_indexer_k_quant_and_cache_launch(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Glm52IndexerCacheGather {
-    pub tokens: usize,
-    pub batch_size: usize,
-    pub num_blocks_per_seq: usize,
-    pub layout: Glm52IndexerCacheLayout,
-}
-
-impl Glm52IndexerCacheGather {
-    pub fn validate(self) -> Result<()> {
-        ensure!(
-            self.tokens > 0,
-            "GLM5.2 indexer gather tokens must be positive"
-        );
-        ensure!(
-            self.batch_size > 0,
-            "GLM5.2 indexer gather batch_size must be positive"
-        );
-        ensure!(
-            self.num_blocks_per_seq > 0,
-            "GLM5.2 indexer gather num_blocks_per_seq must be positive"
-        );
-        self.layout.validate()
-    }
-}
-
-pub fn glm52_indexer_k_gather_quant_cache_launch(
-    ctx: &DeviceContext,
-    contract: Glm52IndexerCacheGather,
-    indexer_cache: &CudaSlice<u8>,
-    dst_k: &mut CudaSlice<u8>,
-    dst_scale: &mut CudaSlice<u8>,
-    block_table: &CudaSlice<i32>,
-    cu_seq_lens: &CudaSlice<i32>,
-) -> Result<()> {
-    contract.validate()?;
-    let min_cache_bytes = contract.layout.min_cache_bytes()?;
-    ensure!(
-        indexer_cache.len() >= min_cache_bytes,
-        "GLM5.2 indexer cache buffer too small: have {}, need {}",
-        indexer_cache.len(),
-        min_cache_bytes
-    );
-    ensure!(
-        dst_k.len() >= contract.tokens * GLM52_INDEXER_HEAD_DIM,
-        "GLM5.2 indexer gather dst_k too small: have {}, need {}",
-        dst_k.len(),
-        contract.tokens * GLM52_INDEXER_HEAD_DIM
-    );
-    ensure!(
-        dst_scale.len() >= contract.tokens * GLM52_INDEXER_SCALE_BYTES_PER_TOKEN,
-        "GLM5.2 indexer gather dst_scale too small: have {}, need {}",
-        dst_scale.len(),
-        contract.tokens * GLM52_INDEXER_SCALE_BYTES_PER_TOKEN
-    );
-    ensure!(
-        block_table.len() >= contract.batch_size * contract.num_blocks_per_seq,
-        "GLM5.2 indexer gather block_table too small: have {}, need {}",
-        block_table.len(),
-        contract.batch_size * contract.num_blocks_per_seq
-    );
-    ensure!(
-        cu_seq_lens.len() > contract.batch_size,
-        "GLM5.2 indexer gather cu_seq_lens too small: have {}, need {}",
-        cu_seq_lens.len(),
-        contract.batch_size + 1
-    );
-
-    let (cache_ptr, _cache_guard) = indexer_cache.device_ptr(&ctx.stream);
-    let (dst_k_ptr, _dst_k_guard) = dst_k.device_ptr_mut(&ctx.stream);
-    let (dst_scale_ptr, _dst_scale_guard) = dst_scale.device_ptr_mut(&ctx.stream);
-    let (block_table_ptr, _block_table_guard) = block_table.device_ptr(&ctx.stream);
-    let (cu_seq_lens_ptr, _cu_seq_lens_guard) = cu_seq_lens.device_ptr(&ctx.stream);
-    let result = unsafe {
-        ffi::glm52_indexer_k_gather_quant_cache_cuda(
-            cache_ptr as *const u8,
-            dst_k_ptr as *mut u8,
-            dst_scale_ptr as *mut u8,
-            block_table_ptr as *const i32,
-            cu_seq_lens_ptr as *const i32,
-            contract.batch_size as i32,
-            contract.num_blocks_per_seq as i32,
-            contract.tokens as i32,
-            GLM52_INDEXER_HEAD_DIM as i32,
-            GLM52_INDEXER_QUANT_BLOCK_SIZE as i32,
-            contract.layout.cache_block_size as i32,
-            contract.layout.cache_block_stride_bytes as i64,
-            ctx.stream.cu_stream(),
-        )
-    };
-    result
-        .result()
-        .map_err(|err| anyhow!("GLM5.2 indexer K gather launch failed: {err}"))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52IndexerLocalTopKToSlots {
     pub num_tokens: usize,
     pub topk: usize,
@@ -331,4 +236,48 @@ pub fn glm52_indexer_local_topk_to_slots_launch(
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 indexer local_topk_to_slots launch failed: {err}"))
+}
+
+/// Fold the per-head `weights_proj` output (bf16) with the per-head q quant
+/// scale and the two attention scale constants into f32 weights for the
+/// DeepGEMM MQA logits kernel: `out[h] = weights[h] * q_scale[h] *
+/// softmax_scale * n_heads_scale` (left-to-right f32, bit-identical to the
+/// retired host-side fold). Replaces two mid-step D2H readbacks + an H2D —
+/// the DSA indexer chain stays on-device (CUDA-graph capturable).
+pub fn glm52_indexer_weights_fold_launch(
+    ctx: &DeviceContext,
+    weights: &CudaSlice<bf16>,
+    q_scale: &CudaSlice<f32>,
+    softmax_scale: f32,
+    n_heads_scale: f32,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    let heads = out.len();
+    ensure!(
+        heads > 0 && heads <= 1024,
+        "GLM5.2 indexer weights fold heads {heads} outside 1..=1024"
+    );
+    ensure!(
+        weights.len() >= heads && q_scale.len() >= heads,
+        "GLM5.2 indexer weights fold inputs too small: weights {}, q_scale {} (need {heads})",
+        weights.len(),
+        q_scale.len()
+    );
+    let (w_ptr, _g0) = weights.device_ptr(&ctx.stream);
+    let (q_ptr, _g1) = q_scale.device_ptr(&ctx.stream);
+    let (out_ptr, _g2) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_weights_fold_cuda(
+            w_ptr as *const ffi::Half,
+            q_ptr as *const f32,
+            softmax_scale,
+            n_heads_scale,
+            out_ptr as *mut f32,
+            heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer weights fold launch failed: {err}"))
 }

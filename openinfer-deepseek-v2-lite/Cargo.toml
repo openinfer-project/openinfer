@@ -30,6 +30,9 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 vllm-text = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
 

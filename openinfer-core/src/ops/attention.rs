@@ -181,3 +181,34 @@ pub fn paged_attention_batch_decode_hd256_into(
         batch_size,
     )
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_via_prefill_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &KvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    positions_d: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+) -> Result<()> {
+    openinfer_kernels::ops::paged_attention_batch_decode_via_prefill_hd256_into(
+        ctx,
+        q,
+        k,
+        v,
+        kv_buffer,
+        &layout.kernel_layout(),
+        layer,
+        plan,
+        positions_d,
+        output,
+        num_qo_heads,
+        batch_size,
+    )
+}

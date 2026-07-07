@@ -1387,13 +1387,17 @@ fn main() {
         ];
         if stem == "glm52_flashmla_sparse" || stem == "glm52_trtllm_grouped_fp8" {
             nvcc_args.extend(glm52_flashmla_arch_args(&nvcc_sm_targets, &nvcc));
-        } else if stem == "glm52_deepgemm_mqa" {
+        } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped" {
             if let Some(sm90a_args) = glm52_sm90a_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(sm90a_args);
-                nvcc_args.push("-DGLM52_DEEPGEMM_MQA_SM90A".to_string());
+                nvcc_args.push(if stem == "glm52_deepgemm_mqa" {
+                    "-DGLM52_DEEPGEMM_MQA_SM90A".to_string()
+                } else {
+                    "-DGLM52_DEEPGEMM_GROUPED_SM90A".to_string()
+                });
             } else {
                 println!(
-                    "cargo:warning=No sm_90a target; GLM5.2 DeepGEMM MQA kernels compile as NOT_SUPPORTED stubs"
+                    "cargo:warning=No sm_90a target; GLM5.2 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
                 );
                 nvcc_args.extend(arch_args.clone());
             }
@@ -1576,10 +1580,11 @@ fn main() {
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
-        } else if stem == "glm52_deepgemm_mqa" {
-            // DeepGEMM paged MQA kernels, AOT-instantiated from the vendored
-            // device headers (torch-free via DG_NO_TORCH, no runtime JIT).
-            // Needs DeepGEMM csrc headers + CUTLASS + fmt, C++20.
+        } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped" {
+            // DeepGEMM paged MQA + masked grouped GEMM kernels,
+            // AOT-instantiated from the vendored device headers (torch-free
+            // via DG_NO_TORCH, no runtime JIT). Needs DeepGEMM csrc headers +
+            // CUTLASS + fmt, C++20.
             let deepgemm_root = root.join("third_party/DeepGEMM");
             let deepgemm_csrc = deepgemm_root.join("csrc");
             let deepgemm_include = deepgemm_root.join("deep_gemm/include");

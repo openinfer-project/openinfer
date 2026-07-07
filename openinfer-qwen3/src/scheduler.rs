@@ -244,8 +244,8 @@ where
     };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (load_tx, load_rx) = watch::channel(LoadSnapshot {
-        kv_used_blocks: 0,
         kv_total_blocks: kv_total,
+        ..LoadSnapshot::default()
     });
 
     // Opt-in KV block-event feed: `Some` only when the executor was built with
@@ -314,8 +314,8 @@ where
     };
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (load_tx, load_rx) = watch::channel(LoadSnapshot {
-        kv_used_blocks: 0,
         kv_total_blocks: kv_total,
+        ..LoadSnapshot::default()
     });
 
     let join_handle = thread::Builder::new()
@@ -449,14 +449,24 @@ fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
 /// parks idle. `watch` coalesces (a consumer wakes at most once per step and
 /// reads the latest); `send_replace` ignores a dropped receiver, so the
 /// scheduler runs whether or not anyone is watching.
+/// `num_waiting_reqs` folds every not-yet-running queue (KV-deferred,
+/// prefetch-loading, post-control) into one number; the vLLM frontend exports
+/// it as `num_requests_waiting` and attributes all of it to
+/// `reason="capacity"` — the `reason="deferred"` gauge is driven by a separate
+/// skipped-requests counter this scheduler does not report, so it reads 0 by
+/// design, not because the local `deferred` queue is invisible.
 fn publish_load<E: ModelExecutor>(
     load_tx: &watch::Sender<LoadSnapshot>,
     kv_total: u64,
     executor: &E,
+    num_running_reqs: u64,
+    num_waiting_reqs: u64,
 ) {
     load_tx.send_replace(LoadSnapshot {
         kv_used_blocks: kv_total.saturating_sub(executor.available_blocks() as u64),
         kv_total_blocks: kv_total,
+        num_running_reqs,
+        num_waiting_reqs,
     });
 }
 
@@ -489,7 +499,15 @@ fn scheduler_loop<E>(
     info!("Scheduler ready");
 
     loop {
-        publish_load(load_tx, kv_total, &executor);
+        publish_load(
+            load_tx,
+            kv_total,
+            &executor,
+            (active.len()
+                + prefilling.len()
+                + inflight_prefill_pending.as_ref().map_or(0, Vec::len)) as u64,
+            (deferred.len() + loading.len()) as u64,
+        );
         // Flush the prior step's cache changes to a router (no-op unless the
         // event feed is on). Top-of-loop, like `publish_load`: one pass per
         // iteration regardless of which branch the step takes, at the cost of a
@@ -685,7 +703,13 @@ fn scheduler_loop_with_lora_control<E>(
     info!("Scheduler ready with LoRA control");
 
     loop {
-        publish_load(load_tx, kv_total, &executor);
+        publish_load(
+            load_tx,
+            kv_total,
+            &executor,
+            (active.len() + prefilling.len()) as u64,
+            (deferred.len() + loading.len() + post_control_deferred.len()) as u64,
+        );
 
         // 1. Drain incoming commands. Generation submitted after a pending
         // control command waits until that control command is handled at idle.
@@ -733,25 +757,14 @@ fn scheduler_loop_with_lora_control<E>(
                     &mut post_control_deferred,
                     &mut next_request_id,
                 );
-            } else {
-                info!("Scheduler: all handles dropped, exiting");
-                return;
+                // Back to the top like the non-LoRA loop: republish the load
+                // snapshot (the new request must show as waiting before its
+                // prefill runs) and let steps 1–2 drain the burst and any
+                // idle-control work instead of repeating them here.
+                continue;
             }
-            while let Ok(command) = command_rx.try_recv() {
-                enqueue_engine_command(
-                    command,
-                    &mut deferred,
-                    &mut pending_control,
-                    &mut post_control_deferred,
-                    &mut next_request_id,
-                );
-            }
-            if active.is_empty() && deferred.is_empty() {
-                drain_idle_control(&mut executor, &mut pending_control);
-                if pending_control.is_empty() && !post_control_deferred.is_empty() {
-                    deferred.append(&mut post_control_deferred);
-                }
-            }
+            info!("Scheduler: all handles dropped, exiting");
+            return;
         }
 
         let lora_validation = reject_unknown_lora_requests(deferred, &executor);

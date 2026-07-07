@@ -8,7 +8,10 @@ pub const GLM52_VOCAB: usize = 154_880;
 pub const GLM52_LAYERS: usize = 78;
 pub const GLM52_DENSE_LAYERS: usize = 3;
 pub const GLM52_MOE_LAYERS: usize = GLM52_LAYERS - GLM52_DENSE_LAYERS;
-const GLM52_MAX_CONTEXT: usize = 1_048_576;
+/// The checkpoint's `max_position_embeddings` — `probe_config_json` pins the
+/// config to exactly this, so it doubles as the architecture ceiling any
+/// launch-time `max_model_len` must respect.
+pub(crate) const GLM52_MAX_CONTEXT: usize = 1_048_576;
 
 pub(crate) const GLM52_HEADS: usize = 64;
 const GLM52_KV_HEADS: usize = 64;
@@ -24,6 +27,13 @@ pub(crate) const GLM52_KV_A_OUT: usize = GLM52_KV_LORA_RANK + GLM52_QK_ROPE_HEAD
 pub(crate) const GLM52_KV_B_OUT: usize = GLM52_HEADS * (GLM52_QK_NOPE_HEAD_DIM + GLM52_V_HEAD_DIM);
 pub(crate) const GLM52_O_PROJ_IN: usize = GLM52_HEADS * GLM52_V_HEAD_DIM;
 
+/// Half of the rotary head dim — the rotary table width shared by MLA and
+/// indexer rope.
+pub(crate) const GLM52_ROPE_HALF: usize = GLM52_QK_ROPE_HEAD_DIM / 2;
+/// `1/sqrt(GLM52_QK_HEAD_DIM)` = 1/sqrt(256) = 0.0625 — the MLA softmax scale
+/// (rope_type "default" means no YaRN mscale correction).
+pub(crate) const GLM52_SM_SCALE: f32 = 0.0625;
+
 pub(crate) const GLM52_DENSE_INTERMEDIATE: usize = 12_288;
 pub(crate) const GLM52_EXPERT_INTERMEDIATE: usize = 2048;
 pub const GLM52_ROUTED_EXPERTS: usize = 256;
@@ -31,6 +41,9 @@ pub const GLM52_TOPK: usize = 8;
 const GLM52_SHARED_EXPERTS: usize = 1;
 const GLM52_ROUTED_SCALING_FACTOR: f64 = 2.5;
 const GLM52_RMS_NORM_EPS: f64 = 1.0e-5;
+/// The f32 the GPU norm kernels consume (every RMSNorm in the model shares
+/// the one checkpoint eps that `probe_config_json` validates).
+pub(crate) const GLM52_RMS_EPS: f32 = GLM52_RMS_NORM_EPS as f32;
 
 pub const GLM52_INDEX_TOPK: usize = 2048;
 const GLM52_INDEX_TOPK_FREQ: usize = 4;
@@ -39,7 +52,16 @@ pub(crate) const GLM52_INDEX_HEADS: usize = 32;
 const GLM52_INDEX_SKIP_TOPK_OFFSET: usize = 3;
 const GLM52_NEXTN_LAYERS: usize = 1;
 
-const GLM52_ROPE_THETA: f64 = 8_000_000.0;
+pub(crate) const GLM52_ROPE_THETA: f64 = 8_000_000.0;
+
+/// `indexer_types[layer]` per the transformers derivation
+/// (`index_topk_freq=4`, `index_skip_topk_offset=3`): full iff
+/// `max(layer-(offset-1), 0) % freq == 0` → {0,1,2} ∪ {6,10,…,74}, 21 of 78 layers.
+pub(crate) fn glm52_layer_has_full_indexer(layer: usize) -> bool {
+    layer
+        .saturating_sub(GLM52_INDEX_SKIP_TOPK_OFFSET - 1)
+        .is_multiple_of(GLM52_INDEX_TOPK_FREQ)
+}
 
 pub fn probe_config_json(json: &Value) -> Result<()> {
     let model_type = string_field(json, "model_type")?;

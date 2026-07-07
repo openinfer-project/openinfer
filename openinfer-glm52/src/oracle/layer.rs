@@ -38,14 +38,18 @@ use openinfer_kernels::ops::{
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
 
+use crate::config::{GLM52_INDEX_HEAD_DIM, GLM52_ROPE_HALF, GLM52_SM_SCALE};
 use crate::fp8::Glm52ProjBytes;
 use crate::indexer::Glm52IndexerLayerWeights;
+use crate::indexer::Glm52IndexerScratch;
 use crate::layer::{
     Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerIndexer, Glm52LayerMlp,
     glm52_decoder_layer_forward,
 };
 use crate::mla_decode::{Glm52MlaLayerWeights, Glm52MlaSchedMetadata};
+use crate::model::{INDEX_CACHE_BLOCK, NUM_SMS, rope_tables};
 use crate::moe_decode::{Glm52MoeExpertPath, Glm52MoeLayerWeights, Glm52MoeRoutedExpertBytes};
+use crate::scratch::Glm52DecodeScratch;
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (dense, layer 0) ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
@@ -229,12 +233,6 @@ const Q_LORA: usize = 2048;
 const DENSE_INTERMEDIATE: usize = 12288;
 const MOE_INTERMEDIATE: usize = 2048;
 const EXPERTS: usize = 256;
-const ROPE_HALF: usize = 32;
-const ROPE_THETA: f32 = 8_000_000.0;
-const SM_SCALE: f32 = 0.0625;
-const INDEX_HEAD_DIM: usize = 128;
-const INDEX_CACHE_BLOCK: usize = 64; // DeepGEMM paged MQA requires BLOCK_KV=64
-const NUM_SMS: usize = 132;
 
 /// Mirror of the Python splitmix64 generator (see `mla_oracle_gate`), with the
 /// layer stage's input scale applied in f64 exactly like the harness.
@@ -257,16 +255,6 @@ fn bf16_digest(data: &[bf16]) -> String {
         hasher.update(v.to_bits().to_le_bytes());
     }
     hex::encode(&hasher.finalize()[..8])
-}
-
-pub(crate) fn rope_tables(position: usize) -> (Vec<bf16>, Vec<bf16>) {
-    (0..ROPE_HALF)
-        .map(|j| {
-            let inv_freq = 1.0 / ROPE_THETA.powf(j as f32 / ROPE_HALF as f32);
-            let angle = position as f32 * inv_freq;
-            (bf16::from_f32(angle.cos()), bf16::from_f32(angle.sin()))
-        })
-        .unzip()
 }
 
 /// Owned copies of every `model.layers.{L}.` tensor (attention + indexer +
@@ -383,8 +371,8 @@ pub(crate) fn load_decoder_layer(
     let ip = format!("{p}.self_attn.indexer");
     let indexer = Glm52IndexerLayerWeights::from_host(
         ctx,
-        &t.proj(&format!("{ip}.wq_b"), 32 * INDEX_HEAD_DIM, Q_LORA)?,
-        &t.proj(&format!("{ip}.wk"), INDEX_HEAD_DIM, HIDDEN)?,
+        &t.proj(&format!("{ip}.wq_b"), 32 * GLM52_INDEX_HEAD_DIM, Q_LORA)?,
+        &t.proj(&format!("{ip}.wk"), GLM52_INDEX_HEAD_DIM, HIDDEN)?,
         t.bytes(&format!("{ip}.weights_proj.weight"))?,
         t.bytes(&format!("{ip}.k_norm.weight"))?,
         t.bytes(&format!("{ip}.k_norm.bias"))?,
@@ -407,7 +395,8 @@ pub(crate) fn load_decoder_layer(
                     upload_u8(ctx, t.bytes(&format!("{mp}.gate.e_score_correction_bias"))?)?,
                 )?,
                 shared: crate::moe_decode::Glm52MoeSharedExpert::new(
-                    crate::fp8::ProjWeight::upload(
+                    ctx,
+                    &crate::fp8::ProjWeight::upload(
                         ctx,
                         &t.proj(
                             &format!("{mp}.shared_experts.gate_proj"),
@@ -415,7 +404,7 @@ pub(crate) fn load_decoder_layer(
                             HIDDEN,
                         )?,
                     )?,
-                    crate::fp8::ProjWeight::upload(
+                    &crate::fp8::ProjWeight::upload(
                         ctx,
                         &t.proj(
                             &format!("{mp}.shared_experts.up_proj"),
@@ -499,13 +488,13 @@ fn run_layer_prefill(
         num_blocks: oracle_ctx.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
         topk: GLM52_FLASHMLA_SPARSE_TOPK,
         num_sm_parts: glm52_flashmla_sparse_decode_num_sm_parts()?,
-        sm_scale: SM_SCALE,
+        sm_scale: GLM52_SM_SCALE,
     };
     let index_blocks = oracle_ctx.div_ceil(INDEX_CACHE_BLOCK);
     let index_cache_layout = Glm52IndexerCacheLayout {
         cache_blocks: index_blocks,
         cache_block_size: INDEX_CACHE_BLOCK,
-        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (INDEX_HEAD_DIM + 4),
+        cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
     };
     let mut caches = Glm52LayerCaches {
         mla_cache: ctx
@@ -523,16 +512,19 @@ fn run_layer_prefill(
         .memcpy_htod(&block_table_host, &mut block_table)?;
     let mut slot_mapping = ctx.stream.alloc_zeros::<i64>(1)?;
     let mut seq_lens = ctx.stream.alloc_zeros::<i32>(1)?;
-    let mut cos = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
-    let mut sin = ctx.stream.alloc_zeros::<bf16>(ROPE_HALF)?;
+    let mut cos = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
+    let mut sin = ctx.stream.alloc_zeros::<bf16>(GLM52_ROPE_HALF)?;
     let mla_sched = Glm52MlaSchedMetadata::new(ctx, contract)?;
+
+    let mqa_shape =
+        Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
+    let mut scratch = Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
-        let mut hidden = ctx.stream.alloc_zeros::<bf16>(HIDDEN)?;
         ctx.stream.memcpy_htod(
             &hidden_host[position * HIDDEN..(position + 1) * HIDDEN],
-            &mut hidden,
+            scratch.hidden.data_mut(),
         )?;
         let (cos_host, sin_host) = rope_tables(position);
         ctx.stream.memcpy_htod(&cos_host, &mut cos)?;
@@ -543,23 +535,26 @@ fn run_layer_prefill(
             .memcpy_htod(&[(position + 1) as i32], &mut seq_lens)?;
 
         let step = Glm52DecodeStep {
-            position,
             mla_cos: &cos,
             mla_sin: &sin,
             idx_cos: &cos,
             idx_sin: &sin,
             mla_sched: &mla_sched,
-            index_cache_layout,
             slot_mapping: &slot_mapping,
             block_table: &block_table,
             seq_lens: &seq_lens,
-            num_sms: NUM_SMS,
-            max_model_len: oracle_ctx,
-            moe_path,
         };
-        let mut topk_carry = None;
-        let out = glm52_decoder_layer_forward(ctx, w, &mut caches, hidden, &step, &mut topk_carry)?;
-        let out_host = ctx.stream.clone_dtoh(&out)?;
+        let mut carry_ready = false;
+        glm52_decoder_layer_forward(
+            ctx,
+            w,
+            &mut caches,
+            &step,
+            moe_path,
+            &mut scratch,
+            &mut carry_ready,
+        )?;
+        let out_host = ctx.stream.clone_dtoh(scratch.hidden.data())?;
         outputs.extend(out_host.iter().map(|v| v.to_f32()));
     }
     // Debugging aid: dump the engine outputs (f32 LE) for offline diffing

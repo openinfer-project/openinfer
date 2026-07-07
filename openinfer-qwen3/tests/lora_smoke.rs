@@ -1,17 +1,13 @@
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use half::bf16;
 use openinfer_core::engine::{
     EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
     TokenEvent, TokenSink,
 };
 use openinfer_core::sampler::SamplingParams;
-use safetensors::Dtype;
-use safetensors::tensor::View;
+use openinfer_qwen3::lora_fixtures as fixtures;
 use serde::Deserialize;
 use vllm_text::tokenizer::DynTokenizer;
 
@@ -27,31 +23,6 @@ struct ModelConfig {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-}
-
-#[derive(Clone)]
-struct TestTensor {
-    dtype: Dtype,
-    shape: Vec<usize>,
-    data: Vec<u8>,
-}
-
-impl View for TestTensor {
-    fn dtype(&self) -> Dtype {
-        self.dtype
-    }
-
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-
-    fn data(&self) -> Cow<'_, [u8]> {
-        Cow::Borrowed(&self.data)
-    }
-
-    fn data_len(&self) -> usize {
-        self.data.len()
-    }
 }
 
 fn get_model_path() -> String {
@@ -73,76 +44,29 @@ fn load_model_config(model_path: &str) -> ModelConfig {
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", config_path.display()))
 }
 
-fn temp_adapter_dir() -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "openinfer-qwen3-lora-smoke-{}-{now}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).expect("create temp adapter dir");
-    path
-}
-
 fn write_zero_lora_adapter(path: &Path, config: &ModelConfig, rank: usize) {
-    fs::write(
-        path.join("adapter_config.json"),
-        format!(
-            r#"{{
-  "peft_type": "LORA",
-  "r": {rank},
-  "lora_alpha": {rank},
-  "target_modules": ["q_proj", "v_proj"]
-}}"#
-        ),
-    )
-    .expect("write adapter_config.json");
+    fixtures::write_adapter_config(path, rank, rank, &["q_proj", "v_proj"]);
 
     let mut tensors = BTreeMap::new();
     for layer_idx in 0..config.num_hidden_layers {
-        push_zero_tensor(
+        fixtures::push_projection(
             &mut tensors,
-            tensor_name(layer_idx, "self_attn.q_proj", "lora_A"),
-            vec![rank, config.hidden_size],
+            layer_idx,
+            "self_attn.q_proj",
+            rank,
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
         );
-        push_zero_tensor(
+        fixtures::push_projection(
             &mut tensors,
-            tensor_name(layer_idx, "self_attn.q_proj", "lora_B"),
-            vec![config.num_attention_heads * config.head_dim, rank],
-        );
-        push_zero_tensor(
-            &mut tensors,
-            tensor_name(layer_idx, "self_attn.v_proj", "lora_A"),
-            vec![rank, config.hidden_size],
-        );
-        push_zero_tensor(
-            &mut tensors,
-            tensor_name(layer_idx, "self_attn.v_proj", "lora_B"),
-            vec![config.num_key_value_heads * config.head_dim, rank],
+            layer_idx,
+            "self_attn.v_proj",
+            rank,
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
         );
     }
-
-    safetensors::serialize_to_file(tensors, None, &path.join("adapter_model.safetensors"))
-        .expect("write adapter_model.safetensors");
-}
-
-fn push_zero_tensor(tensors: &mut BTreeMap<String, TestTensor>, name: String, shape: Vec<usize>) {
-    let elems = shape.iter().product::<usize>();
-    tensors.insert(
-        name,
-        TestTensor {
-            dtype: Dtype::BF16,
-            shape,
-            data: bf16::from_f32(0.0).to_bits().to_le_bytes().repeat(elems),
-        },
-    );
-}
-
-fn tensor_name(layer_idx: usize, path_segment: &str, lora_side: &str) -> String {
-    format!("base_model.model.model.layers.{layer_idx}.{path_segment}.{lora_side}.weight")
+    fixtures::write_adapter_tensors(path, tensors);
 }
 
 fn load_adapter(handle: &EngineHandle, adapter_name: &str, adapter_path: PathBuf) {
@@ -214,8 +138,8 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
         "unexpected Qwen3 config dimensions"
     );
 
-    let adapter_path = temp_adapter_dir();
-    write_zero_lora_adapter(&adapter_path, &config, rank);
+    let adapter_dir = tempfile::tempdir().expect("create temp adapter dir");
+    write_zero_lora_adapter(adapter_dir.path(), &config, rank);
 
     let handle = openinfer_qwen3::start_engine_with_lora_control(
         Path::new(&model_path),
@@ -237,7 +161,7 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
     .expect("start LoRA-capable Qwen3 engine");
 
     assert!(handle.supports_lora_control());
-    load_adapter(&handle, adapter_name, adapter_path);
+    load_adapter(&handle, adapter_name, adapter_dir.path().to_path_buf());
 
     let tokenizer = common::load_tokenizer(&model_path);
     let (tokens, finish_reason) = generate_tokens(

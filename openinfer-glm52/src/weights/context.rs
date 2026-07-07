@@ -44,6 +44,17 @@ impl Glm52RankGpuContext {
         })
     }
 
+    /// This rank's device free VRAM. Re-binds the rank's context first so
+    /// the query reads THIS device regardless of what the calling thread
+    /// happened to have current — the number sizes every rank's cache
+    /// arenas, so a wrong-device read must be unrepresentable.
+    pub(crate) fn free_vram_bytes(&self) -> Result<usize> {
+        self.set_current()?;
+        let (free, _total) = cudarc::driver::result::mem_get_info()
+            .map_err(|err| anyhow::anyhow!("cuMemGetInfo failed: {err:?}"))?;
+        Ok(free)
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
@@ -59,7 +70,6 @@ impl Glm52RankGpuContext {
     /// the kernels-crate per-thread setup that `DeviceContext::new` would do:
     /// the cuBLAS handle is thread-local per device, so the calling worker
     /// thread must initialize its own (idempotent).
-    #[cfg(feature = "glm52")]
     pub(crate) fn device_context(&self) -> Result<openinfer_kernels::tensor::DeviceContext> {
         // SAFETY: plain device selection + idempotent handle creation.
         unsafe {
@@ -77,6 +87,27 @@ impl Glm52RankGpuContext {
             device_ordinal: self.device_ordinal,
         })
     }
+
+    /// A second stream on the same context, for work that overlaps the main
+    /// stream inside the decode step (fork/join via events — the shared
+    /// expert runs concurrently with the MoE collectives).
+    pub(crate) fn auxiliary_device_context(
+        &self,
+        role: &str,
+    ) -> Result<openinfer_kernels::tensor::DeviceContext> {
+        use anyhow::Context as _;
+        let stream = self.ctx.new_stream().with_context(|| {
+            format!(
+                "failed to create GLM5.2 {role} stream for device {}",
+                self.device_ordinal
+            )
+        })?;
+        Ok(openinfer_kernels::tensor::DeviceContext {
+            ctx: self.ctx.clone(),
+            stream,
+            device_ordinal: self.device_ordinal,
+        })
+    }
 }
 
 fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
@@ -84,12 +115,12 @@ fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
     unsafe {
         let mut dev: sys::CUdevice = 0;
         check_cu(
-            sys::cuDeviceGet(&mut dev, device_ordinal as i32),
+            sys::cuDeviceGet(&raw mut dev, device_ordinal as i32),
             "cuDeviceGet",
         )?;
         let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
         check_cu(
-            sys::cuDeviceGetDefaultMemPool(&mut pool, dev),
+            sys::cuDeviceGetDefaultMemPool(&raw mut pool, dev),
             "cuDeviceGetDefaultMemPool",
         )?;
         let mut threshold: u64 = u64::MAX;
@@ -97,7 +128,7 @@ fn retain_async_alloc_pool(device_ordinal: usize) -> Result<()> {
             sys::cuMemPoolSetAttribute(
                 pool,
                 sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                (&mut threshold as *mut u64).cast::<std::ffi::c_void>(),
+                (&raw mut threshold).cast::<std::ffi::c_void>(),
             ),
             "cuMemPoolSetAttribute(RELEASE_THRESHOLD)",
         )?;

@@ -26,25 +26,28 @@ pub fn glm52_indexer_rope_launch(
     q: &mut CudaSlice<bf16>,
     k: &mut CudaSlice<bf16>,
     n_heads: usize,
+    tokens: usize,
     cos: &CudaSlice<bf16>,
     sin: &CudaSlice<bf16>,
 ) -> Result<()> {
     ensure!(n_heads > 0, "GLM5.2 indexer RoPE n_heads must be positive");
+    ensure!(tokens > 0, "GLM5.2 indexer RoPE tokens must be positive");
     ensure!(
-        q.len() >= n_heads * GLM52_INDEXER_HEAD_DIM,
+        q.len() >= tokens * n_heads * GLM52_INDEXER_HEAD_DIM,
         "GLM5.2 indexer RoPE q too small: have {}, need {}",
         q.len(),
-        n_heads * GLM52_INDEXER_HEAD_DIM
+        tokens * n_heads * GLM52_INDEXER_HEAD_DIM
     );
     ensure!(
-        k.len() >= GLM52_INDEXER_HEAD_DIM,
+        k.len() >= tokens * GLM52_INDEXER_HEAD_DIM,
         "GLM5.2 indexer RoPE k too small: have {}, need {}",
         k.len(),
-        GLM52_INDEXER_HEAD_DIM
+        tokens * GLM52_INDEXER_HEAD_DIM
     );
     ensure!(
-        cos.len() >= GLM52_INDEXER_ROPE_HALF && sin.len() >= GLM52_INDEXER_ROPE_HALF,
-        "GLM5.2 indexer RoPE cos/sin must be >= {GLM52_INDEXER_ROPE_HALF}"
+        cos.len() >= tokens * GLM52_INDEXER_ROPE_HALF
+            && sin.len() >= tokens * GLM52_INDEXER_ROPE_HALF,
+        "GLM5.2 indexer RoPE cos/sin must be >= tokens * {GLM52_INDEXER_ROPE_HALF}"
     );
 
     let (q_ptr, _q_guard) = q.device_ptr_mut(&ctx.stream);
@@ -56,6 +59,7 @@ pub fn glm52_indexer_rope_launch(
             q_ptr as *mut ffi::Half,
             k_ptr as *mut ffi::Half,
             n_heads as i32,
+            tokens as i32,
             cos_ptr as *const ffi::Half,
             sin_ptr as *const ffi::Half,
             ctx.stream.cu_stream(),

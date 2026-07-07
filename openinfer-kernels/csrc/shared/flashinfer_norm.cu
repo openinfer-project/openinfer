@@ -314,6 +314,10 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 __global__ void layer_norm_kernel(const DType *x, const float *gamma, const float *beta,
                                    DType *out, int n, float eps) {
     int tid = threadIdx.x;
+    // One block per row; each row's reduction is self-contained, so the
+    // batched launch is bit-identical per row to the rows=1 launch.
+    x += (size_t)blockIdx.x * n;
+    out += (size_t)blockIdx.x * n;
     extern __shared__ float smem[];  // [n] for val, reused for partial sums
 
     // Phase 1: load + mean (warp shuffle reduction).
@@ -370,14 +374,16 @@ __global__ void layer_norm_kernel(const DType *x, const float *gamma, const floa
 }
 
 CUresult layer_norm_cuda(const DType *x, const float *gamma, const float *beta,
-                         DType *out, int n, float eps, cudaStream_t stream) {
-    if (x == nullptr || gamma == nullptr || beta == nullptr || out == nullptr) {
+                         DType *out, int n, int rows, float eps,
+                         cudaStream_t stream) {
+    if (x == nullptr || gamma == nullptr || beta == nullptr || out == nullptr ||
+        rows <= 0) {
         return CUDA_ERROR_INVALID_VALUE;
     }
     int block_size = std::min(n, 1024);
     block_size = 32 * ((block_size + 31) / 32);
     size_t shmem_size = std::min(block_size / 32, (n + 31) / 32) * sizeof(float);
-    layer_norm_kernel<<<1, block_size, shmem_size, stream>>>(x, gamma, beta, out, n, eps);
+    layer_norm_kernel<<<rows, block_size, shmem_size, stream>>>(x, gamma, beta, out, n, eps);
     cudaError_t err = cudaGetLastError();
     return static_cast<CUresult>(err);
 }

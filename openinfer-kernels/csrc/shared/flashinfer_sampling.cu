@@ -1,3 +1,5 @@
+#include "ffi_guard.cuh"
+
 #include "common.cuh"
 #include "flashinfer_radix_scratch.cuh"
 
@@ -71,6 +73,7 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
     uint8_t* valid_scratch, int* output, void* softmax_workspace,
     size_t softmax_workspace_bytes, int n_rows, int vocab_size, int has_top_k_filter,
     int has_top_p_filter, uint64_t seed, uint64_t offset, cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   dim3 gather_grid(
       (vocab_size + GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD - 1) /
           (GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD),
@@ -142,4 +145,5 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
         stream);
   }
   return static_cast<int>(err);
+  OPENINFER_FFI_GUARD_END(-1)
 }

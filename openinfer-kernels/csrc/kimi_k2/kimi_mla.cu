@@ -1,3 +1,5 @@
+#include "../shared/ffi_guard.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -614,6 +616,7 @@ int kimi_flashinfer_single_prefill_mla_cuda(void* q,
                                             int kv_len,
                                             float sm_scale,
                                             cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   // kv_len > seq_len is the prefix-cache suffix prefill: q covers the suffix
   // only, k/v cover cached prefix + suffix. MaskMode::kCausal aligns
   // bottom-right, so query i attends to kv positions <= kv_len - seq_len + i —
@@ -659,6 +662,7 @@ int kimi_flashinfer_single_prefill_mla_cuda(void* q,
           flashinfer::MaskMode::kCausal,
           Variant,
           PrefillParamsT>(params, /*tmp=*/nullptr, stream));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 int kimi_mla_absorb_q_nope_cuda(const DType* kv_b_proj,
@@ -790,6 +794,7 @@ int kimi_mla_paged_kv_append_cuda(void* ckv_cache,
                                   int page_size,
                                   int batch_size,
                                   cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   if (nnz <= 0 || page_size <= 0 || batch_size <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
@@ -809,6 +814,7 @@ int kimi_mla_paged_kv_append_cuda(void* ckv_cache,
           /*append_ckv_stride_n=*/kKvLoraRank,
           /*append_kpe_stride_n=*/kRopeDim,
           stream));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
@@ -831,6 +837,7 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
                                           int batch_size,
                                           float sm_scale,
                                           cudaStream_t stream) {
+  OPENINFER_FFI_GUARD_BEGIN
   if (num_qo_heads <= 0 || page_size <= 0 || batch_size <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
@@ -872,6 +879,7 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
           /*tmp_s=*/nullptr,
           /*enable_pdl=*/false,
           stream));
+  OPENINFER_FFI_GUARD_END(-1)
 }
 
 }  // extern "C"

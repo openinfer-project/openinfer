@@ -18,10 +18,44 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use sha2::{Digest, Sha256};
 
+use cudarc::driver::CudaSlice;
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
-use crate::bookend::{glm52_embed, glm52_final_norm, glm52_lm_head};
+use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
 use crate::config::{GLM52_HIDDEN, GLM52_VOCAB};
+use crate::rows::Rows;
+
+/// Allocating conveniences over the production `_into` bookends — the gate
+/// probes one row at a time, so a fresh output per call is the natural shape.
+fn glm52_embed(
+    ctx: &DeviceContext,
+    embed: &DeviceMatrix,
+    token_id: &CudaSlice<u32>,
+) -> Result<Rows<GLM52_HIDDEN>> {
+    let mut out = Rows::zeros(ctx, 1)?;
+    glm52_embed_into(ctx, embed, token_id, &mut out)?;
+    Ok(out)
+}
+
+fn glm52_final_norm(
+    ctx: &DeviceContext,
+    hidden: &Rows<GLM52_HIDDEN>,
+    norm_weight: &DeviceVec,
+) -> Result<Rows<GLM52_HIDDEN>> {
+    let mut out = Rows::zeros(ctx, hidden.tokens())?;
+    glm52_final_norm_into(ctx, hidden, norm_weight, &mut out)?;
+    Ok(out)
+}
+
+fn glm52_lm_head(
+    ctx: &DeviceContext,
+    normed: &Rows<GLM52_HIDDEN>,
+    lm_head: &DeviceMatrix,
+) -> Result<Rows<GLM52_VOCAB>> {
+    let mut out = Rows::zeros(ctx, normed.tokens())?;
+    glm52_lm_head_into(ctx, normed, lm_head, &mut out)?;
+    Ok(out)
+}
 
 // ---- BEGIN GENERATED: glm52_oracle bookend probes ----
 // uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
@@ -195,7 +229,7 @@ fn bookend_oracle_gate() -> Result<()> {
     for &id in &token_ids {
         ctx.stream.memcpy_htod(&[id], &mut token_id_buf)?;
         let row = glm52_embed(&ctx, &embed, &token_id_buf)?;
-        embed_rows.extend(ctx.stream.clone_dtoh(&row.data)?);
+        embed_rows.extend(ctx.stream.clone_dtoh(row.data())?);
     }
     let embed_digest = bf16_digest(&embed_rows);
     ensure!(
@@ -208,16 +242,16 @@ fn bookend_oracle_gate() -> Result<()> {
     ensure!(ORACLE_ARGMAX.len() == ORACLE_CTX, "argmax length mismatch");
     let mut logits_all: Vec<f32> = Vec::with_capacity(ORACLE_CTX * GLM52_VOCAB);
     for position in 0..ORACLE_CTX {
-        let mut hidden = DeviceVec::zeros(&ctx, GLM52_HIDDEN)?;
+        let mut hidden = Rows::<GLM52_HIDDEN>::zeros(&ctx, 1)?;
         ctx.stream.memcpy_htod(
             &hidden_host[position * GLM52_HIDDEN..(position + 1) * GLM52_HIDDEN],
-            &mut hidden.data,
+            hidden.data_mut(),
         )?;
         let normed = glm52_final_norm(&ctx, &hidden, &norm_weight)?;
         let logits = glm52_lm_head(&ctx, &normed, &lm_head)?;
         let logits_host: Vec<f32> = ctx
             .stream
-            .clone_dtoh(&logits.data)?
+            .clone_dtoh(logits.data())?
             .iter()
             .map(|v| v.to_f32())
             .collect();

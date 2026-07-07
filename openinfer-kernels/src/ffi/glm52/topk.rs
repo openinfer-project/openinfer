@@ -1,4 +1,4 @@
-use cudarc::driver::sys::{CUresult, CUstream};
+use cudarc::driver::sys::CUstream;
 
 unsafe extern "C" {
     pub fn glm52_flashinfer_topk_2048_cuda(
@@ -10,5 +10,5 @@ unsafe extern "C" {
         top_k: i32,
         max_len: i32,
         stream: CUstream,
-    ) -> CUresult;
+    ) -> i32;
 }

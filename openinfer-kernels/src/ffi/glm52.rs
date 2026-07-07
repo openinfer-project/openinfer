@@ -3,8 +3,6 @@ use cudarc::driver::sys::{CUresult, CUstream};
 
 mod flashmla_sparse;
 pub use flashmla_sparse::*;
-mod hadamard;
-pub use hadamard::*;
 mod indexer;
 pub use indexer::*;
 mod indexer_rope;
@@ -15,97 +13,51 @@ mod deepgemm_mqa;
 pub use deepgemm_mqa::*;
 
 unsafe extern "C" {
-    pub fn glm52_deepgemm_mn_major_tma_aligned_f32_cuda(
-        input: *const f32,
-        output: *mut f32,
+    pub fn glm52_decode_feed_launch_cuda(
+        argmax_indices: *const i32,
+        token_ids: *mut u32,
+        positions: *mut u32,
+        slot_mapping: *mut i64,
+        seq_lens: *mut i32,
         rows: i32,
-        scale_cols: i32,
-        aligned_rows: i32,
         stream: CUstream,
-    ) -> CUresult;
-
-    pub fn glm52_deepgemm_grouped_fp8_contract_cuda(
-        operand_kind: i32,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        weight_scale_rows: i32,
-        weight_scale_cols: i32,
-        activation_scale_cols: i32,
-        activation_scale_tma_rows: i32,
-        psum_entries: i32,
-        expert_alignment: i32,
     ) -> CUresult;
 
     pub fn glm52_deepgemm_grouped_fp8_metadata_cuda(
         psum_expert: *const i32,
         expert_offsets: *mut i64,
+        masked_m: *mut i32,
+        row_map: *mut i32,
         groups: i32,
         m_capacity: i32,
         expert_alignment: i32,
+        masked_cap: i32,
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_deepgemm_grouped_fp8_launch_cuda(
+    pub fn glm52_deepgemm_masked_out_to_aligned_cuda(
+        masked_out: *const Half,
+        masked_m: *const i32,
+        expert_offsets: *const i64,
+        aligned_out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_deepgemm_masked_grouped_fp8_launch_cuda(
         operand_kind: i32,
         a: *const u8,
         a_scale: *const f32,
         b: *const u8,
         b_scale: *const f32,
-        psum_expert: *const i32,
+        masked_m: *const i32,
         out: *mut Half,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // --- TRTLLM FP8 block-scale linear (m=1 dense projection) -----------------
-    pub fn glm52_trtllm_fp8_linear_contract_cuda(
-        m: i32,
-        n: i32,
-        k: i32,
-        weight_scale_rows: i32,
-        weight_scale_cols: i32,
-        activation_scale_cols: i32,
-    ) -> CUresult;
-
-    pub fn glm52_trtllm_fp8_linear_workspace_size_cuda(
-        m: i32,
-        n: i32,
-        k: i32,
-        workspace_bytes: *mut usize,
-    ) -> CUresult;
-
-    pub fn glm52_trtllm_fp8_linear_launch_cuda(
-        a: *const u8,
-        a_scale: *const f32,
-        b: *const u8,
-        b_scale: *const f32,
-        out: *mut Half,
-        workspace: *mut std::ffi::c_void,
-        workspace_bytes: usize,
-        m: i32,
         n: i32,
         k: i32,
         stream: CUstream,
     ) -> CUresult;
 
     // --- TRTLLM FP8 block-scale grouped MoE (PR3, compiled now) ---------------
-    pub fn glm52_trtllm_grouped_fp8_contract_cuda(
-        operand_kind: i32,
-        groups: i32,
-        m_capacity: i32,
-        n: i32,
-        k: i32,
-        weight_scale_rows: i32,
-        weight_scale_cols: i32,
-        activation_scale_cols: i32,
-        activation_scale_trtllm_rows: i32,
-    ) -> CUresult;
-
     pub fn glm52_trtllm_grouped_fp8_workspace_size_cuda(
         operand_kind: i32,
         groups: i32,
@@ -141,6 +93,7 @@ unsafe extern "C" {
         cos: *const Half,
         sin: *const Half,
         query: *mut Half,
+        tokens: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -150,7 +103,28 @@ unsafe extern "C" {
         k_pe: *const Half,
         cos: *const Half,
         sin: *const Half,
-        cache_token: *mut u8,
+        cache: *mut u8,
+        slot_mapping: *const i64,
+        max_slots: i64,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_mla_ckv_split_cuda(
+        ckv: *const Half,
+        kv_c: *mut Half,
+        k_pe: *mut Half,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_indexer_weights_fold_cuda(
+        weights: *const Half,
+        q_scale: *const f32,
+        softmax_scale: f32,
+        n_heads_scale: f32,
+        out: *mut f32,
+        heads: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -165,13 +139,30 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_silu_and_mul_per_token_group_quant_bf16_cuda(
+    pub fn glm52_fp8_per_token_group_quant_bf16_masked_cuda(
         input: *const Half,
+        output: *mut u8,
+        scales: *mut f32,
+        rows: i32,
+        hidden_dim: i32,
+        group_size: i32,
+        row_bound: *const i64,
+        row_map: *const i32,
+        masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
+        input: *const Half,
+        topk_weights: *const f32,
         output: *mut u8,
         scales: *mut f32,
         rows: i32,
         hidden_size: i32,
         group_size: i32,
+        row_bound: *const i64,
+        row_map: *const i32,
+        masked_cap: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -260,6 +251,29 @@ unsafe extern "C" {
         weight_scale: *const f32,
         out: *mut Half,
         topk: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_weight_only_gemv_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        out: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_weight_only_gemv_batched_cuda(
+        activation: *const Half,
+        weight: *const u8,
+        weight_scale: *const f32,
+        out: *mut Half,
+        scratch: *mut f32,
+        scratch_floats: usize,
+        batch: i32,
         n: i32,
         k: i32,
         stream: CUstream,

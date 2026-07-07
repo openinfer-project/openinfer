@@ -1,44 +1,41 @@
 use std::fs;
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use openinfer_sim::{SimulatedEngineConfig, start_engine};
 use reqwest::Client;
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_NAME: &str = "openinfer-sim-e2e";
 const SERVER_START_ATTEMPTS: usize = 5;
-static TEMP_MODEL_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct SimServer {
     base_url: String,
     shutdown: CancellationToken,
     task: JoinHandle<Result<()>>,
-    _model_dir: TempModelDir,
+    _model_dir: TempDir,
 }
 
 impl SimServer {
     async fn spawn() -> Result<Self> {
-        Self::spawn_with_model_dir(TempModelDir::with_minimal_metadata()?).await
+        Self::spawn_with_model_dir(model_dir_with_minimal_metadata()?).await
     }
 
     async fn spawn_with_lora_routes() -> Result<Self> {
-        Self::spawn_with_model_dir_and_lora_routes(TempModelDir::with_minimal_metadata()?, true)
-            .await
+        Self::spawn_with_model_dir_and_lora_routes(model_dir_with_minimal_metadata()?, true).await
     }
 
-    async fn spawn_with_model_dir(model_dir: TempModelDir) -> Result<Self> {
+    async fn spawn_with_model_dir(model_dir: TempDir) -> Result<Self> {
         Self::spawn_with_model_dir_and_lora_routes(model_dir, false).await
     }
 
     async fn spawn_with_model_dir_and_lora_routes(
-        model_dir: TempModelDir,
+        model_dir: TempDir,
         enable_lora_routes: bool,
     ) -> Result<Self> {
         let mut last_error = None;
@@ -67,17 +64,14 @@ impl SimServer {
             })
     }
 
-    async fn spawn_once(
-        model_dir: &TempModelDir,
-        enable_lora_routes: bool,
-    ) -> Result<StartedSimServer> {
+    async fn spawn_once(model_dir: &TempDir, enable_lora_routes: bool) -> Result<StartedSimServer> {
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
         let engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
         let server_shutdown = shutdown.clone();
-        let model_path = model_dir.path.to_string_lossy().into_owned();
-        let model_path_buf = model_dir.path.clone();
+        let model_path = model_dir.path().to_string_lossy().into_owned();
+        let model_path_buf = model_dir.path().to_path_buf();
         let mut task = tokio::spawn(async move {
             if enable_lora_routes {
                 openinfer_vllm_frontend::serve_model_with_lora_routes(
@@ -143,51 +137,27 @@ struct StartedSimServer {
     task: JoinHandle<Result<()>>,
 }
 
-struct TempModelDir {
-    path: PathBuf,
+fn empty_model_dir() -> Result<TempDir> {
+    tempfile::tempdir().context("failed to create temp model dir")
 }
 
-impl TempModelDir {
-    fn empty() -> Result<Self> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_nanos();
-        let sequence = TEMP_MODEL_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "openinfer-sim-e2e-{}-{now}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir(&path)
-            .with_context(|| format!("failed to create temp model dir {}", path.display()))?;
+fn model_dir_with_minimal_metadata() -> Result<TempDir> {
+    let dir = empty_model_dir()?;
 
-        Ok(Self { path })
-    }
+    // The simulated frontend still builds the normal vLLM text/chat stack.
+    // Token-id prompts avoid tokenizer encode work, but generated ids still
+    // need a tokenizer for detokenization and a tiny config for metadata.
+    fs::write(dir.path().join("tokenizer.json"), TINY_TOKENIZER_JSON)
+        .context("failed to write tiny tokenizer.json")?;
+    fs::write(
+        dir.path().join("tokenizer_config.json"),
+        TINY_TOKENIZER_CONFIG_JSON,
+    )
+    .context("failed to write tiny tokenizer_config.json")?;
+    fs::write(dir.path().join("config.json"), TINY_CONFIG_JSON)
+        .context("failed to write tiny config.json")?;
 
-    fn with_minimal_metadata() -> Result<Self> {
-        let dir = Self::empty()?;
-
-        // The simulated frontend still builds the normal vLLM text/chat stack.
-        // Token-id prompts avoid tokenizer encode work, but generated ids still
-        // need a tokenizer for detokenization and a tiny config for metadata.
-        fs::write(dir.path.join("tokenizer.json"), TINY_TOKENIZER_JSON)
-            .context("failed to write tiny tokenizer.json")?;
-        fs::write(
-            dir.path.join("tokenizer_config.json"),
-            TINY_TOKENIZER_CONFIG_JSON,
-        )
-        .context("failed to write tiny tokenizer_config.json")?;
-        fs::write(dir.path.join("config.json"), TINY_CONFIG_JSON)
-            .context("failed to write tiny config.json")?;
-
-        Ok(dir)
-    }
-}
-
-impl Drop for TempModelDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
+    Ok(dir)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -253,9 +223,9 @@ async fn streaming_completion_emits_terminal_done() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
-    let model_dir = TempModelDir::with_minimal_metadata()?;
+    let model_dir = model_dir_with_minimal_metadata()?;
     for file in ["tokenizer.json", "tokenizer_config.json", "config.json"] {
-        if !model_dir.path.join(file).is_file() {
+        if !model_dir.path().join(file).is_file() {
             bail!("minimal simulated frontend metadata fixture is missing {file}");
         }
     }
@@ -263,7 +233,7 @@ async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     let server = SimServer::spawn_with_model_dir(model_dir).await?;
     server.shutdown().await?;
 
-    let error = match SimServer::spawn_with_model_dir(TempModelDir::empty()?).await {
+    let error = match SimServer::spawn_with_model_dir(empty_model_dir()?).await {
         Ok(server) => {
             server.shutdown().await?;
             bail!("empty local model metadata directory should fail frontend startup");

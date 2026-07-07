@@ -71,10 +71,12 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub deepseek_prefill_profile: bool,
 
-    /// Enable pegaflow KV offload (host-tier "L2" cache) on the single-GPU
-    /// Qwen3 path. Sealed KV blocks are saved to host pinned memory and
-    /// restored into HBM before prefill when a prompt's prefix has fallen out
-    /// of the GPU cache.
+    /// Enable pegaflow KV offload (host-tier "L2" cache): single-GPU Qwen3,
+    /// or GLM5.2 DP8 (one pool shared by all 8 ranks under one namespace).
+    /// Sealed KV blocks are saved to host pinned memory and restored into
+    /// HBM before prefill when a prompt's prefix has fallen out of the GPU
+    /// cache. GLM5.2 requires the prefix cache: incompatible with
+    /// --no-prefix-cache and the DSpark drafter.
     #[arg(long, default_value_t = false)]
     pub kv_offload: bool,
 
@@ -82,6 +84,13 @@ pub(crate) struct Args {
     /// allocates the whole pool up front, so RSS reflects this at startup.
     #[arg(long, default_value_t = 8.0)]
     pub kv_offload_host_gib: f64,
+
+    /// Back the KV offload pool with 2 MiB hugepages. The box must hold a
+    /// reservation covering the pool (`HugePages_Total` in /proc/meminfo;
+    /// `echo N > /proc/sys/vm/nr_hugepages` as root) — allocation fails at
+    /// startup otherwise.
+    #[arg(long, default_value_t = false, requires = "kv_offload")]
+    pub kv_offload_hugepages: bool,
 
     /// Join the cross-instance KV P2P mesh: pegaflow MetaServer gRPC address
     /// (e.g. `http://127.0.0.1:50056`). Saved block hashes register there and
@@ -116,9 +125,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub no_prefix_cache: bool,
 
-    /// Enable Qwen3 DFlash speculative decoding with this drafter model path.
-    /// Single-GPU greedy only; incompatible with --enable-lora and --kv-offload,
-    /// and forces the prefix cache off (it needs clean target hidden states).
+    /// Speculative drafter model path: Qwen3 DFlash/DSpark decoding, or the
+    /// GLM5.2 DSpark drafter (greedy AND sampled requests speculate;
+    /// per-request accept stats logged). For Qwen3: single-GPU greedy only;
+    /// incompatible with --enable-lora and --kv-offload, and forces the
+    /// prefix cache off (it needs clean target hidden states).
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
@@ -126,6 +137,11 @@ pub(crate) struct Args {
     /// Qwen3 and Qwen3.5 use their own crate defaults.
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
+
+    /// Per-request context cap: prompt + max_tokens - 1 must fit. GLM5.2 only;
+    /// when omitted, GLM5.2 sizes it from post-weight-load free VRAM.
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
@@ -139,6 +155,12 @@ pub(crate) struct Args {
     #[cfg(feature = "qwen3")]
     #[arg(long, default_value_t = (openinfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES >> 20) as usize)]
     pub kv_cache_memory_margin_mib: usize,
+    /// KV cache page (block) size in tokens. FlashInfer's paged attention only
+    /// accepts a restricted set; 16 (default) or 64. Larger pages cut block
+    /// bookkeeping overhead at the cost of coarser-grained allocation.
+    #[cfg(feature = "qwen3")]
+    #[arg(long, default_value_t = openinfer_qwen3::DEFAULT_KV_PAGE_SIZE)]
+    pub kv_page_size: usize,
     /// How prefill and decode share the GPU (single-GPU Qwen3 only).
     /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
     /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green
@@ -237,6 +259,15 @@ impl Args {
                     );
                 }
             }
+        }
+        // Fail loud rather than silently ignoring the flag for a model line
+        // that does not consume it (Qwen3/3.5 read theirs from config.json).
+        #[cfg(feature = "glm52")]
+        let supports_max_model_len = matches!(model_type, ModelType::Glm52);
+        #[cfg(not(feature = "glm52"))]
+        let supports_max_model_len = false;
+        if self.max_model_len.is_some() && !supports_max_model_len {
+            bail!("--max-model-len is currently supported only for GLM5.2 (got {model_type:?})");
         }
         Ok(())
     }

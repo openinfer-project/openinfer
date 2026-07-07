@@ -24,7 +24,6 @@ hw-rdma = [
 cuda-lib = { path = "../openinfer-comm-cuda-lib", package = "openinfer-comm-cuda-lib" }
 fabric-lib = { path = "../openinfer-comm-fabric-lib", package = "openinfer-comm-fabric-lib" }
 logging-lib = { path = "../openinfer-comm-logging-lib", package = "openinfer-comm-logging-lib" }
-thread-lib = { path = "../openinfer-comm-thread-lib", package = "openinfer-comm-thread-lib" }
 torch-lib = { path = "../openinfer-comm-torch-lib", package = "openinfer-comm-torch-lib" }
 p2p-all-to-all = { path = "../openinfer-comm-p2p-all-to-all", package = "openinfer-comm-p2p-all-to-all" }
 

@@ -73,6 +73,7 @@ pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config35,
     pub(super) embed_tokens: DeviceMatrix,
+    pub(super) lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock35>,
     pub(super) norm: DeviceVec,
     // Partial RoPE cache: [max_seq_len * rotary_dim]
@@ -129,6 +130,23 @@ impl Qwen35Model {
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols
         );
+
+        let lm_head = if config.tie_word_embeddings {
+            info!("output projection: tied embed_tokens");
+            None
+        } else {
+            let m = load_tensor_2d(&ctx, &shards, &weight_map, "lm_head.weight")?;
+            anyhow::ensure!(
+                m.rows == config.vocab_size && m.cols == config.hidden_size,
+                "lm_head.weight is [{}, {}], expected [vocab {}, hidden {}]",
+                m.rows,
+                m.cols,
+                config.vocab_size,
+                config.hidden_size,
+            );
+            info!("output projection: untied lm_head [{}, {}]", m.rows, m.cols);
+            Some(m)
+        };
 
         debug!(
             "Loading layers to GPU: num_layers={}",
@@ -356,6 +374,7 @@ impl Qwen35Model {
             ctx,
             config,
             embed_tokens,
+            lm_head,
             layers,
             norm,
             cos_cache,
@@ -366,6 +385,10 @@ impl Qwen35Model {
 
     pub(crate) fn config(&self) -> &Config35 {
         &self.config
+    }
+
+    pub(super) fn output_projection(&self) -> &DeviceMatrix {
+        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
     pub(crate) fn ensure_rope_cache_covers(&self, positions: usize) -> Result<()> {
@@ -476,7 +499,7 @@ impl Qwen35Model {
             .iter()
             .map(|layer| (&layer.mlp.down_proj, 0))
             .collect();
-        let lm_head_samples = [(&self.embed_tokens, 0)];
+        let lm_head_samples = [(self.output_projection(), 0)];
 
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()

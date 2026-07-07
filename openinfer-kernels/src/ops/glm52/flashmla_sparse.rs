@@ -12,6 +12,7 @@ pub const GLM52_FLASHMLA_SPARSE_V_HEAD_DIM: usize = 512;
 pub const GLM52_FLASHMLA_SPARSE_PAGE_SIZE: usize = 64;
 pub const GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN: usize = 656;
 pub const GLM52_FLASHMLA_SPARSE_TOPK: usize = 2048;
+pub const GLM52_FLASHMLA_SPARSE_TOPK_BLOCK: usize = 64;
 pub const GLM52_FLASHMLA_SPARSE_SCHED_META_INTS: usize = 8;
 pub const GLM52_FLASHMLA_SPARSE_MAX_SM_PARTS: usize = 160;
 
@@ -37,8 +38,11 @@ impl Glm52FlashMlaSparseDecode {
             "GLM5.2 FlashMLA sparse decode num_blocks must be positive"
         );
         ensure!(
-            self.topk == GLM52_FLASHMLA_SPARSE_TOPK,
-            "GLM5.2 FlashMLA sparse decode topk must be {}, got {}",
+            self.topk > 0
+                && self.topk <= GLM52_FLASHMLA_SPARSE_TOPK
+                && self.topk.is_multiple_of(GLM52_FLASHMLA_SPARSE_TOPK_BLOCK),
+            "GLM5.2 FlashMLA sparse decode topk must be a multiple of {} in 1..={}, got {}",
+            GLM52_FLASHMLA_SPARSE_TOPK_BLOCK,
             GLM52_FLASHMLA_SPARSE_TOPK,
             self.topk
         );
@@ -98,7 +102,8 @@ impl Glm52FlashMlaSparseDecode {
 
 pub fn glm52_flashmla_sparse_decode_num_sm_parts() -> Result<usize> {
     let mut num_sm_parts = 0i32;
-    let result = unsafe { ffi::glm52_flashmla_sparse_decode_num_sm_parts_cuda(&mut num_sm_parts) };
+    let result =
+        unsafe { ffi::glm52_flashmla_sparse_decode_num_sm_parts_cuda(&raw mut num_sm_parts) };
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 FlashMLA sparse num_sm_parts query failed: {err}"))?;
@@ -113,6 +118,7 @@ pub fn glm52_flashmla_sparse_decode_num_sm_parts() -> Result<usize> {
 pub fn glm52_flashmla_sparse_decode_metadata_launch(
     ctx: &DeviceContext,
     batch_size: usize,
+    topk: usize,
     num_sm_parts: usize,
     tile_scheduler_metadata: &mut CudaSlice<i32>,
     num_splits: &mut CudaSlice<i32>,
@@ -120,7 +126,7 @@ pub fn glm52_flashmla_sparse_decode_metadata_launch(
     let contract = Glm52FlashMlaSparseDecode {
         batch_size,
         num_blocks: 1,
-        topk: GLM52_FLASHMLA_SPARSE_TOPK,
+        topk,
         num_sm_parts,
         sm_scale: 1.0,
     };
@@ -134,7 +140,7 @@ pub fn glm52_flashmla_sparse_decode_metadata_launch(
             sched_ptr as *mut i32,
             splits_ptr as *mut i32,
             batch_size as i32,
-            GLM52_FLASHMLA_SPARSE_TOPK as i32,
+            topk as i32,
             num_sm_parts as i32,
             ctx.stream.cu_stream(),
         )

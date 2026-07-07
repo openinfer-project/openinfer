@@ -250,7 +250,11 @@ fn sample_uniform_batch_into(
                 crate::tensor::active_cu_stream(ctx),
             )
         };
-        ensure!(err == 0, "batch sampling kernel failed: cudaError {err}");
+        ensure!(
+            err == 0,
+            "batch sampling kernel failed with error {err}{}",
+            crate::ops::ffi_exception_message(err)
+        );
     }
 
     let out = ctx
@@ -315,6 +319,43 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     Ok(result[0] as u32)
 }
 
+/// Single-row bf16 argmax into pre-allocated device outputs (`value[0]`,
+/// `index[0]`). Slice-level twin of [`argmax_batch_bf16_into`] (same kernel,
+/// rows=1, lowest index wins ties, NaN never wins) for callers whose logits
+/// live in a persistent decode arena. The bf16 top value is emitted so the
+/// caller can keep the crash-early non-finite guard after the 2-byte D2H.
+pub fn argmax_bf16_into(
+    ctx: &DeviceContext,
+    logits: &CudaSlice<half::bf16>,
+    n: usize,
+    value: &mut CudaSlice<half::bf16>,
+    index: &mut CudaSlice<i32>,
+) -> Result<()> {
+    if n == 0 || logits.len() < n {
+        return Err(anyhow!(
+            "argmax_bf16_into logits too small: have {}, need {n}",
+            logits.len()
+        ));
+    }
+    if value.is_empty() || index.is_empty() {
+        return Err(anyhow!("argmax_bf16_into outputs must hold one element"));
+    }
+    let (x_ptr, _gx) = logits.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = value.device_ptr_mut(&ctx.stream);
+    let (i_ptr, _gi) = index.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::argmax_batch_bf16_cuda(
+            x_ptr as *const ffi::Half,
+            v_ptr as *mut ffi::Half,
+            i_ptr as *mut i32,
+            1,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+    Ok(())
+}
+
 pub fn argmax_batch_bf16_into(
     ctx: &DeviceContext,
     logits: &HiddenStates,
@@ -361,6 +402,76 @@ pub fn argmax_batch_bf16_into(
 pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize {
     const TILE_ELEMS: usize = 4096;
     rows * vocab.div_ceil(TILE_ELEMS)
+}
+
+/// Partial-buffer length for the Markov-step argmax, whose tiles are 1024
+/// elements: its read is one logits row + one bias row, so it needs 4x the
+/// blocks of the full-row batched argmax to not be latency-bound (see
+/// `MARKOV_STEP_TILE_ELEMS` in `argmax.cu`).
+pub fn markov_step_argmax_partials_len(rows: usize, vocab: usize) -> usize {
+    const TILE_ELEMS: usize = 1024;
+    rows * vocab.div_ceil(TILE_ELEMS)
+}
+
+/// Row-wise two-stage bf16 argmax over `rows` rows of `n`: tile-parallel
+/// partials then one finalize block per row. Same per-row total order as
+/// [`argmax_bf16_into`] (lowest GLOBAL index wins ties, NaN never wins) — the
+/// partials carry global indices, so each row's result is bit-identical to
+/// the single-block scan (and independent of the other rows) while each vocab
+/// row spreads over ~n/4096 CTAs instead of one. `partial_*` must hold
+/// `argmax_batch_bf16_split_partials_len(rows, n)` elements; `values`/`indices`
+/// hold one element per row.
+#[allow(clippy::too_many_arguments)]
+pub fn argmax_bf16_split_into(
+    ctx: &DeviceContext,
+    logits: &CudaSlice<half::bf16>,
+    rows: usize,
+    n: usize,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+    values: &mut CudaSlice<half::bf16>,
+    indices: &mut CudaSlice<i32>,
+) -> Result<()> {
+    if rows == 0 || n == 0 || logits.len() < rows * n {
+        return Err(anyhow!(
+            "argmax_bf16_split_into logits too small: have {}, need {}",
+            logits.len(),
+            rows * n
+        ));
+    }
+    if values.len() < rows || indices.len() < rows {
+        return Err(anyhow!(
+            "argmax_bf16_split_into outputs must hold {rows} elements: have {}/{}",
+            values.len(),
+            indices.len()
+        ));
+    }
+    let needed = argmax_batch_bf16_split_partials_len(rows, n);
+    if partial_values.len() < needed || partial_indices.len() < needed {
+        return Err(anyhow!(
+            "argmax_bf16_split_into partials too small: {}/{} need {needed}",
+            partial_values.len(),
+            partial_indices.len()
+        ));
+    }
+    let (x_ptr, _gx) = logits.device_ptr(&ctx.stream);
+    let (pv_ptr, _gpv) = partial_values.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = values.device_ptr_mut(&ctx.stream);
+    let (i_ptr, _gi) = indices.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::argmax_batch_bf16_split_cuda(
+            x_ptr as *const ffi::Half,
+            v_ptr as *mut ffi::Half,
+            i_ptr as *mut i32,
+            pv_ptr as *mut f32,
+            pi_ptr as *mut i32,
+            rows as i32,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+    Ok(())
 }
 
 /// Two-stage indexed batched argmax: tile-parallel partials then a per-row
@@ -487,7 +598,7 @@ pub fn markov_step_argmax_into(
             rows * block_size
         ));
     }
-    let needed = argmax_batch_bf16_split_partials_len(rows, vocab);
+    let needed = markov_step_argmax_partials_len(rows, vocab);
     if partial_values.len() < needed || partial_indices.len() < needed {
         return Err(anyhow!(
             "markov step partials too small: {}/{} need {}",

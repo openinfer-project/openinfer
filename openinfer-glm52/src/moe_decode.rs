@@ -27,25 +27,39 @@
 use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
+#[cfg(test)]
+use openinfer_kernels::ops::add_batch;
+#[cfg(test)]
 use openinfer_kernels::ops::{
     GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT, GLM52_GEMV_KIND_W2, GLM52_GEMV_KIND_W13,
-    Glm52MoeQuantShape, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
-    Glm52TrtllmGroupedFp8Contract, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
-    add_batch, glm52_deepgemm_grouped_offset_tma_aligned_f32_launch,
-    glm52_fp8_per_token_group_quant_bf16_launch, glm52_moe_combine_launch,
+    Glm52MoeQuantShape, glm52_fp8_per_token_group_quant_bf16_launch, glm52_moe_combine_launch,
     glm52_moe_combine_slots_launch, glm52_moe_fp8_weight_only_gemv_launch,
-    glm52_moe_route_offsets_launch, glm52_moe_route_scatter_launch, glm52_router_noaux_tc_launch,
+    glm52_moe_route_offsets_launch, glm52_moe_route_scatter_launch,
     glm52_silu_and_mul_weighted_bf16_launch,
-    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch, glm52_trtllm_grouped_fp8_launch,
+    glm52_silu_and_mul_weighted_per_token_group_quant_bf16_launch,
 };
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
+use openinfer_kernels::ops::{
+    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, glm52_router_noaux_tc_launch,
+};
+#[cfg(test)]
+use openinfer_kernels::ops::{
+    Glm52TrtllmGroupedFp8Contract, Glm52TrtllmGroupedFp8Kind, Glm52TrtllmGroupedOffsetScaleLayout,
+    glm52_deepgemm_grouped_offset_tma_aligned_f32_launch, glm52_trtllm_grouped_fp8_launch,
+};
+use openinfer_kernels::tensor::DeviceContext;
+#[cfg(test)]
+use openinfer_kernels::tensor::HiddenStates;
 
-use crate::fp8::{Glm52ProjBytes, ProjWeight, bytes_to_f32, fp8_mlp};
+#[cfg(test)]
+use crate::fp8::fp8_mlp;
+use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
+#[cfg(test)]
+use crate::fp8::{Glm52ProjBytes, bytes_to_f32};
 
-pub(crate) const HIDDEN: usize = 6144;
-pub(crate) const EXPERTS: usize = 256;
-pub(crate) const TOPK: usize = 8;
-const INTERMEDIATE: usize = 2048;
+pub(crate) const HIDDEN: usize = crate::config::GLM52_HIDDEN;
+pub(crate) const EXPERTS: usize = crate::config::GLM52_ROUTED_EXPERTS;
+pub(crate) const TOPK: usize = crate::config::GLM52_TOPK;
+const INTERMEDIATE: usize = crate::config::GLM52_EXPERT_INTERMEDIATE;
 pub(crate) const QUANT_GROUP: usize = 128;
 
 pub(crate) const W13_N: usize = 2 * INTERMEDIATE; // 4096 (gate|up)
@@ -62,9 +76,11 @@ pub(crate) const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
 /// experts owns at most one row, padded to the 64-row alignment, so
 /// `TOPK * ALIGNMENT` is a tight upper bound (`route_offsets` emits
 /// `expert_offsets[E] <=` it).
+#[cfg(test)]
 const M_CAPACITY: usize = TOPK * GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT; // 512
 
 /// Which expert-GEMM implementation runs the routed contribution.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Glm52MoeExpertPath {
     /// TRTLLM grouped FP8 GEMM over expert-major aligned slots — the layout the
@@ -76,6 +92,7 @@ pub(crate) enum Glm52MoeExpertPath {
 }
 
 /// Raw per-expert checkpoint bytes for one routed expert (fp8 block-scaled).
+#[cfg(test)]
 pub(crate) struct Glm52MoeRoutedExpertBytes<'a> {
     pub(crate) gate: Glm52ProjBytes<'a>, // [INTERMEDIATE, HIDDEN]
     pub(crate) up: Glm52ProjBytes<'a>,   // [INTERMEDIATE, HIDDEN]
@@ -104,14 +121,20 @@ impl Glm52MoeRouterWeights {
 }
 
 /// The single shared expert (a plain fp8 SwiGLU MLP at intermediate 2048).
+/// gate|up are packed into one `[2*INTERMEDIATE, HIDDEN]` projection at build
+/// so the decode path is one GEMV + SwiGLU + one GEMV.
 pub(crate) struct Glm52MoeSharedExpert {
-    gate: ProjWeight, // fp8 [INTERMEDIATE, HIDDEN]
-    up: ProjWeight,   // fp8 [INTERMEDIATE, HIDDEN]
-    down: ProjWeight, // fp8 [HIDDEN, INTERMEDIATE]
+    gate_up: ProjWeight, // fp8 [2*INTERMEDIATE, HIDDEN] (gate | up)
+    down: ProjWeight,    // fp8 [HIDDEN, INTERMEDIATE]
 }
 
 impl Glm52MoeSharedExpert {
-    pub(crate) fn new(gate: ProjWeight, up: ProjWeight, down: ProjWeight) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        gate: &ProjWeight,
+        up: &ProjWeight,
+        down: ProjWeight,
+    ) -> Result<Self> {
         let shape = |label: &str, p: &ProjWeight, n: usize, k: usize| -> Result<()> {
             ensure!(
                 p.n == n && p.k == k,
@@ -121,21 +144,41 @@ impl Glm52MoeSharedExpert {
             );
             Ok(())
         };
-        shape("gate_proj", &gate, INTERMEDIATE, HIDDEN)?;
-        shape("up_proj", &up, INTERMEDIATE, HIDDEN)?;
+        shape("gate_proj", gate, INTERMEDIATE, HIDDEN)?;
+        shape("up_proj", up, INTERMEDIATE, HIDDEN)?;
         shape("down_proj", &down, HIDDEN, INTERMEDIATE)?;
-        Ok(Self { gate, up, down })
+        Ok(Self {
+            gate_up: pack_proj_pair(ctx, gate, up)?,
+            down,
+        })
     }
 
     /// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP.
+    #[cfg(test)]
     pub(crate) fn forward(
         &self,
         ctx: &DeviceContext,
         normed_hidden: &CudaSlice<bf16>,
     ) -> Result<CudaSlice<bf16>> {
-        fp8_mlp(ctx, &self.gate, &self.up, &self.down, normed_hidden)
+        fp8_mlp(ctx, &self.gate_up, &self.down, normed_hidden)
+    }
+
+    /// [`Self::forward`] into a pre-allocated output through persistent
+    /// scratch (the decode path). `mlp` must be sized for the shared-expert
+    /// intermediate (2048).
+    pub(crate) fn forward_into(
+        &self,
+        ctx: &DeviceContext,
+        normed_hidden: &CudaSlice<bf16>,
+        mlp: &mut Glm52MlpScratch,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        fp8_mlp_into(ctx, &self.gate_up, &self.down, normed_hidden, mlp, out)
     }
 }
+
+/// The shared-expert intermediate width (sizes the decode mlp scratch).
+pub(crate) const GLM52_SHARED_EXPERT_INTERMEDIATE: usize = INTERMEDIATE;
 
 /// A bank of routed experts in the expert-major packed layout: fp8 weights
 /// `[n_experts, n, k]` + f32 block scales `[n_experts, n/128, k/128]`, per
@@ -188,6 +231,7 @@ impl Glm52MoeExpertBank {
     /// Pack per-expert checkpoint bytes expert-major and upload (test path;
     /// works for any expert count — 256 at EP1, a 32-expert rank slice for
     /// the EP8 gate).
+    #[cfg(test)]
     pub(crate) fn pack_from_host(
         ctx: &DeviceContext,
         experts: &[Glm52MoeRoutedExpertBytes<'_>],
@@ -268,18 +312,21 @@ impl Glm52MoeExpertBank {
 /// All weights for one MoE layer at EP1 (all 256 routed experts local), plus
 /// the router and the single shared expert. Built once on device; borrowed by
 /// every decode step.
+#[cfg(test)]
 pub(crate) struct Glm52MoeLayerWeights {
     pub(crate) router: Glm52MoeRouterWeights,
     pub(crate) bank: Glm52MoeExpertBank,
     pub(crate) shared: Glm52MoeSharedExpert,
 }
 
+#[cfg(test)]
 impl Glm52MoeLayerWeights {
     /// Pack per-expert checkpoint tensors into the expert-major grouped
     /// buffers and upload everything (the oracle/test path). W13 = per-expert
     /// `[gate; up]` rows with scales concatenated likewise; W2 = down. The
     /// production path adopts loader-packed regions with the same layout
     /// ([`Glm52MoeExpertBank::from_regions`]).
+    #[cfg(test)]
     pub(crate) fn from_host(
         ctx: &DeviceContext,
         gate_weight: &[u8],
@@ -304,8 +351,9 @@ impl Glm52MoeLayerWeights {
             router: Glm52MoeRouterWeights::new(upload_u8(gate_weight)?, upload_u8(e_score_bias)?)?,
             bank: Glm52MoeExpertBank::pack_from_host(ctx, experts)?,
             shared: Glm52MoeSharedExpert::new(
-                ProjWeight::upload(ctx, shared_gate)?,
-                ProjWeight::upload(ctx, shared_up)?,
+                ctx,
+                &ProjWeight::upload(ctx, shared_gate)?,
+                &ProjWeight::upload(ctx, shared_up)?,
                 ProjWeight::upload(ctx, shared_down)?,
             )?,
         })
@@ -320,39 +368,72 @@ pub(crate) struct RoutedTopk {
     pub(crate) topk_weight: CudaSlice<f32>,
 }
 
-pub(crate) fn run_router(
+/// Persistent router scratch for the decode path: the expert logits plus the
+/// top-k output the MoE dispatch consumes, written in place every MoE layer.
+/// Sized for `tokens` rows.
+pub(crate) struct Glm52RouterScratch {
+    tokens: usize,
+    logits: CudaSlice<f32>,
+    pub(crate) route: RoutedTopk,
+}
+
+impl Glm52RouterScratch {
+    pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
+        ensure!(tokens > 0, "GLM5.2 router scratch needs positive tokens");
+        Ok(Self {
+            tokens,
+            logits: ctx.stream.alloc_zeros::<f32>(tokens * EXPERTS)?,
+            route: RoutedTopk {
+                topk_idx: ctx.stream.alloc_zeros::<i32>(tokens * TOPK)?,
+                topk_weight: ctx.stream.alloc_zeros::<f32>(tokens * TOPK)?,
+            },
+        })
+    }
+}
+
+/// Router over the scratch's `tokens` rows into the persistent scratch
+/// (`s.route` holds the per-row top-k, `[T, 8]`).
+pub(crate) fn run_router_into(
     ctx: &DeviceContext,
     router: &Glm52MoeRouterWeights,
     normed_hidden: &CudaSlice<bf16>,
-) -> Result<RoutedTopk> {
-    let stream = &ctx.stream;
-    let mut logits = stream.alloc_zeros::<f32>(EXPERTS)?;
-    let mut topk_idx = stream.alloc_zeros::<i32>(TOPK)?;
-    let mut topk_weight = stream.alloc_zeros::<f32>(TOPK)?;
+    s: &mut Glm52RouterScratch,
+) -> Result<()> {
     let mut router_out = Glm52RouterOutput {
-        topk_weight: &mut topk_weight,
-        topk_idx: &mut topk_idx,
+        topk_weight: &mut s.route.topk_weight,
+        topk_idx: &mut s.route.topk_idx,
     };
     glm52_router_noaux_tc_launch(
         ctx,
         Glm52RouterConfig::glm52(),
         Glm52RouterBatch {
-            active_tokens: 1,
-            padded_tokens: 1,
+            active_tokens: s.tokens,
+            padded_tokens: s.tokens,
         },
         normed_hidden,
         &router.gate_weight,
         &router.e_score_bias,
-        &mut logits,
+        &mut s.logits,
         &mut router_out,
     )?;
-    Ok(RoutedTopk {
-        topk_idx,
-        topk_weight,
-    })
+    Ok(())
+}
+
+/// Allocating convenience over [`run_router_into`] for the oracle-gate/test
+/// paths.
+#[cfg(test)]
+pub(crate) fn run_router(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+) -> Result<RoutedTopk> {
+    let mut s = Glm52RouterScratch::new(ctx, 1)?;
+    run_router_into(ctx, router, normed_hidden, &mut s)?;
+    Ok(s.route)
 }
 
 /// Routed contribution via the DeepEP-shaped grouped FP8 GEMM chain.
+#[cfg(test)]
 fn routed_forward_grouped(
     ctx: &DeviceContext,
     bank: &Glm52MoeExpertBank,
@@ -475,6 +556,7 @@ fn routed_forward_grouped(
 }
 
 /// Routed contribution via the bs=1 weight-only fp8 GEMV chain.
+#[cfg(test)]
 fn routed_forward_gemv(
     ctx: &DeviceContext,
     bank: &Glm52MoeExpertBank,
@@ -537,6 +619,7 @@ fn routed_forward_gemv(
 /// post-attention-layernorm hidden `[HIDDEN]`; returns the routed output
 /// `[HIDDEN]` (route weight + routed_scaling already folded in). The shared
 /// expert is added by `glm52_moe_forward`.
+#[cfg(test)]
 pub(crate) fn glm52_moe_routed_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,
@@ -564,6 +647,7 @@ pub(crate) fn glm52_moe_routed_forward(
 
 /// Shared-expert contribution for a single token: a plain fp8 SwiGLU MLP
 /// (intermediate 2048). Returns `[HIDDEN]` bf16.
+#[cfg(test)]
 pub(crate) fn glm52_moe_shared_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,
@@ -574,6 +658,7 @@ pub(crate) fn glm52_moe_shared_forward(
 
 /// Full MoE contribution for a single token: routed experts + shared expert. The
 /// caller adds this to the post-attention residual. Returns `[HIDDEN]` bf16.
+#[cfg(test)]
 pub(crate) fn glm52_moe_forward(
     ctx: &DeviceContext,
     weights: &Glm52MoeLayerWeights,
@@ -596,10 +681,12 @@ pub(crate) fn glm52_moe_forward(
 }
 
 /// Relayout the plain per-row activation scale into the offset-major TMA layout,
-/// then run one grouped FP8 GEMM. Returns the bf16 output `[m_capacity, n]`.
-/// `groups`/`m_capacity` are runtime: 256/512 at EP1 (bs=1), 32/row-bound at
-/// EP8 (moe_ep8 drives this over the DeepEP recv layout).
+/// then run one TRTLLM grouped FP8 GEMM. Returns the bf16 output
+/// `[m_capacity, n]`. Test-only since the EP8 chain moved to the DeepGEMM
+/// masked grouped GEMM: the EP1 oracle gates keep cross-checking the expert
+/// paths through this reference route.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn grouped_gemm(
     ctx: &DeviceContext,
     kind: Glm52TrtllmGroupedFp8Kind,
@@ -616,65 +703,14 @@ pub(crate) fn grouped_gemm(
     expert_offsets: &CudaSlice<i64>,
 ) -> Result<CudaSlice<bf16>> {
     let scale_layout = Glm52TrtllmGroupedOffsetScaleLayout::f32(m_capacity, scale_cols, groups);
-    let mut activation_scale_tma = ctx.stream.alloc_zeros::<f32>(scale_layout.output_len()?)?;
+    let mut scale_tma = ctx.stream.alloc_zeros::<f32>(scale_layout.output_len()?)?;
     let mut out = ctx.stream.alloc_zeros::<bf16>(m_capacity * n)?;
-    grouped_gemm_into(
-        ctx,
-        kind,
-        groups,
-        m_capacity,
-        n,
-        k,
-        scale_cols,
-        weight_scale_rows,
-        activation,
-        activation_scale_plain,
-        weight,
-        weight_scale,
-        expert_offsets,
-        &mut activation_scale_tma,
-        &mut out,
-    )?;
-    Ok(out)
-}
-
-/// `grouped_gemm` writing into caller-owned buffers (EP8's persistent
-/// workspace): `scale_tma` and `out` must hold at least the layout /
-/// `m_capacity * n` for the largest `m_capacity` ever passed — launches may
-/// cover fewer rows than the buffers, never more.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn grouped_gemm_into(
-    ctx: &DeviceContext,
-    kind: Glm52TrtllmGroupedFp8Kind,
-    groups: usize,
-    m_capacity: usize,
-    n: usize,
-    k: usize,
-    scale_cols: usize,
-    weight_scale_rows: usize,
-    activation: &CudaSlice<u8>,
-    activation_scale_plain: &CudaSlice<f32>,
-    weight: &CudaSlice<u8>,
-    weight_scale: &CudaSlice<f32>,
-    expert_offsets: &CudaSlice<i64>,
-    scale_tma: &mut CudaSlice<f32>,
-    out: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    let scale_layout = Glm52TrtllmGroupedOffsetScaleLayout::f32(m_capacity, scale_cols, groups);
-    let scale_tma_len = scale_layout.output_len()?;
-    ensure!(
-        scale_tma.len() >= scale_tma_len && out.len() >= m_capacity * n,
-        "GLM5.2 grouped GEMM workspace too small: scale_tma {} < {scale_tma_len} or out {} < {}",
-        scale_tma.len(),
-        out.len(),
-        m_capacity * n
-    );
     glm52_deepgemm_grouped_offset_tma_aligned_f32_launch(
         ctx,
         scale_layout,
         activation_scale_plain,
         expert_offsets,
-        scale_tma,
+        &mut scale_tma,
     )?;
 
     let contract = Glm52TrtllmGroupedFp8Contract {
@@ -692,11 +728,11 @@ pub(crate) fn grouped_gemm_into(
         kind,
         contract,
         activation,
-        scale_tma,
+        &scale_tma,
         weight,
         weight_scale,
         expert_offsets,
-        out,
+        &mut out,
     )?;
-    Ok(())
+    Ok(out)
 }

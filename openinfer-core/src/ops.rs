@@ -10,17 +10,18 @@ mod traced;
 
 pub use attention::{
     paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
-    paged_attention_batch_decode_split_kv_into, prefill_attention_paged_into,
+    paged_attention_batch_decode_split_kv_into,
+    paged_attention_batch_decode_via_prefill_hd256_into, prefill_attention_paged_into,
 };
 pub use openinfer_kernels::ops::{
-    GEMM_LT_MAX_N, LoraDecodeGroupedProjection, accumulate_bf16_token_scaled_to_f32_into,
-    add_batch, add_batch_into, argmax, argmax_batch_bf16_into, bf16_hidden_to_f32_into,
-    copy_hidden_rows_into, copy_hidden_token_range_into, dflash_qk_norm_rope_into,
-    embedding_decode_into, extract_vec, extract_vec_into, extract_vec_ref, extract_vec_ref_into,
-    f32_to_bf16_hidden_into, fused_add_rms_norm_into, gather_hidden_tokens_into, gemm,
-    gemm_graphsafe_into_checked, gemm_graphsafe_ref_into_checked, gemm_into_checked, gemm_lt_tune,
-    gemm_per_token, gemv, linear, lora_decode_fused_delta_group3_into,
-    lora_decode_fused_delta_into, pack_lora_b_rows_into,
+    GEMM_LT_MAX_N, LoraDecodeGroupedProjection, SUPPORTED_GQA_GROUP_SIZES,
+    accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, argmax,
+    argmax_batch_bf16_into, bf16_hidden_to_f32_into, copy_hidden_rows_into,
+    copy_hidden_token_range_into, dflash_qk_norm_rope_into, embedding_decode_into, extract_vec,
+    extract_vec_into, extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into,
+    fused_add_rms_norm_into, gather_hidden_tokens_into, gemm, gemm_graphsafe_into_checked,
+    gemm_graphsafe_ref_into_checked, gemm_into_checked, gemm_lt_tune, gemm_per_token, gemv, linear,
+    lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into, pack_lora_b_rows_into,
     qk_norm_partial_rope_batched_decode_hd256_into, rms_norm, rms_norm_batch_offset_into,
     rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into, scale_f32_in_place,
     scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,

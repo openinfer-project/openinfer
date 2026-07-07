@@ -110,7 +110,7 @@ impl Qwen35Model {
             self.config.rms_norm_eps,
             &mut normed,
         )?;
-        let logits = ops::gemm(&self.ctx, &self.embed_tokens, &normed)?;
+        let logits = ops::gemm(&self.ctx, self.output_projection(), &normed)?;
         debug_assert_eq!(logits.seq_len, n);
         Ok(logits)
     }
@@ -387,7 +387,8 @@ impl Qwen35Model {
             };
             anyhow::ensure!(
                 result == 0,
-                "batch_prefill_paged_cuda_hd256 failed: {result}"
+                "batch_prefill_paged_cuda_hd256 failed: {result}{}",
+                openinfer_kernels::ops::ffi_exception_message(result)
             );
         }
 

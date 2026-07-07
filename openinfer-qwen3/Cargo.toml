@@ -22,7 +22,6 @@ fastrace = { workspace = true }
 half = { workspace = true }
 hex = { workspace = true, optional = true }
 log = { workspace = true }
-memmap2 = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
@@ -33,6 +32,7 @@ toml = { workspace = true, optional = true }
 
 [features]
 kernel-call-trace = ["openinfer-core/kernel-call-trace"]
+test-fixtures = []
 kernel-report = [
     "dep:clap",
     "dep:comfy-table",
@@ -45,7 +45,9 @@ kernel-report = [
 ]
 
 [dev-dependencies]
+openinfer-qwen3 = { workspace = true, features = ["test-fixtures"] }
 openinfer-vllm-support = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 vllm-text = { workspace = true }
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the HuggingFace bf16 logprob golden for the Qwen3-4B logits gate.
+"""Generate the HuggingFace bf16 logprob golden for the Qwen3 logits gate.
 
-The gate (`openinfer-qwen3-4b/tests/hf_golden_gate.rs`) compares openinfer's
+The size is read from config.json, so one script serves every size.
+
+The gate (`openinfer-qwen3/tests/hf_golden_gate.rs`) compares openinfer's
 logprobs against HF *without* running HF at test time and *without* binding to
 one GPU's exact bit pattern. So we precompute, once, on the GPU:
 
@@ -21,14 +23,15 @@ margin threshold makes it unnecessary here.
 
 Output is safetensors, not JSON: it is machine-only numeric data, nobody reads it.
 
-    uv run --no-project python tools/accuracy/dump_qwen3_4b_hf_golden.py \
-        --model-path /data/models/Qwen3-4B \
-        --out test_data/qwen3-4b-hf-golden.safetensors
+    uv run --no-project python tools/accuracy/dump_qwen3_hf_golden.py \
+        --model-path /data/models/Qwen3-14B \
+        --out test_data/qwen3-14b-hf-golden.safetensors
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -45,9 +48,9 @@ SEED = 0x_5EED_604D
 # coverage, since the mean/p99 the gate asserts are already stable by here.
 NUM_SEQS = 48
 MIN_PROMPT_LEN = 1
-# Up to 16 KV blocks (block_size 16): spans sub-page prompts to long multi-block
-# context, so the gate exercises long-attention / KV-block indexing / high RoPE
-# positions, not just short prompts.
+# Up to 16 KV blocks (block_size 16): spans sub-page to multi-block prompts, so
+# the gate exercises multi-block KV indexing and cross-block attention, not just
+# single-block prompts. Not long-context: 256 does not cross the 4096 RoPE cache.
 MAX_PROMPT_LEN = 256
 # Teacher-forced tail; gate evaluates DECODE_TOKENS + 1 positions. Long enough to
 # exercise the decode path past the first step (KV append, decode-step indexing),
@@ -55,6 +58,24 @@ MAX_PROMPT_LEN = 256
 DECODE_TOKENS = 16
 VOCAB_CEILING = 100_000  # clear of high-id special tokens, matches the gate
 TOP_K = 64
+
+# (hidden_size, num_hidden_layers) -> fixture size token. Keep in sync with
+# `fixture_size_name` in openinfer-qwen3/tests/hf_golden_gate.rs.
+SIZE_NAMES = {
+    (2560, 36): "4b",
+    (4096, 36): "8b",
+    (5120, 40): "14b",
+    (5120, 64): "32b",
+}
+
+
+def size_from_config(model_path: Path) -> str:
+    config = json.loads((model_path / "config.json").read_text())
+    text = config.get("text_config", config)
+    key = (text["hidden_size"], text["num_hidden_layers"])
+    if key not in SIZE_NAMES:
+        raise SystemExit(f"no size mapping for hidden/layers {key}; extend SIZE_NAMES")
+    return SIZE_NAMES[key]
 
 
 def load_model(model_path: str, dtype: str, device_map: str):
@@ -81,6 +102,14 @@ def main() -> int:
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     parser.add_argument("--device-map", default="auto", help="'none' for single-GPU, 'auto' to shard big models")
     args = parser.parse_args()
+
+    size = size_from_config(Path(args.model_path))
+    expected = f"qwen3-{size}-hf-golden.safetensors"
+    if Path(args.out).name != expected:
+        raise SystemExit(
+            f"--out basename {Path(args.out).name!r} will not be found by the gate; "
+            f"expected {expected!r} for this Qwen3-{size} model"
+        )
 
     gen = torch.Generator().manual_seed(SEED)
     prompts, decodes = [], []
@@ -119,7 +148,6 @@ def main() -> int:
         "topk_logprobs": torch.tensor(lp_all, dtype=torch.float32),  # [S, D+1, K]
     }
     meta = {
-        "model_path": args.model_path,
         "dtype": args.dtype,
         "seed": str(SEED),
         "top_k": str(TOP_K),

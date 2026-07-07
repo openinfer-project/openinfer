@@ -3,19 +3,15 @@ use std::{
     thread,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-#[cfg(not(feature = "glm52"))]
-use openinfer_core::engine::{GenerateRequest, TokenEvent, unix_now_s};
-#[cfg(not(feature = "glm52"))]
-use tokio::sync::mpsc;
+use openinfer_kv_offload::KvArena;
 
-#[cfg(feature = "glm52")]
-use anyhow::Context as _;
+use crate::dspark::{
+    GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch, Glm52DsparkSlotState,
+};
 
-#[cfg(feature = "glm52")]
-use crate::model::Glm52RankModel;
-#[cfg(feature = "glm52")]
+use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
 use crate::moe_ep8::Glm52MoeEp8State;
 use crate::weights::{
     GLM52_EP_RANKS, Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle,
@@ -48,6 +44,46 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) loaded_total_bytes: usize,
     pub(crate) resident_raw_bytes: usize,
     pub(crate) loaded_to_gpu: bool,
+    /// This rank's device free VRAM right after the weights landed — the
+    /// launch-time context-cap probe takes the fleet minimum.
+    pub(crate) free_vram_bytes: usize,
+}
+
+/// The coordinator's launch-ahead directives for one step — both are GLOBAL
+/// claims (a speculative replay is a full set of collectives, so ranks must
+/// act on them together or not at all).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Glm52StepFlags {
+    /// This step IS the speculative replay every rank enqueued last step.
+    pub(crate) consume: bool,
+    /// The next step is guaranteed to repeat this shape with each row
+    /// advanced by its own argmax — every rank MUST enqueue that next
+    /// replay launch-ahead (see `Glm52RankModel::decode_step`).
+    pub(crate) lease: bool,
+}
+
+impl Glm52StepFlags {
+    /// No speculation in either direction (warm pre-capture, tests).
+    pub(crate) fn plain() -> Self {
+        Self {
+            consume: false,
+            lease: false,
+        }
+    }
+}
+
+/// One step row whose committed token is sampled instead of taking the fused
+/// greedy argmax: a non-greedy request's decode span row (every row of a
+/// verify span — anchor and draft prefix alike), or the last row of its
+/// prompt-completing span. `step` is the request-local decode step the row's
+/// token lands at — a seeded request's philox seed mixes it, so its tokens
+/// replay independently of batch composition AND of how many rows rode each
+/// speculative round (spec and plain produce the same seeded stream).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Glm52RowSample {
+    pub(crate) row: usize,
+    pub(crate) params: openinfer_sample::SamplingParams,
+    pub(crate) step: u64,
 }
 
 enum Glm52RankCommand {
@@ -58,26 +94,62 @@ enum Glm52RankCommand {
     /// Non-collective: adopt the resident weights into the rank's model.
     /// Every rank must report success BEFORE anyone enters SetupComm — a
     /// build failure on one rank must never strand the others in NCCL init.
-    #[cfg(feature = "glm52")]
+    /// Replies with the rank's cache arena descriptors so launch can
+    /// register them with the shared KV offload host.
     BuildModel {
-        resp: Sender<Result<()>>,
+        max_model_len: usize,
+        resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
     /// to every rank concurrently, only after all builds succeeded.
-    #[cfg(feature = "glm52")]
     SetupComm {
         unique_id: Box<[u8; 128]>,
         resp: Sender<Result<()>>,
     },
     /// One lock-step full-model step (75 MoE collectives inside): feed
-    /// `token` at `position`, reply with the greedy next token. The
-    /// coordinator sends this to every rank each global step — an idle rank
-    /// gets a padding token and its output is discarded.
-    #[cfg(feature = "glm52")]
+    /// `inputs[row]` per forwarded row (a slot's span rows walk consecutive
+    /// positions), reply with the next token per ROW (greedy argmax, or a
+    /// sampling pass for the rows in `sampling`). The coordinator
+    /// sends this to every rank each global step with the SAME batch bucket
+    /// in `shape` (the collectives require every rank to agree on the step's
+    /// global row count) — padding rows ride free slots and their outputs
+    /// are discarded.
     Step {
-        token: u32,
-        position: usize,
-        resp: Sender<Result<u32>>,
+        inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
+        shape: Glm52StepShape,
+        kv: Box<Glm52StepKv>,
+        flags: Glm52StepFlags,
+        /// Rows sampled instead of argmaxed (non-greedy requests; empty on
+        /// the all-greedy fast path), and the step's philox seed for their
+        /// unseeded members.
+        sampling: Vec<Glm52RowSample>,
+        seed: u64,
+        resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
+    },
+    /// Non-collective: load the DSpark draft model onto this rank. Issued to
+    /// every rank after BuildModel (the draft reuses the target's
+    /// embed/lm_head at forward time).
+    LoadDspark {
+        path: PathBuf,
+        resp: Sender<Result<()>>,
+    },
+    /// Non-collective: report this rank's current free device VRAM (the
+    /// post-build headroom check).
+    FreeVram {
+        resp: Sender<Result<usize>>,
+    },
+    /// Rank-local draft round (no collectives; runs between global steps).
+    /// `resets` clear slot draft states (request left / new admission),
+    /// `appends` feed step rows of the LAST Step's `bucket` capture buffer to
+    /// slot pending contexts, `proposals` ask for a 7-token draft span per
+    /// slot from `(slot, anchor_token, anchor_pos)`. Ordered: resets, then
+    /// appends, then proposals.
+    Draft {
+        bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<(usize, usize)>,
+        proposals: Vec<(usize, u32, usize)>,
+        resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
     },
     Shutdown,
 }
@@ -111,7 +183,7 @@ impl Glm52RankWorker {
                     }
                 };
                 let _ = startup_tx.send(Ok(()));
-                rank_worker_loop(rx, Glm52RankThreadState::new(placement, ctx, bundle));
+                rank_worker_loop(&rx, Glm52RankThreadState::new(placement, ctx, bundle));
             })
             .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 rank worker: {err}"))?;
         startup_rx
@@ -137,16 +209,20 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    #[cfg(feature = "glm52")]
-    pub(crate) fn build_model_async(&self) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn build_model_async(
+        &self,
+        max_model_len: usize,
+    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
-            .send(Glm52RankCommand::BuildModel { resp: resp_tx })
+            .send(Glm52RankCommand::BuildModel {
+                max_model_len,
+                resp: resp_tx,
+            })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
         Ok(resp_rx)
     }
 
-    #[cfg(feature = "glm52")]
     pub(crate) fn setup_comm_async(&self, unique_id: [u8; 128]) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -158,13 +234,63 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    #[cfg(feature = "glm52")]
-    pub(crate) fn step_async(&self, token: u32, position: usize) -> Result<Receiver<Result<u32>>> {
+    pub(crate) fn step_async(
+        &self,
+        inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
+        kv: Glm52StepKv,
+        flags: Glm52StepFlags,
+        sampling: Vec<Glm52RowSample>,
+        seed: u64,
+    ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::Step {
-                token,
-                position,
+                inputs: Box::new(inputs),
+                shape,
+                kv: Box::new(kv),
+                flags,
+                sampling,
+                seed,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::LoadDspark {
+                path: path.to_path_buf(),
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn free_vram_async(&self) -> Result<Receiver<Result<usize>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::FreeVram { resp: resp_tx })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(crate) fn draft_async(
+        &self,
+        bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<(usize, usize)>,
+        proposals: Vec<(usize, u32, usize)>,
+    ) -> Result<Receiver<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::Draft {
+                bucket,
+                resets,
+                appends,
+                proposals,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -200,11 +326,26 @@ impl Drop for Glm52RankWorker {
     }
 }
 
-#[cfg(feature = "glm52")]
 struct Glm52RankRuntime {
     model: Box<Glm52RankModel>,
+    /// Second stream on the same device: the shared expert overlaps the MoE
+    /// collectives on it (fork/join via events inside the decode graph).
+    aux_ctx: openinfer_kernels::tensor::DeviceContext,
     /// Populated by SetupComm (collective), after every rank's build succeeded.
     ep8: Option<Glm52MoeEp8State>,
+    /// Populated by LoadDspark when the drafter is enabled.
+    dspark: Option<Glm52DsparkRank>,
+}
+
+/// This rank's DSpark lane: the replicated draft model, the shared forward
+/// scratch, and one draft state per slot — every buffer preallocated to the
+/// launch-time cap at load (the VRAM probe's ledger charged exactly this
+/// footprint), because a mid-serving draft round must never hit the
+/// allocator: a transient OOM there would tear the whole engine down.
+struct Glm52DsparkRank {
+    model: Glm52DsparkModel,
+    scratch: Glm52DsparkScratch,
+    slots: [Glm52DsparkSlotState; GLM52_MAX_BATCH_PER_RANK],
 }
 
 struct Glm52RankThreadState {
@@ -212,7 +353,6 @@ struct Glm52RankThreadState {
     ctx: Glm52RankGpuContext,
     bundle: Glm52RankLoadBundle,
     loaded: Option<Glm52RankGpuWeights>,
-    #[cfg(feature = "glm52")]
     runtime: Option<Glm52RankRuntime>,
 }
 
@@ -227,7 +367,6 @@ impl Glm52RankThreadState {
             ctx,
             bundle,
             loaded: None,
-            #[cfg(feature = "glm52")]
             runtime: None,
         }
     }
@@ -241,25 +380,30 @@ impl Glm52RankThreadState {
             loaded.loaded_total_bytes,
             loaded.weights.total_bytes
         );
+        let free_vram_bytes = self.ctx.free_vram_bytes()?;
         let report = Glm52RankWeightLoadReport {
             rank: self.placement.rank,
             loaded_tensor_count: loaded.loaded_tensor_count,
             loaded_total_bytes: loaded.loaded_total_bytes,
             resident_raw_bytes: loaded.weights.total_bytes,
             loaded_to_gpu: true,
+            free_vram_bytes,
         };
         self.loaded = Some(loaded.weights);
         Ok(report)
     }
 
-    #[cfg(feature = "glm52")]
-    fn build_model(&mut self) -> Result<()> {
+    fn build_model(&mut self, max_model_len: usize) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
             .take()
             .context("GLM5.2 build_model called before weights were loaded")?;
         let dev_ctx = self.ctx.device_context()?;
-        let model = Box::new(Glm52RankModel::build(&dev_ctx, &mut weights)?);
+        let model = Box::new(Glm52RankModel::build(
+            &dev_ctx,
+            &mut weights,
+            max_model_len,
+        )?);
         ensure!(
             weights.expert_layers.is_empty(),
             "GLM5.2 rank {} left {} expert layers unconsumed after model build",
@@ -269,11 +413,112 @@ impl Glm52RankThreadState {
         // Non-expert leftovers are the MTP-layer tensors (out of scope) —
         // dropped with `weights` here.
         drop(weights);
-        self.runtime = Some(Glm52RankRuntime { model, ep8: None });
+        let arenas = model.kv_arenas(&dev_ctx.stream)?;
+        let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
+        self.runtime = Some(Glm52RankRuntime {
+            model,
+            aux_ctx,
+            ep8: None,
+            dspark: None,
+        });
+        Ok(arenas)
+    }
+
+    fn load_dspark(&mut self, path: &Path) -> Result<()> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 load_dspark before build_model")?;
+        ensure!(
+            runtime.dspark.is_none(),
+            "GLM5.2 rank {} DSpark drafter already loaded",
+            self.placement.rank
+        );
+        let model = Glm52DsparkModel::load(&dev_ctx, path, runtime.model.max_model_len())?;
+        let scratch = Glm52DsparkScratch::new(&dev_ctx, model.cache_len())?;
+        let mut slots = Vec::with_capacity(GLM52_MAX_BATCH_PER_RANK);
+        for _ in 0..GLM52_MAX_BATCH_PER_RANK {
+            slots.push(Glm52DsparkSlotState::new(&dev_ctx, model.cache_len())?);
+        }
+        runtime.dspark = Some(Glm52DsparkRank {
+            model,
+            scratch,
+            slots: slots
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("GLM5.2 dspark slot state count drifted"))?,
+        });
         Ok(())
     }
 
-    #[cfg(feature = "glm52")]
+    fn draft(
+        &mut self,
+        bucket: usize,
+        resets: &[usize],
+        appends: &[(usize, usize)],
+        proposals: &[(usize, u32, usize)],
+    ) -> Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 draft before build_model")?;
+        let Glm52RankRuntime { model, dspark, .. } = runtime;
+        let dspark = dspark
+            .as_mut()
+            .context("GLM5.2 draft command without a loaded DSpark drafter")?;
+
+        for &slot in resets {
+            ensure!(slot < GLM52_MAX_BATCH_PER_RANK, "dspark reset slot {slot}");
+            dspark.slots[slot].reset();
+        }
+        if !appends.is_empty() {
+            let captured = model.captured(bucket)?;
+            for &(row, slot) in appends {
+                ensure!(
+                    row < bucket && slot < GLM52_MAX_BATCH_PER_RANK,
+                    "dspark append row {row} (bucket {bucket}) slot {slot}"
+                );
+                dspark.slots[slot].append_captured_row(&dev_ctx, captured, row)?;
+            }
+        }
+        if proposals.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Proposals must arrive slot-ascending so the reply order is the
+        // request order (and slots are trivially unique).
+        ensure!(
+            proposals.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "dspark proposals must be sorted by slot: {proposals:?}"
+        );
+        let mut states = Vec::with_capacity(proposals.len());
+        let mut anchors = Vec::with_capacity(proposals.len());
+        let mut wanted = proposals.iter().peekable();
+        for (slot, state) in dspark.slots.iter_mut().enumerate() {
+            let Some(&&(want_slot, anchor, anchor_pos)) = wanted.peek() else {
+                break;
+            };
+            if want_slot != slot {
+                continue;
+            }
+            wanted.next();
+            states.push(state);
+            anchors.push((anchor, anchor_pos));
+        }
+        ensure!(
+            wanted.peek().is_none(),
+            "dspark propose slot out of range in {proposals:?}"
+        );
+        dspark.model.propose(
+            &dev_ctx,
+            model.embed(),
+            model.lm_head(),
+            &mut states,
+            &anchors,
+            &mut dspark.scratch,
+        )
+    }
+
     fn setup_comm(&mut self, unique_id: &[u8; 128]) -> Result<()> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -295,8 +540,15 @@ impl Glm52RankThreadState {
         Ok(())
     }
 
-    #[cfg(feature = "glm52")]
-    fn step(&mut self, token: u32, position: usize) -> Result<u32> {
+    fn step(
+        &mut self,
+        inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
+        shape: Glm52StepShape,
+        kv: &Glm52StepKv,
+        flags: Glm52StepFlags,
+        sampling: &[Glm52RowSample],
+        seed: u64,
+    ) -> Result<[u32; GLM52_MAX_BATCH_PER_RANK]> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
             .runtime
@@ -306,31 +558,60 @@ impl Glm52RankThreadState {
             .ep8
             .as_mut()
             .context("GLM5.2 step before setup_comm")?;
-        runtime.model.decode_step(&dev_ctx, ep8, token, position)
+        runtime.model.decode_step(
+            &dev_ctx,
+            &runtime.aux_ctx,
+            ep8,
+            inputs,
+            shape,
+            kv,
+            flags,
+            sampling,
+            seed,
+        )
     }
 }
 
-fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadState) {
+fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadState) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Glm52RankCommand::LoadWeights { model_path, resp } => {
                 let _ = resp.send(state.load_weights(&model_path));
             }
-            #[cfg(feature = "glm52")]
-            Glm52RankCommand::BuildModel { resp } => {
-                let _ = resp.send(state.build_model());
+            Glm52RankCommand::BuildModel {
+                max_model_len,
+                resp,
+            } => {
+                let _ = resp.send(state.build_model(max_model_len));
             }
-            #[cfg(feature = "glm52")]
             Glm52RankCommand::SetupComm { unique_id, resp } => {
                 let _ = resp.send(state.setup_comm(&unique_id));
             }
-            #[cfg(feature = "glm52")]
             Glm52RankCommand::Step {
-                token,
-                position,
+                inputs,
+                shape,
+                kv,
+                flags,
+                sampling,
+                seed,
                 resp,
             } => {
-                let _ = resp.send(state.step(token, position));
+                let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
+            }
+            Glm52RankCommand::LoadDspark { path, resp } => {
+                let _ = resp.send(state.load_dspark(&path));
+            }
+            Glm52RankCommand::FreeVram { resp } => {
+                let _ = resp.send(state.ctx.free_vram_bytes());
+            }
+            Glm52RankCommand::Draft {
+                bucket,
+                resets,
+                appends,
+                proposals,
+                resp,
+            } => {
+                let _ = resp.send(state.draft(bucket, &resets, &appends, &proposals));
             }
             Glm52RankCommand::Shutdown => break,
         }
@@ -338,31 +619,4 @@ fn rank_worker_loop(rx: Receiver<Glm52RankCommand>, mut state: Glm52RankThreadSt
     // The DeepEP context drop is collective — it runs here as every rank's
     // worker exits its loop after the coordinator broadcast Shutdown.
     drop(state);
-}
-
-/// Featureless builds stop at weight residency: requests are rejected after
-/// scheduling (the `glm52` feature compiles the real engine).
-#[cfg(not(feature = "glm52"))]
-pub(crate) fn run_rejecting_load_only_coordinator(
-    mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
-    workers: Vec<Glm52RankWorker>,
-) {
-    let _workers = workers;
-    while let Some(req) = submit_rx.blocking_recv() {
-        let prompt_tokens = req.prompt_tokens.len();
-        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-        let scheduled_at_unix_s = unix_now_s();
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s,
-            prompt_tokens,
-            cached_tokens: 0,
-        });
-        let _ = req.token_tx.send(TokenEvent::Rejected {
-            message: "GLM5.2 forward requires the glm52 cargo feature; this build is load-only"
-                .to_owned(),
-            prompt_tokens,
-            completion_tokens: 0,
-        });
-    }
 }

@@ -6,7 +6,8 @@
 //!
 //! `unified_step` combines:
 //!   1. Serial `batch_prefill` for new requests entering the batch.
-//!   2. CUDA Graph `batch_decode_graph` for existing decode requests.
+//!   2. `batch_decode_graph` for existing decode requests (CUDA Graph for
+//!      compiled GQA groups; eager prefill fallback for uncompiled ones).
 
 use anyhow::Result;
 

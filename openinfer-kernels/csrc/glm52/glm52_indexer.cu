@@ -1,8 +1,8 @@
 // GLM5.2 DSA indexer cache + top-k slot conversion kernels.
 //
-// Cache insert + gather: hand-written, cherry-picked from feat/glm52-dp8-ep8
+// Cache insert: hand-written, cherry-picked from feat/glm52-dp8-ep8
 // (commit 7e4200a). Memory-bound elementwise: fp8 per-128-group quant +
-// scatter write / gather read into DeepGEMM block-split paged layout.
+// scatter write into DeepGEMM block-split paged layout.
 //
 // local_topk_to_slots: hand-written, new in PR2. Ported from TokenSpeed
 // Triton `_local_topk_to_global_slots_kernel` (dsa_sparse_layout.py).
@@ -87,65 +87,6 @@ __global__ void indexer_k_quant_and_cache_kernel(
   }
 }
 
-template <int BlockYSize>
-__global__ void gather_indexer_k_quant_cache_kernel(
-    const unsigned char* __restrict__ indexer_cache,
-    unsigned char* __restrict__ dst_k, unsigned char* __restrict__ dst_scale,
-    const int* __restrict__ block_table,
-    const int* __restrict__ cu_seq_lens, int batch_size,
-    int num_blocks_per_seq, int tokens, int cache_block_size,
-    int64_t cache_block_stride_bytes) {
-  constexpr int kVecSize = sizeof(float4) / sizeof(unsigned char);
-  const int token_idx = blockIdx.x * blockDim.y + threadIdx.y;
-  const int head_idx = (blockIdx.y * blockDim.x + threadIdx.x) * kVecSize;
-
-  __shared__ int batch_idx[BlockYSize];
-  if (threadIdx.x == 0) {
-    batch_idx[threadIdx.y] = -1;
-  }
-  __syncthreads();
-
-  for (int iter = 0; iter < (batch_size + blockDim.x - 1) / blockDim.x;
-       ++iter) {
-    int candidate = iter * blockDim.x + threadIdx.x;
-    if (candidate < batch_size) {
-      const int seq_start = cu_seq_lens[candidate];
-      const int seq_end = cu_seq_lens[candidate + 1];
-      if (token_idx >= seq_start && token_idx < seq_end) {
-        batch_idx[threadIdx.y] = candidate;
-      }
-    }
-  }
-  __syncthreads();
-
-  const int batch = batch_idx[threadIdx.y];
-  if (token_idx >= tokens || head_idx >= kHeadDim || batch < 0) return;
-
-  const int inbatch_seq_idx = token_idx - cu_seq_lens[batch];
-  const int block_idx =
-      block_table[batch * num_blocks_per_seq + inbatch_seq_idx / cache_block_size];
-  const int64_t src_block_offset =
-      static_cast<int64_t>(block_idx) * cache_block_stride_bytes;
-  const int64_t cache_inblock_offset =
-      (inbatch_seq_idx % cache_block_size) * kHeadDim + head_idx;
-  const int64_t src_value_offset = src_block_offset + cache_inblock_offset;
-  const int64_t dst_value_offset =
-      static_cast<int64_t>(token_idx) * kHeadDim + head_idx;
-
-  reinterpret_cast<float4*>(dst_k)[dst_value_offset / kVecSize] =
-      reinterpret_cast<const float4*>(indexer_cache)[src_value_offset /
-                                                     kVecSize];
-
-  if (threadIdx.x == 0) {
-    const int64_t src_scale_offset =
-        src_block_offset + cache_block_size * kHeadDim +
-        cache_inblock_offset * kScaleBytesPerToken / kQuantBlockSize;
-    reinterpret_cast<float*>(dst_scale)[token_idx] =
-        reinterpret_cast<const float*>(indexer_cache)[src_scale_offset /
-                                                     sizeof(float)];
-  }
-}
-
 // Convert local top-k offsets (within a sequence's KV cache) to global KV
 // slot indices using the block table. Ported from TokenSpeed Triton
 // `_local_topk_to_global_slots_kernel`. One block per token.
@@ -205,6 +146,23 @@ __global__ void local_topk_to_global_slots_kernel(
   }
 }
 
+// Fold the per-head weights_proj output with the per-head q quant scale and
+// the two attention scale constants. Multiplication order matches the
+// retired host-side fold bit-for-bit (left-to-right f32, no FMA — there is
+// no add to contract into).
+__global__ void indexer_weights_fold_kernel(
+    const __nv_bfloat16* __restrict__ weights,  // [heads]
+    const float* __restrict__ q_scale,          // [heads]
+    float softmax_scale, float n_heads_scale,
+    float* __restrict__ out,                    // [heads]
+    int heads) {
+  const int h = threadIdx.x;
+  if (h < heads) {
+    out[h] = __bfloat162float(weights[h]) * q_scale[h] * softmax_scale *
+             n_heads_scale;
+  }
+}
+
 CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaSuccess) return CUDA_SUCCESS;
   if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
@@ -256,35 +214,6 @@ CUresult glm52_indexer_k_quant_and_cache_cuda(
   return consume_last_cuda_error();
 }
 
-CUresult glm52_indexer_k_gather_quant_cache_cuda(
-    const unsigned char* indexer_cache, unsigned char* dst_k,
-    unsigned char* dst_scale, const int* block_table,
-    const int* cu_seq_lens, int batch_size, int num_blocks_per_seq,
-    int tokens, int head_dim, int quant_block_size, int cache_block_size,
-    int64_t cache_block_stride_bytes, cudaStream_t stream) {
-  if (indexer_cache == nullptr || dst_k == nullptr || dst_scale == nullptr ||
-      block_table == nullptr || cu_seq_lens == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (tokens <= 0 || batch_size <= 0 || num_blocks_per_seq <= 0 ||
-      !valid_cache_layout(head_dim, quant_block_size, cache_block_size,
-                          cache_block_stride_bytes)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-
-  constexpr int kBlockYSize = 8;
-  constexpr int kVecSize = sizeof(float4) / sizeof(unsigned char);
-  dim3 grid((tokens + kBlockYSize - 1) / kBlockYSize,
-            (kHeadDim + 8 * kVecSize - 1) / (8 * kVecSize));
-  dim3 block(8, kBlockYSize);
-  gather_indexer_k_quant_cache_kernel<kBlockYSize>
-      <<<grid, block, 0, stream>>>(
-          indexer_cache, dst_k, dst_scale, block_table, cu_seq_lens,
-          batch_size, num_blocks_per_seq, tokens, cache_block_size,
-          cache_block_stride_bytes);
-  return consume_last_cuda_error();
-}
-
 CUresult glm52_indexer_local_topk_to_slots_cuda(
     int* global_slots, int* topk_lens, const int* local_topk_offsets,
     int local_topk_stride, const int* seq_lens, const int* block_table,
@@ -307,6 +236,20 @@ CUresult glm52_indexer_local_topk_to_slots_cuda(
       global_slots, topk_lens, local_topk_offsets, local_topk_stride,
       seq_lens, block_table, block_table_stride, block_table_cols,
       block_size, topk);
+  return consume_last_cuda_error();
+}
+
+CUresult glm52_indexer_weights_fold_cuda(const __nv_bfloat16* weights,
+                                          const float* q_scale,
+                                          float softmax_scale,
+                                          float n_heads_scale, float* out,
+                                          int heads, cudaStream_t stream) {
+  if (weights == nullptr || q_scale == nullptr || out == nullptr ||
+      heads <= 0 || heads > 1024) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  indexer_weights_fold_kernel<<<1, heads, 0, stream>>>(
+      weights, q_scale, softmax_scale, n_heads_scale, out, heads);
   return consume_last_cuda_error();
 }
 

@@ -11,6 +11,8 @@ mod executor;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use lora::fixtures as lora_fixtures;
 mod prefill;
 mod scheduler;
 mod speculative;
@@ -28,7 +30,8 @@ use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelIn
 pub use kernel_plan::kernel_plan;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 pub use weights::{
-    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, Qwen3MemoryOptions,
+    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE,
+    Qwen3MemoryOptions,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +93,8 @@ pub struct Qwen3OffloadOptions {
     pub enabled: bool,
     /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
     pub pinned_pool_bytes: usize,
+    /// Back the pool with 2 MiB hugepages (the box must hold a reservation).
+    pub use_hugepages: bool,
     /// `Some` joins the cross-instance P2P mesh: block hashes register with a
     /// MetaServer, peers pull missing prefixes over RDMA, and this engine
     /// serves theirs. The P/D disaggregation data plane.
@@ -123,6 +128,7 @@ impl Qwen3OffloadOptions {
         Self {
             enabled: false,
             pinned_pool_bytes: 0,
+            use_hugepages: false,
             p2p: None,
         }
     }
@@ -131,6 +137,7 @@ impl Qwen3OffloadOptions {
         Self {
             enabled: true,
             pinned_pool_bytes,
+            use_hugepages: false,
             p2p: None,
         }
     }

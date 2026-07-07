@@ -27,7 +27,7 @@ use cudarc::driver::CudaSlice;
 use crate::config::DFlashConfig;
 use openinfer_core::ops;
 use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
-use openinfer_kernels::ops::{argmax_batch_bf16_split_partials_len, markov_step_argmax_into};
+use openinfer_kernels::ops::{markov_step_argmax_into, markov_step_argmax_partials_len};
 
 pub(crate) const MARKOV_W1_TENSOR: &str = "markov_head.markov_w1.weight";
 pub(crate) const MARKOV_W2_TENSOR: &str = "markov_head.markov_w2.weight";
@@ -177,7 +177,7 @@ impl MarkovScratch {
         );
         let vocab = config.vocab_size;
         let rank = config.markov_rank;
-        let partials = argmax_batch_bf16_split_partials_len(max_decode_batch_size, vocab);
+        let partials = markov_step_argmax_partials_len(max_decode_batch_size, vocab);
         let sampled = max_decode_batch_size * config.block_size;
         Ok(Self {
             max_batch: max_decode_batch_size,
@@ -213,7 +213,7 @@ impl MarkovScratch {
 
     fn bytes(vocab: usize, rank: usize, block_size: usize, max_decode_batch_size: usize) -> usize {
         const BF16: usize = 2;
-        let partials = argmax_batch_bf16_split_partials_len(max_decode_batch_size, vocab);
+        let partials = markov_step_argmax_partials_len(max_decode_batch_size, vocab);
         let w1emb = max_decode_batch_size * rank * BF16;
         let bias = max_decode_batch_size * vocab * BF16;
         let partial_bytes = partials * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>());

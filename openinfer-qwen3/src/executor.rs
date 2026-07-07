@@ -1386,6 +1386,15 @@ impl Qwen3Executor {
                 && !matches!(overlap, crate::DecodeOverlap::Off)),
             "--batch-invariant (NumericPolicy::Pin) is not compatible with decode-overlap: the stream override would force the pinned GEMM to bail at runtime"
         );
+        // Overlap's split-concurrent decode stream uses the group-limited decode
+        // kernel this GQA group can't instantiate; reject at load, not mid-serving.
+        anyhow::ensure!(
+            self.metadata.config.decode_group_is_compiled()
+                || matches!(overlap, crate::DecodeOverlap::Off),
+            "decode-overlap is unsupported for GQA group size {}/{}: no compiled decode kernel",
+            self.metadata.config.num_attention_heads,
+            self.metadata.config.num_key_value_heads,
+        );
         let device_ordinal = 0; // single-GPU path
         self.overlap = crate::green_ctx::OverlapStreams::create(device_ordinal, overlap)?;
         Ok(())
@@ -1839,6 +1848,7 @@ fn build_offload(
         opts.pinned_pool_bytes,
     )
     .with_namespace(namespace);
+    config.use_hugepages = opts.use_hugepages;
     if let Some(p2p) = &opts.p2p {
         config = config.with_p2p(openinfer_kv_offload::P2pConfig {
             metaserver_addr: p2p.metaserver_addr.clone(),
@@ -2198,6 +2208,17 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+        if !self.metadata.config.decode_group_is_compiled() {
+            let unified = self.execute_unified(UnifiedPlan {
+                prefill_requests: &[],
+                decode_requests: plan.requests,
+                sample_seed: plan.sample_seed,
+            })?;
+            return Ok(DecodeResult {
+                requests: unified.decode_requests,
+            });
+        }
+
         // 1. Schedule decode for all active requests
         for req in plan.requests {
             let rkv = self

@@ -43,18 +43,24 @@ __device__ __forceinline__ __nv_bfloat16 rope_half(const __nv_bfloat16* x, int r
   return __float2bfloat16(v);
 }
 
-// One block per indexer q-head: applies RoPE to q[head, :64] and copies
-// q[head, 64:128] (pass-through). Also handles k in the same launch via
-// block 0 (k has no head dimension).
+// One block per (token, indexer q-head): applies RoPE to q[t, head, :64] in
+// place (q[t, head, 64:128] passes through untouched). Block (0, t) also
+// handles token t's k (k has no head dimension). cos/sin carry one [32] row
+// per token (each token sits at its own position).
 __global__ void glm52_indexer_rope_kernel(
-    __nv_bfloat16* __restrict__ q,          // [n_heads, head_dim] (in-place)
-    __nv_bfloat16* __restrict__ k,          // [head_dim] (in-place)
+    __nv_bfloat16* __restrict__ q,          // [tokens, n_heads, head_dim] (in-place)
+    __nv_bfloat16* __restrict__ k,          // [tokens, head_dim] (in-place)
     int n_heads,
-    const __nv_bfloat16* __restrict__ cos,  // [32]
-    const __nv_bfloat16* __restrict__ sin)  // [32]
+    const __nv_bfloat16* __restrict__ cos,  // [tokens, 32]
+    const __nv_bfloat16* __restrict__ sin)  // [tokens, 32]
 {
   const int head = blockIdx.x;
+  const int token = blockIdx.y;
   const int tid = threadIdx.x;
+  q += (size_t)token * n_heads * kHeadDim;
+  k += (size_t)token * kHeadDim;
+  cos += (size_t)token * kRopeHalf;
+  sin += (size_t)token * kRopeHalf;
 
   if (head < n_heads) {
     __nv_bfloat16* q_head = q + head * kHeadDim;
@@ -84,16 +90,18 @@ __global__ void glm52_indexer_rope_kernel(
 
 extern "C" {
 
-CUresult glm52_indexer_rope_cuda(__nv_bfloat16* q,      // [n_heads, head_dim]
-                                __nv_bfloat16* k,       // [head_dim]
-                                int n_heads,
+CUresult glm52_indexer_rope_cuda(__nv_bfloat16* q,      // [tokens, n_heads, head_dim]
+                                __nv_bfloat16* k,       // [tokens, head_dim]
+                                int n_heads, int tokens,
                                 const __nv_bfloat16* cos,
                                 const __nv_bfloat16* sin,
                                 cudaStream_t stream) {
-  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) {
+  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr ||
+      tokens <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  glm52_indexer_rope_kernel<<<n_heads, 128, 0, stream>>>(q, k, n_heads, cos, sin);
+  const dim3 grid(n_heads, tokens, 1);
+  glm52_indexer_rope_kernel<<<grid, 128, 0, stream>>>(q, k, n_heads, cos, sin);
   cudaError_t err = cudaGetLastError();
   if (err == cudaSuccess) return CUDA_SUCCESS;
   if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;

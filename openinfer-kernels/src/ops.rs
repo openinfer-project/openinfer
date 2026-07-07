@@ -17,10 +17,12 @@ mod norm;
 mod sampling;
 
 pub use attention::{
-    PrefillPagedPlan, dflash_qk_norm_rope_into, paged_attention_batch_decode_hd256_into,
-    paged_attention_batch_decode_into, paged_attention_batch_decode_split_kv_into,
-    prefill_attention_paged_into, qk_norm_partial_rope_batched_decode_hd256_into,
-    qk_norm_rope_batch_decode_into, single_prefill_nhd_noncausal_into,
+    PrefillPagedPlan, SUPPORTED_GQA_GROUP_SIZES, dflash_qk_norm_rope_into,
+    paged_attention_batch_decode_hd256_into, paged_attention_batch_decode_into,
+    paged_attention_batch_decode_split_kv_into,
+    paged_attention_batch_decode_via_prefill_hd256_into, prefill_attention_paged_into,
+    qk_norm_partial_rope_batched_decode_hd256_into, qk_norm_rope_batch_decode_into,
+    single_prefill_nhd_noncausal_into,
 };
 #[cfg(feature = "moe")]
 pub use deepep::{
@@ -31,15 +33,17 @@ pub use deepep::{Glm52DeepEp, glm52_deepep_info, glm52_deepep_unique_id};
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
 pub use elementwise::{
-    accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, bf16_bytes_to_f32_into,
-    bf16_hidden_to_f32_into, copy_hidden_rows_into, copy_hidden_token_range_into, extract_vec,
-    extract_vec_into, extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into,
-    gather_hidden_tokens_into, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
-    scaled_add_batch_into, scaled_add_rows_indexed_into, scaled_add_rows_into,
-    scaled_add_rows_token_range_into, silu_mul_batch, silu_mul_batch_into,
-    silu_mul_fused_batch_into, write_vec_into,
+    accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, add_into,
+    bf16_bytes_to_f32_into, bf16_hidden_to_f32_into, copy_hidden_rows_into,
+    copy_hidden_rows_raw_into, copy_hidden_token_range_into, extract_vec, extract_vec_into,
+    extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into, gather_hidden_tokens_into,
+    repeat_f32_for_reduce_scatter_into, scale_f32_in_place, scaled_add_batch_into,
+    scaled_add_rows_indexed_into, scaled_add_rows_into, scaled_add_rows_token_range_into,
+    silu_mul_batch, silu_mul_batch_into, silu_mul_fused_batch_into, write_vec_into,
 };
-pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_decode_into};
+pub use embedding::{
+    embedding_batch, embedding_batch_vocab_shard, embedding_decode_into, embedding_rows_into,
+};
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "kimi-k2")]
@@ -58,12 +62,32 @@ pub use lora::{
 };
 pub use norm::{
     fused_add_rms_norm_batch_into, fused_add_rms_norm_into, fused_add_rms_norm_round_batch_into,
-    layer_norm_into, rms_norm, rms_norm_batch_into, rms_norm_batch_offset_into,
-    rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into,
+    fused_add_rms_norm_round_into, layer_norm_into, rms_norm, rms_norm_batch_into,
+    rms_norm_batch_offset_into, rms_norm_gated_batch_into, rms_norm_into, rms_norm_offset_into,
+    rms_norm_rows_into,
 };
 pub use sampling::{
     BatchSamplingRow, BatchSamplingScratch, argmax, argmax_batch_bf16_into,
-    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
-    flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes, gpu_sample_batch_into,
-    markov_step_argmax_into,
+    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len, argmax_bf16_into,
+    argmax_bf16_split_into, flashinfer_top1_batch_into, flashinfer_top1_row_states_bytes,
+    gpu_sample_batch_into, markov_step_argmax_into, markov_step_argmax_partials_len,
 };
+
+/// Calling thread's last FFI exception message, ready to append to an error;
+/// empty unless `result` is the -1 sentinel set by the C++ guard. Public for
+/// crates that call guarded FFI entries directly instead of through a wrapper.
+pub fn ffi_exception_message(result: i32) -> String {
+    if result != -1 {
+        return String::new();
+    }
+    let ptr = unsafe { crate::ffi::openinfer_kernels_last_error() };
+    if ptr.is_null() {
+        return String::new();
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(": {text}")
+    }
+}

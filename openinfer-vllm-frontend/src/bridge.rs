@@ -5,26 +5,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::EngineId;
+use vllm_engine_core_client::protocol::dtype::ModelDtype;
+use vllm_engine_core_client::protocol::encode_msgpack;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::logprobs::{Logprobs, MaybeWireLogprobs, PositionLogprobs};
+use vllm_engine_core_client::protocol::output::{
+    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    EngineCoreOutputs, RequestBatchOutputs, StopReason, UtilityCallOutput,
+};
+use vllm_engine_core_client::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
+use vllm_engine_core_client::protocol::stats::{PrefillStats, SchedulerStats};
 use vllm_engine_core_client::protocol::utility::{
     UtilityCallId, UtilityOutput, UtilityResultEnvelope,
-};
-use vllm_engine_core_client::protocol::{
-    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
-    EngineCoreOutputs, EngineCoreRequest, EngineCoreRequestType, ModelDtype, StopReason,
-    encode_msgpack, stats::PrefillStats,
 };
 use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
 use openinfer_engine::engine::{
-    EngineHandle, GenerateRequest, RequestAbortReason, RequestTag, TokenEvent, TokenSink,
-    TokenStreamReceiver,
+    EngineHandle, GenerateRequest, LoadSnapshot, RequestAbortReason, RequestTag, TokenEvent,
+    TokenSink, TokenStreamReceiver,
 };
 
 use crate::wire::{
@@ -110,6 +113,21 @@ impl LocalEngineBridge {
         let (output_tx, output_rx) = mpsc::unbounded_channel();
         let output_task = tokio::spawn(output_loop(output, output_rx));
 
+        // Republish the scheduler's load snapshots as stats-only output
+        // batches so the frontend's Prometheus gauges (scheduler_running,
+        // scheduler_waiting, kv_cache_usage) track the engine. The watch
+        // channel coalesces to at most one message per scheduler step, and the
+        // scheduler publishes a final drained snapshot before parking idle, so
+        // the gauges settle to zero instead of freezing at the last busy
+        // value. Engines without a load watch simply publish no stats.
+        let stats_task = self.handle.load_watch().map(|load_rx| {
+            tokio::spawn(publish_scheduler_stats(
+                load_rx,
+                output_tx.clone(),
+                shutdown.clone(),
+            ))
+        });
+
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
         // in `streams`, keyed by the same tag, and holds the abort reason the
@@ -152,6 +170,9 @@ impl LocalEngineBridge {
             state.abort(RequestAbortReason::Cancelled);
         }
         drop(output_tx);
+        if let Some(task) = stats_task {
+            task.abort();
+        }
         output_task.abort();
 
         Ok(())
@@ -374,13 +395,14 @@ fn dispatch_burst(
     }
     send_outputs(
         output_tx,
-        EngineCoreOutputs {
+        RequestBatchOutputs {
             engine_index: ENGINE_INDEX,
             outputs,
             finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
             timestamp: now_secs_f64(),
             ..Default::default()
-        },
+        }
+        .into(),
     )
 }
 
@@ -485,6 +507,48 @@ fn reduce_request(
     (Some(output), terminated)
 }
 
+/// Forward every scheduler load snapshot as a stats-only output batch; the
+/// frontend records it into the shared Prometheus registry. Sends the current
+/// snapshot up front so the gauges initialize before the first step, then one
+/// message per watch change until shutdown or either channel closes.
+async fn publish_scheduler_stats(
+    mut load_rx: watch::Receiver<LoadSnapshot>,
+    output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let snapshot = *load_rx.borrow_and_update();
+        let stats = SchedulerStats {
+            num_running_reqs: snapshot.num_running_reqs,
+            num_waiting_reqs: snapshot.num_waiting_reqs,
+            kv_cache_usage: if snapshot.kv_total_blocks == 0 {
+                0.0
+            } else {
+                snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
+            },
+            ..SchedulerStats::default()
+        };
+        let outputs = RequestBatchOutputs {
+            engine_index: ENGINE_INDEX,
+            scheduler_stats: Some(Box::new(stats)),
+            timestamp: now_secs_f64(),
+            ..Default::default()
+        }
+        .into();
+        if send_outputs(&output_tx, outputs).is_err() {
+            return;
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            changed = load_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn output_loop(
     mut output: PushSocket,
     mut output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
@@ -508,7 +572,7 @@ fn send_terminal_output(
 ) -> Result<()> {
     send_outputs(
         output_tx,
-        EngineCoreOutputs {
+        RequestBatchOutputs {
             engine_index: ENGINE_INDEX,
             outputs: vec![engine_output(
                 request_id.clone(),
@@ -522,7 +586,8 @@ fn send_terminal_output(
             finished_requests: Some(BTreeSet::from([request_id])),
             timestamp: now_secs_f64(),
             ..Default::default()
-        },
+        }
+        .into(),
     )
 }
 
@@ -541,16 +606,16 @@ fn send_utility_response(
 
     send_outputs(
         output_tx,
-        EngineCoreOutputs {
+        UtilityCallOutput {
             engine_index: ENGINE_INDEX,
-            utility_output: Some(UtilityOutput {
+            timestamp: now_secs_f64(),
+            output: UtilityOutput {
                 call_id,
                 failure_message: None,
                 result: Some(UtilityResultEnvelope::without_type_info(result)),
-            }),
-            timestamp: now_secs_f64(),
-            ..Default::default()
-        },
+            },
+        }
+        .into(),
     )
 }
 
