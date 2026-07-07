@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use openinfer::server_engine::ModelType;
 use openinfer::vllm_frontend::LoraModule;
 use openinfer_core::engine::EpBackend;
@@ -27,7 +28,8 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
 
-    /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to disable)
+    /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
+    /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 
@@ -50,16 +52,16 @@ pub(crate) struct Args {
     #[arg(long = "max-lora-rank", default_value_t = Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK, value_parser = parse_max_lora_rank_arg)]
     pub max_lora_rank: usize,
 
-    /// CUDA device ordinal for single-GPU Qwen3 loads
+    /// CUDA device ordinal for single-GPU Qwen3/Qwen3.5 loads
     #[arg(long, default_value_t = 0)]
     pub device_ordinal: usize,
 
-    /// Tensor-parallel world size for Qwen3
+    /// Tensor-parallel world size (Qwen3 and Kimi-K2; GLM5.2 requires 1)
     #[arg(long, default_value_t = 1)]
     pub tp_size: usize,
 
-    /// Data-parallel world size. Defaults are model-specific: Kimi-K2 uses 8,
-    /// GLM5.2 load-weight uses 1.
+    /// Data-parallel world size. Kimi-K2 and GLM5.2 both default to 8; GLM5.2
+    /// requires exactly 8.
     #[arg(long)]
     pub dp_size: Option<usize>,
 
@@ -82,7 +84,7 @@ pub(crate) struct Args {
 
     /// Host pinned-memory pool size for the KV offload tier, in GiB. pegaflow
     /// allocates the whole pool up front, so RSS reflects this at startup.
-    #[arg(long, default_value_t = 8.0)]
+    #[arg(long, default_value_t = 8.0, value_parser = parse_offload_gib, requires = "kv_offload")]
     pub kv_offload_host_gib: f64,
 
     /// Back the KV offload pool with 2 MiB hugepages. The box must hold a
@@ -133,8 +135,9 @@ pub(crate) struct Args {
     #[arg(long = "dflash-draft-model-path")]
     pub dflash_draft_model_path: Option<PathBuf>,
 
-    /// Cap on total prompt tokens forwarded in one scheduler step. When omitted,
-    /// Qwen3 and Qwen3.5 use their own crate defaults.
+    /// Cap on total prompt tokens forwarded in one scheduler step. Qwen3 and
+    /// Qwen3.5 only (rejected for other model lines); when omitted, they use
+    /// their own crate defaults.
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 
@@ -153,7 +156,8 @@ pub(crate) struct Args {
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
-    /// runtime buffers, activation peak, CUDA Graph capture, and margin.
+    /// runtime buffers, activation peak, margin, and (single-GPU only) CUDA-graph
+    /// capture; tensor parallelism runs decode eagerly (no graph).
     #[cfg(feature = "qwen3")]
     #[arg(long, default_value_t = openinfer_qwen3::DEFAULT_GPU_MEMORY_UTILIZATION)]
     pub gpu_memory_utilization: f64,
@@ -177,8 +181,8 @@ pub(crate) struct Args {
     pub decode_overlap: CliDecodeOverlap,
 
     /// Percent of SMs pinned to decode in `--decode-overlap green-ctx` (the rest
-    /// go to prefill). Ignored in other modes.
-    #[arg(long, default_value_t = 20)]
+    /// go to prefill); rejected if set in any other mode.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=99))]
     pub decode_sm_pct: u32,
 
     /// Enable Qwen3 projection-GEMM and split-KV chunk-count batch-invariant
@@ -230,20 +234,114 @@ impl CliDecodeOverlap {
     }
 }
 
+/// Flags accepted for every model line regardless of detected type.
+const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
+
+/// The CLI arg ids each model line uses — the applicability source of truth for
+/// `validate()`.
+fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
+    match model_type {
+        #[cfg(feature = "deepseek-v4")]
+        ModelType::DeepSeekV4 => &["cuda_graph", "deepseek_prefill_profile"],
+        #[cfg(feature = "deepseek-v2-lite")]
+        ModelType::DeepSeekV2Lite => &["cuda_graph"],
+        #[cfg(feature = "glm52")]
+        ModelType::Glm52 => &[
+            "tp_size",
+            "dp_size",
+            "dflash_draft_model_path",
+            "max_model_len",
+            "no_prefix_cache",
+            "kv_offload",
+            "kv_offload_host_gib",
+            "kv_offload_hugepages",
+            "moe_topo",
+        ],
+        #[cfg(feature = "kimi-k2")]
+        ModelType::KimiK2 => &["tp_size", "dp_size", "ep_backend", "cuda_graph"],
+        #[cfg(feature = "qwen3")]
+        ModelType::Qwen3 => &[
+            "cuda_graph",
+            "enable_lora",
+            "lora_modules",
+            "max_loras",
+            "max_lora_rank",
+            "device_ordinal",
+            "tp_size",
+            "kv_offload",
+            "kv_offload_host_gib",
+            "kv_offload_hugepages",
+            "kv_p2p_metaserver_addr",
+            "kv_p2p_advertise_addr",
+            "kv_p2p_nics",
+            "kv_p2p_flush_on_finish",
+            "no_prefix_cache",
+            "max_prefill_tokens",
+            "gpu_memory_utilization",
+            "kv_cache_memory_margin_mib",
+            "kv_page_size",
+            "decode_overlap",
+            "decode_sm_pct",
+            "batch_invariant",
+            "dflash_draft_model_path",
+        ],
+        #[cfg(feature = "qwen35-4b")]
+        ModelType::Qwen35 => &["device_ordinal", "cuda_graph", "max_prefill_tokens"],
+    }
+}
+
+fn long_flag(cmd: &clap::Command, id: &str) -> String {
+    cmd.get_arguments()
+        .find(|arg| arg.get_id() == id)
+        .and_then(clap::Arg::get_long)
+        .map_or_else(|| id.to_owned(), str::to_owned)
+}
+
+/// Arg ids the user set explicitly (command line or env), for consume-or-reject.
+pub(crate) fn provided_args(matches: &clap::ArgMatches) -> BTreeSet<String> {
+    // matches.ids() also yields clap's synthetic struct-name group id; keep only real args.
+    let cmd = Args::command();
+    let real: BTreeSet<&str> = cmd
+        .get_arguments()
+        .map(|arg| arg.get_id().as_str())
+        .collect();
+    matches
+        .ids()
+        .map(clap::Id::as_str)
+        .filter(|id| real.contains(id))
+        .filter(|id| {
+            matches!(
+                matches.value_source(id),
+                Some(
+                    clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable
+                )
+            )
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 impl Args {
-    pub(crate) fn validate(&self, model_type: ModelType) -> Result<()> {
+    pub(crate) fn validate(
+        &self,
+        model_type: ModelType,
+        provided: &BTreeSet<String>,
+    ) -> Result<()> {
+        let cmd = Self::command();
+        for id in provided {
+            let id = id.as_str();
+            if CORE_ARGS.contains(&id) || consumed_args(model_type).contains(&id) {
+                continue;
+            }
+            bail!("--{} is not used by {model_type:?}", long_flag(&cmd, id));
+        }
         if !self.enable_lora && !self.lora_modules.is_empty() {
             bail!("--lora-modules requires --enable-lora");
         }
-        #[cfg(feature = "qwen3")]
-        let is_qwen3 = matches!(model_type, ModelType::Qwen3);
-        #[cfg(not(feature = "qwen3"))]
-        let is_qwen3 = false;
-        if self.enable_lora && !is_qwen3 {
-            bail!("--enable-lora is currently supported only for Qwen3");
-        }
-        if self.batch_invariant && !is_qwen3 {
-            bail!("--batch-invariant is currently supported only for Qwen3");
+        if !self.enable_lora
+            && (provided.contains("max_loras") || provided.contains("max_lora_rank"))
+        {
+            bail!("--max-loras and --max-lora-rank require --enable-lora");
         }
         if self.batch_invariant && self.enable_lora {
             bail!("--batch-invariant is not supported with --enable-lora; enable one at a time");
@@ -258,6 +356,19 @@ impl Args {
                 "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time"
             );
         }
+        if provided.contains("decode_sm_pct")
+            && !matches!(self.decode_overlap, CliDecodeOverlap::GreenCtx)
+        {
+            bail!("--decode-sm-pct only applies with --decode-overlap=green-ctx");
+        }
+        if provided.contains("device_ordinal") && self.tp_size > 1 {
+            bail!(
+                "--device-ordinal is ignored under tensor parallelism; tp_size>1 uses devices 0..tp_size"
+            );
+        }
+        if !matches!(self.decode_overlap, CliDecodeOverlap::Off) && self.tp_size > 1 {
+            bail!("--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap");
+        }
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
             if let Some(dp_size) = self.dp_size {
@@ -267,15 +378,6 @@ impl Args {
                     );
                 }
             }
-        }
-        // Fail loud rather than silently ignoring the flag for a model line
-        // that does not consume it (Qwen3/3.5 read theirs from config.json).
-        #[cfg(feature = "glm52")]
-        let supports_max_model_len = matches!(model_type, ModelType::Glm52);
-        #[cfg(not(feature = "glm52"))]
-        let supports_max_model_len = false;
-        if self.max_model_len.is_some() && !supports_max_model_len {
-            bail!("--max-model-len is currently supported only for GLM5.2 (got {model_type:?})");
         }
         Ok(())
     }
@@ -335,6 +437,17 @@ pub(crate) fn parse_lora_modules_arg(value: &str) -> Result<LoraModule, String> 
     }
 }
 
+fn parse_offload_gib(value: &str) -> Result<f64, String> {
+    let gib = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid --kv-offload-host-gib: {error}"))?;
+    if gib.is_finite() && gib > 0.0 {
+        Ok(gib)
+    } else {
+        Err("--kv-offload-host-gib must be a positive, finite number of GiB".to_owned())
+    }
+}
+
 #[cfg(feature = "qwen3")]
 pub(crate) fn parse_max_lora_rank_arg(value: &str) -> Result<usize, String> {
     let rank = value
@@ -366,6 +479,53 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "glm52")]
+    fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
+        use clap::FromArgMatches;
+        let matches = Args::command()
+            .try_get_matches_from(argv)
+            .expect("args parse");
+        let args = Args::from_arg_matches(&matches).expect("args from matches");
+        (args, provided_args(&matches))
+    }
+
+    fn all_model_types() -> Vec<ModelType> {
+        [
+            #[cfg(feature = "deepseek-v4")]
+            ModelType::DeepSeekV4,
+            #[cfg(feature = "deepseek-v2-lite")]
+            ModelType::DeepSeekV2Lite,
+            #[cfg(feature = "glm52")]
+            ModelType::Glm52,
+            #[cfg(feature = "kimi-k2")]
+            ModelType::KimiK2,
+            #[cfg(feature = "qwen3")]
+            ModelType::Qwen3,
+            #[cfg(feature = "qwen35-4b")]
+            ModelType::Qwen35,
+        ]
+        .to_vec()
+    }
+
+    #[test]
+    fn consumed_and_core_are_real_arg_ids() {
+        let ids: BTreeSet<String> = Args::command()
+            .get_arguments()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        for id in CORE_ARGS {
+            assert!(ids.contains(*id), "core arg {id} is not a real CLI arg id");
+        }
+        for model_type in all_model_types() {
+            for id in consumed_args(model_type) {
+                assert!(
+                    ids.contains(*id),
+                    "{model_type:?} lists {id}, which is not a real CLI arg id"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_lora_modules_name_equals_path() {
@@ -427,20 +587,18 @@ mod tests {
     #[cfg(feature = "glm52")]
     #[test]
     fn glm52_accepts_omitted_dp_size() {
-        let args = Args::parse_from(["openinfer"]);
-
-        args.validate(ModelType::Glm52)
+        let (args, provided) = parse_with_provided(&["openinfer"]);
+        args.validate(ModelType::Glm52, &provided)
             .expect("GLM5.2 should default to DP8/EP8 when --dp-size is omitted");
     }
 
     #[cfg(feature = "glm52")]
     #[test]
     fn glm52_rejects_non_dp8() {
-        let args = Args::parse_from(["openinfer", "--dp-size", "1"]);
+        let (args, provided) = parse_with_provided(&["openinfer", "--dp-size", "1"]);
         let error = args
-            .validate(ModelType::Glm52)
+            .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 should reject explicit non-DP8");
-
         assert!(error.to_string().contains("DP8/EP8"));
     }
 }
