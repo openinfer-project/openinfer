@@ -1,15 +1,20 @@
 # GLM5.2 decode MoE: EP8 → TP8-sharded persistent kernel + LL allreduce
 
-> **TL;DR:** Plan (no code yet) to replace the bucket-1 decode MoE path — the DeepEP EP8
+> **TL;DR:** Replace the bucket-1 decode MoE path — the DeepEP EP8
 > dispatch/grouped-GEMM/combine chain, at ~103 µs/layer kernel-resident / ~145 µs/layer
 > wait-inclusive the single largest bucket of the 19.5 ms solo step — with one TP8-sharded
-> cooperative persistent kernel per layer plus a low-latency (LL) packet reduce-scatter.
-> A standalone prototype on the same 8×H200 node measures the TP form at **~36 µs/layer**;
-> target is solo **19.5 → ~14–15 ms/step**. EP8 is *not* deleted: expert sharding is chosen
-> at load time (weights are repacked during H2D anyway), so EP8 remains the high-throughput
-> launch configuration while TP8 becomes the low-latency one. Inspired by the latency-first
-> executor design of TileRT (persistent kernels, communication as graph nodes, no NCCL in
-> the hot path); everything here is measured and implemented independently in this repo.
+> whole-layer persistent kernel per layer plus a low-latency (LL) packet reduce-scatter.
+> P0 + M0 + M1 code are on `feat/glm52-moe-tp8`. M1 pilot (8 layers dual-resident) is
+> functionally green (smoke, determinism ×2, coherent text); in-situ kernel **56.5 µs/layer**
+> vs the EP8 segment's 110.1 µs (**−60 µs/layer real**), but a fixed **+0.85 ms/step
+> peer-access-grant tax** initially ate the win — root-caused by bisection, fixed by
+> VMM-mapped LL buffers (f6da40f), final A/B pending. Target is solo
+> **19.5 → ~14–15 ms/step** at M2 (75 layers). EP8 is *not* deleted: expert sharding is
+> chosen at load time (weights are repacked during H2D anyway), so EP8 remains the
+> high-throughput launch configuration while TP8 becomes the low-latency one. Inspired by
+> the latency-first executor design of TileRT (persistent kernels, communication as graph
+> nodes, no NCCL in the hot path); everything here is measured and implemented
+> independently in this repo.
 >
 > **Last touched:** 2026-07
 
@@ -129,7 +134,7 @@ Per this repo's own calibration discipline, all claims settle on e2e A/B via
 |---|---|---|
 | **P0** | Mechanism probes, before any kernel work — these are the only kill-level unknowns: (a) LL buffer `cudaDeviceEnablePeerAccess` coexisting with NCCL ≥2.30 symmetric-window registration in the real process shape (single process, 8 threads, primary contexts); (b) cooperative launch under cudarc stream capture + graph replay | Both probes pass on jz-38. **Kill: either fails → redesign before spending on kernels**. **(a) PASSED 2026-07-07** — standalone probe (`p0_probe_peer_nccl.cu`, lands with the M1 PR), 8×H200 / NCCL 2.30.7: symmetric window + allreduce, peer-access LL mailboxes, and 50 interleaved NCCL+LL rounds all verify in **both** init orders (NCCL-first and peer-first). Fidelity caveat: probe drives the NCCL *host* API over the window; the DeepEP shim's device API (ncclDevComm/GIN) coexistence is re-checked implicitly in M1 when both run in-process. **(b) PASSED 2026-07-07** — `p0_probe_coop_graph.cu`: cooperative launch via `cudaLaunchKernelExC`+attr (the DeepEP-shim launch shape) captured with `cudaStreamBeginCapture`, instantiated, **50 replays enqueued back-to-back with zero host involvement** — epoch advances via a device-side counter, parity double-buffered LL packets across all 8 GPUs, kernel self-verifies every round; NCCL window allreduce healthy before capture and after the storm. Kernel-design lesson baked into the probe: **no block barrier may sit in a thread-divergent branch of a kernel that also calls `grid.sync()`** — threads parked at the grid barrier never release a `__syncthreads`, deadlocking the block (the probe's first version hung on every coop variant this way; isolation matrix + rerunning the R4 ground truth pinned it) |
 | **M0** | Kernel extension m=1 → m=8 in the standalone prototype (no pegainfer changes) | **DONE 2026-07-07, PASSED**: solo **55.2 µs/layer** (1.54× the m=1 anchor's 35.7 — under the 2× kill line; **6.9 µs/token = 5.2× per-token amortization**), diverse (E_active=22) 74.8 µs; CPU golden 0.0030/0.0044 < 5e-3 both configs; grid 264. Final form differs from the plan sketch in two load-bearing ways: (1) the compute engine is the **batch-8 m16n8k16 mma port** from `glm52_moe_gemv.cu` (σ-permutation, fp8→bf16 lossless, f32 tensor-core accum) — the scalar 8-token-reuse form measured 171 µs (instruction wall + occupancy); (2) activations stay in **global memory (L2-hot), not smem** — 96 KB smem capped occupancy and the mma B-fragment reads pointers anyway. Phases run as a global warp-job pool (expert × proj × 16-row tile × k-slice) with f32 partial scratch and fixed-order epilogues (deterministic). Two portable traps recorded: mma k-slices MUST be multiples of 128 (scale-fold contract, now static_asserted), and per-token top-8 + union compaction must not serialize on one block (was 41.5 µs of grid.sync parking; block-parallel top-8 + ballot-scan → 8 µs). Remaining headroom: phase B 20.1 µs vs ~7 µs weight roofline. Details: skeleton_bench `M0_实验记录.md` |
-| **M1** | Pilot integration, N=8 layers dual-resident: loader TP-slice path (pilot layers only), `Glm52LayerMlp::MoeTp` arm, LL buffers + epoch counters in a resident arena, cooperative-launch FFI, TP layer oracle gate | `glm52_step_bench` bucket-1 A/B: **pilot 8 layers ≥ −0.4 ms total** (~−55 µs/layer, generous margin); oracle + determinism ×2 green. **Kill: < −0.2 ms** → attribute before proceeding |
+| **M1** | Pilot integration, N=8 layers dual-resident: loader TP-slice path (pilot layers only), LL buffers + epoch counters in a resident arena, launch FFI, TP layer oracle gate | `glm52_step_bench` bucket-1 A/B: **pilot 8 layers ≥ −0.4 ms total** (~−55 µs/layer, generous margin); oracle + determinism ×2 green. **Kill: < −0.2 ms** → attribute before proceeding. **Status 2026-07-07: functionally DONE; perf kill-line hit, root-caused, fix committed (f6da40f), final A/B pending.** Wiring: second-pass TP-slice loader (`openinfer-glm52/src/moe_tp8.rs`, pilot layers dual-resident, ~+9.7 GiB/rank correctly charged by the VRAM probe: cap 72576 → 49600), kernel rides the EP8 arm's graph slot for bucket-1 only (`--moe-tp8-pilot-layers`). Functional gates green on jz-38: 96-step smoke across 4 buckets × 2 tiers, determinism ×2 byte-identical, text coherent (one near-tie divergence at byte 55/685 vs EP8 — expected, different partial-sum order). In-situ kernel median **56.5 µs/layer** (= M0's 55.2 reproduced) vs EP8 segment wall 110.1 µs; the **−60 µs/layer** win confirmed by two independent methods (nsys segment walls + untraced layer-count-sweep slope). But untraced solo A/B first read **+0.36 ms** (kill line). Sweep over pilot = 0/1/2/4/8 (19.23 / 20.04 / 20.02 / 19.84 / 19.59 ms) decomposed it: real −60 µs/layer under a **fixed +0.85 ms/step tax paid from the first pilot layer**. Bisection with empty-kernel / no-alloc variants pinned the tax to the *existence of a cross-device peer-access grant*: `cudaDeviceEnablePeerAccess` and pool-scoped `cudaMemPoolSetAccess` both pay it in full (grant + empty kernel node = tax; no grant = 19.12 ms, tax gone). Mechanism: the grant's page-table side effect slows the memory-bound EP8 expert GEMMs on *all* layers. NCCL/DeepEP symmetric windows are tax-free because they map peer ranges precisely via CUDA VMM (`cuMemCreate`/`cuMemMap`/`cuMemSetAccess` per range) — the EP8 baseline itself is the existence proof. Falsified along the way (all measured): grid 132 vs 264, the cooperative-launch attribute (a software sense-reversing grid barrier on a monotonic generation counter measures identical — kept, since it also removes the coop-launch constraint), graph-topology/aux-fork parity, and `cudaGraphLaunch` +94 µs as a cause (symptom: API duration includes enqueue wait). Methodology trap for the record: **node-traced nsys A/B inverted the verdict** (pilot-8 looked *faster* traced) — per-kernel tracing overhead inflates the ~12-kernel EP8 chain more than the 1-kernel TP8 layer; only untraced e2e ITL decides. Fix: LL buffers allocated and peer-mapped via VMM (f6da40f). Expected post-fix: pilot-8 solo ≈ 18.8 ms ≈ baseline −0.4 ms = accept |
 | **M2** | All 75 layers behind a launch-time sharding switch; pad semantics (pads computed, outputs dropped) | solo **≤ 15.5 ms/step**; all e2e gates (determinism, 8-way, disconnect, teardown) green; launch-ahead unaffected (feed kernel untouched) |
 | **M3** | Bucket decision by measurement: masked grouped GEMM on TP slices at m=16/32/64 (per-rank N thins to 512 gate|up) vs staying EP8 for buckets 2/4/8. Within one process the layouts are exclusive (constraint 1), so this sets the *default* of the launch-time switch and decides whether EP8 ever retires | Decision record written from M2 data + the masked-GEMM-on-slice microbench |
 | **M4** | Follow-on (next phase): attention projections TP + o_proj allreduce reusing the same LL machinery; MTP verify path | separate doc when reached |
@@ -145,7 +150,7 @@ same bytes as EP8, but the persistent kernel's tile loop lengthens and dilutes t
 3. **Cooperative kernel occupancy vs existing aux-stream overlap** — the shared expert
    folds into the kernel (no loss by construction), and indexer∥MLA overlap lives
    outside the MoE segment; confirm with an nsys graph trace anyway.
-4. **Grid size** — re-sweep at m=8 after integration.
+4. ~~**Grid size**~~ — measured flat in-situ (132 vs 264 identical, M1).
 5. **Near-tie routing flips under the tolerance gate** — bounded allowance, as EP8.
 
 ## Code map (verified against main @ 9c169f9)
@@ -166,6 +171,7 @@ same bytes as EP8, but the persistent kernel's tile loop lengthens and dilutes t
 
 ## Next action
 
-P0 fully green (both probes passed 2026-07-07). Next: M0 — extend the prototype
-TP-MoE kernel from m=1 to m=8 (8-token smem residency, phase-B weight reuse,
-per-token top-8, reduce-scatter exit), re-sweep grid size, CPU-golden gate.
+M1 blocked only on the final A/B of the VMM fix (f6da40f) — jz-38 currently occupied
+by another workload. On node free: pilot-8 solo ITL ×2 (accept ≈ 18.8 ms) +
+determinism + text, then c8 diverse step-bench A/B for the record, toxic review, PR.
+Then M2: all 75 layers behind the launch-time sharding switch.
