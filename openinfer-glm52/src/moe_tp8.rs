@@ -296,6 +296,7 @@ pub(crate) struct Glm52MoeTp8State {
     peer_ag: [u64; RANKS],
     peer_rs: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
+    barrier_state: CudaSlice<u32>,
     xg: CudaSlice<bf16>,
     topk_all_idx: CudaSlice<i32>,
     topk_all_prob: CudaSlice<f32>,
@@ -345,6 +346,7 @@ impl Glm52MoeTp8State {
             peer_ag,
             peer_rs,
             epoch_dev,
+            barrier_state: ctx.stream.alloc_zeros(2)?,
             xg: ctx.stream.alloc_zeros(RANKS * H)?,
             topk_all_idx: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
             topk_all_prob: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
@@ -386,6 +388,7 @@ impl Glm52MoeTp8State {
             peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
+            barrier_state: &mut self.barrier_state,
         };
         glm52_moe_tp8_layer_launch(
             ctx,

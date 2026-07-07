@@ -29,12 +29,9 @@
 //     the ~100 s device timeout with a half-paired collective)
 //   - no block barrier inside thread-divergent LL branches (a __syncthreads
 //     there deadlocks against grid.sync — probe-proven)
-#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
-
-namespace cg = cooperative_groups;
 
 namespace {
 
@@ -75,6 +72,37 @@ __device__ __forceinline__ void ll_wait(const uint4* p, unsigned tag, uint4* out
     if (++c > 200000000L) __trap();
   } while (q.w != tag);
   *out = q;
+}
+
+// Software grid barrier (sense-reversing on a monotonic generation counter).
+// Deliberately NOT a cooperative launch + cg::grid_group: a full-device
+// cooperative kernel node makes every cudaGraphLaunch of the containing
+// whole-step graph ~90 us more expensive on the host (measured pilot=1 vs
+// pilot=0, graph-mode nsys), and the 8 rank threads' launches serialize on
+// the driver — a flat ~0.8 ms/step tax that erased the per-layer win. The
+// grid is sized to co-residency (occupancy API) and the stream is graph-
+// serialized, so all blocks become resident and the barrier completes; the
+// spin cap traps instead of hanging if that invariant is ever violated.
+// `gen` is monotonic across launches and replays — no reset, same trick as
+// the LL epoch. `count` self-resets each round.
+__device__ __forceinline__ void grid_barrier(unsigned* count, unsigned* gen) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    const unsigned g = *(volatile unsigned*)gen;
+    if (atomicAdd(count, 1u) == gridDim.x - 1) {
+      *count = 0u;
+      __threadfence();
+      atomicAdd(gen, 1u);
+    } else {
+      long c = 0;
+      while (*(volatile unsigned*)gen == g) {
+        if (++c > 2000000000L) __trap();
+      }
+    }
+    __threadfence();
+  }
+  __syncthreads();
 }
 
 // fp8 e4m3 pair -> packed bf16x2, exact (e4m3 is representable in bf16).
@@ -200,6 +228,7 @@ struct Glm52MoeTp8Args {
   uint4* peer_ag[kRanks];        // peer p's ag buffer + myrank*kAgPackets
   uint4* peer_rs[kRanks];        // peer p's rs buffer + myrank*H
   unsigned long long* epoch_dev;
+  unsigned* barrier_state;  // [2] = {count, generation}, zero-initialized once
   int nranks, myrank;
 };
 
@@ -207,7 +236,7 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     Glm52MoeTp8Args a) {
   __shared__ int wcnt[8];
   __shared__ int scomp[kExperts];
-  cg::grid_group grid = cg::this_grid();
+  unsigned* const bar = a.barrier_state;
   const int t = threadIdx.x, w = t >> 5;
   const int gw = blockIdx.x * (kThreads / 32) + w, TW = gridDim.x * (kThreads / 32);
   const int gt = blockIdx.x * kThreads + t;
@@ -258,7 +287,7 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
       }
     }
   }
-  grid.sync();
+  grid_barrier(bar, bar + 1);
 
   // ---- union (block 0): ballot compaction over gathered topk ----
   if (blockIdx.x == 0) {
@@ -292,7 +321,7 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
       }
     }
   }
-  grid.sync();
+  grid_barrier(bar, bar + 1);
   const int UC = *a.gucnt;
 
   // ---- B: gate|up mma over the union (NT=2 chains) ----
@@ -321,7 +350,7 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
       }
     }
   }
-  grid.sync();
+  grid_barrier(bar, bar + 1);
   // SiLU epilogue: gate rows [0,256), up rows [256,512), fixed-order k reduce.
   for (int i = gt; i < UC * kTokens * kSliceI; i += GT) {
     int u = i / (kTokens * kSliceI);
@@ -339,7 +368,7 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     float sg = G / (1.f + __expf(-G));
     a.ug[((size_t)u * kTokens + j) * kSliceI + row] = __float2bfloat16(sg * U);
   }
-  grid.sync();
+  grid_barrier(bar, bar + 1);
 
   // ---- C: down mma (k = 256, single slice) ----
   for (int job = gw; job < UC * (kHidden / 16); job += TW) {
@@ -358,7 +387,7 @@ __global__ void __launch_bounds__(kThreads) glm52_moe_tp8_layer_kernel(
     cp[(size_t)c0 * kHidden + tile * 16 + gid + 8] = acc[0][2];
     cp[(size_t)(c0 + 1) * kHidden + tile * 16 + gid + 8] = acc[0][3];
   }
-  grid.sync();
+  grid_barrier(bar, bar + 1);
 
   // ---- RS: fixed-order prob-weighted sum, push token j -> rank j ----
   for (int i = gt; i < kTokens * kHidden; i += GT) {
@@ -471,7 +500,8 @@ int glm52_moe_tp8_layer_launch_cuda(
     void* topk_all_prob, void* guidx, void* guprob, void* gucnt, void* gused,
     void* bpart, void* ug, void* cpart, void* ag_local, void* rs_local,
     const void* const* peer_ag, const void* const* peer_rs, void* epoch_dev,
-    int nranks, int myrank, int grid_blocks, cudaStream_t stream) {
+    void* barrier_state, int nranks, int myrank, int grid_blocks,
+    cudaStream_t stream) {
   if (nranks != kRanks || myrank < 0 || myrank >= nranks) {
     return (int)cudaErrorInvalidValue;
   }
@@ -501,22 +531,17 @@ int glm52_moe_tp8_layer_launch_cuda(
     a.peer_rs[p] = (uint4*)peer_rs[p];
   }
   a.epoch_dev = (unsigned long long*)epoch_dev;
+  a.barrier_state = (unsigned*)barrier_state;
   a.nranks = nranks;
   a.myrank = myrank;
 
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeCooperative;
-  attrs[0].val.cooperative = 1;
-  cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(grid_blocks);
-  cfg.blockDim = dim3(kThreads);
-  cfg.dynamicSmemBytes = 0;
-  cfg.stream = stream;
-  cfg.attrs = attrs;
-  cfg.numAttrs = 1;
+  // Plain launch on purpose — see grid_barrier above for why the cooperative
+  // attribute is banned here. grid_blocks must not exceed the occupancy
+  // returned by glm52_moe_tp8_max_blocks_cuda (co-residency invariant).
   void* args[] = {&a};
-  return (int)cudaLaunchKernelExC(&cfg, (const void*)glm52_moe_tp8_layer_kernel,
-                                  args);
+  return (int)cudaLaunchKernel((const void*)glm52_moe_tp8_layer_kernel,
+                               dim3(grid_blocks), dim3(kThreads), args, 0,
+                               stream);
 }
 
 }  // extern "C"

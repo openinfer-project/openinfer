@@ -130,6 +130,9 @@ pub struct Glm52MoeTp8Buffers<'a> {
     pub peer_ag: [u64; GLM52_TP8_RANKS],
     pub peer_rs: [u64; GLM52_TP8_RANKS],
     pub epoch_dev: &'a mut CudaSlice<u64>,
+    /// `[count, generation]` for the software grid barrier — zero-initialized
+    /// once; the generation is monotonic across launches and replays.
+    pub barrier_state: &'a mut CudaSlice<u32>,
 }
 
 /// Launch the whole-layer TP8 MoE cooperative kernel for this rank's token.
@@ -188,7 +191,8 @@ pub fn glm52_moe_tp8_layer_launch(
             && bufs.bpart.len() >= GLM52_TP8_BPART_LEN
             && bufs.ug.len() >= GLM52_TP8_UG_LEN
             && bufs.cpart.len() >= GLM52_TP8_CPART_LEN
-            && !bufs.epoch_dev.is_empty(),
+            && !bufs.epoch_dev.is_empty()
+            && bufs.barrier_state.len() >= 2,
         "TP8 scratch arena too small"
     );
     ensure!(grid_blocks > 0, "TP8 grid_blocks must be positive");
@@ -219,6 +223,7 @@ pub fn glm52_moe_tp8_layer_launch(
     let (ug_ptr, _g16) = bufs.ug.device_ptr_mut(&ctx.stream);
     let (cpart_ptr, _g17) = bufs.cpart.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g20) = bufs.epoch_dev.device_ptr_mut(&ctx.stream);
+    let (bar_ptr, _g21) = bufs.barrier_state.device_ptr_mut(&ctx.stream);
     let peer_ag: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
         bufs.peer_ag.map(|p| p as *const std::ffi::c_void);
     let peer_rs: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
@@ -248,6 +253,7 @@ pub fn glm52_moe_tp8_layer_launch(
             peer_ag.as_ptr(),
             peer_rs.as_ptr(),
             epoch_ptr as *mut u64,
+            bar_ptr as *mut u32,
             GLM52_TP8_RANKS as i32,
             myrank as i32,
             grid_blocks as i32,
