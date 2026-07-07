@@ -235,9 +235,15 @@ impl Glm52WeightManifest {
         Ok(manifest)
     }
 
-    pub(crate) fn all_rank_load_bundles(&self) -> Result<Vec<Glm52RankLoadBundle>> {
+    /// `include_experts = false` builds the TP8-topology bundle: every
+    /// non-expert tensor, zero routed experts — the per-rank all-expert
+    /// slice banks are gathered by `load_tp8_slice_layer` instead.
+    pub(crate) fn all_rank_load_bundles(
+        &self,
+        include_experts: bool,
+    ) -> Result<Vec<Glm52RankLoadBundle>> {
         (0..GLM52_EP_RANKS)
-            .map(|rank| self.rank_load_bundle(rank))
+            .map(|rank| self.rank_load_bundle(rank, include_experts))
             .collect()
     }
 
@@ -250,8 +256,8 @@ impl Glm52WeightManifest {
             .with_context(|| format!("GLM5.2 safetensors index missing tensor {name}"))
     }
 
-    fn rank_load_bundle(&self, rank: usize) -> Result<Glm52RankLoadBundle> {
-        let names = self.rank_tensor_names(rank)?;
+    fn rank_load_bundle(&self, rank: usize, include_experts: bool) -> Result<Glm52RankLoadBundle> {
+        let names = self.rank_tensor_names_with(rank, include_experts)?;
         let mut by_shard: BTreeMap<String, Vec<Glm52TensorLoadSpec>> = BTreeMap::new();
         for name in names {
             let shard = self
@@ -284,16 +290,22 @@ impl Glm52WeightManifest {
     /// Every rank loads the full non-expert stack (DP8 replication, ~19.6 GiB
     /// per rank) plus its 32-expert slice of every MoE layer.
     fn rank_tensor_names(&self, rank: usize) -> Result<Vec<String>> {
+        self.rank_tensor_names_with(rank, true)
+    }
+
+    fn rank_tensor_names_with(&self, rank: usize, include_experts: bool) -> Result<Vec<String>> {
         ensure!(
             rank < GLM52_EP_RANKS,
             "GLM5.2 rank must be in 0..{GLM52_EP_RANKS}, got {rank}"
         );
         let mut names = Vec::new();
         self.push_non_expert_names(&mut names);
-        let expert_start = rank * GLM52_LOCAL_EXPERTS;
-        let expert_range = expert_start..expert_start + GLM52_LOCAL_EXPERTS;
-        for layer_idx in GLM52_DENSE_LAYERS..=GLM52_MTP_LAYER {
-            push_routed_experts(&mut names, layer_idx, expert_range.clone());
+        if include_experts {
+            let expert_start = rank * GLM52_LOCAL_EXPERTS;
+            let expert_range = expert_start..expert_start + GLM52_LOCAL_EXPERTS;
+            for layer_idx in GLM52_DENSE_LAYERS..=GLM52_MTP_LAYER {
+                push_routed_experts(&mut names, layer_idx, expert_range.clone());
+            }
         }
         Ok(names)
     }

@@ -60,6 +60,9 @@ struct Cli {
     /// TP8 low-latency MoE pilot layer count (bucket-1 A/B lever). 0 = off.
     #[arg(long, default_value_t = 0)]
     moe_tp8_pilot_layers: usize,
+    /// MoE topology: ep8 (default, all buckets) or tp8 (bucket-1 only).
+    #[arg(long, default_value = "ep8")]
+    moe_topo: String,
 }
 
 const GLM52_RANKS: usize = 8;
@@ -68,6 +71,17 @@ fn main() -> Result<()> {
     logging::init_default();
     let cli = Cli::parse();
     ensure!(!cli.buckets.is_empty(), "--buckets must be non-empty");
+    let moe_topo = match cli.moe_topo.as_str() {
+        "ep8" => openinfer_glm52::Glm52MoeTopo::Ep8,
+        "tp8" => openinfer_glm52::Glm52MoeTopo::Tp8,
+        other => bail!("--moe-topo must be ep8 or tp8, got {other}"),
+    };
+    if moe_topo == openinfer_glm52::Glm52MoeTopo::Tp8 {
+        ensure!(
+            cli.buckets.iter().all(|&b| b == 1),
+            "--moe-topo tp8 serves bucket-1 only; pass --buckets 1"
+        );
+    }
     ensure!(
         cli.steps > cli.warmup_steps + 8,
         "--steps ({}) must exceed --warmup-steps ({}) with room for a steady window",
@@ -86,7 +100,7 @@ fn main() -> Result<()> {
             no_prefix_cache: false,
             kv_offload: None,
             moe_tp8_pilot_layers: cli.moe_tp8_pilot_layers,
-            moe_topo: openinfer_glm52::Glm52MoeTopo::default(),
+            moe_topo,
         },
     )
     .context("failed to start GLM5.2 engine")?;

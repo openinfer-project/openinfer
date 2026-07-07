@@ -388,6 +388,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         w: &mut Glm52RankGpuWeights,
         max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Self> {
         ensure!(
             max_model_len > 0 && max_model_len.is_multiple_of(GLM52_MODEL_LEN_ALIGN),
@@ -416,7 +417,7 @@ impl Glm52RankModel {
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
         for layer in 0..GLM52_LAYERS {
             layers.push(
-                build::build_decoder_layer(ctx, w, layer)
+                build::build_decoder_layer(ctx, w, layer, moe_topo)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
             caches.push(Glm52LayerCaches {
@@ -453,8 +454,11 @@ impl Glm52RankModel {
         let final_norm = build::take_bf16_vec(ctx, w, "model.norm.weight", GLM52_HIDDEN)?;
 
         // The MTP layer's experts are loaded (checkpoint-coverage validation)
-        // but out of campaign scope — drop this rank's copy.
-        let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
+        // but out of campaign scope — drop this rank's copy. The TP8 bundle
+        // never loads routed experts, so there is nothing to drop there.
+        if moe_topo == crate::Glm52MoeTopo::Ep8 {
+            let _ = w.take_expert_layer(crate::weights::GLM52_MTP_LAYER)?;
+        }
 
         let mut cos_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
         let mut sin_host = Vec::with_capacity(max_model_len * GLM52_ROPE_HALF);
@@ -1017,6 +1021,36 @@ fn run_step_body(
                     glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
                         .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
                 }
+            }
+            Glm52LayerMlp::MoeTp8(router) => {
+                // TP8 topology: every MoE layer runs the phase-kernel chain;
+                // the scheduler pins the fleet to bucket-1, enforced here.
+                ensure!(
+                    batch == 1,
+                    "GLM5.2 TP8 topology stepped at bucket {batch} — the scheduler must pin \
+                     bucket-1"
+                );
+                let (state, slot, bank) = tp8
+                    .as_deref_mut()
+                    .and_then(|rank| {
+                        let Glm52MoeTp8Rank { state, slices } = rank;
+                        let slot = slices.range(..layer).count();
+                        slices.get(&layer).map(|bank| (state, slot, bank))
+                    })
+                    .with_context(|| {
+                        format!("GLM5.2 TP8 layer {layer} has no slice bank — loader drifted")
+                    })?;
+                run_router_into(ctx, router, s.layer.normed2.data(), &mut s.router)?;
+                state
+                    .forward(
+                        ctx,
+                        slot,
+                        bank,
+                        s.layer.normed2.data(),
+                        &s.router,
+                        s.layer.mlp_out.data_mut(),
+                    )
+                    .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
             }
             #[cfg(test)]
             Glm52LayerMlp::Moe(_) => {

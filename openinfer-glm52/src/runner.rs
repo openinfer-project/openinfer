@@ -99,6 +99,7 @@ enum Glm52RankCommand {
         /// residency is charged before the context-cap probe reads free
         /// VRAM). 0 = off.
         tp8_pilot_layers: usize,
+        moe_topo: crate::Glm52MoeTopo,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
     /// Non-collective: adopt the resident weights into the rank's model.
@@ -108,6 +109,7 @@ enum Glm52RankCommand {
     /// register them with the shared KV offload host.
     BuildModel {
         max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -212,12 +214,14 @@ impl Glm52RankWorker {
         &self,
         model_path: &Path,
         tp8_pilot_layers: usize,
+        moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 tp8_pilot_layers,
+                moe_topo,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -227,11 +231,13 @@ impl Glm52RankWorker {
     pub(crate) fn build_model_async(
         &self,
         max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::BuildModel {
                 max_model_len,
+                moe_topo,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -403,8 +409,25 @@ impl Glm52RankThreadState {
         &mut self,
         model_path: &Path,
         tp8_pilot_layers: usize,
+        moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Glm52RankWeightLoadReport> {
         let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
+        if moe_topo == crate::Glm52MoeTopo::Tp8 {
+            // TP8 topology: the bundle carried no routed experts; gather this
+            // rank's 1/8-I slice of ALL experts for every MoE layer instead.
+            let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
+            let dev_ctx = self.ctx.device_context()?;
+            for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
+                let bank = load_tp8_slice_layer(
+                    &dev_ctx,
+                    model_path,
+                    &manifest,
+                    self.placement.rank,
+                    layer,
+                )?;
+                self.tp8_slices.insert(layer, bank);
+            }
+        }
         if tp8_pilot_layers > 0 {
             ensure!(
                 crate::config::GLM52_DENSE_LAYERS + tp8_pilot_layers <= crate::config::GLM52_LAYERS,
@@ -445,7 +468,11 @@ impl Glm52RankThreadState {
         Ok(report)
     }
 
-    fn build_model(&mut self, max_model_len: usize) -> Result<Vec<KvArena>> {
+    fn build_model(
+        &mut self,
+        max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
+    ) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
             .take()
@@ -455,6 +482,7 @@ impl Glm52RankThreadState {
             &dev_ctx,
             &mut weights,
             max_model_len,
+            moe_topo,
         )?);
         ensure!(
             weights.expert_layers.is_empty(),
@@ -656,15 +684,17 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::LoadWeights {
                 model_path,
                 tp8_pilot_layers,
+                moe_topo,
                 resp,
             } => {
-                let _ = resp.send(state.load_weights(&model_path, tp8_pilot_layers));
+                let _ = resp.send(state.load_weights(&model_path, tp8_pilot_layers, moe_topo));
             }
             Glm52RankCommand::BuildModel {
                 max_model_len,
+                moe_topo,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(max_model_len));
+                let _ = resp.send(state.build_model(max_model_len, moe_topo));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,

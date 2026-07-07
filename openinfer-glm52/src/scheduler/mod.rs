@@ -128,6 +128,7 @@ pub(crate) fn run_dp8_coordinator(
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
+    max_rows_per_rank: usize,
 ) {
     let offload: Option<Vec<offload::RankOffload>> =
         offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
@@ -183,7 +184,7 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width) {
+    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, max_rows_per_rank) {
         log::error!("GLM5.2 graph pre-capture failed: {err:#}");
         for worker in &workers {
             let _ = worker.request_shutdown();
@@ -234,6 +235,7 @@ pub(crate) fn run_dp8_coordinator(
             dspark_enabled,
             &mut pending_resets,
             &mut slots_changed,
+            max_rows_per_rank,
         ) {
             fail_step(&mut slots, &err);
             break 'serve;
@@ -246,7 +248,7 @@ pub(crate) fn run_dp8_coordinator(
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
-        let shapes = plan_step_shapes(&feed_wants(&slots));
+        let shapes = plan_step_shapes(&feed_wants(&slots), max_rows_per_rank);
         let flags = launch_ahead_flags(
             &shapes,
             leased_shapes.as_deref(),
@@ -352,8 +354,12 @@ fn precapture_step_graphs(
     workers: &[Glm52RankWorker],
     pools: &[BlockPool],
     table_width: usize,
+    max_rows_per_rank: usize,
 ) -> anyhow::Result<()> {
-    for &bucket in &GLM52_DECODE_BUCKETS {
+    for &bucket in GLM52_DECODE_BUCKETS
+        .iter()
+        .filter(|&&bucket| bucket <= max_rows_per_rank)
+    {
         for full_tier in [false, true] {
             let mut shape = Glm52StepShape {
                 bucket,
@@ -392,7 +398,10 @@ fn precapture_step_graphs(
     }
     log::info!(
         "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
-        GLM52_DECODE_BUCKETS.len()
+        GLM52_DECODE_BUCKETS
+            .iter()
+            .filter(|&&bucket| bucket <= max_rows_per_rank)
+            .count()
     );
     Ok(())
 }
@@ -413,6 +422,7 @@ fn admit_from_queue(
     dspark_enabled: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
+    max_rows_per_rank: usize,
 ) -> anyhow::Result<()> {
     while let Some(front) = pending.front() {
         let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
@@ -441,9 +451,13 @@ fn admit_from_queue(
                 .collect(),
             None => usable_blocks.to_vec(),
         };
-        let Some((rank, slot)) =
-            admission_target(&occupancy(slots), &committed, &usable, need_blocks)
-        else {
+        let Some((rank, slot)) = admission_target(
+            &occupancy(slots),
+            &committed,
+            &usable,
+            need_blocks,
+            max_rows_per_rank,
+        ) else {
             break;
         };
         let req = pending.pop_front().expect("checked non-empty");

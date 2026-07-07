@@ -61,6 +61,10 @@ pub(crate) enum Glm52LayerMlp {
     #[cfg(test)]
     Moe(Box<Glm52MoeLayerWeights>),
     MoeEp8(Box<Glm52MoeEp8LayerWeights>),
+    /// TP8 topology: the router is the only per-layer MLP weight here — the
+    /// routed experts AND the shared expert live in the rank's slice bank
+    /// (`Glm52MoeTp8Rank.slices`, shared folded at bank index 256).
+    MoeTp8(Box<crate::moe_decode::Glm52MoeRouterWeights>),
 }
 
 /// The DSA indexer role of a decoder layer (`config.indexer_types[layer]`):
@@ -347,8 +351,8 @@ pub(crate) fn glm52_decoder_layer_forward(
             let mlp = glm52_moe_forward(ctx, moe, s.layer.normed2.data(), moe_path)?;
             ctx.stream.memcpy_dtod(&mlp, s.layer.mlp_out.data_mut())?;
         }
-        Glm52LayerMlp::MoeEp8(_) => anyhow::bail!(
-            "GLM5.2 EP8 MoE layers require the collective driver (moe_ep8), not the single-layer forward"
+        Glm52LayerMlp::MoeEp8(_) | Glm52LayerMlp::MoeTp8(_) => anyhow::bail!(
+            "GLM5.2 EP8/TP8 MoE layers require their collective drivers, not the single-layer forward"
         ),
     }
     glm52_layer_finish(ctx, s, 0)

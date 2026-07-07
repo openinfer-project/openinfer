@@ -56,6 +56,7 @@ pub(super) fn build_decoder_layer(
     ctx: &DeviceContext,
     w: &mut Glm52RankGpuWeights,
     layer: usize,
+    moe_topo: crate::Glm52MoeTopo,
 ) -> Result<Glm52DecoderLayerWeights> {
     let p = format!("model.layers.{layer}");
 
@@ -110,6 +111,19 @@ pub(super) fn build_decoder_layer(
             &take_proj(w, &format!("{mp}.gate_proj"), 12_288, GLM52_HIDDEN)?,
             &take_proj(w, &format!("{mp}.up_proj"), 12_288, GLM52_HIDDEN)?,
             take_proj(w, &format!("{mp}.down_proj"), GLM52_HIDDEN, 12_288)?,
+        )?))
+    } else if moe_topo == crate::Glm52MoeTopo::Tp8 {
+        // TP8 topology: the routed experts and the shared expert live in the
+        // rank's slice bank (shared folded at index 256); only the router is
+        // per-layer MLP weight. The shared-expert tensors were loaded as part
+        // of the non-expert set — drop this rank's copies here.
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            drop(w.take_tensor(&format!("{mp}.shared_experts.{proj}.weight"))?);
+            drop(w.take_tensor(&format!("{mp}.shared_experts.{proj}.weight_scale_inv"))?);
+        }
+        Glm52LayerMlp::MoeTp8(Box::new(Glm52MoeRouterWeights::new(
+            w.take_tensor(&format!("{mp}.gate.weight"))?,
+            w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
         )?))
     } else {
         Glm52LayerMlp::MoeEp8(Box::new(Glm52MoeEp8LayerWeights {
