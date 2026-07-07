@@ -396,19 +396,29 @@ fn start_engine(
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
-    let rank_arenas = build_rank_models(
+    // build_rank_models sends SetupComm, so from inside it the DeepEP
+    // contexts exist and their destruction is COLLECTIVE: any startup failure
+    // from here on must broadcast Shutdown to every rank BEFORE the workers'
+    // sequential Drop joins them one by one (the same teardown contract as
+    // the coordinator exit) — otherwise the first dropped worker blocks in
+    // the destroy barrier waiting for ranks that were never told to shut
+    // down, and the launch error surfaces only after the ~100 s DeepEP
+    // device timeout. The TP8 LL rendezvous rejecting a topology (poison
+    // pill, NVLink probe) is a real failure landing exactly in this window.
+    let rank_arenas = match build_rank_models(
         &loaded.workers,
         max_model_len,
         moe_topo,
         moe_tp8_pilot_layers > 0 || moe_topo == Glm52MoeTopo::Tp8,
-    )?;
-    // From here the DeepEP contexts exist and their destruction is COLLECTIVE:
-    // a startup failure must broadcast Shutdown to every rank BEFORE the
-    // workers' sequential Drop joins them one by one (the same teardown
-    // contract as the coordinator exit) — otherwise the first dropped worker
-    // blocks in the destroy barrier waiting for ranks that were never told to
-    // shut down, and the launch error surfaces only after the ~100 s DeepEP
-    // device timeout.
+    ) {
+        Ok(rank_arenas) => rank_arenas,
+        Err(err) => {
+            for worker in &loaded.workers {
+                let _ = worker.request_shutdown();
+            }
+            return Err(err);
+        }
+    };
     let post_comm_startup = || -> Result<(bool, Option<Vec<OffloadEngine>>)> {
         let dspark_enabled = if let Some(dspark_path) = dspark_path {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
