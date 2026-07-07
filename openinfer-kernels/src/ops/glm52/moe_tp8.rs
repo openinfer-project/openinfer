@@ -41,18 +41,14 @@ pub const GLM52_TP8_CPART_LEN: usize = GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS * G
 /// bf16 scratch length for the SiLU-combined intermediate.
 pub const GLM52_TP8_UG_LEN: usize = GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS * GLM52_TP8_SLICE_I;
 
-/// Enable peer access from the current device to `peer_ordinal` (idempotent).
-/// Required before LL packets can target a peer rank's buffers.
-pub fn glm52_moe_tp8_enable_peer_access(peer_ordinal: usize) -> Result<()> {
-    unsafe { ffi::glm52_moe_tp8_enable_peer_access_cuda(peer_ordinal as i32) }
-        .result()
-        .map_err(|err| anyhow!("TP8 peer access to device {peer_ordinal} failed: {err}"))
-}
-
-/// A zeroed, peer-accessible LL packet buffer on the CURRENT device. Plain
-/// `cudaMalloc` (cudaMallocAsync pool memory is not peer-accessible), freed
-/// on drop. The address is stable for the buffer's lifetime — safe to embed
-/// in captured graphs and to hand to peer ranks.
+/// A zeroed, peer-accessible LL packet buffer on the CURRENT device, from a
+/// dedicated per-device `cudaMemPool` whose access is granted to the peer
+/// devices (`cudaMemPoolSetAccess`). Deliberately NOT
+/// `cudaDeviceEnablePeerAccess`: that is device-wide — it maps the whole
+/// 105 GiB expert slab into every peer's address space and the page-table
+/// pressure taxes the memory-bound expert GEMMs on all layers (~0.8 ms/step
+/// flat on 8xH200). Freed on drop; the address is stable for the buffer's
+/// lifetime — safe to embed in captured graphs and to hand to peer ranks.
 pub struct Glm52Tp8LlBuffer {
     ptr: u64,
     #[allow(dead_code)]
@@ -65,12 +61,26 @@ unsafe impl Send for Glm52Tp8LlBuffer {}
 unsafe impl Sync for Glm52Tp8LlBuffer {}
 
 impl Glm52Tp8LlBuffer {
-    pub fn alloc(bytes: usize) -> Result<Self> {
+    /// `device_ordinals` is the full DP fleet (own ordinal included); peer
+    /// access is granted to every other member on first allocation.
+    pub fn alloc(bytes: usize, device_ordinals: &[usize]) -> Result<Self> {
         ensure!(bytes > 0, "TP8 LL buffer needs positive size");
+        ensure!(
+            !device_ordinals.is_empty() && device_ordinals.len() <= 64,
+            "TP8 LL buffer needs 1..=64 fleet device ordinals"
+        );
+        let ordinals: Vec<i32> = device_ordinals.iter().map(|&d| d as i32).collect();
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe { ffi::glm52_moe_tp8_alloc_ll_cuda(bytes, &mut ptr) }
-            .result()
-            .map_err(|err| anyhow!("TP8 LL buffer alloc ({bytes} B) failed: {err}"))?;
+        unsafe {
+            ffi::glm52_moe_tp8_alloc_ll_cuda(
+                bytes,
+                ordinals.as_ptr(),
+                ordinals.len() as i32,
+                &mut ptr,
+            )
+        }
+        .result()
+        .map_err(|err| anyhow!("TP8 LL buffer alloc ({bytes} B) failed: {err}"))?;
         Ok(Self {
             ptr: ptr as u64,
             bytes,

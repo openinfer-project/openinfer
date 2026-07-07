@@ -403,26 +403,65 @@ int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
   return 0;
 }
 
-// LL buffers must be plain cudaMalloc memory: cudaMallocAsync pool memory is
-// not peer-accessible without per-pool access grants, and the pool pointer
-// may be remapped. Zeroed so no stale word matches a live epoch tag.
-int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, void** out) {
-  cudaError_t e = cudaMalloc(out, bytes);
-  if (e != cudaSuccess) return (int)e;
-  return (int)cudaMemset(*out, 0, bytes);
+// LL buffers come from a dedicated per-device cudaMemPool whose access is
+// granted to the peer devices with cudaMemPoolSetAccess. This is deliberate:
+// cudaDeviceEnablePeerAccess is DEVICE-WIDE — it maps every current and
+// future allocation of this device into the peers' address spaces, and the
+// resulting page-table pressure measurably taxes the memory-bound expert
+// GEMMs on ALL layers (solo bucket-1 paid a flat ~0.8 ms/step for it on
+// 8xH200). Pool-scoped grants map only these few MB. NCCL/DeepEP never call
+// cudaDeviceEnablePeerAccess either (they map their windows explicitly).
+// Zeroed so no stale word matches a live epoch tag.
+namespace {
+cudaMemPool_t g_ll_pool[64] = {};
 }
 
-int glm52_moe_tp8_free_ll_cuda(void* p) { return (int)cudaFree(p); }
-
-// LL packets ride plain device pointers across GPUs (in-process DP8, unified
-// addressing) — every rank pair needs peer access. Idempotent.
-int glm52_moe_tp8_enable_peer_access_cuda(int peer_ordinal) {
-  cudaError_t e = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
-  if (e == cudaErrorPeerAccessAlreadyEnabled) {
-    (void)cudaGetLastError();
-    return 0;
+int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, const int* device_ordinals,
+                                int n_devices, void** out) {
+  int dev = 0;
+  cudaError_t e = cudaGetDevice(&dev);
+  if (e != cudaSuccess) return (int)e;
+  if (dev < 0 || dev >= 64 || n_devices <= 0 || n_devices > 64) {
+    return (int)cudaErrorInvalidValue;
   }
-  return (int)e;
+  if (!g_ll_pool[dev]) {
+    cudaMemPoolProps props = {};
+    props.allocType = cudaMemAllocationTypePinned;
+    props.handleTypes = cudaMemHandleTypeNone;
+    props.location.type = cudaMemLocationTypeDevice;
+    props.location.id = dev;
+    cudaMemPool_t pool = nullptr;
+    e = cudaMemPoolCreate(&pool, &props);
+    if (e != cudaSuccess) return (int)e;
+    cudaMemAccessDesc desc[64];
+    int n = 0;
+    for (int i = 0; i < n_devices; ++i) {
+      if (device_ordinals[i] == dev) continue;
+      desc[n].location.type = cudaMemLocationTypeDevice;
+      desc[n].location.id = device_ordinals[i];
+      desc[n].flags = cudaMemAccessFlagsProtReadWrite;
+      ++n;
+    }
+    if (n > 0) {
+      e = cudaMemPoolSetAccess(pool, desc, n);
+      if (e != cudaSuccess) {
+        (void)cudaMemPoolDestroy(pool);
+        return (int)e;
+      }
+    }
+    g_ll_pool[dev] = pool;
+  }
+  e = cudaMallocFromPoolAsync(out, bytes, g_ll_pool[dev], (cudaStream_t)0);
+  if (e != cudaSuccess) return (int)e;
+  e = cudaMemsetAsync(*out, 0, bytes, (cudaStream_t)0);
+  if (e != cudaSuccess) return (int)e;
+  return (int)cudaStreamSynchronize((cudaStream_t)0);
+}
+
+int glm52_moe_tp8_free_ll_cuda(void* p) {
+  cudaError_t e = cudaFreeAsync(p, (cudaStream_t)0);
+  if (e != cudaSuccess) return (int)e;
+  return (int)cudaStreamSynchronize((cudaStream_t)0);
 }
 
 int glm52_moe_tp8_layer_launch_cuda(

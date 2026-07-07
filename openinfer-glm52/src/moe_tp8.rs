@@ -19,8 +19,7 @@ use openinfer_kernels::ops::{
     GLM52_TP8_AG_BUF_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
     GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_BUF_PACKETS, GLM52_TP8_SLICE_I,
     GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
-    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_enable_peer_access,
-    glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
+    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -317,14 +316,12 @@ impl Glm52MoeTp8State {
         exchange: &Glm52Tp8Exchange,
     ) -> Result<Self> {
         ensure!(rank < RANKS, "TP8 rank {rank} out of range");
-        let ag = Glm52Tp8LlBuffer::alloc(GLM52_TP8_AG_BUF_PACKETS * 16)?;
-        let rs = Glm52Tp8LlBuffer::alloc(GLM52_TP8_RS_BUF_PACKETS * 16)?;
+        // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch);
+        // pool-scoped peer access is granted to all of them at first alloc.
+        let fleet: Vec<usize> = (0..RANKS).collect();
+        let ag = Glm52Tp8LlBuffer::alloc(GLM52_TP8_AG_BUF_PACKETS * 16, &fleet)?;
+        let rs = Glm52Tp8LlBuffer::alloc(GLM52_TP8_RS_BUF_PACKETS * 16, &fleet)?;
         let table = exchange.publish_and_wait(rank, device_ordinal, ag.addr(), rs.addr())?;
-        for &(peer_ordinal, _, _) in &table {
-            if peer_ordinal != device_ordinal {
-                glm52_moe_tp8_enable_peer_access(peer_ordinal)?;
-            }
-        }
         // Peer pointers pre-offset to THIS rank's source-rank slot. Kernel
         // buffer layout is [parity][src_rank][packet] (the kernel adds the
         // parity offset itself), so the slot stride is one rank's packet
