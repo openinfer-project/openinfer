@@ -176,8 +176,42 @@ same bytes as EP8, but the persistent kernel's tile loop lengthens and dilutes t
 | A/B anchor | `openinfer-server/src/bin/glm52_step_bench.rs` (bucket-1 solo = the 19.5 ms reference) |
 | Numeric gates | `openinfer-glm52/src/oracle/layer_ep8.rs` (EP8 layer gate) + `oracle/layer_tp8.rs` (TP8 twin, passing on jz-38); e2e gates per `serving-status.md` |
 
+## TP8 + MTP: the span row mapping (single-user speculative decode)
+
+At bs=1 the bucket-1 dp8 mapping computes m=8 with 1 real row and 7 pads. The **span
+mapping** turns those pads into work: all 8 rows belong to one owner rank (1 committed
+token + 7 DSpark drafts, or 8 prefill positions), gathered from the owner instead of
+one-per-rank — the MoE cost is unchanged (the compute phases are mapping-agnostic;
+only the AG source and RS destination patterns differ). The owner id is read from
+device memory (staged per step, like the epoch), so one captured bucket-8 span graph
+serves any owner. The tp8 scheduler serves exactly two shapes: bucket-1 dp8 (any
+concurrency) and bucket-8 span, planned only when the fleet holds exactly one active
+request wanting >1 row. EP8's span-4 verdict (bucket-4 round beats span-8's tail)
+inverts here, so tp8 feeds the drafter's full 7-draft proposal.
+
+**Measured (jz-38, 8×H200, solo, greedy, 500-token completions):**
+
+| workload | tok/s | round p50/p99 | accept incl. bonus |
+|---|---|---|---|
+| code ×2 | **186.4 / 189.0** | 25.5 / 29.1 ms | 4.80 (19/104 rounds accept all 7) |
+| prose | **106.5** | 24.8 / 27.4 ms | 2.64 |
+| counting | **136.2** | 24.6 / 28.0 ms | 3.37 |
+
+Baselines: plain tp8 solo 65.5 tok/s (15.27 ms/tok), EP8+DSpark span-4 code ≈ 75 —
+**2.5–2.9× on code**. Bonus from the same shape: solo prefill rides span-8 (8 prompt
+tokens/step), long-prompt cold TTFT ~2400 tokens 5.37 s vs ~36 s at 1 token/step.
+Correctness: span-vs-dp8 bit-identity gate (`oracle/layer_tp8.rs::layer_moe_tp8_span_matches_dp8`
+— same 8 rows through both mappings must match exactly, plus the pad zero-fill
+contract), determinism ×2, 2-concurrent clamp-back, clean shutdown, EP8 span-4
+regression. Measurement trap for the record: one SSE event carries one verify round's
+committed text, so event counting understates tok/s by the accept factor — count
+completion tokens against stream wall time.
+
 ## Next action
 
-M2 gate passed (numbers in the milestone table); toxic review, then the single PR for
-the whole branch. M3 (bucket decision: masked grouped GEMM on TP slices at m=16/32/64
-vs staying EP8) picks up from the M2 decision record.
+TP8+MTP measured and gated (table above); toxic review, then the single PR for the
+`feat/glm52-tp8-mtp` branch. Next levers, in order of expected value: **M4
+attention-TP** (q/o head split ×8, MLA latent has no head dimension so the latent KV
+replicates; o_proj allreduce reuses the LL machinery — cuts the ~16 ms non-MoE share
+of the 25 ms round), M3 bucket decision for multi-user (masked grouped GEMM on TP
+slices at m=16/32/64), adaptive span.
