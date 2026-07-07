@@ -247,6 +247,10 @@ pub(crate) struct Glm52RankModel {
     /// rank-wide per-layer MLA and index-K page pools at build time
     /// ([`glm52_pool_blocks`]).
     max_model_len: usize,
+    /// Built with `--moe-topo tp8`: every MoE arm is `MoeTp8`, bucket-8
+    /// steps are span steps (all 8 rows one owner rank), and the
+    /// coordinator must stage the span owner on every such step.
+    tp8_topo: bool,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
     /// Device-resident rope tables for every position (`[max_model_len,
@@ -569,6 +573,7 @@ impl Glm52RankModel {
             buckets,
             table_width,
             max_model_len,
+            tp8_topo: moe_topo == crate::Glm52MoeTopo::Tp8,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
             cos_table: DeviceMatrix {
@@ -640,6 +645,12 @@ impl Glm52RankModel {
             "GLM5.2 sampling rows cannot ride a launch-ahead step (the speculation feeds the \
              argmax token, not the sampled one)"
         );
+        // Span steps change shape every round, so they can never be the
+        // repeated-shape speculation a launch-ahead lease promises.
+        ensure!(
+            flags.tp8_span_owner.is_none() || (!flags.consume && !flags.lease),
+            "GLM5.2 span step cannot ride a launch-ahead lease"
+        );
         let batch = shape.bucket;
         if flags.consume {
             // Launch-ahead fast path: the coordinator says this step IS the
@@ -671,7 +682,16 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp8, inputs, shape, kv)?;
+            self.decode_step_prologue_and_replay(
+                ctx,
+                aux,
+                ep8,
+                tp8,
+                inputs,
+                shape,
+                kv,
+                flags.tp8_span_owner,
+            )?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -762,16 +782,34 @@ impl Glm52RankModel {
     /// The non-leased step path: validate the shape, rewrite every per-step
     /// device input buffer from the coordinator's `inputs`, and run (or lazily
     /// capture) the whole-step graph for the step's bucket × tier.
+    #[allow(clippy::too_many_arguments)]
     fn decode_step_prologue_and_replay(
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: &mut Glm52MoeEp8State,
-        tp8: Option<&mut Glm52MoeTp8Rank>,
+        mut tp8: Option<&mut Glm52MoeTp8Rank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
+        span_owner: Option<u8>,
     ) -> Result<()> {
+        // TP8 span step: stage the owner BEFORE any capture or replay — the
+        // span kernels read it from device memory at run time, so one
+        // captured bucket-8 graph serves whichever rank holds the request.
+        let tp8_span = self.tp8_topo && shape.bucket == GLM52_MAX_BATCH_PER_RANK;
+        ensure!(
+            tp8_span == span_owner.is_some(),
+            "GLM5.2 span-owner flag desync: tp8_topo={}, bucket={}, owner={span_owner:?}",
+            self.tp8_topo,
+            shape.bucket
+        );
+        if let Some(owner) = span_owner {
+            let rank = tp8
+                .as_deref_mut()
+                .context("GLM5.2 span step without TP8 state")?;
+            rank.state.stage_span_owner(ctx, owner as usize)?;
+        }
         // The bucket state's `rows` is the lookup key — an unknown bucket is
         // a coordinator bug and fails the step before touching the GPU.
         let bucket = self
@@ -913,6 +951,7 @@ impl Glm52RankModel {
                 &step,
                 s,
                 global_tokens,
+                tp8_span,
             )
         });
         bucket.graphs[tier] = graph;
@@ -940,12 +979,14 @@ fn run_step_body(
     step: &Glm52DecodeStep<'_>,
     s: &mut Glm52DecodeScratch,
     global_tokens: usize,
+    tp8_span: bool,
 ) -> Result<()> {
     let batch = step.mla_sched.batch();
     // TP8 step head: advance the shared LL epoch exactly once per replayed
-    // step (all pilot layers of the step share the tag; per-layer slot
-    // regions alternate parity across steps).
-    if batch == 1 {
+    // step that runs TP8 kernels (all TP8 layers of the step share the tag;
+    // per-layer slot regions alternate parity across steps). bucket-1 covers
+    // both the tp8 topology and the pilot; a span step is bucket-8.
+    if batch == 1 || tp8_span {
         if let Some(rank) = tp8.as_deref_mut() {
             if !rank.slices.is_empty() {
                 rank.state.advance_epoch(ctx)?;
@@ -1019,12 +1060,15 @@ fn run_step_body(
                 }
             }
             Glm52LayerMlp::MoeTp8(router) => {
-                // TP8 topology: every MoE layer runs the phase-kernel chain;
-                // the scheduler pins the fleet to bucket-1, enforced here.
+                // TP8 topology: every MoE layer runs the phase-kernel chain.
+                // bucket-1 = dp8 mapping (one row per rank); bucket-8 = span
+                // mapping (all 8 rows on the device-staged owner rank — the
+                // prologue staged it before this replay). Any other bucket
+                // is a scheduler bug.
                 ensure!(
-                    batch == 1,
-                    "GLM5.2 TP8 topology stepped at bucket {batch} — the scheduler must pin \
-                     bucket-1"
+                    batch == 1 || tp8_span,
+                    "GLM5.2 TP8 topology stepped at bucket {batch} without a span mapping — \
+                     the scheduler must pin bucket-1 or plan a span-8 step"
                 );
                 let (state, slot, bank) = tp8
                     .as_deref_mut()
@@ -1032,17 +1076,34 @@ fn run_step_body(
                     .with_context(|| {
                         format!("GLM5.2 TP8 layer {layer} has no slice bank — loader drifted")
                     })?;
+                // Every rank routes its own rows (uniform graph content; in
+                // span mode only the owner's routing is consumed by the
+                // kernels, pad ranks' routing is dead weight by design).
                 run_router_into(ctx, router, s.layer.normed2.data(), &mut s.router)?;
-                state
-                    .forward(
-                        ctx,
-                        slot,
-                        bank,
-                        s.layer.normed2.data(),
-                        &s.router,
-                        s.layer.mlp_out.data_mut(),
-                    )
-                    .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
+                if tp8_span {
+                    state
+                        .forward_span(
+                            ctx,
+                            slot,
+                            bank,
+                            s.layer.normed2.data(),
+                            &s.router.route.topk_idx,
+                            &s.router.route.topk_weight,
+                            s.layer.mlp_out.data_mut(),
+                        )
+                        .with_context(|| format!("GLM5.2 layer {layer} TP8 span MoE"))?;
+                } else {
+                    state
+                        .forward(
+                            ctx,
+                            slot,
+                            bank,
+                            s.layer.normed2.data(),
+                            &s.router,
+                            s.layer.mlp_out.data_mut(),
+                        )
+                        .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
+                }
             }
             #[cfg(test)]
             Glm52LayerMlp::Moe(_) => {

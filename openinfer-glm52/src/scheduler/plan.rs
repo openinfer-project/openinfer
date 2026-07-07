@@ -35,16 +35,41 @@ use super::{PAGE, RankSlots};
 pub(super) fn plan_step_shapes(
     wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]],
     max_rows_per_rank: usize,
+    tp8_solo_span: bool,
 ) -> Vec<Glm52StepShape> {
+    // TP8 solo span: when the FLEET holds exactly one active request (one
+    // rank with demand, one slot) and it wants more than one row (prefill
+    // span or a speculative verify round), it may take the whole bucket-8
+    // span shape — all 8 rows on that rank through the span MoE mapping.
+    // Any concurrency clamps back to the bucket-1 dp8 shape. Only {1, 8}
+    // graphs exist under tp8, so a multi-row solo always rounds up to 8.
+    let solo_span = tp8_solo_span && {
+        let mut demanding = wants.iter().filter(|row| row.iter().sum::<usize>() > 0);
+        match (demanding.next(), demanding.next()) {
+            (Some(row), None) => {
+                row.iter().filter(|&&w| w > 0).count() == 1 && row.iter().sum::<usize>() > 1
+            }
+            _ => false,
+        }
+    };
+    let row_cap = if solo_span {
+        GLM52_MAX_BATCH_PER_RANK
+    } else {
+        max_rows_per_rank
+    };
     let hungriest = wants
         .iter()
-        .map(|row| row.iter().sum::<usize>().min(max_rows_per_rank))
+        .map(|row| row.iter().sum::<usize>().min(row_cap))
         .max()
         .unwrap_or(0);
-    let bucket = *GLM52_DECODE_BUCKETS
-        .iter()
-        .find(|&&rows| rows >= hungriest.max(1))
-        .expect("the largest bucket covers every demand by construction");
+    let bucket = if solo_span {
+        GLM52_MAX_BATCH_PER_RANK
+    } else {
+        *GLM52_DECODE_BUCKETS
+            .iter()
+            .find(|&&rows| rows >= hungriest.max(1))
+            .expect("the largest bucket covers every demand by construction")
+    };
     wants
         .iter()
         .map(|row| {
@@ -146,7 +171,14 @@ pub(super) fn launch_ahead_flags(
             .all(|active| {
                 takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
             });
-    Glm52StepFlags { consume, lease }
+    Glm52StepFlags {
+        consume,
+        lease,
+        // The coordinator sets the span owner after planning (span steps
+        // never lease or consume: `feed_want > 1` rows already block the
+        // lease above, and a leased shape is bucket-uniform decode).
+        tp8_span_owner: None,
+    }
 }
 
 /// Whether a request's committed rows take the fused argmax — the shared
@@ -457,18 +489,61 @@ mod tests {
     }
 
     #[test]
+    fn tp8_solo_span_takes_the_whole_bucket() {
+        // One active request, mid-prefill wanting 5 rows: the fleet-solo
+        // request takes the bucket-8 span shape (5 real rows + 3 pads on the
+        // owner; the other rank is all pads).
+        let mut wants = decode_wants(&[0, 0]);
+        wants[1][0] = 5;
+        let shapes = plan_step_shapes(&wants, 1, true);
+        assert_eq!(
+            forwarded(&shapes),
+            vec![
+                (8, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+                (8, vec![0, 0, 0, 0, 0, 1, 2, 3]),
+            ]
+        );
+        assert_eq!(shapes[0].active_rows, 0);
+        assert_eq!(shapes[1].active_rows, 5);
+
+        // Solo single-token decode stays on the bucket-1 dp8 shape.
+        let mut wants = decode_wants(&[0, 0]);
+        wants[1][0] = 1;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants, 1, true)),
+            vec![(1, vec![0]), (1, vec![0])]
+        );
+
+        // Any concurrency clamps back to bucket-1: the second rank's demand
+        // kills the span even though rank 1 wants 5 rows.
+        let mut wants = decode_wants(&[1, 0]);
+        wants[1][0] = 5;
+        assert_eq!(
+            forwarded(&plan_step_shapes(&wants, 1, true)),
+            vec![(1, vec![0]), (1, vec![0])]
+        );
+
+        // NOTE: a rank holding two active slots under cap 1 violates the
+        // function's precondition (admission holds tp8 at one slot per
+        // rank), so the multi-slot-solo case is admission's contract, not
+        // this planner's.
+    }
+
+    #[test]
     fn bucket_is_the_smallest_covering_the_hungriest_rank() {
         assert_eq!(
             forwarded(&plan_step_shapes(
                 &decode_wants(&[0, 0]),
-                GLM52_MAX_BATCH_PER_RANK
+                GLM52_MAX_BATCH_PER_RANK,
+                false
             )),
             vec![(1, vec![0]), (1, vec![0])]
         );
         assert_eq!(
             forwarded(&plan_step_shapes(
                 &decode_wants(&[1; 8]),
-                GLM52_MAX_BATCH_PER_RANK
+                GLM52_MAX_BATCH_PER_RANK,
+                false
             )),
             vec![(1, vec![0]); 8]
         );
@@ -477,14 +552,16 @@ mod tests {
         assert_eq!(
             forwarded(&plan_step_shapes(
                 &decode_wants(&[2, 1]),
-                GLM52_MAX_BATCH_PER_RANK
+                GLM52_MAX_BATCH_PER_RANK,
+                false
             )),
             vec![(2, vec![0, 1]), (2, vec![0, 1])]
         );
         assert_eq!(
             forwarded(&plan_step_shapes(
                 &decode_wants(&[3, 1]),
-                GLM52_MAX_BATCH_PER_RANK
+                GLM52_MAX_BATCH_PER_RANK,
+                false
             ))[0],
             (4, vec![0, 1, 2, 3])
         );
@@ -492,7 +569,8 @@ mod tests {
         assert_eq!(
             forwarded(&plan_step_shapes(
                 &decode_wants(&[5, 1]),
-                GLM52_MAX_BATCH_PER_RANK
+                GLM52_MAX_BATCH_PER_RANK,
+                false
             ))[0]
                 .0,
             8
@@ -507,14 +585,14 @@ mod tests {
         holey[0][1] = 1;
         holey[0][5] = 1;
         assert_eq!(
-            forwarded(&plan_step_shapes(&holey, GLM52_MAX_BATCH_PER_RANK)),
+            forwarded(&plan_step_shapes(&holey, GLM52_MAX_BATCH_PER_RANK, false)),
             vec![(4, vec![1, 5, 0, 2]), (4, vec![0, 1, 2, 3])]
         );
         let mut deep = decode_wants(&[5, 0]);
         deep[0][0] = 0;
         deep[0][7] = 1;
         assert_eq!(
-            forwarded(&plan_step_shapes(&deep, GLM52_MAX_BATCH_PER_RANK))[0],
+            forwarded(&plan_step_shapes(&deep, GLM52_MAX_BATCH_PER_RANK, false))[0],
             (8, vec![1, 2, 3, 4, 7, 0, 5, 6])
         );
     }
@@ -525,7 +603,7 @@ mod tests {
         // whole max bucket with its span; idle ranks pad.
         let mut wants = decode_wants(&[0, 0]);
         wants[0][2] = 3000;
-        let shapes = plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK);
+        let shapes = plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK, false);
         assert_eq!(
             forwarded(&shapes)[0],
             (8, vec![2, 2, 2, 2, 2, 2, 2, 2]),
@@ -540,7 +618,7 @@ mod tests {
         let mut wants = decode_wants(&[0, 0]);
         wants[0][0] = 3;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK))[0],
+            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK, false))[0],
             (4, vec![0, 0, 0, 1])
         );
     }
@@ -554,7 +632,7 @@ mod tests {
         wants[0][0] = 1;
         wants[0][1] = 100;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK))[0],
+            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK, false))[0],
             (8, vec![0, 1, 1, 1, 1, 1, 1, 1])
         );
 
@@ -564,7 +642,7 @@ mod tests {
         wants[0][0] = 3;
         wants[0][1] = 2;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK))[0],
+            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK, false))[0],
             (8, vec![0, 0, 0, 1, 1, 2, 3, 4]),
             "wants met, remaining rows pad on free slots"
         );
@@ -578,7 +656,7 @@ mod tests {
         wants[0][2] = 3000;
         wants[0][5] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK))[0],
+            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK, false))[0],
             (8, vec![2, 2, 2, 2, 5, 5, 5, 5])
         );
 
@@ -589,7 +667,7 @@ mod tests {
         wants[0][3] = 3000;
         wants[0][6] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK))[0],
+            forwarded(&plan_step_shapes(&wants, GLM52_MAX_BATCH_PER_RANK, false))[0],
             (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
         );
     }

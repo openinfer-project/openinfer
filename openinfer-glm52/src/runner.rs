@@ -65,6 +65,10 @@ pub(crate) struct Glm52StepFlags {
     /// advanced by its own argmax — every rank MUST enqueue that next
     /// replay launch-ahead (see `Glm52RankModel::decode_step`).
     pub(crate) lease: bool,
+    /// TP8 span step (bucket-8, tp8 topology): the rank that owns ALL 8
+    /// rows. Staged to device memory before the replay so one captured span
+    /// graph serves any owner. `None` for every other step shape.
+    pub(crate) tp8_span_owner: Option<u8>,
 }
 
 impl Glm52StepFlags {
@@ -73,6 +77,7 @@ impl Glm52StepFlags {
         Self {
             consume: false,
             lease: false,
+            tp8_span_owner: None,
         }
     }
 }

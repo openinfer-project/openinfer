@@ -441,13 +441,6 @@ fn start_engine(
             return Err(err);
         }
     };
-    // TP8 topology is a bucket-1 low-latency configuration: every MoE layer's
-    // TP8 forward asserts batch==1, so the scheduler must never plan a larger
-    // bucket (and admission caps the fleet at 1 request per rank).
-    let max_rows_per_rank = match moe_topo {
-        Glm52MoeTopo::Tp8 => 1,
-        Glm52MoeTopo::Ep8 => model::GLM52_MAX_BATCH_PER_RANK,
-    };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
@@ -460,7 +453,7 @@ fn start_engine(
                 max_model_len,
                 no_prefix_cache,
                 offload,
-                max_rows_per_rank,
+                moe_topo,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
