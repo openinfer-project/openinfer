@@ -11,6 +11,7 @@ mod plan;
 mod resolve;
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
@@ -262,6 +263,8 @@ where
         None => (None, None),
     };
 
+    let spec_decode_stats = executor.spec_decode_stats().map(Arc::clone);
+
     let join_handle = thread::Builder::new()
         .name("scheduler".into())
         .spawn(move || {
@@ -281,6 +284,10 @@ where
         .with_servable_len(servable)
         .with_kv_capacity(kv_capacity)
         .with_load_watch(load_rx);
+    let handle = match spec_decode_stats {
+        Some(stats) => handle.with_spec_decode_stats(stats),
+        None => handle,
+    };
     match kv_events_rx {
         Some(rx) => handle.with_kv_events(rx),
         None => handle,

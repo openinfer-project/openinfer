@@ -20,6 +20,7 @@ uuid = { workspace = true, features = ["v4"] }
 vllm-engine-core-client = { workspace = true }
 vllm-server = { workspace = true }
 zeromq = { workspace = true }
+prometheus = { workspace = true }
 
 [lints]
 workspace = true

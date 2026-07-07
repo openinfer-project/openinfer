@@ -4090,6 +4090,7 @@ dependencies = [
  "axum",
  "log",
  "openinfer-engine",
+ "prometheus",
  "rmp-serde",
  "rmpv",
  "serde",

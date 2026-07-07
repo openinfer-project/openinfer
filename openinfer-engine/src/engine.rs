@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -332,6 +332,83 @@ pub enum KvBlockEvent {
     Removed { sequence_hash: u64 },
 }
 
+/// Shared speculative-decode counters scraped by the `/metrics` endpoint.
+///
+/// Mirrors vLLM's `vllm:spec_decode_*` Prometheus counters so that
+/// `vllm bench serve` can compute acceptance rate/length without a
+/// server-specific metric. The worker thread that runs the verify forward
+/// is the sole writer (via [`Self::observe`]); the HTTP `/metrics`
+/// handler is the reader. All fields are atomic, so no lock contention.
+///
+/// `num_spec_tokens` is the draft block size `K` (number of draft tokens
+/// proposed per verify round). `accepted_per_pos` has `K` slots; position `i`
+/// counts how many rounds accepted **at least** `i + 1` draft tokens
+/// (matching vLLM's `num_accepted_tokens_per_pos` semantics).
+#[derive(Debug)]
+pub struct SpecDecodeStats {
+    num_spec_tokens: usize,
+    num_drafts: AtomicU64,
+    num_draft_tokens: AtomicU64,
+    num_accepted_tokens: AtomicU64,
+    accepted_per_pos: Vec<AtomicU64>,
+}
+
+impl SpecDecodeStats {
+    /// Create a zeroed stats holder for a draft block size of `num_spec_tokens`.
+    pub fn new(num_spec_tokens: usize) -> Self {
+        let accepted_per_pos = (0..num_spec_tokens)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>();
+        Self {
+            num_spec_tokens,
+            num_drafts: AtomicU64::new(0),
+            num_draft_tokens: AtomicU64::new(0),
+            num_accepted_tokens: AtomicU64::new(0),
+            accepted_per_pos,
+        }
+    }
+
+    /// Record one verify round: `num_draft_tokens` proposed, `num_accepted`
+    /// accepted (excluding the bonus target token). Call from the worker
+    /// thread after `accept_greedy` resolves.
+    pub fn observe(&self, num_draft_tokens: u64, num_accepted: u64) {
+        self.num_drafts.fetch_add(1, Ordering::Relaxed);
+        self.num_draft_tokens.fetch_add(num_draft_tokens, Ordering::Relaxed);
+        self.num_accepted_tokens
+            .fetch_add(num_accepted, Ordering::Relaxed);
+        for i in 0..num_accepted as usize {
+            if i < self.accepted_per_pos.len() {
+                self.accepted_per_pos[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn num_spec_tokens(&self) -> usize {
+        self.num_spec_tokens
+    }
+
+    pub fn num_drafts(&self) -> u64 {
+        self.num_drafts.load(Ordering::Relaxed)
+    }
+
+    pub fn num_draft_tokens(&self) -> u64 {
+        self.num_draft_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn num_accepted_tokens(&self) -> u64 {
+        self.num_accepted_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Per-position acceptance counts. Position `i` = number of rounds that
+    /// accepted **at least** `i + 1` draft tokens.
+    pub fn accepted_per_pos(&self) -> Vec<u64> {
+        self.accepted_per_pos
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<EngineInner>,
@@ -347,6 +424,11 @@ pub struct EngineHandle {
     /// single receiver is handed out exactly once via [`Self::take_kv_events`];
     /// the shared cell lets all handle clones agree on who took it.
     kv_events: Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<KvBlockEvent>>>>>,
+    /// Shared speculative-decode counters for the `/metrics` endpoint, or
+    /// `None` if speculative decoding is not enabled. `Arc` so the worker
+    /// thread (writer) and the HTTP handler (reader) share one source of
+    /// truth.
+    spec_decode_stats: Option<Arc<SpecDecodeStats>>,
 }
 
 struct EngineInner {
@@ -398,6 +480,7 @@ impl EngineHandle {
             kv_capacity: None,
             load_watch: None,
             kv_events: None,
+            spec_decode_stats: None,
         }
     }
 
@@ -453,6 +536,18 @@ impl EngineHandle {
             .lock()
             .expect("kv-events cell poisoned")
             .take()
+    }
+
+    #[must_use]
+    pub fn with_spec_decode_stats(mut self, stats: Arc<SpecDecodeStats>) -> Self {
+        self.spec_decode_stats = Some(stats);
+        self
+    }
+
+    /// Shared speculative-decode counters for the `/metrics` endpoint, if the
+    /// engine wired them. `None` when speculative decoding is not enabled.
+    pub fn spec_decode_stats(&self) -> Option<&Arc<SpecDecodeStats>> {
+        self.spec_decode_stats.as_ref()
     }
 
     #[allow(clippy::result_large_err)]

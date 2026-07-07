@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
@@ -9,8 +10,8 @@ use crate::config::{Config, TensorParallelConfig};
 use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
 use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::engine::{
-    LoadLoraAdapterRequest, TokenEvent, TokenLogprob, TokenSink, UnloadLoraAdapterRequest,
-    panic_message,
+    LoadLoraAdapterRequest, SpecDecodeStats, TokenEvent, TokenLogprob, TokenSink,
+    UnloadLoraAdapterRequest, panic_message,
 };
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
@@ -868,6 +869,12 @@ pub(crate) trait ModelExecutor: Send {
     fn take_kv_store_events(&mut self) -> Vec<Vec<RegisteredBlock>> {
         Vec::new()
     }
+
+    /// Shared spec-decode counters for the `/metrics` endpoint, if a draft
+    /// model was loaded. `None` when speculative decoding is not enabled.
+    fn spec_decode_stats(&self) -> Option<&Arc<SpecDecodeStats>> {
+        None
+    }
 }
 
 /// Deliver withheld `Finished` events; failed sends mean the client is gone,
@@ -924,6 +931,9 @@ pub struct Qwen3Executor {
     /// DFlash draft metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DFlashMeta>,
+    /// Shared spec-decode counters exposed via the `/metrics` endpoint.
+    /// `Some` once a draft model is loaded.
+    spec_decode_stats: Option<Arc<SpecDecodeStats>>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
@@ -1080,6 +1090,7 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            spec_decode_stats: None,
             dflash_ready_requests: HashSet::new(),
             kv_events,
         })
@@ -1324,6 +1335,7 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            spec_decode_stats: None,
             dflash_ready_requests: HashSet::new(),
             // KV events are single-GPU only (asserted above); never wired here.
             kv_events: None,
@@ -1443,19 +1455,28 @@ impl Qwen3Executor {
             self.offload.is_none(),
             "speculative decoding is not supported together with KV offload"
         );
-        let meta = self.primary.load_dflash(draft_path.to_string())?;
+        let config = crate::config::DFlashConfig::from_file(draft_path)?;
+        let stats = Arc::new(SpecDecodeStats::new(config.block_size));
+        let meta = self.primary.load_dflash(draft_path.to_string(), Some(Arc::clone(&stats)))?;
         log::info!(
             "Qwen3 DFlash speculative decoding enabled: draft block size {}",
             meta.block_size
         );
         self.prefix_cache_enabled = false;
         self.speculative = Some(meta);
+        self.spec_decode_stats = Some(stats);
         Ok(())
     }
 
     /// Whether KV offload is active on this executor.
     pub fn offload_enabled(&self) -> bool {
         self.offload.is_some()
+    }
+
+    /// Shared speculative-decode counters for the `/metrics` endpoint, if
+    /// a draft model was loaded.
+    pub fn spec_decode_stats(&self) -> Option<&Arc<SpecDecodeStats>> {
+        self.spec_decode_stats.as_ref()
     }
 
     /// Flush pending offload saves into the host read cache so a following
@@ -1995,6 +2016,10 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         runs
+    }
+
+    fn spec_decode_stats(&self) -> Option<&Arc<SpecDecodeStats>> {
+        self.spec_decode_stats.as_ref()
     }
 
     fn begin_kv_prefetch(
@@ -2808,7 +2833,11 @@ impl LocalQwen3Lane {
     /// Load the DFlash draft model into this lane (primary rank only). The draft
     /// model is built here on the worker thread because it reads the co-located
     /// target model's embeddings and head.
-    fn load_dflash(&mut self, draft_path: &str) -> Result<DFlashMeta> {
+    fn load_dflash(
+        &mut self,
+        draft_path: &str,
+        stats: Option<Arc<SpecDecodeStats>>,
+    ) -> Result<DFlashMeta> {
         let model = DFlashDraftModel::from_safetensors_for_target(
             self.model.device_ctx(),
             draft_path,
@@ -2825,6 +2854,7 @@ impl LocalQwen3Lane {
             self.model.device_ctx(),
             model,
             max_decode_batch_size,
+            stats,
         )?);
         Ok(meta)
     }
@@ -3157,6 +3187,7 @@ enum WorkerCommand {
     /// thread because it reads the co-located target model).
     LoadDflash {
         draft_path: String,
+        stats: Option<Arc<SpecDecodeStats>>,
         resp: channel::Sender<Result<DFlashMeta>>,
     },
     /// Drop a request's DFlash draft state (request retired, or it fell back to
@@ -3249,8 +3280,8 @@ impl RankWorker {
                                     let result = lane.resolve_inflight_prefill();
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::LoadDflash { draft_path, resp } => {
-                                    let result = lane.load_dflash(&draft_path);
+                                WorkerCommand::LoadDflash { draft_path, stats, resp } => {
+                                    let result = lane.load_dflash(&draft_path, stats);
                                     let _ = resp.send(result);
                                 }
                                 WorkerCommand::DropDflash { request_id, resp } => {
@@ -3308,11 +3339,16 @@ impl RankWorker {
 
     /// Load the DFlash draft model into this worker's lane and return its
     /// metadata. Blocks until the worker finishes loading.
-    fn load_dflash(&self, draft_path: String) -> Result<DFlashMeta> {
+    fn load_dflash(
+        &self,
+        draft_path: String,
+        stats: Option<Arc<SpecDecodeStats>>,
+    ) -> Result<DFlashMeta> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::LoadDflash {
                 draft_path,
+                stats,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("worker channel closed on load_dflash"))?;

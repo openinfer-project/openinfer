@@ -6,6 +6,7 @@
 //! private to this lane (`pending_context`), never crossing to the scheduler.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use openinfer_core::sampler::SamplingParams;
@@ -17,6 +18,7 @@ use crate::dflash::{DFlashBatchScratch, DFlashDraftModel, DFlashRequestState};
 use crate::speculative::{
     DraftRequestResult, DraftResult, DraftStepItem, VerifyRequestResult, VerifyStepItem,
 };
+use openinfer_core::engine::SpecDecodeStats;
 use openinfer_core::tensor::DeviceContext;
 
 pub(super) struct DFlashLaneState {
@@ -25,6 +27,9 @@ pub(super) struct DFlashLaneState {
     /// Lane-level batched draft scratch, allocated once for the whole decode
     /// batch so the dense draft ops run once instead of once per request.
     scratch: DFlashBatchScratch,
+    /// Prometheus-facing spec-decode counters (drafts, draft tokens, accepted
+    /// tokens, per-position histogram). `None` only on the non-spec path.
+    stats: Option<Arc<SpecDecodeStats>>,
     verified_draft_tokens: usize,
     accepted_draft_tokens: usize,
 }
@@ -34,12 +39,14 @@ impl DFlashLaneState {
         ctx: &DeviceContext,
         model: DFlashDraftModel,
         max_decode_batch_size: usize,
+        stats: Option<Arc<SpecDecodeStats>>,
     ) -> Result<Self> {
         let scratch = model.new_batch_scratch(ctx, max_decode_batch_size)?;
         Ok(Self {
             model,
             requests: HashMap::new(),
             scratch,
+            stats,
             verified_draft_tokens: 0,
             accepted_draft_tokens: 0,
         })
@@ -190,6 +197,12 @@ impl LocalQwen3Lane {
             dflash.requests.insert(req.request_id, state);
             dflash.verified_draft_tokens += req.token_ids.len().saturating_sub(1);
             dflash.accepted_draft_tokens += result.matched_draft_tokens;
+            if let Some(stats) = dflash.stats.as_ref() {
+                stats.observe(
+                    req.token_ids.len().saturating_sub(1) as u64,
+                    result.matched_draft_tokens as u64,
+                );
+            }
             let rate = if dflash.verified_draft_tokens == 0 {
                 0.0
             } else {

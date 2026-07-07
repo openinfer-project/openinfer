@@ -20,6 +20,7 @@ use openinfer_engine::engine::EngineHandle;
 
 mod bridge;
 mod lora;
+mod metrics;
 mod wire;
 
 use bridge::{LocalEngineBridge, ipc_endpoint, local_ipc_namespace};
@@ -145,6 +146,8 @@ where
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
 
+    let stats_cell = metrics::stats_cell();
+
     // The HTTP server runs concurrently with the engine load: vllm-server
     // spends ~1s loading the tokenizer and chat templates before it waits for
     // an engine to register, so neither waits on the other. This task attaches
@@ -158,6 +161,7 @@ where
         let bridge_shutdown = bridge_shutdown.clone();
         let input_address = input_address.clone();
         let output_address = output_address.clone();
+        let stats_cell = Arc::clone(&stats_cell);
         async move {
             let handle = match engine.await {
                 Ok(handle) => handle,
@@ -166,6 +170,11 @@ where
                     return Err(error);
                 }
             };
+            // Wire spec-decode stats into the /metrics cell as soon as the
+            // engine resolves (before the bridge starts serving).
+            if let Some(stats) = handle.spec_decode_stats() {
+                *stats_cell.lock().await = Some(Arc::clone(stats));
+            }
             let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
             let bridge = LocalEngineBridge {
                 input_address,
@@ -216,8 +225,13 @@ where
         shutdown_timeout: Duration::from_secs(10),
     };
 
+    let metrics_router = metrics::metrics_router(Arc::clone(&stats_cell));
     let result =
-        vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
+        vllm_server::serve_with_router_extension(config, server_shutdown, |router| {
+            let router = extend_router(router);
+            router.merge(metrics_router)
+        })
+        .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
     // then collect the engine task. If the server failed while the engine is
     // still loading, the uncancellable blocking load must finish first.
