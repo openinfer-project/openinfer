@@ -41,6 +41,53 @@ pub const GLM52_TP8_CPART_LEN: usize = GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS * G
 /// bf16 scratch length for the SiLU-combined intermediate.
 pub const GLM52_TP8_UG_LEN: usize = GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS * GLM52_TP8_SLICE_I;
 
+/// Enable peer access from the current device to `peer_ordinal` (idempotent).
+/// Required before LL packets can target a peer rank's buffers.
+pub fn glm52_moe_tp8_enable_peer_access(peer_ordinal: usize) -> Result<()> {
+    unsafe { ffi::glm52_moe_tp8_enable_peer_access_cuda(peer_ordinal as i32) }
+        .result()
+        .map_err(|err| anyhow!("TP8 peer access to device {peer_ordinal} failed: {err}"))
+}
+
+/// A zeroed, peer-accessible LL packet buffer on the CURRENT device. Plain
+/// `cudaMalloc` (cudaMallocAsync pool memory is not peer-accessible), freed
+/// on drop. The address is stable for the buffer's lifetime — safe to embed
+/// in captured graphs and to hand to peer ranks.
+pub struct Glm52Tp8LlBuffer {
+    ptr: u64,
+    #[allow(dead_code)]
+    bytes: usize,
+}
+
+// The buffer is device memory touched only by kernels; the owning rank thread
+// coordinates lifetime with peers (destroy barrier before teardown).
+unsafe impl Send for Glm52Tp8LlBuffer {}
+unsafe impl Sync for Glm52Tp8LlBuffer {}
+
+impl Glm52Tp8LlBuffer {
+    pub fn alloc(bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0, "TP8 LL buffer needs positive size");
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { ffi::glm52_moe_tp8_alloc_ll_cuda(bytes, &mut ptr) }
+            .result()
+            .map_err(|err| anyhow!("TP8 LL buffer alloc ({bytes} B) failed: {err}"))?;
+        Ok(Self {
+            ptr: ptr as u64,
+            bytes,
+        })
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.ptr
+    }
+}
+
+impl Drop for Glm52Tp8LlBuffer {
+    fn drop(&mut self) {
+        let _ = unsafe { ffi::glm52_moe_tp8_free_ll_cuda(self.ptr as *mut std::ffi::c_void) };
+    }
+}
+
 /// Co-resident grid size for the cooperative launch on the current device.
 pub fn glm52_moe_tp8_max_blocks() -> Result<usize> {
     let mut blocks: i32 = 0;
@@ -66,8 +113,10 @@ pub struct Glm52MoeTp8Buffers<'a> {
     pub bpart: &'a mut CudaSlice<f32>,
     pub ug: &'a mut CudaSlice<bf16>,
     pub cpart: &'a mut CudaSlice<f32>,
-    pub ag_local: &'a mut CudaSlice<u128>,
-    pub rs_local: &'a mut CudaSlice<u128>,
+    /// Own LL buffers (`Glm52Tp8LlBuffer` addresses; AG sized
+    /// `GLM52_TP8_AG_BUF_PACKETS`, RS `GLM52_TP8_RS_BUF_PACKETS` x 16 B).
+    pub ag_local: u64,
+    pub rs_local: u64,
     pub peer_ag: [u64; GLM52_TP8_RANKS],
     pub peer_rs: [u64; GLM52_TP8_RANKS],
     pub epoch_dev: &'a mut CudaSlice<u64>,
@@ -129,15 +178,16 @@ pub fn glm52_moe_tp8_layer_launch(
             && bufs.bpart.len() >= GLM52_TP8_BPART_LEN
             && bufs.ug.len() >= GLM52_TP8_UG_LEN
             && bufs.cpart.len() >= GLM52_TP8_CPART_LEN
-            && bufs.ag_local.len() >= GLM52_TP8_AG_BUF_PACKETS
-            && bufs.rs_local.len() >= GLM52_TP8_RS_BUF_PACKETS
             && !bufs.epoch_dev.is_empty(),
         "TP8 scratch arena too small"
     );
     ensure!(grid_blocks > 0, "TP8 grid_blocks must be positive");
     ensure!(
-        bufs.peer_ag.iter().all(|&p| p != 0) && bufs.peer_rs.iter().all(|&p| p != 0),
-        "TP8 peer LL pointers not wired"
+        bufs.ag_local != 0
+            && bufs.rs_local != 0
+            && bufs.peer_ag.iter().all(|&p| p != 0)
+            && bufs.peer_rs.iter().all(|&p| p != 0),
+        "TP8 LL pointers not wired"
     );
 
     let (normed2_ptr, _g0) = normed2.device_ptr(&ctx.stream);
@@ -158,8 +208,6 @@ pub fn glm52_moe_tp8_layer_launch(
     let (bpart_ptr, _g15) = bufs.bpart.device_ptr_mut(&ctx.stream);
     let (ug_ptr, _g16) = bufs.ug.device_ptr_mut(&ctx.stream);
     let (cpart_ptr, _g17) = bufs.cpart.device_ptr_mut(&ctx.stream);
-    let (ag_ptr, _g18) = bufs.ag_local.device_ptr_mut(&ctx.stream);
-    let (rs_ptr, _g19) = bufs.rs_local.device_ptr_mut(&ctx.stream);
     let (epoch_ptr, _g20) = bufs.epoch_dev.device_ptr_mut(&ctx.stream);
     let peer_ag: [*const std::ffi::c_void; GLM52_TP8_RANKS] =
         bufs.peer_ag.map(|p| p as *const std::ffi::c_void);
@@ -185,8 +233,8 @@ pub fn glm52_moe_tp8_layer_launch(
             bpart_ptr as *mut f32,
             ug_ptr as *mut ffi::Half,
             cpart_ptr as *mut f32,
-            ag_ptr as *mut std::ffi::c_void,
-            rs_ptr as *mut std::ffi::c_void,
+            bufs.ag_local as *mut std::ffi::c_void,
+            bufs.rs_local as *mut std::ffi::c_void,
             peer_ag.as_ptr(),
             peer_rs.as_ptr(),
             epoch_ptr as *mut u64,

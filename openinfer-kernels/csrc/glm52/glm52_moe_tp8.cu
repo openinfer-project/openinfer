@@ -403,6 +403,28 @@ int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
   return 0;
 }
 
+// LL buffers must be plain cudaMalloc memory: cudaMallocAsync pool memory is
+// not peer-accessible without per-pool access grants, and the pool pointer
+// may be remapped. Zeroed so no stale word matches a live epoch tag.
+int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, void** out) {
+  cudaError_t e = cudaMalloc(out, bytes);
+  if (e != cudaSuccess) return (int)e;
+  return (int)cudaMemset(*out, 0, bytes);
+}
+
+int glm52_moe_tp8_free_ll_cuda(void* p) { return (int)cudaFree(p); }
+
+// LL packets ride plain device pointers across GPUs (in-process DP8, unified
+// addressing) — every rank pair needs peer access. Idempotent.
+int glm52_moe_tp8_enable_peer_access_cuda(int peer_ordinal) {
+  cudaError_t e = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
+  if (e == cudaErrorPeerAccessAlreadyEnabled) {
+    (void)cudaGetLastError();
+    return 0;
+  }
+  return (int)e;
+}
+
 int glm52_moe_tp8_layer_launch_cuda(
     const void* normed2, const void* topk_idx, const void* topk_prob,
     const void* w13, const void* w13_scale, const void* w2,

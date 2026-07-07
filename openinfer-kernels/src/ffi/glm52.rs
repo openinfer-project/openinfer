@@ -299,6 +299,12 @@ unsafe extern "C" {
     // --- TP8 low-latency MoE: whole-layer cooperative kernel + LL packets ----
     pub fn glm52_moe_tp8_max_blocks_cuda(out_blocks: *mut i32) -> CUresult;
 
+    pub fn glm52_moe_tp8_enable_peer_access_cuda(peer_ordinal: i32) -> CUresult;
+
+    pub fn glm52_moe_tp8_alloc_ll_cuda(bytes: usize, out: *mut *mut std::ffi::c_void) -> CUresult;
+
+    pub fn glm52_moe_tp8_free_ll_cuda(p: *mut std::ffi::c_void) -> CUresult;
+
     pub fn glm52_moe_tp8_layer_launch_cuda(
         normed2: *const Half,
         topk_idx: *const i32,

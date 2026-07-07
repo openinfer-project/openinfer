@@ -158,6 +158,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                                 as usize,
                             use_hugepages: args.kv_offload_hugepages,
                         }),
+                    moe_tp8_pilot_layers: args.moe_tp8_pilot_layers,
                 },
             )
             .context("failed to start GLM5.2 engine")?

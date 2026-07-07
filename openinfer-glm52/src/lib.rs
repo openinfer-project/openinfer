@@ -22,6 +22,7 @@ mod mla_decode;
 mod model;
 mod moe_decode;
 mod moe_ep8;
+mod moe_tp8;
 #[cfg(test)]
 mod oracle;
 mod rows;
@@ -77,6 +78,11 @@ pub struct Glm52LaunchOptions {
     /// Requires the prefix cache (rejected at launch alongside the DSpark
     /// drafter or `no_prefix_cache`).
     pub kv_offload: Option<Glm52KvOffloadOptions>,
+    /// TP8 low-latency MoE pilot: the first N MoE layers additionally load a
+    /// 1/8-intermediate slice of ALL experts per rank and run bucket-1 decode
+    /// through the whole-layer cooperative kernel (larger buckets keep the
+    /// EP8 dispatch/combine chain — both banks stay resident). 0 = off.
+    pub moe_tp8_pilot_layers: usize,
 }
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
@@ -103,6 +109,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         max_model_len,
         no_prefix_cache,
         kv_offload,
+        moe_tp8_pilot_layers,
     } = options;
     ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
@@ -130,6 +137,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         max_model_len,
         no_prefix_cache,
         kv_offload,
+        moe_tp8_pilot_layers,
     )
 }
 
@@ -298,9 +306,10 @@ fn start_engine(
     requested_max_model_len: Option<usize>,
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
+    moe_tp8_pilot_layers: usize,
 ) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, options)?;
-    let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
+    let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_tp8_pilot_layers)?;
     log::info!(
         "GLM5.2 load-weight startup complete: ranks={}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}",
         startup.device_ordinals.len(),
@@ -343,7 +352,7 @@ fn start_engine(
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
-    let rank_arenas = build_rank_models(&loaded.workers, max_model_len)?;
+    let rank_arenas = build_rank_models(&loaded.workers, max_model_len, moe_tp8_pilot_layers > 0)?;
     // From here the DeepEP contexts exist and their destruction is COLLECTIVE:
     // a startup failure must broadcast Shutdown to every rank BEFORE the
     // workers' sequential Drop joins them one by one (the same teardown
@@ -457,6 +466,7 @@ fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
 fn build_rank_models(
     workers: &[Glm52RankWorker],
     max_model_len: usize,
+    tp8_pilot: bool,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
@@ -473,9 +483,11 @@ fn build_rank_models(
     }
 
     let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
+    let tp8_exchange =
+        tp8_pilot.then(|| std::sync::Arc::new(crate::moe_tp8::Glm52Tp8Exchange::new()));
     let responses = workers
         .iter()
-        .map(|worker| worker.setup_comm_async(unique_id))
+        .map(|worker| worker.setup_comm_async(unique_id, tp8_exchange.clone()))
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
@@ -635,6 +647,7 @@ fn validate_startup(model_path: &Path, options: &Glm52LoadOptions) -> Result<Sta
 fn load_rank_weights_to_gpu(
     model_path: &Path,
     startup: &StartupValidation,
+    tp8_pilot_layers: usize,
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
@@ -660,7 +673,7 @@ fn load_rank_weights_to_gpu(
     );
     let load_results = workers
         .iter()
-        .map(|worker| worker.load_weights_async(model_path))
+        .map(|worker| worker.load_weights_async(model_path, tp8_pilot_layers))
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(load_results.len());
     for (rank, rx) in load_results.into_iter().enumerate() {

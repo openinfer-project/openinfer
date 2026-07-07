@@ -241,6 +241,15 @@ impl Glm52WeightManifest {
             .collect()
     }
 
+    /// Shard file holding `name` (TP8 slice second-pass loads resolve every
+    /// expert's tensors, not just this rank's 32-expert bundle).
+    pub(crate) fn shard_for(&self, name: &str) -> Result<&str> {
+        self.weight_map
+            .get(name)
+            .map(String::as_str)
+            .with_context(|| format!("GLM5.2 safetensors index missing tensor {name}"))
+    }
+
     fn rank_load_bundle(&self, rank: usize) -> Result<Glm52RankLoadBundle> {
         let names = self.rank_tensor_names(rank)?;
         let mut by_shard: BTreeMap<String, Vec<Glm52TensorLoadSpec>> = BTreeMap::new();

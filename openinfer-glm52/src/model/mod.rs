@@ -46,7 +46,8 @@ use crate::layer::{
 };
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::moe_decode::run_router_into;
-use crate::moe_ep8::{Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::moe_ep8::{Glm52MoeEp8LayerWeights, Glm52MoeEp8State, glm52_moe_ep8_routed_forward};
+use crate::moe_tp8::Glm52MoeTp8Rank;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::{Glm52RankGpuWeights, retype_owned};
 
@@ -618,6 +619,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: &mut Glm52MoeEp8State,
+        tp8: Option<&mut Glm52MoeTp8Rank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
@@ -665,7 +667,7 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(ctx, aux, ep8, inputs, shape, kv)?;
+            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp8, inputs, shape, kv)?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -761,6 +763,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: &mut Glm52MoeEp8State,
+        tp8: Option<&mut Glm52MoeTp8Rank>,
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
@@ -896,6 +899,7 @@ impl Glm52RankModel {
                 ctx,
                 aux,
                 ep8,
+                tp8,
                 &self.layers,
                 &mut self.caches,
                 &self.embed,
@@ -922,6 +926,7 @@ fn run_step_body(
     ctx: &DeviceContext,
     aux: &DeviceContext,
     ep8: &mut Glm52MoeEp8State,
+    mut tp8: Option<&mut Glm52MoeTp8Rank>,
     layers: &[Glm52DecoderLayerWeights],
     caches: &mut [Glm52LayerCaches],
     embed: &DeviceMatrix,
@@ -970,45 +975,36 @@ fn run_step_body(
                 s.layer.mlp_out.data_mut(),
             )?,
             Glm52LayerMlp::MoeEp8(moe) => {
-                // Fork: the shared expert only needs `normed2`, so it runs on
-                // the aux stream concurrently with the routed path's
-                // dispatch/grouped-GEMM/combine — the cooperative collectives
-                // occupy a fixed SM slice and mostly wait on peers, leaving
-                // the rest of the GPU free. The events recorded here during
-                // capture become graph edges; replay keeps the parallel
-                // branches.
-                let normed_ready = ctx.stream.record_event(None)?;
-                aux.stream.wait(&normed_ready)?;
-                moe.shared.forward_into(
-                    aux,
-                    s.layer.normed2.data(),
-                    &mut s.shared_mlp,
-                    s.layer.shared_out.data_mut(),
-                )?;
-                let shared_done = aux.stream.record_event(None)?;
-
-                run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
-                let dispatched = glm52_moe_ep8_routed_forward(
-                    ctx,
-                    ep8,
-                    &moe.bank,
-                    Some((s.layer.normed2.data(), &s.router.route, batch)),
-                    global_tokens,
-                )
-                .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
-                ensure!(
-                    dispatched,
-                    "EP8 MoE returned no combined output for the dispatched rows"
-                );
-                // Join: the closing add consumes both branches.
-                ctx.stream.wait(&shared_done)?;
-                add_into(
-                    ctx,
-                    ep8.combined(),
-                    s.layer.shared_out.data(),
-                    batch * GLM52_HIDDEN,
-                    s.layer.mlp_out.data_mut(),
-                )?;
+                // TP8 pilot: at bucket-1 a pilot layer takes the whole-layer
+                // cooperative kernel (allgather + all-expert slice mma +
+                // reduce-scatter, shared expert folded in) instead of the
+                // EP8 dispatch/combine chain. Same router, same `mlp_out`
+                // contract — larger buckets keep EP8 below.
+                let tp8_layer = if batch == 1 {
+                    tp8.as_deref_mut().and_then(|rank| {
+                        let Glm52MoeTp8Rank { state, slices } = rank;
+                        slices.get(&layer).map(|bank| (state, bank))
+                    })
+                } else {
+                    None
+                };
+                if let Some((tp8_state, bank)) = tp8_layer {
+                    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
+                    tp8_state
+                        .forward(
+                            ctx,
+                            bank,
+                            s.layer.normed2.data(),
+                            &s.router,
+                            s.layer.mlp_out.data_mut(),
+                        )
+                        .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
+                    // `mlp_out` already holds routed + shared — fall through
+                    // to the closing add below the match.
+                } else {
+                    glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
+                        .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
+                }
             }
             #[cfg(test)]
             Glm52LayerMlp::Moe(_) => {
@@ -1059,5 +1055,55 @@ fn run_step_body(
         &mut s.argmax_partial_indices,
         &mut s.argmax_values,
         &mut s.argmax_indices,
+    )
+}
+
+/// One layer's EP8 MoE half: shared expert forked to the aux stream, routed
+/// path through router + DeepEP dispatch/grouped-GEMM/combine, joined by the
+/// closing add into `mlp_out`. The events recorded here during capture
+/// become graph edges; replay keeps the parallel branches.
+fn glm52_moe_ep8_layer(
+    ctx: &DeviceContext,
+    aux: &DeviceContext,
+    ep8: &mut Glm52MoeEp8State,
+    moe: &Glm52MoeEp8LayerWeights,
+    s: &mut Glm52DecodeScratch,
+    batch: usize,
+    global_tokens: usize,
+) -> Result<()> {
+    // Fork: the shared expert only needs `normed2`, so it runs on the aux
+    // stream concurrently with the routed path's dispatch/grouped-GEMM/
+    // combine — the cooperative collectives occupy a fixed SM slice and
+    // mostly wait on peers, leaving the rest of the GPU free.
+    let normed_ready = ctx.stream.record_event(None)?;
+    aux.stream.wait(&normed_ready)?;
+    moe.shared.forward_into(
+        aux,
+        s.layer.normed2.data(),
+        &mut s.shared_mlp,
+        s.layer.shared_out.data_mut(),
+    )?;
+    let shared_done = aux.stream.record_event(None)?;
+
+    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
+    let dispatched = glm52_moe_ep8_routed_forward(
+        ctx,
+        ep8,
+        &moe.bank,
+        Some((s.layer.normed2.data(), &s.router.route, batch)),
+        global_tokens,
+    )?;
+    ensure!(
+        dispatched,
+        "EP8 MoE returned no combined output for the dispatched rows"
+    );
+    // Join: the closing add consumes both branches.
+    ctx.stream.wait(&shared_done)?;
+    add_into(
+        ctx,
+        ep8.combined(),
+        s.layer.shared_out.data(),
+        batch * GLM52_HIDDEN,
+        s.layer.mlp_out.data_mut(),
     )
 }

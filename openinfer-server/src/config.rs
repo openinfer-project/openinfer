@@ -143,6 +143,13 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_model_len: Option<usize>,
 
+    /// GLM5.2 TP8 low-latency MoE pilot: the first N MoE layers additionally
+    /// load a 1/8-intermediate slice of ALL experts per rank (dual-resident
+    /// with the EP8 bank) and run bucket-1 decode through the whole-layer
+    /// cooperative kernel. 0 = off (pure EP8, today's behavior).
+    #[arg(long, default_value_t = 0)]
+    pub moe_tp8_pilot_layers: usize,
+
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, CUDA Graph capture, and margin.
