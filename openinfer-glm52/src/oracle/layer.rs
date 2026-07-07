@@ -342,7 +342,7 @@ pub(crate) fn load_rank_expert_bank(
     crate::moe_decode::Glm52MoeExpertBank::pack_from_host(ctx, &experts)
 }
 
-fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
+pub(super) fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
     let mut dev = ctx.stream.alloc_zeros::<u8>(host.len())?;
     ctx.stream.memcpy_htod(host, &mut dev)?;
     Ok(dev)

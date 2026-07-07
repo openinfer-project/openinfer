@@ -20,4 +20,5 @@ mod bookend;
 mod indexer;
 mod layer;
 mod layer_ep8;
+mod layer_tp8;
 mod mla;
