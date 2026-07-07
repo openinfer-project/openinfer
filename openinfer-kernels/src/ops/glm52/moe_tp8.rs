@@ -41,16 +41,19 @@ pub const GLM52_TP8_CPART_LEN: usize = GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS * G
 /// bf16 scratch length for the SiLU-combined intermediate.
 pub const GLM52_TP8_UG_LEN: usize = GLM52_TP8_UNION_MAX * GLM52_TP8_RANKS * GLM52_TP8_SLICE_I;
 
-/// A zeroed, peer-accessible LL packet buffer on the CURRENT device, from a
-/// dedicated per-device `cudaMemPool` whose access is granted to the peer
-/// devices (`cudaMemPoolSetAccess`). Deliberately NOT
-/// `cudaDeviceEnablePeerAccess`: that is device-wide — it maps the whole
-/// 105 GiB expert slab into every peer's address space and the page-table
-/// pressure taxes the memory-bound expert GEMMs on all layers (~0.8 ms/step
-/// flat on 8xH200). Freed on drop; the address is stable for the buffer's
-/// lifetime — safe to embed in captured graphs and to hand to peer ranks.
+/// A zeroed LL packet buffer physically on the CURRENT device, mapped in the
+/// NCCL-window topology: one VMM allocation, one fresh VA per fleet device,
+/// each VA access-granted to exactly that one device. This is load-bearing —
+/// any VA whose access list names more than its single accessor (device-wide
+/// `cudaDeviceEnablePeerAccess`, pool-scoped `cudaMemPoolSetAccess`, or one
+/// VMM range granted to all 8) taxes the memory-bound expert GEMMs on all
+/// layers ~0.85 ms/step flat on 8xH200; the per-accessor form measures
+/// tax-free. Freed on drop; every VA is stable for the buffer's lifetime —
+/// safe to embed in captured graphs and to hand to peer ranks.
 pub struct Glm52Tp8LlBuffer {
-    ptr: u64,
+    /// `vas[i]` is the VA device `i` must use to reach this buffer
+    /// (positionally aligned with the `device_ordinals` passed to `alloc`).
+    vas: Vec<u64>,
     #[allow(dead_code)]
     bytes: usize,
 }
@@ -61,40 +64,39 @@ unsafe impl Send for Glm52Tp8LlBuffer {}
 unsafe impl Sync for Glm52Tp8LlBuffer {}
 
 impl Glm52Tp8LlBuffer {
-    /// `device_ordinals` is the full DP fleet (own ordinal included); peer
-    /// access is granted to every other member on first allocation.
+    /// `device_ordinals` is the full DP fleet; it must include the current
+    /// device (the physical owner, which also zeroes the pages).
     pub fn alloc(bytes: usize, device_ordinals: &[usize]) -> Result<Self> {
         ensure!(bytes > 0, "TP8 LL buffer needs positive size");
         ensure!(
-            !device_ordinals.is_empty() && device_ordinals.len() <= 64,
-            "TP8 LL buffer needs 1..=64 fleet device ordinals"
+            !device_ordinals.is_empty() && device_ordinals.len() <= 8,
+            "TP8 LL buffer needs 1..=8 fleet device ordinals"
         );
         let ordinals: Vec<i32> = device_ordinals.iter().map(|&d| d as i32).collect();
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut vas = vec![0u64; ordinals.len()];
         unsafe {
             ffi::glm52_moe_tp8_alloc_ll_cuda(
                 bytes,
                 ordinals.as_ptr(),
                 ordinals.len() as i32,
-                &mut ptr,
+                vas.as_mut_ptr(),
             )
         }
         .result()
         .map_err(|err| anyhow!("TP8 LL buffer alloc ({bytes} B) failed: {err}"))?;
-        Ok(Self {
-            ptr: ptr as u64,
-            bytes,
-        })
+        Ok(Self { vas, bytes })
     }
 
-    pub fn addr(&self) -> u64 {
-        self.ptr
+    /// The VA through which fleet member `idx` (position in the `alloc`
+    /// ordinals) reaches this buffer.
+    pub fn addr_for(&self, idx: usize) -> u64 {
+        self.vas[idx]
     }
 }
 
 impl Drop for Glm52Tp8LlBuffer {
     fn drop(&mut self) {
-        let _ = unsafe { ffi::glm52_moe_tp8_free_ll_cuda(self.ptr as *mut std::ffi::c_void) };
+        let _ = unsafe { ffi::glm52_moe_tp8_free_ll_cuda(self.vas[0] as *mut std::ffi::c_void) };
     }
 }
 

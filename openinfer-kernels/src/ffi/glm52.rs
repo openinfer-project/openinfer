@@ -303,7 +303,7 @@ unsafe extern "C" {
         bytes: usize,
         device_ordinals: *const i32,
         n_devices: i32,
-        out: *mut *mut std::ffi::c_void,
+        out_vas: *mut u64,
     ) -> CUresult;
 
     pub fn glm52_moe_tp8_free_ll_cuda(p: *mut std::ffi::c_void) -> CUresult;

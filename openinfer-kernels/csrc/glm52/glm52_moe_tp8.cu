@@ -434,20 +434,24 @@ int glm52_moe_tp8_max_blocks_cuda(int* out_blocks) {
   return 0;
 }
 
-// LL buffers are CUDA VMM allocations (cuMemCreate + cuMemMap) with peer
-// access granted per-range via cuMemSetAccess — the same mechanism NCCL uses
-// for its symmetric windows. This is load-bearing: BOTH device-wide
-// cudaDeviceEnablePeerAccess AND pool-scoped cudaMemPoolSetAccess open a
-// device-wide peer channel under the hood, and its page-table side effect
-// taxes the memory-bound expert GEMMs on ALL layers — measured as a flat
-// ~0.85 ms/step on solo bucket-1 (8xH200), independent of what the kernel
-// does (an empty node with the grant present pays it; no grant, no tax).
-// VMM maps exactly these few MB and nothing else — the running DeepEP
-// windows are the existence proof that this form is tax-free.
+// LL buffers are CUDA VMM allocations in the NCCL-window mapping topology:
+// one physical allocation (cuMemCreate on the owner device), mapped once PER
+// ACCESSOR at a fresh VA, each VA access-granted to exactly that one device.
+// This is load-bearing. Any VA whose access list names a device other than
+// (or in addition to) its single accessor taxes the memory-bound expert
+// GEMMs on ALL layers — a flat ~0.85 ms/step on solo bucket-1 (8xH200),
+// independent of kernel content (an empty node with the grant present pays
+// it; no grant, no tax). Measured to pay the full tax: device-wide
+// cudaDeviceEnablePeerAccess, pool-scoped cudaMemPoolSetAccess, and a single
+// VMM range cuMemSetAccess'd to all 8 devices. Measured tax-free: this
+// per-accessor form (19.04 ms vs the no-grant 19.12 ms control) — the same
+// topology the running DeepEP/NCCL symmetric windows use.
 // Zeroed so no stale word matches a live epoch tag.
 namespace {
+constexpr int kLlMaxDevices = 8;
 struct LlVmmRecord {
-  CUdeviceptr va;
+  CUdeviceptr vas[kLlMaxDevices];  // vas[i] = accessor device_ordinals[i]'s VA
+  int n_vas;
   size_t size;
   CUmemGenericAllocationHandle handle;
 };
@@ -457,12 +461,12 @@ std::mutex g_ll_vmm_mu;  // 8 rank threads allocate concurrently
 }
 
 int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, const int* device_ordinals,
-                                int n_devices, void** out) {
+                                int n_devices, unsigned long long* out_vas) {
   int dev = 0;
   cudaError_t e = cudaGetDevice(&dev);
   if (e != cudaSuccess) return (int)e;
   std::lock_guard<std::mutex> lock(g_ll_vmm_mu);
-  if (n_devices <= 0 || n_devices > 64 || g_ll_vmm_count >= 64) {
+  if (n_devices <= 0 || n_devices > kLlMaxDevices || g_ll_vmm_count >= 64) {
     return (int)cudaErrorInvalidValue;
   }
   CUmemAllocationProp prop = {};
@@ -476,49 +480,65 @@ int glm52_moe_tp8_alloc_ll_cuda(size_t bytes, const int* device_ordinals,
     return (int)cudaErrorUnknown;
   }
   const size_t size = (bytes + gran - 1) / gran * gran;
-  CUdeviceptr va = 0;
   CUmemGenericAllocationHandle handle = 0;
-  if (cuMemAddressReserve(&va, size, 0, 0, 0) != CUDA_SUCCESS) {
-    return (int)cudaErrorMemoryAllocation;
-  }
   if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) {
-    (void)cuMemAddressFree(va, size);
     return (int)cudaErrorMemoryAllocation;
   }
-  if (cuMemMap(va, size, 0, handle, 0) != CUDA_SUCCESS) {
-    (void)cuMemRelease(handle);
-    (void)cuMemAddressFree(va, size);
-    return (int)cudaErrorMemoryAllocation;
-  }
-  CUmemAccessDesc desc[64];
+  LlVmmRecord rec = {};
+  rec.n_vas = n_devices;
+  rec.size = size;
+  rec.handle = handle;
+  bool owner_seen = false;
   for (int i = 0; i < n_devices; ++i) {
-    desc[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    desc[i].location.id = device_ordinals[i];
-    desc[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CUdeviceptr va = 0;
+    if (cuMemAddressReserve(&va, size, 0, 0, 0) != CUDA_SUCCESS) goto fail;
+    rec.vas[i] = va;
+    if (cuMemMap(va, size, 0, handle, 0) != CUDA_SUCCESS) goto fail;
+    {
+      CUmemAccessDesc desc = {};
+      desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      desc.location.id = device_ordinals[i];
+      desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      if (cuMemSetAccess(va, size, &desc, 1) != CUDA_SUCCESS) goto fail;
+    }
+    if (device_ordinals[i] == dev) {
+      owner_seen = true;
+      if (cudaMemset((void*)va, 0, size) != cudaSuccess) goto fail;
+    }
+    out_vas[i] = (unsigned long long)va;
   }
-  if (cuMemSetAccess(va, size, desc, n_devices) != CUDA_SUCCESS) {
-    (void)cuMemUnmap(va, size);
-    (void)cuMemRelease(handle);
-    (void)cuMemAddressFree(va, size);
-    return (int)cudaErrorMemoryAllocation;
-  }
-  e = cudaMemset((void*)va, 0, size);
-  if (e != cudaSuccess) return (int)e;
-  g_ll_vmm[g_ll_vmm_count++] = {va, size, handle};
-  *out = (void*)va;
+  // The fleet must include the allocating device, or nothing zeroed the
+  // physical pages and no VA is pollable locally.
+  if (!owner_seen) goto fail;
+  g_ll_vmm[g_ll_vmm_count++] = rec;
   return 0;
+
+fail:
+  for (int i = 0; i < n_devices; ++i) {
+    if (rec.vas[i] != 0) {
+      (void)cuMemUnmap(rec.vas[i], size);
+      (void)cuMemAddressFree(rec.vas[i], size);
+    }
+  }
+  (void)cuMemRelease(handle);
+  return (int)cudaErrorMemoryAllocation;
 }
 
 int glm52_moe_tp8_free_ll_cuda(void* p) {
   std::lock_guard<std::mutex> lock(g_ll_vmm_mu);
   for (int i = 0; i < g_ll_vmm_count; ++i) {
-    if (g_ll_vmm[i].va == (CUdeviceptr)p) {
-      (void)cuMemUnmap(g_ll_vmm[i].va, g_ll_vmm[i].size);
-      (void)cuMemRelease(g_ll_vmm[i].handle);
-      (void)cuMemAddressFree(g_ll_vmm[i].va, g_ll_vmm[i].size);
-      g_ll_vmm[i] = g_ll_vmm[--g_ll_vmm_count];
-      return 0;
+    bool hit = false;
+    for (int j = 0; j < g_ll_vmm[i].n_vas; ++j) {
+      hit |= g_ll_vmm[i].vas[j] == (CUdeviceptr)p;
     }
+    if (!hit) continue;
+    for (int j = 0; j < g_ll_vmm[i].n_vas; ++j) {
+      (void)cuMemUnmap(g_ll_vmm[i].vas[j], g_ll_vmm[i].size);
+      (void)cuMemAddressFree(g_ll_vmm[i].vas[j], g_ll_vmm[i].size);
+    }
+    (void)cuMemRelease(g_ll_vmm[i].handle);
+    g_ll_vmm[i] = g_ll_vmm[--g_ll_vmm_count];
+    return 0;
   }
   return (int)cudaErrorInvalidValue;
 }

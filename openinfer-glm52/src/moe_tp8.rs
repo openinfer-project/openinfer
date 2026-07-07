@@ -236,10 +236,18 @@ pub(crate) fn load_tp8_slice_layer(
     staging.upload(ctx)
 }
 
-/// Cross-rank rendezvous for LL buffer addresses: every rank publishes its
-/// (device ordinal, AG address, RS address) and blocks until all 8 are in.
+/// One rank's published LL buffer mappings: per-accessor VA tables (indexed
+/// by fleet device ordinal) for its AG and RS buffers.
+#[derive(Clone, Copy)]
+struct Glm52Tp8LlVas {
+    ag: [u64; RANKS],
+    rs: [u64; RANKS],
+}
+
+/// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
+/// per-accessor VA tables and blocks until all 8 are in.
 pub(crate) struct Glm52Tp8Exchange {
-    slots: Mutex<[Option<(usize, u64, u64)>; RANKS]>,
+    slots: Mutex<[Option<Glm52Tp8LlVas>; RANKS]>,
     all_in: Condvar,
 }
 
@@ -251,19 +259,13 @@ impl Glm52Tp8Exchange {
         }
     }
 
-    fn publish_and_wait(
-        &self,
-        rank: usize,
-        ordinal: usize,
-        ag: u64,
-        rs: u64,
-    ) -> Result<[(usize, u64, u64); RANKS]> {
+    fn publish_and_wait(&self, rank: usize, vas: Glm52Tp8LlVas) -> Result<[Glm52Tp8LlVas; RANKS]> {
         let mut slots = self.slots.lock().expect("TP8 exchange poisoned");
         ensure!(
             slots[rank].is_none(),
             "TP8 exchange rank {rank} published twice"
         );
-        slots[rank] = Some((ordinal, ag, rs));
+        slots[rank] = Some(vas);
         self.all_in.notify_all();
         while slots.iter().any(Option::is_none) {
             slots = self.all_in.wait(slots).expect("TP8 exchange poisoned");
@@ -317,20 +319,31 @@ impl Glm52MoeTp8State {
         exchange: &Glm52Tp8Exchange,
     ) -> Result<Self> {
         ensure!(rank < RANKS, "TP8 rank {rank} out of range");
-        // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch);
-        // pool-scoped peer access is granted to all of them at first alloc.
+        // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch), so
+        // the per-accessor VA tables index directly by device ordinal.
         let fleet: Vec<usize> = (0..RANKS).collect();
+        ensure!(
+            fleet.contains(&device_ordinal),
+            "TP8 device ordinal {device_ordinal} outside the 0..8 fleet"
+        );
         let ag = Glm52Tp8LlBuffer::alloc(GLM52_TP8_AG_BUF_PACKETS * 16, &fleet)?;
         let rs = Glm52Tp8LlBuffer::alloc(GLM52_TP8_RS_BUF_PACKETS * 16, &fleet)?;
-        let table = exchange.publish_and_wait(rank, device_ordinal, ag.addr(), rs.addr())?;
-        // Peer pointers pre-offset to THIS rank's source-rank slot. Kernel
-        // buffer layout is [parity][src_rank][packet] (the kernel adds the
-        // parity offset itself), so the slot stride is one rank's packet
-        // count x 16 B.
+        let vas = Glm52Tp8LlVas {
+            ag: std::array::from_fn(|a| ag.addr_for(a)),
+            rs: std::array::from_fn(|a| rs.addr_for(a)),
+        };
+        let table = exchange.publish_and_wait(rank, vas)?;
+        // Peer pointers: THIS device's VA for peer p's buffer (per-accessor
+        // mapping — see `Glm52Tp8LlBuffer`), pre-offset to this rank's
+        // source-rank slot. Kernel buffer layout is [parity][src_rank][packet]
+        // (the kernel adds the parity offset itself), so the slot stride is
+        // one rank's packet count x 16 B.
         let ag_slot = (GLM52_TP8_AG_BUF_PACKETS / RANKS / 2) * 16;
         let rs_slot = (GLM52_TP8_RS_BUF_PACKETS / RANKS / 2) * 16;
-        let peer_ag = std::array::from_fn(|p| table[p].1 + (rank * ag_slot) as u64);
-        let peer_rs = std::array::from_fn(|p| table[p].2 + (rank * rs_slot) as u64);
+        let peer_ag =
+            std::array::from_fn(|p| table[p].ag[device_ordinal] + (rank * ag_slot) as u64);
+        let peer_rs =
+            std::array::from_fn(|p| table[p].rs[device_ordinal] + (rank * rs_slot) as u64);
         // Epoch starts at 1: the LL buffers are zeroed, and a zero tag must
         // never match a live epoch.
         let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
@@ -339,8 +352,8 @@ impl Glm52MoeTp8State {
         Ok(Self {
             rank,
             grid_blocks,
-            ag_local: ag.addr(),
-            rs_local: rs.addr(),
+            ag_local: ag.addr_for(device_ordinal),
+            rs_local: rs.addr_for(device_ordinal),
             _ag: ag,
             _rs: rs,
             peer_ag,
