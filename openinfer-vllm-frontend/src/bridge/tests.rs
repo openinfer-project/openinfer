@@ -70,8 +70,12 @@ impl Demux {
         }
     }
 
-    fn next_output(&mut self) -> Option<EngineCoreOutputs> {
-        self.output_rx.try_recv().ok()
+    fn next_output(&mut self) -> Option<RequestBatchOutputs> {
+        let outputs = self.output_rx.try_recv().ok()?;
+        match outputs {
+            EngineCoreOutputs::RequestBatch(batch) => Some(batch),
+            other => panic!("expected a request batch, got {other:?}"),
+        }
     }
 }
 
@@ -392,4 +396,48 @@ fn rejected_request_is_reported_as_error() {
         !d.streams.contains_key("req-1"),
         "finished stream is removed"
     );
+}
+
+/// The scheduler-stats task turns each load-watch snapshot into a stats-only
+/// batch (no request outputs, no finished set) with the queue gauges and the
+/// fractional KV usage the frontend records into Prometheus, sends the current
+/// snapshot up front, and follows every watch update with exactly one message.
+#[tokio::test]
+async fn load_snapshots_become_stats_only_batches() {
+    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot {
+        kv_used_blocks: 25,
+        kv_total_blocks: 100,
+        num_running_reqs: 2,
+        num_waiting_reqs: 1,
+    });
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(publish_scheduler_stats(
+        load_rx,
+        output_tx,
+        shutdown.clone(),
+    ));
+
+    let batch = match output_rx.recv().await.expect("initial stats batch") {
+        EngineCoreOutputs::RequestBatch(batch) => batch,
+        other => panic!("expected a stats batch, got {other:?}"),
+    };
+    assert!(batch.outputs.is_empty());
+    assert!(batch.finished_requests.is_none());
+    let stats = batch.scheduler_stats.expect("scheduler stats");
+    assert_eq!(stats.num_running_reqs, 2);
+    assert_eq!(stats.num_waiting_reqs, 1);
+    assert!((stats.kv_cache_usage - 0.25).abs() < 1e-9);
+
+    load_tx.send_replace(LoadSnapshot::default());
+    let batch = match output_rx.recv().await.expect("drained stats batch") {
+        EngineCoreOutputs::RequestBatch(batch) => batch,
+        other => panic!("expected a stats batch, got {other:?}"),
+    };
+    let stats = batch.scheduler_stats.expect("scheduler stats");
+    assert_eq!(stats.num_running_reqs, 0);
+    assert_eq!(stats.kv_cache_usage, 0.0);
+
+    shutdown.cancel();
+    task.await.expect("stats task exits on shutdown");
 }

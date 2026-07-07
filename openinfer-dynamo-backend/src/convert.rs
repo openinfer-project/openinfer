@@ -369,6 +369,7 @@ mod tests {
             LoadSnapshot {
                 kv_used_blocks: 25,
                 kv_total_blocks: 100,
+                ..LoadSnapshot::default()
             },
             0,
         );

@@ -2,7 +2,8 @@ use anyhow::{Result, bail};
 use vllm_engine_core_client::protocol::logprobs::{
     PositionLogprobs, TokenLogprob as WireTokenLogprob,
 };
-use vllm_engine_core_client::protocol::{EngineCoreFinishReason, EngineCoreSamplingParams};
+use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
+use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
 use openinfer_engine::engine::{FinishReason, TokenLogprob};
 use openinfer_engine::sampler::SamplingParams;

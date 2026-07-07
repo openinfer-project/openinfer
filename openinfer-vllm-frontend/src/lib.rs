@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::{
     ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
-    HttpListenerMode, ParserSelection, RendererSelection,
+    DEFAULT_KEEP_ALIVE_TIMEOUT, HttpListenerMode, ParserSelection, RendererSelection,
 };
 
 use openinfer_engine::engine::EngineHandle;
@@ -214,6 +214,9 @@ where
         disable_log_stats: true,
         grpc_port: None,
         shutdown_timeout: Duration::from_secs(10),
+        keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
+        profiler: None,
+        tls: None,
     };
 
     let result =
