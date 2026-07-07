@@ -80,9 +80,28 @@ pub struct Glm52LaunchOptions {
     pub kv_offload: Option<Glm52KvOffloadOptions>,
     /// TP8 low-latency MoE pilot: the first N MoE layers additionally load a
     /// 1/8-intermediate slice of ALL experts per rank and run bucket-1 decode
-    /// through the whole-layer cooperative kernel (larger buckets keep the
-    /// EP8 dispatch/combine chain — both banks stay resident). 0 = off.
+    /// through the phase-kernel chain (larger buckets keep the EP8
+    /// dispatch/combine chain — both banks stay resident). 0 = off. Only
+    /// meaningful under the EP8 topology (rejected with `MoeTopo::Tp8`).
     pub moe_tp8_pilot_layers: usize,
+    /// Launch-time MoE sharding topology. `Ep8` (default) is the
+    /// high-throughput configuration: 32 whole experts per rank, DeepEP
+    /// dispatch/combine, buckets 1-8. `Tp8` is the low-latency
+    /// configuration: every rank holds a 1/8-intermediate slice of ALL
+    /// experts on every MoE layer, decode runs bucket-1 only (at most one
+    /// request per rank, prefill advances one token per step), and the MoE
+    /// path is the TP8 phase-kernel chain on all 75 layers.
+    pub moe_topo: Glm52MoeTopo,
+}
+
+/// Launch-time MoE sharding topology (the expert slab is repacked during
+/// H2D load, so this is a boot choice — the two layouts never co-reside
+/// except in the pilot).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Glm52MoeTopo {
+    #[default]
+    Ep8,
+    Tp8,
 }
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
@@ -110,6 +129,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_tp8_pilot_layers,
+        moe_topo,
     } = options;
     ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
@@ -125,6 +145,16 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
          DSpark drafter (speculative decoding and prefix caching are mutually exclusive)"
     );
+    ensure!(
+        moe_topo == Glm52MoeTopo::Ep8 || moe_tp8_pilot_layers == 0,
+        "GLM5.2 --moe-tp8-pilot-layers is the EP8-topology dual-resident pilot; \
+         under --moe-topo tp8 every MoE layer is already TP8-sharded"
+    );
+    ensure!(
+        moe_topo == Glm52MoeTopo::Ep8 || dspark_draft_model_path.is_none(),
+        "GLM5.2 --moe-topo tp8 does not support the DSpark drafter yet (draft \
+         verify spans need buckets > 1)"
+    );
     start_engine(
         model_path,
         &Glm52LoadOptions {
@@ -138,6 +168,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         no_prefix_cache,
         kv_offload,
         moe_tp8_pilot_layers,
+        moe_topo,
     )
 }
 
@@ -307,7 +338,14 @@ fn start_engine(
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
     moe_tp8_pilot_layers: usize,
+    moe_topo: Glm52MoeTopo,
 ) -> Result<EngineHandle> {
+    // M2 wiring in progress: the loader/scheduler arms land in follow-up
+    // commits on this branch; fail loud rather than silently serving EP8.
+    ensure!(
+        moe_topo == Glm52MoeTopo::Ep8,
+        "GLM5.2 --moe-topo tp8 is not wired up yet (M2 in progress)"
+    );
     let startup = validate_startup(model_path, options)?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_tp8_pilot_layers)?;
     log::info!(

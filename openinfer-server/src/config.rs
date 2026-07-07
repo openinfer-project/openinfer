@@ -150,6 +150,14 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 0)]
     pub moe_tp8_pilot_layers: usize,
 
+    /// GLM5.2 launch-time MoE sharding topology: `ep8` (default) is the
+    /// high-throughput configuration (32 whole experts per rank, DeepEP
+    /// dispatch/combine, buckets 1-8); `tp8` is the low-latency
+    /// configuration (1/8-intermediate slice of ALL experts per rank on
+    /// every MoE layer, bucket-1 only — at most one request per rank).
+    #[arg(long, default_value = "ep8")]
+    pub moe_topo: String,
+
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
     /// runtime buffers, activation peak, CUDA Graph capture, and margin.

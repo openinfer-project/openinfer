@@ -86,6 +86,7 @@ fn main() -> Result<()> {
             no_prefix_cache: false,
             kv_offload: None,
             moe_tp8_pilot_layers: cli.moe_tp8_pilot_layers,
+            moe_topo: openinfer_glm52::Glm52MoeTopo::default(),
         },
     )
     .context("failed to start GLM5.2 engine")?;
