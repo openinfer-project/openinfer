@@ -311,7 +311,7 @@ pub(crate) fn run_dp8_coordinator(
             }
         };
 
-        let (rank_appends, rank_proposals) = match apply_step_outputs(
+        let (rank_appends, mut rank_proposals) = match apply_step_outputs(
             &mut slots,
             outputs,
             &shapes,
@@ -329,6 +329,22 @@ pub(crate) fn run_dp8_coordinator(
                 break 'serve;
             }
         };
+        // TP8 clamps a concurrent fleet to bucket-1, where a verify span can
+        // never be fed — drafting there burns a drafter forward every step
+        // for zero accepted tokens. Suppress the proposals (appends and
+        // resets still flow, so the drafter's shadow KV stays fresh and
+        // proposals resume the round after the fleet drains back to solo).
+        if tp8_solo_span
+            && slots
+                .iter()
+                .flat_map(|rank_slots| rank_slots.iter().flatten())
+                .count()
+                != 1
+        {
+            for proposals in &mut rank_proposals {
+                proposals.clear();
+            }
+        }
 
         if dspark_enabled
             && let Err(err) = run_draft_round(
