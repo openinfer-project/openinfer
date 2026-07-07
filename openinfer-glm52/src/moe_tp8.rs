@@ -325,9 +325,11 @@ impl Glm52MoeTp8State {
                 glm52_moe_tp8_enable_peer_access(peer_ordinal)?;
             }
         }
-        // Peer pointers pre-offset to THIS rank's source slot: rank r's push
-        // to peer p lands at p's buffer + r * slot.
-        let ag_slot = (GLM52_TP8_AG_BUF_PACKETS / RANKS / 2) * 16; // per-rank, per-parity
+        // Peer pointers pre-offset to THIS rank's source-rank slot. Kernel
+        // buffer layout is [parity][src_rank][packet] (the kernel adds the
+        // parity offset itself), so the slot stride is one rank's packet
+        // count x 16 B.
+        let ag_slot = (GLM52_TP8_AG_BUF_PACKETS / RANKS / 2) * 16;
         let rs_slot = (GLM52_TP8_RS_BUF_PACKETS / RANKS / 2) * 16;
         let peer_ag = std::array::from_fn(|p| table[p].1 + (rank * ag_slot) as u64);
         let peer_rs = std::array::from_fn(|p| table[p].2 + (rank * rs_slot) as u64);
