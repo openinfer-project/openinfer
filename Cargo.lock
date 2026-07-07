@@ -3389,7 +3389,6 @@ dependencies = [
  "openinfer-comm-fabric-lib",
  "openinfer-comm-logging-lib",
  "openinfer-comm-p2p-all-to-all",
- "openinfer-comm-thread-lib",
  "openinfer-comm-torch-lib",
  "parking_lot",
  "postcard",
@@ -3436,7 +3435,6 @@ dependencies = [
  "parking_lot",
  "safetensors",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -3480,7 +3478,6 @@ dependencies = [
  "crossbeam-channel",
  "cudarc",
  "half",
- "libc",
  "log",
  "memmap2",
  "openinfer-comm",
@@ -3532,7 +3529,6 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
- "log",
  "openinfer-build",
  "serde",
  "tvm-ffi",
@@ -3569,7 +3565,6 @@ dependencies = [
  "anyhow",
  "cudarc",
  "dynamo-kv-hashing",
- "dynamo-tokens",
  "half",
  "kvbm-logical",
  "openinfer-kernels",
@@ -3580,7 +3575,6 @@ dependencies = [
 name = "openinfer-kv-offload"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "cudarc",
  "half",
  "log",
@@ -3603,7 +3597,6 @@ dependencies = [
  "half",
  "hex",
  "log",
- "memmap2",
  "openinfer-bench",
  "openinfer-core",
  "openinfer-cupti",
@@ -3631,7 +3624,6 @@ dependencies = [
  "anyhow",
  "criterion 0.8.2",
  "cudarc",
- "fastrace",
  "half",
  "log",
  "openinfer-core",
@@ -3666,13 +3658,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "colored",
  "comfy-table",
  "cudarc",
- "fastrace",
- "half",
  "log",
- "logforth",
  "openinfer-core",
  "openinfer-deepseek-v2-lite",
  "openinfer-deepseek-v4",

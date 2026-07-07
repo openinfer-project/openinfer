@@ -29,7 +29,6 @@ clap = { workspace = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
-libc = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
 openinfer-comm = { workspace = true, optional = true }

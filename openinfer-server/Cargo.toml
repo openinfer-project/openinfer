@@ -35,13 +35,9 @@ openinfer-vllm-frontend = { workspace = true }
 openinfer-vllm-support = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-colored = { workspace = true }
 comfy-table = { workspace = true }
 cudarc = { workspace = true }
-fastrace = { workspace = true }
-half = { workspace = true }
 log = { workspace = true }
-logforth = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 tokio-util = { workspace = true }
